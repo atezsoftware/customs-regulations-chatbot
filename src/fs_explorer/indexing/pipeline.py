@@ -382,6 +382,8 @@ class IndexingPipeline:
         files: list[str] = []
         for current_root, _, filenames in os.walk(root):
             for filename in filenames:
+                if filename.startswith("~$"):
+                    continue
                 ext = Path(filename).suffix.lower()
                 if ext in SUPPORTED_EXTENSIONS:
                     files.append(str(Path(current_root) / filename))

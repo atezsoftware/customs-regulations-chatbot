@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from .agent import clear_index_context, set_index_context, set_search_flags
@@ -18,6 +18,7 @@ from .embeddings import EmbeddingProvider
 from .exploration_trace import ExplorationTrace, extract_cited_sources
 from .index_config import resolve_db_path
 from .indexing import IndexingPipeline
+from .fs import SUPPORTED_EXTENSIONS
 from .indexing.metadata import auto_discover_profile
 from .search import IndexedQueryEngine
 from .storage import DuckDBStorage
@@ -59,7 +60,7 @@ class IndexRequest(BaseModel):
 
     folder: str = "."
     db_path: str | None = None
-    discover_schema: bool = True
+    discover_schema: bool = False
     schema_name: str | None = None
     with_metadata: bool = False
     metadata_profile: dict[str, Any] | None = None
@@ -82,6 +83,140 @@ class SearchRequest(BaseModel):
     db_path: str | None = None
 
 
+def _format_conversation_context(raw_context: Any) -> str:
+    """Format short-lived frontend memory into prompt context."""
+    if not isinstance(raw_context, list):
+        return ""
+
+    lines: list[str] = []
+    for item in raw_context[-10:]:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        cleaned = " ".join(content.split())
+        if not cleaned:
+            continue
+        if len(cleaned) > 1200:
+            cleaned = f"{cleaned[:1200]}..."
+        label = "User" if role == "user" else "Assistant"
+        lines.append(f"{label}: {cleaned}")
+
+    if not lines:
+        return ""
+
+    return (
+        "Previous conversation context from this browser session:\n"
+        + "\n".join(lines)
+        + "\n\nUse this context when it is relevant, but answer the current "
+        "question using the selected folder and available tools."
+    )
+
+
+def _task_with_context(task: str, raw_context: Any) -> str:
+    context = _format_conversation_context(raw_context)
+    if not context:
+        return task
+    return f"{context}\n\nCurrent question:\n{task}"
+
+
+def _status_for_tool(tool_name: str, tool_input: dict[str, Any]) -> dict[str, str]:
+    """Return compact UI status copy for a tool call."""
+    if tool_name == "semantic_search":
+        query = tool_input.get("query")
+        return {
+            "label": "Searching documents",
+            "detail": str(query) if query else "Running indexed retrieval",
+        }
+    if tool_name in {"parse_file", "preview_file", "get_document", "read"}:
+        target = (
+            tool_input.get("file_path")
+            or tool_input.get("doc_id")
+            or tool_input.get("directory")
+            or "document"
+        )
+        return {"label": "Reading source", "detail": str(target)}
+    if tool_name == "scan_folder":
+        return {
+            "label": "Scanning folder",
+            "detail": str(tool_input.get("directory", "")),
+        }
+    if tool_name in {"grep", "glob"}:
+        return {"label": "Searching files", "detail": str(tool_input)}
+    return {"label": "Using tool", "detail": tool_name}
+
+
+def _iter_supported_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        if path.name.startswith("~$"):
+            continue
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            files.append(path.resolve())
+    return sorted(files)
+
+
+def _index_freshness(folder_path: Path, docs: list[dict[str, Any]]) -> dict[str, Any]:
+    indexed = {str(doc["relative_path"]): doc for doc in docs}
+    current: dict[str, Path] = {}
+    for path in _iter_supported_files(folder_path):
+        current[str(path.relative_to(folder_path))] = path
+
+    added = sorted(set(current) - set(indexed))
+    removed = sorted(set(indexed) - set(current))
+    changed: list[str] = []
+    for relative_path in sorted(set(current) & set(indexed)):
+        path = current[relative_path]
+        stat = path.stat()
+        doc = indexed[relative_path]
+        if int(stat.st_size) != int(doc["file_size"]) or abs(
+            float(stat.st_mtime) - float(doc["file_mtime"])
+        ) > 0.001:
+            changed.append(relative_path)
+
+    return {
+        "fresh": not added and not changed and not removed,
+        "added_files": added,
+        "changed_files": changed,
+        "removed_files": removed,
+        "current_file_count": len(current),
+    }
+
+
+def _source_links(
+    *,
+    cited_sources: list[str],
+    referenced_documents: list[str],
+    root_directory: str,
+) -> dict[str, str]:
+    candidates: list[Path] = [Path(path).resolve() for path in referenced_documents]
+    root = Path(root_directory).resolve()
+
+    # If the final answer cites a document that was not in a direct tool call,
+    # fall back to a quick filename search under the selected folder.
+    known_names = {path.name for path in candidates}
+    for source in cited_sources:
+        source_name = Path(source).name
+        if source_name in known_names:
+            continue
+        for path in root.rglob(source_name):
+            if path.is_file():
+                candidates.append(path.resolve())
+                known_names.add(path.name)
+                break
+
+    links: dict[str, str] = {}
+    for source in cited_sources:
+        source_name = Path(source).name
+        for path in candidates:
+            if path.name == source or path.name == source_name or source in str(path):
+                links[source] = f"/api/document?path={str(path)}"
+                break
+    return links
+
+
 @app.get("/", response_class=HTMLResponse)
 async def get_ui():
     """Serve the main UI HTML file."""
@@ -91,6 +226,15 @@ async def get_ui():
             content=html_path.read_text(encoding="utf-8"), status_code=200
         )
     return HTMLResponse(content="<h1>UI not found</h1>", status_code=404)
+
+
+@app.get("/api/document")
+async def open_document(path: str):
+    """Serve a local source document for citation links."""
+    document_path = Path(path).expanduser().resolve()
+    if not document_path.exists() or not document_path.is_file():
+        return JSONResponse({"error": "Document not found"}, status_code=404)
+    return FileResponse(str(document_path), filename=document_path.name)
 
 
 @app.get("/api/folders")
@@ -154,6 +298,7 @@ async def index_status(folder: str, db_path: str | None = None):
                 return {"indexed": False}
 
             docs = storage.list_documents(corpus_id=corpus_id, include_deleted=False)
+            freshness = _index_freshness(folder_path, docs)
             active_schema = storage.get_active_schema(corpus_id=corpus_id)
             has_embeddings = storage.has_embeddings(corpus_id=corpus_id)
 
@@ -180,6 +325,7 @@ async def index_status(folder: str, db_path: str | None = None):
                 "has_metadata": has_metadata,
                 "has_embeddings": has_embeddings,
                 "schema_fields": schema_fields,
+                **freshness,
             }
         except Exception:
             storage.close()
@@ -328,17 +474,19 @@ async def websocket_explore(websocket: WebSocket):
     3. Final event: {"type": "complete", "data": {...}}
     """
     await websocket.accept()
+    index_storage: DuckDBStorage | None = None
 
     try:
         # Receive the task
         data = await websocket.receive_json()
         task = data.get("task", "")
+        original_task = task
         folder = data.get("folder", ".")
         use_index = bool(data.get("use_index", False))
         db_path = data.get("db_path")
         enable_semantic = bool(data.get("enable_semantic", False))
         enable_metadata = bool(data.get("enable_metadata", False))
-        index_storage: DuckDBStorage | None = None
+        conversation_context = data.get("conversation_context")
 
         if not task:
             await websocket.send_json(
@@ -382,6 +530,7 @@ async def websocket_explore(websocket: WebSocket):
             enable_metadata=enable_metadata and use_index,
         )
 
+        task = _task_with_context(str(task), conversation_context)
         trace = ExplorationTrace(root_directory=str(folder_path))
 
         # Reset agent for fresh state
@@ -392,9 +541,18 @@ async def websocket_explore(websocket: WebSocket):
             {
                 "type": "start",
                 "data": {
-                    "task": task,
+                    "task": original_task,
                     "folder": str(folder_path),
                     "use_index": use_index,
+                },
+            }
+        )
+        await websocket.send_json(
+            {
+                "type": "status",
+                "data": {
+                    "label": "Thinking",
+                    "detail": "Planning the first step",
                 },
             }
         )
@@ -427,6 +585,8 @@ async def websocket_explore(websocket: WebSocket):
                     tool_input=event.tool_input,
                     resolved_document_path=resolved_document_path,
                 )
+                tool_status = _status_for_tool(event.tool_name, event.tool_input)
+                await websocket.send_json({"type": "status", "data": tool_status})
                 await websocket.send_json(
                     {
                         "type": "tool_call",
@@ -435,6 +595,8 @@ async def websocket_explore(websocket: WebSocket):
                             "tool_name": event.tool_name,
                             "tool_input": event.tool_input,
                             "reason": event.reason,
+                            "status_label": tool_status["label"],
+                            "status_detail": tool_status["detail"],
                         },
                     }
                 )
@@ -451,6 +613,15 @@ async def websocket_explore(websocket: WebSocket):
                             "step": step_number,
                             "directory": event.directory,
                             "reason": event.reason,
+                        },
+                    }
+                )
+                await websocket.send_json(
+                    {
+                        "type": "status",
+                        "data": {
+                            "label": "Thinking",
+                            "detail": "Inspecting the selected folder",
                         },
                     }
                 )
@@ -477,7 +648,50 @@ async def websocket_explore(websocket: WebSocket):
 
         # Get final result
         result = await handler
-        cited_sources = extract_cited_sources(result.final_result)
+
+        final_result = result.final_result or ""
+        if not result.error:
+            await websocket.send_json(
+                {
+                    "type": "status",
+                    "data": {
+                        "label": "Writing answer",
+                        "detail": "Composing the final response",
+                    },
+                }
+            )
+            await websocket.send_json({"type": "answer_start", "data": {}})
+            streamed_parts: list[str] = []
+            agent = get_agent()
+            async for chunk in agent.stream_final_answer(fallback_answer=final_result):
+                streamed_parts.append(chunk)
+                await websocket.send_json(
+                    {"type": "answer_delta", "data": {"text": chunk}}
+                )
+            streamed_final = "".join(streamed_parts).strip()
+            if streamed_final:
+                final_result = streamed_final
+            cited_sources = extract_cited_sources(final_result)
+            referenced_documents = trace.sorted_documents()
+            cited_source_links = _source_links(
+                cited_sources=cited_sources,
+                referenced_documents=referenced_documents,
+                root_directory=str(folder_path),
+            )
+            await websocket.send_json(
+                {
+                    "type": "answer_done",
+                    "data": {
+                        "final_result": final_result,
+                        "cited_sources": cited_sources,
+                        "cited_source_links": cited_source_links,
+                    },
+                }
+            )
+        else:
+            cited_sources = []
+            referenced_documents = trace.sorted_documents()
+            cited_source_links = {}
 
         # Get token usage
         agent = get_agent()
@@ -488,7 +702,7 @@ async def websocket_explore(websocket: WebSocket):
             {
                 "type": "complete",
                 "data": {
-                    "final_result": result.final_result,
+                    "final_result": final_result,
                     "error": result.error,
                     "stats": {
                         "steps": step_number,
@@ -503,8 +717,9 @@ async def websocket_explore(websocket: WebSocket):
                     },
                     "trace": {
                         "step_path": trace.step_path,
-                        "referenced_documents": trace.sorted_documents(),
+                        "referenced_documents": referenced_documents,
                         "cited_sources": cited_sources,
+                        "cited_source_links": cited_source_links,
                     },
                 },
             }
@@ -515,6 +730,8 @@ async def websocket_explore(websocket: WebSocket):
     except Exception as e:
         await websocket.send_json({"type": "error", "data": {"message": str(e)}})
     finally:
+        if index_storage is not None:
+            index_storage.close()
         set_search_flags(enable_semantic=False, enable_metadata=False)
         clear_index_context()
 

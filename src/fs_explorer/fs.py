@@ -324,6 +324,8 @@ def scan_folder(
     # Find all supported document files
     doc_files = []
     for item in os.listdir(directory):
+        if item.startswith("~$"):
+            continue
         item_path = os.path.join(directory, item)
         if os.path.isfile(item_path):
             ext = os.path.splitext(item)[1].lower()

@@ -8,14 +8,14 @@ to make decisions about filesystem exploration actions.
 import os
 import re
 from pathlib import Path
-from typing import Callable, Any, cast
+from typing import AsyncIterator, Callable, Any, cast
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from google.genai.types import Content, HttpOptions, Part
 from google.genai import Client as GenAIClient
 
-from .models import Action, ActionType, ToolCallAction, Tools
+from .models import Action, ActionType, Tools
 from .fs import (
     read_file,
     grep_file_content,
@@ -618,15 +618,84 @@ class FsExplorerAgent:
                 self._chat_history.append(response.candidates[0].content)
             if response.text is not None:
                 action = Action.model_validate_json(response.text)
-                if action.to_action_type() == "toolcall":
-                    toolcall = cast(ToolCallAction, action.action)
-                    self.call_tool(
-                        tool_name=toolcall.tool_name,
-                        tool_input=toolcall.to_fn_args(),
-                    )
                 return action, action.to_action_type()
 
         return None
+
+    async def stream_final_answer(
+        self,
+        fallback_answer: str | None = None,
+    ) -> AsyncIterator[str]:
+        """
+        Stream the final user-facing answer as plain text.
+
+        Tool planning uses structured JSON responses. The final answer is
+        generated separately so the WebSocket UI can render it incrementally.
+        If the installed Gemini client does not expose async streaming, this
+        method falls back to yielding the existing structured final answer.
+        """
+        prompt = (
+            "Write the final answer for the user now. Use the evidence and tool "
+            "results already gathered in this conversation. Keep all factual "
+            "claims cited with the required [Source: filename, Section/Page] "
+            "format, and include a Sources Consulted section when sources were "
+            "used. Return plain text only."
+        )
+        stream_contents = [
+            *self._chat_history,
+            Content(role="user", parts=[Part.from_text(text=prompt)]),
+        ]
+
+        stream_fn = getattr(self._client.aio.models, "generate_content_stream", None)
+        if stream_fn is None:
+            if fallback_answer:
+                yield fallback_answer
+            return
+
+        chunks: list[str] = []
+        prompt_tokens = 0
+        completion_tokens = 0
+        saw_usage = False
+
+        try:
+            async for chunk in stream_fn(
+                model="gemini-3-flash-preview",
+                contents=stream_contents,  # type: ignore
+                config={
+                    "system_instruction": _build_system_prompt(
+                        _ENABLE_SEMANTIC, _ENABLE_METADATA
+                    ),
+                },
+            ):
+                if getattr(chunk, "usage_metadata", None):
+                    saw_usage = True
+                    usage = chunk.usage_metadata
+                    prompt_tokens = usage.prompt_token_count or prompt_tokens
+                    completion_tokens = (
+                        usage.candidates_token_count or completion_tokens
+                    )
+
+                text = getattr(chunk, "text", None)
+                if not text:
+                    continue
+                chunks.append(text)
+                yield text
+        except Exception:
+            if fallback_answer and not chunks:
+                yield fallback_answer
+            return
+
+        final_text = "".join(chunks)
+        if final_text:
+            self._chat_history.append(
+                Content(role="model", parts=[Part.from_text(text=final_text)])
+            )
+
+        if saw_usage:
+            self.token_usage.add_api_call(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
     def call_tool(self, tool_name: Tools, tool_input: dict[str, Any]) -> None:
         """

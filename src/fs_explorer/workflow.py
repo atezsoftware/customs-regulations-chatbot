@@ -22,7 +22,14 @@ from pydantic import BaseModel
 from typing import Annotated, cast, Any
 
 from .agent import FsExplorerAgent
-from .models import GoDeeperAction, ToolCallAction, StopAction, AskHumanAction, Action
+from .models import (
+    GoDeeperAction,
+    ToolCallAction,
+    StopAction,
+    AskHumanAction,
+    Action,
+    Tools,
+)
 from .fs import describe_dir_content
 
 # Per-asyncio-task agent storage — each WebSocket connection gets its own.
@@ -286,6 +293,10 @@ class FsExplorerWorkflow(Workflow):
         agent: Annotated[FsExplorerAgent, Resource(get_agent)],
     ) -> WorkflowEvent:
         """Process the result of a tool call."""
+        agent.call_tool(
+            tool_name=cast(Tools, ev.tool_name),
+            tool_input=ev.tool_input,
+        )
         agent.configure_task(
             "Given the result from the tool call you just performed, "
             "what action should you take next?"

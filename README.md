@@ -36,11 +36,20 @@ This video explains the architecture of the project and how to run it.
 git clone https://github.com/PromtEngineer/agentic-file-search.git
 cd agentic-file-search
 
-# Install with uv (recommended)
-uv pip install .
+# Create the uv-managed virtual environment
+uv venv
+source .venv/bin/activate
 
-# Or with pip
-pip install .
+# Install the app and runtime dependencies
+uv pip install .
+```
+
+Windows PowerShell:
+
+```powershell
+uv venv
+.\.venv\Scripts\Activate.ps1
+uv pip install .
 ```
 
 ## Configuration
@@ -69,16 +78,52 @@ uv run explore --task "Look in data/large_acquisition/. What are all the financi
 
 ```bash
 # Start the server
-uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
+PYTHONUTF8=1 uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
+
+# Or use the installed console script
+uv run explore-ui
 
 # Open http://127.0.0.1:8000 in your browser
 ```
 
 The web UI provides:
 - Folder browser to select target directory
-- Real-time step-by-step execution log
-- Final answer with citations
+- Chat-style interface with temporary in-browser conversation memory
+- Real-time status updates for thinking, searching, reading, and analysis
+- Streaming final answers with citations
 - Token usage and cost statistics
+- UTF-8 text handling for Turkish characters and other non-ASCII content
+
+### Turkish / UTF-8 text
+
+The web UI serves UTF-8 HTML and supports Turkish characters in questions,
+answers, folder names, and document text. If your terminal or operating system
+does not default to UTF-8, start the server with UTF-8 enabled:
+
+```bash
+PYTHONUTF8=1 uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
+```
+
+Windows PowerShell:
+
+```powershell
+$env:PYTHONUTF8="1"
+uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
+```
+
+### Optional Indexing
+
+You can ask questions without preparing an index. In that mode, the agent uses
+the original file-exploration flow: it scans folders, previews files, and reads
+only the sources it decides are relevant.
+
+Indexing is optional. It parses the selected folder once, writes searchable
+chunks to DuckDB, and enables the Semantic toggle in the web UI:
+
+```bash
+uv run explore index data/customs_test
+uv run explore --use-index --task "Transit sure asimi cezasi hangi genelgede geciyor?"
+```
 
 ## Architecture
 
@@ -149,7 +194,7 @@ src/fs_explorer/
 
 ```bash
 # Install dev dependencies
-uv pip install -e ".[dev]"
+uv sync --dev
 
 # Run tests
 uv run pytest

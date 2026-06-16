@@ -12,6 +12,9 @@ wheels/
 # caches
 *_cache/
 
+# Local document corpora
+data/
+
 # Environment
 .env
 
