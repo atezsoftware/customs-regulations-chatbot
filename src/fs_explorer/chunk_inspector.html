@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chunk Inspector</title>
+    <style>
+        :root {
+            --bg: #f6f7f9;
+            --surface: #ffffff;
+            --surface-2: #eef1f4;
+            --ink: #16191f;
+            --muted: #68707d;
+            --soft: #8c95a3;
+            --line: #d9dee6;
+            --line-strong: #bdc5d0;
+            --accent: #226f66;
+            --accent-2: #2f5f9e;
+            --warn: #9c6b1d;
+            --danger: #b34332;
+            --shadow: 0 10px 30px rgba(20, 26, 36, 0.08);
+            --radius: 8px;
+            --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+            --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: var(--bg);
+            color: var(--ink);
+            font-family: var(--sans);
+            font-size: 13px;
+            line-height: 1.45;
+        }
+
+        button, input, select {
+            font: inherit;
+        }
+
+        button {
+            cursor: pointer;
+        }
+
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.55;
+        }
+
+        .app {
+            min-height: 100vh;
+            display: grid;
+            grid-template-rows: auto 1fr;
+        }
+
+        .topbar {
+            border-bottom: 1px solid var(--line);
+            background: rgba(246, 247, 249, 0.96);
+            backdrop-filter: blur(10px);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .topbar-inner {
+            padding: 12px 16px;
+            display: grid;
+            grid-template-columns: auto minmax(220px, 1fr) auto auto auto;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .brand {
+            display: grid;
+            gap: 1px;
+            min-width: 150px;
+        }
+
+        .brand-title {
+            font-weight: 760;
+            letter-spacing: 0;
+        }
+
+        .brand-subtitle {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .field {
+            display: grid;
+            gap: 4px;
+            min-width: 0;
+        }
+
+        .label {
+            color: var(--muted);
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0;
+        }
+
+        input {
+            width: 100%;
+            min-height: 36px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--surface);
+            color: var(--ink);
+            padding: 8px 10px;
+            outline: 0;
+        }
+
+        input:focus {
+            border-color: var(--accent-2);
+            box-shadow: 0 0 0 3px rgba(47, 95, 158, 0.12);
+        }
+
+        .number-input {
+            width: 110px;
+        }
+
+        .btn {
+            border: 1px solid var(--line-strong);
+            border-radius: var(--radius);
+            background: var(--surface);
+            color: var(--ink);
+            min-height: 36px;
+            padding: 8px 11px;
+            font-weight: 700;
+        }
+
+        .btn.primary {
+            background: var(--ink);
+            border-color: var(--ink);
+            color: white;
+        }
+
+        .workspace {
+            min-height: 0;
+            display: grid;
+            grid-template-columns: 310px minmax(0, 1fr) 430px;
+        }
+
+        .pane {
+            min-height: 0;
+            border-right: 1px solid var(--line);
+            background: var(--surface);
+            display: grid;
+            grid-template-rows: auto 1fr;
+        }
+
+        .pane:last-child {
+            border-right: 0;
+        }
+
+        .pane-header {
+            min-height: 48px;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--line);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            background: #fbfcfd;
+        }
+
+        .pane-title {
+            min-width: 0;
+            font-weight: 760;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .pane-meta {
+            flex: 0 0 auto;
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 11px;
+        }
+
+        .pane-body {
+            min-height: 0;
+            overflow: auto;
+        }
+
+        .file-list, .chunk-list, .block-list {
+            display: grid;
+            align-content: start;
+        }
+
+        .file-item {
+            width: 100%;
+            border: 0;
+            border-bottom: 1px solid var(--line);
+            background: var(--surface);
+            color: var(--ink);
+            text-align: left;
+            padding: 10px 12px;
+            display: grid;
+            gap: 4px;
+        }
+
+        .file-item:hover,
+        .file-item.active {
+            background: #eef5f4;
+        }
+
+        .file-name {
+            font-weight: 700;
+            overflow-wrap: anywhere;
+        }
+
+        .file-path {
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 11px;
+            overflow-wrap: anywhere;
+        }
+
+        .block-row {
+            display: grid;
+            grid-template-columns: 52px minmax(0, 1fr);
+            border-bottom: 1px solid var(--line);
+            background: var(--surface);
+        }
+
+        .block-row.active {
+            background: #fff8e9;
+        }
+
+        .block-id {
+            padding: 9px 8px;
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 11px;
+            border-right: 1px solid var(--line);
+            background: #fbfcfd;
+        }
+
+        .block-text {
+            padding: 9px 10px;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
+        .block-kind {
+            display: inline-flex;
+            margin-right: 6px;
+            padding: 1px 5px;
+            border-radius: 5px;
+            border: 1px solid var(--line);
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 10px;
+            vertical-align: 1px;
+        }
+
+        .chunk-item {
+            border: 0;
+            border-bottom: 1px solid var(--line);
+            background: var(--surface);
+            color: var(--ink);
+            text-align: left;
+            padding: 10px 12px;
+            display: grid;
+            gap: 7px;
+        }
+
+        .chunk-item:hover,
+        .chunk-item.active {
+            background: #eef5f4;
+        }
+
+        .chunk-head {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 8px;
+            align-items: start;
+        }
+
+        .chunk-title {
+            min-width: 0;
+            font-weight: 760;
+            overflow-wrap: anywhere;
+        }
+
+        .chunk-path {
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 11px;
+            overflow-wrap: anywhere;
+        }
+
+        .chunk-type {
+            color: var(--accent-2);
+            font-family: var(--mono);
+            font-size: 11px;
+        }
+
+        .chunk-preview {
+            color: var(--muted);
+            overflow-wrap: anywhere;
+        }
+
+        .pill-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            min-height: 22px;
+            padding: 3px 6px;
+            border-radius: 6px;
+            border: 1px solid var(--line);
+            background: var(--surface-2);
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 11px;
+        }
+
+        .details {
+            padding: 12px;
+            display: grid;
+            gap: 12px;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 8px;
+        }
+
+        .metric {
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: #fbfcfd;
+            padding: 8px;
+        }
+
+        .metric-value {
+            font-weight: 800;
+            font-family: var(--mono);
+        }
+
+        .metric-label {
+            color: var(--muted);
+            font-size: 11px;
+        }
+
+        .section {
+            display: grid;
+            gap: 7px;
+        }
+
+        .section-title {
+            font-size: 12px;
+            font-weight: 800;
+        }
+
+        .kv {
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+
+        .kv-row {
+            display: grid;
+            grid-template-columns: 148px minmax(0, 1fr);
+            border-bottom: 1px solid var(--line);
+        }
+
+        .kv-row:last-child {
+            border-bottom: 0;
+        }
+
+        .kv-key {
+            background: #fbfcfd;
+            color: var(--muted);
+            padding: 7px 8px;
+            border-right: 1px solid var(--line);
+            font-family: var(--mono);
+            font-size: 11px;
+        }
+
+        .kv-value {
+            padding: 7px 8px;
+            overflow-wrap: anywhere;
+        }
+
+        .chunk-text {
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: #fbfcfd;
+            padding: 10px;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font-family: var(--sans);
+            max-height: 360px;
+            overflow: auto;
+        }
+
+        .notice {
+            padding: 12px;
+            color: var(--muted);
+        }
+
+        .notice.error {
+            color: var(--danger);
+        }
+
+        .warning-list {
+            display: grid;
+            gap: 6px;
+        }
+
+        .warning {
+            border: 1px solid rgba(156, 107, 29, 0.35);
+            border-radius: var(--radius);
+            color: var(--warn);
+            background: #fff8e9;
+            padding: 8px;
+        }
+
+        @media (max-width: 1180px) {
+            .workspace {
+                grid-template-columns: 260px minmax(0, 1fr);
+            }
+
+            .pane.details-pane {
+                grid-column: 1 / -1;
+                min-height: 480px;
+                border-top: 1px solid var(--line);
+            }
+        }
+
+        @media (max-width: 760px) {
+            .topbar-inner {
+                grid-template-columns: 1fr;
+            }
+
+            .number-input {
+                width: 100%;
+            }
+
+            .workspace {
+                grid-template-columns: 1fr;
+            }
+
+            .pane {
+                min-height: 420px;
+                border-right: 0;
+                border-bottom: 1px solid var(--line);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <header class="topbar">
+            <div class="topbar-inner">
+                <div class="brand">
+                    <div class="brand-title">Chunk Inspector</div>
+                    <div class="brand-subtitle">Standalone preview</div>
+                </div>
+                <label class="field">
+                    <span class="label">Folder</span>
+                    <input id="folderInput" value="data/customs_test" autocomplete="off">
+                </label>
+                <label class="field">
+                    <span class="label">Max chars</span>
+                    <input id="maxCharsInput" class="number-input" type="number" min="500" step="100" value="2400">
+                </label>
+                <button id="loadBtn" class="btn" type="button">Load Files</button>
+                <button id="chunkBtn" class="btn primary" type="button" disabled>Chunk File</button>
+            </div>
+        </header>
+
+        <main class="workspace">
+            <section class="pane">
+                <div class="pane-header">
+                    <div class="pane-title">Files</div>
+                    <div id="fileCount" class="pane-meta">0</div>
+                </div>
+                <div id="fileList" class="pane-body file-list">
+                    <div class="notice">No files loaded.</div>
+                </div>
+            </section>
+
+            <section class="pane">
+                <div class="pane-header">
+                    <div class="pane-title">Source Blocks</div>
+                    <div id="blockCount" class="pane-meta">0</div>
+                </div>
+                <div id="blockList" class="pane-body block-list">
+                    <div class="notice">No source blocks.</div>
+                </div>
+            </section>
+
+            <section class="pane details-pane">
+                <div class="pane-header">
+                    <div class="pane-title">Chunks</div>
+                    <div id="chunkCount" class="pane-meta">0</div>
+                </div>
+                <div class="pane-body">
+                    <div id="summary" class="details"></div>
+                    <div id="chunkList" class="chunk-list">
+                        <div class="notice">No chunks.</div>
+                    </div>
+                    <div id="details" class="details"></div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        const folderInput = document.getElementById("folderInput");
+        const maxCharsInput = document.getElementById("maxCharsInput");
+        const loadBtn = document.getElementById("loadBtn");
+        const chunkBtn = document.getElementById("chunkBtn");
+        const fileList = document.getElementById("fileList");
+        const blockList = document.getElementById("blockList");
+        const chunkList = document.getElementById("chunkList");
+        const details = document.getElementById("details");
+        const summary = document.getElementById("summary");
+        const fileCount = document.getElementById("fileCount");
+        const blockCount = document.getElementById("blockCount");
+        const chunkCount = document.getElementById("chunkCount");
+
+        let files = [];
+        let selectedFile = null;
+        let chunked = null;
+        let selectedChunkId = null;
+
+        function esc(value) {
+            return String(value ?? "")
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;");
+        }
+
+        function compact(value, limit = 220) {
+            const text = String(value ?? "").replace(/\s+/g, " ").trim();
+            if (text.length <= limit) return text;
+            return text.slice(0, limit - 1) + "…";
+        }
+
+        function formatBytes(bytes) {
+            const value = Number(bytes || 0);
+            if (value >= 1024 * 1024) return (value / (1024 * 1024)).toFixed(1) + " MB";
+            if (value >= 1024) return (value / 1024).toFixed(1) + " KB";
+            return value + " B";
+        }
+
+        async function loadFiles() {
+            const folder = folderInput.value.trim() || ".";
+            fileList.innerHTML = `<div class="notice">Loading files...</div>`;
+            fileCount.textContent = "0";
+            selectedFile = null;
+            chunkBtn.disabled = true;
+            clearPreview();
+            try {
+                const response = await fetch(`/api/files?folder=${encodeURIComponent(folder)}`);
+                const data = await response.json();
+                if (!response.ok || data.error) throw new Error(data.error || `Failed (${response.status})`);
+                files = data.files || [];
+                folderInput.value = data.folder || folder;
+                fileCount.textContent = String(files.length);
+                renderFiles();
+            } catch (error) {
+                fileList.innerHTML = `<div class="notice error">${esc(error.message)}</div>`;
+            }
+        }
+
+        function renderFiles() {
+            if (!files.length) {
+                fileList.innerHTML = `<div class="notice">No supported files.</div>`;
+                return;
+            }
+            fileList.innerHTML = files.map((file, index) => `
+                <button class="file-item ${selectedFile && selectedFile.path === file.path ? "active" : ""}" type="button" data-index="${index}">
+                    <span class="file-name">${esc(file.name)}</span>
+                    <span class="file-path">${esc(file.relative_path)} · ${esc(formatBytes(file.size_bytes))}</span>
+                </button>
+            `).join("");
+            fileList.querySelectorAll(".file-item").forEach((button) => {
+                button.addEventListener("click", () => {
+                    selectedFile = files[Number(button.dataset.index)];
+                    chunkBtn.disabled = false;
+                    renderFiles();
+                });
+            });
+        }
+
+        async function chunkSelectedFile() {
+            if (!selectedFile) return;
+            chunkBtn.disabled = true;
+            chunkBtn.textContent = "Chunking";
+            clearPreview();
+            summary.innerHTML = `<div class="notice">Chunking ${esc(selectedFile.name)}...</div>`;
+            try {
+                const response = await fetch("/api/chunk", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        file_path: selectedFile.path,
+                        root_path: folderInput.value.trim() || null,
+                        max_chunk_chars: Number(maxCharsInput.value || 2400),
+                    }),
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) throw new Error(data.error || `Failed (${response.status})`);
+                chunked = data;
+                selectedChunkId = data.chunks && data.chunks[0] ? data.chunks[0].chunk_id : null;
+                renderPreview();
+            } catch (error) {
+                summary.innerHTML = `<div class="notice error">${esc(error.message)}</div>`;
+            } finally {
+                chunkBtn.disabled = false;
+                chunkBtn.textContent = "Chunk File";
+            }
+        }
+
+        function clearPreview() {
+            chunked = null;
+            selectedChunkId = null;
+            blockCount.textContent = "0";
+            chunkCount.textContent = "0";
+            blockList.innerHTML = `<div class="notice">No source blocks.</div>`;
+            chunkList.innerHTML = `<div class="notice">No chunks.</div>`;
+            summary.innerHTML = "";
+            details.innerHTML = "";
+        }
+
+        function renderPreview() {
+            if (!chunked) return;
+            blockCount.textContent = String(chunked.blocks.length);
+            chunkCount.textContent = String(chunked.chunks.length);
+            renderSummary();
+            renderBlocks();
+            renderChunks();
+            renderDetails();
+        }
+
+        function renderSummary() {
+            const stats = chunked.stats || {};
+            const metadata = chunked.metadata || {};
+            const warnings = chunked.warnings || [];
+            summary.innerHTML = `
+                <div class="summary-grid">
+                    ${metric("Blocks", stats.block_count)}
+                    ${metric("Chunks", stats.chunk_count)}
+                    ${metric("Parents", (chunked.structure || []).length)}
+                    ${metric("Chars", stats.content_chars)}
+                    ${metric("Parser", metadata.parser || "")}
+                </div>
+                <div class="section">
+                    <div class="section-title">Document</div>
+                    <div class="pill-row">
+                        ${pill(metadata.document_type || "unknown")}
+                        ${pill(metadata.document_date || "date:null")}
+                        ${pill(metadata.document_number || "number:null")}
+                    </div>
+                </div>
+                ${warnings.length ? `
+                    <div class="section">
+                        <div class="section-title">Warnings</div>
+                        <div class="warning-list">${warnings.map((item) => `<div class="warning">${esc(item)}</div>`).join("")}</div>
+                    </div>
+                ` : ""}
+            `;
+        }
+
+        function metric(label, value) {
+            return `
+                <div class="metric">
+                    <div class="metric-value">${esc(value ?? 0)}</div>
+                    <div class="metric-label">${esc(label)}</div>
+                </div>
+            `;
+        }
+
+        function pill(value) {
+            return `<span class="pill">${esc(value)}</span>`;
+        }
+
+        function selectedChunk() {
+            if (!chunked || !selectedChunkId) return null;
+            return chunked.chunks.find((chunk) => chunk.chunk_id === selectedChunkId) || null;
+        }
+
+        function selectedBlockRange() {
+            const chunk = selectedChunk();
+            if (!chunk) return null;
+            return {
+                start: Number(chunk.source_start_block),
+                end: Number(chunk.source_end_block),
+            };
+        }
+
+        function renderBlocks() {
+            const range = selectedBlockRange();
+            blockList.innerHTML = chunked.blocks.map((block) => {
+                const active = range && block.block_id >= range.start && block.block_id <= range.end;
+                return `
+                    <div class="block-row ${active ? "active" : ""}" id="block-${block.block_id}">
+                        <div class="block-id">#${esc(block.block_id)}</div>
+                        <div class="block-text"><span class="block-kind">${esc(block.kind)}</span>${esc(block.text)}</div>
+                    </div>
+                `;
+            }).join("") || `<div class="notice">No source blocks.</div>`;
+        }
+
+        function renderChunks() {
+            chunkList.innerHTML = chunked.chunks.map((chunk) => {
+                const active = chunk.chunk_id === selectedChunkId;
+                const title = chunkTitle(chunk);
+                const path = chunkPath(chunk);
+                return `
+                    <button class="chunk-item ${active ? "active" : ""}" type="button" data-id="${esc(chunk.chunk_id)}">
+                        <span class="chunk-head">
+                            <span class="chunk-title">${esc(title)}</span>
+                            <span class="chunk-type">${esc(chunk.chunk_type)}</span>
+                        </span>
+                        <span class="chunk-path">${esc(compact(path, 260))}</span>
+                        <span class="pill-row">
+                            ${pill(`#${chunk.chunk_order}`)}
+                            ${chunk.article_no ? pill(`MADDE ${chunk.article_no}`) : ""}
+                            ${chunk.paragraph_no ? pill(`(${chunk.paragraph_no})`) : ""}
+                            ${chunk.clause_label ? pill(`${chunk.clause_label})`) : ""}
+                            ${pill(`blocks ${chunk.source_start_block}-${chunk.source_end_block}`)}
+                            ${pill(`valid ${chunk.validity_start_date || "null"} / ${chunk.validity_end_date || "null"}`)}
+                        </span>
+                        <span class="chunk-preview">${esc(compact(chunk.text, 180))}</span>
+                    </button>
+                `;
+            }).join("") || `<div class="notice">No chunks.</div>`;
+
+            chunkList.querySelectorAll(".chunk-item").forEach((button) => {
+                button.addEventListener("click", () => {
+                    selectedChunkId = button.dataset.id;
+                    renderChunks();
+                    renderBlocks();
+                    renderDetails();
+                    const range = selectedBlockRange();
+                    if (range) {
+                        document.getElementById(`block-${range.start}`)?.scrollIntoView({ block: "nearest" });
+                    }
+                });
+            });
+        }
+
+        function chunkTitle(chunk) {
+            const path = Array.isArray(chunk.parent_path) ? chunk.parent_path : [];
+            if ((chunk.chunk_type === "clause" || chunk.chunk_type === "paragraph") && path.length) {
+                return path[path.length - 1];
+            }
+            if (chunk.chunk_type === "clause" && chunk.clause_label) {
+                return `(${chunk.clause_label})`;
+            }
+            if (chunk.chunk_type === "paragraph" && chunk.paragraph_no) {
+                return `(${chunk.paragraph_no})`;
+            }
+            if (chunk.article_no) {
+                return `MADDE ${chunk.article_no}${chunk.article_title ? " · " + chunk.article_title : ""}`;
+            }
+            if (chunk.appendix_label) return chunk.appendix_label;
+            const headingPath = Array.isArray(chunk.heading_path) ? chunk.heading_path : [];
+            if (headingPath.length) return headingPath[headingPath.length - 1];
+            return chunk.chunk_type || "chunk";
+        }
+
+        function chunkPath(chunk) {
+            const path = Array.isArray(chunk.parent_path) ? chunk.parent_path : [];
+            return path.join(" > ");
+        }
+
+        function renderDetails() {
+            const chunk = selectedChunk();
+            if (!chunk) {
+                details.innerHTML = "";
+                return;
+            }
+            details.innerHTML = `
+                <div class="section">
+                    <div class="section-title">Metadata</div>
+                    <div class="kv">
+                        ${kv("chunk_id", chunk.chunk_id)}
+                        ${kv("doc_id", chunk.doc_id)}
+                        ${kv("source_file", chunk.source_file)}
+                        ${kv("document_type", chunk.document_type)}
+                        ${kv("document_date", chunk.document_date)}
+                        ${kv("document_number", chunk.document_number)}
+                        ${kv("chunk_type", chunk.chunk_type)}
+                        ${kv("parent_id", chunk.parent_id)}
+                        ${kv("atomic_path", chunkPath(chunk))}
+                        ${kv("parent_path", (chunk.parent_path || []).join(" > "))}
+                        ${kv("parent_ids", (chunk.parent_ids || []).join(" > "))}
+                        ${kv("heading_path", (chunk.heading_path || []).join(" > "))}
+                        ${kv("article_no", chunk.article_no)}
+                        ${kv("article_title", chunk.article_title)}
+                        ${kv("paragraph_no", chunk.paragraph_no)}
+                        ${kv("clause_label", chunk.clause_label)}
+                        ${kv("subclause_label", chunk.subclause_label)}
+                        ${kv("appendix_label", chunk.appendix_label)}
+                        ${kv("table_index", chunk.table_index)}
+                        ${kv("source_blocks", `${chunk.source_start_block}-${chunk.source_end_block}`)}
+                        ${kv("source_chars", `${chunk.source_start_char}-${chunk.source_end_char}`)}
+                        ${kv("validity_start_date", chunk.validity_start_date)}
+                        ${kv("validity_end_date", chunk.validity_end_date)}
+                    </div>
+                </div>
+                ${chunk.warnings && chunk.warnings.length ? `
+                    <div class="section">
+                        <div class="section-title">Chunk Warnings</div>
+                        <div class="warning-list">${chunk.warnings.map((item) => `<div class="warning">${esc(item)}</div>`).join("")}</div>
+                    </div>
+                ` : ""}
+                <div class="section">
+                    <div class="section-title">Text</div>
+                    <div class="chunk-text">${esc(chunk.text)}</div>
+                </div>
+            `;
+        }
+
+        function kv(key, value) {
+            return `
+                <div class="kv-row">
+                    <div class="kv-key">${esc(key)}</div>
+                    <div class="kv-value">${esc(value ?? "null")}</div>
+                </div>
+            `;
+        }
+
+        loadBtn.addEventListener("click", loadFiles);
+        chunkBtn.addEventListener("click", chunkSelectedFile);
+        folderInput.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") loadFiles();
+        });
+
+        loadFiles();
+    </script>
+</body>
+</html>

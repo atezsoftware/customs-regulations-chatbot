@@ -216,3 +216,9 @@ MIT
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=PromtEngineer/agentic-file-search&type=Date)](https://star-history.com/#PromtEngineer/agentic-file-search&Date)
+
+
+
+
+
+  /home/kubilay-payci/customs-regulations-chatbot/.venv/bin/python -m fs_explorer.chunk_inspector --host 127.0.0.1 --port 8123
