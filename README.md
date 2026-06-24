@@ -1,6 +1,6 @@
 # Agentic File Search
 
-> **Based on**: [run-llama/fs-explorer](https://github.com/run-llama/fs-explorer) — The original CLI agent for filesystem exploration.
+
 
 An AI-powered document search agent that explores files like a human would — scanning, reasoning, and following cross-references. Unlike traditional RAG systems that rely on pre-computed embeddings, this agent dynamically navigates documents to find answers.
 
@@ -11,14 +11,6 @@ Traditional RAG (Retrieval-Augmented Generation) has limitations:
 - **Cross-references are invisible** — "See Exhibit B" means nothing to embeddings
 - **Similarity ≠ Relevance** — Semantic matching misses logical connections
 
-This system uses a **three-phase strategy**:
-1. **Parallel Scan** — Preview all documents in a folder at once
-2. **Deep Dive** — Full extraction on relevant documents only
-3. **Backtrack** — Follow cross-references to previously skipped documents
-
-## Watch the video
-This video explains the architecture of the project and how to run it. 
-[![Watch the demo on YouTube](https://img.youtube.com/vi/rMADSuus6jg/maxresdefault.jpg)](https://www.youtube.com/watch?v=rMADSuus6jg)
 
 ## Features
 
@@ -146,77 +138,6 @@ User Query
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed diagrams.
-
-## Test Documents
-
-The repo includes test document sets for evaluation:
-
-- `data/test_acquisition/` — 10 interconnected legal documents
-- `data/large_acquisition/` — 25 documents with extensive cross-references
-
-Example queries:
-```bash
-# Simple (single doc)
-uv run explore --task "Look in data/test_acquisition/. Who is the CTO?"
-
-# Cross-reference required
-uv run explore --task "Look in data/test_acquisition/. What is the adjusted purchase price?"
-
-# Multi-document synthesis
-uv run explore --task "Look in data/large_acquisition/. What happens to employees after the acquisition?"
-```
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|------------|
-| LLM | Google Gemini 3 Flash |
-| Document Parsing | Docling (local, open-source) |
-| Orchestration | LlamaIndex Workflows |
-| CLI | Typer + Rich |
-| Web Server | FastAPI + WebSocket |
-| Package Manager | uv |
-
-## Project Structure
-
-```
-src/fs_explorer/
-├── agent.py      # Gemini client, token tracking
-├── workflow.py   # LlamaIndex workflow engine
-├── fs.py         # File tools: scan, parse, grep
-├── models.py     # Pydantic models for actions
-├── main.py       # CLI entry point
-├── server.py     # FastAPI + WebSocket server
-└── ui.html       # Single-file web interface
-```
-
-## Development
-
-```bash
-# Install dev dependencies
-uv sync --dev
-
-# Run tests
-uv run pytest
-
-# Lint
-uv run ruff check .
-```
-
-## License
-
-MIT
-
-## Acknowledgments
-
-- Original concept from [run-llama/fs-explorer](https://github.com/run-llama/fs-explorer)
-- Document parsing by [Docling](https://github.com/DS4SD/docling)
-- Powered by [Google Gemini](https://deepmind.google/technologies/gemini/)
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=PromtEngineer/agentic-file-search&type=Date)](https://star-history.com/#PromtEngineer/agentic-file-search&Date)
-
 
 
 
