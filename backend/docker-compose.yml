@@ -1,0 +1,33 @@
+services:
+  backend:
+    build:
+      context: .
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${PORT:-3000}
+      HOST: 0.0.0.0
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+      ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-30}
+      STORAGE_ROOT: /app/storage
+      CORE_INTERNAL_URL: ${CORE_INTERNAL_URL:-ws://core:8000}
+      CORE_INTERNAL_TOKEN: ${CORE_INTERNAL_TOKEN:-}
+    volumes:
+      - customs_storage:/app/storage
+    networks:
+      - customs_internal
+
+networks:
+  customs_internal:
+    external: true
+    name: customs_internal
+
+volumes:
+  customs_storage:
+    name: customs_storage_${APP_ENV:-dev}

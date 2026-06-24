@@ -1,0 +1,23 @@
+services:
+  core:
+    build:
+      context: .
+    environment:
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      CORE_INTERNAL_TOKEN: ${CORE_INTERNAL_TOKEN:-}
+      FS_EXPLORER_LLM_PROVIDER: ${FS_EXPLORER_LLM_PROVIDER:-gemini}
+      FS_EXPLORER_LLM_MODEL: ${FS_EXPLORER_LLM_MODEL:-gemini-3-flash-preview}
+    volumes:
+      - customs_storage:/app/storage
+    networks:
+      - customs_internal
+
+networks:
+  customs_internal:
+    external: true
+    name: customs_internal
+
+volumes:
+  customs_storage:
+    name: customs_storage_${APP_ENV:-dev}

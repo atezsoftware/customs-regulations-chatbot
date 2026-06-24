@@ -1,0 +1,11 @@
+services:
+  backend:
+    container_name: customs-backend-dev
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      - ./src:/app/src
+      - ./tsconfig.json:/app/tsconfig.json
+      - ../storage:/app/storage
+    command: npm run dev
+    restart: unless-stopped

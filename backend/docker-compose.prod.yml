@@ -1,0 +1,13 @@
+services:
+  backend:
+    container_name: customs-backend-prod
+    ports:
+      - "${BACKEND_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      CORE_INTERNAL_URL: ws://core:8000
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 1g

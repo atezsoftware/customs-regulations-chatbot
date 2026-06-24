@@ -1,0 +1,6 @@
+services:
+  core:
+    container_name: customs-core-test
+    ports:
+      - "127.0.0.1:${CORE_PORT:-8001}:8000"
+    restart: "no"

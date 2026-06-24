@@ -1,0 +1,15 @@
+services:
+  postgres:
+    container_name: customs-db-prod
+    restart: always
+    # Intentionally no host port mapping — only reachable by other services on
+    # the same Docker network (e.g. backend), never exposed on the host.
+    volumes:
+      - postgres_data_prod:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+volumes:
+  postgres_data_prod:

@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# Single entrypoint to bring up any subset of this repo's apps (db, core,
+# backend, frontend) in a chosen environment (dev, test, prod).
+#
+# Usage:
+#   scripts/run.sh --env dev --apps all
+#   scripts/run.sh --env dev --apps db,backend
+#   scripts/run.sh --env test --apps db
+#   scripts/run.sh --env prod --apps backend
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENVIRONMENT="dev"
+APPS="all"
+
+usage() {
+  cat <<EOF
+Usage: $0 --env <dev|test|prod> --apps <all|db,core,backend,frontend>
+
+  --env   Environment to run (default: dev)
+  --apps  Comma-separated list of apps to start, or "all" (default: all)
+
+Examples:
+  $0 --env dev --apps all
+  $0 --env dev --apps db,backend
+  $0 --env test --apps db
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env) ENVIRONMENT="$2"; shift 2 ;;
+    --apps) APPS="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+case "$ENVIRONMENT" in
+  dev|test|prod) ;;
+  *) echo "Invalid --env '$ENVIRONMENT' (expected dev, test or prod)" >&2; exit 1 ;;
+esac
+
+if [[ "$APPS" == "all" ]]; then
+  APPS="db,core,backend,frontend"
+fi
+IFS=',' read -ra APP_LIST <<< "$APPS"
+for app in "${APP_LIST[@]}"; do
+  case "$app" in
+    db|core|backend|frontend) ;;
+    *) echo "Invalid app '$app' (expected db, core, backend or frontend)" >&2; exit 1 ;;
+  esac
+done
+
+PIDS=()
+MIGRATIONS_RAN=0
+cleanup() {
+  if [[ ${#PIDS[@]} -gt 0 ]]; then
+    echo
+    echo "Stopping apps..."
+    kill "${PIDS[@]}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+load_env() {
+  local root_env="$ROOT_DIR/.env.$ENVIRONMENT"
+  local db_env="$ROOT_DIR/db/.env.$ENVIRONMENT"
+
+  set -a
+  [[ -f "$root_env" ]] && source "$root_env"
+  [[ -f "$db_env" ]] && source "$db_env"
+  set +a
+
+  export APP_ENV="$ENVIRONMENT"
+  if [[ -z "${DATABASE_URL:-}" ]]; then
+    if [[ -n "${DB_USER:-}" && -n "${DB_HOST:-}" && -n "${DB_NAME:-}" ]]; then
+      export DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD:-}@${DB_HOST}:${DB_PORT:-5432}/${DB_NAME}"
+    elif [[ -n "${POSTGRES_USER:-}" && -n "${POSTGRES_DB:-}" ]]; then
+      export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD:-}@localhost:${POSTGRES_PORT:-5432}/${POSTGRES_DB}"
+    fi
+  fi
+}
+
+run_migrations() {
+  if [[ "$ENVIRONMENT" == "prod" ]]; then
+    echo "==> [db:prod] skipping auto-migration (no host port exposed by design)."
+    echo "    Run migrations from a host on the same docker network, e.g.:"
+    echo "    cd db && DATABASE_URL=postgresql://user:pass@postgres:5432/db npm run migrate:up"
+    return
+  fi
+
+  if [[ "$MIGRATIONS_RAN" == "1" ]]; then
+    return
+  fi
+
+  local env_file="$ROOT_DIR/db/.env.$ENVIRONMENT"
+  if [[ ! -f "$env_file" ]]; then
+    echo "Missing $env_file. Copy db/.env.$ENVIRONMENT.example to $env_file and fill it in." >&2
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$env_file"
+  local port="${POSTGRES_PORT:-5432}"
+  echo "==> [db:$ENVIRONMENT] running migrations"
+  (
+    cd "$ROOT_DIR/db"
+    [[ -d node_modules ]] || npm install
+    DATABASE_URL="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@localhost:$port/$POSTGRES_DB" npm run migrate:up
+  )
+  MIGRATIONS_RAN=1
+}
+
+run_db() {
+  echo "==> [db:$ENVIRONMENT] starting Postgres via docker compose"
+  local env_file="$ROOT_DIR/db/.env.$ENVIRONMENT"
+  if [[ ! -f "$env_file" ]]; then
+    echo "Missing $env_file. Copy db/.env.$ENVIRONMENT.example to $env_file and fill it in." >&2
+    exit 1
+  fi
+  (
+    cd "$ROOT_DIR/db"
+    docker compose -f docker-compose.yml -f "docker-compose.$ENVIRONMENT.yml" --env-file ".env.$ENVIRONMENT" up -d
+  )
+
+  if [[ "$ENVIRONMENT" == "prod" ]]; then
+    run_migrations
+    return
+  fi
+
+  # shellcheck disable=SC1090
+  source "$env_file"
+  local port="${POSTGRES_PORT:-5432}"
+  echo "==> [db:$ENVIRONMENT] waiting for Postgres to become ready on port $port"
+  for _ in $(seq 1 30); do
+    if docker compose -f "$ROOT_DIR/db/docker-compose.yml" -f "$ROOT_DIR/db/docker-compose.$ENVIRONMENT.yml" \
+        --env-file "$env_file" exec -T postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+
+  run_migrations
+}
+
+run_core() {
+  echo "==> [core:$ENVIRONMENT] Python AI engine"
+  load_env
+  case "$ENVIRONMENT" in
+    dev)
+      (
+        cd "$ROOT_DIR/core"
+        if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+          PYTHONUTF8=1 PYTHONPATH="$ROOT_DIR/core/src" "$ROOT_DIR/.venv/bin/python" -m uvicorn \
+            fs_explorer.server:app \
+            --host 127.0.0.1 \
+            --port "${CORE_PORT:-8000}" \
+            --reload \
+            --reload-dir "$ROOT_DIR/core/src"
+        elif command -v uv >/dev/null 2>&1; then
+          uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port "${CORE_PORT:-8000}" --reload
+        else
+          echo "Cannot start core: neither $ROOT_DIR/.venv/bin/python nor uv is available." >&2
+          exit 1
+        fi
+      ) &
+      PIDS+=($!)
+      ;;
+    test|prod)
+      (
+        cd "$ROOT_DIR/core"
+        docker compose -f docker-compose.yml -f "docker-compose.$ENVIRONMENT.yml" up -d --build
+      )
+      ;;
+  esac
+}
+
+run_backend() {
+  echo "==> [backend:$ENVIRONMENT] LoopBack 4 API"
+  load_env
+  case "$ENVIRONMENT" in
+    dev|test)
+      run_migrations
+      (
+        cd "$ROOT_DIR/backend"
+        [[ -d node_modules ]] || npm install
+        case "$ENVIRONMENT" in
+          dev) npm run dev ;;
+          test) NODE_ENV=test npm run build && NODE_ENV=test npm start ;;
+        esac
+      ) &
+      PIDS+=($!)
+      ;;
+    prod)
+      (
+        cd "$ROOT_DIR/backend"
+        docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+      )
+      ;;
+  esac
+}
+
+run_frontend() {
+  if [[ ! -f "$ROOT_DIR/frontend/package.json" ]]; then
+    echo "==> [frontend] not scaffolded yet — skipping."
+    return
+  fi
+  load_env
+  echo "==> [frontend:$ENVIRONMENT] web app"
+  (
+    cd "$ROOT_DIR/frontend"
+    [[ -d node_modules ]] || npm install
+    case "$ENVIRONMENT" in
+      dev) npm run dev ;;
+      test) npm run build ;;
+      prod) npm run build && npm run preview -- --host 0.0.0.0 ;;
+    esac
+  ) &
+  PIDS+=($!)
+}
+
+for app in "${APP_LIST[@]}"; do
+  case "$app" in
+    db) run_db ;;
+    core) run_core ;;
+    backend) run_backend ;;
+    frontend) run_frontend ;;
+  esac
+done
+
+if [[ ${#PIDS[@]} -gt 0 ]]; then
+  echo
+  echo "Running: ${APP_LIST[*]} (env: $ENVIRONMENT). Press Ctrl+C to stop."
+  wait
+fi

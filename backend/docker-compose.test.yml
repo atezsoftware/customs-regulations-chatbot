@@ -1,0 +1,8 @@
+services:
+  backend:
+    container_name: customs-backend-test
+    ports:
+      - "${PORT:-3001}:3000"
+    environment:
+      NODE_ENV: test
+    restart: "no"

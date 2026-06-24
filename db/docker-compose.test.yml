@@ -1,0 +1,7 @@
+services:
+  postgres:
+    container_name: customs-db-test
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    # No named volume: each test run starts from a clean, ephemeral database.
+    restart: "no"
