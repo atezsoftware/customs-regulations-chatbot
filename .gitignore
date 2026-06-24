@@ -12,8 +12,20 @@ wheels/
 # caches
 *_cache/
 
+# Local document corpora
+data/
+
 # Environment
 .env
+.env.dev
+.env.test
+.env.prod
+
+# Node
+node_modules/
+
+# Uploaded files (backend)
+backend/storage/
 
 # OS files
 .DS_Store

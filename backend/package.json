@@ -1,0 +1,40 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "Customs regulations chatbot backend (LoopBack 4)",
+  "private": true,
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "dev": "NODE_ENV=development tsx watch src/index.ts",
+    "start": "node -r dotenv/config dist/index.js",
+    "migrate:up": "npm --prefix ../db run migrate:up",
+    "migrate:down": "npm --prefix ../db run migrate:down"
+  },
+  "dependencies": {
+    "@loopback/boot": "^7.0.7",
+    "@loopback/core": "^6.1.7",
+    "@loopback/repository": "^7.0.7",
+    "@loopback/rest": "^14.0.7",
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "loopback-connector-postgresql": "^7.1.0",
+    "multer": "^2.0.1",
+    "undici": "^5.29.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

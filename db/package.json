@@ -1,0 +1,15 @@
+{
+  "name": "db",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Database infrastructure: docker-compose environments + SQL migrations",
+  "scripts": {
+    "migrate:up": "node-pg-migrate up",
+    "migrate:down": "node-pg-migrate down",
+    "migrate:create": "node-pg-migrate create --migration-file-language sql"
+  },
+  "devDependencies": {
+    "node-pg-migrate": "^7.6.1",
+    "pg": "^8.13.1"
+  }
+}
