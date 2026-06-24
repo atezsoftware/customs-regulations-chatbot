@@ -634,6 +634,25 @@ class PostgresStorage:
                 row = cur.fetchone()
         return bool(row and int(row[0]) > 0)
 
+    def list_chunks_missing_embeddings(
+        self, *, corpus_id: str
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT c.id, c.text
+            FROM core_chunks c
+            JOIN core_documents d ON d.id = c.document_id
+            LEFT JOIN core_chunk_embeddings ce ON ce.chunk_id = c.id
+            WHERE d.corpus_id = %s
+              AND d.is_deleted = false
+              AND ce.chunk_id IS NULL
+            ORDER BY d.relative_path ASC, c.position ASC
+        """
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (corpus_id,))
+                rows = cur.fetchall()
+        return [{"id": str(row[0]), "text": str(row[1])} for row in rows]
+
     @staticmethod
     def _metadata_clause(
         *,

@@ -2,6 +2,8 @@ import type {DirectoryIndexStatus} from '../types';
 
 const LABELS: Record<DirectoryIndexStatus['status'], string> = {
   not_indexed: 'Not indexed',
+  chunking: 'Generating chunks',
+  chunked: 'Chunks ready',
   indexing: 'Indexing',
   completed: 'Indexed',
   stale: 'Stale',
@@ -11,6 +13,8 @@ const LABELS: Record<DirectoryIndexStatus['status'], string> = {
 
 const CLASSES: Record<DirectoryIndexStatus['status'], string> = {
   not_indexed: 'bg-slate-100 text-slate-500',
+  chunking: 'bg-indigo-50 text-indigo-600',
+  chunked: 'bg-sky-50 text-sky-700',
   indexing: 'bg-indigo-50 text-indigo-600',
   completed: 'bg-emerald-50 text-emerald-700',
   stale: 'bg-amber-50 text-amber-700',

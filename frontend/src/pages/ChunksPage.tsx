@@ -29,7 +29,10 @@ export function ChunksPage() {
           .flatMap(directory =>
             directory.files.map(file => ({directoryId: directory.id, file})),
           )
-          .find(item => item.file.storageStatus === 'indexed');
+          .find(
+            item =>
+              item.file.storageStatus === 'indexed' || item.file.storageStatus === 'chunked',
+          );
         setSelected(firstIndexed ?? null);
       })
       .catch(err => {
@@ -110,6 +113,7 @@ export function ChunksPage() {
                       const active =
                         selected?.directoryId === directory.id && selected.file.id === file.id;
                       const indexed = file.storageStatus === 'indexed';
+                      const chunked = file.storageStatus === 'chunked';
                       return (
                         <button
                           key={file.id}
@@ -129,12 +133,14 @@ export function ChunksPage() {
                               className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${
                                 indexed
                                   ? 'bg-emerald-50 text-emerald-700'
-                                  : file.storageStatus === 'error'
-                                    ? 'bg-rose-50 text-rose-700'
-                                    : 'bg-amber-50 text-amber-700'
+                                  : chunked
+                                    ? 'bg-sky-50 text-sky-700'
+                                    : file.storageStatus === 'error'
+                                      ? 'bg-rose-50 text-rose-700'
+                                      : 'bg-amber-50 text-amber-700'
                               }`}
                             >
-                              {indexed ? 'indexed' : file.storageStatus ?? 'stored'}
+                              {file.storageStatus ?? 'stored'}
                             </span>
                           </span>
                           <span className="mt-1 block text-xs text-slate-400">

@@ -6,6 +6,8 @@ const DEFAULT_CORE_URL = 'http://127.0.0.1:8000';
 
 export type DirectoryIndexState =
   | 'not_indexed'
+  | 'chunking'
+  | 'chunked'
   | 'indexing'
   | 'completed'
   | 'stale'
@@ -37,7 +39,7 @@ export interface SkippedDirectoryFile {
   reason: string;
 }
 
-export interface DirectoryIndexCompletion {
+export interface DirectoryChunkingCompletion {
   directoryId: number;
   corpusKey: string;
   indexedFiles: IndexableDirectoryFile[];
@@ -45,33 +47,78 @@ export interface DirectoryIndexCompletion {
   result: Record<string, unknown>;
 }
 
-export interface StartDirectoryIndexOptions {
-  onCompleted?: (completion: DirectoryIndexCompletion) => Promise<void>;
+export interface DirectoryEmbeddingCompletion {
+  directoryId: number;
+  corpusKey: string;
+  result: Record<string, unknown>;
+}
+
+export interface StartDirectoryChunkingOptions {
+  onCompleted?: (completion: DirectoryChunkingCompletion) => Promise<void>;
+}
+
+export interface StartDirectoryEmbeddingOptions {
+  onCompleted?: (completion: DirectoryEmbeddingCompletion) => Promise<void>;
 }
 
 const activeJobs = new Map<number, DirectoryIndexStatus>();
 
-export function startDirectoryIndex(
+const BUSY_STATES: DirectoryIndexState[] = ['chunking', 'indexing'];
+
+export function startDirectoryChunking(
   directoryId: number,
   files: IndexableDirectoryFile[],
-  options: StartDirectoryIndexOptions = {},
+  options: StartDirectoryChunkingOptions = {},
 ): DirectoryIndexStatus {
   const existing = activeJobs.get(directoryId);
-  if (existing?.status === 'indexing') return existing;
+  if (existing && BUSY_STATES.includes(existing.status)) return existing;
 
-  console.info(`[directory-index] starting directory=${directoryId}`);
+  console.info(`[directory-index] starting chunking directory=${directoryId}`);
   const started: DirectoryIndexStatus = {
     directoryId,
-    status: 'indexing',
+    status: 'chunking',
     progress: 10,
-    message: 'Indexing started. Generating embeddings after chunking.',
+    message: 'Parsing files and creating regulatory chunks.',
     updatedAt: new Date().toISOString(),
   };
   activeJobs.set(directoryId, started);
 
-  void runDirectoryIndex(directoryId, files, options).catch(error => {
+  void runDirectoryChunking(directoryId, files, options).catch(error => {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[directory-index] failed directory=${directoryId}: ${message}`);
+    console.error(`[directory-index] chunking failed directory=${directoryId}: ${message}`);
+    activeJobs.set(directoryId, {
+      directoryId,
+      status: 'error',
+      progress: 0,
+      message,
+      updatedAt: new Date().toISOString(),
+    });
+  });
+
+  return started;
+}
+
+export function startCorpusEmbedding(
+  directoryId: number,
+  corpusKey: string,
+  options: StartDirectoryEmbeddingOptions = {},
+): DirectoryIndexStatus {
+  const existing = activeJobs.get(directoryId);
+  if (existing && BUSY_STATES.includes(existing.status)) return existing;
+
+  console.info(`[directory-index] starting embedding directory=${directoryId}`);
+  const started: DirectoryIndexStatus = {
+    directoryId,
+    status: 'indexing',
+    progress: 50,
+    message: 'Generating embeddings for existing chunks.',
+    updatedAt: new Date().toISOString(),
+  };
+  activeJobs.set(directoryId, started);
+
+  void runCorpusEmbedding(directoryId, corpusKey, options).catch(error => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[directory-index] embedding failed directory=${directoryId}: ${message}`);
     activeJobs.set(directoryId, {
       directoryId,
       status: 'error',
@@ -86,7 +133,7 @@ export function startDirectoryIndex(
 
 export async function getDirectoryIndexStatus(directoryId: number): Promise<DirectoryIndexStatus> {
   const active = activeJobs.get(directoryId);
-  if (active?.status === 'indexing' || active?.status === 'error') return active;
+  if (active && (BUSY_STATES.includes(active.status) || active.status === 'error')) return active;
 
   const endpoint = `${resolveCoreRestUrl()}/api/index/status`;
   const headers: Record<string, string> = {};
@@ -121,14 +168,24 @@ export async function getDirectoryIndexStatus(directoryId: number): Promise<Dire
     }
 
     const fresh = Boolean(data.fresh);
-    const status: DirectoryIndexStatus = {
-      directoryId,
-      status: fresh ? 'completed' : 'stale',
-      progress: fresh ? 100 : 65,
-      message: fresh ? 'Index is complete and fresh.' : 'Files changed after indexing.',
-      documentCount: numberOrUndefined(data.document_count),
-      updatedAt: new Date().toISOString(),
-    };
+    const hasEmbeddings = Boolean(data.has_embeddings);
+    const status: DirectoryIndexStatus = !hasEmbeddings
+      ? {
+          directoryId,
+          status: 'chunked',
+          progress: 50,
+          message: 'Chunks are ready. Start indexing to generate embeddings.',
+          documentCount: numberOrUndefined(data.document_count),
+          updatedAt: new Date().toISOString(),
+        }
+      : {
+          directoryId,
+          status: fresh ? 'completed' : 'stale',
+          progress: fresh ? 100 : 65,
+          message: fresh ? 'Index is complete and fresh.' : 'Files changed after indexing.',
+          documentCount: numberOrUndefined(data.document_count),
+          updatedAt: new Date().toISOString(),
+        };
     activeJobs.set(directoryId, status);
     return status;
   } catch (error) {
@@ -142,15 +199,15 @@ export async function getDirectoryIndexStatus(directoryId: number): Promise<Dire
   }
 }
 
-async function runDirectoryIndex(
+async function runDirectoryChunking(
   directoryId: number,
   files: IndexableDirectoryFile[],
-  options: StartDirectoryIndexOptions,
+  options: StartDirectoryChunkingOptions,
 ): Promise<void> {
   console.info(`[directory-index] parsing/chunking directory=${directoryId}`);
   activeJobs.set(directoryId, {
     directoryId,
-    status: 'indexing',
+    status: 'chunking',
     progress: 35,
     message: 'Parsing files and creating regulatory chunks.',
     updatedAt: new Date().toISOString(),
@@ -163,7 +220,7 @@ async function runDirectoryIndex(
     );
   }
 
-  const result = await triggerDirectoryIndex(
+  const result = await triggerDirectoryChunking(
     directoryId,
     manifest.corpusKey,
     manifest.documents,
@@ -176,28 +233,48 @@ async function runDirectoryIndex(
     result,
   });
   console.info(
-    `[directory-index] completed directory=${directoryId} ` +
+    `[directory-index] chunking completed directory=${directoryId} ` +
       `documents=${String(result.active_documents ?? 'n/a')} ` +
-      `chunks=${String(result.chunks_written ?? 'n/a')} ` +
-      `embeddings=${String(result.embeddings_written ?? 'n/a')}`,
+      `chunks=${String(result.chunks_written ?? 'n/a')}`,
   );
   const completed: DirectoryIndexStatus = {
     directoryId,
-    status: 'completed',
-    progress: 100,
+    status: 'chunked',
+    progress: 50,
     message: manifest.skippedFiles.length
-      ? `Index and embeddings are ready. Skipped ${manifest.skippedFiles.length} invalid file(s).`
-      : 'Index and embeddings are ready.',
+      ? `Chunks are ready. Skipped ${manifest.skippedFiles.length} invalid file(s).`
+      : 'Chunks are ready. Start indexing to generate embeddings.',
     documentCount: numberOrUndefined(result.active_documents),
     chunksWritten: numberOrUndefined(result.chunks_written),
-    embeddingsWritten: numberOrUndefined(result.embeddings_written),
     skippedFiles: formatSkippedFiles(manifest.skippedFiles),
     updatedAt: new Date().toISOString(),
   };
   activeJobs.set(directoryId, completed);
 }
 
-export async function triggerDirectoryIndex(
+async function runCorpusEmbedding(
+  directoryId: number,
+  corpusKey: string,
+  options: StartDirectoryEmbeddingOptions,
+): Promise<void> {
+  const result = await triggerCorpusEmbedding(directoryId, corpusKey);
+  await options.onCompleted?.({directoryId, corpusKey, result});
+  console.info(
+    `[directory-index] embedding completed directory=${directoryId} ` +
+      `chunks_embedded=${String(result.chunks_embedded ?? 'n/a')}`,
+  );
+  const completed: DirectoryIndexStatus = {
+    directoryId,
+    status: 'completed',
+    progress: 100,
+    message: 'Index and embeddings are ready.',
+    embeddingsWritten: numberOrUndefined(result.chunks_embedded),
+    updatedAt: new Date().toISOString(),
+  };
+  activeJobs.set(directoryId, completed);
+}
+
+export async function triggerDirectoryChunking(
   directoryId: number,
   corpusKey: string,
   documents: IndexDocumentManifest[],
@@ -213,7 +290,7 @@ export async function triggerDirectoryIndex(
     corpus_key: corpusKey,
     documents,
     database_url: resolveDatabaseUrl(),
-    with_embeddings: true,
+    with_embeddings: false,
   };
 
   console.info(
@@ -238,13 +315,60 @@ export async function triggerDirectoryIndex(
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(
-      `Core indexing failed (${res.status} ${res.statusText}): ${body || 'empty response'}`,
+      `Core chunking failed (${res.status} ${res.statusText}): ${body || 'empty response'}`,
     );
   }
 
   const responseBody = (await res.json()) as Record<string, unknown>;
   if (responseBody.error) {
-    throw new Error(`Core indexing returned error: ${String(responseBody.error)}`);
+    throw new Error(`Core chunking returned error: ${String(responseBody.error)}`);
+  }
+  return responseBody;
+}
+
+export async function triggerCorpusEmbedding(
+  directoryId: number,
+  corpusKey: string,
+): Promise<Record<string, unknown>> {
+  const endpoint = `${resolveCoreRestUrl()}/api/index/embed`;
+  const headers: Record<string, string> = {'Content-Type': 'application/json'};
+  if (process.env.CORE_INTERNAL_TOKEN) {
+    headers['X-Internal-Token'] = process.env.CORE_INTERNAL_TOKEN;
+  }
+
+  const body = {
+    folder: corpusKey,
+    corpus_key: corpusKey,
+    database_url: resolveDatabaseUrl(),
+  };
+
+  console.info(`[directory-index] POST ${endpoint} directory=${directoryId} corpus=${corpusKey}`);
+
+  let res: Response;
+  try {
+    res = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    throw new Error(
+      `Core is not reachable at ${endpoint}. Start core with ` +
+        '`scripts/run.sh --env dev --apps core` or run the full stack. ' +
+        `Original error: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(
+      `Core embedding failed (${res.status} ${res.statusText}): ${body || 'empty response'}`,
+    );
+  }
+
+  const responseBody = (await res.json()) as Record<string, unknown>;
+  if (responseBody.error) {
+    throw new Error(`Core embedding returned error: ${String(responseBody.error)}`);
   }
   return responseBody;
 }

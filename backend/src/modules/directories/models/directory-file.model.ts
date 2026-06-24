@@ -1,6 +1,6 @@
 import {Entity, model, property} from '@loopback/repository';
 
-export type DirectoryFileStorageStatus = 'stored' | 'indexed' | 'error';
+export type DirectoryFileStorageStatus = 'stored' | 'chunked' | 'indexed' | 'error';
 
 @model({settings: {postgresql: {schema: 'public', table: 'directory_files'}}})
 export class DirectoryFile extends Entity {
@@ -28,6 +28,9 @@ export class DirectoryFile extends Entity {
     postgresql: {columnName: 'storage_status'},
   })
   storageStatus?: DirectoryFileStorageStatus;
+
+  @property({type: 'date', postgresql: {columnName: 'chunked_at'}})
+  chunkedAt?: string | null;
 
   @property({type: 'date', postgresql: {columnName: 'indexed_at'}})
   indexedAt?: string | null;

@@ -16,11 +16,14 @@ import {getCurrentUser} from '../../../common/auth';
 import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../repositories';
 import {
-  DirectoryIndexCompletion,
+  DirectoryChunkingCompletion,
+  DirectoryEmbeddingCompletion,
   DirectoryIndexStatus,
   getDirectoryIndexStatus,
-  startDirectoryIndex,
+  startCorpusEmbedding,
+  startDirectoryChunking,
   StorageService,
+  virtualCorpusKey,
 } from '../services';
 import {toSafeDirectory, toSafeFile} from '../transformers';
 
@@ -88,7 +91,7 @@ export class DirectoriesController {
     const user = await getCurrentUser(this.request, this.userRepository);
     await this.ownedDirectoryOrThrow(id, user.id);
     const serviceStatus = await getDirectoryIndexStatus(id);
-    if (serviceStatus.status === 'indexing' || serviceStatus.status === 'error') {
+    if (serviceStatus.status === 'chunking' || serviceStatus.status === 'indexing' || serviceStatus.status === 'error') {
       return serviceStatus;
     }
 
@@ -96,9 +99,9 @@ export class DirectoriesController {
     return this.statusFromFiles(id, files, serviceStatus);
   }
 
-  @post('/directories/{id}/index')
-  @response(202, {description: 'Started indexing this directory'})
-  async startIndex(@param.path.number('id') id: number) {
+  @post('/directories/{id}/chunks')
+  @response(202, {description: 'Started generating chunks for this directory'})
+  async startChunking(@param.path.number('id') id: number) {
     const user = await getCurrentUser(this.request, this.userRepository);
     const directory = await this.ownedDirectoryOrThrow(id, user.id);
     const files = await this.directoryFileRepository.find({
@@ -106,9 +109,12 @@ export class DirectoriesController {
       order: ['createdAt ASC'],
     });
     if (!files.length) {
-      throw new HttpErrors.BadRequest('Upload at least one file before indexing.');
+      throw new HttpErrors.BadRequest('Upload at least one file before generating chunks.');
     }
-    for (const file of files.filter(file => file.storageStatus !== 'indexed')) {
+    const chunkableFiles = files.filter(
+      file => file.storageStatus !== 'chunked' && file.storageStatus !== 'indexed',
+    );
+    for (const file of chunkableFiles) {
       const storedPath = await this.storageService.moveFileToDirectory({
         storedPath: file.storedPath,
         userName: user.email,
@@ -123,16 +129,44 @@ export class DirectoriesController {
         file.storedPath = storedPath;
       }
     }
-    const indexableFiles = files
-      .filter(file => file.storageStatus !== 'indexed')
-      .map(file => ({
-        id: file.id,
-        originalName: file.originalName,
-        storedPath: file.storedPath,
-        storageStatus: file.storageStatus,
-      }));
+    const indexableFiles = chunkableFiles.map(file => ({
+      id: file.id,
+      originalName: file.originalName,
+      storedPath: file.storedPath,
+      storageStatus: file.storageStatus,
+    }));
 
     if (!indexableFiles.length) {
+      return this.statusFromFiles(id, files, {
+        directoryId: id,
+        status: 'chunked',
+        progress: 50,
+        message: 'Chunks are already up to date.',
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    return startDirectoryChunking(id, indexableFiles, {
+      onCompleted: completion => this.markDirectoryChunked(completion),
+    });
+  }
+
+  @post('/directories/{id}/index')
+  @response(202, {description: 'Started indexing (embedding) this directory'})
+  async startIndex(@param.path.number('id') id: number) {
+    const user = await getCurrentUser(this.request, this.userRepository);
+    await this.ownedDirectoryOrThrow(id, user.id);
+    const files = await this.directoryFileRepository.find({where: {directoryId: id}});
+    if (!files.length) {
+      throw new HttpErrors.BadRequest('Upload at least one file before indexing.');
+    }
+    const unchunkedFiles = files.filter(
+      file => file.storageStatus !== 'chunked' && file.storageStatus !== 'indexed' && file.storageStatus !== 'error',
+    );
+    if (unchunkedFiles.length) {
+      throw new HttpErrors.BadRequest('Generate chunks before indexing.');
+    }
+    if (files.every(file => file.storageStatus === 'indexed' || file.storageStatus === 'error')) {
       return this.statusFromFiles(id, files, {
         directoryId: id,
         status: 'completed',
@@ -142,11 +176,9 @@ export class DirectoriesController {
       });
     }
 
-    return startDirectoryIndex(
-      id,
-      indexableFiles,
-      {onCompleted: completion => this.markDirectoryIndexed(completion)},
-    );
+    return startCorpusEmbedding(id, virtualCorpusKey(id), {
+      onCompleted: completion => this.markDirectoryEmbedded(completion),
+    });
   }
 
   @patch('/directories/{id}')
@@ -185,7 +217,7 @@ export class DirectoriesController {
     await this.storageService.deleteFiles(files.map(file => file.storedPath));
   }
 
-  private async markDirectoryIndexed(completion: DirectoryIndexCompletion): Promise<void> {
+  private async markDirectoryChunked(completion: DirectoryChunkingCompletion): Promise<void> {
     const now = new Date().toISOString();
     for (const skipped of completion.skippedFiles) {
       if (!skipped.file?.id) continue;
@@ -198,13 +230,29 @@ export class DirectoriesController {
 
     for (const file of completion.indexedFiles) {
       if (!file.id) continue;
+      // Chunk text is now safely in `core_chunks`/`core_documents` — the raw
+      // upload is no longer needed even though embeddings haven't run yet.
       await this.storageService.deleteFile(file.storedPath);
       await this.directoryFileRepository.updateById(file.id, {
-        storageStatus: 'indexed',
-        indexedAt: now,
+        storageStatus: 'chunked',
+        chunkedAt: now,
         rawDeletedAt: new Date().toISOString(),
         storageError: null,
         updatedAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  private async markDirectoryEmbedded(_completion: DirectoryEmbeddingCompletion): Promise<void> {
+    const now = new Date().toISOString();
+    const files = await this.directoryFileRepository.find({
+      where: {directoryId: _completion.directoryId, storageStatus: 'chunked'},
+    });
+    for (const file of files) {
+      await this.directoryFileRepository.updateById(file.id, {
+        storageStatus: 'indexed',
+        indexedAt: now,
+        updatedAt: now,
       });
     }
   }
@@ -221,13 +269,14 @@ export class DirectoriesController {
     if (!files.length) return fallback;
 
     const indexedCount = files.filter(file => file.storageStatus === 'indexed').length;
+    const chunkedCount = files.filter(file => file.storageStatus === 'chunked').length;
     const errorFiles = files.filter(file => file.storageStatus === 'error');
-    const storedCount = files.length - indexedCount - errorFiles.length;
+    const storedCount = files.length - indexedCount - chunkedCount - errorFiles.length;
     const skippedFiles = errorFiles.map(
       file => `${file.originalName}: ${file.storageError ?? 'not indexed'}`,
     );
 
-    if (indexedCount > 0 && storedCount === 0) {
+    if (indexedCount > 0 && storedCount === 0 && chunkedCount === 0) {
       return {
         directoryId,
         status: 'completed',
@@ -241,13 +290,27 @@ export class DirectoriesController {
       };
     }
 
-    if (indexedCount > 0 && storedCount > 0) {
+    if (indexedCount > 0 && (storedCount > 0 || chunkedCount > 0)) {
       return {
         directoryId,
         status: 'stale',
         progress: 65,
         message: 'Some files were uploaded or changed after the last index.',
         documentCount: indexedCount,
+        skippedFiles,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
+    if (indexedCount === 0 && chunkedCount > 0 && storedCount === 0) {
+      return {
+        directoryId,
+        status: 'chunked',
+        progress: 50,
+        message: skippedFiles.length
+          ? `Chunks are ready. Skipped ${skippedFiles.length} invalid file(s).`
+          : 'Chunks are ready. Start indexing to generate embeddings.',
+        documentCount: chunkedCount,
         skippedFiles,
         updatedAt: new Date().toISOString(),
       };
