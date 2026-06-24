@@ -1,6 +1,6 @@
 # Customs Regulations Chatbot
 
-> **Based on**: [run-llama/fs-explorer](https://github.com/run-llama/fs-explorer) — the original CLI agent for filesystem exploration, extended here into a full product for querying Turkish customs regulations.
+
 
 An AI assistant that answers questions about regulatory documents (gümrük tebliğleri, genelgeler, kanunlar, ...) by either exploring files agentically like a human reader, or querying a pre-built semantic + metadata index — with every claim in the answer backed by a citation back to its source article/clause.
 
@@ -8,14 +8,6 @@ An AI assistant that answers questions about regulatory documents (gümrük tebl
 
 This is a monorepo split into four independent projects:
 
-| App | Tech | Role |
-|-----|------|------|
-| [`core/`](core/) | Python (FastAPI, LlamaIndex Workflows, Docling, Gemini) | The AI engine: agentic document exploration, the regulatory chunker/indexing pipeline, and semantic+metadata search. Talked to over an internal WebSocket/REST API — never exposed directly to browsers. |
-| [`backend/`](backend/) | TypeScript (LoopBack 4) | User-facing API: auth, directories/file uploads, chat sessions, and the bridge that streams `core`'s agent output to the frontend. |
-| [`frontend/`](frontend/) | TypeScript (React + Vite + Tailwind) | The web UI: login/register, directory & file management, chunk inspector, and the chat interface. |
-| [`db/`](db/) | Postgres + pgvector, SQL migrations | Shared database. `core` owns the `core_*` tables (documents/chunks/embeddings/schemas); `backend` owns everything else (users, directories, chat sessions). |
-
-Each app has its own README with the details relevant to that layer — this file covers what ties them together.
 
 ## Quick start
 
@@ -65,33 +57,26 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 ## Architecture
 
 ```
-Browser
-  │  REST + chat (HTTP/SSE)
-  ▼
-backend (LoopBack 4)  ──auth, directories, chat sessions, file storage──▶ Postgres
-  │  internal WebSocket/REST (X-Internal-Token)
-  ▼
-core (FastAPI)
-  ├─ Agentic mode: Workflow → Agent (Gemini) → fs tools (scan/preview/parse/grep/glob) → Docling
-  └─ Indexed mode: Workflow → Agent → semantic_search/get_document → Postgres + pgvector
+User Query
+    ↓
+┌─────────────────┐
+│ Workflow Engine │ ←→ LlamaIndex Workflows (event-driven)
+└────────┬────────┘
+         ↓
+┌─────────────────┐
+│     Agent       │ ←→ Gemini 3 Flash (structured JSON)
+└────────┬────────┘
+         ↓
+┌─────────────────────────────────────────┐
+│ scan_folder │ preview │ parse │ read │ grep │ glob │
+└─────────────────────────────────────────┘
+                    ↓
+              Document Parser (Docling - local)
 ```
 
-See [`core/CLAUDE.md`](core/CLAUDE.md) for a deep dive into `core`'s modules (agent, workflow, chunker, search, storage), and each app's own README for its endpoints/structure.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed diagrams.
 
-## Development
 
-Each app is developed and tested independently — see its README for the exact commands (`core` uses `uv`/`pytest`, `backend`/`frontend` use `npm`). A few cross-cutting things to know:
 
-- `core` and `backend` share one Postgres database (`db/`), split by table prefix (`core_*` vs everything else) — never have one service write to the other's tables directly.
-- Re-indexing is idempotent everywhere: corpus/document/chunk ids are stable content hashes, so re-running chunking or embedding on unchanged content upserts the same rows instead of duplicating them.
-- Tests that need Postgres skip themselves (`pytest.skip`) if `DATABASE_URL` isn't set — point it at a throwaway database with `db/migrations/` applied to run them.
 
-## License
-
-MIT
-
-## Acknowledgments
-
-- Original concept from [run-llama/fs-explorer](https://github.com/run-llama/fs-explorer)
-- Document parsing by [Docling](https://github.com/DS4SD/docling)
-- Powered by [Google Gemini](https://deepmind.google/technologies/gemini/)
+  /home/kubilay-payci/customs-regulations-chatbot/.venv/bin/python -m fs_explorer.chunk_inspector --host 127.0.0.1 --port 8123
