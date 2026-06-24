@@ -1,121 +1,58 @@
-# Agentic File Search
+# Customs Regulations Chatbot
 
 
 
-An AI-powered document search agent that explores files like a human would — scanning, reasoning, and following cross-references. Unlike traditional RAG systems that rely on pre-computed embeddings, this agent dynamically navigates documents to find answers.
+An AI assistant that answers questions about regulatory documents (gümrük tebliğleri, genelgeler, kanunlar, ...) by either exploring files agentically like a human reader, or querying a pre-built semantic + metadata index — with every claim in the answer backed by a citation back to its source article/clause.
 
-## Why Agentic Search?
+## Repo layout
 
-Traditional RAG (Retrieval-Augmented Generation) has limitations:
-- **Chunks lose context** — Splitting documents destroys relationships between sections
-- **Cross-references are invisible** — "See Exhibit B" means nothing to embeddings
-- **Similarity ≠ Relevance** — Semantic matching misses logical connections
+This is a monorepo split into four independent projects:
 
 
-## Features
-
-- 🔍 **6 Tools**: `scan_folder`, `preview_file`, `parse_file`, `read`, `grep`, `glob`
-- 📄 **Document Support**: PDF, DOCX, PPTX, XLSX, HTML, Markdown (via Docling)
-- 🤖 **Powered by**: Google Gemini 3 Flash with structured JSON output
-- 💰 **Cost Efficient**: ~$0.001 per query with token tracking
-- 🌐 **Web UI**: Real-time WebSocket streaming interface
-- 📊 **Citations**: Answers include source references
-
-## Installation
+## Quick start
 
 ```bash
-# Clone the repository
-git clone https://github.com/PromtEngineer/agentic-file-search.git
-cd agentic-file-search
+# 1. Copy and fill in the env files (one set per environment)
+cp .env.dev.example .env.dev
+cp db/.env.dev.example db/.env.dev
+# fill in GOOGLE_API_KEY (https://aistudio.google.com/apikey) and the DB_*/POSTGRES_* secrets
 
-# Create the uv-managed virtual environment
-uv venv
-source .venv/bin/activate
-
-# Install the app and runtime dependencies
-uv pip install .
+# 2. Bring up the whole stack (db + core + backend + frontend) in dev mode
+scripts/run.sh --env dev --apps all
 ```
 
-Windows PowerShell:
+`scripts/run.sh` starts Postgres via docker compose, runs pending migrations, and launches `core`, `backend`, and `frontend` with the right env vars wired together. You can start a subset instead, e.g. `scripts/run.sh --env dev --apps db,backend` (useful when iterating on one layer while the others stay up).
 
-```powershell
-uv venv
-.\.venv\Scripts\Activate.ps1
-uv pip install .
-```
+Once running:
+- Frontend: http://localhost:5173 (or whatever Vite prints)
+- Backend API: http://localhost:3000
+- Core (internal, not meant for direct browser use): http://127.0.0.1:8000
+
+In `development`, the backend auto-creates and logs in a fixed local user — no registration required to start clicking around.
+
+## How a document goes from upload to answer
+
+1. **Upload** — files of any type are uploaded per-directory in the frontend (`backend` stores them under `STORAGE_ROOT`, metadata in Postgres).
+2. **Generate chunks** — parses each file (Docling), runs it through `RegulatoryChunker` (structure-aware: madde/article, paragraph, clause, table, with full locator metadata), and writes documents + chunks to Postgres. Raw uploads are deleted once their text is safely chunked into the database.
+3. **Start indexing** — embeds the chunks that were just generated (Gemini embeddings) and stores the vectors in pgvector, enabling semantic search. This step is separate from chunk generation on purpose: chunks can be inspected/regenerated cheaply without re-spending on embeddings, and indexing only ever has to embed chunks that don't have a vector yet.
+4. **Chat** — a chat session is linked to one or more directories. Each message goes to `core`'s agent, which either explores the linked files directly or (if an index exists) searches indexed chunks semantically and/or by metadata filter, then answers with inline citations (`[Belge Adı, Madde X]`) and a sources list.
+
+### Why not just one big "index" button?
+
+Indexing without a real database happens to be optional in `core` (agentic exploration works on raw files with zero setup), but once you do index, parsing+chunking and embedding are deliberately two steps so a stalled or misconfigured embedding provider never forces you to redo the (slower, Docling-based) parsing/chunking pass — chunks are durable in Postgres as soon as "Generate chunks" finishes, regardless of what happens next. Directories that only have chunks (no embeddings yet) still work in chat: search falls back to keyword matching over chunk text until embeddings are generated.
 
 ## Configuration
 
-Create a `.env` file in the project root:
+Environment variables are split per app (see each app's README/`.env.*.example` for the full list), but the ones you'll touch first:
 
-```bash
-GOOGLE_API_KEY=your_api_key_here
-```
-
-Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
-
-## Usage
-
-### CLI
-
-```bash
-# Basic query
-uv run explore --task "What is the purchase price in data/test_acquisition/?"
-
-# Multi-document query
-uv run explore --task "Look in data/large_acquisition/. What are all the financial terms including adjustments and escrow?"
-```
-
-### Web UI
-
-```bash
-# Start the server
-PYTHONUTF8=1 uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
-
-# Or use the installed console script
-uv run explore-ui
-
-# Open http://127.0.0.1:8000 in your browser
-```
-
-The web UI provides:
-- Folder browser to select target directory
-- Chat-style interface with temporary in-browser conversation memory
-- Real-time status updates for thinking, searching, reading, and analysis
-- Streaming final answers with citations
-- Token usage and cost statistics
-- UTF-8 text handling for Turkish characters and other non-ASCII content
-
-### Turkish / UTF-8 text
-
-The web UI serves UTF-8 HTML and supports Turkish characters in questions,
-answers, folder names, and document text. If your terminal or operating system
-does not default to UTF-8, start the server with UTF-8 enabled:
-
-```bash
-PYTHONUTF8=1 uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
-```
-
-Windows PowerShell:
-
-```powershell
-$env:PYTHONUTF8="1"
-uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
-```
-
-### Optional Indexing
-
-You can ask questions without preparing an index. In that mode, the agent uses
-the original file-exploration flow: it scans folders, previews files, and reads
-only the sources it decides are relevant.
-
-Indexing is optional. It parses the selected folder once, writes searchable
-chunks to DuckDB, and enables the Semantic toggle in the web UI:
-
-```bash
-uv run explore index data/customs_test
-uv run explore --use-index --task "Transit sure asimi cezasi hangi genelgede geciyor?"
-```
+| Variable | Where | Purpose |
+|----------|-------|---------|
+| `GOOGLE_API_KEY` | `core` | Gemini LLM + embeddings. Get one at [Google AI Studio](https://aistudio.google.com/apikey). |
+| `DATABASE_URL` | `core`, `backend` | Shared Postgres connection string. |
+| `CORE_INTERNAL_TOKEN` | `core`, `backend` | Shared secret gating `core`'s internal REST/WebSocket endpoints so only `backend` can call them. |
+| `JWT_SECRET` | `backend` | Signs access tokens. |
+| `STORAGE_ROOT` | `backend` | Where uploaded files live on disk before/while being chunked. |
+| `VITE_API_URL` | `frontend` | Where the backend API lives. |
 
 ## Architecture
 

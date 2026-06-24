@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -136,13 +136,21 @@ class DocumentMetadata:
 
 @dataclass(frozen=True)
 class ChunkMetadata:
-    """Locator metadata for a chunk."""
+    """Locator metadata for a chunk.
+
+    Some fields here exist only so `IndexingPipeline` can derive the stable
+    top-level `core_chunks` columns (`id`, `position`, `start_char`,
+    `end_char`) — they are intentionally left out of `to_storage_dict()`
+    since persisting them again inside the `metadata` JSON column would just
+    duplicate those columns (and `chunk_id`/`doc_id` here are this chunker's
+    own internal hashes, distinct from and easily confused with the real
+    `core_chunks.id`/`core_documents.id` the pipeline actually assigns).
+    """
 
     chunk_id: str
     doc_id: str
     source_file: str
     source_path: str
-    file_date: str | None
     document_date: str | None
     document_number: str | None
     document_type: str
@@ -164,9 +172,31 @@ class ChunkMetadata:
     source_end_char: int = 0
     source_start_block: int = 0
     source_end_block: int = 0
-    validity_start_date: str | None = None
-    validity_end_date: str | None = None
-    warnings: list[str] = field(default_factory=list)
+
+    def to_storage_dict(self) -> dict[str, Any]:
+        """Trimmed projection persisted to `core_chunks.metadata`.
+
+        Excludes fields that only exist for internal id derivation
+        (`chunk_id`, `doc_id`, `chunk_type`, `chunk_order`, `source_*char`,
+        `source_*block`) or that duplicate `heading_path`
+        (`parent_id`/`parent_ids`/`parent_path`) or the document's own
+        `relative_path` (`source_file`/`source_path`) — all already
+        available as top-level `core_chunks`/`core_documents` columns.
+        """
+        return {
+            "document_date": self.document_date,
+            "document_number": self.document_number,
+            "document_type": self.document_type,
+            "heading_path": self.heading_path,
+            "article_no": self.article_no,
+            "article_title": self.article_title,
+            "paragraph_no": self.paragraph_no,
+            "clause_label": self.clause_label,
+            "subclause_label": self.subclause_label,
+            "appendix_label": self.appendix_label,
+            "table_index": self.table_index,
+            "table_row_index": self.table_row_index,
+        }
 
 
 @dataclass(frozen=True)
@@ -651,6 +681,29 @@ class RegulatoryChunker:
                     and _is_structural_article_unit_heading(incoming_unit)
                 ):
                     apply_pending_heading(level=3)
+                if (
+                    current is not None
+                    and current.chunk_type == "article"
+                    and not current.article_title
+                    and len(current.blocks) == 1
+                    and stack
+                    and stack[-1].node_type == "article"
+                ):
+                    # "MADDE N" and its title sit on separate lines (no inline
+                    # rest). Without this, flush() below would close MADDE N
+                    # as a title-only chunk and leave its structure node on
+                    # the stack forever (never popped, since nothing pushes a
+                    # replacement at its level) — every later article would
+                    # then nest one level deeper under it instead of becoming
+                    # its sibling.
+                    current.article_title = clean_text
+                    current.blocks.append(block)
+                    updated_node = replace(
+                        stack[-1], label=f"{stack[-1].label} - {clean_text}"
+                    )
+                    stack[-1] = updated_node
+                    structure[-1] = updated_node
+                    continue
                 flush()
                 pending_title = clean_text
                 pending_title_block = block
@@ -773,7 +826,6 @@ class RegulatoryChunker:
             doc_id=metadata.doc_id,
             source_file=metadata.source_file,
             source_path=metadata.source_path,
-            file_date=metadata.file_date,
             document_date=metadata.document_date,
             document_number=metadata.document_number,
             document_type=metadata.document_type,
@@ -795,7 +847,6 @@ class RegulatoryChunker:
             source_end_char=end_block.end_char,
             source_start_block=start_block.block_id,
             source_end_block=end_block.block_id,
-            warnings=list(draft.warnings),
         )
         return RegulatoryChunk(text=text, metadata=chunk_metadata)
 
@@ -1036,8 +1087,20 @@ def _section_level(text: str) -> int:
 
 
 def _child_level(stack: list[StructureNode], base_level: int) -> int:
-    if len(stack) > 1 and stack[-1].level >= base_level:
-        return stack[-1].level + 1
+    """Level for a new article, anchored to the nearest section/appendix/document
+    ancestor rather than the deepest stack entry.
+
+    Articles are siblings of each other: MADDE 2 must sit at the same level as
+    MADDE 1, not one level deeper. Anchoring on `stack[-1]` (the previous
+    article's leftover context/heading nodes) made the level climb by one on
+    every article, so `push_node`'s pop-while-level>=new-level never popped the
+    prior article off the stack and `heading_path`/`parent_path` accumulated
+    every previous MADDE instead of resetting per article.
+    """
+    anchor_types = {"document", "section", "appendix", "heading", "numbered_section", "preamble"}
+    for node in reversed(stack):
+        if node.node_type in anchor_types:
+            return max(base_level, node.level + 1)
     return base_level
 
 

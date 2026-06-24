@@ -29,8 +29,6 @@ Gümrük Genel Tebliği (Transit Rejimi)
     assert paragraph_chunks[0].metadata.article_title == "Amaç"
     assert paragraph_chunks[0].metadata.paragraph_no == "1"
     assert paragraph_chunks[0].metadata.parent_path[-2] == "MADDE 1 - Amaç"
-    assert paragraph_chunks[0].metadata.validity_start_date is None
-    assert paragraph_chunks[0].metadata.validity_end_date is None
     assert paragraph_chunks[1].metadata.article_no == "2"
     assert paragraph_chunks[1].metadata.article_title == "Kapsam"
     assert paragraph_chunks[1].metadata.paragraph_no == "1"

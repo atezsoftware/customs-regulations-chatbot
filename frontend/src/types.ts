@@ -21,7 +21,7 @@ export interface DirectoryFile {
   name: string;
   mimeType?: string;
   sizeBytes: number | string;
-  storageStatus?: 'stored' | 'indexed' | 'error';
+  storageStatus?: 'stored' | 'chunked' | 'indexed' | 'error';
   indexedAt?: string | null;
   rawDeletedAt?: string | null;
   storageError?: string | null;
@@ -34,7 +34,15 @@ export interface DirectoryDetail extends Directory {
 
 export interface DirectoryIndexStatus {
   directoryId: number;
-  status: 'not_indexed' | 'indexing' | 'completed' | 'stale' | 'error' | 'unavailable';
+  status:
+    | 'not_indexed'
+    | 'chunking'
+    | 'chunked'
+    | 'indexing'
+    | 'completed'
+    | 'stale'
+    | 'error'
+    | 'unavailable';
   progress: number;
   message: string;
   documentCount?: number;

@@ -178,3 +178,8 @@ class StorageBackend(Protocol):
 
     def has_embeddings(self, *, corpus_id: str) -> bool:
         """Return True if the corpus has stored embeddings."""
+
+    def list_chunks_missing_embeddings(
+        self, *, corpus_id: str
+    ) -> list[dict[str, Any]]:
+        """List (id, text) for active chunks in a corpus that have no embedding yet."""

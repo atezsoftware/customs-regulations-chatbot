@@ -111,6 +111,14 @@ class IndexRequest(BaseModel):
     with_embeddings: bool = False
 
 
+class EmbedIndexRequest(BaseModel):
+    """Request model for embedding an already-chunked corpus."""
+
+    folder: str = "."
+    corpus_key: str | None = None
+    database_url: str | None = None
+
+
 class AutoProfileRequest(BaseModel):
     """Request model for auto-profile generation."""
 
@@ -490,6 +498,54 @@ async def build_index(request: IndexRequest):
         return JSONResponse({"error": str(exc)}, status_code=400)
     except PermissionError:
         return JSONResponse({"error": "Permission denied"}, status_code=403)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/index/embed", dependencies=[Depends(require_internal_token)])
+async def embed_index(request: EmbedIndexRequest):
+    """Generate embeddings for an already-chunked corpus.
+
+    Reads chunk text straight from `core_chunks` — does not re-parse or
+    re-chunk source files. Intended for the second ("Index") step once
+    "Generate Chunks" (`/api/index` with `with_embeddings=false`) has
+    already populated the corpus.
+    """
+    try:
+        corpus_root = _corpus_root(request.corpus_key or request.folder)
+        lock = _get_corpus_lock(corpus_root)
+        async with lock:
+            resolved_database_url = resolve_database_url(request.database_url)
+            storage = PostgresStorage(resolved_database_url)
+            corpus_id = storage.get_corpus_id(corpus_root)
+            if corpus_id is None:
+                storage.close()
+                return JSONResponse(
+                    {"error": "No chunks found for this folder. Generate chunks first."},
+                    status_code=404,
+                )
+
+            try:
+                embedding_provider = EmbeddingProvider()
+            except ValueError as exc:
+                storage.close()
+                return JSONResponse({"error": str(exc)}, status_code=400)
+
+            pipeline = IndexingPipeline(
+                storage=storage,
+                embedding_provider=embedding_provider,
+            )
+            result = pipeline.embed_corpus(corpus_id)
+            storage.close()
+
+        return {
+            "database_url": resolved_database_url,
+            "folder": corpus_root,
+            "corpus_id": result.corpus_id,
+            "chunks_embedded": result.chunks_embedded,
+        }
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 

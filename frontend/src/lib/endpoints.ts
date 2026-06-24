@@ -56,6 +56,8 @@ export const directoriesApi = {
     apiFetch<void>(`/directories/${directoryId}/files/${fileId}`, {method: 'DELETE'}),
   indexStatus: (id: number) =>
     apiFetch<DirectoryIndexStatus>(`/directories/${id}/index/status`),
+  startChunking: (id: number) =>
+    apiFetch<DirectoryIndexStatus>(`/directories/${id}/chunks`, {method: 'POST'}),
   startIndex: (id: number) =>
     apiFetch<DirectoryIndexStatus>(`/directories/${id}/index`, {method: 'POST'}),
   fileChunks: (directoryId: number, fileId: number) =>

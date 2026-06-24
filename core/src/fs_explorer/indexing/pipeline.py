@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,14 @@ class IndexingResult:
     active_documents: int
     schema_used: str | None
     embeddings_written: int = 0
+
+
+@dataclass(frozen=True)
+class EmbeddingResult:
+    """Summary output for an embed-only run against an already-chunked corpus."""
+
+    corpus_id: str
+    chunks_embedded: int
 
 
 @dataclass(frozen=True)
@@ -197,7 +205,7 @@ class IndexingPipeline:
                         start_char=meta.source_start_char,
                         end_char=meta.source_end_char,
                         chunk_type=meta.chunk_type,
-                        metadata=asdict(meta),
+                        metadata=meta.to_storage_dict(),
                     )
                 )
 
@@ -432,6 +440,31 @@ class IndexingPipeline:
             chunk_embeddings=pairs,
         )
         return written
+
+    def embed_corpus(self, corpus_id: str) -> EmbeddingResult:
+        """Generate embeddings for an already-chunked corpus's un-embedded chunks.
+
+        Used by the "Index" step once "Generate Chunks" has already populated
+        `core_documents`/`core_chunks` — re-reads chunk text straight from
+        storage instead of re-parsing/re-chunking source files.
+        """
+        if self.embedding_provider is None:
+            raise ValueError("embed_corpus requires an embedding_provider.")
+
+        pending = self.storage.list_chunks_missing_embeddings(corpus_id=corpus_id)
+        if not pending:
+            return EmbeddingResult(corpus_id=corpus_id, chunks_embedded=0)
+
+        texts = [str(item["text"]) for item in pending]
+        embeddings = self.embedding_provider.embed_texts(texts)
+        pairs: list[tuple[str, list[float]]] = [
+            (str(item["id"]), emb) for item, emb in zip(pending, embeddings)
+        ]
+        written = self.storage.store_chunk_embeddings(
+            corpus_id=corpus_id,
+            chunk_embeddings=pairs,
+        )
+        return EmbeddingResult(corpus_id=corpus_id, chunks_embedded=written)
 
     @staticmethod
     def _iter_supported_files(root: str) -> list[str]:

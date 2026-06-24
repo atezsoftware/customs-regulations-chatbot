@@ -16,6 +16,7 @@ export function DirectoriesPage() {
   const [loadingList, setLoadingList] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [chunking, setChunking] = useState(false);
   const [indexing, setIndexing] = useState(false);
   const [indexStatus, setIndexStatus] = useState<DirectoryIndexStatus | null>(null);
   const [indexError, setIndexError] = useState<string | null>(null);
@@ -84,7 +85,8 @@ export function DirectoriesPage() {
   }
 
   useEffect(() => {
-    if (selectedId === null || indexStatus?.status !== 'indexing') return;
+    const busy = indexStatus?.status === 'chunking' || indexStatus?.status === 'indexing';
+    if (selectedId === null || !busy) return;
     const timer = window.setInterval(() => {
       directoriesApi
         .indexStatus(selectedId)
@@ -95,6 +97,20 @@ export function DirectoriesPage() {
     }, 1500);
     return () => window.clearInterval(timer);
   }, [selectedId, indexStatus?.status]);
+
+  async function handleStartChunking() {
+    if (selectedId === null) return;
+    setChunking(true);
+    setIndexError(null);
+    try {
+      const started = await directoriesApi.startChunking(selectedId);
+      setIndexStatus(started);
+    } catch (error) {
+      setIndexError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChunking(false);
+    }
+  }
 
   async function handleStartIndexing() {
     if (selectedId === null) return;
@@ -265,28 +281,57 @@ export function DirectoriesPage() {
                 <div>
                   <h3 className="text-sm font-semibold text-slate-700">Search index</h3>
                   <p className="mt-1 text-xs leading-5 text-slate-400">
-                    Builds regulatory chunks and Gemini embeddings for this directory.
+                    Generate regulatory chunks first, then index them to build Gemini
+                    embeddings for this directory.
                   </p>
                 </div>
-                <Button
-                  type="button"
-                  variant={
-                    indexStatus?.status === 'completed' || indexStatus?.status === 'indexing'
-                      ? 'secondary'
-                      : 'primary'
-                  }
-                  className="shrink-0"
-                  disabled={
-                    indexing || indexStatus?.status === 'indexing' || detail.files.length === 0
-                  }
-                  onClick={() => void handleStartIndexing()}
-                >
-                  {indexStatus?.status === 'indexing'
-                    ? 'Indexing...'
-                    : indexStatus?.status === 'completed'
-                      ? 'Re-index'
-                      : 'Start indexing'}
-                </Button>
+                <div className="flex shrink-0 gap-2">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={
+                      chunking ||
+                      indexStatus?.status === 'chunking' ||
+                      indexStatus?.status === 'indexing' ||
+                      detail.files.length === 0
+                    }
+                    onClick={() => void handleStartChunking()}
+                  >
+                    {indexStatus?.status === 'chunking'
+                      ? 'Generating chunks...'
+                      : indexStatus?.status === 'chunked' ||
+                          indexStatus?.status === 'completed' ||
+                          indexStatus?.status === 'stale'
+                        ? 'Regenerate chunks'
+                        : 'Generate chunks'}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant={
+                      indexStatus?.status === 'completed' || indexStatus?.status === 'indexing'
+                        ? 'secondary'
+                        : 'primary'
+                    }
+                    disabled={
+                      indexing ||
+                      chunking ||
+                      indexStatus?.status === 'chunking' ||
+                      indexStatus?.status === 'indexing' ||
+                      !(
+                        indexStatus?.status === 'chunked' ||
+                        indexStatus?.status === 'completed' ||
+                        indexStatus?.status === 'stale'
+                      )
+                    }
+                    onClick={() => void handleStartIndexing()}
+                  >
+                    {indexStatus?.status === 'indexing'
+                      ? 'Indexing...'
+                      : indexStatus?.status === 'completed'
+                        ? 'Re-index'
+                        : 'Start indexing'}
+                  </Button>
+                </div>
               </div>
               <div className="mt-4">
                 <DirectoryIndexProgress status={indexStatus ?? undefined} />
