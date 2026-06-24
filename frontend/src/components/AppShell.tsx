@@ -47,14 +47,26 @@ export function AppShell() {
           <NavIcon to="/chunks" label="View chunks">
             <ChunksIcon />
           </NavIcon>
+          {user?.role === 'admin' && (
+            <NavIcon to="/admin/support" label="Admin support">
+              <SupportIcon />
+            </NavIcon>
+          )}
         </div>
         <div className="flex flex-col items-center gap-3">
-          <div
-            className="flex h-9 w-9 items-center justify-center rounded-full bg-slate-100 text-xs font-semibold text-slate-600"
+          <NavLink
+            to="/dashboard"
+            className={({isActive}) =>
+              `flex h-9 w-9 items-center justify-center rounded-full text-xs font-semibold transition-colors ${
+                isActive
+                  ? 'bg-indigo-600 text-white shadow-sm shadow-indigo-600/30'
+                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+              }`
+            }
             title={user?.email}
           >
             {(user?.fullName ?? user?.email ?? '?').slice(0, 1).toUpperCase()}
-          </div>
+          </NavLink>
           <button
             onClick={() => void logout()}
             title="Log out"
@@ -100,6 +112,19 @@ function ChunksIcon() {
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
       <path d="M4 5h16M4 12h16M4 19h16" strokeLinecap="round" />
       <path d="M8 3v4M16 10v4M11 17v4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function SupportIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path
+        d="M12 3l7 3v5c0 4.4-2.8 8.3-7 10-4.2-1.7-7-5.6-7-10V6l7-3z"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M9 12h6M12 9v6" strokeLinecap="round" />
     </svg>
   );
 }

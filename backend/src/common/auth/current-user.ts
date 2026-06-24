@@ -40,6 +40,12 @@ export async function getCurrentUser(
   }
 }
 
+export function requireAdmin(user: CurrentUser): void {
+  if (user.role !== 'admin') {
+    throw new HttpErrors.Forbidden('Admin access is required.');
+  }
+}
+
 async function getOrCreateDevUser(userRepository: UserRepository): Promise<CurrentUser> {
   let user = await userRepository.findOne({where: {email: DEV_USER_EMAIL}});
   if (!user) {
