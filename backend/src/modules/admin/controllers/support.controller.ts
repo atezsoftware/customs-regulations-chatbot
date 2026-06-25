@@ -9,43 +9,15 @@ import {
   RestBindings,
 } from '@loopback/rest';
 import {getCurrentUser, requireAdmin} from '../../../common/auth';
-import {PostgresDataSource} from '../../../datasources';
 import {UserRepository} from '../../auth/repositories';
 import {ChatMessage} from '../../chat/models';
 import {
   ChatMessageRepository,
   ChatResearchStepRepository,
+  ChatSessionRepository,
   ChatSourceRepository,
   LlmCallRepository,
 } from '../../chat/repositories';
-
-interface AdminSessionRow {
-  id: number | string;
-  title: string | null;
-  created_at: string | Date | null;
-  updated_at: string | Date | null;
-  user_id: number | string;
-  email: string;
-  full_name: string | null;
-  role: string;
-  message_count: number | string;
-  total_tokens: number | string;
-  last_message_at: string | Date | null;
-  last_message_role: string | null;
-  last_message_status: string | null;
-  last_message_preview: string | null;
-}
-
-interface AdminSessionDetailRow {
-  id: number | string;
-  title: string | null;
-  created_at: string | Date | null;
-  updated_at: string | Date | null;
-  user_id: number | string;
-  email: string;
-  full_name: string | null;
-  role: string;
-}
 
 function toSafeMessage(message: ChatMessage) {
   return {
@@ -65,12 +37,12 @@ function toSafeMessage(message: ChatMessage) {
 export class AdminSupportController {
   constructor(
     @repository(UserRepository) private userRepository: UserRepository,
+    @repository(ChatSessionRepository) private chatSessionRepository: ChatSessionRepository,
     @repository(ChatMessageRepository) private chatMessageRepository: ChatMessageRepository,
     @repository(ChatResearchStepRepository)
     private chatResearchStepRepository: ChatResearchStepRepository,
     @repository(ChatSourceRepository) private chatSourceRepository: ChatSourceRepository,
     @repository(LlmCallRepository) private llmCallRepository: LlmCallRepository,
-    @inject('datasources.postgres') private dataSource: PostgresDataSource,
     @inject(RestBindings.Http.REQUEST) private request: Request,
   ) {}
 
@@ -85,53 +57,10 @@ export class AdminSupportController {
 
     const trimmedSearch = search?.trim() ?? '';
     const cappedLimit = Math.min(Math.max(Math.floor(limit ?? 50), 1), 100);
-    const rows = (await this.dataSource.execute(
-      `
-        SELECT
-          s.id,
-          s.title,
-          s.created_at,
-          s.updated_at,
-          u.id AS user_id,
-          u.email,
-          u.full_name,
-          u.role,
-          COALESCE(message_stats.message_count, 0) AS message_count,
-          COALESCE(token_stats.total_tokens, 0) AS total_tokens,
-          message_stats.last_message_at,
-          last_message.role AS last_message_role,
-          last_message.status AS last_message_status,
-          last_message.content AS last_message_preview
-        FROM chat_sessions s
-        JOIN users u ON u.id = s.user_id
-        LEFT JOIN (
-          SELECT
-            session_id,
-            COUNT(id) AS message_count,
-            MAX(created_at) AS last_message_at
-          FROM chat_messages
-          GROUP BY session_id
-        ) message_stats ON message_stats.session_id = s.id
-        LEFT JOIN (
-          SELECT
-            session_id,
-            SUM(input_tokens + output_tokens + thinking_tokens) AS total_tokens
-          FROM llm_calls
-          GROUP BY session_id
-        ) token_stats ON token_stats.session_id = s.id
-        LEFT JOIN LATERAL (
-          SELECT role, status, left(content, 220) AS content
-          FROM chat_messages lm
-          WHERE lm.session_id = s.id
-          ORDER BY lm.created_at DESC, lm.id DESC
-          LIMIT 1
-        ) last_message ON true
-        WHERE ($1 = '' OR u.email ILIKE $2 OR u.full_name ILIKE $2 OR s.title ILIKE $2)
-        ORDER BY COALESCE(message_stats.last_message_at, s.updated_at, s.created_at) DESC
-        LIMIT $3
-      `,
-      [trimmedSearch, `%${trimmedSearch}%`, cappedLimit],
-    )) as AdminSessionRow[];
+    const rows = await this.chatSessionRepository.findAdminSessions(
+      trimmedSearch,
+      cappedLimit,
+    );
 
     return {
       sessions: rows.map(row => ({
@@ -165,27 +94,11 @@ export class AdminSupportController {
     const user = await getCurrentUser(this.request, this.userRepository);
     requireAdmin(user);
 
-    const sessionRows = (await this.dataSource.execute(
-      `
-        SELECT
-          s.id,
-          s.title,
-          s.created_at,
-          s.updated_at,
-          u.id AS user_id,
-          u.email,
-          u.full_name,
-          u.role
-        FROM chat_sessions s
-        JOIN users u ON u.id = s.user_id
-        WHERE s.id = $1
-      `,
-      [sessionId],
-    )) as AdminSessionDetailRow[];
-    const session = sessionRows[0];
+    const session = await this.chatSessionRepository.findById(sessionId).catch(() => null);
     if (!session) {
       throw new HttpErrors.NotFound('Chat session not found.');
     }
+    const sessionUser = await this.userRepository.findById(session.userId);
 
     const messages = await this.chatMessageRepository.find({
       where: {sessionId},
@@ -217,13 +130,13 @@ export class AdminSupportController {
       session: {
         id: numberValue(session.id),
         title: session.title ?? 'Untitled chat',
-        createdAt: dateString(session.created_at),
-        updatedAt: dateString(session.updated_at),
+        createdAt: dateString(session.createdAt),
+        updatedAt: dateString(session.updatedAt),
         user: {
-          id: numberValue(session.user_id),
-          email: session.email,
-          fullName: session.full_name ?? undefined,
-          role: session.role,
+          id: numberValue(sessionUser.id),
+          email: sessionUser.email,
+          fullName: sessionUser.fullName ?? undefined,
+          role: sessionUser.role,
         },
       },
       messages: messages.map(message => ({
