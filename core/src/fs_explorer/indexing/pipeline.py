@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,7 @@ class IndexingResult:
     active_documents: int
     schema_used: str | None
     embeddings_written: int = 0
+    indexed_paths: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,7 @@ class IndexingPipeline:
         # Pass 2: Chunk + upsert (sequential, DB writes)
         indexed_files = 0
         chunks_written = 0
+        indexed_paths: list[str] = []
         all_chunk_records: list[ChunkRecord] = []
 
         for document, content in parsed_docs:
@@ -213,6 +215,7 @@ class IndexingPipeline:
             all_chunk_records.extend(chunk_records)
             indexed_files += 1
             chunks_written += len(chunk_records)
+            indexed_paths.append(document.relative_path)
 
         if preserve_existing:
             active_paths.update(
@@ -245,6 +248,7 @@ class IndexingPipeline:
             active_documents=active_documents,
             schema_used=selected_schema_name,
             embeddings_written=embeddings_written,
+            indexed_paths=indexed_paths,
         )
 
     def _extract_metadata_batch(

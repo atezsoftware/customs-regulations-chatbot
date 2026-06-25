@@ -39,11 +39,17 @@ export interface SkippedDirectoryFile {
   reason: string;
 }
 
+export interface UnconfirmedDirectoryFile {
+  file: IndexableDirectoryFile;
+  relativePath: string;
+}
+
 export interface DirectoryChunkingCompletion {
   directoryId: number;
   corpusKey: string;
   indexedFiles: IndexableDirectoryFile[];
   skippedFiles: SkippedDirectoryFile[];
+  unconfirmedFiles: UnconfirmedDirectoryFile[];
   result: Record<string, unknown>;
 }
 
@@ -225,11 +231,33 @@ async function runDirectoryChunking(
     manifest.corpusKey,
     manifest.documents,
   );
+
+  // `manifest.documents` and `manifest.indexedFiles` are built 1:1 in the
+  // same loop (buildDirectoryIndexManifest) — zip them and trust only what
+  // core's `indexed_paths` confirms actually landed in `core_chunks`. A
+  // file core silently dropped (parse failure, etc.) must not be treated
+  // as chunked, or its raw upload would get deleted with nothing to show
+  // for it.
+  const confirmedPaths = new Set(
+    Array.isArray(result.indexed_paths) ? (result.indexed_paths as string[]) : [],
+  );
+  const confirmedFiles: IndexableDirectoryFile[] = [];
+  const unconfirmedFiles: UnconfirmedDirectoryFile[] = [];
+  manifest.documents.forEach((document, i) => {
+    const file = manifest.indexedFiles[i];
+    if (confirmedPaths.has(document.relative_path)) {
+      confirmedFiles.push(file);
+    } else {
+      unconfirmedFiles.push({file, relativePath: document.relative_path});
+    }
+  });
+
   await options.onCompleted?.({
     directoryId,
     corpusKey: manifest.corpusKey,
-    indexedFiles: manifest.indexedFiles,
+    indexedFiles: confirmedFiles,
     skippedFiles: manifest.skippedFiles,
+    unconfirmedFiles,
     result,
   });
   console.info(
@@ -237,12 +265,13 @@ async function runDirectoryChunking(
       `documents=${String(result.active_documents ?? 'n/a')} ` +
       `chunks=${String(result.chunks_written ?? 'n/a')}`,
   );
+  const problemCount = manifest.skippedFiles.length + unconfirmedFiles.length;
   const completed: DirectoryIndexStatus = {
     directoryId,
     status: 'chunked',
     progress: 50,
-    message: manifest.skippedFiles.length
-      ? `Chunks are ready. Skipped ${manifest.skippedFiles.length} invalid file(s).`
+    message: problemCount
+      ? `Chunks are ready. ${problemCount} file(s) could not be chunked and were left as-is.`
       : 'Chunks are ready. Start indexing to generate embeddings.',
     documentCount: numberOrUndefined(result.active_documents),
     chunksWritten: numberOrUndefined(result.chunks_written),
@@ -324,6 +353,67 @@ export async function triggerDirectoryChunking(
     throw new Error(`Core chunking returned error: ${String(responseBody.error)}`);
   }
   return responseBody;
+}
+
+export interface DocumentChunksResponse {
+  document: {id: string; relative_path: string; absolute_path: string} | null;
+  chunks: Array<{
+    id: string;
+    document_id: string;
+    relative_path: string;
+    absolute_path: string;
+    text: string;
+    position: number;
+    start_char: number;
+    end_char: number;
+    chunk_type: string | null;
+    metadata: Record<string, unknown>;
+    has_embedding: boolean;
+  }>;
+}
+
+/**
+ * The single read path for a directory file's chunks — calls into `core`,
+ * which owns `core_documents`/`core_chunks`, instead of querying those
+ * tables directly from `backend`.
+ */
+export async function fetchDocumentChunks(
+  corpusKey: string,
+  relativePathPrefix: string,
+): Promise<DocumentChunksResponse> {
+  const endpoint = `${resolveCoreRestUrl()}/api/index/document-chunks`;
+  const params = new URLSearchParams({
+    corpus_key: corpusKey,
+    relative_path_prefix: relativePathPrefix,
+  });
+  const headers: Record<string, string> = {};
+  if (process.env.CORE_INTERNAL_TOKEN) {
+    headers['X-Internal-Token'] = process.env.CORE_INTERNAL_TOKEN;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${endpoint}?${params.toString()}`, {headers});
+  } catch (error) {
+    throw new Error(
+      `Core is not reachable at ${endpoint}. Start core with ` +
+        '`scripts/run.sh --env dev --apps core` or run the full stack. ' +
+        `Original error: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(
+      `Core document-chunks lookup failed (${res.status} ${res.statusText}): ${body || 'empty response'}`,
+    );
+  }
+
+  const responseBody = (await res.json()) as Record<string, unknown>;
+  if (responseBody.error) {
+    throw new Error(`Core document-chunks lookup returned error: ${String(responseBody.error)}`);
+  }
+  return responseBody as unknown as DocumentChunksResponse;
 }
 
 export async function triggerCorpusEmbedding(

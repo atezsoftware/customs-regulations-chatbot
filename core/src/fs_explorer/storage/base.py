@@ -131,6 +131,12 @@ class StorageBackend(Protocol):
     def list_document_chunks(self, *, doc_id: str) -> list[dict[str, Any]]:
         """List chunks for a document ordered by their original position."""
 
+    def get_document_chunks_by_prefix(
+        self, *, corpus_root: str, relative_path_prefix: str
+    ) -> dict[str, Any] | None:
+        """Find the active document under `corpus_root` whose `relative_path`
+        starts with `relative_path_prefix`, plus its chunks and embedding status."""
+
     def save_schema(
         self,
         *,

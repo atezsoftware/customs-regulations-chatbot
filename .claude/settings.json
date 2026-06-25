@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(jobs -l)",
+      "Bash(.venv/bin/python -c \"import fs_explorer; print\\('fs_explorer OK'\\)\")",
+      "Bash(.venv/bin/python -m pytest --version)",
+      "Bash(.venv/bin/pip list *)",
+      "Bash(.venv/bin/pip --version)",
+      "Bash(PYTHONPATH=src ../.venv/bin/python -m pytest tests/ -q)",
+      "Bash(npx tsc *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(curl -s http://127.0.0.1:8000/openapi.json)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\([p for p in d['paths'] if 'index' in p]\\)\")",
+      "Read(//proc/281857/**)",
+      "Bash(ps -o pid,user,lstart,cmd -p 281857)",
+      "Bash(sudo -n lsof -i :8000 -i :3000 -i :5173)",
+      "Bash(sudo -n fuser 8000/tcp)",
+      "Bash(PYTHONPATH=src ../.venv/bin/python -m pytest tests/test_regulatory_chunker.py -v)",
+      "Bash(PYTHONPATH=src ../.venv/bin/python3 -c ' *)"
+    ]
+  }
+}

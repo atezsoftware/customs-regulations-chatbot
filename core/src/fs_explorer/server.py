@@ -408,6 +408,38 @@ async def index_status(folder: str, database_url: str | None = None):
         return {"indexed": False}
 
 
+@app.get(
+    "/api/index/document-chunks", dependencies=[Depends(require_internal_token)]
+)
+async def document_chunks(
+    corpus_key: str, relative_path_prefix: str, database_url: str | None = None
+):
+    """Look up a document and its chunks by corpus + relative-path prefix.
+
+    The single read path for chunks of a specific uploaded file — callers
+    (e.g. `backend`) should use this instead of querying `core_*` tables
+    directly, so reads always agree with how `/api/index` wrote the data.
+    """
+    try:
+        corpus_root = _corpus_root(corpus_key)
+        resolved_database_url = resolve_database_url(database_url)
+        storage = PostgresStorage(
+            resolved_database_url, read_only=True, initialize=False
+        )
+        try:
+            result = storage.get_document_chunks_by_prefix(
+                corpus_root=corpus_root, relative_path_prefix=relative_path_prefix
+            )
+        finally:
+            storage.close()
+
+        if result is None:
+            return {"document": None, "chunks": []}
+        return result
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.post("/api/index/auto-profile", dependencies=[Depends(require_internal_token)])
 async def generate_auto_profile(request: AutoProfileRequest):
     """Generate an auto-discovered metadata profile for preview/editing."""
@@ -493,6 +525,7 @@ async def build_index(request: IndexRequest):
             "schema_used": result.schema_used,
             "embeddings_written": result.embeddings_written,
             "metadata_mode": "langextract" if effective_with_metadata else "heuristic",
+            "indexed_paths": result.indexed_paths,
         }
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
