@@ -265,7 +265,9 @@ class IndexedQueryEngine:
                 semantic_score=float(entry["semantic_score"]),
                 metadata_score=int(entry["metadata_score"]),
                 chunk_id=str(entry["chunk_id"]) if entry.get("chunk_id") else None,
-                chunk_type=str(entry["chunk_type"]) if entry.get("chunk_type") else None,
+                chunk_type=str(entry["chunk_type"])
+                if entry.get("chunk_type")
+                else None,
                 metadata=entry["metadata"]
                 if isinstance(entry.get("metadata"), dict)
                 else {},

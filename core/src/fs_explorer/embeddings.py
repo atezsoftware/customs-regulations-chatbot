@@ -62,14 +62,14 @@ class EmbeddingProvider:
             batch = texts[start : start + self.batch_size]
             result = self._client.models.embed_content(
                 model=self.model,
-                contents=batch,
+                contents=batch,  # ty: ignore[invalid-argument-type]
                 config={
                     "task_type": task_type,
                     "output_dimensionality": self.dim,
                 },
             )
-            for emb in result.embeddings:
-                all_embeddings.append(list(emb.values))
+            for emb in result.embeddings or []:
+                all_embeddings.append(list(emb.values or []))
         return all_embeddings
 
     def embed_query(self, query: str) -> list[float]:
@@ -82,4 +82,7 @@ class EmbeddingProvider:
                 "output_dimensionality": self.dim,
             },
         )
-        return list(result.embeddings[0].values)
+        embeddings = result.embeddings or []
+        if not embeddings:
+            raise RuntimeError("Embedding API returned no embeddings for query.")
+        return list(embeddings[0].values or [])

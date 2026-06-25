@@ -53,7 +53,9 @@ class SmartChunker:
             end = tentative_end
 
             if tentative_end < total:
-                boundary = normalized.rfind("\n\n", start + (self.chunk_size // 2), tentative_end)
+                boundary = normalized.rfind(
+                    "\n\n", start + (self.chunk_size // 2), tentative_end
+                )
                 if boundary != -1:
                     end = boundary + 2
 

@@ -62,12 +62,16 @@ def parse_metadata_filters(
     return parsed
 
 
-def _parse_condition(condition: str, *, allowed_fields: set[str] | None) -> MetadataFilter:
+def _parse_condition(
+    condition: str, *, allowed_fields: set[str] | None
+) -> MetadataFilter:
     text = condition.strip()
     if not text:
         raise MetadataFilterParseError("Empty filter condition.")
 
-    in_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+in\s+(.+)\s*$", text, flags=re.IGNORECASE)
+    in_match = re.match(
+        r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+in\s+(.+)\s*$", text, flags=re.IGNORECASE
+    )
     if in_match:
         field = in_match.group(1)
         _validate_field(field, allowed_fields=allowed_fields)
@@ -76,7 +80,9 @@ def _parse_condition(condition: str, *, allowed_fields: set[str] | None) -> Meta
             raise MetadataFilterParseError(f"`in` filter has no values: {text!r}")
         return MetadataFilter(field=field, operator="in", value=values)
 
-    op_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|!=|=|<|>|~|:)\s*(.+)\s*$", text)
+    op_match = re.match(
+        r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|!=|=|<|>|~|:)\s*(.+)\s*$", text
+    )
     if not op_match:
         raise MetadataFilterParseError(f"Invalid filter syntax: {text!r}")
 

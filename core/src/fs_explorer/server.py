@@ -11,7 +11,14 @@ import re
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -61,7 +68,9 @@ async def require_internal_token(
 ) -> None:
     """FastAPI dependency gating REST endpoints meant only for the backend bridge."""
     if not _internal_token_valid(x_internal_token):
-        raise HTTPException(status_code=403, detail="Invalid or missing internal token.")
+        raise HTTPException(
+            status_code=403, detail="Invalid or missing internal token."
+        )
 
 
 def _get_corpus_lock(folder: str) -> asyncio.Lock:
@@ -189,14 +198,20 @@ def _status_for_tool(tool_name: str, tool_input: dict[str, Any]) -> dict[str, st
             or tool_input.get("directory")
             or "document"
         )
-        return {"label": "Reading indexed chunks", "detail": _display_target(str(target))}
+        return {
+            "label": "Reading indexed chunks",
+            "detail": _display_target(str(target)),
+        }
     if tool_name == "scan_folder":
         return {
             "label": "Scanning indexed documents",
             "detail": _display_target(str(tool_input.get("directory", ""))),
         }
     if tool_name in {"grep", "glob"}:
-        return {"label": "Searching indexed text", "detail": _display_target(str(tool_input.get("pattern", "")))}
+        return {
+            "label": "Searching indexed text",
+            "detail": _display_target(str(tool_input.get("pattern", ""))),
+        }
     return {"label": "Using indexed retrieval", "detail": ""}
 
 
@@ -237,9 +252,10 @@ def _index_freshness(folder_path: Path, docs: list[dict[str, Any]]) -> dict[str,
         path = current[relative_path]
         stat = path.stat()
         doc = indexed[relative_path]
-        if int(stat.st_size) != int(doc["file_size"]) or abs(
-            float(stat.st_mtime) - float(doc["file_mtime"])
-        ) > 0.001:
+        if (
+            int(stat.st_size) != int(doc["file_size"])
+            or abs(float(stat.st_mtime) - float(doc["file_mtime"])) > 0.001
+        ):
             changed.append(relative_path)
 
     return {
@@ -408,9 +424,7 @@ async def index_status(folder: str, database_url: str | None = None):
         return {"indexed": False}
 
 
-@app.get(
-    "/api/index/document-chunks", dependencies=[Depends(require_internal_token)]
-)
+@app.get("/api/index/document-chunks", dependencies=[Depends(require_internal_token)])
 async def document_chunks(
     corpus_key: str, relative_path_prefix: str, database_url: str | None = None
 ):
@@ -554,7 +568,9 @@ async def embed_index(request: EmbedIndexRequest):
             if corpus_id is None:
                 storage.close()
                 return JSONResponse(
-                    {"error": "No chunks found for this folder. Generate chunks first."},
+                    {
+                        "error": "No chunks found for this folder. Generate chunks first."
+                    },
                     status_code=404,
                 )
 
@@ -590,7 +606,9 @@ async def search_index(request: SearchRequest):
         corpus_root = _corpus_root(request.corpus_folder)
 
         resolved_database_url = resolve_database_url(request.database_url)
-        storage = PostgresStorage(resolved_database_url, read_only=True, initialize=False)
+        storage = PostgresStorage(
+            resolved_database_url, read_only=True, initialize=False
+        )
         corpus_id = storage.get_corpus_id(corpus_root)
         if corpus_id is None:
             storage.close()
@@ -635,6 +653,8 @@ async def search_index(request: SearchRequest):
                 for hit in hits
             ],
         }
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
@@ -658,7 +678,10 @@ async def websocket_explore(websocket: WebSocket):
 
         if not _internal_token_valid(data.get("internal_token")):
             await websocket.send_json(
-                {"type": "error", "data": {"message": "Invalid or missing internal token."}}
+                {
+                    "type": "error",
+                    "data": {"message": "Invalid or missing internal token."},
+                }
             )
             return
 
@@ -739,7 +762,9 @@ async def websocket_explore(websocket: WebSocket):
         reset_agent()
         set_agent_llm_config(
             model=model if isinstance(model, str) else None,
-            temperature=float(temperature) if isinstance(temperature, (int, float)) else None,
+            temperature=float(temperature)
+            if isinstance(temperature, (int, float))
+            else None,
         )
 
         # Send start event

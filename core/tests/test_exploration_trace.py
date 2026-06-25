@@ -11,12 +11,16 @@ from fs_explorer.exploration_trace import (
 
 def test_normalize_path_relative() -> None:
     root = "/tmp/project"
-    assert normalize_path("docs/file.pdf", root) == os.path.abspath("/tmp/project/docs/file.pdf")
+    assert normalize_path("docs/file.pdf", root) == os.path.abspath(
+        "/tmp/project/docs/file.pdf"
+    )
 
 
 def test_normalize_path_absolute() -> None:
     root = "/tmp/project"
-    assert normalize_path("/var/data/file.pdf", root) == os.path.abspath("/var/data/file.pdf")
+    assert normalize_path("/var/data/file.pdf", root) == os.path.abspath(
+        "/var/data/file.pdf"
+    )
 
 
 def test_trace_records_steps_and_documents() -> None:

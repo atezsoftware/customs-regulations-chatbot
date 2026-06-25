@@ -147,3 +147,81 @@ export type AgentEvent =
   | {type: 'done'; messageId: number; content: string; stats?: Record<string, unknown>}
   | {type: 'cancelled'; messageId: number}
   | {type: 'error'; message: string};
+
+export type UsageRange = '7d' | '30d' | '90d' | 'all';
+
+export interface UsageAnalytics {
+  range: UsageRange;
+  since?: string | null;
+  totals: {
+    calls: number;
+    sessions: number;
+    inputTokens: number;
+    outputTokens: number;
+    thinkingTokens: number;
+    totalTokens: number;
+    avgDurationMs?: number | null;
+  };
+  daily: Array<{
+    day: string;
+    inputTokens: number;
+    outputTokens: number;
+    thinkingTokens: number;
+    totalTokens: number;
+    calls: number;
+  }>;
+  topSessions: Array<{
+    sessionId: number;
+    title: string;
+    updatedAt?: string;
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    thinkingTokens: number;
+    totalTokens: number;
+  }>;
+  models: Array<{
+    provider: string;
+    model: string;
+    calls: number;
+    totalTokens: number;
+  }>;
+}
+
+export interface AdminSupportUser {
+  id: number;
+  email: string;
+  fullName?: string;
+  role: string;
+}
+
+export interface AdminSupportSession {
+  id: number;
+  title: string;
+  createdAt?: string;
+  updatedAt?: string;
+  user: AdminSupportUser;
+  messageCount: number;
+  totalTokens: number;
+  lastMessageAt?: string;
+  lastMessage?: {
+    role?: string | null;
+    status?: string | null;
+    preview: string;
+  };
+}
+
+export interface AdminSupportSessionsResponse {
+  sessions: AdminSupportSession[];
+}
+
+export interface AdminSupportSessionDetail {
+  session: {
+    id: number;
+    title: string;
+    createdAt?: string;
+    updatedAt?: string;
+    user: AdminSupportUser;
+  };
+  messages: ChatMessageRecord[];
+}

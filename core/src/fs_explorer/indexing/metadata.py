@@ -247,9 +247,7 @@ def auto_discover_profile(
     for file_path in sampled:
         try:
             text = parse_file(file_path)
-            snippets.append(
-                f"--- {Path(file_path).name} ---\n{text[:2000]}"
-            )
+            snippets.append(f"--- {Path(file_path).name} ---\n{text[:2000]}")
         except Exception:
             continue
 
@@ -281,7 +279,9 @@ def auto_discover_profile(
         profile = json.loads(raw_text)
         # Add runtime fields that are always present
         runtime_fields = [
-            f for f in _DEFAULT_LANGEXTRACT_PROFILE["fields"] if f.get("source") == "runtime"
+            f
+            for f in _DEFAULT_LANGEXTRACT_PROFILE["fields"]
+            if f.get("source") == "runtime"
         ]
         existing_names = {
             str(f.get("name")) for f in profile.get("fields", []) if isinstance(f, dict)
@@ -657,7 +657,9 @@ def _extract_langextract_metadata(
     )
 
 
-def _schema_profile_if_present(schema_def: dict[str, Any] | None) -> dict[str, Any] | None:
+def _schema_profile_if_present(
+    schema_def: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     if not schema_def:
         return None
     metadata_profile = schema_def.get("metadata_profile")
@@ -676,7 +678,7 @@ def _resolve_langextract_profile(
     return _schema_profile_if_present(schema_def)
 
 
-def _normalize_source_classes(raw_field: dict[str, Any]) -> list[str]:
+def _normalize_source_classes(raw_field: dict[Any, Any]) -> list[str]:
     classes: list[str] = []
     single = raw_field.get("source_class")
     if isinstance(single, str) and single.strip():
@@ -780,7 +782,9 @@ def _aggregate_profile_metadata(
     by_class: dict[str, list[str]] = defaultdict(list)
 
     for extraction in extractions:
-        extraction_class = str(getattr(extraction, "extraction_class", "")).strip().lower()
+        extraction_class = (
+            str(getattr(extraction, "extraction_class", "")).strip().lower()
+        )
         extraction_text = str(getattr(extraction, "extraction_text", "")).strip()
         if not extraction_class:
             continue
@@ -949,9 +953,7 @@ def _safe_positive_int(value: Any, *, minimum: int, field_name: str) -> int:
             f"Metadata profile field '{field_name}' must be an integer."
         ) from exc
     if integer < minimum:
-        raise ValueError(
-            f"Metadata profile field '{field_name}' must be >= {minimum}."
-        )
+        raise ValueError(f"Metadata profile field '{field_name}' must be >= {minimum}.")
     return integer
 
 

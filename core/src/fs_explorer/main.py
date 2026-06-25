@@ -471,7 +471,9 @@ def main(
     ] = False,
     database_url: Annotated[
         str | None,
-        Option("--database-url", help="Postgres connection string (or set DATABASE_URL)."),
+        Option(
+            "--database-url", help="Postgres connection string (or set DATABASE_URL)."
+        ),
     ] = None,
 ) -> None:
     """
@@ -494,7 +496,9 @@ def main(
         try:
             resolved_folder = os.path.abspath(folder)
             resolved_database_url = resolve_database_url(database_url)
-            storage = PostgresStorage(resolved_database_url, read_only=True, initialize=False)
+            storage = PostgresStorage(
+                resolved_database_url, read_only=True, initialize=False
+            )
             if storage.get_corpus_id(resolved_folder) is not None:
                 effective_use_index = True
             storage.close()
@@ -502,7 +506,9 @@ def main(
             pass
 
     asyncio.run(
-        run_workflow(task, folder, use_index=effective_use_index, database_url=database_url)
+        run_workflow(
+            task, folder, use_index=effective_use_index, database_url=database_url
+        )
     )
 
 
@@ -514,7 +520,9 @@ def index_command(
     ] = ".",
     database_url: Annotated[
         str | None,
-        Option("--database-url", help="Postgres connection string (or set DATABASE_URL)."),
+        Option(
+            "--database-url", help="Postgres connection string (or set DATABASE_URL)."
+        ),
     ] = None,
     discover_schema: Annotated[
         bool,
@@ -638,7 +646,9 @@ def query_command(
     ] = ".",
     database_url: Annotated[
         str | None,
-        Option("--database-url", help="Postgres connection string (or set DATABASE_URL)."),
+        Option(
+            "--database-url", help="Postgres connection string (or set DATABASE_URL)."
+        ),
     ] = None,
 ) -> None:
     """Run the agent with indexed retrieval enabled."""
@@ -653,7 +663,9 @@ def schema_discover_command(
     ] = ".",
     database_url: Annotated[
         str | None,
-        Option("--database-url", help="Postgres connection string (or set DATABASE_URL)."),
+        Option(
+            "--database-url", help="Postgres connection string (or set DATABASE_URL)."
+        ),
     ] = None,
     name: Annotated[
         str | None,
@@ -750,7 +762,9 @@ def schema_show_command(
     ] = ".",
     database_url: Annotated[
         str | None,
-        Option("--database-url", help="Postgres connection string (or set DATABASE_URL)."),
+        Option(
+            "--database-url", help="Postgres connection string (or set DATABASE_URL)."
+        ),
     ] = None,
 ) -> None:
     """Show saved schemas for a folder's corpus."""

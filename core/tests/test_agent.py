@@ -21,7 +21,7 @@ from .conftest import make_mock_llm_client
 
 class TestAgentInitialization:
     """Tests for agent initialization."""
-    
+
     @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
     def test_agent_init_with_env_key(self) -> None:
         """Test agent initialization with API key from environment."""
@@ -41,7 +41,7 @@ class TestAgentInitialization:
         env = os.environ.copy()
         if "GOOGLE_API_KEY" in env:
             del env["GOOGLE_API_KEY"]
-        
+
         with patch.dict(os.environ, env, clear=True):
             with pytest.raises(ValueError, match="GOOGLE_API_KEY not found"):
                 FsExplorerAgent()
@@ -49,7 +49,7 @@ class TestAgentInitialization:
 
 class TestAgentConfiguration:
     """Tests for agent task configuration."""
-    
+
     @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
     def test_configure_task_adds_to_history(self) -> None:
         """Test that configure_task adds message to chat history."""
@@ -74,7 +74,7 @@ class TestAgentConfiguration:
 
 class TestAgentActions:
     """Tests for agent action handling."""
-    
+
     @pytest.mark.asyncio
     @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
     async def test_take_action_returns_action(self) -> None:
@@ -83,7 +83,7 @@ class TestAgentActions:
         agent.configure_task("this is a task")
 
         result = await agent.take_action()
-        
+
         assert result is not None
         action, action_type = result
         assert isinstance(action, Action)
@@ -98,21 +98,21 @@ class TestAgentActions:
         agent = FsExplorerAgent()
         agent.configure_task("task 1")
         agent.token_usage.api_calls = 5
-        
+
         agent.reset()
-        
+
         assert len(agent._chat_history) == 0
         assert agent.token_usage.api_calls == 0
 
 
 class TestTokenUsage:
     """Tests for TokenUsage tracking."""
-    
+
     def test_add_api_call(self) -> None:
         """Test adding API call metrics."""
         usage = TokenUsage()
         usage.add_api_call(100, 50)
-        
+
         assert usage.prompt_tokens == 100
         assert usage.completion_tokens == 50
         assert usage.total_tokens == 150
@@ -122,7 +122,7 @@ class TestTokenUsage:
         """Test tracking parse_file tool usage."""
         usage = TokenUsage()
         usage.add_tool_result("document content here", "parse_file")
-        
+
         assert usage.documents_parsed == 1
         assert usage.tool_result_chars == len("document content here")
 
@@ -132,16 +132,16 @@ class TestTokenUsage:
         # Simulating scan output with document markers
         result = "│ [1/3] doc1.pdf\n│ [2/3] doc2.pdf\n│ [3/3] doc3.pdf"
         usage.add_tool_result(result, "scan_folder")
-        
+
         assert usage.documents_scanned == 3
 
     def test_summary_format(self) -> None:
         """Test that summary produces formatted output."""
         usage = TokenUsage()
         usage.add_api_call(1000, 500)
-        
+
         summary = usage.summary()
-        
+
         assert "TOKEN USAGE SUMMARY" in summary
         assert "1,000" in summary  # Formatted prompt tokens
         assert "API Calls:" in summary
@@ -150,7 +150,7 @@ class TestTokenUsage:
 
 class TestSystemPrompt:
     """Tests for system prompt configuration."""
-    
+
     def test_system_prompt_contains_tools(self) -> None:
         """Test that system prompt documents all tools."""
         assert "scan_folder" in SYSTEM_PROMPT

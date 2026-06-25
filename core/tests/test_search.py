@@ -316,7 +316,9 @@ def test_get_metadata_field_values_returns_distinct_values(
     assert "mentions_currency" in values
 
 
-def test_get_metadata_field_values_empty_corpus(tmp_path: Path, database_url: str) -> None:
+def test_get_metadata_field_values_empty_corpus(
+    tmp_path: Path, database_url: str
+) -> None:
     storage = PostgresStorage(database_url)
     corpus_id = storage.get_or_create_corpus(str(tmp_path / "empty"))
     values = storage.get_metadata_field_values(
@@ -373,9 +375,7 @@ def test_semantic_search_includes_field_catalog_on_first_call(
     )
 
     storage = PostgresStorage(database_url)
-    IndexingPipeline(storage=storage).index_folder(
-        str(corpus), discover_schema=True
-    )
+    IndexingPipeline(storage=storage).index_folder(str(corpus), discover_schema=True)
 
     agent_module.set_index_context(str(corpus), database_url)
     agent_module.set_search_flags(enable_semantic=True, enable_metadata=True)

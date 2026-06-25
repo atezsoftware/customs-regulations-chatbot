@@ -262,7 +262,9 @@ class _ChunkDraft:
 class RegulatoryChunker:
     """Generic Turkish regulatory-text chunker."""
 
-    def __init__(self, *, max_chunk_chars: int = 2400, min_chunk_chars: int = 120) -> None:
+    def __init__(
+        self, *, max_chunk_chars: int = 2400, min_chunk_chars: int = 120
+    ) -> None:
         if max_chunk_chars < 500:
             raise ValueError("max_chunk_chars must be >= 500")
         if min_chunk_chars < 0:
@@ -270,7 +272,9 @@ class RegulatoryChunker:
         self.max_chunk_chars = max_chunk_chars
         self.min_chunk_chars = min_chunk_chars
 
-    def chunk_file(self, file_path: str, *, root_path: str | None = None) -> ChunkedDocument:
+    def chunk_file(
+        self, file_path: str, *, root_path: str | None = None
+    ) -> ChunkedDocument:
         path = Path(file_path).expanduser().resolve()
         if not path.exists() or not path.is_file():
             raise ValueError(f"No such file: {path}")
@@ -362,9 +366,7 @@ class RegulatoryChunker:
         if not chunks and blocks:
             non_empty_drafts = [d for d in drafts if _draft_text(d).strip()]
             if non_empty_drafts:
-                chunks.append(
-                    self._finalize_chunk(non_empty_drafts[0], metadata, 0)
-                )
+                chunks.append(self._finalize_chunk(non_empty_drafts[0], metadata, 0))
 
         return chunks, structure
 
@@ -519,7 +521,8 @@ class RegulatoryChunker:
                     str(classification.get("rest") or ""), article_title_candidate
                 )
                 article_heading = str(
-                    classification.get("article_heading") or f"MADDE {current_article_no}"
+                    classification.get("article_heading")
+                    or f"MADDE {current_article_no}"
                 )
                 if current_article_title:
                     article_heading = f"{article_heading} - {current_article_title}"
@@ -737,19 +740,21 @@ class RegulatoryChunker:
                     article_title=current_article_title,
                     appendix_label=current_appendix,
                 )
+            assert current is not None
+            draft = current
 
-            if current.chunk_type == "article":
+            if draft.chunk_type == "article":
                 paragraph_no = _paragraph_no(clean_text)
                 clause_label = _clause_label(clean_text)
                 subclause_label = _subclause_label(clean_text)
-                if paragraph_no and current.paragraph_no is None:
-                    current.paragraph_no = paragraph_no
-                if clause_label and current.clause_label is None:
-                    current.clause_label = clause_label
-                if subclause_label and current.subclause_label is None:
-                    current.subclause_label = subclause_label
+                if paragraph_no and draft.paragraph_no is None:
+                    draft.paragraph_no = paragraph_no
+                if clause_label and draft.clause_label is None:
+                    draft.clause_label = clause_label
+                if subclause_label and draft.subclause_label is None:
+                    draft.subclause_label = subclause_label
 
-            current.blocks.append(block)
+            draft.blocks.append(block)
 
         flush()
         return _merge_tiny_drafts(drafts, self.min_chunk_chars), structure
@@ -1109,7 +1114,14 @@ def _child_level(stack: list[StructureNode], base_level: int) -> int:
     prior article off the stack and `heading_path`/`parent_path` accumulated
     every previous MADDE instead of resetting per article.
     """
-    anchor_types = {"document", "section", "appendix", "heading", "numbered_section", "preamble"}
+    anchor_types = {
+        "document",
+        "section",
+        "appendix",
+        "heading",
+        "numbered_section",
+        "preamble",
+    }
     for node in reversed(stack):
         if node.node_type in anchor_types:
             return max(base_level, node.level + 1)
@@ -1242,7 +1254,8 @@ def _merge_tiny_drafts(drafts: list[_ChunkDraft], min_chars: int) -> list[_Chunk
             merged
             and len(_draft_text(draft)) < min_chars
             and draft.chunk_type in {"free_text", "heading_section"}
-            and merged[-1].chunk_type in {"free_text", "heading_section", "numbered_section"}
+            and merged[-1].chunk_type
+            in {"free_text", "heading_section", "numbered_section"}
         ):
             previous = merged[-1]
             previous.blocks.extend(draft.blocks)
@@ -1436,9 +1449,7 @@ def _starts_with_bold_clause_marker(raw_text: str, label: str) -> bool:
     stripped = raw_text.lstrip()
     return bool(
         re.match(rf"^\*{{1,3}}\s*\({escaped}\)", stripped, flags=re.IGNORECASE)
-        or re.match(
-            rf"^<strong>\s*\({escaped}\)", stripped, flags=re.IGNORECASE
-        )
+        or re.match(rf"^<strong>\s*\({escaped}\)", stripped, flags=re.IGNORECASE)
     )
 
 

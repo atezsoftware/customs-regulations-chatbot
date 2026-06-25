@@ -1,5 +1,7 @@
 import {apiFetch} from './api';
 import type {
+  AdminSupportSessionDetail,
+  AdminSupportSessionsResponse,
   AuthTokens,
   ChatMessageRecord,
   ChatSession,
@@ -10,6 +12,8 @@ import type {
   FileChunksResponse,
   SafeUser,
   SessionFile,
+  UsageAnalytics,
+  UsageRange,
 } from '../types';
 
 export const authApi = {
@@ -93,4 +97,23 @@ export const chatSessionsApi = {
     apiFetch<void>(`/chat-sessions/${sessionId}/messages/${messageId}/cancel`, {
       method: 'POST',
     }),
+};
+
+export const usageApi = {
+  get: (range: UsageRange = '30d') =>
+    apiFetch<UsageAnalytics>(`/analytics/usage?range=${encodeURIComponent(range)}`),
+};
+
+export const adminSupportApi = {
+  sessions: (input: {search?: string; limit?: number} = {}) => {
+    const params = new URLSearchParams();
+    if (input.search?.trim()) params.set('search', input.search.trim());
+    if (input.limit) params.set('limit', String(input.limit));
+    const query = params.toString();
+    return apiFetch<AdminSupportSessionsResponse>(
+      `/admin/support/sessions${query ? `?${query}` : ''}`,
+    );
+  },
+  messages: (sessionId: number) =>
+    apiFetch<AdminSupportSessionDetail>(`/admin/support/sessions/${sessionId}/messages`),
 };

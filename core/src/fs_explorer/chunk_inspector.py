@@ -52,7 +52,9 @@ async def get_ui() -> HTMLResponse:
 
 
 @app.get("/api/files", response_model=None)
-async def list_files(folder: str = "data/customs_test") -> dict[str, Any] | JSONResponse:
+async def list_files(
+    folder: str = "data/customs_test",
+) -> dict[str, Any] | JSONResponse:
     try:
         root = Path(folder).expanduser().resolve()
         if not root.exists():

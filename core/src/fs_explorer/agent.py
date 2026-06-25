@@ -311,7 +311,11 @@ def _resolve_index_document(
         display_name = _display_name(document)
         basename = Path(relative_path).name
 
-        if value == document["id"] or needle == relative_path or resolved == absolute_path:
+        if (
+            value == document["id"]
+            or needle == relative_path
+            or resolved == absolute_path
+        ):
             exact_matches.append(document)
             continue
         if needle and (
@@ -347,7 +351,9 @@ def _chunk_locator(chunk: dict[str, Any]) -> str:
             locators.append(f"{key}={value}")
     heading_path = metadata.get("heading_path")
     if isinstance(heading_path, list) and heading_path:
-        locators.append("heading=" + " > ".join(str(item) for item in heading_path[-3:]))
+        locators.append(
+            "heading=" + " > ".join(str(item) for item in heading_path[-3:])
+        )
     if locators:
         return " | " + "; ".join(locators)
     return ""
@@ -436,8 +442,7 @@ def describe_indexed_context() -> str:
     ]
     for idx, document in enumerate(documents, start=1):
         lines.append(
-            f"- [{idx}] doc_id={document['id']} "
-            f"title={_display_name(document)}"
+            f"- [{idx}] doc_id={document['id']} title={_display_name(document)}"
         )
     return "\n".join(lines)
 
@@ -509,7 +514,9 @@ def _indexed_grep_file_content(file_path: str, pattern: str) -> str:
             if not matches:
                 continue
             rendered = [
-                match if isinstance(match, str) else " ".join(str(item) for item in match)
+                match
+                if isinstance(match, str)
+                else " ".join(str(item) for item in match)
                 for match in matches[:8]
             ]
             lines.append(
@@ -534,7 +541,9 @@ def _document_matches_directory(document: dict[str, Any], directory: str) -> boo
     corpus_root = str(document.get("corpus_root") or "").replace("\\", "/")
     if needle in {corpus_root, absolute_path, str(Path(absolute_path).parent)}:
         return True
-    return relative_path.startswith(needle + "/") or absolute_path.startswith(needle + "/")
+    return relative_path.startswith(needle + "/") or absolute_path.startswith(
+        needle + "/"
+    )
 
 
 def _indexed_scan_folder(
@@ -543,10 +552,14 @@ def _indexed_scan_folder(
     preview_chars: int = 1500,
 ) -> str:
     if not _index_tools_available():
-        return fs_scan_folder(directory, max_workers=max_workers, preview_chars=preview_chars)
+        return fs_scan_folder(
+            directory, max_workers=max_workers, preview_chars=preview_chars
+        )
     storage, corpora, error = _get_index_storage_and_corpora()
     if error:
-        return fs_scan_folder(directory, max_workers=max_workers, preview_chars=preview_chars)
+        return fs_scan_folder(
+            directory, max_workers=max_workers, preview_chars=preview_chars
+        )
     assert storage is not None
 
     documents = [
@@ -555,7 +568,9 @@ def _indexed_scan_folder(
         if _document_matches_directory(document, directory)
     ]
     if not documents:
-        return fs_scan_folder(directory, max_workers=max_workers, preview_chars=preview_chars)
+        return fs_scan_folder(
+            directory, max_workers=max_workers, preview_chars=preview_chars
+        )
 
     output = [
         "═══════════════════════════════════════════════════════════════",
@@ -617,7 +632,9 @@ def _indexed_glob_paths(directory: str, pattern: str) -> str:
             matches.append(f"{_display_name(document)} (doc_id={document['id']})")
 
     if matches:
-        return f"MATCHES for {pattern} in indexed documents:\n\n- " + "\n- ".join(matches)
+        return f"MATCHES for {pattern} in indexed documents:\n\n- " + "\n- ".join(
+            matches
+        )
     return "No matches found in indexed documents"
 
 
@@ -779,10 +796,7 @@ def list_indexed_documents() -> str:
 
     lines = ["=== INDEXED DOCUMENTS ==="]
     for idx, document in enumerate(documents, start=1):
-        lines.append(
-            f"[{idx}] doc_id={document['id']} "
-            f"title={_display_name(document)}"
-        )
+        lines.append(f"[{idx}] doc_id={document['id']} title={_display_name(document)}")
     lines.append("")
     lines.append(
         "Use semantic_search(...) to find relevant chunks, then get_document(doc_id=...) "
@@ -933,6 +947,7 @@ User asks: "What is the purchase price?"
    subject to working capital adjustments [Disclosure Exhibits, Exhibit B]..."
 ```
 """
+
 
 def _build_system_prompt(enable_semantic: bool, enable_metadata: bool) -> str:
     """Build a system prompt with retrieval-path guidance appended."""
