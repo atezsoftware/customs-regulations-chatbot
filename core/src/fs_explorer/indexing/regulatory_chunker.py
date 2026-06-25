@@ -589,9 +589,19 @@ class RegulatoryChunker:
                 )
                 continue
 
+            # Not gated on `current_article_no` — a leading `N)`/`N.` paragraph
+            # marker or `a)` clause marker means the same thing whether it's
+            # inside a MADDE article or a non-MADDE numbered section/preamble
+            # (protocols, conventions). `_article_unit_level()` and
+            # `apply_article_context_from_current()` already degrade cleanly
+            # with no article on the stack. Restricted to plain "paragraph"
+            # classification so a heading (e.g. "**(a) TARİFLER**") or a
+            # numbered-section title (e.g. "**1. ...:**") is never reinterpreted
+            # as a clause/paragraph marker — those already have their own,
+            # more specific handling below.
             article_unit = (
                 _article_unit(clean_text, block.text)
-                if current_article_no is not None
+                if classification["kind"] == "paragraph"
                 else None
             )
             if article_unit is not None:
@@ -604,7 +614,7 @@ class RegulatoryChunker:
                 apply_article_context_from_current()
                 flush()
                 apply_pending_heading(level=_article_context_level(stack))
-                unit_level = _article_unit_level(stack)
+                unit_level = _article_unit_level(stack, kind=str(article_unit["kind"]))
                 push_node(
                     str(article_unit["kind"]),
                     _article_unit_parent_label(article_unit, clean_text),
@@ -773,9 +783,11 @@ class RegulatoryChunker:
     ) -> _ChunkDraft:
         warnings = list(draft.warnings)
         warnings.append(f"Split from oversized {draft.chunk_type} chunk, part {part}.")
+        # A size-driven cut isn't a structural unit in the source document —
+        # don't fabricate a "Part N" heading for it. `chunk_order` plus
+        # `source_start_char`/`source_end_char` already make each part
+        # locatable, and the warning above makes the split traceable.
         heading_path = list(draft.heading_path)
-        if len(blocks) != len(draft.blocks):
-            heading_path = [*heading_path, f"Part {part}"]
         return _ChunkDraft(
             chunk_type=draft.chunk_type,
             blocks=list(blocks),
@@ -1106,22 +1118,34 @@ def _child_level(stack: list[StructureNode], base_level: int) -> int:
 
 def _article_context_level(stack: list[StructureNode]) -> int:
     article_level = _current_article_level(stack)
-    return article_level + 1 if article_level is not None else 5
+    # 2 matches the level the `numbered_section` branch already applies a
+    # staged heading at (`apply_pending_heading(level=2)`) — keeps any real
+    # heading directly above the level-3 tier `_article_unit_level` uses
+    # below for top-level numbered items with no MADDE article in scope.
+    return article_level + 1 if article_level is not None else 2
 
 
-def _article_unit_level(stack: list[StructureNode]) -> int:
+def _article_unit_level(stack: list[StructureNode], *, kind: str) -> int:
     article_level = _current_article_level(stack)
-    if article_level is None:
-        return 5
+    if article_level is not None:
+        context_levels = [
+            node.level
+            for node in stack
+            if node.level > article_level and node.node_type in {"context", "heading"}
+        ]
+        if context_levels:
+            return max(context_levels) + 1
+        return article_level + 1
 
-    context_levels = [
-        node.level
-        for node in stack
-        if node.level > article_level and node.node_type in {"context", "heading"}
-    ]
-    if context_levels:
-        return max(context_levels) + 1
-    return article_level + 1
+    # No MADDE article in scope (protocols/agreements numbered "1)", "2)",
+    # ... instead of MADDE): top-level paragraph units share the fixed level
+    # the `numbered_section` branch above already uses (3), so "1)", "2)",
+    # ... are recognized as siblings of each other regardless of which one
+    # is currently on the stack — `push_node`'s pop-while-level>=new-level
+    # then correctly pops the previous sibling instead of nesting under it.
+    # A clause ("a)") nests one level beneath whichever top-level item is
+    # currently open.
+    return 4 if kind == "clause" else 3
 
 
 def _current_article_level(stack: list[StructureNode]) -> int | None:

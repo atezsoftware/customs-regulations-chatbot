@@ -430,6 +430,77 @@ class PostgresStorage:
             for row in rows
         ]
 
+    def get_document_chunks_by_prefix(
+        self, *, corpus_root: str, relative_path_prefix: str
+    ) -> dict[str, Any] | None:
+        """Find the (single) active document under `corpus_root` whose
+        `relative_path` starts with `relative_path_prefix`, plus all of its
+        chunks and per-chunk embedding status.
+
+        Mirrors the lookup a caller used to run directly against
+        `core_corpora`/`core_documents`/`core_chunks`/`core_chunk_embeddings` —
+        kept here so this schema has exactly one reader and one writer.
+        """
+        normalized = str(Path(corpus_root).resolve())
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        c.id,
+                        c.document_id,
+                        d.relative_path,
+                        d.absolute_path,
+                        c.text,
+                        c.position,
+                        c.start_char,
+                        c.end_char,
+                        c.chunk_type,
+                        c.metadata::text,
+                        EXISTS (
+                            SELECT 1
+                            FROM core_chunk_embeddings e
+                            WHERE e.chunk_id = c.id
+                        ) AS has_embedding
+                    FROM core_corpora corpus
+                    JOIN core_documents d ON d.corpus_id = corpus.id
+                    JOIN core_chunks c ON c.document_id = d.id
+                    WHERE corpus.root_path = %s
+                      AND d.relative_path LIKE %s
+                      AND d.is_deleted = false
+                    ORDER BY c.position ASC
+                    """,
+                    (normalized, f"{relative_path_prefix}%"),
+                )
+                rows = cur.fetchall()
+
+        if not rows:
+            return None
+
+        return {
+            "document": {
+                "id": str(rows[0][1]),
+                "relative_path": str(rows[0][2]),
+                "absolute_path": str(rows[0][3]),
+            },
+            "chunks": [
+                {
+                    "id": str(row[0]),
+                    "document_id": str(row[1]),
+                    "relative_path": str(row[2]),
+                    "absolute_path": str(row[3]),
+                    "text": str(row[4]),
+                    "position": int(row[5]),
+                    "start_char": int(row[6]),
+                    "end_char": int(row[7]),
+                    "chunk_type": str(row[8]) if row[8] is not None else None,
+                    "metadata": json.loads(str(row[9])) if row[9] is not None else {},
+                    "has_embedding": bool(row[10]),
+                }
+                for row in rows
+            ],
+        }
+
     def save_schema(
         self,
         *,

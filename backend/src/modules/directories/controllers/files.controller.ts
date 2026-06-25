@@ -15,10 +15,9 @@ import {
 } from '@loopback/rest';
 import multer from 'multer';
 import {getCurrentUser} from '../../../common/auth';
-import {PostgresDataSource} from '../../../datasources';
 import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../repositories';
-import {StorageService, virtualCorpusKey} from '../services';
+import {fetchDocumentChunks, StorageService, virtualCorpusKey} from '../services';
 import {toSafeFile} from '../transformers';
 import {DirectoriesController} from './directories.controller';
 
@@ -38,20 +37,6 @@ interface RenameFileBody {
   name: string;
 }
 
-interface ChunkRow {
-  id: string;
-  document_id: string;
-  relative_path: string;
-  absolute_path: string;
-  text: string;
-  position: number;
-  start_char: number;
-  end_char: number;
-  chunk_type?: string | null;
-  metadata: object | string;
-  has_embedding: boolean;
-}
-
 export class FilesController {
   private storageService = new StorageService();
   private directoriesController: DirectoriesController;
@@ -61,7 +46,6 @@ export class FilesController {
     @repository(DirectoryFileRepository)
     private directoryFileRepository: DirectoryFileRepository,
     @repository(UserRepository) private userRepository: UserRepository,
-    @inject('datasources.postgres') private dataSource: PostgresDataSource,
     @inject(RestBindings.Http.REQUEST) private request: Request,
     @inject(RestBindings.Http.RESPONSE) private res: Response,
   ) {
@@ -92,57 +76,33 @@ export class FilesController {
   ) {
     const user = await getCurrentUser(this.request, this.userRepository);
     const file = await this.findOwnedFileOrThrow(directoryId, fileId, user.id);
-    const rows = await this.dataSource.execute(
-      `
-        SELECT
-          c.id,
-          c.document_id,
-          d.relative_path,
-          d.absolute_path,
-          c.text,
-          c.position,
-          c.start_char,
-          c.end_char,
-          c.chunk_type,
-          c.metadata,
-          EXISTS (
-            SELECT 1
-            FROM core_chunk_embeddings e
-            WHERE e.chunk_id = c.id
-          ) AS has_embedding
-        FROM core_corpora corpus
-        JOIN core_documents d ON d.corpus_id = corpus.id
-        JOIN core_chunks c ON c.document_id = d.id
-        WHERE corpus.root_path = $1
-          AND d.relative_path LIKE $2
-          AND d.is_deleted = false
-        ORDER BY c.position ASC
-      `,
-      [virtualCorpusKey(directoryId), `${fileId}-%`],
-    ) as ChunkRow[];
+    const {document, chunks} = await fetchDocumentChunks(
+      virtualCorpusKey(directoryId),
+      `${fileId}-`,
+    );
 
     return {
       directoryId,
       file: toSafeFile(file),
-      document: rows[0]
+      document: document
         ? {
-            id: rows[0].document_id,
-            relativePath: rows[0].relative_path,
-            title: displayTitle(rows[0].absolute_path || file.originalName),
+            id: document.id,
+            relativePath: document.relative_path,
+            title: displayTitle(document.absolute_path || file.originalName),
           }
         : undefined,
-      chunks: rows.map(row => ({
-        id: row.id,
-        documentId: row.document_id,
-        relativePath: row.relative_path,
-        documentTitle: displayTitle(row.absolute_path || file.originalName),
-        text: row.text,
-        position: Number(row.position),
-        startChar: Number(row.start_char),
-        endChar: Number(row.end_char),
-        chunkType: row.chunk_type,
-        metadata: parseMetadata(row.metadata),
-        hasEmbedding: Boolean(row.has_embedding),
+      chunks: chunks.map(chunk => ({
+        id: chunk.id,
+        documentId: chunk.document_id,
+        relativePath: chunk.relative_path,
+        documentTitle: displayTitle(chunk.absolute_path || file.originalName),
+        text: chunk.text,
+        position: Number(chunk.position),
+        startChar: Number(chunk.start_char),
+        endChar: Number(chunk.end_char),
+        chunkType: chunk.chunk_type,
+        metadata: chunk.metadata,
+        hasEmbedding: Boolean(chunk.has_embedding),
       })),
     };
   }
@@ -231,16 +191,6 @@ export class FilesController {
     const file = await this.findOwnedFileOrThrow(directoryId, fileId, user.id);
     await this.directoryFileRepository.deleteById(fileId);
     await this.storageService.deleteFile(file.storedPath);
-  }
-}
-
-function parseMetadata(value: object | string): object {
-  if (typeof value !== 'string') return value;
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
   }
 }
 

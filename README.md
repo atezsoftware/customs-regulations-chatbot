@@ -6,8 +6,22 @@ An AI assistant that answers questions about regulatory documents (gümrük tebl
 
 ## Repo layout
 
-This is a monorepo split into four independent projects:
+This is a monorepo split into four independent projects, plus shared db infra:
 
+- **`core/`** — Python AI engine (agentic file search, indexing pipeline, FastAPI server). See [`CLAUDE.md`](CLAUDE.md).
+- **`backend/`** — TypeScript API (LoopBack 4). See [`backend/README.md`](backend/README.md).
+- **`frontend/`** — TypeScript/React web app. See [`frontend/README.md`](frontend/README.md).
+- **`db/`** — shared Postgres+pgvector docker-compose setup and SQL migrations, used by both `core` and `backend`. See [`db/README.md`](db/README.md).
+
+## Prerequisites
+
+Install these once, before the first `scripts/run.sh` run:
+
+- **Docker + Docker Compose** — runs Postgres. If `docker ps` gives `permission denied`, either run the script with `sudo` (works, but see the warning below) or add yourself to the `docker` group once and re-login: `sudo usermod -aG docker $USER`.
+- **Node.js 20+ and npm** — for `db` (migrations), `backend`, `frontend`.
+- **Python 3.10+** and **[uv](https://docs.astral.sh/uv/getting-started/installation/)** — for `core`. Without `uv`, you can fall back to a plain venv (see [core/README.md](core/README.md)), but `scripts/run.sh` and `core/Makefile` both assume `uv` is on `PATH`.
+
+> **Don't run `scripts/run.sh` with `sudo` if you can avoid it.** The script also runs `npm install`/`pip install` as a side effect of starting `backend`/`frontend`/`db` migrations. If it's invoked under `sudo`, those installs run as `root` and leave `root`-owned files in `*/node_modules` — later, non-sudo `npm install` runs fail with `EACCES`, or get silently skipped because the (incompletely-installed) `node_modules` directory already exists. If you must use `sudo` (e.g. you're not in the `docker` group yet), run `npm install` by hand in `db/`, `backend/`, `frontend/` as your normal user *first*, so `scripts/run.sh` finds `node_modules` already populated and never tries to install as root.
 
 ## Quick start
 
@@ -16,8 +30,17 @@ This is a monorepo split into four independent projects:
 cp .env.dev.example .env.dev
 cp db/.env.dev.example db/.env.dev
 # fill in GOOGLE_API_KEY (https://aistudio.google.com/apikey) and the DB_*/POSTGRES_* secrets
+# (the two files must agree: db/.env.dev's POSTGRES_USER/PASSWORD/DB must match
+# the DB_USER/DB_PASSWORD/DB_NAME in the root .env.dev)
 
-# 2. Bring up the whole stack (db + core + backend + frontend) in dev mode
+# 2. Install dependencies for each app once (as your normal user, not sudo)
+(cd db && npm install)
+(cd backend && npm install)
+(cd frontend && npm install)
+(cd core && uv pip install -e ".[dev]")
+# no uv? see core/README.md for the plain-venv + pip fallback
+
+# 3. Bring up the whole stack (db + core + backend + frontend) in dev mode
 scripts/run.sh --env dev --apps all
 ```
 
@@ -29,6 +52,13 @@ Once running:
 - Core (internal, not meant for direct browser use): http://127.0.0.1:8000
 
 In `development`, the backend auto-creates and logs in a fixed local user — no registration required to start clicking around.
+
+### Troubleshooting
+
+- **`POSTGRES_USER: unbound variable` when starting `db`** — `db/.env.dev` is missing or doesn't define `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`. Copy `db/.env.dev.example` → `db/.env.dev` and fill it in; it's a *separate* file from the root `.env.dev` because the Postgres docker image specifically needs `POSTGRES_*` names.
+- **`sh: 1: node-pg-migrate: not found` when running migrations** — `db/node_modules` exists but is incomplete (an earlier `npm install` was interrupted, e.g. by a network timeout or Ctrl-C). The script only runs `npm install` when `node_modules` doesn't exist at all, so a partial install never gets retried automatically. Fix: `rm -rf db/node_modules && (cd db && npm install)`.
+- **`npm ERR! code EACCES` / `permission denied` inside `node_modules`** — a previous run installed as `root` (typically because the whole script ran under `sudo`). Fix the ownership or just delete and reinstall as your normal user: `sudo rm -rf <app>/node_modules && (cd <app> && npm install)`.
+- **`npm ERR! ETIMEDOUT` reaching `registry.npmjs.org`** — usually a transient network hiccup during the first (uncached) install of a large dependency tree. Just re-run `npm install`.
 
 ## How a document goes from upload to answer
 
@@ -75,8 +105,3 @@ User Query
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed diagrams.
-
-
-
-
-  /home/kubilay-payci/customs-regulations-chatbot/.venv/bin/python -m fs_explorer.chunk_inspector --host 127.0.0.1 --port 8123

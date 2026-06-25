@@ -215,3 +215,70 @@ def test_file_date_and_temporary_article_labels_are_generic_locators() -> None:
     assert temporary[0].metadata.chunk_type == "paragraph"
     assert temporary[0].metadata.paragraph_no == "1"
     assert temporary[0].metadata.parent_path[-2] == "GEÇİCİ MADDE 1"
+
+
+def test_numbered_items_outside_madde_articles_split_into_their_own_chunks() -> None:
+    """Protocols/agreements that number themselves `1)`, `2)`, ... `a)`
+    instead of using MADDE have no article context at all — the inline
+    paragraph/clause splitter must still apply to them, not just inside
+    MADDE articles."""
+    text = """
+PROTOKOL
+Gümrük Müsteşarlığı ile UND arasında aşağıdaki hususlarda mutabık kalmışlardır.
+1) Bu protokol hükümleri konteyner ile taşınan eşyanın taşınmasını üstlenen firmalara uygulanacaktır.
+2) Global Teminat Sistemi kapsamında taşınacak eşya tanımına:
+-petrol ve petrol ürünleri,
+dahil değildir.
+3) Global Teminat Sistemine dahil eşyanın taşınması için teminat mektubu verilecektir.
+4) Teminat mektubu tutarlarının artışı her yıl yeniden hesaplanacaktır.
+5) Sistemden istifade edecek firmaların kabulüne Müsteşarlık yetkilidir.
+6) Firmaların yetki belgeleri Müsteşarlığa gönderilecektir.
+7) Anılan sistem kapsamında taşınan eşyanın süre aşımı halinde aşağıdaki uygulama yapılacaktır.
+a) Hareket gümrük idaresince tayin edilen sürenin aşılması halinde usulsüzlük cezaları uygulanacaktır.
+"""
+
+    result = RegulatoryChunker().chunk_text(text, source_file="und_protokol.docx")
+
+    assert not any(chunk.metadata.chunk_type == "article" for chunk in result.chunks)
+    assert not any("Part" in entry for chunk in result.chunks for entry in chunk.metadata.heading_path)
+
+    paragraph_chunks = [
+        chunk for chunk in result.chunks if chunk.metadata.chunk_type == "paragraph"
+    ]
+    assert [chunk.metadata.paragraph_no for chunk in paragraph_chunks] == [
+        "1",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+    ]
+    assert all(chunk.metadata.article_no is None for chunk in paragraph_chunks)
+
+    seventh = next(chunk for chunk in paragraph_chunks if chunk.metadata.paragraph_no == "7")
+    assert "süre aşımı" in seventh.text
+    assert "a) Hareket" not in seventh.text
+
+    # Items 3-7 are siblings of item 2 (and of each other) under the
+    # document title — none of them should appear nested under a previous
+    # numbered item just because it happened to become a structural node.
+    third = next(chunk for chunk in paragraph_chunks if chunk.metadata.paragraph_no == "3")
+    assert third.metadata.heading_path == [
+        "PROTOKOL",
+        "3) Global Teminat Sistemine dahil eşyanın taşınması için teminat mektubu verilecektir.",
+    ]
+
+    clause_chunks = [
+        chunk for chunk in result.chunks if chunk.metadata.chunk_type == "clause"
+    ]
+    assert [chunk.metadata.clause_label for chunk in clause_chunks] == ["a"]
+    assert "usulsüzlük cezaları" in clause_chunks[0].text
+    # The clause nests specifically under item 7 (its real parent), not
+    # under some other sibling top-level item.
+    assert clause_chunks[0].metadata.heading_path[-2].startswith("7) Anılan sistem")
+
+    numbered_section_chunks = [
+        chunk for chunk in result.chunks if chunk.metadata.chunk_type == "numbered_section"
+    ]
+    assert len(numbered_section_chunks) == 1
+    assert "petrol ve petrol ürünleri" in numbered_section_chunks[0].text

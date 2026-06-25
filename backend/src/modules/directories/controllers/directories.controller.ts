@@ -241,6 +241,18 @@ export class DirectoriesController {
         updatedAt: new Date().toISOString(),
       });
     }
+
+    for (const {file} of completion.unconfirmedFiles) {
+      if (!file.id) continue;
+      // Core's response didn't confirm this file's chunks were written —
+      // leave the raw upload in place rather than deleting data we can't
+      // verify made it into `core_chunks`.
+      await this.directoryFileRepository.updateById(file.id, {
+        storageStatus: 'error',
+        storageError: 'Core did not confirm chunks were written for this file.',
+        updatedAt: now,
+      });
+    }
   }
 
   private async markDirectoryEmbedded(_completion: DirectoryEmbeddingCompletion): Promise<void> {
