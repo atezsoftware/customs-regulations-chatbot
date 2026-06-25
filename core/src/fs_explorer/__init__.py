@@ -47,4 +47,3 @@ __all__ = [
     "ActionType",
     "Tools",
 ]
-

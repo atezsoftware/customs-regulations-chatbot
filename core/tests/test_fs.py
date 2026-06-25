@@ -20,7 +20,7 @@ from fs_explorer.fs import (
 
 class TestDescribeDirContent:
     """Tests for describe_dir_content function."""
-    
+
     def test_valid_directory(self) -> None:
         """Test describing a valid directory with files and subfolders."""
         description = describe_dir_content("tests/testfiles")
@@ -44,7 +44,7 @@ class TestDescribeDirContent:
 
 class TestReadFile:
     """Tests for read_file function."""
-    
+
     def test_valid_file(self) -> None:
         """Test reading a valid text file."""
         content = read_file("tests/testfiles/file1.txt")
@@ -58,7 +58,7 @@ class TestReadFile:
 
 class TestGrepFileContent:
     """Tests for grep_file_content function."""
-    
+
     def test_pattern_match(self) -> None:
         """Test searching for a pattern that exists."""
         result = grep_file_content("tests/testfiles/file2.md", r"(are|is) a test")
@@ -78,7 +78,7 @@ class TestGrepFileContent:
 
 class TestGlobPaths:
     """Tests for glob_paths function."""
-    
+
     def test_pattern_match(self) -> None:
         """Test finding files that match a glob pattern."""
         result = glob_paths("tests/testfiles", "file?.*")
@@ -99,7 +99,7 @@ class TestGlobPaths:
 
 class TestDocumentParsing:
     """Tests for document parsing functions (parse_file, preview_file)."""
-    
+
     def setup_method(self) -> None:
         """Clear cache before each test."""
         clear_document_cache()
@@ -126,7 +126,7 @@ class TestDocumentParsing:
 
     @pytest.mark.skipif(
         not os.path.exists("data/large_acquisition"),
-        reason="Test documents not generated"
+        reason="Test documents not generated",
     )
     def test_parse_file_pdf(self) -> None:
         """Test parsing an actual PDF file."""
@@ -139,7 +139,7 @@ class TestDocumentParsing:
 
     @pytest.mark.skipif(
         not os.path.exists("data/large_acquisition"),
-        reason="Test documents not generated"
+        reason="Test documents not generated",
     )
     def test_preview_file_pdf(self) -> None:
         """Test previewing an actual PDF file."""
@@ -153,7 +153,7 @@ class TestDocumentParsing:
 
 class TestScanFolder:
     """Tests for scan_folder function."""
-    
+
     def setup_method(self) -> None:
         """Clear cache before each test."""
         clear_document_cache()
@@ -173,7 +173,7 @@ class TestScanFolder:
 
     @pytest.mark.skipif(
         not os.path.exists("data/large_acquisition"),
-        reason="Test documents not generated"
+        reason="Test documents not generated",
     )
     def test_scan_folder_with_documents(self) -> None:
         """Test scanning a folder with actual documents."""
@@ -185,11 +185,11 @@ class TestScanFolder:
 
 class TestSupportedExtensions:
     """Tests for supported extensions configuration."""
-    
+
     def test_supported_extensions_is_frozenset(self) -> None:
         """Verify SUPPORTED_EXTENSIONS is immutable."""
         assert isinstance(SUPPORTED_EXTENSIONS, frozenset)
-    
+
     def test_common_extensions_supported(self) -> None:
         """Verify common document extensions are supported."""
         assert ".pdf" in SUPPORTED_EXTENSIONS

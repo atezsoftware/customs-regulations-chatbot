@@ -50,14 +50,20 @@ Varış bildirimi süre aşımı halinde ilgili mevzuat uygulanır.
 
     assert result.metadata.document_type == "genelge"
     assert result.metadata.document_number == "2022/07"
-    assert not any(chunk.metadata.chunk_type == "heading_section" for chunk in result.chunks)
+    assert not any(
+        chunk.metadata.chunk_type == "heading_section" for chunk in result.chunks
+    )
     numbered = [
         chunk.metadata.chunk_type == "numbered_section"
         and "Transit süre" in chunk.metadata.heading_path[-1]
         for chunk in result.chunks
     ]
     assert any(numbered)
-    numbered_chunk = next(chunk for chunk in result.chunks if chunk.metadata.chunk_type == "numbered_section")
+    numbered_chunk = next(
+        chunk
+        for chunk in result.chunks
+        if chunk.metadata.chunk_type == "numbered_section"
+    )
     assert numbered_chunk.metadata.parent_id is not None
     assert numbered_chunk.metadata.parent_path[0] == result.metadata.title
 
@@ -103,7 +109,9 @@ Bu Sözleşmede:
         "k",
     ]
 
-    container = next(chunk for chunk in clause_chunks if chunk.metadata.clause_label == "j")
+    container = next(
+        chunk for chunk in clause_chunks if chunk.metadata.clause_label == "j"
+    )
     assert "(i) içine eşya" in container.text
     assert "(ii) devamlılık" in container.text
     assert container.metadata.parent_path[-1] == '(j) "Konteyner"'
@@ -112,9 +120,7 @@ Bu Sözleşmede:
     assert container.metadata.parent_path[-4] == "(a) TARİFLER"
 
     assert not any(chunk.metadata.subclause_label == "i" for chunk in result.chunks)
-    assert not any(
-        chunk.text.startswith("(i) içine eşya") for chunk in result.chunks
-    )
+    assert not any(chunk.text.startswith("(i) içine eşya") for chunk in result.chunks)
 
 
 def test_treaty_preamble_becomes_parent_context_without_becoming_chunk() -> None:
@@ -137,7 +143,9 @@ Bu Sözleşmede:
 
     assert not any("ANLAŞMIŞLARDIR" in chunk.text for chunk in result.chunks)
 
-    clause = next(chunk for chunk in result.chunks if chunk.metadata.clause_label == "a")
+    clause = next(
+        chunk for chunk in result.chunks if chunk.metadata.clause_label == "a"
+    )
     assert clause.metadata.parent_path == [
         "TIR KARNELERİ HİMAYESİNDE ULUSLARARASI EŞYA TAŞINMASINA DAİR GÜMRÜK SÖZLEŞMESİ",
         "AKİT TARAFLAR, Aşağıdaki hususlarda ANLAŞMIŞLARDIR",
@@ -176,13 +184,9 @@ Mükerrer-2, Bir uluslararası kuruluş ayrıca yetkilendirilmelidir.
         "MÜKERRER 2",
         "3",
     ]
-    assert paragraph_chunks[1].text.startswith(
-        "2.Bir ülkede kuruluşun kefaleti"
-    )
+    assert paragraph_chunks[1].text.startswith("2.Bir ülkede kuruluşun kefaleti")
     assert "2. maddeye atıf" in paragraph_chunks[1].text
-    assert paragraph_chunks[2].text.startswith(
-        "Mükerrer-2, Bir uluslararası kuruluş"
-    )
+    assert paragraph_chunks[2].text.startswith("Mükerrer-2, Bir uluslararası kuruluş")
     assert "2.1. Bu alt numara" in paragraph_chunks[3].text
 
 
@@ -240,7 +244,11 @@ a) Hareket gümrük idaresince tayin edilen sürenin aşılması halinde usulsü
     result = RegulatoryChunker().chunk_text(text, source_file="und_protokol.docx")
 
     assert not any(chunk.metadata.chunk_type == "article" for chunk in result.chunks)
-    assert not any("Part" in entry for chunk in result.chunks for entry in chunk.metadata.heading_path)
+    assert not any(
+        "Part" in entry
+        for chunk in result.chunks
+        for entry in chunk.metadata.heading_path
+    )
 
     paragraph_chunks = [
         chunk for chunk in result.chunks if chunk.metadata.chunk_type == "paragraph"
@@ -255,14 +263,18 @@ a) Hareket gümrük idaresince tayin edilen sürenin aşılması halinde usulsü
     ]
     assert all(chunk.metadata.article_no is None for chunk in paragraph_chunks)
 
-    seventh = next(chunk for chunk in paragraph_chunks if chunk.metadata.paragraph_no == "7")
+    seventh = next(
+        chunk for chunk in paragraph_chunks if chunk.metadata.paragraph_no == "7"
+    )
     assert "süre aşımı" in seventh.text
     assert "a) Hareket" not in seventh.text
 
     # Items 3-7 are siblings of item 2 (and of each other) under the
     # document title — none of them should appear nested under a previous
     # numbered item just because it happened to become a structural node.
-    third = next(chunk for chunk in paragraph_chunks if chunk.metadata.paragraph_no == "3")
+    third = next(
+        chunk for chunk in paragraph_chunks if chunk.metadata.paragraph_no == "3"
+    )
     assert third.metadata.heading_path == [
         "PROTOKOL",
         "3) Global Teminat Sistemine dahil eşyanın taşınması için teminat mektubu verilecektir.",
@@ -278,7 +290,9 @@ a) Hareket gümrük idaresince tayin edilen sürenin aşılması halinde usulsü
     assert clause_chunks[0].metadata.heading_path[-2].startswith("7) Anılan sistem")
 
     numbered_section_chunks = [
-        chunk for chunk in result.chunks if chunk.metadata.chunk_type == "numbered_section"
+        chunk
+        for chunk in result.chunks
+        if chunk.metadata.chunk_type == "numbered_section"
     ]
     assert len(numbered_section_chunks) == 1
     assert "petrol ve petrol ürünleri" in numbered_section_chunks[0].text

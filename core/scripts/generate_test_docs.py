@@ -74,9 +74,8 @@ DOCUMENTS = {
         _________________________<br/>
         StartupXYZ LLC<br/>
         By: Sarah Chen, Founder & CEO
-        """
+        """,
     },
-    
     "02_due_diligence_report.pdf": {
         "title": "DUE DILIGENCE REPORT",
         "content": """
@@ -137,9 +136,8 @@ DOCUMENTS = {
         
         Respectfully submitted,<br/>
         Morrison & Associates, LLP
-        """
+        """,
     },
-    
     "03_ip_certification.pdf": {
         "title": "IP CERTIFICATION LETTER",
         "content": """
@@ -204,9 +202,8 @@ DOCUMENTS = {
         Sincerely,<br/>
         PatentWatch Legal Services<br/>
         By: Robert Kim, Patent Attorney
-        """
+        """,
     },
-    
     "04_risk_assessment.pdf": {
         "title": "RISK ASSESSMENT MEMO",
         "content": """
@@ -275,9 +272,8 @@ DOCUMENTS = {
         - Execute retention agreements<br/>
         - Complete regulatory filings<br/>
         - Prepare for closing per <b>Document: Closing Checklist</b>
-        """
+        """,
     },
-    
     "05_financial_adjustments.pdf": {
         "title": "FINANCIAL ADJUSTMENTS MEMO",
         "content": """
@@ -341,9 +337,8 @@ DOCUMENTS = {
         subject to final negotiation.<br/><br/>
         
         Please refer to <b>Document: Closing Checklist</b> for timeline and requirements.
-        """
+        """,
     },
-    
     "06_legal_opinion.pdf": {
         "title": "LEGAL OPINION LETTER",
         "content": """
@@ -415,9 +410,8 @@ DOCUMENTS = {
         Very truly yours,<br/>
         Wilson & Partners LLP<br/>
         By: Jennifer Walsh, Partner
-        """
+        """,
     },
-    
     "07_nda.pdf": {
         "title": "NON-DISCLOSURE AGREEMENT",
         "content": """
@@ -496,9 +490,8 @@ DOCUMENTS = {
         By: ______________________<br/>
         Name: Sarah Chen<br/>
         Title: Founder & CEO
-        """
+        """,
     },
-    
     "08_regulatory_approval.pdf": {
         "title": "REGULATORY APPROVAL LETTER",
         "content": """
@@ -553,9 +546,8 @@ DOCUMENTS = {
         Sincerely,<br/>
         Premerger Notification Office<br/>
         Federal Trade Commission
-        """
+        """,
     },
-    
     "09_customer_consents.pdf": {
         "title": "CUSTOMER CONSENT LETTERS",
         "content": """
@@ -618,9 +610,8 @@ DOCUMENTS = {
         We recommend proceeding with closing preparations. The risk of CloudTech 
         withholding consent is low based on discussions with their counsel. This 
         is consistent with the risk mitigation strategy in <b>Document: Risk Assessment Memo</b>.
-        """
+        """,
     },
-    
     "10_closing_checklist.pdf": {
         "title": "CLOSING CHECKLIST",
         "content": """
@@ -701,44 +692,45 @@ DOCUMENTS = {
         StartupXYZ: Sarah Chen (CEO), (650) 555-0200<br/>
         Legal (Buyer): John Morrison, (415) 555-0300<br/>
         Legal (Seller): Jennifer Walsh, (415) 555-0400
-        """
-    }
+        """,
+    },
 }
 
 
 def create_pdf(filename: str, title: str, content: str):
     """Create a PDF document."""
     filepath = os.path.join(OUTPUT_DIR, filename)
-    doc = SimpleDocTemplate(filepath, pagesize=letter,
-                           topMargin=1*inch, bottomMargin=1*inch,
-                           leftMargin=1*inch, rightMargin=1*inch)
-    
+    doc = SimpleDocTemplate(
+        filepath,
+        pagesize=letter,
+        topMargin=1 * inch,
+        bottomMargin=1 * inch,
+        leftMargin=1 * inch,
+        rightMargin=1 * inch,
+    )
+
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
+        "CustomTitle",
+        parent=styles["Heading1"],
         fontSize=16,
         spaceAfter=30,
-        alignment=1  # Center
+        alignment=1,  # Center
     )
     body_style = ParagraphStyle(
-        'CustomBody',
-        parent=styles['Normal'],
-        fontSize=11,
-        leading=14,
-        spaceAfter=12
+        "CustomBody", parent=styles["Normal"], fontSize=11, leading=14, spaceAfter=12
     )
-    
+
     story = []
     story.append(Paragraph(title, title_style))
-    story.append(Spacer(1, 0.5*inch))
-    
+    story.append(Spacer(1, 0.5 * inch))
+
     # Split content into paragraphs and add them
-    paragraphs = content.strip().split('<br/><br/>')
+    paragraphs = content.strip().split("<br/><br/>")
     for para in paragraphs:
-        para = para.replace('<br/>', '<br/>')
+        para = para.replace("<br/>", "<br/>")
         story.append(Paragraph(para, body_style))
-    
+
     doc.build(story)
     print(f"Created: {filepath}")
 
@@ -746,12 +738,12 @@ def create_pdf(filename: str, title: str, content: str):
 def main():
     # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
+
     print(f"\nGenerating {len(DOCUMENTS)} test documents in {OUTPUT_DIR}/\n")
-    
+
     for filename, doc_info in DOCUMENTS.items():
         create_pdf(filename, doc_info["title"], doc_info["content"])
-    
+
     print(f"\n✅ Generated {len(DOCUMENTS)} documents successfully!")
     print(f"\nDocument cross-reference map:")
     print("=" * 60)
@@ -799,4 +791,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

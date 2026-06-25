@@ -44,7 +44,9 @@ _AGENT_MODEL: str | None = None
 _AGENT_TEMPERATURE: float | None = None
 
 
-def set_agent_llm_config(*, model: str | None = None, temperature: float | None = None) -> None:
+def set_agent_llm_config(
+    *, model: str | None = None, temperature: float | None = None
+) -> None:
     """Configure which model/temperature the next constructed agent should use."""
     global _AGENT_MODEL, _AGENT_TEMPERATURE
     _AGENT_MODEL = model
@@ -222,9 +224,8 @@ class FsExplorerWorkflow(Workflow):
     ) -> WorkflowEvent:
         """Initialize exploration with the user's task."""
         root_directory = ev.folder if ev.use_index else os.path.abspath(ev.folder)
-        if (
-            not ev.use_index
-            and (not os.path.exists(root_directory) or not os.path.isdir(root_directory))
+        if not ev.use_index and (
+            not os.path.exists(root_directory) or not os.path.isdir(root_directory)
         ):
             return ExplorationEndEvent(error=f"No such directory: {root_directory}")
 
@@ -237,7 +238,9 @@ class FsExplorerWorkflow(Workflow):
             state.enable_metadata = ev.enable_metadata
 
         dirdescription = (
-            describe_indexed_context() if ev.use_index else describe_dir_content(root_directory)
+            describe_indexed_context()
+            if ev.use_index
+            else describe_dir_content(root_directory)
         )
         if ev.enable_semantic and ev.enable_metadata:
             index_hint = (
@@ -255,7 +258,9 @@ class FsExplorerWorkflow(Workflow):
                 "filters, then use chunk-backed tools for details."
             )
         else:
-            index_hint = "Prefer absolute paths from the directory listing when calling tools."
+            index_hint = (
+                "Prefer absolute paths from the directory listing when calling tools."
+            )
         agent.configure_task(
             f"Given that the current directory ('{root_directory}') looks like this:\n\n"
             f"```text\n{dirdescription}\n```\n\n"

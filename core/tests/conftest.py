@@ -33,7 +33,7 @@ def database_url() -> str:
 
 class MockModels:
     """Mock implementation of the GenAI models interface."""
-    
+
     async def generate_content(self, *args, **kwargs) -> GenerateContentResponse:
         """Return a mock response with a stop action."""
         return GenerateContentResponse(
@@ -64,7 +64,7 @@ class MockModels:
 
 class MockAio:
     """Mock implementation of the async GenAI interface."""
-    
+
     @property
     def models(self) -> MockModels:
         """Return mock models interface."""

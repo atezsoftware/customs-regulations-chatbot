@@ -20,7 +20,9 @@ def get_llm_client(
     env var > `"gemini"`. Model precedence: explicit `model` arg >
     `FS_EXPLORER_LLM_MODEL` env var > the provider's own default.
     """
-    resolved_provider = (provider or os.getenv("FS_EXPLORER_LLM_PROVIDER") or "gemini").lower()
+    resolved_provider = (
+        provider or os.getenv("FS_EXPLORER_LLM_PROVIDER") or "gemini"
+    ).lower()
     resolved_model = model or os.getenv("FS_EXPLORER_LLM_MODEL")
 
     if resolved_provider == "gemini":
@@ -31,6 +33,8 @@ def get_llm_client(
                 "GOOGLE_API_KEY not found within the current environment: "
                 "please export it or provide it to the agent constructor."
             )
-        return GeminiLLMClient(api_key=api_key, model=resolved_model, temperature=temperature)
+        return GeminiLLMClient(
+            api_key=api_key, model=resolved_model, temperature=temperature
+        )
 
     raise ValueError(f"Unknown LLM provider: {resolved_provider!r}")

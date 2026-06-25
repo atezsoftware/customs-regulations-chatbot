@@ -10,7 +10,10 @@ import fs_explorer.indexing.metadata as metadata_module
 import fs_explorer.indexing.pipeline as pipeline_module
 from fs_explorer.embeddings import EmbeddingProvider
 from fs_explorer.indexing.chunker import SmartChunker
-from fs_explorer.indexing.metadata import auto_discover_profile, normalize_langextract_profile
+from fs_explorer.indexing.metadata import (
+    auto_discover_profile,
+    normalize_langextract_profile,
+)
 from fs_explorer.indexing.pipeline import IndexingPipeline, SourceDocument
 from fs_explorer.indexing.schema import SchemaDiscovery
 from fs_explorer.storage import PostgresStorage

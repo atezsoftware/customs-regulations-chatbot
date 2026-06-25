@@ -11,7 +11,10 @@ DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 
 
 def _to_contents(history: list[ChatTurn]) -> list[Content]:
-    return [Content(role=turn.role, parts=[Part.from_text(text=turn.text)]) for turn in history]
+    return [
+        Content(role=turn.role, parts=[Part.from_text(text=turn.text)])
+        for turn in history
+    ]
 
 
 class GeminiLLMClient:
@@ -53,7 +56,7 @@ class GeminiLLMClient:
     ) -> tuple[SchemaT, LLMUsage]:
         response = await self.raw_client.aio.models.generate_content(
             model=self.model,
-            contents=_to_contents(history),  # type: ignore[arg-type]
+            contents=_to_contents(history),  # ty: ignore[invalid-argument-type]
             config={
                 "system_instruction": system_prompt,
                 "response_mime_type": "application/json",
@@ -95,7 +98,7 @@ class GeminiLLMClient:
 
         async for chunk in stream_fn(
             model=self.model,
-            contents=_to_contents(history),  # type: ignore[arg-type]
+            contents=_to_contents(history),
             config={
                 "system_instruction": system_prompt,
                 **self._generation_config(),

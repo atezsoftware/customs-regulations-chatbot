@@ -21,7 +21,13 @@ from .regulatory_chunker import RegulatoryChunker
 from .schema import SchemaDiscovery
 from ..embeddings import EmbeddingProvider
 from ..fs import SUPPORTED_EXTENSIONS, parse_file
-from ..storage import ChunkRecord, DocumentRecord, StorageBackend, make_chunk_id, make_document_id
+from ..storage import (
+    ChunkRecord,
+    DocumentRecord,
+    StorageBackend,
+    make_chunk_id,
+    make_document_id,
+)
 
 _PARSE_ERROR_PREFIXES: tuple[str, ...] = (
     "Error parsing ",
@@ -262,7 +268,9 @@ class IndexingPipeline:
     ) -> dict[str, dict[str, Any]]:
         """Extract metadata for all documents in parallel using a thread pool."""
 
-        def _extract_one(item: tuple[SourceDocument, str]) -> tuple[str, dict[str, Any]]:
+        def _extract_one(
+            item: tuple[SourceDocument, str],
+        ) -> tuple[str, dict[str, Any]]:
             document, content = item
             metadata = extract_metadata(
                 file_path=document.file_path,

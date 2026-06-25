@@ -16,7 +16,14 @@ from typing import Any
 
 from psycopg_pool import ConnectionPool
 
-from .base import ChunkRecord, DocumentRecord, SchemaRecord, make_chunk_id, make_document_id, stable_id
+from .base import (
+    ChunkRecord,
+    DocumentRecord,
+    SchemaRecord,
+    make_chunk_id,
+    make_document_id,
+    stable_id,
+)
 
 __all__ = ["PostgresStorage"]
 
@@ -360,7 +367,7 @@ class PostgresStorage:
 
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, params)
+                cur.execute(sql, params)  # ty: ignore[invalid-argument-type]
                 rows = cur.fetchall()
         metadata_score = len(filters)
         return [
@@ -705,9 +712,7 @@ class PostgresStorage:
                 row = cur.fetchone()
         return bool(row and int(row[0]) > 0)
 
-    def list_chunks_missing_embeddings(
-        self, *, corpus_id: str
-    ) -> list[dict[str, Any]]:
+    def list_chunks_missing_embeddings(self, *, corpus_id: str) -> list[dict[str, Any]]:
         sql = """
             SELECT c.id, c.text
             FROM core_chunks c

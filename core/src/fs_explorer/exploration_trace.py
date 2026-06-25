@@ -15,7 +15,9 @@ FILE_TOOLS: frozenset[str] = frozenset({"read", "grep", "preview_file", "parse_f
 # Matches legacy citations like [Source: filename.pdf, Section 2.1]
 SOURCE_CITATION_RE = re.compile(r"\[Source:\s*([^,\]]+)")
 # Matches readable citations like [Gümrük Genel Tebliği, Madde 54(1)]
-READABLE_CITATION_RE = re.compile(r"\[([^\[\]\n,]+),\s*(?:Madde|Article|Section|Bölüm|Ek)\b[^\]]*\]")
+READABLE_CITATION_RE = re.compile(
+    r"\[(?!Source:)([^\[\]\n,]+),\s*(?:Madde|Article|Section|Bölüm|Ek)\b[^\]]*\]"
+)
 
 
 def normalize_path(path: str, root_directory: str) -> str:
@@ -90,7 +92,9 @@ class ExplorationTrace:
 
         directory = tool_input.get("directory")
         if isinstance(directory, str) and directory:
-            path_entries.append(f"directory={normalize_path(directory, self.root_directory)}")
+            path_entries.append(
+                f"directory={normalize_path(directory, self.root_directory)}"
+            )
 
         file_path = tool_input.get("file_path")
         if isinstance(file_path, str) and file_path:
@@ -100,7 +104,9 @@ class ExplorationTrace:
                 self.referenced_documents.add(normalized_file_path)
 
         if resolved_document_path:
-            normalized_doc_path = normalize_path(resolved_document_path, self.root_directory)
+            normalized_doc_path = normalize_path(
+                resolved_document_path, self.root_directory
+            )
             path_entries.append(f"document={normalized_doc_path}")
             self.referenced_documents.add(normalized_doc_path)
 
