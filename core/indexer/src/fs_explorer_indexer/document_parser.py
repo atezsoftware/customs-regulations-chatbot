@@ -26,6 +26,7 @@ def _make_document_converter() -> Any:
         _DocumentConverter = DocumentConverter
     return _DocumentConverter()
 
+
 # Preview settings
 DEFAULT_PREVIEW_CHARS = 3000  # Characters for single file preview (~2-3 pages)
 DEFAULT_SCAN_PREVIEW_CHARS = 1500  # Characters for folder scan preview (~1 page)
