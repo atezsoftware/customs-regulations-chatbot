@@ -1,5 +1,9 @@
 # Build from repository root:
-#   docker build -f core/api/Dockerfile-aws -t customs-regulations-core-api .
+#   docker build -f core/Dockerfile-aws -t customs-regulations-core .
+#
+# Builds the api (chat/agent) service — the one the existing CI/CD workflow
+# deploys. The indexer service has its own Dockerfile-aws at
+# core/indexer/Dockerfile-aws, not wired into any workflow yet.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \

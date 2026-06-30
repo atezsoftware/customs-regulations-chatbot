@@ -21,7 +21,7 @@ This repo is split into independent top-level projects:
 - **`frontend/`** — TypeScript frontend app.
 - **`db/`** — shared database infra (`docker-compose.yml` for Postgres+pgvector; SQL migrations). `core` and `backend` both connect to this same Postgres instance — `core` (via `fs_explorer_shared.storage`) owns the `core_*` tables (documents/chunks/embeddings/schemas), `backend` owns everything else.
 
-> **Deploy status:** the EKS Helm chart (`atezsoftware/devops`, a separate private repo) only has a Deployment+Service for one `core` image. `.github/workflows/customs-regulations-core-codebuild.yaml` builds and pushes both `core-api` and `core-indexer` images, but only deploys `core-api` via Helm today — `core-indexer` is not live in any environment until the devops repo gets a second Deployment+Service (port 8001) and `backend`'s deployed config gets `CORE_INDEXER_URL` pointed at it.
+> **Deploy status:** `.github/workflows/customs-regulations-core-codebuild.yaml` is intentionally untouched by this split and still only builds/pushes one image, from `core/Dockerfile-aws` (the api/chat service — same path and same ECR repo/Helm release as before). `core/indexer/Dockerfile-aws` exists and is verified to build correctly, but nothing wires it into CI/CD yet. Before `core-indexer` can run anywhere: a new ECR repo per environment, a new EKS Deployment+Service (port 8001) in the `atezsoftware/devops` repo, a way to build/push that image (a new workflow, or extending the existing one), and `backend`'s deployed config needs `CORE_INDEXER_URL` pointed at it.
 
 ## Common Commands
 
