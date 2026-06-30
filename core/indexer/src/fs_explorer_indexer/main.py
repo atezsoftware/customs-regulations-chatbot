@@ -13,18 +13,76 @@ from pathlib import Path
 
 from typer import Typer, Option, Argument, BadParameter, Exit
 from typing import Annotated, Any
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
 
-from fs_explorer_shared.embeddings import EmbeddingProvider
-from fs_explorer_shared.index_config import resolve_database_url
-from fs_explorer_shared.storage import PostgresStorage
-from .indexing import IndexingPipeline, SchemaDiscovery
+# Lazy-import override seams for tests and callers that monkeypatch command
+# collaborators without importing Docling/google-genai/Postgres at module import.
+EmbeddingProvider: Any | None = None
+IndexingPipeline: Any | None = None
+PostgresStorage: Any | None = None
+SchemaDiscovery: Any | None = None
+resolve_database_url: Any | None = None
 
 app = Typer()
 schema_app = Typer(help="Manage metadata schemas for indexed corpora.")
 app.add_typer(schema_app, name="schema")
+
+
+def _get_console_cls():
+    from rich.console import Console
+
+    return Console
+
+
+def _get_panel_cls():
+    from rich.panel import Panel
+
+    return Panel
+
+
+def _get_table_cls():
+    from rich.table import Table
+
+    return Table
+
+
+def _get_embedding_provider_cls():
+    if EmbeddingProvider is not None:
+        return EmbeddingProvider
+    from fs_explorer_shared.embeddings import EmbeddingProvider as cls
+
+    return cls
+
+
+def _get_resolve_database_url():
+    if resolve_database_url is not None:
+        return resolve_database_url
+    from fs_explorer_shared.index_config import resolve_database_url as func
+
+    return func
+
+
+def _get_postgres_storage_cls():
+    if PostgresStorage is not None:
+        return PostgresStorage
+    from fs_explorer_shared.storage import PostgresStorage as cls
+
+    return cls
+
+
+def _get_indexing_pipeline_cls():
+    if IndexingPipeline is not None:
+        return IndexingPipeline
+    from .indexing import IndexingPipeline as cls
+
+    return cls
+
+
+def _get_schema_discovery_cls():
+    if SchemaDiscovery is not None:
+        return SchemaDiscovery
+    from .indexing import SchemaDiscovery as cls
+
+    return cls
 
 
 def _load_metadata_profile(path_value: str | None) -> dict[str, Any] | None:
@@ -96,11 +154,19 @@ def index_command(
     ] = False,
 ) -> None:
     """Build or refresh an index for a folder."""
+    Console = _get_console_cls()
+    Panel = _get_panel_cls()
+    Table = _get_table_cls()
+    EmbeddingProvider = _get_embedding_provider_cls()
+    resolve_database_url = _get_resolve_database_url()
+    PostgresStorage = _get_postgres_storage_cls()
+    IndexingPipeline = _get_indexing_pipeline_cls()
+
     console = Console()
     resolved_database_url = resolve_database_url(database_url)
     storage = PostgresStorage(resolved_database_url)
 
-    embedding_provider: EmbeddingProvider | None = None
+    embedding_provider = None
     if with_embeddings:
         try:
             embedding_provider = EmbeddingProvider()
@@ -200,6 +266,13 @@ def schema_discover_command(
     ] = None,
 ) -> None:
     """Auto-discover and store a metadata schema for a folder."""
+    Console = _get_console_cls()
+    Panel = _get_panel_cls()
+    Table = _get_table_cls()
+    resolve_database_url = _get_resolve_database_url()
+    PostgresStorage = _get_postgres_storage_cls()
+    SchemaDiscovery = _get_schema_discovery_cls()
+
     console = Console()
     resolved_folder = str(os.path.abspath(folder))
     if not os.path.isdir(resolved_folder):
@@ -271,6 +344,12 @@ def schema_show_command(
     ] = None,
 ) -> None:
     """Show saved schemas for a folder's corpus."""
+    Console = _get_console_cls()
+    Panel = _get_panel_cls()
+    Table = _get_table_cls()
+    resolve_database_url = _get_resolve_database_url()
+    PostgresStorage = _get_postgres_storage_cls()
+
     console = Console()
     resolved_folder = str(os.path.abspath(folder))
     resolved_database_url = resolve_database_url(database_url)

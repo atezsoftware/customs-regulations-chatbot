@@ -127,9 +127,9 @@ class IndexedQueryEngine:
         if not isinstance(fields, list):
             return None
         allowed: set[str] = set()
-        for field in fields:
-            if isinstance(field, dict):
-                name = field.get("name")
+        for schema_field in fields:
+            if isinstance(schema_field, dict):
+                name = schema_field.get("name")
                 if isinstance(name, str):
                     allowed.add(name)
         return allowed if allowed else None

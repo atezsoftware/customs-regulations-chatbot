@@ -16,18 +16,60 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from fs_explorer_shared.auth import require_internal_token
-from fs_explorer_shared.embeddings import EmbeddingProvider
-from fs_explorer_shared.fs import SUPPORTED_EXTENSIONS
 from fs_explorer_shared.index_config import corpus_root as resolve_corpus_root
 from fs_explorer_shared.index_config import resolve_database_url
-from fs_explorer_shared.storage import PostgresStorage
-from .indexing import IndexingPipeline
-from .indexing.pipeline import SourceDocument
-from .indexing.metadata import auto_discover_profile
+
+# Lazy-import override seams for tests and callers that monkeypatch endpoint
+# collaborators without importing Docling/google-genai/Postgres at module import.
+PostgresStorage: Any | None = None
+EmbeddingProvider: Any | None = None
+IndexingPipeline: Any | None = None
+SourceDocument: Any | None = None
+auto_discover_profile: Any | None = None
 
 app = FastAPI(title="FsExplorer Indexer", description="Document indexing service")
 
 _corpus_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_postgres_storage_cls():
+    if PostgresStorage is not None:
+        return PostgresStorage
+    from fs_explorer_shared.storage import PostgresStorage as cls
+
+    return cls
+
+
+def _get_embedding_provider_cls():
+    if EmbeddingProvider is not None:
+        return EmbeddingProvider
+    from fs_explorer_shared.embeddings import EmbeddingProvider as cls
+
+    return cls
+
+
+def _get_indexing_pipeline_cls():
+    if IndexingPipeline is not None:
+        return IndexingPipeline
+    from .indexing import IndexingPipeline as cls
+
+    return cls
+
+
+def _get_source_document_cls():
+    if SourceDocument is not None:
+        return SourceDocument
+    from .indexing.pipeline import SourceDocument as cls
+
+    return cls
+
+
+def _get_auto_discover_profile():
+    if auto_discover_profile is not None:
+        return auto_discover_profile
+    from .indexing.metadata import auto_discover_profile as func
+
+    return func
 
 
 def _get_corpus_lock(folder: str) -> asyncio.Lock:
@@ -76,6 +118,8 @@ class AutoProfileRequest(BaseModel):
 
 
 def _iter_supported_files(root: Path) -> list[Path]:
+    from fs_explorer_shared.fs import SUPPORTED_EXTENSIONS
+
     files: list[Path] = []
     for path in root.rglob("*"):
         if path.name.startswith("~$"):
@@ -121,6 +165,8 @@ async def index_status(folder: str, database_url: str | None = None):
         folder_path = Path(corpus_root)
 
         try:
+            PostgresStorage = _get_postgres_storage_cls()
+
             resolved_database_url = resolve_database_url(database_url)
             storage = PostgresStorage(
                 resolved_database_url, read_only=True, initialize=False
@@ -194,6 +240,8 @@ async def document_chunks(
     try:
         corpus_root = resolve_corpus_root(corpus_key)
         resolved_database_url = resolve_database_url(database_url)
+        PostgresStorage = _get_postgres_storage_cls()
+
         storage = PostgresStorage(
             resolved_database_url, read_only=True, initialize=False
         )
@@ -221,7 +269,9 @@ async def generate_auto_profile(request: AutoProfileRequest):
                 {"error": f"Invalid folder: {request.folder}"}, status_code=400
             )
 
-        profile = await asyncio.to_thread(auto_discover_profile, str(folder_path))
+        auto_discover_profile_func = _get_auto_discover_profile()
+
+        profile = await asyncio.to_thread(auto_discover_profile_func, str(folder_path))
         return {"profile": profile}
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
@@ -242,8 +292,13 @@ async def build_index(request: IndexRequest):
 
         lock = _get_corpus_lock(corpus_root)
         async with lock:
+            IndexingPipeline = _get_indexing_pipeline_cls()
+            SourceDocument = _get_source_document_cls()
+            EmbeddingProvider = _get_embedding_provider_cls()
+            PostgresStorage = _get_postgres_storage_cls()
+
             resolved_database_url = resolve_database_url(request.database_url)
-            embedding_provider: EmbeddingProvider | None = None
+            embedding_provider = None
             if request.with_embeddings:
                 try:
                     embedding_provider = EmbeddingProvider()
@@ -319,6 +374,8 @@ async def embed_index(request: EmbedIndexRequest):
         corpus_root = resolve_corpus_root(request.corpus_key or request.folder)
         lock = _get_corpus_lock(corpus_root)
         async with lock:
+            PostgresStorage = _get_postgres_storage_cls()
+
             resolved_database_url = resolve_database_url(request.database_url)
             storage = PostgresStorage(resolved_database_url)
             corpus_id = storage.get_corpus_id(corpus_root)
@@ -330,6 +387,9 @@ async def embed_index(request: EmbedIndexRequest):
                     },
                     status_code=404,
                 )
+
+            IndexingPipeline = _get_indexing_pipeline_cls()
+            EmbeddingProvider = _get_embedding_provider_cls()
 
             try:
                 embedding_provider = EmbeddingProvider()
