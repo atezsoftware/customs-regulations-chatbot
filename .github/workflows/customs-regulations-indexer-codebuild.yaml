@@ -1,0 +1,252 @@
+name: Customs Regulations Indexer EKS Build And Deploy
+run-name: Deployment triggered for branch ${{ github.ref }} by @${{ github.actor }} with commit ${{ github.sha }} - ${{ github.event.head_commit.message }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select the environment'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - dev
+      action:
+        description: 'Select the action'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - redeploy
+      image_tag:
+        description: 'Enter the image tag'
+        required: false
+        default: ''
+  push:
+    branches:
+      - develop
+    paths:
+      - "core/shared/**"
+      - "core/indexer/**"
+      - "core/pyproject.toml"
+      - "core/uv.lock"
+      - ".dockerignore"
+      - ".github/workflows/customs-regulations-indexer-codebuild.yaml"
+
+jobs:
+  build-and-deploy:
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      id-token: write
+      issues: write
+      contents: read
+      packages: write
+      checks: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v2
+
+      - name: Creating Environment Variables
+        run: |
+          if [[ "${{ github.ref }}" == 'refs/heads/develop' ]] || [[ "${{ inputs.action }}" == 'redeploy' && "${{ inputs.environment }}" == 'dev' ]]; then
+            echo "SERVICE_NAME=customs-regulations-indexer-dev" >> $GITHUB_ENV
+            echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-indexer-dev" >> $GITHUB_ENV
+            echo "env_x=dev" >> $GITHUB_ENV
+            echo "space_x=dev" >> $GITHUB_ENV
+            echo "namespace=customs-regulations-dev" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=atez-dev-cluster" >> $GITHUB_ENV
+          fi
+          echo "APP_NAME=customs-regulations-indexer" >> $GITHUB_ENV
+          echo "GIT_COMMIT=${{ github.sha }}" >> $GITHUB_ENV
+          echo "AWS_REGION=eu-central-1" >> $GITHUB_ENV
+          echo "AWS_ECR=255114580789.dkr.ecr.eu-central-1.amazonaws.com" >> $GITHUB_ENV
+          if [[ "${{ inputs.action }}" == "redeploy" && -n "${{ inputs.image_tag }}" ]]; then
+            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+          fi
+
+      - name: Validate Redeploy Image
+        if: inputs.action == 'redeploy'
+        run: |
+          if [[ -z "${{ env.IMAGE_TAG }}" ]]; then
+            echo "Error: IMAGE_TAG is required for redeploy action"
+            echo "Please provide image_tag input when using redeploy"
+            exit 1
+          fi
+          echo "Using image tag for redeploy: ${{ env.IMAGE_TAG }}"
+
+      - name: AWS ECR login
+        if: inputs.action != 'redeploy'
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ECR }}
+
+      - name: Docker Build ve Tag
+        if: inputs.action != 'redeploy'
+        run: |
+          docker build . -t ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} -f core/indexer/Dockerfile-aws --network host --no-cache
+          docker tag ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} ${{ env.DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
+          docker tag ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} ${{ env.DOCKER_IMAGE_REPO }}:latest
+          echo "IMAGE_TAG=${{ env.GIT_COMMIT }}" >> $GITHUB_ENV
+
+      - name: Docker Push
+        if: inputs.action != 'redeploy'
+        run: |
+          docker push ${{ env.DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
+          docker push ${{ env.DOCKER_IMAGE_REPO }}:latest
+
+      - name: Checkout Helm Charts from DevOps Repository
+        uses: actions/checkout@v2
+        with:
+          repository: 'atezsoftware/devops'
+          token: ${{ secrets.DEVOPS_TOKEN }}
+          path: 'devops'
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4.2.0
+
+      - name: Clean up terminating pods
+        run: |
+          if ! kubectl get namespace ${{ env.namespace }} >/dev/null 2>&1; then
+            echo "Namespace ${{ env.namespace }} does not exist yet; skipping terminating pod cleanup."
+            exit 0
+          fi
+
+          selector="app=${{ env.env_x }}-${{ env.APP_NAME }}"
+          terminating_pods=$(kubectl get pods --namespace ${{ env.namespace }} -l "$selector" -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name')
+
+          if [[ -z "$terminating_pods" ]]; then
+            echo "No terminating pods found for selector $selector"
+            exit 0
+          fi
+
+          echo "$terminating_pods" | while read -r pod; do
+            echo "Force deleting terminating pod: $pod"
+            kubectl delete pod "$pod" --namespace ${{ env.namespace }} --grace-period=0 --force || true
+          done
+
+      - name: Check Helm Release Status
+        run: |
+          set +e
+          helm status ${{ env.APP_NAME }}-${{ env.env_x }} --namespace ${{ env.namespace }} > helm_status.txt
+          if grep -q "another operation" helm_status.txt; then
+            echo "Another operation is in progress. Rolling back to previous release."
+            CURRENT_REV=$(helm history ${{ env.APP_NAME }}-${{ env.env_x }} -n ${{ env.namespace }} --max 1 -o json | jq -r '.[0].revision // "1"')
+            if [[ "$CURRENT_REV" -gt 1 ]]; then
+              PREV_REV=$((CURRENT_REV - 1))
+              echo "Rolling back from revision $CURRENT_REV to $PREV_REV"
+              helm rollback ${{ env.APP_NAME }}-${{ env.env_x }} $PREV_REV --namespace ${{ env.namespace }}
+            else
+              echo "No previous revision to rollback to, cleaning up failed deployment"
+              helm uninstall ${{ env.APP_NAME }}-${{ env.env_x }} --namespace ${{ env.namespace }} || true
+            fi
+          fi
+          set -e
+
+      - name: Deploy to Kubernetes with Helm
+        id: helm_deploy
+        run: |
+          release="${{ env.APP_NAME }}-${{ env.env_x }}"
+          deployment="${{ env.env_x }}-${{ env.APP_NAME }}-deployment"
+          selector="app=${{ env.env_x }}-${{ env.APP_NAME }}"
+
+          helm upgrade --install "$release" \
+            -f ./devops/${{ env.space_x }}/customs-regulations-indexer/customs-regulations-indexer-values.yaml \
+            --namespace ${{ env.namespace }} \
+            --create-namespace \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            ./devops \
+            --timeout 600s
+
+          echo "Waiting for deployment $deployment to use image tag ${{ env.IMAGE_TAG }}"
+          for attempt in {1..60}; do
+            if kubectl get deployment "$deployment" --namespace ${{ env.namespace }} -o json | jq -e --arg tag "${{ env.IMAGE_TAG }}" 'any(.spec.template.spec.containers[]?; (.image | endswith(":" + $tag)))' >/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+
+          kubectl get deployment "$deployment" --namespace ${{ env.namespace }} -o json | jq -e --arg tag "${{ env.IMAGE_TAG }}" 'any(.spec.template.spec.containers[]?; (.image | endswith(":" + $tag)))' >/dev/null
+
+          echo "Waiting for a Ready pod running image tag ${{ env.IMAGE_TAG }}"
+          for attempt in {1..120}; do
+            ready_pods=$(kubectl get pods --namespace ${{ env.namespace }} -l "$selector" -o json | jq -r --arg tag "${{ env.IMAGE_TAG }}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name')
+            if [[ -n "$ready_pods" ]]; then
+              echo "Ready pod(s) for image tag ${{ env.IMAGE_TAG }}:"
+              echo "$ready_pods"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "No Ready pod found for image tag ${{ env.IMAGE_TAG }}"
+          exit 1
+        continue-on-error: true
+
+      - name: Check Deployment Status
+        if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'
+        run: |
+          echo "Deployment failed. Fetching logs and events..."
+          echo "=== START: Describe Deployment ==="
+          kubectl describe deployment ${{ env.env_x }}-${{ env.APP_NAME }}-deployment -n ${{ env.namespace }}
+          echo "=== END: Describe Deployment ==="
+          echo "=== START: Get Events ==="
+          kubectl get events --namespace ${{ env.namespace }} --sort-by='.metadata.creationTimestamp'
+          echo "=== END: Get Events ==="
+          echo "=== START: Check Non-Running Pods ==="
+          kubectl get pods --namespace ${{ env.namespace }} -l app=${{ env.env_x }}-${{ env.APP_NAME }} -o wide
+
+          echo "=== Problematic Pods ==="
+          kubectl get pods --namespace ${{ env.namespace }} -l app=${{ env.env_x }}-${{ env.APP_NAME }} -o json | jq -r '.items[] | select(.status.phase != "Running" or (.status.conditions[]? | select(.type == "Ready" and .status != "True"))) | "Pod: " + .metadata.name + " | Phase: " + .status.phase + " | Ready: " + (.status.conditions[]? | select(.type == "Ready") | .status // "Unknown")'
+          echo "=== END: Check Non-Running Pods ==="
+          echo "=== START: Pod diagnostics (describe + logs + previous logs) ==="
+          for pod in $(kubectl get pods --namespace ${{ env.namespace }} -l app=${{ env.env_x }}-${{ env.APP_NAME }} -o json | jq -r '.items[] | select(.status.phase != "Running" or (.status.conditions[]? | select(.type == "Ready" and .status != "True"))) | .metadata.name'); do
+            echo ""
+            echo "=== Pod: $pod ==="
+            kubectl describe pod "$pod" --namespace ${{ env.namespace }} || true
+
+            for c in $(kubectl get pod "$pod" --namespace ${{ env.namespace }} -o json | jq -r '.spec.containers[].name'); do
+              echo ""
+              echo "--- Logs: $pod / $c (tail=200) ---"
+              kubectl logs "$pod" --namespace ${{ env.namespace }} -c "$c" --tail=200 || true
+              echo ""
+              echo "--- Previous logs: $pod / $c (tail=200) ---"
+              kubectl logs "$pod" --namespace ${{ env.namespace }} -c "$c" --previous --tail=200 || true
+            done
+
+            for c in $(kubectl get pod "$pod" --namespace ${{ env.namespace }} -o json | jq -r '.spec.initContainers[]?.name // empty'); do
+              echo ""
+              echo "--- Init logs: $pod / $c (tail=200) ---"
+              kubectl logs "$pod" --namespace ${{ env.namespace }} -c "$c" --tail=200 || true
+            done
+          done
+          echo "=== END: Pod diagnostics ==="
+
+      - name: Rollback on Failure
+        id: rollback_step
+        if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'
+        run: |
+          echo "Rolling back deployment..."
+          CURRENT_REV=$(helm history ${{ env.APP_NAME }}-${{ env.env_x }} -n ${{ env.namespace }} --max 1 -o json | jq -r '.[0].revision // "1"')
+          if [[ "$CURRENT_REV" -gt 1 ]]; then
+            PREV_REV=$((CURRENT_REV - 1))
+            echo "Rolling back from revision $CURRENT_REV to $PREV_REV"
+            helm rollback ${{ env.APP_NAME }}-${{ env.env_x }} $PREV_REV --namespace ${{ env.namespace }}
+            echo "ROLLBACK_PERFORMED=true" >> $GITHUB_ENV
+          else
+            echo "No previous revision to rollback to, cleaning up failed deployment"
+            helm uninstall ${{ env.APP_NAME }}-${{ env.env_x }} --namespace ${{ env.namespace }} || true
+            echo "ROLLBACK_PERFORMED=cleanup" >> $GITHUB_ENV
+          fi
+          echo "Marking the job as failed"
+          exit 1
+
+      - name: Confirm Deployment Status
+        if: steps.helm_deploy.outcome == 'success'
+        run: echo "Deployment successful"
