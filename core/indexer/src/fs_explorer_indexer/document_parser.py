@@ -10,9 +10,21 @@ indexer's own debug tools for previewing/scanning raw files before indexing.
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from docling.document_converter import DocumentConverter
+from typing import Any
 
 from fs_explorer_shared.fs import SUPPORTED_EXTENSIONS
+
+_DocumentConverter: Any | None = None
+
+
+def _make_document_converter() -> Any:
+    """Create Docling's converter lazily so service import stays lightweight."""
+    global _DocumentConverter
+    if _DocumentConverter is None:
+        from docling.document_converter import DocumentConverter
+
+        _DocumentConverter = DocumentConverter
+    return _DocumentConverter()
 
 # Preview settings
 DEFAULT_PREVIEW_CHARS = 3000  # Characters for single file preview (~2-3 pages)
@@ -55,7 +67,7 @@ def _get_cached_or_parse(file_path: str) -> str:
     cache_key = f"{abs_path}:{os.path.getmtime(abs_path)}"
 
     if cache_key not in _DOCUMENT_CACHE:
-        converter = DocumentConverter()
+        converter = _make_document_converter()
         result = converter.convert(file_path)
         _DOCUMENT_CACHE[cache_key] = result.document.export_to_markdown()
 

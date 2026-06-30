@@ -21,8 +21,7 @@ from .regulatory_chunker import RegulatoryChunker
 from .schema import SchemaDiscovery
 from fs_explorer_shared.embeddings import EmbeddingProvider
 from fs_explorer_shared.fs import SUPPORTED_EXTENSIONS
-from ..document_parser import parse_file
-from fs_explorer_shared.storage import (
+from fs_explorer_shared.storage.base import (
     ChunkRecord,
     DocumentRecord,
     StorageBackend,
@@ -35,6 +34,13 @@ _PARSE_ERROR_PREFIXES: tuple[str, ...] = (
     "Unsupported file extension",
     "No such file:",
 )
+
+
+def parse_file(file_path: str) -> str:
+    """Lazy proxy for Docling-backed parsing; kept patchable for tests."""
+    from ..document_parser import parse_file as _parse_file
+
+    return _parse_file(file_path)
 
 
 @dataclass(frozen=True)
@@ -425,9 +431,9 @@ class IndexingPipeline:
         if not isinstance(fields, list):
             return set()
         names: set[str] = set()
-        for field in fields:
-            if isinstance(field, dict):
-                name = field.get("name")
+        for schema_field in fields:
+            if isinstance(schema_field, dict):
+                name = schema_field.get("name")
                 if isinstance(name, str):
                     names.add(name)
         return names
