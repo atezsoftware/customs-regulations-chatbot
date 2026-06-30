@@ -29,3 +29,4 @@ backend/storage/
 
 # OS files
 .DS_Store
+.claude/settings.json

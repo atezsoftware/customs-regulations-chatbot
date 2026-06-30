@@ -1,0 +1,21 @@
+[build-system]
+requires = ["uv_build>=0.9.10,<0.10.0"]
+build-backend = "uv_build"
+
+[project]
+name = "fs-explorer-shared"
+version = "0.1.0"
+description = "Code shared between fs-explorer-api and fs-explorer-indexer: storage, embeddings, basic filesystem helpers, auth."
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "google-genai>=1.55.0",
+    "psycopg[binary]>=3.2.0",
+    "psycopg-pool>=3.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+]

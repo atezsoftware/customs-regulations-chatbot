@@ -4,24 +4,26 @@ all: test lint format typecheck
 
 test:
 	$(info ****************** running tests ******************)
-	uv run pytest tests
+	uv run --all-packages pytest tests
 
 lint:
 	$(info ****************** linting ******************)
-	uv run pre-commit run -a
+	uv run --all-packages pre-commit run -a
 
 format:
 	$(info ****************** formatting ******************)
-	uv run ruff format
+	uv run --all-packages ruff format
 
 format-check:
 	$(info ****************** checking formatting ******************)
-	uv run ruff format --check
+	uv run --all-packages ruff format --check
 
 typecheck:
 	$(info ****************** type checking ******************)
-	uv run ty check src/fs_explorer/
+	uv run --all-packages ty check shared/src/fs_explorer_shared/
+	uv run --all-packages ty check api/src/fs_explorer_api/
+	uv run --all-packages ty check indexer/src/fs_explorer_indexer/
 
 build:
 	$(info ****************** building ******************)
-	uv build
+	uv build --all-packages

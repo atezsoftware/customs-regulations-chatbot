@@ -50,10 +50,18 @@ jobs:
         uses: actions/checkout@v2
 
       - name: Creating Environment Variables
+        # NOTE: core was split into two services (core-api, no Docling/langextract,
+        # and core-indexer, which owns them). SERVICE_NAME/DOCKER_IMAGE_REPO below
+        # is the api image and keeps its original ECR repo/Helm release identity
+        # unchanged. INDEXER_SERVICE_NAME/INDEXER_DOCKER_IMAGE_REPO is new — the
+        # `customs-regulations-core-indexer-*` ECR repos must exist before the
+        # push step below can succeed (create them once per environment).
         run: |
           if [[ "${{ github.ref }}" == 'refs/heads/develop' ]] || [[ "${{ inputs.action }}" == 'redeploy' && "${{ inputs.environment }}" == 'dev' ]]; then
             echo "SERVICE_NAME=customs-regulations-core-dev" >> $GITHUB_ENV
             echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-core-dev" >> $GITHUB_ENV
+            echo "INDEXER_SERVICE_NAME=customs-regulations-core-indexer-dev" >> $GITHUB_ENV
+            echo "INDEXER_DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-core-indexer-dev" >> $GITHUB_ENV
             echo "env_x=dev" >> $GITHUB_ENV
             echo "space_x=dev" >> $GITHUB_ENV
             echo "namespace=customs-regulations-dev" >> $GITHUB_ENV
@@ -61,6 +69,8 @@ jobs:
           elif [[ "${{ github.ref }}" == 'refs/heads/test/v1' ]] || [[ "${{ inputs.action }}" == 'redeploy' && "${{ inputs.environment }}" == 'test' ]]; then
             echo "SERVICE_NAME=customs-regulations-core-test-v1" >> $GITHUB_ENV
             echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-core-test-v1" >> $GITHUB_ENV
+            echo "INDEXER_SERVICE_NAME=customs-regulations-core-indexer-test-v1" >> $GITHUB_ENV
+            echo "INDEXER_DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-core-indexer-test-v1" >> $GITHUB_ENV
             echo "env_x=test-v1" >> $GITHUB_ENV
             echo "space_x=test-v1" >> $GITHUB_ENV
             echo "namespace=customs-regulations-test" >> $GITHUB_ENV
@@ -68,6 +78,8 @@ jobs:
           elif [[ "${{ github.ref }}" == 'refs/heads/release/v1' ]] || [[ "${{ inputs.action }}" == 'redeploy' && "${{ inputs.environment }}" == 'production' ]]; then
             echo "SERVICE_NAME=customs-regulations-core-v1" >> $GITHUB_ENV
             echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-core-v1" >> $GITHUB_ENV
+            echo "INDEXER_SERVICE_NAME=customs-regulations-core-indexer-v1" >> $GITHUB_ENV
+            echo "INDEXER_DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-core-indexer-v1" >> $GITHUB_ENV
             echo "env_x=v1" >> $GITHUB_ENV
             echo "space_x=prod" >> $GITHUB_ENV
             echo "namespace=customs-regulations-prod" >> $GITHUB_ENV
@@ -98,19 +110,32 @@ jobs:
         run: |
           aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ECR }}
 
-      - name: Docker Build ve Tag
+      - name: Docker Build ve Tag (core-api)
         if: inputs.action != 'redeploy'
         run: |
-          docker build . -t ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} -f core/Dockerfile-aws --network host --no-cache
+          docker build . -t ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} -f core/api/Dockerfile-aws --network host --no-cache
           docker tag ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} ${{ env.DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
           docker tag ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} ${{ env.DOCKER_IMAGE_REPO }}:latest
           echo "IMAGE_TAG=${{ env.GIT_COMMIT }}" >> $GITHUB_ENV
 
-      - name: Docker Push
+      - name: Docker Push (core-api)
         if: inputs.action != 'redeploy'
         run: |
           docker push ${{ env.DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
           docker push ${{ env.DOCKER_IMAGE_REPO }}:latest
+
+      - name: Docker Build ve Tag (core-indexer)
+        if: inputs.action != 'redeploy'
+        run: |
+          docker build . -t ${{ env.INDEXER_SERVICE_NAME }}:${{ env.GIT_COMMIT }} -f core/indexer/Dockerfile-aws --network host --no-cache
+          docker tag ${{ env.INDEXER_SERVICE_NAME }}:${{ env.GIT_COMMIT }} ${{ env.INDEXER_DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
+          docker tag ${{ env.INDEXER_SERVICE_NAME }}:${{ env.GIT_COMMIT }} ${{ env.INDEXER_DOCKER_IMAGE_REPO }}:latest
+
+      - name: Docker Push (core-indexer)
+        if: inputs.action != 'redeploy'
+        run: |
+          docker push ${{ env.INDEXER_DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
+          docker push ${{ env.INDEXER_DOCKER_IMAGE_REPO }}:latest
 
       - name: Checkout Helm Charts from DevOps Repository
         uses: actions/checkout@v2
@@ -163,6 +188,10 @@ jobs:
             fi
           fi
           set -e
+
+      - name: core-indexer is not deployed by this workflow yet
+        run: |
+          echo "::warning::core-indexer image was built and pushed to ${{ env.INDEXER_DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}, but nothing deploys it to EKS yet. The Helm chart in atezsoftware/devops only defines one Deployment+Service (for core-api, below). Before backend can reach the indexer in this environment, the devops repo needs a second Deployment+Service (port 8001) for fs-explorer-indexer, and backend's CORE_INDEXER_URL needs to point at its internal DNS name."
 
       - name: Deploy to Kubernetes with Helm
         id: helm_deploy

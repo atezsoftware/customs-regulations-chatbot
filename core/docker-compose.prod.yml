@@ -1,9 +1,19 @@
 services:
-  core:
-    container_name: customs-core-prod
+  core-api:
+    container_name: customs-core-api-prod
     restart: always
     # Intentionally no host port mapping. Backend reaches this service over
-    # the private Docker network at ws://core:8000/ws/explore.
+    # the private Docker network at ws://core-api:8000/ws/explore.
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  core-indexer:
+    container_name: customs-core-indexer-prod
+    restart: always
+    # Intentionally no host port mapping. Backend reaches this service over
+    # the private Docker network at http://core-indexer:8001.
     deploy:
       resources:
         limits:

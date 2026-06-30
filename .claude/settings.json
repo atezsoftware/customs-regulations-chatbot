@@ -18,7 +18,8 @@
       "Bash(sudo -n lsof -i :8000 -i :3000 -i :5173)",
       "Bash(sudo -n fuser 8000/tcp)",
       "Bash(PYTHONPATH=src ../.venv/bin/python -m pytest tests/test_regulatory_chunker.py -v)",
-      "Bash(PYTHONPATH=src ../.venv/bin/python3 -c ' *)"
+      "Bash(PYTHONPATH=src ../.venv/bin/python3 -c ' *)",
+      "Bash(gh pr *)"
     ]
   }
 }

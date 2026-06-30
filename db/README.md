@@ -4,7 +4,7 @@ Shared database infrastructure: multi-environment `docker-compose` setup for Pos
 
 Kept separate from `core`/`backend` because both read from and write to the same database — the schema shouldn't be owned by either service's language/framework.
 
-`core` and `backend` share one physical database: `core` owns the `core_*` tables (`core_documents`/`core_chunks`/`core_chunk_embeddings`/`core_schemas`, plus pgvector for embeddings), `backend` owns everything else (`users`, `directories`, `chat_sessions`, ...). `core` connects via `DATABASE_URL` (see `core/src/fs_explorer/index_config.py`).
+`core` and `backend` share one physical database: `core` owns the `core_*` tables (`core_documents`/`core_chunks`/`core_chunk_embeddings`/`core_schemas`, plus pgvector for embeddings), `backend` owns everything else (`users`, `directories`, `chat_sessions`, ...). Both `core-api` and `core-indexer` connect via `DATABASE_URL` (see `core/shared/src/fs_explorer_shared/index_config.py`).
 
 ## Environments
 

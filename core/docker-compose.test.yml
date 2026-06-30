@@ -1,6 +1,12 @@
 services:
-  core:
-    container_name: customs-core-test
+  core-api:
+    container_name: customs-core-api-test
     ports:
       - "127.0.0.1:${CORE_PORT:-8001}:8000"
+    restart: "no"
+
+  core-indexer:
+    container_name: customs-core-indexer-test
+    ports:
+      - "127.0.0.1:${CORE_INDEXER_PORT:-8002}:8001"
     restart: "no"

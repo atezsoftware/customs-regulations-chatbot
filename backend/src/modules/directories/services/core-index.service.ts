@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 
 const STORAGE_ROOT = process.env.STORAGE_ROOT ?? './storage';
-const DEFAULT_CORE_URL = 'http://127.0.0.1:8000';
+const DEFAULT_INDEXER_URL = 'http://127.0.0.1:8001';
 
 export type DirectoryIndexState =
   | 'not_indexed'
@@ -335,8 +335,8 @@ export async function triggerDirectoryChunking(
     });
   } catch (error) {
     throw new Error(
-      `Core is not reachable at ${endpoint}. Start core with ` +
-        '`scripts/run.sh --env dev --apps core` or run the full stack. ' +
+      `Core is not reachable at ${endpoint}. Start the indexer with ` +
+        '`scripts/run.sh --env dev --apps core-indexer` or run the full stack. ' +
         `Original error: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
@@ -396,8 +396,8 @@ export async function fetchDocumentChunks(
     res = await fetch(`${endpoint}?${params.toString()}`, {headers});
   } catch (error) {
     throw new Error(
-      `Core is not reachable at ${endpoint}. Start core with ` +
-        '`scripts/run.sh --env dev --apps core` or run the full stack. ' +
+      `Core is not reachable at ${endpoint}. Start the indexer with ` +
+        '`scripts/run.sh --env dev --apps core-indexer` or run the full stack. ' +
         `Original error: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
@@ -443,8 +443,8 @@ export async function triggerCorpusEmbedding(
     });
   } catch (error) {
     throw new Error(
-      `Core is not reachable at ${endpoint}. Start core with ` +
-        '`scripts/run.sh --env dev --apps core` or run the full stack. ' +
+      `Core is not reachable at ${endpoint}. Start the indexer with ` +
+        '`scripts/run.sh --env dev --apps core-indexer` or run the full stack. ' +
         `Original error: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
@@ -464,13 +464,8 @@ export async function triggerCorpusEmbedding(
 }
 
 function resolveCoreRestUrl(): string {
-  const configured = process.env.CORE_INTERNAL_URL ?? DEFAULT_CORE_URL;
-  const base = configured
-    .replace(/\/ws\/explore$/, '')
-    .replace(/^ws:/, 'http:')
-    .replace(/^wss:/, 'https:')
-    .replace(/\/$/, '');
-  return base;
+  const configured = process.env.CORE_INDEXER_URL ?? DEFAULT_INDEXER_URL;
+  return configured.replace(/\/$/, '');
 }
 
 function resolveDatabaseUrl(): string | undefined {

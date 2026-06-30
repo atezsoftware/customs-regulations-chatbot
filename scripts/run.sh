@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Single entrypoint to bring up any subset of this repo's apps (db, core,
-# backend, frontend) in a chosen environment (dev, test, prod).
+# Single entrypoint to bring up any subset of this repo's apps (db,
+# core-api, core-indexer, backend, frontend) in a chosen environment
+# (dev, test, prod).
 #
 # Usage:
 #   scripts/run.sh --env dev --apps all
@@ -15,7 +16,7 @@ APPS="all"
 
 usage() {
   cat <<EOF
-Usage: $0 --env <dev|test|prod> --apps <all|db,core,backend,frontend>
+Usage: $0 --env <dev|test|prod> --apps <all|db,core-api,core-indexer,backend,frontend>
 
   --env   Environment to run (default: dev)
   --apps  Comma-separated list of apps to start, or "all" (default: all)
@@ -42,13 +43,13 @@ case "$ENVIRONMENT" in
 esac
 
 if [[ "$APPS" == "all" ]]; then
-  APPS="db,core,backend,frontend"
+  APPS="db,core-api,core-indexer,backend,frontend"
 fi
 IFS=',' read -ra APP_LIST <<< "$APPS"
 for app in "${APP_LIST[@]}"; do
   case "$app" in
-    db|core|backend|frontend) ;;
-    *) echo "Invalid app '$app' (expected db, core, backend or frontend)" >&2; exit 1 ;;
+    db|core-api|core-indexer|backend|frontend) ;;
+    *) echo "Invalid app '$app' (expected db, core-api, core-indexer, backend or frontend)" >&2; exit 1 ;;
   esac
 done
 
@@ -144,33 +145,55 @@ run_db() {
   run_migrations
 }
 
-run_core() {
-  echo "==> [core:$ENVIRONMENT] Python AI engine"
+run_core_api() {
+  echo "==> [core-api:$ENVIRONMENT] chat/agent API (no Docling/langextract)"
   load_env
   case "$ENVIRONMENT" in
     dev)
       (
         cd "$ROOT_DIR/core"
-        if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
-          PYTHONUTF8=1 PYTHONPATH="$ROOT_DIR/core/src" "$ROOT_DIR/.venv/bin/python" -m uvicorn \
-            fs_explorer.server:app \
-            --host 127.0.0.1 \
-            --port "${CORE_PORT:-8000}" \
-            --reload \
-            --reload-dir "$ROOT_DIR/core/src"
-        elif command -v uv >/dev/null 2>&1; then
-          uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port "${CORE_PORT:-8000}" --reload
-        else
-          echo "Cannot start core: neither $ROOT_DIR/.venv/bin/python nor uv is available." >&2
-          exit 1
-        fi
+        command -v uv >/dev/null 2>&1 || { echo "Cannot start core-api: uv is not available." >&2; exit 1; }
+        uv run --package fs-explorer-api uvicorn \
+          fs_explorer_api.server:app \
+          --host 127.0.0.1 \
+          --port "${CORE_PORT:-8000}" \
+          --reload \
+          --reload-dir "$ROOT_DIR/core/api/src" \
+          --reload-dir "$ROOT_DIR/core/shared/src"
       ) &
       PIDS+=($!)
       ;;
     test|prod)
       (
         cd "$ROOT_DIR/core"
-        docker compose -f docker-compose.yml -f "docker-compose.$ENVIRONMENT.yml" up -d --build
+        docker compose -f docker-compose.yml -f "docker-compose.$ENVIRONMENT.yml" up -d --build core-api
+      )
+      ;;
+  esac
+}
+
+run_core_indexer() {
+  echo "==> [core-indexer:$ENVIRONMENT] Docling/langextract indexing service"
+  load_env
+  case "$ENVIRONMENT" in
+    dev)
+      (
+        cd "$ROOT_DIR/core"
+        command -v uv >/dev/null 2>&1 || { echo "Cannot start core-indexer: uv is not available." >&2; exit 1; }
+        uv run --package fs-explorer-indexer uvicorn \
+          fs_explorer_indexer.indexer_server:app \
+          --host 127.0.0.1 \
+          --port "${CORE_INDEXER_PORT:-8001}" \
+          --reload \
+          --reload-dir "$ROOT_DIR/core/indexer/src" \
+          --reload-dir "$ROOT_DIR/core/shared/src"
+      ) &
+      PIDS+=($!)
+      ;;
+    test|prod)
+      (
+        cd "$ROOT_DIR/core"
+        docker compose -f docker-compose.yml -f "docker-compose.$ENVIRONMENT.yml" up -d --build core-indexer
       )
       ;;
   esac
@@ -223,7 +246,8 @@ run_frontend() {
 for app in "${APP_LIST[@]}"; do
   case "$app" in
     db) run_db ;;
-    core) run_core ;;
+    core-api) run_core_api ;;
+    core-indexer) run_core_indexer ;;
     backend) run_backend ;;
     frontend) run_frontend ;;
   esac

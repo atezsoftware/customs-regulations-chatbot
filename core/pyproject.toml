@@ -3,26 +3,17 @@ requires = ["uv_build>=0.9.10,<0.10.0"]
 build-backend = "uv_build"
 
 [project]
-name = "fs-explorer"
+name = "fs-explorer-workspace"
 version = "0.1.0"
-description = "Explore and understand your filesystem better with AI."
-readme = "README.md"
+description = "Workspace root coordinating fs-explorer-shared, fs-explorer-api and fs-explorer-indexer."
 requires-python = ">=3.10"
-dependencies = [
-    "docling>=2.55.0",
-    "fastapi>=0.115.0",
-    "google-genai>=1.55.0",
-    "langextract>=1.0.0",
-    "llama-index-workflows>=2.11.5",
-    "psycopg[binary]>=3.2.0",
-    "psycopg-pool>=3.2.0",
-    "python-dotenv>=1.0.0",
-    "reportlab>=4.4.7",
-    "rich>=13.0.0",
-    "typer>=0.12.5,<0.20.0",
-    "uvicorn>=0.34.0",
-    "websockets>=14.0",
-]
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["shared", "api", "indexer"]
 
 [dependency-groups]
 dev = [
@@ -31,8 +22,5 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "ruff>=0.14.9",
     "ty>=0.0.1a33",
+    "reportlab>=4.4.7",
 ]
-
-[project.scripts]
-explore = "fs_explorer.main:app"
-explore-ui = "fs_explorer.server:run_server"
