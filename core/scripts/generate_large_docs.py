@@ -6,7 +6,7 @@ Creates 25 documents, each 3-5 pages, with extensive cross-references.
 
 import os
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 
@@ -718,7 +718,7 @@ uv run explore --task "Look in data/large_acquisition/. What happens after closi
     total_pages = sum(m["pages"] for m in DOCUMENTS.values())
     total_refs = sum(len(m["refs"]) for m in DOCUMENTS.values())
     print(f"\n{'=' * 60}")
-    print("SUMMARY")
+    print(f"SUMMARY")
     print(f"{'=' * 60}")
     print(f"  Documents created: {len(DOCUMENTS)}")
     print(f"  Total pages: ~{total_pages}")

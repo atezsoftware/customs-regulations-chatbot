@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import builtins
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -117,21 +116,6 @@ def test_env_overrides(monkeypatch) -> None:
     call = client.models.calls[0]
     assert call["model"] == "custom-model-001"
     assert call["config"]["output_dimensionality"] == 256
-
-
-def test_client_injection_does_not_import_google_genai(monkeypatch) -> None:
-    real_import = builtins.__import__
-
-    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: ANN001, ANN002
-        if name == "google.genai" or name.startswith("google.genai."):
-            raise AssertionError("client injection should not import google.genai")
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
-
-    provider = EmbeddingProvider(client=_FakeClient(), dim=4)
-
-    assert provider.embed_query("search") == [0.0, 0.0, 0.0, 0.0]
 
 
 def test_missing_api_key_raises(monkeypatch) -> None:

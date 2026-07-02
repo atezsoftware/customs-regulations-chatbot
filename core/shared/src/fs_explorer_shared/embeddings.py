@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from google.genai import Client as GenAIClient
+
 
 _DEFAULT_MODEL = "gemini-embedding-001"
 _DEFAULT_DIM = 768
@@ -43,8 +45,6 @@ class EmbeddingProvider:
                     "GOOGLE_API_KEY not found. "
                     "Provide api_key or set the environment variable."
                 )
-            from google.genai import Client as GenAIClient
-
             self._client = GenAIClient(api_key=resolved_key)
 
     def embed_texts(
