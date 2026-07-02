@@ -8,14 +8,3 @@ services:
       - ./api/src:/app/api/src
     command: uv run --package fs-explorer-api uvicorn fs_explorer_api.server:app --host 0.0.0.0 --port 8000 --reload
     restart: unless-stopped
-
-  core-indexer:
-    container_name: customs-core-indexer-dev
-    ports:
-      - "127.0.0.1:${CORE_INDEXER_PORT:-8001}:8001"
-    volumes:
-      - ./shared/src:/app/shared/src
-      - ./indexer/src:/app/indexer/src
-      - ../storage:/app/storage
-    command: uv run --package fs-explorer-indexer uvicorn fs_explorer_indexer.indexer_server:app --host 0.0.0.0 --port 8001 --reload
-    restart: unless-stopped

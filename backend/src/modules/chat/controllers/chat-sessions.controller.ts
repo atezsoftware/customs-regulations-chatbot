@@ -91,7 +91,7 @@ export class ChatSessionsController {
     if (!links.length) return [];
     const directoryIds = links.map(l => l.directoryId);
     const directories = await this.directoryRepository.find({
-      where: {id: {inq: directoryIds}, userId: user.id},
+      where: {id: {inq: directoryIds}},
     });
     return directories.map(toSafeDirectory);
   }
@@ -113,13 +113,11 @@ export class ChatSessionsController {
 
     const directoryIds = [...new Set(body.directoryIds ?? [])];
     if (directoryIds.length) {
-      const owned = await this.directoryRepository.find({
-        where: {id: {inq: directoryIds}, userId: user.id},
+      const found = await this.directoryRepository.find({
+        where: {id: {inq: directoryIds}},
       });
-      if (owned.length !== directoryIds.length) {
-        throw new HttpErrors.BadRequest(
-          'One or more directoryIds do not exist or do not belong to the current user.',
-        );
+      if (found.length !== directoryIds.length) {
+        throw new HttpErrors.BadRequest('One or more directoryIds do not exist.');
       }
     }
 

@@ -8,13 +8,3 @@ services:
       resources:
         limits:
           memory: 512m
-
-  core-indexer:
-    container_name: customs-core-indexer-prod
-    restart: always
-    # Intentionally no host port mapping. Backend reaches this service over
-    # the private Docker network at http://core-indexer:8001.
-    deploy:
-      resources:
-        limits:
-          memory: 2g

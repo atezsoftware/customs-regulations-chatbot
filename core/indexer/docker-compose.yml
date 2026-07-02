@@ -1,0 +1,18 @@
+# Standalone indexer — run from core/indexer/:
+#   cp .env.example .env        # fill in your credentials
+#   docker-compose up --build
+#
+# The indexer connects to whichever DATABASE_URL is set in .env.
+# Use this to index documents from your local machine against any database
+# (local dev, staging, or production via SSH tunnel).
+services:
+  core-indexer:
+    build:
+      context: ..
+      dockerfile: indexer/Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${CORE_INDEXER_PORT:-8001}:8001"
+    volumes:
+      - ${STORAGE_ROOT:-../../storage}:/app/storage

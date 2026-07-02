@@ -42,14 +42,19 @@ export class DirectoriesController {
     @inject(RestBindings.Http.REQUEST) private request: Request,
   ) {}
 
-  async ownedDirectoryOrThrow(directoryId: number, userId: number) {
+  async findDirectoryOrThrow(directoryId: number) {
     const directory = await this.directoryRepository.findOne({
-      where: {id: directoryId, userId},
+      where: {id: directoryId},
     });
     if (!directory) {
       throw new HttpErrors.NotFound('Directory not found.');
     }
     return directory;
+  }
+
+  // Kept for backward-compat — delegates to findDirectoryOrThrow (ownership no longer enforced).
+  async ownedDirectoryOrThrow(directoryId: number, _userId: number) {
+    return this.findDirectoryOrThrow(directoryId);
   }
 
   @post('/directories')
@@ -63,11 +68,10 @@ export class DirectoriesController {
   }
 
   @get('/directories')
-  @response(200, {description: 'List directories for the current user'})
+  @response(200, {description: 'List all directories'})
   async list() {
-    const user = await getCurrentUser(this.request, this.userRepository);
+    await getCurrentUser(this.request, this.userRepository);
     const directories = await this.directoryRepository.find({
-      where: {userId: user.id},
       order: ['createdAt DESC'],
     });
     return directories.map(toSafeDirectory);
@@ -76,8 +80,8 @@ export class DirectoriesController {
   @get('/directories/{id}')
   @response(200, {description: 'Directory with its files'})
   async getOne(@param.path.number('id') id: number) {
-    const user = await getCurrentUser(this.request, this.userRepository);
-    const directory = await this.ownedDirectoryOrThrow(id, user.id);
+    await getCurrentUser(this.request, this.userRepository);
+    const directory = await this.findDirectoryOrThrow(id);
     const files = await this.directoryFileRepository.find({
       where: {directoryId: id},
       order: ['createdAt DESC'],
@@ -88,8 +92,8 @@ export class DirectoriesController {
   @get('/directories/{id}/index/status')
   @response(200, {description: 'Index status for this directory'})
   async indexStatus(@param.path.number('id') id: number) {
-    const user = await getCurrentUser(this.request, this.userRepository);
-    await this.ownedDirectoryOrThrow(id, user.id);
+    await getCurrentUser(this.request, this.userRepository);
+    await this.findDirectoryOrThrow(id);
     const serviceStatus = await getDirectoryIndexStatus(id);
     if (serviceStatus.status === 'chunking' || serviceStatus.status === 'indexing' || serviceStatus.status === 'error') {
       return serviceStatus;
@@ -103,7 +107,7 @@ export class DirectoriesController {
   @response(202, {description: 'Started generating chunks for this directory'})
   async startChunking(@param.path.number('id') id: number) {
     const user = await getCurrentUser(this.request, this.userRepository);
-    const directory = await this.ownedDirectoryOrThrow(id, user.id);
+    const directory = await this.findDirectoryOrThrow(id);
     const files = await this.directoryFileRepository.find({
       where: {directoryId: id},
       order: ['createdAt ASC'],
@@ -155,7 +159,7 @@ export class DirectoriesController {
   @response(202, {description: 'Started indexing (embedding) this directory'})
   async startIndex(@param.path.number('id') id: number) {
     const user = await getCurrentUser(this.request, this.userRepository);
-    await this.ownedDirectoryOrThrow(id, user.id);
+    await this.findDirectoryOrThrow(id);
     const files = await this.directoryFileRepository.find({where: {directoryId: id}});
     if (!files.length) {
       throw new HttpErrors.BadRequest('Upload at least one file before indexing.');
@@ -185,7 +189,7 @@ export class DirectoriesController {
   @response(204, {description: 'Renamed directory'})
   async rename(@param.path.number('id') id: number, @requestBody() body: DirectoryBody) {
     const user = await getCurrentUser(this.request, this.userRepository);
-    await this.ownedDirectoryOrThrow(id, user.id);
+    await this.findDirectoryOrThrow(id);
     const name = body.name?.trim();
     if (!name) throw new HttpErrors.BadRequest('name is required.');
     const files = await this.directoryFileRepository.find({where: {directoryId: id}});
@@ -209,8 +213,8 @@ export class DirectoriesController {
   @del('/directories/{id}')
   @response(204, {description: 'Deleted directory and its files'})
   async delete(@param.path.number('id') id: number) {
-    const user = await getCurrentUser(this.request, this.userRepository);
-    await this.ownedDirectoryOrThrow(id, user.id);
+    await getCurrentUser(this.request, this.userRepository);
+    await this.findDirectoryOrThrow(id);
     const files = await this.directoryFileRepository.find({where: {directoryId: id}});
     await this.directoryFileRepository.deleteAll({directoryId: id});
     await this.directoryRepository.deleteById(id);
