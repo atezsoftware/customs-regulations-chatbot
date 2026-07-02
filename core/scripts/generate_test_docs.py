@@ -7,7 +7,7 @@ Documents have cross-references to test the agent's ability to follow document r
 """
 
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 import os
@@ -745,7 +745,7 @@ def main():
         create_pdf(filename, doc_info["title"], doc_info["content"])
 
     print(f"\n✅ Generated {len(DOCUMENTS)} documents successfully!")
-    print(f"\nDocument cross-reference map:")
+    print("\nDocument cross-reference map:")
     print("=" * 60)
     print("""
     Acquisition Agreement (01)

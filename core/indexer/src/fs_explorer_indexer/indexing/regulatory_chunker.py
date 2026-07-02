@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 from fs_explorer_shared.fs import SUPPORTED_EXTENSIONS
-from ..document_parser import parse_file
 
 _PARSE_ERROR_PREFIXES: tuple[str, ...] = (
     "Error parsing ",
@@ -871,6 +870,8 @@ class RegulatoryChunker:
 
 def _parse_with_fallback(path: Path) -> tuple[str, str, list[str]]:
     warnings: list[str] = []
+    from ..document_parser import parse_file
+
     content = parse_file(str(path))
     if not content.startswith(_PARSE_ERROR_PREFIXES):
         return content.strip(), "docling_markdown", warnings
