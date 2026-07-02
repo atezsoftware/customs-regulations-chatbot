@@ -7,7 +7,7 @@ TypeScript API backend (LoopBack 4), backed by Postgres (see `../db`).
 ```bash
 npm install
 cp .env.example .env   # fill in DB_*, JWT_SECRET, STORAGE_ROOT
-npm run dev             # NODE_ENV=development, watch mode
+npm run dev             # NODE_ENV=local, watch mode
 npm run build && npm start   # production
 ```
 
@@ -21,13 +21,14 @@ Each domain owns its own models/repositories/services/controllers under `src/mod
 - `modules/directories` — a user's file clusters ("directories") and the files inside them.
 - `modules/chat` — chat sessions and which directories each one is linked to.
 - `common/auth/current-user.ts` — the **only** place that resolves "who is the current user" for every controller; this is also where the dev auth-bypass lives (see below). Don't re-implement auth checks elsewhere.
+- `common/env.ts` — `isLocalEnv()`, the single place that checks `NODE_ENV === 'local'`. Gates both the auth bypass and file uploads. Deliberately distinct from `NODE_ENV=development`, which names a real deployed cluster (the `dev` EKS environment) and must behave like `test`/`production`.
 
 ## Auth, including the dev bypass
 
 `common/auth/current-user.ts`'s `getCurrentUser()` is called by every controller that needs the logged-in user.
 
-- `NODE_ENV=development` → every endpoint (except the `/auth/*` ones, which still work normally if you want to test them) treats the request as a fixed local dev user, auto-created on first use. No login needed.
-- Any other `NODE_ENV` (`test`, `production`) → a valid `Authorization: Bearer <accessToken>` is required everywhere; missing/invalid tokens get a 401.
+- `NODE_ENV=local` → every endpoint (except the `/auth/*` ones, which still work normally if you want to test them) treats the request as a fixed local dev user, auto-created on first use. No login needed. File uploads (`POST /directories/{id}/files`) are also only enabled in this environment; the frontend hides the upload UI via `uploadsEnabled` on `/auth/me`.
+- Any other `NODE_ENV` (`development`, `test`, `production`) → a valid `Authorization: Bearer <accessToken>` is required everywhere; missing/invalid tokens get a 401. File uploads return 404.
 
 ### `/auth/*`
 

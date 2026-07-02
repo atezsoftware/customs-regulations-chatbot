@@ -1,4 +1,5 @@
 import {HttpErrors, Request} from '@loopback/rest';
+import {isLocalEnv} from '../env';
 import {UserRepository} from '../../modules/auth/repositories';
 import {TokenService} from '../../modules/auth/services';
 
@@ -14,17 +15,17 @@ const tokenService = new TokenService();
 /**
  * Resolves the authenticated user for the current request.
  *
- * In `NODE_ENV=development`, every endpoint that calls this is automatically
+ * In `NODE_ENV=local`, every endpoint that calls this is automatically
  * treated as a fixed local dev user — no login required. Every other
- * environment (test, production) requires and verifies a real bearer JWT.
- * This is the single place that distinction is made; nothing else should
- * re-implement it.
+ * environment (development, test, production) requires and verifies a real
+ * bearer JWT. This is the single place that distinction is made; nothing
+ * else should re-implement it.
  */
 export async function getCurrentUser(
   request: Request,
   userRepository: UserRepository,
 ): Promise<CurrentUser> {
-  if (process.env.NODE_ENV === 'development') {
+  if (isLocalEnv()) {
     return getOrCreateDevUser(userRepository);
   }
 

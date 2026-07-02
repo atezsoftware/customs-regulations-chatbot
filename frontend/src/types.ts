@@ -3,6 +3,7 @@ export interface SafeUser {
   email: string;
   fullName?: string;
   role: string;
+  uploadsEnabled: boolean;
 }
 
 export interface AuthTokens {

@@ -5,11 +5,13 @@ import {Button} from '../components/ui/Button';
 import {ConfirmModal} from '../components/ui/ConfirmModal';
 import {NamePromptModal} from '../components/ui/NamePromptModal';
 import {Spinner} from '../components/ui/Spinner';
+import {useAuth} from '../context/useAuth';
 import {directoriesApi} from '../lib/endpoints';
 import {formatBytes} from '../lib/format';
 import type {Directory, DirectoryDetail, DirectoryIndexStatus} from '../types';
 
 export function DirectoriesPage() {
+  const {user} = useAuth();
   const [directories, setDirectories] = useState<Directory[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [detail, setDetail] = useState<DirectoryDetail | null>(null);
@@ -343,25 +345,27 @@ export function DirectoriesPage() {
               </div>
             </div>
 
-            <label className="mt-4 flex cursor-pointer flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-slate-200 bg-slate-50/60 px-4 py-8 text-center transition-colors hover:border-indigo-300 hover:bg-indigo-50/40">
-              {uploading ? (
-                <Spinner className="h-5 w-5 text-indigo-500" />
-              ) : (
-                <UploadIcon />
-              )}
-              <span className="text-sm font-medium text-slate-600">
-                {uploading ? 'Uploading…' : 'Click to add files'}
-              </span>
-              <span className="text-xs text-slate-400">Any file type, multiple at once</span>
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                disabled={uploading}
-                className="hidden"
-                onChange={e => void handleUpload(e.target.files)}
-              />
-            </label>
+            {user?.uploadsEnabled && (
+              <label className="mt-4 flex cursor-pointer flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-slate-200 bg-slate-50/60 px-4 py-8 text-center transition-colors hover:border-indigo-300 hover:bg-indigo-50/40">
+                {uploading ? (
+                  <Spinner className="h-5 w-5 text-indigo-500" />
+                ) : (
+                  <UploadIcon />
+                )}
+                <span className="text-sm font-medium text-slate-600">
+                  {uploading ? 'Uploading…' : 'Click to add files'}
+                </span>
+                <span className="text-xs text-slate-400">Any file type, multiple at once</span>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  disabled={uploading}
+                  className="hidden"
+                  onChange={e => void handleUpload(e.target.files)}
+                />
+              </label>
+            )}
           </div>
         )}
       </main>

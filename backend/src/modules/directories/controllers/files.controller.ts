@@ -15,6 +15,7 @@ import {
 } from '@loopback/rest';
 import multer from 'multer';
 import {getCurrentUser} from '../../../common/auth';
+import {isLocalEnv} from '../../../common/env';
 import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../repositories';
 import {fetchDocumentChunks, StorageService, virtualCorpusKey} from '../services';
@@ -110,6 +111,9 @@ export class FilesController {
   @post('/directories/{id}/files')
   @response(200, {description: 'Uploaded files (multipart field name: "files", repeatable)'})
   async upload(@param.path.number('id') directoryId: number) {
+    if (!isLocalEnv()) {
+      throw new HttpErrors.NotFound('Not found.');
+    }
     const user = await getCurrentUser(this.request, this.userRepository);
     const directory = await this.directoriesController.ownedDirectoryOrThrow(
       directoryId,
