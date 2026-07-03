@@ -14,11 +14,18 @@ export async function main(options: ApplicationConfig = {}) {
 }
 
 if (require.main === module) {
+  const trustProxy = process.env.TRUST_PROXY ?? '1';
   const config = {
     rest: {
       port: +(process.env.PORT ?? 3000),
       host: process.env.HOST,
       gracePeriodForClose: 5000,
+      expressSettings: {
+        // Kubernetes ingress/load balancers set X-Forwarded-For. Express must
+        // trust the known proxy hop so express-rate-limit can use the real
+        // client IP instead of rejecting the forwarded header configuration.
+        'trust proxy': /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy,
+      },
       openApiSpec: {
         setServersFromRequest: true,
       },
