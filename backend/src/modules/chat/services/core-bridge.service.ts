@@ -10,6 +10,7 @@ import {
 } from '../repositories';
 import {virtualCorpusKey} from '../../directories/services';
 import {DirectoryFileRepository, DirectoryRepository} from '../../directories/repositories';
+import {stripNulBytes} from '../../../common/text';
 
 const DEFAULT_CORE_URL = 'ws://127.0.0.1:8000/ws/explore';
 const DEFAULT_MODEL = 'gemini-3-flash-preview';
@@ -887,7 +888,7 @@ function waitForOpen(ws: WebSocket, signal?: AbortSignal): Promise<void> {
 }
 
 function text(value: unknown, fallback = ''): string {
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return stripNulBytes(value);
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return fallback;
 }

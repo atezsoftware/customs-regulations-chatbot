@@ -2,6 +2,7 @@ import {inject} from '@loopback/core';
 import {repository} from '@loopback/repository';
 import {get, HttpErrors, param, post, Request, requestBody, response, Response, RestBindings} from '@loopback/rest';
 import {getCurrentUser} from '../../../common/auth';
+import {stripNulBytes} from '../../../common/text';
 import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../../directories/repositories';
 import {ChatMessage} from '../models';
@@ -99,7 +100,7 @@ export class ChatMessagesController {
   ) {
     const user = await getCurrentUser(this.request, this.userRepository);
     const session = await this.ownedSessionOrThrow(sessionId, user.id);
-    const content = body.content?.trim();
+    const content = stripNulBytes(body.content?.trim() ?? '');
     if (!content) throw new HttpErrors.BadRequest('content is required.');
 
     const links = await this.chatSessionDirectoryRepository.find({where: {sessionId}});
