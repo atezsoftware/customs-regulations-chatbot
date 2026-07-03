@@ -3,6 +3,7 @@ import path from 'path';
 
 const STORAGE_ROOT = process.env.STORAGE_ROOT ?? './storage';
 const DEFAULT_INDEXER_URL = 'http://127.0.0.1:8001';
+const DEFAULT_CORE_API_URL = 'http://127.0.0.1:8000';
 
 export type DirectoryIndexState =
   | 'not_indexed'
@@ -373,15 +374,18 @@ export interface DocumentChunksResponse {
 }
 
 /**
- * The single read path for a directory file's chunks — calls into `core`,
- * which owns `core_documents`/`core_chunks`, instead of querying those
- * tables directly from `backend`.
+ * The single read path for a directory file's chunks — calls into `core-api`
+ * (not `core-indexer`), since this is a pure Postgres read that core-api
+ * duplicates from `core-indexer` specifically so it works wherever core-api
+ * is deployed. `core-indexer` isn't wired into any deployed environment yet
+ * (see CLAUDE.md's "Deploy status" note), so pointing this at
+ * CORE_INDEXER_URL would 500 outside local.
  */
 export async function fetchDocumentChunks(
   corpusKey: string,
   relativePathPrefix: string,
 ): Promise<DocumentChunksResponse> {
-  const endpoint = `${resolveCoreRestUrl()}/api/index/document-chunks`;
+  const endpoint = `${resolveCoreApiRestUrl()}/api/index/document-chunks`;
   const params = new URLSearchParams({
     corpus_key: corpusKey,
     relative_path_prefix: relativePathPrefix,
@@ -396,8 +400,8 @@ export async function fetchDocumentChunks(
     res = await fetch(`${endpoint}?${params.toString()}`, {headers});
   } catch (error) {
     throw new Error(
-      `Core is not reachable at ${endpoint}. Start the indexer with ` +
-        '`scripts/run.sh --env dev --apps core-indexer` or run the full stack. ' +
+      `Core is not reachable at ${endpoint}. Start core-api with ` +
+        '`scripts/run.sh --env dev --apps core-api` or run the full stack. ' +
         `Original error: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
@@ -466,6 +470,15 @@ export async function triggerCorpusEmbedding(
 function resolveCoreRestUrl(): string {
   const configured = process.env.CORE_INDEXER_URL ?? DEFAULT_INDEXER_URL;
   return configured.replace(/\/$/, '');
+}
+
+function resolveCoreApiRestUrl(): string {
+  const configured = process.env.CORE_INTERNAL_URL ?? DEFAULT_CORE_API_URL;
+  return configured
+    .replace(/\/ws\/explore$/, '')
+    .replace(/^ws:/, 'http:')
+    .replace(/^wss:/, 'https:')
+    .replace(/\/$/, '');
 }
 
 function resolveDatabaseUrl(): string | undefined {

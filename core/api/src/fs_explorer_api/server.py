@@ -298,6 +298,37 @@ async def search_index(request: SearchRequest):
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.get("/api/index/document-chunks", dependencies=[Depends(require_internal_token)])
+async def document_chunks(
+    corpus_key: str, relative_path_prefix: str, database_url: str | None = None
+):
+    """Look up a document and its chunks by corpus + relative-path prefix.
+
+    This is a pure Postgres read (`get_document_chunks_by_prefix`, owned by
+    `fs_explorer_shared`) — duplicated here from `core-indexer` so it works
+    wherever `core-api` is deployed, since `core-indexer` isn't wired into
+    any deployed environment yet (see CLAUDE.md's "Deploy status" note).
+    """
+    try:
+        corpus_root = resolve_corpus_root(corpus_key)
+        resolved_database_url = resolve_database_url(database_url)
+        storage = PostgresStorage(
+            resolved_database_url, read_only=True, initialize=False
+        )
+        try:
+            result = storage.get_document_chunks_by_prefix(
+                corpus_root=corpus_root, relative_path_prefix=relative_path_prefix
+            )
+        finally:
+            storage.close()
+
+        if result is None:
+            return {"document": None, "chunks": []}
+        return result
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.websocket("/ws/explore")
 async def websocket_explore(websocket: WebSocket):
     """

@@ -93,7 +93,7 @@ backend uploads a file → core-indexer: IndexingPipeline → Docling parse → 
 
 - **main.py**: Typer CLI — the `query` command (indexed agentic explore; also the implicit default command).
 
-- **server.py**: FastAPI server with WebSocket endpoint `/ws/explore` for real-time streaming, plus `/api/search`, `/api/document`, `/api/folders` and the bundled demo UI (`ui.html`). No `/api/index*` endpoints — those are `core-indexer`'s.
+- **server.py**: FastAPI server with WebSocket endpoint `/ws/explore` for real-time streaming, plus `/api/search`, `/api/document`, `/api/folders` and the bundled demo UI (`ui.html`). Also `/api/index/document-chunks` — a pure-Postgres read (no Docling) duplicated from `core-indexer` so file-chunk lookups work wherever `core-api` is deployed, since `core-indexer` isn't wired into any deployed environment yet; `backend` calls this one on `core-api`, not `core-indexer`. All *other* `/api/index*` endpoints (build/refresh, embed, auto-profile) stay `core-indexer`-only.
 
 - **exploration_trace.py**: Records tool call paths and extracts cited sources from final answers for the CLI summary.
 

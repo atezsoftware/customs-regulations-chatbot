@@ -765,14 +765,32 @@ function findHitForCitation(citation: string, hits: IndexedHit[]): IndexedHit | 
   const normalized = normalizeCitation(citation);
   if (!normalized) return undefined;
 
-  const exact = hits.find(hit => {
-    const labels = [hit.citationLabel, hit.chunkPath];
-    return labels.some(label => {
-      const hitLabel = normalizeCitation(label);
-      return normalized === hitLabel || normalized.includes(hitLabel);
-    });
-  });
-  if (exact) return exact;
+  // Full-equality match first. A hit whose label only *contains* the
+  // citation (checked next) must never outrank one that matches it exactly.
+  const equalMatch = hits.find(hit =>
+    [hit.citationLabel, hit.chunkPath].some(label => normalized === normalizeCitation(label)),
+  );
+  if (equalMatch) return equalMatch;
+
+  // Among hits whose label is a substring of the citation, prefer the
+  // longest (most specific) label rather than the first in score order. A
+  // broader locator like "Madde 54" is a substring of a more specific
+  // citation like "Madde 54(1)", so without this a same-article hit for a
+  // *different* paragraph could shadow the paragraph the citation actually
+  // refers to just because it scored higher.
+  const bestContainment = hits
+    .map(hit => {
+      const bestLabelLength = [hit.citationLabel, hit.chunkPath]
+        .map(normalizeCitation)
+        .filter(label => label && normalized.includes(label))
+        .reduce((max, label) => Math.max(max, label.length), 0);
+      return bestLabelLength > 0 ? {hit, bestLabelLength} : undefined;
+    })
+    .filter((candidate): candidate is {hit: IndexedHit; bestLabelLength: number} =>
+      Boolean(candidate),
+    )
+    .sort((a, b) => b.bestLabelLength - a.bestLabelLength)[0]?.hit;
+  if (bestContainment) return bestContainment;
 
   return hits
     .map(hit => ({hit, matchScore: citationMatchScore(normalized, hit)}))
