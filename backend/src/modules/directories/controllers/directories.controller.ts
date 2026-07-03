@@ -13,6 +13,7 @@ import {
   RestBindings,
 } from '@loopback/rest';
 import {getCurrentUser} from '../../../common/auth';
+import {isLocalEnv} from '../../../common/env';
 import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../repositories';
 import {
@@ -60,6 +61,9 @@ export class DirectoriesController {
   @post('/directories')
   @response(200, {description: 'Created directory'})
   async create(@requestBody() body: DirectoryBody) {
+    if (!isLocalEnv()) {
+      throw new HttpErrors.NotFound('Not found.');
+    }
     const user = await getCurrentUser(this.request, this.userRepository);
     const name = body.name?.trim();
     if (!name) throw new HttpErrors.BadRequest('name is required.');
@@ -95,7 +99,16 @@ export class DirectoriesController {
     await getCurrentUser(this.request, this.userRepository);
     await this.findDirectoryOrThrow(id);
     const serviceStatus = await getDirectoryIndexStatus(id);
-    if (serviceStatus.status === 'chunking' || serviceStatus.status === 'indexing' || serviceStatus.status === 'error') {
+    // `unavailable` means core could not be reached just now — report that
+    // honestly instead of falling through to a reconstruction from this
+    // directory's local file rows, which can look like a stale "completed"
+    // even while core is actually down.
+    if (
+      serviceStatus.status === 'chunking' ||
+      serviceStatus.status === 'indexing' ||
+      serviceStatus.status === 'error' ||
+      serviceStatus.status === 'unavailable'
+    ) {
       return serviceStatus;
     }
 
@@ -106,6 +119,9 @@ export class DirectoriesController {
   @post('/directories/{id}/chunks')
   @response(202, {description: 'Started generating chunks for this directory'})
   async startChunking(@param.path.number('id') id: number) {
+    if (!isLocalEnv()) {
+      throw new HttpErrors.NotFound('Not found.');
+    }
     const user = await getCurrentUser(this.request, this.userRepository);
     const directory = await this.findDirectoryOrThrow(id);
     const files = await this.directoryFileRepository.find({
@@ -158,6 +174,9 @@ export class DirectoriesController {
   @post('/directories/{id}/index')
   @response(202, {description: 'Started indexing (embedding) this directory'})
   async startIndex(@param.path.number('id') id: number) {
+    if (!isLocalEnv()) {
+      throw new HttpErrors.NotFound('Not found.');
+    }
     const user = await getCurrentUser(this.request, this.userRepository);
     await this.findDirectoryOrThrow(id);
     const files = await this.directoryFileRepository.find({where: {directoryId: id}});

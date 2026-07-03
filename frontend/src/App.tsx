@@ -1,6 +1,7 @@
 import {Navigate, Route, Routes} from 'react-router-dom';
 import {AdminRoute} from './components/AdminRoute';
 import {AppShell} from './components/AppShell';
+import {LocalOnlyRoute} from './components/LocalOnlyRoute';
 import {ProtectedRoute} from './components/ProtectedRoute';
 import {AdminSupportPage} from './pages/AdminSupportPage';
 import {ChatPage} from './pages/ChatPage';
@@ -20,7 +21,9 @@ function App() {
         <Route element={<AppShell />}>
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/chat/:sessionId" element={<ChatPage />} />
-          <Route path="/directories" element={<DirectoriesPage />} />
+          <Route element={<LocalOnlyRoute />}>
+            <Route path="/directories" element={<DirectoriesPage />} />
+          </Route>
           <Route path="/chunks" element={<ChunksPage />} />
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route element={<AdminRoute />}>

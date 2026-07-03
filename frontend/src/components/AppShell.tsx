@@ -41,9 +41,11 @@ export function AppShell() {
           <NavIcon to="/chat" label="Chats">
             <ChatIcon />
           </NavIcon>
-          <NavIcon to="/directories" label="Directories">
-            <FolderIcon />
-          </NavIcon>
+          {user?.uploadsEnabled && (
+            <NavIcon to="/directories" label="Directories">
+              <FolderIcon />
+            </NavIcon>
+          )}
           <NavIcon to="/chunks" label="View chunks">
             <ChunksIcon />
           </NavIcon>

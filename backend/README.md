@@ -27,8 +27,8 @@ Each domain owns its own models/repositories/services/controllers under `src/mod
 
 `common/auth/current-user.ts`'s `getCurrentUser()` is called by every controller that needs the logged-in user.
 
-- `NODE_ENV=local` → every endpoint (except the `/auth/*` ones, which still work normally if you want to test them) treats the request as a fixed local dev user, auto-created on first use. No login needed. File uploads (`POST /directories/{id}/files`) are also only enabled in this environment; the frontend hides the upload UI via `uploadsEnabled` on `/auth/me`.
-- Any other `NODE_ENV` (`development`, `test`, `production`) → a valid `Authorization: Bearer <accessToken>` is required everywhere; missing/invalid tokens get a 401. File uploads return 404.
+- `NODE_ENV=local` → every endpoint (except the `/auth/*` ones, which still work normally if you want to test them) treats the request as a fixed local dev user, auto-created on first use. No login needed. Directory management — creating a directory, uploading files (`POST /directories/{id}/files`), generating chunks and indexing (`POST /directories/{id}/chunks` and `/index`) — is also only enabled in this environment, since `core-indexer` isn't wired into any deployed environment yet; the frontend hides the whole Directories page via `uploadsEnabled` on `/auth/me`.
+- Any other `NODE_ENV` (`development`, `test`, `production`) → a valid `Authorization: Bearer <accessToken>` is required everywhere; missing/invalid tokens get a 401. The directory-management endpoints above return 404. Listing/viewing directories and their index status still works everywhere (needed by chat sessions to link an already-indexed directory).
 
 ### `/auth/*`
 
