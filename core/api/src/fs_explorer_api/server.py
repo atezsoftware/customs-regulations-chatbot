@@ -64,6 +64,46 @@ class SearchRequest(BaseModel):
     database_url: str | None = None
 
 
+def _iter_supported_files(root: Path) -> list[Path]:
+    from fs_explorer_shared.fs import SUPPORTED_EXTENSIONS
+
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        if path.name.startswith("~$"):
+            continue
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            files.append(path.resolve())
+    return sorted(files)
+
+
+def _index_freshness(folder_path: Path, docs: list[dict[str, Any]]) -> dict[str, Any]:
+    indexed = {str(doc["relative_path"]): doc for doc in docs}
+    current: dict[str, Path] = {}
+    for path in _iter_supported_files(folder_path):
+        current[str(path.relative_to(folder_path))] = path
+
+    added = sorted(set(current) - set(indexed))
+    removed = sorted(set(indexed) - set(current))
+    changed: list[str] = []
+    for relative_path in sorted(set(current) & set(indexed)):
+        path = current[relative_path]
+        stat = path.stat()
+        doc = indexed[relative_path]
+        if (
+            int(stat.st_size) != int(doc["file_size"])
+            or abs(float(stat.st_mtime) - float(doc["file_mtime"])) > 0.001
+        ):
+            changed.append(relative_path)
+
+    return {
+        "fresh": not added and not changed and not removed,
+        "added_files": added,
+        "changed_files": changed,
+        "removed_files": removed,
+        "current_file_count": len(current),
+    }
+
+
 def _format_conversation_context(raw_context: Any) -> str:
     """Format short-lived frontend memory into prompt context."""
     if not isinstance(raw_context, list):
@@ -236,6 +276,95 @@ async def list_folders(path: str = "."):
         return JSONResponse({"error": "Permission denied"}, status_code=403)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/index/status", dependencies=[Depends(require_internal_token)])
+async def index_status(folder: str, database_url: str | None = None):
+    """Read index status without requiring the heavier indexer service."""
+    try:
+        corpus_root = resolve_corpus_root(folder)
+        folder_path = Path(corpus_root)
+        resolved_database_url = resolve_database_url(database_url)
+        storage = PostgresStorage(
+            resolved_database_url, read_only=True, initialize=False
+        )
+        try:
+            corpus_id = storage.get_corpus_id(corpus_root)
+            if corpus_id is None:
+                return {"indexed": False}
+
+            docs = storage.list_documents(corpus_id=corpus_id, include_deleted=False)
+            freshness = (
+                _index_freshness(folder_path, docs)
+                if folder_path.exists() and folder_path.is_dir()
+                else {
+                    "fresh": True,
+                    "added_files": [],
+                    "changed_files": [],
+                    "removed_files": [],
+                    "current_file_count": len(docs),
+                }
+            )
+            active_schema = storage.get_active_schema(corpus_id=corpus_id)
+            has_embeddings = storage.has_embeddings(corpus_id=corpus_id)
+
+            schema_name: str | None = None
+            has_metadata = False
+            schema_fields: list[str] = []
+            if active_schema is not None:
+                schema_name = active_schema.name
+                has_metadata = (
+                    active_schema.schema_def.get("metadata_profile") is not None
+                )
+                fields_def = active_schema.schema_def.get("fields")
+                if isinstance(fields_def, list):
+                    for field in fields_def:
+                        if isinstance(field, dict) and isinstance(field.get("name"), str):
+                            schema_fields.append(field["name"])
+
+            return {
+                "indexed": True,
+                "corpus_id": corpus_id,
+                "document_count": len(docs),
+                "schema_name": schema_name,
+                "has_metadata": has_metadata,
+                "has_embeddings": has_embeddings,
+                "schema_fields": schema_fields,
+                **freshness,
+            }
+        finally:
+            storage.close()
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/index/document-chunks", dependencies=[Depends(require_internal_token)])
+async def document_chunks(
+    corpus_key: str, relative_path_prefix: str, database_url: str | None = None
+):
+    """Look up a document and its chunks by corpus + relative-path prefix."""
+    try:
+        corpus_root = resolve_corpus_root(corpus_key)
+        resolved_database_url = resolve_database_url(database_url)
+        storage = PostgresStorage(
+            resolved_database_url, read_only=True, initialize=False
+        )
+        try:
+            result = storage.get_document_chunks_by_prefix(
+                corpus_root=corpus_root, relative_path_prefix=relative_path_prefix
+            )
+        finally:
+            storage.close()
+
+        if result is None:
+            return {"document": None, "chunks": []}
+        return result
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.post("/api/search", dependencies=[Depends(require_internal_token)])

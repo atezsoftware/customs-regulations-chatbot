@@ -3,6 +3,7 @@ import path from 'path';
 
 const STORAGE_ROOT = process.env.STORAGE_ROOT ?? './storage';
 const DEFAULT_INDEXER_URL = 'http://127.0.0.1:8001';
+const DEFAULT_CORE_URL = 'ws://127.0.0.1:8000/ws/explore';
 
 export type DirectoryIndexState =
   | 'not_indexed'
@@ -141,59 +142,84 @@ export async function getDirectoryIndexStatus(directoryId: number): Promise<Dire
   const active = activeJobs.get(directoryId);
   if (active && (BUSY_STATES.includes(active.status) || active.status === 'error')) return active;
 
-  const endpoint = `${resolveCoreRestUrl()}/api/index/status`;
   const headers: Record<string, string> = {};
   if (process.env.CORE_INTERNAL_TOKEN) {
     headers['X-Internal-Token'] = process.env.CORE_INTERNAL_TOKEN;
   }
 
+  let lastUnavailable: DirectoryIndexStatus | undefined;
   try {
     const params = new URLSearchParams({folder: virtualCorpusKey(directoryId)});
     const databaseUrl = resolveDatabaseUrl();
     if (databaseUrl) params.set('database_url', databaseUrl);
-    const res = await fetch(`${endpoint}?${params.toString()}`, {headers});
-    if (!res.ok) {
-      return {
+
+    for (const baseUrl of resolveIndexReadRestUrls()) {
+      const endpoint = `${baseUrl}/api/index/status`;
+      try {
+        const res = await fetch(`${endpoint}?${params.toString()}`, {headers});
+        if (!res.ok) {
+          lastUnavailable = {
+            directoryId,
+            status: 'unavailable',
+            progress: 0,
+            message: `Core index status failed at ${endpoint} (${res.status}).`,
+            updatedAt: new Date().toISOString(),
+          };
+          continue;
+        }
+
+        const data = (await res.json()) as Record<string, unknown>;
+        if (!data.indexed) {
+          return {
+            directoryId,
+            status: 'not_indexed',
+            progress: 0,
+            message: 'Not indexed yet.',
+            updatedAt: new Date().toISOString(),
+          };
+        }
+
+        const fresh = Boolean(data.fresh);
+        const hasEmbeddings = Boolean(data.has_embeddings);
+        const status: DirectoryIndexStatus = !hasEmbeddings
+          ? {
+              directoryId,
+              status: 'chunked',
+              progress: 50,
+              message: 'Chunks are ready. Start indexing to generate embeddings.',
+              documentCount: numberOrUndefined(data.document_count),
+              updatedAt: new Date().toISOString(),
+            }
+          : {
+              directoryId,
+              status: fresh ? 'completed' : 'stale',
+              progress: fresh ? 100 : 65,
+              message: fresh ? 'Index is complete and fresh.' : 'Files changed after indexing.',
+              documentCount: numberOrUndefined(data.document_count),
+              updatedAt: new Date().toISOString(),
+            };
+        activeJobs.set(directoryId, status);
+        return status;
+      } catch (error) {
+        lastUnavailable = {
+          directoryId,
+          status: 'unavailable',
+          progress: 0,
+          message: error instanceof Error ? error.message : String(error),
+          updatedAt: new Date().toISOString(),
+        };
+      }
+    }
+
+    return (
+      lastUnavailable ?? {
         directoryId,
         status: 'unavailable',
         progress: 0,
-        message: `Core index status failed (${res.status}).`,
+        message: 'Core index status is unavailable.',
         updatedAt: new Date().toISOString(),
-      };
-    }
-
-    const data = (await res.json()) as Record<string, unknown>;
-    if (!data.indexed) {
-      return {
-        directoryId,
-        status: 'not_indexed',
-        progress: 0,
-        message: 'Not indexed yet.',
-        updatedAt: new Date().toISOString(),
-      };
-    }
-
-    const fresh = Boolean(data.fresh);
-    const hasEmbeddings = Boolean(data.has_embeddings);
-    const status: DirectoryIndexStatus = !hasEmbeddings
-      ? {
-          directoryId,
-          status: 'chunked',
-          progress: 50,
-          message: 'Chunks are ready. Start indexing to generate embeddings.',
-          documentCount: numberOrUndefined(data.document_count),
-          updatedAt: new Date().toISOString(),
-        }
-      : {
-          directoryId,
-          status: fresh ? 'completed' : 'stale',
-          progress: fresh ? 100 : 65,
-          message: fresh ? 'Index is complete and fresh.' : 'Files changed after indexing.',
-          documentCount: numberOrUndefined(data.document_count),
-          updatedAt: new Date().toISOString(),
-        };
-    activeJobs.set(directoryId, status);
-    return status;
+      }
+    );
   } catch (error) {
     return {
       directoryId,
@@ -308,7 +334,7 @@ export async function triggerDirectoryChunking(
   corpusKey: string,
   documents: IndexDocumentManifest[],
 ): Promise<Record<string, unknown>> {
-  const endpoint = `${resolveCoreRestUrl()}/api/index`;
+  const endpoint = `${resolveIndexerRestUrl()}/api/index`;
   const headers: Record<string, string> = {'Content-Type': 'application/json'};
   if (process.env.CORE_INTERNAL_TOKEN) {
     headers['X-Internal-Token'] = process.env.CORE_INTERNAL_TOKEN;
@@ -381,7 +407,6 @@ export async function fetchDocumentChunks(
   corpusKey: string,
   relativePathPrefix: string,
 ): Promise<DocumentChunksResponse> {
-  const endpoint = `${resolveCoreRestUrl()}/api/index/document-chunks`;
   const params = new URLSearchParams({
     corpus_key: corpusKey,
     relative_path_prefix: relativePathPrefix,
@@ -391,36 +416,44 @@ export async function fetchDocumentChunks(
     headers['X-Internal-Token'] = process.env.CORE_INTERNAL_TOKEN;
   }
 
-  let res: Response;
-  try {
-    res = await fetch(`${endpoint}?${params.toString()}`, {headers});
-  } catch (error) {
-    throw new Error(
-      `Core is not reachable at ${endpoint}. Start the indexer with ` +
-        '`scripts/run.sh --env dev --apps core-indexer` or run the full stack. ' +
-        `Original error: ${error instanceof Error ? error.message : String(error)}`,
-    );
+  let lastError: Error | undefined;
+  for (const baseUrl of resolveIndexReadRestUrls()) {
+    const endpoint = `${baseUrl}/api/index/document-chunks`;
+    try {
+      const res = await fetch(`${endpoint}?${params.toString()}`, {headers});
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        lastError = new Error(
+          `Core document-chunks lookup failed at ${endpoint} (${res.status} ${res.statusText}): ${body || 'empty response'}`,
+        );
+        continue;
+      }
+
+      const responseBody = (await res.json()) as Record<string, unknown>;
+      if (responseBody.error) {
+        lastError = new Error(
+          `Core document-chunks lookup returned error at ${endpoint}: ${String(responseBody.error)}`,
+        );
+        continue;
+      }
+      return responseBody as unknown as DocumentChunksResponse;
+    } catch (error) {
+      lastError = new Error(
+        `Core is not reachable for document-chunks lookup at ${endpoint}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(
-      `Core document-chunks lookup failed (${res.status} ${res.statusText}): ${body || 'empty response'}`,
-    );
-  }
-
-  const responseBody = (await res.json()) as Record<string, unknown>;
-  if (responseBody.error) {
-    throw new Error(`Core document-chunks lookup returned error: ${String(responseBody.error)}`);
-  }
-  return responseBody as unknown as DocumentChunksResponse;
+  throw lastError ?? new Error('Core document-chunks lookup failed.');
 }
 
 export async function triggerCorpusEmbedding(
   directoryId: number,
   corpusKey: string,
 ): Promise<Record<string, unknown>> {
-  const endpoint = `${resolveCoreRestUrl()}/api/index/embed`;
+  const endpoint = `${resolveIndexerRestUrl()}/api/index/embed`;
   const headers: Record<string, string> = {'Content-Type': 'application/json'};
   if (process.env.CORE_INTERNAL_TOKEN) {
     headers['X-Internal-Token'] = process.env.CORE_INTERNAL_TOKEN;
@@ -463,9 +496,23 @@ export async function triggerCorpusEmbedding(
   return responseBody;
 }
 
-function resolveCoreRestUrl(): string {
+function resolveIndexerRestUrl(): string {
   const configured = process.env.CORE_INDEXER_URL ?? DEFAULT_INDEXER_URL;
   return configured.replace(/\/$/, '');
+}
+
+function resolveIndexReadRestUrls(): string[] {
+  const urls: string[] = [];
+  if (process.env.CORE_INDEXER_URL) urls.push(resolveIndexerRestUrl());
+  const configured = process.env.CORE_INTERNAL_URL ?? DEFAULT_CORE_URL;
+  urls.push(
+    configured
+      .replace(/\/ws\/explore$/, '')
+      .replace(/^ws:/, 'http:')
+      .replace(/^wss:/, 'https:')
+      .replace(/\/$/, ''),
+  );
+  return [...new Set(urls)];
 }
 
 function resolveDatabaseUrl(): string | undefined {

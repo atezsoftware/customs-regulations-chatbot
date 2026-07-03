@@ -48,7 +48,8 @@ export function DashboardPage() {
     ].filter(item => item.value > 0);
   }, [usage]);
 
-  const maxDaily = Math.max(...(usage?.daily.map(item => item.totalTokens) ?? [0]), 1);
+  const dailySeries = useMemo(() => buildDailySeries(usage), [usage]);
+  const maxDaily = Math.max(...dailySeries.map(item => item.totalTokens), 1);
 
   return (
     <main className="min-w-0 flex-1 overflow-y-auto bg-slate-50">
@@ -113,27 +114,34 @@ export function DashboardPage() {
                   <div>
                     <h2 className="text-base font-semibold text-slate-900">Daily usage</h2>
                     <p className="mt-1 text-sm text-slate-400">
-                      Tokens generated from completed assistant calls.
+                      Tokens generated from tracked LLM calls, grouped by day.
                     </p>
                   </div>
                 </div>
-                {usage.daily.length === 0 ? (
+                {dailySeries.length === 0 ? (
                   <EmptyPanel text="No token usage recorded for this period." />
                 ) : (
                   <div className="flex h-56 items-end gap-2 border-b border-slate-100 pt-4">
-                    {usage.daily.map(day => (
+                    {dailySeries.map((day, index) => (
                       <div key={day.day} className="flex min-w-0 flex-1 flex-col items-center gap-2">
                         <div className="flex h-44 w-full items-end">
                           <div
-                            title={`${day.day}: ${formatNumber(day.totalTokens)} tokens`}
-                            className="w-full rounded-t-md bg-indigo-500/80 transition-colors hover:bg-indigo-600"
+                            title={`${day.day}: ${formatNumber(day.totalTokens)} tokens across ${formatNumber(day.calls)} calls`}
+                            className={`w-full rounded-t-md transition-colors ${
+                              day.totalTokens > 0
+                                ? 'bg-indigo-500/80 hover:bg-indigo-600'
+                                : 'bg-slate-200'
+                            }`}
                             style={{
-                              height: `${Math.max(6, (day.totalTokens / maxDaily) * 100)}%`,
+                              height:
+                                day.totalTokens > 0
+                                  ? `${Math.max(6, (day.totalTokens / maxDaily) * 100)}%`
+                                  : '2px',
                             }}
                           />
                         </div>
                         <span className="w-full truncate text-center text-[11px] text-slate-400">
-                          {shortDate(day.day)}
+                          {shouldShowDateLabel(index, dailySeries.length) ? shortDate(day.day) : ''}
                         </span>
                       </div>
                     ))}
@@ -278,4 +286,55 @@ function shortDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+}
+
+function buildDailySeries(usage: UsageAnalytics | null): UsageAnalytics['daily'] {
+  if (!usage) return [];
+  if (usage.daily.length === 0) return [];
+
+  const byDay = new Map(usage.daily.map(item => [item.day, item]));
+  const start = parseDateOnly(usage.since ?? usage.daily[0]?.day);
+  const end = parseDateOnly(usage.daily[usage.daily.length - 1]?.day) ?? start;
+
+  if (!start || !end || start > end) return usage.daily;
+
+  const series: UsageAnalytics['daily'] = [];
+  for (let cursor = new Date(start); cursor <= end; cursor = addDays(cursor, 1)) {
+    const day = isoDay(cursor);
+    series.push(
+      byDay.get(day) ?? {
+        day,
+        inputTokens: 0,
+        outputTokens: 0,
+        thinkingTokens: 0,
+        totalTokens: 0,
+        calls: 0,
+      },
+    );
+  }
+  return series;
+}
+
+function parseDateOnly(value?: string | null): Date | null {
+  if (!value) return null;
+  const normalized = value.length >= 10 ? value.slice(0, 10) : value;
+  const date = new Date(`${normalized}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function addDays(date: Date, days: number): Date {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function isoDay(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function shouldShowDateLabel(index: number, total: number): boolean {
+  if (total <= 7) return true;
+  if (index === 0 || index === total - 1) return true;
+  const step = total <= 14 ? 3 : total <= 31 ? 7 : 14;
+  return index % step === 0;
 }
