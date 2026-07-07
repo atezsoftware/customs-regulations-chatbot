@@ -37,15 +37,9 @@ class EmbeddingProvider:
         if client is not None:
             self._client = client
         else:
-            resolved_key = api_key or os.getenv("GOOGLE_API_KEY")
-            if resolved_key is None:
-                raise ValueError(
-                    "GOOGLE_API_KEY not found. "
-                    "Provide api_key or set the environment variable."
-                )
-            from google.genai import Client as GenAIClient
+            from fs_explorer_shared.google_genai import build_genai_client
 
-            self._client = GenAIClient(api_key=resolved_key)
+            self._client = build_genai_client(api_key=api_key)
 
     def embed_texts(
         self,

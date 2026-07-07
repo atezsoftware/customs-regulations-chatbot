@@ -4,6 +4,7 @@ from typing import AsyncIterator
 
 from google.genai import Client as GenAIClient
 from google.genai.types import Content, HttpOptions, Part
+from fs_explorer_shared.google_genai import build_genai_client
 
 from .base import ChatTurn, LLMUsage, SchemaT
 
@@ -32,11 +33,7 @@ class GeminiLLMClient:
         if client is not None:
             self.raw_client = client
         else:
-            if api_key is None:
-                raise ValueError(
-                    "GeminiLLMClient requires an api_key (or a pre-built client)."
-                )
-            self.raw_client = GenAIClient(
+            self.raw_client = build_genai_client(
                 api_key=api_key,
                 http_options=HttpOptions(api_version="v1beta"),
             )

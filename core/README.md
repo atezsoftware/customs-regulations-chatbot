@@ -33,3 +33,24 @@ uv run --package fs-explorer-indexer uvicorn fs_explorer_indexer.indexer_server:
 uv run --package fs-explorer-api explore --task "What is the purchase price?" --folder data/test_acquisition/
 uv run --package fs-explorer-indexer explore-index index data/test_acquisition/
 ```
+
+## Google Credentials
+
+The core API and indexer support two Google GenAI auth modes:
+
+```bash
+# Preferred for deployed environments: Vertex AI with a service account.
+export GOOGLE_APPLICATION_CREDENTIALS=/secure/path/service-account.json
+export GOOGLE_CLOUD_PROJECT=customs-regulations-bot-dev
+export GOOGLE_CLOUD_LOCATION=global
+
+# Alternative for secret managers that store JSON values instead of files.
+export GOOGLE_APPLICATION_CREDENTIALS_JSON='{"type":"service_account",...}'
+export GOOGLE_CLOUD_LOCATION=global
+
+# Local fallback: Gemini Developer API key.
+export GOOGLE_API_KEY=...
+```
+
+When service-account credentials are present, the application uses Vertex AI
+auth. Otherwise, it falls back to `GOOGLE_API_KEY`.

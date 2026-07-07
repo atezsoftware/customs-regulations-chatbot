@@ -28,11 +28,6 @@ def get_llm_client(
     if resolved_provider == "gemini":
         if api_key is None:
             api_key = os.getenv("GOOGLE_API_KEY")
-        if api_key is None:
-            raise ValueError(
-                "GOOGLE_API_KEY not found within the current environment: "
-                "please export it or provide it to the agent constructor."
-            )
         return GeminiLLMClient(
             api_key=api_key, model=resolved_model, temperature=temperature
         )

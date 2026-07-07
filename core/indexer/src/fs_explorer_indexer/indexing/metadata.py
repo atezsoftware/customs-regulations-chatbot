@@ -212,11 +212,11 @@ _AUTO_PROFILE_PROMPT_TEMPLATE = (
 )
 
 
-def _get_genai_client(api_key: str) -> Any:
+def _get_genai_client(api_key: str | None = None) -> Any:
     """Instantiate a Google GenAI client. Separated for test patching."""
-    from google.genai import Client as _GenAIClient
+    from fs_explorer_shared.google_genai import build_genai_client
 
-    return _GenAIClient(api_key=api_key)
+    return build_genai_client(api_key=api_key)
 
 
 def auto_discover_profile(
@@ -254,15 +254,12 @@ def auto_discover_profile(
     if not snippets:
         return default_langextract_profile()
 
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        return default_langextract_profile()
-
     effective_model = model_id or os.getenv(
         "FS_EXPLORER_PROFILE_MODEL", "gemini-2.0-flash"
     )
 
     try:
+        api_key = os.getenv("GOOGLE_API_KEY")
         client = _get_genai_client(api_key=api_key)
         prompt = _AUTO_PROFILE_PROMPT_TEMPLATE.replace(
             "SAMPLES_PLACEHOLDER", "\n\n".join(snippets)

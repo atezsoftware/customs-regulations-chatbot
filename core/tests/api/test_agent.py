@@ -36,14 +36,19 @@ class TestAgentInitialization:
         assert isinstance(agent._llm.raw_client, GenAIClient)
 
     def test_agent_init_without_key_raises(self) -> None:
-        """Test that initialization without API key raises ValueError."""
-        # Ensure no key in environment
+        """Test that initialization without Google credentials raises ValueError."""
+        # Ensure no credentials in environment
         env = os.environ.copy()
-        if "GOOGLE_API_KEY" in env:
-            del env["GOOGLE_API_KEY"]
+        for name in (
+            "GOOGLE_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+            "GOOGLE_GENAI_USE_VERTEXAI",
+        ):
+            env.pop(name, None)
 
         with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ValueError, match="GOOGLE_API_KEY not found"):
+            with pytest.raises(ValueError, match="Google GenAI credentials"):
                 FsExplorerAgent()
 
 

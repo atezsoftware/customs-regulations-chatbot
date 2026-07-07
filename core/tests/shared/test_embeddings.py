@@ -136,7 +136,10 @@ def test_client_injection_does_not_import_google_genai(monkeypatch) -> None:
 
 def test_missing_api_key_raises(monkeypatch) -> None:
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", raising=False)
+    monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
+    with pytest.raises(ValueError, match="Google GenAI credentials"):
         EmbeddingProvider(api_key=None, client=None)
 
 

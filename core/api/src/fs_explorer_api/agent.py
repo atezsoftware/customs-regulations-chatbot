@@ -1006,8 +1006,8 @@ class FsExplorerAgent:
 
         Args:
             api_key: Provider API key, used only when `llm_client` is not
-                     given. Falls back to provider-specific env vars
-                     (e.g. `GOOGLE_API_KEY` for Gemini).
+                     given. Service account/Vertex AI credentials can also
+                     be supplied via Google environment variables.
             llm_client: A pre-built `LLMClient` to use directly (mainly for
                         tests/mocking). Takes precedence over api_key/model.
             model: Model name override, passed to `get_llm_client`.
@@ -1015,7 +1015,8 @@ class FsExplorerAgent:
                          `get_llm_client`.
 
         Raises:
-            ValueError: If no API key is available and no llm_client given.
+            ValueError: If no Google credentials are available and no
+                        llm_client given.
         """
         self._llm = llm_client or get_llm_client(
             model=model, temperature=temperature, api_key=api_key

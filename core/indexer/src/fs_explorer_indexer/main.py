@@ -149,7 +149,10 @@ def index_command(
         bool,
         Option(
             "--with-embeddings",
-            help="Generate vector embeddings for indexed chunks (requires GOOGLE_API_KEY).",
+            help=(
+                "Generate vector embeddings for indexed chunks "
+                "(requires Google GenAI credentials)."
+            ),
         ),
     ] = False,
 ) -> None:
