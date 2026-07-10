@@ -472,7 +472,7 @@ function resolveCoreRestUrl(): string {
   return configured.replace(/\/$/, '');
 }
 
-function resolveCoreApiRestUrl(): string {
+export function resolveCoreApiRestUrl(): string {
   const configured = process.env.CORE_INTERNAL_URL ?? DEFAULT_CORE_API_URL;
   return configured
     .replace(/\/ws\/explore$/, '')
@@ -481,7 +481,7 @@ function resolveCoreApiRestUrl(): string {
     .replace(/\/$/, '');
 }
 
-function resolveDatabaseUrl(): string | undefined {
+export function resolveDatabaseUrl(): string | undefined {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
   const host = process.env.DB_HOST;
   const user = process.env.DB_USER;

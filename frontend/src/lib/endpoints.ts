@@ -2,6 +2,10 @@ import {apiFetch} from './api';
 import type {
   AdminSupportSessionDetail,
   AdminSupportSessionsResponse,
+  AmendmentBatch,
+  AmendmentProposal,
+  AnalyzeAmendmentResult,
+  ApproveAmendmentResult,
   AuthTokens,
   ChatMessageRecord,
   ChatSession,
@@ -116,4 +120,38 @@ export const adminSupportApi = {
   },
   messages: (sessionId: number) =>
     apiFetch<AdminSupportSessionDetail>(`/admin/support/sessions/${sessionId}/messages`),
+};
+
+export const amendmentsApi = {
+  analyze: (directoryId: number, rawText: string) =>
+    apiFetch<AnalyzeAmendmentResult>('/admin/amendments/analyze', {
+      method: 'POST',
+      body: {directoryId, rawText},
+    }),
+  listProposals: (input: {status?: string; directoryId?: number} = {}) => {
+    const params = new URLSearchParams();
+    if (input.status) params.set('status', input.status);
+    if (input.directoryId !== undefined) params.set('directoryId', String(input.directoryId));
+    const query = params.toString();
+    return apiFetch<{proposals: AmendmentProposal[]}>(
+      `/admin/amendments/proposals${query ? `?${query}` : ''}`,
+    );
+  },
+  getBatch: (batchId: string) =>
+    apiFetch<{batch: AmendmentBatch; proposals: AmendmentProposal[]}>(
+      `/admin/amendments/batches/${batchId}`,
+    ),
+  approve: (proposalIds: string[]) =>
+    apiFetch<ApproveAmendmentResult>('/admin/amendments/approve', {
+      method: 'POST',
+      body: {proposalIds},
+    }),
+  reject: (proposalId: string) =>
+    apiFetch<{proposal: AmendmentProposal}>(`/admin/amendments/proposals/${proposalId}/reject`, {
+      method: 'POST',
+    }),
+  remove: (proposalId: string) =>
+    apiFetch<{deleted: boolean}>(`/admin/amendments/proposals/${proposalId}`, {
+      method: 'DELETE',
+    }),
 };

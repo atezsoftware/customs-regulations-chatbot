@@ -19,6 +19,17 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from .agent import clear_index_context, set_index_context, set_search_flags
+from .amendments import (
+    AnalyzeAmendmentRequest,
+    AnalyzeAmendmentResponse,
+    ApproveProposalsRequest,
+    ApproveProposalsResponse,
+    DecideProposalRequest,
+    ProposalFailure,
+    ProposalRecord,
+    analyze_amendment,
+    flag_duplicate_targets_in_records,
+)
 from fs_explorer_shared.auth import internal_token_valid, require_internal_token
 from fs_explorer_shared.embeddings import EmbeddingProvider
 from .exploration_trace import ExplorationTrace, extract_cited_sources
@@ -26,6 +37,7 @@ from fs_explorer_shared.index_config import (
     corpus_root as resolve_corpus_root,
     resolve_database_url,
 )
+from .llm import get_llm_client
 from .search import IndexedQueryEngine
 from fs_explorer_shared.storage import PostgresStorage
 from .workflow import (
@@ -327,6 +339,267 @@ async def document_chunks(
         return result
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/amendments/analyze", dependencies=[Depends(require_internal_token)])
+async def analyze_amendment_endpoint(request: AnalyzeAmendmentRequest):
+    """Analyze pasted Resmi Gazete amendment text into reviewable proposals.
+
+    Never writes to `core_chunks` — only creates a batch and pending
+    proposals for an admin to review and individually approve/reject via
+    the endpoints below.
+    """
+    storage: PostgresStorage | None = None
+    try:
+        corpus_root = resolve_corpus_root(request.corpus_folder)
+        resolved_database_url = resolve_database_url(request.database_url)
+        storage = PostgresStorage(resolved_database_url, initialize=False)
+
+        corpus_id = storage.get_corpus_id(corpus_root)
+        if corpus_id is None:
+            return JSONResponse(
+                {"error": "No index found for this folder."}, status_code=404
+            )
+
+        batch_id = storage.create_amendment_batch(
+            corpus_id=corpus_id, raw_text=request.raw_text, created_by=None
+        )
+
+        try:
+            embedding_provider: EmbeddingProvider | None = None
+            if storage.has_embeddings(corpus_id=corpus_id):
+                try:
+                    embedding_provider = EmbeddingProvider()
+                except ValueError:
+                    pass
+
+            result = await analyze_amendment(
+                storage=storage,
+                embedding_provider=embedding_provider,
+                llm=get_llm_client(),
+                corpus_id=corpus_id,
+                raw_text=request.raw_text,
+            )
+        except Exception as exc:
+            storage.update_amendment_batch(
+                batch_id=batch_id, status="failed", error_message=str(exc)
+            )
+            raise
+
+        storage.update_amendment_batch(
+            batch_id=batch_id,
+            status="analyzed",
+            reference_date=result.reference_date,
+        )
+        proposal_ids = storage.create_amendment_proposals(
+            batch_id=batch_id,
+            proposals=[proposal.to_storage_dict() for proposal in result.proposals],
+        )
+        stored = [
+            storage.get_amendment_proposal(proposal_id=proposal_id)
+            for proposal_id in proposal_ids
+        ]
+        records = flag_duplicate_targets_in_records(
+            [record for record in stored if record is not None]
+        )
+
+        return AnalyzeAmendmentResponse(
+            batch_id=batch_id,
+            reference_date=result.reference_date,
+            proposals=[ProposalRecord(**record) for record in records],
+            unmatched_instructions=[
+                instruction.instruction_text
+                for instruction in result.unmatched_instructions
+            ],
+        ).model_dump()
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        if storage is not None:
+            storage.close()
+
+
+@app.get("/api/amendments/proposals", dependencies=[Depends(require_internal_token)])
+async def list_amendment_proposals_endpoint(
+    status: str | None = None,
+    batch_id: str | None = None,
+    corpus_folder: str | None = None,
+    database_url: str | None = None,
+):
+    """List amendment proposals, optionally filtered by status/batch/corpus.
+
+    Used both right after `analyze` and independently later, so proposals
+    an admin didn't act on stay visible ("pending") until approved/deleted.
+    """
+    storage: PostgresStorage | None = None
+    try:
+        resolved_database_url = resolve_database_url(database_url)
+        storage = PostgresStorage(
+            resolved_database_url, read_only=True, initialize=False
+        )
+        corpus_id: str | None = None
+        if corpus_folder:
+            corpus_id = storage.get_corpus_id(resolve_corpus_root(corpus_folder))
+            if corpus_id is None:
+                return {"proposals": []}
+
+        records = storage.list_amendment_proposals(
+            status=status, batch_id=batch_id, corpus_id=corpus_id
+        )
+        records = flag_duplicate_targets_in_records(records)
+        return {
+            "proposals": [ProposalRecord(**record).model_dump() for record in records]
+        }
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        if storage is not None:
+            storage.close()
+
+
+@app.get(
+    "/api/amendments/batches/{batch_id}",
+    dependencies=[Depends(require_internal_token)],
+)
+async def get_amendment_batch_endpoint(batch_id: str, database_url: str | None = None):
+    """Fetch one amendment batch plus all of its proposals."""
+    storage: PostgresStorage | None = None
+    try:
+        resolved_database_url = resolve_database_url(database_url)
+        storage = PostgresStorage(
+            resolved_database_url, read_only=True, initialize=False
+        )
+        batch = storage.get_amendment_batch(batch_id=batch_id)
+        if batch is None:
+            return JSONResponse({"error": "Batch not found."}, status_code=404)
+        records = flag_duplicate_targets_in_records(
+            storage.list_amendment_proposals(batch_id=batch_id, limit=1000)
+        )
+        return {
+            "batch": batch,
+            "proposals": [ProposalRecord(**record).model_dump() for record in records],
+        }
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        if storage is not None:
+            storage.close()
+
+
+@app.post(
+    "/api/amendments/proposals/approve",
+    dependencies=[Depends(require_internal_token)],
+)
+async def approve_amendment_proposals_endpoint(request: ApproveProposalsRequest):
+    """Approve selected proposals. Each is applied independently (its own
+    DB transaction) so one conflict doesn't roll back the others — the
+    caller gets back which succeeded and which failed, with why."""
+    storage: PostgresStorage | None = None
+    try:
+        resolved_database_url = resolve_database_url(request.database_url)
+        storage = PostgresStorage(resolved_database_url, initialize=False)
+
+        embedding_provider: EmbeddingProvider | None = None
+        try:
+            embedding_provider = EmbeddingProvider()
+        except ValueError:
+            pass
+
+        applied: list[ProposalRecord] = []
+        failed: list[ProposalFailure] = []
+        for proposal_id in request.proposal_ids:
+            try:
+                chunk = storage.approve_amendment_proposal(
+                    proposal_id=proposal_id, decided_by=request.decided_by
+                )
+            except ValueError as exc:
+                failed.append(ProposalFailure(proposal_id=proposal_id, reason=str(exc)))
+                continue
+
+            if embedding_provider is not None:
+                try:
+                    document = storage.get_document(doc_id=chunk["document_id"])
+                    if document is not None:
+                        embedding = embedding_provider.embed_texts([chunk["text"]])[0]
+                        storage.store_chunk_embeddings(
+                            corpus_id=document["corpus_id"],
+                            chunk_embeddings=[(chunk["id"], embedding)],
+                        )
+                except Exception:
+                    # Best-effort: an approved chunk without an embedding
+                    # yet is still fully valid — it just won't surface via
+                    # semantic search until a later embed pass fixes it up,
+                    # the same tolerance the indexer already has for
+                    # with_embeddings=false.
+                    pass
+
+            record = storage.get_amendment_proposal(proposal_id=proposal_id)
+            if record is not None:
+                applied.append(
+                    ProposalRecord(**flag_duplicate_targets_in_records([record])[0])
+                )
+
+        return ApproveProposalsResponse(applied=applied, failed=failed).model_dump()
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        if storage is not None:
+            storage.close()
+
+
+@app.post(
+    "/api/amendments/proposals/{proposal_id}/reject",
+    dependencies=[Depends(require_internal_token)],
+)
+async def reject_amendment_proposal_endpoint(
+    proposal_id: str, request: DecideProposalRequest
+):
+    storage: PostgresStorage | None = None
+    try:
+        resolved_database_url = resolve_database_url(request.database_url)
+        storage = PostgresStorage(resolved_database_url, initialize=False)
+        storage.reject_amendment_proposal(
+            proposal_id=proposal_id, decided_by=request.decided_by
+        )
+        record = storage.get_amendment_proposal(proposal_id=proposal_id)
+        if record is None:
+            return JSONResponse({"error": "Proposal not found."}, status_code=404)
+        return {
+            "proposal": ProposalRecord(
+                **flag_duplicate_targets_in_records([record])[0]
+            ).model_dump()
+        }
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        if storage is not None:
+            storage.close()
+
+
+@app.delete(
+    "/api/amendments/proposals/{proposal_id}",
+    dependencies=[Depends(require_internal_token)],
+)
+async def delete_amendment_proposal_endpoint(
+    proposal_id: str, database_url: str | None = None
+):
+    storage: PostgresStorage | None = None
+    try:
+        resolved_database_url = resolve_database_url(database_url)
+        storage = PostgresStorage(resolved_database_url, initialize=False)
+        storage.delete_amendment_proposal(proposal_id=proposal_id)
+        return {"deleted": True}
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        if storage is not None:
+            storage.close()
 
 
 @app.websocket("/ws/explore")

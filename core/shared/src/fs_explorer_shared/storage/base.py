@@ -29,19 +29,42 @@ def make_chunk_id(doc_id: str, position: int, start_char: int, end_char: int) ->
     return stable_id("chunk", f"{doc_id}:{position}:{start_char}:{end_char}")
 
 
+def make_amendment_chunk_id(proposal_id: str) -> str:
+    """Deterministic id for a chunk created by approving an amendment proposal.
+
+    Unlike `make_chunk_id`, this is keyed by proposal id, not document
+    position/offsets — amendment-created chunks have no real source
+    offsets. It only needs to be stable across retries of approving the
+    *same* proposal (so `insert_chunk`/`ON CONFLICT DO NOTHING` is
+    idempotent), not across re-indexing.
+    """
+    return stable_id("chunk", f"amend:{proposal_id}")
+
+
 @dataclass(frozen=True)
 class ChunkRecord:
-    """A text chunk stored for a document."""
+    """A text chunk stored for a document.
+
+    `start_char`/`end_char` are `None` for amendment-created chunks (no real
+    parse offsets exist), and required for indexer-produced chunks — enforced
+    by `core_chunks_indexed_offsets_check` at the DB layer, not here.
+    """
 
     id: str
     doc_id: str
     text: str
     position: int
-    start_char: int
-    end_char: int
+    start_char: int | None
+    end_char: int | None
     embedding: list[float] | None = None
     chunk_type: str | None = None
     metadata: dict[str, Any] | None = None
+    source: str = "indexed"
+    status: str = "active"
+    effective_start_date: str | None = None
+    effective_end_date: str | None = None
+    supersedes_chunk_id: str | None = None
+    superseded_by_chunk_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +110,23 @@ class StorageBackend(Protocol):
         self, document: DocumentRecord, chunks: list[ChunkRecord]
     ) -> None:
         """Insert or update a document and replace its chunks."""
+
+    def insert_chunk(self, *, chunk: ChunkRecord) -> None:
+        """Insert a single chunk without touching any other chunk of its
+        document. Idempotent (ON CONFLICT DO NOTHING)."""
+
+    def get_chunk(self, *, chunk_id: str) -> dict[str, Any] | None:
+        """Fetch one chunk row (all columns) by id."""
+
+    def supersede_chunk(
+        self, *, old_chunk_id: str, new_chunk_id: str, effective_end_date: str | None
+    ) -> bool:
+        """Mark a chunk superseded by a specific successor. Returns False if
+        the chunk was not 'active' (race/conflict, not a silent success)."""
+
+    def expire_chunk(self, *, chunk_id: str, effective_end_date: str) -> None:
+        """Mark a chunk expired (validity window closed with no direct
+        successor)."""
 
     def mark_deleted_missing_documents(
         self,
@@ -172,6 +212,102 @@ class StorageBackend(Protocol):
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         """Search chunks by cosine similarity against a query embedding."""
+
+    def search_chunks_trigram(
+        self,
+        *,
+        corpus_id: str,
+        query_text: str,
+        limit: int = 10,
+        active_only: bool = True,
+        similarity_threshold: float = 0.15,
+    ) -> list[dict[str, Any]]:
+        """Fuzzy (pg_trgm) search over chunk text — Turkish-aware since
+        trigram similarity is character-n-gram based, not tokenizer-based."""
+
+    def search_chunks_by_heading_trigram(
+        self,
+        *,
+        corpus_id: str,
+        heading_query: str,
+        limit: int = 10,
+        active_only: bool = True,
+        similarity_threshold: float = 0.15,
+    ) -> list[dict[str, Any]]:
+        """Fuzzy (pg_trgm) search over each chunk's heading_path, joined into
+        a single string. Complements (not replaces) exact heading_path
+        matching, which is unreliable for inconsistently-formatted sources."""
+
+    def search_chunks_by_structured_metadata(
+        self,
+        *,
+        corpus_id: str,
+        article_no: str | None,
+        document_number: str | None,
+        limit: int = 20,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Exact-match candidates on short structured locators. Empty if
+        neither argument is given."""
+
+    def create_amendment_batch(
+        self, *, corpus_id: str, raw_text: str, created_by: str | None
+    ) -> str:
+        """Create an amendment analysis batch (the audit record for one
+        pasted gazette text) and return its id."""
+
+    def update_amendment_batch(
+        self,
+        *,
+        batch_id: str,
+        status: str,
+        reference_date: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Update a batch's analysis status/reference date/error."""
+
+    def get_amendment_batch(self, *, batch_id: str) -> dict[str, Any] | None:
+        """Fetch one amendment batch by id."""
+
+    def create_amendment_proposals(
+        self, *, batch_id: str, proposals: list[dict[str, Any]]
+    ) -> list[str]:
+        """Bulk-insert proposals for a batch; returns generated proposal ids
+        in the same order as the input."""
+
+    def list_amendment_proposals(
+        self,
+        *,
+        status: str | None = None,
+        batch_id: str | None = None,
+        corpus_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """List proposals, optionally filtered by status, batch, and/or the
+        corpus of the batch that produced them."""
+
+    def get_amendment_proposal(self, *, proposal_id: str) -> dict[str, Any] | None:
+        """Fetch one proposal by id."""
+
+    def approve_amendment_proposal(
+        self, *, proposal_id: str, decided_by: str | None
+    ) -> dict[str, Any]:
+        """Apply a pending proposal in one transaction: insert the new
+        chunk, supersede the old one if any, mark the proposal approved.
+        Returns the applied chunk. Raises ValueError on conflict (already
+        decided, or the old chunk was already superseded by another
+        approval)."""
+
+    def reject_amendment_proposal(
+        self, *, proposal_id: str, decided_by: str | None
+    ) -> None:
+        """Mark a pending proposal rejected. Raises ValueError if it isn't
+        pending."""
+
+    def delete_amendment_proposal(self, *, proposal_id: str) -> None:
+        """Delete a proposal. Raises ValueError if it doesn't exist or is
+        already approved (an applied chunk's audit trail must not be
+        orphaned by deleting it)."""
 
     def get_metadata_field_values(
         self,

@@ -137,26 +137,13 @@ export class CoreBridgeService {
 
     const session = await this.chatSessionRepository.findById(input.sessionId);
     const sessionView = await this.buildSessionView(input.sessionId);
+    // Not injected into the agent's task — the agent decides for itself whether
+    // to call semantic_search. Kept only to resolve citation labels in the final
+    // answer to chunk-backed sources (snippet/score) once the agent has responded.
     const indexedHits = await this.searchLinkedDirectories(
       sessionView.directoryIds,
       input.task,
     );
-    if (indexedHits.length) {
-      yield {
-        type: 'research_step',
-        step: await this.saveStep({
-          messageId: input.assistantMessageId,
-          stepKey: 'indexed-presearch',
-          status: 'completed',
-          title: 'Searching indexed evidence',
-          preview: `${indexedHits.length} semantic matches found in linked directories.`,
-          details: indexedHits
-            .map(hit => `${hit.relativePath} (score ${hit.score.toFixed(3)})`)
-            .join('\n'),
-          metadata: {hits: indexedHits},
-        }),
-      };
-    }
     const ws = new WebSocket(resolveCoreWebSocketUrl());
     const queue = new AsyncQueue();
     let finalContent = '';
@@ -198,7 +185,7 @@ export class CoreBridgeService {
 
       ws.send(
         JSON.stringify({
-          task: withIndexedEvidence(input.task, indexedHits),
+          task: input.task,
           folder: sessionView.viewFolder,
           use_index: sessionView.indexFolders.length > 0,
           index_folders: sessionView.indexFolders,
@@ -664,28 +651,6 @@ function resolveDatabaseUrl(): string | undefined {
   return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(
     password ?? '',
   )}@${host}:${port}/${database}`;
-}
-
-function withIndexedEvidence(task: string, hits: IndexedHit[]): string {
-  if (!hits.length) return task;
-  const evidence = hits
-    .map(
-      (hit, index) =>
-        `[${index + 1}] ${hit.chunkPath}\n` +
-        `Chunk ID: ${hit.chunkId ?? 'metadata-only'}\n` +
-        `Citation label: [${hit.citationLabel}]\n` +
-        `Score: ${hit.score.toFixed(3)}\n` +
-        `Excerpt: ${hit.text}`,
-    )
-    .join('\n\n');
-
-  return (
-    "Indexed semantic search found these potentially relevant excerpts from the linked directories. " +
-    "Use them as starting evidence, and verify/cite facts with the chunk-backed tools exposed by core. " +
-    "When you rely on one of these excerpts, cite it with its exact Citation label so the UI can open the underlying chunk.\n\n" +
-    `${evidence}\n\n` +
-    `Current user question:\n${task}`
-  );
 }
 
 function chunkPathForHit(hit: IndexedHitBase | IndexedHit): string {

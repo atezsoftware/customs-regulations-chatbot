@@ -226,3 +226,47 @@ export interface AdminSupportSessionDetail {
   };
   messages: ChatMessageRecord[];
 }
+
+export interface AmendmentProposal {
+  id: string;
+  batchId: string;
+  instructionIndex: number;
+  instructionText: string;
+  oldChunkId: string | null;
+  oldChunkSnapshot: Record<string, unknown>;
+  newChunkDraft: Record<string, unknown>;
+  matchConfidence: number | null;
+  matchRationale: string | null;
+  dateRationale: string | null;
+  status: 'pending' | 'approved' | 'rejected';
+  appliedNewChunkId: string | null;
+  decidedBy: string | null;
+  decidedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  duplicateTarget: boolean;
+}
+
+export interface AmendmentBatch {
+  id: string;
+  corpusId: string;
+  rawText: string;
+  referenceDate: string | null;
+  status: 'analyzing' | 'analyzed' | 'failed';
+  errorMessage: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AnalyzeAmendmentResult {
+  batchId: string;
+  referenceDate: string | null;
+  proposals: AmendmentProposal[];
+  unmatchedInstructions: string[];
+}
+
+export interface ApproveAmendmentResult {
+  applied: AmendmentProposal[];
+  failed: Array<{proposalId: string; reason: string}>;
+}

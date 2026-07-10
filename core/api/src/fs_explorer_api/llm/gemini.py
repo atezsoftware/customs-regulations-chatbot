@@ -1,5 +1,7 @@
 """Gemini implementation of the provider-agnostic `LLMClient` interface."""
 
+import asyncio
+import os
 from typing import AsyncIterator
 
 from google.genai import Client as GenAIClient
@@ -9,6 +11,17 @@ from fs_explorer_shared.google_genai import build_genai_client
 from .base import ChatTurn, LLMUsage, SchemaT
 
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+
+# Every `GeminiLLMClient` instance shares this one semaphore (module-level,
+# not per-instance) so the cap holds process-wide regardless of how many
+# clients get constructed — the singleton chat agent's client and a
+# freshly-built one per amendments-analysis request both draw from the same
+# pool. Bounds how many Gemini calls this process has in flight at once,
+# which is what actually avoids 429 RESOURCE_EXHAUSTED under concurrent
+# chatbot traffic (a request that can't get a slot simply waits its turn
+# instead of firing and getting rate-limited).
+_MAX_CONCURRENT_GEMINI_CALLS = int(os.getenv("FS_EXPLORER_LLM_MAX_CONCURRENCY", "8"))
+_llm_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GEMINI_CALLS)
 
 
 def _to_contents(history: list[ChatTurn]) -> list[Content]:
@@ -51,16 +64,17 @@ class GeminiLLMClient:
         system_prompt: str,
         schema: type[SchemaT],
     ) -> tuple[SchemaT, LLMUsage]:
-        response = await self.raw_client.aio.models.generate_content(
-            model=self.model,
-            contents=_to_contents(history),  # ty: ignore[invalid-argument-type]
-            config={
-                "system_instruction": system_prompt,
-                "response_mime_type": "application/json",
-                "response_schema": schema,
-                **self._generation_config(),
-            },
-        )
+        async with _llm_semaphore:
+            response = await self.raw_client.aio.models.generate_content(
+                model=self.model,
+                contents=_to_contents(history),  # ty: ignore[invalid-argument-type]
+                config={
+                    "system_instruction": system_prompt,
+                    "response_mime_type": "application/json",
+                    "response_schema": schema,
+                    **self._generation_config(),
+                },
+            )
 
         usage = LLMUsage()
         if response.usage_metadata:
@@ -93,26 +107,27 @@ class GeminiLLMClient:
         thinking_tokens = 0
         saw_usage = False
 
-        async for chunk in stream_fn(
-            model=self.model,
-            contents=_to_contents(history),
-            config={
-                "system_instruction": system_prompt,
-                **self._generation_config(),
-            },
-        ):
-            if getattr(chunk, "usage_metadata", None):
-                saw_usage = True
-                usage = chunk.usage_metadata
-                input_tokens = usage.prompt_token_count or input_tokens
-                output_tokens = usage.candidates_token_count or output_tokens
-                thinking_tokens = (
-                    getattr(usage, "thoughts_token_count", None) or thinking_tokens
-                )
+        async with _llm_semaphore:
+            async for chunk in stream_fn(
+                model=self.model,
+                contents=_to_contents(history),
+                config={
+                    "system_instruction": system_prompt,
+                    **self._generation_config(),
+                },
+            ):
+                if getattr(chunk, "usage_metadata", None):
+                    saw_usage = True
+                    usage = chunk.usage_metadata
+                    input_tokens = usage.prompt_token_count or input_tokens
+                    output_tokens = usage.candidates_token_count or output_tokens
+                    thinking_tokens = (
+                        getattr(usage, "thoughts_token_count", None) or thinking_tokens
+                    )
 
-            text = getattr(chunk, "text", None)
-            if text:
-                yield text
+                text = getattr(chunk, "text", None)
+                if text:
+                    yield text
 
         if saw_usage:
             self._last_stream_usage = LLMUsage(

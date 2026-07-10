@@ -153,6 +153,7 @@ backend uploads a file → core-indexer: IndexingPipeline → Docling parse → 
 - `DATABASE_URL` (required, both services) — Postgres connection string, shared with `backend`
 - `CORE_INTERNAL_TOKEN` (optional, both services) — if set, gates `/ws/explore` and the indexing/search REST endpoints behind a shared secret (checked via `X-Internal-Token` header or the WS message's `internal_token` field); unset = no gate, for local/CLI use
 - `FS_EXPLORER_LLM_PROVIDER` / `FS_EXPLORER_LLM_MODEL` (optional, `core-api`) — select/override the LLM provider+model (default: gemini / `gemini-3-flash-preview`)
+- `FS_EXPLORER_LLM_MAX_CONCURRENCY` (optional, `core-api`) — process-wide cap on concurrent Gemini calls (default 8), enforced by a module-level `asyncio.Semaphore` in `llm/gemini.py` shared by every `GeminiLLMClient` instance (the singleton chat agent and any per-request client, e.g. the amendments pipeline); under concurrent chatbot traffic this queues excess calls instead of firing them all at once and hitting `429 RESOURCE_EXHAUSTED`
 - `FS_EXPLORER_LANGEXTRACT_MAX_CHARS` (optional, `core-indexer`) — max chars sent to langextract (default 6000)
 - `FS_EXPLORER_LANGEXTRACT_MODEL` (optional, `core-indexer`) — model for langextract (default `gemini-3-flash-preview`)
 - `backend` additionally needs `CORE_INTERNAL_URL` (→ `core-api`, default `ws://127.0.0.1:8000`) and `CORE_INDEXER_URL` (→ `core-indexer`, default `http://127.0.0.1:8001`) — see `.env.dev.example` at the repo root.

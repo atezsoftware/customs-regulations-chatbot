@@ -54,6 +54,11 @@ export function AppShell() {
               <SupportIcon />
             </NavIcon>
           )}
+          {user?.role === 'admin' && (
+            <NavIcon to="/admin/amendments" label="Mevzuat güncelleme">
+              <AmendmentsIcon />
+            </NavIcon>
+          )}
         </div>
         <div className="flex flex-col items-center gap-3">
           <NavLink
@@ -127,6 +132,20 @@ function SupportIcon() {
         strokeLinejoin="round"
       />
       <path d="M9 12h6M12 9v6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function AmendmentsIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path
+        d="M4 4h11l5 5v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M15 4v5h5" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M8 13h8M8 17h5" strokeLinecap="round" />
     </svg>
   );
 }

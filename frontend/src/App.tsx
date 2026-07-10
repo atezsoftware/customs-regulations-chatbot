@@ -3,6 +3,7 @@ import {AdminRoute} from './components/AdminRoute';
 import {AppShell} from './components/AppShell';
 import {LocalOnlyRoute} from './components/LocalOnlyRoute';
 import {ProtectedRoute} from './components/ProtectedRoute';
+import {AdminAmendmentsPage} from './pages/AdminAmendmentsPage';
 import {AdminSupportPage} from './pages/AdminSupportPage';
 import {ChatPage} from './pages/ChatPage';
 import {ChunksPage} from './pages/ChunksPage';
@@ -28,6 +29,7 @@ function App() {
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route element={<AdminRoute />}>
             <Route path="/admin/support" element={<AdminSupportPage />} />
+            <Route path="/admin/amendments" element={<AdminAmendmentsPage />} />
           </Route>
         </Route>
       </Route>
