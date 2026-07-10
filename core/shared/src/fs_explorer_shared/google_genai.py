@@ -168,12 +168,15 @@ def build_genai_client(
                 "GOOGLE_PROJECT_ID, or a service-account JSON with project_id."
             )
 
+        # Don't forward a caller-supplied http_options here: it's set up for
+        # the Gemini Developer API (e.g. api_version="v1beta") and would
+        # override the SDK's correct Vertex AI default (api_version
+        # "v1beta1"), sending requests to a path that 404s.
         return GenAIClient(
             vertexai=True,
             credentials=credentials,
             project=project,
             location=_google_location_from_env(),
-            http_options=http_options,
         )
 
     resolved_key = api_key or os.getenv("GOOGLE_API_KEY")
