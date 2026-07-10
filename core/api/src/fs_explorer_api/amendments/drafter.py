@@ -42,14 +42,24 @@ new_chunk alanı için:
 
 dates alanı için:
 - `effective_start_date`: bu yeni metnin YÜRÜRLÜĞE GİRDİĞİ tarih (YYYY-MM-DD).
-  Talimatta doğal dil ifadesi varsa (örn. "yayımı tarihinden itibaren", "1 ay sonra")
-  bunu verilen referans tarihine göre kesin bir tarihe çevir. Hiçbir tarih bilgisi
-  yoksa null bırak. NOT: bu tarih aynı zamanda eski chunk'ın geçerliliğinin SONA
+  Talimatta somut bir tarih varsa (örn. "1 Ocak 2027'den itibaren") direkt onu
+  kullan. "Yayımı tarihinden itibaren" gibi göreli bir ifade varsa VE sana
+  verilen referans/yayım tarihi doluysa, bunu o tarihe göre kesin bir tarihe
+  çevir. NE somut bir tarih NE de kullanabileceğin bir referans/yayım tarihi
+  yoksa (örn. "yayımı tarihinden itibaren geçerlidir" deniyor ama referans
+  tarihi "(belirtilmemiş)" ise) TAHMİN ETME, UYDURMA — null bırak. Bu durumda
+  sistem otomatik olarak onay tarihini (bu değişikliğin fiilen veritabanına
+  işlendiği günü) kullanacak; bu hem Türk mevzuatındaki "aksi belirtilmedikçe
+  yayım tarihinde yürürlüğe girer" varsayılan kuralına hem de pratik olarak
+  elimizdeki en iyi bilgiye uyar. NOT: bu tarih (veya null ise sistemin
+  dolduracağı onay tarihi) aynı zamanda eski chunk'ın geçerliliğinin SONA
   ERDİĞİ tarih olarak kullanılacak (yeni metin başladığında eski metin biter).
 - `effective_end_date`: SADECE talimatın kendisi bu yeni hükmün de geçici/süreli
   olduğunu açıkça belirtiyorsa doldur (örn. "31.12.2027 tarihine kadar geçerlidir").
-  Aksi halde null.
-- `rationale`: bu tarihlere nasıl ulaştığını kısaca açıkla.
+  Aksi halde null — burada ASLA bir varsayılan tarih uydurma, boş bırakmak
+  "süresiz geçerli" anlamına gelir ve bu doğru varsayılandır.
+- `rationale`: bu tarihlere nasıl ulaştığını (veya neden null bıraktığını)
+  kısaca açıkla.
 
 Sadece verilen metinlerde yer alan bilgiyi kullan, hiçbir şey uydurma."""
 

@@ -330,6 +330,12 @@ function ProposalCard({
           {proposal.dateRationale && (
             <p className="mt-0.5 text-xs text-slate-400">{proposal.dateRationale}</p>
           )}
+          {proposal.newChunkDraft.effective_start_date === null && (
+            <p className="mt-0.5 text-xs text-amber-600">
+              Başlangıç tarihi belirlenemedi — onaylandığında o günün tarihiyle
+              başlayacak.
+            </p>
+          )}
         </button>
         <div className="flex shrink-0 gap-2">
           <Button variant="secondary" onClick={onReject}>

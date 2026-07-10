@@ -7,13 +7,37 @@ Every LLM output here is a typed, schema-validated structured response
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # =============================================================================
 # LLM-facing models (segmentation -> matching -> drafting)
 # =============================================================================
+
+
+def _require_iso_date_or_none(value: str | None) -> str | None:
+    """Reject anything that isn't a real `YYYY-MM-DD` date or null.
+
+    LLM structured output only guarantees the *type* (`str`), not the
+    *format* — without this, a model that ignores its prompt instructions
+    could write a natural-language phrase (e.g. "yayımı tarihinden
+    itibaren") straight into a date field. That would either crash on
+    insert (`core_chunks.effective_start_date` is a real `DATE` column) or,
+    worse, silently misbehave upstream of that. Fail validation immediately
+    instead, so the caller sees a clear error at the LLM-response boundary.
+    """
+    if value is None:
+        return None
+    try:
+        date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Expected a YYYY-MM-DD date or null, got {value!r} — natural-language "
+            "date phrases are not valid here."
+        ) from exc
+    return value
 
 
 class AmendmentInstruction(BaseModel):
@@ -40,6 +64,10 @@ class SegmentationResult(BaseModel):
         description="The gazette text's own publication/reference date (YYYY-MM-DD), if stated",
     )
     instructions: list[AmendmentInstruction]
+
+    _validate_reference_date = field_validator("reference_date")(
+        _require_iso_date_or_none
+    )
 
 
 class MatchResult(BaseModel):
@@ -103,6 +131,10 @@ class DateResolution(BaseModel):
     )
     rationale: str = Field(
         description="Brief explanation of how these dates were derived from the text"
+    )
+
+    _validate_dates = field_validator("effective_start_date", "effective_end_date")(
+        _require_iso_date_or_none
     )
 
 

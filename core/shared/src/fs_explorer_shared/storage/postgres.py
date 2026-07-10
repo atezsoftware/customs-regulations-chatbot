@@ -1228,6 +1228,15 @@ class PostgresStorage:
            stops).
         4. Mark the proposal approved and record which chunk it produced.
 
+        Date fallback: if the drafted `effective_start_date` is null (no
+        explicit date in the amendment text, and no gazette reference/
+        publication date to resolve "yayım tarihinden itibaren" against),
+        both the new chunk's start and the old chunk's end default to
+        `CURRENT_DATE` — the day the admin approves it — evaluated once per
+        transaction so both sides land on the identical date. Leaving the
+        new chunk's start null instead would mean "always valid, even
+        before the old text was superseded", which is never correct.
+
         Raises ValueError on any conflict (not found, already decided, old
         chunk already superseded) so callers can surface a clear per-proposal
         failure reason instead of a generic error.
@@ -1261,7 +1270,7 @@ class PostgresStorage:
                     )
                     VALUES (
                         %s, %s, %s, %s, NULL, NULL, %s, %s::jsonb,
-                        'amendment', 'active', %s, %s, %s
+                        'amendment', 'active', COALESCE(%s::date, CURRENT_DATE), %s, %s
                     )
                     ON CONFLICT (id) DO NOTHING
                     """,
@@ -1284,7 +1293,7 @@ class PostgresStorage:
                         UPDATE core_chunks
                         SET status = 'superseded',
                             superseded_by_chunk_id = %s,
-                            effective_end_date = COALESCE(%s, effective_end_date, CURRENT_DATE)
+                            effective_end_date = COALESCE(%s::date, CURRENT_DATE)
                         WHERE id = %s AND status = 'active'
                         """,
                         (new_chunk_id, draft.get("effective_start_date"), old_chunk_id),
