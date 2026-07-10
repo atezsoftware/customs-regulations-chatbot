@@ -9,6 +9,8 @@ from typing import Any
 
 _CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 _DEFAULT_LOCATION = "global"
+_VERTEX_API_VERSION = "v1"
+_DEVELOPER_API_VERSION = "v1beta"
 
 
 def _truthy_env(name: str) -> bool:
@@ -130,6 +132,7 @@ def build_genai_client(
     local fallback for older environments.
     """
     from google.genai import Client as GenAIClient
+    from google.genai.types import HttpOptions
 
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -143,6 +146,8 @@ def build_genai_client(
     )
 
     if use_vertex:
+        if http_options is None:
+            http_options = HttpOptions(api_version=_VERTEX_API_VERSION)
         credentials = None
         credentials_project = None
         if credentials_path:
@@ -181,6 +186,8 @@ def build_genai_client(
 
     resolved_key = api_key or os.getenv("GOOGLE_API_KEY")
     if resolved_key:
+        if http_options is None:
+            http_options = HttpOptions(api_version=_DEVELOPER_API_VERSION)
         return GenAIClient(api_key=resolved_key, http_options=http_options)
 
     raise ValueError(
