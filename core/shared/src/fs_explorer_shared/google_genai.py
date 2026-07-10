@@ -43,10 +43,34 @@ def _load_service_account_credentials(path: str) -> tuple[Any, str | None]:
     return credentials, getattr(credentials, "project_id", None)
 
 
+def _parse_credentials_json(raw_json: str) -> dict[str, Any]:
+    """Parse a service-account payload, tolerating single-quoted dict literals.
+
+    Some secret stores hand back Python `str(dict)`-style values (single
+    quotes around keys/strings) instead of strict JSON. `json.loads` rejects
+    those with "Expecting property name enclosed in double quotes", so fall
+    back to `ast.literal_eval` for that one case before giving up.
+    """
+    try:
+        return json.loads(raw_json)
+    except json.JSONDecodeError as json_error:
+        import ast
+
+        try:
+            info = ast.literal_eval(raw_json)
+        except (ValueError, SyntaxError):
+            raise json_error from None
+        if not isinstance(info, dict):
+            raise ValueError(
+                "GOOGLE_APPLICATION_CREDENTIALS_JSON did not parse to a JSON object"
+            ) from None
+        return info
+
+
 def _load_service_account_credentials_json(raw_json: str) -> tuple[Any, str | None]:
     from google.oauth2 import service_account
 
-    info = json.loads(raw_json)
+    info = _parse_credentials_json(raw_json)
     credentials = service_account.Credentials.from_service_account_info(
         info,
         scopes=[_CLOUD_PLATFORM_SCOPE],

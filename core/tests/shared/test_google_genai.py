@@ -43,6 +43,23 @@ def test_service_account_json_builds_vertex_client(monkeypatch) -> None:
     ]
 
 
+def test_parse_credentials_json_accepts_single_quoted_dict_literal() -> None:
+    raw = "{'type': 'service_account', 'project_id': 'x'}"
+
+    info = google_genai._parse_credentials_json(raw)
+
+    assert info == {"type": "service_account", "project_id": "x"}
+
+
+def test_parse_credentials_json_rejects_garbage() -> None:
+    import json
+
+    import pytest
+
+    with pytest.raises(json.JSONDecodeError):
+        google_genai._parse_credentials_json("not json at all")
+
+
 def test_api_key_fallback_builds_developer_client(monkeypatch) -> None:
     _FakeClient.calls.clear()
     monkeypatch.setattr("google.genai.Client", _FakeClient)
