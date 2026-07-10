@@ -21,6 +21,7 @@ def _google_project_from_env() -> str | None:
         os.getenv("GOOGLE_CLOUD_PROJECT")
         or os.getenv("GOOGLE_PROJECT_ID")
         or os.getenv("GCP_PROJECT")
+        or os.getenv("GOOGLE_VERTEX_PROJECT")
     )
 
 
@@ -29,8 +30,45 @@ def _google_location_from_env() -> str:
         os.getenv("GOOGLE_CLOUD_LOCATION")
         or os.getenv("GOOGLE_CLOUD_REGION")
         or os.getenv("GCP_REGION")
+        or os.getenv("GOOGLE_VERTEX_LOCATION")
         or _DEFAULT_LOCATION
     )
+
+
+def _normalize_private_key(raw: str) -> str:
+    """Unescape a literal `\\n`-encoded PEM into real newlines, if needed.
+
+    Some secret injectors (e.g. a Vault template rendering a JSON field
+    verbatim) hand back the key with actual newlines already; others hand
+    back a single-line value with literal backslash-n sequences. Only
+    unescape when there's no real newline yet, so an already-correct
+    multi-line key is left untouched.
+    """
+    if "\n" not in raw and "\\n" in raw:
+        return raw.replace("\\n", "\n")
+    return raw
+
+
+def _load_service_account_credentials_from_discrete_fields(
+    client_email: str, private_key: str
+) -> tuple[Any, str | None]:
+    from google.oauth2 import service_account
+
+    info = {
+        "type": "service_account",
+        "client_email": client_email,
+        "private_key": _normalize_private_key(private_key),
+        "private_key_id": os.getenv("GOOGLE_VERTEX_PRIVATE_KEY_ID", ""),
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+    project_id = _google_project_from_env()
+    if project_id:
+        info["project_id"] = project_id
+    credentials = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=[_CLOUD_PLATFORM_SCOPE],
+    )
+    return credentials, getattr(credentials, "project_id", None)
 
 
 def _load_service_account_credentials(path: str) -> tuple[Any, str | None]:
@@ -85,17 +123,22 @@ def build_genai_client(
 ) -> Any:
     """Build a Google GenAI client from service account/ADC or API key.
 
-    Service-account/Vertex auth is preferred whenever `GOOGLE_APPLICATION_CREDENTIALS`
-    is set or `GOOGLE_GENAI_USE_VERTEXAI=true` is configured. API key auth remains as
-    a local fallback for older environments.
+    Service-account/Vertex auth is preferred whenever `GOOGLE_APPLICATION_CREDENTIALS`,
+    `GOOGLE_APPLICATION_CREDENTIALS_JSON`, or the discrete `GOOGLE_VERTEX_CLIENT_EMAIL`
+    + `GOOGLE_VERTEX_PRIVATE_KEY` pair (the shape backend's Vault template injects) is
+    set, or `GOOGLE_GENAI_USE_VERTEXAI=true` is configured. API key auth remains as a
+    local fallback for older environments.
     """
     from google.genai import Client as GenAIClient
 
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    vertex_client_email = os.getenv("GOOGLE_VERTEX_CLIENT_EMAIL")
+    vertex_private_key = os.getenv("GOOGLE_VERTEX_PRIVATE_KEY")
     use_vertex = (
         bool(credentials_path)
         or bool(credentials_json)
+        or bool(vertex_client_email and vertex_private_key)
         or _truthy_env("GOOGLE_GENAI_USE_VERTEXAI")
     )
 
@@ -110,6 +153,12 @@ def build_genai_client(
         elif credentials_json:
             credentials, credentials_project = _load_service_account_credentials_json(
                 credentials_json
+            )
+        elif vertex_client_email and vertex_private_key:
+            credentials, credentials_project = (
+                _load_service_account_credentials_from_discrete_fields(
+                    vertex_client_email, vertex_private_key
+                )
             )
 
         project = _google_project_from_env() or credentials_project
