@@ -120,23 +120,57 @@ export function DashboardPage() {
                 {usage.daily.length === 0 ? (
                   <EmptyPanel text="No token usage recorded for this period." />
                 ) : (
-                  <div className="flex h-56 items-end gap-2 border-b border-slate-100 pt-4">
-                    {usage.daily.map(day => (
-                      <div key={day.day} className="flex min-w-0 flex-1 flex-col items-center gap-2">
-                        <div className="flex h-44 w-full items-end">
-                          <div
-                            title={`${day.day}: ${formatNumber(day.totalTokens)} tokens`}
-                            className="w-full rounded-t-md bg-indigo-500/80 transition-colors hover:bg-indigo-600"
-                            style={{
-                              height: `${Math.max(6, (day.totalTokens / maxDaily) * 100)}%`,
-                            }}
-                          />
-                        </div>
-                        <span className="w-full truncate text-center text-[11px] text-slate-400">
-                          {shortDate(day.day)}
-                        </span>
-                      </div>
-                    ))}
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[620px] text-left text-sm">
+                      <thead className="text-xs uppercase tracking-wide text-slate-400">
+                        <tr>
+                          <th className="pb-2 font-semibold">Day</th>
+                          <th className="pb-2 text-right font-semibold">Calls</th>
+                          <th className="pb-2 text-right font-semibold">Input</th>
+                          <th className="pb-2 text-right font-semibold">Output</th>
+                          <th className="pb-2 text-right font-semibold">Thinking</th>
+                          <th className="pb-2 text-right font-semibold">Total</th>
+                          <th className="pb-2 font-semibold">Volume</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {usage.daily.map(day => (
+                          <tr key={day.day}>
+                            <td className="py-3 font-medium text-slate-700">
+                              {fullDate(day.day)}
+                            </td>
+                            <td className="py-3 text-right text-slate-500">
+                              {formatNumber(day.calls)}
+                            </td>
+                            <td className="py-3 text-right text-slate-500">
+                              {formatNumber(day.inputTokens)}
+                            </td>
+                            <td className="py-3 text-right text-slate-500">
+                              {formatNumber(day.outputTokens)}
+                            </td>
+                            <td className="py-3 text-right text-slate-500">
+                              {formatNumber(day.thinkingTokens)}
+                            </td>
+                            <td className="py-3 text-right font-semibold text-slate-800">
+                              {formatNumber(day.totalTokens)}
+                            </td>
+                            <td className="py-3">
+                              <div className="h-2 min-w-28 rounded-full bg-slate-100">
+                                <div
+                                  className="h-2 rounded-full bg-indigo-500"
+                                  style={{
+                                    width: `${Math.max(
+                                      4,
+                                      (day.totalTokens / maxDaily) * 100,
+                                    )}%`,
+                                  }}
+                                />
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 )}
               </div>
@@ -274,8 +308,12 @@ function formatDuration(value: number): string {
   return `${(value / 1000).toFixed(1)} s`;
 }
 
-function shortDate(value: string): string {
-  const date = new Date(value);
+function fullDate(value: string): string {
+  const date = new Date(`${value}T00:00:00`);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+  return date.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
 }

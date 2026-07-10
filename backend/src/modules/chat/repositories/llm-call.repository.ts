@@ -57,18 +57,18 @@ export class LlmCallRepository extends DefaultCrudRepository<
   async usageTotals(userId: number, since: string | null): Promise<UsageTotalsRow[]> {
     return (await this.dataSource.execute(
       `
+        WITH usage_events AS (
+          ${usageEventsSql()}
+        )
         SELECT
-          COUNT(c.id) AS call_count,
-          COUNT(DISTINCT s.id) AS session_count,
-          COALESCE(SUM(c.input_tokens), 0) AS input_tokens,
-          COALESCE(SUM(c.output_tokens), 0) AS output_tokens,
-          COALESCE(SUM(c.thinking_tokens), 0) AS thinking_tokens,
-          COALESCE(SUM(c.input_tokens + c.output_tokens + c.thinking_tokens), 0) AS total_tokens,
-          ROUND(AVG(c.duration_ms)) AS avg_duration_ms
-        FROM chat_sessions s
-        LEFT JOIN llm_calls c ON c.session_id = s.id
-        WHERE s.user_id = $1
-          AND ($2::timestamptz IS NULL OR c.created_at >= $2::timestamptz)
+          COUNT(*) AS call_count,
+          COUNT(DISTINCT session_id) AS session_count,
+          COALESCE(SUM(input_tokens), 0) AS input_tokens,
+          COALESCE(SUM(output_tokens), 0) AS output_tokens,
+          COALESCE(SUM(thinking_tokens), 0) AS thinking_tokens,
+          COALESCE(SUM(input_tokens + output_tokens + thinking_tokens), 0) AS total_tokens,
+          ROUND(AVG(duration_ms)) AS avg_duration_ms
+        FROM usage_events
       `,
       [userId, since],
     )) as UsageTotalsRow[];
@@ -77,19 +77,19 @@ export class LlmCallRepository extends DefaultCrudRepository<
   async usageDaily(userId: number, since: string | null): Promise<DailyUsageRow[]> {
     return (await this.dataSource.execute(
       `
+        WITH usage_events AS (
+          ${usageEventsSql()}
+        )
         SELECT
-          to_char(date_trunc('day', c.created_at), 'YYYY-MM-DD') AS day,
-          COALESCE(SUM(c.input_tokens), 0) AS input_tokens,
-          COALESCE(SUM(c.output_tokens), 0) AS output_tokens,
-          COALESCE(SUM(c.thinking_tokens), 0) AS thinking_tokens,
-          COALESCE(SUM(c.input_tokens + c.output_tokens + c.thinking_tokens), 0) AS total_tokens,
-          COUNT(c.id) AS call_count
-        FROM llm_calls c
-        JOIN chat_sessions s ON s.id = c.session_id
-        WHERE s.user_id = $1
-          AND ($2::timestamptz IS NULL OR c.created_at >= $2::timestamptz)
-        GROUP BY date_trunc('day', c.created_at)
-        ORDER BY date_trunc('day', c.created_at) ASC
+          to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day,
+          COALESCE(SUM(input_tokens), 0) AS input_tokens,
+          COALESCE(SUM(output_tokens), 0) AS output_tokens,
+          COALESCE(SUM(thinking_tokens), 0) AS thinking_tokens,
+          COALESCE(SUM(input_tokens + output_tokens + thinking_tokens), 0) AS total_tokens,
+          COUNT(*) AS call_count
+        FROM usage_events
+        GROUP BY date_trunc('day', created_at)
+        ORDER BY date_trunc('day', created_at) ASC
       `,
       [userId, since],
     )) as DailyUsageRow[];
@@ -98,19 +98,20 @@ export class LlmCallRepository extends DefaultCrudRepository<
   async usageTopSessions(userId: number, since: string | null): Promise<SessionUsageRow[]> {
     return (await this.dataSource.execute(
       `
+        WITH usage_events AS (
+          ${usageEventsSql()}
+        )
         SELECT
           s.id AS session_id,
           s.title,
           s.updated_at,
-          COUNT(c.id) AS call_count,
-          COALESCE(SUM(c.input_tokens), 0) AS input_tokens,
-          COALESCE(SUM(c.output_tokens), 0) AS output_tokens,
-          COALESCE(SUM(c.thinking_tokens), 0) AS thinking_tokens,
-          COALESCE(SUM(c.input_tokens + c.output_tokens + c.thinking_tokens), 0) AS total_tokens
-        FROM chat_sessions s
-        JOIN llm_calls c ON c.session_id = s.id
-        WHERE s.user_id = $1
-          AND ($2::timestamptz IS NULL OR c.created_at >= $2::timestamptz)
+          COUNT(e.id) AS call_count,
+          COALESCE(SUM(e.input_tokens), 0) AS input_tokens,
+          COALESCE(SUM(e.output_tokens), 0) AS output_tokens,
+          COALESCE(SUM(e.thinking_tokens), 0) AS thinking_tokens,
+          COALESCE(SUM(e.input_tokens + e.output_tokens + e.thinking_tokens), 0) AS total_tokens
+        FROM usage_events e
+        JOIN chat_sessions s ON s.id = e.session_id
         GROUP BY s.id
         ORDER BY total_tokens DESC, s.updated_at DESC
         LIMIT 10
@@ -122,19 +123,61 @@ export class LlmCallRepository extends DefaultCrudRepository<
   async usageByModel(userId: number, since: string | null): Promise<ModelUsageRow[]> {
     return (await this.dataSource.execute(
       `
+        WITH usage_events AS (
+          ${usageEventsSql()}
+        )
         SELECT
-          c.provider,
-          c.model,
-          COUNT(c.id) AS call_count,
-          COALESCE(SUM(c.input_tokens + c.output_tokens + c.thinking_tokens), 0) AS total_tokens
-        FROM llm_calls c
-        JOIN chat_sessions s ON s.id = c.session_id
-        WHERE s.user_id = $1
-          AND ($2::timestamptz IS NULL OR c.created_at >= $2::timestamptz)
-        GROUP BY c.provider, c.model
+          provider,
+          model,
+          COUNT(*) AS call_count,
+          COALESCE(SUM(input_tokens + output_tokens + thinking_tokens), 0) AS total_tokens
+        FROM usage_events
+        GROUP BY provider, model
         ORDER BY total_tokens DESC
       `,
       [userId, since],
     )) as ModelUsageRow[];
   }
+}
+
+function usageEventsSql(): string {
+  return `
+    SELECT
+      c.id,
+      c.message_id,
+      c.session_id,
+      c.provider,
+      c.model,
+      c.input_tokens,
+      c.output_tokens,
+      c.thinking_tokens,
+      c.duration_ms,
+      c.created_at
+    FROM llm_calls c
+    JOIN chat_sessions s ON s.id = c.session_id
+    WHERE s.user_id = $1
+      AND ($2::timestamptz IS NULL OR c.created_at >= $2::timestamptz)
+
+    UNION ALL
+
+    SELECT
+      -m.id AS id,
+      m.id AS message_id,
+      m.session_id,
+      'chat' AS provider,
+      COALESCE(s.model, 'estimated') AS model,
+      0 AS input_tokens,
+      GREATEST(1, CEIL(char_length(m.content)::numeric / 4))::integer AS output_tokens,
+      0 AS thinking_tokens,
+      NULL::integer AS duration_ms,
+      COALESCE(m.updated_at, m.created_at) AS created_at
+    FROM chat_messages m
+    JOIN chat_sessions s ON s.id = m.session_id
+    LEFT JOIN llm_calls c ON c.message_id = m.id
+    WHERE s.user_id = $1
+      AND m.role = 'assistant'
+      AND m.status = 'completed'
+      AND c.id IS NULL
+      AND ($2::timestamptz IS NULL OR COALESCE(m.updated_at, m.created_at) >= $2::timestamptz)
+  `;
 }

@@ -5,7 +5,7 @@ import os
 from typing import AsyncIterator
 
 from google.genai import Client as GenAIClient
-from google.genai.types import Content, HttpOptions, Part
+from google.genai.types import Content, Part
 from fs_explorer_shared.google_genai import build_genai_client
 
 from .base import ChatTurn, LLMUsage, SchemaT
@@ -48,7 +48,6 @@ class GeminiLLMClient:
         else:
             self.raw_client = build_genai_client(
                 api_key=api_key,
-                http_options=HttpOptions(api_version="v1beta"),
             )
         self._last_stream_usage: LLMUsage | None = None
 

@@ -13,9 +13,15 @@ class _FakeClient:
         self.__class__.calls.append(kwargs)
 
 
+class _FakeHttpOptions:
+    def __init__(self, *, api_version: str) -> None:
+        self.api_version = api_version
+
+
 def test_service_account_json_builds_vertex_client(monkeypatch) -> None:
     _FakeClient.calls.clear()
     monkeypatch.setattr("google.genai.Client", _FakeClient)
+    monkeypatch.setattr("google.genai.types.HttpOptions", _FakeHttpOptions)
     monkeypatch.setattr(
         google_genai,
         "_load_service_account_credentials_json",
@@ -137,6 +143,7 @@ def test_normalize_private_key_leaves_real_newlines_untouched() -> None:
 def test_api_key_fallback_builds_developer_client(monkeypatch) -> None:
     _FakeClient.calls.clear()
     monkeypatch.setattr("google.genai.Client", _FakeClient)
+    monkeypatch.setattr("google.genai.types.HttpOptions", _FakeHttpOptions)
     monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
     monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", raising=False)
     monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
@@ -145,4 +152,8 @@ def test_api_key_fallback_builds_developer_client(monkeypatch) -> None:
     client = google_genai.build_genai_client()
 
     assert isinstance(client, _FakeClient)
-    assert _FakeClient.calls == [{"api_key": "test-key", "http_options": None}]
+    assert len(_FakeClient.calls) == 1
+    call = _FakeClient.calls[0]
+    assert call["api_key"] == "test-key"
+    assert isinstance(call["http_options"], _FakeHttpOptions)
+    assert call["http_options"].api_version == "v1beta"

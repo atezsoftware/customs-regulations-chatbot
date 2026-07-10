@@ -64,6 +64,32 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+is_local_host() {
+  case "${1:-}" in
+    ""|localhost|127.0.0.1|::1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolved_db_host() {
+  if [[ -n "${DB_HOST:-}" ]]; then
+    printf '%s\n' "$DB_HOST"
+    return
+  fi
+
+  if [[ -n "${DATABASE_URL:-}" ]]; then
+    local after_scheme="${DATABASE_URL#*://}"
+    local after_creds="${after_scheme#*@}"
+    printf '%s\n' "${after_creds%%[:/?]*}"
+  fi
+}
+
+database_is_remote() {
+  local host
+  host="$(resolved_db_host)"
+  [[ -n "$host" ]] && ! is_local_host "$host"
+}
+
 load_env() {
   local root_env="$ROOT_DIR/.env.$ENVIRONMENT"
   local db_env="$ROOT_DIR/db/.env.$ENVIRONMENT"
@@ -95,6 +121,22 @@ run_migrations() {
     return
   fi
 
+  load_env
+  if database_is_remote; then
+    if [[ -z "${DATABASE_URL:-}" ]]; then
+      echo "Remote DB is configured, but DATABASE_URL is empty." >&2
+      exit 1
+    fi
+    echo "==> [db:$ENVIRONMENT] running migrations against remote Postgres ($(resolved_db_host))"
+    (
+      cd "$ROOT_DIR/db"
+      [[ -d node_modules ]] || npm install
+      npm run migrate:up
+    )
+    MIGRATIONS_RAN=1
+    return
+  fi
+
   local env_file="$ROOT_DIR/db/.env.$ENVIRONMENT"
   if [[ ! -f "$env_file" ]]; then
     echo "Missing $env_file. Copy db/.env.$ENVIRONMENT.example to $env_file and fill it in." >&2
@@ -114,6 +156,13 @@ run_migrations() {
 }
 
 run_db() {
+  load_env
+  if database_is_remote; then
+    echo "==> [db:$ENVIRONMENT] remote Postgres configured ($(resolved_db_host)); skipping local docker postgres."
+    run_migrations
+    return
+  fi
+
   echo "==> [db:$ENVIRONMENT] starting Postgres via docker compose"
   local env_file="$ROOT_DIR/db/.env.$ENVIRONMENT"
   if [[ ! -f "$env_file" ]]; then
