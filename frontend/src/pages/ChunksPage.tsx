@@ -198,10 +198,11 @@ export function ChunksPage() {
                 </div>
               ) : chunkData && chunkData.chunks.length > 0 ? (
                 <div className="space-y-3">
-                  <div className="grid grid-cols-[88px_120px_160px_120px_1fr] gap-3 px-4 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  <div className="grid grid-cols-[72px_92px_220px_120px_92px_1fr] gap-3 px-4 text-xs font-semibold uppercase tracking-wide text-slate-400">
                     <span>Position</span>
                     <span>Type</span>
-                    <span>Chars</span>
+                    <span>Heading</span>
+                    <span>Status</span>
                     <span>Embedding</span>
                     <span>Preview</span>
                   </div>
@@ -241,6 +242,12 @@ function Metric({label, value}: {label: string; value: string}) {
   );
 }
 
+const STATUS_BADGE_CLASSES: Record<IndexedChunk['status'], string> = {
+  active: 'bg-emerald-50 text-emerald-700',
+  superseded: 'bg-amber-50 text-amber-700',
+  expired: 'bg-rose-50 text-rose-700',
+};
+
 function ChunkRow({
   chunk,
   open,
@@ -257,24 +264,44 @@ function ChunkRow({
     document_title: chunk.documentTitle,
     text: chunk.text,
     position: chunk.position,
-    start_char: chunk.startChar,
-    end_char: chunk.endChar,
     chunk_type: chunk.chunkType,
     metadata: chunk.metadata,
     has_embedding: chunk.hasEmbedding,
+    source: chunk.source,
+    status: chunk.status,
+    effective_start_date: chunk.effectiveStartDate,
+    effective_end_date: chunk.effectiveEndDate,
+    supersedes_chunk_id: chunk.supersedesChunkId,
+    superseded_by_chunk_id: chunk.supersededByChunkId,
   };
+  const validityRange =
+    chunk.effectiveStartDate || chunk.effectiveEndDate
+      ? `${chunk.effectiveStartDate ?? '...'} → ${chunk.effectiveEndDate ?? '...'}`
+      : null;
 
   return (
     <article className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-md">
       <button
         type="button"
         onClick={onToggle}
-        className="grid w-full grid-cols-[88px_120px_160px_120px_1fr] gap-3 px-4 py-3 text-left"
+        className="grid w-full grid-cols-[72px_92px_220px_120px_92px_1fr] gap-3 px-4 py-3 text-left"
       >
         <span className="text-sm font-semibold text-slate-800">#{chunk.position}</span>
         <span className="truncate text-sm text-slate-600">{chunk.chunkType ?? 'text'}</span>
-        <span className="text-sm text-slate-500">
-          {chunk.startChar}-{chunk.endChar}
+        <span className="truncate text-sm text-slate-500" title={chunk.headingPath.join(' › ')}>
+          {chunk.headingPath.length > 0 ? chunk.headingPath.join(' › ') : '—'}
+        </span>
+        <span className="min-w-0">
+          <span
+            className={`w-fit rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_BADGE_CLASSES[chunk.status]}`}
+          >
+            {chunk.status}
+          </span>
+          {validityRange && (
+            <span className="mt-0.5 block truncate text-[11px] text-slate-400">
+              {validityRange}
+            </span>
+          )}
         </span>
         <span
           className={`w-fit rounded-full px-2 py-0.5 text-xs font-medium ${

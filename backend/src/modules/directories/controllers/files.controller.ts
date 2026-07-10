@@ -99,11 +99,18 @@ export class FilesController {
         documentTitle: displayTitle(chunk.absolute_path || file.originalName),
         text: chunk.text,
         position: Number(chunk.position),
-        startChar: Number(chunk.start_char),
-        endChar: Number(chunk.end_char),
         chunkType: chunk.chunk_type,
+        headingPath: Array.isArray(chunk.metadata.heading_path)
+          ? (chunk.metadata.heading_path as string[])
+          : [],
         metadata: chunk.metadata,
         hasEmbedding: Boolean(chunk.has_embedding),
+        source: chunk.source,
+        status: chunk.status,
+        effectiveStartDate: chunk.effective_start_date,
+        effectiveEndDate: chunk.effective_end_date,
+        supersedesChunkId: chunk.supersedes_chunk_id,
+        supersededByChunkId: chunk.superseded_by_chunk_id,
       })),
     };
   }

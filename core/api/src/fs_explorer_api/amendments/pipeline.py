@@ -87,12 +87,20 @@ async def analyze_amendment(
             reference_date=segmentation.reference_date,
         )
 
+        # Merge, don't replace: the LLM only returns the metadata fields it
+        # actually changed (`metadata_changes`), so fields it wasn't asked
+        # to touch — heading_path, document_date, etc. — survive by
+        # construction instead of depending on the model faithfully
+        # reproducing every unrelated key.
+        base_metadata = (old_chunk.get("metadata") or {}) if old_chunk else {}
+        merged_metadata = {**base_metadata, **draft.new_chunk.metadata_changes}
+
         new_chunk_draft: dict[str, Any] = {
             "document_id": target_document_id,
             "position": target_position,
             "text": draft.new_chunk.text,
             "chunk_type": draft.new_chunk.chunk_type,
-            "metadata": draft.new_chunk.metadata,
+            "metadata": merged_metadata,
             "effective_start_date": draft.dates.effective_start_date,
             "effective_end_date": draft.dates.effective_end_date,
         }

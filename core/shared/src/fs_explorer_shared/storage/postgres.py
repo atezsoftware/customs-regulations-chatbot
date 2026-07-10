@@ -566,7 +566,13 @@ class PostgresStorage:
                             SELECT 1
                             FROM core_chunk_embeddings e
                             WHERE e.chunk_id = c.id
-                        ) AS has_embedding
+                        ) AS has_embedding,
+                        c.source,
+                        c.status,
+                        c.effective_start_date::text,
+                        c.effective_end_date::text,
+                        c.supersedes_chunk_id,
+                        c.superseded_by_chunk_id
                     FROM core_corpora corpus
                     JOIN core_documents d ON d.corpus_id = corpus.id
                     JOIN core_chunks c ON c.document_id = d.id
@@ -601,6 +607,18 @@ class PostgresStorage:
                     "chunk_type": str(row[8]) if row[8] is not None else None,
                     "metadata": json.loads(str(row[9])) if row[9] is not None else {},
                     "has_embedding": bool(row[10]),
+                    "source": str(row[11]),
+                    "status": str(row[12]),
+                    "effective_start_date": str(row[13])
+                    if row[13] is not None
+                    else None,
+                    "effective_end_date": str(row[14]) if row[14] is not None else None,
+                    "supersedes_chunk_id": str(row[15])
+                    if row[15] is not None
+                    else None,
+                    "superseded_by_chunk_id": str(row[16])
+                    if row[16] is not None
+                    else None,
                 }
                 for row in rows
             ],

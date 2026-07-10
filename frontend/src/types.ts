@@ -60,11 +60,16 @@ export interface IndexedChunk {
   documentTitle: string;
   text: string;
   position: number;
-  startChar: number;
-  endChar: number;
   chunkType?: string | null;
+  headingPath: string[];
   metadata: Record<string, unknown>;
   hasEmbedding: boolean;
+  source: 'indexed' | 'amendment';
+  status: 'active' | 'superseded' | 'expired';
+  effectiveStartDate: string | null;
+  effectiveEndDate: string | null;
+  supersedesChunkId: string | null;
+  supersededByChunkId: string | null;
 }
 
 export interface FileChunksResponse {

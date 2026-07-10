@@ -59,19 +59,29 @@ class MatchResult(BaseModel):
 
 class ChunkFieldsDraft(BaseModel):
     """The amended chunk's content. The LLM has authority over every field
-    here, including any key inside `metadata`."""
+    here, including any key inside `metadata_changes`.
+
+    `metadata_changes` is a *patch*, not the full metadata dict — the
+    pipeline merges it onto the old chunk's metadata (`{**old, **changes}`)
+    rather than trusting the LLM to faithfully reproduce every unrelated
+    field (article_no, heading_path, document_date, ...) verbatim. A
+    structured-output model asked to copy a whole dict has no guarantee it
+    won't drop or alter fields it wasn't actually asked to change; asking
+    for only the diff removes that failure mode by construction.
+    """
 
     text: str = Field(description="Full amended chunk text")
     chunk_type: str | None = Field(
         default=None, description="Chunk type, e.g. 'paragraph', 'article', 'table'"
     )
-    metadata: dict[str, Any] = Field(
+    metadata_changes: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Full locator/metadata dict for the amended chunk (article_no, "
-            "heading_path, etc.) — carry over fields unaffected by the "
-            "amendment from the old chunk, and change only what the "
-            "amendment actually changes"
+            "ONLY the metadata fields this amendment actually changes (e.g. "
+            "article_no if the article was renumbered). Do NOT repeat "
+            "fields that stay the same — heading_path, document_date, etc. "
+            "are carried over automatically from the old chunk if omitted "
+            "here. Leave empty ({}) if nothing in metadata changes."
         ),
     )
 

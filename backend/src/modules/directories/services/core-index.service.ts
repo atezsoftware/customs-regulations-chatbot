@@ -365,11 +365,17 @@ export interface DocumentChunksResponse {
     absolute_path: string;
     text: string;
     position: number;
-    start_char: number;
-    end_char: number;
+    start_char: number | null;
+    end_char: number | null;
     chunk_type: string | null;
     metadata: Record<string, unknown>;
     has_embedding: boolean;
+    source: 'indexed' | 'amendment';
+    status: 'active' | 'superseded' | 'expired';
+    effective_start_date: string | null;
+    effective_end_date: string | null;
+    supersedes_chunk_id: string | null;
+    superseded_by_chunk_id: string | null;
   }>;
 }
 

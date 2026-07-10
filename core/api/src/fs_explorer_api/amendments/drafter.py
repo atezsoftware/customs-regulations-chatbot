@@ -21,10 +21,14 @@ new_chunk alanı için:
   kısmı değil, chunk'ın tamamını, değişiklik uygulanmış haliyle yaz).
 - `chunk_type`: genellikle eski chunk ile aynı kalır, değişikliğin doğası
   gerektirmedikçe değiştirme.
-- `metadata`: eski chunk'ın metadata alanlarını (varsa) koru, sadece talimatın
-  gerektirdiği alanları güncelle (örn. madde numarası değişiyorsa article_no). Eski
-  chunk yoksa (yeni madde ekleniyorsa), talimat metninden çıkarabildiğin alanları
-  doldur. metadata içindeki HERHANGİ bir alanı değiştirme yetkin var.
+- `metadata_changes`: SADECE değişen metadata alanlarını buraya yaz (örn. madde
+  numarası değişiyorsa sadece article_no). heading_path, document_date gibi
+  DEĞİŞMEYEN alanları BURAYA TEKRAR YAZMA — bunlar otomatik olarak eski chunk'tan
+  korunacak, sen sadece farkı belirtiyorsun. Hiçbir metadata alanı değişmiyorsa
+  boş obje ({}) döndür. Eski chunk yoksa (yeni madde ekleniyorsa), talimat
+  metninden çıkarabildiğin tüm alanları buraya doldur (bu durumda merge edilecek
+  eski bir metadata olmadığı için pratikte tam metadata'nın kendisi olur).
+  metadata içindeki HERHANGİ bir alanı değiştirme yetkin var.
 
 dates alanı için:
 - `effective_start_date`: bu yeni metnin YÜRÜRLÜĞE GİRDİĞİ tarih (YYYY-MM-DD).
