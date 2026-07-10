@@ -68,6 +68,7 @@ async def analyze_amendment(
                     ),
                 )
 
+        sibling_reference: dict[str, Any] | None = None
         if old_chunk is not None:
             target_document_id = str(old_chunk["document_id"])
             target_position = int(old_chunk["position"])
@@ -75,8 +76,15 @@ async def analyze_amendment(
             # New provision, no existing chunk to replace — attach it to the
             # same document as the strongest candidate (virtually always the
             # one document this gazette text is amending) and append it
-            # after that document's existing chunks.
+            # after that document's existing chunks. Give the LLM that
+            # candidate's own metadata as a reference so it can build a
+            # heading_path/article_no consistent with the rest of the
+            # document instead of leaving them empty — search
+            # (search_chunks_by_heading_trigram) and chat citation labels
+            # (backend's locatorForHit) both depend on these fields being
+            # populated, for amendment-created chunks same as indexed ones.
             target_document_id = candidates[0].doc_id
+            sibling_reference = candidates[0].metadata
             siblings = storage.list_document_chunks(doc_id=target_document_id)
             target_position = max((c["position"] for c in siblings), default=-1) + 1
 
@@ -84,6 +92,7 @@ async def analyze_amendment(
             llm,
             instruction=instruction,
             old_chunk=old_chunk,
+            sibling_reference=sibling_reference,
             reference_date=segmentation.reference_date,
         )
 

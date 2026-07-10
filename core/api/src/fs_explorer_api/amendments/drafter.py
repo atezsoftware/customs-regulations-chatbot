@@ -25,10 +25,20 @@ new_chunk alanı için:
   numarası değişiyorsa sadece article_no). heading_path, document_date gibi
   DEĞİŞMEYEN alanları BURAYA TEKRAR YAZMA — bunlar otomatik olarak eski chunk'tan
   korunacak, sen sadece farkı belirtiyorsun. Hiçbir metadata alanı değişmiyorsa
-  boş obje ({}) döndür. Eski chunk yoksa (yeni madde ekleniyorsa), talimat
-  metninden çıkarabildiğin tüm alanları buraya doldur (bu durumda merge edilecek
-  eski bir metadata olmadığı için pratikte tam metadata'nın kendisi olur).
-  metadata içindeki HERHANGİ bir alanı değiştirme yetkin var.
+  boş obje ({}) döndür. metadata içindeki HERHANGİ bir alanı değiştirme yetkin
+  var.
+
+  EĞER eski chunk YOKSA (bu tamamen yeni bir madde/hüküm ekliyor): merge
+  edilecek eski bir metadata olmadığı için `metadata_changes` pratikte TAM
+  metadata'nın kendisi olur — bu durumda sana "Aynı dokümandan örnek bir chunk"
+  (`sibling_reference`) verilecek. heading_path'i BOŞ BIRAKMA — sibling_reference'ın
+  heading_path'ini TEMEL AL (aynı BÖLÜM/KISIM/ana başlık seviyesinde kal, sadece
+  MADDE numarasını/başlığını yeni maddeye göre güncelle) ki arama ve alıntılama
+  (citation) bu yeni chunk için de doğru çalışsın. document_type, document_number
+  gibi diğer alanları da sibling_reference'tan uygun şekilde türet. article_no'yu
+  talimattan çıkarabiliyorsan (örn. "Madde 7 eklenmiştir") mutlaka doldur —
+  citation'lar öncelikle article_no'ya bakar, heading_path'e ancak o yoksa
+  bakar.
 
 dates alanı için:
 - `effective_start_date`: bu yeni metnin YÜRÜRLÜĞE GİRDİĞİ tarih (YYYY-MM-DD).
@@ -49,6 +59,7 @@ async def draft_new_chunk(
     *,
     instruction: AmendmentInstruction,
     old_chunk: dict[str, Any] | None,
+    sibling_reference: dict[str, Any] | None = None,
     reference_date: str | None,
 ) -> tuple[DraftResult, LLMUsage]:
     old_chunk_json = (
@@ -56,11 +67,18 @@ async def draft_new_chunk(
         if old_chunk is not None
         else "(yok — bu yeni bir madde/hüküm ekliyor)"
     )
+    sibling_json = (
+        json.dumps(sibling_reference, ensure_ascii=False, indent=2)
+        if sibling_reference is not None
+        else "(yok)"
+    )
     prompt = (
         f"Değişiklik talimatı:\n{instruction.instruction_text}\n\n"
         f"Referans/yayım tarihi: {reference_date or '(belirtilmemiş)'}\n\n"
         f"Doğal dil tarih ifadesi: {instruction.raw_date_phrase or '(yok)'}\n\n"
-        f"Eski chunk:\n{old_chunk_json}"
+        f"Eski chunk:\n{old_chunk_json}\n\n"
+        f"Aynı dokümandan örnek bir chunk (sibling_reference, sadece eski chunk "
+        f"yoksa heading_path/metadata konvansiyonu için kullan):\n{sibling_json}"
     )
     history = [ChatTurn(role="user", text=prompt)]
     return await llm.generate_structured(history, _SYSTEM_PROMPT, DraftResult)
