@@ -153,8 +153,16 @@ class StorageBackend(Protocol):
         corpus_id: str,
         query: str,
         limit: int = 5,
+        as_of_date: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search indexed chunks and return ranked matches."""
+        """Search indexed chunks and return ranked matches.
+
+        Only returns chunks whose validity interval
+        (`effective_start_date`/`effective_end_date`, either side may be
+        null/open-ended) covers `as_of_date` — defaults to today
+        (`CURRENT_DATE`) when not given, so a chunk scheduled to take effect
+        in the future is excluded from "what does the law say" queries
+        until its start date arrives."""
 
     def search_documents_by_metadata(
         self,
@@ -210,8 +218,11 @@ class StorageBackend(Protocol):
         corpus_id: str,
         query_embedding: list[float],
         limit: int = 5,
+        as_of_date: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search chunks by cosine similarity against a query embedding."""
+        """Search chunks by cosine similarity against a query embedding.
+
+        Same `as_of_date` validity-interval filtering as `search_chunks`."""
 
     def search_chunks_trigram(
         self,

@@ -52,7 +52,10 @@ class IndexedQueryEngine:
         limit: int = 5,
         enable_semantic: bool = True,
         enable_metadata: bool = True,
+        as_of_date: str | None = None,
     ) -> list[SearchHit]:
+        """`as_of_date` (YYYY-MM-DD) restricts chunk results to those whose
+        validity interval covers that date — omit it to mean "today"."""
         normalized_limit = max(limit, 1)
         parsed_filters = self._parse_filters(corpus_id=corpus_id, filters=filters)
         semantic_limit = max(normalized_limit * 4, normalized_limit)
@@ -70,12 +73,14 @@ class IndexedQueryEngine:
                 metadata_filters=parsed_filters,
                 semantic_limit=semantic_limit,
                 metadata_limit=metadata_limit,
+                as_of_date=as_of_date,
             )
         elif run_semantic:
             semantic_rows = self._semantic_query(
                 corpus_id=corpus_id,
                 query=query,
                 limit=semantic_limit,
+                as_of_date=as_of_date,
             )
             metadata_rows = []
         elif run_metadata:
@@ -142,6 +147,7 @@ class IndexedQueryEngine:
         metadata_filters: list[MetadataFilter],
         semantic_limit: int,
         metadata_limit: int,
+        as_of_date: str | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         with ThreadPoolExecutor(max_workers=2) as executor:
             semantic_future = executor.submit(
@@ -149,6 +155,7 @@ class IndexedQueryEngine:
                 corpus_id=corpus_id,
                 query=query,
                 limit=semantic_limit,
+                as_of_date=as_of_date,
             )
             metadata_future = executor.submit(
                 self._metadata_query,
@@ -166,6 +173,7 @@ class IndexedQueryEngine:
         corpus_id: str,
         query: str,
         limit: int,
+        as_of_date: str | None = None,
     ) -> list[dict[str, Any]]:
         if self.embedding_provider is not None and self.storage.has_embeddings(
             corpus_id=corpus_id
@@ -175,8 +183,11 @@ class IndexedQueryEngine:
                 corpus_id=corpus_id,
                 query_embedding=query_embedding,
                 limit=limit,
+                as_of_date=as_of_date,
             )
-        return self.storage.search_chunks(corpus_id=corpus_id, query=query, limit=limit)
+        return self.storage.search_chunks(
+            corpus_id=corpus_id, query=query, limit=limit, as_of_date=as_of_date
+        )
 
     def _metadata_query(
         self,

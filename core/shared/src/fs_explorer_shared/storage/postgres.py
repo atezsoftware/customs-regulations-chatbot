@@ -378,6 +378,7 @@ class PostgresStorage:
         corpus_id: str,
         query: str,
         limit: int = 5,
+        as_of_date: str | None = None,
     ) -> list[dict[str, Any]]:
         terms = _query_terms(query)
         if not terms:
@@ -404,12 +405,16 @@ class PostgresStorage:
                 WHERE d.corpus_id = %s
                   AND d.is_deleted = false
                   AND c.status = 'active'
+                  AND (c.effective_start_date IS NULL
+                       OR c.effective_start_date <= COALESCE(%s::date, CURRENT_DATE))
+                  AND (c.effective_end_date IS NULL
+                       OR c.effective_end_date >= COALESCE(%s::date, CURRENT_DATE))
             ) ranked
             WHERE score > 0
             ORDER BY score DESC, relative_path ASC, position ASC
             LIMIT %s
         """
-        params: list[Any] = [*terms, corpus_id, limit]
+        params: list[Any] = [*terms, corpus_id, as_of_date, as_of_date, limit]
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
@@ -805,6 +810,7 @@ class PostgresStorage:
         corpus_id: str,
         query_embedding: list[float],
         limit: int = 5,
+        as_of_date: str | None = None,
     ) -> list[dict[str, Any]]:
         sql = """
             SELECT
@@ -823,13 +829,27 @@ class PostgresStorage:
             WHERE ce.corpus_id = %s
               AND d.is_deleted = false
               AND c.status = 'active'
+              AND (c.effective_start_date IS NULL
+                   OR c.effective_start_date <= COALESCE(%s::date, CURRENT_DATE))
+              AND (c.effective_end_date IS NULL
+                   OR c.effective_end_date >= COALESCE(%s::date, CURRENT_DATE))
             ORDER BY ce.embedding <=> %s::vector ASC
             LIMIT %s
         """
         vector_literal = _vector_literal(query_embedding)
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (vector_literal, corpus_id, vector_literal, limit))
+                cur.execute(
+                    sql,
+                    (
+                        vector_literal,
+                        corpus_id,
+                        as_of_date,
+                        as_of_date,
+                        vector_literal,
+                        limit,
+                    ),
+                )
                 rows = cur.fetchall()
         return [self._row_to_search_hit(row) for row in rows]
 

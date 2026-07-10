@@ -74,6 +74,7 @@ class SearchRequest(BaseModel):
     filters: str | None = None
     limit: int = 5
     database_url: str | None = None
+    as_of_date: str | None = None
 
 
 def _format_conversation_context(raw_context: Any) -> str:
@@ -280,6 +281,7 @@ async def search_index(request: SearchRequest):
             query=request.query,
             filters=request.filters,
             limit=request.limit,
+            as_of_date=request.as_of_date,
         )
         storage.close()
 

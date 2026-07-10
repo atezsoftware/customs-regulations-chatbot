@@ -641,8 +641,19 @@ def _indexed_glob_paths(directory: str, pattern: str) -> str:
     return "No matches found in indexed documents"
 
 
-def semantic_search(query: str, filters: str | None = None, limit: int = 5) -> str:
-    """Search indexed chunks and return ranked excerpts."""
+def semantic_search(
+    query: str,
+    filters: str | None = None,
+    limit: int = 5,
+    as_of_date: str | None = None,
+) -> str:
+    """Search indexed chunks and return ranked excerpts.
+
+    `as_of_date` (YYYY-MM-DD) restricts results to chunks whose validity
+    interval covers that date — pass it whenever the user's question refers
+    to a specific date/time period. Omit it (defaults to today) for
+    "what's the current rule" questions.
+    """
     storage, corpora, error = _get_index_storage_and_corpora()
     if error:
         return error
@@ -660,6 +671,7 @@ def semantic_search(query: str, filters: str | None = None, limit: int = 5) -> s
                     limit=limit,
                     enable_semantic=_ENABLE_SEMANTIC,
                     enable_metadata=_ENABLE_METADATA,
+                    as_of_date=as_of_date,
                 )
             )
         hits.sort(key=lambda hit: hit.score, reverse=True)
@@ -680,6 +692,8 @@ def semantic_search(query: str, filters: str | None = None, limit: int = 5) -> s
     ]
     if filters:
         lines.append(f"Filters: {filters}")
+    if as_of_date:
+        lines.append(f"As of date: {as_of_date}")
     lines.append("")
     for idx, hit in enumerate(hits, start=1):
         position = hit.position if hit.position is not None else "<metadata>"
@@ -838,7 +852,7 @@ You are FsExplorer, an AI agent that answers questions about indexed documents.
 | `read` | Read indexed chunk text for a document | `file_path` |
 | `grep` | Search regex pattern in indexed chunk text | `file_path`, `pattern` |
 | `glob` | Find indexed document paths matching a pattern | `directory`, `pattern` |
-| `semantic_search` | Search indexed chunks and metadata-filtered docs, then union/rank results | `query`, `filters`, `limit` |
+| `semantic_search` | Search indexed chunks and metadata-filtered docs, then union/rank results | `query`, `filters`, `limit`, `as_of_date` |
 | `get_document` | Read full indexed document by document id | `doc_id` |
 | `list_indexed_documents` | List indexed documents for active corpus | none |
 
@@ -857,6 +871,26 @@ Filter syntax for `semantic_search(filters=...)`:
 - `field in (a, b, c)`
 - `field~substring`
 - combine conditions with comma or `and`
+
+## Time-Sensitive Questions: `semantic_search(as_of_date=...)`
+
+Regulations change over time. Every indexed chunk has a validity interval
+(when it started/stopped being in force); `semantic_search` only returns
+chunks whose interval covers `as_of_date` (defaults to **today** when
+omitted, so ordinary questions automatically get only what's currently in
+force — amended-away or not-yet-effective text is excluded without you
+doing anything).
+
+- If the user's question references a specific date or period (e.g. "2023
+  yılında", "1 Ocak 2027'den itibaren", "geçen yıl", "o zamanki kural neydi"),
+  extract that date, convert it to `YYYY-MM-DD`, and pass it as
+  `semantic_search(query=..., as_of_date="YYYY-MM-DD")`.
+- If the question is about "the current rule" / "now" / doesn't mention a
+  date at all, omit `as_of_date` entirely — do not pass today's date
+  explicitly, just leave it out.
+- If comparing two points in time ("X, Y'ye göre nasıl değişti"), call
+  `semantic_search` twice, once per `as_of_date`, and compare the results
+  in your answer.
 
 ## Three-Phase Document Exploration Strategy
 
