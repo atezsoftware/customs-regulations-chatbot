@@ -40,6 +40,12 @@ export interface ModelUsageRow {
   total_tokens: number | string;
 }
 
+export interface SessionTotalRow {
+  session_id: number | string;
+  total_tokens: number | string;
+  call_count: number | string;
+}
+
 export class LlmCallRepository extends DefaultCrudRepository<
   LlmCall,
   typeof LlmCall.prototype.id,
@@ -131,6 +137,28 @@ export class LlmCallRepository extends DefaultCrudRepository<
       `,
       [userId, since],
     )) as SessionUsageRow[];
+  }
+
+  /**
+   * All-time total tokens per session for every one of a user's sessions
+   * (not just a top-10 leaderboard) — one batched query so the session
+   * list/sidebar can show a per-chat total without an N+1 query per row.
+   */
+  async usageTotalsPerSession(userId: number): Promise<SessionTotalRow[]> {
+    return (await this.dataSource.execute(
+      `
+        WITH usage_events AS (
+          ${usageEventsSql()}
+        )
+        SELECT
+          session_id,
+          COALESCE(SUM(input_tokens + output_tokens + thinking_tokens), 0) AS total_tokens,
+          COUNT(*) AS call_count
+        FROM usage_events
+        GROUP BY session_id
+      `,
+      [userId, null],
+    )) as SessionTotalRow[];
   }
 
   async usageByModel(userId: number, since: string | null): Promise<ModelUsageRow[]> {

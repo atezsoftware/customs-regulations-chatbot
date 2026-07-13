@@ -125,6 +125,24 @@ class TestTokenUsage:
         assert usage.total_tokens == 150
         assert usage.api_calls == 1
 
+    def test_context_usage_ratio_uses_last_call_not_cumulative_sum(self) -> None:
+        """A multi-step run's prompt_tokens sums every call (correct for
+        billing), but context_usage_ratio must reflect only the size of
+        the most recent request — not that inflated running total, which
+        for a several-step run can overshoot the real context usage by
+        multiple times over."""
+        usage = TokenUsage()
+        usage.add_api_call(prompt_tokens=20_000, completion_tokens=100)
+        usage.add_api_call(prompt_tokens=50_000, completion_tokens=100)
+        usage.add_api_call(prompt_tokens=110_000, completion_tokens=100)
+
+        assert usage.prompt_tokens == 180_000  # cumulative, for cost/billing
+        assert usage.last_prompt_tokens == 110_000  # current history size
+
+        ratio = usage.context_usage_ratio(GEMINI_MAX_CONTEXT_TOKENS)
+        assert ratio == pytest.approx(110_000 / GEMINI_MAX_CONTEXT_TOKENS)
+        assert ratio < 0.15
+
     def test_add_tool_result_parse_file(self) -> None:
         """Test tracking parse_file tool usage."""
         usage = TokenUsage()

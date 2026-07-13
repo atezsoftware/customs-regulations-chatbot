@@ -17,6 +17,9 @@ export class ChatSession extends Entity {
   @property({type: 'number'})
   temperature?: number;
 
+  @property({type: 'number', postgresql: {columnName: 'last_context_usage_ratio'}})
+  lastContextUsageRatio?: number;
+
   @property({type: 'date', postgresql: {columnName: 'created_at'}})
   createdAt?: string;
 

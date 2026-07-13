@@ -5,7 +5,7 @@ import {getCurrentUser} from '../../../common/auth';
 import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../../directories/repositories';
 import {toSafeDirectory, toSafeFile} from '../../directories/transformers';
-import {ChatSessionDirectoryRepository, ChatSessionRepository} from '../repositories';
+import {ChatSessionDirectoryRepository, ChatSessionRepository, LlmCallRepository} from '../repositories';
 
 interface SessionBody {
   title?: string;
@@ -15,8 +15,24 @@ interface SetDirectoriesBody {
   directoryIds: number[];
 }
 
-function toSafeSession(session: {id?: number; title?: string; createdAt?: string; updatedAt?: string}) {
-  return {id: session.id, title: session.title, createdAt: session.createdAt, updatedAt: session.updatedAt};
+function toSafeSession(
+  session: {
+    id?: number;
+    title?: string;
+    createdAt?: string;
+    updatedAt?: string;
+    lastContextUsageRatio?: number;
+  },
+  totalTokens = 0,
+) {
+  return {
+    id: session.id,
+    title: session.title,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    totalTokens,
+    lastContextUsageRatio: session.lastContextUsageRatio ?? null,
+  };
 }
 
 export class ChatSessionsController {
@@ -28,6 +44,7 @@ export class ChatSessionsController {
     @repository(DirectoryFileRepository)
     private directoryFileRepository: DirectoryFileRepository,
     @repository(UserRepository) private userRepository: UserRepository,
+    @repository(LlmCallRepository) private llmCallRepository: LlmCallRepository,
     @inject(RestBindings.Http.REQUEST) private request: Request,
   ) {}
 
@@ -56,11 +73,17 @@ export class ChatSessionsController {
   @response(200, {description: 'List chat sessions for the current user'})
   async list() {
     const user = await getCurrentUser(this.request, this.userRepository);
-    const sessions = await this.chatSessionRepository.find({
-      where: {userId: user.id},
-      order: ['createdAt DESC'],
-    });
-    return sessions.map(toSafeSession);
+    const [sessions, usageRows] = await Promise.all([
+      this.chatSessionRepository.find({
+        where: {userId: user.id},
+        order: ['createdAt DESC'],
+      }),
+      this.llmCallRepository.usageTotalsPerSession(user.id),
+    ]);
+    const totalTokensBySession = new Map(
+      usageRows.map(row => [Number(row.session_id), Number(row.total_tokens)]),
+    );
+    return sessions.map(session => toSafeSession(session, totalTokensBySession.get(session.id ?? -1) ?? 0));
   }
 
   @patch('/chat-sessions/{id}')

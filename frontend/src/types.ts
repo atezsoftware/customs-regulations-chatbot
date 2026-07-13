@@ -90,6 +90,10 @@ export interface ChatSession {
   temperature?: number;
   createdAt?: string;
   updatedAt?: string;
+  /** All-time sum of input+output+thinking tokens across this session's LLM calls. */
+  totalTokens?: number;
+  /** Fraction (0-1) of the model's context window used by the most recent turn's last call, or null if no turn has completed yet. */
+  lastContextUsageRatio?: number | null;
 }
 
 export interface SessionFile extends DirectoryFile {

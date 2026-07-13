@@ -84,6 +84,14 @@ class TokenUsage:
     total_tokens: int = 0
     api_calls: int = 0
 
+    # `prompt_tokens` above is a running SUM across every call so far — a
+    # correct "tokens billed this turn" figure (every call really is
+    # billed for the full history it resends), but NOT the current size of
+    # the chat history, since it adds up an increasing sequence rather
+    # than reporting its last value. `last_prompt_tokens` is that last
+    # value, and is what context-window-fill checks must use instead.
+    last_prompt_tokens: int = 0
+
     # Track content sizes
     tool_result_chars: int = 0
     documents_parsed: int = 0
@@ -105,6 +113,7 @@ class TokenUsage:
         self.thinking_tokens += thinking_tokens
         self.total_tokens += prompt_tokens + completion_tokens + thinking_tokens
         self.api_calls += 1
+        self.last_prompt_tokens = prompt_tokens
 
     def add_tool_result(self, result: str, tool_name: str) -> None:
         """Record metrics from a tool execution."""
@@ -128,16 +137,18 @@ class TokenUsage:
         return input_cost, output_cost, input_cost + output_cost
 
     def context_usage_ratio(self, max_context_tokens: int) -> float:
-        """Fraction of the model's context window the last prompt likely used.
+        """Fraction of the model's context window the last call actually used.
 
-        `prompt_tokens` is a running total across every call so far, not the
-        size of any single request, but since each call resends the full
-        chat history it also approximates "how big is the history right
-        now" — good enough for a warning threshold, not for billing.
+        Uses `last_prompt_tokens` (the size of the most recent request), not
+        the cumulative `prompt_tokens` total — the latter sums every call
+        made so far, so for a multi-step run it overshoots the model's
+        actual context window usage by a wide margin (e.g. a 7-step run
+        whose history grows from ~20K to ~110K tokens sums to nearly
+        400K, even though no single request ever exceeded ~110K).
         """
         if max_context_tokens <= 0:
             return 0.0
-        return self.prompt_tokens / max_context_tokens
+        return self.last_prompt_tokens / max_context_tokens
 
     def summary(self) -> str:
         """Generate a formatted summary of token usage and costs."""

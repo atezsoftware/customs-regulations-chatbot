@@ -4,6 +4,7 @@ import {ChatInput} from '../components/chat/ChatInput';
 import {ChatMessage} from '../components/chat/ChatMessage';
 import {EmptyState} from '../components/chat/EmptyState';
 import {DirectoryIndexStatusBadge} from '../components/DirectoryIndexStatusBadge';
+import {SessionUsageBadge} from '../components/chat/SessionUsageBadge';
 import {ChatSidebar} from '../components/ChatSidebar';
 import {LinkedDirectoriesPanel} from '../components/LinkedDirectoriesPanel';
 import {Spinner} from '../components/ui/Spinner';
@@ -246,6 +247,31 @@ export function ChatPage() {
             : message,
         ),
       );
+      // Session-level totals live only in the sessions list, not per
+      // message — update them from this turn's stats the same way the
+      // message's own usage footer just was, instead of waiting for a
+      // full session-list refetch to reflect the chat's new state.
+      const stats = event.stats;
+      const turnTotalTokens = Number(stats?.total_tokens);
+      const contextUsageRatio = stats?.context_usage_ratio;
+      if (Number.isFinite(turnTotalTokens) || typeof contextUsageRatio === 'number') {
+        setSessions(prev =>
+          prev.map(session =>
+            session.id === selectedId
+              ? {
+                  ...session,
+                  totalTokens: Number.isFinite(turnTotalTokens)
+                    ? (session.totalTokens ?? 0) + turnTotalTokens
+                    : session.totalTokens,
+                  lastContextUsageRatio:
+                    typeof contextUsageRatio === 'number'
+                      ? contextUsageRatio
+                      : session.lastContextUsageRatio,
+                }
+              : session,
+          ),
+        );
+      }
       return;
     }
 
@@ -372,6 +398,7 @@ export function ChatPage() {
                     <h1 className="text-xl font-semibold text-slate-900">
                       {selectedSession.title || 'Untitled chat'}
                     </h1>
+                    <SessionUsageBadge session={selectedSession} />
                     {streamError && (
                       <p className="mt-2 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-600">
                         {streamError}

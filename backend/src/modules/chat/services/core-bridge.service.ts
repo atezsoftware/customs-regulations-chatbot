@@ -391,6 +391,18 @@ export class CoreBridgeService {
             });
           }
 
+          // How full the context window was on this turn's last LLM call
+          // (0-1). Stored on the session (not derived from llm_calls) so
+          // the chat UI can show it without an extra aggregate query.
+          // Guarded on typeof rather than just `stats &&` so an older
+          // core-api that doesn't send this field yet leaves the
+          // session's existing value alone instead of zeroing it out.
+          if (stats && typeof stats.context_usage_ratio === 'number') {
+            await this.chatSessionRepository.updateById(input.sessionId, {
+              lastContextUsageRatio: decimalValue(stats.context_usage_ratio),
+            });
+          }
+
           if (error) throw new Error(error);
 
           finalContent = text(data.final_result, finalContent);
