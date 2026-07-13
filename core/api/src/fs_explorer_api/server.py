@@ -6,6 +6,7 @@ and serves the single-page HTML interface.
 """
 
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,13 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from .agent import clear_index_context, set_index_context, set_search_flags
+from .agent import (
+    GEMINI_MAX_CONTEXT_TOKENS,
+    LLMCallStats,
+    clear_index_context,
+    set_index_context,
+    set_search_flags,
+)
 from .amendments import (
     AnalyzeAmendmentRequest,
     AnalyzeAmendmentResponse,
@@ -46,10 +53,8 @@ from .workflow import (
     HumanAnswerEvent,
     InputEvent,
     ToolCallEvent,
-    get_agent,
-    reset_agent,
-    set_agent_llm_config,
-    workflow,
+    get_run_agent,
+    new_workflow,
 )
 
 app = FastAPI(title="FsExplorer", description="AI-powered filesystem exploration")
@@ -703,14 +708,39 @@ async def websocket_explore(websocket: WebSocket):
         task = _task_with_context(str(task), conversation_context)
         trace = ExplorationTrace(root_directory=str(folder_path))
 
-        # Reset agent for fresh state
-        reset_agent()
-        set_agent_llm_config(
-            model=model if isinstance(model, str) else None,
-            temperature=float(temperature)
-            if isinstance(temperature, (int, float))
-            else None,
+        resolved_model = model if isinstance(model, str) else None
+        resolved_temperature = (
+            float(temperature) if isinstance(temperature, (int, float)) else None
         )
+
+        # Per-LLM-call token/timing observability. The hook runs inside the
+        # workflow's internal worker tasks, not this handler's own task, so
+        # it must not call websocket.send_json directly (concurrent writes
+        # to the same socket from multiple tasks aren't safe) — it just
+        # appends, and _flush_llm_calls() (called from this task only)
+        # drains and sends them.
+        run_started_at = time.monotonic()
+        pending_llm_calls: list[LLMCallStats] = []
+
+        async def _collect_llm_call(stats: LLMCallStats) -> None:
+            pending_llm_calls.append(stats)
+
+        async def _flush_llm_calls() -> None:
+            while pending_llm_calls:
+                stats = pending_llm_calls.pop(0)
+                await websocket.send_json(
+                    {
+                        "type": "llm_call",
+                        "data": {
+                            "purpose": stats.purpose,
+                            "model": stats.model,
+                            "prompt_tokens": stats.prompt_tokens,
+                            "completion_tokens": stats.completion_tokens,
+                            "thinking_tokens": stats.thinking_tokens,
+                            "duration_ms": round(stats.duration_ms),
+                        },
+                    }
+                )
 
         # Send start event
         await websocket.send_json(
@@ -733,9 +763,21 @@ async def websocket_explore(websocket: WebSocket):
             }
         )
 
-        # Run the workflow
+        # Run the workflow. Each connection gets its own workflow instance,
+        # ResourceManager, and explicitly-constructed agent (model/
+        # temperature/hook passed directly, not via module globals — see
+        # new_workflow()'s docstring for why that matters under concurrent
+        # requests). `resource_manager` is kept so the agent this run
+        # actually used can be retrieved after `await handler` via
+        # get_run_agent() — a bare get_agent() call at that point would
+        # return a different, empty agent (see get_run_agent()'s docstring).
         step_number = 0
-        handler = workflow.run(
+        run_workflow, resource_manager = new_workflow(
+            model=resolved_model,
+            temperature=resolved_temperature,
+            on_llm_call=_collect_llm_call,
+        )
+        handler = run_workflow.run(
             start_event=InputEvent(
                 task=task,
                 folder=str(folder_path),
@@ -746,6 +788,7 @@ async def websocket_explore(websocket: WebSocket):
         )
 
         async for event in handler.stream_events():
+            await _flush_llm_calls()
             if isinstance(event, ToolCallEvent):
                 step_number += 1
                 resolved_document_path: str | None = None
@@ -824,6 +867,9 @@ async def websocket_explore(websocket: WebSocket):
 
         # Get final result
         result = await handler
+        # Catch the LLM call that produced the terminal StopAction — it
+        # isn't followed by another loop iteration to flush it.
+        await _flush_llm_calls()
 
         final_result = result.final_result or ""
         if not result.error:
@@ -838,12 +884,13 @@ async def websocket_explore(websocket: WebSocket):
             )
             await websocket.send_json({"type": "answer_start", "data": {}})
             streamed_parts: list[str] = []
-            agent = get_agent()
+            agent = get_run_agent(resource_manager)
             async for chunk in agent.stream_final_answer(fallback_answer=final_result):
                 streamed_parts.append(chunk)
                 await websocket.send_json(
                     {"type": "answer_delta", "data": {"text": chunk}}
                 )
+            await _flush_llm_calls()
             streamed_final = "".join(streamed_parts).strip()
             if streamed_final:
                 final_result = streamed_final
@@ -874,7 +921,7 @@ async def websocket_explore(websocket: WebSocket):
             cited_source_links = {}
 
         # Get token usage
-        agent = get_agent()
+        agent = get_run_agent(resource_manager)
         usage = agent.token_usage
         input_cost, output_cost, total_cost = usage._calculate_cost()
 
@@ -895,6 +942,14 @@ async def websocket_explore(websocket: WebSocket):
                         "total_tokens": usage.total_tokens,
                         "tool_result_chars": usage.tool_result_chars,
                         "estimated_cost": round(total_cost, 6),
+                        "context_summaries": usage.context_summaries,
+                        "model": getattr(agent._llm, "model", None),
+                        "duration_ms": round(
+                            (time.monotonic() - run_started_at) * 1000
+                        ),
+                        "context_usage_ratio": round(
+                            usage.context_usage_ratio(GEMINI_MAX_CONTEXT_TOKENS), 4
+                        ),
                     },
                     "trace": {
                         "step_path": trace.step_path,

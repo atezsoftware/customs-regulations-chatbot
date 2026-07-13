@@ -24,14 +24,13 @@ from fs_explorer_shared.index_config import resolve_database_url
 from fs_explorer_shared.storage import PostgresStorage
 from .agent import set_index_context, clear_index_context
 from .workflow import (
-    workflow,
     InputEvent,
     ToolCallEvent,
     GoDeeperEvent,
     AskHumanEvent,
     HumanAnswerEvent,
-    get_agent,
-    reset_agent,
+    get_run_agent,
+    new_workflow,
 )
 from .exploration_trace import ExplorationTrace, extract_cited_sources
 
@@ -280,15 +279,16 @@ async def run_workflow(
     set_index_context(resolved_folder, resolved_database_url)
 
     try:
-        # Reset agent for fresh state
-        reset_agent()
-
         # Print header
         print_workflow_header(console, task, resolved_folder)
         trace = ExplorationTrace(root_directory=resolved_folder)
 
         step_number = 0
-        handler = workflow.run(
+        # get_run_agent() (not get_agent()) is required to read back the
+        # agent this specific run used once it's done — see that
+        # function's docstring in workflow.py for why.
+        run_workflow, resource_manager = new_workflow()
+        handler = run_workflow.run(
             start_event=InputEvent(
                 task=task,
                 folder=resolved_folder,
@@ -410,7 +410,7 @@ async def run_workflow(
             console.print(error_panel)
 
         # Print workflow summary
-        agent = get_agent()
+        agent = get_run_agent(resource_manager)
         cited_sources = extract_cited_sources(result.final_result)
         print_workflow_summary(console, agent, step_number, trace, cited_sources)
     finally:

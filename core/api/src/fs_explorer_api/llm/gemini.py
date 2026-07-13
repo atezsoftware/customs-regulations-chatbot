@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from typing import AsyncIterator
 
 from google.genai import Client as GenAIClient
@@ -63,6 +64,7 @@ class GeminiLLMClient:
         system_prompt: str,
         schema: type[SchemaT],
     ) -> tuple[SchemaT, LLMUsage]:
+        started_at = time.monotonic()
         async with _llm_semaphore:
             response = await self.raw_client.aio.models.generate_content(
                 model=self.model,
@@ -74,8 +76,9 @@ class GeminiLLMClient:
                     **self._generation_config(),
                 },
             )
+        duration_ms = (time.monotonic() - started_at) * 1000
 
-        usage = LLMUsage()
+        usage = LLMUsage(duration_ms=duration_ms)
         if response.usage_metadata:
             usage = LLMUsage(
                 input_tokens=response.usage_metadata.prompt_token_count or 0,
@@ -84,6 +87,7 @@ class GeminiLLMClient:
                     response.usage_metadata, "thoughts_token_count", None
                 )
                 or 0,
+                duration_ms=duration_ms,
             )
 
         if response.text is None:
@@ -105,6 +109,7 @@ class GeminiLLMClient:
         output_tokens = 0
         thinking_tokens = 0
         saw_usage = False
+        started_at = time.monotonic()
 
         async with _llm_semaphore:
             async for chunk in stream_fn(
@@ -133,6 +138,7 @@ class GeminiLLMClient:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 thinking_tokens=thinking_tokens,
+                duration_ms=(time.monotonic() - started_at) * 1000,
             )
 
     def last_stream_usage(self) -> LLMUsage | None:

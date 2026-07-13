@@ -4,6 +4,7 @@ import {Button} from '../ui/Button';
 import {ResearchActivityPanel} from './ResearchActivityPanel';
 import {SourceList} from './SourceList';
 import {StreamingAnswer} from './StreamingAnswer';
+import {UsageFooter} from './UsageFooter';
 
 export function AssistantMessage({
   message,
@@ -40,6 +41,7 @@ export function AssistantMessage({
         </p>
       )}
       <SourceList sources={message.sources} />
+      <UsageFooter usage={message.usage} />
       <div className="mt-4 flex flex-wrap items-center gap-2">
         {streaming ? (
           <Button variant="secondary" className="px-3 py-1.5 text-xs" onClick={onStop}>

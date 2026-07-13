@@ -27,6 +27,7 @@ class LLMUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     thinking_tokens: int = 0
+    duration_ms: float = 0
 
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)

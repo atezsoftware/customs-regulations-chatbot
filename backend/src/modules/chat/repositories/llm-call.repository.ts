@@ -55,10 +55,23 @@ export class LlmCallRepository extends DefaultCrudRepository<
    * juggler query builder cannot express, so this stays as raw SQL.
    */
   async usageTotals(userId: number, since: string | null): Promise<UsageTotalsRow[]> {
+    // Since a single chat turn now produces several `llm_calls` rows (one
+    // per tool-planning step plus the final answer, each with its own real
+    // duration), a plain AVG(duration_ms) over every row would average
+    // individual-call latency (seconds) rather than "how long until the
+    // final answer" (which is what this metric is meant to show, and what
+    // it showed back when one turn was still one row). Summing durations
+    // per message first, then averaging across messages, restores that.
     return (await this.dataSource.execute(
       `
         WITH usage_events AS (
           ${usageEventsSql()}
+        ),
+        per_message_duration AS (
+          SELECT message_id, SUM(duration_ms) AS turn_duration_ms
+          FROM usage_events
+          WHERE message_id IS NOT NULL
+          GROUP BY message_id
         )
         SELECT
           COUNT(*) AS call_count,
@@ -67,7 +80,7 @@ export class LlmCallRepository extends DefaultCrudRepository<
           COALESCE(SUM(output_tokens), 0) AS output_tokens,
           COALESCE(SUM(thinking_tokens), 0) AS thinking_tokens,
           COALESCE(SUM(input_tokens + output_tokens + thinking_tokens), 0) AS total_tokens,
-          ROUND(AVG(duration_ms)) AS avg_duration_ms
+          (SELECT ROUND(AVG(turn_duration_ms)) FROM per_message_duration) AS avg_duration_ms
         FROM usage_events
       `,
       [userId, since],

@@ -6,15 +6,16 @@ to make decisions about filesystem exploration actions.
 """
 
 import fnmatch
+import os
 import re
 from pathlib import Path
-from typing import AsyncIterator, Callable, Any
+from typing import AsyncIterator, Awaitable, Callable, Any
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-from .llm import ChatTurn, LLMClient, get_llm_client
-from .models import Action, ActionType, Tools
+from .llm import ChatTurn, LLMClient, LLMUsage, get_llm_client
+from .models import Action, ActionType, ContextSummary, Tools
 from fs_explorer_shared.fs import (
     read_file as fs_read_file,
     grep_file_content as fs_grep_file_content,
@@ -43,6 +44,30 @@ if _env_path.exists():
 GEMINI_FLASH_INPUT_COST_PER_MILLION = 0.075
 GEMINI_FLASH_OUTPUT_COST_PER_MILLION = 0.30
 
+# Gemini's hard input-token ceiling (the "1048576" in the
+# `INVALID_ARGUMENT: input token count exceeds the maximum number of
+# tokens allowed 1048576` error). Used only to compute a context-usage
+# percentage for the client/dashboard, not to enforce any limit here.
+GEMINI_MAX_CONTEXT_TOKENS = 1_048_576
+
+# Fraction of GEMINI_MAX_CONTEXT_TOKENS at which the agent proactively
+# compacts its own mid-run chat history (see `_maybe_summarize_history`)
+# instead of waiting to actually hit the ceiling and error out. Every
+# `take_action()` call resends the full history, so this is checked after
+# each one using that call's own prompt token count as the "current size"
+# signal.
+CONTEXT_SUMMARY_THRESHOLD_RATIO = float(
+    os.getenv("FS_EXPLORER_CONTEXT_SUMMARY_THRESHOLD", "0.85")
+)
+
+# How many of the most recent chat turns to keep verbatim when
+# summarizing — recent tool results are more likely to still be relevant
+# to the very next decision than older ones.
+_CONTEXT_SUMMARY_KEEP_RECENT_TURNS = 6
+# The first turn (initial task framing) is always kept verbatim too, so
+# the agent never loses sight of the original task after a summarization.
+_CONTEXT_SUMMARY_KEEP_LEADING_TURNS = 1
+
 
 @dataclass
 class TokenUsage:
@@ -63,6 +88,10 @@ class TokenUsage:
     tool_result_chars: int = 0
     documents_parsed: int = 0
     documents_scanned: int = 0
+
+    # Number of times this run's mid-exploration chat history was
+    # compacted by `FsExplorerAgent._maybe_summarize_history`.
+    context_summaries: int = 0
 
     def add_api_call(
         self,
@@ -97,6 +126,18 @@ class TokenUsage:
             self.completion_tokens / 1_000_000
         ) * GEMINI_FLASH_OUTPUT_COST_PER_MILLION
         return input_cost, output_cost, input_cost + output_cost
+
+    def context_usage_ratio(self, max_context_tokens: int) -> float:
+        """Fraction of the model's context window the last prompt likely used.
+
+        `prompt_tokens` is a running total across every call so far, not the
+        size of any single request, but since each call resends the full
+        chat history it also approximates "how big is the history right
+        now" — good enough for a warning threshold, not for billing.
+        """
+        if max_context_tokens <= 0:
+            return 0.0
+        return self.prompt_tokens / max_context_tokens
 
     def summary(self) -> str:
         """Generate a formatted summary of token usage and costs."""
@@ -1016,6 +1057,28 @@ def _build_system_prompt(enable_semantic: bool, enable_metadata: bool) -> str:
 # =============================================================================
 
 
+@dataclass
+class LLMCallStats:
+    """Per-call token/timing observation, for external instrumentation.
+
+    Distinct from `TokenUsage`, which only tracks running totals for the
+    life of one agent. Callers (server.py, main.py) that want per-message
+    granularity — one row per LLM call, not just an end-of-run total —
+    hook `FsExplorerAgent(on_llm_call=...)` to receive one of these
+    per Gemini call as it happens.
+    """
+
+    purpose: str  # "action" (tool-planning step) | "final_answer"
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    thinking_tokens: int
+    duration_ms: float
+
+
+OnLLMCall = Callable[[LLMCallStats], Awaitable[None]]
+
+
 class FsExplorerAgent:
     """
     AI agent for exploring filesystems, talking to the LLM via the
@@ -1034,6 +1097,7 @@ class FsExplorerAgent:
         llm_client: LLMClient | None = None,
         model: str | None = None,
         temperature: float | None = None,
+        on_llm_call: OnLLMCall | None = None,
     ) -> None:
         """
         Initialize the agent with an LLM client.
@@ -1047,6 +1111,11 @@ class FsExplorerAgent:
             model: Model name override, passed to `get_llm_client`.
             temperature: Sampling temperature override, passed to
                          `get_llm_client`.
+            on_llm_call: Optional async callback invoked after every
+                         individual Gemini call with per-call token/timing
+                         stats (see `LLMCallStats`), for callers that want
+                         incremental observability instead of only the
+                         cumulative `token_usage` totals.
 
         Raises:
             ValueError: If no Google credentials are available and no
@@ -1057,6 +1126,21 @@ class FsExplorerAgent:
         )
         self._chat_history: list[ChatTurn] = []
         self.token_usage = TokenUsage()
+        self._on_llm_call = on_llm_call
+
+    async def _report_llm_call(self, purpose: str, usage: "LLMUsage") -> None:
+        if self._on_llm_call is None:
+            return
+        await self._on_llm_call(
+            LLMCallStats(
+                purpose=purpose,
+                model=getattr(self._llm, "model", "unknown"),
+                prompt_tokens=usage.input_tokens,
+                completion_tokens=usage.output_tokens,
+                thinking_tokens=usage.thinking_tokens,
+                duration_ms=usage.duration_ms,
+            )
+        )
 
     def configure_task(self, task: str) -> None:
         """
@@ -1087,8 +1171,81 @@ class FsExplorerAgent:
             completion_tokens=usage.output_tokens,
             thinking_tokens=usage.thinking_tokens,
         )
+        await self._report_llm_call("action", usage)
         self._chat_history.append(ChatTurn(role="model", text=action.model_dump_json()))
+        await self._maybe_summarize_history(usage.input_tokens)
         return action, action.to_action_type()
+
+    async def _maybe_summarize_history(self, last_prompt_tokens: int) -> None:
+        """
+        Compact the chat history once it nears the model's context window.
+
+        `last_prompt_tokens` is the size (in tokens) of the request that was
+        just sent — since every call resends the full history, that's also
+        a good proxy for "how big is `_chat_history` right now". Above
+        `CONTEXT_SUMMARY_THRESHOLD_RATIO` of the model's ceiling, the middle
+        of the history (everything except the original task framing and the
+        most recent turns) is replaced with a single compact summary turn,
+        generated by one extra LLM call over just that middle slice.
+        """
+        if (
+            last_prompt_tokens / GEMINI_MAX_CONTEXT_TOKENS
+            < CONTEXT_SUMMARY_THRESHOLD_RATIO
+        ):
+            return
+
+        keep = _CONTEXT_SUMMARY_KEEP_LEADING_TURNS + _CONTEXT_SUMMARY_KEEP_RECENT_TURNS
+        if len(self._chat_history) <= keep:
+            return  # Nothing worth compacting yet.
+
+        leading = self._chat_history[:_CONTEXT_SUMMARY_KEEP_LEADING_TURNS]
+        recent = self._chat_history[-_CONTEXT_SUMMARY_KEEP_RECENT_TURNS:]
+        middle = self._chat_history[
+            _CONTEXT_SUMMARY_KEEP_LEADING_TURNS:-_CONTEXT_SUMMARY_KEEP_RECENT_TURNS
+        ]
+        if not middle:
+            return
+
+        summary_prompt = (
+            "Summarize the exploration steps and tool results below into a "
+            "compact paragraph. Preserve concrete facts: document names/paths, "
+            "article/section numbers, figures, and findings relevant to the "
+            "task. Omit conversational filler and raw tool-call formatting. "
+            "Do not answer the task yourself — only summarize what has been "
+            "discovered so far."
+        )
+        try:
+            result, usage = await self._llm.generate_structured(
+                [*middle, ChatTurn(role="user", text=summary_prompt)],
+                "You are compacting an AI agent's exploration transcript to "
+                "free up context window space. Be faithful and concise.",
+                ContextSummary,
+            )
+        except Exception:
+            # Summarization is a best-effort space-saving measure — if it
+            # fails, carry on with the untouched (larger) history rather
+            # than losing the run over it.
+            return
+
+        self.token_usage.add_api_call(
+            prompt_tokens=usage.input_tokens,
+            completion_tokens=usage.output_tokens,
+            thinking_tokens=usage.thinking_tokens,
+        )
+        self.token_usage.context_summaries += 1
+        await self._report_llm_call("context_summary", usage)
+
+        self._chat_history = [
+            *leading,
+            ChatTurn(
+                role="user",
+                text=(
+                    "Summary of earlier exploration steps (compacted to save "
+                    f"context space):\n\n{result.summary}"
+                ),
+            ),
+            *recent,
+        ]
 
     async def stream_final_answer(
         self,
@@ -1136,6 +1293,7 @@ class FsExplorerAgent:
                 completion_tokens=usage.output_tokens,
                 thinking_tokens=usage.thinking_tokens,
             )
+            await self._report_llm_call("final_answer", usage)
 
     def call_tool(self, tool_name: Tools, tool_input: dict[str, Any]) -> None:
         """

@@ -151,6 +151,7 @@ export class CoreBridgeService {
     let statusCounter = 0;
     let closedByAbort = false;
     let terminalEventSeen = false;
+    let llmCallsRecorded = 0;
 
     const closeSocket = () => {
       try {
@@ -295,6 +296,30 @@ export class CoreBridgeService {
           throw new Error('Core requested human clarification, which is not supported in SSE chat yet.');
         }
 
+        if (event.type === 'llm_call') {
+          // One row per actual Gemini call (tool-planning steps and the
+          // final-answer generation are separate calls), not just one
+          // end-of-run aggregate — lets the dashboard show per-message
+          // token/model/duration instead of only a session-wide total.
+          llmCallsRecorded += 1;
+          await this.llmCallRepository.create({
+            messageId: input.assistantMessageId,
+            sessionId: input.sessionId,
+            provider: 'gemini',
+            model:
+              text(data.model) ||
+              session.model ||
+              process.env.FS_EXPLORER_LLM_MODEL ||
+              DEFAULT_MODEL,
+            purpose: text(data.purpose, 'action'),
+            inputTokens: numberValue(data.prompt_tokens),
+            outputTokens: numberValue(data.completion_tokens),
+            thinkingTokens: numberValue(data.thinking_tokens),
+            durationMs: numberValue(data.duration_ms),
+          });
+          continue;
+        }
+
         if (event.type === 'answer_start') {
           if (lastRunningStepKey) {
             yield {
@@ -347,7 +372,12 @@ export class CoreBridgeService {
 
           const error = text(data.error);
           const stats = objectOrUndefined(data.stats);
-          if (stats) {
+          // Normally superseded by the per-call 'llm_call' rows recorded
+          // above (real per-call durations from core-api). Only fall back
+          // to one aggregate row here if none arrived — e.g. an older
+          // core-api that doesn't emit 'llm_call' yet, or a run that
+          // produced usage without any incremental events.
+          if (stats && llmCallsRecorded === 0) {
             await this.llmCallRepository.create({
               messageId: input.assistantMessageId,
               sessionId: input.sessionId,

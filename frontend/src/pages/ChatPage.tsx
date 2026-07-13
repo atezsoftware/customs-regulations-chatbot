@@ -16,6 +16,7 @@ import type {
   ChatSession,
   Directory,
   DirectoryIndexStatus,
+  LlmUsage,
   SessionFile,
 } from '../types';
 
@@ -26,6 +27,34 @@ function normalizeMessage(message: Partial<ChatMessageRecord> & {id: number; ses
     sources: message.sources ?? [],
     usage: message.usage ?? [],
   };
+}
+
+// The live 'done' event's aggregate `stats` (one number per token type,
+// summed over every LLM call the turn made) arrives before the DB-backed
+// per-call `llm_calls` rows can be refetched. Shown as a single synthetic
+// summary row so token/model/duration are visible immediately; a page
+// reload replaces it with the real per-call breakdown from the database.
+function usageFromStats(stats: Record<string, unknown> | undefined): LlmUsage[] | undefined {
+  if (!stats) return undefined;
+  const inputTokens = Number(stats.prompt_tokens);
+  const outputTokens = Number(stats.completion_tokens);
+  if (!Number.isFinite(inputTokens) && !Number.isFinite(outputTokens)) return undefined;
+  return [
+    {
+      id: -1,
+      provider: 'gemini',
+      model: typeof stats.model === 'string' ? stats.model : undefined,
+      purpose: 'turn_summary',
+      inputTokens: Number.isFinite(inputTokens) ? inputTokens : 0,
+      outputTokens: Number.isFinite(outputTokens) ? outputTokens : 0,
+      thinkingTokens: Number.isFinite(Number(stats.thinking_tokens))
+        ? Number(stats.thinking_tokens)
+        : 0,
+      durationMs: Number.isFinite(Number(stats.duration_ms))
+        ? Number(stats.duration_ms)
+        : undefined,
+    },
+  ];
 }
 
 function previousUserContent(messages: ChatMessageRecord[], index: number): string | undefined {
@@ -204,10 +233,16 @@ export function ChatPage() {
     }
 
     if (event.type === 'done') {
+      const usage = usageFromStats(event.stats);
       setMessages(prev =>
         prev.map(message =>
           message.id === assistantMessageId
-            ? {...message, status: 'completed', content: event.content}
+            ? {
+                ...message,
+                status: 'completed',
+                content: event.content,
+                usage: usage ?? message.usage,
+              }
             : message,
         ),
       );

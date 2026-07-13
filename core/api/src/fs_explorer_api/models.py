@@ -102,6 +102,26 @@ class ToolCallAction(BaseModel):
         return {arg.parameter_name: arg.parameter_value for arg in self.tool_input}
 
 
+class ContextSummary(BaseModel):
+    """
+    Compacted summary of an earlier stretch of an exploration run's history.
+
+    Produced mid-run when the accumulated chat history approaches the
+    model's context window, so older tool-call/reasoning turns can be
+    replaced with a compact standalone paragraph instead of being resent
+    verbatim on every subsequent call. See `FsExplorerAgent._maybe_summarize_history`.
+    """
+
+    summary: str = Field(
+        description=(
+            "Compact paragraph summarizing the exploration steps and tool "
+            "results being replaced: concrete facts, document names/paths, "
+            "article/section numbers, and findings relevant to the task. "
+            "Does not answer the user's task itself."
+        )
+    )
+
+
 class Action(BaseModel):
     """
     Container for an agent action with reasoning.

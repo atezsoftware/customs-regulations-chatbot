@@ -17,11 +17,11 @@ from workflows.events import (
     InputRequiredEvent,
     HumanResponseEvent,
 )
-from workflows.resource import Resource
+from workflows.resource import Resource, ResourceManager
 from pydantic import BaseModel
 from typing import Annotated, cast, Any
 
-from .agent import FsExplorerAgent, describe_indexed_context
+from .agent import FsExplorerAgent, OnLLMCall, describe_indexed_context
 from .models import (
     GoDeeperAction,
     ToolCallAction,
@@ -32,39 +32,73 @@ from .models import (
 )
 from fs_explorer_shared.fs import describe_dir_content
 
-# Per-asyncio-task agent storage — each WebSocket connection gets its own.
+# Per-asyncio-task fallback agent storage, consulted only by get_agent()'s
+# factory below — which itself is only reached if a workflow was built
+# without going through new_workflow() (see get_agent()'s docstring).
 _AGENT_VAR: contextvars.ContextVar[FsExplorerAgent | None] = contextvars.ContextVar(
     "_AGENT_VAR", default=None
 )
 
-# Model/temperature requested for the next agent constructed in this context
-# (mirrors the existing set_search_flags/set_index_context pattern in agent.py:
-# configure-then-construct, read once when the agent is first created).
-_AGENT_MODEL: str | None = None
-_AGENT_TEMPERATURE: float | None = None
-
-
-def set_agent_llm_config(
-    *, model: str | None = None, temperature: float | None = None
-) -> None:
-    """Configure which model/temperature the next constructed agent should use."""
-    global _AGENT_MODEL, _AGENT_TEMPERATURE
-    _AGENT_MODEL = model
-    _AGENT_TEMPERATURE = temperature
-
 
 def get_agent() -> FsExplorerAgent:
-    """Get or create the agent instance for the current context."""
+    """Fallback factory backing the `Resource(get_agent)` annotation on every step.
+
+    Production callers never actually reach this: `new_workflow()`
+    constructs the agent explicitly from its arguments and pre-registers it
+    into the run's own `ResourceManager` before any step executes, so
+    `ResourceManager.get()` returns that pre-registered agent without ever
+    invoking this factory. It still has to exist (and keep this exact
+    `__qualname__`, used as the resource cache key both here and in
+    `new_workflow()`/`get_run_agent()`) so the `Resource(get_agent)`
+    annotations below have something to construct as a last resort if a
+    `FsExplorerWorkflow` is ever built directly instead.
+
+    This used to also read per-request model/temperature/hook config from
+    module-level globals set via `set_agent_llm_config()`/
+    `set_llm_call_hook()`. That was racy under concurrent requests: those
+    setters and this factory's read of them could be arbitrarily far apart
+    in time (a step's resource resolution can run in a different asyncio
+    task, scheduled whenever the workflow engine gets to it), so a second
+    concurrent request's `set_...()` call could land in between and hand
+    the first request's agent the wrong model/temperature/hook. Since nothing
+    reaches this fallback in practice, it just builds a default agent now —
+    real per-request config always goes through `new_workflow()`'s
+    arguments instead, which has no such window.
+    """
     agent = _AGENT_VAR.get()
     if agent is None:
-        agent = FsExplorerAgent(model=_AGENT_MODEL, temperature=_AGENT_TEMPERATURE)
+        agent = FsExplorerAgent()
         _AGENT_VAR.set(agent)
     return agent
 
 
 def reset_agent() -> None:
-    """Reset the agent instance for the current context."""
+    """Reset get_agent()'s fallback-path agent. See get_agent()'s docstring."""
     _AGENT_VAR.set(None)
+
+
+def get_run_agent(resource_manager: ResourceManager) -> FsExplorerAgent:
+    """Return the agent that a specific run's steps actually used.
+
+    Must be passed the `ResourceManager` returned alongside that run's
+    workflow by `new_workflow()`. Calling bare `get_agent()` again after
+    `await handler` does NOT reliably return that same agent: workflow
+    steps execute inside internal worker `asyncio.Task`s spawned by the
+    `workflows` engine, so the `_AGENT_VAR.set(...)` a step's resource
+    resolution performs is invisible to whichever task called
+    `workflow.run(...)` — a later bare `get_agent()` call there sees an
+    untouched (still-reset) contextvar and silently constructs a brand
+    new, empty agent instead. `ResourceManager.resources` is a plain dict
+    on a shared object, not contextvar-scoped, so reading the agent back
+    out of it here is reliable regardless of which task populated it.
+    """
+    agent = resource_manager.get_all().get(get_agent.__qualname__)
+    if agent is None:
+        # No step ever resolved the resource (e.g. the run failed before
+        # start_exploration ran) — fall back to a fresh, empty agent so
+        # callers can still read `.token_usage` etc. without crashing.
+        agent = FsExplorerAgent()
+    return cast(FsExplorerAgent, agent)
 
 
 class WorkflowState(BaseModel):
@@ -335,4 +369,54 @@ class FsExplorerWorkflow(Workflow):
 # Workflow timeout for complex multi-document analysis (5 minutes)
 WORKFLOW_TIMEOUT_SECONDS = 300
 
-workflow = FsExplorerWorkflow(timeout=WORKFLOW_TIMEOUT_SECONDS)
+
+def new_workflow(
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    on_llm_call: OnLLMCall | None = None,
+) -> tuple[FsExplorerWorkflow, ResourceManager]:
+    """Build a fresh workflow instance with its own ResourceManager and agent.
+
+    `Resource(get_agent)` caches on the *Workflow instance's* resource
+    manager (see workflows.resource.ResourceManager), not per-run. A
+    module-level singleton workflow would therefore cache the same
+    `FsExplorerAgent` — and its `_chat_history` — for the lifetime of the
+    process, silently leaking one chat's history (and eventually its
+    context-limit errors) into every other chat. Callers must use a fresh
+    instance per request instead of reusing a shared one.
+
+    The agent for this run is constructed here, directly from `model`/
+    `temperature`/`on_llm_call`, and pre-registered into the fresh
+    `ResourceManager` — *not* built lazily by `get_agent()`'s factory from
+    module-level config globals. Two concurrent requests both calling a
+    `set_agent_llm_config()`-style setter then relying on a shared
+    factory to read it back later have a race window between the setter
+    call and whenever a step's resource resolution actually runs (which
+    can be a different asyncio task, scheduled arbitrarily later by the
+    workflow engine) — a second request's setter call landing in that
+    window would hand the first request's agent the wrong config. Passing
+    the config here and registering the agent before any step runs closes
+    that window entirely: `get_agent()`'s factory is never even invoked
+    for a workflow built this way.
+
+    Returns the `ResourceManager` too — callers need it after the run
+    completes to look up the agent the run actually used, via
+    `get_run_agent()`. See that function's docstring for why a plain
+    `get_agent()` call doesn't work for this.
+    """
+    resource_manager = ResourceManager()
+    agent = FsExplorerAgent(
+        model=model, temperature=temperature, on_llm_call=on_llm_call
+    )
+    resource_manager.resources[get_agent.__qualname__] = agent
+    workflow = FsExplorerWorkflow(
+        timeout=WORKFLOW_TIMEOUT_SECONDS, resource_manager=resource_manager
+    )
+    return workflow, resource_manager
+
+
+# Kept for the CLI (single-shot process, one workflow run per invocation —
+# no cross-request caching risk) and for tests that import `workflow`
+# directly. Long-lived server processes must use `new_workflow()` instead.
+workflow, _default_resource_manager = new_workflow()

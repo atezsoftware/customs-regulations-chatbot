@@ -23,6 +23,8 @@ from .workflow import (
     AskHumanEvent,
     HumanAnswerEvent,
     get_agent,
+    get_run_agent,
+    new_workflow,
     reset_agent,
 )
 from .models import Action, ActionType, Tools
@@ -41,6 +43,8 @@ __all__ = [
     "AskHumanEvent",
     "HumanAnswerEvent",
     "get_agent",
+    "get_run_agent",
+    "new_workflow",
     "reset_agent",
     # Models
     "Action",

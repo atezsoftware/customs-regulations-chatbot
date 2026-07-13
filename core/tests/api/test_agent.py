@@ -7,6 +7,7 @@ from unittest.mock import patch
 from google.genai import Client as GenAIClient
 
 from fs_explorer_api.agent import (
+    GEMINI_MAX_CONTEXT_TOKENS,
     FsExplorerAgent,
     SYSTEM_PROMPT,
     TokenUsage,
@@ -15,7 +16,8 @@ from fs_explorer_api.agent import (
     get_search_flags,
     clear_index_context,
 )
-from fs_explorer_api.models import Action, StopAction
+from fs_explorer_api.llm import LLMUsage
+from fs_explorer_api.models import Action, ContextSummary, GoDeeperAction, StopAction
 from .conftest import make_mock_llm_client
 
 
@@ -227,3 +229,92 @@ class TestSearchFlags:
 
         last = agent._chat_history[-1]
         assert "not available" not in last.text
+
+
+class _ScriptedLLMClient:
+    """LLMClient whose `generate_structured` responses are scripted per call.
+
+    `action_token_counts` gives the reported `input_tokens` for each
+    non-summary ("action") call, in order; the last one always resolves to
+    a StopAction (so a test-driven exploration loop terminates on its own).
+    Any call using the `ContextSummary` schema is intercepted separately
+    and does not consume from that list, mirroring how
+    `_maybe_summarize_history` issues an extra, distinct call.
+    """
+
+    def __init__(self, action_token_counts: list[int]) -> None:
+        self._action_token_counts = list(action_token_counts)
+        self.summary_calls = 0
+
+    async def generate_structured(self, history, system_prompt, schema):
+        if schema is ContextSummary:
+            self.summary_calls += 1
+            return ContextSummary(summary="compact summary"), LLMUsage(
+                input_tokens=500, output_tokens=50
+            )
+
+        tokens = self._action_token_counts.pop(0)
+        is_last = not self._action_token_counts
+        action = Action(
+            reason="done" if is_last else "continuing",
+            action=StopAction(final_result="done")
+            if is_last
+            else GoDeeperAction(directory="."),
+        )
+        return action, LLMUsage(input_tokens=tokens, output_tokens=10)
+
+    async def stream_text(self, history, system_prompt):
+        return
+        yield ""  # pragma: no cover - makes this an async generator
+
+    def last_stream_usage(self):
+        return None
+
+
+class TestContextSummarization:
+    """Tests for mid-run chat history compaction (`_maybe_summarize_history`)."""
+
+    @pytest.mark.asyncio
+    async def test_triggers_above_threshold_and_shrinks_history(self) -> None:
+        # 8 small calls to build up history, then one that crosses 85% of
+        # the context ceiling and should trigger a compaction.
+        over_threshold = int(GEMINI_MAX_CONTEXT_TOKENS * 0.9)
+        client = _ScriptedLLMClient([1000] * 8 + [over_threshold])
+        agent = FsExplorerAgent(llm_client=client)
+
+        for i in range(9):
+            agent.configure_task(f"step {i}")
+            await agent.take_action()
+
+        assert client.summary_calls == 1
+        assert agent.token_usage.context_summaries == 1
+        # leading task turn (1) + summary turn (1) + recent turns (6)
+        assert len(agent._chat_history) == 8
+        assert agent._chat_history[0].text == "step 0"
+        assert "compact summary" in agent._chat_history[1].text
+
+    @pytest.mark.asyncio
+    async def test_does_not_trigger_below_threshold(self) -> None:
+        client = _ScriptedLLMClient([1000] * 9)
+        agent = FsExplorerAgent(llm_client=client)
+
+        for i in range(9):
+            agent.configure_task(f"step {i}")
+            await agent.take_action()
+
+        assert client.summary_calls == 0
+        assert agent.token_usage.context_summaries == 0
+        assert len(agent._chat_history) == 18
+
+    @pytest.mark.asyncio
+    async def test_no_trigger_when_history_too_short(self) -> None:
+        # Crosses the ratio on the very first call, but there's nothing
+        # worth compacting yet (history shorter than leading+recent).
+        over_threshold = int(GEMINI_MAX_CONTEXT_TOKENS * 0.9)
+        client = _ScriptedLLMClient([over_threshold])
+        agent = FsExplorerAgent(llm_client=client)
+
+        agent.configure_task("only step")
+        await agent.take_action()
+
+        assert client.summary_calls == 0
