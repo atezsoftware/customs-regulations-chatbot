@@ -24,6 +24,19 @@ DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 _MAX_CONCURRENT_GEMINI_CALLS = int(os.getenv("FS_EXPLORER_LLM_MAX_CONCURRENCY", "8"))
 _llm_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GEMINI_CALLS)
 
+# Per-call ceiling, applied to every individual Gemini call (each tool-
+# planning step, each context-summary compaction, and — via `stream_text`'s
+# per-chunk wait below — the final-answer stream too). Without this, a
+# single stalled call had no bound at all: it could hang indefinitely,
+# holding a `_llm_semaphore` slot forever and eventually starving the whole
+# pool, and on the WebSocket side it surfaced only as the connection going
+# quiet until something upstream (backend, proxy) gave up and closed it —
+# "Core stream closed before completion" with nothing to explain why. A
+# bound here means a stuck call now fails fast with a clear timeout instead.
+_LLM_CALL_TIMEOUT_SECONDS = float(
+    os.getenv("FS_EXPLORER_LLM_CALL_TIMEOUT_SECONDS", "90")
+)
+
 
 def _to_contents(history: list[ChatTurn]) -> list[Content]:
     return [
@@ -66,15 +79,18 @@ class GeminiLLMClient:
     ) -> tuple[SchemaT, LLMUsage]:
         started_at = time.monotonic()
         async with _llm_semaphore:
-            response = await self.raw_client.aio.models.generate_content(
-                model=self.model,
-                contents=_to_contents(history),  # ty: ignore[invalid-argument-type]
-                config={
-                    "system_instruction": system_prompt,
-                    "response_mime_type": "application/json",
-                    "response_schema": schema,
-                    **self._generation_config(),
-                },
+            response = await asyncio.wait_for(
+                self.raw_client.aio.models.generate_content(
+                    model=self.model,
+                    contents=_to_contents(history),  # ty: ignore[invalid-argument-type]
+                    config={
+                        "system_instruction": system_prompt,
+                        "response_mime_type": "application/json",
+                        "response_schema": schema,
+                        **self._generation_config(),
+                    },
+                ),
+                timeout=_LLM_CALL_TIMEOUT_SECONDS,
             )
         duration_ms = (time.monotonic() - started_at) * 1000
 
@@ -112,14 +128,28 @@ class GeminiLLMClient:
         started_at = time.monotonic()
 
         async with _llm_semaphore:
-            async for chunk in stream_fn(
+            stream = stream_fn(
                 model=self.model,
                 contents=_to_contents(history),
                 config={
                     "system_instruction": system_prompt,
                     **self._generation_config(),
                 },
-            ):
+            ).__aiter__()
+            # Bounded per-chunk, not per-stream: a healthy stream can
+            # legitimately run longer than one timeout window as long as
+            # chunks keep arriving. What this catches is the stream going
+            # silent for `_LLM_CALL_TIMEOUT_SECONDS` — previously unbounded,
+            # so a stalled final-answer stream could hang the whole request
+            # indefinitely (see `_LLM_CALL_TIMEOUT_SECONDS` docstring above).
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        stream.__anext__(), timeout=_LLM_CALL_TIMEOUT_SECONDS
+                    )
+                except StopAsyncIteration:
+                    break
+
                 if getattr(chunk, "usage_metadata", None):
                     saw_usage = True
                     usage = chunk.usage_metadata

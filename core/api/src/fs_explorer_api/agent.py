@@ -5,6 +5,7 @@ This module contains the agent that interacts with the Gemini AI model
 to make decisions about filesystem exploration actions.
 """
 
+import contextvars
 import fnmatch
 import os
 import re
@@ -56,6 +57,12 @@ GEMINI_MAX_CONTEXT_TOKENS = 1_048_576
 # `take_action()` call resends the full history, so this is checked after
 # each one using that call's own prompt token count as the "current size"
 # signal.
+#
+# A 41-step run was once observed summing to ~900K billed tokens; that
+# turned out to be a symptom of the cross-chat index-context race (see
+# `_INDEX_CONTEXT_VAR` below) causing the agent to re-plan/re-search after
+# getting corrupted tool results, not this threshold being too high — so
+# it's left at float(1M ceiling)-adjacent rather than tuned down for cost.
 CONTEXT_SUMMARY_THRESHOLD_RATIO = float(
     os.getenv("FS_EXPLORER_CONTEXT_SUMMARY_THRESHOLD", "0.85")
 )
@@ -197,73 +204,94 @@ class IndexContext:
     database_url: str
 
 
-_INDEX_CONTEXT: IndexContext | None = None
-_EMBEDDING_PROVIDER: EmbeddingProvider | None = None
-_FIELD_CATALOG_SHOWN: bool = False
-_ENABLE_SEMANTIC: bool = False
-_ENABLE_METADATA: bool = False
+# `ContextVar`, not a plain module global: `core-api` handles multiple
+# chats concurrently in one process (that's what FS_EXPLORER_LLM_MAX_CONCURRENCY
+# exists for), and a plain `global` here was a real cross-chat data-leak bug
+# — request A's `set_index_context()` and request B's `clear_index_context()`
+# raced on the same variable, so a slow-running chat could have its index
+# context silently wiped out (tool calls start erroring "not configured")
+# or replaced by a *different* chat's corpus mid-run out from under it,
+# purely based on request timing. A `ContextVar` gives each request's task
+# (and the workflow's internal step tasks spawned from it, which copy the
+# context at creation time) its own isolated value instead of one shared
+# by the whole process. This mirrors the fix already applied to per-request
+# model/temperature/hook config in `workflow.py`'s `new_workflow()` — see
+# that function's docstring for the same class of bug.
+_INDEX_CONTEXT_VAR: contextvars.ContextVar[IndexContext | None] = (
+    contextvars.ContextVar("_INDEX_CONTEXT", default=None)
+)
+_EMBEDDING_PROVIDER_VAR: contextvars.ContextVar[EmbeddingProvider | None] = (
+    contextvars.ContextVar("_EMBEDDING_PROVIDER", default=None)
+)
+_FIELD_CATALOG_SHOWN_VAR: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_FIELD_CATALOG_SHOWN", default=False
+)
+_ENABLE_SEMANTIC_VAR: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_ENABLE_SEMANTIC", default=False
+)
+_ENABLE_METADATA_VAR: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_ENABLE_METADATA", default=False
+)
 
 
 def set_search_flags(
     *, enable_semantic: bool = False, enable_metadata: bool = False
 ) -> None:
-    """Configure which indexed retrieval paths are active."""
-    global _ENABLE_SEMANTIC, _ENABLE_METADATA
-    _ENABLE_SEMANTIC = enable_semantic
-    _ENABLE_METADATA = enable_metadata
+    """Configure which indexed retrieval paths are active for this request."""
+    _ENABLE_SEMANTIC_VAR.set(enable_semantic)
+    _ENABLE_METADATA_VAR.set(enable_metadata)
 
 
 def get_search_flags() -> tuple[bool, bool]:
-    """Return (enable_semantic, enable_metadata)."""
-    return _ENABLE_SEMANTIC, _ENABLE_METADATA
+    """Return (enable_semantic, enable_metadata) for this request."""
+    return _ENABLE_SEMANTIC_VAR.get(), _ENABLE_METADATA_VAR.get()
 
 
 def set_embedding_provider(provider: EmbeddingProvider | None) -> None:
     """Set the embedding provider for vector search in indexed tools."""
-    global _EMBEDDING_PROVIDER
-    _EMBEDDING_PROVIDER = provider
+    _EMBEDDING_PROVIDER_VAR.set(provider)
 
 
 def set_index_context(
     folder: str | list[str] | tuple[str, ...],
     database_url: str | None = None,
 ) -> None:
-    """Enable indexed tools for one or more folder corpora."""
-    global _INDEX_CONTEXT, _EMBEDDING_PROVIDER
+    """Enable indexed tools for one or more folder corpora, for this request."""
     folders = (folder,) if isinstance(folder, str) else tuple(folder)
-    _INDEX_CONTEXT = IndexContext(
-        root_folders=tuple(str(Path(item).resolve()) for item in folders),
-        database_url=resolve_database_url(database_url),
+    _INDEX_CONTEXT_VAR.set(
+        IndexContext(
+            root_folders=tuple(str(Path(item).resolve()) for item in folders),
+            database_url=resolve_database_url(database_url),
+        )
     )
     # Auto-create embedding provider if API key available
-    if _EMBEDDING_PROVIDER is None:
+    if _EMBEDDING_PROVIDER_VAR.get() is None:
         try:
-            _EMBEDDING_PROVIDER = EmbeddingProvider()
+            _EMBEDDING_PROVIDER_VAR.set(EmbeddingProvider())
         except ValueError:
             pass
 
 
 def clear_index_context() -> None:
-    """Disable indexed tools for the current process."""
-    global _INDEX_CONTEXT, _EMBEDDING_PROVIDER, _FIELD_CATALOG_SHOWN
-    global _ENABLE_SEMANTIC, _ENABLE_METADATA
-    _INDEX_CONTEXT = None
-    _EMBEDDING_PROVIDER = None
-    _FIELD_CATALOG_SHOWN = False
-    _ENABLE_SEMANTIC = False
-    _ENABLE_METADATA = False
+    """Disable indexed tools for this request."""
+    _INDEX_CONTEXT_VAR.set(None)
+    _EMBEDDING_PROVIDER_VAR.set(None)
+    _FIELD_CATALOG_SHOWN_VAR.set(False)
+    _ENABLE_SEMANTIC_VAR.set(False)
+    _ENABLE_METADATA_VAR.set(False)
 
 
 def _get_index_storage_and_corpora() -> tuple[
     PostgresStorage | None, list[IndexedCorpus], str | None
 ]:
-    if _INDEX_CONTEXT is None:
+    index_context = _INDEX_CONTEXT_VAR.get()
+    if index_context is None:
         return None, [], "Index context is not configured. Re-run with `--use-index`."
 
-    storage = PostgresStorage(_INDEX_CONTEXT.database_url)
+    storage = PostgresStorage(index_context.database_url)
     corpora: list[IndexedCorpus] = []
     missing: list[str] = []
-    for root_folder in _INDEX_CONTEXT.root_folders:
+    for root_folder in index_context.root_folders:
         corpus_id = storage.get_corpus_id(root_folder)
         if corpus_id is None:
             missing.append(root_folder)
@@ -275,7 +303,7 @@ def _get_index_storage_and_corpora() -> tuple[
         return (
             None,
             [],
-            f"No index found for folders: {', '.join(_INDEX_CONTEXT.root_folders)}. "
+            f"No index found for folders: {', '.join(index_context.root_folders)}. "
             "Run `explore index <folder>` first.",
         )
     return storage, corpora, None
@@ -470,7 +498,7 @@ def _indexed_preview_for_document(
 
 
 def _index_tools_available() -> bool:
-    return _INDEX_CONTEXT is not None
+    return _INDEX_CONTEXT_VAR.get() is not None
 
 
 def describe_indexed_context() -> str:
@@ -711,7 +739,7 @@ def semantic_search(
         return error
     assert storage is not None and corpora
 
-    engine = IndexedQueryEngine(storage, embedding_provider=_EMBEDDING_PROVIDER)
+    engine = IndexedQueryEngine(storage, embedding_provider=_EMBEDDING_PROVIDER_VAR.get())
     hits: list[Any] = []
     try:
         for corpus in corpora:
@@ -721,8 +749,8 @@ def semantic_search(
                     query=query,
                     filters=filters,
                     limit=limit,
-                    enable_semantic=_ENABLE_SEMANTIC,
-                    enable_metadata=_ENABLE_METADATA,
+                    enable_semantic=_ENABLE_SEMANTIC_VAR.get(),
+                    enable_metadata=_ENABLE_METADATA_VAR.get(),
                     as_of_date=as_of_date,
                 )
             )
@@ -774,8 +802,7 @@ def semantic_search(
 
     # Include a rich field catalog on the first search so the agent can
     # construct effective metadata filters.
-    global _FIELD_CATALOG_SHOWN
-    if not _FIELD_CATALOG_SHOWN:
+    if not _FIELD_CATALOG_SHOWN_VAR.get():
         for corpus in corpora:
             active_schema = storage.get_active_schema(corpus_id=corpus.corpus_id)
             if active_schema is None:
@@ -830,7 +857,7 @@ def semantic_search(
                     )
                     for desc in field_descs:
                         lines.append(f"  - {desc}")
-                _FIELD_CATALOG_SHOWN = True
+                _FIELD_CATALOG_SHOWN_VAR.set(True)
                 break
 
     return "\n".join(lines)
@@ -1174,7 +1201,7 @@ class FsExplorerAgent:
         """
         action, usage = await self._llm.generate_structured(
             self._chat_history,
-            _build_system_prompt(_ENABLE_SEMANTIC, _ENABLE_METADATA),
+            _build_system_prompt(*get_search_flags()),
             Action,
         )
         self.token_usage.add_api_call(
@@ -1279,7 +1306,7 @@ class FsExplorerAgent:
             "section with readable document titles only. Return plain text only."
         )
         stream_history = [*self._chat_history, ChatTurn(role="user", text=prompt)]
-        system_prompt = _build_system_prompt(_ENABLE_SEMANTIC, _ENABLE_METADATA)
+        system_prompt = _build_system_prompt(*get_search_flags())
 
         chunks: list[str] = []
         try:

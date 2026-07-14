@@ -5,6 +5,7 @@ Provides a WebSocket endpoint for real-time workflow streaming
 and serves the single-page HTML interface.
 """
 
+import logging
 import re
 import time
 from pathlib import Path
@@ -18,6 +19,8 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from .agent import (
     GEMINI_MAX_CONTEXT_TOKENS,
@@ -804,8 +807,12 @@ async def websocket_explore(websocket: WebSocket):
                     tool_input=event.tool_input,
                     resolved_document_path=resolved_document_path,
                 )
+                # status_label/status_detail below are sent as part of this
+                # single tool_call event (not also as a standalone "status"
+                # event) so the frontend doesn't end up with two adjacent
+                # research steps carrying the identical label/detail text
+                # for what is really one action.
                 tool_status = _status_for_tool(event.tool_name, event.tool_input)
-                await websocket.send_json({"type": "status", "data": tool_status})
                 await websocket.send_json(
                     {
                         "type": "tool_call",
@@ -825,6 +832,9 @@ async def websocket_explore(websocket: WebSocket):
                 trace.record_go_deeper(
                     step_number=step_number, directory=event.directory
                 )
+                # No separate "status" event here either — the go_deeper
+                # event above already carries the directory being
+                # inspected, which is what the frontend displays for it.
                 await websocket.send_json(
                     {
                         "type": "go_deeper",
@@ -832,15 +842,6 @@ async def websocket_explore(websocket: WebSocket):
                             "step": step_number,
                             "directory": event.directory,
                             "reason": event.reason,
-                        },
-                    }
-                )
-                await websocket.send_json(
-                    {
-                        "type": "status",
-                        "data": {
-                            "label": "Thinking",
-                            "detail": "Inspecting the selected folder",
                         },
                     }
                 )
@@ -962,9 +963,22 @@ async def websocket_explore(websocket: WebSocket):
         )
 
     except WebSocketDisconnect:
-        pass
+        logger.warning("Client disconnected from /ws/explore before completion")
     except Exception as e:
-        await websocket.send_json({"type": "error", "data": {"message": str(e)}})
+        # Log unconditionally, before attempting to notify the client — if the
+        # underlying cause is a broken connection, the send below will raise
+        # the same kind of error again and, unguarded, would propagate out of
+        # this handler and kill the socket with zero trace of what happened
+        # (surfaces to the backend only as "Core stream closed before
+        # completion", with nothing in these logs to explain why).
+        logger.exception("Unhandled error in /ws/explore")
+        try:
+            await websocket.send_json({"type": "error", "data": {"message": str(e)}})
+        except Exception:
+            logger.warning(
+                "Failed to deliver error event over /ws/explore; "
+                "connection likely already broken"
+            )
     finally:
         if index_storage is not None:
             index_storage.close()
