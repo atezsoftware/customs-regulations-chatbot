@@ -92,7 +92,13 @@ export type AgentEvent =
   | {type: 'research_step'; step: AgentResearchStep}
   | {type: 'answer_delta'; text: string}
   | {type: 'source'; source: AgentSource}
-  | {type: 'done'; messageId: number; content: string; stats?: JsonObject}
+  | {
+      type: 'done';
+      messageId: number;
+      content: string;
+      stats?: JsonObject;
+      incomplete?: boolean;
+    }
   | {type: 'cancelled'; messageId: number}
   | {type: 'error'; message: string; runId?: string};
 
@@ -435,7 +441,17 @@ export class CoreBridgeService {
             status: 'completed',
             updatedAt: new Date().toISOString(),
           });
-          yield {type: 'done', messageId: input.assistantMessageId, content: finalContent, stats};
+          yield {
+            type: 'done',
+            messageId: input.assistantMessageId,
+            content: finalContent,
+            stats,
+            // The run hit its step-budget safety net instead of a real
+            // conclusion — technically not an `error`, but the answer may
+            // be an unsatisfying apology. Lets the UI offer "Continue" even
+            // on this otherwise-successful completion.
+            incomplete: data.incomplete === true,
+          };
           break;
         }
 

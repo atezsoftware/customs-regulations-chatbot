@@ -796,6 +796,12 @@ async def _finish_run(
             "data": {
                 "final_result": final_result,
                 "error": result_error,
+                # True when this run ended by hitting the step-budget safety
+                # net rather than a real StopAction — the answer may be an
+                # unsatisfying apology rather than a conclusion, even though
+                # there's no `error` here. Lets the client offer "Continue"
+                # even on an otherwise-successful completion.
+                "incomplete": not result_error and agent.forced_stop,
                 "stats": {
                     "steps": step_number,
                     "api_calls": usage.api_calls,
@@ -1098,6 +1104,10 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
     remove_run(run_id)  # re-registered below only if interrupted again
 
     agent = record.agent
+    # Give this run a genuinely fresh step budget rather than immediately
+    # re-hitting the same lifetime ceiling on the first take_action() call
+    # below — see grant_more_steps()'s docstring.
+    agent.grant_more_steps()
     trace = record.trace
     step_number = record.step_number
     folder_path = Path(record.folder)

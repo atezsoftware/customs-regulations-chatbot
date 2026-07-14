@@ -73,9 +73,16 @@ CONTEXT_SUMMARY_THRESHOLD_RATIO = float(
 # does nothing for cost until history is already ~900K tokens. This much
 # lower absolute cap keeps the resent history — and therefore the
 # per-call and cumulative cost — bounded throughout a long run instead of
-# only in its final stretch.
+# only in its final stretch. This is the *real* lever for total run cost:
+# the agent is allowed to take as many genuine research steps as it needs
+# (see _MAX_STEPS below) — what must not scale with step count is the size
+# of the history resent on every single one of those steps, which is
+# exactly what this cap (re-triggering every time the sawtooth refills)
+# bounds. Lowered from 8000 on the observation that even 8-10 genuine
+# (non-duplicate) steps between compactions was still enough to make a
+# single run's *input* tokens dominate its cost.
 CONTEXT_SUMMARY_MAX_TOKENS = int(
-    os.getenv("FS_EXPLORER_CONTEXT_SUMMARY_MAX_TOKENS", "8000")
+    os.getenv("FS_EXPLORER_CONTEXT_SUMMARY_MAX_TOKENS", "4000")
 )
 
 # How many of the most recent chat turns to keep verbatim when
@@ -88,12 +95,18 @@ _CONTEXT_SUMMARY_KEEP_RECENT_TURNS = 4
 # the agent never loses sight of the original task after a summarization.
 _CONTEXT_SUMMARY_KEEP_LEADING_TURNS = 1
 
-# Hard ceiling on total agent decision-points (take_action() calls) in a
-# single run. Once reached, the agent is forced to stop and compose its
-# final answer from whatever has been gathered so far — a run stuck
-# re-searching in circles (see the duplicate-query guard below) no longer
-# has an unbounded number of $-per-call chances to keep doing so.
-_MAX_STEPS = int(os.getenv("FS_EXPLORER_MAX_STEPS", "10"))
+# Safety-net ceiling on total agent decision-points (take_action() calls)
+# in a single run — NOT a normal operating limit. A genuinely hard
+# multi-document question can legitimately need many real (non-duplicate)
+# research steps, and cutting that off early just produces an incomplete
+# answer for no token savings worth mentioning (see CONTEXT_SUMMARY_MAX_TOKENS
+# above for the actual cost control — that bounds the size of *each* step,
+# not how many steps are allowed). This only exists to stop a run that's
+# escaped the near-duplicate-call guard below (or hit some other bug) from
+# looping indefinitely and never terminating; it should essentially never
+# fire in practice. Previously defaulted to 10, which was cutting off
+# legitimate multi-step research runs before they reached a real answer.
+_MAX_STEPS = int(os.getenv("FS_EXPLORER_MAX_STEPS", "40"))
 _FORCED_STOP_FALLBACK_ANSWER = (
     "Bu soruyu yanıtlamak için ayrılan araştırma adımı bütçesi doldu ve "
     "kesin bir cevaba ulaşılamadı. Şu ana kadar bulunanlara dayanarak "
@@ -1321,14 +1334,29 @@ class FsExplorerAgent:
         self.token_usage = TokenUsage()
         self._on_llm_call = on_llm_call
         self._step_count = 0
+        # Instance-level, not just the module constant — grant_more_steps()
+        # (called on resume) raises this so a resumed run gets genuine extra
+        # room instead of immediately re-hitting the same lifetime ceiling.
+        self._max_steps = _MAX_STEPS
         # (tool_name, dedup_key) for the last `_DUPLICATE_CALL_LOOKBACK`
         # real tool calls — see `_dedup_key`/`_is_near_duplicate_call`.
         self._recent_tool_calls: list[tuple[str, str]] = []
+        # Set when take_action() hits the _MAX_STEPS safety net rather than
+        # the model choosing to stop on its own — the run technically
+        # "completed" (no error), but the answer may be an unsatisfying
+        # apology rather than a real conclusion. Callers (server.py) use
+        # this to flag the run as resumable even without an error/cancel.
+        self._forced_stop = False
 
     @property
     def step_count(self) -> int:
         """Decision-points (`take_action()` calls) made so far this run."""
         return self._step_count
+
+    @property
+    def forced_stop(self) -> bool:
+        """Whether the run ended by hitting _MAX_STEPS, not a real StopAction."""
+        return self._forced_stop
 
     async def _report_llm_call(self, purpose: str, usage: "LLMUsage") -> None:
         if self._on_llm_call is None:
@@ -1343,6 +1371,19 @@ class FsExplorerAgent:
                 duration_ms=usage.duration_ms,
             )
         )
+
+    def grant_more_steps(self, extra: int | None = None) -> None:
+        """Extend this agent's step budget — call when resuming a run.
+
+        `_max_steps` is a lifetime ceiling on `_step_count`, which keeps
+        growing across a resume (it's the same agent instance). Without
+        this, resuming a run that hit the step budget would immediately
+        re-trigger the exact same forced stop on its very next
+        `take_action()` call, making "Continue" a no-op. Also clears
+        `forced_stop`, since the run is no longer sitting at that state.
+        """
+        self._max_steps += extra if extra is not None else _MAX_STEPS
+        self._forced_stop = False
 
     def configure_task(self, task: str) -> None:
         """
@@ -1377,7 +1418,7 @@ class FsExplorerAgent:
             A tuple of (Action, ActionType) if successful, None otherwise.
         """
         self._step_count += 1
-        if self._step_count > _MAX_STEPS:
+        if self._step_count > self._max_steps:
             # Force a stop without spending another LLM call on it — a run
             # that's hit the step budget doesn't need the model's opinion on
             # whether to keep going, it needs to wrap up. `final_result`
@@ -1388,10 +1429,11 @@ class FsExplorerAgent:
             # if streaming itself fails, so it must never be blank: an
             # empty string there plus a failed stream previously meant the
             # user got a silently empty response.
+            self._forced_stop = True
             action = Action(
                 action=StopAction(final_result=_FORCED_STOP_FALLBACK_ANSWER),
                 reason=(
-                    f"Reached the step budget ({_MAX_STEPS} actions) without "
+                    f"Reached the step budget ({self._max_steps} actions) without "
                     "a conclusive path through further tool calls — "
                     "stopping to compose the best answer from what has "
                     "been gathered so far."
@@ -1613,4 +1655,6 @@ class FsExplorerAgent:
         self._chat_history.clear()
         self.token_usage = TokenUsage()
         self._step_count = 0
+        self._max_steps = _MAX_STEPS
         self._recent_tool_calls.clear()
+        self._forced_stop = False

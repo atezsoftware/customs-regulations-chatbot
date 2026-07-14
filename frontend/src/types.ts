@@ -152,6 +152,10 @@ export interface ChatMessageRecord {
   // run (via ?resumeRunId=) instead of only "Regenerate" (a brand-new run
   // that throws away whatever the interrupted run had already gathered).
   runId?: string;
+  // True when a 'completed' message hit core-api's step-budget safety net
+  // rather than a real conclusion — not an error, but still worth offering
+  // "Continue" for instead of treating it as a normal finished answer.
+  incomplete?: boolean;
 }
 
 export type AgentEvent =
@@ -160,7 +164,13 @@ export type AgentEvent =
   | {type: 'research_step'; step: ResearchStep}
   | {type: 'answer_delta'; text: string}
   | {type: 'source'; source: Source}
-  | {type: 'done'; messageId: number; content: string; stats?: Record<string, unknown>}
+  | {
+      type: 'done';
+      messageId: number;
+      content: string;
+      stats?: Record<string, unknown>;
+      incomplete?: boolean;
+    }
   | {type: 'cancelled'; messageId: number}
   | {type: 'error'; message: string; runId?: string};
 

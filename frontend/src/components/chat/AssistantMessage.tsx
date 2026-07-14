@@ -23,10 +23,14 @@ export function AssistantMessage({
   // core-api keeps an interrupted run's agent state (chat history, tool
   // results already gathered) around for a while — Continue picks that up
   // instead of throwing it away and starting over like Regenerate does.
+  // Includes a 'completed' message that only hit the step-budget safety
+  // net (message.incomplete) — not an error, but still worth continuing.
   const canContinue =
     !streaming &&
-    (message.status === 'error' || message.status === 'cancelled') &&
-    Boolean(message.runId);
+    Boolean(message.runId) &&
+    (message.status === 'error' ||
+      message.status === 'cancelled' ||
+      (message.status === 'completed' && message.incomplete));
 
   async function copy() {
     if (!message.content) return;
@@ -49,6 +53,12 @@ export function AssistantMessage({
         <p className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-500">
           This response was stopped.
           {canContinue ? ' Click Continue to pick up where it left off.' : ''}
+        </p>
+      )}
+      {message.status === 'completed' && message.incomplete && (
+        <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-700">
+          This answer may be incomplete — research ran out of steps before
+          reaching a firm conclusion. Click Continue to keep researching.
         </p>
       )}
       <SourceList sources={message.sources} />

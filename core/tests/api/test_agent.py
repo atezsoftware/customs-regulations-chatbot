@@ -381,6 +381,51 @@ class TestMaxSteps:
         assert action_type == "stop"
         assert agent._chat_history[-1].role == "model"
 
+    @pytest.mark.asyncio
+    @patch("fs_explorer_api.agent._MAX_STEPS", 2)
+    async def test_forced_stop_sets_forced_stop_flag(self) -> None:
+        client = _ScriptedLLMClient([100] * 5)
+        agent = FsExplorerAgent(llm_client=client)
+
+        agent.configure_task("step 0")
+        await agent.take_action()
+        agent.configure_task("step 1")
+        await agent.take_action()
+        agent.configure_task("step 2")
+        await agent.take_action()
+
+        assert agent.forced_stop is True
+
+    @pytest.mark.asyncio
+    @patch("fs_explorer_api.agent._MAX_STEPS", 2)
+    async def test_grant_more_steps_lets_a_resumed_run_actually_continue(self) -> None:
+        # Regression test: resuming a forced-stopped agent must not
+        # immediately re-trigger the exact same forced stop on the very
+        # next take_action() call — grant_more_steps() (called by
+        # server.py's resume path) must raise the ceiling for real.
+        client = _ScriptedLLMClient([100] * 10)
+        agent = FsExplorerAgent(llm_client=client)
+
+        agent.configure_task("step 0")
+        await agent.take_action()
+        agent.configure_task("step 1")
+        await agent.take_action()
+        agent.configure_task("step 2")
+        _forced_action, forced_type = await agent.take_action()
+        assert forced_type == "stop"
+        assert agent.forced_stop is True
+
+        agent.grant_more_steps()
+        assert agent.forced_stop is False
+
+        agent.configure_task("step 3 (resumed)")
+        _action, action_type = await agent.take_action()
+
+        # A real scripted action was returned (there were 10 queued, only 3
+        # consumed before the forced stop) — not another forced stop.
+        assert action_type == "godeeper"
+        assert agent.forced_stop is False
+
 
 class TestDuplicateCallGuard:
     """Tests for the near-duplicate tool-call short-circuit in `call_tool()`."""

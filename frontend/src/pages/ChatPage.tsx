@@ -252,6 +252,7 @@ export function ChatPage() {
                 status: 'completed',
                 content: event.content,
                 usage: usage ?? message.usage,
+                incomplete: event.incomplete,
               }
             : message,
         ),
