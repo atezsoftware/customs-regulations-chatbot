@@ -764,7 +764,19 @@ class RegulatoryChunker:
             return [draft]
 
         if len(draft.blocks) <= 1:
-            return [draft]
+            # Nothing to split *across* (e.g. a table: `_markdown_to_blocks`
+            # always collapses an entire table into one `SourceBlock`,
+            # `blocks=[block]`) — but the block's own text can still have
+            # internal line/row boundaries worth splitting on. Without this,
+            # an oversized single-block draft (a large table, most often)
+            # was kept whole no matter how big it got — real corpora have
+            # produced single "table" chunks past 700K characters this way,
+            # which both blows up `parse_file`/`get_document`/`read` (that
+            # rebuild a document by concatenating every chunk verbatim) and
+            # makes the table effectively unsearchable via semantic_search,
+            # since the embedding step silently truncates anything past its
+            # own, much smaller, token limit.
+            return self._split_oversized_single_block(draft)
 
         splits: list[_ChunkDraft] = []
         current_blocks: list[SourceBlock] = []
@@ -780,6 +792,49 @@ class RegulatoryChunker:
 
         if current_blocks:
             splits.append(self._copy_draft_part(draft, current_blocks, part))
+        return splits
+
+    def _split_oversized_single_block(self, draft: _ChunkDraft) -> list[_ChunkDraft]:
+        block = draft.blocks[0]
+        lines = block.text.splitlines(keepends=True)
+        if len(lines) <= 1:
+            # No internal line boundary to split on (one giant paragraph/
+            # line with no breaks) — cutting mid-line would produce
+            # incoherent chunks, so keep it as one oversized chunk instead.
+            return [draft]
+
+        groups: list[list[str]] = []
+        current_group: list[str] = []
+        current_len = 0
+        for line in lines:
+            if current_group and current_len + len(line) > self.max_chunk_chars:
+                groups.append(current_group)
+                current_group = [line]
+                current_len = len(line)
+            else:
+                current_group.append(line)
+                current_len += len(line)
+        if current_group:
+            groups.append(current_group)
+
+        if len(groups) <= 1:
+            return [draft]
+
+        splits: list[_ChunkDraft] = []
+        offset = block.start_char
+        for part, group in enumerate(groups, start=1):
+            group_text = "".join(group)
+            start_char = offset
+            end_char = start_char + len(group_text)
+            offset = end_char
+            sub_block = SourceBlock(
+                block_id=block.block_id,
+                kind=block.kind,
+                text=group_text,
+                start_char=start_char,
+                end_char=end_char,
+            )
+            splits.append(self._copy_draft_part(draft, [sub_block], part))
         return splits
 
     @staticmethod

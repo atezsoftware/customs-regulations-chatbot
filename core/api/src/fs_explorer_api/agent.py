@@ -75,6 +75,25 @@ _CONTEXT_SUMMARY_KEEP_RECENT_TURNS = 6
 # the agent never loses sight of the original task after a summarization.
 _CONTEXT_SUMMARY_KEEP_LEADING_TURNS = 1
 
+# Hard cap on how much raw chunk text a single "deep read" call (read,
+# parse_file, get_document) can inject into chat history in one go. Real
+# indexed documents are not all small: some in production run well past a
+# million characters (a full treaty text with annexes, e.g.), and these
+# tools previously had no cap at all — a single call on one of those could
+# single-handedly inject 300K+ tokens, then get rebilled on *every*
+# subsequent step since the whole history is resent each call. `grep`
+# already searches a document's full, uncapped chunk set server-side and
+# returns only matching excerpts, so capping this doesn't lose the ability
+# to search a huge document — it only stops one call from being able to
+# dump the entire thing into memory at once.
+_DEEP_READ_MAX_CHARS = int(os.getenv("FS_EXPLORER_DEEP_READ_MAX_CHARS", "50000"))
+_DEEP_READ_TRUNCATION_HINT = (
+    "This is already the full-content tool and will not return more via a "
+    "repeat call. Use grep(file_path=..., pattern=...) to search this "
+    "document's complete text for specific terms, or semantic_search for "
+    "a different angle."
+)
+
 
 @dataclass
 class TokenUsage:
@@ -441,6 +460,9 @@ def _document_from_chunks(
     document: dict[str, Any],
     *,
     max_chars: int | None = None,
+    truncation_hint: str = (
+        "Use parse_file() or get_document() for more of this document's text."
+    ),
 ) -> str:
     chunks = storage.list_document_chunks(doc_id=str(document["id"]))
     header = (
@@ -454,8 +476,8 @@ def _document_from_chunks(
         body = content if max_chars is None else content[:max_chars]
         if max_chars is not None and len(content) > max_chars:
             body += (
-                f"\n\n[... PREVIEW TRUNCATED. Full document has {len(content):,} "
-                "characters. Use parse_file() or get_document() for full indexed content ...]"
+                f"\n\n[... TRUNCATED. Full document has {len(content):,} "
+                f"characters. {truncation_hint} ...]"
             )
         return header + body
 
@@ -481,9 +503,10 @@ def _document_from_chunks(
         total += len(addition)
 
     if truncated:
+        total_chars = sum(len(str(chunk["text"])) for chunk in chunks)
         lines.append(
-            f"\n\n[... PREVIEW TRUNCATED. Document has {len(chunks)} indexed chunks. "
-            "Use parse_file() or get_document() for all chunk text ...]"
+            f"\n\n[... TRUNCATED. Document has {len(chunks)} indexed chunks "
+            f"({total_chars:,} characters total). {truncation_hint} ...]"
         )
     return "".join(lines)
 
@@ -546,7 +569,12 @@ def _indexed_read_file(file_path: str) -> str:
     document = _resolve_index_document(storage, corpora, file_path)
     if document is None:
         return fs_read_file(file_path)
-    return _document_from_chunks(storage, document)
+    return _document_from_chunks(
+        storage,
+        document,
+        max_chars=_DEEP_READ_MAX_CHARS,
+        truncation_hint=_DEEP_READ_TRUNCATION_HINT,
+    )
 
 
 def _indexed_preview_file(file_path: str, max_chars: int = 3000) -> str:
@@ -572,7 +600,12 @@ def _indexed_parse_file(file_path: str) -> str:
     document = _resolve_index_document(storage, corpora, file_path)
     if document is None:
         return _not_indexed_message(file_path)
-    return _document_from_chunks(storage, document)
+    return _document_from_chunks(
+        storage,
+        document,
+        max_chars=_DEEP_READ_MAX_CHARS,
+        truncation_hint=_DEEP_READ_TRUNCATION_HINT,
+    )
 
 
 def _indexed_grep_file_content(file_path: str, pattern: str) -> str:
