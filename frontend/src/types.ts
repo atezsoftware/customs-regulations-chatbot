@@ -147,16 +147,22 @@ export interface ChatMessageRecord {
   steps: ResearchStep[];
   sources: Source[];
   usage: LlmUsage[];
+  // Set once core-api's `start` event arrives. Kept around after an
+  // 'error'/'cancelled' status so the UI can offer to resume this exact
+  // run (via ?resumeRunId=) instead of only "Regenerate" (a brand-new run
+  // that throws away whatever the interrupted run had already gathered).
+  runId?: string;
 }
 
 export type AgentEvent =
   | {type: 'message_created'; messageId: number}
+  | {type: 'run_started'; runId: string; resumed: boolean}
   | {type: 'research_step'; step: ResearchStep}
   | {type: 'answer_delta'; text: string}
   | {type: 'source'; source: Source}
   | {type: 'done'; messageId: number; content: string; stats?: Record<string, unknown>}
   | {type: 'cancelled'; messageId: number}
-  | {type: 'error'; message: string};
+  | {type: 'error'; message: string; runId?: string};
 
 export type UsageRange = '7d' | '30d' | '90d' | 'all';
 

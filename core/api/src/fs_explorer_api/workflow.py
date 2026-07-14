@@ -19,7 +19,7 @@ from workflows.events import (
 )
 from workflows.resource import Resource, ResourceManager
 from pydantic import BaseModel
-from typing import Annotated, cast, Any
+from typing import Annotated, AsyncGenerator, cast, Any
 
 from .agent import FsExplorerAgent, OnLLMCall, describe_indexed_context
 from .models import (
@@ -414,6 +414,94 @@ def new_workflow(
         timeout=WORKFLOW_TIMEOUT_SECONDS, resource_manager=resource_manager
     )
     return workflow, resource_manager
+
+
+async def resume_agent_run(
+    agent: FsExplorerAgent,
+    *,
+    use_index: bool,
+    current_directory: str,
+    initial_task: str,
+) -> AsyncGenerator[WorkflowEvent, str | None]:
+    """Continue an already-in-progress agent's decision loop directly.
+
+    Used only to resume a run whose original `/ws/explore` connection was
+    lost or explicitly stopped mid-run (see `runs.py`): `agent` already
+    carries its accumulated `_chat_history`/`_step_count` from before the
+    interruption, so this calls `take_action()` again exactly as
+    `tool_call_action`/`go_deeper_action`/`receive_human_answer` would have
+    — it does not go through the `workflows` engine/`InputEvent` at all
+    (re-entering via `InputEvent` would re-run `start_exploration` and
+    prepend a second "what should you do first" prompt on top of history
+    that already has an answer to that question). It yields the same
+    `WorkflowEvent` subclasses the engine-driven fresh-run path yields, so
+    the caller can share event-translation code between both paths.
+
+    For an `AskHumanEvent`, advance this generator with `asend(response)`
+    (the human's answer text) instead of a plain `__anext__()`/`asend(None)`
+    — mirrors how the `workflows` engine threads `HumanResponseEvent` back
+    into `receive_human_answer`, just without that engine in the loop.
+    """
+    directory = current_directory
+    human_response: str | None = None
+
+    while True:
+        if human_response is not None:
+            agent.configure_task(
+                f"Human response to your question: {human_response}\n\n"
+                f"Based on it, proceed with your exploration based on the "
+                f"original task: {initial_task}"
+            )
+            human_response = None
+
+        result = await agent.take_action()
+        if result is None:
+            yield ExplorationEndEvent(error="Could not produce action to take")
+            return
+
+        action, action_type = result
+
+        if action_type == "godeeper":
+            godeeper = cast(GoDeeperAction, action.action)
+            directory = godeeper.directory
+            yield GoDeeperEvent(directory=godeeper.directory, reason=action.reason)
+            dirdescription = (
+                describe_indexed_context()
+                if use_index
+                else describe_dir_content(directory)
+            )
+            agent.configure_task(
+                f"Given that the current directory ('{directory}') "
+                f"looks like this:\n\n```text\n{dirdescription}\n```\n\n"
+                f"And that the user is giving you this task: '{initial_task}', "
+                f"what action should you take next?"
+            )
+
+        elif action_type == "toolcall":
+            toolcall = cast(ToolCallAction, action.action)
+            tool_input = toolcall.to_fn_args()
+            yield ToolCallEvent(
+                tool_name=toolcall.tool_name,
+                tool_input=tool_input,
+                reason=action.reason,
+            )
+            agent.call_tool(tool_name=toolcall.tool_name, tool_input=tool_input)
+            agent.configure_task(
+                "Given the result from the tool call you just performed, "
+                "what action should you take next?"
+            )
+
+        elif action_type == "askhuman":
+            askhuman = cast(AskHumanAction, action.action)
+            received = yield AskHumanEvent(
+                question=askhuman.question, reason=action.reason
+            )
+            human_response = received if isinstance(received, str) else ""
+
+        else:  # stop
+            stopaction = cast(StopAction, action.action)
+            yield ExplorationEndEvent(final_result=stopaction.final_result)
+            return
 
 
 # Kept for the CLI (single-shot process, one workflow run per invocation —

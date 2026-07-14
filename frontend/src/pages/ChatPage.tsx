@@ -181,6 +181,15 @@ export function ChatPage() {
   }
 
   function applyAgentEvent(event: AgentEvent, assistantMessageId: number) {
+    if (event.type === 'run_started') {
+      setMessages(prev =>
+        prev.map(message =>
+          message.id === assistantMessageId ? {...message, runId: event.runId} : message,
+        ),
+      );
+      return;
+    }
+
     if (event.type === 'research_step') {
       setMessages(prev =>
         prev.map(message => {
@@ -288,7 +297,9 @@ export function ChatPage() {
       setStreamError(event.message);
       setMessages(prev =>
         prev.map(message =>
-          message.id === assistantMessageId ? {...message, status: 'error'} : message,
+          message.id === assistantMessageId
+            ? {...message, status: 'error', runId: event.runId ?? message.runId}
+            : message,
         ),
       );
     }
@@ -334,6 +345,49 @@ export function ChatPage() {
             ),
           );
         }
+      }
+    } finally {
+      if (activeStreamRef.current?.controller === controller) {
+        activeStreamRef.current = null;
+      }
+      setSending(false);
+    }
+  }
+
+  // Continues a run that errored out or was manually stopped, instead of
+  // starting a brand-new one (Regenerate) — reuses core-api's still-held
+  // agent state (chat history, tool results already gathered) via the
+  // run_id captured off that message's earlier 'run_started' event, so
+  // work already done/paid for isn't thrown away.
+  async function continueMessage(assistantMessageId: number) {
+    if (selectedId === null || sending) return;
+    const target = messages.find(message => message.id === assistantMessageId);
+    if (!target?.runId) return;
+    setSending(true);
+    setStreamError(null);
+    const controller = new AbortController();
+    setMessages(prev =>
+      prev.map(message =>
+        message.id === assistantMessageId ? {...message, status: 'streaming'} : message,
+      ),
+    );
+    activeStreamRef.current = {sessionId: selectedId, messageId: assistantMessageId, controller};
+    try {
+      await streamMessageEvents({
+        sessionId: selectedId,
+        messageId: assistantMessageId,
+        signal: controller.signal,
+        resumeRunId: target.runId,
+        onEvent: event => applyAgentEvent(event, assistantMessageId),
+      });
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setStreamError(error instanceof Error ? error.message : String(error));
+        setMessages(prev =>
+          prev.map(message =>
+            message.id === assistantMessageId ? {...message, status: 'error'} : message,
+          ),
+        );
       }
     } finally {
       if (activeStreamRef.current?.controller === controller) {
@@ -417,6 +471,7 @@ export function ChatPage() {
                           previousUserContent={previousUserContent(messages, index)}
                           onStop={() => void stopStream()}
                           onRegenerate={content => void sendMessage(content)}
+                          onContinue={() => void continueMessage(message.id)}
                         />
                       ))
                     )}

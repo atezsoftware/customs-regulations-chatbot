@@ -6,11 +6,13 @@ export function ChatMessage({
   previousUserContent,
   onStop,
   onRegenerate,
+  onContinue,
 }: {
   message: ChatMessageRecord;
   previousUserContent?: string;
   onStop: () => void;
   onRegenerate: (content: string) => void;
+  onContinue: () => void;
 }) {
   if (message.role === 'user') {
     return (
@@ -25,6 +27,7 @@ export function ChatMessage({
       message={message}
       onStop={onStop}
       onRegenerate={() => previousUserContent && onRegenerate(previousUserContent)}
+      onContinue={onContinue}
     />
   );
 }

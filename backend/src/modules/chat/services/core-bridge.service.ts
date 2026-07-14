@@ -56,6 +56,10 @@ export interface BridgeInput {
   task: string;
   conversationContext: ChatHistoryItem[];
   signal?: AbortSignal;
+  // When set, continues a run core-api is still holding onto as resumable
+  // (see core-api's runs.py) instead of starting a brand-new one — sent as
+  // `{"type": "resume", "run_id": ...}` instead of the usual task payload.
+  resumeRunId?: string;
 }
 
 export interface AgentResearchStep {
@@ -84,12 +88,13 @@ export interface AgentSource {
 
 export type AgentEvent =
   | {type: 'message_created'; messageId: number}
+  | {type: 'run_started'; runId: string; resumed: boolean}
   | {type: 'research_step'; step: AgentResearchStep}
   | {type: 'answer_delta'; text: string}
   | {type: 'source'; source: AgentSource}
   | {type: 'done'; messageId: number; content: string; stats?: JsonObject}
   | {type: 'cancelled'; messageId: number}
-  | {type: 'error'; message: string};
+  | {type: 'error'; message: string; runId?: string};
 
 interface QueueItem {
   event?: CoreEvent;
@@ -152,6 +157,9 @@ export class CoreBridgeService {
     let closedByAbort = false;
     let terminalEventSeen = false;
     let llmCallsRecorded = 0;
+    // Captured from core-api's `start` event so a later error/disconnect
+    // can be reported back with the run_id the caller needs to resume it.
+    let capturedRunId: string | undefined;
 
     const closeSocket = () => {
       try {
@@ -185,19 +193,27 @@ export class CoreBridgeService {
       });
 
       ws.send(
-        JSON.stringify({
-          task: input.task,
-          folder: sessionView.viewFolder,
-          use_index: sessionView.indexFolders.length > 0,
-          index_folders: sessionView.indexFolders,
-          database_url: resolveDatabaseUrl(),
-          enable_semantic: sessionView.indexFolders.length > 0,
-          enable_metadata: sessionView.indexFolders.length > 0,
-          conversation_context: input.conversationContext,
-          internal_token: process.env.CORE_INTERNAL_TOKEN,
-          model: session.model,
-          temperature: session.temperature,
-        }),
+        JSON.stringify(
+          input.resumeRunId
+            ? {
+                type: 'resume',
+                run_id: input.resumeRunId,
+                internal_token: process.env.CORE_INTERNAL_TOKEN,
+              }
+            : {
+                task: input.task,
+                folder: sessionView.viewFolder,
+                use_index: sessionView.indexFolders.length > 0,
+                index_folders: sessionView.indexFolders,
+                database_url: resolveDatabaseUrl(),
+                enable_semantic: sessionView.indexFolders.length > 0,
+                enable_metadata: sessionView.indexFolders.length > 0,
+                conversation_context: input.conversationContext,
+                internal_token: process.env.CORE_INTERNAL_TOKEN,
+                model: session.model,
+                temperature: session.temperature,
+              },
+        ),
       );
 
       while (true) {
@@ -208,6 +224,14 @@ export class CoreBridgeService {
 
         const event = item.event;
         const data = event.data ?? {};
+
+        if (event.type === 'start') {
+          capturedRunId = text(data.run_id) || undefined;
+          if (capturedRunId) {
+            yield {type: 'run_started', runId: capturedRunId, resumed: Boolean(data.resumed)};
+          }
+          continue;
+        }
 
         if (event.type === 'status') {
           const stepKey = `status-${++statusCounter}`;
@@ -440,7 +464,7 @@ export class CoreBridgeService {
       if (status === 'cancelled') {
         yield {type: 'cancelled', messageId: input.assistantMessageId};
       } else {
-        yield {type: 'error', message};
+        yield {type: 'error', message, runId: capturedRunId};
       }
     } finally {
       input.signal?.removeEventListener('abort', abortHandler);

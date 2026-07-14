@@ -1325,6 +1325,11 @@ class FsExplorerAgent:
         # real tool calls — see `_dedup_key`/`_is_near_duplicate_call`.
         self._recent_tool_calls: list[tuple[str, str]] = []
 
+    @property
+    def step_count(self) -> int:
+        """Decision-points (`take_action()` calls) made so far this run."""
+        return self._step_count
+
     async def _report_llm_call(self, purpose: str, usage: "LLMUsage") -> None:
         if self._on_llm_call is None:
             return
@@ -1347,6 +1352,19 @@ class FsExplorerAgent:
             task: The task or context to add to the conversation.
         """
         self._chat_history.append(ChatTurn(role="user", text=task))
+
+    def set_llm_call_hook(self, on_llm_call: OnLLMCall | None) -> None:
+        """Rebind the per-call observability hook to a new connection.
+
+        Used when resuming an interrupted run: the agent instance is reused
+        as-is (its `_chat_history`/`_step_count` are exactly what makes
+        resuming meaningful), but its original `on_llm_call` closure was
+        bound to the WebSocket connection that got interrupted — calling it
+        after that connection is gone would send into a dead socket. The
+        resumed connection rebinds this to its own closure before driving
+        the agent any further.
+        """
+        self._on_llm_call = on_llm_call
 
     async def take_action(self) -> tuple[Action, ActionType] | None:
         """

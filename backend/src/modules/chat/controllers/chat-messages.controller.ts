@@ -221,6 +221,7 @@ export class ChatMessagesController {
   async stream(
     @param.path.number('id') sessionId: number,
     @param.path.number('messageId') messageId: number,
+    @param.query.string('resumeRunId') resumeRunId?: string,
   ) {
     const user = await getCurrentUser(this.request, this.userRepository);
     await this.ownedSessionOrThrow(sessionId, user.id);
@@ -271,6 +272,7 @@ export class ChatMessagesController {
         task: userMessage.content,
         conversationContext,
         signal: abortController.signal,
+        resumeRunId: resumeRunId || undefined,
       })) {
         if (this.res.writableEnded) break;
         this.res.write(sseFrame(event));

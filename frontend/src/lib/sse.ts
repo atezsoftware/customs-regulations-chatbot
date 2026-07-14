@@ -7,20 +7,27 @@ export async function streamMessageEvents({
   messageId,
   signal,
   onEvent,
+  resumeRunId,
 }: {
   sessionId: number;
   messageId: number;
   signal: AbortSignal;
   onEvent: (event: AgentEvent) => void;
+  // Continues a run core-api is still holding onto as resumable instead of
+  // starting a brand-new one for this message — see AssistantMessage's
+  // "Continue" button.
+  resumeRunId?: string;
 }) {
   const headers: Record<string, string> = {};
   const access = tokenStore.getAccess();
   if (access) headers.Authorization = `Bearer ${access}`;
 
-  const res = await fetch(
+  const url = new URL(
     `${API_BASE_URL}/chat-sessions/${sessionId}/messages/${messageId}/stream`,
-    {headers, signal},
   );
+  if (resumeRunId) url.searchParams.set('resumeRunId', resumeRunId);
+
+  const res = await fetch(url, {headers, signal});
   if (!res.ok) {
     throw new Error(res.statusText || `Stream failed with ${res.status}`);
   }

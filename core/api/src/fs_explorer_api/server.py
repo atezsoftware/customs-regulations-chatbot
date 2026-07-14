@@ -9,7 +9,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from fastapi import (
     Depends,
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 from .agent import (
     GEMINI_MAX_CONTEXT_TOKENS,
+    FsExplorerAgent,
     LLMCallStats,
     clear_index_context,
     set_index_context,
@@ -48,16 +49,19 @@ from fs_explorer_shared.index_config import (
     resolve_database_url,
 )
 from .llm import get_llm_client
+from .runs import RunRecord, get_run, new_run_id, register_run, remove_run
 from .search import IndexedQueryEngine
 from fs_explorer_shared.storage import PostgresStorage
 from .workflow import (
     AskHumanEvent,
+    ExplorationEndEvent,
     GoDeeperEvent,
     HumanAnswerEvent,
     InputEvent,
     ToolCallEvent,
     get_run_agent,
     new_workflow,
+    resume_agent_run,
 )
 
 app = FastAPI(title="FsExplorer", description="AI-powered filesystem exploration")
@@ -612,32 +616,234 @@ async def delete_amendment_proposal_endpoint(
             storage.close()
 
 
-@app.websocket("/ws/explore")
-async def websocket_explore(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time exploration streaming.
+def _tool_call_ws_message(
+    event: ToolCallEvent,
+    *,
+    step_number: int,
+    trace: ExplorationTrace,
+    index_storage: PostgresStorage | None,
+) -> dict[str, Any]:
+    resolved_document_path: str | None = None
+    if event.tool_name == "get_document":
+        doc_id = event.tool_input.get("doc_id")
+        if index_storage is not None and isinstance(doc_id, str) and doc_id:
+            document = index_storage.get_document(doc_id=doc_id)
+            if document and not document["is_deleted"]:
+                resolved_document_path = str(document["absolute_path"])
+    trace.record_tool_call(
+        step_number=step_number,
+        tool_name=event.tool_name,
+        tool_input=event.tool_input,
+        resolved_document_path=resolved_document_path,
+    )
+    # status_label/status_detail below are sent as part of this single
+    # tool_call event (not also as a standalone "status" event) so the
+    # frontend doesn't end up with two adjacent research steps carrying the
+    # identical label/detail text for what is really one action.
+    tool_status = _status_for_tool(event.tool_name, event.tool_input)
+    return {
+        "type": "tool_call",
+        "data": {
+            "step": step_number,
+            "tool_name": event.tool_name,
+            "tool_input": event.tool_input,
+            "reason": event.reason,
+            "status_label": tool_status["label"],
+            "status_detail": tool_status["detail"],
+        },
+    }
 
-    Protocol:
-    1. Client sends: {"task": "user question"}
-    2. Server streams events: {"type": "...", "data": {...}}
-    3. Final event: {"type": "complete", "data": {...}}
+
+def _go_deeper_ws_message(
+    event: GoDeeperEvent, *, step_number: int, trace: ExplorationTrace
+) -> dict[str, Any]:
+    trace.record_go_deeper(step_number=step_number, directory=event.directory)
+    # No separate "status" event here either — the go_deeper event above
+    # already carries the directory being inspected, which is what the
+    # frontend displays for it.
+    return {
+        "type": "go_deeper",
+        "data": {
+            "step": step_number,
+            "directory": event.directory,
+            "reason": event.reason,
+        },
+    }
+
+
+def _ask_human_ws_message(event: AskHumanEvent, *, step_number: int) -> dict[str, Any]:
+    return {
+        "type": "ask_human",
+        "data": {
+            "step": step_number,
+            "question": event.question,
+            "reason": event.reason,
+        },
+    }
+
+
+def _register_if_resumable(
+    *,
+    run_id: str,
+    agent: FsExplorerAgent | None,
+    trace: ExplorationTrace | None,
+    step_number: int,
+    folder_path: Path,
+    use_index: bool,
+    enable_semantic: bool,
+    enable_metadata: bool,
+    index_folders: list[str],
+    database_url: str | None,
+    original_task: str,
+) -> None:
+    """Best-effort: keep an interrupted run resumable if it made real progress.
+
+    Called from the `except` branch of both session functions below, right
+    before the exception is re-raised for the outer handler's usual
+    logging. Skips registration if the agent never got far enough to be
+    worth resuming (no tool calls made yet) — nothing there for a "resume"
+    to meaningfully continue.
     """
-    await websocket.accept()
+    if agent is None or trace is None or agent.step_count == 0:
+        return
+    register_run(
+        RunRecord(
+            run_id=run_id,
+            agent=agent,
+            trace=trace,
+            step_number=step_number,
+            folder=str(folder_path),
+            use_index=use_index,
+            enable_semantic=enable_semantic,
+            enable_metadata=enable_metadata,
+            index_folders=index_folders,
+            database_url=database_url,
+            original_task=original_task,
+        )
+    )
+
+
+async def _finish_run(
+    websocket: WebSocket,
+    *,
+    run_id: str,
+    agent: FsExplorerAgent,
+    trace: ExplorationTrace,
+    step_number: int,
+    folder_path: Path,
+    use_index: bool,
+    final_result: str,
+    result_error: str | None,
+    run_started_at: float,
+    flush_llm_calls: Callable[[], Awaitable[None]],
+) -> None:
+    """Stream the final answer (if no error) and send the terminal `complete`
+    event. Shared by a fresh run and a resumed one — by this point there is
+    no meaningful difference between the two: both have an `agent` with a
+    full chat history and a `trace` of everything gathered so far.
+    """
+    if not result_error:
+        await websocket.send_json(
+            {
+                "type": "status",
+                "data": {
+                    "label": "Writing answer",
+                    "detail": "Composing the final response",
+                },
+            }
+        )
+        await websocket.send_json({"type": "answer_start", "data": {}})
+        streamed_parts: list[str] = []
+        async for chunk in agent.stream_final_answer(fallback_answer=final_result):
+            streamed_parts.append(chunk)
+            await websocket.send_json({"type": "answer_delta", "data": {"text": chunk}})
+        await flush_llm_calls()
+        streamed_final = "".join(streamed_parts).strip()
+        if streamed_final:
+            final_result = streamed_final
+        cited_sources = extract_cited_sources(final_result)
+        referenced_documents = trace.sorted_documents()
+        cited_source_links = (
+            {}
+            if use_index
+            else _source_links(
+                cited_sources=cited_sources,
+                referenced_documents=referenced_documents,
+                root_directory=str(folder_path),
+            )
+        )
+        await websocket.send_json(
+            {
+                "type": "answer_done",
+                "data": {
+                    "final_result": final_result,
+                    "cited_sources": cited_sources,
+                    "cited_source_links": cited_source_links,
+                },
+            }
+        )
+    else:
+        cited_sources = []
+        referenced_documents = trace.sorted_documents()
+        cited_source_links = {}
+
+    usage = agent.token_usage
+    _input_cost, _output_cost, total_cost = usage._calculate_cost()
+
+    await websocket.send_json(
+        {
+            "type": "complete",
+            "data": {
+                "final_result": final_result,
+                "error": result_error,
+                "stats": {
+                    "steps": step_number,
+                    "api_calls": usage.api_calls,
+                    "documents_scanned": usage.documents_scanned,
+                    "documents_parsed": usage.documents_parsed,
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "thinking_tokens": usage.thinking_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "tool_result_chars": usage.tool_result_chars,
+                    "estimated_cost": round(total_cost, 6),
+                    "context_summaries": usage.context_summaries,
+                    "model": getattr(agent._llm, "model", None),
+                    "duration_ms": round((time.monotonic() - run_started_at) * 1000),
+                    "context_usage_ratio": round(
+                        usage.context_usage_ratio(GEMINI_MAX_CONTEXT_TOKENS), 4
+                    ),
+                },
+                "trace": {
+                    "step_path": trace.step_path,
+                    "referenced_documents": referenced_documents,
+                    "cited_sources": cited_sources,
+                    "cited_source_links": cited_source_links,
+                },
+            },
+        }
+    )
+    # Run reached a real terminal state (answer or error) — nothing further
+    # for a later "resume" to do, so it must not still be resumable.
+    remove_run(run_id)
+
+
+async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None:
+    """Start and drive a brand-new exploration run, end to end."""
+    run_id = new_run_id()
     index_storage: PostgresStorage | None = None
+    agent: FsExplorerAgent | None = None
+    trace: ExplorationTrace | None = None
+    step_number = 0
+    folder_path = Path(".")
+    use_index = False
+    enable_semantic = False
+    enable_metadata = False
+    index_folders: list[str] = []
+    resolved_database_url: str | None = None
+    original_task = ""
 
     try:
-        # Receive the task
-        data = await websocket.receive_json()
-
-        if not internal_token_valid(data.get("internal_token")):
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "data": {"message": "Invalid or missing internal token."},
-                }
-            )
-            return
-
         task = data.get("task", "")
         original_task = task
         folder = data.get("folder", ".")
@@ -678,10 +884,10 @@ async def websocket_explore(websocket: WebSocket):
                 database_url if isinstance(database_url, str) else None
             )
             storage = PostgresStorage(resolved_database_url)
-            index_folders = index_folder_values or [str(folder_path)]
+            candidate_index_folders = index_folder_values or [str(folder_path)]
 
             available_index_folders: list[str] = []
-            for index_folder in index_folders:
+            for index_folder in candidate_index_folders:
                 corpus_root = resolve_corpus_root(index_folder)
                 if storage.get_corpus_id(corpus_root) is not None:
                     available_index_folders.append(corpus_root)
@@ -701,6 +907,7 @@ async def websocket_explore(websocket: WebSocket):
                 )
                 return
             index_storage = storage
+            index_folders = available_index_folders
             set_index_context(available_index_folders, resolved_database_url)
 
         set_search_flags(
@@ -745,7 +952,9 @@ async def websocket_explore(websocket: WebSocket):
                     }
                 )
 
-        # Send start event
+        # Send start event. The client should hold onto run_id and offer to
+        # resume with it if the connection drops or the run errors out
+        # before a `complete` event arrives.
         await websocket.send_json(
             {
                 "type": "start",
@@ -753,6 +962,7 @@ async def websocket_explore(websocket: WebSocket):
                     "task": original_task,
                     "folder": str(folder_path),
                     "use_index": use_index,
+                    "run_id": run_id,
                 },
             }
         )
@@ -770,16 +980,17 @@ async def websocket_explore(websocket: WebSocket):
         # ResourceManager, and explicitly-constructed agent (model/
         # temperature/hook passed directly, not via module globals — see
         # new_workflow()'s docstring for why that matters under concurrent
-        # requests). `resource_manager` is kept so the agent this run
-        # actually used can be retrieved after `await handler` via
-        # get_run_agent() — a bare get_agent() call at that point would
-        # return a different, empty agent (see get_run_agent()'s docstring).
-        step_number = 0
+        # requests). The agent is pre-registered into resource_manager
+        # before any step runs, so get_run_agent() reliably returns it here
+        # even while the run is still in progress (needed so a disconnect
+        # mid-run can still register whatever the agent has gathered so far
+        # — see _register_if_resumable() below).
         run_workflow, resource_manager = new_workflow(
             model=resolved_model,
             temperature=resolved_temperature,
             on_llm_call=_collect_llm_call,
         )
+        agent = get_run_agent(resource_manager)
         handler = run_workflow.run(
             start_event=InputEvent(
                 task=task,
@@ -794,72 +1005,24 @@ async def websocket_explore(websocket: WebSocket):
             await _flush_llm_calls()
             if isinstance(event, ToolCallEvent):
                 step_number += 1
-                resolved_document_path: str | None = None
-                if event.tool_name == "get_document":
-                    doc_id = event.tool_input.get("doc_id")
-                    if index_storage is not None and isinstance(doc_id, str) and doc_id:
-                        document = index_storage.get_document(doc_id=doc_id)
-                        if document and not document["is_deleted"]:
-                            resolved_document_path = str(document["absolute_path"])
-                trace.record_tool_call(
-                    step_number=step_number,
-                    tool_name=event.tool_name,
-                    tool_input=event.tool_input,
-                    resolved_document_path=resolved_document_path,
-                )
-                # status_label/status_detail below are sent as part of this
-                # single tool_call event (not also as a standalone "status"
-                # event) so the frontend doesn't end up with two adjacent
-                # research steps carrying the identical label/detail text
-                # for what is really one action.
-                tool_status = _status_for_tool(event.tool_name, event.tool_input)
                 await websocket.send_json(
-                    {
-                        "type": "tool_call",
-                        "data": {
-                            "step": step_number,
-                            "tool_name": event.tool_name,
-                            "tool_input": event.tool_input,
-                            "reason": event.reason,
-                            "status_label": tool_status["label"],
-                            "status_detail": tool_status["detail"],
-                        },
-                    }
+                    _tool_call_ws_message(
+                        event,
+                        step_number=step_number,
+                        trace=trace,
+                        index_storage=index_storage,
+                    )
                 )
-
             elif isinstance(event, GoDeeperEvent):
                 step_number += 1
-                trace.record_go_deeper(
-                    step_number=step_number, directory=event.directory
-                )
-                # No separate "status" event here either — the go_deeper
-                # event above already carries the directory being
-                # inspected, which is what the frontend displays for it.
                 await websocket.send_json(
-                    {
-                        "type": "go_deeper",
-                        "data": {
-                            "step": step_number,
-                            "directory": event.directory,
-                            "reason": event.reason,
-                        },
-                    }
+                    _go_deeper_ws_message(event, step_number=step_number, trace=trace)
                 )
-
             elif isinstance(event, AskHumanEvent):
                 step_number += 1
                 await websocket.send_json(
-                    {
-                        "type": "ask_human",
-                        "data": {
-                            "step": step_number,
-                            "question": event.question,
-                            "reason": event.reason,
-                        },
-                    }
+                    _ask_human_ws_message(event, step_number=step_number)
                 )
-
-                # Wait for human response
                 response_data = await websocket.receive_json()
                 if response_data.get("type") == "human_response":
                     handler.ctx.send_event(
@@ -872,95 +1035,262 @@ async def websocket_explore(websocket: WebSocket):
         # isn't followed by another loop iteration to flush it.
         await _flush_llm_calls()
 
-        final_result = result.final_result or ""
-        if not result.error:
-            await websocket.send_json(
-                {
-                    "type": "status",
-                    "data": {
-                        "label": "Writing answer",
-                        "detail": "Composing the final response",
-                    },
-                }
-            )
-            await websocket.send_json({"type": "answer_start", "data": {}})
-            streamed_parts: list[str] = []
-            agent = get_run_agent(resource_manager)
-            async for chunk in agent.stream_final_answer(fallback_answer=final_result):
-                streamed_parts.append(chunk)
-                await websocket.send_json(
-                    {"type": "answer_delta", "data": {"text": chunk}}
-                )
-            await _flush_llm_calls()
-            streamed_final = "".join(streamed_parts).strip()
-            if streamed_final:
-                final_result = streamed_final
-            cited_sources = extract_cited_sources(final_result)
-            referenced_documents = trace.sorted_documents()
-            cited_source_links = (
-                {}
-                if use_index
-                else _source_links(
-                    cited_sources=cited_sources,
-                    referenced_documents=referenced_documents,
-                    root_directory=str(folder_path),
-                )
-            )
-            await websocket.send_json(
-                {
-                    "type": "answer_done",
-                    "data": {
-                        "final_result": final_result,
-                        "cited_sources": cited_sources,
-                        "cited_source_links": cited_source_links,
-                    },
-                }
-            )
-        else:
-            cited_sources = []
-            referenced_documents = trace.sorted_documents()
-            cited_source_links = {}
+        await _finish_run(
+            websocket,
+            run_id=run_id,
+            agent=agent,
+            trace=trace,
+            step_number=step_number,
+            folder_path=folder_path,
+            use_index=use_index,
+            final_result=result.final_result or "",
+            result_error=result.error,
+            run_started_at=run_started_at,
+            flush_llm_calls=_flush_llm_calls,
+        )
+    except Exception:
+        _register_if_resumable(
+            run_id=run_id,
+            agent=agent,
+            trace=trace,
+            step_number=step_number,
+            folder_path=folder_path,
+            use_index=use_index,
+            enable_semantic=enable_semantic,
+            enable_metadata=enable_metadata,
+            index_folders=index_folders,
+            database_url=resolved_database_url,
+            original_task=original_task,
+        )
+        raise
+    finally:
+        if index_storage is not None:
+            index_storage.close()
+        set_search_flags(enable_semantic=False, enable_metadata=False)
+        clear_index_context()
 
-        # Get token usage
-        agent = get_run_agent(resource_manager)
-        usage = agent.token_usage
-        input_cost, output_cost, total_cost = usage._calculate_cost()
 
+async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
+    """Continue a run that was previously interrupted (see `runs.py`).
+
+    Reuses the same `FsExplorerAgent` the original connection was driving —
+    its `_chat_history`/`_step_count` already hold everything gathered
+    before the interruption — and drives it directly via
+    `workflow.resume_agent_run()` instead of restarting through
+    `InputEvent`/`start_exploration`.
+    """
+    index_storage: PostgresStorage | None = None
+    record = get_run(run_id)
+    if record is None:
         await websocket.send_json(
             {
-                "type": "complete",
+                "type": "error",
                 "data": {
-                    "final_result": final_result,
-                    "error": result.error,
-                    "stats": {
-                        "steps": step_number,
-                        "api_calls": usage.api_calls,
-                        "documents_scanned": usage.documents_scanned,
-                        "documents_parsed": usage.documents_parsed,
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens,
-                        "thinking_tokens": usage.thinking_tokens,
-                        "total_tokens": usage.total_tokens,
-                        "tool_result_chars": usage.tool_result_chars,
-                        "estimated_cost": round(total_cost, 6),
-                        "context_summaries": usage.context_summaries,
-                        "model": getattr(agent._llm, "model", None),
-                        "duration_ms": round(
-                            (time.monotonic() - run_started_at) * 1000
-                        ),
-                        "context_usage_ratio": round(
-                            usage.context_usage_ratio(GEMINI_MAX_CONTEXT_TOKENS), 4
-                        ),
-                    },
-                    "trace": {
-                        "step_path": trace.step_path,
-                        "referenced_documents": referenced_documents,
-                        "cited_sources": cited_sources,
-                        "cited_source_links": cited_source_links,
-                    },
+                    "message": (
+                        "No resumable run found for that run_id — it may have "
+                        "already finished, expired, or the server restarted. "
+                        "Please start a new question."
+                    )
                 },
             }
         )
+        return
+    remove_run(run_id)  # re-registered below only if interrupted again
+
+    agent = record.agent
+    trace = record.trace
+    step_number = record.step_number
+    folder_path = Path(record.folder)
+    use_index = record.use_index
+    enable_semantic = record.enable_semantic
+    enable_metadata = record.enable_metadata
+    index_folders = record.index_folders
+    resolved_database_url = record.database_url
+    original_task = record.original_task
+
+    try:
+        clear_index_context()
+        if use_index:
+            storage = PostgresStorage(resolved_database_url)
+            index_storage = storage
+            set_index_context(index_folders, resolved_database_url)
+
+        set_search_flags(
+            enable_semantic=enable_semantic and use_index,
+            enable_metadata=enable_metadata and use_index,
+        )
+
+        run_started_at = time.monotonic()
+        pending_llm_calls: list[LLMCallStats] = []
+
+        async def _collect_llm_call(stats: LLMCallStats) -> None:
+            pending_llm_calls.append(stats)
+
+        async def _flush_llm_calls() -> None:
+            while pending_llm_calls:
+                stats = pending_llm_calls.pop(0)
+                await websocket.send_json(
+                    {
+                        "type": "llm_call",
+                        "data": {
+                            "purpose": stats.purpose,
+                            "model": stats.model,
+                            "prompt_tokens": stats.prompt_tokens,
+                            "completion_tokens": stats.completion_tokens,
+                            "thinking_tokens": stats.thinking_tokens,
+                            "duration_ms": round(stats.duration_ms),
+                        },
+                    }
+                )
+
+        # The agent's original hook closure was bound to the interrupted
+        # connection's websocket — rebind it to this one before driving the
+        # agent any further.
+        agent.set_llm_call_hook(_collect_llm_call)
+
+        await websocket.send_json(
+            {
+                "type": "start",
+                "data": {
+                    "task": original_task,
+                    "folder": str(folder_path),
+                    "use_index": use_index,
+                    "run_id": run_id,
+                    "resumed": True,
+                },
+            }
+        )
+        await websocket.send_json(
+            {
+                "type": "status",
+                "data": {
+                    "label": "Continuing",
+                    "detail": "Resuming from where the run left off",
+                },
+            }
+        )
+
+        final_result = ""
+        result_error: str | None = None
+
+        gen = resume_agent_run(
+            agent,
+            use_index=use_index,
+            current_directory=str(folder_path),
+            initial_task=original_task,
+        )
+        send_value: str | None = None
+        while True:
+            try:
+                event = await gen.asend(send_value)
+            except StopAsyncIteration:
+                break
+            send_value = None
+            await _flush_llm_calls()
+
+            if isinstance(event, ToolCallEvent):
+                step_number += 1
+                await websocket.send_json(
+                    _tool_call_ws_message(
+                        event,
+                        step_number=step_number,
+                        trace=trace,
+                        index_storage=index_storage,
+                    )
+                )
+            elif isinstance(event, GoDeeperEvent):
+                step_number += 1
+                await websocket.send_json(
+                    _go_deeper_ws_message(event, step_number=step_number, trace=trace)
+                )
+            elif isinstance(event, AskHumanEvent):
+                step_number += 1
+                await websocket.send_json(
+                    _ask_human_ws_message(event, step_number=step_number)
+                )
+                response_data = await websocket.receive_json()
+                if response_data.get("type") == "human_response":
+                    send_value = response_data.get("response", "")
+                else:
+                    send_value = ""
+            elif isinstance(event, ExplorationEndEvent):
+                final_result = event.final_result or ""
+                result_error = event.error
+
+        await _flush_llm_calls()
+
+        await _finish_run(
+            websocket,
+            run_id=run_id,
+            agent=agent,
+            trace=trace,
+            step_number=step_number,
+            folder_path=folder_path,
+            use_index=use_index,
+            final_result=final_result,
+            result_error=result_error,
+            run_started_at=run_started_at,
+            flush_llm_calls=_flush_llm_calls,
+        )
+    except Exception:
+        _register_if_resumable(
+            run_id=run_id,
+            agent=agent,
+            trace=trace,
+            step_number=step_number,
+            folder_path=folder_path,
+            use_index=use_index,
+            enable_semantic=enable_semantic,
+            enable_metadata=enable_metadata,
+            index_folders=index_folders,
+            database_url=resolved_database_url,
+            original_task=original_task,
+        )
+        raise
+    finally:
+        if index_storage is not None:
+            index_storage.close()
+        set_search_flags(enable_semantic=False, enable_metadata=False)
+        clear_index_context()
+
+
+@app.websocket("/ws/explore")
+async def websocket_explore(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time exploration streaming.
+
+    Protocol:
+    1. Client sends either:
+       - {"task": "user question", ...} to start a new run, or
+       - {"type": "resume", "run_id": "..."} to continue a run that was
+         interrupted (dropped connection, manual stop, or an
+         unrecoverable error) before it completed — see `runs.py` for
+         what makes a run resumable.
+    2. Server streams events: {"type": "...", "data": {...}}
+    3. Final event: {"type": "complete", "data": {...}}
+
+    The `start` event always carries a `run_id`. If the connection is lost
+    or the run ends up erroring before a `complete` event, the client
+    should offer to resume with that same run_id on a fresh connection.
+    """
+    await websocket.accept()
+
+    try:
+        data = await websocket.receive_json()
+
+        if not internal_token_valid(data.get("internal_token")):
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "data": {"message": "Invalid or missing internal token."},
+                }
+            )
+            return
+
+        if data.get("type") == "resume":
+            await _run_resume_session(websocket, str(data.get("run_id", "")))
+        else:
+            await _run_fresh_session(websocket, data)
 
     except WebSocketDisconnect:
         logger.warning("Client disconnected from /ws/explore before completion")
@@ -979,11 +1309,6 @@ async def websocket_explore(websocket: WebSocket):
                 "Failed to deliver error event over /ws/explore; "
                 "connection likely already broken"
             )
-    finally:
-        if index_storage is not None:
-            index_storage.close()
-        set_search_flags(enable_semantic=False, enable_metadata=False)
-        clear_index_context()
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8000):
