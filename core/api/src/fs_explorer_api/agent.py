@@ -94,6 +94,11 @@ _DEEP_READ_TRUNCATION_HINT = (
     "a different angle."
 )
 
+# Cap on how many matched-chunk lines a single grep call can render — see
+# `_indexed_grep_file_content`'s docstring comment for why an uncapped
+# corpus-wide grep is at least as dangerous as an uncapped deep-read.
+_GREP_MAX_MATCH_LINES = int(os.getenv("FS_EXPLORER_GREP_MAX_MATCH_LINES", "60"))
+
 
 @dataclass
 class TokenUsage:
@@ -629,11 +634,26 @@ def _indexed_grep_file_content(file_path: str, pattern: str) -> str:
             return fs_grep_file_content(file_path, pattern)
         documents = [document]
 
+    # Unlike the deep-read tools, this had no output cap at all — a broad
+    # pattern run across `file_path="all"` (which the system prompt itself
+    # suggests for corpus-wide search) can match a large fraction of every
+    # chunk in the corpus: a real pattern with no word-boundary anchoring
+    # matched 55% of a 30K-chunk corpus (16,928 chunks, all 323 documents)
+    # in testing. Without a cap, that becomes one tool result with tens of
+    # thousands of lines — hundreds of thousands of tokens in a single call,
+    # then rebilled on every subsequent step since the full history is
+    # resent each time.
     lines: list[str] = []
+    matched_documents: set[str] = set()
+    truncated = False
     for document in documents:
         for chunk in storage.list_document_chunks(doc_id=str(document["id"])):
             matches = regex.findall(str(chunk["text"]))
             if not matches:
+                continue
+            matched_documents.add(str(document["id"]))
+            if len(lines) >= _GREP_MAX_MATCH_LINES:
+                truncated = True
                 continue
             rendered = [
                 match
@@ -646,12 +666,21 @@ def _indexed_grep_file_content(file_path: str, pattern: str) -> str:
                 f"chunk={chunk['position']}: " + "; ".join(rendered)
             )
 
-    if lines:
-        return (
-            f"MATCHES for {pattern} in indexed chunks ({file_path}):\n\n"
-            + "\n".join(lines)
+    if not lines:
+        return "No matches found in indexed chunks"
+
+    header = f"MATCHES for {pattern!r} in indexed chunks ({file_path}):\n\n"
+    body = "\n".join(lines)
+    if truncated:
+        body += (
+            f"\n\n[... TRUNCATED at {_GREP_MAX_MATCH_LINES} matches, already "
+            f"spanning {len(matched_documents)} of {len(documents)} documents "
+            "searched. This pattern is too broad to be useful here — narrow "
+            "it (word boundaries, a longer/more specific phrase) or restrict "
+            "to one file_path instead of 'all', or use semantic_search "
+            "instead for a relevance-ranked result ...]"
         )
-    return "No matches found in indexed chunks"
+    return header + body
 
 
 def _document_matches_directory(document: dict[str, Any], directory: str) -> bool:
