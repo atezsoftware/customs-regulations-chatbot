@@ -6,6 +6,7 @@ import time
 from typing import AsyncIterator
 
 from google.genai import Client as GenAIClient
+from google.genai import errors as genai_errors
 from google.genai.types import Content, Part
 from fs_explorer_shared.google_genai import build_genai_client
 
@@ -36,6 +37,27 @@ _llm_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GEMINI_CALLS)
 _LLM_CALL_TIMEOUT_SECONDS = float(
     os.getenv("FS_EXPLORER_LLM_CALL_TIMEOUT_SECONDS", "90")
 )
+
+# Transient-failure retry: `429 RESOURCE_EXHAUSTED` (rate limit) and
+# `503 UNAVAILABLE` (transient overload) are worth a short wait-and-retry
+# instead of failing the whole run outright — a chatbot request that's
+# already spent several tool-call steps shouldn't die because one call
+# got rate-limited for a moment. A call that timed out (see
+# `_LLM_CALL_TIMEOUT_SECONDS`) is retried too, on the same assumption that
+# it was a transient stall rather than a truly stuck request.
+_LLM_RETRY_ATTEMPTS = int(os.getenv("FS_EXPLORER_LLM_RETRY_ATTEMPTS", "3"))
+_LLM_RETRY_BACKOFF_SECONDS = float(
+    os.getenv("FS_EXPLORER_LLM_RETRY_BACKOFF_SECONDS", "2")
+)
+_RETRYABLE_STATUS_CODES = {429, 503}
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    if isinstance(exc, genai_errors.APIError):
+        return exc.code in _RETRYABLE_STATUS_CODES
+    return False
 
 
 def _to_contents(history: list[ChatTurn]) -> list[Content]:
@@ -78,20 +100,29 @@ class GeminiLLMClient:
         schema: type[SchemaT],
     ) -> tuple[SchemaT, LLMUsage]:
         started_at = time.monotonic()
-        async with _llm_semaphore:
-            response = await asyncio.wait_for(
-                self.raw_client.aio.models.generate_content(
-                    model=self.model,
-                    contents=_to_contents(history),  # ty: ignore[invalid-argument-type]
-                    config={
-                        "system_instruction": system_prompt,
-                        "response_mime_type": "application/json",
-                        "response_schema": schema,
-                        **self._generation_config(),
-                    },
-                ),
-                timeout=_LLM_CALL_TIMEOUT_SECONDS,
-            )
+        attempt = 0
+        while True:
+            try:
+                async with _llm_semaphore:
+                    response = await asyncio.wait_for(
+                        self.raw_client.aio.models.generate_content(
+                            model=self.model,
+                            contents=_to_contents(history),  # ty: ignore[invalid-argument-type]
+                            config={
+                                "system_instruction": system_prompt,
+                                "response_mime_type": "application/json",
+                                "response_schema": schema,
+                                **self._generation_config(),
+                            },
+                        ),
+                        timeout=_LLM_CALL_TIMEOUT_SECONDS,
+                    )
+                break
+            except Exception as exc:
+                attempt += 1
+                if attempt > _LLM_RETRY_ATTEMPTS or not _is_retryable(exc):
+                    raise
+                await asyncio.sleep(_LLM_RETRY_BACKOFF_SECONDS)
         duration_ms = (time.monotonic() - started_at) * 1000
 
         usage = LLMUsage(duration_ms=duration_ms)
@@ -126,42 +157,62 @@ class GeminiLLMClient:
         thinking_tokens = 0
         saw_usage = False
         started_at = time.monotonic()
+        yielded_any = False
+        attempt = 0
 
-        async with _llm_semaphore:
-            stream = stream_fn(
-                model=self.model,
-                contents=_to_contents(history),
-                config={
-                    "system_instruction": system_prompt,
-                    **self._generation_config(),
-                },
-            ).__aiter__()
-            # Bounded per-chunk, not per-stream: a healthy stream can
-            # legitimately run longer than one timeout window as long as
-            # chunks keep arriving. What this catches is the stream going
-            # silent for `_LLM_CALL_TIMEOUT_SECONDS` — previously unbounded,
-            # so a stalled final-answer stream could hang the whole request
-            # indefinitely (see `_LLM_CALL_TIMEOUT_SECONDS` docstring above).
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        stream.__anext__(), timeout=_LLM_CALL_TIMEOUT_SECONDS
-                    )
-                except StopAsyncIteration:
-                    break
+        # Retries the whole stream setup — only safe (no duplicated output)
+        # as long as nothing has been yielded to the caller yet. A failure
+        # after real text already streamed out is *not* retried here; it
+        # propagates to the caller (`FsExplorerAgent.stream_final_answer`),
+        # which falls back to whatever partial/fallback answer it has
+        # rather than risk sending duplicate or out-of-order text.
+        while True:
+            try:
+                async with _llm_semaphore:
+                    stream = stream_fn(
+                        model=self.model,
+                        contents=_to_contents(history),
+                        config={
+                            "system_instruction": system_prompt,
+                            **self._generation_config(),
+                        },
+                    ).__aiter__()
+                    # Bounded per-chunk, not per-stream: a healthy stream can
+                    # legitimately run longer than one timeout window as long
+                    # as chunks keep arriving. What this catches is the
+                    # stream going silent for `_LLM_CALL_TIMEOUT_SECONDS` —
+                    # previously unbounded, so a stalled final-answer stream
+                    # could hang the whole request indefinitely.
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(
+                                stream.__anext__(), timeout=_LLM_CALL_TIMEOUT_SECONDS
+                            )
+                        except StopAsyncIteration:
+                            break
 
-                if getattr(chunk, "usage_metadata", None):
-                    saw_usage = True
-                    usage = chunk.usage_metadata
-                    input_tokens = usage.prompt_token_count or input_tokens
-                    output_tokens = usage.candidates_token_count or output_tokens
-                    thinking_tokens = (
-                        getattr(usage, "thoughts_token_count", None) or thinking_tokens
-                    )
+                        if getattr(chunk, "usage_metadata", None):
+                            saw_usage = True
+                            usage = chunk.usage_metadata
+                            input_tokens = usage.prompt_token_count or input_tokens
+                            output_tokens = (
+                                usage.candidates_token_count or output_tokens
+                            )
+                            thinking_tokens = (
+                                getattr(usage, "thoughts_token_count", None)
+                                or thinking_tokens
+                            )
 
-                text = getattr(chunk, "text", None)
-                if text:
-                    yield text
+                        text = getattr(chunk, "text", None)
+                        if text:
+                            yielded_any = True
+                            yield text
+                break
+            except Exception as exc:
+                attempt += 1
+                if yielded_any or attempt > _LLM_RETRY_ATTEMPTS or not _is_retryable(exc):
+                    raise
+                await asyncio.sleep(_LLM_RETRY_BACKOFF_SECONDS)
 
         if saw_usage:
             self._last_stream_usage = LLMUsage(

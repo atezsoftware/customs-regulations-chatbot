@@ -7,6 +7,7 @@ to make decisions about filesystem exploration actions.
 
 import contextvars
 import fnmatch
+import logging
 import os
 import re
 from pathlib import Path
@@ -30,6 +31,8 @@ from .search import (
     supported_filter_syntax,
 )
 from fs_explorer_shared.storage import PostgresStorage
+
+logger = logging.getLogger(__name__)
 
 # Load .env file from project root
 _env_path = Path(__file__).parent.parent.parent / ".env"
@@ -91,6 +94,11 @@ _CONTEXT_SUMMARY_KEEP_LEADING_TURNS = 1
 # re-searching in circles (see the duplicate-query guard below) no longer
 # has an unbounded number of $-per-call chances to keep doing so.
 _MAX_STEPS = int(os.getenv("FS_EXPLORER_MAX_STEPS", "10"))
+_FORCED_STOP_FALLBACK_ANSWER = (
+    "Bu soruyu yanıtlamak için ayrılan araştırma adımı bütçesi doldu ve "
+    "kesin bir cevaba ulaşılamadı. Şu ana kadar bulunanlara dayanarak "
+    "elimden gelen en iyi özeti vermeye çalışacağım."
+)
 
 # Hard cap on how much raw chunk text a single "deep read" call (read,
 # parse_file, get_document) can inject into chat history in one go. Real
@@ -1354,12 +1362,16 @@ class FsExplorerAgent:
         if self._step_count > _MAX_STEPS:
             # Force a stop without spending another LLM call on it — a run
             # that's hit the step budget doesn't need the model's opinion on
-            # whether to keep going, it needs to wrap up. `final_result` is
-            # left blank; `stream_final_answer()` (called next, with the
-            # full accumulated history) is what actually composes the real
-            # answer — this only has to satisfy the Action schema.
+            # whether to keep going, it needs to wrap up. `final_result`
+            # normally only has to satisfy the Action schema, since
+            # `stream_final_answer()` (called next, with the full
+            # accumulated history) is what actually composes the real
+            # answer — but it's also used verbatim as that call's fallback
+            # if streaming itself fails, so it must never be blank: an
+            # empty string there plus a failed stream previously meant the
+            # user got a silently empty response.
             action = Action(
-                action=StopAction(final_result=""),
+                action=StopAction(final_result=_FORCED_STOP_FALLBACK_ANSWER),
                 reason=(
                     f"Reached the step budget ({_MAX_STEPS} actions) without "
                     "a conclusive path through further tool calls — "
@@ -1491,11 +1503,18 @@ class FsExplorerAgent:
                 chunks.append(text)
                 yield text
         except Exception:
-            pass
+            logger.exception("stream_final_answer: final-answer streaming failed")
 
         if not chunks:
-            if fallback_answer:
-                yield fallback_answer
+            # `fallback_answer` can itself be empty (e.g. a forced max-steps
+            # stop with no real StopAction text) — falling through to a
+            # generic message here means a double failure (forced stop *and*
+            # streaming both coming up empty) still shows the user something
+            # instead of a silent blank response.
+            yield fallback_answer or (
+                "Üzgünüm, bu soru için şu anda bir cevap oluşturamadım. "
+                "Lütfen tekrar deneyin."
+            )
             return
 
         final_text = "".join(chunks)
