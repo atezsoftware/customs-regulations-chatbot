@@ -106,7 +106,7 @@ _CONTEXT_SUMMARY_KEEP_LEADING_TURNS = 1
 # looping indefinitely and never terminating; it should essentially never
 # fire in practice. Previously defaulted to 10, which was cutting off
 # legitimate multi-step research runs before they reached a real answer.
-_MAX_STEPS = int(os.getenv("FS_EXPLORER_MAX_STEPS", "40"))
+_MAX_STEPS = int(os.getenv("FS_EXPLORER_MAX_STEPS", "60"))
 _FORCED_STOP_FALLBACK_ANSWER = (
     "Bu soruyu yanıtlamak için ayrılan araştırma adımı bütçesi doldu ve "
     "kesin bir cevaba ulaşılamadı. Şu ana kadar bulunanlara dayanarak "

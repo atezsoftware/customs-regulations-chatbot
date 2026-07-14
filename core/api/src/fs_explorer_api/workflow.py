@@ -366,11 +366,11 @@ class FsExplorerWorkflow(Workflow):
         return await _process_agent_action(agent, ctx, update_directory=True)
 
 
-# Workflow timeout for complex multi-document analysis (10 minutes) — raised
-# alongside agent.py's _MAX_STEPS default (10 -> 40): a run now allowed to
+# Workflow timeout for complex multi-document analysis (15 minutes) — raised
+# alongside agent.py's _MAX_STEPS default (10 -> 60): a run now allowed to
 # take many more genuine research steps needs proportionally more wall-clock
 # room to actually reach them before this (not the step count) cuts it off.
-WORKFLOW_TIMEOUT_SECONDS = 600
+WORKFLOW_TIMEOUT_SECONDS = 900
 
 
 def new_workflow(
