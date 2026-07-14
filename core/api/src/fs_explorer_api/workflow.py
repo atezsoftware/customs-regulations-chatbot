@@ -366,11 +366,15 @@ class FsExplorerWorkflow(Workflow):
         return await _process_agent_action(agent, ctx, update_directory=True)
 
 
-# Workflow timeout for complex multi-document analysis (15 minutes) — raised
-# alongside agent.py's _MAX_STEPS default (10 -> 60): a run now allowed to
-# take many more genuine research steps needs proportionally more wall-clock
-# room to actually reach them before this (not the step count) cuts it off.
-WORKFLOW_TIMEOUT_SECONDS = 900
+# No wall-clock ceiling on the tool-call loop itself — a genuinely hard
+# multi-document question should be allowed to take as many real research
+# steps as it needs. What still bounds a run: `agent.py`'s `_MAX_STEPS`
+# (a safety net against an escaped duplicate-call loop, not a normal
+# limit) and `llm/gemini.py`'s per-call timeout/retry logic (so any single
+# stalled Gemini call still fails fast rather than hanging forever) — a
+# run can no longer be killed by *this* timeout while it's still making
+# genuine progress one bounded call at a time.
+WORKFLOW_TIMEOUT_SECONDS = None
 
 
 def new_workflow(
