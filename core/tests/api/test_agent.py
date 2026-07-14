@@ -293,9 +293,12 @@ class TestContextSummarization:
     """Tests for mid-run chat history compaction (`_maybe_summarize_history`)."""
 
     @pytest.mark.asyncio
+    @patch("fs_explorer_api.agent._MAX_STEPS", 100)
     async def test_triggers_above_threshold_and_shrinks_history(self) -> None:
         # 8 small calls to build up history, then one that crosses 85% of
-        # the context ceiling and should trigger a compaction.
+        # the context ceiling and should trigger a compaction. Step budget
+        # patched well above 9 so this run of the step-count guard doesn't
+        # interfere with what this test is actually exercising.
         over_threshold = int(GEMINI_MAX_CONTEXT_TOKENS * 0.9)
         client = _ScriptedLLMClient([1000] * 8 + [over_threshold])
         agent = FsExplorerAgent(llm_client=client)
@@ -306,12 +309,13 @@ class TestContextSummarization:
 
         assert client.summary_calls == 1
         assert agent.token_usage.context_summaries == 1
-        # leading task turn (1) + summary turn (1) + recent turns (6)
-        assert len(agent._chat_history) == 8
+        # leading task turn (1) + summary turn (1) + recent turns (4)
+        assert len(agent._chat_history) == 6
         assert agent._chat_history[0].text == "step 0"
         assert "compact summary" in agent._chat_history[1].text
 
     @pytest.mark.asyncio
+    @patch("fs_explorer_api.agent._MAX_STEPS", 100)
     async def test_does_not_trigger_below_threshold(self) -> None:
         client = _ScriptedLLMClient([1000] * 9)
         agent = FsExplorerAgent(llm_client=client)
@@ -336,3 +340,119 @@ class TestContextSummarization:
         await agent.take_action()
 
         assert client.summary_calls == 0
+
+
+class TestMaxSteps:
+    """Tests for the `_MAX_STEPS` hard step budget in `take_action()`."""
+
+    @pytest.mark.asyncio
+    @patch("fs_explorer_api.agent._MAX_STEPS", 3)
+    async def test_forces_stop_after_budget_without_extra_llm_call(self) -> None:
+        # Every scripted action is a GoDeeperAction (never resolves itself
+        # to a stop) so the *only* way this loop terminates is the budget.
+        client = _ScriptedLLMClient([100] * 10)
+        agent = FsExplorerAgent(llm_client=client)
+
+        results = []
+        for i in range(5):
+            agent.configure_task(f"step {i}")
+            results.append(await agent.take_action())
+
+        # First 3 calls really hit the LLM; the 4th and 5th are forced
+        # stops that must not consume any more scripted responses.
+        assert len(client._action_token_counts) == 10 - 3
+        assert results[3][1] == "stop"
+        assert results[4][1] == "stop"
+        assert "step budget" in results[3][0].reason
+
+    @pytest.mark.asyncio
+    @patch("fs_explorer_api.agent._MAX_STEPS", 2)
+    async def test_forced_stop_still_produces_valid_history_turn(self) -> None:
+        client = _ScriptedLLMClient([100] * 5)
+        agent = FsExplorerAgent(llm_client=client)
+
+        agent.configure_task("step 0")
+        await agent.take_action()
+        agent.configure_task("step 1")
+        await agent.take_action()
+        agent.configure_task("step 2")
+        action, action_type = await agent.take_action()
+
+        assert action_type == "stop"
+        assert agent._chat_history[-1].role == "model"
+
+
+class TestDuplicateCallGuard:
+    """Tests for the near-duplicate tool-call short-circuit in `call_tool()`."""
+
+    def test_exact_duplicate_query_is_skipped(self) -> None:
+        from fs_explorer_api.agent import TOOLS
+
+        calls = []
+        original = TOOLS["semantic_search"]
+        TOOLS["semantic_search"] = lambda **kwargs: calls.append(kwargs) or "real result"
+        try:
+            agent = FsExplorerAgent(llm_client=make_mock_llm_client())
+            agent.call_tool("semantic_search", {"query": "TIR karnesi ekstre teminat"})
+            agent.call_tool("semantic_search", {"query": "TIR karnesi ekstre teminat"})
+        finally:
+            TOOLS["semantic_search"] = original
+
+        assert len(calls) == 1  # second call never reached the real tool
+        assert "SKIPPED" in agent._chat_history[-1].text
+
+    def test_near_duplicate_reworded_query_is_skipped(self) -> None:
+        from fs_explorer_api.agent import TOOLS
+
+        calls = []
+        original = TOOLS["semantic_search"]
+        TOOLS["semantic_search"] = lambda **kwargs: calls.append(kwargs) or "real result"
+        try:
+            agent = FsExplorerAgent(llm_client=make_mock_llm_client())
+            agent.call_tool(
+                "semantic_search",
+                {"query": "TIR karnesi ekstre teminat hassas eşya yüksek riskli eşya listesi"},
+            )
+            agent.call_tool(
+                "semantic_search",
+                {"query": "TIR karnesi kapsamında ek teminat veya hassas eşya listesi yüksek riskli eşyalar"},
+            )
+        finally:
+            TOOLS["semantic_search"] = original
+
+        assert len(calls) == 1
+
+    def test_genuinely_different_query_is_not_skipped(self) -> None:
+        from fs_explorer_api.agent import TOOLS
+
+        calls = []
+        original = TOOLS["semantic_search"]
+        TOOLS["semantic_search"] = lambda **kwargs: calls.append(kwargs) or "real result"
+        try:
+            agent = FsExplorerAgent(llm_client=make_mock_llm_client())
+            agent.call_tool("semantic_search", {"query": "TIR karnesi ekstra teminat"})
+            agent.call_tool("semantic_search", {"query": "gümrük vergisi iade süresi"})
+        finally:
+            TOOLS["semantic_search"] = original
+
+        assert len(calls) == 2
+
+    def test_same_document_via_different_tool_name_is_skipped(self) -> None:
+        """parse_file/get_document/read all fetch the same underlying
+        document content — a repeat via a different tool name must still
+        count as a duplicate, not get a fresh "first one's free"."""
+        from fs_explorer_api.agent import TOOLS
+
+        calls = []
+        originals = {name: TOOLS[name] for name in ("parse_file", "get_document")}
+        for name in originals:
+            TOOLS[name] = lambda **kwargs: calls.append(kwargs) or "doc text"
+        try:
+            agent = FsExplorerAgent(llm_client=make_mock_llm_client())
+            agent.call_tool("parse_file", {"file_path": "doc_abc123"})
+            agent.call_tool("get_document", {"doc_id": "doc_abc123"})
+        finally:
+            TOOLS.update(originals)
+
+        assert len(calls) == 1
+        assert "SKIPPED" in agent._chat_history[-1].text

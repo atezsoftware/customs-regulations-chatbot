@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 from .llm import ChatTurn, LLMClient, LLMUsage, get_llm_client
-from .models import Action, ActionType, ContextSummary, Tools
+from .models import Action, ActionType, ContextSummary, StopAction, Tools
 from fs_explorer_shared.fs import (
     read_file as fs_read_file,
     grep_file_content as fs_grep_file_content,
@@ -53,27 +53,44 @@ GEMINI_MAX_CONTEXT_TOKENS = 1_048_576
 
 # Fraction of GEMINI_MAX_CONTEXT_TOKENS at which the agent proactively
 # compacts its own mid-run chat history (see `_maybe_summarize_history`)
-# instead of waiting to actually hit the ceiling and error out. Every
-# `take_action()` call resends the full history, so this is checked after
-# each one using that call's own prompt token count as the "current size"
-# signal.
-#
-# A 41-step run was once observed summing to ~900K billed tokens; that
-# turned out to be a symptom of the cross-chat index-context race (see
-# `_INDEX_CONTEXT_VAR` below) causing the agent to re-plan/re-search after
-# getting corrupted tool results, not this threshold being too high — so
-# it's left at float(1M ceiling)-adjacent rather than tuned down for cost.
+# instead of waiting to actually hit the ceiling and error out. Kept as a
+# hard backstop against ever actually hitting the ceiling — the *cost*
+# lever is `CONTEXT_SUMMARY_MAX_TOKENS` below, which triggers far earlier.
 CONTEXT_SUMMARY_THRESHOLD_RATIO = float(
     os.getenv("FS_EXPLORER_CONTEXT_SUMMARY_THRESHOLD", "0.85")
 )
 
+# Absolute-token trigger for the same compaction, checked *in addition to*
+# the ratio above (whichever fires first wins). A 20+-step run was
+# observed summing to ~900K billed tokens even after every individual tool
+# result was capped (see _DEEP_READ_MAX_CHARS/_GREP_MAX_MATCH_LINES below)
+# — because every call resends the *entire* history, a long run's cost is
+# dominated by how large that history is allowed to grow, not by any one
+# call. The 0.85-of-1M ratio above only ever prevents a hard crash; it
+# does nothing for cost until history is already ~900K tokens. This much
+# lower absolute cap keeps the resent history — and therefore the
+# per-call and cumulative cost — bounded throughout a long run instead of
+# only in its final stretch.
+CONTEXT_SUMMARY_MAX_TOKENS = int(
+    os.getenv("FS_EXPLORER_CONTEXT_SUMMARY_MAX_TOKENS", "8000")
+)
+
 # How many of the most recent chat turns to keep verbatim when
 # summarizing — recent tool results are more likely to still be relevant
-# to the very next decision than older ones.
-_CONTEXT_SUMMARY_KEEP_RECENT_TURNS = 6
+# to the very next decision than older ones. Kept small on purpose: a
+# single kept-verbatim deep-read turn can already be ~_DEEP_READ_MAX_CHARS
+# characters, so keeping many of them defeats the point of compacting.
+_CONTEXT_SUMMARY_KEEP_RECENT_TURNS = 4
 # The first turn (initial task framing) is always kept verbatim too, so
 # the agent never loses sight of the original task after a summarization.
 _CONTEXT_SUMMARY_KEEP_LEADING_TURNS = 1
+
+# Hard ceiling on total agent decision-points (take_action() calls) in a
+# single run. Once reached, the agent is forced to stop and compose its
+# final answer from whatever has been gathered so far — a run stuck
+# re-searching in circles (see the duplicate-query guard below) no longer
+# has an unbounded number of $-per-call chances to keep doing so.
+_MAX_STEPS = int(os.getenv("FS_EXPLORER_MAX_STEPS", "10"))
 
 # Hard cap on how much raw chunk text a single "deep read" call (read,
 # parse_file, get_document) can inject into chat history in one go. Real
@@ -86,7 +103,7 @@ _CONTEXT_SUMMARY_KEEP_LEADING_TURNS = 1
 # returns only matching excerpts, so capping this doesn't lose the ability
 # to search a huge document — it only stops one call from being able to
 # dump the entire thing into memory at once.
-_DEEP_READ_MAX_CHARS = int(os.getenv("FS_EXPLORER_DEEP_READ_MAX_CHARS", "50000"))
+_DEEP_READ_MAX_CHARS = int(os.getenv("FS_EXPLORER_DEEP_READ_MAX_CHARS", "15000"))
 _DEEP_READ_TRUNCATION_HINT = (
     "This is already the full-content tool and will not return more via a "
     "repeat call. Use grep(file_path=..., pattern=...) to search this "
@@ -97,7 +114,70 @@ _DEEP_READ_TRUNCATION_HINT = (
 # Cap on how many matched-chunk lines a single grep call can render — see
 # `_indexed_grep_file_content`'s docstring comment for why an uncapped
 # corpus-wide grep is at least as dangerous as an uncapped deep-read.
-_GREP_MAX_MATCH_LINES = int(os.getenv("FS_EXPLORER_GREP_MAX_MATCH_LINES", "60"))
+_GREP_MAX_MATCH_LINES = int(os.getenv("FS_EXPLORER_GREP_MAX_MATCH_LINES", "25"))
+
+# --- Near-duplicate tool-call guard ---
+#
+# Real runs have been observed re-issuing 10+ near-identical semantic_search
+# queries in a row (same topic, slightly reworded each time) when the
+# corpus doesn't have a clean answer — each one resent the *entire* history
+# plus a full new search result, multiplying cost for zero new information.
+# This tracks each tool's identifying argument (query/pattern/file_path)
+# across the last few calls and short-circuits an obvious repeat with a
+# tiny canned message instead of re-running the real (expensive) tool —
+# cutting both the wasted DB/embedding work and, more importantly, the
+# runaway step count that was the actual dominant driver of total cost.
+_DUPLICATE_CALL_LOOKBACK = 5
+_DUPLICATE_QUERY_SIMILARITY_THRESHOLD = 0.6
+_FUZZY_DEDUP_GROUPS = {"semantic_search", "grep", "glob"}
+
+# parse_file/get_document/read all resolve to the exact same content
+# (`_document_from_chunks` on the same document) — grouped together so
+# fetching the same document through a different tool *name* still counts
+# as a repeat, instead of each name getting its own "first one's free".
+_DEEP_READ_GROUP = "deep_read"
+_TOOL_DEDUP_GROUPS: dict[str, str] = {
+    "semantic_search": "semantic_search",
+    "grep": "grep",
+    "glob": "glob",
+    "parse_file": _DEEP_READ_GROUP,
+    "get_document": _DEEP_READ_GROUP,
+    "read": _DEEP_READ_GROUP,
+    "preview_file": "preview_file",
+    "scan_folder": "scan_folder",
+}
+
+
+def _dedup_key(tool_name: str, tool_input: dict[str, Any]) -> tuple[str, str] | None:
+    """Extract (group, identifying-argument) for a tool call, so repeats —
+    including the same document fetched via a different tool name — can be
+    detected regardless of other arguments."""
+    group = _TOOL_DEDUP_GROUPS.get(tool_name)
+    if group is None:
+        return None
+    if tool_name == "semantic_search":
+        value = tool_input.get("query", "")
+    elif tool_name in {"grep", "glob"}:
+        value = tool_input.get("pattern", "")
+    elif tool_name in {"parse_file", "preview_file", "get_document", "read"}:
+        value = tool_input.get("file_path") or tool_input.get("doc_id") or ""
+    elif tool_name == "scan_folder":
+        value = tool_input.get("directory", "")
+    else:
+        value = ""
+    value = str(value).strip()
+    return (group, value) if value else None
+
+
+def _query_token_overlap(a: str, b: str) -> float:
+    """Jaccard-style token overlap, used only as a cheap "is this basically
+    the same search again" signal — not a real semantic similarity."""
+    tokens_a = set(re.findall(r"\w+", a.lower()))
+    tokens_b = set(re.findall(r"\w+", b.lower()))
+    if not tokens_a or not tokens_b:
+        return 0.0
+    overlap = len(tokens_a & tokens_b)
+    return overlap / max(len(tokens_a), len(tokens_b))
 
 
 @dataclass
@@ -926,7 +1006,7 @@ def semantic_search(
 
 
 def get_document(doc_id: str) -> str:
-    """Return full document content by id from the active index context."""
+    """Return document content by id from the active index context."""
     storage, corpora, error = _get_index_storage_and_corpora()
     if error:
         return error
@@ -938,7 +1018,12 @@ def get_document(doc_id: str) -> str:
     if document["is_deleted"]:
         return f"Document {doc_id} is marked as deleted in the index."
 
-    return _document_from_chunks(storage, document)
+    return _document_from_chunks(
+        storage,
+        document,
+        max_chars=_DEEP_READ_MAX_CHARS,
+        truncation_hint=_DEEP_READ_TRUNCATION_HINT,
+    )
 
 
 def list_indexed_documents() -> str:
@@ -1227,6 +1312,10 @@ class FsExplorerAgent:
         self._chat_history: list[ChatTurn] = []
         self.token_usage = TokenUsage()
         self._on_llm_call = on_llm_call
+        self._step_count = 0
+        # (tool_name, dedup_key) for the last `_DUPLICATE_CALL_LOOKBACK`
+        # real tool calls — see `_dedup_key`/`_is_near_duplicate_call`.
+        self._recent_tool_calls: list[tuple[str, str]] = []
 
     async def _report_llm_call(self, purpose: str, usage: "LLMUsage") -> None:
         if self._on_llm_call is None:
@@ -1261,6 +1350,28 @@ class FsExplorerAgent:
         Returns:
             A tuple of (Action, ActionType) if successful, None otherwise.
         """
+        self._step_count += 1
+        if self._step_count > _MAX_STEPS:
+            # Force a stop without spending another LLM call on it — a run
+            # that's hit the step budget doesn't need the model's opinion on
+            # whether to keep going, it needs to wrap up. `final_result` is
+            # left blank; `stream_final_answer()` (called next, with the
+            # full accumulated history) is what actually composes the real
+            # answer — this only has to satisfy the Action schema.
+            action = Action(
+                action=StopAction(final_result=""),
+                reason=(
+                    f"Reached the step budget ({_MAX_STEPS} actions) without "
+                    "a conclusive path through further tool calls — "
+                    "stopping to compose the best answer from what has "
+                    "been gathered so far."
+                ),
+            )
+            self._chat_history.append(
+                ChatTurn(role="model", text=action.model_dump_json())
+            )
+            return action, action.to_action_type()
+
         action, usage = await self._llm.generate_structured(
             self._chat_history,
             _build_system_prompt(*get_search_flags()),
@@ -1282,16 +1393,20 @@ class FsExplorerAgent:
 
         `last_prompt_tokens` is the size (in tokens) of the request that was
         just sent — since every call resends the full history, that's also
-        a good proxy for "how big is `_chat_history` right now". Above
-        `CONTEXT_SUMMARY_THRESHOLD_RATIO` of the model's ceiling, the middle
-        of the history (everything except the original task framing and the
+        a good proxy for "how big is `_chat_history` right now". Once that
+        crosses `CONTEXT_SUMMARY_MAX_TOKENS` (the cost-driven trigger) or
+        `CONTEXT_SUMMARY_THRESHOLD_RATIO` of the model's ceiling (the
+        crash-prevention backstop) — whichever comes first — the middle of
+        the history (everything except the original task framing and the
         most recent turns) is replaced with a single compact summary turn,
         generated by one extra LLM call over just that middle slice.
         """
-        if (
+        ratio_trigger = (
             last_prompt_tokens / GEMINI_MAX_CONTEXT_TOKENS
-            < CONTEXT_SUMMARY_THRESHOLD_RATIO
-        ):
+            >= CONTEXT_SUMMARY_THRESHOLD_RATIO
+        )
+        absolute_trigger = last_prompt_tokens >= CONTEXT_SUMMARY_MAX_TOKENS
+        if not (ratio_trigger or absolute_trigger):
             return
 
         keep = _CONTEXT_SUMMARY_KEEP_LEADING_TURNS + _CONTEXT_SUMMARY_KEEP_RECENT_TURNS
@@ -1399,17 +1514,40 @@ class FsExplorerAgent:
         """
         Execute a tool and add the result to the conversation history.
 
+        Skips the actual (potentially expensive) tool call and short-circuits
+        with a small canned message if this looks like a near-duplicate of a
+        recent call — see the near-duplicate guard constants near the top of
+        this module for why.
+
         Args:
             tool_name: Name of the tool to execute.
             tool_input: Dictionary of arguments to pass to the tool.
         """
-        try:
-            result = TOOLS[tool_name](**tool_input)
-        except Exception as e:
+        dedup = _dedup_key(tool_name, tool_input)
+        if dedup is not None and self._is_near_duplicate_call(*dedup):
             result = (
-                f"An error occurred while calling tool {tool_name} "
-                f"with {tool_input}: {e}"
+                "SKIPPED: this looks like a near-duplicate of a search you "
+                "already ran in the last few steps — repeating it (even via "
+                "a different tool name for the same document) will not "
+                "surface new information. Try a genuinely different tool or "
+                "query (a different search angle, a specific article/"
+                "document number, an exact phrase for grep), or if you "
+                "already have enough information, STOP now and give your "
+                "final answer."
             )
+        else:
+            try:
+                result = TOOLS[tool_name](**tool_input)
+            except Exception as e:
+                result = (
+                    f"An error occurred while calling tool {tool_name} "
+                    f"with {tool_input}: {e}"
+                )
+            if dedup is not None:
+                self._recent_tool_calls.append(dedup)
+                self._recent_tool_calls = self._recent_tool_calls[
+                    -_DUPLICATE_CALL_LOOKBACK:
+                ]
 
         # Track tool result sizes
         self.token_usage.add_tool_result(result, tool_name)
@@ -1418,7 +1556,24 @@ class FsExplorerAgent:
             ChatTurn(role="user", text=f"Tool result for {tool_name}:\n\n{result}")
         )
 
+    def _is_near_duplicate_call(self, group: str, key: str) -> bool:
+        fuzzy = group in _FUZZY_DEDUP_GROUPS
+        for prior_group, prior_key in self._recent_tool_calls:
+            if prior_group != group:
+                continue
+            if fuzzy:
+                if (
+                    _query_token_overlap(key, prior_key)
+                    >= _DUPLICATE_QUERY_SIMILARITY_THRESHOLD
+                ):
+                    return True
+            elif key.strip().lower() == prior_key.strip().lower():
+                return True
+        return False
+
     def reset(self) -> None:
         """Reset the agent's conversation history and token tracking."""
         self._chat_history.clear()
         self.token_usage = TokenUsage()
+        self._step_count = 0
+        self._recent_tool_calls.clear()
