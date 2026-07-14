@@ -19,6 +19,18 @@ body {
   }
 }
 
+/* Sweeping brightness highlight for the live "what's happening now" research
+   status text (ResearchActivityPanel) — moves the gradient's bright band
+   across the text left to right, on loop, while a step is in progress. */
+@keyframes shimmer {
+  from {
+    background-position: 150% 0;
+  }
+  to {
+    background-position: -50% 0;
+  }
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
