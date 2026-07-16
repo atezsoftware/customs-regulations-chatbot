@@ -7,6 +7,7 @@ to make decisions about filesystem exploration actions.
 
 import contextvars
 import fnmatch
+import html
 import logging
 import os
 import re
@@ -131,6 +132,11 @@ _DEEP_READ_TRUNCATION_HINT = (
     "document's complete text for specific terms, or semantic_search for "
     "a different angle."
 )
+
+
+def _normalize_indexed_text(value: str) -> str:
+    """Decode document-export entities before they become model context."""
+    return html.unescape(value)
 
 # Cap on how many matched-chunk lines a single grep call can render — see
 # `_indexed_grep_file_content`'s docstring comment for why an uncapped
@@ -578,7 +584,7 @@ def _document_from_chunks(
         f"content_source: core_chunks.text\n\n"
     )
     if not chunks:
-        content = str(document.get("content") or "")
+        content = _normalize_indexed_text(str(document.get("content") or ""))
         body = content if max_chars is None else content[:max_chars]
         if max_chars is not None and len(content) > max_chars:
             body += (
@@ -591,7 +597,7 @@ def _document_from_chunks(
     total = 0
     truncated = False
     for chunk in chunks:
-        chunk_text = str(chunk["text"])
+        chunk_text = _normalize_indexed_text(str(chunk["text"]))
         chunk_header = (
             f"\n--- chunk {chunk['position']} "
             f"({chunk.get('chunk_type') or 'text'}, chars "
@@ -749,7 +755,8 @@ def _indexed_grep_file_content(file_path: str, pattern: str) -> str:
     truncated = False
     for document in documents:
         for chunk in storage.list_document_chunks(doc_id=str(document["id"])):
-            matches = regex.findall(str(chunk["text"]))
+            chunk_text = _normalize_indexed_text(str(chunk["text"]))
+            matches = regex.findall(chunk_text)
             if not matches:
                 continue
             matched_documents.add(str(document["id"]))
@@ -955,7 +962,7 @@ def semantic_search(
                 f"    semantic_score: {hit.semantic_score}",
                 f"    metadata_score: {hit.metadata_score}",
                 f"    score: {hit.score:.2f}",
-                f"    excerpt: {_clean_excerpt(hit.text)}",
+                f"    excerpt: {_clean_excerpt(_normalize_indexed_text(hit.text))}",
                 "",
             ]
         )
@@ -1088,6 +1095,13 @@ TOOLS: dict[Tools, Callable[..., str]] = {
 
 SYSTEM_PROMPT = """
 You are FsExplorer, an AI agent that answers questions about indexed documents.
+
+## Output Encoding
+
+Write answers as plain Unicode UTF-8 text. Never emit HTML/XML entities such
+as `&uuml;`, `&ccedil;`, `&#351;`, `&ldquo;`, or `&rsquo;`; always write the actual
+Unicode character, even if an indexed source contains an entity. Do not use
+HTML markup for answer formatting.
 
 ## Available Tools
 
@@ -1552,7 +1566,8 @@ class FsExplorerAgent:
             "claims cited with the required [Readable Document Title, Article/Section] "
             "format. Do not use 'Source:' labels, local paths, backend/storage paths, "
             "or raw slugified filenames in citations. Include a final '## Sources' "
-            "section with readable document titles only. Return plain text only."
+            "section with readable document titles only. Return plain UTF-8 text "
+            "with actual Unicode characters, never HTML/XML entities or markup."
         )
         stream_history = [*self._chat_history, ChatTurn(role="user", text=prompt)]
         system_prompt = _build_system_prompt(*get_search_flags())

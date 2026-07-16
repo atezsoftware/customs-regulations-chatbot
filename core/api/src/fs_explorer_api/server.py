@@ -5,6 +5,7 @@ Provides a WebSocket endpoint for real-time workflow streaming
 and serves the single-page HTML interface.
 """
 
+import html
 import logging
 import re
 import time
@@ -65,6 +66,11 @@ from .workflow import (
 )
 
 app = FastAPI(title="FsExplorer", description="AI-powered filesystem exploration")
+
+
+def _decode_html_entities(value: str) -> str:
+    """Keep model-generated HTML entities out of plain-text chat answers."""
+    return html.unescape(value)
 
 
 class TaskRequest(BaseModel):
@@ -758,7 +764,7 @@ async def _finish_run(
             streamed_parts.append(chunk)
             await websocket.send_json({"type": "answer_delta", "data": {"text": chunk}})
         await flush_llm_calls()
-        streamed_final = "".join(streamed_parts).strip()
+        streamed_final = _decode_html_entities("".join(streamed_parts)).strip()
         if streamed_final:
             final_result = streamed_final
         cited_sources = extract_cited_sources(final_result)

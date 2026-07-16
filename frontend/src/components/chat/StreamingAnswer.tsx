@@ -1,5 +1,6 @@
 import {useEffect, useRef, useState} from 'react';
 import type {Source} from '../../types';
+import {decodeHtmlEntities} from '../../lib/text';
 
 export function StreamingAnswer({
   content,
@@ -10,7 +11,7 @@ export function StreamingAnswer({
   streaming?: boolean;
   sources?: Source[];
 }) {
-  const blocks = parseMarkdownBlocks(content);
+  const blocks = parseMarkdownBlocks(decodeHtmlEntities(content));
   return (
     <div className="space-y-3 text-sm leading-6 text-slate-700">
       {blocks.map((block, index) => (
