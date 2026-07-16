@@ -28,18 +28,44 @@ async function refreshAccessToken(): Promise<boolean> {
   return true;
 }
 
+function withAccessToken(init: RequestInit = {}): RequestInit {
+  const headers = new Headers(init.headers);
+  const access = tokenStore.getAccess();
+  if (access) headers.set('Authorization', `Bearer ${access}`);
+  return {...init, headers};
+}
+
+/**
+ * Sends an authenticated request and retries it once after refreshing an
+ * expired access token. Keeping this at the transport layer lets both JSON
+ * API calls and long-lived SSE streams recover without losing their URL or
+ * request-specific options.
+ */
+export async function fetchWithAuthRetry(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+): Promise<Response> {
+  let res = await fetch(input, withAccessToken(init));
+  if (res.status !== 401) return res;
+
+  refreshPromise ??= refreshAccessToken().finally(() => {
+    refreshPromise = null;
+  });
+  if (!await refreshPromise) return res;
+
+  res = await fetch(input, withAccessToken(init));
+  return res;
+}
+
 interface RequestOptions {
   method?: string;
   body?: unknown;
   isForm?: boolean;
-  skipAuthRetry?: boolean;
 }
 
 export async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const {method = 'GET', body, isForm, skipAuthRetry} = options;
+  const {method = 'GET', body, isForm} = options;
   const headers: Record<string, string> = {};
-  const access = tokenStore.getAccess();
-  if (access) headers.Authorization = `Bearer ${access}`;
 
   let fetchBody: BodyInit | undefined;
   if (body !== undefined) {
@@ -51,16 +77,11 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
     }
   }
 
-  const res = await fetch(`${API_BASE_URL}${path}`, {method, headers, body: fetchBody});
-
-  if (res.status === 401 && !skipAuthRetry) {
-    refreshPromise ??= refreshAccessToken().finally(() => {
-      refreshPromise = null;
-    });
-    if (await refreshPromise) {
-      return apiFetch<T>(path, {...options, skipAuthRetry: true});
-    }
-  }
+  const res = await fetchWithAuthRetry(`${API_BASE_URL}${path}`, {
+    method,
+    headers,
+    body: fetchBody,
+  });
 
   if (!res.ok) {
     let message = res.statusText;

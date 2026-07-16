@@ -29,24 +29,49 @@ export function ChatSidebar({
           </p>
         )}
         <ul className="space-y-1">
-          {sessions.map(session => (
-            <li key={session.id}>
-              <button
-                onClick={() => onSelect(session.id)}
-                className={`w-full truncate rounded-xl px-3 py-2.5 text-left text-sm transition-colors ${
-                  session.id === selectedId
-                    ? 'bg-indigo-50 font-medium text-indigo-700'
-                    : 'text-slate-600 hover:bg-slate-50'
-                }`}
-              >
-                {session.title || 'Untitled chat'}
-              </button>
-            </li>
-          ))}
+          {sessions.map(session => {
+            const createdAt = formatSessionDateTime(session.createdAt);
+            return (
+              <li key={session.id}>
+                <button
+                  onClick={() => onSelect(session.id)}
+                  className={`w-full rounded-xl px-3 py-2.5 text-left text-sm transition-colors ${
+                    session.id === selectedId
+                      ? 'bg-indigo-50 font-medium text-indigo-700'
+                      : 'text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  <span className="block truncate">{session.title || 'Untitled chat'}</span>
+                  {createdAt && (
+                    <span
+                      className={`mt-0.5 block text-xs font-normal ${
+                        session.id === selectedId ? 'text-indigo-500' : 'text-slate-400'
+                      }`}
+                    >
+                      {createdAt}
+                    </span>
+                  )}
+                </button>
+              </li>
+            );
+          })}
         </ul>
       </div>
     </aside>
   );
+}
+
+function formatSessionDateTime(value?: string): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return new Intl.DateTimeFormat(undefined, {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
 }
 
 function PlusIcon() {

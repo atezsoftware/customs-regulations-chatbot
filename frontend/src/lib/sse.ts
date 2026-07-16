@@ -1,6 +1,5 @@
 import type {AgentEvent} from '../types';
-import {API_BASE_URL} from './api';
-import {tokenStore} from './tokenStore';
+import {API_BASE_URL, fetchWithAuthRetry} from './api';
 
 export async function streamMessageEvents({
   sessionId,
@@ -18,16 +17,12 @@ export async function streamMessageEvents({
   // "Continue" button.
   resumeRunId?: string;
 }) {
-  const headers: Record<string, string> = {};
-  const access = tokenStore.getAccess();
-  if (access) headers.Authorization = `Bearer ${access}`;
-
   const url = new URL(
     `${API_BASE_URL}/chat-sessions/${sessionId}/messages/${messageId}/stream`,
   );
   if (resumeRunId) url.searchParams.set('resumeRunId', resumeRunId);
 
-  const res = await fetch(url, {headers, signal});
+  const res = await fetchWithAuthRetry(url, {signal});
   if (!res.ok) {
     throw new Error(res.statusText || `Stream failed with ${res.status}`);
   }
