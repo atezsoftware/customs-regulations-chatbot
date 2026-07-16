@@ -10,8 +10,10 @@ from fs_explorer_api.agent import (
     GEMINI_MAX_CONTEXT_TOKENS,
     FsExplorerAgent,
     SYSTEM_PROMPT,
+    FINAL_SYSTEM_PROMPT,
     TokenUsage,
     _build_system_prompt,
+    _chunk_context_from_storage,
     set_search_flags,
     get_search_flags,
     clear_index_context,
@@ -77,6 +79,50 @@ class TestAgentConfiguration:
         assert len(agent._chat_history) == 2
         assert agent._chat_history[0].text == "task 1"
         assert agent._chat_history[1].text == "task 2"
+
+
+class TestChunkContextRetrieval:
+    def test_returns_target_and_bounded_neighbor_chunks(self) -> None:
+        chunks = [
+            {
+                "id": f"chunk_{position}",
+                "doc_id": "doc_1",
+                "text": f"text {position}",
+                "position": position,
+                "start_char": position * 10,
+                "end_char": position * 10 + 9,
+                "chunk_type": "article",
+                "metadata": {"article_no": str(position)},
+            }
+            for position in range(5)
+        ]
+        storage = _ChunkStorage(chunks)
+
+        result = _chunk_context_from_storage(storage, "chunk_2", before=1, after=1)
+
+        assert "chunk 1" in result
+        assert "chunk 2" in result
+        assert "chunk 3" in result
+        assert "chunk 0" not in result
+        assert "chunk 4" not in result
+
+    def test_missing_chunk_returns_clear_message(self) -> None:
+        storage = _ChunkStorage([])
+
+        result = _chunk_context_from_storage(storage, "missing", before=1, after=1)
+
+        assert result == "No indexed chunk found for chunk_id='missing'"
+
+
+class _ChunkStorage:
+    def __init__(self, chunks) -> None:
+        self.chunks = chunks
+
+    def get_chunk(self, *, chunk_id):
+        return next((chunk for chunk in self.chunks if chunk["id"] == chunk_id), None)
+
+    def list_document_chunks(self, *, doc_id):
+        return [chunk for chunk in self.chunks if chunk["doc_id"] == doc_id]
 
 
 class TestAgentActions:
@@ -187,15 +233,66 @@ class TestSystemPrompt:
 
     def test_system_prompt_contains_strategy(self) -> None:
         """Test that system prompt includes exploration strategy."""
-        assert "Three-Phase" in SYSTEM_PROMPT or "PHASE" in SYSTEM_PROMPT
-        assert "Parallel Scan" in SYSTEM_PROMPT or "PARALLEL" in SYSTEM_PROMPT
-        assert "Backtracking" in SYSTEM_PROMPT or "BACKTRACK" in SYSTEM_PROMPT
+        assert "Strategy" in SYSTEM_PROMPT
+        assert "semantic_search" in SYSTEM_PROMPT
+        assert "cross-reference" in SYSTEM_PROMPT
 
     def test_system_prompt_contains_index_tools(self) -> None:
         """Test that system prompt documents index-aware tools."""
         assert "semantic_search" in SYSTEM_PROMPT
         assert "get_document" in SYSTEM_PROMPT
         assert "list_indexed_documents" in SYSTEM_PROMPT
+
+    def test_action_and_final_prompts_are_purpose_specific(self) -> None:
+        assert "Tools:" in SYSTEM_PROMPT
+        assert "Sources section" not in SYSTEM_PROMPT
+        assert "Available Tools" not in FINAL_SYSTEM_PROMPT
+        assert "## Sources" in FINAL_SYSTEM_PROMPT
+        assert len(SYSTEM_PROMPT) < 4000
+
+
+class TestPurposeSpecificThinking:
+    @pytest.mark.asyncio
+    async def test_action_uses_low_thinking(self) -> None:
+        client = _PurposeCapturingClient()
+        agent = FsExplorerAgent(llm_client=client)
+        agent.configure_task("test")
+
+        await agent.take_action()
+
+        assert client.structured_thinking_levels == ["low"]
+
+    @pytest.mark.asyncio
+    async def test_final_answer_uses_high_thinking(self) -> None:
+        client = _PurposeCapturingClient()
+        agent = FsExplorerAgent(llm_client=client)
+        agent.configure_task("evidence")
+
+        chunks = [chunk async for chunk in agent.stream_final_answer("fallback")]
+
+        assert chunks == ["answer"]
+        assert client.stream_thinking_levels == ["high"]
+
+
+class _PurposeCapturingClient:
+    model = "test"
+
+    def __init__(self) -> None:
+        self.structured_thinking_levels: list[str | None] = []
+        self.stream_thinking_levels: list[str | None] = []
+
+    async def generate_structured(
+        self, history, system_prompt, schema, *, thinking_level=None
+    ):
+        self.structured_thinking_levels.append(thinking_level)
+        return Action(reason="done", action=StopAction(final_result="done")), LLMUsage()
+
+    async def stream_text(self, history, system_prompt, *, thinking_level=None):
+        self.stream_thinking_levels.append(thinking_level)
+        yield "answer"
+
+    def last_stream_usage(self):
+        return None
 
 
 class TestSearchFlags:
@@ -264,7 +361,9 @@ class _ScriptedLLMClient:
         self._action_token_counts = list(action_token_counts)
         self.summary_calls = 0
 
-    async def generate_structured(self, history, system_prompt, schema):
+    async def generate_structured(
+        self, history, system_prompt, schema, *, thinking_level=None
+    ):
         if schema is ContextSummary:
             self.summary_calls += 1
             return ContextSummary(summary="compact summary"), LLMUsage(
@@ -281,7 +380,7 @@ class _ScriptedLLMClient:
         )
         return action, LLMUsage(input_tokens=tokens, output_tokens=10)
 
-    async def stream_text(self, history, system_prompt):
+    async def stream_text(self, history, system_prompt, *, thinking_level=None):
         return
         yield ""  # pragma: no cover - makes this an async generator
 
@@ -309,10 +408,39 @@ class TestContextSummarization:
 
         assert client.summary_calls == 1
         assert agent.token_usage.context_summaries == 1
-        # leading task turn (1) + summary turn (1) + recent turns (4)
-        assert len(agent._chat_history) == 6
+        # leading task turn + summary + token-budgeted recent turns
+        assert len(agent._chat_history) <= 5
         assert agent._chat_history[0].text == "step 0"
         assert "compact summary" in agent._chat_history[1].text
+
+    @pytest.mark.asyncio
+    async def test_large_tool_result_is_summarized_instead_of_kept_recent(self) -> None:
+        client = _ScriptedLLMClient([5000])
+        agent = FsExplorerAgent(llm_client=client)
+        agent.configure_task("original task")
+        agent.configure_task("Tool result:\n" + "evidence " * 3000)
+        agent.configure_task("choose next action")
+
+        await agent.take_action()
+
+        assert client.summary_calls == 1
+        assert all("evidence " * 100 not in turn.text for turn in agent._chat_history)
+        assert "compact summary" in agent._chat_history[1].text
+
+    @pytest.mark.asyncio
+    async def test_compacted_history_is_not_summarized_again_without_new_evidence(
+        self,
+    ) -> None:
+        client = _ScriptedLLMClient([5000])
+        agent = FsExplorerAgent(llm_client=client)
+        agent.configure_task("original task")
+        for i in range(6):
+            agent.configure_task(f"evidence {i} " * 300)
+
+        await agent.take_action()
+        await agent._maybe_summarize_history(5000)
+
+        assert client.summary_calls == 1
 
     @pytest.mark.asyncio
     @patch("fs_explorer_api.agent._MAX_STEPS", 100)
@@ -435,7 +563,9 @@ class TestDuplicateCallGuard:
 
         calls = []
         original = TOOLS["semantic_search"]
-        TOOLS["semantic_search"] = lambda **kwargs: calls.append(kwargs) or "real result"
+        TOOLS["semantic_search"] = lambda **kwargs: (
+            calls.append(kwargs) or "real result"
+        )
         try:
             agent = FsExplorerAgent(llm_client=make_mock_llm_client())
             agent.call_tool("semantic_search", {"query": "TIR karnesi ekstre teminat"})
@@ -451,16 +581,22 @@ class TestDuplicateCallGuard:
 
         calls = []
         original = TOOLS["semantic_search"]
-        TOOLS["semantic_search"] = lambda **kwargs: calls.append(kwargs) or "real result"
+        TOOLS["semantic_search"] = lambda **kwargs: (
+            calls.append(kwargs) or "real result"
+        )
         try:
             agent = FsExplorerAgent(llm_client=make_mock_llm_client())
             agent.call_tool(
                 "semantic_search",
-                {"query": "TIR karnesi ekstre teminat hassas eşya yüksek riskli eşya listesi"},
+                {
+                    "query": "TIR karnesi ekstre teminat hassas eşya yüksek riskli eşya listesi"
+                },
             )
             agent.call_tool(
                 "semantic_search",
-                {"query": "TIR karnesi kapsamında ek teminat veya hassas eşya listesi yüksek riskli eşyalar"},
+                {
+                    "query": "TIR karnesi kapsamında ek teminat veya hassas eşya listesi yüksek riskli eşyalar"
+                },
             )
         finally:
             TOOLS["semantic_search"] = original
@@ -472,7 +608,9 @@ class TestDuplicateCallGuard:
 
         calls = []
         original = TOOLS["semantic_search"]
-        TOOLS["semantic_search"] = lambda **kwargs: calls.append(kwargs) or "real result"
+        TOOLS["semantic_search"] = lambda **kwargs: (
+            calls.append(kwargs) or "real result"
+        )
         try:
             agent = FsExplorerAgent(llm_client=make_mock_llm_client())
             agent.call_tool("semantic_search", {"query": "TIR karnesi ekstra teminat"})

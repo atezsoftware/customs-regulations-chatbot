@@ -13,11 +13,13 @@ from fs_explorer_api.models import (
     StopAction,
     ToolCallAction,
     ToolCallArg,
+    ToolBatchAction,
 )
 from fs_explorer_api.workflow import (
     AskHumanEvent,
     ExplorationEndEvent,
     ToolCallEvent,
+    ToolBatchEvent,
     get_run_agent,
     new_workflow,
     resume_agent_run,
@@ -80,12 +82,14 @@ class _QueuedLLMClient:
         self._actions = list(actions)
         self.calls = 0
 
-    async def generate_structured(self, history, system_prompt, schema):
+    async def generate_structured(
+        self, history, system_prompt, schema, *, thinking_level=None
+    ):
         self.calls += 1
         action = self._actions.pop(0)
         return action, LLMUsage(input_tokens=100, output_tokens=10)
 
-    async def stream_text(self, history, system_prompt):
+    async def stream_text(self, history, system_prompt, *, thinking_level=None):
         return
         yield ""  # pragma: no cover - makes this an async generator
 
@@ -128,8 +132,12 @@ class TestResumeAgentRun:
                     action=ToolCallAction(
                         tool_name="glob",
                         tool_input=[
-                            ToolCallArg(parameter_name="directory", parameter_value="."),
-                            ToolCallArg(parameter_name="pattern", parameter_value="*.md"),
+                            ToolCallArg(
+                                parameter_name="directory", parameter_value="."
+                            ),
+                            ToolCallArg(
+                                parameter_name="pattern", parameter_value="*.md"
+                            ),
                         ],
                     ),
                     reason="look around",
@@ -188,4 +196,55 @@ class TestResumeAgentRun:
             "the TIR document" in turn.text
             for turn in agent._chat_history
             if turn.role == "user"
+        )
+
+    @pytest.mark.asyncio
+    async def test_batch_tool_calls_share_one_planning_round_trip(self) -> None:
+        calls = [
+            ToolCallAction(
+                tool_name="glob",
+                tool_input=[
+                    ToolCallArg(
+                        parameter_name="directory", parameter_value="tests/testfiles"
+                    ),
+                    ToolCallArg(parameter_name="pattern", parameter_value="file1.*"),
+                ],
+            ),
+            ToolCallAction(
+                tool_name="glob",
+                tool_input=[
+                    ToolCallArg(
+                        parameter_name="directory", parameter_value="tests/testfiles"
+                    ),
+                    ToolCallArg(parameter_name="pattern", parameter_value="file2.*"),
+                ],
+            ),
+        ]
+        llm_client = _QueuedLLMClient(
+            [
+                Action(
+                    action=ToolBatchAction(tool_calls=calls),
+                    reason="independent searches",
+                ),
+                Action(action=StopAction(final_result="done"), reason="finished"),
+            ]
+        )
+        agent = FsExplorerAgent(llm_client=llm_client)
+        agent.configure_task("find both files")
+
+        events = await _drain(
+            resume_agent_run(
+                agent,
+                use_index=False,
+                current_directory=".",
+                initial_task="find both files",
+            )
+        )
+
+        assert isinstance(events[0], ToolBatchEvent)
+        assert len(events[0].tool_calls) == 2
+        assert isinstance(events[1], ExplorationEndEvent)
+        assert llm_client.calls == 2
+        assert (
+            sum("Batch tool results" in turn.text for turn in agent._chat_history) == 1
         )

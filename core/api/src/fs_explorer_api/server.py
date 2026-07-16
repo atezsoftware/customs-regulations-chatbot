@@ -21,8 +21,6 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-logger = logging.getLogger(__name__)
-
 from .agent import (
     GEMINI_MAX_CONTEXT_TOKENS,
     FsExplorerAgent,
@@ -60,10 +58,13 @@ from .workflow import (
     HumanAnswerEvent,
     InputEvent,
     ToolCallEvent,
+    ToolBatchEvent,
     get_run_agent,
     new_workflow,
     resume_agent_run,
 )
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FsExplorer", description="AI-powered filesystem exploration")
 
@@ -1025,6 +1026,21 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
                         index_storage=index_storage,
                     )
                 )
+            elif isinstance(event, ToolBatchEvent):
+                for call in event.tool_calls:
+                    step_number += 1
+                    await websocket.send_json(
+                        _tool_call_ws_message(
+                            ToolCallEvent(
+                                tool_name=call.tool_name,
+                                tool_input=call.to_fn_args(),
+                                reason=event.reason,
+                            ),
+                            step_number=step_number,
+                            trace=trace,
+                            index_storage=index_storage,
+                        )
+                    )
             elif isinstance(event, GoDeeperEvent):
                 step_number += 1
                 await websocket.send_json(
@@ -1127,6 +1143,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
     try:
         clear_index_context()
         if use_index:
+            assert resolved_database_url is not None
             storage = PostgresStorage(resolved_database_url)
             index_storage = storage
             set_index_context(index_folders, resolved_database_url)
@@ -1214,6 +1231,21 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                         index_storage=index_storage,
                     )
                 )
+            elif isinstance(event, ToolBatchEvent):
+                for call in event.tool_calls:
+                    step_number += 1
+                    await websocket.send_json(
+                        _tool_call_ws_message(
+                            ToolCallEvent(
+                                tool_name=call.tool_name,
+                                tool_input=call.to_fn_args(),
+                                reason=event.reason,
+                            ),
+                            step_number=step_number,
+                            trace=trace,
+                            index_storage=index_storage,
+                        )
+                    )
             elif isinstance(event, GoDeeperEvent):
                 step_number += 1
                 await websocket.send_json(

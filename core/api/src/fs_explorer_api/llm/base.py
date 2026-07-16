@@ -12,6 +12,7 @@ from typing import AsyncIterator, Literal, Protocol, TypeVar
 from pydantic import BaseModel
 
 Role = Literal["user", "model"]
+ThinkingLevel = Literal["minimal", "low", "medium", "high"]
 
 
 class ChatTurn(BaseModel):
@@ -41,6 +42,8 @@ class LLMClient(Protocol):
         history: list[ChatTurn],
         system_prompt: str,
         schema: type[SchemaT],
+        *,
+        thinking_level: ThinkingLevel | None = None,
     ) -> tuple[SchemaT, LLMUsage]:
         """Request a structured (schema-validated) response."""
         ...
@@ -49,6 +52,8 @@ class LLMClient(Protocol):
         self,
         history: list[ChatTurn],
         system_prompt: str,
+        *,
+        thinking_level: ThinkingLevel | None = None,
     ) -> AsyncIterator[str]:
         """Stream a plain-text response chunk by chunk."""
         ...

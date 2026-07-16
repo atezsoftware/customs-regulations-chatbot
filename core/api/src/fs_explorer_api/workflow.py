@@ -25,6 +25,7 @@ from .agent import FsExplorerAgent, OnLLMCall, describe_indexed_context
 from .models import (
     GoDeeperAction,
     ToolCallAction,
+    ToolBatchAction,
     StopAction,
     AskHumanAction,
     Action,
@@ -137,6 +138,13 @@ class ToolCallEvent(Event):
     reason: str
 
 
+class ToolBatchEvent(Event):
+    """Independent tool calls selected in one planning turn."""
+
+    tool_calls: list[ToolCallAction]
+    reason: str
+
+
 class AskHumanEvent(InputRequiredEvent):
     """Event triggered when human input is required."""
 
@@ -158,7 +166,9 @@ class ExplorationEndEvent(StopEvent):
 
 
 # Type alias for the union of possible workflow events
-WorkflowEvent = ExplorationEndEvent | GoDeeperEvent | ToolCallEvent | AskHumanEvent
+WorkflowEvent = (
+    ExplorationEndEvent | GoDeeperEvent | ToolCallEvent | ToolBatchEvent | AskHumanEvent
+)
 
 
 def _handle_action_result(
@@ -193,6 +203,12 @@ def _handle_action_result(
             tool_input=toolcall.to_fn_args(),
             reason=action.reason,
         )
+        ctx.write_event_to_stream(event)
+        return event
+
+    elif action_type == "toolbatch":
+        batch = cast(ToolBatchAction, action.action)
+        event = ToolBatchEvent(tool_calls=batch.tool_calls, reason=action.reason)
         ctx.write_event_to_stream(event)
         return event
 
@@ -365,6 +381,22 @@ class FsExplorerWorkflow(Workflow):
 
         return await _process_agent_action(agent, ctx, update_directory=True)
 
+    @step
+    async def tool_batch_action(
+        self,
+        ev: ToolBatchEvent,
+        ctx: Context[WorkflowState],
+        agent: Annotated[FsExplorerAgent, Resource(get_agent)],
+    ) -> WorkflowEvent:
+        """Execute independent calls concurrently and continue once."""
+        await agent.call_tools(
+            [(call.tool_name, call.to_fn_args()) for call in ev.tool_calls]
+        )
+        agent.configure_task(
+            "Use the combined batch tool results and continue the original task."
+        )
+        return await _process_agent_action(agent, ctx, update_directory=True)
+
 
 # No wall-clock ceiling on the tool-call loop itself — a genuinely hard
 # multi-document question should be allowed to take as many real research
@@ -496,6 +528,16 @@ async def resume_agent_run(
             agent.configure_task(
                 "Given the result from the tool call you just performed, "
                 "what action should you take next?"
+            )
+
+        elif action_type == "toolbatch":
+            batch = cast(ToolBatchAction, action.action)
+            yield ToolBatchEvent(tool_calls=batch.tool_calls, reason=action.reason)
+            await agent.call_tools(
+                [(call.tool_name, call.to_fn_args()) for call in batch.tool_calls]
+            )
+            agent.configure_task(
+                "Use the combined batch tool results and continue the original task."
             )
 
         elif action_type == "askhuman":

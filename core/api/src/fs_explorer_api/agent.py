@@ -6,6 +6,7 @@ to make decisions about filesystem exploration actions.
 """
 
 import contextvars
+import asyncio
 import fnmatch
 import html
 import logging
@@ -86,15 +87,39 @@ CONTEXT_SUMMARY_MAX_TOKENS = int(
     os.getenv("FS_EXPLORER_CONTEXT_SUMMARY_MAX_TOKENS", "4000")
 )
 
-# How many of the most recent chat turns to keep verbatim when
-# summarizing — recent tool results are more likely to still be relevant
-# to the very next decision than older ones. Kept small on purpose: a
-# single kept-verbatim deep-read turn can already be ~_DEEP_READ_MAX_CHARS
-# characters, so keeping many of them defeats the point of compacting.
-_CONTEXT_SUMMARY_KEEP_RECENT_TURNS = 4
+# Recent history is retained by token budget rather than a fixed count. Always
+# keep the final instruction/action pair, then add at most one more turn if it
+# fits. A large raw tool result is therefore summarized after the model has
+# extracted its findings instead of surviving several more paid requests.
+_CONTEXT_RECENT_MAX_TOKENS = int(
+    os.getenv("FS_EXPLORER_CONTEXT_RECENT_MAX_TOKENS", "1000")
+)
+_CONTEXT_RECENT_MIN_TURNS = 2
+_CONTEXT_RECENT_MAX_TURNS = 3
 # The first turn (initial task framing) is always kept verbatim too, so
 # the agent never loses sight of the original task after a summarization.
 _CONTEXT_SUMMARY_KEEP_LEADING_TURNS = 1
+
+
+def _estimated_turn_tokens(turn: ChatTurn) -> int:
+    return max(1, (len(turn.text) + 3) // 4)
+
+
+def _token_budgeted_recent_turns(history: list[ChatTurn]) -> list[ChatTurn]:
+    selected: list[ChatTurn] = []
+    used = 0
+    for turn in reversed(history[_CONTEXT_SUMMARY_KEEP_LEADING_TURNS:]):
+        turn_tokens = _estimated_turn_tokens(turn)
+        must_keep = len(selected) < _CONTEXT_RECENT_MIN_TURNS
+        if not must_keep and (
+            len(selected) >= _CONTEXT_RECENT_MAX_TURNS
+            or used + turn_tokens > _CONTEXT_RECENT_MAX_TOKENS
+        ):
+            break
+        selected.append(turn)
+        used += turn_tokens
+    return list(reversed(selected))
+
 
 # Safety-net ceiling on total agent decision-points (take_action() calls)
 # in a single run — NOT a normal operating limit. A genuinely hard
@@ -138,6 +163,7 @@ def _normalize_indexed_text(value: str) -> str:
     """Decode document-export entities before they become model context."""
     return html.unescape(value)
 
+
 # Cap on how many matched-chunk lines a single grep call can render — see
 # `_indexed_grep_file_content`'s docstring comment for why an uncapped
 # corpus-wide grep is at least as dangerous as an uncapped deep-read.
@@ -165,6 +191,7 @@ _FUZZY_DEDUP_GROUPS = {"semantic_search", "grep", "glob"}
 _DEEP_READ_GROUP = "deep_read"
 _TOOL_DEDUP_GROUPS: dict[str, str] = {
     "semantic_search": "semantic_search",
+    "get_chunk_context": "chunk_context",
     "grep": "grep",
     "glob": "glob",
     "parse_file": _DEEP_READ_GROUP,
@@ -186,8 +213,19 @@ def _dedup_key(tool_name: str, tool_input: dict[str, Any]) -> tuple[str, str] | 
         value = tool_input.get("query", "")
     elif tool_name in {"grep", "glob"}:
         value = tool_input.get("pattern", "")
-    elif tool_name in {"parse_file", "preview_file", "get_document", "read"}:
-        value = tool_input.get("file_path") or tool_input.get("doc_id") or ""
+    elif tool_name in {
+        "parse_file",
+        "preview_file",
+        "get_document",
+        "get_chunk_context",
+        "read",
+    }:
+        value = (
+            tool_input.get("file_path")
+            or tool_input.get("doc_id")
+            or tool_input.get("chunk_id")
+            or ""
+        )
     elif tool_name == "scan_folder":
         value = tool_input.get("directory", "")
     else:
@@ -909,7 +947,9 @@ def semantic_search(
         return error
     assert storage is not None and corpora
 
-    engine = IndexedQueryEngine(storage, embedding_provider=_EMBEDDING_PROVIDER_VAR.get())
+    engine = IndexedQueryEngine(
+        storage, embedding_provider=_EMBEDDING_PROVIDER_VAR.get()
+    )
     hits: list[Any] = []
     try:
         for corpus in corpora:
@@ -1054,6 +1094,51 @@ def get_document(doc_id: str) -> str:
     )
 
 
+def _chunk_context_from_storage(
+    storage: PostgresStorage,
+    chunk_id: str,
+    *,
+    before: int = 1,
+    after: int = 1,
+) -> str:
+    target = storage.get_chunk(chunk_id=chunk_id)
+    if target is None:
+        return f"No indexed chunk found for chunk_id={chunk_id!r}"
+
+    doc_id = str(target.get("document_id") or target.get("doc_id") or "")
+    chunks = storage.list_document_chunks(doc_id=doc_id)
+    target_index = next(
+        (index for index, chunk in enumerate(chunks) if str(chunk["id"]) == chunk_id),
+        None,
+    )
+    if target_index is None:
+        return f"No indexed chunk found for chunk_id={chunk_id!r}"
+
+    bounded_before = min(max(int(before), 0), 3)
+    bounded_after = min(max(int(after), 0), 3)
+    selected = chunks[
+        max(0, target_index - bounded_before) : target_index + bounded_after + 1
+    ]
+    lines = [
+        f"=== RELEVANT CHUNK CONTEXT ===\nchunk_id: {chunk_id}\ndoc_id: {doc_id}\n"
+    ]
+    for chunk in selected:
+        lines.append(
+            f"\n--- chunk {chunk['position']}{_chunk_locator(chunk)} ---\n"
+            f"{_normalize_indexed_text(str(chunk['text'])).strip()}\n"
+        )
+    return "".join(lines)
+
+
+def get_chunk_context(chunk_id: str, before: int = 1, after: int = 1) -> str:
+    """Return a semantic hit plus a small bounded neighboring chunk window."""
+    storage, _corpora, error = _get_index_storage_and_corpora()
+    if error:
+        return error
+    assert storage is not None
+    return _chunk_context_from_storage(storage, chunk_id, before=before, after=after)
+
+
 def list_indexed_documents() -> str:
     """List indexed documents for active corpora."""
     storage, corpora, error = _get_index_storage_and_corpora()
@@ -1084,6 +1169,7 @@ TOOLS: dict[Tools, Callable[..., str]] = {
     "preview_file": _indexed_preview_file,
     "parse_file": _indexed_parse_file,
     "semantic_search": semantic_search,
+    "get_chunk_context": get_chunk_context,
     "get_document": get_document,
     "list_indexed_documents": list_indexed_documents,
 }
@@ -1093,7 +1179,7 @@ TOOLS: dict[Tools, Callable[..., str]] = {
 # System Prompt
 # =============================================================================
 
-SYSTEM_PROMPT = """
+_DETAILED_SYSTEM_PROMPT = """
 You are FsExplorer, an AI agent that answers questions about indexed documents.
 
 ## Output Encoding
@@ -1243,6 +1329,40 @@ User asks: "What is the purchase price?"
    "The purchase price is $50,000,000 [Master Purchase Agreement, Section 2.1], 
    subject to working capital adjustments [Disclosure Exhibits, Exhibit B]..."
 ```
+"""
+
+SYSTEM_PROMPT = """You are an indexed-document research planner.
+
+Choose the next action using the response schema. Keep `reason` concise but
+record concrete findings and document/article locators so later synthesis can
+cite them accurately.
+
+Tools: semantic_search finds ranked chunks; get_chunk_context reads a hit and
+its neighbors; get_document reads a selected full document only when the chunk
+window is insufficient; grep searches exact terms; scan_folder lists the corpus;
+preview_file/parse_file/read inspect indexed text; glob lists matching paths;
+list_indexed_documents lists document IDs.
+
+Strategy:
+1. Start with semantic_search. Use `as_of_date=YYYY-MM-DD` when the question
+   names a historical date; otherwise omit it for current rules.
+   Put two or three independent searches/reads in one ToolBatchAction.
+2. Read the best hit with get_chunk_context. Use get_document only when the
+   bounded chunk window cannot resolve a material ambiguity or cross-reference.
+3. Use a genuinely different query/tool after a miss; do not repeat searches.
+4. Stop as soon as the gathered evidence answers the question, while retaining
+   readable document titles and article/section locators for citations.
+5. Never expose internal paths or storage identifiers in the final answer.
+"""
+
+FINAL_SYSTEM_PROMPT = """Write the final answer from the gathered evidence.
+
+Start with a direct answer. Cite every factual claim inline as
+`[Readable Document Title, Article/Section]`. Never cite local paths, storage
+paths, raw filenames, or `Source:` labels. End with `## Sources` containing
+readable document titles only. Use plain Unicode UTF-8 text, never HTML/XML
+entities or HTML markup. Do not invent facts or citations absent from the
+evidence.
 """
 
 
@@ -1461,6 +1581,7 @@ class FsExplorerAgent:
             self._chat_history,
             _build_system_prompt(*get_search_flags()),
             Action,
+            thinking_level="low",
         )
         self.token_usage.add_api_call(
             prompt_tokens=usage.input_tokens,
@@ -1494,16 +1615,15 @@ class FsExplorerAgent:
         if not (ratio_trigger or absolute_trigger):
             return
 
-        keep = _CONTEXT_SUMMARY_KEEP_LEADING_TURNS + _CONTEXT_SUMMARY_KEEP_RECENT_TURNS
-        if len(self._chat_history) <= keep:
-            return  # Nothing worth compacting yet.
-
         leading = self._chat_history[:_CONTEXT_SUMMARY_KEEP_LEADING_TURNS]
-        recent = self._chat_history[-_CONTEXT_SUMMARY_KEEP_RECENT_TURNS:]
-        middle = self._chat_history[
-            _CONTEXT_SUMMARY_KEEP_LEADING_TURNS:-_CONTEXT_SUMMARY_KEEP_RECENT_TURNS
-        ]
+        recent = _token_budgeted_recent_turns(self._chat_history)
+        middle_end = len(self._chat_history) - len(recent)
+        middle = self._chat_history[_CONTEXT_SUMMARY_KEEP_LEADING_TURNS:middle_end]
         if not middle:
+            return
+        if len(middle) == 1 and middle[0].text.startswith(
+            "Summary of earlier exploration steps"
+        ):
             return
 
         summary_prompt = (
@@ -1520,6 +1640,7 @@ class FsExplorerAgent:
                 "You are compacting an AI agent's exploration transcript to "
                 "free up context window space. Be faithful and concise.",
                 ContextSummary,
+                thinking_level="low",
             )
         except Exception:
             # Summarization is a best-effort space-saving measure — if it
@@ -1559,21 +1680,15 @@ class FsExplorerAgent:
         If the LLM client does not support streaming (or errors before
         yielding anything), falls back to yielding `fallback_answer` once.
         """
-        prompt = (
-            "Write the final answer for the user now. Use the evidence and tool "
-            "results already gathered in this conversation. Keep all factual "
-            "claims cited with the required [Readable Document Title, Article/Section] "
-            "format. Do not use 'Source:' labels, local paths, backend/storage paths, "
-            "or raw slugified filenames in citations. Include a final '## Sources' "
-            "section with readable document titles only. Return plain UTF-8 text "
-            "with actual Unicode characters, never HTML/XML entities or markup."
-        )
+        prompt = "Using the evidence above, write the final answer now."
         stream_history = [*self._chat_history, ChatTurn(role="user", text=prompt)]
-        system_prompt = _build_system_prompt(*get_search_flags())
+        system_prompt = FINAL_SYSTEM_PROMPT
 
         chunks: list[str] = []
         try:
-            async for text in self._llm.stream_text(stream_history, system_prompt):
+            async for text in self._llm.stream_text(
+                stream_history, system_prompt, thinking_level="high"
+            ):
                 chunks.append(text)
                 yield text
         except Exception:
@@ -1648,6 +1763,47 @@ class FsExplorerAgent:
         self._chat_history.append(
             ChatTurn(role="user", text=f"Tool result for {tool_name}:\n\n{result}")
         )
+
+    async def call_tools(self, calls: list[tuple[Tools, dict[str, Any]]]) -> None:
+        """Execute a bounded independent batch and append one combined turn."""
+        if not 2 <= len(calls) <= 3:
+            raise ValueError("A tool batch must contain two or three calls.")
+
+        results: list[str | None] = [None] * len(calls)
+        pending: list[tuple[int, Tools, dict[str, Any]]] = []
+        for index, (tool_name, tool_input) in enumerate(calls):
+            dedup = _dedup_key(tool_name, tool_input)
+            if dedup is not None and self._is_near_duplicate_call(*dedup):
+                results[index] = "SKIPPED: duplicate of a recent or batched tool call."
+                continue
+            if dedup is not None:
+                self._recent_tool_calls.append(dedup)
+                self._recent_tool_calls = self._recent_tool_calls[
+                    -_DUPLICATE_CALL_LOOKBACK:
+                ]
+            pending.append((index, tool_name, tool_input))
+
+        async def execute(tool_name: Tools, tool_input: dict[str, Any]) -> str:
+            try:
+                return await asyncio.to_thread(TOOLS[tool_name], **tool_input)
+            except Exception as exc:
+                return (
+                    f"An error occurred while calling tool {tool_name} "
+                    f"with {tool_input}: {exc}"
+                )
+
+        completed = await asyncio.gather(
+            *(execute(tool_name, tool_input) for _, tool_name, tool_input in pending)
+        )
+        for (index, _tool_name, _tool_input), result in zip(pending, completed):
+            results[index] = result
+
+        sections: list[str] = ["Batch tool results:"]
+        for (tool_name, tool_input), result in zip(calls, results):
+            resolved = result or "No result"
+            self.token_usage.add_tool_result(resolved, tool_name)
+            sections.append(f"\n## {tool_name} {tool_input}\n{resolved}")
+        self._chat_history.append(ChatTurn(role="user", text="\n".join(sections)))
 
     def _is_near_duplicate_call(self, group: str, key: str) -> bool:
         fuzzy = group in _FUZZY_DEDUP_GROUPS

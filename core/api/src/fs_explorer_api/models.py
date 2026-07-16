@@ -21,12 +21,13 @@ Tools: TypeAlias = Literal[
     "preview_file",
     "parse_file",
     "semantic_search",
+    "get_chunk_context",
     "get_document",
     "list_indexed_documents",
 ]
 """Available tool names that the agent can invoke."""
 
-ActionType: TypeAlias = Literal["stop", "godeeper", "toolcall", "askhuman"]
+ActionType: TypeAlias = Literal["stop", "godeeper", "toolcall", "toolbatch", "askhuman"]
 """Types of actions the agent can take."""
 
 
@@ -102,6 +103,12 @@ class ToolCallAction(BaseModel):
         return {arg.parameter_name: arg.parameter_value for arg in self.tool_input}
 
 
+class ToolBatchAction(BaseModel):
+    """Two or three independent tool calls planned in one model turn."""
+
+    tool_calls: list[ToolCallAction] = Field(min_length=2, max_length=3)
+
+
 class ContextSummary(BaseModel):
     """
     Compacted summary of an earlier stretch of an exploration run's history.
@@ -131,9 +138,9 @@ class Action(BaseModel):
     for why this action was chosen.
     """
 
-    action: ToolCallAction | GoDeeperAction | StopAction | AskHumanAction = Field(
-        description="The specific action to take"
-    )
+    action: (
+        ToolBatchAction | ToolCallAction | GoDeeperAction | StopAction | AskHumanAction
+    ) = Field(description="The specific action to take")
     reason: str = Field(description="Explanation for why this action was chosen")
 
     def to_action_type(self) -> ActionType:
@@ -145,6 +152,8 @@ class Action(BaseModel):
         """
         if isinstance(self.action, ToolCallAction):
             return "toolcall"
+        elif isinstance(self.action, ToolBatchAction):
+            return "toolbatch"
         elif isinstance(self.action, GoDeeperAction):
             return "godeeper"
         elif isinstance(self.action, AskHumanAction):

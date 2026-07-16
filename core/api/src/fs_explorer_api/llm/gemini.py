@@ -1,6 +1,7 @@
 """Gemini implementation of the provider-agnostic `LLMClient` interface."""
 
 import asyncio
+import inspect
 import os
 import time
 from typing import AsyncIterator
@@ -10,7 +11,7 @@ from google.genai import errors as genai_errors
 from google.genai.types import Content, Part
 from fs_explorer_shared.google_genai import build_genai_client
 
-from .base import ChatTurn, LLMUsage, SchemaT
+from .base import ChatTurn, LLMUsage, SchemaT, ThinkingLevel
 
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 
@@ -87,10 +88,12 @@ class GeminiLLMClient:
             )
         self._last_stream_usage: LLMUsage | None = None
 
-    def _generation_config(self) -> dict:
+    def _generation_config(self, thinking_level: ThinkingLevel | None = None) -> dict:
         config: dict = {}
         if self.temperature is not None:
             config["temperature"] = self.temperature
+        if thinking_level is not None:
+            config["thinking_config"] = {"thinking_level": thinking_level}
         return config
 
     async def generate_structured(
@@ -98,6 +101,8 @@ class GeminiLLMClient:
         history: list[ChatTurn],
         system_prompt: str,
         schema: type[SchemaT],
+        *,
+        thinking_level: ThinkingLevel | None = None,
     ) -> tuple[SchemaT, LLMUsage]:
         started_at = time.monotonic()
         attempt = 0
@@ -112,7 +117,7 @@ class GeminiLLMClient:
                                 "system_instruction": system_prompt,
                                 "response_mime_type": "application/json",
                                 "response_schema": schema,
-                                **self._generation_config(),
+                                **self._generation_config(thinking_level),
                             },
                         ),
                         timeout=_LLM_CALL_TIMEOUT_SECONDS,
@@ -146,6 +151,8 @@ class GeminiLLMClient:
         self,
         history: list[ChatTurn],
         system_prompt: str,
+        *,
+        thinking_level: ThinkingLevel | None = None,
     ) -> AsyncIterator[str]:
         self._last_stream_usage = None
         stream_fn = getattr(self.raw_client.aio.models, "generate_content_stream", None)
@@ -169,14 +176,17 @@ class GeminiLLMClient:
         while True:
             try:
                 async with _llm_semaphore:
-                    stream = stream_fn(
+                    stream_result = stream_fn(
                         model=self.model,
                         contents=_to_contents(history),
                         config={
                             "system_instruction": system_prompt,
-                            **self._generation_config(),
+                            **self._generation_config(thinking_level),
                         },
-                    ).__aiter__()
+                    )
+                    if inspect.isawaitable(stream_result):
+                        stream_result = await stream_result
+                    stream = stream_result.__aiter__()
                     # Bounded per-chunk, not per-stream: a healthy stream can
                     # legitimately run longer than one timeout window as long
                     # as chunks keep arriving. What this catches is the
@@ -210,7 +220,11 @@ class GeminiLLMClient:
                 break
             except Exception as exc:
                 attempt += 1
-                if yielded_any or attempt > _LLM_RETRY_ATTEMPTS or not _is_retryable(exc):
+                if (
+                    yielded_any
+                    or attempt > _LLM_RETRY_ATTEMPTS
+                    or not _is_retryable(exc)
+                ):
                     raise
                 await asyncio.sleep(_LLM_RETRY_BACKOFF_SECONDS)
 
