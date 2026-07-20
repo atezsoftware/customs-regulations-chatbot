@@ -25,6 +25,7 @@ function toSafeMessage(message: ChatMessage) {
     sessionId: message.sessionId,
     role: message.role,
     content: message.content ?? '',
+    errorMessage: message.errorMessage ?? null,
     status: message.status,
     createdAt: message.createdAt,
     updatedAt: message.updatedAt,

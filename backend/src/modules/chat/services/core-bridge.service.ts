@@ -11,6 +11,7 @@ import {
 import {virtualCorpusKey} from '../../directories/services';
 import {DirectoryFileRepository, DirectoryRepository} from '../../directories/repositories';
 import {stripNulBytes} from '../../../common/text';
+import {formatChatError} from '../../../common/chat-error';
 
 const DEFAULT_CORE_URL = 'ws://127.0.0.1:8000/ws/explore';
 const DEFAULT_MODEL = 'gemini-3-flash-preview';
@@ -141,6 +142,7 @@ export class CoreBridgeService {
     const startedAt = Date.now();
     await this.chatMessageRepository.updateById(input.assistantMessageId, {
       status: 'streaming',
+      errorMessage: null,
       updatedAt: new Date().toISOString(),
     });
 
@@ -439,6 +441,7 @@ export class CoreBridgeService {
           await this.chatMessageRepository.updateById(input.assistantMessageId, {
             content: finalContent,
             status: 'completed',
+            errorMessage: null,
             updatedAt: new Date().toISOString(),
           });
           yield {
@@ -471,10 +474,11 @@ export class CoreBridgeService {
         throw new Error('Core stream closed before completion.');
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = formatChatError(error);
       const status = input.signal?.aborted || closedByAbort ? 'cancelled' : 'error';
       await this.chatMessageRepository.updateById(input.assistantMessageId, {
         status,
+        ...(status === 'error' ? {errorMessage: message} : {}),
         updatedAt: new Date().toISOString(),
       });
       if (status === 'cancelled') {

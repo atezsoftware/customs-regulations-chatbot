@@ -17,6 +17,9 @@ export class ChatMessage extends Entity {
   @property({type: 'string'})
   content: string;
 
+  @property({type: 'string', postgresql: {columnName: 'error_message'}})
+  errorMessage?: string | null;
+
   @property({type: 'string', required: true})
   status: ChatMessageStatus;
 

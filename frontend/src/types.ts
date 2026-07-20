@@ -141,6 +141,7 @@ export interface ChatMessageRecord {
   sessionId: number;
   role: 'user' | 'assistant';
   content: string;
+  errorMessage?: string | null;
   status: 'pending' | 'streaming' | 'completed' | 'error' | 'cancelled';
   createdAt?: string;
   updatedAt?: string;

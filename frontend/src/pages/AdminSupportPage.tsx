@@ -215,7 +215,14 @@ function SupportMessage({message}: {message: ChatMessageRecord}) {
           {formatDate(message.createdAt)}
         </span>
       </div>
-      <p className="whitespace-pre-wrap text-sm leading-6">{message.content || 'No content'}</p>
+      <p className="whitespace-pre-wrap text-sm leading-6">
+        {message.content || (message.errorMessage ? `Error: ${message.errorMessage}` : 'No content')}
+      </p>
+      {message.errorMessage && message.content && (
+        <p className="mt-2 whitespace-pre-wrap rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
+          Error: {message.errorMessage}
+        </p>
+      )}
       {!isUser && (
         <div className="mt-4 flex flex-wrap gap-2 text-xs">
           <Badge label={`${message.steps.length} steps`} />
