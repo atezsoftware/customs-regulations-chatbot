@@ -99,10 +99,17 @@ export class DirectoriesController {
     await getCurrentUser(this.request, this.userRepository);
     await this.findDirectoryOrThrow(id);
     const serviceStatus = await getDirectoryIndexStatus(id);
-    // `unavailable` means core could not be reached just now — report that
-    // honestly instead of falling through to a reconstruction from this
-    // directory's local file rows, which can look like a stale "completed"
-    // even while core is actually down.
+    const files = await this.directoryFileRepository.find({where: {directoryId: id}});
+
+    // Chat retrieval uses the shared core database, while the optional
+    // indexer status service is not present in every deployment. If that
+    // status probe is unavailable, the persisted file lifecycle is still a
+    // reliable indication that this directory is indexed and usable.
+    if (serviceStatus.status === 'unavailable') {
+      const localStatus = this.statusFromFiles(id, files, serviceStatus);
+      if (localStatus.status !== 'unavailable') return localStatus;
+    }
+
     if (
       serviceStatus.status === 'chunking' ||
       serviceStatus.status === 'indexing' ||
@@ -112,7 +119,6 @@ export class DirectoriesController {
       return serviceStatus;
     }
 
-    const files = await this.directoryFileRepository.find({where: {directoryId: id}});
     return this.statusFromFiles(id, files, serviceStatus);
   }
 

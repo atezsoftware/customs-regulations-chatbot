@@ -136,12 +136,10 @@ export function ChatPage() {
     return () => window.clearTimeout(timer);
   }, [selectedId, loadDetail]);
 
-  useEffect(() => {
-    return () => {
-      activeStreamRef.current?.controller.abort();
-      activeStreamRef.current = null;
-    };
-  }, [selectedId]);
+  // Do not abort an active stream when this page unmounts. Route changes
+  // (another chat, directories, dashboard, etc.) should not cancel work that
+  // is already running on the backend. The response is persisted there and
+  // `loadDetail` will show the completed message when the user returns.
 
   useEffect(() => {
     if (!linkedIds.length) return;
