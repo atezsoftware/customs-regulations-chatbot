@@ -14,6 +14,9 @@ export class ChatSession extends Entity {
   @property({type: 'string'})
   model?: string;
 
+  @property({type: 'string', required: true, postgresql: {columnName: 'llm_provider'}})
+  llmProvider: string;
+
   @property({type: 'number'})
   temperature?: number;
 

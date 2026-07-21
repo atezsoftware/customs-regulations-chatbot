@@ -1413,6 +1413,13 @@ class LLMCallStats:
     completion_tokens: int
     thinking_tokens: int
     duration_ms: float
+    provider: str = "gemini"
+    generation_id: str | None = None
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    billed_cost_usd: str | None = None
+    upstream_cost_usd: str | None = None
+    cost_source: str | None = None
 
 
 OnLLMCall = Callable[[LLMCallStats], Awaitable[None]]
@@ -1434,6 +1441,7 @@ class FsExplorerAgent:
         self,
         api_key: str | None = None,
         llm_client: LLMClient | None = None,
+        provider: str | None = None,
         model: str | None = None,
         temperature: float | None = None,
         on_llm_call: OnLLMCall | None = None,
@@ -1461,7 +1469,7 @@ class FsExplorerAgent:
                         llm_client given.
         """
         self._llm = llm_client or get_llm_client(
-            model=model, temperature=temperature, api_key=api_key
+            provider=provider, model=model, temperature=temperature, api_key=api_key
         )
         self._chat_history: list[ChatTurn] = []
         self.token_usage = TokenUsage()
@@ -1502,6 +1510,17 @@ class FsExplorerAgent:
                 completion_tokens=usage.output_tokens,
                 thinking_tokens=usage.thinking_tokens,
                 duration_ms=usage.duration_ms,
+                provider=(
+                    "openrouter"
+                    if self._llm.__class__.__name__ == "OpenRouterLLMClient"
+                    else "gemini"
+                ),
+                generation_id=usage.generation_id,
+                cached_input_tokens=usage.cached_input_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                billed_cost_usd=(str(usage.billed_cost_usd) if usage.billed_cost_usd is not None else None),
+                upstream_cost_usd=(str(usage.upstream_cost_usd) if usage.upstream_cost_usd is not None else None),
+                cost_source=usage.cost_source,
             )
         )
 

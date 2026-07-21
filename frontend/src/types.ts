@@ -87,6 +87,7 @@ export interface ChatSession {
   id: number;
   title?: string;
   model?: string;
+  llmProvider?: string;
   temperature?: number;
   createdAt?: string;
   updatedAt?: string;
@@ -133,7 +134,30 @@ export interface LlmUsage {
   outputTokens: number;
   thinkingTokens: number;
   durationMs?: number;
+  billedCostUsd?: string;
+  costSource?: 'provider' | 'estimated';
   createdAt?: string;
+}
+
+export interface LlmModelOption {
+  provider: string;
+  modelId: string;
+  displayName: string;
+  description?: string;
+  contextLength: number;
+  maxCompletionTokens?: number;
+  inputModalities: string[];
+  outputModalities: string[];
+  supportsReasoning: boolean;
+  promptUsdPerMillion: string | null;
+  completionUsdPerMillion: string | null;
+  requestUsd: string | null;
+}
+
+export interface LlmModelsResponse {
+  defaultModelId: string;
+  lastSyncedAt: string;
+  models: LlmModelOption[];
 }
 
 export interface ChatMessageRecord {

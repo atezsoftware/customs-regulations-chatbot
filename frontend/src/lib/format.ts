@@ -6,3 +6,12 @@ export function formatBytes(value: number | string): string {
   const size = bytes / 1024 ** exponent;
   return `${exponent === 0 ? size : size.toFixed(1)} ${units[exponent]}`;
 }
+
+export function formatUsd(value: string | number | null | undefined): string | undefined {
+  if (value === null || value === undefined || value === '') return undefined;
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return undefined;
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 6,
+  }).format(amount);
+}

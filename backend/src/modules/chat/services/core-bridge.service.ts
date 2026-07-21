@@ -218,6 +218,7 @@ export class CoreBridgeService {
                 enable_metadata: sessionView.indexFolders.length > 0,
                 conversation_context: input.conversationContext,
                 internal_token: process.env.CORE_INTERNAL_TOKEN,
+                provider: session.llmProvider,
                 model: session.model,
                 temperature: session.temperature,
               },
@@ -337,7 +338,7 @@ export class CoreBridgeService {
           await this.llmCallRepository.create({
             messageId: input.assistantMessageId,
             sessionId: input.sessionId,
-            provider: 'gemini',
+            provider: text(data.provider) || session.llmProvider || 'gemini',
             model:
               text(data.model) ||
               session.model ||
@@ -348,6 +349,14 @@ export class CoreBridgeService {
             outputTokens: numberValue(data.completion_tokens),
             thinkingTokens: numberValue(data.thinking_tokens),
             durationMs: numberValue(data.duration_ms),
+            generationId: text(data.generation_id) || undefined,
+            cachedInputTokens: numberValue(data.cached_input_tokens),
+            cacheWriteTokens: numberValue(data.cache_write_tokens),
+            billedCostUsd: text(data.billed_cost_usd) || undefined,
+            upstreamCostUsd: text(data.upstream_cost_usd) || undefined,
+            costSource: text(data.cost_source) === 'provider' || text(data.cost_source) === 'estimated'
+              ? text(data.cost_source) as 'provider' | 'estimated'
+              : undefined,
           });
           continue;
         }

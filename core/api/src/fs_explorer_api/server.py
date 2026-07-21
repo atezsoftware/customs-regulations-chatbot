@@ -866,6 +866,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
         enable_semantic = bool(data.get("enable_semantic", False))
         enable_metadata = bool(data.get("enable_metadata", False))
         conversation_context = data.get("conversation_context")
+        provider = data.get("provider")
         model = data.get("model")
         temperature = data.get("temperature")
 
@@ -932,6 +933,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
         trace = ExplorationTrace(root_directory=str(folder_path))
 
         resolved_model = model if isinstance(model, str) else None
+        resolved_provider = provider if isinstance(provider, str) else None
         resolved_temperature = (
             float(temperature) if isinstance(temperature, (int, float)) else None
         )
@@ -956,11 +958,18 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
                         "type": "llm_call",
                         "data": {
                             "purpose": stats.purpose,
+                            "provider": stats.provider,
                             "model": stats.model,
                             "prompt_tokens": stats.prompt_tokens,
                             "completion_tokens": stats.completion_tokens,
                             "thinking_tokens": stats.thinking_tokens,
                             "duration_ms": round(stats.duration_ms),
+                            "generation_id": stats.generation_id,
+                            "cached_input_tokens": stats.cached_input_tokens,
+                            "cache_write_tokens": stats.cache_write_tokens,
+                            "billed_cost_usd": stats.billed_cost_usd,
+                            "upstream_cost_usd": stats.upstream_cost_usd,
+                            "cost_source": stats.cost_source,
                         },
                     }
                 )
@@ -999,6 +1008,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
         # mid-run can still register whatever the agent has gathered so far
         # — see _register_if_resumable() below).
         run_workflow, resource_manager = new_workflow(
+            provider=resolved_provider,
             model=resolved_model,
             temperature=resolved_temperature,
             on_llm_call=_collect_llm_call,
@@ -1167,11 +1177,18 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                         "type": "llm_call",
                         "data": {
                             "purpose": stats.purpose,
+                            "provider": stats.provider,
                             "model": stats.model,
                             "prompt_tokens": stats.prompt_tokens,
                             "completion_tokens": stats.completion_tokens,
                             "thinking_tokens": stats.thinking_tokens,
                             "duration_ms": round(stats.duration_ms),
+                            "generation_id": stats.generation_id,
+                            "cached_input_tokens": stats.cached_input_tokens,
+                            "cache_write_tokens": stats.cache_write_tokens,
+                            "billed_cost_usd": stats.billed_cost_usd,
+                            "upstream_cost_usd": stats.upstream_cost_usd,
+                            "cost_source": stats.cost_source,
                         },
                     }
                 )

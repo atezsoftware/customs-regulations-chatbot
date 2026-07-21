@@ -18,6 +18,7 @@ import type {
   SessionFile,
   UsageAnalytics,
   UsageRange,
+  LlmModelsResponse,
 } from '../types';
 
 export const authApi = {
@@ -79,6 +80,8 @@ export const chatSessionsApi = {
   rename: (id: number, title: string) =>
     apiFetch<void>(`/chat-sessions/${id}`, {method: 'PATCH', body: {title}}),
   remove: (id: number) => apiFetch<void>(`/chat-sessions/${id}`, {method: 'DELETE'}),
+  setModel: (id: number, input: {provider: string; modelId: string}) =>
+    apiFetch<ChatSession>(`/chat-sessions/${id}/model`, {method: 'PATCH', body: input}),
   linkedDirectories: (id: number) =>
     apiFetch<Directory[]>(`/chat-sessions/${id}/directories`),
   setLinkedDirectories: (id: number, directoryIds: number[]) =>
@@ -88,7 +91,7 @@ export const chatSessionsApi = {
     }),
   visibleFiles: (id: number) => apiFetch<SessionFile[]>(`/chat-sessions/${id}/files`),
   messages: (id: number) => apiFetch<ChatMessageRecord[]>(`/chat-sessions/${id}/messages`),
-  sendMessage: (id: number, input: {content: string; model?: string; temperature?: number}) =>
+  sendMessage: (id: number, input: {content: string; temperature?: number}) =>
     apiFetch<{
       messageId: number;
       userMessage: ChatMessageRecord;
@@ -101,6 +104,10 @@ export const chatSessionsApi = {
     apiFetch<void>(`/chat-sessions/${sessionId}/messages/${messageId}/cancel`, {
       method: 'POST',
     }),
+};
+
+export const llmModelsApi = {
+  list: () => apiFetch<LlmModelsResponse>('/llm/models'),
 };
 
 export const usageApi = {

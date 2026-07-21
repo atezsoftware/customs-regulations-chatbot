@@ -8,7 +8,7 @@ import {SessionUsageBadge} from '../components/chat/SessionUsageBadge';
 import {ChatSidebar} from '../components/ChatSidebar';
 import {LinkedDirectoriesPanel} from '../components/LinkedDirectoriesPanel';
 import {Spinner} from '../components/ui/Spinner';
-import {chatSessionsApi, directoriesApi} from '../lib/endpoints';
+import {chatSessionsApi, directoriesApi, llmModelsApi} from '../lib/endpoints';
 import {formatBytes} from '../lib/format';
 import {streamMessageEvents} from '../lib/sse';
 import type {
@@ -18,6 +18,7 @@ import type {
   Directory,
   DirectoryIndexStatus,
   LlmUsage,
+  LlmModelOption,
   SessionFile,
 } from '../types';
 
@@ -73,6 +74,8 @@ export function ChatPage() {
 
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [directories, setDirectories] = useState<Directory[]>([]);
+  const [models, setModels] = useState<LlmModelOption[]>([]);
+  const [defaultModelId, setDefaultModelId] = useState<string>();
   const [linkedIds, setLinkedIds] = useState<number[]>([]);
   const [visibleFiles, setVisibleFiles] = useState<SessionFile[]>([]);
   const [indexStatuses, setIndexStatuses] = useState<Record<number, DirectoryIndexStatus>>({});
@@ -85,10 +88,14 @@ export function ChatPage() {
   const [streamError, setStreamError] = useState<string | null>(null);
 
   useEffect(() => {
-    Promise.all([chatSessionsApi.list(), directoriesApi.list()])
-      .then(([sessionList, directoryList]) => {
+    Promise.all([chatSessionsApi.list(), directoriesApi.list(), llmModelsApi.list().catch(() => null)])
+      .then(([sessionList, directoryList, catalog]) => {
         setSessions(sessionList);
         setDirectories(directoryList);
+        if (catalog) {
+          setModels(catalog.models);
+          setDefaultModelId(catalog.defaultModelId);
+        }
       })
       .finally(() => setLoadingSessions(false));
   }, []);
@@ -176,6 +183,12 @@ export function ChatPage() {
     } finally {
       setSavingLinks(false);
     }
+  }
+
+  async function handleModelChange(model: LlmModelOption) {
+    if (selectedId === null || sending) return;
+    const session = await chatSessionsApi.setModel(selectedId, {provider: model.provider, modelId: model.modelId});
+    setSessions(prev => prev.map(item => item.id === selectedId ? {...item, ...session} : item));
   }
 
   function applyAgentEvent(event: AgentEvent, assistantMessageId: number) {
@@ -484,6 +497,10 @@ export function ChatPage() {
                     sending={sending}
                     onSend={content => void sendMessage(content)}
                     onStop={() => void stopStream()}
+                    models={models}
+                    modelId={selectedSession.model}
+                    defaultModelId={defaultModelId}
+                    onModelChange={model => void handleModelChange(model)}
                   />
                 </section>
 

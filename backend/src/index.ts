@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import {ApplicationConfig, BackendApplication} from './application';
+import {PostgresDataSource} from './datasources';
+import {OpenRouterCatalogService} from './modules/llm-catalog/services';
 
 export * from './application';
 
@@ -7,6 +9,22 @@ export async function main(options: ApplicationConfig = {}) {
   const app = new BackendApplication(options);
   await app.boot();
   await app.start();
+
+  // Catalog sync is intentionally best-effort: a first-boot failure leaves
+  // the safe model endpoint unavailable (503), while a later failure retains
+  // the last successful catalog. It must never prevent the backend itself
+  // from starting.
+  const syncCatalog = async () => {
+    try {
+      const dataSource = await app.get<PostgresDataSource>('datasources.postgres');
+      await new OpenRouterCatalogService(dataSource).sync();
+    } catch (error) {
+      console.warn('OpenRouter catalog sync failed:', error instanceof Error ? error.message : 'unknown error');
+    }
+  };
+  void syncCatalog();
+  const syncMinutes = Math.max(1, Number(process.env.OPENROUTER_CATALOG_SYNC_MINUTES ?? 60));
+  setInterval(() => void syncCatalog(), syncMinutes * 60_000).unref();
 
   const url = app.restServer.url;
   console.log(`Server is running at ${url}`);

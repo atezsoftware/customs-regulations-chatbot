@@ -1,5 +1,7 @@
 import {useState} from 'react';
 import {Button} from '../ui/Button';
+import {ModelSelector} from './ModelSelector';
+import type {LlmModelOption} from '../../types';
 
 export function ChatInput({
   disabled,
@@ -7,12 +9,20 @@ export function ChatInput({
   sending,
   onSend,
   onStop,
+  models = [],
+  modelId,
+  defaultModelId,
+  onModelChange,
 }: {
   disabled?: boolean;
   disabledReason?: string;
   sending: boolean;
   onSend: (content: string) => void;
   onStop: () => void;
+  models?: LlmModelOption[];
+  modelId?: string;
+  defaultModelId?: string;
+  onModelChange?: (model: LlmModelOption) => void;
 }) {
   const [draft, setDraft] = useState('');
 
@@ -41,9 +51,12 @@ export function ChatInput({
           className="block w-full resize-none rounded-lg border-0 px-3 py-2 text-sm text-slate-800 outline-none placeholder:text-slate-400 disabled:bg-white disabled:text-slate-300"
         />
         <div className="flex items-center justify-between gap-3 px-1 pb-1">
-          <p className="text-xs text-slate-400">
+          <div className="flex min-w-0 items-center gap-2">
+            {onModelChange && models.length > 0 && <ModelSelector models={models} modelId={modelId} defaultModelId={defaultModelId} disabled={sending} onChange={onModelChange} />}
+            <p className="text-xs text-slate-400">
             {sending ? 'Research is running.' : 'Enter sends, Shift+Enter adds a line.'}
-          </p>
+            </p>
+          </div>
           <div className="flex items-center gap-2">
             {sending && (
               <Button type="button" variant="secondary" onClick={onStop}>

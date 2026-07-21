@@ -32,6 +32,24 @@ export class LlmCall extends Entity {
   @property({type: 'number', postgresql: {columnName: 'duration_ms'}})
   durationMs?: number;
 
+  @property({type: 'string', postgresql: {columnName: 'generation_id'}})
+  generationId?: string;
+
+  @property({type: 'number', postgresql: {columnName: 'cached_input_tokens'}})
+  cachedInputTokens?: number;
+
+  @property({type: 'number', postgresql: {columnName: 'cache_write_tokens'}})
+  cacheWriteTokens?: number;
+
+  @property({type: 'string', postgresql: {columnName: 'billed_cost_usd'}})
+  billedCostUsd?: string;
+
+  @property({type: 'string', postgresql: {columnName: 'upstream_cost_usd'}})
+  upstreamCostUsd?: string;
+
+  @property({type: 'string', postgresql: {columnName: 'cost_source'}})
+  costSource?: 'provider' | 'estimated';
+
   @property({type: 'date', postgresql: {columnName: 'created_at'}})
   createdAt?: string;
 

@@ -4,6 +4,7 @@ import os
 
 from .base import LLMClient
 from .gemini import GeminiLLMClient
+from .openrouter import OpenRouterLLMClient
 
 
 def get_llm_client(
@@ -30,6 +31,15 @@ def get_llm_client(
             api_key = os.getenv("GOOGLE_API_KEY")
         return GeminiLLMClient(
             api_key=api_key, model=resolved_model, temperature=temperature
+        )
+
+    if resolved_provider == "openrouter":
+        if api_key is None:
+            api_key = os.getenv("OPENROUTER_API_KEY")
+        return OpenRouterLLMClient(
+            api_key=api_key,
+            model=resolved_model or os.getenv("OPENROUTER_DEFAULT_MODEL"),
+            temperature=temperature,
         )
 
     raise ValueError(f"Unknown LLM provider: {resolved_provider!r}")

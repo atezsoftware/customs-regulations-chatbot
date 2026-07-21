@@ -18,7 +18,6 @@ import {AgentEvent, ChatHistoryItem, CoreBridgeService} from '../services';
 
 interface SendMessageBody {
   content: string;
-  model?: string;
   temperature?: number;
 }
 
@@ -108,10 +107,9 @@ export class ChatMessagesController {
       throw new HttpErrors.BadRequest('Link at least one directory before sending a message.');
     }
 
-    const sessionPatch: {updatedAt: string; title?: string; model?: string; temperature?: number} = {
+    const sessionPatch: {updatedAt: string; title?: string; temperature?: number} = {
       updatedAt: new Date().toISOString(),
     };
-    if (body.model?.trim()) sessionPatch.model = body.model.trim();
     if (typeof body.temperature === 'number' && Number.isFinite(body.temperature)) {
       sessionPatch.temperature = body.temperature;
     }
@@ -211,6 +209,8 @@ export class ChatMessagesController {
           outputTokens: call.outputTokens,
           thinkingTokens: call.thinkingTokens,
           durationMs: call.durationMs,
+          billedCostUsd: call.billedCostUsd,
+          costSource: call.costSource,
           createdAt: call.createdAt,
         })),
     }));

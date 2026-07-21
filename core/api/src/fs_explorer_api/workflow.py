@@ -411,6 +411,7 @@ WORKFLOW_TIMEOUT_SECONDS = None
 
 def new_workflow(
     *,
+    provider: str | None = None,
     model: str | None = None,
     temperature: float | None = None,
     on_llm_call: OnLLMCall | None = None,
@@ -446,7 +447,7 @@ def new_workflow(
     """
     resource_manager = ResourceManager()
     agent = FsExplorerAgent(
-        model=model, temperature=temperature, on_llm_call=on_llm_call
+        provider=provider, model=model, temperature=temperature, on_llm_call=on_llm_call
     )
     resource_manager.resources[get_agent.__qualname__] = agent
     workflow = FsExplorerWorkflow(

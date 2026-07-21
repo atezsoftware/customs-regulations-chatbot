@@ -7,6 +7,7 @@ later means adding a new `LLMClient` implementation, not touching the agent's
 decision logic.
 """
 
+from decimal import Decimal
 from typing import AsyncIterator, Literal, Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -28,7 +29,13 @@ class LLMUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     thinking_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
     duration_ms: float = 0
+    generation_id: str | None = None
+    billed_cost_usd: Decimal | None = None
+    upstream_cost_usd: Decimal | None = None
+    cost_source: Literal["provider", "estimated"] | None = None
 
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)

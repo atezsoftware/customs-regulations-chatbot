@@ -6,6 +6,7 @@ import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../../directories/repositories';
 import {toSafeDirectory, toSafeFile} from '../../directories/transformers';
 import {ChatSessionDirectoryRepository, ChatSessionRepository, LlmCallRepository} from '../repositories';
+import {LlmModelRepository} from '../../llm-catalog/repositories';
 
 interface SessionBody {
   title?: string;
@@ -15,6 +16,8 @@ interface SetDirectoriesBody {
   directoryIds: number[];
 }
 
+interface SetModelBody { provider: string; modelId: string; }
+
 function toSafeSession(
   session: {
     id?: number;
@@ -22,6 +25,8 @@ function toSafeSession(
     createdAt?: string;
     updatedAt?: string;
     lastContextUsageRatio?: number;
+    llmProvider?: string;
+    model?: string;
   },
   totalTokens = 0,
 ) {
@@ -32,6 +37,8 @@ function toSafeSession(
     updatedAt: session.updatedAt,
     totalTokens,
     lastContextUsageRatio: session.lastContextUsageRatio ?? null,
+    llmProvider: session.llmProvider,
+    model: session.model,
   };
 }
 
@@ -45,6 +52,7 @@ export class ChatSessionsController {
     private directoryFileRepository: DirectoryFileRepository,
     @repository(UserRepository) private userRepository: UserRepository,
     @repository(LlmCallRepository) private llmCallRepository: LlmCallRepository,
+    @repository(LlmModelRepository) private llmModelRepository: LlmModelRepository,
     @inject(RestBindings.Http.REQUEST) private request: Request,
   ) {}
 
@@ -62,11 +70,34 @@ export class ChatSessionsController {
   @response(200, {description: 'Created chat session'})
   async create(@requestBody() body: SessionBody) {
     const user = await getCurrentUser(this.request, this.userRepository);
+    const defaultModel = process.env.OPENROUTER_DEFAULT_MODEL ?? 'google/gemini-3-flash-preview';
+    const available = await this.llmModelRepository.findOne({
+      where: {provider: 'openrouter', modelId: defaultModel, isActive: true},
+    });
+    if (!available) {
+      throw new HttpErrors.ServiceUnavailable('The configured default model is temporarily unavailable.');
+    }
     const session = await this.chatSessionRepository.create({
       userId: user.id,
       title: body.title?.trim() || 'New chat',
+      llmProvider: 'openrouter',
+      model: defaultModel,
     });
     return toSafeSession(session);
+  }
+
+  @patch('/chat-sessions/{id}/model')
+  @response(200, {description: 'Persisted chat model selection'})
+  async setModel(@param.path.number('id') id: number, @requestBody() body: SetModelBody) {
+    const user = await getCurrentUser(this.request, this.userRepository);
+    const session = await this.ownedSessionOrThrow(id, user.id);
+    if (body.provider !== 'openrouter' || !body.modelId?.trim()) {
+      throw new HttpErrors.BadRequest('Choose an active OpenRouter model.');
+    }
+    const model = await this.llmModelRepository.findOne({where: {provider: 'openrouter', modelId: body.modelId.trim(), isActive: true}});
+    if (!model) throw new HttpErrors.BadRequest('Selected model is not available.');
+    await this.chatSessionRepository.updateById(id, {llmProvider: 'openrouter', model: model.modelId, updatedAt: new Date().toISOString()});
+    return toSafeSession({...session, llmProvider: 'openrouter', model: model.modelId, updatedAt: new Date().toISOString()});
   }
 
   @get('/chat-sessions')
