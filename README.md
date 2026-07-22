@@ -29,7 +29,7 @@ Install these once, before the first `scripts/run.sh` run:
 # 1. Copy and fill in the env files (one set per environment)
 cp .env.dev.example .env.dev
 cp db/.env.dev.example db/.env.dev
-# fill in GOOGLE_API_KEY (https://aistudio.google.com/apikey) and the DB_*/POSTGRES_* secrets
+# fill in OPENROUTER_API_KEY and the DB_*/POSTGRES_* secrets
 # (the two files must agree: db/.env.dev's POSTGRES_USER/PASSWORD/DB must match
 # the DB_USER/DB_PASSWORD/DB_NAME in the root .env.dev)
 
@@ -78,6 +78,10 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 
 | Variable | Where | Purpose |
 |----------|-------|---------|
+| `OPENROUTER_API_KEY` | `core-api`, `backend` | Required for chat inference (`core-api`) and model catalog sync (`backend`). |
+| `FS_EXPLORER_LLM_PROVIDER` | `core-api` | Active chat provider. Set to `openrouter` for the new model selector flow. |
+| `OPENROUTER_DEFAULT_MODEL` | `core-api`, `backend` | Default model for new sessions and provider fallback (`google/gemini-3-flash-preview`). |
+| `OPENROUTER_CATALOG_SYNC_MINUTES` | `backend` | How often the backend refreshes the available OpenRouter model catalog. |
 | `GOOGLE_API_KEY` | `core-api`, `core-indexer` | Gemini LLM + embeddings. Get one at [Google AI Studio](https://aistudio.google.com/apikey). |
 | `DATABASE_URL` | `core-api`, `core-indexer`, `backend` | Shared Postgres connection string. |
 | `CORE_INTERNAL_TOKEN` | `core-api`, `core-indexer`, `backend` | Shared secret gating both core services' internal REST/WebSocket endpoints so only `backend` can call them. |

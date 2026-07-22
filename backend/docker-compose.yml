@@ -18,6 +18,10 @@ services:
       STORAGE_ROOT: /app/storage
       CORE_INTERNAL_URL: ${CORE_INTERNAL_URL:-ws://core:8000}
       CORE_INTERNAL_TOKEN: ${CORE_INTERNAL_TOKEN:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_DEFAULT_MODEL: ${OPENROUTER_DEFAULT_MODEL:-google/gemini-3-flash-preview}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_CATALOG_SYNC_MINUTES: ${OPENROUTER_CATALOG_SYNC_MINUTES:-60}
     volumes:
       - customs_storage:/app/storage
     networks:
