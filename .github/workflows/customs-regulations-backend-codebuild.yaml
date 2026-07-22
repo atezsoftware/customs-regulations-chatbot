@@ -266,3 +266,17 @@ jobs:
       - name: Confirm Deployment Status
         if: steps.helm_deploy.outcome == 'success'
         run: echo "Deployment successful"
+
+      - name: Slack Notification
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_CHANNEL: ops-customs-regulation-chatbot
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_ICON: https://avatars.githubusercontent.com/u/9919?s=48&v=4
+          SLACK_MESSAGE: |
+            ${{ job.status }}: Job '${{ env.SERVICE_NAME }} [${{ github.run_number }}]' in environment '${{ env.space_x }}'
+            ${{ env.ROLLBACK_PERFORMED == 'true' && '🔄 Rollback performed to previous revision' || env.ROLLBACK_PERFORMED == 'cleanup' && '🧹 Failed deployment cleaned up (no previous revision)' || '' }}
+          SLACK_TITLE: 'Github Workflow'
+          SLACK_USERNAME: Github
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
