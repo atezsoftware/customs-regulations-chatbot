@@ -117,6 +117,7 @@ export class BenchmarkRunnerService {
       }
 
       let judgment: JudgeResult | null = null;
+      let judgeError: string | undefined;
       try {
         judgment = await this.callJudge({
           question: question.prompt,
@@ -131,12 +132,12 @@ export class BenchmarkRunnerService {
       } catch (error) {
         // Judging is best-effort: a candidate run that itself succeeded
         // should still count as completed even if the judge call fails
-        // (rate limit, judge model outage) — metrics stay valid, just
-        // without a score for this item.
-        console.warn(
-          `[benchmark] judge call failed item=${item.id}:`,
-          error instanceof Error ? error.message : error,
-        );
+        // (rate limit, judge model outage, schema validation) — metrics
+        // stay valid, just without a score for this item. Persisted (not
+        // just logged) so the failure is visible from the UI/DB without
+        // needing server log access.
+        judgeError = (error instanceof Error ? error.message : String(error)).slice(0, 2000);
+        console.warn(`[benchmark] judge call failed item=${item.id}:`, judgeError);
       }
 
       await this.items.updateById(item.id, {
@@ -156,6 +157,7 @@ export class BenchmarkRunnerService {
         costSource: runResult.stats.cost_source ?? undefined,
         citedSources: runResult.cited_sources,
         stepPath: runResult.step_path,
+        judgeError,
         completedAt: new Date().toISOString(),
       });
 

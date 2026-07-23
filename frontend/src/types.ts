@@ -359,6 +359,9 @@ export interface BenchmarkModelMetrics {
   avgSteps: number | null;
   avgTokensPerStep: number | null;
   avgTotalTokens: number | null;
+  avgPromptTokens: number | null;
+  avgCompletionTokens: number | null;
+  avgThinkingTokens: number | null;
   avgDurationMs: number | null;
   avgDurationPerStepMs: number | null;
   p50DurationMs: number | null;
@@ -404,9 +407,13 @@ export interface BenchmarkRunItem {
   stepPath: string[];
   steps: number | null;
   totalTokens: number | null;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  thinkingTokens: number | null;
   durationMs: number | null;
   costUsd: string | null;
   startedAt: string | null;
   completedAt: string | null;
   judgment: BenchmarkRunItemJudgment | null;
+  judgeError: string | null;
 }

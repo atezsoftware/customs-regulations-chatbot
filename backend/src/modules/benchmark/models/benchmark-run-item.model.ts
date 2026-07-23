@@ -34,6 +34,13 @@ export class BenchmarkRunItem extends Entity {
   @property({type: 'boolean', required: true})
   incomplete: boolean;
 
+  // Set only when the candidate run itself succeeded but the best-effort
+  // judge call failed (rate limit, judge model outage, schema validation) —
+  // see BenchmarkRunnerService.executeItem. Null/undefined means either the
+  // item hasn't been judged yet or judging succeeded.
+  @property({type: 'string', postgresql: {columnName: 'judge_error'}})
+  judgeError?: string;
+
   @property({type: 'number'})
   steps?: number;
 

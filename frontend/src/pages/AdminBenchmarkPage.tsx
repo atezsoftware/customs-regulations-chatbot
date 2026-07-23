@@ -825,14 +825,17 @@ function RunDetail({
       <BenchmarkMetricBars metrics={metrics} />
 
       <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
-        <table className="w-full min-w-[1100px] text-left text-sm">
+        <table className="w-full min-w-[1400px] text-left text-sm">
           <thead className="border-b border-slate-100 text-xs uppercase tracking-wide text-slate-400">
             <tr>
               <th className="px-3 py-2.5">Model</th>
               <th className="px-3 py-2.5">Items</th>
               <th className="px-3 py-2.5">Avg steps</th>
               <th className="px-3 py-2.5">Tokens/step</th>
-              <th className="px-3 py-2.5">Avg tokens</th>
+              <th className="px-3 py-2.5">Input tokens</th>
+              <th className="px-3 py-2.5">Output tokens</th>
+              <th className="px-3 py-2.5">Thinking tokens</th>
+              <th className="px-3 py-2.5">Avg tokens (total)</th>
               <th className="px-3 py-2.5">Avg duration</th>
               <th className="px-3 py-2.5">Duration/step</th>
               <th className="px-3 py-2.5">p50 / p95</th>
@@ -866,6 +869,9 @@ function RunDetail({
                   <td className="px-3 py-2.5">{model.totalCount}</td>
                   <td className="px-3 py-2.5">{formatNumber(model.avgSteps)}</td>
                   <td className="px-3 py-2.5">{formatNumber(model.avgTokensPerStep)}</td>
+                  <td className="px-3 py-2.5">{formatNumber(model.avgPromptTokens)}</td>
+                  <td className="px-3 py-2.5">{formatNumber(model.avgCompletionTokens)}</td>
+                  <td className="px-3 py-2.5">{formatNumber(model.avgThinkingTokens)}</td>
                   <td className="px-3 py-2.5">{formatNumber(model.avgTotalTokens)}</td>
                   <td className="px-3 py-2.5">{formatMs(model.avgDurationMs)}</td>
                   <td className="px-3 py-2.5">{formatMs(model.avgDurationPerStepMs)}</td>
@@ -919,11 +925,16 @@ function RunDetail({
                           </span>
                         ))}
                       </div>
-                      {item.judgment && (
+                      {item.judgment ? (
                         <p className="mt-2 text-xs text-slate-500">
-                          Judge: {item.judgment.overallScore}/100 — {item.judgment.rationale}
+                          Judge: {item.judgment.overallScore}/100 (correctness{' '}
+                          {item.judgment.correctnessScore}/5 · groundedness {item.judgment.groundednessScore}/5 ·
+                          completeness {item.judgment.completenessScore}/5 · clarity{' '}
+                          {item.judgment.clarityScore}/5) — {item.judgment.rationale}
                         </p>
-                      )}
+                      ) : item.judgeError ? (
+                        <p className="mt-2 text-xs text-rose-600">Judge scoring failed: {item.judgeError}</p>
+                      ) : null}
                     </>
                   )}
                 </li>

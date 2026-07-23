@@ -12,6 +12,9 @@ export interface BenchmarkModelMetricsRow {
   avg_steps: number | string | null;
   avg_tokens_per_step: number | string | null;
   avg_total_tokens: number | string | null;
+  avg_prompt_tokens: number | string | null;
+  avg_completion_tokens: number | string | null;
+  avg_thinking_tokens: number | string | null;
   avg_duration_ms: number | string | null;
   avg_duration_per_step_ms: number | string | null;
   avg_cost_usd: number | string | null;
@@ -113,6 +116,9 @@ export class BenchmarkRunItemRepository extends DefaultCrudRepository<
           (SUM(bri.total_tokens) FILTER (WHERE bri.status = 'completed'))::float
             / NULLIF(SUM(bri.steps) FILTER (WHERE bri.status = 'completed'), 0) AS avg_tokens_per_step,
           AVG(bri.total_tokens) FILTER (WHERE bri.status = 'completed') AS avg_total_tokens,
+          AVG(bri.prompt_tokens) FILTER (WHERE bri.status = 'completed') AS avg_prompt_tokens,
+          AVG(bri.completion_tokens) FILTER (WHERE bri.status = 'completed') AS avg_completion_tokens,
+          AVG(bri.thinking_tokens) FILTER (WHERE bri.status = 'completed') AS avg_thinking_tokens,
           AVG(bri.duration_ms) FILTER (WHERE bri.status = 'completed') AS avg_duration_ms,
           (SUM(bri.duration_ms) FILTER (WHERE bri.status = 'completed'))::float
             / NULLIF(SUM(bri.steps) FILTER (WHERE bri.status = 'completed'), 0) AS avg_duration_per_step_ms,

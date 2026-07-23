@@ -54,6 +54,9 @@ function toSafeMetrics(row: BenchmarkModelMetricsRow, percentiles?: BenchmarkMod
     avgSteps: toNumber(row.avg_steps),
     avgTokensPerStep: toNumber(row.avg_tokens_per_step),
     avgTotalTokens: toNumber(row.avg_total_tokens),
+    avgPromptTokens: toNumber(row.avg_prompt_tokens),
+    avgCompletionTokens: toNumber(row.avg_completion_tokens),
+    avgThinkingTokens: toNumber(row.avg_thinking_tokens),
     avgDurationMs: toNumber(row.avg_duration_ms),
     avgDurationPerStepMs: toNumber(row.avg_duration_per_step_ms),
     p50DurationMs: toNumber(percentiles?.p50_duration_ms),
@@ -211,6 +214,9 @@ export class BenchmarkRunsController {
           stepPath: row.stepPath ?? [],
           steps: row.steps ?? null,
           totalTokens: row.totalTokens ?? null,
+          promptTokens: row.promptTokens ?? null,
+          completionTokens: row.completionTokens ?? null,
+          thinkingTokens: row.thinkingTokens ?? null,
           durationMs: row.durationMs ?? null,
           costUsd: row.costUsd ?? null,
           startedAt: row.startedAt ?? null,
@@ -225,6 +231,7 @@ export class BenchmarkRunsController {
                 rationale: judgment.rationale ?? null,
               }
             : null,
+          judgeError: row.judgeError ?? null,
         };
       }),
     };
