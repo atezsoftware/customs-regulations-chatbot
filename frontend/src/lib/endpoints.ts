@@ -7,6 +7,10 @@ import type {
   AnalyzeAmendmentResult,
   ApproveAmendmentResult,
   AuthTokens,
+  BenchmarkQuestion,
+  BenchmarkRun,
+  BenchmarkRunDetail,
+  BenchmarkRunItem,
   ChatMessageRecord,
   ChatSession,
   Directory,
@@ -127,6 +131,45 @@ export const adminSupportApi = {
   },
   messages: (sessionId: number) =>
     apiFetch<AdminSupportSessionDetail>(`/admin/support/sessions/${sessionId}/messages`),
+};
+
+export const benchmarkApi = {
+  questions: {
+    list: () => apiFetch<{questions: BenchmarkQuestion[]}>('/admin/benchmark/questions'),
+    create: (
+      input: Partial<Omit<BenchmarkQuestion, 'id'>> & {prompt: string},
+    ) =>
+      apiFetch<BenchmarkQuestion>('/admin/benchmark/questions', {
+        method: 'POST',
+        body: input,
+      }),
+    update: (id: number, input: Partial<Omit<BenchmarkQuestion, 'id'>>) =>
+      apiFetch<BenchmarkQuestion>(`/admin/benchmark/questions/${id}`, {
+        method: 'PATCH',
+        body: input,
+      }),
+    remove: (id: number) =>
+      apiFetch<void>(`/admin/benchmark/questions/${id}`, {method: 'DELETE'}),
+  },
+  runs: {
+    list: () => apiFetch<{runs: BenchmarkRun[]}>('/admin/benchmark/runs'),
+    create: (input: {
+      label?: string;
+      providerModelPairs: Array<{provider: string; modelId: string}>;
+      questionIds: number[] | 'all-active';
+      judgeProvider: string;
+      judgeModel: string;
+    }) =>
+      apiFetch<{runId: number}>('/admin/benchmark/runs', {
+        method: 'POST',
+        body: input,
+      }),
+    get: (id: number) => apiFetch<BenchmarkRunDetail>(`/admin/benchmark/runs/${id}`),
+    items: (id: number) =>
+      apiFetch<{items: BenchmarkRunItem[]}>(`/admin/benchmark/runs/${id}/items`),
+    cancel: (id: number) =>
+      apiFetch<void>(`/admin/benchmark/runs/${id}/cancel`, {method: 'POST'}),
+  },
 };
 
 export const amendmentsApi = {

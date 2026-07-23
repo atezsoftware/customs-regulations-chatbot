@@ -4,6 +4,7 @@ import {AppShell} from './components/AppShell';
 import {LocalOnlyRoute} from './components/LocalOnlyRoute';
 import {ProtectedRoute} from './components/ProtectedRoute';
 import {AdminAmendmentsPage} from './pages/AdminAmendmentsPage';
+import {AdminBenchmarkPage} from './pages/AdminBenchmarkPage';
 import {AdminSupportPage} from './pages/AdminSupportPage';
 import {ChatPage} from './pages/ChatPage';
 import {ChunksPage} from './pages/ChunksPage';
@@ -30,6 +31,8 @@ function App() {
           <Route element={<AdminRoute />}>
             <Route path="/admin/support" element={<AdminSupportPage />} />
             <Route path="/admin/amendments" element={<AdminAmendmentsPage />} />
+            <Route path="/admin/benchmark" element={<AdminBenchmarkPage />} />
+            <Route path="/admin/benchmark/:runId" element={<AdminBenchmarkPage />} />
           </Route>
         </Route>
       </Route>

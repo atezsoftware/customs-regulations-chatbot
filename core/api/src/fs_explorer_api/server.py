@@ -40,6 +40,7 @@ from .amendments import (
     analyze_amendment,
     flag_duplicate_targets_in_records,
 )
+from .benchmark_runner import judge_answer, run_agentic_session
 from fs_explorer_shared.auth import internal_token_valid, require_internal_token
 from fs_explorer_shared.embeddings import EmbeddingProvider
 from .exploration_trace import ExplorationTrace, extract_cited_sources
@@ -94,6 +95,30 @@ class SearchRequest(BaseModel):
     limit: int = 5
     database_url: str | None = None
     as_of_date: str | None = None
+
+
+class BenchmarkRunQuestionRequest(BaseModel):
+    """Request model for one headless benchmark agent run."""
+
+    task: str
+    index_folders: list[str]
+    database_url: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    temperature: float | None = None
+
+
+class BenchmarkJudgeRequest(BaseModel):
+    """Request model for scoring one benchmark candidate answer."""
+
+    question: str
+    reference_answer: str | None = None
+    expected_facts: list[str] | None = None
+    rubric_notes: str | None = None
+    candidate_answer: str
+    cited_sources: list[str] = []
+    judge_provider: str
+    judge_model: str
 
 
 def _format_conversation_context(raw_context: Any) -> str:
@@ -358,6 +383,59 @@ async def document_chunks(
         if result is None:
             return {"document": None, "chunks": []}
         return result
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/benchmark/run-question", dependencies=[Depends(require_internal_token)])
+async def benchmark_run_question_endpoint(request: BenchmarkRunQuestionRequest):
+    """Drive one headless agent run for the benchmark system.
+
+    Blocking/synchronous by design — the caller (`backend`'s benchmark
+    orchestrator) provides parallelism across items via its own bounded
+    concurrency loop; this endpoint never streams and never touches the
+    `/ws/explore` code path.
+    """
+    try:
+        result = await run_agentic_session(
+            task=request.task,
+            index_folders=request.index_folders,
+            database_url=request.database_url,
+            provider=request.provider,
+            model=request.model,
+            temperature=request.temperature,
+        )
+        return {
+            "final_result": result.final_result,
+            "error": result.error,
+            "incomplete": result.incomplete,
+            "cited_sources": result.cited_sources,
+            "step_path": result.step_path,
+            "stats": result.stats,
+        }
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/benchmark/judge", dependencies=[Depends(require_internal_token)])
+async def benchmark_judge_endpoint(request: BenchmarkJudgeRequest):
+    """Score one benchmark candidate answer with a single LLM-judge call."""
+    try:
+        judgment = await judge_answer(
+            question=request.question,
+            reference_answer=request.reference_answer,
+            expected_facts=request.expected_facts,
+            rubric_notes=request.rubric_notes,
+            candidate_answer=request.candidate_answer,
+            cited_sources=request.cited_sources,
+            judge_provider=request.judge_provider,
+            judge_model=request.judge_model,
+        )
+        return judgment
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 

@@ -320,3 +320,93 @@ export interface ApproveAmendmentResult {
   applied: AmendmentProposal[];
   failed: Array<{proposalId: string; reason: string}>;
 }
+
+export interface BenchmarkQuestion {
+  id: number;
+  prompt: string;
+  referenceAnswer: string | null;
+  expectedFacts: string[];
+  rubricNotes: string | null;
+  tags: string[];
+  isActive: boolean;
+  directoryIds: number[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export type BenchmarkRunStatus = 'pending' | 'running' | 'completed' | 'error' | 'cancelled';
+
+export interface BenchmarkRun {
+  id: number;
+  label: string | null;
+  status: BenchmarkRunStatus;
+  judgeProvider: string;
+  judgeModel: string;
+  totalItems: number;
+  completedItems: number;
+  failedItems: number;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt?: string;
+}
+
+export interface BenchmarkModelMetrics {
+  provider: string;
+  modelId: string;
+  totalCount: number;
+  completedCount: number;
+  errorCount: number;
+  avgSteps: number | null;
+  avgTokensPerStep: number | null;
+  avgTotalTokens: number | null;
+  avgDurationMs: number | null;
+  avgDurationPerStepMs: number | null;
+  p50DurationMs: number | null;
+  p95DurationMs: number | null;
+  avgCostUsd: number | null;
+  totalCostUsd: number | null;
+  successRate: number | null;
+  errorRate: number | null;
+  citationRate: number | null;
+  avgApiCalls: number | null;
+  avgContextSummaries: number | null;
+  judgeOverallScore: number | null;
+  judgeCorrectness: number | null;
+  judgeGroundedness: number | null;
+  judgeCompleteness: number | null;
+  judgeClarity: number | null;
+}
+
+export interface BenchmarkRunDetail {
+  run: BenchmarkRun;
+  metrics: BenchmarkModelMetrics[];
+}
+
+export interface BenchmarkRunItemJudgment {
+  overallScore: number;
+  correctnessScore: number;
+  groundednessScore: number;
+  completenessScore: number;
+  clarityScore: number;
+  rationale: string | null;
+}
+
+export interface BenchmarkRunItem {
+  id: number;
+  provider: string;
+  modelId: string;
+  questionId: number;
+  status: 'pending' | 'running' | 'completed' | 'error';
+  incomplete: boolean;
+  errorMessage: string | null;
+  finalResult: string | null;
+  citedSources: string[];
+  stepPath: string[];
+  steps: number | null;
+  totalTokens: number | null;
+  durationMs: number | null;
+  costUsd: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  judgment: BenchmarkRunItemJudgment | null;
+}

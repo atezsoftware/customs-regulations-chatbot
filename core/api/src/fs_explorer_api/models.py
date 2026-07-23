@@ -160,3 +160,36 @@ class Action(BaseModel):
             return "askhuman"
         else:
             return "stop"
+
+
+# =============================================================================
+# Benchmark Judge Model
+# =============================================================================
+
+
+class JudgmentResult(BaseModel):
+    """Structured LLM-judge score for one benchmark candidate answer.
+
+    Scored against a fixed rubric (see `benchmark_runner.JUDGE_SYSTEM_PROMPT`)
+    on four 1-5 dimensions; the weighted `overall_score` is computed by the
+    caller from these, not requested from the judge model directly, so the
+    weighting stays server-controlled regardless of which judge model runs.
+    """
+
+    correctness: int = Field(
+        ge=1, le=5, description="Factual match to the reference answer/expected facts"
+    )
+    groundedness: int = Field(
+        ge=1, le=5, description="How well claims are backed by cited sources"
+    )
+    completeness: int = Field(
+        ge=1,
+        le=5,
+        description="Coverage of the question, including relevant exceptions",
+    )
+    clarity: int = Field(
+        ge=1, le=5, description="How clear, direct, and actionable the answer is"
+    )
+    rationale: str = Field(
+        description="Short, specific explanation for the scores given"
+    )

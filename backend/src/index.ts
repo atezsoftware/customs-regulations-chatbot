@@ -2,6 +2,14 @@ import 'dotenv/config';
 import {ApplicationConfig, BackendApplication} from './application';
 import {PostgresDataSource} from './datasources';
 import {OpenRouterCatalogService} from './modules/llm-catalog/services';
+import {
+  BenchmarkQuestionDirectoryRepository,
+  BenchmarkQuestionRepository,
+  BenchmarkRunItemRepository,
+  BenchmarkRunJudgmentRepository,
+  BenchmarkRunRepository,
+  BenchmarkRunnerService,
+} from './modules/benchmark';
 
 export * from './application';
 
@@ -25,6 +33,30 @@ export async function main(options: ApplicationConfig = {}) {
   void syncCatalog();
   const syncMinutes = Math.max(1, Number(process.env.OPENROUTER_CATALOG_SYNC_MINUTES ?? 60));
   setInterval(() => void syncCatalog(), syncMinutes * 60_000).unref();
+
+  // Benchmark orchestration runs on a short tick (not a long interval like
+  // the catalog sync above) because it drives a queue of pending work
+  // items rather than a single periodic refresh — see
+  // BenchmarkRunnerService.tick's advisory-lock/bounded-concurrency
+  // docstring. Best-effort for the same reason as the catalog sync: a
+  // failed tick must never affect the rest of the backend.
+  const runBenchmarkTick = async () => {
+    try {
+      const dataSource = await app.get<PostgresDataSource>('datasources.postgres');
+      const service = new BenchmarkRunnerService(
+        dataSource,
+        new BenchmarkRunRepository(dataSource),
+        new BenchmarkRunItemRepository(dataSource),
+        new BenchmarkRunJudgmentRepository(dataSource),
+        new BenchmarkQuestionRepository(dataSource),
+        new BenchmarkQuestionDirectoryRepository(dataSource),
+      );
+      await service.tick();
+    } catch (error) {
+      console.warn('Benchmark tick failed:', error instanceof Error ? error.message : 'unknown error');
+    }
+  };
+  setInterval(() => void runBenchmarkTick(), 5_000).unref();
 
   const url = app.restServer.url;
   console.log(`Server is running at ${url}`);
