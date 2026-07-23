@@ -1,6 +1,7 @@
 import {useMemo, useState} from 'react';
 import {formatUsd} from '../../lib/format';
 import type {LlmModelOption} from '../../types';
+import {applyModelSelection} from './model-selector-state';
 
 export function ModelSelector({models, modelId, defaultModelId, disabled, onChange}: {
   models: LlmModelOption[];
@@ -10,6 +11,7 @@ export function ModelSelector({models, modelId, defaultModelId, disabled, onChan
   onChange: (model: LlmModelOption) => void;
 }) {
   const [query, setQuery] = useState('');
+  const [isOpen, setIsOpen] = useState(false);
   const selected = models.find(model => model.modelId === modelId) ?? models.find(model => model.modelId === defaultModelId);
   const shown = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -17,7 +19,15 @@ export function ModelSelector({models, modelId, defaultModelId, disabled, onChan
   }, [models, query]);
   if (!selected) return <span className="text-xs text-slate-400">Models unavailable</span>;
   return (
-    <details className="relative min-w-0" onToggle={event => { if (!(event.currentTarget as HTMLDetailsElement).open) setQuery(''); }}>
+    <details
+      open={isOpen}
+      className="relative min-w-0"
+      onToggle={event => {
+        const open = (event.currentTarget as HTMLDetailsElement).open;
+        setIsOpen(open);
+        if (!open) setQuery('');
+      }}
+    >
       <summary className="cursor-pointer list-none rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-600 disabled:cursor-not-allowed">
         {selected.displayName} · {formatUsd(selected.promptUsdPerMillion) ?? '$—'} in / {formatUsd(selected.completionUsdPerMillion) ?? '$—'} out
       </summary>
@@ -25,7 +35,16 @@ export function ModelSelector({models, modelId, defaultModelId, disabled, onChan
         <input autoFocus value={query} onChange={event => setQuery(event.target.value)} placeholder="Search models" className="mb-2 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm" />
         <ul className="max-h-64 overflow-y-auto">
           {shown.map(model => <li key={model.modelId}>
-            <button type="button" disabled={disabled} onClick={() => onChange(model)} className="w-full rounded-lg px-2 py-2 text-left hover:bg-slate-50 disabled:cursor-not-allowed">
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() => {
+                const nextState = applyModelSelection(model, onChange);
+                setIsOpen(nextState.isOpen);
+                setQuery(nextState.query);
+              }}
+              className="w-full rounded-lg px-2 py-2 text-left hover:bg-slate-50 disabled:cursor-not-allowed"
+            >
               <span className="block text-sm font-medium text-slate-800">{model.displayName}{model.modelId === defaultModelId ? ' · Default' : ''}</span>
               <span className="block text-xs text-slate-500">{model.modelId} · {formatUsd(model.promptUsdPerMillion) ?? '$—'} / 1M in · {formatUsd(model.completionUsdPerMillion) ?? '$—'} / 1M out</span>
             </button>
