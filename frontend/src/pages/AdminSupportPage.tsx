@@ -125,6 +125,11 @@ export function AdminSupportPage() {
                         {session.lastMessage.preview}
                       </span>
                     )}
+                    {session.model && (
+                      <span className="mt-2 block truncate text-xs font-medium text-indigo-600">
+                        {formatModel(session.model.provider, session.model.modelId)}
+                      </span>
+                    )}
                     <span className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
                       <span>{session.messageCount} messages</span>
                       <span>{formatDate(session.lastMessageAt ?? session.updatedAt)}</span>
@@ -166,6 +171,11 @@ export function AdminSupportPage() {
                       {detail.session.user.fullName ?? 'Unnamed user'} ·{' '}
                       {detail.messages.length} messages
                     </p>
+                    {detail.session.model && (
+                      <p className="mt-1 text-sm font-medium text-indigo-600">
+                        Model: {formatModel(detail.session.model.provider, detail.session.model.modelId)}
+                      </p>
+                    )}
                   </div>
                   <div className="grid grid-cols-3 gap-2 text-center">
                     <MiniMetric label="Input" value={formatNumber(tokenSum(detail.messages, 'inputTokens'))} />
@@ -290,4 +300,8 @@ function formatDate(value?: string): string {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+function formatModel(provider: string, modelId: string): string {
+  return `${provider} · ${modelId}`;
 }

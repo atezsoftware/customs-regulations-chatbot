@@ -18,6 +18,7 @@ import {
   ChatSourceRepository,
   LlmCallRepository,
 } from '../../chat/repositories';
+import {toAdminSupportModel, toAdminSupportSession} from '../support-session';
 
 function toSafeMessage(message: ChatMessage) {
   return {
@@ -75,6 +76,7 @@ export class AdminSupportController {
           fullName: row.full_name ?? undefined,
           role: row.role,
         },
+        ...toAdminSupportSession(row),
         messageCount: numberValue(row.message_count),
         totalTokens: numberValue(row.total_tokens),
         lastMessageAt: dateString(row.last_message_at),
@@ -139,6 +141,7 @@ export class AdminSupportController {
           fullName: sessionUser.fullName ?? undefined,
           role: sessionUser.role,
         },
+        model: toAdminSupportModel(session.llmProvider, session.model),
       },
       messages: messages.map(message => ({
         ...toSafeMessage(message),

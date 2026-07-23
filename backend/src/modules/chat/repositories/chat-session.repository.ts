@@ -12,6 +12,8 @@ export interface AdminSessionRow {
   email: string;
   full_name: string | null;
   role: string;
+  llm_provider: string | null;
+  model: string | null;
   message_count: number | string;
   total_tokens: number | string;
   last_message_at: string | Date | null;
@@ -47,6 +49,8 @@ export class ChatSessionRepository extends DefaultCrudRepository<
           u.email,
           u.full_name,
           u.role,
+          s.llm_provider,
+          s.model,
           COALESCE(message_stats.message_count, 0) AS message_count,
           COALESCE(token_stats.total_tokens, 0) AS total_tokens,
           message_stats.last_message_at,

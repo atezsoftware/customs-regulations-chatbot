@@ -252,6 +252,10 @@ export interface AdminSupportSession {
   createdAt?: string;
   updatedAt?: string;
   user: AdminSupportUser;
+  model?: {
+    provider: string;
+    modelId: string;
+  };
   messageCount: number;
   totalTokens: number;
   lastMessageAt?: string;
@@ -273,6 +277,10 @@ export interface AdminSupportSessionDetail {
     createdAt?: string;
     updatedAt?: string;
     user: AdminSupportUser;
+    model?: {
+      provider: string;
+      modelId: string;
+    };
   };
   messages: ChatMessageRecord[];
 }
