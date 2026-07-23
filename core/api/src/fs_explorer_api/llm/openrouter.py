@@ -24,24 +24,31 @@ class OpenRouterError(RuntimeError):
 
 
 def _error_detail(response: httpx.Response) -> str:
-    """Best-effort extraction of *why* OpenRouter rejected a request.
-
-    Previously discarded entirely — every rejection surfaced as the same
-    opaque "OpenRouter rejected the request." with only a status code,
-    making a bad request body (e.g. an unsupported JSON Schema keyword in
-    a `strict: true` call) undiagnosable without direct log/network access.
-    """
+    """Return a bounded provider error detail without retaining request data."""
     try:
         body = response.json()
     except ValueError:
-        return response.text[:300] or f"HTTP {response.status_code}"
+        return ""
     if isinstance(body, dict):
         error = body.get("error")
         if isinstance(error, dict) and isinstance(error.get("message"), str):
-            return error["message"][:300]
+            return " ".join(error["message"].split())[:300]
         if isinstance(error, str):
-            return error[:300]
-    return response.text[:300] or f"HTTP {response.status_code}"
+            return " ".join(error.split())[:300]
+        elif isinstance(body.get("message"), str):
+            return " ".join(body["message"].split())[:300]
+    return ""
+
+
+def _rejection_error(response: httpx.Response, *, stream: bool = False) -> OpenRouterError:
+    """Turn a rejected response into an actionable, bounded safe error."""
+    message = "OpenRouter stream could not be started" if stream else "OpenRouter rejected the request"
+    detail = _error_detail(response)
+    if detail:
+        message = f"{message} (HTTP {response.status_code}): {detail}"
+    else:
+        message = f"{message} (HTTP {response.status_code})."
+    return OpenRouterError(message, status_code=response.status_code)
 
 
 def _integer(value: Any) -> int:
@@ -136,8 +143,11 @@ class OpenRouterLLMClient:
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        if thinking_level and thinking_level != "minimal":
-            payload["reasoning"] = {"effort": thinking_level}
+        # The picker intentionally includes all models that can produce the
+        # strict schemas the agent needs. Reasoning controls are optional and
+        # model-specific, so sending them would make otherwise compatible
+        # selections fail with a 4xx response.
+        del thinking_level
         return payload
 
     async def _post(self, payload: dict[str, Any]) -> httpx.Response:
@@ -145,7 +155,8 @@ class OpenRouterLLMClient:
             try:
                 response = await self._client.post("/chat/completions", json=payload)
                 if response.status_code not in _RETRYABLE_STATUS_CODES:
-                    response.raise_for_status()
+                    if response.is_error:
+                        raise _rejection_error(response)
                     return response
                 if attempt == self._max_retries:
                     raise OpenRouterError(
@@ -157,11 +168,6 @@ class OpenRouterLLMClient:
                 if attempt == self._max_retries:
                     raise OpenRouterError("OpenRouter request timed out.") from None
                 delay = 1
-            except httpx.HTTPStatusError as exc:
-                raise OpenRouterError(
-                    f"OpenRouter rejected the request: {_error_detail(exc.response)}",
-                    status_code=exc.response.status_code,
-                ) from None
             await asyncio.sleep(delay)
         raise AssertionError("unreachable")
 
@@ -183,6 +189,7 @@ class OpenRouterLLMClient:
                 "schema": schema.model_json_schema(),
             },
         }
+        payload["provider"] = {"require_parameters": True}
         response = await self._post(payload)
         body = response.json()
         choices = body.get("choices") if isinstance(body, dict) else None
@@ -213,16 +220,12 @@ class OpenRouterLLMClient:
         started_at = time.monotonic()
         payload = self._payload(history, system_prompt, thinking_level)
         payload["stream"] = True
-        yielded = False
         try:
             async with self._client.stream(
                 "POST", "/chat/completions", json=payload
             ) as response:
                 if response.status_code >= 400:
-                    raise OpenRouterError(
-                        "OpenRouter stream could not be started.",
-                        status_code=response.status_code,
-                    )
+                    raise _rejection_error(response, stream=True)
                 async for line in response.aiter_lines():
                     if not line or line.startswith(":") or not line.startswith("data:"):
                         continue
@@ -254,7 +257,6 @@ class OpenRouterLLMClient:
                     )
                     content = delta.get("content") if isinstance(delta, dict) else None
                     if isinstance(content, str) and content:
-                        yielded = True
                         yield content
         except httpx.TimeoutException:
             raise OpenRouterError("OpenRouter stream timed out.") from None
