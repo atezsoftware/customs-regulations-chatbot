@@ -322,3 +322,58 @@ class TestJudgeAnswer:
 
         # All 1s -> 100 * (1/5) == 20.
         assert result["overall_score"] == 20
+
+    def test_schema_has_no_numeric_bounds_openrouter_strict_mode_rejects(self) -> None:
+        # Regression test: `ge=`/`le=` on a Pydantic field become JSON
+        # Schema `minimum`/`maximum`, which OpenRouter's `strict: true`
+        # structured-output mode rejects the whole request for — this is
+        # exactly what broke every judge call before this test existed.
+        schema = JudgmentResult.model_json_schema()
+
+        def assert_no_bounds(node: object) -> None:
+            if isinstance(node, dict):
+                assert "minimum" not in node, node
+                assert "maximum" not in node, node
+                for value in node.values():
+                    assert_no_bounds(value)
+            elif isinstance(node, list):
+                for item in node:
+                    assert_no_bounds(item)
+
+        assert_no_bounds(schema)
+
+    @pytest.mark.asyncio
+    async def test_clamps_out_of_rubric_scores_from_a_misbehaving_judge(
+        self, monkeypatch
+    ) -> None:
+        # JudgmentResult has no schema-level bounds (see the regression test
+        # above), so a judge model could return a value outside 1-5 despite
+        # the rubric asking for it — judge_answer must clamp rather than
+        # let it corrupt the weighted overall_score or violate the DB's
+        # 1-5 CHECK constraint.
+        judgment = JudgmentResult(
+            correctness=9,
+            groundedness=0,
+            completeness=3,
+            clarity=5,
+            rationale="out of range",
+        )
+        client = _JudgeClient(judgment)
+        monkeypatch.setattr(
+            benchmark_runner_mod, "get_llm_client", lambda **_kwargs: client
+        )
+
+        result = await judge_answer(
+            question="q",
+            reference_answer=None,
+            expected_facts=None,
+            rubric_notes=None,
+            candidate_answer="a",
+            cited_sources=[],
+            judge_provider="openrouter",
+            judge_model="test/judge",
+        )
+
+        assert result["correctness"] == 5
+        assert result["groundedness"] == 1
+        assert 0 <= result["overall_score"] <= 100

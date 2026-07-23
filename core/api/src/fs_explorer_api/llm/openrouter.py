@@ -23,6 +23,27 @@ class OpenRouterError(RuntimeError):
         self.status_code = status_code
 
 
+def _error_detail(response: httpx.Response) -> str:
+    """Best-effort extraction of *why* OpenRouter rejected a request.
+
+    Previously discarded entirely — every rejection surfaced as the same
+    opaque "OpenRouter rejected the request." with only a status code,
+    making a bad request body (e.g. an unsupported JSON Schema keyword in
+    a `strict: true` call) undiagnosable without direct log/network access.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text[:300] or f"HTTP {response.status_code}"
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            return error["message"][:300]
+        if isinstance(error, str):
+            return error[:300]
+    return response.text[:300] or f"HTTP {response.status_code}"
+
+
 def _integer(value: Any) -> int:
     return int(value) if isinstance(value, (int, float)) else 0
 
@@ -83,7 +104,9 @@ class OpenRouterLLMClient:
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", ""),
-                "X-Title": os.getenv("OPENROUTER_APP_TITLE", "Customs Regulations Chatbot"),
+                "X-Title": os.getenv(
+                    "OPENROUTER_APP_TITLE", "Customs Regulations Chatbot"
+                ),
             },
         )
         self._last_stream_usage: LLMUsage | None = None
@@ -93,15 +116,24 @@ class OpenRouterLLMClient:
     def _messages(history: list[ChatTurn], system_prompt: str) -> list[dict[str, str]]:
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(
-            {"role": "assistant" if turn.role == "model" else "user", "content": turn.text}
+            {
+                "role": "assistant" if turn.role == "model" else "user",
+                "content": turn.text,
+            }
             for turn in history
         )
         return messages
 
     def _payload(
-        self, history: list[ChatTurn], system_prompt: str, thinking_level: ThinkingLevel | None
+        self,
+        history: list[ChatTurn],
+        system_prompt: str,
+        thinking_level: ThinkingLevel | None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"model": self.model, "messages": self._messages(history, system_prompt)}
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._messages(history, system_prompt),
+        }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
         if thinking_level and thinking_level != "minimal":
@@ -116,39 +148,66 @@ class OpenRouterLLMClient:
                     response.raise_for_status()
                     return response
                 if attempt == self._max_retries:
-                    raise OpenRouterError("OpenRouter request could not be completed.", status_code=response.status_code)
+                    raise OpenRouterError(
+                        "OpenRouter request could not be completed.",
+                        status_code=response.status_code,
+                    )
                 delay = float(response.headers.get("Retry-After", "1"))
             except httpx.TimeoutException:
                 if attempt == self._max_retries:
                     raise OpenRouterError("OpenRouter request timed out.") from None
                 delay = 1
             except httpx.HTTPStatusError as exc:
-                raise OpenRouterError("OpenRouter rejected the request.", status_code=exc.response.status_code) from None
+                raise OpenRouterError(
+                    f"OpenRouter rejected the request: {_error_detail(exc.response)}",
+                    status_code=exc.response.status_code,
+                ) from None
             await asyncio.sleep(delay)
         raise AssertionError("unreachable")
 
     async def generate_structured(
-        self, history: list[ChatTurn], system_prompt: str, schema: type[SchemaT], *, thinking_level: ThinkingLevel | None = None
+        self,
+        history: list[ChatTurn],
+        system_prompt: str,
+        schema: type[SchemaT],
+        *,
+        thinking_level: ThinkingLevel | None = None,
     ) -> tuple[SchemaT, LLMUsage]:
         started_at = time.monotonic()
         payload = self._payload(history, system_prompt, thinking_level)
         payload["response_format"] = {
             "type": "json_schema",
-            "json_schema": {"name": schema.__name__, "strict": True, "schema": schema.model_json_schema()},
+            "json_schema": {
+                "name": schema.__name__,
+                "strict": True,
+                "schema": schema.model_json_schema(),
+            },
         }
         response = await self._post(payload)
         body = response.json()
         choices = body.get("choices") if isinstance(body, dict) else None
-        message = choices[0].get("message", {}) if isinstance(choices, list) and choices else {}
+        message = (
+            choices[0].get("message", {})
+            if isinstance(choices, list) and choices
+            else {}
+        )
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
             raise OpenRouterError("OpenRouter returned no structured content.")
-        usage = usage_from_openrouter(body.get("usage", {}), duration_ms=(time.monotonic() - started_at) * 1000)
-        usage.generation_id = str(body.get("id")) if body.get("id") else usage.generation_id
+        usage = usage_from_openrouter(
+            body.get("usage", {}), duration_ms=(time.monotonic() - started_at) * 1000
+        )
+        usage.generation_id = (
+            str(body.get("id")) if body.get("id") else usage.generation_id
+        )
         return schema.model_validate_json(content), usage
 
     async def stream_text(
-        self, history: list[ChatTurn], system_prompt: str, *, thinking_level: ThinkingLevel | None = None
+        self,
+        history: list[ChatTurn],
+        system_prompt: str,
+        *,
+        thinking_level: ThinkingLevel | None = None,
     ) -> AsyncIterator[str]:
         self._last_stream_usage = None
         started_at = time.monotonic()
@@ -156,9 +215,14 @@ class OpenRouterLLMClient:
         payload["stream"] = True
         yielded = False
         try:
-            async with self._client.stream("POST", "/chat/completions", json=payload) as response:
+            async with self._client.stream(
+                "POST", "/chat/completions", json=payload
+            ) as response:
                 if response.status_code >= 400:
-                    raise OpenRouterError("OpenRouter stream could not be started.", status_code=response.status_code)
+                    raise OpenRouterError(
+                        "OpenRouter stream could not be started.",
+                        status_code=response.status_code,
+                    )
                 async for line in response.aiter_lines():
                     if not line or line.startswith(":") or not line.startswith("data:"):
                         continue
@@ -175,14 +239,19 @@ class OpenRouterLLMClient:
                         continue
                     if isinstance(event.get("usage"), dict):
                         self._last_stream_usage = usage_from_openrouter(
-                            event["usage"], duration_ms=(time.monotonic() - started_at) * 1000
+                            event["usage"],
+                            duration_ms=(time.monotonic() - started_at) * 1000,
                         )
                     if event.get("id") and self._last_stream_usage:
                         self._last_stream_usage.generation_id = str(event["id"])
                     choices = event.get("choices")
                     if not isinstance(choices, list) or not choices:
                         continue
-                    delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                    delta = (
+                        choices[0].get("delta")
+                        if isinstance(choices[0], dict)
+                        else None
+                    )
                     content = delta.get("content") if isinstance(delta, dict) else None
                     if isinstance(content, str) and content:
                         yielded = True

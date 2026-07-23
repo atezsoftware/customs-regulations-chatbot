@@ -361,21 +361,34 @@ async def judge_answer(
         JUDGE_SYSTEM_PROMPT,
         JudgmentResult,
     )
+    # JudgmentResult intentionally has no ge=/le= schema bounds (see its
+    # docstring), so a judge model could in principle return an
+    # out-of-rubric value. Clamp here instead, at the one place all four
+    # scores are consumed, so the DB's 1-5 CHECK constraint and the
+    # overall_score formula never see anything outside the rubric.
+    correctness = _clamp_score(judgment.correctness)
+    groundedness = _clamp_score(judgment.groundedness)
+    completeness = _clamp_score(judgment.completeness)
+    clarity = _clamp_score(judgment.clarity)
     overall_score = round(
         100
         * (
-            _JUDGE_WEIGHTS["correctness"] * judgment.correctness
-            + _JUDGE_WEIGHTS["groundedness"] * judgment.groundedness
-            + _JUDGE_WEIGHTS["completeness"] * judgment.completeness
-            + _JUDGE_WEIGHTS["clarity"] * judgment.clarity
+            _JUDGE_WEIGHTS["correctness"] * correctness
+            + _JUDGE_WEIGHTS["groundedness"] * groundedness
+            + _JUDGE_WEIGHTS["completeness"] * completeness
+            + _JUDGE_WEIGHTS["clarity"] * clarity
         )
         / 5
     )
     return {
-        "correctness": judgment.correctness,
-        "groundedness": judgment.groundedness,
-        "completeness": judgment.completeness,
-        "clarity": judgment.clarity,
+        "correctness": correctness,
+        "groundedness": groundedness,
+        "completeness": completeness,
+        "clarity": clarity,
         "overall_score": overall_score,
         "rationale": judgment.rationale,
     }
+
+
+def _clamp_score(value: int) -> int:
+    return max(1, min(5, value))

@@ -174,21 +174,27 @@ class JudgmentResult(BaseModel):
     on four 1-5 dimensions; the weighted `overall_score` is computed by the
     caller from these, not requested from the judge model directly, so the
     weighting stays server-controlled regardless of which judge model runs.
+
+    Deliberately no `ge=`/`le=` bounds here (unlike the DB columns storing
+    these scores, which do enforce 1-5): a Pydantic numeric constraint shows
+    up as JSON Schema `minimum`/`maximum`, which OpenRouter's `strict: true`
+    structured-output mode rejects the whole request for — every other
+    schema in this module avoids numeric bounds for the same reason. Out-of
+    range values are clamped defensively in `benchmark_runner.judge_answer`
+    instead.
     """
 
     correctness: int = Field(
-        ge=1, le=5, description="Factual match to the reference answer/expected facts"
+        description="Factual match to the reference answer/expected facts, 1-5"
     )
     groundedness: int = Field(
-        ge=1, le=5, description="How well claims are backed by cited sources"
+        description="How well claims are backed by cited sources, 1-5"
     )
     completeness: int = Field(
-        ge=1,
-        le=5,
-        description="Coverage of the question, including relevant exceptions",
+        description="Coverage of the question, including relevant exceptions, 1-5",
     )
     clarity: int = Field(
-        ge=1, le=5, description="How clear, direct, and actionable the answer is"
+        description="How clear, direct, and actionable the answer is, 1-5"
     )
     rationale: str = Field(
         description="Short, specific explanation for the scores given"
