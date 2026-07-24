@@ -1402,8 +1402,14 @@ Strategy:
 2. Read the best hit with get_chunk_context. Use get_document only when the
    bounded chunk window cannot resolve a material ambiguity or cross-reference.
 3. Use a genuinely different query/tool after a miss; do not repeat searches.
-4. Stop as soon as the gathered evidence answers the question, while retaining
-   readable document titles and article/section locators for citations.
+4. Stop as soon as the gathered evidence directly answers the question. Do not
+   run additional searches or reads purely to re-confirm or gather more
+   support for an answer you already have — only continue if you found a
+   genuine gap, contradiction, or an unresolved cross-reference, not to
+   double-check something already well-supported. Retain readable document
+   titles and article/section locators for citations before stopping; the
+   final synthesis step (not this one) is where the answer gets written out
+   in full, so stopping early here does not mean a shorter final answer.
 5. Never expose internal paths or storage identifiers in the final answer.
 """
 
