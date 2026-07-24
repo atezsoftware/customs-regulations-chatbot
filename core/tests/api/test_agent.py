@@ -3,12 +3,14 @@
 import pytest
 import os
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from google.genai import Client as GenAIClient
 
 from fs_explorer_api.agent import (
     GEMINI_MAX_CONTEXT_TOKENS,
+    DEFAULT_EFFORT,
     FsExplorerAgent,
+    IndexedCorpus,
     SYSTEM_PROMPT,
     FINAL_SYSTEM_PROMPT,
     TokenUsage,
@@ -16,6 +18,8 @@ from fs_explorer_api.agent import (
     _chunk_context_from_storage,
     set_search_flags,
     get_search_flags,
+    set_effort,
+    get_effort,
     clear_index_context,
 )
 from fs_explorer_api.llm import LLMUsage
@@ -639,3 +643,77 @@ class TestDuplicateCallGuard:
 
         assert len(calls) == 1
         assert "SKIPPED" in agent._chat_history[-1].text
+
+
+class _RecordingEngine:
+    """Stand-in for `IndexedQueryEngine` that just records `.search()` kwargs
+    instead of touching Postgres, so effort-driven limit/overfetch clamping
+    can be asserted without a real index."""
+
+    calls: list[dict] = []
+
+    def __init__(self, storage, embedding_provider=None) -> None:
+        pass
+
+    def search(self, **kwargs):
+        _RecordingEngine.calls.append(kwargs)
+        return []
+
+
+class TestEffortLevels:
+    """Tests for the user-selectable effort level clamping `semantic_search`'s
+    retrieval breadth — this is what makes `limit` a hard ceiling instead of
+    a suggestion the model could previously set to any value."""
+
+    def setup_method(self) -> None:
+        clear_index_context()
+        set_effort(DEFAULT_EFFORT)
+        _RecordingEngine.calls = []
+
+    def teardown_method(self) -> None:
+        clear_index_context()
+        set_effort(DEFAULT_EFFORT)
+
+    def _run_semantic_search(self, *, limit=None) -> dict:
+        import fs_explorer_api.agent as agent_module
+
+        with (
+            patch.object(
+                agent_module,
+                "_get_index_storage_and_corpora",
+                return_value=(
+                    Mock(),
+                    [IndexedCorpus(root_folder="/x", corpus_id="c1")],
+                    None,
+                ),
+            ),
+            patch.object(agent_module, "IndexedQueryEngine", _RecordingEngine),
+        ):
+            agent_module.semantic_search("query", limit=limit)
+        return _RecordingEngine.calls[-1]
+
+    def test_default_effort_uses_medium_defaults(self) -> None:
+        call = self._run_semantic_search()
+        assert call["limit"] == 5
+        assert call["overfetch_multiplier"] == 4
+
+    def test_low_effort_caps_limit_even_when_model_asks_for_more(self) -> None:
+        set_effort("low")
+        call = self._run_semantic_search(limit=100)
+        assert call["limit"] == 5  # low's max_limit — a hard ceiling
+        assert call["overfetch_multiplier"] == 3
+
+    def test_high_effort_default_limit_applies_when_model_omits_limit(self) -> None:
+        set_effort("high")
+        call = self._run_semantic_search(limit=None)
+        assert call["limit"] == 10  # high's default_limit
+        assert call["overfetch_multiplier"] == 6
+
+    def test_model_supplied_limit_within_ceiling_is_honored(self) -> None:
+        set_effort("high")
+        call = self._run_semantic_search(limit=2)
+        assert call["limit"] == 2
+
+    def test_unknown_effort_falls_back_to_default(self) -> None:
+        set_effort("bogus-value")
+        assert get_effort() == DEFAULT_EFFORT

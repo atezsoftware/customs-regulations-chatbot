@@ -2,6 +2,12 @@ import {Entity, model, property} from '@loopback/repository';
 
 export type ChatMessageRole = 'user' | 'assistant';
 export type ChatMessageStatus = 'pending' | 'streaming' | 'completed' | 'error' | 'cancelled';
+// Retrieval breadth the user picked for this message — mirrors core-api's
+// EffortLevel (agent.py). Chosen client-side and forwarded straight through
+// to core-api's /ws/explore `start` payload; not persisted on the message
+// row since it's only needed for the one streamAssistantResponse() call
+// that create() and stream() together make (see chat-messages.controller.ts).
+export type ChatEffortLevel = 'low' | 'medium' | 'high';
 
 @model({settings: {postgresql: {schema: 'public', table: 'chat_messages'}}})
 export class ChatMessage extends Entity {

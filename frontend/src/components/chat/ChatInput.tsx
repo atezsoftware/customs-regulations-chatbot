@@ -1,7 +1,8 @@
 import {useState} from 'react';
 import {Button} from '../ui/Button';
 import {ModelSelector} from './ModelSelector';
-import type {LlmModelOption} from '../../types';
+import {EffortSelector} from './EffortSelector';
+import type {ChatEffortLevel, LlmModelOption} from '../../types';
 
 export function ChatInput({
   disabled,
@@ -13,16 +14,20 @@ export function ChatInput({
   modelId,
   defaultModelId,
   onModelChange,
+  effort,
+  onEffortChange,
 }: {
   disabled?: boolean;
   disabledReason?: string;
   sending: boolean;
-  onSend: (content: string) => void;
+  onSend: (content: string, effort: ChatEffortLevel) => void;
   onStop: () => void;
   models?: LlmModelOption[];
   modelId?: string;
   defaultModelId?: string;
   onModelChange?: (model: LlmModelOption) => void;
+  effort: ChatEffortLevel;
+  onEffortChange: (effort: ChatEffortLevel) => void;
 }) {
   const [draft, setDraft] = useState('');
 
@@ -30,7 +35,7 @@ export function ChatInput({
     const content = draft.trim();
     if (!content || disabled || sending) return;
     setDraft('');
-    onSend(content);
+    onSend(content, effort);
   }
 
   return (
@@ -53,6 +58,7 @@ export function ChatInput({
         <div className="flex items-center justify-between gap-3 px-1 pb-1">
           <div className="flex min-w-0 items-center gap-2">
             {onModelChange && models.length > 0 && <ModelSelector models={models} modelId={modelId} defaultModelId={defaultModelId} disabled={sending} onChange={onModelChange} />}
+            <EffortSelector effort={effort} onChange={onEffortChange} disabled={sending} />
             <p className="text-xs text-slate-400">
             {sending ? 'Research is running.' : 'Enter sends, Shift+Enter adds a line.'}
             </p>

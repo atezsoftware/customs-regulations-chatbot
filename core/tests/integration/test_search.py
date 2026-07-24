@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import Mock
 
 import fs_explorer_indexer.indexing.pipeline as pipeline_module
 import pytest
@@ -388,6 +389,78 @@ def test_semantic_search_includes_field_catalog_on_first_call(
         assert "Available filter fields" not in second
     finally:
         agent_module.clear_index_context()
+
+
+# ---------------------------------------------------------------------------
+# Cross-encoder reranker integration
+# ---------------------------------------------------------------------------
+
+
+class _FakeMultiHitStorage:
+    def search_chunks(
+        self, *, corpus_id: str, query: str, limit: int = 5, as_of_date=None
+    ):  # noqa: ARG002
+        return [
+            {
+                "doc_id": "doc_a",
+                "chunk_id": "chunk_a",
+                "relative_path": "a.md",
+                "absolute_path": "/a.md",
+                "position": 0,
+                "text": "alpha content",
+                "score": 1,
+            },
+            {
+                "doc_id": "doc_b",
+                "chunk_id": "chunk_b",
+                "relative_path": "b.md",
+                "absolute_path": "/b.md",
+                "position": 0,
+                "text": "beta content",
+                "score": 2,
+            },
+            {
+                "doc_id": "doc_c",
+                "chunk_id": "chunk_c",
+                "relative_path": "c.md",
+                "absolute_path": "/c.md",
+                "position": 0,
+                "text": "gamma content",
+                "score": 3,
+            },
+        ]
+
+
+def test_indexed_query_engine_uses_reranker_ordering_when_available(
+    monkeypatch,
+) -> None:
+    fake_reranker = Mock(rerank=Mock(return_value=[(0, 0.95), (2, 0.5), (1, 0.2)]))
+    monkeypatch.setattr(
+        "fs_explorer_api.search.query.get_reranker", lambda: fake_reranker
+    )
+
+    engine = IndexedQueryEngine(_FakeMultiHitStorage())
+    hits = engine.search(corpus_id="c", query="q", limit=3, enable_metadata=False)
+
+    # Reranker's order wins over the heuristic semantic_score ordering
+    # (which would have put doc_c first, per its higher raw `score`).
+    assert [hit.doc_id for hit in hits] == ["doc_a", "doc_c", "doc_b"]
+    assert hits[0].score == 0.95
+
+
+def test_indexed_query_engine_falls_back_when_reranker_returns_none(
+    monkeypatch,
+) -> None:
+    fake_reranker = Mock(rerank=Mock(return_value=None))
+    monkeypatch.setattr(
+        "fs_explorer_api.search.query.get_reranker", lambda: fake_reranker
+    )
+
+    engine = IndexedQueryEngine(_FakeMultiHitStorage())
+    hits = engine.search(corpus_id="c", query="q", limit=3, enable_metadata=False)
+
+    # Falls back to the linear heuristic: highest raw semantic score first.
+    assert [hit.doc_id for hit in hits] == ["doc_c", "doc_b", "doc_a"]
 
 
 def test_float_scoring_in_ranked_documents() -> None:

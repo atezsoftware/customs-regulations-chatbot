@@ -111,6 +111,7 @@ class WorkflowState(BaseModel):
     use_index: bool = False
     enable_semantic: bool = False
     enable_metadata: bool = False
+    effort: str = "medium"
 
 
 class InputEvent(StartEvent):
@@ -121,6 +122,7 @@ class InputEvent(StartEvent):
     use_index: bool = False
     enable_semantic: bool = False
     enable_metadata: bool = False
+    effort: str = "medium"
 
 
 class GoDeeperEvent(Event):
@@ -286,6 +288,7 @@ class FsExplorerWorkflow(Workflow):
             state.use_index = ev.use_index
             state.enable_semantic = ev.enable_semantic
             state.enable_metadata = ev.enable_metadata
+            state.effort = ev.effort
 
         dirdescription = (
             describe_indexed_context()

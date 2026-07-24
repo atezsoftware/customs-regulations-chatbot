@@ -16,6 +16,7 @@ from dataclasses import replace
 from fs_explorer_shared.embeddings import EmbeddingProvider
 from fs_explorer_shared.storage import StorageBackend
 
+from ..rerank import get_reranker
 from .models import AmendmentInstruction
 from .ranker import CandidateChunk, rank_candidates
 
@@ -98,4 +99,25 @@ def find_candidates(
             ):
                 _upsert_structured(row)
 
-    return rank_candidates(list(merged.values()), limit=limit)
+    return _rank(query_text, list(merged.values()), limit=limit)
+
+
+def _rank(
+    query_text: str, candidates: list[CandidateChunk], *, limit: int
+) -> list[CandidateChunk]:
+    """Cross-encoder rerank when available, falling back to the linear
+    hybrid-score heuristic in `rank_candidates` on any failure.
+
+    This is the highest-value rerank target in the codebase: `matcher.py`'s
+    `confirm_match` sends every returned candidate's *full, untruncated*
+    chunk text to the LLM, so narrowing `limit` candidates down from a
+    higher-precision cross-encoder pass (instead of the linear heuristic
+    alone) directly cuts full-chunk tokens sent per amendment instruction."""
+    reranker = get_reranker()
+    if reranker is not None and len(candidates) > 1:
+        pairs = reranker.rerank(
+            query_text, [candidate.text for candidate in candidates], top_n=limit
+        )
+        if pairs is not None:
+            return [candidates[i] for i, _score in pairs][:limit]
+    return rank_candidates(candidates, limit=limit)

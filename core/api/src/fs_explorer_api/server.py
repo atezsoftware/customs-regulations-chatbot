@@ -22,10 +22,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from .agent import (
+    DEFAULT_EFFORT,
     GEMINI_MAX_CONTEXT_TOKENS,
     FsExplorerAgent,
     LLMCallStats,
     clear_index_context,
+    set_effort,
     set_index_context,
     set_search_flags,
 )
@@ -777,6 +779,7 @@ def _register_if_resumable(
     use_index: bool,
     enable_semantic: bool,
     enable_metadata: bool,
+    effort: str,
     index_folders: list[str],
     database_url: str | None,
     original_task: str,
@@ -801,6 +804,7 @@ def _register_if_resumable(
             use_index=use_index,
             enable_semantic=enable_semantic,
             enable_metadata=enable_metadata,
+            effort=effort,
             index_folders=index_folders,
             database_url=database_url,
             original_task=original_task,
@@ -930,6 +934,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
     use_index = False
     enable_semantic = False
     enable_metadata = False
+    effort = DEFAULT_EFFORT
     index_folders: list[str] = []
     resolved_database_url: str | None = None
     original_task = ""
@@ -943,6 +948,10 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
         database_url = data.get("database_url")
         enable_semantic = bool(data.get("enable_semantic", False))
         enable_metadata = bool(data.get("enable_metadata", False))
+        raw_effort = data.get("effort")
+        effort = (
+            raw_effort if isinstance(raw_effort, str) and raw_effort else DEFAULT_EFFORT
+        )
         conversation_context = data.get("conversation_context")
         provider = data.get("provider")
         model = data.get("model")
@@ -1006,6 +1015,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             enable_semantic=enable_semantic and use_index,
             enable_metadata=enable_metadata and use_index,
         )
+        set_effort(effort)
 
         task = _task_with_context(str(task), conversation_context)
         trace = ExplorationTrace(root_directory=str(folder_path))
@@ -1099,6 +1109,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
                 use_index=use_index,
                 enable_semantic=enable_semantic and use_index,
                 enable_metadata=enable_metadata and use_index,
+                effort=effort,
             )
         )
 
@@ -1174,6 +1185,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             use_index=use_index,
             enable_semantic=enable_semantic,
             enable_metadata=enable_metadata,
+            effort=effort,
             index_folders=index_folders,
             database_url=resolved_database_url,
             original_task=original_task,
@@ -1183,6 +1195,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
         if index_storage is not None:
             index_storage.close()
         set_search_flags(enable_semantic=False, enable_metadata=False)
+        set_effort(DEFAULT_EFFORT)
         clear_index_context()
 
 
@@ -1224,6 +1237,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
     use_index = record.use_index
     enable_semantic = record.enable_semantic
     enable_metadata = record.enable_metadata
+    effort = record.effort
     index_folders = record.index_folders
     resolved_database_url = record.database_url
     original_task = record.original_task
@@ -1240,6 +1254,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
             enable_semantic=enable_semantic and use_index,
             enable_metadata=enable_metadata and use_index,
         )
+        set_effort(effort)
 
         run_started_at = time.monotonic()
         pending_llm_calls: list[LLMCallStats] = []
@@ -1385,6 +1400,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
             use_index=use_index,
             enable_semantic=enable_semantic,
             enable_metadata=enable_metadata,
+            effort=effort,
             index_folders=index_folders,
             database_url=resolved_database_url,
             original_task=original_task,
@@ -1394,6 +1410,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
         if index_storage is not None:
             index_storage.close()
         set_search_flags(enable_semantic=False, enable_metadata=False)
+        set_effort(DEFAULT_EFFORT)
         clear_index_context()
 
 

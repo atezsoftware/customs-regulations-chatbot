@@ -13,6 +13,7 @@ import {formatBytes} from '../lib/format';
 import {streamMessageEvents} from '../lib/sse';
 import type {
   AgentEvent,
+  ChatEffortLevel,
   ChatMessageRecord,
   ChatSession,
   Directory,
@@ -86,6 +87,7 @@ export function ChatPage() {
   const [savingLinks, setSavingLinks] = useState(false);
   const [sending, setSending] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [effort, setEffort] = useState<ChatEffortLevel>('medium');
 
   useEffect(() => {
     Promise.all([chatSessionsApi.list(), directoriesApi.list(), llmModelsApi.list().catch(() => null)])
@@ -317,7 +319,7 @@ export function ChatPage() {
     }
   }
 
-  async function sendMessage(content: string) {
+  async function sendMessage(content: string, messageEffort: ChatEffortLevel) {
     if (selectedId === null || sending) return;
     setSending(true);
     setStreamError(null);
@@ -345,6 +347,7 @@ export function ChatPage() {
         sessionId: selectedId,
         messageId: created.messageId,
         signal: controller.signal,
+        effort: messageEffort,
         onEvent: event => applyAgentEvent(event, created.messageId),
       });
     } catch (error) {
@@ -482,7 +485,7 @@ export function ChatPage() {
                           message={message}
                           previousUserContent={previousUserContent(messages, index)}
                           onStop={() => void stopStream()}
-                          onRegenerate={content => void sendMessage(content)}
+                          onRegenerate={content => void sendMessage(content, effort)}
                           onContinue={() => void continueMessage(message.id)}
                         />
                       ))
@@ -495,12 +498,14 @@ export function ChatPage() {
                       linkedIds.length === 0 ? 'Link at least one directory first.' : undefined
                     }
                     sending={sending}
-                    onSend={content => void sendMessage(content)}
+                    onSend={(content, messageEffort) => void sendMessage(content, messageEffort)}
                     onStop={() => void stopStream()}
                     models={models}
                     modelId={selectedSession.model}
                     defaultModelId={defaultModelId}
                     onModelChange={model => void handleModelChange(model)}
+                    effort={effort}
+                    onEffortChange={setEffort}
                   />
                 </section>
 

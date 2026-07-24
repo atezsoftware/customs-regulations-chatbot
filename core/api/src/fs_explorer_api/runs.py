@@ -41,6 +41,7 @@ class RunRecord:
     use_index: bool
     enable_semantic: bool
     enable_metadata: bool
+    effort: str
     index_folders: list[str]
     database_url: str | None
     original_task: str

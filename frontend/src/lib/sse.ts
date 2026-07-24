@@ -1,4 +1,4 @@
-import type {AgentEvent} from '../types';
+import type {AgentEvent, ChatEffortLevel} from '../types';
 import {API_BASE_URL, fetchWithAuthRetry} from './api';
 
 export async function streamMessageEvents({
@@ -7,6 +7,7 @@ export async function streamMessageEvents({
   signal,
   onEvent,
   resumeRunId,
+  effort,
 }: {
   sessionId: number;
   messageId: number;
@@ -16,11 +17,15 @@ export async function streamMessageEvents({
   // starting a brand-new one for this message — see AssistantMessage's
   // "Continue" button.
   resumeRunId?: string;
+  // Retrieval breadth for a fresh run — ignored server-side on a resume,
+  // since core-api already has the original run's effort.
+  effort?: ChatEffortLevel;
 }) {
   const url = new URL(
     `${API_BASE_URL}/chat-sessions/${sessionId}/messages/${messageId}/stream`,
   );
   if (resumeRunId) url.searchParams.set('resumeRunId', resumeRunId);
+  if (effort) url.searchParams.set('effort', effort);
 
   const res = await fetchWithAuthRetry(url, {signal});
   if (!res.ok) {

@@ -10,6 +10,7 @@ from typing import Any
 
 from fs_explorer_shared.embeddings import EmbeddingProvider
 from fs_explorer_shared.storage import StorageBackend
+from ..rerank import get_reranker
 from .filters import MetadataFilter, parse_metadata_filters
 from .ranker import RankedDocument, rank_documents
 
@@ -53,13 +54,19 @@ class IndexedQueryEngine:
         enable_semantic: bool = True,
         enable_metadata: bool = True,
         as_of_date: str | None = None,
+        overfetch_multiplier: int = 4,
     ) -> list[SearchHit]:
         """`as_of_date` (YYYY-MM-DD) restricts chunk results to those whose
-        validity interval covers that date — omit it to mean "today"."""
+        validity interval covers that date — omit it to mean "today".
+
+        `overfetch_multiplier` controls how many candidates are pulled from
+        each retrieval path before ranking/reranking trims back down to
+        `limit` — a larger pool gives the cross-encoder reranker (see
+        `_rank`) more to work with, at the cost of a bigger rerank call."""
         normalized_limit = max(limit, 1)
         parsed_filters = self._parse_filters(corpus_id=corpus_id, filters=filters)
-        semantic_limit = max(normalized_limit * 4, normalized_limit)
-        metadata_limit = max(normalized_limit * 4, normalized_limit)
+        semantic_limit = max(normalized_limit * overfetch_multiplier, normalized_limit)
+        metadata_limit = max(normalized_limit * overfetch_multiplier, normalized_limit)
 
         run_semantic = enable_semantic
         run_metadata = enable_metadata and bool(parsed_filters)
@@ -93,10 +100,11 @@ class IndexedQueryEngine:
         else:
             semantic_rows, metadata_rows = [], []
 
-        ranked = self._merge_and_rank(
-            semantic_rows=semantic_rows,
-            metadata_rows=metadata_rows,
-            limit=normalized_limit,
+        merged_documents = self._merge(
+            semantic_rows=semantic_rows, metadata_rows=metadata_rows
+        )
+        ranked = self._rank(
+            query=query, documents=merged_documents, limit=normalized_limit
         )
         return [
             SearchHit(
@@ -107,13 +115,13 @@ class IndexedQueryEngine:
                 text=doc.text,
                 semantic_score=doc.semantic_score,
                 metadata_score=doc.metadata_score,
-                score=doc.combined_score,
+                score=score,
                 matched_by=doc.matched_by,
                 chunk_id=doc.chunk_id,
                 chunk_type=doc.chunk_type,
                 metadata=doc.metadata,
             )
-            for doc in ranked
+            for doc, score in ranked
         ]
 
     def _parse_filters(
@@ -203,11 +211,10 @@ class IndexedQueryEngine:
         )
 
     @staticmethod
-    def _merge_and_rank(
+    def _merge(
         *,
         semantic_rows: list[dict[str, Any]],
         metadata_rows: list[dict[str, Any]],
-        limit: int,
     ) -> list[RankedDocument]:
         merged: dict[str, dict[str, Any]] = {}
 
@@ -285,4 +292,26 @@ class IndexedQueryEngine:
             )
             for entry in merged.values()
         ]
-        return rank_documents(documents, limit=limit)
+        return documents
+
+    @staticmethod
+    def _rank(
+        *, query: str, documents: list[RankedDocument], limit: int
+    ) -> list[tuple[RankedDocument, float]]:
+        """Cross-encoder rerank when available, falling back to the linear
+        semantic/metadata heuristic in `rank_documents` on any failure.
+
+        Returns (document, score) pairs rather than bare documents so a
+        caller merging several independently-ranked result sets (e.g.
+        `semantic_search` fanning out across multiple linked corpora) can
+        re-sort the union by a score that's consistent with whichever path
+        produced each entry, instead of resorting by the heuristic score
+        alone and silently undoing the rerank ordering."""
+        reranker = get_reranker()
+        if reranker is not None and len(documents) > 1:
+            pairs = reranker.rerank(query, [doc.text for doc in documents], top_n=limit)
+            if pairs is not None:
+                return [(documents[i], score) for i, score in pairs][:limit]
+        return [
+            (doc, doc.combined_score) for doc in rank_documents(documents, limit=limit)
+        ]

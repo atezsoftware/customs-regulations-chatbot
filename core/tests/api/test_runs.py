@@ -6,7 +6,13 @@ from unittest.mock import patch
 
 from fs_explorer_api.agent import FsExplorerAgent
 from fs_explorer_api.exploration_trace import ExplorationTrace
-from fs_explorer_api.runs import RunRecord, get_run, new_run_id, register_run, remove_run
+from fs_explorer_api.runs import (
+    RunRecord,
+    get_run,
+    new_run_id,
+    register_run,
+    remove_run,
+)
 from fs_explorer_api import runs as runs_mod
 from .conftest import make_mock_llm_client
 
@@ -21,6 +27,7 @@ def _record(run_id: str, **overrides) -> RunRecord:
         use_index=False,
         enable_semantic=False,
         enable_metadata=False,
+        effort="medium",
         index_folders=[],
         database_url=None,
         original_task="find the readme",

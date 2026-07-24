@@ -5,7 +5,7 @@ import {getCurrentUser} from '../../../common/auth';
 import {stripNulBytes} from '../../../common/text';
 import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../../directories/repositories';
-import {ChatMessage} from '../models';
+import {ChatEffortLevel, ChatMessage} from '../models';
 import {
   ChatMessageRepository,
   ChatResearchStepRepository,
@@ -19,6 +19,17 @@ import {AgentEvent, ChatHistoryItem, CoreBridgeService} from '../services';
 interface SendMessageBody {
   content: string;
   temperature?: number;
+}
+
+const EFFORT_LEVELS: ChatEffortLevel[] = ['low', 'medium', 'high'];
+const DEFAULT_EFFORT: ChatEffortLevel = 'medium';
+
+export function parseEffort(effort: string | undefined): ChatEffortLevel {
+  if (effort === undefined) return DEFAULT_EFFORT;
+  if (!EFFORT_LEVELS.includes(effort as ChatEffortLevel)) {
+    throw new HttpErrors.BadRequest(`Invalid effort level: ${effort}`);
+  }
+  return effort as ChatEffortLevel;
 }
 
 const activeStreams = new Map<number, AbortController>();
@@ -222,7 +233,9 @@ export class ChatMessagesController {
     @param.path.number('id') sessionId: number,
     @param.path.number('messageId') messageId: number,
     @param.query.string('resumeRunId') resumeRunId?: string,
+    @param.query.string('effort') effortParam?: string,
   ) {
+    const effort = parseEffort(effortParam);
     const user = await getCurrentUser(this.request, this.userRepository);
     await this.ownedSessionOrThrow(sessionId, user.id);
     const assistantMessage = await this.assistantMessageOrThrow(sessionId, messageId);
@@ -273,6 +286,7 @@ export class ChatMessagesController {
         conversationContext,
         signal: abortController.signal,
         resumeRunId: resumeRunId || undefined,
+        effort,
       })) {
         if (this.res.writableEnded) break;
         this.res.write(sseFrame(event));

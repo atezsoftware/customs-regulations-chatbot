@@ -13,7 +13,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import AsyncIterator, Awaitable, Callable, Any
+from typing import AsyncIterator, Awaitable, Callable, Any, Literal
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -414,6 +414,41 @@ def set_search_flags(
 def get_search_flags() -> tuple[bool, bool]:
     """Return (enable_semantic, enable_metadata) for this request."""
     return _ENABLE_SEMANTIC_VAR.get(), _ENABLE_METADATA_VAR.get()
+
+
+# User-selectable per-message retrieval breadth. Unlike `limit` being a mere
+# suggestion the model could previously override to any value, this is a
+# hard ceiling — see `semantic_search`'s `effective_limit` below — so a user
+# picking "low" always gets a cheaper/faster run regardless of what the
+# model itself asks for.
+EffortLevel = Literal["low", "medium", "high"]
+DEFAULT_EFFORT: EffortLevel = "medium"
+# Keyed by plain `str`, not `EffortLevel` — looked up with `_EFFORT_VAR.get()`,
+# which is a `str` since it's fed by arbitrary client-supplied WS input
+# (validated/defaulted in `set_effort`, not narrowed at the type level).
+_EFFORT_LEVELS: dict[str, dict[str, int]] = {
+    "low": {"default_limit": 3, "max_limit": 5, "overfetch_multiplier": 3},
+    "medium": {"default_limit": 5, "max_limit": 8, "overfetch_multiplier": 4},
+    "high": {"default_limit": 10, "max_limit": 15, "overfetch_multiplier": 6},
+}
+_EFFORT_VAR: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_EFFORT", default=DEFAULT_EFFORT
+)
+
+
+def set_effort(effort: str) -> None:
+    """Configure retrieval breadth for this request; unknown values fall
+    back to `DEFAULT_EFFORT` rather than erroring, since this is fed by
+    client-supplied input."""
+    _EFFORT_VAR.set(effort if effort in _EFFORT_LEVELS else DEFAULT_EFFORT)
+
+
+def get_effort() -> str:
+    return _EFFORT_VAR.get()
+
+
+def _effort_config() -> dict[str, int]:
+    return _EFFORT_LEVELS[_EFFORT_VAR.get()]
 
 
 def set_embedding_provider(provider: EmbeddingProvider | None) -> None:
@@ -932,7 +967,7 @@ def _indexed_glob_paths(directory: str, pattern: str) -> str:
 def semantic_search(
     query: str,
     filters: str | None = None,
-    limit: int = 5,
+    limit: int | None = None,
     as_of_date: str | None = None,
 ) -> str:
     """Search indexed chunks and return ranked excerpts.
@@ -941,11 +976,21 @@ def semantic_search(
     interval covers that date — pass it whenever the user's question refers
     to a specific date/time period. Omit it (defaults to today) for
     "what's the current rule" questions.
+
+    `limit` is capped by the user's selected effort level rather than honored
+    verbatim — the effort level is what actually controls retrieval breadth.
     """
     storage, corpora, error = _get_index_storage_and_corpora()
     if error:
         return error
     assert storage is not None and corpora
+
+    effort_config = _effort_config()
+    effective_limit = (
+        min(limit, effort_config["max_limit"])
+        if limit
+        else effort_config["default_limit"]
+    )
 
     engine = IndexedQueryEngine(
         storage, embedding_provider=_EMBEDDING_PROVIDER_VAR.get()
@@ -958,14 +1003,15 @@ def semantic_search(
                     corpus_id=corpus.corpus_id,
                     query=query,
                     filters=filters,
-                    limit=limit,
+                    limit=effective_limit,
                     enable_semantic=_ENABLE_SEMANTIC_VAR.get(),
                     enable_metadata=_ENABLE_METADATA_VAR.get(),
                     as_of_date=as_of_date,
+                    overfetch_multiplier=effort_config["overfetch_multiplier"],
                 )
             )
         hits.sort(key=lambda hit: hit.score, reverse=True)
-        hits = hits[: max(limit, 1)]
+        hits = hits[:effective_limit]
     except MetadataFilterParseError as exc:
         return f"Invalid metadata filter: {exc}\n{supported_filter_syntax()}"
     except ValueError as exc:
@@ -1518,8 +1564,16 @@ class FsExplorerAgent:
                 generation_id=usage.generation_id,
                 cached_input_tokens=usage.cached_input_tokens,
                 cache_write_tokens=usage.cache_write_tokens,
-                billed_cost_usd=(str(usage.billed_cost_usd) if usage.billed_cost_usd is not None else None),
-                upstream_cost_usd=(str(usage.upstream_cost_usd) if usage.upstream_cost_usd is not None else None),
+                billed_cost_usd=(
+                    str(usage.billed_cost_usd)
+                    if usage.billed_cost_usd is not None
+                    else None
+                ),
+                upstream_cost_usd=(
+                    str(usage.upstream_cost_usd)
+                    if usage.upstream_cost_usd is not None
+                    else None
+                ),
                 cost_source=usage.cost_source,
             )
         )

@@ -83,6 +83,11 @@ export interface FileChunksResponse {
   chunks: IndexedChunk[];
 }
 
+// Retrieval breadth picked per message, not persisted on the session — see
+// backend's ChatEffortLevel (chat-message.model.ts) / core-api's EffortLevel
+// (agent.py).
+export type ChatEffortLevel = 'low' | 'medium' | 'high';
+
 export interface ChatSession {
   id: number;
   title?: string;

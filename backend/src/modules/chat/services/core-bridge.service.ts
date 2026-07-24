@@ -1,5 +1,5 @@
 import {WebSocket} from 'undici';
-import {ChatMessage, ChatResearchStep, ChatSource} from '../models';
+import {ChatEffortLevel, ChatMessage, ChatResearchStep, ChatSource} from '../models';
 import {
   ChatMessageRepository,
   ChatResearchStepRepository,
@@ -61,6 +61,10 @@ export interface BridgeInput {
   // (see core-api's runs.py) instead of starting a brand-new one — sent as
   // `{"type": "resume", "run_id": ...}` instead of the usual task payload.
   resumeRunId?: string;
+  // Retrieval breadth the user picked for this message (see agent.py's
+  // EffortLevel) — only meaningful on a fresh run; a resumed run keeps
+  // whatever effort core-api already captured for it.
+  effort?: ChatEffortLevel;
 }
 
 export interface AgentResearchStep {
@@ -221,6 +225,7 @@ export class CoreBridgeService {
                 provider: session.llmProvider,
                 model: session.model,
                 temperature: session.temperature,
+                effort: input.effort ?? 'medium',
               },
         ),
       );
