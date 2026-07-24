@@ -41,7 +41,7 @@ export function AssistantMessage({
 
   return (
     <article className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <ResearchActivityPanel steps={message.steps} />
+      <ResearchActivityPanel steps={message.steps} usage={message.usage} />
       <StreamingAnswer content={content} streaming={streaming} sources={message.sources} />
       {message.status === 'error' && (
         <p className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-600">

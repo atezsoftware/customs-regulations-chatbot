@@ -23,7 +23,9 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .agent import (
+    CHUNK_BEARING_TOOLS,
     LLMCallStats,
+    RetrievalStats,
     clear_index_context,
     set_index_context,
     set_search_flags,
@@ -131,9 +133,22 @@ async def run_agentic_session(
     run_started_at = time.monotonic()
     step_number = 0
     llm_calls: list[LLMCallStats] = []
+    retrieval_stats: list[RetrievalStats] = []
+    # RetrievalStats.step is the agent's own step counter, which a single
+    # ToolBatchAction shares across 2-3 tool calls — not fine-grained
+    # enough to match this function's own per-tool_call `step_number`
+    # (what `step_path` uses). Since exactly one retrieval_stats fires per
+    # chunk-bearing tool call, in the same order those calls are made
+    # (including within a batch — see agent.py's call_tools()), this queue
+    # lets the final retrieval_steps list use the same step numbering as
+    # step_path, by pairing the two lists positionally once the run ends.
+    pending_retrieval_step_numbers: list[int] = []
 
     async def _collect_llm_call(stats: LLMCallStats) -> None:
         llm_calls.append(stats)
+
+    def _collect_retrieval(stats: RetrievalStats) -> None:
+        retrieval_stats.append(stats)
 
     index_storage = PostgresStorage(resolved_database_url)
     try:
@@ -155,6 +170,7 @@ async def run_agentic_session(
             model=model,
             temperature=temperature,
             on_llm_call=_collect_llm_call,
+            on_retrieval=_collect_retrieval,
         )
         agent = get_run_agent(resource_manager)
         handler = run_workflow.run(
@@ -170,6 +186,8 @@ async def run_agentic_session(
         async for event in handler.stream_events():
             if isinstance(event, ToolCallEvent):
                 step_number += 1
+                if event.tool_name in CHUNK_BEARING_TOOLS:
+                    pending_retrieval_step_numbers.append(step_number)
                 _record_tool_call(
                     event,
                     step_number=step_number,
@@ -179,6 +197,8 @@ async def run_agentic_session(
             elif isinstance(event, ToolBatchEvent):
                 for call in event.tool_calls:
                     step_number += 1
+                    if call.tool_name in CHUNK_BEARING_TOOLS:
+                        pending_retrieval_step_numbers.append(step_number)
                     _record_tool_call(
                         ToolCallEvent(
                             tool_name=call.tool_name,
@@ -225,6 +245,16 @@ async def run_agentic_session(
         cited_sources = extract_cited_sources(final_result) if not result_error else []
         usage = agent.token_usage
         cost_usd, cost_source = _sum_call_cost(llm_calls)
+        retrieval_steps = [
+            {
+                "step": ws_step,
+                "tool_name": stats.tool_name,
+                "chunk_count": stats.chunk_count,
+                "chars": stats.chars,
+                "estimated_tokens": stats.estimated_tokens,
+            }
+            for ws_step, stats in zip(pending_retrieval_step_numbers, retrieval_stats)
+        ]
 
         return BenchmarkRunResult(
             final_result=final_result,
@@ -241,6 +271,7 @@ async def run_agentic_session(
                 "total_tokens": usage.total_tokens,
                 "tool_result_chars": usage.tool_result_chars,
                 "context_summaries": usage.context_summaries,
+                "retrieval_steps": retrieval_steps,
                 "duration_ms": round((time.monotonic() - run_started_at) * 1000),
                 "cost_usd": cost_usd,
                 "cost_source": cost_source,

@@ -85,7 +85,14 @@ def test_indexed_query_engine_unions_semantic_and_metadata_results(
 
 
 class _SlowStorage:
-    def search_chunks(self, *, corpus_id: str, query: str, limit: int = 5):  # noqa: ARG002
+    def search_chunks(
+        self,
+        *,
+        corpus_id: str,
+        query: str,
+        limit: int = 5,
+        as_of_date=None,
+    ):  # noqa: ARG002
         time.sleep(0.3)
         return [
             {

@@ -68,6 +68,8 @@ function toSafeMetrics(row: BenchmarkModelMetricsRow, percentiles?: BenchmarkMod
     citationRate: toNumber(row.citation_rate),
     avgApiCalls: toNumber(row.avg_api_calls),
     avgContextSummaries: toNumber(row.avg_context_summaries),
+    avgRetrievalChunks: toNumber(row.avg_retrieval_chunks),
+    avgRetrievalTokens: toNumber(row.avg_retrieval_tokens),
     judgeOverallScore: toNumber(row.judge_overall_score),
     judgeCorrectness: toNumber(row.judge_correctness),
     judgeGroundedness: toNumber(row.judge_groundedness),
@@ -196,11 +198,17 @@ export class BenchmarkRunsController {
     const judgmentRows = itemIds.length
       ? await this.judgments.find({where: {runItemId: {inq: itemIds}}})
       : [];
-    const judgmentByItemId = new Map(judgmentRows.map(judgment => [judgment.runItemId, judgment]));
+    // Both columns are BIGINT in Postgres. Depending on which repository
+    // path materialized the row, the connector can return one id as a
+    // number and the other as a decimal string. Normalize the lookup key or
+    // every valid judgment silently appears as `null` in the API response.
+    const judgmentByItemId = new Map(
+      judgmentRows.map(judgment => [String(judgment.runItemId), judgment]),
+    );
 
     return {
       items: rows.map(row => {
-        const judgment = judgmentByItemId.get(row.id!);
+        const judgment = judgmentByItemId.get(String(row.id));
         return {
           id: row.id,
           provider: row.provider,
@@ -212,11 +220,15 @@ export class BenchmarkRunsController {
           finalResult: row.finalResult ?? null,
           citedSources: row.citedSources ?? [],
           stepPath: row.stepPath ?? [],
+          retrievalSteps: row.retrievalSteps ?? [],
           steps: row.steps ?? null,
+          apiCalls: row.apiCalls ?? null,
           totalTokens: row.totalTokens ?? null,
           promptTokens: row.promptTokens ?? null,
           completionTokens: row.completionTokens ?? null,
           thinkingTokens: row.thinkingTokens ?? null,
+          toolResultChars: row.toolResultChars ?? null,
+          contextSummaries: row.contextSummaries ?? null,
           durationMs: row.durationMs ?? null,
           costUsd: row.costUsd ?? null,
           startedAt: row.startedAt ?? null,

@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {parseEffort} from './chat-messages.controller';
 
-test('parseEffort defaults to medium when omitted', () => {
-  assert.equal(parseEffort(undefined), 'medium');
+test('parseEffort defaults to low when omitted', () => {
+  // "low" matches the pre-effort baseline exactly, so any caller that omits
+  // `effort` (an older client, a dropped query param) never regresses.
+  assert.equal(parseEffort(undefined), 'low');
 });
 
 test('parseEffort passes through valid effort levels', () => {

@@ -21,7 +21,7 @@ from workflows.resource import Resource, ResourceManager
 from pydantic import BaseModel
 from typing import Annotated, AsyncGenerator, cast, Any
 
-from .agent import FsExplorerAgent, OnLLMCall, describe_indexed_context
+from .agent import FsExplorerAgent, OnLLMCall, OnRetrieval, describe_indexed_context
 from .models import (
     GoDeeperAction,
     ToolCallAction,
@@ -418,6 +418,7 @@ def new_workflow(
     model: str | None = None,
     temperature: float | None = None,
     on_llm_call: OnLLMCall | None = None,
+    on_retrieval: OnRetrieval | None = None,
 ) -> tuple[FsExplorerWorkflow, ResourceManager]:
     """Build a fresh workflow instance with its own ResourceManager and agent.
 
@@ -450,7 +451,11 @@ def new_workflow(
     """
     resource_manager = ResourceManager()
     agent = FsExplorerAgent(
-        provider=provider, model=model, temperature=temperature, on_llm_call=on_llm_call
+        provider=provider,
+        model=model,
+        temperature=temperature,
+        on_llm_call=on_llm_call,
+        on_retrieval=on_retrieval,
     )
     resource_manager.resources[get_agent.__qualname__] = agent
     workflow = FsExplorerWorkflow(

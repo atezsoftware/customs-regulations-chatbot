@@ -20,6 +20,9 @@ export class LlmCall extends Entity {
   @property({type: 'string', required: true})
   purpose: string;
 
+  @property({type: 'number'})
+  step?: number;
+
   @property({type: 'number', required: true, postgresql: {columnName: 'input_tokens'}})
   inputTokens: number;
 

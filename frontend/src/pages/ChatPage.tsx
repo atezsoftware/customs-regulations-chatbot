@@ -259,6 +259,22 @@ export function ChatPage() {
       return;
     }
 
+    if (event.type === 'llm_call') {
+      setMessages(prev =>
+        prev.map(message => {
+          if (message.id !== assistantMessageId) return message;
+          const exists = message.usage.some(usage => usage.id === event.usage.id);
+          return {
+            ...message,
+            usage: exists
+              ? message.usage.map(usage => (usage.id === event.usage.id ? event.usage : usage))
+              : [...message.usage, event.usage],
+          };
+        }),
+      );
+      return;
+    }
+
     if (event.type === 'done') {
       const usage = usageFromStats(event.stats);
       setMessages(prev =>
@@ -268,7 +284,12 @@ export function ChatPage() {
                 ...message,
                 status: 'completed',
                 content: event.content,
-                usage: usage ?? message.usage,
+                // Live 'llm_call' events (above) already built the real
+                // per-call breakdown as the run progressed — only fall back
+                // to this single synthetic aggregate (id: -1, no per-step
+                // detail) if none arrived this run, so a normal completion
+                // doesn't flatten the granular list right as it finishes.
+                usage: message.usage.length ? message.usage : (usage ?? message.usage),
                 incomplete: event.incomplete,
               }
             : message,

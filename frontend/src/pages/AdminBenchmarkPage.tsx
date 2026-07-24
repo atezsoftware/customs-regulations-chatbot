@@ -836,6 +836,10 @@ function RunDetail({
               <th className="px-3 py-2.5">Output tokens</th>
               <th className="px-3 py-2.5">Thinking tokens</th>
               <th className="px-3 py-2.5">Avg tokens (total)</th>
+              <th className="px-3 py-2.5">Avg chunks</th>
+              <th className="px-3 py-2.5">Avg retrieval tokens</th>
+              <th className="px-3 py-2.5">Avg API calls</th>
+              <th className="px-3 py-2.5">Avg context summaries</th>
               <th className="px-3 py-2.5">Avg duration</th>
               <th className="px-3 py-2.5">Duration/step</th>
               <th className="px-3 py-2.5">p50 / p95</th>
@@ -873,6 +877,10 @@ function RunDetail({
                   <td className="px-3 py-2.5">{formatNumber(model.avgCompletionTokens)}</td>
                   <td className="px-3 py-2.5">{formatNumber(model.avgThinkingTokens)}</td>
                   <td className="px-3 py-2.5">{formatNumber(model.avgTotalTokens)}</td>
+                  <td className="px-3 py-2.5">{formatNumber(model.avgRetrievalChunks)}</td>
+                  <td className="px-3 py-2.5">{formatNumber(model.avgRetrievalTokens)}</td>
+                  <td className="px-3 py-2.5">{formatNumber(model.avgApiCalls)}</td>
+                  <td className="px-3 py-2.5">{formatNumber(model.avgContextSummaries)}</td>
                   <td className="px-3 py-2.5">{formatMs(model.avgDurationMs)}</td>
                   <td className="px-3 py-2.5">{formatMs(model.avgDurationPerStepMs)}</td>
                   <td className="px-3 py-2.5">
@@ -925,13 +933,50 @@ function RunDetail({
                           </span>
                         ))}
                       </div>
+                      {item.stepPath.length > 0 && (
+                        <details className="mt-2">
+                          <summary className="cursor-pointer text-xs font-medium text-slate-400 hover:text-slate-600">
+                            Show steps ({item.stepPath.length})
+                          </summary>
+                          <ul className="mt-1.5 space-y-1 rounded-lg border border-slate-100 bg-slate-50 p-2">
+                            {item.stepPath.map((line, index) => {
+                              const stepNumber = Number(/^(\d+)\./.exec(line)?.[1]);
+                              const retrieval = item.retrievalSteps.find(
+                                entry => entry.step === stepNumber,
+                              );
+                              return (
+                                <li key={index} className="text-xs text-slate-600">
+                                  {line}
+                                  {retrieval && (
+                                    <span className="text-slate-400">
+                                      {' '}
+                                      — {retrieval.chunk_count} chunk{retrieval.chunk_count === 1 ? '' : 's'} · ~
+                                      {retrieval.estimated_tokens.toLocaleString()} tokens
+                                    </span>
+                                  )}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        </details>
+                      )}
                       {item.judgment ? (
-                        <p className="mt-2 text-xs text-slate-500">
-                          Judge: {item.judgment.overallScore}/100 (correctness{' '}
-                          {item.judgment.correctnessScore}/5 · groundedness {item.judgment.groundednessScore}/5 ·
-                          completeness {item.judgment.completenessScore}/5 · clarity{' '}
-                          {item.judgment.clarityScore}/5) — {item.judgment.rationale}
-                        </p>
+                        <div className="mt-2">
+                          <p className="text-xs text-slate-500">
+                            Judge: {item.judgment.overallScore}/100 (correctness{' '}
+                            {item.judgment.correctnessScore}/5 · groundedness {item.judgment.groundednessScore}/5 ·
+                            completeness {item.judgment.completenessScore}/5 · clarity{' '}
+                            {item.judgment.clarityScore}/5)
+                          </p>
+                          <div className="mt-1.5 rounded-lg border border-slate-100 bg-slate-50 p-2">
+                            <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                              Judge rationale
+                            </p>
+                            <p className="mt-1 text-xs text-slate-600">
+                              {item.judgment.rationale || 'No rationale recorded.'}
+                            </p>
+                          </div>
+                        </div>
                       ) : item.judgeError ? (
                         <p className="mt-2 text-xs text-rose-600">Judge scoring failed: {item.judgeError}</p>
                       ) : null}

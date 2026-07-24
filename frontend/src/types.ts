@@ -135,6 +135,7 @@ export interface LlmUsage {
   provider: string;
   model?: string;
   purpose: string;
+  step?: number;
   inputTokens: number;
   outputTokens: number;
   thinkingTokens: number;
@@ -194,6 +195,7 @@ export type AgentEvent =
   | {type: 'research_step'; step: ResearchStep}
   | {type: 'answer_delta'; text: string}
   | {type: 'source'; source: Source}
+  | {type: 'llm_call'; usage: LlmUsage}
   | {
       type: 'done';
       messageId: number;
@@ -386,6 +388,8 @@ export interface BenchmarkModelMetrics {
   citationRate: number | null;
   avgApiCalls: number | null;
   avgContextSummaries: number | null;
+  avgRetrievalChunks: number | null;
+  avgRetrievalTokens: number | null;
   judgeOverallScore: number | null;
   judgeCorrectness: number | null;
   judgeGroundedness: number | null;
@@ -407,6 +411,14 @@ export interface BenchmarkRunItemJudgment {
   rationale: string | null;
 }
 
+export interface RetrievalStepEntry {
+  step: number;
+  tool_name: string;
+  chunk_count: number;
+  chars: number;
+  estimated_tokens: number;
+}
+
 export interface BenchmarkRunItem {
   id: number;
   provider: string;
@@ -418,11 +430,15 @@ export interface BenchmarkRunItem {
   finalResult: string | null;
   citedSources: string[];
   stepPath: string[];
+  retrievalSteps: RetrievalStepEntry[];
   steps: number | null;
+  apiCalls: number | null;
   totalTokens: number | null;
   promptTokens: number | null;
   completionTokens: number | null;
   thinkingTokens: number | null;
+  toolResultChars: number | null;
+  contextSummaries: number | null;
   durationMs: number | null;
   costUsd: string | null;
   startedAt: string | null;

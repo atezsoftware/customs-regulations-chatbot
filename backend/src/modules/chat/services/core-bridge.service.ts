@@ -91,12 +91,28 @@ export interface AgentSource {
   createdAt?: string;
 }
 
+export interface AgentLlmUsage {
+  id: number;
+  provider: string;
+  model?: string;
+  purpose: string;
+  step?: number;
+  inputTokens: number;
+  outputTokens: number;
+  thinkingTokens: number;
+  durationMs?: number;
+  billedCostUsd?: string;
+  costSource?: 'provider' | 'estimated';
+  createdAt?: string;
+}
+
 export type AgentEvent =
   | {type: 'message_created'; messageId: number}
   | {type: 'run_started'; runId: string; resumed: boolean}
   | {type: 'research_step'; step: AgentResearchStep}
   | {type: 'answer_delta'; text: string}
   | {type: 'source'; source: AgentSource}
+  | {type: 'llm_call'; usage: AgentLlmUsage}
   | {
       type: 'done';
       messageId: number;
@@ -291,6 +307,23 @@ export class CoreBridgeService {
           continue;
         }
 
+        if (event.type === 'retrieval_stats') {
+          // Chunk/token counts for a chunk-bearing tool call, arriving as a
+          // separate event after the 'tool_call' that already created this
+          // step's row — core-api correlates `data.step` to the exact same
+          // per-tool_call step number used above (not the agent's own,
+          // coarser step counter, which a batch of 2-3 calls shares), so
+          // this stepKey always matches the row 'tool_call' just created.
+          const stepKey = `tool-${text(data.step)}`;
+          const step = await this.mergeStepMetadata(input.assistantMessageId, stepKey, {
+            chunkCount: numberValue(data.chunk_count),
+            retrievalChars: numberValue(data.chars),
+            retrievalTokensEstimated: numberValue(data.estimated_tokens),
+          });
+          if (step) yield {type: 'research_step', step};
+          continue;
+        }
+
         if (event.type === 'go_deeper') {
           const stepKey = `go-deeper-${text(data.step, String(++statusCounter))}`;
           if (lastRunningStepKey) {
@@ -340,29 +373,60 @@ export class CoreBridgeService {
           // end-of-run aggregate — lets the dashboard show per-message
           // token/model/duration instead of only a session-wide total.
           llmCallsRecorded += 1;
-          await this.llmCallRepository.create({
+          const provider = text(data.provider) || session.llmProvider || 'gemini';
+          const model =
+            text(data.model) ||
+            session.model ||
+            process.env.FS_EXPLORER_LLM_MODEL ||
+            DEFAULT_MODEL;
+          const purpose = text(data.purpose, 'action');
+          const step = numberValue(data.step);
+          const inputTokens = numberValue(data.prompt_tokens);
+          const outputTokens = numberValue(data.completion_tokens);
+          const thinkingTokens = numberValue(data.thinking_tokens);
+          const durationMs = numberValue(data.duration_ms);
+          const billedCostUsd = text(data.billed_cost_usd) || undefined;
+          const costSource =
+            text(data.cost_source) === 'provider' || text(data.cost_source) === 'estimated'
+              ? (text(data.cost_source) as 'provider' | 'estimated')
+              : undefined;
+          const created = await this.llmCallRepository.create({
             messageId: input.assistantMessageId,
             sessionId: input.sessionId,
-            provider: text(data.provider) || session.llmProvider || 'gemini',
-            model:
-              text(data.model) ||
-              session.model ||
-              process.env.FS_EXPLORER_LLM_MODEL ||
-              DEFAULT_MODEL,
-            purpose: text(data.purpose, 'action'),
-            inputTokens: numberValue(data.prompt_tokens),
-            outputTokens: numberValue(data.completion_tokens),
-            thinkingTokens: numberValue(data.thinking_tokens),
-            durationMs: numberValue(data.duration_ms),
+            provider,
+            model,
+            purpose,
+            step,
+            inputTokens,
+            outputTokens,
+            thinkingTokens,
+            durationMs,
             generationId: text(data.generation_id) || undefined,
             cachedInputTokens: numberValue(data.cached_input_tokens),
             cacheWriteTokens: numberValue(data.cache_write_tokens),
-            billedCostUsd: text(data.billed_cost_usd) || undefined,
+            billedCostUsd,
             upstreamCostUsd: text(data.upstream_cost_usd) || undefined,
-            costSource: text(data.cost_source) === 'provider' || text(data.cost_source) === 'estimated'
-              ? text(data.cost_source) as 'provider' | 'estimated'
-              : undefined,
+            costSource,
           });
+          // Previously persisted-only — the live run never showed per-call
+          // token growth, only a single post-hoc total once `done` arrived.
+          yield {
+            type: 'llm_call',
+            usage: {
+              id: created.id ?? -1,
+              provider,
+              model,
+              purpose,
+              step,
+              inputTokens,
+              outputTokens,
+              thinkingTokens,
+              durationMs,
+              billedCostUsd,
+              costSource,
+              createdAt: created.createdAt,
+            },
+          };
           continue;
         }
 
@@ -626,6 +690,24 @@ export class CoreBridgeService {
       status: 'completed',
       completedAt: new Date().toISOString(),
     });
+    return this.toAgentStep(await this.chatResearchStepRepository.findById(existing.id));
+  }
+
+  // Merges into (rather than replacing) a step's metadata — used for
+  // 'retrieval_stats', which arrives as a separate event after the
+  // 'tool_call' event that already created this step's row with `{}`
+  // metadata. No-ops if the step isn't found: retrieval_stats always
+  // follows a real tool_call in practice, but a mismatch here (e.g. a
+  // stale client) should be silently dropped, not create a phantom step.
+  private async mergeStepMetadata(
+    messageId: number,
+    stepKey: string,
+    metadata: Record<string, unknown>,
+  ): Promise<AgentResearchStep | undefined> {
+    const existing = await this.chatResearchStepRepository.findOne({where: {messageId, stepKey}});
+    if (!existing?.id) return undefined;
+    const merged = {...(existing.metadata as object | undefined), ...metadata};
+    await this.chatResearchStepRepository.updateById(existing.id, {metadata: merged});
     return this.toAgentStep(await this.chatResearchStepRepository.findById(existing.id));
   }
 

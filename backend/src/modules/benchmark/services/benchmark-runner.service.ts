@@ -1,6 +1,6 @@
 import {PostgresDataSource} from '../../../datasources';
 import {resolveCoreApiRestUrl, resolveDatabaseUrl, virtualCorpusKey} from '../../directories/services';
-import {BenchmarkRunItem} from '../models';
+import {BenchmarkRunItem, RetrievalStepEntry} from '../models';
 import {
   BenchmarkQuestionDirectoryRepository,
   BenchmarkQuestionRepository,
@@ -24,6 +24,7 @@ interface RunQuestionStats {
   total_tokens: number;
   tool_result_chars: number;
   context_summaries: number;
+  retrieval_steps: RetrievalStepEntry[];
   duration_ms: number;
   cost_usd: string | null;
   cost_source: 'provider' | 'estimated' | null;
@@ -152,6 +153,7 @@ export class BenchmarkRunnerService {
         totalTokens: runResult.stats.total_tokens,
         toolResultChars: runResult.stats.tool_result_chars,
         contextSummaries: runResult.stats.context_summaries,
+        retrievalSteps: runResult.stats.retrieval_steps,
         durationMs: runResult.stats.duration_ms,
         costUsd: runResult.stats.cost_usd ?? undefined,
         costSource: runResult.stats.cost_source ?? undefined,

@@ -2,6 +2,14 @@ import {Entity, model, property} from '@loopback/repository';
 
 export type BenchmarkRunItemStatus = 'pending' | 'running' | 'completed' | 'error';
 
+export interface RetrievalStepEntry {
+  step: number;
+  tool_name: string;
+  chunk_count: number;
+  chars: number;
+  estimated_tokens: number;
+}
+
 @model({settings: {postgresql: {schema: 'public', table: 'benchmark_run_items'}}})
 export class BenchmarkRunItem extends Entity {
   @property({type: 'number', id: true, generated: true})
@@ -79,6 +87,13 @@ export class BenchmarkRunItem extends Entity {
 
   @property({type: 'array', itemType: 'string', postgresql: {columnName: 'step_path'}})
   stepPath?: string[];
+
+  @property({
+    type: 'array',
+    itemType: 'object',
+    postgresql: {columnName: 'retrieval_steps', dataType: 'jsonb'},
+  })
+  retrievalSteps?: RetrievalStepEntry[];
 
   @property({type: 'date', postgresql: {columnName: 'started_at'}})
   startedAt?: string;

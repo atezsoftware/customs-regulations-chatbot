@@ -210,6 +210,57 @@ class TestTokenUsage:
 
         assert usage.documents_scanned == 3
 
+    def test_add_tool_result_counts_semantic_search_hits_as_retrieval(self) -> None:
+        """`semantic_search`'s rendered hits are counted via the same
+        `[idx] doc_id:` marker the tool itself already emits per hit."""
+        usage = TokenUsage()
+        result = (
+            "=== INDEXED SEARCH RESULTS ===\n"
+            "Query: test\n\n"
+            "[1] doc_id: doc_a\n    title: a\n\n"
+            "[2] doc_id: doc_b\n    title: b\n\n"
+            "[3] doc_id: doc_c\n    title: c\n\n"
+        )
+        usage.add_tool_result(result, "semantic_search")
+
+        assert usage.retrieval_chunks == 3
+        assert usage.retrieval_chars == len(result)
+        assert usage.retrieval_estimated_tokens() == (len(result) + 3) // 4
+
+    def test_add_tool_result_counts_chunk_headers_as_retrieval(self) -> None:
+        """`get_document`/`parse_file`/`read`/`get_chunk_context` all share
+        the `--- chunk ` header marker regardless of which tool emitted it."""
+        usage = TokenUsage()
+        result = (
+            "=== INDEXED DOCUMENT FROM CHUNKS ===\n"
+            "doc_id: doc_a\n\n"
+            "--- chunk 0 (text, chars 0-10) ---\nfirst\n"
+            "--- chunk 1 (text, chars 10-20) ---\nsecond\n"
+        )
+        for tool_name in ("get_document", "parse_file", "read", "get_chunk_context"):
+            usage = TokenUsage()
+            usage.add_tool_result(result, tool_name)
+            assert usage.retrieval_chunks == 2, tool_name
+            assert usage.retrieval_chars == len(result), tool_name
+
+    def test_add_tool_result_excludes_preview_file_from_retrieval(self) -> None:
+        """`preview_file` shares `_document_from_chunks`'s rendering with
+        `get_document`/`parse_file`/`read` but is deliberately excluded —
+        it's a fixed, cheap, truncated peek, not real retrieval breadth."""
+        usage = TokenUsage()
+        result = "--- chunk 0 (text, chars 0-10) ---\nfirst\n"
+        usage.add_tool_result(result, "preview_file")
+
+        assert usage.retrieval_chunks == 0
+        assert usage.retrieval_chars == 0
+
+    def test_add_tool_result_excludes_non_chunk_tools_from_retrieval(self) -> None:
+        usage = TokenUsage()
+        usage.add_tool_result("some grep output", "grep")
+
+        assert usage.retrieval_chunks == 0
+        assert usage.retrieval_chars == 0
+
     def test_summary_format(self) -> None:
         """Test that summary produces formatted output."""
         usage = TokenUsage()
@@ -720,3 +771,123 @@ class TestEffortLevels:
     def test_unknown_effort_falls_back_to_default(self) -> None:
         set_effort("bogus-value")
         assert get_effort() == DEFAULT_EFFORT
+
+
+class TestRetrievalHook:
+    """Tests for `on_retrieval`/`RetrievalStats` — the retrieval-specific
+    analog of `on_llm_call`, firing once per chunk-bearing tool call from
+    both the sequential (`call_tool`) and concurrent-batch (`call_tools`)
+    dispatch paths."""
+
+    def _fake_semantic_search_result(self, hit_count: int) -> str:
+        return "".join(f"[{i}] doc_id: doc_{i}\n" for i in range(1, hit_count + 1))
+
+    def test_call_tool_fires_hook_for_chunk_bearing_tool(self) -> None:
+        from fs_explorer_api.agent import TOOLS, RetrievalStats
+
+        original = TOOLS["semantic_search"]
+        TOOLS["semantic_search"] = lambda **kwargs: self._fake_semantic_search_result(3)
+        received: list[RetrievalStats] = []
+        try:
+            agent = FsExplorerAgent(
+                llm_client=make_mock_llm_client(), on_retrieval=received.append
+            )
+            agent._step_count = 5
+            agent.call_tool("semantic_search", {"query": "test"})
+        finally:
+            TOOLS["semantic_search"] = original
+
+        assert len(received) == 1
+        assert received[0].step == 5
+        assert received[0].tool_name == "semantic_search"
+        assert received[0].chunk_count == 3
+
+    def test_call_tool_fires_hook_even_for_zero_chunk_result(self) -> None:
+        """A chunk-bearing tool that genuinely found nothing still reports
+        a (chunk_count=0) event — server.py's WS layer relies on exactly
+        one retrieval_stats event per chunk-bearing tool_call to correlate
+        the two in order, including within a batch; silently skipping
+        zero-chunk calls would desync every call after the first one."""
+        from fs_explorer_api.agent import TOOLS, RetrievalStats
+
+        original = TOOLS["get_document"]
+        TOOLS["get_document"] = lambda **kwargs: "=== INDEXED DOCUMENT FROM CHUNKS ===\nno chunks here"
+        received: list[RetrievalStats] = []
+        try:
+            agent = FsExplorerAgent(
+                llm_client=make_mock_llm_client(), on_retrieval=received.append
+            )
+            agent.call_tool("get_document", {"doc_id": "doc_empty"})
+        finally:
+            TOOLS["get_document"] = original
+
+        assert len(received) == 1
+        assert received[0].chunk_count == 0
+
+    def test_call_tool_does_not_fire_hook_for_non_chunk_tool(self) -> None:
+        from fs_explorer_api.agent import TOOLS, RetrievalStats
+
+        original = TOOLS["glob"]
+        TOOLS["glob"] = lambda **kwargs: "some/path.txt"
+        received: list[RetrievalStats] = []
+        try:
+            agent = FsExplorerAgent(
+                llm_client=make_mock_llm_client(), on_retrieval=received.append
+            )
+            agent.call_tool("glob", {"directory": ".", "pattern": "*.txt"})
+        finally:
+            TOOLS["glob"] = original
+
+        assert received == []
+
+    @pytest.mark.asyncio
+    async def test_call_tools_batch_fires_hook_for_each_chunk_bearing_call(
+        self,
+    ) -> None:
+        from fs_explorer_api.agent import TOOLS, RetrievalStats
+
+        original_search = TOOLS["semantic_search"]
+        original_glob = TOOLS["glob"]
+        TOOLS["semantic_search"] = lambda **kwargs: self._fake_semantic_search_result(2)
+        TOOLS["glob"] = lambda **kwargs: "some/path.txt"
+        received: list[RetrievalStats] = []
+        try:
+            agent = FsExplorerAgent(
+                llm_client=make_mock_llm_client(), on_retrieval=received.append
+            )
+            agent._step_count = 2
+            await agent.call_tools(
+                [
+                    ("semantic_search", {"query": "a"}),
+                    ("glob", {"directory": ".", "pattern": "*.txt"}),
+                ]
+            )
+        finally:
+            TOOLS["semantic_search"] = original_search
+            TOOLS["glob"] = original_glob
+
+        # Only the chunk-bearing call in the batch reports retrieval stats —
+        # `glob` produces no chunk markers, so it's silently skipped.
+        assert len(received) == 1
+        assert received[0].tool_name == "semantic_search"
+        assert received[0].chunk_count == 2
+        assert received[0].step == 2
+
+    def test_set_retrieval_hook_rebinds_for_resume(self) -> None:
+        from fs_explorer_api.agent import TOOLS, RetrievalStats
+
+        original = TOOLS["semantic_search"]
+        TOOLS["semantic_search"] = lambda **kwargs: self._fake_semantic_search_result(1)
+        first_run: list[RetrievalStats] = []
+        second_run: list[RetrievalStats] = []
+        try:
+            agent = FsExplorerAgent(
+                llm_client=make_mock_llm_client(), on_retrieval=first_run.append
+            )
+            agent.set_retrieval_hook(second_run.append)
+            agent.call_tool("semantic_search", {"query": "test"})
+        finally:
+            TOOLS["semantic_search"] = original
+
+        assert first_run == []
+        assert len(second_run) == 1

@@ -216,6 +216,7 @@ export class ChatMessagesController {
           provider: call.provider,
           model: call.model,
           purpose: call.purpose,
+          step: call.step,
           inputTokens: call.inputTokens,
           outputTokens: call.outputTokens,
           thinkingTokens: call.thinkingTokens,

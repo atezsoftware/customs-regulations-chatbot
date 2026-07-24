@@ -17,6 +17,19 @@ export function ResearchStepItem({
       ? 'bg-rose-500'
       : 'bg-emerald-500';
 
+  // Only present for chunk-bearing tool calls (semantic_search,
+  // get_document, parse_file, read, get_chunk_context) — see agent.py's
+  // CHUNK_BEARING_TOOLS. A genuine 0-chunk result still shows (e.g. "0
+  // chunks"), so this stays visible rather than silently vanishing.
+  const chunkCount = step.metadata?.chunkCount;
+  const retrievalTokens = step.metadata?.retrievalTokensEstimated;
+  const chunkSummary =
+    typeof chunkCount === 'number'
+      ? `${chunkCount} chunk${chunkCount === 1 ? '' : 's'}${
+          typeof retrievalTokens === 'number' ? ` · ~${retrievalTokens.toLocaleString()} tokens` : ''
+        }`
+      : undefined;
+
   return (
     <li>
       <button
@@ -31,6 +44,9 @@ export function ResearchStepItem({
           </span>
           {step.preview && (
             <span className="mt-0.5 block truncate text-xs text-slate-400">{step.preview}</span>
+          )}
+          {chunkSummary && (
+            <span className="mt-0.5 block truncate text-xs text-slate-400">{chunkSummary}</span>
           )}
         </span>
         <span className="text-xs text-slate-300 transition group-hover:text-slate-500">

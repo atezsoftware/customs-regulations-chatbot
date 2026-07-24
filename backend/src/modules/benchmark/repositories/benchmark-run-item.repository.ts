@@ -24,6 +24,8 @@ export interface BenchmarkModelMetricsRow {
   citation_rate: number | string | null;
   avg_api_calls: number | string | null;
   avg_context_summaries: number | string | null;
+  avg_retrieval_chunks: number | string | null;
+  avg_retrieval_tokens: number | string | null;
   judge_overall_score: number | string | null;
   judge_correctness: number | string | null;
   judge_groundedness: number | string | null;
@@ -133,6 +135,14 @@ export class BenchmarkRunItemRepository extends DefaultCrudRepository<
           ))::float / NULLIF(COUNT(*) FILTER (WHERE bri.status = 'completed'), 0) AS citation_rate,
           AVG(bri.api_calls) FILTER (WHERE bri.status = 'completed') AS avg_api_calls,
           AVG(bri.context_summaries) FILTER (WHERE bri.status = 'completed') AS avg_context_summaries,
+          AVG(
+            (SELECT COALESCE(SUM((e->>'chunk_count')::int), 0)
+             FROM jsonb_array_elements(COALESCE(bri.retrieval_steps, '[]'::jsonb)) e)
+          ) FILTER (WHERE bri.status = 'completed') AS avg_retrieval_chunks,
+          AVG(
+            (SELECT COALESCE(SUM((e->>'estimated_tokens')::int), 0)
+             FROM jsonb_array_elements(COALESCE(bri.retrieval_steps, '[]'::jsonb)) e)
+          ) FILTER (WHERE bri.status = 'completed') AS avg_retrieval_tokens,
           AVG(brj.overall_score) AS judge_overall_score,
           AVG(brj.correctness_score) AS judge_correctness,
           AVG(brj.groundedness_score) AS judge_groundedness,
@@ -195,6 +205,7 @@ export class BenchmarkRunItemRepository extends DefaultCrudRepository<
       costSource: (row.cost_source as BenchmarkRunItem['costSource']) ?? undefined,
       citedSources: (row.cited_sources as string[] | null) ?? undefined,
       stepPath: (row.step_path as string[] | null) ?? undefined,
+      retrievalSteps: (row.retrieval_steps as BenchmarkRunItem['retrievalSteps'] | null) ?? undefined,
       startedAt: (row.started_at as string | null) ?? undefined,
       completedAt: (row.completed_at as string | null) ?? undefined,
     };

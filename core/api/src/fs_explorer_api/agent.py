@@ -245,6 +245,36 @@ def _query_token_overlap(a: str, b: str) -> float:
     return overlap / max(len(tokens_a), len(tokens_b))
 
 
+# Tools whose rendered output actually contains indexed chunk text — the
+# ones "how many chunks/tokens went to the LLM" should be counted against,
+# distinct from `tool_result_chars` (which sums every tool's output,
+# including non-retrieval ones like grep/scan_folder). `preview_file` is
+# deliberately excluded even though it shares `_document_from_chunks` with
+# `get_document`/`parse_file`/`read` — it's a fixed, cheap, truncated peek
+# (`max_chars=3000` default), not representative of real retrieval breadth.
+CHUNK_BEARING_TOOLS = frozenset(
+    {"semantic_search", "get_chunk_context", "get_document", "parse_file", "read"}
+)
+_SEMANTIC_SEARCH_HIT_RE = re.compile(r"^\[\d+\] doc_id: ", re.MULTILINE)
+_CHUNK_HEADER_RE = re.compile(r"^--- chunk ", re.MULTILINE)
+
+
+def _count_chunk_markers(tool_name: str, result: str) -> int:
+    """Count chunks in a chunk-bearing tool's rendered output by counting
+    the same small structured markers the rendering itself already emits
+    (`"[idx] doc_id:"` for `semantic_search`, `"--- chunk "` for the
+    document/context readers) — mirrors `exploration_trace.py`'s
+    `extract_cited_sources()`, which already recovers structured data by
+    regex-parsing already-rendered text, and `add_tool_result`'s own
+    existing `result.count("│ [")` for `scan_folder` below, rather than
+    plumbing a new return type through every one of the `TOOLS` functions."""
+    if tool_name == "semantic_search":
+        return len(_SEMANTIC_SEARCH_HIT_RE.findall(result))
+    if tool_name in {"get_chunk_context", "get_document", "parse_file", "read"}:
+        return len(_CHUNK_HEADER_RE.findall(result))
+    return 0
+
+
 @dataclass
 class TokenUsage:
     """
@@ -259,6 +289,13 @@ class TokenUsage:
     thinking_tokens: int = 0
     total_tokens: int = 0
     api_calls: int = 0
+
+    # Retrieval-specific subset of `tool_result_chars` below — how many
+    # indexed chunks were actually sent to the LLM, and how many chars of
+    # that were chunk text specifically (as opposed to every tool's output
+    # combined). See `CHUNK_BEARING_TOOLS`/`_count_chunk_markers` above.
+    retrieval_chunks: int = 0
+    retrieval_chars: int = 0
 
     # `prompt_tokens` above is a running SUM across every call so far — a
     # correct "tokens billed this turn" figure (every call really is
@@ -291,8 +328,14 @@ class TokenUsage:
         self.api_calls += 1
         self.last_prompt_tokens = prompt_tokens
 
-    def add_tool_result(self, result: str, tool_name: str) -> None:
-        """Record metrics from a tool execution."""
+    def add_tool_result(self, result: str, tool_name: str) -> tuple[int, int]:
+        """Record metrics from a tool execution.
+
+        Returns `(chunk_count, chars)` for *this call specifically* — `(0, 0)`
+        for non-chunk-bearing tools — so callers wanting per-call granularity
+        (e.g. a retrieval-stats hook) don't need to duplicate
+        `_count_chunk_markers` themselves.
+        """
         self.tool_result_chars += len(result)
         if tool_name == "parse_file":
             self.documents_parsed += 1
@@ -301,6 +344,19 @@ class TokenUsage:
             self.documents_scanned += result.count("│ [")
         elif tool_name == "preview_file":
             self.documents_parsed += 1
+        if tool_name not in CHUNK_BEARING_TOOLS:
+            return 0, 0
+        chunk_count = _count_chunk_markers(tool_name, result)
+        chars = len(result)
+        self.retrieval_chunks += chunk_count
+        self.retrieval_chars += chars
+        return chunk_count, chars
+
+    def retrieval_estimated_tokens(self) -> int:
+        """Rough chars/4 estimate for `retrieval_chars` — same heuristic
+        `_estimated_turn_tokens` already uses elsewhere in this file, so the
+        two are directly comparable."""
+        return (self.retrieval_chars + 3) // 4
 
     def _calculate_cost(self) -> tuple[float, float, float]:
         """Calculate estimated costs based on Gemini Flash pricing."""
@@ -1471,6 +1527,7 @@ class LLMCallStats:
     completion_tokens: int
     thinking_tokens: int
     duration_ms: float
+    step: int = 0
     provider: str = "gemini"
     generation_id: str | None = None
     cached_input_tokens: int = 0
@@ -1481,6 +1538,28 @@ class LLMCallStats:
 
 
 OnLLMCall = Callable[[LLMCallStats], Awaitable[None]]
+
+
+@dataclass
+class RetrievalStats:
+    """Per-call chunk/token observation, for external instrumentation —
+    the retrieval-specific analog of `LLMCallStats` above, firing once per
+    chunk-bearing tool call (see `CHUNK_BEARING_TOOLS`) rather than once
+    per LLM call. Plain sync callback, deliberately not `Awaitable` like
+    `OnLLMCall` — `call_tool()` is a sync method; a sync callback lets both
+    it and the async `call_tools()` batch path invoke it directly without
+    making `call_tool` itself `async def`, which would ripple into its
+    `workflow.py` call sites.
+    """
+
+    step: int
+    tool_name: str
+    chunk_count: int
+    chars: int
+    estimated_tokens: int
+
+
+OnRetrieval = Callable[[RetrievalStats], None]
 
 
 class FsExplorerAgent:
@@ -1503,6 +1582,7 @@ class FsExplorerAgent:
         model: str | None = None,
         temperature: float | None = None,
         on_llm_call: OnLLMCall | None = None,
+        on_retrieval: OnRetrieval | None = None,
     ) -> None:
         """
         Initialize the agent with an LLM client.
@@ -1521,6 +1601,12 @@ class FsExplorerAgent:
                          stats (see `LLMCallStats`), for callers that want
                          incremental observability instead of only the
                          cumulative `token_usage` totals.
+            on_retrieval: Optional sync callback invoked after every
+                          chunk-bearing tool call with per-call chunk/token
+                          stats (see `RetrievalStats`), for callers that
+                          want incremental "how many chunks/tokens went to
+                          the LLM" observability instead of only the
+                          cumulative `token_usage.retrieval_*` totals.
 
         Raises:
             ValueError: If no Google credentials are available and no
@@ -1532,6 +1618,7 @@ class FsExplorerAgent:
         self._chat_history: list[ChatTurn] = []
         self.token_usage = TokenUsage()
         self._on_llm_call = on_llm_call
+        self._on_retrieval = on_retrieval
         self._step_count = 0
         # Instance-level, not just the module constant — grant_more_steps()
         # (called on resume) raises this so a resumed run gets genuine extra
@@ -1568,6 +1655,7 @@ class FsExplorerAgent:
                 completion_tokens=usage.output_tokens,
                 thinking_tokens=usage.thinking_tokens,
                 duration_ms=usage.duration_ms,
+                step=self._step_count,
                 provider=(
                     "openrouter"
                     if self._llm.__class__.__name__ == "OpenRouterLLMClient"
@@ -1587,6 +1675,26 @@ class FsExplorerAgent:
                     else None
                 ),
                 cost_source=usage.cost_source,
+            )
+        )
+
+    def _report_retrieval(self, tool_name: str, chunk_count: int, chars: int) -> None:
+        # Fires for every chunk-bearing call, even a genuine chunk_count=0
+        # (e.g. a get_document on a doc_id with no indexed chunks) — not
+        # just when chunks were actually found. server.py's WS layer relies
+        # on exactly one retrieval_stats event per chunk-bearing tool_call
+        # event (including within a batch) to correlate the two in order;
+        # skipping zero-chunk calls here would silently desync that
+        # correlation for every call after the first zero-chunk one.
+        if self._on_retrieval is None or tool_name not in CHUNK_BEARING_TOOLS:
+            return
+        self._on_retrieval(
+            RetrievalStats(
+                step=self._step_count,
+                tool_name=tool_name,
+                chunk_count=chunk_count,
+                chars=chars,
+                estimated_tokens=(chars + 3) // 4,
             )
         )
 
@@ -1624,6 +1732,15 @@ class FsExplorerAgent:
         the agent any further.
         """
         self._on_llm_call = on_llm_call
+
+    def set_retrieval_hook(self, on_retrieval: OnRetrieval | None) -> None:
+        """Rebind the per-call retrieval-stats hook to a new connection.
+
+        Same reason as `set_llm_call_hook()` — a resumed run reuses this
+        agent instance as-is, but the original hook closure was bound to
+        the interrupted connection.
+        """
+        self._on_retrieval = on_retrieval
 
     async def take_action(self) -> tuple[Action, ActionType] | None:
         """
@@ -1843,7 +1960,8 @@ class FsExplorerAgent:
                 ]
 
         # Track tool result sizes
-        self.token_usage.add_tool_result(result, tool_name)
+        chunk_count, chars = self.token_usage.add_tool_result(result, tool_name)
+        self._report_retrieval(tool_name, chunk_count, chars)
 
         self._chat_history.append(
             ChatTurn(role="user", text=f"Tool result for {tool_name}:\n\n{result}")
@@ -1886,7 +2004,8 @@ class FsExplorerAgent:
         sections: list[str] = ["Batch tool results:"]
         for (tool_name, tool_input), result in zip(calls, results):
             resolved = result or "No result"
-            self.token_usage.add_tool_result(resolved, tool_name)
+            chunk_count, chars = self.token_usage.add_tool_result(resolved, tool_name)
+            self._report_retrieval(tool_name, chunk_count, chars)
             sections.append(f"\n## {tool_name} {tool_input}\n{resolved}")
         self._chat_history.append(ChatTurn(role="user", text="\n".join(sections)))
 

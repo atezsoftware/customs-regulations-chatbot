@@ -22,10 +22,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from .agent import (
+    CHUNK_BEARING_TOOLS,
     DEFAULT_EFFORT,
     GEMINI_MAX_CONTEXT_TOKENS,
     FsExplorerAgent,
     LLMCallStats,
+    RetrievalStats,
     clear_index_context,
     set_effort,
     set_index_context,
@@ -1048,6 +1050,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
                             "purpose": stats.purpose,
                             "provider": stats.provider,
                             "model": stats.model,
+                            "step": stats.step,
                             "prompt_tokens": stats.prompt_tokens,
                             "completion_tokens": stats.completion_tokens,
                             "thinking_tokens": stats.thinking_tokens,
@@ -1058,6 +1061,45 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
                             "billed_cost_usd": stats.billed_cost_usd,
                             "upstream_cost_usd": stats.upstream_cost_usd,
                             "cost_source": stats.cost_source,
+                        },
+                    }
+                )
+
+        # Same pattern as pending_llm_calls above, for the retrieval-stats
+        # hook — sync callback (see RetrievalStats/OnRetrieval), so it's a
+        # plain function, not a coroutine.
+        pending_retrieval_stats: list[RetrievalStats] = []
+        # agent.py's RetrievalStats.step is the *agent's* step counter,
+        # which a single ToolBatchAction shares across 2-3 tool calls — not
+        # precise enough to key a specific chat_research_steps row (keyed
+        # by this WS layer's own per-tool_call step_number). Since exactly
+        # one retrieval_stats event fires per chunk-bearing tool_call, in
+        # the same order those tool_call events are sent (including within
+        # a batch — see agent.py's call_tools()), a plain FIFO queue of
+        # "step_numbers already sent for a chunk-bearing tool_call" lets
+        # _flush_retrieval_stats() recover the right one deterministically.
+        pending_retrieval_step_numbers: list[int] = []
+
+        def _collect_retrieval(stats: RetrievalStats) -> None:
+            pending_retrieval_stats.append(stats)
+
+        async def _flush_retrieval_stats() -> None:
+            while pending_retrieval_stats:
+                stats = pending_retrieval_stats.pop(0)
+                ws_step = (
+                    pending_retrieval_step_numbers.pop(0)
+                    if pending_retrieval_step_numbers
+                    else stats.step
+                )
+                await websocket.send_json(
+                    {
+                        "type": "retrieval_stats",
+                        "data": {
+                            "step": ws_step,
+                            "tool_name": stats.tool_name,
+                            "chunk_count": stats.chunk_count,
+                            "chars": stats.chars,
+                            "estimated_tokens": stats.estimated_tokens,
                         },
                     }
                 )
@@ -1100,6 +1142,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             model=resolved_model,
             temperature=resolved_temperature,
             on_llm_call=_collect_llm_call,
+            on_retrieval=_collect_retrieval,
         )
         agent = get_run_agent(resource_manager)
         handler = run_workflow.run(
@@ -1115,8 +1158,11 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
 
         async for event in handler.stream_events():
             await _flush_llm_calls()
+            await _flush_retrieval_stats()
             if isinstance(event, ToolCallEvent):
                 step_number += 1
+                if event.tool_name in CHUNK_BEARING_TOOLS:
+                    pending_retrieval_step_numbers.append(step_number)
                 await websocket.send_json(
                     _tool_call_ws_message(
                         event,
@@ -1128,6 +1174,8 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             elif isinstance(event, ToolBatchEvent):
                 for call in event.tool_calls:
                     step_number += 1
+                    if call.tool_name in CHUNK_BEARING_TOOLS:
+                        pending_retrieval_step_numbers.append(step_number)
                     await websocket.send_json(
                         _tool_call_ws_message(
                             ToolCallEvent(
@@ -1161,6 +1209,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
         # Catch the LLM call that produced the terminal StopAction — it
         # isn't followed by another loop iteration to flush it.
         await _flush_llm_calls()
+        await _flush_retrieval_stats()
 
         await _finish_run(
             websocket,
@@ -1272,6 +1321,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                             "purpose": stats.purpose,
                             "provider": stats.provider,
                             "model": stats.model,
+                            "step": stats.step,
                             "prompt_tokens": stats.prompt_tokens,
                             "completion_tokens": stats.completion_tokens,
                             "thinking_tokens": stats.thinking_tokens,
@@ -1286,10 +1336,47 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                     }
                 )
 
-        # The agent's original hook closure was bound to the interrupted
-        # connection's websocket — rebind it to this one before driving the
-        # agent any further.
+        pending_retrieval_stats: list[RetrievalStats] = []
+        # agent.py's RetrievalStats.step is the *agent's* step counter,
+        # which a single ToolBatchAction shares across 2-3 tool calls — not
+        # precise enough to key a specific chat_research_steps row (keyed
+        # by this WS layer's own per-tool_call step_number). Since exactly
+        # one retrieval_stats event fires per chunk-bearing tool_call, in
+        # the same order those tool_call events are sent (including within
+        # a batch — see agent.py's call_tools()), a plain FIFO queue of
+        # "step_numbers already sent for a chunk-bearing tool_call" lets
+        # _flush_retrieval_stats() recover the right one deterministically.
+        pending_retrieval_step_numbers: list[int] = []
+
+        def _collect_retrieval(stats: RetrievalStats) -> None:
+            pending_retrieval_stats.append(stats)
+
+        async def _flush_retrieval_stats() -> None:
+            while pending_retrieval_stats:
+                stats = pending_retrieval_stats.pop(0)
+                ws_step = (
+                    pending_retrieval_step_numbers.pop(0)
+                    if pending_retrieval_step_numbers
+                    else stats.step
+                )
+                await websocket.send_json(
+                    {
+                        "type": "retrieval_stats",
+                        "data": {
+                            "step": ws_step,
+                            "tool_name": stats.tool_name,
+                            "chunk_count": stats.chunk_count,
+                            "chars": stats.chars,
+                            "estimated_tokens": stats.estimated_tokens,
+                        },
+                    }
+                )
+
+        # The agent's original hook closures were bound to the interrupted
+        # connection's websocket — rebind them to this one before driving
+        # the agent any further.
         agent.set_llm_call_hook(_collect_llm_call)
+        agent.set_retrieval_hook(_collect_retrieval)
 
         await websocket.send_json(
             {
@@ -1330,9 +1417,12 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                 break
             send_value = None
             await _flush_llm_calls()
+            await _flush_retrieval_stats()
 
             if isinstance(event, ToolCallEvent):
                 step_number += 1
+                if event.tool_name in CHUNK_BEARING_TOOLS:
+                    pending_retrieval_step_numbers.append(step_number)
                 await websocket.send_json(
                     _tool_call_ws_message(
                         event,
@@ -1344,6 +1434,8 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
             elif isinstance(event, ToolBatchEvent):
                 for call in event.tool_calls:
                     step_number += 1
+                    if call.tool_name in CHUNK_BEARING_TOOLS:
+                        pending_retrieval_step_numbers.append(step_number)
                     await websocket.send_json(
                         _tool_call_ws_message(
                             ToolCallEvent(
@@ -1376,6 +1468,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                 result_error = event.error
 
         await _flush_llm_calls()
+        await _flush_retrieval_stats()
 
         await _finish_run(
             websocket,

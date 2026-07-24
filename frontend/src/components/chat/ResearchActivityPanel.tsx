@@ -1,5 +1,5 @@
 import {useState} from 'react';
-import type {ResearchStep} from '../../types';
+import type {LlmUsage, ResearchStep} from '../../types';
 import {ResearchStepItem} from './ResearchStepItem';
 
 /**
@@ -9,7 +9,7 @@ import {ResearchStepItem} from './ResearchStepItem';
  * swapping in place as steps complete rather than growing a list underneath
  * it (that full list only ever renders once expanded).
  */
-export function ResearchActivityPanel({steps}: {steps: ResearchStep[]}) {
+export function ResearchActivityPanel({steps, usage}: {steps: ResearchStep[]; usage: LlmUsage[]}) {
   const [expanded, setExpanded] = useState(false);
   const [expandAllDetails, setExpandAllDetails] = useState(false);
 
@@ -20,6 +20,17 @@ export function ResearchActivityPanel({steps}: {steps: ResearchStep[]}) {
   const liveStep = [...steps].reverse().find(step => step.status === 'running') ?? steps[steps.length - 1];
 
   const dotClass = running ? 'bg-indigo-500 animate-pulse' : hasError ? 'bg-rose-500' : 'bg-emerald-500';
+
+  // Only shown while the run is still in progress — once it completes,
+  // UsageFooter below already shows the final per-call breakdown, so this
+  // would just be a redundant, now-static duplicate of the same numbers.
+  const currentStep = usage.length
+    ? Math.max(...usage.map(call => call.step ?? 0))
+    : undefined;
+  const tokensSoFar = usage.reduce(
+    (sum, call) => sum + call.inputTokens + call.outputTokens + call.thinkingTokens,
+    0,
+  );
 
   return (
     <div className="mb-4 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm transition duration-200">
@@ -45,6 +56,12 @@ export function ResearchActivityPanel({steps}: {steps: ResearchStep[]}) {
           )}
         </span>
         <span className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-slate-400">
+          {running && tokensSoFar > 0 && (
+            <span className="animate-[fadeIn_180ms_ease-out] text-slate-400">
+              {currentStep ? `step ${currentStep} · ` : ''}
+              {tokensSoFar.toLocaleString()} tokens
+            </span>
+          )}
           {expanded ? 'Hide steps' : 'Show steps'}
           <svg
             viewBox="0 0 20 20"
