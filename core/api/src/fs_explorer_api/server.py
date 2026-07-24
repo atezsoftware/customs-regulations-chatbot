@@ -1174,7 +1174,10 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             elif isinstance(event, ToolBatchEvent):
                 for call in event.tool_calls:
                     step_number += 1
-                    if call.tool_name in CHUNK_BEARING_TOOLS:
+                    if (
+                        not event.stateless_retrieval
+                        and call.tool_name in CHUNK_BEARING_TOOLS
+                    ):
                         pending_retrieval_step_numbers.append(step_number)
                     await websocket.send_json(
                         _tool_call_ws_message(
@@ -1188,6 +1191,11 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
                             index_storage=index_storage,
                         )
                     )
+                if event.stateless_retrieval:
+                    # The fan-out emits one aggregate retrieval metric for
+                    # the globally selected evidence, not one inflated metric
+                    # per intermediate query.
+                    pending_retrieval_step_numbers.append(step_number)
             elif isinstance(event, GoDeeperEvent):
                 step_number += 1
                 await websocket.send_json(
@@ -1434,7 +1442,10 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
             elif isinstance(event, ToolBatchEvent):
                 for call in event.tool_calls:
                     step_number += 1
-                    if call.tool_name in CHUNK_BEARING_TOOLS:
+                    if (
+                        not event.stateless_retrieval
+                        and call.tool_name in CHUNK_BEARING_TOOLS
+                    ):
                         pending_retrieval_step_numbers.append(step_number)
                     await websocket.send_json(
                         _tool_call_ws_message(
@@ -1448,6 +1459,8 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                             index_storage=index_storage,
                         )
                     )
+                if event.stateless_retrieval:
+                    pending_retrieval_step_numbers.append(step_number)
             elif isinstance(event, GoDeeperEvent):
                 step_number += 1
                 await websocket.send_json(

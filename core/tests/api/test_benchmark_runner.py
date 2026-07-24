@@ -5,7 +5,7 @@ from decimal import Decimal
 import pytest
 
 from fs_explorer_api import benchmark_runner as benchmark_runner_mod
-from fs_explorer_api.agent import _index_tools_available
+from fs_explorer_api.agent import PlannedSearchResult, _index_tools_available
 from fs_explorer_api.benchmark_runner import (
     _sum_call_cost,
     judge_answer,
@@ -13,7 +13,11 @@ from fs_explorer_api.benchmark_runner import (
 )
 from fs_explorer_api.agent import LLMCallStats
 from fs_explorer_api.llm.base import LLMUsage
-from fs_explorer_api.models import Action, JudgmentResult, StopAction
+from fs_explorer_api.models import (
+    JudgmentResult,
+    RetrievalPlan,
+    RetrievalQuery,
+)
 
 
 class _FakeStorage:
@@ -43,7 +47,7 @@ class _EmptyCorpusStorage(_FakeStorage):
 
 
 class _StopActionClient:
-    """Fake `LLMClient`: stops immediately, reports a fixed provider cost."""
+    """Fake `LLMClient`: plans once, then streams a fixed final answer."""
 
     model = "fake/model"
 
@@ -56,7 +60,7 @@ class _StopActionClient:
     ):
         self.structured_calls += 1
         return (
-            Action(reason="done", action=StopAction(final_result="benchmark answer")),
+            RetrievalPlan(searches=[RetrievalQuery(query="transit penalty")]),
             LLMUsage(
                 input_tokens=100,
                 output_tokens=20,
@@ -107,6 +111,10 @@ class TestRunAgenticSession:
         monkeypatch.setattr(
             "fs_explorer_api.agent.get_llm_client",
             lambda **_kwargs: _StopActionClient(),
+        )
+        monkeypatch.setattr(
+            "fs_explorer_api.agent._run_planned_index_search",
+            lambda **kwargs: PlannedSearchResult(query=kwargs["query"], hits=[]),
         )
 
         result = await run_agentic_session(
@@ -161,6 +169,10 @@ class TestRunAgenticSession:
         monkeypatch.setattr("fs_explorer_api.agent.PostgresStorage", _FakeStorage)
         monkeypatch.setattr(
             "fs_explorer_api.agent.get_llm_client", lambda **_kwargs: _RaisingClient()
+        )
+        monkeypatch.setattr(
+            "fs_explorer_api.agent._run_planned_index_search",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
         )
 
         with pytest.raises(RuntimeError, match="boom"):

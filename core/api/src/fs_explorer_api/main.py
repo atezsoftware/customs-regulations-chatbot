@@ -22,10 +22,15 @@ from rich.text import Text
 
 from fs_explorer_shared.index_config import resolve_database_url
 from fs_explorer_shared.storage import PostgresStorage
-from .agent import set_index_context, clear_index_context
+from .agent import (
+    clear_index_context,
+    set_index_context,
+    set_search_flags,
+)
 from .workflow import (
     InputEvent,
     ToolCallEvent,
+    ToolBatchEvent,
     GoDeeperEvent,
     AskHumanEvent,
     HumanAnswerEvent,
@@ -287,12 +292,15 @@ async def run_workflow(
         # get_run_agent() (not get_agent()) is required to read back the
         # agent this specific run used once it's done — see that
         # function's docstring in workflow.py for why.
+        set_search_flags(enable_semantic=True, enable_metadata=True)
         run_workflow, resource_manager = new_workflow()
         handler = run_workflow.run(
             start_event=InputEvent(
                 task=task,
                 folder=resolved_folder,
                 use_index=True,
+                enable_semantic=True,
+                enable_metadata=True,
             )
         )
 
@@ -348,6 +356,22 @@ async def run_workflow(
                     console.print()
 
                     status.update("[bold cyan]🔄 Processing results...")
+                elif isinstance(event, ToolBatchEvent):
+                    for call in event.tool_calls:
+                        step_number += 1
+                        tool_event = ToolCallEvent(
+                            tool_name=call.tool_name,
+                            tool_input=call.to_fn_args(),
+                            reason=event.reason,
+                        )
+                        trace.record_tool_call(
+                            step_number=step_number,
+                            tool_name=tool_event.tool_name,
+                            tool_input=tool_event.tool_input,
+                        )
+                        console.print(format_tool_panel(tool_event, step_number))
+                        console.print()
+                    status.update("[bold magenta]🧠 Merging retrieval evidence...")
                 elif isinstance(event, GoDeeperEvent):
                     step_number += 1
                     trace.record_go_deeper(
@@ -386,6 +410,16 @@ async def run_workflow(
             # Get final result
             result = await handler
             status.update("[bold green]✨ Preparing final answer...")
+            if result.error is None:
+                streamed_parts = [
+                    chunk
+                    async for chunk in get_run_agent(
+                        resource_manager
+                    ).stream_final_answer(result.final_result)
+                ]
+                streamed_final = "".join(streamed_parts).strip()
+                if streamed_final:
+                    result.final_result = streamed_final
             await asyncio.sleep(0.1)
             status.stop()
 
@@ -414,6 +448,7 @@ async def run_workflow(
         cited_sources = extract_cited_sources(result.final_result)
         print_workflow_summary(console, agent, step_number, trace, cited_sources)
     finally:
+        set_search_flags(enable_semantic=False, enable_metadata=False)
         clear_index_context()
 
 

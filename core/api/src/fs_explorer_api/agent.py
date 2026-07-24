@@ -19,7 +19,16 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 from .llm import ChatTurn, LLMClient, LLMUsage, get_llm_client
-from .models import Action, ActionType, ContextSummary, StopAction, Tools
+from .models import (
+    Action,
+    ActionType,
+    ContextSummary,
+    RetrievalPlan,
+    StopAction,
+    ToolCallAction,
+    ToolCallArg,
+    Tools,
+)
 from fs_explorer_shared.fs import (
     read_file as fs_read_file,
     grep_file_content as fs_grep_file_content,
@@ -30,6 +39,7 @@ from fs_explorer_shared.index_config import resolve_database_url
 from .search import (
     IndexedQueryEngine,
     MetadataFilterParseError,
+    SearchHit,
     supported_filter_syntax,
 )
 from .search.ranker import RankedDocument
@@ -424,6 +434,15 @@ class IndexContext:
     database_url: str
 
 
+@dataclass(frozen=True)
+class PlannedSearchResult:
+    """Structured result of one stateless parallel indexed search."""
+
+    query: str
+    hits: list[SearchHit]
+    error: str | None = None
+
+
 # `ContextVar`, not a plain module global: `core-api` handles multiple
 # chats concurrently in one process (that's what FS_EXPLORER_LLM_MAX_CONCURRENCY
 # exists for), and a plain `global` here was a real cross-chat data-leak bug
@@ -488,6 +507,7 @@ _EFFORT_LEVELS: dict[str, dict[str, int]] = {
     "medium": {"default_limit": 8, "max_limit": 10, "overfetch_multiplier": 5},
     "high": {"default_limit": 12, "max_limit": 20, "overfetch_multiplier": 6},
 }
+_PARALLEL_QUERY_COUNTS = {"low": 3, "medium": 4, "high": 5}
 _EFFORT_VAR: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_EFFORT", default=DEFAULT_EFFORT
 )
@@ -1088,6 +1108,48 @@ def _indexed_glob_paths(directory: str, pattern: str) -> str:
     return "No matches found in indexed documents"
 
 
+def _run_planned_index_search(
+    *,
+    query: str,
+    filters: str | None = None,
+    as_of_date: str | None = None,
+) -> PlannedSearchResult:
+    """Run one independent search and return structured hits, not rendered text."""
+    storage, corpora, error = _get_index_storage_and_corpora()
+    if error:
+        return PlannedSearchResult(query=query, hits=[], error=error)
+    assert storage is not None and corpora
+
+    effort_config = _effort_config()
+    engine = IndexedQueryEngine(
+        storage, embedding_provider=_EMBEDDING_PROVIDER_VAR.get()
+    )
+    hits: list[SearchHit] = []
+    try:
+        for corpus in corpora:
+            hits.extend(
+                engine.search(
+                    corpus_id=corpus.corpus_id,
+                    query=query,
+                    filters=filters,
+                    limit=effort_config["default_limit"],
+                    enable_semantic=_ENABLE_SEMANTIC_VAR.get(),
+                    enable_metadata=_ENABLE_METADATA_VAR.get(),
+                    as_of_date=as_of_date,
+                    overfetch_multiplier=effort_config["overfetch_multiplier"],
+                )
+            )
+        hits.sort(key=lambda hit: hit.score, reverse=True)
+        return PlannedSearchResult(
+            query=query,
+            hits=hits[: effort_config["default_limit"]],
+        )
+    except (MetadataFilterParseError, ValueError) as exc:
+        return PlannedSearchResult(query=query, hits=[], error=str(exc))
+    finally:
+        storage.close()
+
+
 def semantic_search(
     query: str,
     filters: str | None = None,
@@ -1544,6 +1606,17 @@ entities or HTML markup. Do not invent facts or citations absent from the
 evidence.
 """
 
+RETRIEVAL_PLANNER_PROMPT = """Plan independent indexed searches; do not answer.
+
+Return complementary standalone queries that can run concurrently without
+seeing one another's results. Cover the main legal rule and, when relevant,
+exceptions, procedure/deadlines, definitions, and likely cross-references.
+Avoid paraphrase duplicates. Use the question's language. Set `as_of_date`
+only when the question names a historical date. Set `filters` only for an
+explicit metadata constraint you can express reliably; otherwise use null.
+Keep every query concise.
+"""
+
 
 def _build_system_prompt(enable_semantic: bool, enable_metadata: bool) -> str:
     """Build a system prompt with retrieval-path guidance appended."""
@@ -1693,6 +1766,8 @@ class FsExplorerAgent:
         # (tool_name, dedup_key) for the last `_DUPLICATE_CALL_LOOKBACK`
         # real tool calls — see `_dedup_key`/`_is_near_duplicate_call`.
         self._recent_tool_calls: list[tuple[str, str]] = []
+        self._planned_search_calls: list[ToolCallAction] = []
+        self._prepared_indexed_evidence = False
         # Set when take_action() hits the _MAX_STEPS safety net rather than
         # the model choosing to stop on its own — the run technically
         # "completed" (no error), but the answer may be an unsatisfying
@@ -1709,6 +1784,16 @@ class FsExplorerAgent:
     def forced_stop(self) -> bool:
         """Whether the run ended by hitting _MAX_STEPS, not a real StopAction."""
         return self._forced_stop
+
+    @property
+    def prepared_indexed_evidence(self) -> bool:
+        """Whether the stateless indexed path is ready for final synthesis."""
+        return self._prepared_indexed_evidence
+
+    @property
+    def planned_search_calls(self) -> list[ToolCallAction]:
+        """Return a copy of any planned-but-not-yet-executed indexed searches."""
+        return list(self._planned_search_calls)
 
     async def _report_llm_call(self, purpose: str, usage: "LLMUsage") -> None:
         if self._on_llm_call is None:
@@ -1807,6 +1892,188 @@ class FsExplorerAgent:
         the interrupted connection.
         """
         self._on_retrieval = on_retrieval
+
+    async def plan_indexed_retrieval(self, task: str) -> list[ToolCallAction]:
+        """Create one bounded fan-out plan without adding it to chat history."""
+        self._step_count += 1
+        max_queries = _PARALLEL_QUERY_COUNTS.get(get_effort(), 3)
+        try:
+            plan, usage = await self._llm.generate_structured(
+                [ChatTurn(role="user", text=task)],
+                RETRIEVAL_PLANNER_PROMPT
+                + f"\nReturn at most {max_queries} searches for this effort level.",
+                RetrievalPlan,
+                thinking_level="low",
+            )
+            self.token_usage.add_api_call(
+                prompt_tokens=usage.input_tokens,
+                completion_tokens=usage.output_tokens,
+                thinking_tokens=usage.thinking_tokens,
+            )
+            await self._report_llm_call("retrieval_plan", usage)
+            planned = plan.searches
+        except Exception:
+            logger.exception(
+                "plan_indexed_retrieval: planner failed; using original question"
+            )
+            planned = []
+
+        calls: list[ToolCallAction] = []
+        seen: set[str] = set()
+        for search in planned:
+            query = " ".join(search.query.split()).strip()
+            normalized = query.casefold()
+            if not query or normalized in seen:
+                continue
+            seen.add(normalized)
+            args = [ToolCallArg(parameter_name="query", parameter_value=query)]
+            if search.filters:
+                args.append(
+                    ToolCallArg(
+                        parameter_name="filters", parameter_value=search.filters
+                    )
+                )
+            if search.as_of_date:
+                args.append(
+                    ToolCallArg(
+                        parameter_name="as_of_date",
+                        parameter_value=search.as_of_date,
+                    )
+                )
+            calls.append(
+                ToolCallAction(tool_name="semantic_search", tool_input=args)
+            )
+            if len(calls) >= max_queries:
+                break
+
+        if not calls:
+            calls = [
+                ToolCallAction(
+                    tool_name="semantic_search",
+                    tool_input=[
+                        ToolCallArg(parameter_name="query", parameter_value=task)
+                    ],
+                )
+            ]
+        self._planned_search_calls = calls
+        return list(calls)
+
+    async def collect_parallel_indexed_evidence(
+        self,
+        task: str,
+        calls: list[ToolCallAction] | None = None,
+    ) -> str:
+        """Run searches concurrently and retain only global reranked evidence."""
+        resolved_calls = list(calls or self._planned_search_calls)
+        if not resolved_calls:
+            resolved_calls = await self.plan_indexed_retrieval(task)
+
+        async def execute(call: ToolCallAction) -> PlannedSearchResult:
+            args = call.to_fn_args()
+            return await asyncio.to_thread(
+                _run_planned_index_search,
+                query=str(args.get("query") or task),
+                filters=(
+                    str(args["filters"])
+                    if args.get("filters") is not None
+                    else None
+                ),
+                as_of_date=(
+                    str(args["as_of_date"])
+                    if args.get("as_of_date") is not None
+                    else None
+                ),
+            )
+
+        search_results = await asyncio.gather(
+            *(execute(call) for call in resolved_calls)
+        )
+        unique_hits: dict[str, SearchHit] = {}
+        for result in search_results:
+            for hit in result.hits:
+                key = hit.chunk_id or f"{hit.doc_id}:{hit.position}"
+                prior = unique_hits.get(key)
+                if prior is None or hit.score > prior.score:
+                    unique_hits[key] = hit
+
+        candidates = [
+            RankedDocument(
+                doc_id=hit.doc_id,
+                relative_path=hit.relative_path,
+                absolute_path=hit.absolute_path,
+                position=hit.position,
+                text=hit.text,
+                semantic_score=hit.semantic_score,
+                metadata_score=hit.metadata_score,
+                chunk_id=hit.chunk_id,
+                chunk_type=hit.chunk_type,
+                metadata=hit.metadata,
+            )
+            for hit in unique_hits.values()
+        ]
+        ranked = (
+            await asyncio.to_thread(
+                IndexedQueryEngine.rank_candidates,
+                query=task,
+                documents=candidates,
+                limit=_effort_config()["default_limit"],
+            )
+            if candidates
+            else []
+        )
+
+        queries = [
+            str(call.to_fn_args().get("query") or task) for call in resolved_calls
+        ]
+        lines = [
+            "=== PARALLEL RETRIEVAL EVIDENCE ===",
+            "Queries ran independently without sharing chat history.",
+            "Queries:",
+            *(f"- {query}" for query in queries),
+            "",
+        ]
+        for index, (candidate, score) in enumerate(ranked, start=1):
+            lines.extend(
+                _render_full_chunk_result(
+                    index=index,
+                    doc_id=candidate.doc_id,
+                    title=_display_name(
+                        {
+                            "relative_path": candidate.relative_path,
+                            "absolute_path": candidate.absolute_path,
+                        }
+                    ),
+                    matched_by=candidate.matched_by,
+                    chunk_id=candidate.chunk_id,
+                    chunk_position=candidate.position,
+                    chunk_type=candidate.chunk_type,
+                    metadata=candidate.metadata,
+                    score=score,
+                    text=candidate.text,
+                    semantic_score=candidate.semantic_score,
+                    metadata_score=candidate.metadata_score,
+                )
+            )
+        if not ranked:
+            errors = [result.error for result in search_results if result.error]
+            lines.append("No indexed evidence was found.")
+            if errors:
+                lines.append("Retrieval errors: " + "; ".join(errors[:3]))
+
+        evidence = "\n".join(lines)
+        chunk_count, chars = self.token_usage.add_tool_result(
+            evidence, "semantic_search"
+        )
+        self._report_retrieval("semantic_search", chunk_count, chars)
+        # The final model sees selected evidence exactly once—never planner
+        # JSON or intermediate per-query result turns.
+        self._chat_history = [
+            ChatTurn(role="user", text=f"Original question:\n{task}"),
+            ChatTurn(role="user", text=evidence),
+        ]
+        self._planned_search_calls.clear()
+        self._prepared_indexed_evidence = True
+        return evidence
 
     async def take_action(self) -> tuple[Action, ActionType] | None:
         """
@@ -2097,4 +2364,6 @@ class FsExplorerAgent:
         self._step_count = 0
         self._max_steps = _MAX_STEPS
         self._recent_tool_calls.clear()
+        self._planned_search_calls.clear()
+        self._prepared_indexed_evidence = False
         self._forced_stop = False

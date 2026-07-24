@@ -39,6 +39,10 @@ from fs_explorer_shared.fs import describe_dir_content
 _AGENT_VAR: contextvars.ContextVar[FsExplorerAgent | None] = contextvars.ContextVar(
     "_AGENT_VAR", default=None
 )
+_INDEXED_FINAL_FALLBACK = (
+    "İndeks kanıtları toplandı ancak nihai yanıt oluşturulamadı. "
+    "Lütfen tekrar deneyin."
+)
 
 
 def get_agent() -> FsExplorerAgent:
@@ -145,6 +149,7 @@ class ToolBatchEvent(Event):
 
     tool_calls: list[ToolCallAction]
     reason: str
+    stateless_retrieval: bool = False
 
 
 class AskHumanEvent(InputRequiredEvent):
@@ -290,6 +295,22 @@ class FsExplorerWorkflow(Workflow):
             state.enable_metadata = ev.enable_metadata
             state.effort = ev.effort
 
+        # Indexed questions use a stateless scatter/gather path: one small
+        # planner call, parallel searches with no LLM turns between them,
+        # then one final synthesis over globally reranked evidence.
+        if ev.use_index and ev.enable_semantic:
+            calls = await agent.plan_indexed_retrieval(ev.task)
+            event = ToolBatchEvent(
+                tool_calls=calls,
+                reason=(
+                    "Run independent indexed searches in parallel, then merge, "
+                    "deduplicate, and globally rerank their chunks."
+                ),
+                stateless_retrieval=True,
+            )
+            ctx.write_event_to_stream(event)
+            return event
+
         dirdescription = (
             describe_indexed_context()
             if ev.use_index
@@ -392,6 +413,15 @@ class FsExplorerWorkflow(Workflow):
         agent: Annotated[FsExplorerAgent, Resource(get_agent)],
     ) -> WorkflowEvent:
         """Execute independent calls concurrently and continue once."""
+        if ev.stateless_retrieval:
+            state = await ctx.store.get_state()
+            await agent.collect_parallel_indexed_evidence(
+                state.initial_task, ev.tool_calls
+            )
+            return ExplorationEndEvent(
+                final_result=_INDEXED_FINAL_FALLBACK
+            )
+
         await agent.call_tools(
             [(call.tool_name, call.to_fn_args()) for call in ev.tool_calls]
         )
@@ -492,6 +522,21 @@ async def resume_agent_run(
     """
     directory = current_directory
     human_response: str | None = None
+
+    if use_index and agent.prepared_indexed_evidence:
+        yield ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
+        return
+
+    pending_searches = agent.planned_search_calls
+    if use_index and pending_searches:
+        yield ToolBatchEvent(
+            tool_calls=pending_searches,
+            reason="Resume the pending stateless parallel retrieval plan.",
+            stateless_retrieval=True,
+        )
+        await agent.collect_parallel_indexed_evidence(initial_task, pending_searches)
+        yield ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
+        return
 
     while True:
         if human_response is not None:

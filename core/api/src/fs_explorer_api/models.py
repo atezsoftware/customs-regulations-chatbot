@@ -108,6 +108,39 @@ class ToolBatchAction(BaseModel):
     tool_calls: list[ToolCallAction] = Field(min_length=2, max_length=3)
 
 
+class RetrievalQuery(BaseModel):
+    """One independent query in the stateless indexed-retrieval fan-out."""
+
+    query: str = Field(
+        description="Standalone search query that can run independently"
+    )
+    filters: str | None = Field(
+        default=None,
+        description=(
+            "Optional metadata filter expression; null unless the question "
+            "contains an explicit, reliable metadata constraint"
+        ),
+    )
+    as_of_date: str | None = Field(
+        default=None,
+        description=(
+            "Optional YYYY-MM-DD date for historical-law questions; null for "
+            "questions about the current rule"
+        ),
+    )
+
+
+class RetrievalPlan(BaseModel):
+    """Small stateless fan-out plan generated in one cheap LLM call."""
+
+    searches: list[RetrievalQuery] = Field(
+        description=(
+            "Three to five complementary, non-duplicate searches covering the "
+            "main rule, exceptions, procedure, and likely cross-references"
+        )
+    )
+
+
 class ContextSummary(BaseModel):
     """
     Compacted summary of an earlier stretch of an exploration run's history.

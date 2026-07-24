@@ -197,7 +197,10 @@ async def run_agentic_session(
             elif isinstance(event, ToolBatchEvent):
                 for call in event.tool_calls:
                     step_number += 1
-                    if call.tool_name in CHUNK_BEARING_TOOLS:
+                    if (
+                        not event.stateless_retrieval
+                        and call.tool_name in CHUNK_BEARING_TOOLS
+                    ):
                         pending_retrieval_step_numbers.append(step_number)
                     _record_tool_call(
                         ToolCallEvent(
@@ -209,6 +212,8 @@ async def run_agentic_session(
                         trace=trace,
                         index_storage=index_storage,
                     )
+                if event.stateless_retrieval:
+                    pending_retrieval_step_numbers.append(step_number)
             elif isinstance(event, GoDeeperEvent):
                 step_number += 1
                 trace.record_go_deeper(

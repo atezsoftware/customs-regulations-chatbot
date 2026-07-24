@@ -11,6 +11,8 @@ from fs_explorer_api.agent import (
     DEFAULT_EFFORT,
     FsExplorerAgent,
     IndexedCorpus,
+    PlannedSearchResult,
+    RetrievalStats,
     SYSTEM_PROMPT,
     FINAL_SYSTEM_PROMPT,
     TokenUsage,
@@ -23,7 +25,15 @@ from fs_explorer_api.agent import (
     clear_index_context,
 )
 from fs_explorer_api.llm import LLMUsage
-from fs_explorer_api.models import Action, ContextSummary, GoDeeperAction, StopAction
+from fs_explorer_api.models import (
+    Action,
+    ContextSummary,
+    GoDeeperAction,
+    RetrievalPlan,
+    RetrievalQuery,
+    StopAction,
+)
+from fs_explorer_api.search import SearchHit
 from fs_explorer_api.search.ranker import RankedDocument
 from .conftest import make_mock_llm_client
 
@@ -1003,3 +1013,142 @@ class TestRetrievalHook:
 
         assert first_run == []
         assert len(second_run) == 1
+
+
+class _StatelessRetrievalClient:
+    model = "test"
+
+    def __init__(self) -> None:
+        self.structured_histories = []
+        self.stream_histories = []
+        self._stream_usage = None
+
+    async def generate_structured(
+        self, history, system_prompt, schema, *, thinking_level=None
+    ):
+        self.structured_histories.append(list(history))
+        assert schema is RetrievalPlan
+        return (
+            RetrievalPlan(
+                searches=[
+                    RetrievalQuery(query="ana kural"),
+                    RetrievalQuery(query="istisnalar"),
+                    RetrievalQuery(query="ana kural"),
+                    RetrievalQuery(query="süre ve usul"),
+                    RetrievalQuery(query="fazladan sorgu"),
+                ]
+            ),
+            LLMUsage(input_tokens=500, output_tokens=80),
+        )
+
+    async def stream_text(self, history, system_prompt, *, thinking_level=None):
+        self.stream_histories.append(list(history))
+        self._stream_usage = LLMUsage(input_tokens=2400, output_tokens=300)
+        yield "nihai cevap"
+
+    def last_stream_usage(self):
+        return self._stream_usage
+
+
+def _search_hit(
+    *,
+    chunk_id: str,
+    text: str,
+    score: float,
+    position: int,
+) -> SearchHit:
+    return SearchHit(
+        doc_id=f"doc_{chunk_id}",
+        relative_path=f"{chunk_id}.md",
+        absolute_path=f"/{chunk_id}.md",
+        position=position,
+        text=text,
+        semantic_score=score,
+        metadata_score=0,
+        score=score,
+        matched_by="semantic",
+        chunk_id=chunk_id,
+        chunk_type="text",
+        metadata={"article_no": str(position + 1)},
+    )
+
+
+class TestStatelessParallelRetrieval:
+    @pytest.mark.asyncio
+    async def test_uses_one_plan_and_one_final_call_without_search_history(
+        self,
+    ) -> None:
+        import fs_explorer_api.agent as agent_module
+
+        client = _StatelessRetrievalClient()
+        retrieval_events: list[RetrievalStats] = []
+        agent = FsExplorerAgent(
+            llm_client=client, on_retrieval=retrieval_events.append
+        )
+        set_effort("low")
+
+        calls = await agent.plan_indexed_retrieval("Transit süresi nedir?")
+        assert [call.to_fn_args()["query"] for call in calls] == [
+            "ana kural",
+            "istisnalar",
+            "süre ve usul",
+        ]
+
+        def fake_search(*, query, filters=None, as_of_date=None):
+            common = _search_hit(
+                chunk_id="common",
+                text="ortak tam chunk",
+                score=0.8,
+                position=0,
+            )
+            unique = _search_hit(
+                chunk_id=query.replace(" ", "_"),
+                text=f"{query} için tam chunk",
+                score=0.7,
+                position=1,
+            )
+            return PlannedSearchResult(query=query, hits=[common, unique])
+
+        captured_candidates: list[RankedDocument] = []
+
+        def fake_global_rank(*, query, documents, limit):
+            captured_candidates.extend(documents)
+            return [
+                (document, 0.9 - index * 0.1)
+                for index, document in enumerate(documents[:limit])
+            ]
+
+        with (
+            patch.object(
+                agent_module, "_run_planned_index_search", side_effect=fake_search
+            ),
+            patch.object(
+                agent_module.IndexedQueryEngine,
+                "rank_candidates",
+                side_effect=fake_global_rank,
+            ),
+        ):
+            evidence = await agent.collect_parallel_indexed_evidence(
+                "Transit süresi nedir?", calls
+            )
+
+        assert len(captured_candidates) == 4  # shared hit deduplicated
+        assert evidence.count("ortak tam chunk") == 1
+        assert len(agent._chat_history) == 2
+        assert agent._chat_history[0].text == (
+            "Original question:\nTransit süresi nedir?"
+        )
+        assert agent._chat_history[1].text == evidence
+        assert len(retrieval_events) == 1
+        assert retrieval_events[0].chunk_count == 4
+
+        answer = "".join(
+            [part async for part in agent.stream_final_answer("fallback")]
+        )
+
+        assert answer == "nihai cevap"
+        assert agent.token_usage.api_calls == 2
+        assert agent.token_usage.total_tokens == 3280
+        assert len(client.structured_histories) == 1
+        assert len(client.stream_histories) == 1
+        assert len(client.stream_histories[0]) == 3  # question, evidence, final prompt
