@@ -29,6 +29,7 @@ from fs_explorer_api.models import (
     Action,
     ContextSummary,
     GoDeeperAction,
+    ResearchDecision,
     RetrievalPlan,
     RetrievalQuery,
     StopAction,
@@ -1018,27 +1019,44 @@ class TestRetrievalHook:
 class _StatelessRetrievalClient:
     model = "test"
 
-    def __init__(self) -> None:
+    def __init__(
+        self, decisions: list[ResearchDecision] | None = None
+    ) -> None:
         self.structured_histories = []
         self.stream_histories = []
         self._stream_usage = None
+        self._decisions = list(
+            decisions
+            or [
+                ResearchDecision(
+                    enough_evidence=True,
+                    reason="Evidence covers the question.",
+                    additional_searches=[],
+                )
+            ]
+        )
 
     async def generate_structured(
         self, history, system_prompt, schema, *, thinking_level=None
     ):
         self.structured_histories.append(list(history))
-        assert schema is RetrievalPlan
-        return (
-            RetrievalPlan(
-                searches=[
-                    RetrievalQuery(query="ana kural"),
-                    RetrievalQuery(query="istisnalar"),
-                    RetrievalQuery(query="ana kural"),
-                    RetrievalQuery(query="süre ve usul"),
-                    RetrievalQuery(query="fazladan sorgu"),
-                ]
-            ),
-            LLMUsage(input_tokens=500, output_tokens=80),
+        if schema is RetrievalPlan:
+            return (
+                RetrievalPlan(
+                    research_question="Transit süresi nedir?",
+                    searches=[
+                        RetrievalQuery(query="ana kural"),
+                        RetrievalQuery(query="istisnalar"),
+                        RetrievalQuery(query="ana kural"),
+                        RetrievalQuery(query="süre ve usul"),
+                        RetrievalQuery(query="fazladan sorgu"),
+                    ]
+                ),
+                LLMUsage(input_tokens=500, output_tokens=80),
+            )
+        assert schema is ResearchDecision
+        return self._decisions.pop(0), LLMUsage(
+            input_tokens=400, output_tokens=50
         )
 
     async def stream_text(self, history, system_prompt, *, thinking_level=None):
@@ -1111,7 +1129,7 @@ class TestStatelessParallelRetrieval:
 
         captured_candidates: list[RankedDocument] = []
 
-        def fake_global_rank(*, query, documents, limit):
+        def fake_global_rank(*, query, documents, limit, diversify=True):
             captured_candidates.extend(documents)
             return [
                 (document, 0.9 - index * 0.1)
@@ -1128,27 +1146,169 @@ class TestStatelessParallelRetrieval:
                 side_effect=fake_global_rank,
             ),
         ):
-            evidence = await agent.collect_parallel_indexed_evidence(
+            digest = await agent.collect_parallel_indexed_evidence(
                 "Transit süresi nedir?", calls
+            )
+            next_calls = await agent.review_indexed_evidence(
+                "Transit süresi nedir?"
             )
 
         assert len(captured_candidates) == 4  # shared hit deduplicated
-        assert evidence.count("ortak tam chunk") == 1
+        assert next_calls == []
+        assert digest.count("ortak tam chunk") == 1
         assert len(agent._chat_history) == 2
         assert agent._chat_history[0].text == (
             "Original question:\nTransit süresi nedir?"
         )
-        assert agent._chat_history[1].text == evidence
+        assert agent._chat_history[1].text.count("ortak tam chunk") == 1
         assert len(retrieval_events) == 1
-        assert retrieval_events[0].chunk_count == 4
+        # Four bounded digest entries went to the reviewer and the same four
+        # full chunks went once to final synthesis.
+        assert retrieval_events[0].chunk_count == 8
 
         answer = "".join(
             [part async for part in agent.stream_final_answer("fallback")]
         )
 
         assert answer == "nihai cevap"
-        assert agent.token_usage.api_calls == 2
-        assert agent.token_usage.total_tokens == 3280
-        assert len(client.structured_histories) == 1
+        assert agent.token_usage.api_calls == 3
+        assert agent.token_usage.total_tokens == 3730
+        assert len(client.structured_histories) == 2
         assert len(client.stream_histories) == 1
         assert len(client.stream_histories[0]) == 3  # question, evidence, final prompt
+        assert all(len(history) == 1 for history in client.structured_histories)
+
+    @pytest.mark.asyncio
+    async def test_opens_another_stateless_round_for_a_material_gap(self) -> None:
+        import fs_explorer_api.agent as agent_module
+
+        client = _StatelessRetrievalClient(
+            decisions=[
+                ResearchDecision(
+                    enough_evidence=False,
+                    reason="A specific force-majeure exception is unresolved.",
+                    additional_searches=[
+                        RetrievalQuery(query="mücbir sebep gecikme istisnası")
+                    ],
+                ),
+                ResearchDecision(
+                    enough_evidence=True,
+                    reason="The exception is now covered.",
+                    additional_searches=[],
+                ),
+            ]
+        )
+        agent = FsExplorerAgent(llm_client=client)
+        set_effort("low")
+
+        def fake_search(*, query, filters=None, as_of_date=None):
+            marker = (
+                "YENİ_İSTİSNA_KANITI"
+                if "mücbir" in query
+                else f"İLK_TUR_{query}"
+            )
+            return PlannedSearchResult(
+                query=query,
+                hits=[
+                    _search_hit(
+                        chunk_id=query.replace(" ", "_"),
+                        text=marker,
+                        score=0.8,
+                        position=1,
+                    )
+                ],
+            )
+
+        def fake_global_rank(*, query, documents, limit, diversify=True):
+            return [
+                (document, 0.95 - index * 0.01)
+                for index, document in enumerate(documents[:limit])
+            ]
+
+        with (
+            patch.object(
+                agent_module, "_run_planned_index_search", side_effect=fake_search
+            ),
+            patch.object(
+                agent_module.IndexedQueryEngine,
+                "rank_candidates",
+                side_effect=fake_global_rank,
+            ),
+        ):
+            first_calls = await agent.plan_indexed_retrieval("Soru")
+            await agent.collect_parallel_indexed_evidence("Soru", first_calls)
+            second_calls = await agent.review_indexed_evidence("Soru")
+            assert [call.to_fn_args()["query"] for call in second_calls] == [
+                "mücbir sebep gecikme istisnası"
+            ]
+
+            await agent.collect_parallel_indexed_evidence("Soru", second_calls)
+            assert await agent.review_indexed_evidence("Soru") == []
+
+        assert agent.prepared_indexed_evidence is True
+        assert "YENİ_İSTİSNA_KANITI" in agent._chat_history[1].text
+        # Planner + two fresh reviews; no accumulated review conversation.
+        assert len(client.structured_histories) == 3
+        assert all(len(history) == 1 for history in client.structured_histories)
+        assert "force-majeure exception" not in client.structured_histories[2][0].text
+
+    @pytest.mark.asyncio
+    async def test_round_limit_stops_without_an_extra_review_call(self) -> None:
+        import fs_explorer_api.agent as agent_module
+
+        client = _StatelessRetrievalClient(
+            decisions=[
+                ResearchDecision(
+                    enough_evidence=False,
+                    reason="Keep searching.",
+                    additional_searches=[RetrievalQuery(query="ikinci tur")],
+                ),
+                ResearchDecision(
+                    enough_evidence=False,
+                    reason="This decision must never be requested.",
+                    additional_searches=[RetrievalQuery(query="üçüncü tur")],
+                ),
+            ]
+        )
+        agent = FsExplorerAgent(llm_client=client)
+        set_effort("low")
+
+        def fake_search(*, query, filters=None, as_of_date=None):
+            return PlannedSearchResult(
+                query=query,
+                hits=[
+                    _search_hit(
+                        chunk_id=query.replace(" ", "_"),
+                        text=f"kanıt {query}",
+                        score=0.8,
+                        position=1,
+                    )
+                ],
+            )
+
+        def fake_rank(*, query, documents, limit, diversify=True):
+            return [(document, 0.8) for document in documents]
+
+        with (
+            patch.object(
+                agent_module, "_PARALLEL_ROUND_LIMITS", {"low": 2}
+            ),
+            patch.object(
+                agent_module, "_run_planned_index_search", side_effect=fake_search
+            ),
+            patch.object(
+                agent_module.IndexedQueryEngine,
+                "rank_candidates",
+                side_effect=fake_rank,
+            ),
+        ):
+            calls = await agent.plan_indexed_retrieval("Soru")
+            await agent.collect_parallel_indexed_evidence("Soru", calls)
+            calls = await agent.review_indexed_evidence("Soru")
+            await agent.collect_parallel_indexed_evidence("Soru", calls)
+            assert await agent.review_indexed_evidence("Soru") == []
+
+        assert agent.prepared_indexed_evidence is True
+        # Initial planner + first review only; the hard-cap path skips a
+        # pointless second review because it cannot authorize another round.
+        assert len(client.structured_histories) == 2

@@ -323,7 +323,11 @@ class IndexedQueryEngine:
 
     @staticmethod
     def rank_candidates(
-        *, query: str, documents: list[RankedDocument], limit: int
+        *,
+        query: str,
+        documents: list[RankedDocument],
+        limit: int,
+        diversify: bool = True,
     ) -> list[tuple[RankedDocument, float]]:
         """Cross-encoder rerank when available, falling back to the linear
         semantic/metadata heuristic in `rank_documents` on any failure.
@@ -344,6 +348,8 @@ class IndexedQueryEngine:
             )
             if pairs is not None:
                 ranked = [(documents[i], score) for i, score in pairs]
+                if not diversify:
+                    return ranked[: max(limit, 1)]
                 diversified = IndexedQueryEngine._diversify(
                     ranked, limit=limit, min_relevance=_RERANK_MIN_RELEVANCE
                 )
@@ -353,6 +359,8 @@ class IndexedQueryEngine:
             (doc, doc.combined_score)
             for doc in rank_documents(documents, limit=len(documents))
         ]
+        if not diversify:
+            return heuristic_ranked[: max(limit, 1)]
         return IndexedQueryEngine._diversify(
             heuristic_ranked, limit=limit, min_relevance=None
         )

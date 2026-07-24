@@ -418,6 +418,18 @@ class FsExplorerWorkflow(Workflow):
             await agent.collect_parallel_indexed_evidence(
                 state.initial_task, ev.tool_calls
             )
+            next_calls = await agent.review_indexed_evidence(state.initial_task)
+            if next_calls:
+                event = ToolBatchEvent(
+                    tool_calls=next_calls,
+                    reason=(
+                        "The bounded evidence review found a material gap; run "
+                        "another independent parallel retrieval round."
+                    ),
+                    stateless_retrieval=True,
+                )
+                ctx.write_event_to_stream(event)
+                return event
             return ExplorationEndEvent(
                 final_result=_INDEXED_FINAL_FALLBACK
             )
@@ -527,14 +539,21 @@ async def resume_agent_run(
         yield ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
         return
 
-    pending_searches = agent.planned_search_calls
-    if use_index and pending_searches:
-        yield ToolBatchEvent(
-            tool_calls=pending_searches,
-            reason="Resume the pending stateless parallel retrieval plan.",
-            stateless_retrieval=True,
-        )
-        await agent.collect_parallel_indexed_evidence(initial_task, pending_searches)
+    if use_index and agent.indexed_research_active:
+        while not agent.prepared_indexed_evidence:
+            pending_searches = agent.planned_search_calls
+            if pending_searches:
+                yield ToolBatchEvent(
+                    tool_calls=pending_searches,
+                    reason="Resume the pending stateless parallel retrieval round.",
+                    stateless_retrieval=True,
+                )
+                await agent.collect_parallel_indexed_evidence(
+                    initial_task, pending_searches
+                )
+            next_calls = await agent.review_indexed_evidence(initial_task)
+            if not next_calls:
+                break
         yield ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
         return
 

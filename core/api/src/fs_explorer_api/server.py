@@ -1073,9 +1073,10 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
         # which a single ToolBatchAction shares across 2-3 tool calls — not
         # precise enough to key a specific chat_research_steps row (keyed
         # by this WS layer's own per-tool_call step_number). Since exactly
-        # one retrieval_stats event fires per chunk-bearing tool_call, in
-        # the same order those tool_call events are sent (including within
-        # a batch — see agent.py's call_tools()), a plain FIFO queue of
+        # one retrieval_stats event normally fires per chunk-bearing
+        # tool_call. The adaptive stateless fan-out is the deliberate
+        # exception: one aggregate event per round describes exactly the
+        # bounded digest/full evidence exposed to LLM calls. A FIFO queue of
         # "step_numbers already sent for a chunk-bearing tool_call" lets
         # _flush_retrieval_stats() recover the right one deterministically.
         pending_retrieval_step_numbers: list[int] = []
@@ -1349,9 +1350,9 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
         # which a single ToolBatchAction shares across 2-3 tool calls — not
         # precise enough to key a specific chat_research_steps row (keyed
         # by this WS layer's own per-tool_call step_number). Since exactly
-        # one retrieval_stats event fires per chunk-bearing tool_call, in
-        # the same order those tool_call events are sent (including within
-        # a batch — see agent.py's call_tools()), a plain FIFO queue of
+        # one retrieval_stats event normally fires per chunk-bearing
+        # tool_call; adaptive stateless batches emit one aggregate event per
+        # round for the evidence actually exposed to LLM calls. A FIFO of
         # "step_numbers already sent for a chunk-bearing tool_call" lets
         # _flush_retrieval_stats() recover the right one deterministically.
         pending_retrieval_step_numbers: list[int] = []

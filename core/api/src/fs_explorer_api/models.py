@@ -133,10 +133,39 @@ class RetrievalQuery(BaseModel):
 class RetrievalPlan(BaseModel):
     """Small stateless fan-out plan generated in one cheap LLM call."""
 
+    research_question: str = Field(
+        description=(
+            "Concise standalone version of the current question, resolving only "
+            "conversation references needed for retrieval and later coverage checks"
+        )
+    )
     searches: list[RetrievalQuery] = Field(
         description=(
             "Three to five complementary, non-duplicate searches covering the "
             "main rule, exceptions, procedure, and likely cross-references"
+        )
+    )
+
+
+class ResearchDecision(BaseModel):
+    """Coordinator decision after one stateless parallel retrieval round."""
+
+    enough_evidence: bool = Field(
+        description=(
+            "True only when the available evidence can support a reliable, "
+            "complete answer without another search round"
+        )
+    )
+    reason: str = Field(
+        description=(
+            "Concise coverage assessment naming any material gap, conflict, "
+            "or unresolved cross-reference"
+        )
+    )
+    additional_searches: list[RetrievalQuery] = Field(
+        description=(
+            "New non-duplicate searches needed to close material gaps; empty "
+            "when enough_evidence is true"
         )
     )
 

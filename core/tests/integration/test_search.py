@@ -569,6 +569,46 @@ def test_indexed_query_engine_falls_back_when_reranker_returns_none(
     assert [hit.doc_id for hit in hits] == ["doc_c", "doc_b", "doc_a"]
 
 
+def test_rank_candidates_can_skip_diversification_for_adaptive_facets(
+    monkeypatch,
+) -> None:
+    from fs_explorer_api.search.ranker import RankedDocument
+
+    documents = [
+        RankedDocument(
+            doc_id="same_doc",
+            relative_path="rule.md",
+            absolute_path="/rule.md",
+            position=index,
+            text=f"facet {index}",
+            semantic_score=0.8,
+            metadata_score=0,
+            chunk_id=f"chunk_{index}",
+        )
+        for index in range(3)
+    ]
+    fake_reranker = Mock(
+        rerank=Mock(return_value=[(0, 0.9), (1, 0.8), (2, 0.7)])
+    )
+    monkeypatch.setattr(
+        "fs_explorer_api.search.query.get_reranker", lambda: fake_reranker
+    )
+
+    diversified = IndexedQueryEngine.rank_candidates(
+        query="q", documents=documents, limit=3
+    )
+    full_scored = IndexedQueryEngine.rank_candidates(
+        query="q", documents=documents, limit=3, diversify=False
+    )
+
+    assert len(diversified) == 2
+    assert [document.chunk_id for document, _score in full_scored] == [
+        "chunk_0",
+        "chunk_1",
+        "chunk_2",
+    ]
+
+
 def test_float_scoring_in_ranked_documents() -> None:
     from fs_explorer_api.search.ranker import RankedDocument, rank_documents
 

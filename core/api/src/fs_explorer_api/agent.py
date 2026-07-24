@@ -23,7 +23,9 @@ from .models import (
     Action,
     ActionType,
     ContextSummary,
+    ResearchDecision,
     RetrievalPlan,
+    RetrievalQuery,
     StopAction,
     ToolCallAction,
     ToolCallArg,
@@ -189,6 +191,9 @@ def _normalize_indexed_text(value: str) -> str:
 # runaway step count that was the actual dominant driver of total cost.
 _DUPLICATE_CALL_LOOKBACK = 5
 _DUPLICATE_QUERY_SIMILARITY_THRESHOLD = 0.6
+_ADAPTIVE_QUERY_SIMILARITY_THRESHOLD = float(
+    os.getenv("FS_EXPLORER_ADAPTIVE_QUERY_SIMILARITY_THRESHOLD", "0.85")
+)
 _FUZZY_DEDUP_GROUPS = {"semantic_search", "grep", "glob"}
 
 # parse_file/get_document/read all resolve to the exact same content
@@ -508,6 +513,10 @@ _EFFORT_LEVELS: dict[str, dict[str, int]] = {
     "high": {"default_limit": 12, "max_limit": 20, "overfetch_multiplier": 6},
 }
 _PARALLEL_QUERY_COUNTS = {"low": 3, "medium": 4, "high": 5}
+_PARALLEL_ROUND_LIMITS = {"low": 3, "medium": 4, "high": 5}
+_EVIDENCE_DIGEST_EXCERPT_CHARS = int(
+    os.getenv("FS_EXPLORER_EVIDENCE_DIGEST_EXCERPT_CHARS", "500")
+)
 _EFFORT_VAR: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_EFFORT", default=DEFAULT_EFFORT
 )
@@ -1614,7 +1623,19 @@ exceptions, procedure/deadlines, definitions, and likely cross-references.
 Avoid paraphrase duplicates. Use the question's language. Set `as_of_date`
 only when the question names a historical date. Set `filters` only for an
 explicit metadata constraint you can express reliably; otherwise use null.
-Keep every query concise.
+Resolve any necessary conversation reference into a concise standalone
+`research_question`; do not copy unrelated chat context. Keep every query concise.
+"""
+
+RESEARCH_COORDINATOR_PROMPT = """Assess evidence coverage; do not answer the user.
+
+You receive a fresh, bounded evidence inventory rather than prior agent chat.
+Set `enough_evidence=true` only when the main rule and every material part of
+the question are supported. Request another parallel round when a meaningful
+gap, contradiction, exception, definition, date issue, or unresolved
+cross-reference remains. Do not search merely to reconfirm an already
+supported point. Additional searches must be standalone, complementary, and
+different from the listed searches already run. Keep the reason concise.
 """
 
 
@@ -1768,6 +1789,17 @@ class FsExplorerAgent:
         self._recent_tool_calls: list[tuple[str, str]] = []
         self._planned_search_calls: list[ToolCallAction] = []
         self._prepared_indexed_evidence = False
+        self._indexed_research_active = False
+        self._indexed_research_question = ""
+        self._indexed_evidence_candidates: dict[str, RankedDocument] = {}
+        self._ranked_indexed_evidence: list[tuple[RankedDocument, float]] = []
+        self._executed_indexed_queries: list[str] = []
+        self._executed_indexed_search_keys: set[tuple[str, str, str]] = set()
+        self._indexed_query_candidate_keys: dict[
+            tuple[str, str, str], list[str]
+        ] = {}
+        self._indexed_retrieval_rounds = 0
+        self._indexed_no_novelty_rounds = 0
         # Set when take_action() hits the _MAX_STEPS safety net rather than
         # the model choosing to stop on its own — the run technically
         # "completed" (no error), but the answer may be an unsatisfying
@@ -1789,6 +1821,11 @@ class FsExplorerAgent:
     def prepared_indexed_evidence(self) -> bool:
         """Whether the stateless indexed path is ready for final synthesis."""
         return self._prepared_indexed_evidence
+
+    @property
+    def indexed_research_active(self) -> bool:
+        """Whether an adaptive stateless indexed research run is in progress."""
+        return self._indexed_research_active
 
     @property
     def planned_search_calls(self) -> list[ToolCallAction]:
@@ -1832,11 +1869,10 @@ class FsExplorerAgent:
     def _report_retrieval(self, tool_name: str, chunk_count: int, chars: int) -> None:
         # Fires for every chunk-bearing call, even a genuine chunk_count=0
         # (e.g. a get_document on a doc_id with no indexed chunks) — not
-        # just when chunks were actually found. server.py's WS layer relies
-        # on exactly one retrieval_stats event per chunk-bearing tool_call
-        # event (including within a batch) to correlate the two in order;
-        # skipping zero-chunk calls here would silently desync that
-        # correlation for every call after the first zero-chunk one.
+        # just when chunks were actually found. Ordinary tool execution emits
+        # one event per chunk-bearing call. Adaptive stateless retrieval calls
+        # this once per parallel round with the bounded digest/full evidence
+        # actually exposed to its coordinator/final synthesis.
         if self._on_retrieval is None or tool_name not in CHUNK_BEARING_TOOLS:
             return
         self._on_retrieval(
@@ -1893,39 +1929,36 @@ class FsExplorerAgent:
         """
         self._on_retrieval = on_retrieval
 
-    async def plan_indexed_retrieval(self, task: str) -> list[ToolCallAction]:
-        """Create one bounded fan-out plan without adding it to chat history."""
-        self._step_count += 1
+    def _retrieval_calls(
+        self,
+        searches: list[RetrievalQuery],
+        *,
+        task: str,
+        allow_fallback: bool,
+    ) -> list[ToolCallAction]:
+        """Normalize, bound, and de-duplicate coordinator search requests."""
         max_queries = _PARALLEL_QUERY_COUNTS.get(get_effort(), 3)
-        try:
-            plan, usage = await self._llm.generate_structured(
-                [ChatTurn(role="user", text=task)],
-                RETRIEVAL_PLANNER_PROMPT
-                + f"\nReturn at most {max_queries} searches for this effort level.",
-                RetrievalPlan,
-                thinking_level="low",
-            )
-            self.token_usage.add_api_call(
-                prompt_tokens=usage.input_tokens,
-                completion_tokens=usage.output_tokens,
-                thinking_tokens=usage.thinking_tokens,
-            )
-            await self._report_llm_call("retrieval_plan", usage)
-            planned = plan.searches
-        except Exception:
-            logger.exception(
-                "plan_indexed_retrieval: planner failed; using original question"
-            )
-            planned = []
-
+        accepted: list[tuple[str, str, str]] = []
         calls: list[ToolCallAction] = []
-        seen: set[str] = set()
-        for search in planned:
+        for search in searches:
             query = " ".join(search.query.split()).strip()
-            normalized = query.casefold()
-            if not query or normalized in seen:
+            if not query:
                 continue
-            seen.add(normalized)
+            filters = " ".join((search.filters or "").split()).casefold()
+            as_of_date = (search.as_of_date or "").strip()
+            key = (query.casefold(), filters, as_of_date)
+            comparable = [
+                prior
+                for prior in [*self._executed_indexed_search_keys, *accepted]
+                if prior[1:] == key[1:]
+            ]
+            if key in self._executed_indexed_search_keys or any(
+                _query_token_overlap(query, prior[0])
+                >= _ADAPTIVE_QUERY_SIMILARITY_THRESHOLD
+                for prior in comparable
+            ):
+                continue
+            accepted.append(key)
             args = [ToolCallArg(parameter_name="query", parameter_value=query)]
             if search.filters:
                 args.append(
@@ -1946,7 +1979,7 @@ class FsExplorerAgent:
             if len(calls) >= max_queries:
                 break
 
-        if not calls:
+        if allow_fallback and not calls:
             calls = [
                 ToolCallAction(
                     tool_name="semantic_search",
@@ -1955,6 +1988,43 @@ class FsExplorerAgent:
                     ],
                 )
             ]
+        return calls
+
+    async def plan_indexed_retrieval(self, task: str) -> list[ToolCallAction]:
+        """Create the first fan-out plan without starting a growing history."""
+        self._step_count += 1
+        self._indexed_research_active = True
+        max_queries = _PARALLEL_QUERY_COUNTS.get(get_effort(), 3)
+        try:
+            plan, usage = await self._llm.generate_structured(
+                [ChatTurn(role="user", text=task)],
+                RETRIEVAL_PLANNER_PROMPT
+                + f"\nReturn at most {max_queries} searches for this effort level.",
+                RetrievalPlan,
+                thinking_level="low",
+            )
+            self.token_usage.add_api_call(
+                prompt_tokens=usage.input_tokens,
+                completion_tokens=usage.output_tokens,
+                thinking_tokens=usage.thinking_tokens,
+            )
+            await self._report_llm_call("retrieval_plan", usage)
+            planned = plan.searches
+            research_question = " ".join(plan.research_question.split()).strip()
+        except Exception:
+            logger.exception(
+                "plan_indexed_retrieval: planner failed; using original question"
+            )
+            planned = []
+            research_question = ""
+
+        if not research_question:
+            marker = "\n\nCurrent question:\n"
+            research_question = task.rsplit(marker, 1)[-1].strip() or task
+        self._indexed_research_question = research_question
+        calls = self._retrieval_calls(
+            planned, task=research_question, allow_fallback=True
+        )
         self._planned_search_calls = calls
         return list(calls)
 
@@ -1963,76 +2033,180 @@ class FsExplorerAgent:
         task: str,
         calls: list[ToolCallAction] | None = None,
     ) -> str:
-        """Run searches concurrently and retain only global reranked evidence."""
+        """Run one independent search round and update the server-side evidence pool."""
         resolved_calls = list(calls or self._planned_search_calls)
         if not resolved_calls:
             resolved_calls = await self.plan_indexed_retrieval(task)
+        research_question = self._indexed_research_question or task
 
         async def execute(call: ToolCallAction) -> PlannedSearchResult:
             args = call.to_fn_args()
-            return await asyncio.to_thread(
-                _run_planned_index_search,
-                query=str(args.get("query") or task),
-                filters=(
-                    str(args["filters"])
-                    if args.get("filters") is not None
-                    else None
-                ),
-                as_of_date=(
-                    str(args["as_of_date"])
-                    if args.get("as_of_date") is not None
-                    else None
-                ),
-            )
+            query = str(args.get("query") or research_question)
+            try:
+                return await asyncio.to_thread(
+                    _run_planned_index_search,
+                    query=query,
+                    filters=(
+                        str(args["filters"])
+                        if args.get("filters") is not None
+                        else None
+                    ),
+                    as_of_date=(
+                        str(args["as_of_date"])
+                        if args.get("as_of_date") is not None
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                return PlannedSearchResult(query=query, hits=[], error=str(exc))
 
         search_results = await asyncio.gather(
             *(execute(call) for call in resolved_calls)
         )
-        unique_hits: dict[str, SearchHit] = {}
-        for result in search_results:
+        prior_candidate_count = len(self._indexed_evidence_candidates)
+        for call, result in zip(resolved_calls, search_results):
+            call_args = call.to_fn_args()
+            query = str(call_args.get("query") or research_question)
+            self._executed_indexed_queries.append(query)
+            search_key = (
+                query.casefold(),
+                " ".join(str(call_args.get("filters") or "").split()).casefold(),
+                str(call_args.get("as_of_date") or "").strip(),
+            )
+            self._executed_indexed_search_keys.add(search_key)
+            query_candidate_keys: list[str] = []
             for hit in result.hits:
                 key = hit.chunk_id or f"{hit.doc_id}:{hit.position}"
-                prior = unique_hits.get(key)
-                if prior is None or hit.score > prior.score:
-                    unique_hits[key] = hit
+                query_candidate_keys.append(key)
+                candidate = RankedDocument(
+                    doc_id=hit.doc_id,
+                    relative_path=hit.relative_path,
+                    absolute_path=hit.absolute_path,
+                    position=hit.position,
+                    text=hit.text,
+                    semantic_score=hit.semantic_score,
+                    metadata_score=hit.metadata_score,
+                    chunk_id=hit.chunk_id,
+                    chunk_type=hit.chunk_type,
+                    metadata=hit.metadata,
+                )
+                prior = self._indexed_evidence_candidates.get(key)
+                if prior is None or candidate.combined_score > prior.combined_score:
+                    self._indexed_evidence_candidates[key] = candidate
+            self._indexed_query_candidate_keys[search_key] = query_candidate_keys
 
-        candidates = [
-            RankedDocument(
-                doc_id=hit.doc_id,
-                relative_path=hit.relative_path,
-                absolute_path=hit.absolute_path,
-                position=hit.position,
-                text=hit.text,
-                semantic_score=hit.semantic_score,
-                metadata_score=hit.metadata_score,
-                chunk_id=hit.chunk_id,
-                chunk_type=hit.chunk_type,
-                metadata=hit.metadata,
-            )
-            for hit in unique_hits.values()
-        ]
-        ranked = (
+        if len(self._indexed_evidence_candidates) == prior_candidate_count:
+            self._indexed_no_novelty_rounds += 1
+        else:
+            self._indexed_no_novelty_rounds = 0
+        self._indexed_retrieval_rounds += 1
+        self._planned_search_calls.clear()
+
+        candidates = list(self._indexed_evidence_candidates.values())
+        fully_ranked = (
             await asyncio.to_thread(
                 IndexedQueryEngine.rank_candidates,
-                query=task,
+                query=research_question,
                 documents=candidates,
-                limit=_effort_config()["default_limit"],
+                limit=max(len(candidates), 1),
+                diversify=False,
             )
             if candidates
             else []
         )
+        self._ranked_indexed_evidence = self._select_diverse_indexed_evidence(
+            fully_ranked
+        )
+        return self._indexed_evidence_digest(task)
 
-        queries = [
-            str(call.to_fn_args().get("query") or task) for call in resolved_calls
-        ]
+    def _select_diverse_indexed_evidence(
+        self, ranked: list[tuple[RankedDocument, float]]
+    ) -> list[tuple[RankedDocument, float]]:
+        """Reserve recent facet hits, then fill the fixed budget globally."""
+        budget = _effort_config()["default_limit"]
+        by_key = {
+            (document.chunk_id or f"{document.doc_id}:{document.position}"): (
+                document,
+                score,
+            )
+            for document, score in ranked
+        }
+        selected: list[tuple[RankedDocument, float]] = []
+        selected_keys: set[str] = set()
+
+        # New follow-up facets are the easiest to lose in a global top-K.
+        # Reserve at most half the budget for their strongest novel hits.
+        reserve_budget = max(1, budget // 2)
+        for search_key in reversed(list(self._indexed_query_candidate_keys)):
+            if len(selected) >= reserve_budget:
+                break
+            for candidate_key in self._indexed_query_candidate_keys[search_key]:
+                item = by_key.get(candidate_key)
+                if item is None or candidate_key in selected_keys:
+                    continue
+                selected.append(item)
+                selected_keys.add(candidate_key)
+                break
+
+        for document, score in ranked:
+            candidate_key = document.chunk_id or f"{document.doc_id}:{document.position}"
+            if candidate_key in selected_keys:
+                continue
+            selected.append((document, score))
+            selected_keys.add(candidate_key)
+            if len(selected) >= budget:
+                break
+        return sorted(selected, key=lambda item: item[1], reverse=True)
+
+    def _indexed_evidence_digest(self, task: str) -> str:
+        """Build the bounded, history-free inventory seen by the coordinator."""
+        research_question = self._indexed_research_question or task
         lines = [
-            "=== PARALLEL RETRIEVAL EVIDENCE ===",
-            "Queries ran independently without sharing chat history.",
-            "Queries:",
-            *(f"- {query}" for query in queries),
+            f"QUESTION:\n{research_question}",
+            "",
+            f"SEARCH ROUNDS COMPLETED: {self._indexed_retrieval_rounds}",
+            "SEARCHES ALREADY RUN:",
+            *(f"- {query}" for query in self._executed_indexed_queries),
+            "",
+            "CURRENT EVIDENCE INVENTORY:",
+        ]
+        if not self._ranked_indexed_evidence:
+            lines.append("No relevant indexed chunks found yet.")
+            return "\n".join(lines)
+
+        for index, (candidate, score) in enumerate(
+            self._ranked_indexed_evidence, start=1
+        ):
+            title = _display_name(
+                {
+                    "relative_path": candidate.relative_path,
+                    "absolute_path": candidate.absolute_path,
+                }
+            )
+            locator = _chunk_locator({"metadata": candidate.metadata})
+            excerpt = re.sub(r"\s+", " ", candidate.text).strip()
+            excerpt = excerpt[: max(_EVIDENCE_DIGEST_EXCERPT_CHARS, 100)]
+            lines.extend(
+                [
+                    f"[{index}] doc_id: {candidate.doc_id}",
+                    f"    title: {title}",
+                    f"    chunk_id: {candidate.chunk_id or '<unknown>'}",
+                    f"    locator: {locator or '<none>'}",
+                    f"    relevance: {score:.3f}",
+                    f"    evidence_excerpt: {excerpt}",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _render_final_indexed_evidence(self) -> str:
+        lines = [
+            "=== ADAPTIVE PARALLEL RETRIEVAL EVIDENCE ===",
+            "Only globally selected full chunks are included below.",
             "",
         ]
-        for index, (candidate, score) in enumerate(ranked, start=1):
+        for index, (candidate, score) in enumerate(
+            self._ranked_indexed_evidence, start=1
+        ):
             lines.extend(
                 _render_full_chunk_result(
                     index=index,
@@ -2054,26 +2228,76 @@ class FsExplorerAgent:
                     metadata_score=candidate.metadata_score,
                 )
             )
-        if not ranked:
-            errors = [result.error for result in search_results if result.error]
-            lines.append("No indexed evidence was found.")
-            if errors:
-                lines.append("Retrieval errors: " + "; ".join(errors[:3]))
+        if not self._ranked_indexed_evidence:
+            lines.append("No indexed evidence was found after adaptive retrieval.")
+        return "\n".join(lines)
 
-        evidence = "\n".join(lines)
+    def _record_coordinator_evidence(
+        self, digest: str, final_evidence: str | None = None
+    ) -> None:
+        """Record exactly the retrieval-derived text sent to LLM calls this round."""
+        exposed = digest if final_evidence is None else f"{digest}\n\n{final_evidence}"
         chunk_count, chars = self.token_usage.add_tool_result(
-            evidence, "semantic_search"
+            exposed, "semantic_search"
         )
         self._report_retrieval("semantic_search", chunk_count, chars)
-        # The final model sees selected evidence exactly once—never planner
-        # JSON or intermediate per-query result turns.
+
+    def _finalize_indexed_evidence(self, task: str, digest: str) -> None:
+        final_evidence = self._render_final_indexed_evidence()
+        self._record_coordinator_evidence(digest, final_evidence)
         self._chat_history = [
             ChatTurn(role="user", text=f"Original question:\n{task}"),
-            ChatTurn(role="user", text=evidence),
+            ChatTurn(role="user", text=final_evidence),
         ]
         self._planned_search_calls.clear()
         self._prepared_indexed_evidence = True
-        return evidence
+        self._indexed_research_active = False
+
+    async def review_indexed_evidence(self, task: str) -> list[ToolCallAction]:
+        """Decide from a fresh compact inventory whether another round is useful."""
+        digest = self._indexed_evidence_digest(task)
+        round_limit = _PARALLEL_ROUND_LIMITS.get(get_effort(), 3)
+        if (
+            self._indexed_retrieval_rounds >= round_limit
+            or self._indexed_no_novelty_rounds >= 2
+        ):
+            self._finalize_indexed_evidence(task, digest)
+            return []
+
+        self._step_count += 1
+        try:
+            decision, usage = await self._llm.generate_structured(
+                [ChatTurn(role="user", text=digest)],
+                RESEARCH_COORDINATOR_PROMPT,
+                ResearchDecision,
+                thinking_level="low",
+            )
+            self.token_usage.add_api_call(
+                prompt_tokens=usage.input_tokens,
+                completion_tokens=usage.output_tokens,
+                thinking_tokens=usage.thinking_tokens,
+            )
+            await self._report_llm_call("evidence_review", usage)
+        except Exception:
+            logger.exception(
+                "review_indexed_evidence: coordinator failed; synthesizing "
+                "from current evidence"
+            )
+            self._finalize_indexed_evidence(task, digest)
+            return []
+
+        next_calls = self._retrieval_calls(
+            decision.additional_searches,
+            task=task,
+            allow_fallback=False,
+        )
+        if decision.enough_evidence or not next_calls:
+            self._finalize_indexed_evidence(task, digest)
+            return []
+
+        self._record_coordinator_evidence(digest)
+        self._planned_search_calls = next_calls
+        return list(next_calls)
 
     async def take_action(self) -> tuple[Action, ActionType] | None:
         """
@@ -2366,4 +2590,13 @@ class FsExplorerAgent:
         self._recent_tool_calls.clear()
         self._planned_search_calls.clear()
         self._prepared_indexed_evidence = False
+        self._indexed_research_active = False
+        self._indexed_research_question = ""
+        self._indexed_evidence_candidates.clear()
+        self._ranked_indexed_evidence.clear()
+        self._executed_indexed_queries.clear()
+        self._executed_indexed_search_keys.clear()
+        self._indexed_query_candidate_keys.clear()
+        self._indexed_retrieval_rounds = 0
+        self._indexed_no_novelty_rounds = 0
         self._forced_stop = False

@@ -15,9 +15,11 @@ from fs_explorer_api.agent import LLMCallStats
 from fs_explorer_api.llm.base import LLMUsage
 from fs_explorer_api.models import (
     JudgmentResult,
+    ResearchDecision,
     RetrievalPlan,
     RetrievalQuery,
 )
+from fs_explorer_api.search import SearchHit
 
 
 class _FakeStorage:
@@ -59,8 +61,25 @@ class _StopActionClient:
         self, history, system_prompt, schema, *, thinking_level=None
     ):
         self.structured_calls += 1
+        if schema is ResearchDecision:
+            return (
+                ResearchDecision(
+                    enough_evidence=True,
+                    reason="Enough for the benchmark.",
+                    additional_searches=[],
+                ),
+                LLMUsage(
+                    input_tokens=100,
+                    output_tokens=20,
+                    billed_cost_usd=Decimal("0.0010"),
+                    cost_source="provider",
+                ),
+            )
         return (
-            RetrievalPlan(searches=[RetrievalQuery(query="transit penalty")]),
+            RetrievalPlan(
+                research_question="What is the transit penalty?",
+                searches=[RetrievalQuery(query="transit penalty")],
+            ),
             LLMUsage(
                 input_tokens=100,
                 output_tokens=20,
@@ -92,6 +111,32 @@ class _RaisingClient:
 
     def last_stream_usage(self):
         return None
+
+
+class _AdaptiveRoundClient(_StopActionClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reviews = 0
+
+    async def generate_structured(
+        self, history, system_prompt, schema, *, thinking_level=None
+    ):
+        if schema is ResearchDecision:
+            self.structured_calls += 1
+            self.reviews += 1
+            return (
+                ResearchDecision(
+                    enough_evidence=self.reviews >= 2,
+                    reason="covered" if self.reviews >= 2 else "exception missing",
+                    additional_searches=[]
+                    if self.reviews >= 2
+                    else [RetrievalQuery(query="force majeure exception")],
+                ),
+                LLMUsage(input_tokens=100, output_tokens=20),
+            )
+        return await super().generate_structured(
+            history, system_prompt, schema, thinking_level=thinking_level
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -139,10 +184,10 @@ class TestRunAgenticSession:
             "cost_usd",
             "cost_source",
         }
-        # One structured (action) call + one streamed final-answer call.
-        assert result.stats["api_calls"] == 2
+        # One planner + one bounded evidence review + one final answer.
+        assert result.stats["api_calls"] == 3
         assert result.stats["cost_source"] == "provider"
-        assert result.stats["cost_usd"] == "0.0015"
+        assert result.stats["cost_usd"] == "0.0025"
 
     @pytest.mark.asyncio
     async def test_raises_when_no_folder_is_indexed(self, monkeypatch) -> None:
@@ -164,15 +209,62 @@ class TestRunAgenticSession:
         assert _index_tools_available() is False
 
     @pytest.mark.asyncio
+    async def test_runs_an_adaptive_second_parallel_round(self, monkeypatch) -> None:
+        client = _AdaptiveRoundClient()
+        monkeypatch.setattr(benchmark_runner_mod, "PostgresStorage", _FakeStorage)
+        monkeypatch.setattr("fs_explorer_api.agent.PostgresStorage", _FakeStorage)
+        monkeypatch.setattr(
+            "fs_explorer_api.agent.get_llm_client", lambda **_kwargs: client
+        )
+        def fake_search(**kwargs):
+            query = kwargs["query"]
+            return PlannedSearchResult(
+                query=query,
+                hits=[
+                    SearchHit(
+                        doc_id=f"doc_{len(query)}",
+                        relative_path=f"{len(query)}.md",
+                        absolute_path=f"/{len(query)}.md",
+                        position=0,
+                        text=f"evidence for {query}",
+                        semantic_score=0.8,
+                        metadata_score=0,
+                        score=0.8,
+                        matched_by="semantic",
+                        chunk_id=f"chunk_{len(query)}",
+                    )
+                ],
+            )
+
+        monkeypatch.setattr(
+            "fs_explorer_api.agent._run_planned_index_search", fake_search
+        )
+
+        result = await run_agentic_session(
+            task="What is the transit penalty and its exception?",
+            index_folders=["virtual://corpus-1"],
+            database_url="postgresql://test/test",
+        )
+
+        assert result.error is None
+        assert result.final_result == "benchmark answer"
+        assert client.reviews == 2
+        assert result.stats["api_calls"] == 4
+        assert result.stats["steps"] == 2
+
+    @pytest.mark.asyncio
     async def test_clears_index_context_when_the_run_raises(self, monkeypatch) -> None:
         monkeypatch.setattr(benchmark_runner_mod, "PostgresStorage", _FakeStorage)
         monkeypatch.setattr("fs_explorer_api.agent.PostgresStorage", _FakeStorage)
         monkeypatch.setattr(
             "fs_explorer_api.agent.get_llm_client", lambda **_kwargs: _RaisingClient()
         )
+        async def raise_during_collection(self, task, calls=None):
+            raise RuntimeError("boom")
+
         monkeypatch.setattr(
-            "fs_explorer_api.agent._run_planned_index_search",
-            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+            "fs_explorer_api.agent.FsExplorerAgent.collect_parallel_indexed_evidence",
+            raise_during_collection,
         )
 
         with pytest.raises(RuntimeError, match="boom"):
