@@ -111,7 +111,7 @@ class WorkflowState(BaseModel):
     use_index: bool = False
     enable_semantic: bool = False
     enable_metadata: bool = False
-    effort: str = "medium"
+    effort: str = "low"
 
 
 class InputEvent(StartEvent):
@@ -122,7 +122,7 @@ class InputEvent(StartEvent):
     use_index: bool = False
     enable_semantic: bool = False
     enable_metadata: bool = False
-    effort: str = "medium"
+    effort: str = "low"
 
 
 class GoDeeperEvent(Event):

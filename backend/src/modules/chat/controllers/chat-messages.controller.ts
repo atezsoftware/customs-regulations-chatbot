@@ -22,7 +22,7 @@ interface SendMessageBody {
 }
 
 const EFFORT_LEVELS: ChatEffortLevel[] = ['low', 'medium', 'high'];
-const DEFAULT_EFFORT: ChatEffortLevel = 'medium';
+const DEFAULT_EFFORT: ChatEffortLevel = 'low';
 
 export function parseEffort(effort: string | undefined): ChatEffortLevel {
   if (effort === undefined) return DEFAULT_EFFORT;

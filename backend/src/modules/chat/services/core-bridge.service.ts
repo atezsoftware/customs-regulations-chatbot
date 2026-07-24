@@ -225,7 +225,7 @@ export class CoreBridgeService {
                 provider: session.llmProvider,
                 model: session.model,
                 temperature: session.temperature,
-                effort: input.effort ?? 'medium',
+                effort: input.effort ?? 'low',
               },
         ),
       );

@@ -87,7 +87,11 @@ export function ChatPage() {
   const [savingLinks, setSavingLinks] = useState(false);
   const [sending, setSending] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
-  const [effort, setEffort] = useState<ChatEffortLevel>('medium');
+  // Defaults to "low" ("Fast"), not "medium" — "low" is tuned to match the
+  // pre-effort baseline exactly (see agent.py's EffortLevel comment), so a
+  // user who never touches the selector gets unchanged cost/behavior;
+  // "medium"/"high" are opt-in increases in depth and cost.
+  const [effort, setEffort] = useState<ChatEffortLevel>('low');
 
   useEffect(() => {
     Promise.all([chatSessionsApi.list(), directoriesApi.list(), llmModelsApi.list().catch(() => null)])

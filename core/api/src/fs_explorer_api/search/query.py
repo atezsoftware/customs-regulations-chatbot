@@ -8,11 +8,22 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+import os
+
 from fs_explorer_shared.embeddings import EmbeddingProvider
 from fs_explorer_shared.storage import StorageBackend
 from ..rerank import get_reranker
 from .filters import MetadataFilter, parse_metadata_filters
 from .ranker import RankedDocument, rank_documents
+
+# Without these, a handful of near-duplicate/overlapping chunks from the
+# same source document can crowd out genuinely different sources in the
+# final top-K — reducing `limit` alone doesn't help if most of what
+# survives is redundant. `_RERANK_MIN_RELEVANCE` only applies to real
+# cross-encoder scores (0-1 range); the heuristic combined_score is a
+# different scale entirely, so it's skipped there.
+_MAX_CHUNKS_PER_DOCUMENT = int(os.getenv("FS_EXPLORER_MAX_CHUNKS_PER_DOCUMENT", "2"))
+_RERANK_MIN_RELEVANCE = float(os.getenv("FS_EXPLORER_RERANK_MIN_RELEVANCE", "0.05"))
 
 
 @dataclass(frozen=True)
@@ -309,9 +320,50 @@ class IndexedQueryEngine:
         alone and silently undoing the rerank ordering."""
         reranker = get_reranker()
         if reranker is not None and len(documents) > 1:
-            pairs = reranker.rerank(query, [doc.text for doc in documents], top_n=limit)
+            # Ask for the full ranked order (not just `limit`) so
+            # `_diversify` has enough candidates to backfill from after
+            # dropping near-duplicates/low-relevance ones.
+            pairs = reranker.rerank(
+                query, [doc.text for doc in documents], top_n=len(documents)
+            )
             if pairs is not None:
-                return [(documents[i], score) for i, score in pairs][:limit]
-        return [
-            (doc, doc.combined_score) for doc in rank_documents(documents, limit=limit)
+                ranked = [(documents[i], score) for i, score in pairs]
+                diversified = IndexedQueryEngine._diversify(
+                    ranked, limit=limit, min_relevance=_RERANK_MIN_RELEVANCE
+                )
+                if diversified:
+                    return diversified
+        heuristic_ranked = [
+            (doc, doc.combined_score)
+            for doc in rank_documents(documents, limit=len(documents))
         ]
+        return IndexedQueryEngine._diversify(
+            heuristic_ranked, limit=limit, min_relevance=None
+        )
+
+    @staticmethod
+    def _diversify(
+        ranked: list[tuple[RankedDocument, float]],
+        *,
+        limit: int,
+        min_relevance: float | None,
+    ) -> list[tuple[RankedDocument, float]]:
+        """Trim a fully-ranked candidate list down to `limit`, capping how
+        many chunks from the same source document can appear (so a handful
+        of overlapping/near-duplicate chunks from one document can't crowd
+        out other sources) and dropping anything below `min_relevance` when
+        set. Walks the full ranked order so a document hitting its cap or a
+        below-threshold chunk is simply skipped in favor of the next
+        distinct, qualifying one — not just truncated."""
+        per_doc_count: dict[str, int] = {}
+        result: list[tuple[RankedDocument, float]] = []
+        for doc, score in ranked:
+            if min_relevance is not None and score < min_relevance:
+                continue
+            if per_doc_count.get(doc.doc_id, 0) >= _MAX_CHUNKS_PER_DOCUMENT:
+                continue
+            per_doc_count[doc.doc_id] = per_doc_count.get(doc.doc_id, 0) + 1
+            result.append((doc, score))
+            if len(result) >= limit:
+                break
+        return result

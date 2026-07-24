@@ -418,18 +418,24 @@ def get_search_flags() -> tuple[bool, bool]:
 
 # User-selectable per-message retrieval breadth. Unlike `limit` being a mere
 # suggestion the model could previously override to any value, this is a
-# hard ceiling — see `semantic_search`'s `effective_limit` below — so a user
-# picking "low" always gets a cheaper/faster run regardless of what the
-# model itself asks for.
+# hard ceiling — see `semantic_search`'s `effective_limit` below. "low" is
+# deliberately tuned to match the old (pre-effort) unconditional behavior
+# (`limit=5`, `overfetch_multiplier=4`) rather than cutting below it —
+# retrieving fewer/shallower chunks doesn't save tokens if the model just
+# compensates with extra `semantic_search`/`get_document` round trips, each
+# of which resends the entire accumulated history plus (for `get_document`)
+# up to 15,000 chars of chunk text. So "low" is the safe floor (never worse
+# than before this feature existed) and "medium"/"high" are opt-in increases
+# in depth/cost, not "low" being an opt-in decrease.
 EffortLevel = Literal["low", "medium", "high"]
-DEFAULT_EFFORT: EffortLevel = "medium"
+DEFAULT_EFFORT: EffortLevel = "low"
 # Keyed by plain `str`, not `EffortLevel` — looked up with `_EFFORT_VAR.get()`,
 # which is a `str` since it's fed by arbitrary client-supplied WS input
 # (validated/defaulted in `set_effort`, not narrowed at the type level).
 _EFFORT_LEVELS: dict[str, dict[str, int]] = {
-    "low": {"default_limit": 3, "max_limit": 5, "overfetch_multiplier": 3},
-    "medium": {"default_limit": 5, "max_limit": 8, "overfetch_multiplier": 4},
-    "high": {"default_limit": 10, "max_limit": 15, "overfetch_multiplier": 6},
+    "low": {"default_limit": 5, "max_limit": 6, "overfetch_multiplier": 4},
+    "medium": {"default_limit": 8, "max_limit": 10, "overfetch_multiplier": 5},
+    "high": {"default_limit": 12, "max_limit": 20, "overfetch_multiplier": 6},
 }
 _EFFORT_VAR: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_EFFORT", default=DEFAULT_EFFORT

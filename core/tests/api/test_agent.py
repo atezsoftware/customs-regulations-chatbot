@@ -692,7 +692,10 @@ class TestEffortLevels:
             agent_module.semantic_search("query", limit=limit)
         return _RecordingEngine.calls[-1]
 
-    def test_default_effort_uses_medium_defaults(self) -> None:
+    def test_default_effort_matches_low_baseline(self) -> None:
+        # DEFAULT_EFFORT is "low", tuned to match the pre-effort behavior
+        # exactly (limit=5, overfetch_multiplier=4) — never a regression
+        # for callers that omit `effort` entirely.
         call = self._run_semantic_search()
         assert call["limit"] == 5
         assert call["overfetch_multiplier"] == 4
@@ -700,13 +703,13 @@ class TestEffortLevels:
     def test_low_effort_caps_limit_even_when_model_asks_for_more(self) -> None:
         set_effort("low")
         call = self._run_semantic_search(limit=100)
-        assert call["limit"] == 5  # low's max_limit — a hard ceiling
-        assert call["overfetch_multiplier"] == 3
+        assert call["limit"] == 6  # low's max_limit — a hard ceiling
+        assert call["overfetch_multiplier"] == 4
 
     def test_high_effort_default_limit_applies_when_model_omits_limit(self) -> None:
         set_effort("high")
         call = self._run_semantic_search(limit=None)
-        assert call["limit"] == 10  # high's default_limit
+        assert call["limit"] == 12  # high's default_limit
         assert call["overfetch_multiplier"] == 6
 
     def test_model_supplied_limit_within_ceiling_is_honored(self) -> None:
