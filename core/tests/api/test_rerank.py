@@ -1,3 +1,4 @@
+import json
 import os
 from unittest.mock import patch
 
@@ -6,10 +7,24 @@ import httpx
 from fs_explorer_api.rerank import ChunkReranker, get_reranker, reset_reranker_singleton
 
 
-def test_rerank_short_circuits_for_zero_or_one_document() -> None:
+def test_rerank_short_circuits_for_zero_documents() -> None:
     client = ChunkReranker(api_key="test", client=httpx.Client())
     assert client.rerank("q", [], top_n=5) == []
-    assert client.rerank("q", ["only doc"], top_n=5) == [(0, 1.0)]
+
+
+def test_rerank_sends_single_document_to_cross_encoder() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.read())["documents"] == ["only doc"]
+        return httpx.Response(
+            200, json={"results": [{"index": 0, "relevance_score": 0.83}]}
+        )
+
+    raw_client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    )
+    client = ChunkReranker(api_key="test", client=raw_client)
+
+    assert client.rerank("q", ["only doc"], top_n=5) == [(0, 0.83)]
 
 
 def test_rerank_returns_ordered_index_score_pairs() -> None:
@@ -33,6 +48,38 @@ def test_rerank_returns_ordered_index_score_pairs() -> None:
     result = reranker.rerank("query", ["doc a", "doc b", "doc c"], top_n=2)
 
     assert result == [(2, 0.9), (0, 0.4)]
+
+
+def test_rerank_batches_all_documents_and_merges_scores() -> None:
+    received_documents: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read())
+        documents = payload["documents"]
+        received_documents.extend(documents)
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "index": index,
+                        "relevance_score": float(document.removeprefix("doc-")),
+                    }
+                    for index, document in enumerate(documents)
+                ]
+            },
+        )
+
+    raw_client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    )
+    reranker = ChunkReranker(api_key="test", batch_size=2, client=raw_client)
+    documents = [f"doc-{index}" for index in range(5)]
+
+    result = reranker.rerank("query", documents, top_n=5)
+
+    assert received_documents == documents
+    assert result == [(4, 4.0), (3, 3.0), (2, 2.0), (1, 1.0), (0, 0.0)]
 
 
 def test_rerank_returns_none_on_http_error() -> None:

@@ -21,7 +21,6 @@ Tools: TypeAlias = Literal[
     "preview_file",
     "parse_file",
     "semantic_search",
-    "get_chunk_context",
     "get_document",
     "list_indexed_documents",
 ]

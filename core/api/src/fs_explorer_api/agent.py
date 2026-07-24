@@ -32,6 +32,7 @@ from .search import (
     MetadataFilterParseError,
     supported_filter_syntax,
 )
+from .search.ranker import RankedDocument
 from fs_explorer_shared.storage import PostgresStorage
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,8 @@ CONTEXT_SUMMARY_THRESHOLD_RATIO = float(
 # Absolute-token trigger for the same compaction, checked *in addition to*
 # the ratio above (whichever fires first wins). A 20+-step run was
 # observed summing to ~900K billed tokens even after every individual tool
-# result was capped (see _DEEP_READ_MAX_CHARS/_GREP_MAX_MATCH_LINES below)
+# result was capped (see _DEEP_READ_MAX_CHARS and the whole-chunk search
+# result limits below)
 # — because every call resends the *entire* history, a long run's cost is
 # dominated by how large that history is allowed to grow, not by any one
 # call. The 0.85-of-1M ratio above only ever prevents a hard crash; it
@@ -164,11 +166,6 @@ def _normalize_indexed_text(value: str) -> str:
     return html.unescape(value)
 
 
-# Cap on how many matched-chunk lines a single grep call can render — see
-# `_indexed_grep_file_content`'s docstring comment for why an uncapped
-# corpus-wide grep is at least as dangerous as an uncapped deep-read.
-_GREP_MAX_MATCH_LINES = int(os.getenv("FS_EXPLORER_GREP_MAX_MATCH_LINES", "25"))
-
 # --- Near-duplicate tool-call guard ---
 #
 # Real runs have been observed re-issuing 10+ near-identical semantic_search
@@ -191,7 +188,6 @@ _FUZZY_DEDUP_GROUPS = {"semantic_search", "grep", "glob"}
 _DEEP_READ_GROUP = "deep_read"
 _TOOL_DEDUP_GROUPS: dict[str, str] = {
     "semantic_search": "semantic_search",
-    "get_chunk_context": "chunk_context",
     "grep": "grep",
     "glob": "glob",
     "parse_file": _DEEP_READ_GROUP,
@@ -217,7 +213,6 @@ def _dedup_key(tool_name: str, tool_input: dict[str, Any]) -> tuple[str, str] | 
         "parse_file",
         "preview_file",
         "get_document",
-        "get_chunk_context",
         "read",
     }:
         value = (
@@ -248,12 +243,12 @@ def _query_token_overlap(a: str, b: str) -> float:
 # Tools whose rendered output actually contains indexed chunk text — the
 # ones "how many chunks/tokens went to the LLM" should be counted against,
 # distinct from `tool_result_chars` (which sums every tool's output,
-# including non-retrieval ones like grep/scan_folder). `preview_file` is
+# including non-retrieval ones like glob/scan_folder). `preview_file` is
 # deliberately excluded even though it shares `_document_from_chunks` with
 # `get_document`/`parse_file`/`read` — it's a fixed, cheap, truncated peek
 # (`max_chars=3000` default), not representative of real retrieval breadth.
 CHUNK_BEARING_TOOLS = frozenset(
-    {"semantic_search", "get_chunk_context", "get_document", "parse_file", "read"}
+    {"semantic_search", "grep", "get_document", "parse_file", "read"}
 )
 _SEMANTIC_SEARCH_HIT_RE = re.compile(r"^\[\d+\] doc_id: ", re.MULTILINE)
 _CHUNK_HEADER_RE = re.compile(r"^--- chunk ", re.MULTILINE)
@@ -270,7 +265,7 @@ def _count_chunk_markers(tool_name: str, result: str) -> int:
     plumbing a new return type through every one of the `TOOLS` functions."""
     if tool_name == "semantic_search":
         return len(_SEMANTIC_SEARCH_HIT_RE.findall(result))
-    if tool_name in {"get_chunk_context", "get_document", "parse_file", "read"}:
+    if tool_name in {"grep", "get_document", "parse_file", "read"}:
         return len(_CHUNK_HEADER_RE.findall(result))
     return 0
 
@@ -584,13 +579,6 @@ def _get_index_storage_and_corpus() -> tuple[
     return storage, corpora[0].corpus_id, None
 
 
-def _clean_excerpt(text: str, max_chars: int = 320) -> str:
-    squashed = re.sub(r"\s+", " ", text).strip()
-    if len(squashed) <= max_chars:
-        return squashed
-    return f"{squashed[:max_chars]}..."
-
-
 def _display_path(document: dict[str, Any]) -> str:
     return str(document.get("relative_path") or document.get("absolute_path") or "")
 
@@ -855,6 +843,48 @@ def _indexed_parse_file(file_path: str) -> str:
     )
 
 
+def _render_full_chunk_result(
+    *,
+    index: int,
+    doc_id: str,
+    title: str,
+    matched_by: str,
+    chunk_id: str | None,
+    chunk_position: int | None,
+    chunk_type: str | None,
+    metadata: dict[str, Any],
+    score: float,
+    text: str,
+    semantic_score: float | None = None,
+    metadata_score: int | None = None,
+) -> list[str]:
+    """Render one selected retrieval hit with its complete chunk text."""
+    locator = _chunk_locator({"metadata": metadata})
+    position = chunk_position if chunk_position is not None else "<unknown>"
+    lines = [
+        f"[{index}] doc_id: {doc_id}",
+        f"    title: {title}",
+        f"    match: {matched_by}",
+        f"    chunk_id: {chunk_id or '<unknown>'}",
+        f"    chunk_path: {title}{locator}",
+        f"    chunk_position: {position}",
+    ]
+    if semantic_score is not None:
+        lines.append(f"    semantic_score: {semantic_score}")
+    if metadata_score is not None:
+        lines.append(f"    metadata_score: {metadata_score}")
+    lines.extend(
+        [
+            f"    score: {score:.2f}",
+            "",
+            f"--- chunk {position} ({chunk_type or 'text'}){locator} ---",
+            _normalize_indexed_text(text).strip(),
+            "",
+        ]
+    )
+    return lines
+
+
 def _indexed_grep_file_content(file_path: str, pattern: str) -> str:
     if not _index_tools_available():
         return fs_grep_file_content(file_path, pattern)
@@ -876,18 +906,12 @@ def _indexed_grep_file_content(file_path: str, pattern: str) -> str:
             return fs_grep_file_content(file_path, pattern)
         documents = [document]
 
-    # Unlike the deep-read tools, this had no output cap at all — a broad
-    # pattern run across `file_path="all"` (which the system prompt itself
-    # suggests for corpus-wide search) can match a large fraction of every
-    # chunk in the corpus: a real pattern with no word-boundary anchoring
-    # matched 55% of a 30K-chunk corpus (16,928 chunks, all 323 documents)
-    # in testing. Without a cap, that becomes one tool result with tens of
-    # thousands of lines — hundreds of thousands of tokens in a single call,
-    # then rebilled on every subsequent step since the full history is
-    # resent each time.
-    lines: list[str] = []
+    # Grep is a chunk retriever, not merely a matched-substring renderer:
+    # send every matching whole chunk to the same hosted cross-encoder used
+    # by semantic_search, and deliver every selected chunk to the LLM
+    # without truncation.
+    candidates: list[RankedDocument] = []
     matched_documents: set[str] = set()
-    truncated = False
     for document in documents:
         for chunk in storage.list_document_chunks(doc_id=str(document["id"])):
             chunk_text = _normalize_indexed_text(str(chunk["text"]))
@@ -895,35 +919,73 @@ def _indexed_grep_file_content(file_path: str, pattern: str) -> str:
             if not matches:
                 continue
             matched_documents.add(str(document["id"]))
-            if len(lines) >= _GREP_MAX_MATCH_LINES:
-                truncated = True
-                continue
-            rendered = [
-                match
-                if isinstance(match, str)
-                else " ".join(str(item) for item in match)
-                for match in matches[:8]
-            ]
-            lines.append(
-                f"- {_display_name(document)} doc_id={document['id']} "
-                f"chunk={chunk['position']}: " + "; ".join(rendered)
+            raw_metadata = chunk.get("metadata")
+            chunk_metadata: dict[str, Any] = (
+                dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            )
+            candidates.append(
+                RankedDocument(
+                    doc_id=str(document["id"]),
+                    relative_path=str(document["relative_path"]),
+                    absolute_path=str(document["absolute_path"]),
+                    position=int(chunk["position"]),
+                    text=chunk_text,
+                    semantic_score=float(len(matches)),
+                    metadata_score=0,
+                    chunk_id=str(chunk["id"]),
+                    chunk_type=str(chunk.get("chunk_type") or "text"),
+                    metadata=chunk_metadata,
+                )
             )
 
-    if not lines:
+    if not candidates:
         return "No matches found in indexed chunks"
 
-    header = f"MATCHES for {pattern!r} in indexed chunks ({file_path}):\n\n"
-    body = "\n".join(lines)
-    if truncated:
-        body += (
-            f"\n\n[... TRUNCATED at {_GREP_MAX_MATCH_LINES} matches, already "
-            f"spanning {len(matched_documents)} of {len(documents)} documents "
-            "searched. This pattern is too broad to be useful here — narrow "
-            "it (word boundaries, a longer/more specific phrase) or restrict "
-            "to one file_path instead of 'all', or use semantic_search "
-            "instead for a relevance-ranked result ...]"
+    candidates.sort(
+        key=lambda candidate: (
+            -candidate.semantic_score,
+            candidate.relative_path,
+            candidate.position or 0,
         )
-    return header + body
+    )
+    ranked = IndexedQueryEngine.rank_candidates(
+        query=pattern,
+        documents=candidates,
+        limit=_effort_config()["default_limit"],
+    )
+
+    lines = [
+        "=== INDEXED GREP RESULTS (FULL CHUNKS) ===",
+        f"Pattern: {pattern}",
+        f"Searched: {file_path}",
+        f"Matched documents: {len(matched_documents)}",
+        "",
+    ]
+    for idx, (candidate, score) in enumerate(ranked, start=1):
+        lines.extend(
+            _render_full_chunk_result(
+                index=idx,
+                doc_id=candidate.doc_id,
+                title=_display_name(
+                    {
+                        "relative_path": candidate.relative_path,
+                        "absolute_path": candidate.absolute_path,
+                    }
+                ),
+                matched_by="grep",
+                chunk_id=candidate.chunk_id,
+                chunk_position=candidate.position,
+                chunk_type=candidate.chunk_type,
+                metadata=candidate.metadata,
+                score=score,
+                text=candidate.text,
+            )
+        )
+    lines.append(
+        "The selected grep hits above already include complete chunk text. "
+        "Use the evidence directly; do not issue a deep-read call merely to reread it."
+    )
+    return "\n".join(lines)
 
 
 def _document_matches_directory(document: dict[str, Any], directory: str) -> bool:
@@ -1032,7 +1094,7 @@ def semantic_search(
     limit: int | None = None,
     as_of_date: str | None = None,
 ) -> str:
-    """Search indexed chunks and return ranked excerpts.
+    """Search indexed chunks, rerank them, and return full selected chunks.
 
     `as_of_date` (YYYY-MM-DD) restricts results to chunks whose validity
     interval covers that date — pass it whenever the user's question refers
@@ -1094,28 +1156,30 @@ def semantic_search(
         lines.append(f"As of date: {as_of_date}")
     lines.append("")
     for idx, hit in enumerate(hits, start=1):
-        position = hit.position if hit.position is not None else "<metadata>"
         title = _display_name(
             {"relative_path": hit.relative_path, "absolute_path": hit.absolute_path}
         )
-        chunk_locator = _chunk_locator({"metadata": hit.metadata})
         lines.extend(
-            [
-                f"[{idx}] doc_id: {hit.doc_id}",
-                f"    title: {title}",
-                f"    match: {hit.matched_by}",
-                f"    chunk_id: {hit.chunk_id or '<metadata>'}",
-                f"    chunk_path: {title}{chunk_locator}",
-                f"    chunk_position: {position}",
-                f"    semantic_score: {hit.semantic_score}",
-                f"    metadata_score: {hit.metadata_score}",
-                f"    score: {hit.score:.2f}",
-                f"    excerpt: {_clean_excerpt(_normalize_indexed_text(hit.text))}",
-                "",
-            ]
+            _render_full_chunk_result(
+                index=idx,
+                doc_id=hit.doc_id,
+                title=title,
+                matched_by=hit.matched_by,
+                chunk_id=hit.chunk_id,
+                chunk_position=hit.position,
+                chunk_type=hit.chunk_type,
+                metadata=hit.metadata,
+                score=hit.score,
+                text=hit.text,
+                semantic_score=hit.semantic_score,
+                metadata_score=hit.metadata_score,
+            )
         )
     lines.append(
-        "Use get_document(doc_id=...) to read full content for the most relevant documents."
+        "Every selected result above already includes its complete chunk text. "
+        "Use that evidence directly; do not call get_document merely to reread "
+        "a returned hit. Deep-read a document only for a specific unresolved "
+        "cross-reference or document-wide question."
     )
 
     # Include a rich field catalog on the first search so the agent can
@@ -1263,8 +1327,8 @@ def list_indexed_documents() -> str:
         lines.append(f"[{idx}] doc_id={document['id']} title={_display_name(document)}")
     lines.append("")
     lines.append(
-        "Use semantic_search(...) to find relevant chunks, then get_document(doc_id=...) "
-        "or parse_file(file_path=...) to read chunk text."
+        "Use semantic_search(...) to retrieve relevant full chunks. Deep-read a "
+        "document only for a specific unresolved cross-reference or document-wide question."
     )
     return "\n".join(lines)
 
@@ -1277,7 +1341,6 @@ TOOLS: dict[Tools, Callable[..., str]] = {
     "preview_file": _indexed_preview_file,
     "parse_file": _indexed_parse_file,
     "semantic_search": semantic_search,
-    "get_chunk_context": get_chunk_context,
     "get_document": get_document,
     "list_indexed_documents": list_indexed_documents,
 }
@@ -1304,19 +1367,20 @@ Do not use HTML markup for answer formatting.
 | `preview_file` | Quick preview of one indexed document from chunk text | `file_path` |
 | `parse_file` | **DEEP READ** - full indexed chunk text for a document | `file_path` |
 | `read` | Read indexed chunk text for a document | `file_path` |
-| `grep` | Search regex pattern in indexed chunk text | `file_path`, `pattern` |
+| `grep` | Search and rerank regex-matching full chunks | `file_path`, `pattern` |
 | `glob` | Find indexed document paths matching a pattern | `directory`, `pattern` |
-| `semantic_search` | Search indexed chunks and metadata-filtered docs, then union/rank results | `query`, `filters`, `limit`, `as_of_date` |
+| `semantic_search` | Search/rerank indexed candidates and return complete selected chunks | `query`, `filters`, `limit`, `as_of_date` |
 | `get_document` | Read full indexed document by document id | `doc_id` |
 | `list_indexed_documents` | List indexed documents for active corpus | none |
 
 ## Indexed Retrieval Strategy
 
 When indexed tools are available:
-1. Start with `semantic_search` to quickly find relevant documents.
-2. Use `get_document` for the top candidate doc IDs, or `parse_file(file_path=...)` if you have a path.
+1. Start with `semantic_search`; every selected result already contains its complete chunk text.
+2. Use those chunks directly. Do not call `get_document`, `parse_file`, or `read` merely to reread a returned hit.
 3. Treat `parse_file`, `preview_file`, `read`, `grep`, `glob`, and `scan_folder` as chunk-backed tools. They read `core_chunks.text`/`core_documents`, not raw upload files.
-4. If indexed tools report index is unavailable, only then fall back to filesystem tools.
+4. Deep-read only for a specific unresolved cross-reference or a genuinely document-wide question.
+5. If indexed tools report index is unavailable, only then fall back to filesystem tools.
 
 Filter syntax for `semantic_search(filters=...)`:
 - `field=value`
@@ -1358,9 +1422,9 @@ When you encounter a folder with documents:
    - **MAYBE**: Documents that might be relevant (list them)
    - **SKIP**: Documents not relevant (list them)
 
-### PHASE 2: Deep Dive (Use `get_document` or `parse_file`)
-1. Use `parse_file` on documents marked RELEVANT
-2. Use `get_document(doc_id=...)` when you have a doc_id from `semantic_search`
+### PHASE 2: Evidence Check (Usually no second read)
+1. Read the complete selected chunks already returned by `semantic_search` or `grep`
+2. Use `get_document`/`parse_file` only when a specific unresolved cross-reference or document-wide structure requires text outside those chunks
 3. In your **reason**, explain what key information you found
 3. **WATCH FOR CROSS-REFERENCES** - look for mentions like:
    - "See Exhibit A/B/C..."
@@ -1445,9 +1509,9 @@ Choose the next action using the response schema. Keep `reason` concise but
 record concrete findings and document/article locators so later synthesis can
 cite them accurately.
 
-Tools: semantic_search finds ranked chunks; get_chunk_context reads a hit and
-its neighbors; get_document reads a selected full document only when the chunk
-window is insufficient; grep searches exact terms; scan_folder lists the corpus;
+Tools: semantic_search and grep return complete reranked chunks; get_document
+reads a selected full document only for unresolved cross-references or genuinely
+document-wide questions; scan_folder lists the corpus;
 preview_file/parse_file/read inspect indexed text; glob lists matching paths;
 list_indexed_documents lists document IDs.
 
@@ -1455,8 +1519,9 @@ Strategy:
 1. Start with semantic_search. Use `as_of_date=YYYY-MM-DD` when the question
    names a historical date; otherwise omit it for current rules.
    Put two or three independent searches/reads in one ToolBatchAction.
-2. Read the best hit with get_chunk_context. Use get_document only when the
-   bounded chunk window cannot resolve a material ambiguity or cross-reference.
+2. Search results already contain complete selected chunks. Use them directly;
+   never call get_document/parse_file/read merely to reread a returned hit.
+   Deep-read only when evidence outside those chunks is specifically required.
 3. Use a genuinely different query/tool after a miss; do not repeat searches.
 4. Stop as soon as the gathered evidence directly answers the question. Do not
    run additional searches or reads purely to re-confirm or gather more
@@ -1486,19 +1551,20 @@ def _build_system_prompt(enable_semantic: bool, enable_metadata: bool) -> str:
         hint = (
             "\n\n## Retrieval: Semantic + Metadata\n"
             "An index is available. Start with `semantic_search` using optional "
-            "`filters` for best results, then use chunk-backed tools for deep dives."
+            "`filters`; selected results already include complete reranked chunks."
         )
     elif enable_semantic:
         hint = (
             "\n\n## Retrieval: Semantic Only\n"
             "An index is available. Use `semantic_search` WITHOUT the `filters` "
-            "parameter for similarity search, then use chunk-backed tools for details."
+            "parameter; selected results already include complete reranked chunks."
         )
     elif enable_metadata:
         hint = (
             "\n\n## Retrieval: Metadata Only\n"
             "An index is available. Use `semantic_search` with the `filters=` "
-            "parameter for metadata filtering, then use chunk-backed tools for details."
+            "parameter for metadata filtering; matching documents are hydrated "
+            "and reranked as complete chunks."
         )
     else:
         return SYSTEM_PROMPT

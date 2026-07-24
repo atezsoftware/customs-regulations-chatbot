@@ -114,7 +114,7 @@ class IndexedQueryEngine:
         merged_documents = self._merge(
             semantic_rows=semantic_rows, metadata_rows=metadata_rows
         )
-        ranked = self._rank(
+        ranked = self.rank_candidates(
             query=query, documents=merged_documents, limit=normalized_limit
         )
         return [
@@ -221,8 +221,8 @@ class IndexedQueryEngine:
             limit=limit,
         )
 
-    @staticmethod
     def _merge(
+        self,
         *,
         semantic_rows: list[dict[str, Any]],
         metadata_rows: list[dict[str, Any]],
@@ -258,29 +258,45 @@ class IndexedQueryEngine:
                 entry["chunk_type"] = row.get("chunk_type")
                 entry["metadata"] = row.get("metadata") or {}
 
-        for row in metadata_rows:
-            doc_id = str(row["doc_id"])
-            entry = merged.setdefault(
-                f"doc:{doc_id}",
-                {
+        metadata_by_doc = {str(row["doc_id"]): row for row in metadata_rows}
+        semantic_doc_ids = {
+            str(entry["doc_id"])
+            for entry in merged.values()
+            if entry.get("chunk_id") is not None
+        }
+
+        # A metadata match is document-level, while the model needs actual
+        # chunk evidence. Boost already-retrieved chunks from matching
+        # documents, then hydrate metadata-only documents into full chunk
+        # candidates before the cross-encoder sees them. Do not pre-rank or
+        # truncate this candidate set: every retrieved chunk must be scored
+        # by the cross-encoder.
+        for entry in merged.values():
+            metadata_row = metadata_by_doc.get(str(entry["doc_id"]))
+            if metadata_row is not None:
+                entry["metadata_score"] = max(
+                    int(entry["metadata_score"]),
+                    int(metadata_row.get("metadata_score", 1)),
+                )
+
+        for doc_id, row in metadata_by_doc.items():
+            if doc_id in semantic_doc_ids:
+                continue
+            chunks = self.storage.list_document_chunks(doc_id=doc_id)
+            for chunk in chunks:
+                chunk_id = str(chunk["id"])
+                merged[f"chunk:{chunk_id}"] = {
                     "doc_id": doc_id,
                     "relative_path": str(row["relative_path"]),
                     "absolute_path": str(row["absolute_path"]),
-                    "position": None,
-                    "text": str(row.get("preview_text", "")),
+                    "position": int(chunk["position"]),
+                    "text": str(chunk["text"]),
                     "semantic_score": 0.0,
-                    "metadata_score": 0,
-                    "chunk_id": None,
-                    "chunk_type": None,
-                    "metadata": {},
-                },
-            )
-            entry["metadata_score"] = max(
-                int(entry["metadata_score"]),
-                int(row.get("metadata_score", 1)),
-            )
-            if not entry["text"]:
-                entry["text"] = str(row.get("preview_text", ""))
+                    "metadata_score": int(row.get("metadata_score", 1)),
+                    "chunk_id": chunk_id,
+                    "chunk_type": chunk.get("chunk_type"),
+                    "metadata": chunk.get("metadata") or {},
+                }
 
         documents = [
             RankedDocument(
@@ -306,7 +322,7 @@ class IndexedQueryEngine:
         return documents
 
     @staticmethod
-    def _rank(
+    def rank_candidates(
         *, query: str, documents: list[RankedDocument], limit: int
     ) -> list[tuple[RankedDocument, float]]:
         """Cross-encoder rerank when available, falling back to the linear
@@ -319,7 +335,7 @@ class IndexedQueryEngine:
         produced each entry, instead of resorting by the heuristic score
         alone and silently undoing the rerank ordering."""
         reranker = get_reranker()
-        if reranker is not None and len(documents) > 1:
+        if reranker is not None and documents:
             # Ask for the full ranked order (not just `limit`) so
             # `_diversify` has enough candidates to backfill from after
             # dropping near-duplicates/low-relevance ones.

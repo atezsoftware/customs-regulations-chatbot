@@ -97,11 +97,14 @@ class _SlowStorage:
         return [
             {
                 "doc_id": "doc_semantic",
+                "chunk_id": "chunk_semantic",
                 "relative_path": "a.md",
                 "absolute_path": "/tmp/a.md",
                 "position": 0,
                 "text": "semantic hit",
                 "score": 3,
+                "chunk_type": "text",
+                "metadata": {},
             }
         ]
 
@@ -119,6 +122,19 @@ class _SlowStorage:
 
     def get_active_schema(self, *, corpus_id: str):  # noqa: ARG002
         return None
+
+    def list_document_chunks(self, *, doc_id: str):
+        assert doc_id == "doc_metadata"
+        return [
+            {
+                "id": "chunk_metadata",
+                "doc_id": doc_id,
+                "position": 7,
+                "text": "metadata full chunk text",
+                "chunk_type": "text",
+                "metadata": {"article_no": "12"},
+            }
+        ]
 
 
 def test_indexed_query_engine_executes_semantic_and_metadata_in_parallel() -> None:
@@ -151,6 +167,8 @@ def test_search_enable_semantic_false_returns_only_metadata() -> None:
 
     assert len(hits) == 1
     assert hits[0].doc_id == "doc_metadata"
+    assert hits[0].chunk_id == "chunk_metadata"
+    assert hits[0].text == "metadata full chunk text"
 
 
 def test_search_enable_metadata_false_returns_only_semantic() -> None:
@@ -453,6 +471,87 @@ def test_indexed_query_engine_uses_reranker_ordering_when_available(
     # (which would have put doc_c first, per its higher raw `score`).
     assert [hit.doc_id for hit in hits] == ["doc_a", "doc_c", "doc_b"]
     assert hits[0].score == 0.95
+    fake_reranker.rerank.assert_called_once_with(
+        "q",
+        ["alpha content", "beta content", "gamma content"],
+        top_n=3,
+    )
+
+
+class _MetadataChunkStorage:
+    def get_active_schema(self, *, corpus_id: str):  # noqa: ARG002
+        return None
+
+    def search_documents_by_metadata(
+        self, *, corpus_id: str, filters, limit: int = 20
+    ):  # noqa: ARG002
+        return [
+            {
+                "doc_id": "doc_metadata",
+                "relative_path": "metadata.md",
+                "absolute_path": "/metadata.md",
+                "preview_text": "preview must not reach reranker",
+                "metadata_score": 1,
+            }
+        ]
+
+    def list_document_chunks(self, *, doc_id: str):
+        return [
+            {
+                "id": "chunk_1",
+                "doc_id": doc_id,
+                "position": 0,
+                "text": "first complete metadata chunk",
+                "chunk_type": "text",
+                "metadata": {},
+            },
+            {
+                "id": "chunk_2",
+                "doc_id": doc_id,
+                "position": 1,
+                "text": "second complete metadata chunk",
+                "chunk_type": "text",
+                "metadata": {},
+            },
+            {
+                "id": "chunk_3",
+                "doc_id": doc_id,
+                "position": 2,
+                "text": "third complete metadata chunk",
+                "chunk_type": "text",
+                "metadata": {},
+            },
+        ]
+
+
+def test_metadata_only_search_hydrates_full_chunks_before_rerank(monkeypatch) -> None:
+    fake_reranker = Mock(
+        rerank=Mock(return_value=[(1, 0.9), (2, 0.6), (0, 0.4)])
+    )
+    monkeypatch.setattr(
+        "fs_explorer_api.search.query.get_reranker", lambda: fake_reranker
+    )
+
+    engine = IndexedQueryEngine(_MetadataChunkStorage())
+    hits = engine.search(
+        corpus_id="c",
+        query="metadata query",
+        filters="document_type=agreement",
+        limit=2,
+        enable_semantic=False,
+    )
+
+    fake_reranker.rerank.assert_called_once_with(
+        "metadata query",
+        [
+            "first complete metadata chunk",
+            "second complete metadata chunk",
+            "third complete metadata chunk",
+        ],
+        top_n=3,
+    )
+    assert [hit.chunk_id for hit in hits] == ["chunk_2", "chunk_3"]
+    assert all("complete metadata chunk" in hit.text for hit in hits)
 
 
 def test_indexed_query_engine_falls_back_when_reranker_returns_none(

@@ -24,6 +24,7 @@ from fs_explorer_api.agent import (
 )
 from fs_explorer_api.llm import LLMUsage
 from fs_explorer_api.models import Action, ContextSummary, GoDeeperAction, StopAction
+from fs_explorer_api.search.ranker import RankedDocument
 from .conftest import make_mock_llm_client
 
 
@@ -228,8 +229,7 @@ class TestTokenUsage:
         assert usage.retrieval_estimated_tokens() == (len(result) + 3) // 4
 
     def test_add_tool_result_counts_chunk_headers_as_retrieval(self) -> None:
-        """`get_document`/`parse_file`/`read`/`get_chunk_context` all share
-        the `--- chunk ` header marker regardless of which tool emitted it."""
+        """Deep reads and full-chunk grep share the same chunk marker."""
         usage = TokenUsage()
         result = (
             "=== INDEXED DOCUMENT FROM CHUNKS ===\n"
@@ -237,7 +237,7 @@ class TestTokenUsage:
             "--- chunk 0 (text, chars 0-10) ---\nfirst\n"
             "--- chunk 1 (text, chars 10-20) ---\nsecond\n"
         )
-        for tool_name in ("get_document", "parse_file", "read", "get_chunk_context"):
+        for tool_name in ("get_document", "parse_file", "read", "grep"):
             usage = TokenUsage()
             usage.add_tool_result(result, tool_name)
             assert usage.retrieval_chunks == 2, tool_name
@@ -256,7 +256,7 @@ class TestTokenUsage:
 
     def test_add_tool_result_excludes_non_chunk_tools_from_retrieval(self) -> None:
         usage = TokenUsage()
-        usage.add_tool_result("some grep output", "grep")
+        usage.add_tool_result("some glob output", "glob")
 
         assert usage.retrieval_chunks == 0
         assert usage.retrieval_chars == 0
@@ -297,6 +297,8 @@ class TestSystemPrompt:
         assert "semantic_search" in SYSTEM_PROMPT
         assert "get_document" in SYSTEM_PROMPT
         assert "list_indexed_documents" in SYSTEM_PROMPT
+        assert "get_chunk_context" not in SYSTEM_PROMPT
+        assert "complete selected chunks" in SYSTEM_PROMPT
 
     def test_action_and_final_prompts_are_purpose_specific(self) -> None:
         assert "Tools:" in SYSTEM_PROMPT
@@ -771,6 +773,116 @@ class TestEffortLevels:
     def test_unknown_effort_falls_back_to_default(self) -> None:
         set_effort("bogus-value")
         assert get_effort() == DEFAULT_EFFORT
+
+
+class TestFullChunkSearchResults:
+    def test_semantic_search_renders_complete_selected_chunk(self) -> None:
+        import fs_explorer_api.agent as agent_module
+
+        full_text = "başlangıç " + ("uzun kanıt " * 80) + "TAM_CHUNK_SONU"
+        hit = Mock(
+            doc_id="doc_a",
+            relative_path="a.md",
+            absolute_path="/a.md",
+            position=4,
+            text=full_text,
+            semantic_score=0.8,
+            metadata_score=0,
+            score=0.95,
+            matched_by="semantic",
+            chunk_id="chunk_a",
+            chunk_type="text",
+            metadata={"article_no": "54"},
+        )
+
+        class FullHitEngine:
+            def __init__(self, storage, embedding_provider=None) -> None:
+                pass
+
+            def search(self, **kwargs):
+                return [hit]
+
+        storage = Mock()
+        storage.get_active_schema.return_value = None
+        with (
+            patch.object(
+                agent_module,
+                "_get_index_storage_and_corpora",
+                return_value=(
+                    storage,
+                    [IndexedCorpus(root_folder="/x", corpus_id="c1")],
+                    None,
+                ),
+            ),
+            patch.object(agent_module, "IndexedQueryEngine", FullHitEngine),
+        ):
+            result = agent_module.semantic_search("TIR karnesi")
+
+        assert full_text in result
+        assert "TAM_CHUNK_SONU" in result
+        assert "excerpt:" not in result
+        assert "--- chunk 4 (text)" in result
+        assert "already includes its complete chunk text" in result
+
+    def test_indexed_grep_reranks_and_renders_complete_chunks(self) -> None:
+        import fs_explorer_api.agent as agent_module
+
+        storage = Mock()
+        storage.list_document_chunks.return_value = [
+            {
+                "id": f"chunk_{index}",
+                "text": (
+                    f"aranan ifade aday {index} "
+                    + ("tam bağlam " * 30)
+                    + f"GREP_CHUNK_SONU_{index}"
+                ),
+                "position": index,
+                "chunk_type": "text",
+                "metadata": {"article_no": str(index + 5)},
+            }
+            for index in range(2, 5)
+        ]
+        document = {
+            "id": "doc_a",
+            "relative_path": "a.md",
+            "absolute_path": "/a.md",
+        }
+        captured: list[RankedDocument] = []
+
+        def fake_rank(*, query, documents, limit):
+            captured.extend(documents)
+            return [(documents[-1], 0.91)]
+
+        with (
+            patch.object(agent_module, "_index_tools_available", return_value=True),
+            patch.object(
+                agent_module,
+                "_get_index_storage_and_corpora",
+                return_value=(
+                    storage,
+                    [IndexedCorpus(root_folder="/x", corpus_id="c1")],
+                    None,
+                ),
+            ),
+            patch.object(
+                agent_module,
+                "_all_index_documents",
+                return_value=[document],
+            ),
+            patch.object(
+                agent_module.IndexedQueryEngine,
+                "rank_candidates",
+                side_effect=fake_rank,
+            ),
+        ):
+            result = agent_module._indexed_grep_file_content("all", "aranan ifade")
+
+        assert len(captured) == 3
+        assert [candidate.position for candidate in captured] == [2, 3, 4]
+        assert all("GREP_CHUNK_SONU_" in candidate.text for candidate in captured)
+        assert "GREP_CHUNK_SONU_4" in result
+        assert "--- chunk 4 (text)" in result
+        assert "complete chunk text" in result
 
 
 class TestRetrievalHook:

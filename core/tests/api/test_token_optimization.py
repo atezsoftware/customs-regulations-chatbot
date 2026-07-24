@@ -157,7 +157,6 @@ SCENARIOS = [
         question="Transit süresi aşılırsa ceza uygulanır mı?",
         actions=[
             _tool_action("semantic_search", query="transit süre aşımı ceza"),
-            _tool_action("get_chunk_context", chunk_id="chunk_direct"),
             Action(reason="Enough evidence", action=StopAction(final_result="ready")),
         ],
         required_evidence={"DIRECT_RULE"},
@@ -167,7 +166,6 @@ SCENARIOS = [
         question="Mücbir sebepte transit cezası uygulanır mı?",
         actions=[
             _tool_action("semantic_search", query="transit mücbir sebep"),
-            _tool_action("get_chunk_context", chunk_id="chunk_exception"),
             Action(reason="Enough evidence", action=StopAction(final_result="ready")),
         ],
         required_evidence={"EXCEPTION"},
@@ -180,10 +178,6 @@ SCENARIOS = [
                 _tool_action("semantic_search", query="transit gecikme ceza"),
                 _tool_action("semantic_search", query="transit süre uzatımı başvuru"),
             ),
-            _batch_action(
-                _tool_action("get_chunk_context", chunk_id="chunk_direct"),
-                _tool_action("get_chunk_context", chunk_id="chunk_cross"),
-            ),
             Action(reason="Enough evidence", action=StopAction(final_result="ready")),
         ],
         required_evidence={"DIRECT_RULE", "CROSS_REFERENCE"},
@@ -192,16 +186,18 @@ SCENARIOS = [
 
 
 TOOL_RESULTS = {
-    "transit süre aşımı ceza": "chunk_id=chunk_direct doc_id=doc_direct DIRECT_RULE",
-    "transit mücbir sebep": "chunk_id=chunk_exception doc_id=doc_exception EXCEPTION",
-    "transit gecikme ceza": "chunk_id=chunk_direct doc_id=doc_direct DIRECT_RULE",
-    "transit süre uzatımı başvuru": "chunk_id=chunk_cross doc_id=doc_cross CROSS_REFERENCE",
-    "doc_direct": ("DIRECT_RULE " + EVIDENCE["DIRECT_RULE"] + " ") * 120,
-    "doc_exception": ("EXCEPTION " + EVIDENCE["EXCEPTION"] + " ") * 120,
-    "doc_cross": ("CROSS_REFERENCE " + EVIDENCE["CROSS_REFERENCE"] + " ") * 120,
-    "chunk_direct": ("DIRECT_RULE " + EVIDENCE["DIRECT_RULE"] + " ") * 8,
-    "chunk_exception": ("EXCEPTION " + EVIDENCE["EXCEPTION"] + " ") * 8,
-    "chunk_cross": ("CROSS_REFERENCE " + EVIDENCE["CROSS_REFERENCE"] + " ") * 8,
+    "transit süre aşımı ceza": (
+        "--- chunk 1 ---\nDIRECT_RULE " + EVIDENCE["DIRECT_RULE"]
+    ),
+    "transit mücbir sebep": (
+        "--- chunk 2 ---\nEXCEPTION " + EVIDENCE["EXCEPTION"]
+    ),
+    "transit gecikme ceza": (
+        "--- chunk 1 ---\nDIRECT_RULE " + EVIDENCE["DIRECT_RULE"]
+    ),
+    "transit süre uzatımı başvuru": (
+        "--- chunk 3 ---\nCROSS_REFERENCE " + EVIDENCE["CROSS_REFERENCE"]
+    ),
 }
 
 
@@ -252,8 +248,6 @@ async def _run_scenario(scenario: Scenario) -> dict[str, Any]:
 async def run_benchmark() -> dict[str, Any]:
     originals = dict(TOOLS)
     TOOLS["semantic_search"] = lambda query, **_: TOOL_RESULTS[query]
-    TOOLS["get_document"] = lambda doc_id, **_: TOOL_RESULTS[doc_id]
-    TOOLS["get_chunk_context"] = lambda chunk_id, **_: TOOL_RESULTS[chunk_id]
     try:
         results = [await _run_scenario(scenario) for scenario in SCENARIOS]
     finally:
@@ -283,6 +277,7 @@ async def run_benchmark() -> dict[str, Any]:
 async def test_accuracy_and_token_benchmark() -> None:
     report = await run_benchmark()
     assert report["accuracy_passed"] == report["accuracy_total"] == 3
+    assert all(scenario["api_calls"] == 3 for scenario in report["scenarios"])
 
 
 if __name__ == "__main__":
