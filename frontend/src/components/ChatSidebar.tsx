@@ -2,6 +2,7 @@ import {useCallback, useEffect, useRef, useState} from 'react';
 import type {PointerEvent as ReactPointerEvent} from 'react';
 import type {ChatSession} from '../types';
 import {Button} from './ui/Button';
+import {ConfirmModal} from './ui/ConfirmModal';
 
 const WIDTH_KEY = 'cc_chat_sidebar_width';
 const COLLAPSED_KEY = 'cc_chat_sidebar_collapsed';
@@ -32,18 +33,35 @@ export function ChatSidebar({
   onSelect,
   onCreate,
   creating,
+  onDelete,
 }: {
   sessions: ChatSession[];
   selectedId: number | null;
   onSelect: (id: number) => void;
   onCreate: () => void;
   creating: boolean;
+  onDelete: (id: number) => Promise<void>;
 }) {
   const [width, setWidth] = useState(readStoredWidth);
   const [collapsed, setCollapsed] = useState(readStoredCollapsed);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const draggingRef = useRef(false);
   const startXRef = useRef(0);
   const startWidthRef = useRef(width);
+
+  async function handleDeleteConfirm() {
+    if (deletingId === null) return;
+    setDeleteBusy(true);
+    try {
+      await onDelete(deletingId);
+      setDeletingId(null);
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
+  const deletingSession = sessions.find(s => s.id === deletingId) ?? null;
 
   useEffect(() => {
     localStorage.setItem(WIDTH_KEY, String(width));
@@ -139,10 +157,10 @@ export function ChatSidebar({
           {sessions.map(session => {
             const createdAt = formatSessionDateTime(session.createdAt);
             return (
-              <li key={session.id}>
+              <li key={session.id} className="group relative">
                 <button
                   onClick={() => onSelect(session.id)}
-                  className={`w-full min-w-0 rounded-xl px-3 py-2.5 text-left text-sm transition-colors ${
+                  className={`w-full min-w-0 rounded-xl py-2.5 pl-3 pr-9 text-left text-sm transition-colors ${
                     session.id === selectedId
                       ? 'bg-indigo-50 font-medium text-indigo-700'
                       : 'text-slate-600 hover:bg-slate-50'
@@ -159,6 +177,16 @@ export function ChatSidebar({
                     </span>
                   )}
                 </button>
+                <button
+                  onClick={event => {
+                    event.stopPropagation();
+                    setDeletingId(session.id);
+                  }}
+                  title="Delete chat"
+                  className="absolute right-1.5 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-lg text-slate-300 opacity-0 transition-colors hover:bg-rose-50 hover:text-rose-500 focus-visible:opacity-100 group-hover:opacity-100"
+                >
+                  <TrashIcon />
+                </button>
               </li>
             );
           })}
@@ -171,6 +199,16 @@ export function ChatSidebar({
       >
         <div className="mx-auto h-full w-px bg-transparent transition-colors hover:bg-indigo-300" />
       </div>
+      {deletingSession && (
+        <ConfirmModal
+          title="Delete chat"
+          message={`"${deletingSession.title || 'Untitled chat'}" and all of its messages will be permanently deleted. This can't be undone.`}
+          confirmLabel="Delete"
+          busy={deleteBusy}
+          onCancel={() => setDeletingId(null)}
+          onConfirm={() => void handleDeleteConfirm()}
+        />
+      )}
     </aside>
   );
 }
@@ -208,6 +246,18 @@ function ChevronRightIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
       <path d="M9 6l6 6-6 6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path
+        d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m2 0-1 13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 7h14z"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
     </svg>
   );
 }

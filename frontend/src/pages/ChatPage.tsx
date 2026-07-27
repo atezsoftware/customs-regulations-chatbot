@@ -175,6 +175,12 @@ export function ChatPage() {
     }
   }
 
+  async function handleDeleteSession(id: number) {
+    await chatSessionsApi.remove(id);
+    setSessions(prev => prev.filter(session => session.id !== id));
+    if (selectedId === id) navigate('/chat');
+  }
+
   async function handleSaveLinks(ids: number[]) {
     if (selectedId === null) return;
     setSavingLinks(true);
@@ -470,6 +476,7 @@ export function ChatPage() {
         onSelect={id => navigate(`/chat/${id}`)}
         onCreate={handleCreate}
         creating={creating}
+        onDelete={handleDeleteSession}
       />
       <main className="flex flex-1 flex-col overflow-y-auto">
         {!selectedSession ? (
