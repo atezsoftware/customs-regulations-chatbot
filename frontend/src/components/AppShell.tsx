@@ -59,6 +59,11 @@ export function AppShell() {
               <AmendmentsIcon />
             </NavIcon>
           )}
+          {user?.role === 'admin' && (
+            <NavIcon to="/admin/benchmark" label="Benchmark">
+              <BenchmarkIcon />
+            </NavIcon>
+          )}
         </div>
         <div className="flex flex-col items-center gap-3">
           <NavLink
@@ -146,6 +151,14 @@ function AmendmentsIcon() {
       />
       <path d="M15 4v5h5" strokeLinecap="round" strokeLinejoin="round" />
       <path d="M8 13h8M8 17h5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function BenchmarkIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M4 20V10M12 20V4M20 20v-7" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
