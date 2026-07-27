@@ -60,8 +60,41 @@ async def test_structured_request_uses_strict_schema_and_provider_cost() -> None
     assert seen["response_format"]["json_schema"]["strict"] is True
     assert seen["provider"] == {"require_parameters": True}
     assert seen["messages"][0] == {"role": "system", "content": "system"}
+    assert seen["max_tokens"] == 8000
     assert usage.generation_id == "gen-1"
     assert usage.billed_cost_usd == Decimal("0.00001")
+
+
+@pytest.mark.asyncio
+async def test_truncated_reasoning_response_raises_actionable_error() -> None:
+    """A verbose reasoning model (e.g. z-ai/glm-5.2) can burn its whole output
+    budget on hidden chain-of-thought and never emit visible content —
+    OpenRouter reports this as `finish_reason: "length"` with `content`
+    missing. The resulting error should point at the real cause instead of
+    the bare "no structured content" message.
+    """
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {}, "finish_reason": "length"}],
+                "usage": {
+                    "prompt_tokens": 50,
+                    "completion_tokens": 8000,
+                    "completion_tokens_details": {"reasoning_tokens": 8000},
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as raw_client:
+        client = OpenRouterLLMClient(api_key="test", client=raw_client)
+        with pytest.raises(RuntimeError, match="OPENROUTER_MAX_OUTPUT_TOKENS"):
+            await client.generate_structured(
+                [ChatTurn(role="user", text="hello")], "system", Reply
+            )
 
 
 @pytest.mark.asyncio

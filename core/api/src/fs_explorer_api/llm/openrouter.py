@@ -118,6 +118,7 @@ class OpenRouterLLMClient:
         )
         self._last_stream_usage: LLMUsage | None = None
         self._max_retries = int(os.getenv("OPENROUTER_MAX_RETRIES", "3"))
+        self._max_output_tokens = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "8000"))
 
     @staticmethod
     def _messages(history: list[ChatTurn], system_prompt: str) -> list[dict[str, str]]:
@@ -140,6 +141,17 @@ class OpenRouterLLMClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": self._messages(history, system_prompt),
+            # Reasoning models (e.g. z-ai/glm-5.2) spend completion tokens on
+            # hidden chain-of-thought before ever emitting visible content.
+            # Without an explicit ceiling, requests fall back to whatever
+            # small default the upstream provider applies, which a verbose
+            # reasoner can exhaust entirely on thinking — OpenRouter then
+            # returns `finish_reason: "length"` with an empty `content`,
+            # surfacing here as "no structured content" even though the
+            # request itself succeeded. `max_tokens` is a baseline
+            # OpenAI-compatible field every provider honors, unlike the
+            # provider-specific `reasoning` controls below.
+            "max_tokens": self._max_output_tokens,
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
@@ -200,7 +212,18 @@ class OpenRouterLLMClient:
         )
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
-            raise OpenRouterError("OpenRouter returned no structured content.")
+            finish_reason = (
+                choices[0].get("finish_reason")
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+                else None
+            )
+            hint = (
+                " (truncated before emitting content — the model likely ran out of "
+                "output tokens; see OPENROUTER_MAX_OUTPUT_TOKENS)"
+                if finish_reason == "length"
+                else ""
+            )
+            raise OpenRouterError(f"OpenRouter returned no structured content.{hint}")
         usage = usage_from_openrouter(
             body.get("usage", {}), duration_ms=(time.monotonic() - started_at) * 1000
         )
