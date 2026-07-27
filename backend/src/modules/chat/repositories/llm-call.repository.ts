@@ -94,21 +94,26 @@ export class LlmCallRepository extends DefaultCrudRepository<
   }
 
   async usageDaily(userId: number, since: string | null): Promise<DailyUsageRow[]> {
+    // Bucketed in the business's local calendar day (Türkiye), not UTC —
+    // otherwise every day's post-21:00 UTC activity (past midnight local
+    // time) is attributed to the previous day's bucket. That's a 1-day
+    // shift regardless of range, but it's far more noticeable over a 7-day
+    // window (~1/7 of the visible days) than a 30-day one (~1/30).
     return (await this.dataSource.execute(
       `
         WITH usage_events AS (
           ${usageEventsSql()}
         )
         SELECT
-          to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day,
+          to_char(date_trunc('day', created_at AT TIME ZONE 'Europe/Istanbul'), 'YYYY-MM-DD') AS day,
           COALESCE(SUM(input_tokens), 0) AS input_tokens,
           COALESCE(SUM(output_tokens), 0) AS output_tokens,
           COALESCE(SUM(thinking_tokens), 0) AS thinking_tokens,
           COALESCE(SUM(input_tokens + output_tokens + thinking_tokens), 0) AS total_tokens,
           COUNT(*) AS call_count
         FROM usage_events
-        GROUP BY date_trunc('day', created_at)
-        ORDER BY date_trunc('day', created_at) ASC
+        GROUP BY date_trunc('day', created_at AT TIME ZONE 'Europe/Istanbul')
+        ORDER BY date_trunc('day', created_at AT TIME ZONE 'Europe/Istanbul') ASC
       `,
       [userId, since],
     )) as DailyUsageRow[];
