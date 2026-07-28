@@ -14,7 +14,8 @@ import {stripNulBytes} from '../../../common/text';
 import {formatChatError} from '../../../common/chat-error';
 
 const DEFAULT_CORE_URL = 'ws://127.0.0.1:8000/ws/explore';
-const DEFAULT_MODEL = 'gemini-3-flash-preview';
+const DEFAULT_PROVIDER = 'openrouter';
+const DEFAULT_MODEL = 'google/gemini-3.6-flash';
 
 type JsonObject = Record<string, unknown>;
 
@@ -405,12 +406,16 @@ export class CoreBridgeService {
         }
 
         if (event.type === 'llm_call') {
-          // One row per actual Gemini call (tool-planning steps and the
+          // One row per actual LLM call (tool-planning steps and the
           // final-answer generation are separate calls), not just one
           // end-of-run aggregate — lets the dashboard show per-message
           // token/model/duration instead of only a session-wide total.
           llmCallsRecorded += 1;
-          const provider = text(data.provider) || session.llmProvider || 'gemini';
+          const provider =
+            text(data.provider) ||
+            session.llmProvider ||
+            process.env.FS_EXPLORER_LLM_PROVIDER ||
+            DEFAULT_PROVIDER;
           const model =
             text(data.model) ||
             session.model ||
@@ -554,8 +559,11 @@ export class CoreBridgeService {
             await this.llmCallRepository.create({
               messageId: input.assistantMessageId,
               sessionId: input.sessionId,
-              provider: 'gemini',
-              model: session.model ?? process.env.FS_EXPLORER_LLM_MODEL ?? DEFAULT_MODEL,
+              provider:
+                session.llmProvider ||
+                process.env.FS_EXPLORER_LLM_PROVIDER ||
+                DEFAULT_PROVIDER,
+              model: session.model || process.env.FS_EXPLORER_LLM_MODEL || DEFAULT_MODEL,
               purpose: 'chat_completion',
               inputTokens: numberValue(stats.prompt_tokens),
               outputTokens: numberValue(stats.completion_tokens),

@@ -35,6 +35,13 @@ class PlanMode(str, Enum):
     DECOMPOSED = "decomposed"
 
 
+class ExecutionStrategy(str, Enum):
+    """How much task-local orchestration a validated plan requires."""
+
+    SINGLE_PASS = "single_pass"
+    ADAPTIVE = "adaptive"
+
+
 class WorkerStatus(str, Enum):
     """Outcome of one search worker assignment."""
 
@@ -92,9 +99,15 @@ class TaskSpec(_StrictArtifact):
 class GlobalPlan(_StrictArtifact):
     """Single-call routing and research plan produced by the global planner."""
 
-    version: Literal["1"] = Field(description="Orchestration contract version")
+    version: Literal["2"] = Field(description="Orchestration contract version")
     mode: PlanMode = Field(
         description="direct for one coherent task; decomposed for a task DAG"
+    )
+    execution_strategy: ExecutionStrategy = Field(
+        description=(
+            "single_pass for one precise lookup; adaptive when task-local "
+            "coordination or follow-up searches may be needed"
+        )
     )
     normalized_question: str = Field(
         description="Standalone user question with only necessary references resolved"
@@ -270,6 +283,8 @@ def validate_global_plan(
     if plan.mode == PlanMode.DIRECT and task_count != 1:
         errors.append("direct mode must contain exactly one task")
     if plan.mode == PlanMode.DECOMPOSED:
+        if plan.execution_strategy != ExecutionStrategy.ADAPTIVE:
+            errors.append("decomposed mode must use adaptive execution")
         if task_count < 2:
             errors.append("decomposed mode must contain at least two tasks")
         if task_count > max_tasks:
@@ -370,8 +385,11 @@ def make_direct_fallback_plan(original_question: str) -> GlobalPlan:
         raise ValueError("original_question must not be blank")
 
     return GlobalPlan(
-        version="1",
+        version="2",
         mode=PlanMode.DIRECT,
+        # A planner failure gives us no reliable simplicity signal. Preserve
+        # answer quality by using the bounded adaptive path in that case.
+        execution_strategy=ExecutionStrategy.ADAPTIVE,
         normalized_question=question,
         answer_requirements=["Answer every explicit part of the original question."],
         tasks=[

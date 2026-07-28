@@ -11,7 +11,7 @@ import httpx
 
 from .base import ChatTurn, LLMUsage, SchemaT, ThinkingLevel
 
-DEFAULT_OPENROUTER_MODEL = "google/gemini-3-flash-preview"
+DEFAULT_OPENROUTER_MODEL = "google/gemini-3.6-flash"
 _RETRYABLE_STATUS_CODES = {408, 429, 502, 503}
 
 

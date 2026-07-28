@@ -14,6 +14,8 @@ def test_global_planner_prompt_routes_without_separate_intent_call() -> None:
 
     assert "mode=direct with exactly one task" in prompt
     assert "mode=decomposed" in prompt
+    assert "execution_strategy=single_pass only when one precise" in prompt
+    assert "When uncertain, prefer adaptive" in prompt
     assert "2 to\n  4 tasks" in prompt
     assert "Do not add a separate intent-analysis task" in prompt
     assert "OUTPUT CONTRACT — GlobalPlan" in prompt

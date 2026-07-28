@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from fs_explorer_api.orchestration_models import (
+    ExecutionStrategy,
     GlobalPlan,
     PlanMode,
     PlanValidationError,
@@ -26,10 +27,16 @@ def _task(task_id: str, *, depends_on: list[str] | None = None) -> TaskSpec:
     )
 
 
-def _plan(mode: PlanMode, tasks: list[TaskSpec]) -> GlobalPlan:
+def _plan(
+    mode: PlanMode,
+    tasks: list[TaskSpec],
+    *,
+    execution_strategy: ExecutionStrategy = ExecutionStrategy.ADAPTIVE,
+) -> GlobalPlan:
     return GlobalPlan(
-        version="1",
+        version="2",
         mode=mode,
+        execution_strategy=execution_strategy,
         normalized_question="What rules apply?",
         answer_requirements=["Explain the applicable rules."],
         tasks=tasks,
@@ -50,6 +57,27 @@ def test_validate_global_plan_accepts_direct_plan() -> None:
     plan = _plan(PlanMode.DIRECT, [_task("task_1")])
 
     assert validate_global_plan(plan) is plan
+
+
+def test_validate_global_plan_accepts_single_pass_only_for_direct_mode() -> None:
+    plan = _plan(
+        PlanMode.DIRECT,
+        [_task("task_1")],
+        execution_strategy=ExecutionStrategy.SINGLE_PASS,
+    )
+
+    assert validate_global_plan(plan) is plan
+
+
+def test_validate_global_plan_rejects_single_pass_decomposed_plan() -> None:
+    plan = _plan(
+        PlanMode.DECOMPOSED,
+        [_task("one"), _task("two")],
+        execution_strategy=ExecutionStrategy.SINGLE_PASS,
+    )
+
+    with pytest.raises(PlanValidationError, match="must use adaptive execution"):
+        validate_global_plan(plan)
 
 
 def test_validate_global_plan_accepts_acyclic_dependency_graph() -> None:
@@ -140,6 +168,7 @@ def test_make_direct_fallback_plan_preserves_original_question() -> None:
     plan = make_direct_fallback_plan("  What is the deadline?  ")
 
     assert plan.mode == PlanMode.DIRECT
+    assert plan.execution_strategy == ExecutionStrategy.ADAPTIVE
     assert plan.normalized_question == "What is the deadline?"
     assert len(plan.tasks) == 1
     assert plan.tasks[0].question == "What is the deadline?"

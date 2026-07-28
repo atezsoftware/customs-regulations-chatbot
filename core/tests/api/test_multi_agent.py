@@ -21,6 +21,7 @@ from fs_explorer_api.multi_agent import (
 from fs_explorer_api.orchestration_models import (
     EvidenceClaim,
     EvidenceConfidence,
+    ExecutionStrategy,
     GlobalPlan,
     PlanMode,
     SearchAssignment,
@@ -71,10 +72,14 @@ def _task(
     )
 
 
-def _plan(*tasks: TaskSpec) -> GlobalPlan:
+def _plan(
+    *tasks: TaskSpec,
+    execution_strategy: ExecutionStrategy = ExecutionStrategy.ADAPTIVE,
+) -> GlobalPlan:
     return GlobalPlan(
-        version="1",
+        version="2",
         mode=PlanMode.DIRECT if len(tasks) == 1 else PlanMode.DECOMPOSED,
+        execution_strategy=execution_strategy,
         normalized_question="Normalized question",
         answer_requirements=["Answer all requested parts."],
         tasks=list(tasks),
@@ -331,6 +336,105 @@ async def test_direct_question_stays_one_task_and_uses_verified_source() -> None
     assert [event.sequence for event in progress] == sorted(
         event.sequence for event in progress
     )
+
+
+@pytest.mark.asyncio
+async def test_single_pass_direct_skips_redundant_task_llm_calls() -> None:
+    planner = _ScriptedClient(
+        "planner",
+        lambda schema, _text: _plan(
+            _task("task_1", "Question one"),
+            execution_strategy=ExecutionStrategy.SINGLE_PASS,
+        ),
+    )
+    task_client = _ScriptedClient(
+        "task",
+        lambda _schema, _text: pytest.fail(
+            "single-pass coverage must not call coordinator or reviewer"
+        ),
+    )
+    worker = _ScriptedClient("worker", _worker_responder)
+    searches: list[str] = []
+
+    def search(**kwargs):
+        searches.append(kwargs["query"])
+        return _SearchResult(query=kwargs["query"], hits=[_hit("task_1")])
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=task_client,
+        worker_llm=worker,
+        search_runner=search,
+        limits=_limits(),
+        search_runner_in_thread=False,
+    ).run("Question one")
+
+    assert result.plan.execution_strategy == ExecutionStrategy.SINGLE_PASS
+    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
+    assert searches == ["Question one"]
+    assert len(planner.calls) == 1
+    assert len(worker.calls) == 1
+    assert task_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_single_pass_coverage_miss_upgrades_to_adaptive_wave() -> None:
+    planner = _ScriptedClient(
+        "planner",
+        lambda schema, _text: _plan(
+            _task("task_1", "Question one"),
+            execution_strategy=ExecutionStrategy.SINGLE_PASS,
+        ),
+    )
+
+    def task_responder(schema: type, text: str) -> object:
+        if schema is SearchAssignmentBatch:
+            return SearchAssignmentBatch(
+                task_id="task_1",
+                stop=False,
+                stop_reason=None,
+                assignments=[
+                    SearchAssignment(
+                        assignment_id="adaptive-follow-up",
+                        task_id="task_1",
+                        query="query-task_1",
+                        objective="Fill the missing direct-search evidence",
+                        evidence_requirements=["criterion-task_1"],
+                        excluded_queries=["Question one"],
+                        as_of_date=None,
+                        filters=None,
+                    )
+                ],
+            )
+        return _task_responder(schema, text)
+
+    task_client = _ScriptedClient("task", task_responder)
+    worker = _ScriptedClient("worker", _worker_responder)
+    searches: list[str] = []
+
+    def search(**kwargs):
+        query = kwargs["query"]
+        searches.append(query)
+        return _SearchResult(
+            query=query,
+            hits=[] if query == "Question one" else [_hit("task_1")],
+        )
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=task_client,
+        worker_llm=worker,
+        search_runner=search,
+        limits=_limits(),
+        search_runner_in_thread=False,
+    ).run("Question one")
+
+    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
+    assert searches == ["Question one", "query-task_1"]
+    assert [schema for schema, _history, _prompt in task_client.calls] == [
+        SearchAssignmentBatch,
+        TaskArtifact,
+    ]
 
 
 @pytest.mark.asyncio

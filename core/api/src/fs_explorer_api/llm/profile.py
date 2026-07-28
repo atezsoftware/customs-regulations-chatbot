@@ -1,9 +1,9 @@
 """Role-specific LLM policy for the multi-agent research workflow.
 
 The legacy agent still uses the global ``FS_EXPLORER_LLM_*`` settings through
-``get_llm_client()``.  New orchestration code opts into this policy by asking
-the factory for a named role.  Keeping the two configuration paths separate
-allows a feature-flagged rollout without silently changing existing chats.
+``get_llm_client()``. New orchestration code opts into this policy by asking
+the factory for a named role. Keeping the two configuration paths separate
+preserves the explicit production kill switch and legacy fallback behavior.
 """
 
 from __future__ import annotations

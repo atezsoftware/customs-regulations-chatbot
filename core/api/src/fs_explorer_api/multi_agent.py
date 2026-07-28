@@ -24,7 +24,9 @@ from typing import Awaitable, Callable, Literal, Protocol, Sequence, cast
 from .llm import ChatTurn, LLMClient, LLMUsage
 from .orchestration_models import (
     EvidenceClaim,
+    ExecutionStrategy,
     GlobalPlan,
+    PlanMode,
     SearchAssignment,
     SearchAssignmentBatch,
     TaskArtifact,
@@ -631,7 +633,10 @@ class MultiAgentResearchOrchestrator:
         )
         plan = self._bounded_plan(resolution.plan)
         self._used_plan_fallback = resolution.used_fallback
-        detail = f"{plan.mode.value}: {len(plan.tasks)} task(s)"
+        detail = (
+            f"{plan.mode.value}/{plan.execution_strategy.value}: "
+            f"{len(plan.tasks)} task(s)"
+        )
         if resolution.used_fallback:
             detail += " (safe direct fallback)"
         self._emit(
@@ -808,6 +813,14 @@ class MultiAgentResearchOrchestrator:
         ]
         worker_by_assignment = self._worker_artifacts.setdefault(spec.task_id, {})
         searches_run = self._searches_by_task.setdefault(spec.task_id, set())
+        single_pass = (
+            self._plan is not None
+            and self._plan.mode == PlanMode.DIRECT
+            and self._plan.execution_strategy == ExecutionStrategy.SINGLE_PASS
+            and len(self._plan.tasks) == 1
+            and not dependency_artifacts
+        )
+        single_pass_complete = False
 
         first_round = self._next_round_by_task.get(spec.task_id, 1)
         for round_index in range(
@@ -816,22 +829,33 @@ class MultiAgentResearchOrchestrator:
         ):
             if self._worker_count >= self._limits.max_total_workers:
                 break
-            try:
-                dispatch = await self._coordinate_task(
-                    spec=spec,
-                    dependency_artifacts=dependency_artifacts,
-                    worker_artifacts=list(worker_by_assignment.values()),
-                    searches_run=sorted(searches_run),
-                    round_index=round_index,
+            if single_pass and round_index == 1 and not worker_by_assignment:
+                # The global planner has already established that this is one
+                # precise lookup. Reuse its standalone TaskSpec as the search
+                # assignment instead of paying for a redundant coordinator
+                # call. Any coverage miss automatically falls through to the
+                # normal adaptive second wave below.
+                dispatch = self._single_pass_dispatch(
+                    spec,
+                    searches_run=searches_run,
                 )
-            except Exception:
-                logger.exception(
-                    "Task coordinator failed for %s; using bounded fallback",
-                    spec.task_id,
-                )
-                dispatch = self._fallback_dispatch(
-                    spec, searches_run=searches_run, round_index=round_index
-                )
+            else:
+                try:
+                    dispatch = await self._coordinate_task(
+                        spec=spec,
+                        dependency_artifacts=dependency_artifacts,
+                        worker_artifacts=list(worker_by_assignment.values()),
+                        searches_run=sorted(searches_run),
+                        round_index=round_index,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Task coordinator failed for %s; using bounded fallback",
+                        spec.task_id,
+                    )
+                    dispatch = self._fallback_dispatch(
+                        spec, searches_run=searches_run, round_index=round_index
+                    )
 
             assignments = self._validated_assignments(
                 spec,
@@ -914,9 +938,11 @@ class MultiAgentResearchOrchestrator:
                 for claim in worker.claims
                 for criterion in claim.supports_success_criteria
             }
-            if all(
+            coverage_complete = all(
                 criterion in supported_criteria for criterion in spec.success_criteria
-            ):
+            )
+            if coverage_complete:
+                single_pass_complete = single_pass and round_index == 1
                 self._worker_closed_tasks.add(spec.task_id)
                 self._next_round_by_task[spec.task_id] = (
                     self._limits.max_worker_rounds + 1
@@ -924,11 +950,20 @@ class MultiAgentResearchOrchestrator:
                 break
 
         self._worker_closed_tasks.add(spec.task_id)
-        artifact = await self._review_task(
-            spec=spec,
-            dependency_artifacts=dependency_artifacts,
-            worker_artifacts=list(worker_by_assignment.values()),
-        )
+        if single_pass_complete:
+            # IDs, excerpts, criteria and source membership were already
+            # verified server-side in `_run_worker`. A second model reviewer
+            # cannot add evidence for this deliberately simple route.
+            artifact = self._fallback_task_artifact(
+                spec,
+                worker_artifacts=list(worker_by_assignment.values()),
+            )
+        else:
+            artifact = await self._review_task(
+                spec=spec,
+                dependency_artifacts=dependency_artifacts,
+                worker_artifacts=list(worker_by_assignment.values()),
+            )
         status: ProgressStatus = (
             "completed" if artifact.status != TaskStatus.FAILED else "failed"
         )
@@ -1009,6 +1044,32 @@ class MultiAgentResearchOrchestrator:
             assignments=[
                 SearchAssignment(
                     assignment_id=f"{spec.task_id}_fallback",
+                    task_id=spec.task_id,
+                    query=spec.question,
+                    objective=spec.expected_output,
+                    evidence_requirements=list(spec.success_criteria),
+                    excluded_queries=sorted(searches_run),
+                    as_of_date=_validated_as_of_date(spec.as_of_date),
+                    filters=spec.filters,
+                )
+            ],
+        )
+
+    def _single_pass_dispatch(
+        self,
+        spec: TaskSpec,
+        *,
+        searches_run: set[str],
+    ) -> SearchAssignmentBatch:
+        """Create the one deterministic search authorized by a simple plan."""
+
+        return SearchAssignmentBatch(
+            task_id=spec.task_id,
+            stop=False,
+            stop_reason=None,
+            assignments=[
+                SearchAssignment(
+                    assignment_id=f"{spec.task_id}_single_pass",
                     task_id=spec.task_id,
                     query=spec.question,
                     objective=spec.expected_output,
@@ -1510,6 +1571,18 @@ class MultiAgentResearchOrchestrator:
             max_chars=self._limits.review_hit_chars,
         )
         exposed_records = list(review_evidence.records)
+        if (
+            not exposed_records
+            and not any(artifact.claims for artifact in worker_artifacts)
+            and not any(artifact.claims for artifact in dependency_artifacts)
+        ):
+            # With no verified material at any boundary, a reviewer can only
+            # restate gaps. Preserve those deterministically and spend no
+            # additional model tokens.
+            return self._fallback_task_artifact(
+                spec,
+                worker_artifacts=worker_artifacts,
+            )
         try:
             raw, _usage = await self._generate_structured(
                 client=self._task_llm,
@@ -1567,7 +1640,7 @@ class MultiAgentResearchOrchestrator:
             for record in records
         ]
         ranked_records: list[EvidenceRecord]
-        if candidates:
+        if len(candidates) > 1:
             operation = self._task_rerank_tasks.get(spec.task_id)
             if operation is None:
 
@@ -1623,6 +1696,11 @@ class MultiAgentResearchOrchestrator:
                     key=lambda record: record.score,
                     reverse=True,
                 )
+            )
+        elif candidates:
+            # Hosted reranking cannot change a one-item ordering.
+            ranked_records = sorted(
+                records, key=lambda record: record.score, reverse=True
             )
         else:
             ranked_records = []

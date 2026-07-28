@@ -7,6 +7,7 @@ and serves the single-page HTML interface.
 
 import html
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -73,6 +74,20 @@ from .workflow import (
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FsExplorer", description="AI-powered filesystem exploration")
+
+
+def _server_multi_agent_enabled() -> bool:
+    """Enable the production research path by default with an explicit kill switch."""
+
+    value = os.getenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "true").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "FS_EXPLORER_MULTI_AGENT_ENABLED must be a boolean value "
+        "(true/false, yes/no, on/off, or 1/0)."
+    )
 
 
 def _decode_html_entities(value: str) -> str:
@@ -1177,6 +1192,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             temperature=resolved_temperature,
             on_llm_call=_collect_llm_call,
             on_retrieval=_collect_retrieval,
+            multi_agent_enabled=_server_multi_agent_enabled(),
         )
         agent = get_run_agent(resource_manager)
         handler = run_workflow.run(

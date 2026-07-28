@@ -7,7 +7,7 @@ on:
       environment:
         description: 'Select the environment'
         required: false
-        default: ''
+        default: dev
         type: choice
         options:
           - dev
@@ -16,10 +16,10 @@ on:
       action:
         description: 'Select the action'
         required: false
-        default: ''
+        default: deploy
         type: choice
         options:
-          - ''
+          - deploy
           - redeploy
       image_tag:
         description: 'Enter the image tag'
@@ -47,11 +47,36 @@ jobs:
 
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
 
       - name: Creating Environment Variables
+        env:
+          WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_GIT_REF: ${{ github.ref }}
+          WORKFLOW_GIT_SHA: ${{ github.sha }}
+          DISPATCH_ENVIRONMENT: ${{ inputs.environment }}
+          DISPATCH_ACTION: ${{ inputs.action }}
+          DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          if [[ "${{ github.ref }}" == 'refs/heads/develop' ]] || [[ "${{ inputs.action }}" == 'redeploy' && "${{ inputs.environment }}" == 'dev' ]]; then
+          if [[ "$WORKFLOW_EVENT_NAME" == "workflow_dispatch" ]]; then
+            deployment_target="$DISPATCH_ENVIRONMENT"
+          elif [[ "$WORKFLOW_EVENT_NAME" == "push" ]]; then
+            case "$WORKFLOW_GIT_REF" in
+              refs/heads/develop) deployment_target="dev" ;;
+              refs/heads/test/v1) deployment_target="test" ;;
+              refs/heads/release/v1) deployment_target="production" ;;
+              *)
+                echo "Unsupported deployment ref: $WORKFLOW_GIT_REF" >&2
+                exit 1
+                ;;
+            esac
+          else
+            echo "Unsupported deployment event: $WORKFLOW_EVENT_NAME" >&2
+            exit 1
+          fi
+
+          case "$deployment_target" in
+          dev)
             echo "SERVICE_NAME=customs-regulations-ui-dev" >> $GITHUB_ENV
             echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-ui-dev" >> $GITHUB_ENV
             echo "env_x=dev" >> $GITHUB_ENV
@@ -59,7 +84,8 @@ jobs:
             echo "namespace=customs-regulations-dev" >> $GITHUB_ENV
             echo "CLUSTER_NAME=atez-dev-cluster" >> $GITHUB_ENV
             echo "VITE_API_URL=https://dev-customs-regulations-api.singlewindow.io" >> $GITHUB_ENV
-          elif [[ "${{ github.ref }}" == 'refs/heads/test/v1' ]] || [[ "${{ inputs.action }}" == 'redeploy' && "${{ inputs.environment }}" == 'test' ]]; then
+            ;;
+          test)
             echo "SERVICE_NAME=customs-regulations-ui-test-v1" >> $GITHUB_ENV
             echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-ui-test-v1" >> $GITHUB_ENV
             echo "env_x=test-v1" >> $GITHUB_ENV
@@ -67,7 +93,8 @@ jobs:
             echo "namespace=customs-regulations-test" >> $GITHUB_ENV
             echo "CLUSTER_NAME=atez-dev-cluster" >> $GITHUB_ENV
             echo "VITE_API_URL=https://test-customs-regulations-api.singlewindow.io" >> $GITHUB_ENV
-          elif [[ "${{ github.ref }}" == 'refs/heads/release/v1' ]] || [[ "${{ inputs.action }}" == 'redeploy' && "${{ inputs.environment }}" == 'production' ]]; then
+            ;;
+          production)
             echo "SERVICE_NAME=customs-regulations-ui-v1" >> $GITHUB_ENV
             echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-ui-v1" >> $GITHUB_ENV
             echo "env_x=v1" >> $GITHUB_ENV
@@ -75,26 +102,33 @@ jobs:
             echo "namespace=customs-regulations-prod" >> $GITHUB_ENV
             echo "CLUSTER_NAME=atez-prod-cluster" >> $GITHUB_ENV
             echo "VITE_API_URL=https://customs-regulations-api.singlewindow.io" >> $GITHUB_ENV
-          fi
+            ;;
+          *)
+            echo "Unsupported deployment target: $deployment_target" >&2
+            exit 1
+            ;;
+          esac
+
           echo "APP_NAME=customs-regulations-ui" >> $GITHUB_ENV
-          echo "GIT_COMMIT=${{ github.sha }}" >> $GITHUB_ENV
+          echo "GIT_COMMIT=$WORKFLOW_GIT_SHA" >> $GITHUB_ENV
           echo "AWS_REGION=eu-central-1" >> $GITHUB_ENV
           echo "AWS_ECR=255114580789.dkr.ecr.eu-central-1.amazonaws.com" >> $GITHUB_ENV
-          if [[ "${{ inputs.action }}" == "redeploy" && -n "${{ inputs.image_tag }}" ]]; then
-            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_ENV
+          if [[ "$DISPATCH_ACTION" == "redeploy" ]]; then
+            echo "IMAGE_TAG=$DISPATCH_IMAGE_TAG" >> $GITHUB_ENV
           else
-            echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+            echo "IMAGE_TAG=$WORKFLOW_GIT_SHA" >> $GITHUB_ENV
           fi
 
       - name: Validate Redeploy Image
         if: inputs.action == 'redeploy'
+        env:
+          REDEPLOY_IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          if [[ -z "${{ env.IMAGE_TAG }}" ]]; then
-            echo "Error: IMAGE_TAG is required for redeploy action"
-            echo "Please provide image_tag input when using redeploy"
+          if [[ -z "${REDEPLOY_IMAGE_TAG//[[:space:]]/}" ]]; then
+            echo "Error: image_tag input is required for redeploy action." >&2
             exit 1
           fi
-          echo "Using image tag for redeploy: ${{ env.IMAGE_TAG }}"
+          echo "Using image tag for redeploy: $REDEPLOY_IMAGE_TAG"
 
       - name: AWS ECR login
         if: inputs.action != 'redeploy'
@@ -120,7 +154,7 @@ jobs:
           docker push ${{ env.DOCKER_IMAGE_REPO }}:latest
 
       - name: Checkout Helm Charts from DevOps Repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
         with:
           repository: 'atezsoftware/devops'
           token: ${{ secrets.DEVOPS_TOKEN }}
@@ -131,7 +165,11 @@ jobs:
           aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4.2.0
+        uses: azure/setup-helm@v5.0.0
+        with:
+          # `latest` moved this workflow from Helm 3 to Helm 4 without a
+          # repository change. Pin the binary so apply semantics stay stable.
+          version: v4.2.3
 
       - name: Clean up terminating pods
         run: |
@@ -155,21 +193,35 @@ jobs:
 
       - name: Check Helm Release Status
         run: |
-          set +e
-          helm status ${{ env.APP_NAME }}-${{ env.env_x }} --namespace ${{ env.namespace }} > helm_status.txt
-          if grep -q "another operation" helm_status.txt; then
-            echo "Another operation is in progress. Rolling back to previous release."
-            CURRENT_REV=$(helm history ${{ env.APP_NAME }}-${{ env.env_x }} -n ${{ env.namespace }} --max 1 -o json | jq -r '.[0].revision // "1"')
-            if [[ "$CURRENT_REV" -gt 1 ]]; then
-              PREV_REV=$((CURRENT_REV - 1))
-              echo "Rolling back from revision $CURRENT_REV to $PREV_REV"
-              helm rollback ${{ env.APP_NAME }}-${{ env.env_x }} $PREV_REV --namespace ${{ env.namespace }}
-            else
-              echo "No previous revision to rollback to, cleaning up failed deployment"
-              helm uninstall ${{ env.APP_NAME }}-${{ env.env_x }} --namespace ${{ env.namespace }} || true
+          release="${{ env.APP_NAME }}-${{ env.env_x }}"
+          if status_json=$(helm status "$release" --namespace ${{ env.namespace }} -o json 2>/dev/null); then
+            if ! release_status=$(jq -r '.info.status // empty' <<<"$status_json"); then
+              echo "Unable to parse Helm status for $release." >&2
+              exit 1
+            fi
+            if [[ "$release_status" == pending-* ]]; then
+              echo "Release $release is $release_status; recovering the last successful revision."
+              if ! history_json=$(helm history "$release" --namespace ${{ env.namespace }} -o json); then
+                echo "Unable to inspect Helm history for $release; refusing cleanup." >&2
+                exit 1
+              fi
+              if ! rollback_revision=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty' <<<"$history_json"); then
+                echo "Unable to parse Helm history for $release; refusing cleanup." >&2
+                exit 1
+              fi
+              if [[ -n "$rollback_revision" ]]; then
+                echo "Rolling back to last successful revision $rollback_revision"
+                helm rollback "$release" "$rollback_revision" \
+                --namespace ${{ env.namespace }} \
+                --server-side=false \
+                --wait=watcher \
+                --timeout 600s
+              else
+                echo "No successful revision exists; cleaning up failed first installation"
+                helm uninstall "$release" --namespace ${{ env.namespace }} || true
+              fi
             fi
           fi
-          set -e
 
       - name: Deploy to Kubernetes with Helm
         id: helm_deploy
@@ -182,6 +234,7 @@ jobs:
             -f ./devops/${{ env.space_x }}/customs-regulations-ui/customs-regulations-ui-values.yaml \
             --namespace ${{ env.namespace }} \
             --create-namespace \
+            --server-side=false \
             --set image.tag=${{ env.IMAGE_TAG }} \
             ./devops \
             --timeout 600s
@@ -249,15 +302,26 @@ jobs:
         if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'
         run: |
           echo "Rolling back deployment..."
-          CURRENT_REV=$(helm history ${{ env.APP_NAME }}-${{ env.env_x }} -n ${{ env.namespace }} --max 1 -o json | jq -r '.[0].revision // "1"')
-          if [[ "$CURRENT_REV" -gt 1 ]]; then
-            PREV_REV=$((CURRENT_REV - 1))
-            echo "Rolling back from revision $CURRENT_REV to $PREV_REV"
-            helm rollback ${{ env.APP_NAME }}-${{ env.env_x }} $PREV_REV --namespace ${{ env.namespace }}
+          release="${{ env.APP_NAME }}-${{ env.env_x }}"
+          if ! history_json=$(helm history "$release" --namespace ${{ env.namespace }} -o json); then
+            echo "Unable to inspect Helm history for $release; refusing cleanup." >&2
+            exit 1
+          fi
+          if ! rollback_revision=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty' <<<"$history_json"); then
+            echo "Unable to parse Helm history for $release; refusing cleanup." >&2
+            exit 1
+          fi
+          if [[ -n "$rollback_revision" ]]; then
+            echo "Rolling back to last successful revision $rollback_revision"
+            helm rollback "$release" "$rollback_revision" \
+              --namespace ${{ env.namespace }} \
+              --server-side=false \
+              --wait=watcher \
+              --timeout 600s
             echo "ROLLBACK_PERFORMED=true" >> $GITHUB_ENV
           else
-            echo "No previous revision to rollback to, cleaning up failed deployment"
-            helm uninstall ${{ env.APP_NAME }}-${{ env.env_x }} --namespace ${{ env.namespace }} || true
+            echo "No successful revision exists; cleaning up failed first installation"
+            helm uninstall "$release" --namespace ${{ env.namespace }} || true
             echo "ROLLBACK_PERFORMED=cleanup" >> $GITHUB_ENV
           fi
           echo "Marking the job as failed"

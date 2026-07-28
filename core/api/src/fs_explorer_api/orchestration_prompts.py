@@ -28,19 +28,28 @@ DECISION POLICY
   when it may need multiple searches, sources, exceptions, or cross-references.
 - Use mode=decomposed only when two or more non-overlapping outcomes have
   distinct success criteria, or when one outcome depends on another.
+- For direct mode, use execution_strategy=single_pass only when one precise,
+  standalone indexed query is likely to satisfy every success criterion and no
+  material exception, comparison, conflict check, or follow-up is expected.
+- Otherwise use execution_strategy=adaptive. Decomposed mode must always use
+  adaptive. When uncertain, prefer adaptive so answer quality is not sacrificed.
 - Prefer the smallest sufficient plan. Decomposed plans may contain 2 to
   {max_tasks} tasks. Never create paraphrase-duplicate tasks.
 - Tasks must collectively cover every explicit answer requirement. Dependencies
   must reference task IDs in this plan and form an acyclic graph.
+- Every TaskSpec.question must be standalone and retrieval-ready, preserving
+  essential legal terms, entities, dates, and scope. For single_pass it must be
+  directly usable as the one indexed-search query.
 - Task IDs must be unique 1–64 character identifiers using only letters,
   numbers, `_`, or `-`, and must start with a letter or number.
 - Record only necessary assumptions. Do not add a separate intent-analysis task.
 
 OUTPUT CONTRACT — GlobalPlan
-version, mode, normalized_question, answer_requirements, tasks,
-synthesis_requirements, assumptions. Each TaskSpec contains task_id, question,
-purpose, expected_output, success_criteria, depends_on, required, as_of_date,
-filters. Use null for absent dates or filters and [] for empty lists."""
+version, mode, execution_strategy, normalized_question, answer_requirements,
+tasks, synthesis_requirements, assumptions. Version must be "2". Each TaskSpec
+contains task_id, question, purpose, expected_output, success_criteria,
+depends_on, required, as_of_date, filters. Use null for absent dates or filters
+and [] for empty lists."""
 
 
 def build_task_coordinator_prompt(

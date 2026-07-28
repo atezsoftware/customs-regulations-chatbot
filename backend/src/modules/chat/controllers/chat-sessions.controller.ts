@@ -70,7 +70,7 @@ export class ChatSessionsController {
   @response(200, {description: 'Created chat session'})
   async create(@requestBody() body: SessionBody) {
     const user = await getCurrentUser(this.request, this.userRepository);
-    const defaultModel = process.env.OPENROUTER_DEFAULT_MODEL ?? 'google/gemini-3-flash-preview';
+    const defaultModel = process.env.OPENROUTER_DEFAULT_MODEL ?? 'google/gemini-3.6-flash';
     const available = await this.llmModelRepository.findOne({
       where: {provider: 'openrouter', modelId: defaultModel, isActive: true},
     });

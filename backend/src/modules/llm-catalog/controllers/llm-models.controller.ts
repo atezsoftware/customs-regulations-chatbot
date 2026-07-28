@@ -3,7 +3,7 @@ import {repository} from '@loopback/repository';
 import {get, HttpErrors, response} from '@loopback/rest';
 import {LlmModelRepository} from '../repositories/llm-model.repository';
 
-const DEFAULT_MODEL = 'google/gemini-3-flash-preview';
+const DEFAULT_MODEL = 'google/gemini-3.6-flash';
 
 export class LlmModelsController {
   constructor(@repository(LlmModelRepository) private models: LlmModelRepository) {}
