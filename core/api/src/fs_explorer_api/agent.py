@@ -12,13 +12,21 @@ import html
 import logging
 import os
 import re
+from decimal import Decimal
 from pathlib import Path
-from typing import AsyncIterator, Awaitable, Callable, Any, Literal
+from typing import AsyncIterator, Awaitable, Callable, Any, Literal, Mapping
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
 from .llm import ChatTurn, LLMClient, LLMUsage, get_llm_client
+from .llm.profile import LLMProfile, LLMRole, load_llm_profile
+from .multi_agent import (
+    MultiAgentResearchOrchestrator,
+    MultiAgentResearchResult,
+    ResearchProgress,
+)
+from .orchestration_prompts import FINAL_SYNTHESIS_SYSTEM_PROMPT
 from .models import (
     Action,
     ActionType,
@@ -178,6 +186,13 @@ def _normalize_indexed_text(value: str) -> str:
     return html.unescape(value)
 
 
+def _current_indexed_question(task: str) -> str:
+    """Strip the optional bounded conversation prefix from a retrieval task."""
+
+    marker = "\n\nCurrent question:\n"
+    return task.rsplit(marker, 1)[-1].strip() or task.strip()
+
+
 # --- Near-duplicate tool-call guard ---
 #
 # Real runs have been observed re-issuing 10+ near-identical semantic_search
@@ -323,6 +338,8 @@ class TokenUsage:
     # Number of times this run's mid-exploration chat history was
     # compacted by `FsExplorerAgent._maybe_summarize_history`.
     context_summaries: int = 0
+    provider_billed_cost_usd: Decimal = Decimal("0")
+    provider_cost_calls: int = 0
 
     def add_api_call(
         self,
@@ -377,6 +394,21 @@ class TokenUsage:
             self.completion_tokens / 1_000_000
         ) * GEMINI_FLASH_OUTPUT_COST_PER_MILLION
         return input_cost, output_cost, input_cost + output_cost
+
+    def add_provider_cost(self, billed_cost_usd: Decimal | None) -> None:
+        """Accumulate authoritative per-call provider billing when available."""
+
+        if billed_cost_usd is None:
+            return
+        self.provider_billed_cost_usd += billed_cost_usd
+        self.provider_cost_calls += 1
+
+    def total_cost_usd(self) -> float:
+        """Prefer provider billing over the legacy single-model estimate."""
+
+        if self.provider_cost_calls:
+            return float(self.provider_billed_cost_usd)
+        return self._calculate_cost()[2]
 
     def context_usage_ratio(self, max_context_tokens: int) -> float:
         """Fraction of the model's context window the last call actually used.
@@ -1678,7 +1710,7 @@ class LLMCallStats:
     life of one agent. Callers (server.py, main.py) that want per-message
     granularity — one row per LLM call, not just an end-of-run total —
     hook `FsExplorerAgent(on_llm_call=...)` to receive one of these
-    per Gemini call as it happens.
+    per provider call as it happens.
     """
 
     purpose: str  # "action" (tool-planning step) | "final_answer"
@@ -1695,6 +1727,10 @@ class LLMCallStats:
     billed_cost_usd: str | None = None
     upstream_cost_usd: str | None = None
     cost_source: str | None = None
+    agent_role: str | None = None
+    task_id: str | None = None
+    agent_id: str | None = None
+    sequence: int | None = None
 
 
 OnLLMCall = Callable[[LLMCallStats], Awaitable[None]]
@@ -1717,6 +1753,9 @@ class RetrievalStats:
     chunk_count: int
     chars: int
     estimated_tokens: int
+    task_id: str | None = None
+    agent_id: str | None = None
+    sequence: int | None = None
 
 
 OnRetrieval = Callable[[RetrievalStats], None]
@@ -1743,6 +1782,9 @@ class FsExplorerAgent:
         temperature: float | None = None,
         on_llm_call: OnLLMCall | None = None,
         on_retrieval: OnRetrieval | None = None,
+        llm_profile: LLMProfile | None = None,
+        role_clients: Mapping[LLMRole, LLMClient] | None = None,
+        multi_agent_enabled: bool | None = None,
     ) -> None:
         """
         Initialize the agent with an LLM client.
@@ -1757,7 +1799,7 @@ class FsExplorerAgent:
             temperature: Sampling temperature override, passed to
                          `get_llm_client`.
             on_llm_call: Optional async callback invoked after every
-                         individual Gemini call with per-call token/timing
+                         individual provider call with per-call token/timing
                          stats (see `LLMCallStats`), for callers that want
                          incremental observability instead of only the
                          cumulative `token_usage` totals.
@@ -1779,6 +1821,20 @@ class FsExplorerAgent:
         self.token_usage = TokenUsage()
         self._on_llm_call = on_llm_call
         self._on_retrieval = on_retrieval
+        self._llm_profile = llm_profile
+        self._role_clients: dict[LLMRole, LLMClient] = dict(role_clients or {})
+        configured_multi_agent = os.getenv(
+            "FS_EXPLORER_MULTI_AGENT_ENABLED", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._multi_agent_enabled = (
+            bool(self._role_clients) or configured_multi_agent
+            if multi_agent_enabled is None
+            else multi_agent_enabled
+        )
+        self._multi_agent_orchestrator: MultiAgentResearchOrchestrator | None = None
+        self._multi_agent_result: MultiAgentResearchResult | None = None
+        self._multi_agent_final_llm: LLMClient | None = None
+        self._multi_agent_research_active = False
         self._step_count = 0
         # Instance-level, not just the module constant — grant_more_steps()
         # (called on resume) raises this so a resumed run gets genuine extra
@@ -1795,9 +1851,7 @@ class FsExplorerAgent:
         self._ranked_indexed_evidence: list[tuple[RankedDocument, float]] = []
         self._executed_indexed_queries: list[str] = []
         self._executed_indexed_search_keys: set[tuple[str, str, str]] = set()
-        self._indexed_query_candidate_keys: dict[
-            tuple[str, str, str], list[str]
-        ] = {}
+        self._indexed_query_candidate_keys: dict[tuple[str, str, str], list[str]] = {}
         self._indexed_retrieval_rounds = 0
         self._indexed_no_novelty_rounds = 0
         # Set when take_action() hits the _MAX_STEPS safety net rather than
@@ -1832,23 +1886,153 @@ class FsExplorerAgent:
         """Return a copy of any planned-but-not-yet-executed indexed searches."""
         return list(self._planned_search_calls)
 
-    async def _report_llm_call(self, purpose: str, usage: "LLMUsage") -> None:
+    @property
+    def multi_agent_enabled(self) -> bool:
+        """Whether indexed semantic questions use the multi-agent branch."""
+
+        return self._multi_agent_enabled
+
+    @property
+    def multi_agent_research_active(self) -> bool:
+        """Whether a resumable multi-agent research plan is in progress."""
+
+        return self._multi_agent_research_active
+
+    @property
+    def multi_agent_incomplete(self) -> bool:
+        """Whether a required task remained partial or failed."""
+
+        return bool(self._multi_agent_result and self._multi_agent_result.incomplete)
+
+    @property
+    def final_model(self) -> str | None:
+        """Model that will write the user-visible answer."""
+
+        client = (
+            self._multi_agent_final_llm
+            if self._multi_agent_result is not None
+            else self._llm
+        )
+        return getattr(client, "model", None)
+
+    def evidence_sources_for_answer(self, final_answer: str) -> list[dict[str, object]]:
+        """Return only chunks cited by their exact readable title and locator."""
+
+        if self._multi_agent_result is None:
+            return []
+        normalized_answer = " ".join(html.unescape(final_answer).casefold().split())
+        selected: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for source in self._multi_agent_result.evidence_sources:
+            title = str(source.get("title") or "").strip()
+            locator = str(source.get("locator") or "").strip()
+            chunk_id = str(source.get("chunk_id") or "").strip()
+            citation = " ".join(
+                html.unescape(f"[{title}, {locator}]").casefold().split()
+            )
+            if (
+                not title
+                or not locator
+                or citation not in normalized_answer
+                or not chunk_id
+                or chunk_id in seen
+            ):
+                continue
+            seen.add(chunk_id)
+            selected.append(dict(source))
+        return selected
+
+    def _multi_agent_fallback_answer(self) -> str | None:
+        """Render a deterministic cited answer if final-model streaming fails."""
+
+        result = self._multi_agent_result
+        if result is None:
+            return None
+        exposed_sources = {
+            (
+                str(source.get("document_id") or ""),
+                str(source.get("chunk_id") or ""),
+            )
+            for source in result.evidence_sources
+        }
+        claims = [
+            claim
+            for artifact in result.task_artifacts
+            for claim in artifact.claims
+            if (claim.document_id, claim.chunk_id) in exposed_sources
+        ]
+        if not claims:
+            return None
+
+        question = result.plan.normalized_question.casefold()
+        turkish = bool(
+            re.search(
+                r"[çğıöşü]|\b(nedir|nelerdir|nasıl|hangi|gümrük|için|ve|ile)\b",
+                question,
+            )
+        )
+        lines = [
+            (
+                "Doğrulanmış indeks kanıtlarından çıkarılabilen sonuçlar:"
+                if turkish
+                else "Conclusions supported by the verified indexed evidence:"
+            ),
+            "",
+        ]
+        source_titles: list[str] = []
+        for claim in claims:
+            lines.append(f"- {claim.claim} [{claim.readable_title}, {claim.locator}]")
+            if claim.readable_title not in source_titles:
+                source_titles.append(claim.readable_title)
+        if result.incomplete:
+            lines.extend(
+                [
+                    "",
+                    (
+                        "Bazı gerekli araştırma ölçütleri doğrulanamadığı için "
+                        "bu sonuç eksik olabilir."
+                        if turkish
+                        else "Some required research criteria could not be "
+                        "verified, so this result may be incomplete."
+                    ),
+                ]
+            )
+        lines.extend(["", "## Sources"])
+        lines.extend(f"- {title}" for title in source_titles)
+        return "\n".join(lines)
+
+    async def _report_llm_call(
+        self,
+        purpose: str,
+        usage: "LLMUsage",
+        *,
+        client: LLMClient | None = None,
+        agent_role: str | None = None,
+        task_id: str | None = None,
+        agent_id: str | None = None,
+        sequence: int | None = None,
+    ) -> None:
+        self.token_usage.add_provider_cost(usage.billed_cost_usd)
         if self._on_llm_call is None:
             return
+        resolved_client = client or self._llm
+        provider = getattr(resolved_client, "provider", None)
+        if not isinstance(provider, str):
+            provider = (
+                "openrouter"
+                if resolved_client.__class__.__name__ == "OpenRouterLLMClient"
+                else "gemini"
+            )
         await self._on_llm_call(
             LLMCallStats(
                 purpose=purpose,
-                model=getattr(self._llm, "model", "unknown"),
+                model=getattr(resolved_client, "model", "unknown"),
                 prompt_tokens=usage.input_tokens,
                 completion_tokens=usage.output_tokens,
                 thinking_tokens=usage.thinking_tokens,
                 duration_ms=usage.duration_ms,
-                step=self._step_count,
-                provider=(
-                    "openrouter"
-                    if self._llm.__class__.__name__ == "OpenRouterLLMClient"
-                    else "gemini"
-                ),
+                step=sequence if sequence is not None else self._step_count,
+                provider=provider,
                 generation_id=usage.generation_id,
                 cached_input_tokens=usage.cached_input_tokens,
                 cache_write_tokens=usage.cache_write_tokens,
@@ -1863,6 +2047,10 @@ class FsExplorerAgent:
                     else None
                 ),
                 cost_source=usage.cost_source,
+                agent_role=agent_role,
+                task_id=task_id,
+                agent_id=agent_id,
+                sequence=sequence,
             )
         )
 
@@ -1884,6 +2072,128 @@ class FsExplorerAgent:
                 estimated_tokens=(chars + 3) // 4,
             )
         )
+
+    def _ensure_multi_agent_clients(self) -> dict[LLMRole, LLMClient]:
+        """Create one immutable role-client set lazily for this run."""
+
+        profile = self._llm_profile or load_llm_profile()
+        for role in ("planner", "task", "worker", "final"):
+            if role not in self._role_clients:
+                self._role_clients[role] = get_llm_client(
+                    role=role,
+                    profile=profile,
+                )
+        return self._role_clients
+
+    async def _record_multi_agent_llm_usage(
+        self,
+        role: str,
+        purpose: str,
+        client: LLMClient,
+        usage: LLMUsage,
+        task_id: str | None,
+        agent_id: str | None,
+        sequence: int,
+    ) -> None:
+        """Fold one isolated role call into legacy aggregate telemetry."""
+
+        self._step_count += 1
+        self.token_usage.add_api_call(
+            prompt_tokens=usage.input_tokens,
+            completion_tokens=usage.output_tokens,
+            thinking_tokens=usage.thinking_tokens,
+        )
+        await self._report_llm_call(
+            purpose,
+            usage,
+            client=client,
+            agent_role=role,
+            task_id=task_id,
+            agent_id=agent_id,
+            sequence=sequence,
+        )
+
+    def _record_multi_agent_retrieval(
+        self,
+        chunk_count: int,
+        chars: int,
+        task_id: str | None,
+        agent_id: str | None,
+        sequence: int,
+    ) -> None:
+        """Record the bounded evidence actually exposed to one worker."""
+
+        self.token_usage.tool_result_chars += chars
+        self.token_usage.retrieval_chunks += chunk_count
+        self.token_usage.retrieval_chars += chars
+        if self._on_retrieval is not None:
+            self._on_retrieval(
+                RetrievalStats(
+                    step=sequence,
+                    tool_name="semantic_search",
+                    chunk_count=chunk_count,
+                    chars=chars,
+                    estimated_tokens=(chars + 3) // 4,
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    sequence=sequence,
+                )
+            )
+
+    async def prepare_multi_agent_indexed(
+        self,
+        task: str,
+        *,
+        on_progress: Callable[[ResearchProgress], None] | None = None,
+    ) -> MultiAgentResearchResult:
+        """Run or resume the context-isolated multi-agent indexed workflow."""
+
+        if self._multi_agent_result is not None:
+            return self._multi_agent_result
+
+        clients = self._ensure_multi_agent_clients()
+        self._multi_agent_final_llm = clients["final"]
+        if self._multi_agent_orchestrator is None:
+            self._multi_agent_orchestrator = MultiAgentResearchOrchestrator(
+                planner_llm=clients["planner"],
+                task_llm=clients["task"],
+                worker_llm=clients["worker"],
+                search_runner=_run_planned_index_search,
+                on_llm_usage=self._record_multi_agent_llm_usage,
+                on_retrieval=self._record_multi_agent_retrieval,
+                on_progress=on_progress,
+            )
+        else:
+            self._multi_agent_orchestrator.set_progress_observer(on_progress)
+
+        self._multi_agent_research_active = True
+        try:
+            result = await self._multi_agent_orchestrator.run(task)
+        except BaseException:
+            # Keep the orchestrator and completed artifacts on the agent so an
+            # interrupted WebSocket run can continue without replaying them.
+            raise
+        else:
+            self._multi_agent_result = result
+            self._multi_agent_research_active = False
+            self._prepared_indexed_evidence = True
+            self._indexed_research_active = False
+            self._chat_history = [
+                ChatTurn(
+                    role="user",
+                    text=f"Original question:\n{_current_indexed_question(task)}",
+                ),
+                ChatTurn(role="user", text=result.final_context),
+            ]
+            return result
+
+    def abandon_multi_agent_research(self) -> None:
+        """Clear a failed optional branch before falling back to legacy retrieval."""
+
+        self._multi_agent_orchestrator = None
+        self._multi_agent_result = None
+        self._multi_agent_final_llm = None
+        self._multi_agent_research_active = False
 
     def grant_more_steps(self, extra: int | None = None) -> None:
         """Extend this agent's step budget — call when resuming a run.
@@ -1973,9 +2283,7 @@ class FsExplorerAgent:
                         parameter_value=search.as_of_date,
                     )
                 )
-            calls.append(
-                ToolCallAction(tool_name="semantic_search", tool_input=args)
-            )
+            calls.append(ToolCallAction(tool_name="semantic_search", tool_input=args))
             if len(calls) >= max_queries:
                 break
 
@@ -2149,7 +2457,9 @@ class FsExplorerAgent:
                 break
 
         for document, score in ranked:
-            candidate_key = document.chunk_id or f"{document.doc_id}:{document.position}"
+            candidate_key = (
+                document.chunk_id or f"{document.doc_id}:{document.position}"
+            )
             if candidate_key in selected_keys:
                 continue
             selected.append((document, score))
@@ -2439,14 +2749,29 @@ class FsExplorerAgent:
         If the LLM client does not support streaming (or errors before
         yielding anything), falls back to yielding `fallback_answer` once.
         """
-        prompt = "Using the evidence above, write the final answer now."
+        is_multi_agent = (
+            self._multi_agent_result is not None
+            and self._multi_agent_final_llm is not None
+        )
+        prompt = (
+            "Synthesize the final answer from the verified task artifacts and "
+            "evidence above. Preserve every material limitation."
+            if is_multi_agent
+            else "Using the evidence above, write the final answer now."
+        )
         stream_history = [*self._chat_history, ChatTurn(role="user", text=prompt)]
-        system_prompt = FINAL_SYSTEM_PROMPT
+        system_prompt = (
+            FINAL_SYNTHESIS_SYSTEM_PROMPT if is_multi_agent else FINAL_SYSTEM_PROMPT
+        )
+        client = self._multi_agent_final_llm if is_multi_agent else self._llm
+        assert client is not None
 
         chunks: list[str] = []
         try:
-            async for text in self._llm.stream_text(
-                stream_history, system_prompt, thinking_level="high"
+            async for text in client.stream_text(
+                stream_history,
+                system_prompt,
+                thinking_level=None if is_multi_agent else "high",
             ):
                 chunks.append(text)
                 yield text
@@ -2459,23 +2784,35 @@ class FsExplorerAgent:
             # generic message here means a double failure (forced stop *and*
             # streaming both coming up empty) still shows the user something
             # instead of a silent blank response.
-            yield fallback_answer or (
-                "Üzgünüm, bu soru için şu anda bir cevap oluşturamadım. "
-                "Lütfen tekrar deneyin."
+            yield (
+                self._multi_agent_fallback_answer()
+                or fallback_answer
+                or (
+                    "Üzgünüm, bu soru için şu anda bir cevap oluşturamadım. "
+                    "Lütfen tekrar deneyin."
+                )
             )
             return
 
         final_text = "".join(chunks)
         self._chat_history.append(ChatTurn(role="model", text=final_text))
 
-        usage = self._llm.last_stream_usage()
+        usage = client.last_stream_usage()
         if usage:
             self.token_usage.add_api_call(
                 prompt_tokens=usage.input_tokens,
                 completion_tokens=usage.output_tokens,
                 thinking_tokens=usage.thinking_tokens,
             )
-            await self._report_llm_call("final_answer", usage)
+            if is_multi_agent:
+                self._step_count += 1
+            await self._report_llm_call(
+                "final_answer",
+                usage,
+                client=client,
+                agent_role="final" if is_multi_agent else None,
+                agent_id="final-synthesizer" if is_multi_agent else None,
+            )
 
     def call_tool(self, tool_name: Tools, tool_input: dict[str, Any]) -> None:
         """
@@ -2599,4 +2936,8 @@ class FsExplorerAgent:
         self._indexed_query_candidate_keys.clear()
         self._indexed_retrieval_rounds = 0
         self._indexed_no_novelty_rounds = 0
+        self._multi_agent_orchestrator = None
+        self._multi_agent_result = None
+        self._multi_agent_final_llm = None
+        self._multi_agent_research_active = False
         self._forced_stop = False

@@ -97,6 +97,10 @@ export interface AgentLlmUsage {
   model?: string;
   purpose: string;
   step?: number;
+  agentRole?: string;
+  taskId?: string;
+  agentId?: string;
+  sequence?: number;
   inputTokens: number;
   outputTokens: number;
   thinkingTokens: number;
@@ -181,6 +185,12 @@ export class CoreBridgeService {
     const queue = new AsyncQueue();
     let finalContent = '';
     let lastRunningStepKey: string | undefined;
+    // Multi-agent progress events overlap by design. Track those rows
+    // independently from the legacy, strictly sequential status/tool
+    // stream so one worker finishing cannot close a sibling's live step.
+    const activeAgentStepKeys = new Set<string>();
+    const agentStepKeysByCorrelation = new Map<string, string>();
+    const pendingAgentRetrievalMetadata = new Map<string, Record<string, unknown>>();
     let statusCounter = 0;
     let closedByAbort = false;
     let terminalEventSeen = false;
@@ -263,6 +273,36 @@ export class CoreBridgeService {
           continue;
         }
 
+        if (event.type === 'research_progress') {
+          const progress = parseResearchProgress(data);
+          if (!progress) continue;
+          let step = await this.saveStep({
+            messageId: input.assistantMessageId,
+            ...progress,
+          });
+          const correlationKey = researchProgressCorrelationKey(progress);
+          if (correlationKey) {
+            agentStepKeysByCorrelation.set(correlationKey, progress.stepKey);
+            const pendingMetadata = pendingAgentRetrievalMetadata.get(correlationKey);
+            if (pendingMetadata) {
+              step =
+                (await this.mergeStepMetadata(
+                  input.assistantMessageId,
+                  progress.stepKey,
+                  pendingMetadata,
+                )) ?? step;
+              pendingAgentRetrievalMetadata.delete(correlationKey);
+            }
+          }
+          if (progress.status === 'running') {
+            activeAgentStepKeys.add(progress.stepKey);
+          } else {
+            activeAgentStepKeys.delete(progress.stepKey);
+          }
+          yield {type: 'research_step', step};
+          continue;
+        }
+
         if (event.type === 'status') {
           const stepKey = `status-${++statusCounter}`;
           if (lastRunningStepKey) {
@@ -307,18 +347,15 @@ export class CoreBridgeService {
           continue;
         }
 
-        if (event.type === 'retrieval_stats') {
-          // Chunk/token counts for a chunk-bearing tool call, arriving as a
-          // separate event after the 'tool_call' that already created this
-          // step's row — core-api correlates `data.step` to the exact same
-          // per-tool_call step number used above (not the agent's own,
-          // coarser step counter, which a batch of 2-3 calls shares), so
-          // this stepKey always matches the row 'tool_call' just created.
-          const stepKey = `tool-${text(data.step)}`;
-          const step = await this.mergeStepMetadata(input.assistantMessageId, stepKey, {
-            chunkCount: numberValue(data.chunk_count),
-            retrievalChars: numberValue(data.chars),
-            retrievalTokensEstimated: numberValue(data.estimated_tokens),
+        if (event.type === 'retrieval_stats' || event.type === 'retrieval_done') {
+          // Legacy calls correlate through `data.step` to a tool row.
+          // Multi-agent searches have no tool row, so their task/agent/
+          // sequence tuple targets the parallel search progress row instead.
+          const step = await this.mergeRetrievalMetadata({
+            messageId: input.assistantMessageId,
+            data,
+            agentStepKeysByCorrelation,
+            pendingAgentRetrievalMetadata,
           });
           if (step) yield {type: 'research_step', step};
           continue;
@@ -381,6 +418,10 @@ export class CoreBridgeService {
             DEFAULT_MODEL;
           const purpose = text(data.purpose, 'action');
           const step = numberValue(data.step);
+          const agentRole = text(data.agent_role) || undefined;
+          const taskId = text(data.task_id) || undefined;
+          const agentId = text(data.agent_id) || undefined;
+          const sequence = optionalInteger(data.sequence);
           const inputTokens = numberValue(data.prompt_tokens);
           const outputTokens = numberValue(data.completion_tokens);
           const thinkingTokens = numberValue(data.thinking_tokens);
@@ -418,6 +459,10 @@ export class CoreBridgeService {
               model,
               purpose,
               step,
+              agentRole,
+              taskId,
+              agentId,
+              sequence,
               inputTokens,
               outputTokens,
               thinkingTokens,
@@ -438,6 +483,15 @@ export class CoreBridgeService {
             };
             lastRunningStepKey = undefined;
           }
+          for (const step of await this.completeRunningAgentSteps(
+            input.assistantMessageId,
+            activeAgentStepKeys,
+          )) {
+            yield {type: 'research_step', step};
+          }
+          activeAgentStepKeys.clear();
+          agentStepKeysByCorrelation.clear();
+          pendingAgentRetrievalMetadata.clear();
           continue;
         }
 
@@ -479,6 +533,15 @@ export class CoreBridgeService {
             };
             lastRunningStepKey = undefined;
           }
+          for (const step of await this.completeRunningAgentSteps(
+            input.assistantMessageId,
+            activeAgentStepKeys,
+          )) {
+            yield {type: 'research_step', step};
+          }
+          activeAgentStepKeys.clear();
+          agentStepKeysByCorrelation.clear();
+          pendingAgentRetrievalMetadata.clear();
 
           const error = text(data.error);
           const stats = objectOrUndefined(data.stats);
@@ -663,7 +726,15 @@ export class CoreBridgeService {
           : undefined,
     };
     if (existing?.id) {
-      await this.chatResearchStepRepository.updateById(existing.id, data);
+      await this.chatResearchStepRepository.updateById(existing.id, {
+        ...data,
+        // Lifecycle updates share one row. Preserve retrieval telemetry
+        // merged after the started event when the completed event arrives.
+        metadata: {
+          ...(objectOrUndefined(existing.metadata) ?? {}),
+          ...(input.metadata ?? {}),
+        },
+      });
       return this.toAgentStep(await this.chatResearchStepRepository.findById(existing.id));
     }
     return this.toAgentStep(
@@ -693,6 +764,75 @@ export class CoreBridgeService {
     return this.toAgentStep(await this.chatResearchStepRepository.findById(existing.id));
   }
 
+  /**
+   * Close both agent steps observed on this socket and running agent rows
+   * left by an interrupted socket. The database lookup is the recovery
+   * path: a resumed stream starts with an empty in-memory active set.
+   */
+  private async completeRunningAgentSteps(
+    messageId: number,
+    activeStepKeys: ReadonlySet<string>,
+  ): Promise<AgentResearchStep[]> {
+    const runningSteps = await this.chatResearchStepRepository.find({
+      where: {messageId, status: 'running'},
+    });
+    const stepKeys = new Set(activeStepKeys);
+    for (const step of runningSteps) {
+      if (step.stepKey.startsWith('agent-')) stepKeys.add(step.stepKey);
+    }
+
+    const completed: AgentResearchStep[] = [];
+    for (const stepKey of stepKeys) {
+      completed.push(await this.completeStep(messageId, stepKey));
+    }
+    return completed;
+  }
+
+  /**
+   * Attach retrieval telemetry to a multi-agent search lifecycle row when
+   * correlation fields are present; otherwise retain the legacy tool-step
+   * behavior. A pending map tolerates Core sending the side-channel stats
+   * just before its corresponding progress event reaches this consumer.
+   */
+  private async mergeRetrievalMetadata(input: {
+    messageId: number;
+    data: JsonObject;
+    agentStepKeysByCorrelation: Map<string, string>;
+    pendingAgentRetrievalMetadata: Map<string, Record<string, unknown>>;
+  }): Promise<AgentResearchStep | undefined> {
+    const metadata = retrievalMetadata(input.data);
+    const correlationKey = agentRetrievalCorrelationKey(input.data);
+    if (!correlationKey) {
+      return this.mergeStepMetadata(
+        input.messageId,
+        `tool-${text(input.data.step)}`,
+        metadata,
+      );
+    }
+
+    let stepKey = input.agentStepKeysByCorrelation.get(correlationKey);
+    if (!stepKey) {
+      const runningSteps = await this.chatResearchStepRepository.find({
+        where: {messageId: input.messageId, status: 'running'},
+      });
+      stepKey = runningSteps.find(step => {
+        if (!step.stepKey.startsWith('agent-')) return false;
+        const stepMetadata = objectOrUndefined(step.metadata);
+        return (
+          stepMetadata?.kind === 'search_started' &&
+          researchMetadataCorrelationKey(stepMetadata) === correlationKey
+        );
+      })?.stepKey;
+      if (stepKey) input.agentStepKeysByCorrelation.set(correlationKey, stepKey);
+    }
+
+    if (!stepKey) {
+      input.pendingAgentRetrievalMetadata.set(correlationKey, metadata);
+      return undefined;
+    }
+    return this.mergeStepMetadata(input.messageId, stepKey, metadata);
+  }
+
   // Merges into (rather than replacing) a step's metadata — used for
   // 'retrieval_stats', which arrives as a separate event after the
   // 'tool_call' event that already created this step's row with `{}`
@@ -717,12 +857,49 @@ export class CoreBridgeService {
     indexedHits: IndexedHit[],
     finalContent: string,
   ): Promise<AgentSource[]> {
+    const evidenceSources = Array.isArray(data.evidence_sources) ? data.evidence_sources : [];
     const citedSources = Array.isArray(data.cited_sources) ? data.cited_sources : [];
     const links = objectOrUndefined(data.cited_source_links) ?? {};
     const persisted: AgentSource[] = [];
     const seen = new Set<string>();
+    // Kept separately from chunk-level deduplication so several cited
+    // locators from one exact document can all be persisted while the
+    // later bare-title legacy fallback is still suppressed.
+    const exactTitleKeys = new Set<string>();
+
+    // New multi-agent runs return the exact evidence selected during
+    // synthesis. Persist that authoritative provenance first; the legacy
+    // original-query pre-search below remains only as a compatibility
+    // fallback for older core-api versions and non-indexed citations.
+    for (const rawSource of evidenceSources) {
+      const source = objectOrUndefined(rawSource);
+      if (!source) continue;
+      const title = text(source.title);
+      const locator = text(source.locator);
+      const chunkId = text(source.chunk_id) || undefined;
+      const snippet = text(source.snippet) || undefined;
+      if (!title && !chunkId) continue;
+      if (title) exactTitleKeys.add(normalizeCitation(title));
+
+      const displayTitle = evidenceSourceTitle(title || 'Indexed document', locator);
+      const sourceKey = normalizeCitation(chunkId || displayTitle);
+      if (!sourceKey || seen.has(sourceKey)) continue;
+      seen.add(sourceKey);
+      seen.add(normalizeCitation(displayTitle));
+      if (chunkId) seen.add(normalizeCitation(chunkId));
+
+      const record = await this.chatSourceRepository.create({
+        messageId,
+        title: displayTitle,
+        snippet,
+        chunkId,
+        score: optionalDecimal(source.score),
+      });
+      persisted.push(this.toAgentSource(record));
+    }
 
     for (const citation of extractCitationLabels(finalContent)) {
+      if (seen.has(normalizeCitation(citation))) continue;
       const hit = findHitForCitation(citation, indexedHits);
       if (!hit?.chunkId) continue;
       const key = normalizeCitation(hit.chunkId);
@@ -743,7 +920,7 @@ export class CoreBridgeService {
       const title = text(source);
       if (!title) continue;
       const key = normalizeCitation(title);
-      if (seen.has(key)) continue;
+      if (seen.has(key) || exactTitleKeys.has(key)) continue;
       const hit = findHitForCitation(title, indexedHits);
       if (hit?.chunkId) {
         const chunkKey = normalizeCitation(hit.chunkId);
@@ -1058,6 +1235,15 @@ function decimalValue(value: unknown): number {
   return 0;
 }
 
+function optionalDecimal(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
 function optionalInteger(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
   if (typeof value === 'string') {
@@ -1065,6 +1251,128 @@ function optionalInteger(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return Math.trunc(parsed);
   }
   return undefined;
+}
+
+function definedObject(values: Record<string, unknown>): JsonObject {
+  return Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value !== undefined && value !== ''),
+  );
+}
+
+/**
+ * Normalizes core-api's multi-agent lifecycle event into the existing
+ * research-step persistence contract. The event id is deliberately the
+ * sole key input: started/completed/failed updates must address the same
+ * row even when several agents interleave their events.
+ */
+export function parseResearchProgress(data: JsonObject):
+  | {
+      stepKey: string;
+      status: 'running' | 'completed' | 'error';
+      title: string;
+      preview?: string;
+      metadata: JsonObject;
+    }
+  | undefined {
+  const eventId = text(data.event_id);
+  const status = researchProgressStatus(data.status);
+  // Without both fields we cannot safely upsert a parallel step, so a
+  // malformed event is intentionally ignored rather than assigned a
+  // sequence-derived key that could collide on resume.
+  if (!eventId || !status) return undefined;
+
+  const agentRole = text(data.agent_role) || undefined;
+  return {
+    stepKey: `agent-${eventId}`,
+    status,
+    title: text(data.label) || researchProgressFallbackLabel(agentRole, data.kind),
+    preview: text(data.detail) || undefined,
+    metadata: definedObject({
+      eventId,
+      kind: text(data.kind) || undefined,
+      sequence: optionalInteger(data.sequence),
+      taskId: text(data.task_id) || undefined,
+      agentId: text(data.agent_id) || undefined,
+      agentRole,
+    }),
+  };
+}
+
+function researchProgressCorrelationKey(progress: {
+  status: string;
+  metadata: JsonObject;
+}): string | undefined {
+  if (progress.status !== 'running' || progress.metadata.kind !== 'search_started') {
+    return undefined;
+  }
+  return researchMetadataCorrelationKey(progress.metadata);
+}
+
+function researchMetadataCorrelationKey(metadata: JsonObject): string | undefined {
+  return agentCorrelationKey(
+    text(metadata.taskId) || undefined,
+    text(metadata.agentId) || undefined,
+    optionalInteger(metadata.sequence),
+  );
+}
+
+function agentRetrievalCorrelationKey(data: JsonObject): string | undefined {
+  return agentCorrelationKey(
+    text(data.task_id) || undefined,
+    text(data.agent_id) || undefined,
+    optionalInteger(data.sequence),
+  );
+}
+
+function agentCorrelationKey(
+  taskId: string | undefined,
+  agentId: string | undefined,
+  sequence: number | undefined,
+): string | undefined {
+  if (!taskId || !agentId || sequence === undefined) return undefined;
+  return JSON.stringify([taskId, agentId, sequence]);
+}
+
+function retrievalMetadata(data: JsonObject): Record<string, unknown> {
+  return definedObject({
+    chunkCount: numberValue(data.chunk_count),
+    retrievalChars: numberValue(data.chars),
+    retrievalTokensEstimated: numberValue(data.estimated_tokens),
+    retrievalToolName: text(data.tool_name) || undefined,
+    retrievalSequence: optionalInteger(data.sequence),
+  });
+}
+
+function researchProgressStatus(
+  value: unknown,
+): 'running' | 'completed' | 'error' | undefined {
+  switch (text(value)) {
+    case 'started':
+      return 'running';
+    case 'completed':
+      return 'completed';
+    case 'failed':
+      return 'error';
+    default:
+      return undefined;
+  }
+}
+
+function researchProgressFallbackLabel(agentRole: string | undefined, kind: unknown): string {
+  const label = agentRole || text(kind);
+  if (!label) return 'Researching';
+  return label
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, character => character.toUpperCase());
+}
+
+function evidenceSourceTitle(title: string, locator: string): string {
+  if (!locator) return title;
+  const normalizedTitle = normalizeCitation(title);
+  const normalizedLocator = normalizeCitation(locator);
+  return normalizedLocator && normalizedTitle.includes(normalizedLocator)
+    ? title
+    : `${title}, ${locator}`;
 }
 
 function cleanSnippet(value: string, maxChars: number): string {

@@ -44,7 +44,11 @@ async def test_structured_request_uses_strict_schema_and_provider_cost() -> None
             json={
                 "id": "gen-1",
                 "choices": [{"message": {"content": '{"answer":"ok"}'}}],
-                "usage": {"prompt_tokens": 4, "completion_tokens": 3, "cost": "0.00001"},
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 3,
+                    "cost": "0.00001",
+                },
             },
         )
 
@@ -61,6 +65,7 @@ async def test_structured_request_uses_strict_schema_and_provider_cost() -> None
     assert seen["provider"] == {"require_parameters": True}
     assert seen["messages"][0] == {"role": "system", "content": "system"}
     assert seen["max_tokens"] == 8000
+    assert "reasoning" not in seen
     assert usage.generation_id == "gen-1"
     assert usage.billed_cost_usd == Decimal("0.00001")
 
@@ -113,10 +118,42 @@ async def test_structured_request_omits_reasoning_for_model_compatibility() -> N
     ) as raw_client:
         client = OpenRouterLLMClient(api_key="test", client=raw_client)
         await client.generate_structured(
-            [ChatTurn(role="user", text="hello")], "system", Reply, thinking_level="high"
+            [ChatTurn(role="user", text="hello")],
+            "system",
+            Reply,
+            thinking_level="high",
         )
 
     assert "reasoning" not in seen
+
+
+@pytest.mark.asyncio
+async def test_role_enabled_request_sends_normalized_reasoning_effort() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"answer":"ok"}'}}]},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as raw_client:
+        client = OpenRouterLLMClient(
+            api_key="test",
+            client=raw_client,
+            enable_reasoning_effort=True,
+        )
+        await client.generate_structured(
+            [ChatTurn(role="user", text="hello")],
+            "system",
+            Reply,
+            thinking_level="high",
+        )
+
+    assert seen["reasoning"] == {"effort": "high"}
 
 
 @pytest.mark.asyncio

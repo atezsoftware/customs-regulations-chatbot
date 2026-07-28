@@ -13,6 +13,7 @@ from fs_explorer_api.benchmark_runner import (
 )
 from fs_explorer_api.agent import LLMCallStats
 from fs_explorer_api.llm.base import LLMUsage
+from fs_explorer_api.llm.profile import LLMProfile
 from fs_explorer_api.models import (
     JudgmentResult,
     ResearchDecision,
@@ -150,6 +151,59 @@ def _clear_context_before_and_after():
 
 class TestRunAgenticSession:
     @pytest.mark.asyncio
+    async def test_candidate_profile_reaches_every_role_and_interrupted_run_is_cancelled(
+        self, monkeypatch
+    ) -> None:
+        handler = _InterruptedHandler()
+        captured_workflow_args: dict[str, object] = {}
+
+        class _InterruptedWorkflow:
+            def run(self, **_kwargs):
+                return handler
+
+        def fake_new_workflow(**kwargs):
+            captured_workflow_args.update(kwargs)
+            return _InterruptedWorkflow(), object()
+
+        monkeypatch.setattr(benchmark_runner_mod, "PostgresStorage", _FakeStorage)
+        monkeypatch.setattr(benchmark_runner_mod, "new_workflow", fake_new_workflow)
+        monkeypatch.setattr(
+            benchmark_runner_mod,
+            "get_run_agent",
+            lambda _resource_manager: object(),
+        )
+        monkeypatch.setenv("FS_EXPLORER_PLANNER_REASONING", "high")
+        monkeypatch.setenv("FS_EXPLORER_TASK_REASONING", "medium")
+        monkeypatch.setenv("FS_EXPLORER_WORKER_REASONING", "low")
+        monkeypatch.setenv("FS_EXPLORER_FINAL_REASONING", "minimal")
+
+        with pytest.raises(RuntimeError, match="benchmark stream interrupted"):
+            await run_agentic_session(
+                task="x",
+                index_folders=["virtual://corpus-1"],
+                database_url="postgresql://test/test",
+                provider="openrouter",
+                model="candidate/model",
+            )
+
+        profile = captured_workflow_args["llm_profile"]
+        assert isinstance(profile, LLMProfile)
+        assert {
+            role: (
+                profile.for_role(role).provider,
+                profile.for_role(role).model,
+                profile.for_role(role).reasoning_effort,
+            )
+            for role in ("planner", "task", "worker", "final")
+        } == {
+            "planner": ("openrouter", "candidate/model", "high"),
+            "task": ("openrouter", "candidate/model", "medium"),
+            "worker": ("openrouter", "candidate/model", "low"),
+            "final": ("openrouter", "candidate/model", "minimal"),
+        }
+        assert handler.cancelled is True
+
+    @pytest.mark.asyncio
     async def test_returns_stats_shape_and_pools_call_cost(self, monkeypatch) -> None:
         monkeypatch.setattr(benchmark_runner_mod, "PostgresStorage", _FakeStorage)
         monkeypatch.setattr("fs_explorer_api.agent.PostgresStorage", _FakeStorage)
@@ -216,6 +270,7 @@ class TestRunAgenticSession:
         monkeypatch.setattr(
             "fs_explorer_api.agent.get_llm_client", lambda **_kwargs: client
         )
+
         def fake_search(**kwargs):
             query = kwargs["query"]
             return PlannedSearchResult(
@@ -259,6 +314,7 @@ class TestRunAgenticSession:
         monkeypatch.setattr(
             "fs_explorer_api.agent.get_llm_client", lambda **_kwargs: _RaisingClient()
         )
+
         async def raise_during_collection(self, task, calls=None):
             raise RuntimeError("boom")
 
@@ -275,6 +331,21 @@ class TestRunAgenticSession:
             )
 
         assert _index_tools_available() is False
+
+
+class _InterruptedHandler:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def stream_events(self):
+        raise RuntimeError("benchmark stream interrupted")
+        yield  # pragma: no cover - makes this an async generator
+
+    def is_done(self) -> bool:
+        return False
+
+    async def cancel_run(self) -> None:
+        self.cancelled = True
 
 
 class TestSumCallCost:

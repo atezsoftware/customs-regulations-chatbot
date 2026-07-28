@@ -6,8 +6,11 @@ exploration of the filesystem, handling tool calls, directory navigation,
 and human interaction.
 """
 
+import asyncio
 import contextvars
+import logging
 import os
+from contextlib import suppress
 
 from workflows import Workflow, Context, step
 from workflows.events import (
@@ -19,9 +22,12 @@ from workflows.events import (
 )
 from workflows.resource import Resource, ResourceManager
 from pydantic import BaseModel
-from typing import Annotated, AsyncGenerator, cast, Any
+from typing import Annotated, AsyncGenerator, cast, Any, Mapping
 
 from .agent import FsExplorerAgent, OnLLMCall, OnRetrieval, describe_indexed_context
+from .llm import LLMClient
+from .llm.profile import LLMProfile, LLMRole
+from .multi_agent import ResearchProgress
 from .models import (
     GoDeeperAction,
     ToolCallAction,
@@ -40,9 +46,9 @@ _AGENT_VAR: contextvars.ContextVar[FsExplorerAgent | None] = contextvars.Context
     "_AGENT_VAR", default=None
 )
 _INDEXED_FINAL_FALLBACK = (
-    "İndeks kanıtları toplandı ancak nihai yanıt oluşturulamadı. "
-    "Lütfen tekrar deneyin."
+    "İndeks kanıtları toplandı ancak nihai yanıt oluşturulamadı. Lütfen tekrar deneyin."
 )
+logger = logging.getLogger(__name__)
 
 
 def get_agent() -> FsExplorerAgent:
@@ -172,10 +178,39 @@ class ExplorationEndEvent(StopEvent):
     error: str | None = None
 
 
+class ResearchProgressEvent(Event):
+    """Correlated lifecycle event for one multi-agent research component."""
+
+    event_id: str
+    kind: str
+    sequence: int
+    agent_role: str
+    status: str
+    label: str
+    detail: str
+    task_id: str | None = None
+    agent_id: str | None = None
+
+    @classmethod
+    def from_progress(cls, progress: ResearchProgress) -> "ResearchProgressEvent":
+        return cls(
+            event_id=progress.event_id,
+            kind=progress.kind,
+            sequence=progress.sequence,
+            agent_role=progress.agent_role,
+            status=progress.status,
+            label=progress.label,
+            detail=progress.detail,
+            task_id=progress.task_id,
+            agent_id=progress.agent_id,
+        )
+
+
 # Type alias for the union of possible workflow events
 WorkflowEvent = (
     ExplorationEndEvent | GoDeeperEvent | ToolCallEvent | ToolBatchEvent | AskHumanEvent
 )
+ResumedWorkflowEvent = WorkflowEvent | ResearchProgressEvent
 
 
 def _handle_action_result(
@@ -295,10 +330,28 @@ class FsExplorerWorkflow(Workflow):
             state.enable_metadata = ev.enable_metadata
             state.effort = ev.effort
 
-        # Indexed questions use a stateless scatter/gather path: one small
-        # planner call, parallel searches with no LLM turns between them,
-        # then one final synthesis over globally reranked evidence.
+        # The multi-agent path is feature-flagged and reuses the same indexed
+        # retrieval engine. Its planner routes simple questions to one task
+        # and builds a bounded DAG only for genuinely separable requirements.
         if ev.use_index and ev.enable_semantic:
+            if agent.multi_agent_enabled:
+                try:
+                    await agent.prepare_multi_agent_indexed(
+                        ev.task,
+                        on_progress=lambda progress: ctx.write_event_to_stream(
+                            ResearchProgressEvent.from_progress(progress)
+                        ),
+                    )
+                    return ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
+                except Exception:
+                    logger.exception(
+                        "Multi-agent indexed research failed before completion; "
+                        "falling back to the legacy stateless retrieval path"
+                    )
+                    agent.abandon_multi_agent_research()
+
+            # Rollback path: one planner call, parallel deterministic searches,
+            # one evidence review and one final synthesis.
             calls = await agent.plan_indexed_retrieval(ev.task)
             event = ToolBatchEvent(
                 tool_calls=calls,
@@ -430,9 +483,7 @@ class FsExplorerWorkflow(Workflow):
                 )
                 ctx.write_event_to_stream(event)
                 return event
-            return ExplorationEndEvent(
-                final_result=_INDEXED_FINAL_FALLBACK
-            )
+            return ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
 
         await agent.call_tools(
             [(call.tool_name, call.to_fn_args()) for call in ev.tool_calls]
@@ -461,6 +512,9 @@ def new_workflow(
     temperature: float | None = None,
     on_llm_call: OnLLMCall | None = None,
     on_retrieval: OnRetrieval | None = None,
+    llm_profile: LLMProfile | None = None,
+    role_clients: Mapping[LLMRole, LLMClient] | None = None,
+    multi_agent_enabled: bool | None = None,
 ) -> tuple[FsExplorerWorkflow, ResourceManager]:
     """Build a fresh workflow instance with its own ResourceManager and agent.
 
@@ -498,6 +552,9 @@ def new_workflow(
         temperature=temperature,
         on_llm_call=on_llm_call,
         on_retrieval=on_retrieval,
+        llm_profile=llm_profile,
+        role_clients=role_clients,
+        multi_agent_enabled=multi_agent_enabled,
     )
     resource_manager.resources[get_agent.__qualname__] = agent
     workflow = FsExplorerWorkflow(
@@ -512,7 +569,7 @@ async def resume_agent_run(
     use_index: bool,
     current_directory: str,
     initial_task: str,
-) -> AsyncGenerator[WorkflowEvent, str | None]:
+) -> AsyncGenerator[ResumedWorkflowEvent, str | None]:
     """Continue an already-in-progress agent's decision loop directly.
 
     Used only to resume a run whose original `/ws/explore` connection was
@@ -536,6 +593,38 @@ async def resume_agent_run(
     human_response: str | None = None
 
     if use_index and agent.prepared_indexed_evidence:
+        yield ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
+        return
+
+    if use_index and agent.multi_agent_research_active:
+        progress_events: asyncio.Queue[ResearchProgressEvent] = asyncio.Queue()
+        research_task = asyncio.create_task(
+            agent.prepare_multi_agent_indexed(
+                initial_task,
+                on_progress=lambda progress: progress_events.put_nowait(
+                    ResearchProgressEvent.from_progress(progress)
+                ),
+            )
+        )
+        try:
+            while not research_task.done() or not progress_events.empty():
+                if research_task.done():
+                    yield progress_events.get_nowait()
+                    continue
+                try:
+                    progress_event = await asyncio.wait_for(
+                        progress_events.get(),
+                        timeout=0.1,
+                    )
+                except TimeoutError:
+                    continue
+                yield progress_event
+            await research_task
+        finally:
+            if not research_task.done():
+                research_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await research_task
         yield ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
         return
 

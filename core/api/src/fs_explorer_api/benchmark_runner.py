@@ -17,6 +17,7 @@ design.
 from __future__ import annotations
 
 import html
+import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -33,12 +34,14 @@ from .agent import (
 from .exploration_trace import ExplorationTrace, extract_cited_sources
 from .llm import get_llm_client
 from .llm.base import ChatTurn
+from .llm.profile import LLMProfile, LLMRole, LLMRoleConfig, load_llm_profile
 from .models import JudgmentResult
 from .workflow import (
     AskHumanEvent,
     GoDeeperEvent,
     HumanAnswerEvent,
     InputEvent,
+    ResearchProgressEvent,
     ToolBatchEvent,
     ToolCallEvent,
     get_run_agent,
@@ -46,6 +49,8 @@ from .workflow import (
 )
 from fs_explorer_shared.index_config import resolve_database_url
 from fs_explorer_shared.storage import PostgresStorage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -110,6 +115,49 @@ def _sum_call_cost(llm_calls: list[LLMCallStats]) -> tuple[str | None, str | Non
     return str(total), "estimated" if saw_estimated else "provider"
 
 
+def _benchmark_llm_profile(
+    *,
+    provider: str | None,
+    model: str | None,
+) -> LLMProfile | None:
+    """Apply one benchmark candidate to every role without flattening reasoning.
+
+    Benchmark rows represent one provider/model candidate.  When the
+    multi-agent feature is enabled, letting role clients fall back to the
+    process-wide profile would make every row run the same fixed models while
+    the backend still attributes results to the requested candidate.  Snapshot
+    the configured role policy and replace only provider/model so planner,
+    task, worker, and final retain their independently tuned reasoning levels.
+    """
+
+    if provider is None and model is None:
+        return None
+    if provider is None or model is None:
+        raise ValueError("Benchmark provider and model must be provided together.")
+
+    candidate_provider = provider.strip().lower()
+    candidate_model = model.strip()
+    if not candidate_provider or not candidate_model:
+        raise ValueError("Benchmark provider and model must not be empty.")
+
+    configured = load_llm_profile()
+
+    def candidate(role: LLMRole) -> LLMRoleConfig:
+        role_config = configured.for_role(role)
+        return LLMRoleConfig(
+            provider=candidate_provider,
+            model=candidate_model,
+            reasoning_effort=role_config.reasoning_effort,
+        )
+
+    return LLMProfile(
+        planner=candidate("planner"),
+        task=candidate("task"),
+        worker=candidate("worker"),
+        final=candidate("final"),
+    )
+
+
 async def run_agentic_session(
     *,
     task: str,
@@ -151,6 +199,7 @@ async def run_agentic_session(
         retrieval_stats.append(stats)
 
     index_storage = PostgresStorage(resolved_database_url)
+    handler: Any = None
     try:
         available_index_folders = [
             folder
@@ -171,6 +220,10 @@ async def run_agentic_session(
             temperature=temperature,
             on_llm_call=_collect_llm_call,
             on_retrieval=_collect_retrieval,
+            llm_profile=_benchmark_llm_profile(
+                provider=provider,
+                model=model,
+            ),
         )
         agent = get_run_agent(resource_manager)
         handler = run_workflow.run(
@@ -184,7 +237,13 @@ async def run_agentic_session(
         )
 
         async for event in handler.stream_events():
-            if isinstance(event, ToolCallEvent):
+            if isinstance(event, ResearchProgressEvent):
+                step_number = max(step_number, event.sequence)
+                trace.step_path.append(
+                    f"{event.sequence}. {event.kind} "
+                    f"({event.task_id or event.agent_id or event.agent_role})"
+                )
+            elif isinstance(event, ToolCallEvent):
                 step_number += 1
                 if event.tool_name in CHUNK_BEARING_TOOLS:
                     pending_retrieval_step_numbers.append(step_number)
@@ -250,21 +309,36 @@ async def run_agentic_session(
         cited_sources = extract_cited_sources(final_result) if not result_error else []
         usage = agent.token_usage
         cost_usd, cost_source = _sum_call_cost(llm_calls)
-        retrieval_steps = [
-            {
-                "step": ws_step,
-                "tool_name": stats.tool_name,
-                "chunk_count": stats.chunk_count,
-                "chars": stats.chars,
-                "estimated_tokens": stats.estimated_tokens,
-            }
-            for ws_step, stats in zip(pending_retrieval_step_numbers, retrieval_stats)
-        ]
+        retrieval_steps = []
+        for stats in retrieval_stats:
+            ws_step = (
+                pending_retrieval_step_numbers.pop(0)
+                if pending_retrieval_step_numbers
+                else stats.step
+            )
+            retrieval_steps.append(
+                {
+                    "step": ws_step,
+                    "tool_name": stats.tool_name,
+                    "chunk_count": stats.chunk_count,
+                    "chars": stats.chars,
+                    "estimated_tokens": stats.estimated_tokens,
+                    "task_id": stats.task_id,
+                    "agent_id": stats.agent_id,
+                    "sequence": stats.sequence,
+                }
+            )
+
+        final_call = next(
+            (call for call in reversed(llm_calls) if call.agent_role == "final"),
+            None,
+        )
 
         return BenchmarkRunResult(
             final_result=final_result,
             error=result_error,
-            incomplete=not result_error and agent.forced_stop,
+            incomplete=not result_error
+            and (agent.forced_stop or agent.multi_agent_incomplete),
             cited_sources=cited_sources,
             step_path=trace.step_path,
             stats={
@@ -280,14 +354,20 @@ async def run_agentic_session(
                 "duration_ms": round((time.monotonic() - run_started_at) * 1000),
                 "cost_usd": cost_usd,
                 "cost_source": cost_source,
-                "model": model,
-                "provider": provider,
+                "model": final_call.model if final_call else agent.final_model,
+                "provider": final_call.provider if final_call else provider,
             },
         )
     finally:
-        index_storage.close()
-        set_search_flags(enable_semantic=False, enable_metadata=False)
-        clear_index_context()
+        try:
+            if handler is not None and not handler.is_done():
+                await handler.cancel_run()
+        except Exception:
+            logger.exception("Failed to cancel an interrupted benchmark workflow")
+        finally:
+            index_storage.close()
+            set_search_flags(enable_semantic=False, enable_metadata=False)
+            clear_index_context()
 
 
 # =============================================================================

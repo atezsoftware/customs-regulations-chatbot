@@ -5,9 +5,9 @@ import {ResearchStepItem} from './ResearchStepItem';
 /**
  * Collapsed by default, always — the caller expands it manually if they
  * want the full step-by-step trace. While a step is running, the header
- * shows a single shimmering line for whichever step is currently active,
- * swapping in place as steps complete rather than growing a list underneath
- * it (that full list only ever renders once expanded).
+ * shows the most recent active step. Multi-agent runs can have several live
+ * rows at once, so the header also reports their concurrent agent count
+ * while the full per-agent list remains available when expanded.
  */
 export function ResearchActivityPanel({steps, usage}: {steps: ResearchStep[]; usage: LlmUsage[]}) {
   const [expanded, setExpanded] = useState(false);
@@ -15,9 +15,18 @@ export function ResearchActivityPanel({steps, usage}: {steps: ResearchStep[]; us
 
   if (!steps.length) return null;
 
-  const running = steps.some(step => step.status === 'running');
+  const runningSteps = steps.filter(step => step.status === 'running');
+  const running = runningSteps.length > 0;
   const hasError = steps.some(step => step.status === 'error');
-  const liveStep = [...steps].reverse().find(step => step.status === 'running') ?? steps[steps.length - 1];
+  const liveStep = runningSteps[runningSteps.length - 1] ?? steps[steps.length - 1];
+  const runningAgentCount = new Set(
+    runningSteps
+      .filter(step => step.stepId.startsWith('agent-'))
+      .map(step => {
+        const agentId = step.metadata?.agentId;
+        return typeof agentId === 'string' && agentId ? agentId : step.stepId;
+      }),
+  ).size;
 
   const dotClass = running ? 'bg-indigo-500 animate-pulse' : hasError ? 'bg-rose-500' : 'bg-emerald-500';
 
@@ -46,7 +55,9 @@ export function ResearchActivityPanel({steps, usage}: {steps: ResearchStep[]; us
               <span
                 className="bg-[length:200%_100%] bg-clip-text font-medium text-transparent [background-image:linear-gradient(110deg,#475569_40%,#a5b4fc_50%,#475569_60%)] motion-safe:animate-[shimmer_1.8s_linear_infinite]"
               >
-                {liveStep.title}
+                {runningAgentCount > 1
+                  ? `${runningAgentCount} agents working · ${liveStep.title}`
+                  : liveStep.title}
               </span>
             </span>
           ) : (

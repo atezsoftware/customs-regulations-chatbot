@@ -80,8 +80,17 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 |----------|-------|---------|
 | `OPENROUTER_API_KEY` | `core-api`, `backend` | Required for chat inference (`core-api`) and model catalog sync (`backend`). |
 | `FS_EXPLORER_LLM_PROVIDER` | `core-api` | Active chat provider. Set to `openrouter` for the new model selector flow. |
-| `OPENROUTER_DEFAULT_MODEL` | `core-api`, `backend` | Default model for new sessions and provider fallback (`google/gemini-3-flash-preview`). |
+| `OPENROUTER_DEFAULT_MODEL` | `core-api`, `backend` | Default model for new sessions and provider fallback (`google/gemini-3.6-flash`). |
 | `OPENROUTER_CATALOG_SYNC_MINUTES` | `backend` | How often the backend refreshes the available OpenRouter model catalog. |
+| `FS_EXPLORER_MULTI_AGENT_ENABLED` | `core-api` | Enables hierarchical multi-agent indexed research. Core Compose defaults to `true`; direct library usage safely defaults to `false` when unset. |
+| `FS_EXPLORER_PLANNER_{PROVIDER,MODEL,REASONING}` | `core-api` | Global planner policy. Defaults to OpenRouter, `openai/gpt-5.6-sol`, `medium`. |
+| `FS_EXPLORER_TASK_{PROVIDER,MODEL,REASONING}` | `core-api` | Task coordinator policy. Defaults to OpenRouter, `google/gemini-3.6-flash`, `medium`. |
+| `FS_EXPLORER_WORKER_{PROVIDER,MODEL,REASONING}` | `core-api` | Search worker policy. Defaults to OpenRouter, `google/gemini-3.5-flash-lite`, `low`. |
+| `FS_EXPLORER_FINAL_{PROVIDER,MODEL,REASONING}` | `core-api` | Final synthesis policy. Defaults to OpenRouter, `google/gemini-3.6-flash`, `high`. |
+| `FS_EXPLORER_MULTI_AGENT_MAX_{TASKS,WORKERS_PER_TASK,WORKER_ROUNDS,TOTAL_WORKERS,LLM_CALLS}` | `core-api` | Hard per-run fan-out/call budgets. Defaults: `5`, `3`, `2`, `8`, `24`. |
+| `FS_EXPLORER_MULTI_AGENT_MAX_ARTIFACT_CONTEXT_CHARS` | `core-api` | Total serialized artifact-context cap per boundary (`16000`), independent of per-field limits. |
+| `FS_EXPLORER_MULTI_AGENT_SEARCH_TIMEOUT_SECONDS` | `core-api` | Hard wait limit for each indexed search attempt and task-global rerank (`20`). |
+| `FS_EXPLORER_MULTI_AGENT_LLM_TIMEOUT_SECONDS` | `core-api` | Hard wait limit for each planner/coordinator/worker/reviewer LLM stage (`120`). |
 | `GOOGLE_API_KEY` | `core-api`, `core-indexer` | Gemini LLM + embeddings. Get one at [Google AI Studio](https://aistudio.google.com/apikey). |
 | `DATABASE_URL` | `core-api`, `core-indexer`, `backend` | Shared Postgres connection string. |
 | `CORE_INTERNAL_TOKEN` | `core-api`, `core-indexer`, `backend` | Shared secret gating both core services' internal REST/WebSocket endpoints so only `backend` can call them. |
@@ -94,21 +103,46 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 ## Architecture
 
 ```
-                    core-api                              core-indexer
-User Query             ↓                                       ↑
-    ↓            ┌─────────────────┐                  ┌─────────────────┐
-    └──────────→ │ Workflow Engine │                  │ IndexingPipeline │
-                 │  (LlamaIndex)   │                  │  (Docling parse  │
-                 └────────┬────────┘                  │  + chunking +    │
-                          ↓                            │  embedding)      │
-                 ┌─────────────────┐                  └────────┬────────┘
-                 │     Agent       │ ←→ Gemini (structured JSON)│
-                 └────────┬────────┘                            ↓
-                          ↓                              ┌─────────────┐
-            semantic_search / get_document  ──────────→  │  Postgres   │
-                                                          │  + pgvector │
-                                                          └─────────────┘
+User question
+     │
+     ▼
+GPT-5.6 Sol global planner ── simple question ──▶ one TaskSpec
+     │
+     └── genuinely separable question ─────────▶ bounded TaskSpec DAG
+                                                       │
+                                  independent tasks run concurrently
+                                                       ▼
+                                     Gemini 3.6 task coordinators
+                                                       │
+                                      1–3 isolated search assignments
+                                                       ▼
+                                   Gemini 3.5 Flash Lite workers
+                                                       │
+                                  Postgres + pgvector indexed chunks
+                                                       ▼
+                             server-verified claims + compact TaskArtifacts
+                                                       │
+                                                       ▼
+                                    Gemini 3.6 final synthesis
+                                                       │
+                                                       ▼
+                                    cited answer + exact chunk provenance
 ```
+
+The global planner performs routing and decomposition in the same call; there
+is no separate intent-analysis request. Every worker receives only its own
+assignment and retrieved hits, while agents exchange compact typed artifacts
+instead of chat transcripts. Task/worker fan-out, rounds, concurrency, total
+LLM calls, claims, and evidence context are all server-bounded. Invalid plans
+fall back to one direct task, and an unrecoverable multi-agent failure falls
+back to the legacy stateless indexed retrieval path.
+
+Each task deduplicates candidates across its search assignments and reranks the
+union against the task question before review. Evidence/context budgets are
+shared fairly across tasks and sources. In-flight indexed searches and
+structured LLM operations have stable identities, hard wait limits, and cached
+results, so a WebSocket reconnect resumes completed work without paying for
+the same operation again.
 
 `core-api` never imports Docling — it only ever reads chunks/embeddings that
 `core-indexer` already wrote to Postgres. See [ARCHITECTURE.md](ARCHITECTURE.md)

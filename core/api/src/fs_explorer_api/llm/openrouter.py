@@ -40,9 +40,15 @@ def _error_detail(response: httpx.Response) -> str:
     return ""
 
 
-def _rejection_error(response: httpx.Response, *, stream: bool = False) -> OpenRouterError:
+def _rejection_error(
+    response: httpx.Response, *, stream: bool = False
+) -> OpenRouterError:
     """Turn a rejected response into an actionable, bounded safe error."""
-    message = "OpenRouter stream could not be started" if stream else "OpenRouter rejected the request"
+    message = (
+        "OpenRouter stream could not be started"
+        if stream
+        else "OpenRouter rejected the request"
+    )
     detail = _error_detail(response)
     if detail:
         message = f"{message} (HTTP {response.status_code}): {detail}"
@@ -100,11 +106,14 @@ class OpenRouterLLMClient:
         model: str | None = None,
         temperature: float | None = None,
         client: httpx.AsyncClient | None = None,
+        *,
+        enable_reasoning_effort: bool = False,
     ) -> None:
         if not api_key:
             raise ValueError("OpenRouter API key is not configured.")
         self.model = model or DEFAULT_OPENROUTER_MODEL
         self.temperature = temperature
+        self._enable_reasoning_effort = enable_reasoning_effort
         self._client = client or httpx.AsyncClient(
             base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             timeout=float(os.getenv("OPENROUTER_REQUEST_TIMEOUT_SECONDS", "90")),
@@ -155,11 +164,12 @@ class OpenRouterLLMClient:
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        # The picker intentionally includes all models that can produce the
-        # strict schemas the agent needs. Reasoning controls are optional and
-        # model-specific, so sending them would make otherwise compatible
-        # selections fail with a 4xx response.
-        del thinking_level
+        if self._enable_reasoning_effort and thinking_level is not None:
+            # OpenRouter normalizes this shape across providers, including
+            # OpenAI reasoning effort and Gemini thinking levels. This is
+            # enabled only for curated role profiles; arbitrary legacy model
+            # selections omit the model-specific parameter for compatibility.
+            payload["reasoning"] = {"effort": thinking_level}
         return payload
 
     async def _post(self, payload: dict[str, Any]) -> httpx.Response:
@@ -214,7 +224,9 @@ class OpenRouterLLMClient:
         if not isinstance(content, str):
             finish_reason = (
                 choices[0].get("finish_reason")
-                if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+                if isinstance(choices, list)
+                and choices
+                and isinstance(choices[0], dict)
                 else None
             )
             hint = (

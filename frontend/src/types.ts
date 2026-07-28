@@ -136,6 +136,10 @@ export interface LlmUsage {
   model?: string;
   purpose: string;
   step?: number;
+  agentRole?: string;
+  taskId?: string;
+  agentId?: string;
+  sequence?: number;
   inputTokens: number;
   outputTokens: number;
   thinkingTokens: number;

@@ -3,6 +3,8 @@
 import pytest
 import os
 
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import Mock, patch
 from google.genai import Client as GenAIClient
 
@@ -340,6 +342,34 @@ class TestPurposeSpecificThinking:
 
         assert chunks == ["answer"]
         assert client.stream_thinking_levels == ["high"]
+
+    def test_exact_evidence_sources_require_title_and_locator_citation(self) -> None:
+        client = _PurposeCapturingClient()
+        agent = FsExplorerAgent(llm_client=client)
+        agent._multi_agent_result = cast(
+            Any,
+            SimpleNamespace(
+                evidence_sources=(
+                    {
+                        "title": "Transit Regulation",
+                        "locator": "Article 5",
+                        "chunk_id": "chunk-5",
+                    },
+                    {
+                        "title": "Transit Regulation",
+                        "locator": "Article 8",
+                        "chunk_id": "chunk-8",
+                    },
+                )
+            ),
+        )
+
+        sources = agent.evidence_sources_for_answer(
+            "The period is fixed [Transit Regulation, Article 5].\n\n"
+            "## Sources\n- Transit Regulation"
+        )
+
+        assert [source["chunk_id"] for source in sources] == ["chunk-5"]
 
 
 class _PurposeCapturingClient:
@@ -934,7 +964,9 @@ class TestRetrievalHook:
         from fs_explorer_api.agent import TOOLS, RetrievalStats
 
         original = TOOLS["get_document"]
-        TOOLS["get_document"] = lambda **kwargs: "=== INDEXED DOCUMENT FROM CHUNKS ===\nno chunks here"
+        TOOLS["get_document"] = lambda **kwargs: (
+            "=== INDEXED DOCUMENT FROM CHUNKS ===\nno chunks here"
+        )
         received: list[RetrievalStats] = []
         try:
             agent = FsExplorerAgent(
@@ -1019,9 +1051,7 @@ class TestRetrievalHook:
 class _StatelessRetrievalClient:
     model = "test"
 
-    def __init__(
-        self, decisions: list[ResearchDecision] | None = None
-    ) -> None:
+    def __init__(self, decisions: list[ResearchDecision] | None = None) -> None:
         self.structured_histories = []
         self.stream_histories = []
         self._stream_usage = None
@@ -1050,14 +1080,12 @@ class _StatelessRetrievalClient:
                         RetrievalQuery(query="ana kural"),
                         RetrievalQuery(query="süre ve usul"),
                         RetrievalQuery(query="fazladan sorgu"),
-                    ]
+                    ],
                 ),
                 LLMUsage(input_tokens=500, output_tokens=80),
             )
         assert schema is ResearchDecision
-        return self._decisions.pop(0), LLMUsage(
-            input_tokens=400, output_tokens=50
-        )
+        return self._decisions.pop(0), LLMUsage(input_tokens=400, output_tokens=50)
 
     async def stream_text(self, history, system_prompt, *, thinking_level=None):
         self.stream_histories.append(list(history))
@@ -1100,9 +1128,7 @@ class TestStatelessParallelRetrieval:
 
         client = _StatelessRetrievalClient()
         retrieval_events: list[RetrievalStats] = []
-        agent = FsExplorerAgent(
-            llm_client=client, on_retrieval=retrieval_events.append
-        )
+        agent = FsExplorerAgent(llm_client=client, on_retrieval=retrieval_events.append)
         set_effort("low")
 
         calls = await agent.plan_indexed_retrieval("Transit süresi nedir?")
@@ -1149,9 +1175,7 @@ class TestStatelessParallelRetrieval:
             digest = await agent.collect_parallel_indexed_evidence(
                 "Transit süresi nedir?", calls
             )
-            next_calls = await agent.review_indexed_evidence(
-                "Transit süresi nedir?"
-            )
+            next_calls = await agent.review_indexed_evidence("Transit süresi nedir?")
 
         assert len(captured_candidates) == 4  # shared hit deduplicated
         assert next_calls == []
@@ -1166,9 +1190,7 @@ class TestStatelessParallelRetrieval:
         # full chunks went once to final synthesis.
         assert retrieval_events[0].chunk_count == 8
 
-        answer = "".join(
-            [part async for part in agent.stream_final_answer("fallback")]
-        )
+        answer = "".join([part async for part in agent.stream_final_answer("fallback")])
 
         assert answer == "nihai cevap"
         assert agent.token_usage.api_calls == 3
@@ -1202,11 +1224,7 @@ class TestStatelessParallelRetrieval:
         set_effort("low")
 
         def fake_search(*, query, filters=None, as_of_date=None):
-            marker = (
-                "YENİ_İSTİSNA_KANITI"
-                if "mücbir" in query
-                else f"İLK_TUR_{query}"
-            )
+            marker = "YENİ_İSTİSNA_KANITI" if "mücbir" in query else f"İLK_TUR_{query}"
             return PlannedSearchResult(
                 query=query,
                 hits=[
@@ -1290,9 +1308,7 @@ class TestStatelessParallelRetrieval:
             return [(document, 0.8) for document in documents]
 
         with (
-            patch.object(
-                agent_module, "_PARALLEL_ROUND_LIMITS", {"low": 2}
-            ),
+            patch.object(agent_module, "_PARALLEL_ROUND_LIMITS", {"low": 2}),
             patch.object(
                 agent_module, "_run_planned_index_search", side_effect=fake_search
             ),

@@ -1,5 +1,6 @@
 """Tests for workflow.py's per-run agent construction and isolation."""
 
+import asyncio
 import os
 
 import pytest
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 from fs_explorer_api.agent import FsExplorerAgent
 from fs_explorer_api.llm import LLMUsage
+from fs_explorer_api.multi_agent import ResearchProgress
 from fs_explorer_api.models import (
     Action,
     AskHumanAction,
@@ -18,6 +20,7 @@ from fs_explorer_api.models import (
 from fs_explorer_api.workflow import (
     AskHumanEvent,
     ExplorationEndEvent,
+    ResearchProgressEvent,
     ToolCallEvent,
     ToolBatchEvent,
     get_run_agent,
@@ -248,3 +251,62 @@ class TestResumeAgentRun:
         assert (
             sum("Batch tool results" in turn.text for turn in agent._chat_history) == 1
         )
+
+    @pytest.mark.asyncio
+    async def test_multi_agent_resume_rebinds_and_streams_progress(self) -> None:
+        agent = FsExplorerAgent(llm_client=_QueuedLLMClient([]))
+        agent._multi_agent_research_active = True
+
+        async def fake_prepare(task, *, on_progress=None):
+            assert task == "original question"
+            assert on_progress is not None
+            on_progress(
+                ResearchProgress(
+                    event_id="worker-task_1-assignment_1",
+                    kind="worker_started",
+                    sequence=10,
+                    agent_role="worker",
+                    status="started",
+                    label="Searching",
+                    detail="First wave",
+                    task_id="task_1",
+                    agent_id="worker-task_1-r1-1",
+                )
+            )
+            await asyncio.sleep(0)
+            on_progress(
+                ResearchProgress(
+                    event_id="worker-task_1-assignment_1",
+                    kind="worker_completed",
+                    sequence=11,
+                    agent_role="worker",
+                    status="completed",
+                    label="Search complete",
+                    detail="One verified claim",
+                    task_id="task_1",
+                    agent_id="worker-task_1-r1-1",
+                )
+            )
+            agent._multi_agent_research_active = False
+            return object()
+
+        with patch.object(
+            agent,
+            "prepare_multi_agent_indexed",
+            new=fake_prepare,
+        ):
+            events = await _drain(
+                resume_agent_run(
+                    agent,
+                    use_index=True,
+                    current_directory=".",
+                    initial_task="original question",
+                )
+            )
+
+        progress = [
+            event for event in events if isinstance(event, ResearchProgressEvent)
+        ]
+        assert [event.status for event in progress] == ["started", "completed"]
+        assert progress[0].event_id == progress[1].event_id
+        assert isinstance(events[-1], ExplorationEndEvent)

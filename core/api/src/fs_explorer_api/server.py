@@ -62,6 +62,7 @@ from .workflow import (
     GoDeeperEvent,
     HumanAnswerEvent,
     InputEvent,
+    ResearchProgressEvent,
     ToolCallEvent,
     ToolBatchEvent,
     get_run_agent,
@@ -771,6 +772,25 @@ def _ask_human_ws_message(event: AskHumanEvent, *, step_number: int) -> dict[str
     }
 
 
+def _research_progress_ws_message(event: ResearchProgressEvent) -> dict[str, Any]:
+    """Forward a stable, parallel-safe multi-agent lifecycle event."""
+
+    return {
+        "type": "research_progress",
+        "data": {
+            "event_id": event.event_id,
+            "kind": event.kind,
+            "sequence": event.sequence,
+            "task_id": event.task_id,
+            "agent_id": event.agent_id,
+            "agent_role": event.agent_role,
+            "status": event.status,
+            "label": event.label,
+            "detail": event.detail,
+        },
+    }
+
+
 def _register_if_resumable(
     *,
     run_id: str,
@@ -870,6 +890,7 @@ async def _finish_run(
                     "final_result": final_result,
                     "cited_sources": cited_sources,
                     "cited_source_links": cited_source_links,
+                    "evidence_sources": agent.evidence_sources_for_answer(final_result),
                 },
             }
         )
@@ -879,7 +900,7 @@ async def _finish_run(
         cited_source_links = {}
 
     usage = agent.token_usage
-    _input_cost, _output_cost, total_cost = usage._calculate_cost()
+    total_cost = usage.total_cost_usd()
 
     await websocket.send_json(
         {
@@ -892,6 +913,9 @@ async def _finish_run(
                 # unsatisfying apology rather than a conclusion, even though
                 # there's no `error` here. Lets the client offer "Continue"
                 # even on an otherwise-successful completion.
+                # A multi-agent run that exhausted its bounded evidence search
+                # is terminal and the answer explicitly discloses its gaps.
+                # Only the legacy step-budget stop is actually resumable.
                 "incomplete": not result_error and agent.forced_stop,
                 "stats": {
                     "steps": step_number,
@@ -905,7 +929,7 @@ async def _finish_run(
                     "tool_result_chars": usage.tool_result_chars,
                     "estimated_cost": round(total_cost, 6),
                     "context_summaries": usage.context_summaries,
-                    "model": getattr(agent._llm, "model", None),
+                    "model": agent.final_model,
                     "duration_ms": round((time.monotonic() - run_started_at) * 1000),
                     "context_usage_ratio": round(
                         usage.context_usage_ratio(GEMINI_MAX_CONTEXT_TOKENS), 4
@@ -920,14 +944,16 @@ async def _finish_run(
             },
         }
     )
-    # Run reached a real terminal state (answer or error) — nothing further
-    # for a later "resume" to do, so it must not still be resumable.
-    remove_run(run_id)
+    # A legacy forced stop is intentionally resumable after grant_more_steps().
+    # All other answers/errors are terminal.
+    if result_error or not agent.forced_stop:
+        remove_run(run_id)
 
 
 async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None:
     """Start and drive a brand-new exploration run, end to end."""
     run_id = new_run_id()
+    handler: Any = None
     index_storage: PostgresStorage | None = None
     agent: FsExplorerAgent | None = None
     trace: ExplorationTrace | None = None
@@ -1061,6 +1087,10 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
                             "billed_cost_usd": stats.billed_cost_usd,
                             "upstream_cost_usd": stats.upstream_cost_usd,
                             "cost_source": stats.cost_source,
+                            "agent_role": stats.agent_role,
+                            "task_id": stats.task_id,
+                            "agent_id": stats.agent_id,
+                            "sequence": stats.sequence,
                         },
                     }
                 )
@@ -1101,6 +1131,9 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
                             "chunk_count": stats.chunk_count,
                             "chars": stats.chars,
                             "estimated_tokens": stats.estimated_tokens,
+                            "task_id": stats.task_id,
+                            "agent_id": stats.agent_id,
+                            "sequence": stats.sequence,
                         },
                     }
                 )
@@ -1160,7 +1193,9 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
         async for event in handler.stream_events():
             await _flush_llm_calls()
             await _flush_retrieval_stats()
-            if isinstance(event, ToolCallEvent):
+            if isinstance(event, ResearchProgressEvent):
+                await websocket.send_json(_research_progress_ws_message(event))
+            elif isinstance(event, ToolCallEvent):
                 step_number += 1
                 if event.tool_name in CHUNK_BEARING_TOOLS:
                     pending_retrieval_step_numbers.append(step_number)
@@ -1233,7 +1268,30 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             run_started_at=run_started_at,
             flush_llm_calls=_flush_llm_calls,
         )
-    except Exception:
+        if agent.forced_stop:
+            _register_if_resumable(
+                run_id=run_id,
+                agent=agent,
+                trace=trace,
+                step_number=step_number,
+                folder_path=folder_path,
+                use_index=use_index,
+                enable_semantic=enable_semantic,
+                enable_metadata=enable_metadata,
+                effort=effort,
+                index_folders=index_folders,
+                database_url=resolved_database_url,
+                original_task=original_task,
+            )
+    except BaseException:
+        # Leaving stream_events() does not stop the workflow engine. Cancel
+        # and await it before checkpointing the shared agent, otherwise a
+        # resumed request can race the still-running original orchestrator.
+        if handler is not None and not handler.is_done():
+            try:
+                await handler.cancel_run()
+            except BaseException:
+                logger.exception("Failed to cancel an interrupted workflow")
         _register_if_resumable(
             run_id=run_id,
             agent=agent,
@@ -1267,6 +1325,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
     `InputEvent`/`start_exploration`.
     """
     index_storage: PostgresStorage | None = None
+    gen: Any = None
     record = get_run(run_id)
     if record is None:
         await websocket.send_json(
@@ -1341,6 +1400,10 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                             "billed_cost_usd": stats.billed_cost_usd,
                             "upstream_cost_usd": stats.upstream_cost_usd,
                             "cost_source": stats.cost_source,
+                            "agent_role": stats.agent_role,
+                            "task_id": stats.task_id,
+                            "agent_id": stats.agent_id,
+                            "sequence": stats.sequence,
                         },
                     }
                 )
@@ -1377,6 +1440,9 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                             "chunk_count": stats.chunk_count,
                             "chars": stats.chars,
                             "estimated_tokens": stats.estimated_tokens,
+                            "task_id": stats.task_id,
+                            "agent_id": stats.agent_id,
+                            "sequence": stats.sequence,
                         },
                     }
                 )
@@ -1428,7 +1494,9 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
             await _flush_llm_calls()
             await _flush_retrieval_stats()
 
-            if isinstance(event, ToolCallEvent):
+            if isinstance(event, ResearchProgressEvent):
+                await websocket.send_json(_research_progress_ws_message(event))
+            elif isinstance(event, ToolCallEvent):
                 step_number += 1
                 if event.tool_name in CHUNK_BEARING_TOOLS:
                     pending_retrieval_step_numbers.append(step_number)
@@ -1497,7 +1565,29 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
             run_started_at=run_started_at,
             flush_llm_calls=_flush_llm_calls,
         )
-    except Exception:
+        if agent.forced_stop:
+            _register_if_resumable(
+                run_id=run_id,
+                agent=agent,
+                trace=trace,
+                step_number=step_number,
+                folder_path=folder_path,
+                use_index=use_index,
+                enable_semantic=enable_semantic,
+                enable_metadata=enable_metadata,
+                effort=effort,
+                index_folders=index_folders,
+                database_url=resolved_database_url,
+                original_task=original_task,
+            )
+    except BaseException:
+        # Closing the async generator runs its finally block, which cancels
+        # and awaits any in-flight multi-agent continuation task.
+        if gen is not None:
+            try:
+                await gen.aclose()
+            except BaseException:
+                logger.exception("Failed to close a resumed agent generator")
         _register_if_resumable(
             run_id=run_id,
             agent=agent,
