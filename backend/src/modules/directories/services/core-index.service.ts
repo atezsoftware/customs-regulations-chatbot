@@ -426,6 +426,52 @@ export async function fetchDocumentChunks(
   return responseBody as unknown as DocumentChunksResponse;
 }
 
+/** Keep the vector index consistent with administrative file operations. */
+export async function hideIndexedFile(directoryId: number, fileId: number): Promise<void> {
+  await mutateCoreIndex('/api/index/document-delete', {
+    corpus_key: virtualCorpusKey(directoryId),
+    relative_path_prefix: `${fileId}-`,
+  });
+}
+
+export async function hideIndexedDirectory(directoryId: number): Promise<void> {
+  await mutateCoreIndex('/api/index/corpus-delete', {
+    corpus_key: virtualCorpusKey(directoryId),
+  });
+}
+
+export async function renameIndexedFile(
+  directoryId: number,
+  fileId: number,
+  displayName: string,
+): Promise<void> {
+  await mutateCoreIndex('/api/index/document-rename', {
+    corpus_key: virtualCorpusKey(directoryId),
+    relative_path_prefix: `${fileId}-`,
+    display_name: displayName,
+  });
+}
+
+async function mutateCoreIndex(pathname: string, body: Record<string, string>): Promise<void> {
+  const endpoint = `${resolveCoreApiRestUrl()}${pathname}`;
+  const headers: Record<string, string> = {'Content-Type': 'application/json'};
+  if (process.env.CORE_INTERNAL_TOKEN) headers['X-Internal-Token'] = process.env.CORE_INTERNAL_TOKEN;
+
+  let res: Response;
+  try {
+    res = await fetch(endpoint, {method: 'POST', headers, body: JSON.stringify(body)});
+  } catch (error) {
+    throw new Error(
+      `Core is not reachable at ${endpoint}. ` +
+        `Index changes were not applied: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!res.ok) {
+    const response = await res.text().catch(() => '');
+    throw new Error(`Core index mutation failed (${res.status}): ${response || 'empty response'}`);
+  }
+}
+
 export async function triggerCorpusEmbedding(
   directoryId: number,
   corpusKey: string,

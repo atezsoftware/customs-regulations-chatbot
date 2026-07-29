@@ -18,6 +18,10 @@ services:
       STORAGE_ROOT: /app/storage
       CORE_INTERNAL_URL: ${CORE_INTERNAL_URL:-ws://core:8000}
       CORE_INTERNAL_TOKEN: ${CORE_INTERNAL_TOKEN:-}
+      # Opt-in admin-only dataset management for trusted deployments.
+      DATASET_MANAGEMENT_ENABLED: ${DATASET_MANAGEMENT_ENABLED:-false}
+      # Required when dataset chunking/indexing is enabled outside local.
+      CORE_INDEXER_URL: ${CORE_INDEXER_URL:-http://core-indexer:8001}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_DEFAULT_MODEL: ${OPENROUTER_DEFAULT_MODEL:-google/gemini-3.6-flash}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}

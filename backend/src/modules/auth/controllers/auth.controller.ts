@@ -2,7 +2,7 @@ import {inject} from '@loopback/core';
 import {repository} from '@loopback/repository';
 import {get, HttpErrors, post, Request, requestBody, response, RestBindings} from '@loopback/rest';
 import {getCurrentUser} from '../../../common/auth';
-import {isLocalEnv} from '../../../common/env';
+import {isDatasetManagementEnabled, isLocalEnv} from '../../../common/env';
 import {RefreshTokenRepository, UserRepository} from '../repositories';
 import {PasswordService} from '../services/password.service';
 import {TokenService} from '../services/token.service';
@@ -42,9 +42,8 @@ interface SafeUser {
   email: string;
   fullName?: string;
   role: string;
-  // Environment property, not a per-user one — true only when NODE_ENV=local.
-  // Lets the frontend hide the file-upload UI outside local without a
-  // separate config endpoint.
+  // Admin-only outside local; lets the frontend hide dataset management
+  // without a separate config endpoint.
   uploadsEnabled: boolean;
 }
 
@@ -59,7 +58,7 @@ function toSafeUser(user: {
     email: user.email,
     fullName: user.fullName,
     role: user.role,
-    uploadsEnabled: isLocalEnv(),
+    uploadsEnabled: isDatasetManagementEnabled() && (isLocalEnv() || user.role === 'admin'),
   };
 }
 

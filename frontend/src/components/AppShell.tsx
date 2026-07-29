@@ -42,7 +42,7 @@ export function AppShell() {
             <ChatIcon />
           </NavIcon>
           {user?.uploadsEnabled && (
-            <NavIcon to="/directories" label="Directories">
+            <NavIcon to="/directories" label="Dataset management">
               <FolderIcon />
             </NavIcon>
           )}

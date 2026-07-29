@@ -12,8 +12,8 @@ import {
   response,
   RestBindings,
 } from '@loopback/rest';
-import {getCurrentUser} from '../../../common/auth';
-import {isLocalEnv} from '../../../common/env';
+import {getCurrentUser, requireAdmin} from '../../../common/auth';
+import {isDatasetManagementEnabled} from '../../../common/env';
 import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../repositories';
 import {
@@ -21,6 +21,7 @@ import {
   DirectoryEmbeddingCompletion,
   DirectoryIndexStatus,
   getDirectoryIndexStatus,
+  hideIndexedDirectory,
   startCorpusEmbedding,
   startDirectoryChunking,
   StorageService,
@@ -58,13 +59,19 @@ export class DirectoriesController {
     return this.findDirectoryOrThrow(directoryId);
   }
 
+  private async requireDatasetAdmin() {
+    if (!isDatasetManagementEnabled()) throw new HttpErrors.NotFound('Not found.');
+    const user = await getCurrentUser(this.request, this.userRepository);
+    // Local retains its zero-friction developer workflow; every deployed
+    // environment requires an authenticated admin.
+    if (process.env.NODE_ENV !== 'local') requireAdmin(user);
+    return user;
+  }
+
   @post('/directories')
   @response(200, {description: 'Created directory'})
   async create(@requestBody() body: DirectoryBody) {
-    if (!isLocalEnv()) {
-      throw new HttpErrors.NotFound('Not found.');
-    }
-    const user = await getCurrentUser(this.request, this.userRepository);
+    const user = await this.requireDatasetAdmin();
     const name = body.name?.trim();
     if (!name) throw new HttpErrors.BadRequest('name is required.');
     const directory = await this.directoryRepository.create({userId: user.id, name});
@@ -125,10 +132,7 @@ export class DirectoriesController {
   @post('/directories/{id}/chunks')
   @response(202, {description: 'Started generating chunks for this directory'})
   async startChunking(@param.path.number('id') id: number) {
-    if (!isLocalEnv()) {
-      throw new HttpErrors.NotFound('Not found.');
-    }
-    const user = await getCurrentUser(this.request, this.userRepository);
+    const user = await this.requireDatasetAdmin();
     const directory = await this.findDirectoryOrThrow(id);
     const files = await this.directoryFileRepository.find({
       where: {directoryId: id},
@@ -180,10 +184,7 @@ export class DirectoriesController {
   @post('/directories/{id}/index')
   @response(202, {description: 'Started indexing (embedding) this directory'})
   async startIndex(@param.path.number('id') id: number) {
-    if (!isLocalEnv()) {
-      throw new HttpErrors.NotFound('Not found.');
-    }
-    const user = await getCurrentUser(this.request, this.userRepository);
+    await this.requireDatasetAdmin();
     await this.findDirectoryOrThrow(id);
     const files = await this.directoryFileRepository.find({where: {directoryId: id}});
     if (!files.length) {
@@ -213,7 +214,7 @@ export class DirectoriesController {
   @patch('/directories/{id}')
   @response(204, {description: 'Renamed directory'})
   async rename(@param.path.number('id') id: number, @requestBody() body: DirectoryBody) {
-    const user = await getCurrentUser(this.request, this.userRepository);
+    const user = await this.requireDatasetAdmin();
     await this.findDirectoryOrThrow(id);
     const name = body.name?.trim();
     if (!name) throw new HttpErrors.BadRequest('name is required.');
@@ -238,9 +239,14 @@ export class DirectoriesController {
   @del('/directories/{id}')
   @response(204, {description: 'Deleted directory and its files'})
   async delete(@param.path.number('id') id: number) {
-    await getCurrentUser(this.request, this.userRepository);
+    await this.requireDatasetAdmin();
     await this.findDirectoryOrThrow(id);
     const files = await this.directoryFileRepository.find({where: {directoryId: id}});
+    // A failed core mutation must leave the local records intact: otherwise a
+    // document could remain searchable with no way for an admin to remove it.
+    if (files.some(file => file.storageStatus === 'chunked' || file.storageStatus === 'indexed')) {
+      await hideIndexedDirectory(id);
+    }
     await this.directoryFileRepository.deleteAll({directoryId: id});
     await this.directoryRepository.deleteById(id);
     await this.storageService.deleteFiles(files.map(file => file.storedPath));
