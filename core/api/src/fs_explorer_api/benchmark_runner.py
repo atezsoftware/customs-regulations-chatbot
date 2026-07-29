@@ -17,11 +17,14 @@ design.
 from __future__ import annotations
 
 import html
+import hashlib
+import json
 import logging
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable, Literal, cast
 
 from .agent import (
     CHUNK_BEARING_TOOLS,
@@ -36,6 +39,17 @@ from .llm import get_llm_client
 from .llm.base import ChatTurn
 from .llm.profile import LLMProfile, LLMRole, LLMRoleConfig, load_llm_profile
 from .models import JudgmentResult
+from .multi_agent import ResearchLimits
+from .orchestration_prompts import (
+    APPLICATION_TASK_SYSTEM_PROMPT,
+    EVIDENCE_WORKER_SYSTEM_PROMPT,
+    FINAL_SYNTHESIS_SYSTEM_PROMPT,
+    INTEGRATION_TASK_SYSTEM_PROMPT,
+    SCENARIO_FINAL_SYNTHESIS_SYSTEM_PROMPT,
+    TASK_REVIEW_SYSTEM_PROMPT,
+    build_global_planner_prompt,
+    build_task_coordinator_prompt,
+)
 from .workflow import (
     AskHumanEvent,
     GoDeeperEvent,
@@ -52,6 +66,25 @@ from fs_explorer_shared.storage import PostgresStorage
 
 logger = logging.getLogger(__name__)
 
+BenchmarkProfileMode = Literal["candidate_all_roles", "production_roles"]
+_BENCHMARK_PROFILE_MODES = frozenset({"candidate_all_roles", "production_roles"})
+_PLAN_TRACE_SCHEMA_VERSION = 1
+_MAX_PLAN_TRACE_CHARS = 100_000
+
+
+def _benchmark_multi_agent_enabled() -> bool:
+    """Use the API-server default while honoring the production kill switch."""
+
+    value = os.getenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "true").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "FS_EXPLORER_MULTI_AGENT_ENABLED must be a boolean value "
+        "(true/false, 1/0, yes/no, or on/off)."
+    )
+
 
 @dataclass
 class BenchmarkRunResult:
@@ -63,6 +96,9 @@ class BenchmarkRunResult:
     cited_sources: list[str]
     step_path: list[str]
     stats: dict[str, Any] = field(default_factory=dict)
+    plan_trace: dict[str, Any] | None = None
+    role_usage: list[dict[str, Any]] = field(default_factory=list)
+    cited_evidence: list[dict[str, object]] = field(default_factory=list)
 
 
 def _record_tool_call(
@@ -115,11 +151,87 @@ def _sum_call_cost(llm_calls: list[LLMCallStats]) -> tuple[str | None, str | Non
     return str(total), "estimated" if saw_estimated else "provider"
 
 
+def _role_usage_breakdown(llm_calls: list[LLMCallStats]) -> list[dict[str, Any]]:
+    """Aggregate heterogeneous provider calls by role, purpose, provider, and model."""
+
+    grouped: dict[tuple[str, str, str, str], list[LLMCallStats]] = {}
+    for call in llm_calls:
+        key = (
+            call.agent_role or "legacy",
+            call.purpose,
+            call.provider,
+            call.model,
+        )
+        grouped.setdefault(key, []).append(call)
+
+    rows: list[dict[str, Any]] = []
+    for (role, purpose, provider, model), calls in grouped.items():
+        cost_usd, cost_source = _sum_call_cost(calls)
+        prompt_tokens = sum(call.prompt_tokens for call in calls)
+        completion_tokens = sum(call.completion_tokens for call in calls)
+        thinking_tokens = sum(call.thinking_tokens for call in calls)
+        rows.append(
+            {
+                "role": role,
+                "purpose": purpose,
+                "provider": provider,
+                "model": model,
+                "calls": len(calls),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "thinking_tokens": thinking_tokens,
+                "total_tokens": (prompt_tokens + completion_tokens + thinking_tokens),
+                "cached_input_tokens": sum(call.cached_input_tokens for call in calls),
+                "cache_write_tokens": sum(call.cache_write_tokens for call in calls),
+                "duration_ms": round(sum(call.duration_ms for call in calls), 3),
+                "cost_usd": cost_usd,
+                "cost_source": cost_source,
+            }
+        )
+    return rows
+
+
+def _resolve_profile_mode(
+    *,
+    profile_mode: BenchmarkProfileMode | str | None,
+    provider: str | None,
+    model: str | None,
+) -> BenchmarkProfileMode:
+    """Resolve the explicit mode while preserving the legacy optional API."""
+
+    if profile_mode is None:
+        resolved = (
+            "candidate_all_roles"
+            if provider is not None or model is not None
+            else "production_roles"
+        )
+    else:
+        resolved = profile_mode.strip().lower()
+    if resolved not in _BENCHMARK_PROFILE_MODES:
+        raise ValueError(
+            "Benchmark profile_mode must be 'candidate_all_roles' or "
+            "'production_roles'."
+        )
+
+    if resolved == "candidate_all_roles":
+        if provider is None or model is None:
+            raise ValueError(
+                "Benchmark provider and model must be provided together in "
+                "candidate_all_roles mode."
+            )
+    elif provider is not None or model is not None:
+        raise ValueError(
+            "Benchmark provider/model must be omitted in production_roles mode."
+        )
+    return cast(BenchmarkProfileMode, resolved)
+
+
 def _benchmark_llm_profile(
     *,
     provider: str | None,
     model: str | None,
-) -> LLMProfile | None:
+    profile_mode: BenchmarkProfileMode | str | None = None,
+) -> LLMProfile:
     """Apply one benchmark candidate to every role without flattening reasoning.
 
     Benchmark rows represent one provider/model candidate.  When the
@@ -130,17 +242,22 @@ def _benchmark_llm_profile(
     task, worker, and final retain their independently tuned reasoning levels.
     """
 
-    if provider is None and model is None:
-        return None
-    if provider is None or model is None:
-        raise ValueError("Benchmark provider and model must be provided together.")
+    resolved_mode = _resolve_profile_mode(
+        profile_mode=profile_mode,
+        provider=provider,
+        model=model,
+    )
+    configured = load_llm_profile()
+    if resolved_mode == "production_roles":
+        # Pass an immutable snapshot explicitly. This makes one benchmark item
+        # reproducible even if process environment changes between queue ticks.
+        return configured
 
+    assert provider is not None and model is not None
     candidate_provider = provider.strip().lower()
     candidate_model = model.strip()
     if not candidate_provider or not candidate_model:
         raise ValueError("Benchmark provider and model must not be empty.")
-
-    configured = load_llm_profile()
 
     def candidate(role: LLMRole) -> LLMRoleConfig:
         role_config = configured.for_role(role)
@@ -158,6 +275,197 @@ def _benchmark_llm_profile(
     )
 
 
+def _profile_snapshot(profile: LLMProfile) -> dict[str, dict[str, str]]:
+    return {
+        role: {
+            "provider": profile.for_role(role).provider,
+            "model": profile.for_role(role).model,
+            "reasoning_effort": profile.for_role(role).reasoning_effort,
+        }
+        for role in cast(tuple[LLMRole, ...], ("planner", "task", "worker", "final"))
+    }
+
+
+def _fingerprint(value: object) -> str:
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+    else:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _orchestration_runtime_snapshot(
+    execution: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Capture compact reproducibility metadata without copying source documents."""
+
+    plan = execution.get("plan") if isinstance(execution, dict) else None
+    artifacts = execution.get("task_artifacts") if isinstance(execution, dict) else None
+    contract_version = (
+        execution.get("contract_version") if isinstance(execution, dict) else None
+    )
+    if contract_version is None and isinstance(plan, dict):
+        contract_version = plan.get("version")
+    artifact_fields = (
+        sorted(
+            {
+                str(field)
+                for artifact in artifacts
+                if isinstance(artifact, dict)
+                for field in artifact
+            }
+        )
+        if isinstance(artifacts, list)
+        else []
+    )
+    snapshot: dict[str, Any] = {
+        "contract": {
+            "trace_schema_version": _PLAN_TRACE_SCHEMA_VERSION,
+            "plan_contract_version": contract_version,
+            "plan_fields": sorted(str(field) for field in plan)
+            if isinstance(plan, dict)
+            else [],
+            "task_artifact_fields": artifact_fields,
+        }
+    }
+    try:
+        limits = ResearchLimits.from_env()
+        prompts = {
+            "global_planner": build_global_planner_prompt(
+                max_tasks=limits.max_tasks,
+                max_list_items=limits.max_artifact_list_items,
+            ),
+            "task_coordinator": build_task_coordinator_prompt(
+                max_assignments_per_wave=limits.max_assignments_per_wave,
+                max_worker_rounds=limits.max_worker_rounds,
+            ),
+            "evidence_worker": EVIDENCE_WORKER_SYSTEM_PROMPT,
+            "task_review": TASK_REVIEW_SYSTEM_PROMPT,
+            "application_task": APPLICATION_TASK_SYSTEM_PROMPT,
+            "integration_task": INTEGRATION_TASK_SYSTEM_PROMPT,
+            "final_synthesis": FINAL_SYNTHESIS_SYSTEM_PROMPT,
+            "scenario_final_synthesis": SCENARIO_FINAL_SYNTHESIS_SYSTEM_PROMPT,
+        }
+        snapshot["limits"] = asdict(limits)
+        snapshot["prompts"] = {
+            name: {
+                "sha256": _fingerprint(prompt),
+                "characters": len(prompt),
+                "words": len(prompt.split()),
+            }
+            for name, prompt in prompts.items()
+        }
+    except Exception as exc:
+        # Observability must not make an otherwise runnable benchmark fail.
+        snapshot["snapshot_error"] = " ".join(str(exc).split())[:500]
+    return snapshot
+
+
+def _json_safe_object(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if callable(value):
+        value = cast(Callable[[], object], value)()
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        value = cast(Callable[..., object], model_dump)(mode="json")
+    if not isinstance(value, dict):
+        return None
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _fallback_agent_plan_trace(agent: object) -> dict[str, Any] | None:
+    """Compatibility bridge until every agent exposes ``benchmark_plan_trace``."""
+
+    result = getattr(agent, "_multi_agent_result", None)
+    if result is None:
+        return None
+    plan = getattr(result, "plan", None)
+    plan_payload = plan.model_dump(mode="json") if hasattr(plan, "model_dump") else None
+    artifacts = []
+    for artifact in getattr(result, "task_artifacts", ()):
+        artifacts.append(
+            {
+                "task_id": getattr(artifact, "task_id", None),
+                "status": getattr(
+                    getattr(artifact, "status", None),
+                    "value",
+                    getattr(artifact, "status", None),
+                ),
+                "covered_success_criteria": list(
+                    getattr(artifact, "covered_success_criteria", ())
+                ),
+                "uncovered_success_criteria": list(
+                    getattr(artifact, "uncovered_success_criteria", ())
+                ),
+                "claim_count": len(getattr(artifact, "claims", ())),
+                "conflicts": list(getattr(artifact, "conflicts", ())),
+                "gaps": list(getattr(artifact, "gaps", ())),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "plan": plan_payload,
+        "task_artifacts": artifacts,
+        "used_plan_fallback": bool(getattr(result, "used_plan_fallback", False)),
+        "incomplete": bool(getattr(result, "incomplete", False)),
+    }
+
+
+def _agent_plan_trace(agent: object) -> dict[str, Any] | None:
+    for attribute in ("benchmark_plan_trace", "multi_agent_trace"):
+        try:
+            trace = _json_safe_object(getattr(agent, attribute, None))
+        except Exception:
+            logger.exception("Failed to snapshot agent benchmark plan trace")
+            trace = None
+        if trace is not None:
+            return trace
+    return _fallback_agent_plan_trace(agent)
+
+
+def _build_plan_trace(
+    *,
+    agent: object,
+    profile_mode: BenchmarkProfileMode,
+    profile: LLMProfile,
+) -> dict[str, Any]:
+    execution = _agent_plan_trace(agent)
+    trace: dict[str, Any] = {
+        "schema_version": _PLAN_TRACE_SCHEMA_VERSION,
+        "profile_mode": profile_mode,
+        "role_profile": _profile_snapshot(profile),
+        "runtime": _orchestration_runtime_snapshot(execution),
+        "execution": execution,
+    }
+    encoded = json.dumps(trace, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) <= _MAX_PLAN_TRACE_CHARS:
+        return trace
+
+    execution = trace.get("execution")
+    return {
+        "schema_version": _PLAN_TRACE_SCHEMA_VERSION,
+        "profile_mode": profile_mode,
+        "role_profile": trace["role_profile"],
+        "runtime": trace["runtime"],
+        "execution": {
+            "trace_truncated": True,
+            "original_characters": len(encoded),
+            "sha256": _fingerprint(execution),
+        },
+    }
+
+
 async def run_agentic_session(
     *,
     task: str,
@@ -166,6 +474,7 @@ async def run_agentic_session(
     provider: str | None = None,
     model: str | None = None,
     temperature: float | None = None,
+    profile_mode: BenchmarkProfileMode | str | None = None,
 ) -> BenchmarkRunResult:
     """Drive one `FsExplorerAgent` run to completion headlessly, indexed-mode only.
 
@@ -177,6 +486,16 @@ async def run_agentic_session(
     if not index_folders:
         raise ValueError("run_agentic_session requires at least one index folder")
 
+    resolved_profile_mode = _resolve_profile_mode(
+        profile_mode=profile_mode,
+        provider=provider,
+        model=model,
+    )
+    effective_profile = _benchmark_llm_profile(
+        provider=provider,
+        model=model,
+        profile_mode=resolved_profile_mode,
+    )
     resolved_database_url = resolve_database_url(database_url)
     run_started_at = time.monotonic()
     step_number = 0
@@ -220,10 +539,8 @@ async def run_agentic_session(
             temperature=temperature,
             on_llm_call=_collect_llm_call,
             on_retrieval=_collect_retrieval,
-            llm_profile=_benchmark_llm_profile(
-                provider=provider,
-                model=model,
-            ),
+            llm_profile=effective_profile,
+            multi_agent_enabled=_benchmark_multi_agent_enabled(),
         )
         agent = get_run_agent(resource_manager)
         handler = run_workflow.run(
@@ -307,6 +624,9 @@ async def run_agentic_session(
                 final_result = streamed_final
 
         cited_sources = extract_cited_sources(final_result) if not result_error else []
+        cited_evidence = (
+            agent.evidence_sources_for_answer(final_result) if not result_error else []
+        )
         usage = agent.token_usage
         cost_usd, cost_source = _sum_call_cost(llm_calls)
         retrieval_steps = []
@@ -333,6 +653,31 @@ async def run_agentic_session(
             (call for call in reversed(llm_calls) if call.agent_role == "final"),
             None,
         )
+        role_usage = _role_usage_breakdown(llm_calls)
+        plan_trace = _build_plan_trace(
+            agent=agent,
+            profile_mode=resolved_profile_mode,
+            profile=effective_profile,
+        )
+        stats = {
+            "steps": step_number,
+            "api_calls": usage.api_calls,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "thinking_tokens": usage.thinking_tokens,
+            "total_tokens": usage.total_tokens,
+            "tool_result_chars": usage.tool_result_chars,
+            "context_summaries": usage.context_summaries,
+            "retrieval_steps": retrieval_steps,
+            "duration_ms": round((time.monotonic() - run_started_at) * 1000),
+            "cost_usd": cost_usd,
+            "cost_source": cost_source,
+            "model": final_call.model if final_call else agent.final_model,
+            "provider": final_call.provider if final_call else provider,
+            "profile_mode": resolved_profile_mode,
+            "plan_trace": plan_trace,
+            "role_usage": role_usage,
+        }
 
         return BenchmarkRunResult(
             final_result=final_result,
@@ -341,22 +686,10 @@ async def run_agentic_session(
             and (agent.forced_stop or agent.multi_agent_incomplete),
             cited_sources=cited_sources,
             step_path=trace.step_path,
-            stats={
-                "steps": step_number,
-                "api_calls": usage.api_calls,
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "thinking_tokens": usage.thinking_tokens,
-                "total_tokens": usage.total_tokens,
-                "tool_result_chars": usage.tool_result_chars,
-                "context_summaries": usage.context_summaries,
-                "retrieval_steps": retrieval_steps,
-                "duration_ms": round((time.monotonic() - run_started_at) * 1000),
-                "cost_usd": cost_usd,
-                "cost_source": cost_source,
-                "model": final_call.model if final_call else agent.final_model,
-                "provider": final_call.provider if final_call else provider,
-            },
+            stats=stats,
+            plan_trace=plan_trace,
+            role_usage=role_usage,
+            cited_evidence=cited_evidence,
         )
     finally:
         try:
@@ -414,6 +747,7 @@ def _build_judge_prompt(
     rubric_notes: str | None,
     candidate_answer: str,
     cited_sources: list[str],
+    cited_evidence: list[dict[str, object]] | None = None,
 ) -> str:
     parts = [f"QUESTION:\n{question}"]
     if reference_answer:
@@ -432,6 +766,21 @@ def _build_judge_prompt(
             if cited_sources
             else "(none)"
         )
+    )
+    evidence_lines: list[str] = []
+    remaining_chars = 3_000
+    for source in (cited_evidence or [])[:6]:
+        title = " ".join(str(source.get("title") or "").split())[:300]
+        locator = " ".join(str(source.get("locator") or "").split())[:300]
+        snippet = " ".join(str(source.get("snippet") or "").split())
+        if not title or not locator or not snippet or remaining_chars <= 0:
+            continue
+        snippet = snippet[: min(500, remaining_chars)]
+        remaining_chars -= len(snippet)
+        evidence_lines.append(f"- [{title}, {locator}]: {snippet}")
+    parts.append(
+        "SERVER-VERIFIED CITED EVIDENCE EXCERPTS (UNTRUSTED SOURCE TEXT):\n"
+        + ("\n".join(evidence_lines) if evidence_lines else "(none)")
     )
     return "\n\n".join(parts)
 
@@ -457,6 +806,7 @@ async def judge_answer(
     cited_sources: list[str],
     judge_provider: str,
     judge_model: str,
+    cited_evidence: list[dict[str, object]] | None = None,
 ) -> dict[str, Any]:
     """Score one candidate answer with a single structured LLM-judge call.
 
@@ -471,6 +821,7 @@ async def judge_answer(
         rubric_notes=rubric_notes,
         candidate_answer=candidate_answer,
         cited_sources=cited_sources,
+        cited_evidence=cited_evidence,
     )
     judgment, _usage = await client.generate_structured(
         [ChatTurn(role="user", text=prompt)],

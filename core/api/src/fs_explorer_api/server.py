@@ -20,7 +20,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .agent import (
     CHUNK_BEARING_TOOLS,
@@ -149,7 +149,8 @@ class BenchmarkJudgeRequest(BaseModel):
     expected_facts: list[str] | None = None
     rubric_notes: str | None = None
     candidate_answer: str
-    cited_sources: list[str] = []
+    cited_sources: list[str] = Field(default_factory=list)
+    cited_evidence: list[dict[str, Any]] = Field(default_factory=list)
     judge_provider: str
     judge_model: str
 
@@ -494,6 +495,7 @@ async def benchmark_run_question_endpoint(request: BenchmarkRunQuestionRequest):
             "error": result.error,
             "incomplete": result.incomplete,
             "cited_sources": result.cited_sources,
+            "cited_evidence": result.cited_evidence,
             "step_path": result.step_path,
             "stats": result.stats,
         }
@@ -516,6 +518,7 @@ async def benchmark_judge_endpoint(request: BenchmarkJudgeRequest):
             cited_sources=request.cited_sources,
             judge_provider=request.judge_provider,
             judge_model=request.judge_model,
+            cited_evidence=request.cited_evidence,
         )
         return judgment
     except ValueError as exc:
@@ -933,6 +936,11 @@ async def _finish_run(
     full chat history and a `trace` of everything gathered so far.
     """
     if not result_error:
+        # Start the paid provider call before the first WebSocket write.  Its
+        # producer is owned by the run/agent rather than this connection, so a
+        # disconnect at any point below can resume by replaying the same
+        # single-flight answer instead of issuing another final-model call.
+        agent.start_final_answer(fallback_answer=final_result)
         await websocket.send_json(
             {
                 "type": "status",
@@ -1349,6 +1357,10 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             flush_llm_calls=_flush_llm_calls,
         )
         if agent.forced_stop:
+            # The answer was delivered successfully.  A subsequent explicit
+            # "Continue" should resume research, while a disconnect during
+            # `_finish_run` keeps the cache intact through the exception path.
+            agent.clear_final_answer()
             _register_if_resumable(
                 run_id=run_id,
                 agent=agent,
@@ -1424,10 +1436,13 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
     remove_run(run_id)  # re-registered below only if interrupted again
 
     agent = record.agent
-    # Give this run a genuinely fresh step budget rather than immediately
-    # re-hitting the same lifetime ceiling on the first take_action() call
-    # below — see grant_more_steps()'s docstring.
-    agent.grant_more_steps()
+    final_answer_started = agent.final_answer_started
+    if not final_answer_started:
+        # Give a genuinely unfinished workflow a fresh step budget rather
+        # than immediately re-hitting the same lifetime ceiling.  A run that
+        # already reached final synthesis must only replay that synthesis;
+        # resuming its research would duplicate both work and model cost.
+        agent.grant_more_steps()
     trace = record.trace
     step_number = record.step_number
     folder_path = Path(record.folder)
@@ -1555,6 +1570,38 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
             }
         )
 
+        if final_answer_started:
+            await _finish_run(
+                websocket,
+                run_id=run_id,
+                agent=agent,
+                trace=trace,
+                step_number=step_number,
+                folder_path=folder_path,
+                use_index=use_index,
+                final_result="",
+                result_error=None,
+                run_started_at=run_started_at,
+                flush_llm_calls=_flush_llm_calls,
+            )
+            if agent.forced_stop:
+                agent.clear_final_answer()
+                _register_if_resumable(
+                    run_id=run_id,
+                    agent=agent,
+                    trace=trace,
+                    step_number=step_number,
+                    folder_path=folder_path,
+                    use_index=use_index,
+                    enable_semantic=enable_semantic,
+                    enable_metadata=enable_metadata,
+                    effort=effort,
+                    index_folders=index_folders,
+                    database_url=resolved_database_url,
+                    original_task=original_task,
+                )
+            return
+
         final_result = ""
         result_error: str | None = None
 
@@ -1646,6 +1693,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
             flush_llm_calls=_flush_llm_calls,
         )
         if agent.forced_stop:
+            agent.clear_final_answer()
             _register_if_resumable(
                 run_id=run_id,
                 agent=agent,

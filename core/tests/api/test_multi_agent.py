@@ -17,16 +17,27 @@ from fs_explorer_api.multi_agent import (
     MultiAgentResearchOrchestrator,
     ResearchLimits,
     ResearchProgress,
+    _bounded_planner_input,
+    _claim_identifier,
 )
 from fs_explorer_api.orchestration_models import (
+    AnswerRequirement,
+    AnswerRequirementKind,
+    DerivedConclusion,
     EvidenceClaim,
     EvidenceConfidence,
+    EvidenceRequirement,
+    EvidenceRequirementKind,
     ExecutionStrategy,
     GlobalPlan,
     PlanMode,
+    ProblemType,
     SearchAssignment,
     SearchAssignmentBatch,
     TaskArtifact,
+    TaskKind,
+    TaskOutput,
+    TaskOutputRef,
     TaskSpec,
     TaskStatus,
     WorkerArtifact,
@@ -59,13 +70,34 @@ def _task(
     *,
     depends_on: list[str] | None = None,
 ) -> TaskSpec:
+    criterion_id = f"criterion-{task_id}"
     return TaskSpec(
         task_id=task_id,
-        question=question,
-        purpose=f"Resolve {task_id}",
-        expected_output=f"Supported conclusion for {task_id}",
-        success_criteria=[f"criterion-{task_id}"],
-        depends_on=list(depends_on or []),
+        kind=TaskKind.EVIDENCE,
+        issue=f"Resolve {task_id}",
+        search_question=question,
+        requirement_ids=[criterion_id],
+        fact_ids=[],
+        unknown_ids=[],
+        branch_ids=[],
+        evidence_requirements=[
+            EvidenceRequirement(
+                evidence_requirement_id=criterion_id,
+                kind=EvidenceRequirementKind.GOVERNING_RULE,
+                description=criterion_id,
+                requirement_ids=[criterion_id],
+            )
+        ],
+        consumes=[
+            TaskOutputRef(task_id=dependency, output_id=f"output-{dependency}")
+            for dependency in depends_on or []
+        ],
+        produces=[
+            TaskOutput(
+                output_id=f"output-{task_id}",
+                description=f"Supported conclusion for {task_id}",
+            )
+        ],
         required=True,
         as_of_date=None,
         filters=None,
@@ -76,12 +108,23 @@ def _plan(
     *tasks: TaskSpec,
     execution_strategy: ExecutionStrategy = ExecutionStrategy.ADAPTIVE,
 ) -> GlobalPlan:
+    requirements = [
+        AnswerRequirement(
+            requirement_id=task.requirement_ids[0],
+            kind=AnswerRequirementKind.OUTCOME,
+            description=f"Answer the requirement for {task.task_id}.",
+            required=True,
+        )
+        for task in tasks
+    ]
     return GlobalPlan(
-        version="2",
+        version="3",
+        problem_type=(ProblemType.LOOKUP if len(tasks) == 1 else ProblemType.MIXED),
         mode=PlanMode.DIRECT if len(tasks) == 1 else PlanMode.DECOMPOSED,
         execution_strategy=execution_strategy,
         normalized_question="Normalized question",
-        answer_requirements=["Answer all requested parts."],
+        answer_requirements=requirements,
+        scenario=None,
         tasks=list(tasks),
         synthesis_requirements=[],
         assumptions=[],
@@ -90,13 +133,16 @@ def _plan(
 
 def _claim(task_id: str, *, excerpt: str | None = None) -> EvidenceClaim:
     return EvidenceClaim(
+        claim_id=f"claim-{task_id}",
         claim=f"Supported claim for {task_id}",
         document_id=f"doc-{task_id}",
         chunk_id=f"chunk-{task_id}",
         readable_title=f"Model title {task_id}",
         locator="Model locator",
         evidence_excerpt=excerpt or f"Evidence text for {task_id}.",
-        supports_success_criteria=[f"criterion-{task_id}"],
+        requirement_ids=[f"criterion-{task_id}"],
+        evidence_requirement_ids=[f"criterion-{task_id}"],
+        fact_ids=[],
         confidence=EvidenceConfidence.HIGH,
         effective_start_date=None,
         effective_end_date=None,
@@ -155,13 +201,16 @@ def _source_claim(
     locator: str = "Model-provided locator",
 ) -> EvidenceClaim:
     return EvidenceClaim(
+        claim_id=f"claim-{task_id}-{chunk_id}",
         claim=f"Supported claim from {chunk_id}",
         document_id=document_id,
         chunk_id=chunk_id,
         readable_title=title,
         locator=locator,
         evidence_excerpt=excerpt,
-        supports_success_criteria=[f"criterion-{task_id}"],
+        requirement_ids=[f"criterion-{task_id}"],
+        evidence_requirement_ids=[f"criterion-{task_id}"],
+        fact_ids=[],
         confidence=EvidenceConfidence.HIGH,
         effective_start_date=None,
         effective_end_date=None,
@@ -253,9 +302,10 @@ def _task_responder(schema: type, text: str) -> object:
         task_id=task_id,
         status=TaskStatus.COMPLETE,
         answer_fragment=f"Conclusion for {task_id}",
-        covered_success_criteria=[f"criterion-{task_id}"],
-        uncovered_success_criteria=[],
+        covered_requirement_ids=[f"criterion-{task_id}"],
+        uncovered_requirement_ids=[],
         claims=[_claim(task_id)],
+        application_findings=[],
         conflicts=[],
         gaps=[],
         contributing_worker_ids=[f"worker-{task_id}-r1-1"],
@@ -378,6 +428,122 @@ async def test_single_pass_direct_skips_redundant_task_llm_calls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_semantically_invalid_plan_runs_safe_adaptive_fallback() -> None:
+    original_question = "What is the original filing requirement?"
+    invalid = _plan(
+        _task("one", "First duplicate part"),
+        _task("two", "Second duplicate part"),
+    ).model_copy(update={"problem_type": ProblemType.LOOKUP})
+    planner = _ScriptedClient("planner", lambda _schema, _text: invalid)
+
+    def task_responder(schema: type, text: str) -> object:
+        if schema is SearchAssignmentBatch:
+            return SearchAssignmentBatch(
+                task_id="task_1",
+                stop=False,
+                stop_reason=None,
+                assignments=[
+                    SearchAssignment(
+                        assignment_id="fallback_search",
+                        task_id="task_1",
+                        query=original_question,
+                        objective="Answer the preserved original question.",
+                        evidence_requirements=["evidence_1"],
+                        excluded_queries=[],
+                        as_of_date=None,
+                        filters=None,
+                    )
+                ],
+            )
+        assert schema is TaskArtifact
+        claim = EvidenceClaim(
+            claim_id="fallback_claim",
+            claim="The indexed rule answers the original question.",
+            document_id="doc-fallback",
+            chunk_id="chunk-fallback",
+            readable_title="Fallback Regulation",
+            locator="Article 1",
+            evidence_excerpt="The filing requirement is thirty days.",
+            requirement_ids=["req_1"],
+            evidence_requirement_ids=["evidence_1"],
+            fact_ids=[],
+            confidence=EvidenceConfidence.HIGH,
+            effective_start_date=None,
+            effective_end_date=None,
+        )
+        return TaskArtifact(
+            task_id="task_1",
+            status=TaskStatus.COMPLETE,
+            answer_fragment=claim.claim,
+            covered_requirement_ids=["req_1"],
+            uncovered_requirement_ids=[],
+            claims=[claim],
+            application_findings=[],
+            conflicts=[],
+            gaps=[],
+            contributing_worker_ids=["worker-task_1-fallback_search"],
+        )
+
+    def worker_responder(schema: type, _text: str) -> object:
+        assert schema is WorkerArtifact
+        return WorkerArtifact(
+            task_id="task_1",
+            assignment_id="fallback_search",
+            worker_id="worker-task_1-fallback_search",
+            status=WorkerStatus.SUCCESS,
+            searches_run=[original_question],
+            claims=[
+                EvidenceClaim(
+                    claim_id="candidate_claim",
+                    claim="The indexed rule answers the original question.",
+                    document_id="doc-fallback",
+                    chunk_id="chunk-fallback",
+                    readable_title="Fallback Regulation",
+                    locator="Article 1",
+                    evidence_excerpt="The filing requirement is thirty days.",
+                    requirement_ids=["req_1"],
+                    evidence_requirement_ids=["evidence_1"],
+                    fact_ids=[],
+                    confidence=EvidenceConfidence.HIGH,
+                    effective_start_date=None,
+                    effective_end_date=None,
+                )
+            ],
+            gaps=[],
+            cross_references=[],
+            error_code=None,
+            error_message=None,
+        )
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", task_responder),
+        worker_llm=_ScriptedClient("worker", worker_responder),
+        search_runner=lambda **kwargs: _SearchResult(
+            query=kwargs["query"],
+            hits=[
+                _source_hit(
+                    document_id="doc-fallback",
+                    chunk_id="chunk-fallback",
+                    relative_path="fallback_regulation.pdf",
+                    article="1",
+                    text="The filing requirement is thirty days.",
+                    score=1.0,
+                )
+            ],
+        ),
+        limits=_limits(),
+        search_runner_in_thread=False,
+    ).run(original_question)
+
+    assert result.used_plan_fallback is True
+    assert result.plan.mode == PlanMode.DIRECT
+    assert result.plan.execution_strategy == ExecutionStrategy.ADAPTIVE
+    assert result.plan.normalized_question == original_question
+    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
+
+
+@pytest.mark.asyncio
 async def test_single_pass_coverage_miss_upgrades_to_adaptive_wave() -> None:
     planner = _ScriptedClient(
         "planner",
@@ -481,6 +647,111 @@ async def test_independent_tasks_search_in_parallel_without_sibling_context() ->
 
 
 @pytest.mark.asyncio
+async def test_identical_cross_task_worker_query_reuses_one_inflight_search() -> None:
+    task_1 = _task("task_1", "Find the governing rule.")
+    task_2 = _task("task_2", "Find the effective-date rule.")
+    planner = _ScriptedClient("planner", lambda _schema, _text: _plan(task_1, task_2))
+    shared_query = "shared indexed query"
+
+    def task_responder(schema: type, text: str) -> object:
+        task_id = _task_id_from_text(text)
+        if schema is SearchAssignmentBatch:
+            return SearchAssignmentBatch(
+                task_id=task_id,
+                stop=False,
+                stop_reason=None,
+                assignments=[
+                    SearchAssignment(
+                        assignment_id=f"shared_{task_id}",
+                        task_id=task_id,
+                        query=shared_query,
+                        objective=f"Resolve {task_id}.",
+                        evidence_requirements=[f"criterion-{task_id}"],
+                        excluded_queries=[],
+                        as_of_date=None,
+                        filters=None,
+                    )
+                ],
+            )
+        assert schema is TaskArtifact
+        claim = _source_claim(
+            task_id,
+            document_id="doc-shared",
+            chunk_id="chunk-shared",
+            excerpt="The shared provision supplies both required rules.",
+        )
+        return TaskArtifact(
+            task_id=task_id,
+            status=TaskStatus.COMPLETE,
+            answer_fragment=claim.claim,
+            covered_requirement_ids=[f"criterion-{task_id}"],
+            uncovered_requirement_ids=[],
+            claims=[claim],
+            application_findings=[],
+            conflicts=[],
+            gaps=[],
+            contributing_worker_ids=[f"worker-{task_id}-shared_{task_id}"],
+        )
+
+    def worker_responder(schema: type, text: str) -> object:
+        assert schema is WorkerArtifact
+        task_id = _task_id_from_text(text)
+        return WorkerArtifact(
+            task_id=task_id,
+            assignment_id=f"shared_{task_id}",
+            worker_id=f"worker-{task_id}-shared_{task_id}",
+            status=WorkerStatus.SUCCESS,
+            searches_run=[shared_query],
+            claims=[
+                _source_claim(
+                    task_id,
+                    document_id="doc-shared",
+                    chunk_id="chunk-shared",
+                    excerpt="The shared provision supplies both required rules.",
+                )
+            ],
+            gaps=[],
+            cross_references=[],
+            error_code=None,
+            error_message=None,
+        )
+
+    search_calls = 0
+
+    async def search(**kwargs):
+        nonlocal search_calls
+        search_calls += 1
+        await asyncio.sleep(0.05)
+        return _SearchResult(
+            query=kwargs["query"],
+            hits=[
+                _source_hit(
+                    document_id="doc-shared",
+                    chunk_id="chunk-shared",
+                    relative_path="shared_regulation.pdf",
+                    article="7",
+                    text="The shared provision supplies both required rules.",
+                    score=1.0,
+                )
+            ],
+        )
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", task_responder),
+        worker_llm=_ScriptedClient("worker", worker_responder),
+        search_runner=search,
+        limits=_limits(),
+        search_runner_in_thread=False,
+    ).run("Answer both distinct requirements.")
+
+    assert search_calls == 1
+    assert all(
+        artifact.status == TaskStatus.COMPLETE for artifact in result.task_artifacts
+    )
+
+
+@pytest.mark.asyncio
 async def test_dependency_task_waits_for_required_artifact() -> None:
     task_1 = _task("task_1", "Question one")
     task_2 = _task("task_2", "Question two", depends_on=["task_1"])
@@ -527,9 +798,10 @@ async def test_failed_required_task_isolated_and_marks_run_incomplete() -> None:
                 task_id=task_id,
                 status=TaskStatus.FAILED,
                 answer_fragment=None,
-                covered_success_criteria=[],
-                uncovered_success_criteria=[f"criterion-{task_id}"],
+                covered_requirement_ids=[],
+                uncovered_requirement_ids=[f"criterion-{task_id}"],
                 claims=[],
+                application_findings=[],
                 conflicts=[],
                 gaps=["retrieval unavailable"],
                 contributing_worker_ids=[],
@@ -657,6 +929,34 @@ def test_evidence_renderer_enforces_one_total_character_budget() -> None:
     assert 1 <= rendered.count("BEGIN_UNTRUSTED_SOURCE_TEXT") <= len(records)
 
 
+def test_claim_identifier_retains_uniqueness_when_long_ids_are_truncated() -> None:
+    task_id = "task_" + ("a" * 59)
+    first = _claim_identifier(task_id, "assignment_" + ("x" * 70), 1)
+    second = _claim_identifier(task_id, "assignment_" + ("y" * 70), 1)
+    third = _claim_identifier(task_id, "assignment_" + ("x" * 70), 2)
+
+    assert len(first) <= 64
+    assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", first)
+    assert len({first, second, third}) == 3
+    assert _claim_identifier("task_1", "single_pass", 1) == (
+        "task_1_single_pass_claim_1"
+    )
+
+
+def test_planner_input_bounds_history_without_dropping_current_question() -> None:
+    current = "CURRENT-QUESTION-" + ("q" * 4_000)
+    rendered = _bounded_planner_input(
+        f"{'old ' * 10_000}\n\nCurrent question:\n{current}",
+        max_question_chars=1_000,
+        max_context_chars=1_500,
+    )
+
+    assert len(rendered) <= 1_500
+    assert rendered.startswith("CURRENT QUESTION:\nCURRENT-QUESTION-")
+    assert current[:1_000] in rendered
+    assert "RECENT CONVERSATION CONTEXT" in rendered
+
+
 def test_compact_artifacts_are_valid_json_with_one_total_context_budget() -> None:
     limits = replace(_limits(), max_artifact_context_chars=3_000)
     orchestrator = MultiAgentResearchOrchestrator(
@@ -671,7 +971,8 @@ def test_compact_artifacts_are_valid_json_with_one_total_context_budget() -> Non
         update={
             "claim": "claim " * 1_000,
             "evidence_excerpt": "evidence " * 1_000,
-            "supports_success_criteria": ["criterion " * 500] * 12,
+            "requirement_ids": ["criterion-task_1"],
+            "evidence_requirement_ids": ["criterion-task_1"],
         }
     )
     workers = [
@@ -697,12 +998,13 @@ def test_compact_artifacts_are_valid_json_with_one_total_context_budget() -> Non
             task_id=f"task_{index}",
             status=TaskStatus.PARTIAL,
             answer_fragment="answer " * 1_000,
-            covered_success_criteria=["covered " * 500] * 12,
-            uncovered_success_criteria=[
+            covered_requirement_ids=["covered"],
+            uncovered_requirement_ids=[
                 "MATERIAL_UNCOVERED_CRITERION",
-                *(["uncovered " * 500] * 11),
+                *(f"uncovered-{item}" for item in range(11)),
             ],
             claims=[long_claim],
+            application_findings=[],
             conflicts=["MATERIAL_CONFLICT", *(["conflict " * 500] * 11)],
             gaps=["MATERIAL_TASK_GAP", *(["gap " * 500] * 11)],
             contributing_worker_ids=["worker " * 500] * 12,
@@ -722,6 +1024,89 @@ def test_compact_artifacts_are_valid_json_with_one_total_context_budget() -> Non
     assert "MATERIAL_UNCOVERED_CRITERION" in task_context
     assert "MATERIAL_CONFLICT" in task_context
     assert "MATERIAL_TASK_GAP" in task_context
+
+
+def test_final_boundary_drops_conclusion_when_any_supporting_claim_is_omitted() -> None:
+    first_claim = _claim("task_1")
+    second_claim = _source_claim(
+        "task_1",
+        document_id="doc-second",
+        chunk_id="chunk-second",
+        excerpt="Second required source.",
+    )
+    evidence_artifact = TaskArtifact(
+        task_id="task_1",
+        status=TaskStatus.COMPLETE,
+        answer_fragment="Both claims are required.",
+        covered_requirement_ids=["criterion-task_1"],
+        uncovered_requirement_ids=[],
+        claims=[first_claim, second_claim],
+        application_findings=[],
+        conflicts=[],
+        gaps=[],
+        contributing_worker_ids=["worker-1"],
+    )
+    finding_text = "The multi-source conclusion applies."
+    application_artifact = TaskArtifact(
+        task_id="apply",
+        status=TaskStatus.COMPLETE,
+        answer_fragment=finding_text,
+        covered_requirement_ids=["criterion-task_1"],
+        uncovered_requirement_ids=[],
+        claims=[],
+        application_findings=[
+            DerivedConclusion(
+                conclusion_id="conclusion_1",
+                finding=finding_text,
+                requirement_ids=["criterion-task_1"],
+                fact_ids=["fact_1"],
+                branch_ids=[],
+                supporting_claim_ids=[
+                    first_claim.claim_id,
+                    second_claim.claim_id,
+                ],
+                dependency_refs=[TaskOutputRef(task_id="task_1", output_id="result")],
+                confidence=EvidenceConfidence.HIGH,
+                limitations=[],
+            )
+        ],
+        conflicts=[],
+        gaps=[],
+        contributing_worker_ids=[],
+    )
+    first_record = EvidenceRecord(
+        evidence_id="evidence-1",
+        document_id=first_claim.document_id,
+        chunk_id=first_claim.chunk_id,
+        readable_title=first_claim.readable_title,
+        locator=first_claim.locator,
+        text=first_claim.evidence_excerpt,
+        score=1.0,
+        metadata={},
+    )
+    orchestrator = MultiAgentResearchOrchestrator(
+        planner_llm=_ScriptedClient("planner", lambda _schema, _text: None),
+        task_llm=_ScriptedClient("task", lambda _schema, _text: None),
+        worker_llm=_ScriptedClient("worker", lambda _schema, _text: None),
+        search_runner=lambda **_kwargs: _SearchResult(query="", hits=[]),
+        limits=_limits(),
+        search_runner_in_thread=False,
+    )
+
+    compact = orchestrator._compact_task_artifacts(
+        [evidence_artifact, application_artifact],
+        allowed_sources={(first_record.document_id, first_record.chunk_id)},
+    )
+
+    assert finding_text not in compact
+    assert "findings were omitted" in compact
+    assert (
+        orchestrator._all_finding_support_rendered(
+            [evidence_artifact, application_artifact],
+            [first_record],
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -748,7 +1133,11 @@ async def test_final_evidence_budget_fair_and_sources_match_rendered_records() -
         task_llm=_ScriptedClient("task", _task_responder),
         worker_llm=_ScriptedClient("worker", _worker_responder),
         search_runner=search,
-        limits=replace(_limits(), final_chunk_chars=650),
+        limits=replace(
+            _limits(),
+            final_chunk_chars=650,
+            max_final_context_chars=4_000,
+        ),
         search_runner_in_thread=False,
     ).run("Compare both questions")
 
@@ -763,6 +1152,7 @@ async def test_final_evidence_budget_fair_and_sources_match_rendered_records() -
     assert {str(source["chunk_id"]) for source in result.evidence_sources} == set(
         rendered_chunk_ids
     )
+    assert len(result.final_context) <= 4_000
 
 
 @pytest.mark.asyncio
@@ -949,9 +1339,10 @@ async def test_task_global_rerank_uses_task_question_and_reviewer_gets_that_orde
             task_id="task_1",
             status=TaskStatus.COMPLETE,
             answer_fragment="Both sources support the conclusion.",
-            covered_success_criteria=["criterion-task_1"],
-            uncovered_success_criteria=[],
+            covered_requirement_ids=["criterion-task_1"],
+            uncovered_requirement_ids=[],
             claims=[claims["chunk-a"], claims["chunk-b"]],
+            application_findings=[],
             conflicts=[],
             gaps=[],
             contributing_worker_ids=[],
@@ -1028,6 +1419,7 @@ async def test_task_global_rerank_uses_task_question_and_reviewer_gets_that_orde
 
 @pytest.mark.asyncio
 async def test_task_review_preserves_verified_gap_and_sourced_conflict_only() -> None:
+    verified_gap = "missing-detail"
     spec = _task("task_1", "Compare the rule and exception")
     planner = _ScriptedClient("planner", lambda schema, _text: _plan(spec))
     claims = {
@@ -1045,7 +1437,6 @@ async def test_task_review_preserves_verified_gap_and_sourced_conflict_only() ->
         ),
     }
     verified_reference = "See Regulation B Article 9."
-    verified_gap = "missing-detail"
     sourced_conflict = (
         "The provisions conflict [regulation a, Article 7] [regulation b, Article 9]."
     )
@@ -1086,9 +1477,10 @@ async def test_task_review_preserves_verified_gap_and_sourced_conflict_only() ->
             task_id="task_1",
             status=TaskStatus.COMPLETE,
             answer_fragment="The rule and exception must be reconciled.",
-            covered_success_criteria=["criterion-task_1"],
-            uncovered_success_criteria=[],
+            covered_requirement_ids=["criterion-task_1"],
+            uncovered_requirement_ids=[],
             claims=[claims["a"], claims["b"]],
+            application_findings=[],
             conflicts=[sourced_conflict, unsourced_conflict],
             gaps=[verified_reference, verified_gap, "invented gap"],
             contributing_worker_ids=[],
@@ -1105,7 +1497,9 @@ async def test_task_review_preserves_verified_gap_and_sourced_conflict_only() ->
             searches_run=[f"query-{suffix}"],
             claims=[claims[suffix]],
             gaps=[verified_gap],
-            cross_references=[verified_reference] if suffix == "a" else [],
+            cross_references=(
+                [verified_reference, verified_gap] if suffix == "a" else []
+            ),
             error_code=None,
             error_message=None,
         )
@@ -1118,7 +1512,7 @@ async def test_task_review_preserves_verified_gap_and_sourced_conflict_only() ->
                 chunk_id="chunk-a",
                 relative_path="regulation_a.pdf",
                 article="7",
-                text=f"Rule A applies. {verified_reference}",
+                text=f"Rule A applies. {verified_reference} {verified_gap}",
                 score=0.95,
             )
         else:
@@ -1205,5 +1599,7 @@ async def test_workflow_streams_multi_agent_progress_and_prepares_final_context(
     assert any(isinstance(event, ResearchProgressEvent) for event in events)
     assert result.error is None
     assert agent.prepared_indexed_evidence is True
-    assert "SERVER-VERIFIED FULL EVIDENCE" in agent._chat_history[1].text
+    assert len(agent._chat_history) == 1
+    assert "SERVER-VERIFIED FULL EVIDENCE" in agent._chat_history[0].text
+    assert agent._chat_history[0].text.count("ORIGINAL QUESTION") == 1
     assert agent.final_model == "test/final"

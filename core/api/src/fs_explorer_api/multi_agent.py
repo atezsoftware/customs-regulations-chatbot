@@ -10,6 +10,7 @@ transcripts and hidden reasoning are never passed between roles.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import inspect
 import json
@@ -23,6 +24,8 @@ from typing import Awaitable, Callable, Literal, Protocol, Sequence, cast
 
 from .llm import ChatTurn, LLMClient, LLMUsage
 from .orchestration_models import (
+    ArtifactValidationError,
+    DerivedConclusion,
     EvidenceClaim,
     ExecutionStrategy,
     GlobalPlan,
@@ -30,14 +33,19 @@ from .orchestration_models import (
     SearchAssignment,
     SearchAssignmentBatch,
     TaskArtifact,
+    TaskKind,
     TaskSpec,
     TaskStatus,
     WorkerArtifact,
     WorkerStatus,
     resolve_global_plan,
+    validate_global_plan,
+    validate_task_artifact,
 )
 from .orchestration_prompts import (
+    APPLICATION_TASK_SYSTEM_PROMPT,
     EVIDENCE_WORKER_SYSTEM_PROMPT,
+    INTEGRATION_TASK_SYSTEM_PROMPT,
     TASK_REVIEW_SYSTEM_PROMPT,
     build_global_planner_prompt,
     build_task_coordinator_prompt,
@@ -48,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 ProgressStatus = Literal["started", "completed", "failed"]
 AgentRole = Literal["planner", "task", "worker", "final"]
+_FINAL_SYNTHESIS_CALL_RESERVE = 1
 
 
 class SearchResult(Protocol):
@@ -90,6 +99,9 @@ class ResearchLimits:
     max_artifact_list_items: int = 12
     max_artifact_text_chars: int = 1_500
     max_artifact_context_chars: int = 16_000
+    max_question_chars: int = 8_000
+    max_planner_context_chars: int = 16_000
+    max_final_context_chars: int = 48_000
     max_query_chars: int = 1_000
     max_search_attempts: int = 2
     search_timeout_seconds: float = 20.0
@@ -192,6 +204,18 @@ class ResearchLimits:
                 "FS_EXPLORER_MULTI_AGENT_MAX_ARTIFACT_CONTEXT_CHARS",
                 defaults.max_artifact_context_chars,
             ),
+            max_question_chars=positive(
+                "FS_EXPLORER_MULTI_AGENT_MAX_QUESTION_CHARS",
+                defaults.max_question_chars,
+            ),
+            max_planner_context_chars=positive(
+                "FS_EXPLORER_MULTI_AGENT_MAX_PLANNER_CONTEXT_CHARS",
+                defaults.max_planner_context_chars,
+            ),
+            max_final_context_chars=positive(
+                "FS_EXPLORER_MULTI_AGENT_MAX_FINAL_CONTEXT_CHARS",
+                defaults.max_final_context_chars,
+            ),
             max_query_chars=positive(
                 "FS_EXPLORER_MULTI_AGENT_MAX_QUERY_CHARS",
                 defaults.max_query_chars,
@@ -284,6 +308,24 @@ def _safe_identifier(value: str, *, fallback: str) -> str:
     return normalized or fallback
 
 
+def _claim_identifier(task_id: str, assignment_id: str, index: int) -> str:
+    """Build a stable contract-safe ID without losing uniqueness to truncation."""
+
+    raw = re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "_",
+        f"{task_id}_{assignment_id}_claim_{index}",
+    ).strip("_")
+    if len(raw) <= 64:
+        return raw
+    digest = hashlib.sha256(
+        f"{task_id}\0{assignment_id}\0{index}".encode()
+    ).hexdigest()[:10]
+    suffix = f"_{digest}"
+    prefix = raw[: 64 - len(suffix)].rstrip("_-")
+    return f"{prefix}{suffix}"
+
+
 def _bounded_error(value: object, limit: int = 300) -> str:
     return " ".join(str(value).split())[:limit]
 
@@ -324,6 +366,31 @@ def _is_transient_search_error(value: str | None) -> bool:
 def _current_question(task: str) -> str:
     marker = "\n\nCurrent question:\n"
     return task.rsplit(marker, 1)[-1].strip() or task.strip()
+
+
+def _bounded_planner_input(
+    task: str,
+    *,
+    max_question_chars: int,
+    max_context_chars: int,
+) -> str:
+    """Preserve the current question first, then fit only recent context."""
+
+    marker = "\n\nCurrent question:\n"
+    current = _bounded_text(
+        _current_question(task),
+        min(max_question_chars, max_context_chars),
+    )
+    prior = task.rsplit(marker, 1)[0] if marker in task else ""
+    question_block = f"CURRENT QUESTION:\n{current}"
+    if not prior:
+        return question_block[:max_context_chars]
+    context_label = "\n\nRECENT CONVERSATION CONTEXT:\n"
+    remaining = max(max_context_chars - len(question_block) - len(context_label), 0)
+    if remaining == 0:
+        return question_block[:max_context_chars]
+    recent_context = _bounded_text(prior[-remaining:], remaining)
+    return f"{question_block}{context_label}{recent_context}"[:max_context_chars]
 
 
 def _consume_background_task_exception(task: asyncio.Task[object]) -> None:
@@ -419,6 +486,10 @@ class MultiAgentResearchOrchestrator:
         self._run_lock = asyncio.Lock()
         self._sequence = 0
         self._llm_call_count = 0
+        self._structured_llm_call_limit = max(
+            self._limits.max_total_llm_calls - _FINAL_SYNTHESIS_CALL_RESERVE,
+            0,
+        )
         self._llm_tasks: dict[str, asyncio.Task[tuple[object, LLMUsage]]] = {}
         self._search_tasks: dict[tuple[str, str, str], asyncio.Task[SearchResult]] = {}
         self._task_rerank_tasks: dict[
@@ -502,8 +573,11 @@ class MultiAgentResearchOrchestrator:
         async with self._llm_budget_lock:
             operation = self._llm_tasks.get(operation_id)
             if operation is None:
-                if self._llm_call_count >= self._limits.max_total_llm_calls:
-                    raise RuntimeError("Multi-agent LLM call budget exhausted.")
+                if self._llm_call_count >= self._structured_llm_call_limit:
+                    raise RuntimeError(
+                        "Multi-agent LLM call budget exhausted after reserving "
+                        "the final synthesis call."
+                    )
                 self._llm_call_count += 1
 
                 async def invoke() -> tuple[object, LLMUsage]:
@@ -558,11 +632,14 @@ class MultiAgentResearchOrchestrator:
             if self._plan is None:
                 self._plan = await self._create_plan(task)
 
-            required_tasks = sum(spec.required for spec in self._plan.tasks)
-            if required_tasks > self._limits.max_total_workers:
+            required_evidence_tasks = sum(
+                spec.required and spec.kind == TaskKind.EVIDENCE
+                for spec in self._plan.tasks
+            )
+            if required_evidence_tasks > self._limits.max_total_workers:
                 raise RuntimeError(
                     "The worker budget cannot reserve one worker for every "
-                    "required research task."
+                    "required evidence task."
                 )
             await self._run_task_dag(self._plan)
             ordered_artifacts = tuple(
@@ -580,6 +657,10 @@ class MultiAgentResearchOrchestrator:
                 and self._task_artifacts[spec.task_id].status != TaskStatus.COMPLETE
                 for spec in self._plan.tasks
             ) or len(rendered_evidence) < len(selected_evidence)
+            incomplete = incomplete or not self._all_finding_support_rendered(
+                ordered_artifacts,
+                rendered_evidence,
+            )
             sources = tuple(record.source_payload() for record in rendered_evidence)
             return MultiAgentResearchResult(
                 plan=self._plan,
@@ -608,11 +689,13 @@ class MultiAgentResearchOrchestrator:
                 client=self._planner_llm,
                 role="planner",
                 purpose="global_plan",
-                prompt=build_global_planner_prompt(max_tasks=self._limits.max_tasks),
+                prompt=build_global_planner_prompt(
+                    max_tasks=self._limits.max_tasks,
+                    max_list_items=self._limits.max_artifact_list_items,
+                ),
                 user_text=(
                     f"CURRENT DATE: {date.today().isoformat()}\n\n"
-                    "CURRENT QUESTION AND BOUNDED CONVERSATION CONTEXT:\n"
-                    f"{task}"
+                    f"{_bounded_planner_input(task, max_question_chars=self._limits.max_question_chars, max_context_chars=self._limits.max_planner_context_chars)}"
                 ),
                 operation_id="global-plan",
                 schema=GlobalPlan,
@@ -629,13 +712,14 @@ class MultiAgentResearchOrchestrator:
             candidate,
             original_question=_current_question(task),
             max_tasks=self._limits.max_tasks,
+            max_list_items=self._limits.max_artifact_list_items,
             planner_error=planner_error,
         )
         plan = self._bounded_plan(resolution.plan)
         self._used_plan_fallback = resolution.used_fallback
         detail = (
-            f"{plan.mode.value}/{plan.execution_strategy.value}: "
-            f"{len(plan.tasks)} task(s)"
+            f"{plan.problem_type.value}/{plan.mode.value}/"
+            f"{plan.execution_strategy.value}: {len(plan.tasks)} task(s)"
         )
         if resolution.used_fallback:
             detail += " (safe direct fallback)"
@@ -651,73 +735,135 @@ class MultiAgentResearchOrchestrator:
         return plan
 
     def _bounded_plan(self, plan: GlobalPlan) -> GlobalPlan:
-        """Apply server-owned artifact budgets after semantic validation."""
+        """Bound free text without mutating the validated graph structure."""
 
-        tasks = [
-            task.model_copy(
+        text_limit = self._limits.max_artifact_text_chars
+        tasks = []
+        for task in plan.tasks:
+            tasks.append(
+                task.model_copy(
+                    update={
+                        "issue": _bounded_text(task.issue, text_limit),
+                        "search_question": (
+                            _bounded_text(task.search_question, text_limit)
+                            if task.search_question is not None
+                            else None
+                        ),
+                        "evidence_requirements": [
+                            requirement.model_copy(
+                                update={
+                                    "description": _bounded_text(
+                                        requirement.description,
+                                        text_limit,
+                                    )
+                                }
+                            )
+                            for requirement in task.evidence_requirements
+                        ],
+                        "produces": [
+                            output.model_copy(
+                                update={
+                                    "description": _bounded_text(
+                                        output.description,
+                                        text_limit,
+                                    )
+                                }
+                            )
+                            for output in task.produces
+                        ],
+                        "as_of_date": _validated_as_of_date(task.as_of_date),
+                        "filters": self._bounded_filter(task.filters),
+                    }
+                )
+            )
+
+        scenario = plan.scenario
+        if scenario is not None:
+            scenario = scenario.model_copy(
                 update={
-                    "question": _bounded_text(
-                        task.question,
-                        self._limits.max_artifact_text_chars,
+                    "jurisdiction": (
+                        _bounded_text(scenario.jurisdiction, text_limit)
+                        if scenario.jurisdiction is not None
+                        else None
                     ),
-                    "purpose": _bounded_text(
-                        task.purpose,
-                        self._limits.max_artifact_text_chars,
-                    ),
-                    "expected_output": _bounded_text(
-                        task.expected_output,
-                        self._limits.max_artifact_text_chars,
-                    ),
-                    "success_criteria": [
-                        _bounded_text(
-                            criterion,
-                            self._limits.max_artifact_text_chars,
+                    "law_as_of_date": _validated_as_of_date(scenario.law_as_of_date),
+                    "facts": [
+                        fact.model_copy(
+                            update={
+                                "description": _bounded_text(
+                                    fact.description,
+                                    text_limit,
+                                )
+                            }
                         )
-                        for criterion in task.success_criteria[
-                            : self._limits.max_artifact_list_items
-                        ]
+                        for fact in scenario.facts
                     ],
-                    "as_of_date": _validated_as_of_date(task.as_of_date),
-                    "filters": self._bounded_filter(task.filters),
+                    "material_unknowns": [
+                        unknown.model_copy(
+                            update={
+                                "description": _bounded_text(
+                                    unknown.description,
+                                    text_limit,
+                                ),
+                                "why_material": _bounded_text(
+                                    unknown.why_material,
+                                    text_limit,
+                                ),
+                            }
+                        )
+                        for unknown in scenario.material_unknowns
+                    ],
+                    "decision_branches": [
+                        branch.model_copy(
+                            update={
+                                "condition": _bounded_text(
+                                    branch.condition,
+                                    text_limit,
+                                ),
+                                "consequence": _bounded_text(
+                                    branch.consequence,
+                                    text_limit,
+                                ),
+                            }
+                        )
+                        for branch in scenario.decision_branches
+                    ],
                 }
             )
-            for task in plan.tasks
-        ]
-        return plan.model_copy(
+
+        bounded = plan.model_copy(
             update={
                 "normalized_question": _bounded_text(
                     plan.normalized_question,
-                    self._limits.max_artifact_text_chars,
+                    text_limit,
                 ),
                 "answer_requirements": [
-                    _bounded_text(
-                        requirement,
-                        self._limits.max_artifact_text_chars,
+                    requirement.model_copy(
+                        update={
+                            "description": _bounded_text(
+                                requirement.description,
+                                text_limit,
+                            )
+                        }
                     )
-                    for requirement in plan.answer_requirements[
-                        : self._limits.max_artifact_list_items
-                    ]
+                    for requirement in plan.answer_requirements
                 ],
+                "scenario": scenario,
                 "tasks": tasks,
                 "synthesis_requirements": [
-                    _bounded_text(
-                        requirement,
-                        self._limits.max_artifact_text_chars,
-                    )
-                    for requirement in plan.synthesis_requirements[
-                        : self._limits.max_artifact_list_items
-                    ]
+                    _bounded_text(requirement, text_limit)
+                    for requirement in plan.synthesis_requirements
                 ],
                 "assumptions": [
-                    _bounded_text(
-                        assumption,
-                        self._limits.max_artifact_text_chars,
-                    )
-                    for assumption in plan.assumptions[
-                        : self._limits.max_artifact_list_items
-                    ]
+                    _bounded_text(assumption, text_limit)
+                    for assumption in plan.assumptions
                 ],
             }
+        )
+        return validate_global_plan(
+            bounded,
+            max_tasks=self._limits.max_tasks,
+            max_list_items=self._limits.max_artifact_list_items,
         )
 
     async def _run_task_dag(self, plan: GlobalPlan) -> None:
@@ -788,6 +934,7 @@ class MultiAgentResearchOrchestrator:
             for candidate in self._plan.tasks
             if candidate.task_id != task_id
             and candidate.required
+            and candidate.kind == TaskKind.EVIDENCE
             and candidate.task_id not in self._worker_closed_tasks
             and candidate.task_id not in self._task_artifacts
             and self._worker_count_by_task.get(candidate.task_id, 0) == 0
@@ -795,6 +942,13 @@ class MultiAgentResearchOrchestrator:
         return max(global_remaining - reserved_for_others, 0)
 
     async def _run_task(self, spec: TaskSpec) -> TaskArtifact:
+        if spec.kind == TaskKind.EVIDENCE:
+            return await self._run_evidence_task(spec)
+        return await self._run_application_task(spec)
+
+    async def _run_evidence_task(self, spec: TaskSpec) -> TaskArtifact:
+        """Run the bounded search/coordinator/reviewer path for one evidence task."""
+
         event_id = f"task-{spec.task_id}"
         self._emit(
             event_id=event_id,
@@ -933,13 +1087,14 @@ class MultiAgentResearchOrchestrator:
                 worker_by_assignment[assignment.assignment_id] = artifact
             self._next_round_by_task[spec.task_id] = round_index + 1
             supported_criteria = {
-                criterion
+                evidence_requirement_id
                 for worker in worker_by_assignment.values()
                 for claim in worker.claims
-                for criterion in claim.supports_success_criteria
+                for evidence_requirement_id in claim.evidence_requirement_ids
             }
             coverage_complete = all(
-                criterion in supported_criteria for criterion in spec.success_criteria
+                requirement.evidence_requirement_id in supported_criteria
+                for requirement in spec.evidence_requirements
             )
             if coverage_complete:
                 single_pass_complete = single_pass and round_index == 1
@@ -979,12 +1134,366 @@ class MultiAgentResearchOrchestrator:
             ),
             detail=(
                 f"{len(artifact.claims)} verified claim(s); "
-                f"{len(artifact.uncovered_success_criteria)} gap(s)"
+                f"{len(artifact.uncovered_requirement_ids)} gap(s)"
             ),
             task_id=spec.task_id,
             agent_id=f"task-coordinator-{spec.task_id}",
         )
         return artifact
+
+    def _scenario_context_for_task(self, spec: TaskSpec) -> dict[str, object] | None:
+        """Return only the scenario inputs explicitly assigned to one task."""
+
+        scenario = self._plan.scenario if self._plan is not None else None
+        if scenario is None:
+            return None
+        fact_ids = set(spec.fact_ids)
+        unknown_ids = set(spec.unknown_ids)
+        branch_ids = set(spec.branch_ids)
+        return {
+            "jurisdiction": (
+                _bounded_text(scenario.jurisdiction, 300)
+                if scenario.jurisdiction is not None
+                else None
+            ),
+            "law_as_of_date": scenario.law_as_of_date,
+            "facts": [
+                {
+                    "fact_id": fact.fact_id,
+                    "description": _bounded_text(fact.description, 600),
+                    "requirement_ids": fact.requirement_ids,
+                }
+                for fact in scenario.facts
+                if fact.fact_id in fact_ids
+            ],
+            "material_unknowns": [
+                {
+                    "unknown_id": unknown.unknown_id,
+                    "description": _bounded_text(unknown.description, 600),
+                    "why_material": _bounded_text(unknown.why_material, 600),
+                    "requirement_ids": unknown.requirement_ids,
+                }
+                for unknown in scenario.material_unknowns
+                if unknown.unknown_id in unknown_ids
+            ],
+            "decision_branches": [
+                {
+                    "branch_id": branch.branch_id,
+                    "condition": _bounded_text(branch.condition, 600),
+                    "consequence": _bounded_text(branch.consequence, 600),
+                    "requirement_ids": branch.requirement_ids,
+                }
+                for branch in scenario.decision_branches
+                if branch.branch_id in branch_ids
+            ],
+        }
+
+    async def _run_application_task(self, spec: TaskSpec) -> TaskArtifact:
+        """Apply verified dependency outputs without opening a retrieval boundary."""
+
+        event_id = f"task-{spec.task_id}"
+        dependency_artifacts = [
+            self._task_artifacts[task_id]
+            for task_id in spec.depends_on
+            if task_id in self._task_artifacts
+        ]
+        self._emit(
+            event_id=event_id,
+            kind="task_started",
+            role="task",
+            status="started",
+            label=(
+                "Applying evidence to a scenario"
+                if spec.kind == TaskKind.APPLICATION
+                else "Integrating grounded task results"
+            ),
+            detail=spec.issue,
+            task_id=spec.task_id,
+            agent_id=f"task-application-{spec.task_id}",
+        )
+
+        has_grounded_dependency = any(
+            artifact.claims or artifact.application_findings
+            for artifact in dependency_artifacts
+        )
+        if not has_grounded_dependency:
+            artifact = self._failed_task_artifact(
+                spec,
+                "No grounded dependency output was available for application.",
+            )
+        else:
+            try:
+                raw, _usage = await self._generate_structured(
+                    client=self._task_llm,
+                    role="task",
+                    purpose=(
+                        "scenario_application"
+                        if spec.kind == TaskKind.APPLICATION
+                        else "task_integration"
+                    ),
+                    prompt=(
+                        APPLICATION_TASK_SYSTEM_PROMPT
+                        if spec.kind == TaskKind.APPLICATION
+                        else INTEGRATION_TASK_SYSTEM_PROMPT
+                    ),
+                    user_text=(
+                        f"TASK SPEC:\n{spec.model_dump_json()}\n\n"
+                        "ASSIGNED SCENARIO INPUTS:\n"
+                        f"{json.dumps(self._scenario_context_for_task(spec), ensure_ascii=False, separators=(',', ':'))}\n\n"
+                        "DECLARED DEPENDENCY ARTIFACTS:\n"
+                        f"{self._compact_task_artifacts(dependency_artifacts)}"
+                    ),
+                    operation_id=f"task-application:{spec.task_id}",
+                    schema=TaskArtifact,
+                    task_id=spec.task_id,
+                    agent_id=f"task-application-{spec.task_id}",
+                )
+                assert isinstance(raw, TaskArtifact)
+                artifact = self._verify_application_artifact(
+                    raw,
+                    spec=spec,
+                    dependency_artifacts=dependency_artifacts,
+                )
+            except Exception as exc:
+                logger.exception("Application task failed for %s", spec.task_id)
+                artifact = self._failed_task_artifact(spec, _bounded_error(exc))
+
+        status: ProgressStatus = (
+            "completed" if artifact.status != TaskStatus.FAILED else "failed"
+        )
+        self._emit(
+            event_id=event_id,
+            kind=("task_completed" if status == "completed" else "task_failed"),
+            role="task",
+            status=status,
+            label=(
+                "Scenario application complete"
+                if status == "completed"
+                else "Scenario application failed"
+            ),
+            detail=(
+                f"{len(artifact.application_findings)} grounded finding(s); "
+                f"{len(artifact.uncovered_requirement_ids)} gap(s)"
+            ),
+            task_id=spec.task_id,
+            agent_id=f"task-application-{spec.task_id}",
+        )
+        return artifact
+
+    def _verify_application_artifact(
+        self,
+        candidate: TaskArtifact,
+        *,
+        spec: TaskSpec,
+        dependency_artifacts: Sequence[TaskArtifact],
+    ) -> TaskArtifact:
+        """Keep only conclusions whose complete reference set is available."""
+
+        plan = self._plan
+        if plan is None:
+            return self._failed_task_artifact(
+                spec,
+                "The validated global plan was unavailable.",
+            )
+        allowed_requirement_ids = set(spec.requirement_ids)
+        allowed_fact_ids = set(spec.fact_ids)
+        allowed_branch_ids = set(spec.branch_ids)
+        allowed_claim_ids = {
+            claim.claim_id
+            for artifact in dependency_artifacts
+            for claim in artifact.claims
+        } | {
+            claim_id
+            for artifact in dependency_artifacts
+            for finding in artifact.application_findings
+            for claim_id in finding.supporting_claim_ids
+        }
+        present_dependency_ids = {artifact.task_id for artifact in dependency_artifacts}
+        allowed_dependency_refs = {
+            (reference.task_id, reference.output_id)
+            for reference in spec.consumes
+            if reference.task_id in present_dependency_ids
+        }
+
+        scenario = plan.scenario
+        assigned_unknowns = []
+        if scenario is not None:
+            assigned_unknowns = [
+                unknown
+                for unknown in scenario.material_unknowns
+                if unknown.unknown_id in set(spec.unknown_ids)
+            ]
+        allowed_limitations = [
+            text
+            for unknown in assigned_unknowns
+            for text in (unknown.description, unknown.why_material)
+        ]
+        for artifact in dependency_artifacts:
+            allowed_limitations.extend(artifact.gaps)
+            allowed_limitations.extend(artifact.conflicts)
+        limitation_by_key = {
+            _normalize_evidence_text(value).casefold(): _bounded_text(
+                value,
+                self._limits.max_artifact_text_chars,
+            )
+            for value in allowed_limitations
+            if _normalize_evidence_text(value)
+        }
+
+        findings: list[DerivedConclusion] = []
+        seen_ids: set[str] = set()
+        for candidate_finding in candidate.application_findings[
+            : self._limits.max_artifact_list_items
+        ]:
+            conclusion_id = re.sub(
+                r"[^A-Za-z0-9_-]+",
+                "_",
+                candidate_finding.conclusion_id.strip(),
+            ).strip("_")[:64]
+            if not conclusion_id:
+                conclusion_id = f"{spec.task_id}_finding_{len(findings) + 1}"[:64]
+            if conclusion_id in seen_ids:
+                continue
+            requirement_ids = [
+                requirement_id
+                for requirement_id in spec.requirement_ids
+                if requirement_id in set(candidate_finding.requirement_ids)
+                and requirement_id in allowed_requirement_ids
+            ]
+            fact_ids = [
+                fact_id
+                for fact_id in spec.fact_ids
+                if fact_id in set(candidate_finding.fact_ids)
+                and fact_id in allowed_fact_ids
+            ]
+            branch_ids = [
+                branch_id
+                for branch_id in spec.branch_ids
+                if branch_id in set(candidate_finding.branch_ids)
+                and branch_id in allowed_branch_ids
+            ]
+            supporting_claim_ids = [
+                claim_id
+                for claim_id in dict.fromkeys(candidate_finding.supporting_claim_ids)
+                if claim_id in allowed_claim_ids
+            ][: self._limits.max_artifact_list_items]
+            dependency_refs = [
+                reference
+                for reference in candidate_finding.dependency_refs
+                if (reference.task_id, reference.output_id) in allowed_dependency_refs
+            ][: self._limits.max_artifact_list_items]
+            limitations = [
+                limitation_by_key[key]
+                for key in dict.fromkeys(
+                    _normalize_evidence_text(value).casefold()
+                    for value in candidate_finding.limitations
+                )
+                if key in limitation_by_key
+            ]
+            # Assigned material unknowns are always carried forward even when
+            # the model omits them. User-visible conditionality is not an
+            # optional stylistic choice.
+            for value in limitation_by_key.values():
+                if value not in limitations:
+                    limitations.append(value)
+                if len(limitations) >= self._limits.max_artifact_list_items:
+                    break
+
+            finding_text = _bounded_text(
+                candidate_finding.finding,
+                self._limits.max_artifact_text_chars,
+            )
+            if (
+                not finding_text
+                or not requirement_ids
+                or (spec.kind == TaskKind.APPLICATION and not fact_ids)
+                or (spec.kind == TaskKind.APPLICATION and not supporting_claim_ids)
+                or (spec.kind == TaskKind.APPLICATION and not dependency_refs)
+                or (
+                    spec.kind == TaskKind.INTEGRATION
+                    and (not supporting_claim_ids or not dependency_refs)
+                )
+            ):
+                continue
+            seen_ids.add(conclusion_id)
+            findings.append(
+                candidate_finding.model_copy(
+                    update={
+                        "conclusion_id": conclusion_id,
+                        "finding": finding_text,
+                        "requirement_ids": requirement_ids,
+                        "fact_ids": fact_ids,
+                        "branch_ids": branch_ids,
+                        "supporting_claim_ids": supporting_claim_ids,
+                        "dependency_refs": dependency_refs,
+                        "limitations": limitations,
+                    }
+                )
+            )
+
+        supported_ids = {
+            requirement_id
+            for finding in findings
+            for requirement_id in finding.requirement_ids
+        }
+        covered = [
+            requirement_id
+            for requirement_id in spec.requirement_ids
+            if requirement_id in supported_ids
+        ]
+        uncovered = [
+            requirement_id
+            for requirement_id in spec.requirement_ids
+            if requirement_id not in supported_ids
+        ]
+        status = (
+            TaskStatus.COMPLETE
+            if findings and not uncovered
+            else TaskStatus.PARTIAL
+            if findings
+            else TaskStatus.FAILED
+        )
+        gaps = list(uncovered)
+        for value in limitation_by_key.values():
+            if value not in gaps:
+                gaps.append(value)
+            if len(gaps) >= self._limits.max_artifact_list_items:
+                break
+        conflicts = list(
+            dict.fromkeys(
+                conflict
+                for artifact in dependency_artifacts
+                for conflict in artifact.conflicts
+            )
+        )[: self._limits.max_artifact_list_items]
+        verified = TaskArtifact(
+            task_id=spec.task_id,
+            status=status,
+            answer_fragment=(
+                " ".join(finding.finding for finding in findings) if findings else None
+            ),
+            covered_requirement_ids=covered,
+            uncovered_requirement_ids=uncovered,
+            claims=[],
+            application_findings=findings,
+            conflicts=conflicts,
+            gaps=gaps,
+            contributing_worker_ids=[],
+        )
+        try:
+            return validate_task_artifact(
+                verified,
+                plan=plan,
+                dependency_artifacts=dependency_artifacts,
+            )
+        except ArtifactValidationError:
+            logger.exception(
+                "Application artifact failed deterministic reference validation"
+            )
+            return self._failed_task_artifact(
+                spec,
+                "Application conclusions failed reference validation.",
+            )
 
     async def _coordinate_task(
         self,
@@ -1047,7 +1556,10 @@ class MultiAgentResearchOrchestrator:
                     task_id=spec.task_id,
                     query=spec.question,
                     objective=spec.expected_output,
-                    evidence_requirements=list(spec.success_criteria),
+                    evidence_requirements=[
+                        requirement.evidence_requirement_id
+                        for requirement in spec.evidence_requirements
+                    ],
                     excluded_queries=sorted(searches_run),
                     as_of_date=_validated_as_of_date(spec.as_of_date),
                     filters=spec.filters,
@@ -1073,7 +1585,10 @@ class MultiAgentResearchOrchestrator:
                     task_id=spec.task_id,
                     query=spec.question,
                     objective=spec.expected_output,
-                    evidence_requirements=list(spec.success_criteria),
+                    evidence_requirements=[
+                        requirement.evidence_requirement_id
+                        for requirement in spec.evidence_requirements
+                    ],
                     excluded_queries=sorted(searches_run),
                     as_of_date=_validated_as_of_date(spec.as_of_date),
                     filters=spec.filters,
@@ -1091,6 +1606,10 @@ class MultiAgentResearchOrchestrator:
     ) -> list[SearchAssignment]:
         if dispatch.task_id != spec.task_id or dispatch.stop:
             return []
+        known_evidence_ids = {
+            requirement.evidence_requirement_id
+            for requirement in spec.evidence_requirements
+        }
         accepted: list[SearchAssignment] = []
         accepted_queries: set[str] = set()
         accepted_ids: set[str] = set()
@@ -1123,15 +1642,19 @@ class MultiAgentResearchOrchestrator:
                             candidate.objective,
                             self._limits.max_artifact_text_chars,
                         ),
-                        "evidence_requirements": [
-                            _bounded_text(
-                                requirement,
-                                self._limits.max_artifact_text_chars,
-                            )
-                            for requirement in candidate.evidence_requirements[
-                                : self._limits.max_artifact_list_items
-                            ]
-                        ],
+                        "evidence_requirements": (
+                            [
+                                requirement_id
+                                for requirement_id in dict.fromkeys(
+                                    candidate.evidence_requirements
+                                )
+                                if requirement_id in known_evidence_ids
+                            ][: self._limits.max_artifact_list_items]
+                            or [
+                                requirement.evidence_requirement_id
+                                for requirement in spec.evidence_requirements
+                            ][: self._limits.max_artifact_list_items]
+                        ),
                         "excluded_queries": [
                             _bounded_text(
                                 excluded,
@@ -1350,8 +1873,10 @@ class MultiAgentResearchOrchestrator:
                     purpose="evidence_extraction",
                     prompt=EVIDENCE_WORKER_SYSTEM_PROMPT,
                     user_text=(
-                        f"TASK SUCCESS CRITERIA:\n"
-                        f"{json.dumps(spec.success_criteria, ensure_ascii=False)}\n\n"
+                        "TASK ANSWER REQUIREMENT IDS:\n"
+                        f"{json.dumps(spec.requirement_ids, ensure_ascii=False)}\n\n"
+                        "TYPED EVIDENCE REQUIREMENTS:\n"
+                        f"{json.dumps([item.model_dump(mode='json') for item in spec.evidence_requirements], ensure_ascii=False)}\n\n"
                         f"SEARCH ASSIGNMENT:\n{assignment.model_dump_json()}\n\n"
                         "RETRIEVED HITS:\n"
                         f"{rendered}"
@@ -1464,6 +1989,10 @@ class MultiAgentResearchOrchestrator:
         by_source = {
             (record.document_id, record.chunk_id): record for record in records
         }
+        evidence_requirements = {
+            requirement.evidence_requirement_id: requirement
+            for requirement in spec.evidence_requirements
+        }
         verified: list[EvidenceClaim] = []
         seen_claims: set[tuple[str, str, str]] = set()
         rejected = 0
@@ -1480,14 +2009,32 @@ class MultiAgentResearchOrchestrator:
                 rejected += 1
                 continue
             seen_claims.add(claim_key)
-            supported_criteria = [
-                criterion
-                for criterion in claim.supports_success_criteria
-                if criterion in spec.success_criteria
+            supported_evidence_ids = [
+                requirement_id
+                for requirement_id in dict.fromkeys(claim.evidence_requirement_ids)
+                if requirement_id in evidence_requirements
             ]
+            mapped_requirement_ids = {
+                requirement_id
+                for evidence_requirement_id in supported_evidence_ids
+                for requirement_id in evidence_requirements[
+                    evidence_requirement_id
+                ].requirement_ids
+            }
+            supported_requirement_ids = [
+                requirement_id
+                for requirement_id in spec.requirement_ids
+                if requirement_id in mapped_requirement_ids
+            ]
+            claim_id = _claim_identifier(
+                spec.task_id,
+                assignment.assignment_id,
+                len(verified) + 1,
+            )
             verified.append(
                 claim.model_copy(
                     update={
+                        "claim_id": claim_id,
                         "document_id": record.document_id,
                         "chunk_id": record.chunk_id,
                         "readable_title": record.readable_title,
@@ -1500,7 +2047,13 @@ class MultiAgentResearchOrchestrator:
                             claim.evidence_excerpt,
                             self._limits.max_artifact_text_chars,
                         ),
-                        "supports_success_criteria": supported_criteria,
+                        "requirement_ids": supported_requirement_ids,
+                        "evidence_requirement_ids": supported_evidence_ids,
+                        "fact_ids": [
+                            fact_id
+                            for fact_id in spec.fact_ids
+                            if fact_id in set(claim.fact_ids)
+                        ],
                         "effective_start_date": _effective_date(
                             record.metadata,
                             "effective_start_date",
@@ -1515,9 +2068,9 @@ class MultiAgentResearchOrchestrator:
                 )
             )
         supported = {
-            criterion
+            requirement_id
             for claim in verified
-            for criterion in claim.supports_success_criteria
+            for requirement_id in claim.evidence_requirement_ids
         }
         gaps = [
             _bounded_text(
@@ -1795,18 +2348,44 @@ class MultiAgentResearchOrchestrator:
                 if len(claims) >= self._limits.max_claims_per_task:
                     break
 
-        supported = {
-            criterion
+        supported_evidence_ids = {
+            evidence_requirement_id
             for claim in claims
-            for criterion in claim.supports_success_criteria
+            for evidence_requirement_id in claim.evidence_requirement_ids
+        }
+        evidence_ids_by_requirement = {
+            requirement_id: {
+                requirement.evidence_requirement_id
+                for requirement in spec.evidence_requirements
+                if requirement_id in requirement.requirement_ids
+            }
+            for requirement_id in spec.requirement_ids
         }
         covered = [
-            criterion for criterion in spec.success_criteria if criterion in supported
+            requirement_id
+            for requirement_id in spec.requirement_ids
+            if evidence_ids_by_requirement[requirement_id]
+            and evidence_ids_by_requirement[requirement_id].issubset(
+                supported_evidence_ids
+            )
         ]
         uncovered = [
-            criterion
-            for criterion in spec.success_criteria
-            if criterion not in supported
+            requirement_id
+            for requirement_id in spec.requirement_ids
+            if requirement_id not in covered
+        ]
+        covered_set = set(covered)
+        claims = [
+            claim.model_copy(
+                update={
+                    "requirement_ids": [
+                        requirement_id
+                        for requirement_id in claim.requirement_ids
+                        if requirement_id in covered_set
+                    ]
+                }
+            )
+            for claim in claims
         ]
         if claims and not uncovered:
             status = TaskStatus.COMPLETE
@@ -1874,21 +2453,34 @@ class MultiAgentResearchOrchestrator:
             if len(conflicts) >= self._limits.max_artifact_list_items:
                 break
 
-        return TaskArtifact(
+        verified = TaskArtifact(
             task_id=spec.task_id,
             status=status,
             answer_fragment=(
                 " ".join(claim.claim for claim in claims) if claims else None
             ),
-            covered_success_criteria=covered,
-            uncovered_success_criteria=uncovered,
+            covered_requirement_ids=covered,
+            uncovered_requirement_ids=uncovered,
             claims=claims,
+            application_findings=[],
             conflicts=conflicts,
             gaps=gaps,
             contributing_worker_ids=list(dict.fromkeys(contributors))[
                 : self._limits.max_artifact_list_items
             ],
         )
+        if self._plan is None:
+            return verified
+        try:
+            return validate_task_artifact(verified, plan=self._plan)
+        except ArtifactValidationError:
+            logger.exception(
+                "Evidence artifact failed deterministic reference validation"
+            )
+            return self._failed_task_artifact(
+                spec,
+                "Evidence artifact failed reference validation.",
+            )
 
     def _fallback_task_artifact(
         self,
@@ -1908,19 +2500,44 @@ class MultiAgentResearchOrchestrator:
                         break
             if len(claims) >= self._limits.max_claims_per_task:
                 break
-        supported = {
-            criterion
+        supported_evidence_ids = {
+            evidence_requirement_id
             for claim in claims
-            for criterion in claim.supports_success_criteria
-            if criterion in spec.success_criteria
+            for evidence_requirement_id in claim.evidence_requirement_ids
+        }
+        evidence_ids_by_requirement = {
+            requirement_id: {
+                requirement.evidence_requirement_id
+                for requirement in spec.evidence_requirements
+                if requirement_id in requirement.requirement_ids
+            }
+            for requirement_id in spec.requirement_ids
         }
         covered = [
-            criterion for criterion in spec.success_criteria if criterion in supported
+            requirement_id
+            for requirement_id in spec.requirement_ids
+            if evidence_ids_by_requirement[requirement_id]
+            and evidence_ids_by_requirement[requirement_id].issubset(
+                supported_evidence_ids
+            )
         ]
         uncovered = [
-            criterion
-            for criterion in spec.success_criteria
-            if criterion not in supported
+            requirement_id
+            for requirement_id in spec.requirement_ids
+            if requirement_id not in covered
+        ]
+        covered_set = set(covered)
+        claims = [
+            claim.model_copy(
+                update={
+                    "requirement_ids": [
+                        requirement_id
+                        for requirement_id in claim.requirement_ids
+                        if requirement_id in covered_set
+                    ]
+                }
+            )
+            for claim in claims
         ]
         status = (
             TaskStatus.COMPLETE
@@ -1947,15 +2564,16 @@ class MultiAgentResearchOrchestrator:
             gaps.append(bounded)
             if len(gaps) >= self._limits.max_artifact_list_items:
                 break
-        return TaskArtifact(
+        verified = TaskArtifact(
             task_id=spec.task_id,
             status=status,
             answer_fragment=(
                 " ".join(claim.claim for claim in claims) if claims else None
             ),
-            covered_success_criteria=covered,
-            uncovered_success_criteria=uncovered,
+            covered_requirement_ids=covered,
+            uncovered_requirement_ids=uncovered,
             claims=claims,
+            application_findings=[],
             conflicts=[],
             gaps=gaps,
             contributing_worker_ids=list(
@@ -1966,6 +2584,18 @@ class MultiAgentResearchOrchestrator:
                 )
             )[: self._limits.max_artifact_list_items],
         )
+        if self._plan is None:
+            return verified
+        try:
+            return validate_task_artifact(verified, plan=self._plan)
+        except ArtifactValidationError:
+            logger.exception(
+                "Fallback evidence artifact failed deterministic validation"
+            )
+            return self._failed_task_artifact(
+                spec,
+                "Verified worker claims failed reference validation.",
+            )
 
     def _failed_worker_artifact(
         self,
@@ -1993,9 +2623,10 @@ class MultiAgentResearchOrchestrator:
             task_id=spec.task_id,
             status=TaskStatus.FAILED,
             answer_fragment=None,
-            covered_success_criteria=[],
-            uncovered_success_criteria=list(spec.success_criteria),
+            covered_requirement_ids=[],
+            uncovered_requirement_ids=list(spec.requirement_ids),
             claims=[],
+            application_findings=[],
             conflicts=[],
             gaps=[_bounded_error(error)],
             contributing_worker_ids=[],
@@ -2005,6 +2636,35 @@ class MultiAgentResearchOrchestrator:
         self, artifacts: Sequence[TaskArtifact]
     ) -> list[EvidenceRecord]:
         by_source = dict(self._evidence_by_source)
+        claims_by_id = {
+            claim.claim_id: claim for artifact in artifacts for claim in artifact.claims
+        }
+        selected: list[EvidenceRecord] = []
+        seen: set[str] = set()
+
+        # Scenario/application outputs explicitly name the claims they rely
+        # on. Reserve the evidence budget for those sources before adding
+        # general supporting detail.
+        required_claim_ids = list(
+            dict.fromkeys(
+                claim_id
+                for artifact in artifacts
+                for finding in artifact.application_findings
+                for claim_id in finding.supporting_claim_ids
+            )
+        )
+        for claim_id in required_claim_ids:
+            claim = claims_by_id.get(claim_id)
+            if claim is None:
+                continue
+            record = by_source.get((claim.document_id, claim.chunk_id))
+            if record is None or record.chunk_id in seen:
+                continue
+            selected.append(record)
+            seen.add(record.chunk_id)
+            if len(selected) >= self._limits.final_evidence_limit:
+                return selected
+
         per_task: list[list[EvidenceRecord]] = []
         for artifact in artifacts:
             task_records: list[EvidenceRecord] = []
@@ -2017,8 +2677,6 @@ class MultiAgentResearchOrchestrator:
                 task_records.append(record)
             per_task.append(task_records)
 
-        selected: list[EvidenceRecord] = []
-        seen: set[str] = set()
         max_depth = max((len(records) for records in per_task), default=0)
         for depth in range(max_depth):
             for task_records in per_task:
@@ -2032,6 +2690,184 @@ class MultiAgentResearchOrchestrator:
                         return selected
         return selected
 
+    @staticmethod
+    def _all_finding_support_rendered(
+        artifacts: Sequence[TaskArtifact],
+        rendered_evidence: Sequence[EvidenceRecord],
+    ) -> bool:
+        """Require every claim behind a retained conclusion at final boundary."""
+
+        claims_by_id = {
+            claim.claim_id: claim for artifact in artifacts for claim in artifact.claims
+        }
+        rendered_sources = {
+            (record.document_id, record.chunk_id) for record in rendered_evidence
+        }
+        return all(
+            finding.supporting_claim_ids
+            and all(
+                claim_id in claims_by_id
+                and (
+                    claims_by_id[claim_id].document_id,
+                    claims_by_id[claim_id].chunk_id,
+                )
+                in rendered_sources
+                for claim_id in finding.supporting_claim_ids
+            )
+            for artifact in artifacts
+            for finding in artifact.application_findings
+        )
+
+    @staticmethod
+    def _plan_summary_payload(
+        plan: GlobalPlan,
+        *,
+        text_limit: int,
+        evidence_context_truncated: bool,
+    ) -> dict[str, object]:
+        scenario = plan.scenario
+        return {
+            "version": plan.version,
+            "problem_type": plan.problem_type.value,
+            "mode": plan.mode.value,
+            "execution_strategy": plan.execution_strategy.value,
+            "normalized_question": _bounded_text(
+                plan.normalized_question,
+                text_limit,
+            ),
+            "answer_requirements": [
+                {
+                    "requirement_id": requirement.requirement_id,
+                    "kind": requirement.kind.value,
+                    "description": _bounded_text(
+                        requirement.description,
+                        text_limit,
+                    ),
+                    "required": requirement.required,
+                }
+                for requirement in plan.answer_requirements
+            ],
+            "scenario": (
+                {
+                    "jurisdiction": (
+                        _bounded_text(scenario.jurisdiction, text_limit)
+                        if scenario.jurisdiction is not None
+                        else None
+                    ),
+                    "law_as_of_date": scenario.law_as_of_date,
+                    "facts": [
+                        {
+                            "fact_id": fact.fact_id,
+                            "description": _bounded_text(
+                                fact.description,
+                                text_limit,
+                            ),
+                            "requirement_ids": fact.requirement_ids,
+                        }
+                        for fact in scenario.facts
+                    ],
+                    "material_unknowns": [
+                        {
+                            "unknown_id": unknown.unknown_id,
+                            "description": _bounded_text(
+                                unknown.description,
+                                text_limit,
+                            ),
+                            "why_material": _bounded_text(
+                                unknown.why_material,
+                                text_limit,
+                            ),
+                            "requirement_ids": unknown.requirement_ids,
+                        }
+                        for unknown in scenario.material_unknowns
+                    ],
+                    "decision_branches": [
+                        {
+                            "branch_id": branch.branch_id,
+                            "condition": _bounded_text(
+                                branch.condition,
+                                text_limit,
+                            ),
+                            "consequence": _bounded_text(
+                                branch.consequence,
+                                text_limit,
+                            ),
+                            "requirement_ids": branch.requirement_ids,
+                        }
+                        for branch in scenario.decision_branches
+                    ],
+                }
+                if scenario is not None
+                else None
+            ),
+            "tasks": [
+                {
+                    "task_id": task.task_id,
+                    "kind": task.kind.value,
+                    "issue": _bounded_text(task.issue, text_limit),
+                    "requirement_ids": task.requirement_ids,
+                    "fact_ids": task.fact_ids,
+                    "unknown_ids": task.unknown_ids,
+                    "branch_ids": task.branch_ids,
+                    "consumes": [
+                        reference.model_dump(mode="json") for reference in task.consumes
+                    ],
+                    "produces": [output.output_id for output in task.produces],
+                }
+                for task in plan.tasks
+            ],
+            "synthesis_requirements": [
+                _bounded_text(requirement, text_limit)
+                for requirement in plan.synthesis_requirements
+            ],
+            "assumptions": [
+                _bounded_text(assumption, text_limit) for assumption in plan.assumptions
+            ],
+            "evidence_context_truncated": evidence_context_truncated,
+        }
+
+    def _render_plan_summary(
+        self,
+        plan: GlobalPlan,
+        *,
+        max_chars: int,
+        evidence_context_truncated: bool,
+    ) -> str:
+        """Fit valid plan JSON by reducing prose while retaining typed IDs."""
+
+        for text_limit in (600, 300, 180, 120, 80, 40):
+            rendered = json.dumps(
+                self._plan_summary_payload(
+                    plan,
+                    text_limit=text_limit,
+                    evidence_context_truncated=evidence_context_truncated,
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            if len(rendered) <= max_chars:
+                return rendered
+        minimal = json.dumps(
+            {
+                "version": plan.version,
+                "problem_type": plan.problem_type.value,
+                "mode": plan.mode.value,
+                "answer_requirement_ids": [
+                    requirement.requirement_id
+                    for requirement in plan.answer_requirements
+                ],
+                "task_ids": [task.task_id for task in plan.tasks],
+                "scenario_present": plan.scenario is not None,
+                "summary_truncated": True,
+                "evidence_context_truncated": evidence_context_truncated,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(minimal) <= max_chars:
+            return minimal
+        return "{}" if max_chars >= 2 else ""
+
     def _render_final_context(
         self,
         *,
@@ -2040,37 +2876,52 @@ class MultiAgentResearchOrchestrator:
         artifacts: Sequence[TaskArtifact],
         evidence: Sequence[EvidenceRecord],
     ) -> tuple[str, tuple[EvidenceRecord, ...]]:
+        headers = (
+            "ORIGINAL QUESTION:\n",
+            "\n\nGLOBAL PLAN SUMMARY:\n",
+            "\n\nTASK ARTIFACTS:\n",
+            "\n\nSERVER-VERIFIED FULL EVIDENCE:\n",
+        )
+        total_limit = self._limits.max_final_context_chars
+        available = max(total_limit - sum(len(header) for header in headers), 0)
+        question_budget = min(self._limits.max_question_chars, available // 6)
+        evidence_budget = min(self._limits.final_chunk_chars, available // 5)
+        artifact_budget = min(
+            self._limits.max_artifact_context_chars,
+            available // 3,
+        )
         rendered_evidence = self._render_evidence_bundle(
             evidence,
-            max_chars=self._limits.final_chunk_chars,
+            max_chars=evidence_budget,
         )
-        plan_summary = {
-            "mode": plan.mode.value,
-            "normalized_question": plan.normalized_question,
-            "answer_requirements": plan.answer_requirements,
-            "synthesis_requirements": plan.synthesis_requirements,
-            "assumptions": plan.assumptions,
-            "evidence_context_truncated": (
-                len(rendered_evidence.records) < len(evidence)
-            ),
-        }
         artifact_context = self._compact_task_artifacts(
             artifacts,
             allowed_sources={
                 (record.document_id, record.chunk_id)
                 for record in rendered_evidence.records
             },
+            max_chars=artifact_budget,
+        )
+        bounded_question = _bounded_text(original_question, question_budget)
+        plan_budget = max(
+            available
+            - len(bounded_question)
+            - len(artifact_context)
+            - len(rendered_evidence.text),
+            0,
+        )
+        plan_summary = self._render_plan_summary(
+            plan,
+            max_chars=plan_budget,
+            evidence_context_truncated=(len(rendered_evidence.records) < len(evidence)),
         )
         context = (
-            f"ORIGINAL QUESTION:\n{original_question}\n\n"
-            "GLOBAL PLAN SUMMARY:\n"
-            f"{json.dumps(plan_summary, ensure_ascii=False)}\n\n"
-            "TASK ARTIFACTS:\n"
-            f"{artifact_context}\n\n"
-            "SERVER-VERIFIED FULL EVIDENCE:\n"
-            f"{rendered_evidence.text}"
+            f"{headers[0]}{bounded_question}"
+            f"{headers[1]}{plan_summary}"
+            f"{headers[2]}{artifact_context}"
+            f"{headers[3]}{rendered_evidence.text}"
         )
-        return context, rendered_evidence.records
+        return context[:total_limit], rendered_evidence.records
 
     def _claim_payload(self, claim: EvidenceClaim) -> dict[str, object]:
         payload = claim.model_dump(mode="json")
@@ -2084,12 +2935,14 @@ class MultiAgentResearchOrchestrator:
         )
         payload["readable_title"] = _bounded_text(claim.readable_title, 300)
         payload["locator"] = _bounded_text(claim.locator, 300)
-        payload["supports_success_criteria"] = [
-            _bounded_text(criterion, 300)
-            for criterion in claim.supports_success_criteria[
-                : min(self._limits.max_artifact_list_items, 6)
-            ]
-        ]
+        for field in (
+            "requirement_ids",
+            "evidence_requirement_ids",
+            "fact_ids",
+        ):
+            value = payload.get(field)
+            if isinstance(value, list):
+                payload[field] = value[: self._limits.max_artifact_list_items]
         return payload
 
     def _dump_artifact_payloads(
@@ -2109,16 +2962,19 @@ class MultiAgentResearchOrchestrator:
         payload_index: int,
         field: str,
         value: object,
+        max_chars: int | None = None,
     ) -> bool:
         target = payloads[payload_index].get(field)
         if not isinstance(target, list):
             raise TypeError(f"{field} is not an artifact list")
         target_list = cast(list[object], target)
         target_list.append(value)
-        if (
-            len(self._dump_artifact_payloads(payloads))
-            <= self._limits.max_artifact_context_chars
-        ):
+        context_limit = (
+            self._limits.max_artifact_context_chars
+            if max_chars is None
+            else max(max_chars, 0)
+        )
+        if len(self._dump_artifact_payloads(payloads)) <= context_limit:
             return True
         target_list.pop()
         return False
@@ -2130,13 +2986,16 @@ class MultiAgentResearchOrchestrator:
         payload_index: int,
         field: str,
         value: object,
+        max_chars: int | None = None,
     ) -> bool:
         previous = payloads[payload_index].get(field)
         payloads[payload_index][field] = value
-        if (
-            len(self._dump_artifact_payloads(payloads))
-            <= self._limits.max_artifact_context_chars
-        ):
+        context_limit = (
+            self._limits.max_artifact_context_chars
+            if max_chars is None
+            else max(max_chars, 0)
+        )
+        if len(self._dump_artifact_payloads(payloads)) <= context_limit:
             return True
         payloads[payload_index][field] = previous
         return False
@@ -2235,8 +3094,19 @@ class MultiAgentResearchOrchestrator:
         artifacts: Sequence[TaskArtifact],
         *,
         allowed_sources: set[tuple[str, str]] | None = None,
+        max_chars: int | None = None,
     ) -> str:
+        context_limit = (
+            self._limits.max_artifact_context_chars
+            if max_chars is None
+            else max(max_chars, 0)
+        )
         selected = list(artifacts[: self._limits.max_tasks])
+        specs = (
+            {task.task_id: task for task in self._plan.tasks}
+            if self._plan is not None
+            else {}
+        )
         claims_by_task = {
             artifact.task_id: [
                 claim
@@ -2246,109 +3116,130 @@ class MultiAgentResearchOrchestrator:
             ]
             for artifact in selected
         }
-        supported_by_task = {
-            artifact.task_id: {
-                criterion
-                for claim in claims_by_task[artifact.task_id]
-                for criterion in claim.supports_success_criteria
-            }
-            for artifact in selected
+        allowed_claim_ids = {
+            claim.claim_id for claims in claims_by_task.values() for claim in claims
         }
-        covered_by_task = {
-            artifact.task_id: (
-                artifact.covered_success_criteria
-                if allowed_sources is None
-                else [
-                    criterion
-                    for criterion in artifact.covered_success_criteria
-                    if criterion in supported_by_task[artifact.task_id]
-                ]
-            )
-            for artifact in selected
-        }
-        uncovered_by_task = {
-            artifact.task_id: (
-                artifact.uncovered_success_criteria
-                if allowed_sources is None
-                else list(
-                    dict.fromkeys(
-                        [
-                            *artifact.uncovered_success_criteria,
-                            *(
-                                criterion
-                                for criterion in artifact.covered_success_criteria
-                                if criterion not in supported_by_task[artifact.task_id]
+        findings_by_task: dict[str, list[DerivedConclusion]] = {}
+        for artifact in selected:
+            findings: list[DerivedConclusion] = []
+            for finding in artifact.application_findings:
+                supporting_claim_ids = (
+                    list(finding.supporting_claim_ids)
+                    if allowed_sources is None
+                    else [
+                        claim_id
+                        for claim_id in finding.supporting_claim_ids
+                        if claim_id in allowed_claim_ids
+                    ]
+                )
+                if allowed_sources is not None and (
+                    len(supporting_claim_ids) != len(finding.supporting_claim_ids)
+                    or not supporting_claim_ids
+                ):
+                    continue
+                findings.append(
+                    finding.model_copy(
+                        update={
+                            "supporting_claim_ids": supporting_claim_ids,
+                            "finding": _bounded_text(
+                                finding.finding,
+                                self._limits.max_artifact_text_chars,
                             ),
-                        ]
+                            "limitations": [
+                                _bounded_text(value, 500)
+                                for value in finding.limitations[
+                                    : self._limits.max_artifact_list_items
+                                ]
+                            ],
+                        }
                     )
                 )
-            )
-            for artifact in selected
+            findings_by_task[artifact.task_id] = findings
+
+        all_citations = {
+            _normalize_evidence_text(
+                f"[{claim.readable_title}, {claim.locator}]"
+            ).casefold()
+            for claims in claims_by_task.values()
+            for claim in claims
         }
         conflicts_by_task: dict[str, list[str]] = {}
         for artifact in selected:
             if allowed_sources is None:
                 conflicts_by_task[artifact.task_id] = artifact.conflicts
-                continue
-            citations = {
-                _normalize_evidence_text(
-                    f"[{claim.readable_title}, {claim.locator}]"
-                ).casefold()
-                for claim in claims_by_task[artifact.task_id]
-            }
-            conflicts_by_task[artifact.task_id] = [
-                conflict
-                for conflict in artifact.conflicts
-                if sum(
-                    citation in _normalize_evidence_text(conflict).casefold()
-                    for citation in citations
+            else:
+                conflicts_by_task[artifact.task_id] = [
+                    conflict
+                    for conflict in artifact.conflicts
+                    if sum(
+                        citation in _normalize_evidence_text(conflict).casefold()
+                        for citation in all_citations
+                    )
+                    >= 2
+                ]
+
+        payloads: list[dict[str, object]] = []
+        for artifact in selected:
+            spec = specs.get(artifact.task_id)
+            requirement_ids = (
+                list(spec.requirement_ids)
+                if spec is not None
+                else list(
+                    dict.fromkeys(
+                        [
+                            *artifact.covered_requirement_ids,
+                            *artifact.uncovered_requirement_ids,
+                        ]
+                    )
                 )
-                >= 2
-            ]
+            )
+            payloads.append(
+                {
+                    "task_id": artifact.task_id,
+                    "kind": spec.kind.value if spec is not None else None,
+                    "status": TaskStatus.FAILED.value,
+                    "answer_fragment": None,
+                    "covered_requirement_ids": [],
+                    # Reserve room for limitations first. IDs are short and
+                    # deterministic, so retaining all is safer than silently
+                    # presenting a truncated artifact as complete.
+                    "uncovered_requirement_ids": requirement_ids,
+                    "claims": [],
+                    "application_findings": [],
+                    "conflicts": [],
+                    "gaps": [],
+                    "contributing_worker_ids": [],
+                }
+            )
+
         gaps_by_task = {
-            artifact.task_id: [
-                *artifact.gaps,
-                *(
-                    ["Verified claims were omitted by the final context budget."]
-                    if allowed_sources is not None
-                    and len(claims_by_task[artifact.task_id]) < len(artifact.claims)
-                    else []
-                ),
-            ]
+            artifact.task_id: list(
+                dict.fromkeys(
+                    [
+                        *artifact.gaps,
+                        *(
+                            ["Verified claims were omitted by the context budget."]
+                            if len(claims_by_task[artifact.task_id])
+                            < len(artifact.claims)
+                            else []
+                        ),
+                        *(
+                            [
+                                "Grounded application findings were omitted "
+                                "because their evidence was outside the context budget."
+                            ]
+                            if len(findings_by_task[artifact.task_id])
+                            < len(artifact.application_findings)
+                            else []
+                        ),
+                    ]
+                )
+            )
             for artifact in selected
         }
-        payloads: list[dict[str, object]] = [
-            {
-                "task_id": artifact.task_id,
-                "status": (
-                    artifact.status.value
-                    if allowed_sources is None
-                    or len(claims_by_task[artifact.task_id]) == len(artifact.claims)
-                    else (
-                        TaskStatus.PARTIAL.value
-                        if claims_by_task[artifact.task_id]
-                        else TaskStatus.FAILED.value
-                    )
-                ),
-                "answer_fragment": None,
-                "covered_success_criteria": [],
-                "uncovered_success_criteria": [],
-                "claims": [],
-                "conflicts": [],
-                "gaps": [],
-                "contributing_worker_ids": [],
-            }
-            for artifact in selected
-        ]
 
-        # Limitations are first-class final-synthesis input. Reserve the
-        # shared budget for them before adding supported detail.
+        # Preserve limitations before supported detail.
         for field, extractor, text_limit in (
-            (
-                "uncovered_success_criteria",
-                lambda item: uncovered_by_task[item.task_id],
-                400,
-            ),
             ("conflicts", lambda item: conflicts_by_task[item.task_id], 600),
             ("gaps", lambda item: gaps_by_task[item.task_id], 500),
         ):
@@ -2359,85 +3250,145 @@ class MultiAgentResearchOrchestrator:
             for depth in range(min(max_items, self._limits.max_artifact_list_items)):
                 for index, artifact in enumerate(selected):
                     values = extractor(artifact)
-                    if depth >= len(values):
-                        continue
-                    self._append_artifact_value(
-                        payloads,
-                        payload_index=index,
-                        field=field,
-                        value=_bounded_text(values[depth], text_limit),
-                    )
+                    if depth < len(values):
+                        self._append_artifact_value(
+                            payloads,
+                            payload_index=index,
+                            field=field,
+                            value=_bounded_text(values[depth], text_limit),
+                            max_chars=context_limit,
+                        )
 
-        claim_count = 0
-        max_depth = max(
+        included_findings: dict[str, list[DerivedConclusion]] = {
+            artifact.task_id: [] for artifact in selected
+        }
+        max_finding_depth = max(
+            (len(findings_by_task[artifact.task_id]) for artifact in selected),
+            default=0,
+        )
+        finding_count = 0
+        for depth in range(max_finding_depth):
+            for index, artifact in enumerate(selected):
+                findings = findings_by_task[artifact.task_id]
+                if (
+                    depth >= len(findings)
+                    or finding_count >= self._limits.max_artifact_list_items
+                ):
+                    continue
+                finding = findings[depth]
+                if self._append_artifact_value(
+                    payloads,
+                    payload_index=index,
+                    field="application_findings",
+                    value=finding.model_dump(mode="json"),
+                    max_chars=context_limit,
+                ):
+                    included_findings[artifact.task_id].append(finding)
+                    finding_count += 1
+
+        included_claims: dict[str, list[EvidenceClaim]] = {
+            artifact.task_id: [] for artifact in selected
+        }
+        max_claim_depth = max(
             (len(claims_by_task[artifact.task_id]) for artifact in selected),
             default=0,
         )
-        for depth in range(max_depth):
+        claim_count = 0
+        for depth in range(max_claim_depth):
             for index, artifact in enumerate(selected):
-                task_claims = claims_by_task[artifact.task_id]
+                claims = claims_by_task[artifact.task_id]
                 if (
-                    depth >= len(task_claims)
+                    depth >= len(claims)
                     or claim_count >= self._limits.max_claims_per_task
                 ):
                     continue
+                claim = claims[depth]
                 if self._append_artifact_value(
                     payloads,
                     payload_index=index,
                     field="claims",
-                    value=self._claim_payload(task_claims[depth]),
+                    value=self._claim_payload(claim),
+                    max_chars=context_limit,
                 ):
+                    included_claims[artifact.task_id].append(claim)
                     claim_count += 1
 
         for index, artifact in enumerate(selected):
-            answer_fragment = (
-                artifact.answer_fragment
-                if allowed_sources is None
-                else " ".join(claim.claim for claim in claims_by_task[artifact.task_id])
+            spec = specs.get(artifact.task_id)
+            requirement_ids = (
+                list(spec.requirement_ids)
+                if spec is not None
+                else list(
+                    dict.fromkeys(
+                        [
+                            *artifact.covered_requirement_ids,
+                            *artifact.uncovered_requirement_ids,
+                        ]
+                    )
+                )
             )
-            if answer_fragment:
+            supported_ids = {
+                requirement_id
+                for claim in included_claims[artifact.task_id]
+                for requirement_id in claim.requirement_ids
+            } | {
+                requirement_id
+                for finding in included_findings[artifact.task_id]
+                for requirement_id in finding.requirement_ids
+            }
+            covered = [
+                requirement_id
+                for requirement_id in requirement_ids
+                if requirement_id in supported_ids
+            ]
+            uncovered = [
+                requirement_id
+                for requirement_id in requirement_ids
+                if requirement_id not in supported_ids
+            ]
+            status = (
+                TaskStatus.COMPLETE
+                if supported_ids and not uncovered
+                else TaskStatus.PARTIAL
+                if supported_ids
+                else TaskStatus.FAILED
+            )
+            payloads[index]["status"] = status.value
+            payloads[index]["covered_requirement_ids"] = covered
+            payloads[index]["uncovered_requirement_ids"] = uncovered
+            fragments = [
+                finding.finding for finding in included_findings[artifact.task_id]
+            ] or [claim.claim for claim in included_claims[artifact.task_id]]
+            if fragments:
                 self._set_artifact_value(
                     payloads,
                     payload_index=index,
                     field="answer_fragment",
                     value=_bounded_text(
-                        answer_fragment,
-                        min(self._limits.max_artifact_text_chars, 600),
+                        " ".join(fragments),
+                        min(self._limits.max_artifact_text_chars, 800),
                     ),
+                    max_chars=context_limit,
+                )
+            for worker_id in artifact.contributing_worker_ids[
+                : self._limits.max_artifact_list_items
+            ]:
+                self._append_artifact_value(
+                    payloads,
+                    payload_index=index,
+                    field="contributing_worker_ids",
+                    value=_bounded_text(worker_id, 120),
+                    max_chars=context_limit,
                 )
 
-        for field, extractor, text_limit in (
-            (
-                "covered_success_criteria",
-                lambda item: covered_by_task[item.task_id],
-                400,
-            ),
-            (
-                "contributing_worker_ids",
-                lambda item: item.contributing_worker_ids,
-                120,
-            ),
-        ):
-            max_items = max(
-                (len(extractor(artifact)) for artifact in selected),
-                default=0,
-            )
-            for depth in range(min(max_items, self._limits.max_artifact_list_items)):
-                for index, artifact in enumerate(selected):
-                    values = extractor(artifact)
-                    if depth >= len(values):
-                        continue
-                    self._append_artifact_value(
-                        payloads,
-                        payload_index=index,
-                        field=field,
-                        value=_bounded_text(values[depth], text_limit),
-                    )
-
         rendered = self._dump_artifact_payloads(payloads)
-        if len(rendered) > self._limits.max_artifact_context_chars:
-            return "[]"
-        return rendered
+        return (
+            rendered
+            if len(rendered) <= context_limit
+            else "[]"
+            if context_limit >= 2
+            else ""
+        )
 
     @staticmethod
     def _render_evidence_bundle(

@@ -1,6 +1,12 @@
 import {PostgresDataSource} from '../../../datasources';
 import {resolveCoreApiRestUrl, resolveDatabaseUrl, virtualCorpusKey} from '../../directories/services';
-import {BenchmarkRunItem, RetrievalStepEntry} from '../models';
+import {
+  BenchmarkPlanTrace,
+  BenchmarkProfileMode,
+  BenchmarkRoleUsageEntry,
+  BenchmarkRunItem,
+  RetrievalStepEntry,
+} from '../models';
 import {
   BenchmarkQuestionDirectoryRepository,
   BenchmarkQuestionRepository,
@@ -14,8 +20,44 @@ import {
 const ADVISORY_LOCK_ID = 7412110;
 const DEFAULT_MAX_CONCURRENCY = 3;
 const DEFAULT_STALE_MINUTES = 10;
+export const DEFAULT_BENCHMARK_PROFILE_MODE: BenchmarkProfileMode = 'candidate_all_roles';
+export const PRODUCTION_PROFILE_PROVIDER = 'profile';
+export const PRODUCTION_PROFILE_MODEL = 'production-roles';
 
-interface RunQuestionStats {
+export interface BenchmarkCandidate {
+  provider: string;
+  modelId: string;
+}
+
+export function resolveBenchmarkCandidates(
+  requestedMode: BenchmarkProfileMode | string | undefined,
+  providerModelPairs: BenchmarkCandidate[] | undefined,
+): {profileMode: BenchmarkProfileMode; candidates: BenchmarkCandidate[]} {
+  const profileMode = requestedMode ?? DEFAULT_BENCHMARK_PROFILE_MODE;
+  if (profileMode !== 'candidate_all_roles' && profileMode !== 'production_roles') {
+    throw new Error('Invalid benchmark profile mode.');
+  }
+  if (profileMode === 'production_roles') {
+    if (providerModelPairs?.length) {
+      throw new Error('providerModelPairs must be omitted in production_roles mode.');
+    }
+    return {
+      profileMode,
+      candidates: [
+        {
+          provider: PRODUCTION_PROFILE_PROVIDER,
+          modelId: PRODUCTION_PROFILE_MODEL,
+        },
+      ],
+    };
+  }
+  if (!providerModelPairs?.length) {
+    throw new Error('Select at least one model.');
+  }
+  return {profileMode, candidates: providerModelPairs};
+}
+
+export interface RunQuestionStats {
   steps: number;
   api_calls: number;
   prompt_tokens: number;
@@ -28,15 +70,103 @@ interface RunQuestionStats {
   duration_ms: number;
   cost_usd: string | null;
   cost_source: 'provider' | 'estimated' | null;
+  profile_mode?: BenchmarkProfileMode;
+  plan_trace?: BenchmarkPlanTrace | null;
+  role_usage?: BenchmarkRoleUsageEntry[];
 }
 
-interface RunQuestionResult {
+export interface RunQuestionResult {
   final_result: string;
   error: string | null;
   incomplete: boolean;
   cited_sources: string[];
+  cited_evidence?: Array<Record<string, unknown>>;
   step_path: string[];
   stats: RunQuestionStats;
+}
+
+export interface RunQuestionInput {
+  task: string;
+  indexFolders: string[];
+  databaseUrl: string | null;
+  profileMode: BenchmarkProfileMode;
+  provider?: string;
+  model?: string;
+}
+
+export function buildRunQuestionPayload(input: RunQuestionInput): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    task: input.task,
+    index_folders: input.indexFolders,
+    database_url: input.databaseUrl,
+  };
+  if (input.profileMode === 'candidate_all_roles') {
+    if (!input.provider || !input.model) {
+      throw new Error('Candidate benchmark items require provider and model.');
+    }
+    payload.provider = input.provider;
+    payload.model = input.model;
+  }
+  return payload;
+}
+
+export function buildCompletedItemPatch(
+  runResult: RunQuestionResult,
+  options: {judgeError?: string; completedAt: string},
+): Partial<BenchmarkRunItem> {
+  return {
+    status: 'completed',
+    finalResult: runResult.final_result,
+    incomplete: runResult.incomplete,
+    steps: runResult.stats.steps,
+    apiCalls: runResult.stats.api_calls,
+    promptTokens: runResult.stats.prompt_tokens,
+    completionTokens: runResult.stats.completion_tokens,
+    thinkingTokens: runResult.stats.thinking_tokens,
+    totalTokens: runResult.stats.total_tokens,
+    toolResultChars: runResult.stats.tool_result_chars,
+    contextSummaries: runResult.stats.context_summaries,
+    retrievalSteps: runResult.stats.retrieval_steps,
+    planTrace: runResult.stats.plan_trace ?? undefined,
+    roleUsage: runResult.stats.role_usage ?? undefined,
+    durationMs: runResult.stats.duration_ms,
+    costUsd: runResult.stats.cost_usd ?? undefined,
+    costSource: runResult.stats.cost_source ?? undefined,
+    citedSources: runResult.cited_sources,
+    stepPath: runResult.step_path,
+    judgeError: options.judgeError,
+    completedAt: options.completedAt,
+  };
+}
+
+export function buildErroredItemPatch(
+  message: string,
+  options: {completedAt: string; runResult?: RunQuestionResult},
+): Partial<BenchmarkRunItem> {
+  const runResult = options.runResult;
+  return {
+    status: 'error',
+    errorMessage: message.slice(0, 2000),
+    finalResult: runResult?.final_result || undefined,
+    incomplete: runResult?.incomplete,
+    steps: runResult?.stats.steps,
+    apiCalls: runResult?.stats.api_calls,
+    promptTokens: runResult?.stats.prompt_tokens,
+    completionTokens: runResult?.stats.completion_tokens,
+    thinkingTokens: runResult?.stats.thinking_tokens,
+    totalTokens: runResult?.stats.total_tokens,
+    toolResultChars: runResult?.stats.tool_result_chars,
+    contextSummaries: runResult?.stats.context_summaries,
+    retrievalSteps: runResult?.stats.retrieval_steps,
+    planTrace: runResult?.stats.plan_trace ?? undefined,
+    roleUsage: runResult?.stats.role_usage ?? undefined,
+    durationMs: runResult?.stats.duration_ms,
+    costUsd: runResult?.stats.cost_usd ?? undefined,
+    costSource: runResult?.stats.cost_source ?? undefined,
+    citedSources: runResult?.cited_sources,
+    stepPath: runResult?.step_path,
+    completedAt: options.completedAt,
+  };
 }
 
 interface JudgeResult {
@@ -108,12 +238,14 @@ export class BenchmarkRunnerService {
       const runResult = await this.callRunQuestion({
         task: question.prompt,
         indexFolders,
-        provider: item.provider,
-        model: item.modelId,
+        profileMode: run.profileMode ?? DEFAULT_BENCHMARK_PROFILE_MODE,
+        provider:
+          run.profileMode === 'production_roles' ? undefined : item.provider,
+        model: run.profileMode === 'production_roles' ? undefined : item.modelId,
       });
 
       if (runResult.error) {
-        await this.markItemError(item, runResult.error);
+        await this.markItemError(item, runResult.error, runResult);
         return;
       }
 
@@ -127,6 +259,7 @@ export class BenchmarkRunnerService {
           rubricNotes: question.rubricNotes,
           candidateAnswer: runResult.final_result,
           citedSources: runResult.cited_sources,
+          citedEvidence: runResult.cited_evidence,
           judgeProvider: run.judgeProvider,
           judgeModel: run.judgeModel,
         });
@@ -141,27 +274,13 @@ export class BenchmarkRunnerService {
         console.warn(`[benchmark] judge call failed item=${item.id}:`, judgeError);
       }
 
-      await this.items.updateById(item.id, {
-        status: 'completed',
-        finalResult: runResult.final_result,
-        incomplete: runResult.incomplete,
-        steps: runResult.stats.steps,
-        apiCalls: runResult.stats.api_calls,
-        promptTokens: runResult.stats.prompt_tokens,
-        completionTokens: runResult.stats.completion_tokens,
-        thinkingTokens: runResult.stats.thinking_tokens,
-        totalTokens: runResult.stats.total_tokens,
-        toolResultChars: runResult.stats.tool_result_chars,
-        contextSummaries: runResult.stats.context_summaries,
-        retrievalSteps: runResult.stats.retrieval_steps,
-        durationMs: runResult.stats.duration_ms,
-        costUsd: runResult.stats.cost_usd ?? undefined,
-        costSource: runResult.stats.cost_source ?? undefined,
-        citedSources: runResult.cited_sources,
-        stepPath: runResult.step_path,
-        judgeError,
-        completedAt: new Date().toISOString(),
-      });
+      await this.items.updateById(
+        item.id,
+        buildCompletedItemPatch(runResult, {
+          judgeError,
+          completedAt: new Date().toISOString(),
+        }),
+      );
 
       if (judgment) {
         await this.judgments.create({
@@ -186,32 +305,40 @@ export class BenchmarkRunnerService {
     }
   }
 
-  private async markItemError(item: BenchmarkRunItem, message: string): Promise<void> {
-    await this.items.updateById(item.id, {
-      status: 'error',
-      errorMessage: message.slice(0, 2000),
-      completedAt: new Date().toISOString(),
-    });
+  private async markItemError(
+    item: BenchmarkRunItem,
+    message: string,
+    runResult?: RunQuestionResult,
+  ): Promise<void> {
+    await this.items.updateById(
+      item.id,
+      buildErroredItemPatch(message, {
+        completedAt: new Date().toISOString(),
+        runResult,
+      }),
+    );
     await this.runs.recordItemOutcome(item.runId, 'failed');
   }
 
   private async callRunQuestion(input: {
     task: string;
     indexFolders: string[];
-    provider: string;
-    model: string;
+    profileMode: BenchmarkProfileMode;
+    provider?: string;
+    model?: string;
   }): Promise<RunQuestionResult> {
     const endpoint = `${resolveCoreApiRestUrl()}/api/benchmark/run-question`;
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: this.internalHeaders(),
-      body: JSON.stringify({
+      body: JSON.stringify(buildRunQuestionPayload({
         task: input.task,
-        index_folders: input.indexFolders,
-        database_url: resolveDatabaseUrl() ?? null,
+        indexFolders: input.indexFolders,
+        databaseUrl: resolveDatabaseUrl() ?? null,
+        profileMode: input.profileMode,
         provider: input.provider,
         model: input.model,
-      }),
+      })),
     });
     const body = (await res.json()) as Record<string, unknown>;
     if (!res.ok) {
@@ -229,6 +356,7 @@ export class BenchmarkRunnerService {
     rubricNotes?: string;
     candidateAnswer: string;
     citedSources: string[];
+    citedEvidence?: Array<Record<string, unknown>>;
     judgeProvider: string;
     judgeModel: string;
   }): Promise<JudgeResult> {
@@ -243,6 +371,7 @@ export class BenchmarkRunnerService {
         rubric_notes: input.rubricNotes ?? null,
         candidate_answer: input.candidateAnswer,
         cited_sources: input.citedSources,
+        cited_evidence: input.citedEvidence ?? [],
         judge_provider: input.judgeProvider,
         judge_model: input.judgeModel,
       }),

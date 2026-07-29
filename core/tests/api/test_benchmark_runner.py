@@ -7,13 +7,18 @@ import pytest
 from fs_explorer_api import benchmark_runner as benchmark_runner_mod
 from fs_explorer_api.agent import PlannedSearchResult, _index_tools_available
 from fs_explorer_api.benchmark_runner import (
+    _benchmark_llm_profile,
+    _benchmark_multi_agent_enabled,
+    _build_plan_trace,
+    _resolve_profile_mode,
+    _role_usage_breakdown,
     _sum_call_cost,
     judge_answer,
     run_agentic_session,
 )
 from fs_explorer_api.agent import LLMCallStats
 from fs_explorer_api.llm.base import LLMUsage
-from fs_explorer_api.llm.profile import LLMProfile
+from fs_explorer_api.llm.profile import DEFAULT_LLM_PROFILE, LLMProfile
 from fs_explorer_api.models import (
     JudgmentResult,
     ResearchDecision,
@@ -141,9 +146,13 @@ class _AdaptiveRoundClient(_StopActionClient):
 
 
 @pytest.fixture(autouse=True)
-def _clear_context_before_and_after():
+def _clear_context_before_and_after(monkeypatch):
     from fs_explorer_api.agent import clear_index_context
 
+    # Most legacy runner tests exercise the established stateless path. The
+    # production API default is covered separately and can still be disabled
+    # through the same operational kill switch.
+    monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "false")
     clear_index_context()
     yield
     clear_index_context()
@@ -204,6 +213,56 @@ class TestRunAgenticSession:
         assert handler.cancelled is True
 
     @pytest.mark.asyncio
+    async def test_production_profile_reaches_workflow_without_candidate_override(
+        self, monkeypatch
+    ) -> None:
+        handler = _InterruptedHandler()
+        captured_workflow_args: dict[str, object] = {}
+
+        class _InterruptedWorkflow:
+            def run(self, **_kwargs):
+                return handler
+
+        def fake_new_workflow(**kwargs):
+            captured_workflow_args.update(kwargs)
+            return _InterruptedWorkflow(), object()
+
+        monkeypatch.setattr(benchmark_runner_mod, "PostgresStorage", _FakeStorage)
+        monkeypatch.setattr(benchmark_runner_mod, "new_workflow", fake_new_workflow)
+        monkeypatch.setattr(
+            benchmark_runner_mod,
+            "get_run_agent",
+            lambda _resource_manager: object(),
+        )
+        monkeypatch.setenv("FS_EXPLORER_PLANNER_MODEL", "planner/model")
+        monkeypatch.setenv("FS_EXPLORER_TASK_MODEL", "task/model")
+        monkeypatch.setenv("FS_EXPLORER_WORKER_MODEL", "worker/model")
+        monkeypatch.setenv("FS_EXPLORER_FINAL_MODEL", "final/model")
+
+        with pytest.raises(RuntimeError, match="benchmark stream interrupted"):
+            await run_agentic_session(
+                task="x",
+                index_folders=["virtual://corpus-1"],
+                database_url="postgresql://test/test",
+                profile_mode="production_roles",
+            )
+
+        profile = captured_workflow_args["llm_profile"]
+        assert isinstance(profile, LLMProfile)
+        assert {
+            role: profile.for_role(role).model
+            for role in ("planner", "task", "worker", "final")
+        } == {
+            "planner": "planner/model",
+            "task": "task/model",
+            "worker": "worker/model",
+            "final": "final/model",
+        }
+        assert captured_workflow_args["provider"] is None
+        assert captured_workflow_args["model"] is None
+        assert handler.cancelled is True
+
+    @pytest.mark.asyncio
     async def test_returns_stats_shape_and_pools_call_cost(self, monkeypatch) -> None:
         monkeypatch.setattr(benchmark_runner_mod, "PostgresStorage", _FakeStorage)
         monkeypatch.setattr("fs_explorer_api.agent.PostgresStorage", _FakeStorage)
@@ -237,11 +296,19 @@ class TestRunAgenticSession:
             "duration_ms",
             "cost_usd",
             "cost_source",
+            "profile_mode",
+            "plan_trace",
+            "role_usage",
         }
         # One planner + one bounded evidence review + one final answer.
         assert result.stats["api_calls"] == 3
         assert result.stats["cost_source"] == "provider"
         assert result.stats["cost_usd"] == "0.0025"
+        assert result.stats["profile_mode"] == "candidate_all_roles"
+        assert result.plan_trace == result.stats["plan_trace"]
+        assert result.role_usage == result.stats["role_usage"]
+        assert result.cited_evidence == []
+        assert sum(row["calls"] for row in result.role_usage) == 3
 
     @pytest.mark.asyncio
     async def test_raises_when_no_folder_is_indexed(self, monkeypatch) -> None:
@@ -417,6 +484,139 @@ class TestSumCallCost:
         assert _sum_call_cost(calls) == (None, None)
 
 
+class TestBenchmarkObservability:
+    def test_benchmark_uses_server_multi_agent_default_and_kill_switch(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("FS_EXPLORER_MULTI_AGENT_ENABLED", raising=False)
+        assert _benchmark_multi_agent_enabled() is True
+
+        monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "false")
+        assert _benchmark_multi_agent_enabled() is False
+
+        monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "invalid")
+        with pytest.raises(ValueError, match="must be a boolean"):
+            _benchmark_multi_agent_enabled()
+
+    def test_legacy_optional_arguments_resolve_to_the_same_profile_modes(self) -> None:
+        assert (
+            _resolve_profile_mode(
+                profile_mode=None,
+                provider="openrouter",
+                model="candidate/model",
+            )
+            == "candidate_all_roles"
+        )
+        assert (
+            _resolve_profile_mode(
+                profile_mode=None,
+                provider=None,
+                model=None,
+            )
+            == "production_roles"
+        )
+
+    def test_production_profile_snapshots_heterogeneous_role_models(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("FS_EXPLORER_PLANNER_MODEL", "planner/model")
+        monkeypatch.setenv("FS_EXPLORER_TASK_MODEL", "task/model")
+        monkeypatch.setenv("FS_EXPLORER_WORKER_MODEL", "worker/model")
+        monkeypatch.setenv("FS_EXPLORER_FINAL_MODEL", "final/model")
+
+        profile = _benchmark_llm_profile(
+            provider=None,
+            model=None,
+            profile_mode="production_roles",
+        )
+
+        assert {
+            role: profile.for_role(role).model
+            for role in ("planner", "task", "worker", "final")
+        } == {
+            "planner": "planner/model",
+            "task": "task/model",
+            "worker": "worker/model",
+            "final": "final/model",
+        }
+
+    def test_role_usage_groups_calls_by_role_purpose_provider_and_model(self) -> None:
+        calls = [
+            LLMCallStats(
+                purpose="evidence_extraction",
+                model="worker/model",
+                provider="openrouter",
+                agent_role="worker",
+                prompt_tokens=10,
+                completion_tokens=4,
+                thinking_tokens=1,
+                cached_input_tokens=2,
+                cache_write_tokens=3,
+                duration_ms=12.5,
+                billed_cost_usd="0.001",
+                cost_source="provider",
+            ),
+            LLMCallStats(
+                purpose="evidence_extraction",
+                model="worker/model",
+                provider="openrouter",
+                agent_role="worker",
+                prompt_tokens=20,
+                completion_tokens=5,
+                thinking_tokens=2,
+                cached_input_tokens=4,
+                cache_write_tokens=1,
+                duration_ms=7.5,
+                billed_cost_usd="0.002",
+                cost_source="estimated",
+            ),
+        ]
+
+        assert _role_usage_breakdown(calls) == [
+            {
+                "role": "worker",
+                "purpose": "evidence_extraction",
+                "provider": "openrouter",
+                "model": "worker/model",
+                "calls": 2,
+                "prompt_tokens": 30,
+                "completion_tokens": 9,
+                "thinking_tokens": 3,
+                "total_tokens": 42,
+                "cached_input_tokens": 6,
+                "cache_write_tokens": 4,
+                "duration_ms": 20.0,
+                "cost_usd": "0.003",
+                "cost_source": "estimated",
+            }
+        ]
+
+    def test_plan_trace_uses_agent_hook_and_runtime_fingerprints(self) -> None:
+        class _Agent:
+            benchmark_plan_trace = {
+                "schema_version": 1,
+                "contract_version": "2",
+                "plan": {"mode": "direct"},
+                "task_artifacts": [{"task_id": "task_1", "claim_count": 2}],
+            }
+
+        trace = _build_plan_trace(
+            agent=_Agent(),
+            profile_mode="production_roles",
+            profile=DEFAULT_LLM_PROFILE,
+        )
+
+        assert trace["profile_mode"] == "production_roles"
+        assert trace["role_profile"]["planner"]["model"] == "openai/gpt-5.6-sol"
+        assert trace["execution"]["contract_version"] == "2"
+        assert trace["runtime"]["contract"]["plan_contract_version"] == "2"
+        assert trace["runtime"]["contract"]["plan_fields"] == ["mode"]
+        assert trace["runtime"]["prompts"]["global_planner"]["sha256"]
+        assert trace["runtime"]["prompts"]["application_task"]["sha256"]
+        assert trace["runtime"]["prompts"]["integration_task"]["sha256"]
+        assert trace["runtime"]["prompts"]["scenario_final_synthesis"]["sha256"]
+
+
 class _JudgeClient:
     def __init__(self, judgment: JudgmentResult) -> None:
         self._judgment = judgment
@@ -462,11 +662,20 @@ class TestJudgeAnswer:
             cited_sources=["Gümrük Kanunu Madde 241"],
             judge_provider="openrouter",
             judge_model="test/judge",
+            cited_evidence=[
+                {
+                    "title": "Gümrük Kanunu",
+                    "locator": "Madde 241",
+                    "snippet": "Süre aşımında kademeli usulsüzlük cezası uygulanır.",
+                }
+            ],
         )
 
         assert result["overall_score"] == 100
         assert "241" in client.seen_prompt
         assert "Madde 241" in client.seen_prompt
+        assert "Süre aşımında kademeli usulsüzlük" in client.seen_prompt
+        assert "UNTRUSTED SOURCE TEXT" in client.seen_prompt
 
     @pytest.mark.asyncio
     async def test_partial_scores_yield_partial_weighted_total(

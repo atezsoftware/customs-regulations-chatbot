@@ -1,6 +1,7 @@
 import {Entity, model, property} from '@loopback/repository';
 
 export type BenchmarkRunStatus = 'pending' | 'running' | 'completed' | 'error' | 'cancelled';
+export type BenchmarkProfileMode = 'candidate_all_roles' | 'production_roles';
 
 @model({settings: {postgresql: {schema: 'public', table: 'benchmark_runs'}}})
 export class BenchmarkRun extends Entity {
@@ -12,6 +13,14 @@ export class BenchmarkRun extends Entity {
 
   @property({type: 'string', required: true})
   status: BenchmarkRunStatus;
+
+  @property({
+    type: 'string',
+    required: true,
+    default: 'candidate_all_roles',
+    postgresql: {columnName: 'profile_mode'},
+  })
+  profileMode: BenchmarkProfileMode;
 
   @property({type: 'string', required: true, postgresql: {columnName: 'judge_provider'}})
   judgeProvider: string;

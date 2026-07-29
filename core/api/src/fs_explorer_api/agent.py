@@ -26,7 +26,11 @@ from .multi_agent import (
     MultiAgentResearchResult,
     ResearchProgress,
 )
-from .orchestration_prompts import FINAL_SYNTHESIS_SYSTEM_PROMPT
+from .orchestration_models import ProblemType
+from .orchestration_prompts import (
+    FINAL_SYNTHESIS_SYSTEM_PROMPT,
+    SCENARIO_FINAL_SYNTHESIS_SYSTEM_PROMPT,
+)
 from .models import (
     Action,
     ActionType,
@@ -1835,6 +1839,15 @@ class FsExplorerAgent:
         self._multi_agent_result: MultiAgentResearchResult | None = None
         self._multi_agent_final_llm: LLMClient | None = None
         self._multi_agent_research_active = False
+        # Final synthesis is a per-run single-flight operation.  The provider
+        # stream is drained by a background task and its chunks are retained on
+        # this agent, so a dropped WebSocket can replay the same answer instead
+        # of paying for another final-model call.  The agent itself is owned by
+        # the run registry, whose bounded TTL controls the cache lifetime.
+        self._final_answer_task: asyncio.Task[None] | None = None
+        self._final_answer_chunks: list[str] = []
+        self._final_answer_complete = False
+        self._final_answer_condition = asyncio.Condition()
         self._step_count = 0
         # Instance-level, not just the module constant — grant_more_steps()
         # (called on resume) raises this so a resumed run gets genuine extra
@@ -1899,10 +1912,59 @@ class FsExplorerAgent:
         return self._multi_agent_research_active
 
     @property
+    def final_answer_started(self) -> bool:
+        """Whether this run has entered its single-flight final synthesis."""
+
+        return self._final_answer_task is not None
+
+    @property
     def multi_agent_incomplete(self) -> bool:
         """Whether a required task remained partial or failed."""
 
         return bool(self._multi_agent_result and self._multi_agent_result.incomplete)
+
+    @property
+    def benchmark_plan_trace(self) -> dict[str, object] | None:
+        """Return a bounded JSON-safe orchestration trace for offline scoring."""
+
+        result = self._multi_agent_result
+        if result is None:
+            return None
+        task_artifacts = [
+            {
+                "task_id": artifact.task_id,
+                "status": artifact.status.value,
+                "covered_requirement_ids": list(artifact.covered_requirement_ids),
+                "uncovered_requirement_ids": list(artifact.uncovered_requirement_ids),
+                "claim_ids": [claim.claim_id for claim in artifact.claims],
+                "application_findings": [
+                    {
+                        "conclusion_id": finding.conclusion_id,
+                        "requirement_ids": list(finding.requirement_ids),
+                        "fact_ids": list(finding.fact_ids),
+                        "branch_ids": list(finding.branch_ids),
+                        "supporting_claim_ids": list(finding.supporting_claim_ids),
+                        "dependency_refs": [
+                            reference.model_dump(mode="json")
+                            for reference in finding.dependency_refs
+                        ],
+                        "confidence": finding.confidence.value,
+                        "limitations": list(finding.limitations),
+                    }
+                    for finding in artifact.application_findings
+                ],
+                "gaps": list(artifact.gaps),
+            }
+            for artifact in result.task_artifacts
+        ]
+        return {
+            "schema_version": 1,
+            "contract_version": result.plan.version,
+            "plan": result.plan.model_dump(mode="json"),
+            "task_artifacts": task_artifacts,
+            "used_plan_fallback": result.used_plan_fallback,
+            "incomplete": result.incomplete,
+        }
 
     @property
     def final_model(self) -> str | None:
@@ -1961,7 +2023,17 @@ class FsExplorerAgent:
             for claim in artifact.claims
             if (claim.document_id, claim.chunk_id) in exposed_sources
         ]
-        if not claims:
+        claims_by_id = {claim.claim_id: claim for claim in claims}
+        findings = [
+            finding
+            for artifact in result.task_artifacts
+            for finding in artifact.application_findings
+            if finding.supporting_claim_ids
+            and all(
+                claim_id in claims_by_id for claim_id in finding.supporting_claim_ids
+            )
+        ]
+        if not claims and not findings:
             return None
 
         question = result.plan.normalized_question.casefold()
@@ -1971,19 +2043,76 @@ class FsExplorerAgent:
                 question,
             )
         )
+        scenario_answer = bool(findings and result.plan.scenario is not None)
         lines = [
             (
-                "Doğrulanmış indeks kanıtlarından çıkarılabilen sonuçlar:"
+                "Senaryoya uygulanan doğrulanmış sonuçlar:"
+                if turkish and scenario_answer
+                else "Grounded conclusions applied to the scenario:"
+                if scenario_answer
+                else "Doğrulanmış indeks kanıtlarından çıkarılabilen sonuçlar:"
                 if turkish
                 else "Conclusions supported by the verified indexed evidence:"
             ),
             "",
         ]
         source_titles: list[str] = []
-        for claim in claims:
-            lines.append(f"- {claim.claim} [{claim.readable_title}, {claim.locator}]")
-            if claim.readable_title not in source_titles:
-                source_titles.append(claim.readable_title)
+        finding_requirement_ids = {
+            requirement_id
+            for finding in findings
+            for requirement_id in finding.requirement_ids
+        }
+        if findings:
+            for finding in findings:
+                supporting_claims = [
+                    claims_by_id[claim_id]
+                    for claim_id in finding.supporting_claim_ids
+                    if claim_id in claims_by_id
+                ]
+                citations = " ".join(
+                    f"[{claim.readable_title}, {claim.locator}]"
+                    for claim in supporting_claims
+                )
+                lines.append(f"- {finding.finding} {citations}".rstrip())
+                for limitation in finding.limitations:
+                    lines.append(
+                        (
+                            f"  - Koşul/sınırlama: {limitation}"
+                            if turkish
+                            else f"  - Condition/limitation: {limitation}"
+                        )
+                    )
+                for claim in supporting_claims:
+                    if claim.readable_title not in source_titles:
+                        source_titles.append(claim.readable_title)
+        evidence_only_claims = [
+            claim
+            for claim in claims
+            if not findings
+            or any(
+                requirement_id not in finding_requirement_ids
+                for requirement_id in claim.requirement_ids
+            )
+        ]
+        if evidence_only_claims:
+            if findings:
+                lines.extend(
+                    [
+                        "",
+                        (
+                            "Ayrıca doğrulanan kural ve usuller:"
+                            if turkish
+                            else "Additional verified rules and procedures:"
+                        ),
+                        "",
+                    ]
+                )
+            for claim in evidence_only_claims:
+                lines.append(
+                    f"- {claim.claim} [{claim.readable_title}, {claim.locator}]"
+                )
+                if claim.readable_title not in source_titles:
+                    source_titles.append(claim.readable_title)
         if result.incomplete:
             lines.extend(
                 [
@@ -2179,10 +2308,6 @@ class FsExplorerAgent:
             self._prepared_indexed_evidence = True
             self._indexed_research_active = False
             self._chat_history = [
-                ChatTurn(
-                    role="user",
-                    text=f"Original question:\n{_current_indexed_question(task)}",
-                ),
                 ChatTurn(role="user", text=result.final_context),
             ]
             return result
@@ -2737,54 +2862,112 @@ class FsExplorerAgent:
             *recent,
         ]
 
-    async def stream_final_answer(
-        self,
-        fallback_answer: str | None = None,
-    ) -> AsyncIterator[str]:
-        """
-        Stream the final user-facing answer as plain text.
+    def start_final_answer(self, fallback_answer: str | None = None) -> None:
+        """Start final synthesis once, independently of its WebSocket consumer.
 
-        Tool planning uses structured JSON responses. The final answer is
-        generated separately so the WebSocket UI can render it incrementally.
-        If the LLM client does not support streaming (or errors before
-        yielding anything), falls back to yielding `fallback_answer` once.
+        Keeping the producer in its own task is intentional: cancellation of a
+        disconnected response iterator must not cancel the paid provider call.
+        A resumed connection consumes the retained chunks from the beginning
+        and then follows the same in-flight task to completion.
         """
+        if self._final_answer_task is None:
+            self._final_answer_task = asyncio.create_task(
+                self._run_final_answer_producer(fallback_answer),
+                name="fs-explorer-final-answer",
+            )
+
+    def clear_final_answer(self) -> None:
+        """Discard final replay state before deliberately continuing a run."""
+        if self._final_answer_task is not None and not self._final_answer_task.done():
+            self._final_answer_task.cancel()
+        self._final_answer_task = None
+        self._final_answer_chunks.clear()
+        self._final_answer_complete = False
+
+    async def _publish_final_chunk(self, text: str) -> None:
+        async with self._final_answer_condition:
+            self._final_answer_chunks.append(text)
+            self._final_answer_condition.notify_all()
+
+    async def _run_final_answer_producer(self, fallback_answer: str | None) -> None:
+        """Always release replay consumers, including on observability errors."""
+        try:
+            await self._produce_final_answer(fallback_answer)
+        except Exception:
+            logger.exception("stream_final_answer: final-answer producer failed")
+            if not self._final_answer_chunks:
+                await self._publish_final_chunk(
+                    fallback_answer
+                    or (
+                        "Üzgünüm, bu soru için şu anda bir cevap oluşturamadım. "
+                        "Lütfen tekrar deneyin."
+                    )
+                )
+        finally:
+            # `reset()` can cancel an old producer and immediately clear the
+            # state for reuse.  Do not let that old task mark the new state as
+            # complete when its cancellation is delivered on the next loop.
+            if asyncio.current_task() is self._final_answer_task:
+                async with self._final_answer_condition:
+                    self._final_answer_complete = True
+                    self._final_answer_condition.notify_all()
+
+    async def _produce_final_answer(self, fallback_answer: str | None) -> None:
+        """Drain exactly one final-model stream into the replayable run cache."""
         is_multi_agent = (
             self._multi_agent_result is not None
             and self._multi_agent_final_llm is not None
         )
+        is_scenario = bool(
+            is_multi_agent
+            and self._multi_agent_result is not None
+            and self._multi_agent_result.plan.scenario is not None
+            and self._multi_agent_result.plan.problem_type
+            in {
+                ProblemType.SCENARIO_APPLICATION,
+                ProblemType.MIXED,
+            }
+        )
         prompt = (
-            "Synthesize the final answer from the verified task artifacts and "
-            "evidence above. Preserve every material limitation."
+            (
+                "Write the scenario-specific final answer from the validated "
+                "application findings and verified evidence above. Preserve "
+                "every material unknown and conditional branch."
+                if is_scenario
+                else "Synthesize the final answer from the verified task "
+                "artifacts and evidence above. Preserve every material limitation."
+            )
             if is_multi_agent
             else "Using the evidence above, write the final answer now."
         )
         stream_history = [*self._chat_history, ChatTurn(role="user", text=prompt)]
         system_prompt = (
-            FINAL_SYNTHESIS_SYSTEM_PROMPT if is_multi_agent else FINAL_SYSTEM_PROMPT
+            SCENARIO_FINAL_SYNTHESIS_SYSTEM_PROMPT
+            if is_scenario
+            else FINAL_SYNTHESIS_SYSTEM_PROMPT
+            if is_multi_agent
+            else FINAL_SYSTEM_PROMPT
         )
         client = self._multi_agent_final_llm if is_multi_agent else self._llm
         assert client is not None
 
-        chunks: list[str] = []
         try:
             async for text in client.stream_text(
                 stream_history,
                 system_prompt,
                 thinking_level=None if is_multi_agent else "high",
             ):
-                chunks.append(text)
-                yield text
+                await self._publish_final_chunk(text)
         except Exception:
             logger.exception("stream_final_answer: final-answer streaming failed")
 
-        if not chunks:
+        if not self._final_answer_chunks:
             # `fallback_answer` can itself be empty (e.g. a forced max-steps
             # stop with no real StopAction text) — falling through to a
             # generic message here means a double failure (forced stop *and*
             # streaming both coming up empty) still shows the user something
             # instead of a silent blank response.
-            yield (
+            await self._publish_final_chunk(
                 self._multi_agent_fallback_answer()
                 or fallback_answer
                 or (
@@ -2792,27 +2975,52 @@ class FsExplorerAgent:
                     "Lütfen tekrar deneyin."
                 )
             )
-            return
+        else:
+            final_text = "".join(self._final_answer_chunks)
+            self._chat_history.append(ChatTurn(role="model", text=final_text))
 
-        final_text = "".join(chunks)
-        self._chat_history.append(ChatTurn(role="model", text=final_text))
+            usage = client.last_stream_usage()
+            if usage:
+                self.token_usage.add_api_call(
+                    prompt_tokens=usage.input_tokens,
+                    completion_tokens=usage.output_tokens,
+                    thinking_tokens=usage.thinking_tokens,
+                )
+                if is_multi_agent:
+                    self._step_count += 1
+                await self._report_llm_call(
+                    "final_answer",
+                    usage,
+                    client=client,
+                    agent_role="final" if is_multi_agent else None,
+                    agent_id="final-synthesizer" if is_multi_agent else None,
+                )
 
-        usage = client.last_stream_usage()
-        if usage:
-            self.token_usage.add_api_call(
-                prompt_tokens=usage.input_tokens,
-                completion_tokens=usage.output_tokens,
-                thinking_tokens=usage.thinking_tokens,
-            )
-            if is_multi_agent:
-                self._step_count += 1
-            await self._report_llm_call(
-                "final_answer",
-                usage,
-                client=client,
-                agent_role="final" if is_multi_agent else None,
-                agent_id="final-synthesizer" if is_multi_agent else None,
-            )
+    async def stream_final_answer(
+        self,
+        fallback_answer: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Replay and follow this run's single-flight final answer stream."""
+        self.start_final_answer(fallback_answer)
+
+        next_chunk = 0
+        while True:
+            async with self._final_answer_condition:
+                await self._final_answer_condition.wait_for(
+                    lambda: (
+                        next_chunk < len(self._final_answer_chunks)
+                        or self._final_answer_complete
+                    )
+                )
+                available = self._final_answer_chunks[next_chunk:]
+                is_complete = self._final_answer_complete
+
+            for chunk in available:
+                next_chunk += 1
+                yield chunk
+
+            if is_complete and next_chunk == len(self._final_answer_chunks):
+                return
 
     def call_tool(self, tool_name: Tools, tool_input: dict[str, Any]) -> None:
         """
@@ -2920,6 +3128,7 @@ class FsExplorerAgent:
 
     def reset(self) -> None:
         """Reset the agent's conversation history and token tracking."""
+        self.clear_final_answer()
         self._chat_history.clear()
         self.token_usage = TokenUsage()
         self._step_count = 0

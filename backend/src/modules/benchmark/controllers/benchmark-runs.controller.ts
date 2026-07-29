@@ -4,7 +4,7 @@ import {get, HttpErrors, param, post, Request, requestBody, response, RestBindin
 import {getCurrentUser, requireAdmin} from '../../../common/auth';
 import {UserRepository} from '../../auth/repositories';
 import {LlmModelRepository} from '../../llm-catalog/repositories';
-import {BenchmarkRun} from '../models';
+import {BenchmarkProfileMode, BenchmarkRun} from '../models';
 import {
   BenchmarkModelMetricsRow,
   BenchmarkModelPercentilesRow,
@@ -13,10 +13,15 @@ import {
   BenchmarkRunJudgmentRepository,
   BenchmarkRunRepository,
 } from '../repositories';
+import {
+  DEFAULT_BENCHMARK_PROFILE_MODE,
+  resolveBenchmarkCandidates,
+} from '../services/benchmark-runner.service';
 
 interface CreateRunBody {
   label?: string;
-  providerModelPairs: Array<{provider: string; modelId: string}>;
+  profileMode?: BenchmarkProfileMode;
+  providerModelPairs?: Array<{provider: string; modelId: string}>;
   questionIds: number[] | 'all-active';
   judgeProvider: string;
   judgeModel: string;
@@ -33,6 +38,7 @@ function toSafeRun(run: BenchmarkRun) {
     id: run.id,
     label: run.label ?? null,
     status: run.status,
+    profileMode: run.profileMode ?? DEFAULT_BENCHMARK_PROFILE_MODE,
     judgeProvider: run.judgeProvider,
     judgeModel: run.judgeModel,
     totalItems: run.totalItems,
@@ -95,14 +101,22 @@ export class BenchmarkRunsController {
     const user = await getCurrentUser(this.request, this.userRepository);
     requireAdmin(user);
 
-    if (!body.providerModelPairs?.length) {
-      throw new HttpErrors.BadRequest('Select at least one model.');
+    let selection: ReturnType<typeof resolveBenchmarkCandidates>;
+    try {
+      selection = resolveBenchmarkCandidates(body.profileMode, body.providerModelPairs);
+    } catch (error) {
+      throw new HttpErrors.BadRequest(
+        error instanceof Error ? error.message : 'Invalid benchmark profile selection.',
+      );
     }
-    for (const pair of body.providerModelPairs) {
-      const model = await this.llmModels.findOne({
-        where: {provider: pair.provider, modelId: pair.modelId, isActive: true},
-      });
-      if (!model) throw new HttpErrors.BadRequest(`Model not available: ${pair.provider}/${pair.modelId}`);
+    const {profileMode, candidates} = selection;
+    if (profileMode === 'candidate_all_roles') {
+      for (const pair of candidates) {
+        const model = await this.llmModels.findOne({
+          where: {provider: pair.provider, modelId: pair.modelId, isActive: true},
+        });
+        if (!model) throw new HttpErrors.BadRequest(`Model not available: ${pair.provider}/${pair.modelId}`);
+      }
     }
     const judge = await this.llmModels.findOne({
       where: {provider: body.judgeProvider, modelId: body.judgeModel, isActive: true},
@@ -121,10 +135,11 @@ export class BenchmarkRunsController {
       throw new HttpErrors.BadRequest('One or more selected questions do not exist.');
     }
 
-    const totalItems = body.providerModelPairs.length * questionIds.length;
+    const totalItems = candidates.length * questionIds.length;
     const run = await this.runs.create({
       label: body.label?.trim() || undefined,
       status: 'running',
+      profileMode,
       judgeProvider: body.judgeProvider,
       judgeModel: body.judgeModel,
       createdBy: user.id,
@@ -134,7 +149,7 @@ export class BenchmarkRunsController {
       startedAt: new Date().toISOString(),
     });
 
-    for (const pair of body.providerModelPairs) {
+    for (const pair of candidates) {
       for (const questionId of questionIds) {
         await this.items.create({
           runId: run.id!,
@@ -221,6 +236,8 @@ export class BenchmarkRunsController {
           citedSources: row.citedSources ?? [],
           stepPath: row.stepPath ?? [],
           retrievalSteps: row.retrievalSteps ?? [],
+          planTrace: row.planTrace ?? null,
+          roleUsage: row.roleUsage ?? [],
           steps: row.steps ?? null,
           apiCalls: row.apiCalls ?? null,
           totalTokens: row.totalTokens ?? null,

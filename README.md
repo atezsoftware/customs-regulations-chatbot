@@ -88,7 +88,9 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 | `FS_EXPLORER_WORKER_{PROVIDER,MODEL,REASONING}` | `core-api` | Search worker policy. Defaults to OpenRouter, `google/gemini-3.5-flash-lite`, `low`. |
 | `FS_EXPLORER_FINAL_{PROVIDER,MODEL,REASONING}` | `core-api` | Final synthesis policy. Defaults to OpenRouter, `google/gemini-3.6-flash`, `high`. |
 | `FS_EXPLORER_MULTI_AGENT_MAX_{TASKS,WORKERS_PER_TASK,WORKER_ROUNDS,TOTAL_WORKERS,LLM_CALLS}` | `core-api` | Hard per-run fan-out/call budgets. Defaults: `5`, `3`, `2`, `8`, `24`. |
+| `FS_EXPLORER_MULTI_AGENT_MAX_ARTIFACT_ITEMS` | `core-api` | Maximum structural items per typed plan/artifact list (`12`), preventing scenario fan-out from expanding downstream contexts. |
 | `FS_EXPLORER_MULTI_AGENT_MAX_ARTIFACT_CONTEXT_CHARS` | `core-api` | Total serialized artifact-context cap per boundary (`16000`), independent of per-field limits. |
+| `FS_EXPLORER_MULTI_AGENT_MAX_{QUESTION,PLANNER_CONTEXT,FINAL_CONTEXT}_CHARS` | `core-api` | Hard user-input and aggregate synthesis-context caps. Defaults: `8000`, `16000`, `48000`; the current question is retained before older conversation context. |
 | `FS_EXPLORER_MULTI_AGENT_SEARCH_TIMEOUT_SECONDS` | `core-api` | Hard wait limit for each indexed search attempt and task-global rerank (`20`). |
 | `FS_EXPLORER_MULTI_AGENT_LLM_TIMEOUT_SECONDS` | `core-api` | Hard wait limit for each planner/coordinator/worker/reviewer LLM stage (`120`). |
 | `GOOGLE_API_KEY` | `core-api`, `core-indexer` | Gemini LLM + embeddings. Get one at [Google AI Studio](https://aistudio.google.com/apikey). |
@@ -109,11 +111,11 @@ User question
      ▼
 GPT-5.6 Sol global planner ── precise lookup ───▶ one search + evidence worker
      │
-     ├── coherent but multi-search question ───▶ one adaptive TaskSpec
+     ├── coherent but multi-search question ───▶ one adaptive evidence task
      │
-     └── genuinely separable question ─────────▶ bounded TaskSpec DAG
+     └── scenario / multi-part question ────────▶ typed evidence/application DAG
                                                        │
-                                  independent tasks run concurrently
+                           shared evidence tasks run concurrently
                                                        ▼
                                      Gemini 3.6 task coordinators
                                                        │
@@ -123,29 +125,46 @@ GPT-5.6 Sol global planner ── precise lookup ───▶ one search + evide
                                                        │
                                   Postgres + pgvector indexed chunks
                                                        ▼
-                             server-verified claims + compact TaskArtifacts
+                                server-verified evidence claims
+                                                       │
+                         scenario facts + claim IDs only (no new search)
+                                                       ▼
+                             Gemini 3.6 application/integration tasks
                                                        │
                                                        ▼
                                     Gemini 3.6 final synthesis
                                                        │
                                                        ▼
-                                    cited answer + exact chunk provenance
+                              scenario-specific cited answer + provenance
 ```
 
-The global planner performs routing and decomposition in the same call; there
-is no separate intent-analysis request. Every worker receives only its own
-assignment and retrieved hits, while agents exchange compact typed artifacts
-instead of chat transcripts. Task/worker fan-out, rounds, concurrency, total
-LLM calls, claims, and evidence context are all server-bounded. Invalid plans
-fall back to one direct task, and an unrecoverable multi-agent failure falls
-back to the legacy stateless indexed retrieval path.
+The global planner performs routing, intent recognition, and decomposition in
+the same call; there is no separate intent-analysis request. Its versioned plan
+maps every required answer to stable requirement IDs. Scenario plans also map
+the user's facts, material unknowns, and decision branches to evidence,
+application, and integration tasks. Deterministic validation rejects
+topic-outline plans, uncovered required outputs, invalid references, scenario
+plans without an application step, and unsafe `single_pass` routing before any
+task runs.
+
+Every search worker receives only its own assignment and retrieved hits.
+Application tasks cannot search: they receive only the scenario facts assigned
+to that task and compact artifacts from declared dependencies. Their
+conclusions must reference existing fact, branch, claim, and dependency-output
+IDs; the server rejects ungrounded references before final synthesis. Agents
+exchange these compact typed artifacts instead of chat transcripts.
+Task/worker fan-out, rounds, concurrency, total LLM calls (including one
+reserved final-synthesis call), claims, user input, and aggregate final context
+are all server-bounded. Invalid plans fall back to one direct task, and
+an unrecoverable multi-agent failure falls back to the legacy stateless indexed
+retrieval path.
 
 For a precise one-query lookup, the planner selects `single_pass`. The server
 then skips the redundant task coordinator and reviewer calls after verified
-evidence covers every criterion (planner + worker + final synthesis). If that
-first lookup leaves a gap, the same task automatically upgrades to the normal
-adaptive second wave; complex-question quality is therefore not traded for
-the common-case token saving.
+evidence covers every typed requirement (planner + worker + final synthesis).
+If that first lookup leaves a gap, the same task automatically upgrades to the
+normal adaptive second wave. Scenario and comparison plans are never eligible
+for this shortcut.
 
 Each task deduplicates candidates across its search assignments and reranks the
 union against the task question before review. Evidence/context budgets are
@@ -153,6 +172,13 @@ shared fairly across tasks and sources. In-flight indexed searches and
 structured LLM operations have stable identities, hard wait limits, and cached
 results, so a WebSocket reconnect resumes completed work without paying for
 the same operation again.
+
+Benchmark runs keep the existing single-candidate mode and also support a
+`production_roles` profile that evaluates the real heterogeneous
+planner/task/worker/final model policy. Each item stores a bounded versioned
+plan trace plus per-role token and cost usage. The answer judge receives only
+evidence chunks that the final answer actually cited, capped at six excerpts
+and 3,000 characters total.
 
 `core-api` never imports Docling — it only ever reads chunks/embeddings that
 `core-indexer` already wrote to Postgres. See [ARCHITECTURE.md](ARCHITECTURE.md)

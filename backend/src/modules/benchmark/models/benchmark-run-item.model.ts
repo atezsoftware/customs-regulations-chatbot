@@ -10,6 +10,25 @@ export interface RetrievalStepEntry {
   estimated_tokens: number;
 }
 
+export type BenchmarkPlanTrace = Record<string, unknown>;
+
+export interface BenchmarkRoleUsageEntry {
+  role: string;
+  purpose: string;
+  provider: string;
+  model: string;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  thinking_tokens: number;
+  total_tokens: number;
+  cached_input_tokens: number;
+  cache_write_tokens: number;
+  duration_ms: number;
+  cost_usd: string | null;
+  cost_source: 'provider' | 'estimated' | null;
+}
+
 @model({settings: {postgresql: {schema: 'public', table: 'benchmark_run_items'}}})
 export class BenchmarkRunItem extends Entity {
   @property({type: 'number', id: true, generated: true})
@@ -94,6 +113,19 @@ export class BenchmarkRunItem extends Entity {
     postgresql: {columnName: 'retrieval_steps', dataType: 'jsonb'},
   })
   retrievalSteps?: RetrievalStepEntry[];
+
+  @property({
+    type: 'object',
+    postgresql: {columnName: 'plan_trace', dataType: 'jsonb'},
+  })
+  planTrace?: BenchmarkPlanTrace;
+
+  @property({
+    type: 'array',
+    itemType: 'object',
+    postgresql: {columnName: 'role_usage', dataType: 'jsonb'},
+  })
+  roleUsage?: BenchmarkRoleUsageEntry[];
 
   @property({type: 'date', postgresql: {columnName: 'started_at'}})
   startedAt?: string;

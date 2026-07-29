@@ -1,5 +1,6 @@
 """Tests for the FsExplorerAgent class."""
 
+import asyncio
 import pytest
 import os
 
@@ -391,6 +392,52 @@ class _PurposeCapturingClient:
 
     def last_stream_usage(self):
         return None
+
+
+class _ReplayableFinalClient:
+    model = "test"
+
+    def __init__(self) -> None:
+        self.stream_calls = 0
+        self.release = asyncio.Event()
+
+    async def generate_structured(
+        self, history, system_prompt, schema, *, thinking_level=None
+    ):
+        return Action(reason="done", action=StopAction(final_result="done")), LLMUsage()
+
+    async def stream_text(self, history, system_prompt, *, thinking_level=None):
+        self.stream_calls += 1
+        yield "first "
+        await self.release.wait()
+        yield "second"
+
+    def last_stream_usage(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_final_answer_replays_after_consumer_disconnect_without_second_call() -> (
+    None
+):
+    client = _ReplayableFinalClient()
+    agent = FsExplorerAgent(llm_client=client)
+    agent.configure_task("evidence")
+
+    disconnected_stream = agent.stream_final_answer("fallback")
+    assert await anext(disconnected_stream) == "first "
+    await disconnected_stream.aclose()
+
+    client.release.set()
+    assert agent._final_answer_task is not None
+    await asyncio.wait_for(agent._final_answer_task, timeout=1)
+
+    replayed = "".join(
+        [chunk async for chunk in agent.stream_final_answer("different fallback")]
+    )
+
+    assert replayed == "first second"
+    assert client.stream_calls == 1
 
 
 class TestSearchFlags:

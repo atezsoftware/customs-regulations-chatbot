@@ -206,6 +206,8 @@ export class BenchmarkRunItemRepository extends DefaultCrudRepository<
       citedSources: (row.cited_sources as string[] | null) ?? undefined,
       stepPath: (row.step_path as string[] | null) ?? undefined,
       retrievalSteps: (row.retrieval_steps as BenchmarkRunItem['retrievalSteps'] | null) ?? undefined,
+      planTrace: (row.plan_trace as BenchmarkRunItem['planTrace'] | null) ?? undefined,
+      roleUsage: (row.role_usage as BenchmarkRunItem['roleUsage'] | null) ?? undefined,
       startedAt: (row.started_at as string | null) ?? undefined,
       completedAt: (row.completed_at as string | null) ?? undefined,
     };
