@@ -26,26 +26,12 @@ DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 _MAX_CONCURRENT_GEMINI_CALLS = int(os.getenv("FS_EXPLORER_LLM_MAX_CONCURRENCY", "8"))
 _llm_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GEMINI_CALLS)
 
-# Per-call ceiling, applied to every individual Gemini call (each tool-
-# planning step, each context-summary compaction, and — via `stream_text`'s
-# per-chunk wait below — the final-answer stream too). Without this, a
-# single stalled call had no bound at all: it could hang indefinitely,
-# holding a `_llm_semaphore` slot forever and eventually starving the whole
-# pool, and on the WebSocket side it surfaced only as the connection going
-# quiet until something upstream (backend, proxy) gave up and closed it —
-# "Core stream closed before completion" with nothing to explain why. A
-# bound here means a stuck call now fails fast with a clear timeout instead.
-_LLM_CALL_TIMEOUT_SECONDS = float(
-    os.getenv("FS_EXPLORER_LLM_CALL_TIMEOUT_SECONDS", "90")
-)
-
 # Transient-failure retry: `429 RESOURCE_EXHAUSTED` (rate limit) and
 # `503 UNAVAILABLE` (transient overload) are worth a short wait-and-retry
 # instead of failing the whole run outright — a chatbot request that's
 # already spent several tool-call steps shouldn't die because one call
-# got rate-limited for a moment. A call that timed out (see
-# `_LLM_CALL_TIMEOUT_SECONDS`) is retried too, on the same assumption that
-# it was a transient stall rather than a truly stuck request.
+# got rate-limited for a moment. Provider/network timeout exceptions remain
+# retryable, but this client does not impose its own wall-clock deadline.
 _LLM_RETRY_ATTEMPTS = int(os.getenv("FS_EXPLORER_LLM_RETRY_ATTEMPTS", "3"))
 _LLM_RETRY_BACKOFF_SECONDS = float(
     os.getenv("FS_EXPLORER_LLM_RETRY_BACKOFF_SECONDS", "2")
@@ -109,18 +95,15 @@ class GeminiLLMClient:
         while True:
             try:
                 async with _llm_semaphore:
-                    response = await asyncio.wait_for(
-                        self.raw_client.aio.models.generate_content(
-                            model=self.model,
-                            contents=_to_contents(history),  # ty: ignore[invalid-argument-type]
-                            config={
-                                "system_instruction": system_prompt,
-                                "response_mime_type": "application/json",
-                                "response_schema": schema,
-                                **self._generation_config(thinking_level),
-                            },
-                        ),
-                        timeout=_LLM_CALL_TIMEOUT_SECONDS,
+                    response = await self.raw_client.aio.models.generate_content(
+                        model=self.model,
+                        contents=_to_contents(history),  # ty: ignore[invalid-argument-type]
+                        config={
+                            "system_instruction": system_prompt,
+                            "response_mime_type": "application/json",
+                            "response_schema": schema,
+                            **self._generation_config(thinking_level),
+                        },
                     )
                 break
             except Exception as exc:
@@ -187,17 +170,9 @@ class GeminiLLMClient:
                     if inspect.isawaitable(stream_result):
                         stream_result = await stream_result
                     stream = stream_result.__aiter__()
-                    # Bounded per-chunk, not per-stream: a healthy stream can
-                    # legitimately run longer than one timeout window as long
-                    # as chunks keep arriving. What this catches is the
-                    # stream going silent for `_LLM_CALL_TIMEOUT_SECONDS` —
-                    # previously unbounded, so a stalled final-answer stream
-                    # could hang the whole request indefinitely.
                     while True:
                         try:
-                            chunk = await asyncio.wait_for(
-                                stream.__anext__(), timeout=_LLM_CALL_TIMEOUT_SECONDS
-                            )
+                            chunk = await stream.__anext__()
                         except StopAsyncIteration:
                             break
 

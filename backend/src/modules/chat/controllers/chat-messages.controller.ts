@@ -23,6 +23,7 @@ interface SendMessageBody {
 
 const EFFORT_LEVELS: ChatEffortLevel[] = ['low', 'medium', 'high'];
 const DEFAULT_EFFORT: ChatEffortLevel = 'low';
+const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 
 export function parseEffort(effort: string | undefined): ChatEffortLevel {
   if (effort === undefined) return DEFAULT_EFFORT;
@@ -277,7 +278,17 @@ export class ChatMessagesController {
     this.res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     this.res.setHeader('Cache-Control', 'no-cache, no-transform');
     this.res.setHeader('Connection', 'keep-alive');
+    this.res.setHeader('X-Accel-Buffering', 'no');
     this.res.flushHeaders?.();
+    // Research stages use non-streaming structured LLM calls and can be
+    // silent for a while. SSE comments keep browsers and reverse proxies
+    // connected without exposing intermediate model output to the UI.
+    const heartbeat = setInterval(() => {
+      if (!this.res.writableEnded && !this.res.destroyed) {
+        this.res.write(': keep-alive\n\n');
+      }
+    }, SSE_HEARTBEAT_INTERVAL_MS);
+    heartbeat.unref();
 
     try {
       for await (const event of this.bridge().streamAssistantResponse({
@@ -293,6 +304,7 @@ export class ChatMessagesController {
         this.res.write(sseFrame(event));
       }
     } finally {
+      clearInterval(heartbeat);
       activeStreams.delete(messageId);
       this.request.removeListener('close', onClose);
       if (!this.res.writableEnded) this.res.end();

@@ -86,8 +86,6 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 | `FS_EXPLORER_TASK_{PROVIDER,MODEL,REASONING}` | `core-api` | Task coordinator policy. Defaults to OpenRouter, `google/gemini-3.6-flash`, `medium`. |
 | `FS_EXPLORER_WORKER_{PROVIDER,MODEL,REASONING}` | `core-api` | Search worker policy. Defaults to OpenRouter, `google/gemini-3.5-flash-lite`, `low`. |
 | `FS_EXPLORER_FINAL_{PROVIDER,MODEL,REASONING}` | `core-api` | Final synthesis policy. Defaults to OpenRouter, `google/gemini-3.6-flash`, `high`. |
-| `FS_EXPLORER_MULTI_AGENT_SEARCH_TIMEOUT_SECONDS` | `core-api` | Hard wait limit for each indexed search attempt and task-global rerank (`20`). |
-| `FS_EXPLORER_MULTI_AGENT_LLM_TIMEOUT_SECONDS` | `core-api` | Hard wait limit for each planner/coordinator/worker/reviewer LLM stage (`120`). |
 | `GOOGLE_API_KEY` | `core-api`, `core-indexer` | Gemini LLM + embeddings. Get one at [Google AI Studio](https://aistudio.google.com/apikey). |
 | `DATABASE_URL` | `core-api`, `core-indexer`, `backend` | Shared Postgres connection string. |
 | `CORE_INTERNAL_TOKEN` | `core-api`, `core-indexer`, `backend` | Shared secret gating both core services' internal REST/WebSocket endpoints so only `backend` can call them. |
@@ -158,9 +156,9 @@ conclusions must reference existing fact, branch, claim, and dependency-output
 IDs; the server rejects ungrounded references before final synthesis. Agents
 exchange typed artifacts instead of chat transcripts. Production research has
 no task, worker, wave, search-count, LLM-call, claim, or artifact-count budget;
-coverage and explicit model exhaustion control termination. Operational
-per-call timeouts and cancellation remain in place so a hung provider cannot
-hold a request forever. Invalid plans are returned to the planner with exact
+coverage and explicit model exhaustion control termination. Planner, worker,
+search, rerank, and final-answer calls have no application wall-clock deadline;
+transport heartbeats keep long waits connected. Invalid plans are returned to the planner with exact
 validation errors until it produces a valid graph; no alternate planner path is
 used.
 
@@ -191,8 +189,8 @@ offer a broken continuation action.
 Each task deduplicates candidates across its search assignments and reranks the
 union against the task question before review. Complete verified evidence
 reports cross the production agent boundaries. In-flight indexed searches and
-structured LLM operations have stable identities, operational wait timeouts,
-and cached results, so a WebSocket reconnect resumes completed work without
+structured LLM operations have stable identities and cached results, so a
+WebSocket reconnect resumes completed work without
 paying for the same operation again.
 
 Benchmark runs keep the existing single-candidate mode and also support a

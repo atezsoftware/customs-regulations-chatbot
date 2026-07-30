@@ -52,7 +52,13 @@ from .orchestration_prompts import (
     build_global_planner_prompt,
     build_task_coordinator_prompt,
 )
-from .search import IndexedQueryEngine, RankedDocument, SearchHit
+from .search import (
+    IndexedQueryEngine,
+    MetadataFilterParseError,
+    RankedDocument,
+    SearchHit,
+    parse_metadata_filters,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +118,7 @@ class ResearchLimits:
 
     @classmethod
     def from_env(cls) -> "ResearchLimits":
-        """Load only concurrency, retry, and timeout safeguards for production."""
+        """Load only production concurrency safeguards."""
 
         defaults = cls()
 
@@ -128,18 +134,6 @@ class ResearchLimits:
                 raise ValueError(f"{name} must be at least 1.")
             return value
 
-        def positive_float(name: str, default: float) -> float:
-            raw = os.getenv(name)
-            if raw is None:
-                return default
-            try:
-                value = float(raw)
-            except ValueError as exc:
-                raise ValueError(f"{name} must be a number.") from exc
-            if value <= 0:
-                raise ValueError(f"{name} must be greater than 0.")
-            return value
-
         return cls(
             max_parallel_tasks=positive(
                 "FS_EXPLORER_MULTI_AGENT_MAX_PARALLEL_TASKS",
@@ -152,14 +146,6 @@ class ResearchLimits:
             max_parallel_retrievals=positive(
                 "FS_EXPLORER_MULTI_AGENT_RETRIEVAL_CONCURRENCY",
                 defaults.max_parallel_retrievals,
-            ),
-            search_timeout_seconds=positive_float(
-                "FS_EXPLORER_MULTI_AGENT_SEARCH_TIMEOUT_SECONDS",
-                defaults.search_timeout_seconds,
-            ),
-            llm_timeout_seconds=positive_float(
-                "FS_EXPLORER_MULTI_AGENT_LLM_TIMEOUT_SECONDS",
-                defaults.llm_timeout_seconds,
             ),
         )
 
@@ -580,7 +566,10 @@ class MultiAgentResearchOrchestrator:
                 self._llm_tasks[operation_id] = operation
 
         # The provider call is shielded so a WebSocket disconnect cannot
-        # discard a paid response. A resumed run awaits this same operation.
+        # discard a paid response. Production research has no stage deadline;
+        # connection heartbeats keep a slow but healthy call alive.
+        if self._unlimited_research:
+            return await asyncio.shield(operation)
         try:
             return await asyncio.wait_for(
                 asyncio.shield(operation),
@@ -1149,7 +1138,10 @@ class MultiAgentResearchOrchestrator:
                 else:
                     artifact = result
                 worker_by_assignment[assignment.assignment_id] = artifact
-                if artifact.status == WorkerStatus.FAILED:
+                if (
+                    artifact.status == WorkerStatus.FAILED
+                    and _is_transient_search_error(artifact.error_message)
+                ):
                     for query in artifact.searches_run:
                         searches_run.discard(_normalized_query(query))
                 else:
@@ -2020,6 +2012,13 @@ class MultiAgentResearchOrchestrator:
         normalized = " ".join(value.split()).strip()
         if not normalized:
             return None
+        try:
+            # A model may put search instructions or legal prose in this
+            # optional field. Invalid syntax must not suppress the semantic
+            # query itself.
+            parse_metadata_filters(normalized)
+        except (MetadataFilterParseError, ValueError):
+            return None
         if (
             not self._unlimited_research
             and len(normalized) > self._limits.max_query_chars
@@ -2058,7 +2057,7 @@ class MultiAgentResearchOrchestrator:
         self,
         assignment: SearchAssignment,
     ) -> SearchResult:
-        """Await one cached search with a hard caller-visible timeout."""
+        """Await one cached search, without a production wall-clock limit."""
 
         key = self._search_key(assignment)
         operation = self._search_tasks.get(key)
@@ -2070,6 +2069,8 @@ class MultiAgentResearchOrchestrator:
             operation.add_done_callback(_consume_background_task_exception)
             self._search_tasks[key] = operation
         try:
+            if self._unlimited_research:
+                return await asyncio.shield(operation)
             return await asyncio.wait_for(
                 asyncio.shield(operation),
                 timeout=self._limits.search_timeout_seconds,
@@ -2138,7 +2139,9 @@ class MultiAgentResearchOrchestrator:
                 successful_search_seen or artifact.status != WorkerStatus.FAILED
             )
             searches_run.extend(artifact.searches_run)
-            if artifact.status != WorkerStatus.FAILED:
+            if artifact.status != WorkerStatus.FAILED or not _is_transient_search_error(
+                artifact.error_message
+            ):
                 completed_queries.update(
                     _normalized_query(query)
                     for query in artifact.searches_run
@@ -2827,10 +2830,13 @@ class MultiAgentResearchOrchestrator:
                 operation.add_done_callback(_consume_background_task_exception)
                 self._task_rerank_tasks[spec.task_id] = operation
             try:
-                ranked_pairs = await asyncio.wait_for(
-                    asyncio.shield(operation),
-                    timeout=self._limits.search_timeout_seconds,
-                )
+                if self._unlimited_research:
+                    ranked_pairs = await asyncio.shield(operation)
+                else:
+                    ranked_pairs = await asyncio.wait_for(
+                        asyncio.shield(operation),
+                        timeout=self._limits.search_timeout_seconds,
+                    )
             except TimeoutError:
                 logger.warning(
                     "Task-global rerank timed out for %s; using retrieval scores",

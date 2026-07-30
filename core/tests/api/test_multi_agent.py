@@ -949,6 +949,94 @@ def test_near_duplicate_queries_are_rejected_without_an_llm_call() -> None:
     )
 
 
+def test_natural_language_metadata_filter_is_discarded() -> None:
+    orchestrator = MultiAgentResearchOrchestrator(
+        planner_llm=_ScriptedClient("planner", lambda _schema, _text: None),
+        task_llm=_ScriptedClient("task", lambda _schema, _text: None),
+        worker_llm=_ScriptedClient("worker", lambda _schema, _text: None),
+        search_runner=lambda **_kwargs: _SearchResult(query="", hits=[]),
+        search_runner_in_thread=False,
+    )
+
+    assert orchestrator._bounded_filter("Öncelikle yürürlükteki resmî mevzuat") is None
+    assert orchestrator._bounded_filter("document_type=tebliğ") == (
+        "document_type=tebliğ"
+    )
+
+
+@pytest.mark.asyncio
+async def test_production_lookup_searches_without_planner_prose_filter() -> None:
+    task = _task("task_1", "TIR karnesi ek teminat").model_copy(
+        update={"filters": "Öncelikle yürürlükteki resmî mevzuat"}
+    )
+    planner = _ScriptedClient(
+        "planner",
+        lambda _schema, _text: _plan(
+            task,
+            execution_strategy=ExecutionStrategy.SINGLE_PASS,
+        ),
+    )
+    seen_filters: list[str | None] = []
+
+    def search(**kwargs):
+        seen_filters.append(kwargs["filters"])
+        return _SearchResult(query=kwargs["query"], hits=[_hit("task_1")])
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", _task_responder),
+        worker_llm=_ScriptedClient("worker", _unlimited_worker_responder),
+        search_runner=search,
+        search_runner_in_thread=False,
+    ).run("TIR karnesi ek teminat")
+
+    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
+    assert seen_filters == [None]
+
+
+@pytest.mark.asyncio
+async def test_production_structured_stage_has_no_wall_clock_timeout() -> None:
+    class SlowClient(_ScriptedClient):
+        async def generate_structured(
+            self,
+            history,
+            system_prompt,
+            schema,
+            *,
+            thinking_level=None,
+        ):
+            await asyncio.sleep(0.03)
+            return await super().generate_structured(
+                history,
+                system_prompt,
+                schema,
+                thinking_level=thinking_level,
+            )
+
+    plan = _plan(_task("task_1", "Question one"))
+    planner = SlowClient("planner", lambda _schema, _text: plan)
+    orchestrator = MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", lambda _schema, _text: None),
+        worker_llm=_ScriptedClient("worker", lambda _schema, _text: None),
+        search_runner=lambda **_kwargs: _SearchResult(query="", hits=[]),
+        search_runner_in_thread=False,
+    )
+    object.__setattr__(orchestrator._limits, "llm_timeout_seconds", 0.001)
+
+    result = await orchestrator._generate_structured(
+        client=planner,
+        role="planner",
+        purpose="global_plan",
+        prompt="system",
+        user_text="Question one",
+        operation_id="no-timeout",
+        schema=GlobalPlan,
+    )
+
+    assert result[0] is plan
+
+
 @pytest.mark.asyncio
 async def test_independent_tasks_search_in_parallel_without_sibling_context() -> None:
     task_1 = _task("task_1", "Question one")

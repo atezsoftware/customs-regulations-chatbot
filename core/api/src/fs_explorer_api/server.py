@@ -5,12 +5,14 @@ Provides a WebSocket endpoint for real-time workflow streaming
 and serves the single-page HTML interface.
 """
 
+import asyncio
 import html
 import logging
 import re
 import time
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, TypeVar
 
 from fastapi import (
     Depends,
@@ -73,6 +75,36 @@ from .workflow import (
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FsExplorer", description="AI-powered filesystem exploration")
+_T = TypeVar("_T")
+_WEBSOCKET_HEARTBEAT_SECONDS = 10.0
+
+
+async def _await_with_websocket_heartbeat(
+    awaitable: Awaitable[_T],
+    websocket: WebSocket,
+    *,
+    phase: str,
+    interval_seconds: float = _WEBSOCKET_HEARTBEAT_SECONDS,
+) -> _T:
+    """Await slow work while keeping the internal WebSocket visibly alive."""
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=interval_seconds,
+            )
+            if done:
+                return await task
+            # This is transport liveness, not model-token streaming. The
+            # backend intentionally does not surface it as a research step.
+            await websocket.send_json({"type": "heartbeat", "data": {"phase": phase}})
+    finally:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 def _decode_html_entities(value: str) -> str:
@@ -947,7 +979,18 @@ async def _finish_run(
         )
         await websocket.send_json({"type": "answer_start", "data": {}})
         streamed_parts: list[str] = []
-        async for chunk in agent.stream_final_answer(fallback_answer=final_result):
+        answer_stream = agent.stream_final_answer(
+            fallback_answer=final_result
+        ).__aiter__()
+        while True:
+            try:
+                chunk = await _await_with_websocket_heartbeat(
+                    answer_stream.__anext__(),
+                    websocket,
+                    phase="final_answer",
+                )
+            except StopAsyncIteration:
+                break
             streamed_parts.append(chunk)
             await websocket.send_json({"type": "answer_delta", "data": {"text": chunk}})
         await flush_llm_calls()
@@ -1275,7 +1318,16 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             )
         )
 
-        async for event in handler.stream_events():
+        workflow_events = handler.stream_events().__aiter__()
+        while True:
+            try:
+                event = await _await_with_websocket_heartbeat(
+                    workflow_events.__anext__(),
+                    websocket,
+                    phase="research",
+                )
+            except StopAsyncIteration:
+                break
             await _flush_llm_calls()
             await _flush_retrieval_stats()
             if isinstance(event, ResearchProgressEvent):
@@ -1603,7 +1655,11 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
         send_value: str | None = None
         while True:
             try:
-                event = await gen.asend(send_value)
+                event = await _await_with_websocket_heartbeat(
+                    gen.asend(send_value),
+                    websocket,
+                    phase="research",
+                )
             except StopAsyncIteration:
                 break
             send_value = None

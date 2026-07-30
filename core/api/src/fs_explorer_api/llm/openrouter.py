@@ -335,7 +335,10 @@ class OpenRouterLLMClient:
         self._enable_reasoning_effort = enable_reasoning_effort
         self._client = client or httpx.AsyncClient(
             base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-            timeout=float(os.getenv("OPENROUTER_REQUEST_TIMEOUT_SECONDS", "90")),
+            # Planning and research stages may legitimately take longer than
+            # a fixed request deadline. Connection-level heartbeats keep the
+            # user-facing stream alive while this call remains pending.
+            timeout=None,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", ""),

@@ -20,6 +20,7 @@ from fs_explorer_api.agent import (
     TokenUsage,
     _build_system_prompt,
     _chunk_context_from_storage,
+    _run_planned_index_search,
     set_search_flags,
     get_search_flags,
     set_effort,
@@ -35,6 +36,7 @@ from fs_explorer_api.models import (
     StopAction,
 )
 from fs_explorer_api.search.ranker import RankedDocument
+from fs_explorer_api.search import MetadataFilterParseError
 from .conftest import make_mock_llm_client
 
 
@@ -499,6 +501,40 @@ class TestSearchFlags:
     def test_build_system_prompt_both(self) -> None:
         prompt = _build_system_prompt(True, True)
         assert "Semantic + Metadata" in prompt
+
+    def test_planned_search_retries_unknown_filter_without_filter(self) -> None:
+        storage = Mock()
+        engine = Mock()
+        engine.search.side_effect = [
+            MetadataFilterParseError("Unknown metadata field"),
+            [],
+        ]
+
+        with (
+            patch(
+                "fs_explorer_api.agent._get_index_storage_and_corpora",
+                return_value=(
+                    storage,
+                    [IndexedCorpus(root_folder="/corpus", corpus_id="corpus-1")],
+                    None,
+                ),
+            ),
+            patch("fs_explorer_api.agent.IndexedQueryEngine", return_value=engine),
+        ):
+            result = _run_planned_index_search(
+                query="TIR ek teminat",
+                filters="unknown_field=value",
+            )
+
+        assert result.error is None
+        assert result.hits == []
+        assert engine.search.call_count == 2
+        assert engine.search.call_args_list[0].kwargs["filters"] == (
+            "unknown_field=value"
+        )
+        assert engine.search.call_args_list[1].kwargs["filters"] is None
+        assert engine.search.call_args_list[1].kwargs["enable_metadata"] is False
+        storage.close.assert_called_once()
 
     @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
     def test_all_tools_always_available(self) -> None:

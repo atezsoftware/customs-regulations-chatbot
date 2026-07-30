@@ -134,6 +134,8 @@ interface QueueItem {
   event?: CoreEvent;
   error?: Error;
   closed?: boolean;
+  closeCode?: number;
+  closeReason?: string;
 }
 
 class AsyncQueue {
@@ -198,6 +200,7 @@ export class CoreBridgeService {
     let closedByAbort = false;
     let terminalEventSeen = false;
     let llmCallsRecorded = 0;
+    let unexpectedCloseDetail = '';
     // Captured from core-api's `start` event so a later error/disconnect
     // can be reported back with the run_id the caller needs to resume it.
     let capturedRunId: string | undefined;
@@ -229,8 +232,12 @@ export class CoreBridgeService {
       ws.addEventListener('error', () => {
         queue.push({error: new Error('Core WebSocket connection failed.')});
       });
-      ws.addEventListener('close', () => {
-        queue.push({closed: true});
+      ws.addEventListener('close', event => {
+        queue.push({
+          closed: true,
+          closeCode: event.code,
+          closeReason: event.reason,
+        });
       });
 
       ws.send(
@@ -261,7 +268,15 @@ export class CoreBridgeService {
 
       while (true) {
         const item = await queue.next();
-        if (item.closed) break;
+        if (item.closed) {
+          if (!closedByAbort && !terminalEventSeen) {
+            const reason = text(item.closeReason);
+            unexpectedCloseDetail = ` (WebSocket code ${item.closeCode ?? 'unknown'}${
+              reason ? `: ${reason}` : ''
+            })`;
+          }
+          break;
+        }
         if (item.error) throw item.error;
         if (!item.event) continue;
 
@@ -628,7 +643,7 @@ export class CoreBridgeService {
         });
         yield {type: 'cancelled', messageId: input.assistantMessageId};
       } else if (!terminalEventSeen) {
-        throw new Error('Core stream closed before completion.');
+        throw new Error(`Core stream closed before completion${unexpectedCloseDetail}.`);
       }
     } catch (error) {
       const message = formatChatError(error);

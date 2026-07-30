@@ -1,8 +1,15 @@
+import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from fs_explorer_api.agent import _normalize_indexed_text
-from fs_explorer_api.server import _completion_is_incomplete, _decode_html_entities
+from fs_explorer_api.server import (
+    _await_with_websocket_heartbeat,
+    _completion_is_incomplete,
+    _decode_html_entities,
+)
 
 
 def test_decode_html_entities_preserves_turkish_text() -> None:
@@ -30,3 +37,29 @@ def test_completion_surfaces_terminal_multi_agent_evidence_gaps() -> None:
     assert (
         _completion_is_incomplete(agent=agent, result_error="provider failed") is False
     )
+
+
+@pytest.mark.asyncio
+async def test_slow_work_emits_transport_heartbeats_until_result() -> None:
+    class RecordingWebSocket:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        async def send_json(self, message: dict[str, object]) -> None:
+            self.messages.append(message)
+
+    async def slow_result() -> str:
+        await asyncio.sleep(0.035)
+        return "finished"
+
+    websocket = RecordingWebSocket()
+    result = await _await_with_websocket_heartbeat(
+        slow_result(),
+        cast(Any, websocket),
+        phase="research",
+        interval_seconds=0.01,
+    )
+
+    assert result == "finished"
+    assert len(websocket.messages) >= 2
+    assert all(message["type"] == "heartbeat" for message in websocket.messages)

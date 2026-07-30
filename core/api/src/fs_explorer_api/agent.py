@@ -1164,8 +1164,8 @@ def _run_planned_index_search(
     hits: list[SearchHit] = []
     try:
         for corpus in corpora:
-            hits.extend(
-                engine.search(
+            try:
+                corpus_hits = engine.search(
                     corpus_id=corpus.corpus_id,
                     query=query,
                     filters=filters,
@@ -1175,7 +1175,22 @@ def _run_planned_index_search(
                     as_of_date=as_of_date,
                     overfetch_multiplier=effort_config["overfetch_multiplier"],
                 )
-            )
+            except MetadataFilterParseError:
+                # Corpus-specific unknown fields can only be detected here.
+                # A metadata filter is an optional narrowing hint, so retry
+                # the semantic query without it instead of returning zero
+                # evidence and triggering a futile agent retry loop.
+                corpus_hits = engine.search(
+                    corpus_id=corpus.corpus_id,
+                    query=query,
+                    filters=None,
+                    limit=effort_config["default_limit"],
+                    enable_semantic=_ENABLE_SEMANTIC_VAR.get(),
+                    enable_metadata=False,
+                    as_of_date=as_of_date,
+                    overfetch_multiplier=effort_config["overfetch_multiplier"],
+                )
+            hits.extend(corpus_hits)
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return PlannedSearchResult(
             query=query,
