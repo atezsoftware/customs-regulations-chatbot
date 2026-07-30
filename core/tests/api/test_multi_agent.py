@@ -1,4 +1,4 @@
-"""Tests for bounded, context-isolated multi-agent indexed research."""
+"""Tests for context-isolated, model-controlled multi-agent research."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from typing import Callable
 
 import pytest
 
-from fs_explorer_api.llm import ChatTurn, LLMUsage
+from fs_explorer_api.llm import ChatTurn, LLMClient, LLMUsage
+from fs_explorer_api.llm.profile import LLMRole
 from fs_explorer_api.multi_agent import (
     EvidenceRecord,
     MultiAgentResearchOrchestrator,
@@ -330,6 +331,18 @@ def _worker_responder(schema: type, text: str) -> object:
     )
 
 
+def _unlimited_worker_responder(schema: type, text: str) -> object:
+    if schema is SearchAssignmentBatch:
+        assert "LAST INDEXED_SEARCH TOOL RESULT" in text
+        return SearchAssignmentBatch(
+            task_id=_task_id_from_text(text),
+            stop=True,
+            stop_reason="The latest verified result sufficiently supports the need.",
+            assignments=[],
+        )
+    return _worker_responder(schema, text)
+
+
 def _limits() -> ResearchLimits:
     return ResearchLimits(
         max_tasks=5,
@@ -432,6 +445,16 @@ async def test_unlimited_search_agent_self_corrects_until_it_finds_evidence() ->
     def worker_responder(schema: type, text: str) -> object:
         if schema is SearchAssignmentBatch:
             continuation_inputs.append(text)
+            if "Evidence text for task_1." in text:
+                return SearchAssignmentBatch(
+                    task_id="task_1",
+                    stop=True,
+                    stop_reason=(
+                        "The latest evidence supports the assigned requirement "
+                        "and exposes no unresolved exception or cross-reference."
+                    ),
+                    assignments=[],
+                )
             query = (
                 "correct instrument terminology"
                 if len(continuation_inputs) == 1
@@ -494,9 +517,10 @@ async def test_unlimited_search_agent_self_corrects_until_it_finds_evidence() ->
         "correct instrument terminology",
         "cross referenced procedure phrase",
     ]
-    assert len(continuation_inputs) == 2
+    assert len(continuation_inputs) == 3
     assert "initial wrong terminology" in continuation_inputs[0]
     assert "correct instrument terminology" in continuation_inputs[1]
+    assert "Evidence text for task_1." in continuation_inputs[2]
     assert result.task_artifacts[0].status == TaskStatus.COMPLETE
     assert result.incomplete is False
     assert "Evidence text for task_1." in result.final_context
@@ -570,6 +594,163 @@ async def test_unlimited_search_stops_only_after_search_agent_reports_exhaustion
     assert len(worker.calls) == 1
     assert result.incomplete is True
     assert result.task_artifacts[0].status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_task_coordinator_repairs_non_executable_stop() -> None:
+    task = _task("task_1", "governing instrument phrase")
+    planner = _ScriptedClient("planner", lambda _schema, _text: _plan(task))
+    coordinator_calls = 0
+
+    def task_responder(schema: type, text: str) -> object:
+        nonlocal coordinator_calls
+        if schema is TaskArtifact:
+            return TaskArtifact(
+                task_id="task_1",
+                status=TaskStatus.COMPLETE,
+                answer_fragment=None,
+                covered_requirement_ids=[],
+                uncovered_requirement_ids=["criterion-task_1"],
+                claims=[],
+                application_findings=[],
+                conflicts=[],
+                gaps=[],
+                contributing_worker_ids=[],
+            )
+        coordinator_calls += 1
+        if coordinator_calls == 1:
+            return SearchAssignmentBatch(
+                task_id="task_1",
+                stop=True,
+                stop_reason="Stopped before delegating.",
+                assignments=[],
+            )
+        assert "REJECTED PREVIOUS DECISION" in text
+        assert "delegate at least one search" in text
+        return SearchAssignmentBatch(
+            task_id="task_1",
+            stop=False,
+            stop_reason=None,
+            assignments=[
+                SearchAssignment(
+                    assignment_id="agent_chosen_search",
+                    task_id="task_1",
+                    query="governing instrument phrase",
+                    objective="Search the governing instrument wording.",
+                    evidence_requirements=["criterion-task_1"],
+                    excluded_queries=[],
+                    as_of_date=None,
+                    filters=None,
+                )
+            ],
+        )
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", task_responder),
+        worker_llm=_ScriptedClient("worker", _unlimited_worker_responder),
+        search_runner=lambda **kwargs: _SearchResult(
+            query=kwargs["query"],
+            hits=[_hit("task_1")],
+        ),
+        search_runner_in_thread=False,
+    ).run("Find the governing rule.")
+
+    assert coordinator_calls == 2
+    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_search_agent_may_retry_same_tool_call_after_transient_failure() -> None:
+    task = _task("task_1", "exact governing phrase")
+    planner = _ScriptedClient("planner", lambda _schema, _text: _plan(task))
+    search_calls = 0
+
+    def task_responder(schema: type, text: str) -> object:
+        if schema is SearchAssignmentBatch:
+            return SearchAssignmentBatch(
+                task_id="task_1",
+                stop=False,
+                stop_reason=None,
+                assignments=[
+                    SearchAssignment(
+                        assignment_id="initial_exact",
+                        task_id="task_1",
+                        query="exact governing phrase",
+                        objective="Run the exact indexed search.",
+                        evidence_requirements=["criterion-task_1"],
+                        excluded_queries=[],
+                        as_of_date=None,
+                        filters=None,
+                    )
+                ],
+            )
+        return TaskArtifact(
+            task_id="task_1",
+            status=TaskStatus.COMPLETE,
+            answer_fragment=None,
+            covered_requirement_ids=[],
+            uncovered_requirement_ids=["criterion-task_1"],
+            claims=[],
+            application_findings=[],
+            conflicts=[],
+            gaps=[],
+            contributing_worker_ids=[],
+        )
+
+    def worker_responder(schema: type, text: str) -> object:
+        if schema is SearchAssignmentBatch:
+            if "Evidence text for task_1." in text:
+                return SearchAssignmentBatch(
+                    task_id="task_1",
+                    stop=True,
+                    stop_reason="The successful retry supports the requirement.",
+                    assignments=[],
+                )
+            assert "worker_execution_failed" in text
+            return SearchAssignmentBatch(
+                task_id="task_1",
+                stop=False,
+                stop_reason=None,
+                assignments=[
+                    SearchAssignment(
+                        assignment_id="retry_exact",
+                        task_id="task_1",
+                        query="exact governing phrase",
+                        objective=(
+                            "The tool failed transiently; retry the same valid "
+                            "search instead of treating it as corpus exhaustion."
+                        ),
+                        evidence_requirements=["criterion-task_1"],
+                        excluded_queries=[],
+                        as_of_date=None,
+                        filters=None,
+                    )
+                ],
+            )
+        return _worker_responder(schema, text)
+
+    def search(**kwargs):
+        nonlocal search_calls
+        search_calls += 1
+        if search_calls <= 2:
+            return _SearchResult(
+                query=kwargs["query"],
+                hits=[],
+                error="temporary connection timeout",
+            )
+        return _SearchResult(query=kwargs["query"], hits=[_hit("task_1")])
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", task_responder),
+        worker_llm=_ScriptedClient("worker", worker_responder),
+        search_runner=search,
+        search_runner_in_thread=False,
+    ).run("Find the exact rule.")
+
+    assert search_calls == 3
+    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
 
 
 @pytest.mark.asyncio
@@ -654,119 +835,39 @@ async def test_single_pass_direct_skips_redundant_task_llm_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_semantically_invalid_plan_runs_safe_adaptive_fallback() -> None:
+async def test_semantically_invalid_plan_is_returned_to_planner_for_correction() -> (
+    None
+):
     original_question = "What is the original filing requirement?"
     invalid = _plan(
         _task("one", "First duplicate part"),
         _task("two", "Second duplicate part"),
     ).model_copy(update={"problem_type": ProblemType.LOOKUP})
-    planner = _ScriptedClient("planner", lambda _schema, _text: invalid)
-
-    def task_responder(schema: type, text: str) -> object:
-        if schema is SearchAssignmentBatch:
-            return SearchAssignmentBatch(
-                task_id="task_1",
-                stop=False,
-                stop_reason=None,
-                assignments=[
-                    SearchAssignment(
-                        assignment_id="fallback_search",
-                        task_id="task_1",
-                        query=original_question,
-                        objective="Answer the preserved original question.",
-                        evidence_requirements=["evidence_1"],
-                        excluded_queries=[],
-                        as_of_date=None,
-                        filters=None,
-                    )
-                ],
-            )
-        assert schema is TaskArtifact
-        claim = EvidenceClaim(
-            claim_id="fallback_claim",
-            claim="The indexed rule answers the original question.",
-            document_id="doc-fallback",
-            chunk_id="chunk-fallback",
-            readable_title="Fallback Regulation",
-            locator="Article 1",
-            evidence_excerpt="The filing requirement is thirty days.",
-            requirement_ids=["req_1"],
-            evidence_requirement_ids=["evidence_1"],
-            fact_ids=[],
-            confidence=EvidenceConfidence.HIGH,
-            effective_start_date=None,
-            effective_end_date=None,
-        )
-        return TaskArtifact(
-            task_id="task_1",
-            status=TaskStatus.COMPLETE,
-            answer_fragment=claim.claim,
-            covered_requirement_ids=["req_1"],
-            uncovered_requirement_ids=[],
-            claims=[claim],
-            application_findings=[],
-            conflicts=[],
-            gaps=[],
-            contributing_worker_ids=["worker-task_1-fallback_search"],
-        )
-
-    def worker_responder(schema: type, _text: str) -> object:
-        assert schema is WorkerArtifact
-        return WorkerArtifact(
-            task_id="task_1",
-            assignment_id="fallback_search",
-            worker_id="worker-task_1-fallback_search",
-            status=WorkerStatus.SUCCESS,
-            searches_run=[original_question],
-            claims=[
-                EvidenceClaim(
-                    claim_id="candidate_claim",
-                    claim="The indexed rule answers the original question.",
-                    document_id="doc-fallback",
-                    chunk_id="chunk-fallback",
-                    readable_title="Fallback Regulation",
-                    locator="Article 1",
-                    evidence_excerpt="The filing requirement is thirty days.",
-                    requirement_ids=["req_1"],
-                    evidence_requirement_ids=["evidence_1"],
-                    fact_ids=[],
-                    confidence=EvidenceConfidence.HIGH,
-                    effective_start_date=None,
-                    effective_end_date=None,
-                )
-            ],
-            gaps=[],
-            cross_references=[],
-            error_code=None,
-            error_message=None,
-        )
-
-    result = await MultiAgentResearchOrchestrator(
+    corrected = _plan(_task("task_1", original_question))
+    responses = iter([invalid, corrected])
+    planner = _ScriptedClient("planner", lambda _schema, _text: next(responses))
+    orchestrator = MultiAgentResearchOrchestrator(
         planner_llm=planner,
-        task_llm=_ScriptedClient("task", task_responder),
-        worker_llm=_ScriptedClient("worker", worker_responder),
-        search_runner=lambda **kwargs: _SearchResult(
-            query=kwargs["query"],
-            hits=[
-                _source_hit(
-                    document_id="doc-fallback",
-                    chunk_id="chunk-fallback",
-                    relative_path="fallback_regulation.pdf",
-                    article="1",
-                    text="The filing requirement is thirty days.",
-                    score=1.0,
-                )
-            ],
+        task_llm=_ScriptedClient(
+            "task",
+            lambda _schema, _text: pytest.fail("Planning must not run tasks."),
         ),
-        limits=_limits(),
+        worker_llm=_ScriptedClient(
+            "worker",
+            lambda _schema, _text: pytest.fail("Planning must not run workers."),
+        ),
+        search_runner=lambda **_kwargs: pytest.fail("Planning must not search."),
         search_runner_in_thread=False,
-    ).run(original_question)
+    )
 
-    assert result.used_plan_fallback is True
-    assert result.plan.mode == PlanMode.DIRECT
-    assert result.plan.execution_strategy == ExecutionStrategy.ADAPTIVE
-    assert result.plan.normalized_question == original_question
-    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
+    plan = await orchestrator._create_plan(original_question)
+
+    assert plan is corrected
+    assert len(planner.calls) == 2
+    correction_text = planner.calls[1][1][0].text
+    assert "YOUR PREVIOUS PLAN FAILED SERVER VALIDATION" in correction_text
+    assert "lookup plans must use one direct task" in correction_text
+    assert "do not replace it with a simplified graph" in correction_text
 
 
 @pytest.mark.asyncio
@@ -835,125 +936,6 @@ async def test_single_pass_coverage_miss_upgrades_to_adaptive_wave() -> None:
     gap_events = [event for event in progress if event.kind == "gap_recovery_started"]
     assert len(gap_events) == 1
     assert "criterion-task_1" in gap_events[0].detail
-
-
-@pytest.mark.asyncio
-async def test_premature_stop_escalates_to_a_distinct_recovery_search() -> None:
-    planner = _ScriptedClient(
-        "planner",
-        lambda schema, _text: _plan(_task("task_1", "Question one")),
-    )
-
-    def task_responder(schema: type, text: str) -> object:
-        if schema is SearchAssignmentBatch:
-            if "PERSISTENT GAP RECOVERY WAVE" in text:
-                return SearchAssignmentBatch(
-                    task_id="task_1",
-                    stop=False,
-                    stop_reason=None,
-                    assignments=[
-                        SearchAssignment(
-                            assignment_id="different-angle",
-                            task_id="task_1",
-                            query="alternative exception terminology",
-                            objective="Try a distinct legal terminology angle.",
-                            evidence_requirements=["criterion-task_1"],
-                            excluded_queries=["query-task_1"],
-                            as_of_date=None,
-                            filters=None,
-                        )
-                    ],
-                )
-            if "WORKER ARTIFACTS SO FAR:\n[]" in text:
-                return _task_responder(schema, text)
-            return SearchAssignmentBatch(
-                task_id="task_1",
-                stop=True,
-                stop_reason="The first query returned no evidence.",
-                assignments=[],
-            )
-        return _task_responder(schema, text)
-
-    searches: list[str] = []
-    progress: list[ResearchProgress] = []
-
-    def search(**kwargs):
-        query = kwargs["query"]
-        searches.append(query)
-        return _SearchResult(
-            query=query,
-            hits=(
-                [_hit("task_1")] if query == "alternative exception terminology" else []
-            ),
-        )
-
-    result = await MultiAgentResearchOrchestrator(
-        planner_llm=planner,
-        task_llm=_ScriptedClient("task", task_responder),
-        worker_llm=_ScriptedClient("worker", _worker_responder),
-        search_runner=search,
-        limits=_limits(),
-        on_progress=progress.append,
-        search_runner_in_thread=False,
-    ).run("Question one")
-
-    assert searches == ["query-task_1", "alternative exception terminology"]
-    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
-    assert result.incomplete is False
-    assert any(event.kind == "search_persistence_enforced" for event in progress)
-
-
-@pytest.mark.asyncio
-async def test_uncovered_requirement_gets_three_angles_before_stop_is_accepted() -> (
-    None
-):
-    planner = _ScriptedClient(
-        "planner",
-        lambda schema, _text: _plan(_task("task_1", "Question one")),
-    )
-
-    def task_responder(schema: type, text: str) -> object:
-        assert schema is SearchAssignmentBatch
-        if "WORKER ARTIFACTS SO FAR:\n[]" in text:
-            return _task_responder(schema, text)
-        return SearchAssignmentBatch(
-            task_id="task_1",
-            stop=True,
-            stop_reason="No more searches proposed.",
-            assignments=[],
-        )
-
-    searches: list[str] = []
-    progress: list[ResearchProgress] = []
-
-    result = await MultiAgentResearchOrchestrator(
-        planner_llm=planner,
-        task_llm=_ScriptedClient("task", task_responder),
-        worker_llm=_ScriptedClient(
-            "worker",
-            lambda _schema, _text: pytest.fail(
-                "Empty searches must not spend evidence-extraction tokens"
-            ),
-        ),
-        search_runner=lambda **kwargs: (
-            searches.append(kwargs["query"])
-            or _SearchResult(query=kwargs["query"], hits=[])
-        ),
-        limits=replace(
-            _limits(),
-            max_worker_rounds=4,
-            max_total_workers=12,
-        ),
-        on_progress=progress.append,
-        search_runner_in_thread=False,
-    ).run("Question one")
-
-    assert len(searches) == 3
-    assert len({_normalized.casefold() for _normalized in searches}) == 3
-    assert result.incomplete is True
-    exhausted = [event for event in progress if event.kind == "gap_recovery_exhausted"]
-    assert len(exhausted) == 1
-    assert "3 farklı hedefli aramaya rağmen" in exhausted[0].detail
 
 
 def test_near_duplicate_queries_are_rejected_without_an_llm_call() -> None:
@@ -1581,10 +1563,11 @@ async def test_total_worker_budget_is_shared_fairly_across_ready_tasks() -> None
         search_runner_in_thread=False,
     ).run("Answer all three parts")
 
-    searched_tasks = [
-        re.search(r"(task_\d+)", query).group(1)  # type: ignore[union-attr]
-        for query in searches
-    ]
+    searched_tasks: list[str] = []
+    for query in searches:
+        match = re.search(r"(task_\d+)", query)
+        assert match is not None
+        searched_tasks.append(match.group(1))
     assert sorted(searched_tasks) == ["task_1", "task_2", "task_3"]
     assert all(
         artifact.status == TaskStatus.COMPLETE for artifact in result.task_artifacts
@@ -1934,7 +1917,7 @@ async def test_workflow_streams_multi_agent_progress_and_prepares_final_context(
         ),
     )
 
-    roles = {
+    roles: dict[LLMRole, LLMClient] = {
         "planner": _ScriptedClient(
             "planner",
             lambda schema, _text: _plan(_task("task_1", "Question one")),

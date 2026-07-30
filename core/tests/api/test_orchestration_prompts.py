@@ -8,7 +8,6 @@ from fs_explorer_api.orchestration_prompts import (
     TASK_COORDINATOR_SYSTEM_PROMPT,
     TASK_REVIEW_SYSTEM_PROMPT,
     WORKER_SEARCH_CONTINUATION_PROMPT,
-    build_gap_recovery_prompt,
     build_global_planner_prompt,
     build_task_coordinator_prompt,
 )
@@ -17,8 +16,8 @@ from fs_explorer_api.orchestration_prompts import (
 def test_global_planner_prompt_routes_without_separate_intent_call() -> None:
     prompt = build_global_planner_prompt(max_tasks=4)
 
-    assert "In this one call, understand the request" in prompt
-    assert "intent-analysis task/call" in prompt
+    assert "In one call, classify the request" in prompt
+    assert "intent-analysis call" in prompt
     assert "problem_type=lookup, mode=direct" in prompt
     assert "execution_strategy=single_pass only" in prompt
     assert "Decomposed plans use adaptive and contain 2 to 4 tasks" in prompt
@@ -52,15 +51,6 @@ def test_task_coordinator_prompt_enforces_bounded_non_recursive_fanout() -> None
     assert "OUTPUT CONTRACT — SearchAssignmentBatch" in prompt
 
 
-def test_gap_recovery_prompt_forbids_stopping_after_one_empty_query() -> None:
-    prompt = build_gap_recovery_prompt(max_assignments_per_wave=2)
-
-    assert "stop must be false" in prompt
-    assert "issue 1 to 2" in prompt
-    assert "Do not merely\n  reorder or lightly paraphrase" in prompt
-    assert "explicit unresolved cross-reference" in prompt
-
-
 def test_unlimited_prompts_delegate_stop_and_contextual_self_correction() -> None:
     planner = build_global_planner_prompt(max_tasks=None, max_list_items=None)
     coordinator = build_task_coordinator_prompt(
@@ -72,6 +62,17 @@ def test_unlimited_prompts_delegate_stop_and_contextual_self_correction() -> Non
     assert "Include every material item" in planner
     assert "There is no scheduler wave limit" in coordinator
     assert "explicit exhaustion reports" in coordinator
+    assert "control the `indexed_search` tool" in WORKER_SEARCH_CONTINUATION_PROMPT
+    assert "After every tool result, decide" in WORKER_SEARCH_CONTINUATION_PROMPT
+    assert "request exactly one next SearchAssignment" in (
+        WORKER_SEARCH_CONTINUATION_PROMPT
+    )
+    assert "Even when the formal requirement appears supported" in (
+        WORKER_SEARCH_CONTINUATION_PROMPT
+    )
+    assert "scheduler does not make this research judgment" in (
+        WORKER_SEARCH_CONTINUATION_PROMPT
+    )
     assert "correct a wrong term, jurisdiction/instrument assumption" in (
         WORKER_SEARCH_CONTINUATION_PROMPT
     )

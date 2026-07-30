@@ -15,7 +15,6 @@ Semantic validation remains server-owned and deterministic.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, Sequence
 
@@ -479,15 +478,6 @@ class ArtifactValidationError(ValueError):
     def __init__(self, errors: Sequence[str]) -> None:
         self.errors = tuple(errors)
         super().__init__("Invalid task artifact: " + "; ".join(self.errors))
-
-
-@dataclass(frozen=True)
-class PlanResolution:
-    """Validated planner output or a deterministic direct-mode fallback."""
-
-    plan: GlobalPlan
-    used_fallback: bool
-    validation_errors: tuple[str, ...]
 
 
 def _validate_id(
@@ -1177,98 +1167,3 @@ def validate_task_artifact(
     if errors:
         raise ArtifactValidationError(errors)
     return artifact
-
-
-def make_direct_fallback_plan(original_question: str) -> GlobalPlan:
-    """Create a safe adaptive evidence task when planning or validation fails."""
-
-    question = original_question.strip()
-    if not question:
-        raise ValueError("original_question must not be blank")
-    return GlobalPlan(
-        version="3",
-        problem_type=ProblemType.LOOKUP,
-        mode=PlanMode.DIRECT,
-        execution_strategy=ExecutionStrategy.ADAPTIVE,
-        normalized_question=question,
-        answer_requirements=[
-            AnswerRequirement(
-                requirement_id="req_1",
-                kind=AnswerRequirementKind.OUTCOME,
-                description="Answer every explicit part of the original question.",
-                required=True,
-            )
-        ],
-        scenario=None,
-        tasks=[
-            TaskSpec(
-                task_id="task_1",
-                kind=TaskKind.EVIDENCE,
-                issue=question,
-                search_question=question,
-                requirement_ids=["req_1"],
-                fact_ids=[],
-                unknown_ids=[],
-                branch_ids=[],
-                evidence_requirements=[
-                    EvidenceRequirement(
-                        evidence_requirement_id="evidence_1",
-                        kind=EvidenceRequirementKind.GOVERNING_RULE,
-                        description=(
-                            "Evidence sufficient to answer every explicit part "
-                            "of the original question."
-                        ),
-                        requirement_ids=["req_1"],
-                    )
-                ],
-                consumes=[],
-                produces=[
-                    TaskOutput(
-                        output_id="evidence",
-                        description="Verified evidence answering the original question.",
-                    )
-                ],
-                required=True,
-                as_of_date=None,
-                filters=None,
-            )
-        ],
-        synthesis_requirements=[],
-        assumptions=[],
-    )
-
-
-def resolve_global_plan(
-    candidate: GlobalPlan | None,
-    *,
-    original_question: str,
-    max_tasks: int | None = 5,
-    max_list_items: int | None = 12,
-    planner_error: str | None = None,
-) -> PlanResolution:
-    """Return a valid plan, falling back to one adaptive task on any failure."""
-
-    if candidate is None:
-        error = planner_error or "planner returned no structured plan"
-        return PlanResolution(
-            plan=make_direct_fallback_plan(original_question),
-            used_fallback=True,
-            validation_errors=(error,),
-        )
-    try:
-        validated = validate_global_plan(
-            candidate,
-            max_tasks=max_tasks,
-            max_list_items=max_list_items,
-        )
-    except PlanValidationError as exc:
-        return PlanResolution(
-            plan=make_direct_fallback_plan(original_question),
-            used_fallback=True,
-            validation_errors=exc.errors,
-        )
-    return PlanResolution(
-        plan=validated,
-        used_fallback=False,
-        validation_errors=(),
-    )

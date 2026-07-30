@@ -145,10 +145,13 @@ plans without an application step, and unsafe `single_pass` routing before any
 task runs.
 
 Every search agent receives only its own assignment and retrieved hits. It owns
-that evidence need, reviews the result of each attempt, and decides whether to
-correct its terminology, jurisdiction, instrument, scope, date, exception, or
-cross-reference strategy and continue. It stops only when the evidence is found
-or it reports that no materially different safe corpus query remains.
+that evidence need and makes a fresh tool decision after every result, including
+a successful one. It can stop because the need is sufficiently supported,
+continue to resolve an exception or cross-reference exposed by the result, or
+correct its terminology, jurisdiction, instrument, scope, date, or search angle.
+An empty result or tool failure is returned to that same agent; no hidden
+scheduler retry or query is substituted. It stops without evidence only when it
+reports that no materially different safe corpus query remains.
 Application tasks cannot search: they receive only the scenario facts assigned
 to that task and complete typed reports from declared dependencies. Their
 conclusions must reference existing fact, branch, claim, and dependency-output
@@ -157,16 +160,16 @@ exchange typed artifacts instead of chat transcripts. Production research has
 no task, worker, wave, search-count, LLM-call, claim, or artifact-count budget;
 coverage and explicit model exhaustion control termination. Operational
 per-call timeouts and cancellation remain in place so a hung provider cannot
-hold a request forever. Invalid plans fall back to one direct task; this is the
-single indexed research path, so an unrecoverable failure surfaces as a real
-error instead of falling back to a different pipeline.
+hold a request forever. Invalid plans are returned to the planner with exact
+validation errors until it produces a valid graph; no alternate planner path is
+used.
 
 For a precise one-query lookup, the planner selects `single_pass`. The server
-then skips the redundant task coordinator and reviewer calls after verified
-evidence covers every typed requirement (planner + worker + final synthesis).
-If that first lookup leaves a gap, the same task automatically upgrades to
-persistent adaptive research. Scenario and comparison plans are never eligible
-for the single-pass shortcut.
+skips the redundant task coordinator and reviewer, but the search agent still
+inspects the verified result and explicitly decides whether to stop or issue one
+focused follow-up before final synthesis. If that first lookup leaves a gap, the
+same task upgrades to persistent adaptive research. Scenario and comparison
+plans are never eligible for the single-pass shortcut.
 
 Adaptive follow-ups are server-constrained to the still-uncovered evidence
 requirements. The coordinator receives those requirements explicitly, while
@@ -174,9 +177,11 @@ exact and near-duplicate queries are rejected before they consume a worker or
 search call. The WebSocket progress stream reports when a targeted gap-recovery
 wave starts and when the search agents conclude that a required point cannot be
 verified from the indexed corpus.
-If a coordinator tries to stop early, a dedicated recovery strategist changes
-terminology/scope/reference angle; a deterministic requirement/cross-reference
-query is the fallback, so one empty query is never treated as exhaustive.
+Each search agent receives every `indexed_search` tool result, then decides
+whether to search again, change terminology/scope/reference angle, stop because
+the need is supported, or stop as exhausted. Follow-ups are requested one at a
+time so the next action always uses the latest result. The scheduler never
+invents a query.
 Terminal responses expose both `incomplete` and complete
 `unresolved_information`; material facts that only the user can supply are
 reported separately and remain conditional instead of being guessed.

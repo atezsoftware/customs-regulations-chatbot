@@ -400,7 +400,6 @@ def _fallback_agent_plan_trace(agent: object) -> dict[str, Any] | None:
         "schema_version": 1,
         "plan": plan_payload,
         "task_artifacts": artifacts,
-        "used_plan_fallback": bool(getattr(result, "used_plan_fallback", False)),
         "incomplete": bool(getattr(result, "incomplete", False)),
     }
 

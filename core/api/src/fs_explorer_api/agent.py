@@ -1931,7 +1931,6 @@ class FsExplorerAgent:
             "contract_version": result.plan.version,
             "plan": result.plan.model_dump(mode="json"),
             "task_artifacts": task_artifacts,
-            "used_plan_fallback": result.used_plan_fallback,
             "incomplete": result.incomplete,
         }
 

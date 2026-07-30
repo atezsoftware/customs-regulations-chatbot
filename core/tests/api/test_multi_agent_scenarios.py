@@ -327,10 +327,10 @@ def _task_id(text: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_precise_lookup_uses_direct_single_pass_three_call_path(
+async def test_precise_lookup_uses_direct_single_pass_result_decision_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The simple path is planner + one worker + final synthesis."""
+    """Even the simple path lets the worker decide after its tool result."""
 
     import fs_explorer_api.agent as agent_module
 
@@ -362,9 +362,19 @@ async def test_precise_lookup_uses_direct_single_pass_three_call_path(
         "deadline",
         "The filing deadline is 30 days.",
     )
-    worker = _ScriptedClient(
-        "worker",
-        lambda schema, text: WorkerArtifact(
+
+    def worker_response(schema: type, _text: str) -> object:
+        if schema is SearchAssignmentBatch:
+            return SearchAssignmentBatch(
+                task_id="lookup",
+                stop=True,
+                stop_reason=(
+                    "The latest verified result supports the deadline and "
+                    "contains no unresolved exception or cross-reference."
+                ),
+                assignments=[],
+            )
+        return WorkerArtifact(
             task_id="lookup",
             assignment_id="lookup_single_pass",
             worker_id="worker-lookup-lookup_single_pass",
@@ -375,8 +385,9 @@ async def test_precise_lookup_uses_direct_single_pass_three_call_path(
             cross_references=[],
             error_code=None,
             error_message=None,
-        ),
-    )
+        )
+
+    worker = _ScriptedClient("worker", worker_response)
     task_client = _ScriptedClient(
         "task",
         lambda schema, text: pytest.fail(
@@ -393,7 +404,6 @@ async def test_precise_lookup_uses_direct_single_pass_three_call_path(
         return function(*args, **kwargs)
 
     monkeypatch.setattr(asyncio, "to_thread", inline_to_thread)
-    monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_MAX_LLM_CALLS", "3")
     monkeypatch.setattr(
         agent_module,
         "_run_planned_index_search",
@@ -423,7 +433,7 @@ async def test_precise_lookup_uses_direct_single_pass_three_call_path(
         len(planner.structured_calls)
         + len(worker.structured_calls)
         + len(final.stream_calls)
-        == 3
+        == 4
     )
 
 
@@ -530,7 +540,6 @@ async def test_scenario_result_selects_scenario_final_synthesis_prompt() -> None
         final_context="Validated scenario artifacts.",
         evidence_sources=(),
         incomplete=False,
-        used_plan_fallback=False,
     )
     agent._multi_agent_final_llm = final
     agent._chat_history = [
@@ -588,7 +597,6 @@ def test_scenario_fallback_keeps_separate_evidence_only_deliverables() -> None:
             },
         ),
         incomplete=False,
-        used_plan_fallback=False,
     )
 
     answer = agent._multi_agent_fallback_answer()

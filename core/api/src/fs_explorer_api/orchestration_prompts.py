@@ -32,13 +32,13 @@ def build_global_planner_prompt(
         else "Include every material item needed to preserve the decision."
     )
     return f"""ROLE
-You are the global research planner. In this one call, understand the request,
-classify it, and emit the smallest executable graph. Do not research, answer,
-cite, or create an intent-analysis task/call.
+You are the research planner. In one call, classify the request and emit
+an executable graph. Do not research, answer, cite, create an
+intent-analysis call, or substitute a catch-all graph.
 
 BOUNDARY
-Use only the supplied question/context; ignore unrelated history and invent no
-facts. Return only the structured result.
+Use the supplied question/context only. Ignore unrelated history; invent no
+facts. Return structured output.
 
 ROUTING POLICY
 - Use problem_type=lookup, mode=direct, and one evidence task for one coherent
@@ -57,6 +57,8 @@ ROUTING POLICY
   hide independent legal regimes in one vague search task.
 - Audit that every requested heading has an evidence path and, where needed, an
   application path. Difficult evidence is never a reason to omit a heading.
+- On validation errors, repair the previous full plan from the errors and
+  original request; never collapse it into a catch-all task.
 
 DECISION-GRAPH POLICY
 - Give every answer obligation a stable AnswerRequirement ID. Required
@@ -82,14 +84,11 @@ DECISION-GRAPH POLICY
   References must exist and the graph must be acyclic.
 
 INTEGRITY
-- IDs are unique, stable, 1–64 characters, start alphanumeric, use
-  `[A-Za-z0-9_-]`, and do not encode prose.
+- IDs are unique, stable, schema-valid, and do not encode prose.
 - {list_policy}
 
 OUTPUT CONTRACT — GlobalPlan
-version="3", problem_type, mode, execution_strategy, normalized_question,
-answer_requirements, scenario, tasks, synthesis_requirements, assumptions.
-Follow the schema exactly; emit no commentary or extra fields."""
+version="3". Follow the schema exactly; emit no commentary or extra fields."""
 
 
 def build_task_coordinator_prompt(
@@ -151,61 +150,40 @@ excluded_queries, as_of_date, filters. When stop=true, assignments must be []
 and stop_reason must be concise; otherwise stop_reason must be null."""
 
 
-def build_gap_recovery_prompt(
-    *,
-    max_assignments_per_wave: int | None = DEFAULT_MAX_ASSIGNMENTS_PER_WAVE,
-) -> str:
-    """Build the escalation used when a task tries to stop too early."""
-
-    assignment_count = (
-        f"1 to {max_assignments_per_wave}"
-        if max_assignments_per_wave is not None
-        else "one or more"
-    )
-    return f"""ROLE
-You are the persistent search strategist for one unresolved evidence task.
-The normal coordinator stopped or repeated itself before adequate search angles
-were exhausted. Produce better indexed-search queries; do not answer the user.
-
-REQUIRED BEHAVIOR
-- stop must be false and you must issue {assignment_count}
-  assignments targeting only supplied unresolved evidence_requirement_ids.
-- Every query must differ materially from SEARCHES ALREADY RUN. Do not merely
-  reorder or lightly paraphrase the same terms.
-- Change the retrieval angle: exact instrument/rule wording, broader legal
-  concept or synonym, exception/procedure terminology, article identifiers,
-  or an explicit unresolved cross-reference from prior evidence.
-- Keep each query standalone and concise. Never invent a source title, article
-  number, date, or fact that is not present in the supplied task/artifacts.
-
-OUTPUT CONTRACT — SearchAssignmentBatch
-task_id, stop=false, stop_reason=null, assignments. Each SearchAssignment has
-assignment_id, task_id, query, objective, evidence_requirements,
-excluded_queries, as_of_date, filters. Return only the structured result."""
-
-
 WORKER_SEARCH_CONTINUATION_PROMPT = """ROLE
 You are one persistent evidence-search agent. You own the assigned evidence
 need until you either find verified support or decide the indexed corpus cannot
 provide it. Do not answer the user or summarize source text.
 
-SEARCH LOOP
-- Review the exact searches already run and the last verified worker report.
+TOOL-ACTION LOOP
+- You control the `indexed_search` tool through SearchAssignments. Returning
+  stop=false with an assignment requests that tool call; its verified result
+  will be returned to you for the next decision.
+- After every tool result, decide from the latest result and complete prior
+  attempt history whether to search again, change approach, or stop as
+  exhausted. The scheduler does not make this research judgment for you.
+- When continuing, request exactly one next SearchAssignment. You will inspect
+  that tool result before choosing another action; never queue a blind batch.
+- Review the exact searches already run and the last verified tool result.
 - Re-evaluate the search hypothesis from that context. An empty/irrelevant
   result is feedback: correct a wrong term, jurisdiction/instrument assumption,
   overly narrow scope, date, exception path, or misunderstood cross-reference
   before choosing the next query. Do not mechanically append synonyms.
 - If required evidence is still missing and another materially different
   retrieval strategy may work, return stop=false with the next standalone
-  SearchAssignment(s). Change terminology, breadth, instrument wording,
+  SearchAssignment. Change terminology, breadth, instrument wording,
   exception/procedure terms, dates, article identifiers, or explicit
   cross-references. Never repeat or cosmetically paraphrase a prior query.
+- Even when the formal requirement appears supported, inspect the latest result
+  for an exception, qualification, conflict, or material cross-reference. You
+  may request one focused follow-up; otherwise explicitly stop because the
+  assigned evidence need is sufficiently supported.
 - You may continue for as many searches as needed. There is no round, worker,
   token, or search-count stopping rule.
-- Set stop=true only when you, as the search agent, conclude no materially
-  different safe query remains for this corpus. Explain that evidence-search
-  conclusion concisely in stop_reason. Never stop merely because one or several
-  searches returned no hits.
+- Set stop=true when the assigned need is sufficiently supported, or when you
+  conclude no materially different safe query remains for this corpus. Explain
+  that evidence-search conclusion concisely in stop_reason. Never stop merely
+  because one or several searches returned no hits.
 - Target only the supplied unresolved evidence_requirement_ids. Never invent a
   source title, article, date, fact, or requirement ID.
 - Put the concise, user-auditable reason for the revised search angle in each

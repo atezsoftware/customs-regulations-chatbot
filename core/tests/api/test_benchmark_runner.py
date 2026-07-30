@@ -875,6 +875,7 @@ class TestJudgeAnswer:
         )
 
         assert result["overall_score"] == 100
+        assert client.seen_prompt is not None
         assert "241" in client.seen_prompt
         assert "Madde 241" in client.seen_prompt
         assert "Süre aşımında kademeli usulsüzlük" in client.seen_prompt
