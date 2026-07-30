@@ -1,6 +1,5 @@
 import {inject} from '@loopback/core';
 import {repository} from '@loopback/repository';
-import {extname} from 'path';
 import {
   del,
   get,
@@ -15,17 +14,11 @@ import {
   RestBindings,
 } from '@loopback/rest';
 import multer from 'multer';
-import {getCurrentUser, requireAdmin} from '../../../common/auth';
-import {isDatasetManagementEnabled} from '../../../common/env';
+import {getCurrentUser} from '../../../common/auth';
+import {isLocalEnv} from '../../../common/env';
 import {UserRepository} from '../../auth/repositories';
 import {DirectoryFileRepository, DirectoryRepository} from '../repositories';
-import {
-  fetchDocumentChunks,
-  hideIndexedFile,
-  renameIndexedFile,
-  StorageService,
-  virtualCorpusKey,
-} from '../services';
+import {fetchDocumentChunks, StorageService, virtualCorpusKey} from '../services';
 import {toSafeFile} from '../transformers';
 import {DirectoriesController} from './directories.controller';
 
@@ -74,13 +67,6 @@ export class FilesController {
       throw new HttpErrors.NotFound('File not found.');
     }
     return file;
-  }
-
-  private async requireDatasetAdmin() {
-    if (!isDatasetManagementEnabled()) throw new HttpErrors.NotFound('Not found.');
-    const user = await getCurrentUser(this.request, this.userRepository);
-    if (process.env.NODE_ENV !== 'local') requireAdmin(user);
-    return user;
   }
 
   @get('/directories/{id}/files/{fileId}/chunks')
@@ -132,7 +118,10 @@ export class FilesController {
   @post('/directories/{id}/files')
   @response(200, {description: 'Uploaded files (multipart field name: "files", repeatable)'})
   async upload(@param.path.number('id') directoryId: number) {
-    const user = await this.requireDatasetAdmin();
+    if (!isLocalEnv()) {
+      throw new HttpErrors.NotFound('Not found.');
+    }
+    const user = await getCurrentUser(this.request, this.userRepository);
     const directory = await this.directoriesController.ownedDirectoryOrThrow(
       directoryId,
       user.id,
@@ -179,27 +168,14 @@ export class FilesController {
     @param.path.number('fileId') fileId: number,
     @requestBody() body: RenameFileBody,
   ) {
-    const user = await this.requireDatasetAdmin();
+    const user = await getCurrentUser(this.request, this.userRepository);
     const directory = await this.directoriesController.ownedDirectoryOrThrow(
       directoryId,
       user.id,
     );
     const file = await this.findOwnedFileOrThrow(directoryId, fileId, user.id);
-    let name = body.name?.trim();
+    const name = body.name?.trim();
     if (!name) throw new HttpErrors.BadRequest('name is required.');
-    // The indexer determines the parser from the on-disk extension. A name
-    // such as "Gümrük Kanunu" must therefore remain a PDF/DOCX/TXT file;
-    // otherwise the upload is moved to a path with no extension and the next
-    // chunk run reports it as an unconfirmed/unsupported document.
-    const currentExtension = extname(file.originalName).toLowerCase();
-    const requestedExtension = extname(name).toLowerCase();
-    if (currentExtension && !requestedExtension) {
-      name = `${name}${currentExtension}`;
-    } else if (currentExtension && requestedExtension !== currentExtension) {
-      throw new HttpErrors.BadRequest(
-        `File extension cannot change (keep ${currentExtension}).`,
-      );
-    }
     const storedPath =
       file.storageStatus !== 'indexed'
         ? await this.storageService.moveFileToDirectory({
@@ -209,11 +185,6 @@ export class FilesController {
             originalName: name,
           })
         : file.storedPath;
-    if (file.storageStatus === 'chunked' || file.storageStatus === 'indexed') {
-      // The document ID/path stays stable; this changes only the label shown
-      // in chunks, citations and retrieval results, without re-embedding.
-      await renameIndexedFile(directoryId, fileId, name);
-    }
     await this.directoryFileRepository.updateById(fileId, {
       originalName: name,
       storedPath,
@@ -227,13 +198,8 @@ export class FilesController {
     @param.path.number('id') directoryId: number,
     @param.path.number('fileId') fileId: number,
   ) {
-    const user = await this.requireDatasetAdmin();
+    const user = await getCurrentUser(this.request, this.userRepository);
     const file = await this.findOwnedFileOrThrow(directoryId, fileId, user.id);
-    if (file.storageStatus === 'chunked' || file.storageStatus === 'indexed') {
-      // Do this first so a core outage cannot leave an orphaned, searchable
-      // document after the metadata record is removed.
-      await hideIndexedFile(directoryId, fileId);
-    }
     await this.directoryFileRepository.deleteById(fileId);
     await this.storageService.deleteFile(file.storedPath);
   }

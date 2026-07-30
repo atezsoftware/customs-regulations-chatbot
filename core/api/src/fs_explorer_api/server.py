@@ -134,19 +134,6 @@ class SearchRequest(BaseModel):
     as_of_date: str | None = None
 
 
-class DirectoryDocumentMutationRequest(BaseModel):
-    corpus_key: str
-    relative_path_prefix: str
-
-
-class DirectoryDocumentRenameRequest(DirectoryDocumentMutationRequest):
-    display_name: str
-
-
-class DirectoryCorpusMutationRequest(BaseModel):
-    corpus_key: str
-
-
 class BenchmarkRunQuestionRequest(BaseModel):
     """Request model for one headless benchmark agent run."""
 
@@ -434,57 +421,6 @@ async def document_chunks(
         if result is None:
             return {"document": None, "chunks": []}
         return result
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-@app.post("/api/index/document-delete", dependencies=[Depends(require_internal_token)])
-async def delete_indexed_document(request: DirectoryDocumentMutationRequest):
-    """Soft-delete one document so its chunks immediately leave retrieval."""
-    try:
-        storage = PostgresStorage(resolve_database_url(), initialize=False)
-        try:
-            deleted = storage.mark_document_deleted_by_prefix(
-                corpus_root=resolve_corpus_root(request.corpus_key),
-                relative_path_prefix=request.relative_path_prefix,
-            )
-        finally:
-            storage.close()
-        return {"deleted": deleted}
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-@app.post("/api/index/corpus-delete", dependencies=[Depends(require_internal_token)])
-async def delete_indexed_corpus(request: DirectoryCorpusMutationRequest):
-    """Soft-delete all documents belonging to a dataset."""
-    try:
-        storage = PostgresStorage(resolve_database_url(), initialize=False)
-        try:
-            deleted = storage.mark_corpus_documents_deleted(
-                corpus_root=resolve_corpus_root(request.corpus_key)
-            )
-        finally:
-            storage.close()
-        return {"deleted": deleted}
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-@app.post("/api/index/document-rename", dependencies=[Depends(require_internal_token)])
-async def rename_indexed_document(request: DirectoryDocumentRenameRequest):
-    """Update the label shown for an indexed document without re-embedding."""
-    try:
-        storage = PostgresStorage(resolve_database_url(), initialize=False)
-        try:
-            renamed = storage.rename_document_display_name_by_prefix(
-                corpus_root=resolve_corpus_root(request.corpus_key),
-                relative_path_prefix=request.relative_path_prefix,
-                display_name=request.display_name,
-            )
-        finally:
-            storage.close()
-        return {"renamed": renamed}
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 

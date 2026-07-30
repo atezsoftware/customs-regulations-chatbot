@@ -91,7 +91,6 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 | `CORE_INTERNAL_TOKEN` | `core-api`, `core-indexer`, `backend` | Shared secret gating both core services' internal REST/WebSocket endpoints so only `backend` can call them. |
 | `CORE_INTERNAL_URL` | `backend` | Where `core-api` lives (`/ws/explore`, `/api/search`). |
 | `CORE_INDEXER_URL` | `backend` | Where `core-indexer` lives (`/api/index*`). |
-| `DATASET_MANAGEMENT_ENABLED` | `backend` | Opt-in admin-only dataset panel and its upload/chunk/index actions. Set to `true` only after `core-indexer` is deployed and reachable through `CORE_INDEXER_URL`. |
 | `JWT_SECRET` | `backend` | Signs access tokens. |
 | `STORAGE_ROOT` | `backend` | Where uploaded files live on disk before/while being chunked. |
 | `VITE_API_URL` | `frontend` | Where the backend API lives. |

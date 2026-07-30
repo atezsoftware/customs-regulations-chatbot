@@ -325,69 +325,6 @@ class PostgresStorage:
             conn.commit()
         return int(row[0]) if row else 0
 
-    def mark_document_deleted_by_prefix(
-        self, *, corpus_root: str, relative_path_prefix: str
-    ) -> int:
-        normalized = str(Path(corpus_root).resolve())
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE core_documents AS d
-                    SET is_deleted = true
-                    FROM core_corpora AS corpus
-                    WHERE d.corpus_id = corpus.id
-                      AND corpus.root_path = %s
-                      AND d.relative_path LIKE %s
-                      AND d.is_deleted = false
-                    """,
-                    (normalized, f"{relative_path_prefix}%"),
-                )
-                changed = cur.rowcount
-            conn.commit()
-        return int(changed)
-
-    def mark_corpus_documents_deleted(self, *, corpus_root: str) -> int:
-        normalized = str(Path(corpus_root).resolve())
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE core_documents AS d
-                    SET is_deleted = true
-                    FROM core_corpora AS corpus
-                    WHERE d.corpus_id = corpus.id
-                      AND corpus.root_path = %s
-                      AND d.is_deleted = false
-                    """,
-                    (normalized,),
-                )
-                changed = cur.rowcount
-            conn.commit()
-        return int(changed)
-
-    def rename_document_display_name_by_prefix(
-        self, *, corpus_root: str, relative_path_prefix: str, display_name: str
-    ) -> bool:
-        normalized = str(Path(corpus_root).resolve())
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE core_documents AS d
-                    SET absolute_path = %s
-                    FROM core_corpora AS corpus
-                    WHERE d.corpus_id = corpus.id
-                      AND corpus.root_path = %s
-                      AND d.relative_path LIKE %s
-                      AND d.is_deleted = false
-                    """,
-                    (display_name, normalized, f"{relative_path_prefix}%"),
-                )
-                changed = cur.rowcount
-            conn.commit()
-        return bool(changed)
-
     def list_documents(
         self,
         *,

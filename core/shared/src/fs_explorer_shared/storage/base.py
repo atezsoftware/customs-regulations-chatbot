@@ -136,25 +136,6 @@ class StorageBackend(Protocol):
     ) -> int:
         """Mark documents deleted when not present in the latest index run."""
 
-    def mark_document_deleted_by_prefix(
-        self, *, corpus_root: str, relative_path_prefix: str
-    ) -> int:
-        """Hide one active document (identified by its stable path prefix).
-
-        Chunks and embeddings are preserved for auditability, but every query
-        joins through active documents so deleted content is immediately
-        excluded from retrieval.
-        """
-
-    def mark_corpus_documents_deleted(self, *, corpus_root: str) -> int:
-        """Hide every active document in a corpus."""
-
-    def rename_document_display_name_by_prefix(
-        self, *, corpus_root: str, relative_path_prefix: str, display_name: str
-    ) -> bool:
-        """Update a document's human-readable source label without changing
-        its stable relative path or embeddings."""
-
     def list_documents(
         self,
         *,
