@@ -37,6 +37,8 @@ def test_global_planner_prompt_builds_decision_graph_not_topic_outline() -> None
     assert "consumes={task_id, output_id}" in prompt
     assert "enumerate every requested heading" in prompt
     assert "Difficult evidence is never a reason to omit a heading" in prompt
+    assert "GlobalPlan is routing metadata" in prompt
+    assert "restate scenario prose" in prompt
 
 
 def test_task_coordinator_prompt_enforces_bounded_non_recursive_fanout() -> None:

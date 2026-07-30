@@ -13,7 +13,7 @@ from google.genai.types import (
     Part,
     GenerateContentResponseUsageMetadata,
 )
-from fs_explorer_api.models import StopAction, Action
+from fs_explorer_api.models import Action, CompletenessCheck, StopAction
 
 
 class MockModels:
@@ -21,21 +21,21 @@ class MockModels:
 
     async def generate_content(self, *args, **kwargs) -> GenerateContentResponse:
         """Return a mock response with a stop action."""
+        schema = kwargs.get("config", {}).get("response_schema")
+        payload = (
+            CompletenessCheck(can_answer_fully=True, missing_information="")
+            if schema is CompletenessCheck
+            else Action(
+                action=StopAction(final_result="this is a final result"),
+                reason="I am done",
+            )
+        )
         return GenerateContentResponse(
             candidates=[
                 Candidate(
                     content=Content(
                         role="model",
-                        parts=[
-                            Part.from_text(
-                                text=Action(
-                                    action=StopAction(
-                                        final_result="this is a final result"
-                                    ),
-                                    reason="I am done",
-                                ).model_dump_json()
-                            )
-                        ],
+                        parts=[Part.from_text(text=payload.model_dump_json())],
                     )
                 )
             ],

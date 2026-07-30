@@ -82,6 +82,11 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 | `FS_EXPLORER_LLM_PROVIDER` | `core-api` | Active chat provider. Set to `openrouter` for the new model selector flow. |
 | `OPENROUTER_DEFAULT_MODEL` | `core-api`, `backend` | Default model for new sessions and provider fallback (`google/gemini-3.6-flash`). |
 | `OPENROUTER_CATALOG_SYNC_MINUTES` | `backend` | How often the backend refreshes the available OpenRouter model catalog. |
+| `OPENROUTER_MAX_OUTPUT_TOKENS` | `core-api` | Optional operator-selected provider output cap; unset by default, so the application adds no token ceiling. |
+| `OPENROUTER_STRUCTURED_RETRIES` | `core-api` | Optional operator-selected recovery ceiling; unset by default, so incomplete/schema-invalid output keeps regenerating with the same model/schema until valid. |
+| `GEMINI_STRUCTURED_RETRIES` | `core-api` | Optional operator-selected recovery ceiling; unset by default, so malformed/truncated Gemini structured output keeps regenerating until valid. |
+| `FS_EXPLORER_LLM_RETRY_ATTEMPTS` | `core-api` | Optional Gemini transient-error retry ceiling; unset by default (unlimited). |
+| `FS_EXPLORER_LLM_MAX_CONCURRENCY` | `core-api` | Optional Gemini concurrency ceiling; unset by default, so the application does not queue calls behind a fixed worker count. |
 | `FS_EXPLORER_PLANNER_{PROVIDER,MODEL,REASONING}` | `core-api` | Global planner policy. Defaults to OpenRouter, `openai/gpt-5.6-sol`, `medium`. |
 | `FS_EXPLORER_TASK_{PROVIDER,MODEL,REASONING}` | `core-api` | Task coordinator policy. Defaults to OpenRouter, `google/gemini-3.6-flash`, `medium`. |
 | `FS_EXPLORER_WORKER_{PROVIDER,MODEL,REASONING}` | `core-api` | Search worker policy. Defaults to OpenRouter, `google/gemini-3.5-flash-lite`, `low`. |

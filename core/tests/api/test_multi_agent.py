@@ -1038,6 +1038,83 @@ async def test_production_structured_stage_has_no_wall_clock_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_structured_operation_records_usage_and_can_be_retried() -> None:
+    plan = _plan(_task("task_1", "Question one"))
+
+    class PaidStructuredFailure(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("safe structured failure")
+            self.usage = LLMUsage(input_tokens=11, output_tokens=4)
+
+    class RecoveringClient(_ScriptedClient):
+        async def generate_structured(
+            self,
+            history,
+            system_prompt,
+            schema,
+            *,
+            thinking_level=None,
+        ):
+            self.calls.append((schema, list(history), system_prompt))
+            if len(self.calls) == 1:
+                raise PaidStructuredFailure
+            return plan, LLMUsage(input_tokens=20, output_tokens=5)
+
+    recorded: list[LLMUsage] = []
+
+    async def record_usage(
+        role,
+        purpose,
+        client,
+        usage,
+        task_id,
+        agent_id,
+        sequence,
+    ):
+        del role, purpose, client, task_id, agent_id, sequence
+        recorded.append(usage)
+
+    planner = RecoveringClient("planner", lambda _schema, _text: plan)
+    orchestrator = MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", lambda _schema, _text: None),
+        worker_llm=_ScriptedClient("worker", lambda _schema, _text: None),
+        search_runner=lambda **_kwargs: _SearchResult(query="", hits=[]),
+        on_llm_usage=record_usage,
+        search_runner_in_thread=False,
+    )
+
+    with pytest.raises(PaidStructuredFailure):
+        await orchestrator._generate_structured(
+            client=planner,
+            role="planner",
+            purpose="global_plan",
+            prompt="system",
+            user_text="Question one",
+            operation_id="recoverable-operation",
+            schema=GlobalPlan,
+        )
+    await asyncio.sleep(0)
+
+    result, _usage = await orchestrator._generate_structured(
+        client=planner,
+        role="planner",
+        purpose="global_plan",
+        prompt="system",
+        user_text="Question one",
+        operation_id="recoverable-operation",
+        schema=GlobalPlan,
+    )
+
+    assert result is plan
+    assert len(planner.calls) == 2
+    assert [(usage.input_tokens, usage.output_tokens) for usage in recorded] == [
+        (11, 4),
+        (20, 5),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_independent_tasks_search_in_parallel_without_sibling_context() -> None:
     task_1 = _task("task_1", "Question one")
     task_2 = _task("task_2", "Question two")

@@ -1,5 +1,6 @@
 """Tests for the headless benchmark runner and LLM-judge scoring."""
 
+import asyncio
 from decimal import Decimal
 
 import pytest
@@ -40,6 +41,7 @@ from fs_explorer_api.orchestration_models import (
     WorkerArtifact,
     WorkerStatus,
 )
+from fs_explorer_api.orchestration_prompts import WORKER_SEARCH_CONTINUATION_PROMPT
 from fs_explorer_api.search import SearchHit
 
 
@@ -199,6 +201,24 @@ class _MultiAgentStopClient:
                     cost_source="provider",
                 ),
             )
+        if schema is SearchAssignmentBatch:
+            return (
+                SearchAssignmentBatch(
+                    task_id="task_1",
+                    stop=True,
+                    stop_reason=(
+                        "The search agent found the required rule and no "
+                        "material follow-up angle remains."
+                    ),
+                    assignments=[],
+                ),
+                LLMUsage(
+                    input_tokens=100,
+                    output_tokens=20,
+                    billed_cost_usd=Decimal("0.0010"),
+                    cost_source="provider",
+                ),
+            )
         assert schema is WorkerArtifact
         return (
             _worker_artifact("task_1"),
@@ -317,6 +337,19 @@ class _AdaptiveRoundClient:
                 LLMUsage(input_tokens=100, output_tokens=20),
             )
         if schema is SearchAssignmentBatch:
+            if system_prompt == WORKER_SEARCH_CONTINUATION_PROMPT:
+                return (
+                    SearchAssignmentBatch(
+                        task_id="task_1",
+                        stop=True,
+                        stop_reason=(
+                            "The assigned evidence requirement is covered; "
+                            "return control to the task coordinator."
+                        ),
+                        assignments=[],
+                    ),
+                    LLMUsage(input_tokens=100, output_tokens=20),
+                )
             self.rounds += 1
             requirement_id = f"task_1-{'a' if self.rounds == 1 else 'b'}"
             return (
@@ -388,9 +421,14 @@ class _AdaptiveRoundClient:
 
 
 @pytest.fixture(autouse=True)
-def _clear_context_before_and_after():
+def _clear_context_before_and_after(monkeypatch: pytest.MonkeyPatch):
     from fs_explorer_api.agent import clear_index_context
 
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    # Benchmark tests validate workflow/metrics, not executor scheduling.
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
     clear_index_context()
     yield
     clear_index_context()
@@ -540,14 +578,16 @@ class TestRunAgenticSession:
             "plan_trace",
             "role_usage",
         }
-        # One plan + one single-pass worker round + one final answer.
-        assert result.stats["api_calls"] == 3
+        # One plan + one worker extraction + its model-controlled stop decision
+        # + one final answer. Even a covered requirement is not stopped by a
+        # scheduler counter.
+        assert result.stats["api_calls"] == 4
         assert result.stats["cost_source"] == "provider"
-        assert result.stats["cost_usd"] == "0.0025"
+        assert result.stats["cost_usd"] == "0.0035"
         assert result.stats["profile_mode"] == "candidate_all_roles"
         assert result.plan_trace == result.stats["plan_trace"]
         assert result.role_usage == result.stats["role_usage"]
-        assert sum(row["calls"] for row in result.role_usage) == 3
+        assert sum(row["calls"] for row in result.role_usage) == 4
 
     @pytest.mark.asyncio
     async def test_raises_when_no_folder_is_indexed(self, monkeypatch) -> None:

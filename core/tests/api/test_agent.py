@@ -35,6 +35,7 @@ from fs_explorer_api.models import (
     GoDeeperAction,
     StopAction,
 )
+from fs_explorer_api.orchestration_models import ProblemType
 from fs_explorer_api.search.ranker import RankedDocument
 from fs_explorer_api.search import MetadataFilterParseError
 from .conftest import make_mock_llm_client
@@ -439,6 +440,15 @@ class _ReplayableFinalClient:
         return None
 
 
+class _FailingFinalClient(_ReplayableFinalClient):
+    async def stream_text(self, history, system_prompt, *, thinking_level=None):
+        del history, system_prompt, thinking_level
+        self.stream_calls += 1
+        if False:
+            yield ""
+        raise RuntimeError("final provider failed")
+
+
 @pytest.mark.asyncio
 async def test_final_answer_replays_after_consumer_disconnect_without_second_call() -> (
     None
@@ -460,6 +470,33 @@ async def test_final_answer_replays_after_consumer_disconnect_without_second_cal
     )
 
     assert replayed == "first second"
+    assert client.stream_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_indexed_final_failure_is_propagated_without_direct_fallback() -> None:
+    client = _FailingFinalClient()
+    agent = FsExplorerAgent(llm_client=client)
+    agent._multi_agent_final_llm = client
+    agent._multi_agent_result = cast(
+        Any,
+        SimpleNamespace(
+            plan=SimpleNamespace(
+                scenario=None,
+                problem_type=ProblemType.LOOKUP,
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="final provider failed"):
+        _ = [
+            chunk
+            async for chunk in agent.stream_final_answer(
+                "SAFE DIRECT FALLBACK MUST NOT BE USED"
+            )
+        ]
+
+    assert agent._final_answer_chunks == []
     assert client.stream_calls == 1
 
 
@@ -1231,9 +1268,15 @@ class TestRetrievalHook:
     @pytest.mark.asyncio
     async def test_call_tools_batch_fires_hook_for_each_chunk_bearing_call(
         self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from fs_explorer_api.agent import TOOLS
 
+        async def run_inline(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        # This test verifies per-result telemetry, not thread scheduling.
+        monkeypatch.setattr(asyncio, "to_thread", run_inline)
         original_search = TOOLS["semantic_search"]
         original_glob = TOOLS["glob"]
         TOOLS["semantic_search"] = lambda **kwargs: self._fake_semantic_search_result(2)

@@ -281,7 +281,15 @@ async def run_benchmark() -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_accuracy_and_token_benchmark() -> None:
+async def test_accuracy_and_token_benchmark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    # This benchmark verifies retrieval accuracy and token accounting, not
+    # executor scheduling.
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
     report = await run_benchmark()
     assert report["accuracy_passed"] == report["accuracy_total"] == 3
     # 2 scripted decisions (tool call/batch + stop) + 1 pre-answer

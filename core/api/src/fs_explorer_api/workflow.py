@@ -331,7 +331,7 @@ class FsExplorerWorkflow(Workflow):
 
         # The context-isolated multi-agent orchestrator is the single indexed
         # research flow: its planner routes simple questions to one task and
-        # builds a bounded DAG only for genuinely separable requirements. A
+        # builds a typed DAG only for genuinely separable requirements. A
         # failure here propagates as a real error rather than silently
         # falling back to a different pipeline.
         if ev.use_index and ev.enable_semantic:

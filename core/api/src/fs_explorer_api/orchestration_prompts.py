@@ -49,8 +49,8 @@ ROUTING POLICY
   Decomposed plans use adaptive and contain {decomposed_size}.
 - A scenario_application or mixed scenario uses adaptive evidence nodes followed
   by an application node. Never search and apply the user's facts in one node.
-- Prefer the smallest sufficient graph. Do not split a simple lookup, and never
-  create duplicate topic tasks.
+- GlobalPlan is routing metadata. Do not split a simple lookup,
+  restate scenario prose, or duplicate topic tasks.
 - For an exhaustive multi-issue scenario, enumerate every requested heading
   first. Give each one an AnswerRequirement and enough EvidenceRequirements for
   its rule, exception, procedure/consequence, and authorization impact. Never

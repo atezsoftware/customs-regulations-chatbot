@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, AsyncIterator
 
 import httpx
+from pydantic import ValidationError
 
 from .base import ChatTurn, LLMUsage, SchemaT, ThinkingLevel
 
@@ -41,11 +42,15 @@ class OpenRouterError(RuntimeError):
         status_code: int | None = None,
         error_type: str | None = None,
         provider_code: str | None = None,
+        usage: LLMUsage | None = None,
+        attempts: int = 1,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.error_type = error_type
         self.provider_code = provider_code
+        self.usage = usage
+        self.attempts = attempts
 
 
 def _bounded_message(value: object) -> str:
@@ -146,6 +151,35 @@ def _decimal(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _optional_retry_limit(name: str) -> int | None:
+    """Read an opt-in retry ceiling; unset means keep recovering."""
+
+    raw = os.getenv(name)
+    if raw is None or raw.strip().casefold() in {
+        "",
+        "none",
+        "unlimited",
+        "infinite",
+    }:
+        return None
+    return max(int(raw), 0)
+
+
+def _optional_output_token_limit() -> int | None:
+    """Read an opt-in provider token ceiling; unset/zero means no app cap."""
+
+    raw = os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS")
+    if raw is None or raw.strip().casefold() in {
+        "",
+        "0",
+        "none",
+        "unlimited",
+        "infinite",
+    }:
+        return None
+    return max(int(raw), 1)
 
 
 def _is_endpoint_eligibility_error(error: OpenRouterError) -> bool:
@@ -316,6 +350,214 @@ def usage_from_openrouter(raw: dict[str, Any], *, duration_ms: float = 0) -> LLM
     )
 
 
+def _merge_openrouter_usage(total: LLMUsage, current: LLMUsage) -> LLMUsage:
+    """Account for every paid response consumed by structured recovery."""
+
+    def add_decimal(left: Decimal | None, right: Decimal | None) -> Decimal | None:
+        if left is None:
+            return right
+        if right is None:
+            return left
+        return left + right
+
+    return LLMUsage(
+        input_tokens=total.input_tokens + current.input_tokens,
+        output_tokens=total.output_tokens + current.output_tokens,
+        thinking_tokens=total.thinking_tokens + current.thinking_tokens,
+        cached_input_tokens=total.cached_input_tokens + current.cached_input_tokens,
+        cache_write_tokens=(total.cache_write_tokens + current.cache_write_tokens),
+        duration_ms=total.duration_ms + current.duration_ms,
+        generation_id=current.generation_id or total.generation_id,
+        billed_cost_usd=add_decimal(
+            total.billed_cost_usd,
+            current.billed_cost_usd,
+        ),
+        upstream_cost_usd=add_decimal(
+            total.upstream_cost_usd,
+            current.upstream_cost_usd,
+        ),
+        cost_source=(
+            "provider"
+            if "provider" in {total.cost_source, current.cost_source}
+            else current.cost_source or total.cost_source
+        ),
+    )
+
+
+def _structured_validation_summary(error: ValidationError) -> str:
+    """Return one safe validation hint without echoing the model output."""
+
+    errors = error.errors(include_input=False, include_url=False)
+    if not errors:
+        return "schema validation failed"
+    first = errors[0]
+    location = ".".join(str(item) for item in first.get("loc", ())) or "$"
+    error_type = _bounded_message(first.get("type")) or "validation_error"
+    message = _bounded_message(first.get("msg")) or "schema validation failed"
+    return f"{error_type} at {location}: {message}"[:400]
+
+
+def _validation_looks_truncated(error: ValidationError) -> bool:
+    """Recognize incomplete JSON even when a provider omits its finish reason."""
+
+    for item in error.errors(include_input=False, include_url=False):
+        if item.get("type") != "json_invalid":
+            continue
+        message = _bounded_message(item.get("msg")).casefold()
+        if any(
+            marker in message
+            for marker in (
+                "eof",
+                "end of input",
+                "unexpected end",
+                "unterminated",
+            )
+        ):
+            return True
+    return False
+
+
+def _normalized_finish_reasons(choice: dict[str, Any]) -> set[str]:
+    reasons: set[str] = set()
+    for key in ("finish_reason", "native_finish_reason"):
+        value = choice.get(key)
+        if isinstance(value, str) and value.strip():
+            reasons.add(value.strip().casefold().replace("-", "_").replace(" ", "_"))
+    return reasons
+
+
+def _is_token_boundary(reasons: set[str]) -> bool:
+    return any(
+        reason
+        in {
+            "length",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "max_tokens",
+            "model_length",
+            "token_limit",
+        }
+        or "max_token" in reason
+        for reason in reasons
+    )
+
+
+def _is_safety_stop(reasons: set[str]) -> bool:
+    return any(
+        reason
+        in {
+            "blocked",
+            "content_filter",
+            "prohibited_content",
+            "recitation",
+            "safety",
+        }
+        or "safety" in reason
+        or "content_filter" in reason
+        for reason in reasons
+    )
+
+
+def _choice_error_summary(choice: dict[str, Any]) -> tuple[str, bool]:
+    """Return a bounded choice-level error and whether it is a policy stop."""
+
+    error = choice.get("error")
+    if not isinstance(error, dict):
+        return "", False
+    message = _bounded_message(error.get("message"))
+    code = _bounded_message(error.get("code"))
+    error_type = _bounded_message(error.get("type"))
+    summary = message or code or error_type or "provider choice failed"
+    normalized = " ".join((message, code, error_type)).casefold()
+    policy_stop = any(
+        marker in normalized
+        for marker in ("content_filter", "content policy", "refusal", "safety")
+    )
+    return summary[:400], policy_stop
+
+
+def _structured_message_content(message: dict[str, Any]) -> str | None:
+    """Normalize structured content shapes used by OpenRouter providers."""
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type", "")).casefold()
+            text = part.get("text")
+            if part_type in {"text", "output_text"} and isinstance(text, str):
+                text_parts.append(text)
+        if text_parts:
+            return "".join(text_parts)
+
+    parsed = message.get("parsed")
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list) and len(tool_calls) == 1:
+        tool_call = tool_calls[0]
+        function = tool_call.get("function") if isinstance(tool_call, dict) else None
+        arguments = function.get("arguments") if isinstance(function, dict) else None
+        if isinstance(arguments, str):
+            return arguments
+        if isinstance(arguments, (dict, list)):
+            return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    return None
+
+
+def _with_output_token_budget(
+    payload: dict[str, Any],
+    output_tokens: int,
+) -> dict[str, Any]:
+    adjusted = dict(payload)
+    if "max_completion_tokens" in adjusted:
+        adjusted["max_completion_tokens"] = output_tokens
+    elif "max_tokens" in adjusted:
+        adjusted["max_tokens"] = output_tokens
+    else:
+        adjusted["max_tokens"] = output_tokens
+    return adjusted
+
+
+def _structured_retry_payload(
+    payload: dict[str, Any],
+    *,
+    schema_name: str,
+    failure: str,
+) -> dict[str, Any]:
+    """Repeat the original request without feeding back a huge broken output."""
+
+    retry = dict(payload)
+    messages = payload.get("messages")
+    messages = list(messages) if isinstance(messages, list) else []
+    retry["messages"] = [
+        *messages,
+        {
+            "role": "user",
+            "content": (
+                f"The previous {schema_name} structured response was incomplete "
+                f"or schema-invalid ({failure}). Generate it again from the "
+                "original request. Return exactly one COMPLETE, concise JSON "
+                "object satisfying the supplied response schema. Preserve every "
+                "distinct requirement, but use compact wording. Do not repeat "
+                "items, add commentary, or pad with whitespace. Close every "
+                "array, object, and string."
+            ),
+        },
+    ]
+    return retry
+
+
 class OpenRouterLLMClient:
     """Adapter for compatible OpenRouter models used by the research agent."""
 
@@ -351,8 +593,11 @@ class OpenRouterLLMClient:
             },
         )
         self._last_stream_usage: LLMUsage | None = None
-        self._max_retries = int(os.getenv("OPENROUTER_MAX_RETRIES", "3"))
-        self._max_output_tokens = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "8000"))
+        self._max_retries = _optional_retry_limit("OPENROUTER_MAX_RETRIES")
+        self._structured_retries = _optional_retry_limit(
+            "OPENROUTER_STRUCTURED_RETRIES"
+        )
+        self._max_output_tokens = _optional_output_token_limit()
 
     @staticmethod
     def _messages(history: list[ChatTurn], system_prompt: str) -> list[dict[str, str]]:
@@ -375,23 +620,16 @@ class OpenRouterLLMClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": self._messages(history, system_prompt),
-            # Reasoning models (e.g. z-ai/glm-5.2) spend completion tokens on
-            # hidden chain-of-thought before ever emitting visible content.
-            # Without an explicit ceiling, requests fall back to whatever
-            # small default the upstream provider applies, which a verbose
-            # reasoner can exhaust entirely on thinking — OpenRouter then
-            # returns `finish_reason: "length"` with an empty `content`,
-            # surfacing here as "no structured content" even though the
-            # request itself succeeded. `max_tokens` is a baseline
-            # OpenAI-compatible field every provider honors, unlike the
-            # provider-specific `reasoning` controls below.
+            # No application output-token ceiling is sent by default. The
+            # selected provider/model may use its full native capacity.
         }
-        token_parameter = (
-            "max_completion_tokens"
-            if self.model.startswith(_MAX_COMPLETION_TOKEN_MODEL_PREFIXES)
-            else "max_tokens"
-        )
-        payload[token_parameter] = self._max_output_tokens
+        if self._max_output_tokens is not None:
+            token_parameter = (
+                "max_completion_tokens"
+                if self.model.startswith(_MAX_COMPLETION_TOKEN_MODEL_PREFIXES)
+                else "max_tokens"
+            )
+            payload[token_parameter] = self._max_output_tokens
         if self.temperature is not None:
             payload["temperature"] = self.temperature
         if self._enable_reasoning_effort and thinking_level is not None:
@@ -403,7 +641,8 @@ class OpenRouterLLMClient:
         return payload
 
     async def _post_variant(self, payload: dict[str, Any]) -> httpx.Response:
-        for attempt in range(self._max_retries + 1):
+        attempt = 0
+        while True:
             try:
                 response = await self._client.post("/chat/completions", json=payload)
                 if response.status_code not in _RETRYABLE_STATUS_CODES:
@@ -413,18 +652,18 @@ class OpenRouterLLMClient:
                 routing_error = _rejection_error(response, model=self.model)
                 if _is_parameter_compatibility_error(routing_error):
                     raise routing_error
-                if attempt == self._max_retries:
+                if self._max_retries is not None and attempt >= self._max_retries:
                     raise OpenRouterError(
                         "OpenRouter request could not be completed.",
                         status_code=response.status_code,
                     )
                 delay = float(response.headers.get("Retry-After", "1"))
             except httpx.TimeoutException:
-                if attempt == self._max_retries:
+                if self._max_retries is not None and attempt >= self._max_retries:
                     raise OpenRouterError("OpenRouter request timed out.") from None
                 delay = 1
+            attempt += 1
             await asyncio.sleep(delay)
-        raise AssertionError("unreachable")
 
     async def _post(self, payload: dict[str, Any]) -> httpx.Response:
         last_error: OpenRouterError | None = None
@@ -447,8 +686,8 @@ class OpenRouterLLMClient:
         thinking_level: ThinkingLevel | None = None,
     ) -> tuple[SchemaT, LLMUsage]:
         started_at = time.monotonic()
-        payload = self._payload(history, system_prompt, thinking_level)
-        payload["response_format"] = {
+        base_payload = self._payload(history, system_prompt, thinking_level)
+        base_payload["response_format"] = {
             "type": "json_schema",
             "json_schema": {
                 "name": schema.__name__,
@@ -456,38 +695,146 @@ class OpenRouterLLMClient:
                 "schema": _provider_compatible_json_schema(schema.model_json_schema()),
             },
         }
-        payload["provider"] = {"require_parameters": True}
-        response = await self._post(payload)
-        body = response.json()
-        choices = body.get("choices") if isinstance(body, dict) else None
-        message = (
-            choices[0].get("message", {})
-            if isinstance(choices, list) and choices
-            else {}
-        )
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str):
-            finish_reason = (
-                choices[0].get("finish_reason")
+        base_payload["provider"] = {"require_parameters": True}
+        payload = base_payload
+        total_usage = LLMUsage()
+        last_failure = "provider returned no structured response"
+        last_was_truncated = False
+        output_token_budget = self._max_output_tokens
+        attempt = 0
+
+        while True:
+            attempt += 1
+            response = await self._post(payload)
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+                last_failure = "invalid JSON response envelope"
+
+            raw_usage = body.get("usage", {}) if isinstance(body, dict) else {}
+            current_usage = usage_from_openrouter(
+                raw_usage if isinstance(raw_usage, dict) else {}
+            )
+            if isinstance(body, dict) and body.get("id"):
+                current_usage.generation_id = str(body["id"])
+            total_usage = _merge_openrouter_usage(total_usage, current_usage)
+
+            choices = body.get("choices") if isinstance(body, dict) else None
+            top_level_error = (
+                _nested_provider_message(body)
+                if isinstance(body, dict) and body.get("error")
+                else ""
+            )
+            choice = (
+                choices[0]
                 if isinstance(choices, list)
                 and choices
                 and isinstance(choices[0], dict)
-                else None
+                else {}
             )
-            hint = (
-                " (truncated before emitting content — the model likely ran out of "
-                "output tokens; see OPENROUTER_MAX_OUTPUT_TOKENS)"
-                if finish_reason == "length"
-                else ""
+            message = choice.get("message", {})
+            message = message if isinstance(message, dict) else {}
+            reasons = _normalized_finish_reasons(choice)
+            last_was_truncated = _is_token_boundary(reasons)
+            refusal = message.get("refusal")
+            if refusal:
+                total_usage.duration_ms = (time.monotonic() - started_at) * 1000
+                raise OpenRouterError(
+                    f"OpenRouter refused the {schema.__name__} structured request.",
+                    usage=total_usage,
+                    attempts=attempt,
+                )
+            if _is_safety_stop(reasons):
+                total_usage.duration_ms = (time.monotonic() - started_at) * 1000
+                raise OpenRouterError(
+                    f"OpenRouter blocked the {schema.__name__} structured response.",
+                    usage=total_usage,
+                    attempts=attempt,
+                )
+
+            choice_error, policy_stop = _choice_error_summary(choice)
+            top_level_policy_stop = any(
+                marker in top_level_error.casefold()
+                for marker in (
+                    "content_filter",
+                    "content policy",
+                    "refusal",
+                    "safety",
+                )
             )
-            raise OpenRouterError(f"OpenRouter returned no structured content.{hint}")
-        usage = usage_from_openrouter(
-            body.get("usage", {}), duration_ms=(time.monotonic() - started_at) * 1000
-        )
-        usage.generation_id = (
-            str(body.get("id")) if body.get("id") else usage.generation_id
-        )
-        return schema.model_validate_json(content), usage
+            if policy_stop or top_level_policy_stop:
+                total_usage.duration_ms = (time.monotonic() - started_at) * 1000
+                raise OpenRouterError(
+                    f"OpenRouter blocked the {schema.__name__} structured response.",
+                    usage=total_usage,
+                    attempts=attempt,
+                )
+            if top_level_error:
+                last_was_truncated = False
+                last_failure = f"provider response failed: {top_level_error}"
+            elif choice_error or "error" in reasons:
+                last_was_truncated = False
+                last_failure = (
+                    f"provider choice failed: {choice_error}"
+                    if choice_error
+                    else "provider choice failed"
+                )
+            elif last_was_truncated:
+                # A syntactically valid prefix can still satisfy a permissive
+                # schema. A provider token-boundary signal therefore wins over
+                # parsing so a silently incomplete plan is never accepted.
+                last_failure = "output ended at the model token boundary"
+            else:
+                content = _structured_message_content(message)
+                if isinstance(content, str) and content.strip():
+                    try:
+                        result = schema.model_validate_json(content)
+                    except ValidationError as exc:
+                        last_was_truncated = _validation_looks_truncated(exc)
+                        last_failure = (
+                            "output ended before the JSON object was complete"
+                            if last_was_truncated
+                            else _structured_validation_summary(exc)
+                        )
+                    else:
+                        total_usage.duration_ms = (time.monotonic() - started_at) * 1000
+                        return result, total_usage
+                else:
+                    last_failure = "provider returned no structured content"
+
+            if (
+                self._structured_retries is not None
+                and attempt > self._structured_retries
+            ):
+                total_usage.duration_ms = (time.monotonic() - started_at) * 1000
+                truncation_hint = (
+                    " The provider repeatedly stopped at its output-token boundary."
+                    if last_was_truncated
+                    else ""
+                )
+                raise OpenRouterError(
+                    (
+                        f"OpenRouter could not produce a complete valid "
+                        f"{schema.__name__} response after {attempt} attempts: "
+                        f"{last_failure}.{truncation_hint}"
+                    ),
+                    usage=total_usage,
+                    attempts=attempt,
+                )
+
+            if last_was_truncated and output_token_budget is not None:
+                output_token_budget *= 2
+            retry_base = (
+                _with_output_token_budget(base_payload, output_token_budget)
+                if output_token_budget is not None
+                else base_payload
+            )
+            payload = _structured_retry_payload(
+                retry_base,
+                schema_name=schema.__name__,
+                failure=last_failure,
+            )
 
     async def stream_text(
         self,

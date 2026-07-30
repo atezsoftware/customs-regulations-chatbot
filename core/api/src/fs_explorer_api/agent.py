@@ -482,8 +482,8 @@ class PlannedSearchResult:
 
 
 # `ContextVar`, not a plain module global: `core-api` handles multiple
-# chats concurrently in one process (that's what FS_EXPLORER_LLM_MAX_CONCURRENCY
-# exists for), and a plain `global` here was a real cross-chat data-leak bug
+# chats concurrently in one process, and a plain `global` here was a real
+# cross-chat data-leak bug
 # — request A's `set_index_context()` and request B's `clear_index_context()`
 # raced on the same variable, so a slow-running chat could have its index
 # context silently wiped out (tool calls start erroring "not configured")
@@ -1844,6 +1844,7 @@ class FsExplorerAgent:
         self._final_answer_task: asyncio.Task[None] | None = None
         self._final_answer_chunks: list[str] = []
         self._final_answer_complete = False
+        self._final_answer_error: Exception | None = None
         self._final_answer_condition = asyncio.Condition()
         self._step_count = 0
         # Instance-level, not just the module constant — grant_more_steps()
@@ -1986,113 +1987,6 @@ class FsExplorerAgent:
             seen.add(chunk_id)
             selected.append(dict(source))
         return selected
-
-    def _multi_agent_fallback_answer(self) -> str | None:
-        """Render a deterministic citation-free answer if final streaming fails."""
-
-        result = self._multi_agent_result
-        if result is None:
-            return None
-        exposed_sources = {
-            (
-                str(source.get("document_id") or ""),
-                str(source.get("chunk_id") or ""),
-            )
-            for source in result.evidence_sources
-        }
-        claims = [
-            claim
-            for artifact in result.task_artifacts
-            for claim in artifact.claims
-            if (claim.document_id, claim.chunk_id) in exposed_sources
-        ]
-        claims_by_id = {claim.claim_id: claim for claim in claims}
-        findings = [
-            finding
-            for artifact in result.task_artifacts
-            for finding in artifact.application_findings
-            if finding.supporting_claim_ids
-            and all(
-                claim_id in claims_by_id for claim_id in finding.supporting_claim_ids
-            )
-        ]
-        if not claims and not findings:
-            return None
-
-        question = result.plan.normalized_question.casefold()
-        turkish = bool(
-            re.search(
-                r"[çğıöşü]|\b(nedir|nelerdir|nasıl|hangi|gümrük|için|ve|ile)\b",
-                question,
-            )
-        )
-        scenario_answer = bool(findings and result.plan.scenario is not None)
-        lines = [
-            (
-                "Senaryoya uygulanan doğrulanmış sonuçlar:"
-                if turkish and scenario_answer
-                else "Grounded conclusions applied to the scenario:"
-                if scenario_answer
-                else "Doğrulanmış indeks kanıtlarından çıkarılabilen sonuçlar:"
-                if turkish
-                else "Conclusions supported by the verified indexed evidence:"
-            ),
-            "",
-        ]
-        finding_requirement_ids = {
-            requirement_id
-            for finding in findings
-            for requirement_id in finding.requirement_ids
-        }
-        if findings:
-            for finding in findings:
-                lines.append(f"- {finding.finding}")
-                for limitation in finding.limitations:
-                    lines.append(
-                        (
-                            f"  - Koşul/sınırlama: {limitation}"
-                            if turkish
-                            else f"  - Condition/limitation: {limitation}"
-                        )
-                    )
-        evidence_only_claims = [
-            claim
-            for claim in claims
-            if not findings
-            or any(
-                requirement_id not in finding_requirement_ids
-                for requirement_id in claim.requirement_ids
-            )
-        ]
-        if evidence_only_claims:
-            if findings:
-                lines.extend(
-                    [
-                        "",
-                        (
-                            "Ayrıca doğrulanan kural ve usuller:"
-                            if turkish
-                            else "Additional verified rules and procedures:"
-                        ),
-                        "",
-                    ]
-                )
-            for claim in evidence_only_claims:
-                lines.append(f"- {claim.claim}")
-        if result.incomplete:
-            lines.extend(
-                [
-                    "",
-                    (
-                        "Bazı gerekli araştırma ölçütleri doğrulanamadığı için "
-                        "bu sonuç eksik olabilir."
-                        if turkish
-                        else "Some required research criteria could not be "
-                        "verified, so this result may be incomplete."
-                    ),
-                ]
-            )
-        return "\n".join(lines)
 
     async def _report_llm_call(
         self,
@@ -2531,6 +2425,7 @@ class FsExplorerAgent:
         self._final_answer_task = None
         self._final_answer_chunks.clear()
         self._final_answer_complete = False
+        self._final_answer_error = None
 
     async def _publish_final_chunk(self, text: str) -> None:
         async with self._final_answer_condition:
@@ -2538,19 +2433,12 @@ class FsExplorerAgent:
             self._final_answer_condition.notify_all()
 
     async def _run_final_answer_producer(self, fallback_answer: str | None) -> None:
-        """Always release replay consumers, including on observability errors."""
+        """Always release replay consumers and preserve provider failures."""
         try:
             await self._produce_final_answer(fallback_answer)
-        except Exception:
+        except Exception as exc:
             logger.exception("stream_final_answer: final-answer producer failed")
-            if not self._final_answer_chunks:
-                await self._publish_final_chunk(
-                    fallback_answer
-                    or (
-                        "Üzgünüm, bu soru için şu anda bir cevap oluşturamadım. "
-                        "Lütfen tekrar deneyin."
-                    )
-                )
+            self._final_answer_error = exc
         finally:
             # `reset()` can cancel an old producer and immediately clear the
             # state for reuse.  Do not let that old task mark the new state as
@@ -2599,25 +2487,23 @@ class FsExplorerAgent:
         client = self._multi_agent_final_llm if is_multi_agent else self._llm
         assert client is not None
 
-        try:
-            async for text in client.stream_text(
-                stream_history,
-                system_prompt,
-                thinking_level=None if is_multi_agent else "high",
-            ):
-                await self._publish_final_chunk(text)
-        except Exception:
-            logger.exception("stream_final_answer: final-answer streaming failed")
+        async for text in client.stream_text(
+            stream_history,
+            system_prompt,
+            thinking_level=None if is_multi_agent else "high",
+        ):
+            await self._publish_final_chunk(text)
 
         if not self._final_answer_chunks:
-            # `fallback_answer` can itself be empty (e.g. a forced max-steps
-            # stop with no real StopAction text) — falling through to a
-            # generic message here means a double failure (forced stop *and*
-            # streaming both coming up empty) still shows the user something
-            # instead of a silent blank response.
+            if is_multi_agent:
+                raise RuntimeError(
+                    "The final model returned no answer content for the "
+                    "completed research workflow."
+                )
+            # Retain legacy non-indexed behavior; the indexed multi-agent path
+            # above never substitutes a deterministic/direct fallback.
             await self._publish_final_chunk(
-                self._multi_agent_fallback_answer()
-                or fallback_answer
+                fallback_answer
                 or (
                     "Üzgünüm, bu soru için şu anda bir cevap oluşturamadım. "
                     "Lütfen tekrar deneyin."
@@ -2662,12 +2548,15 @@ class FsExplorerAgent:
                 )
                 available = self._final_answer_chunks[next_chunk:]
                 is_complete = self._final_answer_complete
+                final_error = self._final_answer_error
 
             for chunk in available:
                 next_chunk += 1
                 yield chunk
 
             if is_complete and next_chunk == len(self._final_answer_chunks):
+                if final_error is not None:
+                    raise final_error
                 return
 
     def call_tool(self, tool_name: Tools, tool_input: dict[str, Any]) -> None:

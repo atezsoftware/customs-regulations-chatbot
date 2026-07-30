@@ -554,61 +554,6 @@ async def test_scenario_result_selects_scenario_final_synthesis_prompt() -> None
     assert "conditional branch" in final.stream_calls[0][0][-1].text
 
 
-def test_scenario_fallback_keeps_separate_evidence_only_deliverables() -> None:
-    plan, _markers = _two_scenario_plan()
-    claim = _claim(
-        "shared_rule",
-        ["req_rule"],
-        ["ev_rule"],
-        "shared",
-        "The shared governing rule applies.",
-        claim_id="claim_shared",
-    )
-    finding = DerivedConclusion(
-        conclusion_id="scenario_a",
-        finding="The rule produces the scenario A outcome.",
-        requirement_ids=["req_a"],
-        fact_ids=["fact_a"],
-        branch_ids=["branch_a"],
-        supporting_claim_ids=[claim.claim_id],
-        dependency_refs=[
-            TaskOutputRef(task_id="shared_rule", output_id="rule_evidence")
-        ],
-        confidence=EvidenceConfidence.HIGH,
-        limitations=[],
-    )
-    final = _ScriptedClient("final", lambda _schema, _text: None)
-    agent = FsExplorerAgent(llm_client=final)
-    agent._multi_agent_result = MultiAgentResearchResult(
-        plan=plan,
-        task_artifacts=(
-            _artifact("shared_rule", ["req_rule"], claims=[claim]),
-            _artifact("apply_a", ["req_a"], findings=[finding]),
-        ),
-        final_context="",
-        evidence_sources=(
-            {
-                "title": claim.readable_title,
-                "snippet": claim.evidence_excerpt,
-                "document_id": claim.document_id,
-                "chunk_id": claim.chunk_id,
-                "score": 1.0,
-                "locator": claim.locator,
-            },
-        ),
-        incomplete=False,
-    )
-
-    answer = agent._multi_agent_fallback_answer()
-
-    assert answer is not None
-    assert finding.finding in answer
-    assert claim.claim in answer
-    assert "Additional verified rules and procedures" in answer
-    assert claim.readable_title not in answer
-    assert "## Sources" not in answer
-
-
 @pytest.mark.asyncio
 async def test_shared_evidence_fans_out_to_isolated_application_nodes() -> None:
     plan, markers = _two_scenario_plan()

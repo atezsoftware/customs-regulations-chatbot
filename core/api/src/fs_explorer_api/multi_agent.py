@@ -150,6 +150,21 @@ class ResearchLimits:
         )
 
 
+class _UnlimitedAsyncLimiter:
+    """Async context manager that never queues production research work."""
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(
+        self,
+        exc_type: object,
+        exc: object,
+        traceback: object,
+    ) -> None:
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class ResearchProgress:
     """One correlated lifecycle update emitted by the orchestrator."""
@@ -420,11 +435,16 @@ class MultiAgentResearchOrchestrator:
         self._on_retrieval = on_retrieval
         self._on_progress = on_progress
         self._search_runner_in_thread = search_runner_in_thread
-        self._llm_semaphore = asyncio.Semaphore(self._limits.max_parallel_llm_calls)
-        self._retrieval_semaphore = asyncio.Semaphore(
-            self._limits.max_parallel_retrievals
-        )
-        self._task_semaphore = asyncio.Semaphore(self._limits.max_parallel_tasks)
+        if self._unlimited_research:
+            self._llm_semaphore = _UnlimitedAsyncLimiter()
+            self._retrieval_semaphore = _UnlimitedAsyncLimiter()
+            self._task_semaphore = _UnlimitedAsyncLimiter()
+        else:
+            self._llm_semaphore = asyncio.Semaphore(self._limits.max_parallel_llm_calls)
+            self._retrieval_semaphore = asyncio.Semaphore(
+                self._limits.max_parallel_retrievals
+            )
+            self._task_semaphore = asyncio.Semaphore(self._limits.max_parallel_tasks)
         self._llm_budget_lock = asyncio.Lock()
         self._run_lock = asyncio.Lock()
         self._sequence = 0
@@ -533,15 +553,11 @@ class MultiAgentResearchOrchestrator:
                 self._llm_call_count += 1
 
                 async def invoke() -> tuple[object, LLMUsage]:
-                    async with self._llm_semaphore:
-                        result, usage = await client.generate_structured(
-                            [ChatTurn(role="user", text=user_text)],
-                            prompt,
-                            schema,
-                        )
-                    self._sequence += 1
-                    sequence = self._sequence
-                    if self._on_llm_usage is not None:
+                    async def record_usage(usage: LLMUsage) -> None:
+                        self._sequence += 1
+                        sequence = self._sequence
+                        if self._on_llm_usage is None:
+                            return
                         try:
                             await self._on_llm_usage(
                                 role,
@@ -556,13 +572,46 @@ class MultiAgentResearchOrchestrator:
                             logger.exception(
                                 "Multi-agent LLM telemetry callback failed"
                             )
+
+                    try:
+                        async with self._llm_semaphore:
+                            result, usage = await client.generate_structured(
+                                [ChatTurn(role="user", text=user_text)],
+                                prompt,
+                                schema,
+                            )
+                    except Exception as exc:
+                        # Structured adapters attach aggregate usage after
+                        # exhausting malformed/truncated-response recovery.
+                        # Record the paid call even though no artifact survived.
+                        failed_usage = getattr(exc, "usage", None)
+                        if isinstance(failed_usage, LLMUsage):
+                            await record_usage(failed_usage)
+                        raise
+                    await record_usage(usage)
                     return result, usage
+
+                def finalize(
+                    completed: asyncio.Task[tuple[object, LLMUsage]],
+                ) -> None:
+                    _consume_background_task_exception(completed)
+                    failed = completed.cancelled()
+                    if not failed:
+                        try:
+                            failed = completed.exception() is not None
+                        except BaseException:
+                            failed = True
+                    if failed and self._llm_tasks.get(operation_id) is completed:
+                        # Successful and in-flight operations remain reusable
+                        # across reconnects. A terminal failed task must not
+                        # poison Continue with the same cached exception.
+                        self._llm_tasks.pop(operation_id, None)
 
                 operation = asyncio.create_task(
                     invoke(),
                     name=f"multi-agent-llm:{operation_id}",
                 )
-                operation.add_done_callback(_consume_background_task_exception)
+                operation.add_done_callback(finalize)
                 self._llm_tasks[operation_id] = operation
 
         # The provider call is shielded so a WebSocket disconnect cannot
