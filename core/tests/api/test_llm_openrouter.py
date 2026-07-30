@@ -1,16 +1,65 @@
+from enum import Enum
 from decimal import Decimal
 
 import httpx
 import json
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from fs_explorer_api.llm.base import ChatTurn
-from fs_explorer_api.llm.openrouter import OpenRouterLLMClient, usage_from_openrouter
+from fs_explorer_api.llm.openrouter import (
+    OpenRouterLLMClient,
+    _provider_compatible_json_schema,
+    usage_from_openrouter,
+)
+from fs_explorer_api.orchestration_models import (
+    GlobalPlan,
+    SearchAssignmentBatch,
+    TaskArtifact,
+    WorkerArtifact,
+)
 
 
 class Reply(BaseModel):
     answer: str
+
+
+class ReplyKind(str, Enum):
+    SUCCESS = "success"
+
+
+class ReferencedReply(BaseModel):
+    kind: ReplyKind = Field(description="Result category")
+
+
+def _ref_nodes(value: object) -> list[dict]:
+    if isinstance(value, list):
+        return [node for item in value for node in _ref_nodes(item)]
+    if not isinstance(value, dict):
+        return []
+    nodes = [value] if "$ref" in value else []
+    return nodes + [node for item in value.values() for node in _ref_nodes(item)]
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [GlobalPlan, SearchAssignmentBatch, WorkerArtifact, TaskArtifact],
+)
+def test_orchestration_schemas_have_no_ref_siblings_after_normalization(
+    schema: type[BaseModel],
+) -> None:
+    normalized = _provider_compatible_json_schema(schema.model_json_schema())
+
+    refs = _ref_nodes(normalized)
+    assert refs
+    assert all(set(node) == {"$ref"} for node in refs)
+
+
+def test_schema_normalization_never_discards_validation_keywords() -> None:
+    with pytest.raises(ValueError, match=r"beside \$ref.*minLength"):
+        _provider_compatible_json_schema(
+            {"$ref": "#/$defs/Name", "description": "Name", "minLength": 1}
+        )
 
 
 def test_openrouter_completion_total_is_not_double_counted() -> None:
@@ -68,6 +117,34 @@ async def test_structured_request_uses_strict_schema_and_provider_cost() -> None
     assert "reasoning" not in seen
     assert usage.generation_id == "gen-1"
     assert usage.billed_cost_usd == Decimal("0.00001")
+
+
+@pytest.mark.asyncio
+async def test_structured_request_removes_annotations_beside_ref() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"kind":"success"}'}}],
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as raw_client:
+        client = OpenRouterLLMClient(api_key="test", client=raw_client)
+        result, _usage = await client.generate_structured(
+            [ChatTurn(role="user", text="hello")],
+            "system",
+            ReferencedReply,
+        )
+
+    kind_schema = seen["response_format"]["json_schema"]["schema"]["properties"]["kind"]
+    assert kind_schema == {"$ref": "#/$defs/ReplyKind"}
+    assert result.kind is ReplyKind.SUCCESS
 
 
 @pytest.mark.asyncio

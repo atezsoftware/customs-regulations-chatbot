@@ -19,6 +19,16 @@ _MAX_COMPLETION_TOKEN_MODEL_PREFIXES = (
     "openai/o3",
     "openai/o4",
 )
+_REF_ANNOTATION_KEYS = {
+    "$comment",
+    "default",
+    "deprecated",
+    "description",
+    "examples",
+    "readOnly",
+    "title",
+    "writeOnly",
+}
 
 
 class OpenRouterError(RuntimeError):
@@ -245,6 +255,40 @@ def _request_payload_variants(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return variants
 
 
+def _provider_compatible_json_schema(value: Any, *, path: str = "$") -> Any:
+    """Normalize Pydantic schemas for strict OpenAI-compatible endpoints.
+
+    JSON Schema permits annotation keywords beside ``$ref``. Some OpenRouter
+    providers implement the narrower OpenAI structured-output dialect and
+    reject those valid schemas. Annotations do not affect validation, so they
+    can be removed without changing the Pydantic contract. Validation keywords
+    are never discarded silently.
+    """
+    if isinstance(value, list):
+        return [
+            _provider_compatible_json_schema(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if not isinstance(value, dict):
+        return value
+
+    normalized = {
+        key: _provider_compatible_json_schema(item, path=f"{path}.{key}")
+        for key, item in value.items()
+    }
+    if "$ref" not in normalized:
+        return normalized
+
+    siblings = set(normalized) - {"$ref"}
+    unsupported = siblings - _REF_ANNOTATION_KEYS
+    if unsupported:
+        joined = ", ".join(sorted(unsupported))
+        raise ValueError(
+            f"Cannot normalize validation keywords beside $ref at {path}: {joined}"
+        )
+    return {"$ref": normalized["$ref"]}
+
+
 def usage_from_openrouter(raw: dict[str, Any], *, duration_ms: float = 0) -> LLMUsage:
     """Normalize provider usage while keeping reasoning out of visible output."""
     details = raw.get("completion_tokens_details")
@@ -406,7 +450,7 @@ class OpenRouterLLMClient:
             "json_schema": {
                 "name": schema.__name__,
                 "strict": True,
-                "schema": schema.model_json_schema(),
+                "schema": _provider_compatible_json_schema(schema.model_json_schema()),
             },
         }
         payload["provider"] = {"require_parameters": True}
