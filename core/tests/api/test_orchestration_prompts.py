@@ -7,6 +7,7 @@ from fs_explorer_api.orchestration_prompts import (
     SCENARIO_FINAL_SYNTHESIS_SYSTEM_PROMPT,
     TASK_COORDINATOR_SYSTEM_PROMPT,
     TASK_REVIEW_SYSTEM_PROMPT,
+    build_gap_recovery_prompt,
     build_global_planner_prompt,
     build_task_coordinator_prompt,
 )
@@ -48,6 +49,15 @@ def test_task_coordinator_prompt_enforces_bounded_non_recursive_fanout() -> None
     assert "at most 1 waves" in prompt
     assert "Do not spawn coordinators, create recursive tasks" in prompt
     assert "OUTPUT CONTRACT — SearchAssignmentBatch" in prompt
+
+
+def test_gap_recovery_prompt_forbids_stopping_after_one_empty_query() -> None:
+    prompt = build_gap_recovery_prompt(max_assignments_per_wave=2)
+
+    assert "stop must be false" in prompt
+    assert "issue 1 to 2" in prompt
+    assert "Do not merely\n  reorder or lightly paraphrase" in prompt
+    assert "explicit unresolved cross-reference" in prompt
 
 
 def test_worker_prompt_distinguishes_no_evidence_from_failure() -> None:

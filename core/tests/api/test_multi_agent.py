@@ -612,6 +612,125 @@ async def test_single_pass_coverage_miss_upgrades_to_adaptive_wave() -> None:
     assert "criterion-task_1" in gap_events[0].detail
 
 
+@pytest.mark.asyncio
+async def test_premature_stop_escalates_to_a_distinct_recovery_search() -> None:
+    planner = _ScriptedClient(
+        "planner",
+        lambda schema, _text: _plan(_task("task_1", "Question one")),
+    )
+
+    def task_responder(schema: type, text: str) -> object:
+        if schema is SearchAssignmentBatch:
+            if "PERSISTENT GAP RECOVERY WAVE" in text:
+                return SearchAssignmentBatch(
+                    task_id="task_1",
+                    stop=False,
+                    stop_reason=None,
+                    assignments=[
+                        SearchAssignment(
+                            assignment_id="different-angle",
+                            task_id="task_1",
+                            query="alternative exception terminology",
+                            objective="Try a distinct legal terminology angle.",
+                            evidence_requirements=["criterion-task_1"],
+                            excluded_queries=["query-task_1"],
+                            as_of_date=None,
+                            filters=None,
+                        )
+                    ],
+                )
+            if "WORKER ARTIFACTS SO FAR:\n[]" in text:
+                return _task_responder(schema, text)
+            return SearchAssignmentBatch(
+                task_id="task_1",
+                stop=True,
+                stop_reason="The first query returned no evidence.",
+                assignments=[],
+            )
+        return _task_responder(schema, text)
+
+    searches: list[str] = []
+    progress: list[ResearchProgress] = []
+
+    def search(**kwargs):
+        query = kwargs["query"]
+        searches.append(query)
+        return _SearchResult(
+            query=query,
+            hits=(
+                [_hit("task_1")] if query == "alternative exception terminology" else []
+            ),
+        )
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", task_responder),
+        worker_llm=_ScriptedClient("worker", _worker_responder),
+        search_runner=search,
+        limits=_limits(),
+        on_progress=progress.append,
+        search_runner_in_thread=False,
+    ).run("Question one")
+
+    assert searches == ["query-task_1", "alternative exception terminology"]
+    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
+    assert result.incomplete is False
+    assert any(event.kind == "search_persistence_enforced" for event in progress)
+
+
+@pytest.mark.asyncio
+async def test_uncovered_requirement_gets_three_angles_before_stop_is_accepted() -> (
+    None
+):
+    planner = _ScriptedClient(
+        "planner",
+        lambda schema, _text: _plan(_task("task_1", "Question one")),
+    )
+
+    def task_responder(schema: type, text: str) -> object:
+        assert schema is SearchAssignmentBatch
+        if "WORKER ARTIFACTS SO FAR:\n[]" in text:
+            return _task_responder(schema, text)
+        return SearchAssignmentBatch(
+            task_id="task_1",
+            stop=True,
+            stop_reason="No more searches proposed.",
+            assignments=[],
+        )
+
+    searches: list[str] = []
+    progress: list[ResearchProgress] = []
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", task_responder),
+        worker_llm=_ScriptedClient(
+            "worker",
+            lambda _schema, _text: pytest.fail(
+                "Empty searches must not spend evidence-extraction tokens"
+            ),
+        ),
+        search_runner=lambda **kwargs: (
+            searches.append(kwargs["query"])
+            or _SearchResult(query=kwargs["query"], hits=[])
+        ),
+        limits=replace(
+            _limits(),
+            max_worker_rounds=4,
+            max_total_workers=12,
+        ),
+        on_progress=progress.append,
+        search_runner_in_thread=False,
+    ).run("Question one")
+
+    assert len(searches) == 3
+    assert len({_normalized.casefold() for _normalized in searches}) == 3
+    assert result.incomplete is True
+    exhausted = [event for event in progress if event.kind == "gap_recovery_exhausted"]
+    assert len(exhausted) == 1
+    assert "3 farklı hedefli aramaya rağmen" in exhausted[0].detail
+
+
 def test_near_duplicate_queries_are_rejected_without_an_llm_call() -> None:
     assert _is_near_duplicate_query(
         "transit süresi aşımı cezası yönetmelik",

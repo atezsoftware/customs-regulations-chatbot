@@ -10,7 +10,7 @@ from __future__ import annotations
 DEFAULT_MAX_TASKS = 5
 DEFAULT_MAX_LIST_ITEMS = 12
 DEFAULT_MAX_ASSIGNMENTS_PER_WAVE = 3
-DEFAULT_MAX_WORKER_ROUNDS = 2
+DEFAULT_MAX_WORKER_ROUNDS = 4
 
 
 def build_global_planner_prompt(
@@ -103,14 +103,19 @@ DISPATCH POLICY
 - Map every assignment to existing evidence_requirement_ids. Never create or
   rename a plan ID. Target only IDs in UNRESOLVED EVIDENCE REQUIREMENTS; never
   spend a search on an already-covered ID.
-- If all required evidence IDs are covered, or another search is unlikely to
-  add novel support, set stop=true and issue no assignments.
+- If all required evidence IDs are covered, set stop=true. Otherwise continue
+  searching until the supplied attempt inventory shows that each unresolved ID
+  has been tried through multiple materially different retrieval angles. A
+  single empty or irrelevant result never justifies stop=true.
 - Otherwise issue 1 to {max_assignments_per_wave} independent assignments for
   the current wave. The scheduler permits at most {max_worker_rounds} waves.
 - Each query must be standalone, materially different from prior queries, and
   narrowly tied to named evidence IDs. Split assignments by genuinely independent
-  retrieval angle, not by paraphrase. Use explicit historical dates and only
-  reliable metadata filters.
+  retrieval angle, not by superficial paraphrase. Deliberately vary legal
+  terminology: try the exact rule or instrument phrase, broader concept and
+  synonyms, then named exceptions, procedures, article references, or explicit
+  cross-references found in prior evidence. Use explicit historical dates and
+  only reliable metadata filters.
 - Assignment IDs must be unique within the task and use short stable
   alphanumeric, `_`, or `-` identifiers.
 - Do not spawn coordinators, create recursive tasks, broaden the issue, or
@@ -121,6 +126,34 @@ task_id, stop, stop_reason, assignments. Each SearchAssignment contains
 assignment_id, task_id, query, objective, evidence_requirements,
 excluded_queries, as_of_date, filters. When stop=true, assignments must be []
 and stop_reason must be concise; otherwise stop_reason must be null."""
+
+
+def build_gap_recovery_prompt(
+    *,
+    max_assignments_per_wave: int = DEFAULT_MAX_ASSIGNMENTS_PER_WAVE,
+) -> str:
+    """Build the bounded escalation used when a task tries to stop too early."""
+
+    return f"""ROLE
+You are the persistent search strategist for one unresolved evidence task.
+The normal coordinator stopped or repeated itself before adequate search angles
+were exhausted. Produce better indexed-search queries; do not answer the user.
+
+REQUIRED BEHAVIOR
+- stop must be false and you must issue 1 to {max_assignments_per_wave}
+  assignments targeting only supplied unresolved evidence_requirement_ids.
+- Every query must differ materially from SEARCHES ALREADY RUN. Do not merely
+  reorder or lightly paraphrase the same terms.
+- Change the retrieval angle: exact instrument/rule wording, broader legal
+  concept or synonym, exception/procedure terminology, article identifiers,
+  or an explicit unresolved cross-reference from prior evidence.
+- Keep each query standalone and concise. Never invent a source title, article
+  number, date, or fact that is not present in the supplied task/artifacts.
+
+OUTPUT CONTRACT — SearchAssignmentBatch
+task_id, stop=false, stop_reason=null, assignments. Each SearchAssignment has
+assignment_id, task_id, query, objective, evidence_requirements,
+excluded_queries, as_of_date, filters. Return only the structured result."""
 
 
 EVIDENCE_WORKER_SYSTEM_PROMPT = """ROLE

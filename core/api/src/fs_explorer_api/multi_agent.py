@@ -48,6 +48,7 @@ from .orchestration_prompts import (
     EVIDENCE_WORKER_SYSTEM_PROMPT,
     INTEGRATION_TASK_SYSTEM_PROMPT,
     TASK_REVIEW_SYSTEM_PROMPT,
+    build_gap_recovery_prompt,
     build_global_planner_prompt,
     build_task_coordinator_prompt,
 )
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 ProgressStatus = Literal["started", "completed", "failed"]
 AgentRole = Literal["planner", "task", "worker", "final"]
 _FINAL_SYNTHESIS_CALL_RESERVE = 1
+_MIN_SEARCH_ANGLES_PER_REQUIREMENT = 3
 
 
 class SearchResult(Protocol):
@@ -86,8 +88,8 @@ class ResearchLimits:
     max_tasks: int = 5
     max_parallel_tasks: int = 3
     max_assignments_per_wave: int = 3
-    max_worker_rounds: int = 2
-    max_total_workers: int = 8
+    max_worker_rounds: int = 4
+    max_total_workers: int = 12
     max_parallel_llm_calls: int = 4
     max_parallel_retrievals: int = 8
     worker_hit_limit: int = 6
@@ -536,6 +538,7 @@ class MultiAgentResearchOrchestrator:
         self._evidence_by_source: dict[tuple[str, str], EvidenceRecord] = {}
         self._task_evidence: dict[str, dict[str, EvidenceRecord]] = {}
         self._searches_by_task: dict[str, set[str]] = {}
+        self._search_attempts_by_task: dict[str, dict[str, set[str]]] = {}
         self._gap_progress_rounds: set[tuple[str, int]] = set()
         self._material_unknowns_announced = False
 
@@ -1009,6 +1012,10 @@ class MultiAgentResearchOrchestrator:
         ]
         worker_by_assignment = self._worker_artifacts.setdefault(spec.task_id, {})
         searches_run = self._searches_by_task.setdefault(spec.task_id, set())
+        attempts_by_requirement = self._search_attempts_by_task.setdefault(
+            spec.task_id,
+            {},
+        )
         single_pass = (
             self._plan is not None
             and self._plan.mode == PlanMode.DIRECT
@@ -1054,6 +1061,7 @@ class MultiAgentResearchOrchestrator:
                         searches_run=sorted(searches_run),
                         round_index=round_index,
                         uncovered_evidence=uncovered_evidence,
+                        attempts_by_requirement=attempts_by_requirement,
                     )
                 except Exception:
                     logger.exception(
@@ -1074,9 +1082,59 @@ class MultiAgentResearchOrchestrator:
                     for requirement in uncovered_evidence
                 },
             )
+            if (
+                (dispatch.stop or not assignments)
+                and self._requires_more_search_angles(
+                    uncovered_evidence,
+                    attempts_by_requirement,
+                )
+                and self._available_worker_slots(spec.task_id) > 0
+            ):
+                self._emit_search_persistence_progress(
+                    spec,
+                    uncovered_evidence,
+                    attempts_by_requirement=attempts_by_requirement,
+                    round_index=round_index,
+                )
+                recovery_dispatch = await self._persistent_recovery_dispatch(
+                    spec=spec,
+                    worker_artifacts=list(worker_by_assignment.values()),
+                    searches_run=sorted(searches_run),
+                    uncovered_evidence=uncovered_evidence,
+                    attempts_by_requirement=attempts_by_requirement,
+                    round_index=round_index,
+                )
+                assignments = self._validated_assignments(
+                    spec,
+                    recovery_dispatch,
+                    searches_run=searches_run,
+                    existing_assignment_ids=set(worker_by_assignment),
+                    allowed_evidence_requirement_ids={
+                        requirement.evidence_requirement_id
+                        for requirement in uncovered_evidence
+                    },
+                )
+                if not assignments:
+                    deterministic_dispatch = self._deterministic_gap_dispatch(
+                        spec=spec,
+                        worker_artifacts=list(worker_by_assignment.values()),
+                        searches_run=searches_run,
+                        uncovered_evidence=uncovered_evidence,
+                        round_index=round_index,
+                    )
+                    assignments = self._validated_assignments(
+                        spec,
+                        deterministic_dispatch,
+                        searches_run=searches_run,
+                        existing_assignment_ids=set(worker_by_assignment),
+                        allowed_evidence_requirement_ids={
+                            requirement.evidence_requirement_id
+                            for requirement in uncovered_evidence
+                        },
+                    )
             remaining_slots = self._available_worker_slots(spec.task_id)
             assignments = assignments[:remaining_slots]
-            if dispatch.stop or not assignments:
+            if not assignments:
                 self._worker_closed_tasks.add(spec.task_id)
                 self._next_round_by_task[spec.task_id] = (
                     self._limits.max_worker_rounds + 1
@@ -1142,6 +1200,11 @@ class MultiAgentResearchOrchestrator:
                 else:
                     artifact = result
                 worker_by_assignment[assignment.assignment_id] = artifact
+                if artifact.status != WorkerStatus.FAILED:
+                    self._record_search_angles(
+                        attempts_by_requirement,
+                        assignment,
+                    )
             self._next_round_by_task[spec.task_id] = round_index + 1
             supported_criteria = {
                 evidence_requirement_id
@@ -1212,6 +1275,13 @@ class MultiAgentResearchOrchestrator:
                 )
                 for requirement_id in artifact.uncovered_requirement_ids[:3]
             ]
+            distinct_searches = len(
+                {
+                    query
+                    for queries in attempts_by_requirement.values()
+                    for query in queries
+                }
+            )
             self._emit(
                 event_id=f"gap-unresolved-{spec.task_id}",
                 kind="gap_recovery_exhausted",
@@ -1219,7 +1289,8 @@ class MultiAgentResearchOrchestrator:
                 status="completed",
                 label="Kanıt açığı kaldı",
                 detail=(
-                    "Hedefli aramaya rağmen şu bölüm tamamlanamadı: "
+                    f"{distinct_searches} farklı hedefli aramaya rağmen şu "
+                    "bölüm tamamlanamadı: "
                     f"{'; '.join(descriptions)}. "
                     "Yanıt mevcut kanıtla sınırlandırılacak ve eksik açıkça belirtilecek."
                 ),
@@ -1316,6 +1387,58 @@ class MultiAgentResearchOrchestrator:
                 "Yanıt için eksik kalan kanıt: "
                 f"{'; '.join(descriptions)}{suffix}. "
                 "Yalnızca bu eksikleri tamamlamak için hedefli arama yapıyorum."
+            ),
+            task_id=spec.task_id,
+            agent_id=f"task-coordinator-{spec.task_id}",
+        )
+
+    @staticmethod
+    def _record_search_angles(
+        attempts_by_requirement: dict[str, set[str]],
+        assignment: SearchAssignment,
+    ) -> None:
+        normalized = _normalized_query(assignment.query)
+        for requirement_id in assignment.evidence_requirements:
+            attempts_by_requirement.setdefault(requirement_id, set()).add(normalized)
+
+    @staticmethod
+    def _requires_more_search_angles(
+        requirements: Sequence[EvidenceRequirement],
+        attempts_by_requirement: dict[str, set[str]],
+    ) -> bool:
+        return any(
+            len(attempts_by_requirement.get(requirement.evidence_requirement_id, set()))
+            < _MIN_SEARCH_ANGLES_PER_REQUIREMENT
+            for requirement in requirements
+        )
+
+    def _emit_search_persistence_progress(
+        self,
+        spec: TaskSpec,
+        requirements: Sequence[EvidenceRequirement],
+        *,
+        attempts_by_requirement: dict[str, set[str]],
+        round_index: int,
+    ) -> None:
+        counts = [
+            len(
+                attempts_by_requirement.get(
+                    requirement.evidence_requirement_id,
+                    set(),
+                )
+            )
+            for requirement in requirements
+        ]
+        self._emit(
+            event_id=f"search-persistence-{spec.task_id}-{round_index}",
+            kind="search_persistence_enforced",
+            role="task",
+            status="started",
+            label="Arama farklı açılarla sürdürülüyor",
+            detail=(
+                "İlk sorgular yeterli kanıt vermedi. Erken durmak yerine "
+                "terminoloji, kapsam, istisna, usul ve cross-reference "
+                f"açıları değiştirilecek (mevcut deneme sayıları: {counts})."
             ),
             task_id=spec.task_id,
             agent_id=f"task-coordinator-{spec.task_id}",
@@ -1738,6 +1861,7 @@ class MultiAgentResearchOrchestrator:
         searches_run: Sequence[str],
         round_index: int,
         uncovered_evidence: Sequence[EvidenceRequirement],
+        attempts_by_requirement: dict[str, set[str]],
     ) -> SearchAssignmentBatch:
         agent_id = f"task-coordinator-{spec.task_id}"
         raw, _usage = await self._generate_structured(
@@ -1757,6 +1881,8 @@ class MultiAgentResearchOrchestrator:
                 f"{self._compact_worker_artifacts(worker_artifacts)}\n\n"
                 "UNRESOLVED EVIDENCE REQUIREMENTS:\n"
                 f"{json.dumps([requirement.model_dump(mode='json') for requirement in uncovered_evidence], ensure_ascii=False, separators=(',', ':'))}\n\n"
+                "SEARCH ATTEMPTS BY EVIDENCE REQUIREMENT:\n"
+                f"{json.dumps({requirement.evidence_requirement_id: sorted(attempts_by_requirement.get(requirement.evidence_requirement_id, set())) for requirement in uncovered_evidence}, ensure_ascii=False, separators=(',', ':'))}\n\n"
                 "SEARCHES ALREADY RUN:\n"
                 f"{json.dumps(list(searches_run), ensure_ascii=False)}"
             ),
@@ -1767,6 +1893,133 @@ class MultiAgentResearchOrchestrator:
         )
         assert isinstance(raw, SearchAssignmentBatch)
         return raw
+
+    async def _persistent_recovery_dispatch(
+        self,
+        *,
+        spec: TaskSpec,
+        worker_artifacts: Sequence[WorkerArtifact],
+        searches_run: Sequence[str],
+        uncovered_evidence: Sequence[EvidenceRequirement],
+        attempts_by_requirement: dict[str, set[str]],
+        round_index: int,
+    ) -> SearchAssignmentBatch:
+        """Escalate a premature stop into materially different search angles."""
+
+        try:
+            raw, _usage = await self._generate_structured(
+                client=self._task_llm,
+                role="task",
+                purpose="gap_query_recovery",
+                prompt=build_gap_recovery_prompt(
+                    max_assignments_per_wave=(self._limits.max_assignments_per_wave),
+                ),
+                user_text=(
+                    f"PERSISTENT GAP RECOVERY WAVE: {round_index}/"
+                    f"{self._limits.max_worker_rounds}\n\n"
+                    f"TASK SPEC:\n{spec.model_dump_json()}\n\n"
+                    "UNRESOLVED EVIDENCE REQUIREMENTS:\n"
+                    f"{json.dumps([requirement.model_dump(mode='json') for requirement in uncovered_evidence], ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    "ATTEMPTS BY EVIDENCE REQUIREMENT:\n"
+                    f"{json.dumps({requirement.evidence_requirement_id: sorted(attempts_by_requirement.get(requirement.evidence_requirement_id, set())) for requirement in uncovered_evidence}, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    "VERIFIED WORKER ARTIFACTS AND CROSS-REFERENCES:\n"
+                    f"{self._compact_worker_artifacts(worker_artifacts)}\n\n"
+                    "SEARCHES ALREADY RUN:\n"
+                    f"{json.dumps(list(searches_run), ensure_ascii=False)}"
+                ),
+                operation_id=f"task-gap-recovery:{spec.task_id}:{round_index}",
+                schema=SearchAssignmentBatch,
+                task_id=spec.task_id,
+                agent_id=f"task-gap-recovery-{spec.task_id}",
+            )
+            assert isinstance(raw, SearchAssignmentBatch)
+            return raw
+        except Exception:
+            logger.exception(
+                "Persistent gap-query recovery failed for %s",
+                spec.task_id,
+            )
+            return SearchAssignmentBatch(
+                task_id=spec.task_id,
+                stop=True,
+                stop_reason="Gap-query recovery could not produce a safe query.",
+                assignments=[],
+            )
+
+    def _deterministic_gap_dispatch(
+        self,
+        *,
+        spec: TaskSpec,
+        worker_artifacts: Sequence[WorkerArtifact],
+        searches_run: set[str],
+        uncovered_evidence: Sequence[EvidenceRequirement],
+        round_index: int,
+    ) -> SearchAssignmentBatch:
+        """Guarantee safe fallback searches when the strategist still stops."""
+
+        cross_references = list(
+            dict.fromkeys(
+                reference
+                for worker in worker_artifacts
+                for reference in worker.cross_references
+                if reference.strip()
+            )
+        )
+        selected_queries: list[str] = []
+        assignments: list[SearchAssignment] = []
+        for requirement in uncovered_evidence:
+            candidates = [
+                *cross_references,
+                requirement.description,
+                f"{spec.issue} {requirement.description}",
+                f"{requirement.description} {spec.expected_output}",
+                (
+                    f"{requirement.description} "
+                    f"{requirement.kind.value.replace('_', ' ')}"
+                ),
+            ]
+            query = next(
+                (
+                    _bounded_text(candidate, self._limits.max_query_chars)
+                    for candidate in candidates
+                    if candidate.strip()
+                    and not _is_near_duplicate_query(
+                        candidate,
+                        [*searches_run, *selected_queries],
+                    )
+                ),
+                None,
+            )
+            if query is None:
+                continue
+            selected_queries.append(query)
+            assignments.append(
+                SearchAssignment(
+                    assignment_id=(
+                        f"{spec.task_id}_persistent_{round_index}_"
+                        f"{len(assignments) + 1}"
+                    ),
+                    task_id=spec.task_id,
+                    query=query,
+                    objective=(f"Find missing evidence for: {requirement.description}"),
+                    evidence_requirements=[requirement.evidence_requirement_id],
+                    excluded_queries=sorted(searches_run),
+                    as_of_date=_validated_as_of_date(spec.as_of_date),
+                    filters=spec.filters,
+                )
+            )
+            if len(assignments) >= self._limits.max_assignments_per_wave:
+                break
+        return SearchAssignmentBatch(
+            task_id=spec.task_id,
+            stop=not assignments,
+            stop_reason=(
+                None
+                if assignments
+                else "No materially distinct safe fallback query remained."
+            ),
+            assignments=assignments,
+        )
 
     def _fallback_dispatch(
         self,
