@@ -71,6 +71,149 @@ async def test_structured_request_uses_strict_schema_and_provider_cost() -> None
 
 
 @pytest.mark.asyncio
+async def test_openai_reasoning_model_uses_azure_compatible_token_parameter() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"answer":"ok"}'}}]},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as raw_client:
+        client = OpenRouterLLMClient(
+            api_key="test",
+            model="openai/gpt-5.6-sol",
+            client=raw_client,
+            enable_reasoning_effort=True,
+        )
+        await client.generate_structured(
+            [ChatTurn(role="user", text="hello")],
+            "system",
+            Reply,
+            thinking_level="medium",
+        )
+
+    assert seen["max_completion_tokens"] == 8000
+    assert "max_tokens" not in seen
+    assert seen["provider"] == {"require_parameters": True}
+
+
+@pytest.mark.asyncio
+async def test_endpoint_eligibility_adapts_parameters_without_changing_model() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        seen.append(payload)
+        if (
+            "max_tokens" in payload
+            or "max_completion_tokens" in payload
+            or "reasoning" in payload
+            or "temperature" in payload
+        ):
+            return httpx.Response(
+                404,
+                json={
+                    "error": {
+                        "message": (
+                            "No endpoints available matching your guardrail "
+                            "restrictions and data policy."
+                        )
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"answer":"ok"}'}}]},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as raw_client:
+        client = OpenRouterLLMClient(
+            api_key="test",
+            model="vendor/model",
+            temperature=0.2,
+            client=raw_client,
+            enable_reasoning_effort=True,
+        )
+        result, _usage = await client.generate_structured(
+            [ChatTurn(role="user", text="hello")],
+            "system",
+            Reply,
+            thinking_level="medium",
+        )
+
+    assert result.answer == "ok"
+    assert len(seen) == 5
+    assert all(payload["model"] == "vendor/model" for payload in seen)
+    assert all(payload["messages"] == seen[0]["messages"] for payload in seen)
+    assert all(
+        payload["response_format"] == seen[0]["response_format"] for payload in seen
+    )
+    assert all(payload["provider"] == {"require_parameters": True} for payload in seen)
+    assert "max_tokens" not in seen[-1]
+    assert "max_completion_tokens" not in seen[-1]
+    assert "reasoning" not in seen[-1]
+    assert "temperature" not in seen[-1]
+
+
+@pytest.mark.asyncio
+async def test_stream_adapts_token_parameter_before_emitting_text() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        seen.append(payload)
+        if "max_tokens" in payload:
+            return httpx.Response(
+                404,
+                json={
+                    "error": {
+                        "message": (
+                            "No endpoints available matching your guardrail "
+                            "restrictions and data policy."
+                        )
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            text=(
+                'data: {"choices":[{"delta":{"content":"compatible"}}]}\n\n'
+                "data: [DONE]\n\n"
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as raw_client:
+        client = OpenRouterLLMClient(
+            api_key="test",
+            model="vendor/model",
+            client=raw_client,
+        )
+        chunks = [
+            chunk
+            async for chunk in client.stream_text(
+                [ChatTurn(role="user", text="hello")],
+                "system",
+            )
+        ]
+
+    assert chunks == ["compatible"]
+    assert len(seen) == 2
+    assert seen[0]["max_tokens"] == 8000
+    assert seen[1]["max_completion_tokens"] == 8000
+    assert all(payload["model"] == "vendor/model" for payload in seen)
+
+
+@pytest.mark.asyncio
 async def test_truncated_reasoning_response_raises_actionable_error() -> None:
     """A verbose reasoning model (e.g. z-ai/glm-5.2) can burn its whole output
     budget on hidden chain-of-thought and never emit visible content —
@@ -169,6 +312,38 @@ async def test_rejected_request_keeps_bounded_provider_error_detail() -> None:
     ) as raw_client:
         client = OpenRouterLLMClient(api_key="test", client=raw_client)
         with pytest.raises(RuntimeError, match="400.*reasoning is not supported"):
+            await client.generate_structured(
+                [ChatTurn(role="user", text="hello")], "system", Reply
+            )
+
+
+@pytest.mark.asyncio
+async def test_routing_policy_error_names_ineligible_model() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            json={
+                "error": {
+                    "message": (
+                        "No endpoints available matching your guardrail "
+                        "restrictions and data policy."
+                    )
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as raw_client:
+        client = OpenRouterLLMClient(
+            api_key="test",
+            model="openai/gpt-5.6-sol",
+            client=raw_client,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=r"openai/gpt-5\.6-sol.*Privacy and Guardrail policy",
+        ):
             await client.generate_structured(
                 [ChatTurn(role="user", text="hello")], "system", Reply
             )
