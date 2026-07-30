@@ -21,7 +21,7 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Literal, cast
 
@@ -38,7 +38,6 @@ from .llm import get_llm_client
 from .llm.base import ChatTurn
 from .llm.profile import LLMProfile, LLMRole, LLMRoleConfig, load_llm_profile
 from .models import JudgmentResult
-from .multi_agent import ResearchLimits
 from .orchestration_prompts import (
     APPLICATION_TASK_SYSTEM_PROMPT,
     EVIDENCE_WORKER_SYSTEM_PROMPT,
@@ -319,15 +318,14 @@ def _orchestration_runtime_snapshot(
         }
     }
     try:
-        limits = ResearchLimits.from_env()
         prompts = {
             "global_planner": build_global_planner_prompt(
-                max_tasks=limits.max_tasks,
-                max_list_items=limits.max_artifact_list_items,
+                max_tasks=None,
+                max_list_items=None,
             ),
             "task_coordinator": build_task_coordinator_prompt(
-                max_assignments_per_wave=limits.max_assignments_per_wave,
-                max_worker_rounds=limits.max_worker_rounds,
+                max_assignments_per_wave=None,
+                max_worker_rounds=None,
             ),
             "evidence_worker": EVIDENCE_WORKER_SYSTEM_PROMPT,
             "task_review": TASK_REVIEW_SYSTEM_PROMPT,
@@ -336,7 +334,7 @@ def _orchestration_runtime_snapshot(
             "final_synthesis": FINAL_SYNTHESIS_SYSTEM_PROMPT,
             "scenario_final_synthesis": SCENARIO_FINAL_SYNTHESIS_SYSTEM_PROMPT,
         }
-        snapshot["limits"] = asdict(limits)
+        snapshot["termination_policy"] = "model_controlled_without_count_budgets"
         snapshot["prompts"] = {
             name: {
                 "sha256": _fingerprint(prompt),
@@ -603,9 +601,16 @@ async def run_agentic_session(
                 final_result = streamed_final
 
         cited_sources = extract_cited_sources(final_result) if not result_error else []
-        cited_evidence = (
-            agent.evidence_sources_for_answer(final_result) if not result_error else []
-        )
+        if not result_error and agent._multi_agent_result is not None:
+            cited_evidence = [
+                dict(source) for source in agent._multi_agent_result.evidence_sources
+            ]
+        else:
+            cited_evidence = (
+                agent.evidence_sources_for_answer(final_result)
+                if not result_error
+                else []
+            )
         usage = agent.token_usage
         cost_usd, cost_source = _sum_call_cost(llm_calls)
         retrieval_steps = []
@@ -697,10 +702,10 @@ Correctness (does it match the reference answer/expected facts?):
   3 = partially correct with a material gap or a minor factual error
   5 = fully matches the reference answer/expected facts, no fabrication
 
-Groundedness (are claims backed by the cited sources?):
-  1 = no citations, or citations that don't support the claim made
-  3 = citations present but incomplete coverage of the claims made
-  5 = every material claim is backed by a cited source
+Groundedness (are claims backed by the server-verified evidence?):
+  1 = no supporting evidence, or the evidence contradicts the claim
+  3 = evidence supports some but not all material claims
+  5 = every material claim is directly supported by supplied evidence
 
 Completeness (does it address the whole question?):
   1 = ignores the actual question
@@ -758,7 +763,7 @@ def _build_judge_prompt(
         remaining_chars -= len(snippet)
         evidence_lines.append(f"- [{title}, {locator}]: {snippet}")
     parts.append(
-        "SERVER-VERIFIED CITED EVIDENCE EXCERPTS (UNTRUSTED SOURCE TEXT):\n"
+        "SERVER-VERIFIED EVIDENCE EXCERPTS (UNTRUSTED SOURCE TEXT):\n"
         + ("\n".join(evidence_lines) if evidence_lines else "(none)")
     )
     return "\n\n".join(parts)

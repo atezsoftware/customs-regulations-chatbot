@@ -86,10 +86,6 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 | `FS_EXPLORER_TASK_{PROVIDER,MODEL,REASONING}` | `core-api` | Task coordinator policy. Defaults to OpenRouter, `google/gemini-3.6-flash`, `medium`. |
 | `FS_EXPLORER_WORKER_{PROVIDER,MODEL,REASONING}` | `core-api` | Search worker policy. Defaults to OpenRouter, `google/gemini-3.5-flash-lite`, `low`. |
 | `FS_EXPLORER_FINAL_{PROVIDER,MODEL,REASONING}` | `core-api` | Final synthesis policy. Defaults to OpenRouter, `google/gemini-3.6-flash`, `high`. |
-| `FS_EXPLORER_MULTI_AGENT_MAX_{TASKS,WORKERS_PER_TASK,WORKER_ROUNDS,TOTAL_WORKERS,LLM_CALLS}` | `core-api` | Hard per-run fan-out/call budgets. Defaults: `5`, `3`, `4`, `12`, `24`. |
-| `FS_EXPLORER_MULTI_AGENT_MAX_ARTIFACT_ITEMS` | `core-api` | Maximum structural items per typed plan/artifact list (`12`), preventing scenario fan-out from expanding downstream contexts. |
-| `FS_EXPLORER_MULTI_AGENT_MAX_ARTIFACT_CONTEXT_CHARS` | `core-api` | Total serialized artifact-context cap per boundary (`16000`), independent of per-field limits. |
-| `FS_EXPLORER_MULTI_AGENT_MAX_{QUESTION,PLANNER_CONTEXT,FINAL_CONTEXT}_CHARS` | `core-api` | Hard user-input and aggregate synthesis-context caps. Defaults: `8000`, `16000`, `48000`; the current question is retained before older conversation context. |
 | `FS_EXPLORER_MULTI_AGENT_SEARCH_TIMEOUT_SECONDS` | `core-api` | Hard wait limit for each indexed search attempt and task-global rerank (`20`). |
 | `FS_EXPLORER_MULTI_AGENT_LLM_TIMEOUT_SECONDS` | `core-api` | Hard wait limit for each planner/coordinator/worker/reviewer LLM stage (`120`). |
 | `GOOGLE_API_KEY` | `core-api`, `core-indexer` | Gemini LLM + embeddings. Get one at [Google AI Studio](https://aistudio.google.com/apikey). |
@@ -118,9 +114,11 @@ GPT-5.6 Sol global planner ── precise lookup ───▶ one search + evide
                                                        ▼
                                      Gemini 3.6 task coordinators
                                                        │
-                                      1–3 isolated search assignments
+                                 isolated search-strategy assignments
                                                        ▼
-                                   Gemini 3.5 Flash Lite workers
+                         persistent Gemini 3.5 Flash Lite search agents
+                                                       │
+                         self-correct query strategy from prior results
                                                        │
                                   Postgres + pgvector indexed chunks
                                                        ▼
@@ -134,7 +132,7 @@ GPT-5.6 Sol global planner ── precise lookup ───▶ one search + evide
                                     Gemini 3.6 final synthesis
                                                        │
                                                        ▼
-                              scenario-specific cited answer + provenance
+                               scenario-specific grounded answer
 ```
 
 The global planner performs routing, intent recognition, and decomposition in
@@ -146,54 +144,57 @@ topic-outline plans, uncovered required outputs, invalid references, scenario
 plans without an application step, and unsafe `single_pass` routing before any
 task runs.
 
-Every search worker receives only its own assignment and retrieved hits.
+Every search agent receives only its own assignment and retrieved hits. It owns
+that evidence need, reviews the result of each attempt, and decides whether to
+correct its terminology, jurisdiction, instrument, scope, date, exception, or
+cross-reference strategy and continue. It stops only when the evidence is found
+or it reports that no materially different safe corpus query remains.
 Application tasks cannot search: they receive only the scenario facts assigned
-to that task and compact artifacts from declared dependencies. Their
+to that task and complete typed reports from declared dependencies. Their
 conclusions must reference existing fact, branch, claim, and dependency-output
 IDs; the server rejects ungrounded references before final synthesis. Agents
-exchange these compact typed artifacts instead of chat transcripts.
-Task/worker fan-out, rounds, concurrency, total LLM calls (including one
-reserved final-synthesis call), claims, user input, and aggregate final context
-are all server-bounded. Invalid plans fall back to one direct task; this is
-the single indexed research path, so an unrecoverable failure surfaces as a
-real error instead of falling back to a different pipeline.
+exchange typed artifacts instead of chat transcripts. Production research has
+no task, worker, wave, search-count, LLM-call, claim, or artifact-count budget;
+coverage and explicit model exhaustion control termination. Operational
+per-call timeouts and cancellation remain in place so a hung provider cannot
+hold a request forever. Invalid plans fall back to one direct task; this is the
+single indexed research path, so an unrecoverable failure surfaces as a real
+error instead of falling back to a different pipeline.
 
 For a precise one-query lookup, the planner selects `single_pass`. The server
 then skips the redundant task coordinator and reviewer calls after verified
 evidence covers every typed requirement (planner + worker + final synthesis).
 If that first lookup leaves a gap, the same task automatically upgrades to
-persistent adaptive research. An unresolved requirement is tried through at
-least three materially different search angles before an early stop is
-accepted, with up to four bounded waves. Scenario and comparison plans are
-never eligible for the single-pass shortcut.
+persistent adaptive research. Scenario and comparison plans are never eligible
+for the single-pass shortcut.
 
 Adaptive follow-ups are server-constrained to the still-uncovered evidence
 requirements. The coordinator receives those requirements explicitly, while
 exact and near-duplicate queries are rejected before they consume a worker or
 search call. The WebSocket progress stream reports when a targeted gap-recovery
-wave starts and when the bounded search still cannot verify a required point.
+wave starts and when the search agents conclude that a required point cannot be
+verified from the indexed corpus.
 If a coordinator tries to stop early, a dedicated recovery strategist changes
 terminology/scope/reference angle; a deterministic requirement/cross-reference
-query is the final fallback, so one empty query is never treated as exhaustive.
-Terminal responses expose both `incomplete` and bounded
+query is the fallback, so one empty query is never treated as exhaustive.
+Terminal responses expose both `incomplete` and complete
 `unresolved_information`; material facts that only the user can supply are
 reported separately and remain conditional instead of being guessed.
 `resumable` is a separate lifecycle flag, so a terminal evidence gap does not
 offer a broken continuation action.
 
 Each task deduplicates candidates across its search assignments and reranks the
-union against the task question before review. Evidence/context budgets are
-shared fairly across tasks and sources. In-flight indexed searches and
-structured LLM operations have stable identities, hard wait limits, and cached
-results, so a WebSocket reconnect resumes completed work without paying for
-the same operation again.
+union against the task question before review. Complete verified evidence
+reports cross the production agent boundaries. In-flight indexed searches and
+structured LLM operations have stable identities, operational wait timeouts,
+and cached results, so a WebSocket reconnect resumes completed work without
+paying for the same operation again.
 
 Benchmark runs keep the existing single-candidate mode and also support a
 `production_roles` profile that evaluates the real heterogeneous
 planner/task/worker/final model policy. Each item stores a bounded versioned
 plan trace plus per-role token and cost usage. The answer judge receives only
-evidence chunks that the final answer actually cited, capped at six excerpts
-and 3,000 characters total.
+server-verified evidence excerpts; presentation citations are not required.
 
 `core-api` never imports Docling — it only ever reads chunks/embeddings that
 `core-indexer` already wrote to Postgres. See [ARCHITECTURE.md](ARCHITECTURE.md)

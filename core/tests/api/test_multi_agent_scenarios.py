@@ -597,6 +597,8 @@ def test_scenario_fallback_keeps_separate_evidence_only_deliverables() -> None:
     assert finding.finding in answer
     assert claim.claim in answer
     assert "Additional verified rules and procedures" in answer
+    assert claim.readable_title not in answer
+    assert "## Sources" not in answer
 
 
 @pytest.mark.asyncio

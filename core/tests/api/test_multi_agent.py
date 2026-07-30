@@ -390,6 +390,231 @@ async def test_direct_question_stays_one_task_and_uses_verified_source() -> None
 
 
 @pytest.mark.asyncio
+async def test_unlimited_search_agent_self_corrects_until_it_finds_evidence() -> None:
+    task = _task("task_1", "initial wrong terminology")
+    planner = _ScriptedClient("planner", lambda _schema, _text: _plan(task))
+    searches: list[str] = []
+    continuation_inputs: list[str] = []
+
+    def task_responder(schema: type, _text: str) -> object:
+        if schema is SearchAssignmentBatch:
+            return SearchAssignmentBatch(
+                task_id="task_1",
+                stop=False,
+                stop_reason=None,
+                assignments=[
+                    SearchAssignment(
+                        assignment_id="initial_search",
+                        task_id="task_1",
+                        query="initial wrong terminology",
+                        objective="Test the initial terminology.",
+                        evidence_requirements=["criterion-task_1"],
+                        excluded_queries=[],
+                        as_of_date=None,
+                        filters=None,
+                    )
+                ],
+            )
+        assert schema is TaskArtifact
+        return TaskArtifact(
+            task_id="task_1",
+            status=TaskStatus.COMPLETE,
+            answer_fragment=None,
+            covered_requirement_ids=[],
+            uncovered_requirement_ids=["criterion-task_1"],
+            claims=[],
+            application_findings=[],
+            conflicts=[],
+            gaps=[],
+            contributing_worker_ids=[],
+        )
+
+    def worker_responder(schema: type, text: str) -> object:
+        if schema is SearchAssignmentBatch:
+            continuation_inputs.append(text)
+            query = (
+                "correct instrument terminology"
+                if len(continuation_inputs) == 1
+                else "cross referenced procedure phrase"
+            )
+            return SearchAssignmentBatch(
+                task_id="task_1",
+                stop=False,
+                stop_reason=None,
+                assignments=[
+                    SearchAssignment(
+                        assignment_id=f"revised_{len(continuation_inputs)}",
+                        task_id="task_1",
+                        query=query,
+                        objective=(
+                            "The prior result shows the terminology was wrong; "
+                            "switch to the governing instrument wording."
+                        ),
+                        evidence_requirements=["criterion-task_1"],
+                        excluded_queries=list(searches),
+                        as_of_date=None,
+                        filters=None,
+                    )
+                ],
+            )
+        assert schema is WorkerArtifact
+        return WorkerArtifact(
+            task_id="task_1",
+            assignment_id="revised_2",
+            worker_id="model-worker",
+            status=WorkerStatus.SUCCESS,
+            searches_run=["cross referenced procedure phrase"],
+            claims=[_claim("task_1")],
+            gaps=[],
+            cross_references=[],
+            error_code=None,
+            error_message=None,
+        )
+
+    def search(**kwargs):
+        query = kwargs["query"]
+        searches.append(query)
+        return _SearchResult(
+            query=query,
+            hits=[_hit("task_1")]
+            if query == "cross referenced procedure phrase"
+            else [],
+        )
+
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", task_responder),
+        worker_llm=_ScriptedClient("worker", worker_responder),
+        search_runner=search,
+        search_runner_in_thread=False,
+    ).run("Find the rule even if the first terminology is wrong.")
+
+    assert searches == [
+        "initial wrong terminology",
+        "correct instrument terminology",
+        "cross referenced procedure phrase",
+    ]
+    assert len(continuation_inputs) == 2
+    assert "initial wrong terminology" in continuation_inputs[0]
+    assert "correct instrument terminology" in continuation_inputs[1]
+    assert result.task_artifacts[0].status == TaskStatus.COMPLETE
+    assert result.incomplete is False
+    assert "Evidence text for task_1." in result.final_context
+    assert "doc-task_1" not in result.final_context
+    assert "Model title" not in result.final_context
+
+
+@pytest.mark.asyncio
+async def test_unlimited_search_stops_only_after_search_agent_reports_exhaustion() -> (
+    None
+):
+    task = _task("task_1", "rare corpus phrase")
+    planner = _ScriptedClient("planner", lambda _schema, _text: _plan(task))
+
+    def task_responder(schema: type, text: str) -> object:
+        assert schema is SearchAssignmentBatch
+        if "WORKER ARTIFACTS SO FAR:\n[]" not in text:
+            return SearchAssignmentBatch(
+                task_id="task_1",
+                stop=True,
+                stop_reason="The owning search agent reported corpus exhaustion.",
+                assignments=[],
+            )
+        return SearchAssignmentBatch(
+            task_id="task_1",
+            stop=False,
+            stop_reason=None,
+            assignments=[
+                SearchAssignment(
+                    assignment_id="rare_search",
+                    task_id="task_1",
+                    query="rare corpus phrase",
+                    objective="Find the rare governing phrase.",
+                    evidence_requirements=["criterion-task_1"],
+                    excluded_queries=[],
+                    as_of_date=None,
+                    filters=None,
+                )
+            ],
+        )
+
+    worker = _ScriptedClient(
+        "worker",
+        lambda schema, _text: (
+            SearchAssignmentBatch(
+                task_id="task_1",
+                stop=True,
+                stop_reason=(
+                    "No distinct terminology, instrument, date, exception, or "
+                    "cross-reference search remains."
+                ),
+                assignments=[],
+            )
+            if schema is SearchAssignmentBatch
+            else pytest.fail("An empty search must not run evidence extraction.")
+        ),
+    )
+    searches: list[str] = []
+    result = await MultiAgentResearchOrchestrator(
+        planner_llm=planner,
+        task_llm=_ScriptedClient("task", task_responder),
+        worker_llm=worker,
+        search_runner=lambda **kwargs: (
+            searches.append(kwargs["query"])
+            or _SearchResult(query=kwargs["query"], hits=[])
+        ),
+        search_runner_in_thread=False,
+    ).run("Find the rare rule.")
+
+    assert searches == ["rare corpus phrase"]
+    assert len(worker.calls) == 1
+    assert result.incomplete is True
+    assert result.task_artifacts[0].status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_exhaustive_scenario_planner_keeps_all_requested_legal_headings() -> None:
+    headings = [
+        ("tir_rejection", "Why the TIR Carnet was rejected"),
+        ("driver_vehicle", "Driver and vehicle certification requirements"),
+        ("guarantee", "Validity of UND and DAC global guarantees"),
+        ("accident_debt", "Accident, leaked goods, and customs debt"),
+        ("basel", "Basel Convention and illegal traffic"),
+        ("debt_recovery", "Turkey Italy mutual assistance and debt recovery"),
+        ("authorizations", "Authorized Consignor and guarantee reduction impact"),
+    ]
+    question = "\n".join(description for _task_id, description in headings)
+    planned_tasks = [_task(task_id, description) for task_id, description in headings]
+
+    def planner_responder(_schema: type, text: str) -> object:
+        for _task_id, description in headings:
+            assert description in text
+        return _plan(*planned_tasks)
+
+    orchestrator = MultiAgentResearchOrchestrator(
+        planner_llm=_ScriptedClient("planner", planner_responder),
+        task_llm=_ScriptedClient(
+            "task",
+            lambda _schema, _text: pytest.fail("Planning must not run a task."),
+        ),
+        worker_llm=_ScriptedClient(
+            "worker",
+            lambda _schema, _text: pytest.fail("Planning must not run a worker."),
+        ),
+        search_runner=lambda **_kwargs: pytest.fail("Planning must not search."),
+        search_runner_in_thread=False,
+    )
+
+    plan = await orchestrator._create_plan(question)
+
+    assert len(plan.answer_requirements) == 7
+    assert [task.task_id for task in plan.tasks] == [
+        task_id for task_id, _description in headings
+    ]
+    assert orchestrator._unlimited_research is True
+
+
+@pytest.mark.asyncio
 async def test_single_pass_direct_skips_redundant_task_llm_calls() -> None:
     planner = _ScriptedClient(
         "planner",
@@ -1558,7 +1783,7 @@ async def test_task_global_rerank_uses_task_question_and_reviewer_gets_that_orde
 
 
 @pytest.mark.asyncio
-async def test_task_review_preserves_verified_gap_and_sourced_conflict_only() -> None:
+async def test_task_review_preserves_verified_gap_and_exact_conflict_only() -> None:
     verified_gap = "missing-detail"
     spec = _task("task_1", "Compare the rule and exception")
     planner = _ScriptedClient("planner", lambda schema, _text: _plan(spec))
@@ -1577,9 +1802,7 @@ async def test_task_review_preserves_verified_gap_and_sourced_conflict_only() ->
         ),
     }
     verified_reference = "See Regulation B Article 9."
-    sourced_conflict = (
-        "The provisions conflict [regulation a, Article 7] [regulation b, Article 9]."
-    )
+    sourced_conflict = "Rule A applies. Rule B creates an exception."
     unsourced_conflict = "Another authority silently overrides both provisions."
 
     def task_responder(schema: type, text: str) -> object:

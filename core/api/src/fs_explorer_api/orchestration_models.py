@@ -526,14 +526,14 @@ def _validate_refs(
 def validate_global_plan(
     plan: GlobalPlan,
     *,
-    max_tasks: int = 5,
-    max_list_items: int = 12,
+    max_tasks: int | None = 5,
+    max_list_items: int | None = 12,
 ) -> GlobalPlan:
     """Validate coverage, scenario semantics, typed dataflow, and acyclicity."""
 
-    if max_tasks < 1:
+    if max_tasks is not None and max_tasks < 1:
         raise ValueError("max_tasks must be at least 1")
-    if max_list_items < 1:
+    if max_list_items is not None and max_list_items < 1:
         raise ValueError("max_list_items must be at least 1")
 
     errors: list[str] = []
@@ -545,22 +545,22 @@ def validate_global_plan(
             errors.append("decomposed mode must use adaptive execution")
         if task_count < 2:
             errors.append("decomposed mode must contain at least two tasks")
-    if task_count > max_tasks:
+    if max_tasks is not None and task_count > max_tasks:
         errors.append(f"plan exceeds the maximum of {max_tasks} tasks")
 
     if not plan.normalized_question.strip():
         errors.append("normalized_question must not be blank")
     if not plan.answer_requirements:
         errors.append("answer_requirements must not be empty")
-    if len(plan.answer_requirements) > max_list_items:
+    if max_list_items is not None and len(plan.answer_requirements) > max_list_items:
         errors.append(
             f"answer_requirements exceeds the maximum of {max_list_items} items"
         )
-    if len(plan.synthesis_requirements) > max_list_items:
+    if max_list_items is not None and len(plan.synthesis_requirements) > max_list_items:
         errors.append(
             f"synthesis_requirements exceeds the maximum of {max_list_items} items"
         )
-    if len(plan.assumptions) > max_list_items:
+    if max_list_items is not None and len(plan.assumptions) > max_list_items:
         errors.append(f"assumptions exceeds the maximum of {max_list_items} items")
     if any(not requirement.strip() for requirement in plan.synthesis_requirements):
         errors.append("synthesis_requirements must not contain blank items")
@@ -602,7 +602,7 @@ def validate_global_plan(
             (scenario.material_unknowns, "unknown_id", "material unknown"),
             (scenario.decision_branches, "branch_id", "decision branch"),
         ):
-            if len(collection) > max_list_items:
+            if max_list_items is not None and len(collection) > max_list_items:
                 errors.append(
                     f"{label} list exceeds the maximum of {max_list_items} items"
                 )
@@ -714,7 +714,7 @@ def validate_global_plan(
             ("consumes", task.consumes),
             ("produces", task.produces),
         ):
-            if len(values) > max_list_items:
+            if max_list_items is not None and len(values) > max_list_items:
                 errors.append(
                     f"task {label!r} {field_name} exceeds the maximum of "
                     f"{max_list_items} items"
@@ -1242,8 +1242,8 @@ def resolve_global_plan(
     candidate: GlobalPlan | None,
     *,
     original_question: str,
-    max_tasks: int = 5,
-    max_list_items: int = 12,
+    max_tasks: int | None = 5,
+    max_list_items: int | None = 12,
     planner_error: str | None = None,
 ) -> PlanResolution:
     """Return a valid plan, falling back to one adaptive task on any failure."""

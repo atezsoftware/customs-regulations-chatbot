@@ -7,6 +7,7 @@ from fs_explorer_api.orchestration_prompts import (
     SCENARIO_FINAL_SYNTHESIS_SYSTEM_PROMPT,
     TASK_COORDINATOR_SYSTEM_PROMPT,
     TASK_REVIEW_SYSTEM_PROMPT,
+    WORKER_SEARCH_CONTINUATION_PROMPT,
     build_gap_recovery_prompt,
     build_global_planner_prompt,
     build_task_coordinator_prompt,
@@ -35,8 +36,8 @@ def test_global_planner_prompt_builds_decision_graph_not_topic_outline() -> None
     assert "Consolidate shared evidence" in prompt
     assert "Application tasks do no search" in prompt
     assert "consumes={task_id, output_id}" in prompt
-    assert 'BAD: independent topic tasks named "law"' in prompt
-    assert "GOOD: one shared rule/exception evidence task" in prompt
+    assert "enumerate every requested heading" in prompt
+    assert "Difficult evidence is never a reason to omit a heading" in prompt
 
 
 def test_task_coordinator_prompt_enforces_bounded_non_recursive_fanout() -> None:
@@ -58,6 +59,25 @@ def test_gap_recovery_prompt_forbids_stopping_after_one_empty_query() -> None:
     assert "issue 1 to 2" in prompt
     assert "Do not merely\n  reorder or lightly paraphrase" in prompt
     assert "explicit unresolved cross-reference" in prompt
+
+
+def test_unlimited_prompts_delegate_stop_and_contextual_self_correction() -> None:
+    planner = build_global_planner_prompt(max_tasks=None, max_list_items=None)
+    coordinator = build_task_coordinator_prompt(
+        max_assignments_per_wave=None,
+        max_worker_rounds=None,
+    )
+
+    assert "as many tasks as the distinct information needs require" in planner
+    assert "Include every material item" in planner
+    assert "There is no scheduler wave limit" in coordinator
+    assert "explicit exhaustion reports" in coordinator
+    assert "correct a wrong term, jurisdiction/instrument assumption" in (
+        WORKER_SEARCH_CONTINUATION_PROMPT
+    )
+    assert "There is no round, worker,\n  token, or search-count stopping rule" in (
+        WORKER_SEARCH_CONTINUATION_PROMPT
+    )
 
 
 def test_worker_prompt_distinguishes_no_evidence_from_failure() -> None:
@@ -84,6 +104,10 @@ def test_task_review_prompt_has_strict_coverage_semantics() -> None:
     )
     assert "application_findings=[]" in TASK_REVIEW_SYSTEM_PROMPT
     assert "covered_requirement_ids" in TASK_REVIEW_SYSTEM_PROMPT
+    assert "exact unmodified evidence excerpt" in TASK_REVIEW_SYSTEM_PROMPT
+    assert "without source titles, locators, or citations" in (
+        TASK_REVIEW_SYSTEM_PROMPT
+    )
     assert "OUTPUT CONTRACT — TaskArtifact" in TASK_REVIEW_SYSTEM_PROMPT
 
 
@@ -108,10 +132,9 @@ def test_integration_prompt_uses_upstream_grounding_without_requiring_facts() ->
     assert "conditional application finding" in prompt
 
 
-def test_final_prompt_requires_grounded_citations_and_discloses_gaps() -> None:
-    assert "[Readable Document Title, Article/Section]" in (
-        FINAL_SYNTHESIS_SYSTEM_PROMPT
-    )
+def test_final_prompt_omits_citations_and_discloses_gaps() -> None:
+    assert "Do not add inline\ncitations" in FINAL_SYNTHESIS_SYSTEM_PROMPT
+    assert "or a sources\nsection" in FINAL_SYNTHESIS_SYSTEM_PROMPT
     assert "required task is partial or failed" in FINAL_SYNTHESIS_SYSTEM_PROMPT
     assert "clearly labeled missing-information section" in (
         FINAL_SYNTHESIS_SYSTEM_PROMPT
@@ -119,21 +142,22 @@ def test_final_prompt_requires_grounded_citations_and_discloses_gaps() -> None:
     assert "Never present a partial" in FINAL_SYNTHESIS_SYSTEM_PROMPT
     assert "result as complete" in FINAL_SYNTHESIS_SYSTEM_PROMPT
     assert "Never expose raw" in FINAL_SYNTHESIS_SYSTEM_PROMPT
-    assert "## Sources" in FINAL_SYNTHESIS_SYSTEM_PROMPT
+    assert "## Sources" not in FINAL_SYNTHESIS_SYSTEM_PROMPT
 
 
 def test_scenario_final_prompt_preserves_unknowns_and_decision_branches() -> None:
     prompt = SCENARIO_FINAL_SYNTHESIS_SYSTEM_PROMPT
 
-    assert "ScenarioFacts are inputs and need no source citation" in prompt
-    assert "Applied outcomes must come from" in prompt
+    assert "ScenarioFacts are inputs; label them as the assumed facts" in prompt
+    assert "Applied outcomes\nmust come from" in prompt
     assert "MaterialUnknown or\nDecisionBranch" in prompt
     assert "never silently\nchoose a branch" in prompt
     assert "Distinguish source-backed rules, user facts" in prompt
     assert "smallest precise question(s)" in prompt
     assert "facts only the user can provide" in prompt
     assert "Never expose task, requirement, fact, claim" in prompt
-    assert "## Sources" in prompt
+    assert "Do not include citations" in prompt
+    assert "## Sources" not in prompt
 
 
 def test_default_prompts_remain_lean() -> None:

@@ -1974,7 +1974,7 @@ class FsExplorerAgent:
         return selected
 
     def _multi_agent_fallback_answer(self) -> str | None:
-        """Render a deterministic cited answer if final-model streaming fails."""
+        """Render a deterministic citation-free answer if final streaming fails."""
 
         result = self._multi_agent_result
         if result is None:
@@ -2025,7 +2025,6 @@ class FsExplorerAgent:
             ),
             "",
         ]
-        source_titles: list[str] = []
         finding_requirement_ids = {
             requirement_id
             for finding in findings
@@ -2033,16 +2032,7 @@ class FsExplorerAgent:
         }
         if findings:
             for finding in findings:
-                supporting_claims = [
-                    claims_by_id[claim_id]
-                    for claim_id in finding.supporting_claim_ids
-                    if claim_id in claims_by_id
-                ]
-                citations = " ".join(
-                    f"[{claim.readable_title}, {claim.locator}]"
-                    for claim in supporting_claims
-                )
-                lines.append(f"- {finding.finding} {citations}".rstrip())
+                lines.append(f"- {finding.finding}")
                 for limitation in finding.limitations:
                     lines.append(
                         (
@@ -2051,9 +2041,6 @@ class FsExplorerAgent:
                             else f"  - Condition/limitation: {limitation}"
                         )
                     )
-                for claim in supporting_claims:
-                    if claim.readable_title not in source_titles:
-                        source_titles.append(claim.readable_title)
         evidence_only_claims = [
             claim
             for claim in claims
@@ -2077,11 +2064,7 @@ class FsExplorerAgent:
                     ]
                 )
             for claim in evidence_only_claims:
-                lines.append(
-                    f"- {claim.claim} [{claim.readable_title}, {claim.locator}]"
-                )
-                if claim.readable_title not in source_titles:
-                    source_titles.append(claim.readable_title)
+                lines.append(f"- {claim.claim}")
         if result.incomplete:
             lines.extend(
                 [
@@ -2095,8 +2078,6 @@ class FsExplorerAgent:
                     ),
                 ]
             )
-        lines.extend(["", "## Sources"])
-        lines.extend(f"- {title}" for title in source_titles)
         return "\n".join(lines)
 
     async def _report_llm_call(
