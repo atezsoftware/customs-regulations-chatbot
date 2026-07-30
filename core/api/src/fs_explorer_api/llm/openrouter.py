@@ -24,26 +24,69 @@ _MAX_COMPLETION_TOKEN_MODEL_PREFIXES = (
 class OpenRouterError(RuntimeError):
     """Sanitized OpenRouter failure safe for persistence and user handling."""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        provider_code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.error_type = error_type
+        self.provider_code = provider_code
 
 
-def _error_detail(response: httpx.Response) -> str:
-    """Return a bounded provider error detail without retaining request data."""
+def _bounded_message(value: object) -> str:
+    return " ".join(value.split())[:300] if isinstance(value, str) else ""
+
+
+def _nested_provider_message(value: object) -> str:
+    """Extract only a provider error message, never an arbitrary raw body."""
+    if isinstance(value, dict):
+        error = value.get("error")
+        if isinstance(error, dict):
+            message = _bounded_message(error.get("message"))
+            if message:
+                return message
+        message = _bounded_message(value.get("message"))
+        if message:
+            return message
+    if not isinstance(value, str):
+        return ""
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return ""
+    return _nested_provider_message(decoded)
+
+
+def _error_fields(
+    response: httpx.Response,
+) -> tuple[str, str | None, str | None]:
+    """Return safe message/type/code fields without retaining request data."""
     try:
         body = response.json()
     except ValueError:
-        return ""
+        return "", None, None
     if isinstance(body, dict):
         error = body.get("error")
-        if isinstance(error, dict) and isinstance(error.get("message"), str):
-            return " ".join(error["message"].split())[:300]
+        if isinstance(error, dict):
+            detail = _bounded_message(error.get("message"))
+            metadata = error.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            error_type = _bounded_message(metadata.get("error_type")) or None
+            provider_code = _bounded_message(metadata.get("provider_code")) or None
+            provider_detail = _nested_provider_message(metadata.get("raw"))
+            if provider_detail and provider_detail.casefold() != detail.casefold():
+                detail = f"{detail} — {provider_detail}" if detail else provider_detail
+            return detail[:600], error_type, provider_code
         if isinstance(error, str):
-            return " ".join(error.split())[:300]
+            return _bounded_message(error), None, None
         elif isinstance(body.get("message"), str):
-            return " ".join(body["message"].split())[:300]
-    return ""
+            return _bounded_message(body["message"]), None, None
+    return "", None, None
 
 
 def _rejection_error(
@@ -58,7 +101,7 @@ def _rejection_error(
         if stream
         else "OpenRouter rejected the request"
     )
-    detail = _error_detail(response)
+    detail, error_type, provider_code = _error_fields(response)
     if detail:
         message = f"{message} (HTTP {response.status_code}): {detail}"
     else:
@@ -74,7 +117,12 @@ def _rejection_error(
             "the API key/workspace Privacy and Guardrail policy; allow this "
             "model/provider in OpenRouter or configure an eligible role model."
         )
-    return OpenRouterError(message, status_code=response.status_code)
+    return OpenRouterError(
+        message,
+        status_code=response.status_code,
+        error_type=error_type,
+        provider_code=provider_code,
+    )
 
 
 def _integer(value: Any) -> int:
@@ -100,6 +148,48 @@ def _is_endpoint_eligibility_error(error: OpenRouterError) -> bool:
         or "guardrail restrictions" in message
         or "data policy" in message
         or "routing requirements" in message
+    )
+
+
+def _is_parameter_compatibility_error(error: OpenRouterError) -> bool:
+    """Whether the same model should be retried with a leaner parameter set."""
+    if _is_endpoint_eligibility_error(error):
+        return True
+    if error.status_code != 400:
+        return False
+    if error.error_type in {
+        "content_policy_violation",
+        "refusal",
+        "context_length_exceeded",
+        "max_tokens_exceeded",
+        "token_limit_exceeded",
+        "string_too_long",
+        "invalid_prompt",
+        "invalid_image",
+        "image_too_large",
+        "image_too_small",
+        "unsupported_image_format",
+        "image_not_found",
+        "image_download_failed",
+    }:
+        return False
+    if error.error_type == "invalid_request":
+        return True
+    detail = str(error).casefold()
+    provider_code = (error.provider_code or "").casefold()
+    return (
+        "provider returned error" in detail
+        or "unsupported parameter" in detail
+        or "unknown parameter" in detail
+        or "invalid parameter" in detail
+        or "not supported" in detail
+        or provider_code
+        in {
+            "bad_request",
+            "invalid_argument",
+            "invalid_request",
+            "unsupported_parameter",
+        }
     )
 
 
@@ -208,6 +298,9 @@ class OpenRouterLLMClient:
                 "X-Title": os.getenv(
                     "OPENROUTER_APP_TITLE", "Customs Regulations Chatbot"
                 ),
+                # Adds typed provider/guardrail routing diagnostics to errors;
+                # it does not opt into prompt or completion logging.
+                "X-OpenRouter-Metadata": "enabled",
             },
         )
         self._last_stream_usage: LLMUsage | None = None
@@ -271,7 +364,7 @@ class OpenRouterLLMClient:
                         raise _rejection_error(response, model=self.model)
                     return response
                 routing_error = _rejection_error(response, model=self.model)
-                if _is_endpoint_eligibility_error(routing_error):
+                if _is_parameter_compatibility_error(routing_error):
                     raise routing_error
                 if attempt == self._max_retries:
                     raise OpenRouterError(
@@ -292,7 +385,7 @@ class OpenRouterLLMClient:
             try:
                 return await self._post_variant(candidate)
             except OpenRouterError as exc:
-                if not _is_endpoint_eligibility_error(exc):
+                if not _is_parameter_compatibility_error(exc):
                     raise
                 last_error = exc
         assert last_error is not None
@@ -372,7 +465,7 @@ class OpenRouterLLMClient:
                             model=self.model,
                             stream=True,
                         )
-                        if _is_endpoint_eligibility_error(error):
+                        if _is_parameter_compatibility_error(error):
                             last_error = error
                             continue
                         raise error

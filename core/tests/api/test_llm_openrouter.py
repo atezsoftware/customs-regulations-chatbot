@@ -163,6 +163,96 @@ async def test_endpoint_eligibility_adapts_parameters_without_changing_model() -
 
 
 @pytest.mark.asyncio
+async def test_generic_provider_400_adapts_same_model_parameters() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        seen.append(payload)
+        if "max_tokens" in payload:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "Provider returned error",
+                        "metadata": {
+                            "error_type": "invalid_request",
+                            "provider_code": "invalid_argument",
+                            "raw": json.dumps(
+                                {
+                                    "error": {
+                                        "message": (
+                                            "max_tokens is not supported; use "
+                                            "max_completion_tokens"
+                                        )
+                                    }
+                                }
+                            ),
+                        },
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"answer":"ok"}'}}]},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as raw_client:
+        client = OpenRouterLLMClient(
+            api_key="test",
+            model="vendor/model",
+            client=raw_client,
+        )
+        result, _usage = await client.generate_structured(
+            [ChatTurn(role="user", text="hello")],
+            "system",
+            Reply,
+        )
+
+    assert result.answer == "ok"
+    assert len(seen) == 2
+    assert seen[0]["max_tokens"] == 8000
+    assert seen[1]["max_completion_tokens"] == 8000
+    assert all(payload["model"] == "vendor/model" for payload in seen)
+
+
+@pytest.mark.asyncio
+async def test_typed_content_policy_error_is_not_retried_as_compatibility() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Provider returned error",
+                    "metadata": {
+                        "error_type": "content_policy_violation",
+                        "provider_code": "content_filter",
+                    },
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as raw_client:
+        client = OpenRouterLLMClient(api_key="test", client=raw_client)
+        with pytest.raises(RuntimeError, match="Provider returned error"):
+            await client.generate_structured(
+                [ChatTurn(role="user", text="hello")],
+                "system",
+                Reply,
+            )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_stream_adapts_token_parameter_before_emitting_text() -> None:
     seen: list[dict] = []
 
