@@ -15,6 +15,7 @@ from fs_explorer_api.multi_agent import (
     MultiAgentResearchOrchestrator,
     MultiAgentResearchResult,
     ResearchLimits,
+    ResearchProgress,
 )
 from fs_explorer_api.orchestration_models import (
     AnswerRequirement,
@@ -409,7 +410,6 @@ async def test_precise_lookup_uses_direct_single_pass_three_call_path(
             "worker": worker,
             "final": final,
         },
-        multi_agent_enabled=True,
     )
     result = await agent.prepare_multi_agent_indexed(question)
     answer = "".join([chunk async for chunk in agent.stream_final_answer()])
@@ -523,7 +523,6 @@ async def test_scenario_result_selects_scenario_final_synthesis_prompt() -> None
             "worker": final,
             "final": final,
         },
-        multi_agent_enabled=True,
     )
     agent._multi_agent_result = MultiAgentResearchResult(
         plan=plan,
@@ -570,7 +569,7 @@ def test_scenario_fallback_keeps_separate_evidence_only_deliverables() -> None:
         limitations=[],
     )
     final = _ScriptedClient("final", lambda _schema, _text: None)
-    agent = FsExplorerAgent(llm_client=final, multi_agent_enabled=True)
+    agent = FsExplorerAgent(llm_client=final)
     agent._multi_agent_result = MultiAgentResearchResult(
         plan=plan,
         task_artifacts=(
@@ -1065,6 +1064,7 @@ async def test_missing_material_fact_yields_conditional_limitation_in_final_cont
             error_message=None,
         ),
     )
+    progress: list[ResearchProgress] = []
     result = await MultiAgentResearchOrchestrator(
         planner_llm=planner,
         task_llm=_ScriptedClient("task", task_response),
@@ -1079,6 +1079,7 @@ async def test_missing_material_fact_yields_conditional_limitation_in_final_cont
             ],
         ),
         limits=_limits(),
+        on_progress=progress.append,
         search_runner_in_thread=False,
     ).run(plan.normalized_question)
 
@@ -1090,5 +1091,11 @@ async def test_missing_material_fact_yields_conditional_limitation_in_final_cont
     assert finding.finding.startswith("If the shipment is non-commercial")
     assert unknown_text in finding.limitations
     assert "conclusion_conditional" in result.final_context
+    assert unknown_text in result.unresolved_information
+    information_events = [
+        event for event in progress if event.kind == "information_needed"
+    ]
+    assert len(information_events) == 1
+    assert unknown_text in information_events[0].detail
     assert finding.finding in result.final_context
     assert unknown_text in result.final_context

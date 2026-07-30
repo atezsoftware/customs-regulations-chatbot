@@ -187,10 +187,11 @@ export interface ChatMessageRecord {
   // run (via ?resumeRunId=) instead of only "Regenerate" (a brand-new run
   // that throws away whatever the interrupted run had already gathered).
   runId?: string;
-  // True when a 'completed' message hit core-api's step-budget safety net
-  // rather than a real conclusion — not an error, but still worth offering
-  // "Continue" for instead of treating it as a normal finished answer.
+  // Answer quality and run lifecycle are separate: bounded evidence research
+  // can be incomplete but terminal, while a step-budget stop is resumable.
   incomplete?: boolean;
+  resumable?: boolean;
+  unresolvedInformation?: string[];
 }
 
 export type AgentEvent =
@@ -206,6 +207,8 @@ export type AgentEvent =
       content: string;
       stats?: Record<string, unknown>;
       incomplete?: boolean;
+      resumable?: boolean;
+      unresolvedInformation?: string[];
     }
   | {type: 'cancelled'; messageId: number}
   | {type: 'error'; message: string; runId?: string};

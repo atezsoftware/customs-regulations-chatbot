@@ -124,6 +124,8 @@ export type AgentEvent =
       content: string;
       stats?: JsonObject;
       incomplete?: boolean;
+      resumable?: boolean;
+      unresolvedInformation?: string[];
     }
   | {type: 'cancelled'; messageId: number}
   | {type: 'error'; message: string; runId?: string};
@@ -603,6 +605,12 @@ export class CoreBridgeService {
             // be an unsatisfying apology. Lets the UI offer "Continue" even
             // on this otherwise-successful completion.
             incomplete: data.incomplete === true,
+            resumable: data.resumable === true,
+            unresolvedInformation: Array.isArray(data.unresolved_information)
+              ? data.unresolved_information.filter(
+                  (value): value is string => typeof value === 'string',
+                )
+              : [],
           };
           break;
         }

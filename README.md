@@ -82,7 +82,6 @@ Environment variables are split per app (see each app's README/`.env.*.example` 
 | `FS_EXPLORER_LLM_PROVIDER` | `core-api` | Active chat provider. Set to `openrouter` for the new model selector flow. |
 | `OPENROUTER_DEFAULT_MODEL` | `core-api`, `backend` | Default model for new sessions and provider fallback (`google/gemini-3.6-flash`). |
 | `OPENROUTER_CATALOG_SYNC_MINUTES` | `backend` | How often the backend refreshes the available OpenRouter model catalog. |
-| `FS_EXPLORER_MULTI_AGENT_ENABLED` | `core-api` | Enables hierarchical multi-agent indexed research. The API server and Core Compose default to `true`; direct library usage safely defaults to `false`. Set `false` as the production kill switch. |
 | `FS_EXPLORER_PLANNER_{PROVIDER,MODEL,REASONING}` | `core-api` | Global planner policy. Defaults to OpenRouter, `openai/gpt-5.6-sol`, `medium`. |
 | `FS_EXPLORER_TASK_{PROVIDER,MODEL,REASONING}` | `core-api` | Task coordinator policy. Defaults to OpenRouter, `google/gemini-3.6-flash`, `medium`. |
 | `FS_EXPLORER_WORKER_{PROVIDER,MODEL,REASONING}` | `core-api` | Search worker policy. Defaults to OpenRouter, `google/gemini-3.5-flash-lite`, `low`. |
@@ -155,9 +154,9 @@ IDs; the server rejects ungrounded references before final synthesis. Agents
 exchange these compact typed artifacts instead of chat transcripts.
 Task/worker fan-out, rounds, concurrency, total LLM calls (including one
 reserved final-synthesis call), claims, user input, and aggregate final context
-are all server-bounded. Invalid plans fall back to one direct task, and
-an unrecoverable multi-agent failure falls back to the legacy stateless indexed
-retrieval path.
+are all server-bounded. Invalid plans fall back to one direct task; this is
+the single indexed research path, so an unrecoverable failure surfaces as a
+real error instead of falling back to a different pipeline.
 
 For a precise one-query lookup, the planner selects `single_pass`. The server
 then skips the redundant task coordinator and reviewer calls after verified
@@ -165,6 +164,17 @@ evidence covers every typed requirement (planner + worker + final synthesis).
 If that first lookup leaves a gap, the same task automatically upgrades to the
 normal adaptive second wave. Scenario and comparison plans are never eligible
 for this shortcut.
+
+Adaptive follow-ups are server-constrained to the still-uncovered evidence
+requirements. The coordinator receives those requirements explicitly, while
+exact and near-duplicate queries are rejected before they consume a worker or
+search call. The WebSocket progress stream reports when a targeted gap-recovery
+wave starts and when the bounded search still cannot verify a required point.
+Terminal responses expose both `incomplete` and bounded
+`unresolved_information`; material facts that only the user can supply are
+reported separately and remain conditional instead of being guessed.
+`resumable` is a separate lifecycle flag, so a terminal evidence gap does not
+offer a broken continuation action.
 
 Each task deduplicates candidates across its search assignments and reranks the
 union against the task question before review. Evidence/context budgets are

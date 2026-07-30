@@ -20,7 +20,6 @@ import html
 import hashlib
 import json
 import logging
-import os
 import time
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -70,20 +69,6 @@ BenchmarkProfileMode = Literal["candidate_all_roles", "production_roles"]
 _BENCHMARK_PROFILE_MODES = frozenset({"candidate_all_roles", "production_roles"})
 _PLAN_TRACE_SCHEMA_VERSION = 1
 _MAX_PLAN_TRACE_CHARS = 100_000
-
-
-def _benchmark_multi_agent_enabled() -> bool:
-    """Use the API-server default while honoring the production kill switch."""
-
-    value = os.getenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "true").strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(
-        "FS_EXPLORER_MULTI_AGENT_ENABLED must be a boolean value "
-        "(true/false, 1/0, yes/no, or on/off)."
-    )
 
 
 @dataclass
@@ -540,7 +525,6 @@ async def run_agentic_session(
             on_llm_call=_collect_llm_call,
             on_retrieval=_collect_retrieval,
             llm_profile=effective_profile,
-            multi_agent_enabled=_benchmark_multi_agent_enabled(),
         )
         agent = get_run_agent(resource_manager)
         handler = run_workflow.run(
@@ -573,10 +557,7 @@ async def run_agentic_session(
             elif isinstance(event, ToolBatchEvent):
                 for call in event.tool_calls:
                     step_number += 1
-                    if (
-                        not event.stateless_retrieval
-                        and call.tool_name in CHUNK_BEARING_TOOLS
-                    ):
+                    if call.tool_name in CHUNK_BEARING_TOOLS:
                         pending_retrieval_step_numbers.append(step_number)
                     _record_tool_call(
                         ToolCallEvent(
@@ -588,8 +569,6 @@ async def run_agentic_session(
                         trace=trace,
                         index_storage=index_storage,
                     )
-                if event.stateless_retrieval:
-                    pending_retrieval_step_numbers.append(step_number)
             elif isinstance(event, GoDeeperEvent):
                 step_number += 1
                 trace.record_go_deeper(

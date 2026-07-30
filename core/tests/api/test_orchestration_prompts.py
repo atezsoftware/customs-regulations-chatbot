@@ -103,6 +103,11 @@ def test_final_prompt_requires_grounded_citations_and_discloses_gaps() -> None:
         FINAL_SYNTHESIS_SYSTEM_PROMPT
     )
     assert "required task is partial or failed" in FINAL_SYNTHESIS_SYSTEM_PROMPT
+    assert "clearly labeled missing-information section" in (
+        FINAL_SYNTHESIS_SYSTEM_PROMPT
+    )
+    assert "Never present a partial" in FINAL_SYNTHESIS_SYSTEM_PROMPT
+    assert "result as complete" in FINAL_SYNTHESIS_SYSTEM_PROMPT
     assert "Never expose raw" in FINAL_SYNTHESIS_SYSTEM_PROMPT
     assert "## Sources" in FINAL_SYNTHESIS_SYSTEM_PROMPT
 
@@ -115,6 +120,8 @@ def test_scenario_final_prompt_preserves_unknowns_and_decision_branches() -> Non
     assert "MaterialUnknown or\nDecisionBranch" in prompt
     assert "never silently\nchoose a branch" in prompt
     assert "Distinguish source-backed rules, user facts" in prompt
+    assert "smallest precise question(s)" in prompt
+    assert "facts only the user can provide" in prompt
     assert "Never expose task, requirement, fact, claim" in prompt
     assert "## Sources" in prompt
 

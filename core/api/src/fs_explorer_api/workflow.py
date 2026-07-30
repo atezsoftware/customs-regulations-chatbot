@@ -155,7 +155,6 @@ class ToolBatchEvent(Event):
 
     tool_calls: list[ToolCallAction]
     reason: str
-    stateless_retrieval: bool = False
 
 
 class AskHumanEvent(InputRequiredEvent):
@@ -330,39 +329,19 @@ class FsExplorerWorkflow(Workflow):
             state.enable_metadata = ev.enable_metadata
             state.effort = ev.effort
 
-        # The multi-agent path is feature-flagged and reuses the same indexed
-        # retrieval engine. Its planner routes simple questions to one task
-        # and builds a bounded DAG only for genuinely separable requirements.
+        # The context-isolated multi-agent orchestrator is the single indexed
+        # research flow: its planner routes simple questions to one task and
+        # builds a bounded DAG only for genuinely separable requirements. A
+        # failure here propagates as a real error rather than silently
+        # falling back to a different pipeline.
         if ev.use_index and ev.enable_semantic:
-            if agent.multi_agent_enabled:
-                try:
-                    await agent.prepare_multi_agent_indexed(
-                        ev.task,
-                        on_progress=lambda progress: ctx.write_event_to_stream(
-                            ResearchProgressEvent.from_progress(progress)
-                        ),
-                    )
-                    return ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
-                except Exception:
-                    logger.exception(
-                        "Multi-agent indexed research failed before completion; "
-                        "falling back to the legacy stateless retrieval path"
-                    )
-                    agent.abandon_multi_agent_research()
-
-            # Rollback path: one planner call, parallel deterministic searches,
-            # one evidence review and one final synthesis.
-            calls = await agent.plan_indexed_retrieval(ev.task)
-            event = ToolBatchEvent(
-                tool_calls=calls,
-                reason=(
-                    "Run independent indexed searches in parallel, then merge, "
-                    "deduplicate, and globally rerank their chunks."
+            await agent.prepare_multi_agent_indexed(
+                ev.task,
+                on_progress=lambda progress: ctx.write_event_to_stream(
+                    ResearchProgressEvent.from_progress(progress)
                 ),
-                stateless_retrieval=True,
             )
-            ctx.write_event_to_stream(event)
-            return event
+            return ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
 
         dirdescription = (
             describe_indexed_context()
@@ -466,25 +445,6 @@ class FsExplorerWorkflow(Workflow):
         agent: Annotated[FsExplorerAgent, Resource(get_agent)],
     ) -> WorkflowEvent:
         """Execute independent calls concurrently and continue once."""
-        if ev.stateless_retrieval:
-            state = await ctx.store.get_state()
-            await agent.collect_parallel_indexed_evidence(
-                state.initial_task, ev.tool_calls
-            )
-            next_calls = await agent.review_indexed_evidence(state.initial_task)
-            if next_calls:
-                event = ToolBatchEvent(
-                    tool_calls=next_calls,
-                    reason=(
-                        "The bounded evidence review found a material gap; run "
-                        "another independent parallel retrieval round."
-                    ),
-                    stateless_retrieval=True,
-                )
-                ctx.write_event_to_stream(event)
-                return event
-            return ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
-
         await agent.call_tools(
             [(call.tool_name, call.to_fn_args()) for call in ev.tool_calls]
         )
@@ -514,7 +474,6 @@ def new_workflow(
     on_retrieval: OnRetrieval | None = None,
     llm_profile: LLMProfile | None = None,
     role_clients: Mapping[LLMRole, LLMClient] | None = None,
-    multi_agent_enabled: bool | None = None,
 ) -> tuple[FsExplorerWorkflow, ResourceManager]:
     """Build a fresh workflow instance with its own ResourceManager and agent.
 
@@ -554,7 +513,6 @@ def new_workflow(
         on_retrieval=on_retrieval,
         llm_profile=llm_profile,
         role_clients=role_clients,
-        multi_agent_enabled=multi_agent_enabled,
     )
     resource_manager.resources[get_agent.__qualname__] = agent
     workflow = FsExplorerWorkflow(
@@ -625,24 +583,6 @@ async def resume_agent_run(
                 research_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await research_task
-        yield ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
-        return
-
-    if use_index and agent.indexed_research_active:
-        while not agent.prepared_indexed_evidence:
-            pending_searches = agent.planned_search_calls
-            if pending_searches:
-                yield ToolBatchEvent(
-                    tool_calls=pending_searches,
-                    reason="Resume the pending stateless parallel retrieval round.",
-                    stateless_retrieval=True,
-                )
-                await agent.collect_parallel_indexed_evidence(
-                    initial_task, pending_searches
-                )
-            next_calls = await agent.review_indexed_evidence(initial_task)
-            if not next_calls:
-                break
         yield ExplorationEndEvent(final_result=_INDEXED_FINAL_FALLBACK)
         return
 

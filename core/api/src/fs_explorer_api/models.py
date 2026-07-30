@@ -108,64 +108,25 @@ class ToolBatchAction(BaseModel):
     tool_calls: list[ToolCallAction] = Field(min_length=2, max_length=3)
 
 
-class RetrievalQuery(BaseModel):
-    """One independent query in the stateless indexed-retrieval fan-out."""
+class CompletenessCheck(BaseModel):
+    """
+    Self-check run on a just-proposed `StopAction`, before it is accepted as
+    terminal (see `FsExplorerAgent._verify_answer_completeness`). Reviews the
+    proposed `final_result` against the full exploration transcript, so it
+    can flag a stop that is premature even though the model itself chose to
+    stop.
+    """
 
-    query: str = Field(
-        description="Standalone search query that can run independently"
-    )
-    filters: str | None = Field(
-        default=None,
+    can_answer_fully: bool = Field(
         description=(
-            "Optional metadata filter expression; null unless the question "
-            "contains an explicit, reliable metadata constraint"
-        ),
-    )
-    as_of_date: str | None = Field(
-        default=None,
-        description=(
-            "Optional YYYY-MM-DD date for historical-law questions; null for "
-            "questions about the current rule"
-        ),
-    )
-
-
-class RetrievalPlan(BaseModel):
-    """Small stateless fan-out plan generated in one cheap LLM call."""
-
-    research_question: str = Field(
-        description=(
-            "Concise standalone version of the current question, resolving only "
-            "conversation references needed for retrieval and later coverage checks"
+            "True only if the gathered evidence fully and accurately supports "
+            "the proposed final_result, with no material gap"
         )
     )
-    searches: list[RetrievalQuery] = Field(
+    missing_information: str = Field(
         description=(
-            "Three to five complementary, non-duplicate searches covering the "
-            "main rule, exceptions, procedure, and likely cross-references"
-        )
-    )
-
-
-class ResearchDecision(BaseModel):
-    """Coordinator decision after one stateless parallel retrieval round."""
-
-    enough_evidence: bool = Field(
-        description=(
-            "True only when the available evidence can support a reliable, "
-            "complete answer without another search round"
-        )
-    )
-    reason: str = Field(
-        description=(
-            "Concise coverage assessment naming any material gap, conflict, "
-            "or unresolved cross-reference"
-        )
-    )
-    additional_searches: list[RetrievalQuery] = Field(
-        description=(
-            "New non-duplicate searches needed to close material gaps; empty "
-            "when enough_evidence is true"
+            "Concise description of the single most important missing or "
+            "unresolved piece of evidence; empty when can_answer_fully is true"
         )
     )
 

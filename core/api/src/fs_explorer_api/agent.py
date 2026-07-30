@@ -34,13 +34,9 @@ from .orchestration_prompts import (
 from .models import (
     Action,
     ActionType,
+    CompletenessCheck,
     ContextSummary,
-    ResearchDecision,
-    RetrievalPlan,
-    RetrievalQuery,
     StopAction,
-    ToolCallAction,
-    ToolCallArg,
     Tools,
 )
 from fs_explorer_shared.fs import (
@@ -159,6 +155,17 @@ def _token_budgeted_recent_turns(history: list[ChatTurn]) -> list[ChatTurn]:
 # fire in practice. Previously defaulted to 10, which was cutting off
 # legitimate multi-step research runs before they reached a real answer.
 _MAX_STEPS = int(os.getenv("FS_EXPLORER_MAX_STEPS", "60"))
+
+# Cap on how many times a proposed StopAction can be rejected by the
+# pre-answer completeness check (`_verify_answer_completeness`) before a
+# run just accepts whatever the model proposes instead of asking it to
+# keep researching. Without this, a question that is genuinely
+# unanswerable from the indexed corpus could cycle "propose stop → check
+# says incomplete → propose stop again" indefinitely — each cycle costs
+# two extra LLM calls (the rejected action + the check itself) on top of
+# the eventual _MAX_STEPS safety net, so this bounds that specific cost
+# far below the full step budget rather than relying on _MAX_STEPS alone.
+_MAX_STOP_REJECTIONS = int(os.getenv("FS_EXPLORER_MAX_STOP_REJECTIONS", "2"))
 _FORCED_STOP_FALLBACK_ANSWER = (
     "Bu soruyu yanıtlamak için ayrılan araştırma adımı bütçesi doldu ve "
     "kesin bir cevaba ulaşılamadı. Şu ana kadar bulunanlara dayanarak "
@@ -190,13 +197,6 @@ def _normalize_indexed_text(value: str) -> str:
     return html.unescape(value)
 
 
-def _current_indexed_question(task: str) -> str:
-    """Strip the optional bounded conversation prefix from a retrieval task."""
-
-    marker = "\n\nCurrent question:\n"
-    return task.rsplit(marker, 1)[-1].strip() or task.strip()
-
-
 # --- Near-duplicate tool-call guard ---
 #
 # Real runs have been observed re-issuing 10+ near-identical semantic_search
@@ -210,9 +210,6 @@ def _current_indexed_question(task: str) -> str:
 # runaway step count that was the actual dominant driver of total cost.
 _DUPLICATE_CALL_LOOKBACK = 5
 _DUPLICATE_QUERY_SIMILARITY_THRESHOLD = 0.6
-_ADAPTIVE_QUERY_SIMILARITY_THRESHOLD = float(
-    os.getenv("FS_EXPLORER_ADAPTIVE_QUERY_SIMILARITY_THRESHOLD", "0.85")
-)
 _FUZZY_DEDUP_GROUPS = {"semantic_search", "grep", "glob"}
 
 # parse_file/get_document/read all resolve to the exact same content
@@ -548,11 +545,6 @@ _EFFORT_LEVELS: dict[str, dict[str, int]] = {
     "medium": {"default_limit": 8, "max_limit": 10, "overfetch_multiplier": 5},
     "high": {"default_limit": 12, "max_limit": 20, "overfetch_multiplier": 6},
 }
-_PARALLEL_QUERY_COUNTS = {"low": 3, "medium": 4, "high": 5}
-_PARALLEL_ROUND_LIMITS = {"low": 3, "medium": 4, "high": 5}
-_EVIDENCE_DIGEST_EXCERPT_CHARS = int(
-    os.getenv("FS_EXPLORER_EVIDENCE_DIGEST_EXCERPT_CHARS", "500")
-)
 _EFFORT_VAR: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_EFFORT", default=DEFAULT_EFFORT
 )
@@ -1651,27 +1643,26 @@ entities or HTML markup. Do not invent facts or citations absent from the
 evidence.
 """
 
-RETRIEVAL_PLANNER_PROMPT = """Plan independent indexed searches; do not answer.
+COMPLETENESS_CHECK_PROMPT = """Review the exploration transcript above, which
+ends with a proposed STOP action and its final_result. Do not answer the
+user's question yourself — only judge whether the proposed final_result is
+actually ready to send.
 
-Return complementary standalone queries that can run concurrently without
-seeing one another's results. Cover the main legal rule and, when relevant,
-exceptions, procedure/deadlines, definitions, and likely cross-references.
-Avoid paraphrase duplicates. Use the question's language. Set `as_of_date`
-only when the question names a historical date. Set `filters` only for an
-explicit metadata constraint you can express reliably; otherwise use null.
-Resolve any necessary conversation reference into a concise standalone
-`research_question`; do not copy unrelated chat context. Keep every query concise.
-"""
+Set `can_answer_fully=true` only when the main rule and every material part
+of the original question are supported by evidence already gathered in the
+transcript, with no unresolved gap. Set it to `false` when any of these hold:
+- a cross-reference the transcript itself flagged (e.g. "see Exhibit B",
+  "refer to Genelge X") was never actually followed up and read,
+- an exception, condition, procedural detail, or date qualifier relevant to
+  the question was not checked,
+- the evidence conflicts or is ambiguous and that was never reconciled,
+- the proposed final_result would have to guess, generalize, or state
+  something not actually present in the retrieved evidence.
 
-RESEARCH_COORDINATOR_PROMPT = """Assess evidence coverage; do not answer the user.
-
-You receive a fresh, bounded evidence inventory rather than prior agent chat.
-Set `enough_evidence=true` only when the main rule and every material part of
-the question are supported. Request another parallel round when a meaningful
-gap, contradiction, exception, definition, date issue, or unresolved
-cross-reference remains. Do not search merely to reconfirm an already
-supported point. Additional searches must be standalone, complementary, and
-different from the listed searches already run. Keep the reason concise.
+When `can_answer_fully` is false, name the single most important missing
+piece of evidence in `missing_information` so the next research step has a
+concrete target. Do not flag a stop as incomplete merely to double-check an
+already well-supported point.
 """
 
 
@@ -1788,7 +1779,6 @@ class FsExplorerAgent:
         on_retrieval: OnRetrieval | None = None,
         llm_profile: LLMProfile | None = None,
         role_clients: Mapping[LLMRole, LLMClient] | None = None,
-        multi_agent_enabled: bool | None = None,
     ) -> None:
         """
         Initialize the agent with an LLM client.
@@ -1827,14 +1817,6 @@ class FsExplorerAgent:
         self._on_retrieval = on_retrieval
         self._llm_profile = llm_profile
         self._role_clients: dict[LLMRole, LLMClient] = dict(role_clients or {})
-        configured_multi_agent = os.getenv(
-            "FS_EXPLORER_MULTI_AGENT_ENABLED", "false"
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        self._multi_agent_enabled = (
-            bool(self._role_clients) or configured_multi_agent
-            if multi_agent_enabled is None
-            else multi_agent_enabled
-        )
         self._multi_agent_orchestrator: MultiAgentResearchOrchestrator | None = None
         self._multi_agent_result: MultiAgentResearchResult | None = None
         self._multi_agent_final_llm: LLMClient | None = None
@@ -1856,23 +1838,17 @@ class FsExplorerAgent:
         # (tool_name, dedup_key) for the last `_DUPLICATE_CALL_LOOKBACK`
         # real tool calls — see `_dedup_key`/`_is_near_duplicate_call`.
         self._recent_tool_calls: list[tuple[str, str]] = []
-        self._planned_search_calls: list[ToolCallAction] = []
         self._prepared_indexed_evidence = False
-        self._indexed_research_active = False
-        self._indexed_research_question = ""
-        self._indexed_evidence_candidates: dict[str, RankedDocument] = {}
-        self._ranked_indexed_evidence: list[tuple[RankedDocument, float]] = []
-        self._executed_indexed_queries: list[str] = []
-        self._executed_indexed_search_keys: set[tuple[str, str, str]] = set()
-        self._indexed_query_candidate_keys: dict[tuple[str, str, str], list[str]] = {}
-        self._indexed_retrieval_rounds = 0
-        self._indexed_no_novelty_rounds = 0
         # Set when take_action() hits the _MAX_STEPS safety net rather than
         # the model choosing to stop on its own — the run technically
         # "completed" (no error), but the answer may be an unsatisfying
         # apology rather than a real conclusion. Callers (server.py) use
         # this to flag the run as resumable even without an error/cancel.
         self._forced_stop = False
+        # How many proposed StopActions the pre-answer completeness check
+        # has rejected so far this run — see _verify_answer_completeness
+        # and _MAX_STOP_REJECTIONS.
+        self._stop_rejections = 0
 
     @property
     def step_count(self) -> int:
@@ -1886,24 +1862,8 @@ class FsExplorerAgent:
 
     @property
     def prepared_indexed_evidence(self) -> bool:
-        """Whether the stateless indexed path is ready for final synthesis."""
+        """Whether the multi-agent research result is ready for final synthesis."""
         return self._prepared_indexed_evidence
-
-    @property
-    def indexed_research_active(self) -> bool:
-        """Whether an adaptive stateless indexed research run is in progress."""
-        return self._indexed_research_active
-
-    @property
-    def planned_search_calls(self) -> list[ToolCallAction]:
-        """Return a copy of any planned-but-not-yet-executed indexed searches."""
-        return list(self._planned_search_calls)
-
-    @property
-    def multi_agent_enabled(self) -> bool:
-        """Whether indexed semantic questions use the multi-agent branch."""
-
-        return self._multi_agent_enabled
 
     @property
     def multi_agent_research_active(self) -> bool:
@@ -1922,6 +1882,15 @@ class FsExplorerAgent:
         """Whether a required task remained partial or failed."""
 
         return bool(self._multi_agent_result and self._multi_agent_result.incomplete)
+
+    @property
+    def multi_agent_unresolved_information(self) -> list[str]:
+        """Return bounded, user-readable evidence gaps and material unknowns."""
+
+        result = self._multi_agent_result
+        if result is None:
+            return []
+        return list(getattr(result, "unresolved_information", ()))
 
     @property
     def benchmark_plan_trace(self) -> dict[str, object] | None:
@@ -2306,19 +2275,10 @@ class FsExplorerAgent:
             self._multi_agent_result = result
             self._multi_agent_research_active = False
             self._prepared_indexed_evidence = True
-            self._indexed_research_active = False
             self._chat_history = [
                 ChatTurn(role="user", text=result.final_context),
             ]
             return result
-
-    def abandon_multi_agent_research(self) -> None:
-        """Clear a failed optional branch before falling back to legacy retrieval."""
-
-        self._multi_agent_orchestrator = None
-        self._multi_agent_result = None
-        self._multi_agent_final_llm = None
-        self._multi_agent_research_active = False
 
     def grant_more_steps(self, extra: int | None = None) -> None:
         """Extend this agent's step budget — call when resuming a run.
@@ -2364,428 +2324,121 @@ class FsExplorerAgent:
         """
         self._on_retrieval = on_retrieval
 
-    def _retrieval_calls(
-        self,
-        searches: list[RetrievalQuery],
-        *,
-        task: str,
-        allow_fallback: bool,
-    ) -> list[ToolCallAction]:
-        """Normalize, bound, and de-duplicate coordinator search requests."""
-        max_queries = _PARALLEL_QUERY_COUNTS.get(get_effort(), 3)
-        accepted: list[tuple[str, str, str]] = []
-        calls: list[ToolCallAction] = []
-        for search in searches:
-            query = " ".join(search.query.split()).strip()
-            if not query:
-                continue
-            filters = " ".join((search.filters or "").split()).casefold()
-            as_of_date = (search.as_of_date or "").strip()
-            key = (query.casefold(), filters, as_of_date)
-            comparable = [
-                prior
-                for prior in [*self._executed_indexed_search_keys, *accepted]
-                if prior[1:] == key[1:]
-            ]
-            if key in self._executed_indexed_search_keys or any(
-                _query_token_overlap(query, prior[0])
-                >= _ADAPTIVE_QUERY_SIMILARITY_THRESHOLD
-                for prior in comparable
-            ):
-                continue
-            accepted.append(key)
-            args = [ToolCallArg(parameter_name="query", parameter_value=query)]
-            if search.filters:
-                args.append(
-                    ToolCallArg(
-                        parameter_name="filters", parameter_value=search.filters
-                    )
-                )
-            if search.as_of_date:
-                args.append(
-                    ToolCallArg(
-                        parameter_name="as_of_date",
-                        parameter_value=search.as_of_date,
-                    )
-                )
-            calls.append(ToolCallAction(tool_name="semantic_search", tool_input=args))
-            if len(calls) >= max_queries:
-                break
-
-        if allow_fallback and not calls:
-            calls = [
-                ToolCallAction(
-                    tool_name="semantic_search",
-                    tool_input=[
-                        ToolCallArg(parameter_name="query", parameter_value=task)
-                    ],
-                )
-            ]
-        return calls
-
-    async def plan_indexed_retrieval(self, task: str) -> list[ToolCallAction]:
-        """Create the first fan-out plan without starting a growing history."""
-        self._step_count += 1
-        self._indexed_research_active = True
-        max_queries = _PARALLEL_QUERY_COUNTS.get(get_effort(), 3)
-        try:
-            plan, usage = await self._llm.generate_structured(
-                [ChatTurn(role="user", text=task)],
-                RETRIEVAL_PLANNER_PROMPT
-                + f"\nReturn at most {max_queries} searches for this effort level.",
-                RetrievalPlan,
-                thinking_level="low",
-            )
-            self.token_usage.add_api_call(
-                prompt_tokens=usage.input_tokens,
-                completion_tokens=usage.output_tokens,
-                thinking_tokens=usage.thinking_tokens,
-            )
-            await self._report_llm_call("retrieval_plan", usage)
-            planned = plan.searches
-            research_question = " ".join(plan.research_question.split()).strip()
-        except Exception:
-            logger.exception(
-                "plan_indexed_retrieval: planner failed; using original question"
-            )
-            planned = []
-            research_question = ""
-
-        if not research_question:
-            marker = "\n\nCurrent question:\n"
-            research_question = task.rsplit(marker, 1)[-1].strip() or task
-        self._indexed_research_question = research_question
-        calls = self._retrieval_calls(
-            planned, task=research_question, allow_fallback=True
-        )
-        self._planned_search_calls = calls
-        return list(calls)
-
-    async def collect_parallel_indexed_evidence(
-        self,
-        task: str,
-        calls: list[ToolCallAction] | None = None,
-    ) -> str:
-        """Run one independent search round and update the server-side evidence pool."""
-        resolved_calls = list(calls or self._planned_search_calls)
-        if not resolved_calls:
-            resolved_calls = await self.plan_indexed_retrieval(task)
-        research_question = self._indexed_research_question or task
-
-        async def execute(call: ToolCallAction) -> PlannedSearchResult:
-            args = call.to_fn_args()
-            query = str(args.get("query") or research_question)
-            try:
-                return await asyncio.to_thread(
-                    _run_planned_index_search,
-                    query=query,
-                    filters=(
-                        str(args["filters"])
-                        if args.get("filters") is not None
-                        else None
-                    ),
-                    as_of_date=(
-                        str(args["as_of_date"])
-                        if args.get("as_of_date") is not None
-                        else None
-                    ),
-                )
-            except Exception as exc:
-                return PlannedSearchResult(query=query, hits=[], error=str(exc))
-
-        search_results = await asyncio.gather(
-            *(execute(call) for call in resolved_calls)
-        )
-        prior_candidate_count = len(self._indexed_evidence_candidates)
-        for call, result in zip(resolved_calls, search_results):
-            call_args = call.to_fn_args()
-            query = str(call_args.get("query") or research_question)
-            self._executed_indexed_queries.append(query)
-            search_key = (
-                query.casefold(),
-                " ".join(str(call_args.get("filters") or "").split()).casefold(),
-                str(call_args.get("as_of_date") or "").strip(),
-            )
-            self._executed_indexed_search_keys.add(search_key)
-            query_candidate_keys: list[str] = []
-            for hit in result.hits:
-                key = hit.chunk_id or f"{hit.doc_id}:{hit.position}"
-                query_candidate_keys.append(key)
-                candidate = RankedDocument(
-                    doc_id=hit.doc_id,
-                    relative_path=hit.relative_path,
-                    absolute_path=hit.absolute_path,
-                    position=hit.position,
-                    text=hit.text,
-                    semantic_score=hit.semantic_score,
-                    metadata_score=hit.metadata_score,
-                    chunk_id=hit.chunk_id,
-                    chunk_type=hit.chunk_type,
-                    metadata=hit.metadata,
-                )
-                prior = self._indexed_evidence_candidates.get(key)
-                if prior is None or candidate.combined_score > prior.combined_score:
-                    self._indexed_evidence_candidates[key] = candidate
-            self._indexed_query_candidate_keys[search_key] = query_candidate_keys
-
-        if len(self._indexed_evidence_candidates) == prior_candidate_count:
-            self._indexed_no_novelty_rounds += 1
-        else:
-            self._indexed_no_novelty_rounds = 0
-        self._indexed_retrieval_rounds += 1
-        self._planned_search_calls.clear()
-
-        candidates = list(self._indexed_evidence_candidates.values())
-        fully_ranked = (
-            await asyncio.to_thread(
-                IndexedQueryEngine.rank_candidates,
-                query=research_question,
-                documents=candidates,
-                limit=max(len(candidates), 1),
-                diversify=False,
-            )
-            if candidates
-            else []
-        )
-        self._ranked_indexed_evidence = self._select_diverse_indexed_evidence(
-            fully_ranked
-        )
-        return self._indexed_evidence_digest(task)
-
-    def _select_diverse_indexed_evidence(
-        self, ranked: list[tuple[RankedDocument, float]]
-    ) -> list[tuple[RankedDocument, float]]:
-        """Reserve recent facet hits, then fill the fixed budget globally."""
-        budget = _effort_config()["default_limit"]
-        by_key = {
-            (document.chunk_id or f"{document.doc_id}:{document.position}"): (
-                document,
-                score,
-            )
-            for document, score in ranked
-        }
-        selected: list[tuple[RankedDocument, float]] = []
-        selected_keys: set[str] = set()
-
-        # New follow-up facets are the easiest to lose in a global top-K.
-        # Reserve at most half the budget for their strongest novel hits.
-        reserve_budget = max(1, budget // 2)
-        for search_key in reversed(list(self._indexed_query_candidate_keys)):
-            if len(selected) >= reserve_budget:
-                break
-            for candidate_key in self._indexed_query_candidate_keys[search_key]:
-                item = by_key.get(candidate_key)
-                if item is None or candidate_key in selected_keys:
-                    continue
-                selected.append(item)
-                selected_keys.add(candidate_key)
-                break
-
-        for document, score in ranked:
-            candidate_key = (
-                document.chunk_id or f"{document.doc_id}:{document.position}"
-            )
-            if candidate_key in selected_keys:
-                continue
-            selected.append((document, score))
-            selected_keys.add(candidate_key)
-            if len(selected) >= budget:
-                break
-        return sorted(selected, key=lambda item: item[1], reverse=True)
-
-    def _indexed_evidence_digest(self, task: str) -> str:
-        """Build the bounded, history-free inventory seen by the coordinator."""
-        research_question = self._indexed_research_question or task
-        lines = [
-            f"QUESTION:\n{research_question}",
-            "",
-            f"SEARCH ROUNDS COMPLETED: {self._indexed_retrieval_rounds}",
-            "SEARCHES ALREADY RUN:",
-            *(f"- {query}" for query in self._executed_indexed_queries),
-            "",
-            "CURRENT EVIDENCE INVENTORY:",
-        ]
-        if not self._ranked_indexed_evidence:
-            lines.append("No relevant indexed chunks found yet.")
-            return "\n".join(lines)
-
-        for index, (candidate, score) in enumerate(
-            self._ranked_indexed_evidence, start=1
-        ):
-            title = _display_name(
-                {
-                    "relative_path": candidate.relative_path,
-                    "absolute_path": candidate.absolute_path,
-                }
-            )
-            locator = _chunk_locator({"metadata": candidate.metadata})
-            excerpt = re.sub(r"\s+", " ", candidate.text).strip()
-            excerpt = excerpt[: max(_EVIDENCE_DIGEST_EXCERPT_CHARS, 100)]
-            lines.extend(
-                [
-                    f"[{index}] doc_id: {candidate.doc_id}",
-                    f"    title: {title}",
-                    f"    chunk_id: {candidate.chunk_id or '<unknown>'}",
-                    f"    locator: {locator or '<none>'}",
-                    f"    relevance: {score:.3f}",
-                    f"    evidence_excerpt: {excerpt}",
-                ]
-            )
-        return "\n".join(lines)
-
-    def _render_final_indexed_evidence(self) -> str:
-        lines = [
-            "=== ADAPTIVE PARALLEL RETRIEVAL EVIDENCE ===",
-            "Only globally selected full chunks are included below.",
-            "",
-        ]
-        for index, (candidate, score) in enumerate(
-            self._ranked_indexed_evidence, start=1
-        ):
-            lines.extend(
-                _render_full_chunk_result(
-                    index=index,
-                    doc_id=candidate.doc_id,
-                    title=_display_name(
-                        {
-                            "relative_path": candidate.relative_path,
-                            "absolute_path": candidate.absolute_path,
-                        }
-                    ),
-                    matched_by=candidate.matched_by,
-                    chunk_id=candidate.chunk_id,
-                    chunk_position=candidate.position,
-                    chunk_type=candidate.chunk_type,
-                    metadata=candidate.metadata,
-                    score=score,
-                    text=candidate.text,
-                    semantic_score=candidate.semantic_score,
-                    metadata_score=candidate.metadata_score,
-                )
-            )
-        if not self._ranked_indexed_evidence:
-            lines.append("No indexed evidence was found after adaptive retrieval.")
-        return "\n".join(lines)
-
-    def _record_coordinator_evidence(
-        self, digest: str, final_evidence: str | None = None
-    ) -> None:
-        """Record exactly the retrieval-derived text sent to LLM calls this round."""
-        exposed = digest if final_evidence is None else f"{digest}\n\n{final_evidence}"
-        chunk_count, chars = self.token_usage.add_tool_result(
-            exposed, "semantic_search"
-        )
-        self._report_retrieval("semantic_search", chunk_count, chars)
-
-    def _finalize_indexed_evidence(self, task: str, digest: str) -> None:
-        final_evidence = self._render_final_indexed_evidence()
-        self._record_coordinator_evidence(digest, final_evidence)
-        self._chat_history = [
-            ChatTurn(role="user", text=f"Original question:\n{task}"),
-            ChatTurn(role="user", text=final_evidence),
-        ]
-        self._planned_search_calls.clear()
-        self._prepared_indexed_evidence = True
-        self._indexed_research_active = False
-
-    async def review_indexed_evidence(self, task: str) -> list[ToolCallAction]:
-        """Decide from a fresh compact inventory whether another round is useful."""
-        digest = self._indexed_evidence_digest(task)
-        round_limit = _PARALLEL_ROUND_LIMITS.get(get_effort(), 3)
-        if (
-            self._indexed_retrieval_rounds >= round_limit
-            or self._indexed_no_novelty_rounds >= 2
-        ):
-            self._finalize_indexed_evidence(task, digest)
-            return []
-
-        self._step_count += 1
-        try:
-            decision, usage = await self._llm.generate_structured(
-                [ChatTurn(role="user", text=digest)],
-                RESEARCH_COORDINATOR_PROMPT,
-                ResearchDecision,
-                thinking_level="low",
-            )
-            self.token_usage.add_api_call(
-                prompt_tokens=usage.input_tokens,
-                completion_tokens=usage.output_tokens,
-                thinking_tokens=usage.thinking_tokens,
-            )
-            await self._report_llm_call("evidence_review", usage)
-        except Exception:
-            logger.exception(
-                "review_indexed_evidence: coordinator failed; synthesizing "
-                "from current evidence"
-            )
-            self._finalize_indexed_evidence(task, digest)
-            return []
-
-        next_calls = self._retrieval_calls(
-            decision.additional_searches,
-            task=task,
-            allow_fallback=False,
-        )
-        if decision.enough_evidence or not next_calls:
-            self._finalize_indexed_evidence(task, digest)
-            return []
-
-        self._record_coordinator_evidence(digest)
-        self._planned_search_calls = next_calls
-        return list(next_calls)
-
     async def take_action(self) -> tuple[Action, ActionType] | None:
         """
         Request the next action from the LLM.
 
         Sends the current conversation history and receives a structured
-        JSON response indicating the next action to take.
+        JSON response indicating the next action to take. When that action
+        is a `StopAction`, it is not handed back as-is: `_verify_answer_completeness`
+        runs one extra, cheap check asking whether the gathered evidence
+        actually supports a complete answer. If the check says no, the
+        proposed stop is rejected — a note describing the gap is appended to
+        history and this loops back for another real action instead of
+        letting an under-researched answer reach final synthesis. Bounded by
+        `_MAX_STOP_REJECTIONS` so a question that turns out to be genuinely
+        unanswerable from the corpus still terminates rather than looping
+        forever.
 
         Returns:
             A tuple of (Action, ActionType) if successful, None otherwise.
         """
-        self._step_count += 1
-        if self._step_count > self._max_steps:
-            # Force a stop without spending another LLM call on it — a run
-            # that's hit the step budget doesn't need the model's opinion on
-            # whether to keep going, it needs to wrap up. `final_result`
-            # normally only has to satisfy the Action schema, since
-            # `stream_final_answer()` (called next, with the full
-            # accumulated history) is what actually composes the real
-            # answer — but it's also used verbatim as that call's fallback
-            # if streaming itself fails, so it must never be blank: an
-            # empty string there plus a failed stream previously meant the
-            # user got a silently empty response.
-            self._forced_stop = True
-            action = Action(
-                action=StopAction(final_result=_FORCED_STOP_FALLBACK_ANSWER),
-                reason=(
-                    f"Reached the step budget ({self._max_steps} actions) without "
-                    "a conclusive path through further tool calls — "
-                    "stopping to compose the best answer from what has "
-                    "been gathered so far."
-                ),
+        while True:
+            self._step_count += 1
+            if self._step_count > self._max_steps:
+                # Force a stop without spending another LLM call on it — a run
+                # that's hit the step budget doesn't need the model's opinion on
+                # whether to keep going, it needs to wrap up. `final_result`
+                # normally only has to satisfy the Action schema, since
+                # `stream_final_answer()` (called next, with the full
+                # accumulated history) is what actually composes the real
+                # answer — but it's also used verbatim as that call's fallback
+                # if streaming itself fails, so it must never be blank: an
+                # empty string there plus a failed stream previously meant the
+                # user got a silently empty response.
+                self._forced_stop = True
+                action = Action(
+                    action=StopAction(final_result=_FORCED_STOP_FALLBACK_ANSWER),
+                    reason=(
+                        f"Reached the step budget ({self._max_steps} actions) without "
+                        "a conclusive path through further tool calls — "
+                        "stopping to compose the best answer from what has "
+                        "been gathered so far."
+                    ),
+                )
+                self._chat_history.append(
+                    ChatTurn(role="model", text=action.model_dump_json())
+                )
+                return action, action.to_action_type()
+
+            action, usage = await self._llm.generate_structured(
+                self._chat_history,
+                _build_system_prompt(*get_search_flags()),
+                Action,
+                thinking_level="low",
             )
+            self.token_usage.add_api_call(
+                prompt_tokens=usage.input_tokens,
+                completion_tokens=usage.output_tokens,
+                thinking_tokens=usage.thinking_tokens,
+            )
+            await self._report_llm_call("action", usage)
             self._chat_history.append(
                 ChatTurn(role="model", text=action.model_dump_json())
             )
-            return action, action.to_action_type()
+            await self._maybe_summarize_history(usage.input_tokens)
 
-        action, usage = await self._llm.generate_structured(
-            self._chat_history,
-            _build_system_prompt(*get_search_flags()),
-            Action,
-            thinking_level="low",
-        )
+            action_type = action.to_action_type()
+            if action_type != "stop" or self._stop_rejections >= _MAX_STOP_REJECTIONS:
+                return action, action_type
+
+            check = await self._verify_answer_completeness()
+            if check is None or check.can_answer_fully:
+                return action, action_type
+
+            self._stop_rejections += 1
+            self._chat_history.append(
+                ChatTurn(
+                    role="user",
+                    text=(
+                        "Your proposed stop was rejected by a completeness "
+                        f"check: {check.missing_information}\n\n"
+                        "Do not answer yet — take another action to resolve "
+                        "this gap, then stop again once it is addressed."
+                    ),
+                )
+            )
+
+    async def _verify_answer_completeness(self) -> CompletenessCheck | None:
+        """Ask one extra, cheap follow-up call whether a just-proposed
+        StopAction is actually ready to answer, before treating it as terminal.
+
+        Best-effort: any failure here falls open (returns `None`, which the
+        caller treats the same as "accept the stop") rather than blocking a
+        run on a secondary check that isn't itself essential to producing an
+        answer.
+        """
+        self._step_count += 1
+        try:
+            check, usage = await self._llm.generate_structured(
+                self._chat_history,
+                COMPLETENESS_CHECK_PROMPT,
+                CompletenessCheck,
+                thinking_level="low",
+            )
+        except Exception:
+            logger.exception(
+                "_verify_answer_completeness: completeness check failed; "
+                "accepting the proposed stop as-is"
+            )
+            return None
         self.token_usage.add_api_call(
             prompt_tokens=usage.input_tokens,
             completion_tokens=usage.output_tokens,
             thinking_tokens=usage.thinking_tokens,
         )
-        await self._report_llm_call("action", usage)
-        self._chat_history.append(ChatTurn(role="model", text=action.model_dump_json()))
-        await self._maybe_summarize_history(usage.input_tokens)
-        return action, action.to_action_type()
+        await self._report_llm_call("completeness_check", usage)
+        return check
 
     async def _maybe_summarize_history(self, last_prompt_tokens: int) -> None:
         """
@@ -3134,19 +2787,10 @@ class FsExplorerAgent:
         self._step_count = 0
         self._max_steps = _MAX_STEPS
         self._recent_tool_calls.clear()
-        self._planned_search_calls.clear()
         self._prepared_indexed_evidence = False
-        self._indexed_research_active = False
-        self._indexed_research_question = ""
-        self._indexed_evidence_candidates.clear()
-        self._ranked_indexed_evidence.clear()
-        self._executed_indexed_queries.clear()
-        self._executed_indexed_search_keys.clear()
-        self._indexed_query_candidate_keys.clear()
-        self._indexed_retrieval_rounds = 0
-        self._indexed_no_novelty_rounds = 0
         self._multi_agent_orchestrator = None
         self._multi_agent_result = None
         self._multi_agent_final_llm = None
         self._multi_agent_research_active = False
         self._forced_stop = False
+        self._stop_rejections = 0

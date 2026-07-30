@@ -14,7 +14,6 @@ from fs_explorer_api.agent import (
     DEFAULT_EFFORT,
     FsExplorerAgent,
     IndexedCorpus,
-    PlannedSearchResult,
     RetrievalStats,
     SYSTEM_PROMPT,
     FINAL_SYSTEM_PROMPT,
@@ -30,14 +29,11 @@ from fs_explorer_api.agent import (
 from fs_explorer_api.llm import LLMUsage
 from fs_explorer_api.models import (
     Action,
+    CompletenessCheck,
     ContextSummary,
     GoDeeperAction,
-    ResearchDecision,
-    RetrievalPlan,
-    RetrievalQuery,
     StopAction,
 )
-from fs_explorer_api.search import SearchHit
 from fs_explorer_api.search.ranker import RankedDocument
 from .conftest import make_mock_llm_client
 
@@ -372,6 +368,24 @@ class TestPurposeSpecificThinking:
 
         assert [source["chunk_id"] for source in sources] == ["chunk-5"]
 
+    def test_unresolved_information_is_exposed_without_internal_ids(self) -> None:
+        client = _PurposeCapturingClient()
+        agent = FsExplorerAgent(llm_client=client)
+        agent._multi_agent_result = cast(
+            Any,
+            SimpleNamespace(
+                unresolved_information=(
+                    "İlgili istisna hükmü doğrulanamadı.",
+                    "Taşıma türü kullanıcı tarafından belirtilmeli.",
+                )
+            ),
+        )
+
+        assert agent.multi_agent_unresolved_information == [
+            "İlgili istisna hükmü doğrulanamadı.",
+            "Taşıma türü kullanıcı tarafından belirtilmeli.",
+        ]
+
 
 class _PurposeCapturingClient:
     model = "test"
@@ -383,6 +397,13 @@ class _PurposeCapturingClient:
     async def generate_structured(
         self, history, system_prompt, schema, *, thinking_level=None
     ):
+        if schema is CompletenessCheck:
+            # Always accept the proposed stop — this client exists to
+            # capture per-purpose thinking levels for the *action* call,
+            # not to exercise the completeness gate itself.
+            return CompletenessCheck(can_answer_fully=True, missing_information=""), (
+                LLMUsage()
+            )
         self.structured_thinking_levels.append(thinking_level)
         return Action(reason="done", action=StopAction(final_result="done")), LLMUsage()
 
@@ -514,6 +535,13 @@ class _ScriptedLLMClient:
             return ContextSummary(summary="compact summary"), LLMUsage(
                 input_tokens=500, output_tokens=50
             )
+        if schema is CompletenessCheck:
+            # Always accept the proposed stop — these tests exercise history
+            # compaction/step budgeting, not the completeness gate itself
+            # (see TestStopCompletenessGate for that).
+            return CompletenessCheck(
+                can_answer_fully=True, missing_information=""
+            ), LLMUsage(input_tokens=10, output_tokens=5)
 
         tokens = self._action_token_counts.pop(0)
         is_last = not self._action_token_counts
@@ -698,6 +726,128 @@ class TestMaxSteps:
         # consumed before the forced stop) — not another forced stop.
         assert action_type == "godeeper"
         assert agent.forced_stop is False
+
+
+class _CompletenessScriptedClient:
+    """LLMClient with independent scripted responses per schema.
+
+    `action_script` supplies each requested `Action` in order; `check_script`
+    supplies each requested `CompletenessCheck` verdict in order — kept
+    separate so a test can script "propose stop, get rejected, propose a
+    real action" without the two interleaving in one list.
+    """
+
+    def __init__(
+        self,
+        action_script: list[Action],
+        check_script: list[CompletenessCheck] | None = None,
+    ) -> None:
+        self._action_script = list(action_script)
+        self._check_script = list(check_script or [])
+
+    async def generate_structured(
+        self, history, system_prompt, schema, *, thinking_level=None
+    ):
+        if schema is CompletenessCheck:
+            return self._check_script.pop(0), LLMUsage(input_tokens=10, output_tokens=5)
+        return self._action_script.pop(0), LLMUsage(input_tokens=100, output_tokens=10)
+
+    async def stream_text(self, history, system_prompt, *, thinking_level=None):
+        return
+        yield ""  # pragma: no cover - makes this an async generator
+
+    def last_stream_usage(self):
+        return None
+
+
+class TestStopCompletenessGate:
+    """Tests for the pre-answer completeness check in `take_action()`: a
+    proposed `StopAction` is verified before being handed back, and a
+    rejected one loops back for another real action instead of
+    terminating."""
+
+    @pytest.mark.asyncio
+    async def test_rejected_stop_continues_the_loop_instead_of_terminating(
+        self,
+    ) -> None:
+        client = _CompletenessScriptedClient(
+            action_script=[
+                Action(reason="premature", action=StopAction(final_result="too early")),
+                Action(reason="found it", action=GoDeeperAction(directory=".")),
+            ],
+            check_script=[
+                CompletenessCheck(
+                    can_answer_fully=False,
+                    missing_information="the exception clause",
+                ),
+            ],
+        )
+        agent = FsExplorerAgent(llm_client=client)
+        agent.configure_task("what's the rule?")
+
+        action, action_type = await agent.take_action()
+
+        assert action_type == "godeeper"
+        assert agent._stop_rejections == 1
+        assert any(
+            "the exception clause" in turn.text
+            for turn in agent._chat_history
+            if turn.role == "user"
+        )
+
+    @pytest.mark.asyncio
+    async def test_completeness_check_failure_falls_open_and_accepts_the_stop(
+        self,
+    ) -> None:
+        class _FailingCheckClient:
+            async def generate_structured(
+                self, history, system_prompt, schema, *, thinking_level=None
+            ):
+                if schema is CompletenessCheck:
+                    raise RuntimeError("boom")
+                return Action(
+                    reason="done", action=StopAction(final_result="answer")
+                ), LLMUsage(input_tokens=100, output_tokens=10)
+
+            async def stream_text(self, history, system_prompt, *, thinking_level=None):
+                return
+                yield ""  # pragma: no cover - makes this an async generator
+
+            def last_stream_usage(self):
+                return None
+
+        agent = FsExplorerAgent(llm_client=_FailingCheckClient())
+        agent.configure_task("task")
+
+        action, action_type = await agent.take_action()
+
+        assert action_type == "stop"
+        assert action.action.final_result == "answer"
+
+    @pytest.mark.asyncio
+    @patch("fs_explorer_api.agent._MAX_STOP_REJECTIONS", 2)
+    async def test_accepts_the_stop_after_max_rejections_without_looping_forever(
+        self,
+    ) -> None:
+        client = _CompletenessScriptedClient(
+            action_script=[
+                Action(reason="stop1", action=StopAction(final_result="v1")),
+                Action(reason="stop2", action=StopAction(final_result="v2")),
+                Action(reason="stop3", action=StopAction(final_result="v3")),
+            ],
+            check_script=[
+                CompletenessCheck(can_answer_fully=False, missing_information="gap1"),
+                CompletenessCheck(can_answer_fully=False, missing_information="gap2"),
+            ],
+        )
+        agent = FsExplorerAgent(llm_client=client)
+        agent.configure_task("task")
+
+        action, action_type = await agent.take_action()
+
+        assert action_type == "stop"
+        assert action.action.final_result == "v3"
+        assert agent._stop_rejections == 2
 
 
 class TestDuplicateCallGuard:
@@ -983,7 +1133,7 @@ class TestRetrievalHook:
         return "".join(f"[{i}] doc_id: doc_{i}\n" for i in range(1, hit_count + 1))
 
     def test_call_tool_fires_hook_for_chunk_bearing_tool(self) -> None:
-        from fs_explorer_api.agent import TOOLS, RetrievalStats
+        from fs_explorer_api.agent import TOOLS
 
         original = TOOLS["semantic_search"]
         TOOLS["semantic_search"] = lambda **kwargs: self._fake_semantic_search_result(3)
@@ -1008,7 +1158,7 @@ class TestRetrievalHook:
         one retrieval_stats event per chunk-bearing tool_call to correlate
         the two in order, including within a batch; silently skipping
         zero-chunk calls would desync every call after the first one."""
-        from fs_explorer_api.agent import TOOLS, RetrievalStats
+        from fs_explorer_api.agent import TOOLS
 
         original = TOOLS["get_document"]
         TOOLS["get_document"] = lambda **kwargs: (
@@ -1027,7 +1177,7 @@ class TestRetrievalHook:
         assert received[0].chunk_count == 0
 
     def test_call_tool_does_not_fire_hook_for_non_chunk_tool(self) -> None:
-        from fs_explorer_api.agent import TOOLS, RetrievalStats
+        from fs_explorer_api.agent import TOOLS
 
         original = TOOLS["glob"]
         TOOLS["glob"] = lambda **kwargs: "some/path.txt"
@@ -1046,7 +1196,7 @@ class TestRetrievalHook:
     async def test_call_tools_batch_fires_hook_for_each_chunk_bearing_call(
         self,
     ) -> None:
-        from fs_explorer_api.agent import TOOLS, RetrievalStats
+        from fs_explorer_api.agent import TOOLS
 
         original_search = TOOLS["semantic_search"]
         original_glob = TOOLS["glob"]
@@ -1076,7 +1226,7 @@ class TestRetrievalHook:
         assert received[0].step == 2
 
     def test_set_retrieval_hook_rebinds_for_resume(self) -> None:
-        from fs_explorer_api.agent import TOOLS, RetrievalStats
+        from fs_explorer_api.agent import TOOLS
 
         original = TOOLS["semantic_search"]
         TOOLS["semantic_search"] = lambda **kwargs: self._fake_semantic_search_result(1)
@@ -1093,285 +1243,3 @@ class TestRetrievalHook:
 
         assert first_run == []
         assert len(second_run) == 1
-
-
-class _StatelessRetrievalClient:
-    model = "test"
-
-    def __init__(self, decisions: list[ResearchDecision] | None = None) -> None:
-        self.structured_histories = []
-        self.stream_histories = []
-        self._stream_usage = None
-        self._decisions = list(
-            decisions
-            or [
-                ResearchDecision(
-                    enough_evidence=True,
-                    reason="Evidence covers the question.",
-                    additional_searches=[],
-                )
-            ]
-        )
-
-    async def generate_structured(
-        self, history, system_prompt, schema, *, thinking_level=None
-    ):
-        self.structured_histories.append(list(history))
-        if schema is RetrievalPlan:
-            return (
-                RetrievalPlan(
-                    research_question="Transit süresi nedir?",
-                    searches=[
-                        RetrievalQuery(query="ana kural"),
-                        RetrievalQuery(query="istisnalar"),
-                        RetrievalQuery(query="ana kural"),
-                        RetrievalQuery(query="süre ve usul"),
-                        RetrievalQuery(query="fazladan sorgu"),
-                    ],
-                ),
-                LLMUsage(input_tokens=500, output_tokens=80),
-            )
-        assert schema is ResearchDecision
-        return self._decisions.pop(0), LLMUsage(input_tokens=400, output_tokens=50)
-
-    async def stream_text(self, history, system_prompt, *, thinking_level=None):
-        self.stream_histories.append(list(history))
-        self._stream_usage = LLMUsage(input_tokens=2400, output_tokens=300)
-        yield "nihai cevap"
-
-    def last_stream_usage(self):
-        return self._stream_usage
-
-
-def _search_hit(
-    *,
-    chunk_id: str,
-    text: str,
-    score: float,
-    position: int,
-) -> SearchHit:
-    return SearchHit(
-        doc_id=f"doc_{chunk_id}",
-        relative_path=f"{chunk_id}.md",
-        absolute_path=f"/{chunk_id}.md",
-        position=position,
-        text=text,
-        semantic_score=score,
-        metadata_score=0,
-        score=score,
-        matched_by="semantic",
-        chunk_id=chunk_id,
-        chunk_type="text",
-        metadata={"article_no": str(position + 1)},
-    )
-
-
-class TestStatelessParallelRetrieval:
-    @pytest.mark.asyncio
-    async def test_uses_one_plan_and_one_final_call_without_search_history(
-        self,
-    ) -> None:
-        import fs_explorer_api.agent as agent_module
-
-        client = _StatelessRetrievalClient()
-        retrieval_events: list[RetrievalStats] = []
-        agent = FsExplorerAgent(llm_client=client, on_retrieval=retrieval_events.append)
-        set_effort("low")
-
-        calls = await agent.plan_indexed_retrieval("Transit süresi nedir?")
-        assert [call.to_fn_args()["query"] for call in calls] == [
-            "ana kural",
-            "istisnalar",
-            "süre ve usul",
-        ]
-
-        def fake_search(*, query, filters=None, as_of_date=None):
-            common = _search_hit(
-                chunk_id="common",
-                text="ortak tam chunk",
-                score=0.8,
-                position=0,
-            )
-            unique = _search_hit(
-                chunk_id=query.replace(" ", "_"),
-                text=f"{query} için tam chunk",
-                score=0.7,
-                position=1,
-            )
-            return PlannedSearchResult(query=query, hits=[common, unique])
-
-        captured_candidates: list[RankedDocument] = []
-
-        def fake_global_rank(*, query, documents, limit, diversify=True):
-            captured_candidates.extend(documents)
-            return [
-                (document, 0.9 - index * 0.1)
-                for index, document in enumerate(documents[:limit])
-            ]
-
-        with (
-            patch.object(
-                agent_module, "_run_planned_index_search", side_effect=fake_search
-            ),
-            patch.object(
-                agent_module.IndexedQueryEngine,
-                "rank_candidates",
-                side_effect=fake_global_rank,
-            ),
-        ):
-            digest = await agent.collect_parallel_indexed_evidence(
-                "Transit süresi nedir?", calls
-            )
-            next_calls = await agent.review_indexed_evidence("Transit süresi nedir?")
-
-        assert len(captured_candidates) == 4  # shared hit deduplicated
-        assert next_calls == []
-        assert digest.count("ortak tam chunk") == 1
-        assert len(agent._chat_history) == 2
-        assert agent._chat_history[0].text == (
-            "Original question:\nTransit süresi nedir?"
-        )
-        assert agent._chat_history[1].text.count("ortak tam chunk") == 1
-        assert len(retrieval_events) == 1
-        # Four bounded digest entries went to the reviewer and the same four
-        # full chunks went once to final synthesis.
-        assert retrieval_events[0].chunk_count == 8
-
-        answer = "".join([part async for part in agent.stream_final_answer("fallback")])
-
-        assert answer == "nihai cevap"
-        assert agent.token_usage.api_calls == 3
-        assert agent.token_usage.total_tokens == 3730
-        assert len(client.structured_histories) == 2
-        assert len(client.stream_histories) == 1
-        assert len(client.stream_histories[0]) == 3  # question, evidence, final prompt
-        assert all(len(history) == 1 for history in client.structured_histories)
-
-    @pytest.mark.asyncio
-    async def test_opens_another_stateless_round_for_a_material_gap(self) -> None:
-        import fs_explorer_api.agent as agent_module
-
-        client = _StatelessRetrievalClient(
-            decisions=[
-                ResearchDecision(
-                    enough_evidence=False,
-                    reason="A specific force-majeure exception is unresolved.",
-                    additional_searches=[
-                        RetrievalQuery(query="mücbir sebep gecikme istisnası")
-                    ],
-                ),
-                ResearchDecision(
-                    enough_evidence=True,
-                    reason="The exception is now covered.",
-                    additional_searches=[],
-                ),
-            ]
-        )
-        agent = FsExplorerAgent(llm_client=client)
-        set_effort("low")
-
-        def fake_search(*, query, filters=None, as_of_date=None):
-            marker = "YENİ_İSTİSNA_KANITI" if "mücbir" in query else f"İLK_TUR_{query}"
-            return PlannedSearchResult(
-                query=query,
-                hits=[
-                    _search_hit(
-                        chunk_id=query.replace(" ", "_"),
-                        text=marker,
-                        score=0.8,
-                        position=1,
-                    )
-                ],
-            )
-
-        def fake_global_rank(*, query, documents, limit, diversify=True):
-            return [
-                (document, 0.95 - index * 0.01)
-                for index, document in enumerate(documents[:limit])
-            ]
-
-        with (
-            patch.object(
-                agent_module, "_run_planned_index_search", side_effect=fake_search
-            ),
-            patch.object(
-                agent_module.IndexedQueryEngine,
-                "rank_candidates",
-                side_effect=fake_global_rank,
-            ),
-        ):
-            first_calls = await agent.plan_indexed_retrieval("Soru")
-            await agent.collect_parallel_indexed_evidence("Soru", first_calls)
-            second_calls = await agent.review_indexed_evidence("Soru")
-            assert [call.to_fn_args()["query"] for call in second_calls] == [
-                "mücbir sebep gecikme istisnası"
-            ]
-
-            await agent.collect_parallel_indexed_evidence("Soru", second_calls)
-            assert await agent.review_indexed_evidence("Soru") == []
-
-        assert agent.prepared_indexed_evidence is True
-        assert "YENİ_İSTİSNA_KANITI" in agent._chat_history[1].text
-        # Planner + two fresh reviews; no accumulated review conversation.
-        assert len(client.structured_histories) == 3
-        assert all(len(history) == 1 for history in client.structured_histories)
-        assert "force-majeure exception" not in client.structured_histories[2][0].text
-
-    @pytest.mark.asyncio
-    async def test_round_limit_stops_without_an_extra_review_call(self) -> None:
-        import fs_explorer_api.agent as agent_module
-
-        client = _StatelessRetrievalClient(
-            decisions=[
-                ResearchDecision(
-                    enough_evidence=False,
-                    reason="Keep searching.",
-                    additional_searches=[RetrievalQuery(query="ikinci tur")],
-                ),
-                ResearchDecision(
-                    enough_evidence=False,
-                    reason="This decision must never be requested.",
-                    additional_searches=[RetrievalQuery(query="üçüncü tur")],
-                ),
-            ]
-        )
-        agent = FsExplorerAgent(llm_client=client)
-        set_effort("low")
-
-        def fake_search(*, query, filters=None, as_of_date=None):
-            return PlannedSearchResult(
-                query=query,
-                hits=[
-                    _search_hit(
-                        chunk_id=query.replace(" ", "_"),
-                        text=f"kanıt {query}",
-                        score=0.8,
-                        position=1,
-                    )
-                ],
-            )
-
-        def fake_rank(*, query, documents, limit, diversify=True):
-            return [(document, 0.8) for document in documents]
-
-        with (
-            patch.object(agent_module, "_PARALLEL_ROUND_LIMITS", {"low": 2}),
-            patch.object(
-                agent_module, "_run_planned_index_search", side_effect=fake_search
-            ),
-            patch.object(
-                agent_module.IndexedQueryEngine,
-                "rank_candidates",
-                side_effect=fake_rank,
-            ),
-        ):
-            calls = await agent.plan_indexed_retrieval("Soru")
-            await agent.collect_parallel_indexed_evidence("Soru", calls)
-            calls = await agent.review_indexed_evidence("Soru")
-            await agent.collect_parallel_indexed_evidence("Soru", calls)
-            assert await agent.review_indexed_evidence("Soru") == []
-
-        assert agent.prepared_indexed_evidence is True
-        # Initial planner + first review only; the hard-cap path skips a
-        # pointless second review because it cannot authorize another round.
-        assert len(client.structured_histories) == 2

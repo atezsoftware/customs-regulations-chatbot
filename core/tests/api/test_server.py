@@ -1,10 +1,8 @@
-import pytest
+from types import SimpleNamespace
+from typing import Any, cast
 
 from fs_explorer_api.agent import _normalize_indexed_text
-from fs_explorer_api.server import (
-    _decode_html_entities,
-    _server_multi_agent_enabled,
-)
+from fs_explorer_api.server import _completion_is_incomplete, _decode_html_entities
 
 
 def test_decode_html_entities_preserves_turkish_text() -> None:
@@ -22,20 +20,13 @@ def test_normalize_indexed_text_decodes_entities_before_model_context() -> None:
     assert _normalize_indexed_text(value) == "Gümrük & transit: aşılma"
 
 
-def test_api_server_enables_multi_agent_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("FS_EXPLORER_MULTI_AGENT_ENABLED", raising=False)
+def test_completion_surfaces_terminal_multi_agent_evidence_gaps() -> None:
+    agent = cast(
+        Any,
+        SimpleNamespace(forced_stop=False, multi_agent_incomplete=True),
+    )
 
-    assert _server_multi_agent_enabled() is True
-
-
-def test_api_server_respects_multi_agent_kill_switch(monkeypatch) -> None:
-    monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "false")
-
-    assert _server_multi_agent_enabled() is False
-
-
-def test_api_server_rejects_ambiguous_multi_agent_flag(monkeypatch) -> None:
-    monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "sometimes")
-
-    with pytest.raises(ValueError, match="must be a boolean"):
-        _server_multi_agent_enabled()
+    assert _completion_is_incomplete(agent=agent, result_error=None) is True
+    assert (
+        _completion_is_incomplete(agent=agent, result_error="provider failed") is False
+    )

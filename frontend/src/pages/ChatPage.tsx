@@ -297,6 +297,8 @@ export function ChatPage() {
                 // doesn't flatten the granular list right as it finishes.
                 usage: message.usage.length ? message.usage : (usage ?? message.usage),
                 incomplete: event.incomplete,
+                resumable: event.resumable,
+                unresolvedInformation: event.unresolvedInformation,
               }
             : message,
         ),

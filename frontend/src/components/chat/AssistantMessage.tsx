@@ -23,14 +23,14 @@ export function AssistantMessage({
   // core-api keeps an interrupted run's agent state (chat history, tool
   // results already gathered) around for a while — Continue picks that up
   // instead of throwing it away and starting over like Regenerate does.
-  // Includes a 'completed' message that only hit the step-budget safety
-  // net (message.incomplete) — not an error, but still worth continuing.
+  // A bounded evidence gap can be terminal, so answer quality (`incomplete`)
+  // is deliberately separate from whether core still retains the run.
   const canContinue =
     !streaming &&
     Boolean(message.runId) &&
     (message.status === 'error' ||
       message.status === 'cancelled' ||
-      (message.status === 'completed' && message.incomplete));
+      (message.status === 'completed' && message.resumable));
 
   async function copy() {
     if (!message.content) return;
@@ -57,10 +57,17 @@ export function AssistantMessage({
       )}
       {message.status === 'completed' && message.incomplete && (
         <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-700">
-          This answer may be incomplete — research ran out of steps before
-          reaching a firm conclusion. Click Continue to keep researching.
+          {message.resumable
+            ? 'This answer may be incomplete — research ran out of steps before reaching a firm conclusion. Click Continue to keep researching.'
+            : 'This answer is limited because some required evidence or user information could not be verified.'}
         </p>
       )}
+      {message.status === 'completed' &&
+        Boolean(message.unresolvedInformation?.length) && (
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-amber-800">
+            {message.unresolvedInformation?.map(item => <li key={item}>{item}</li>)}
+          </ul>
+        )}
       <SourceList sources={message.sources} />
       <UsageFooter usage={message.usage} />
       <div className="mt-4 flex flex-wrap items-center gap-2">

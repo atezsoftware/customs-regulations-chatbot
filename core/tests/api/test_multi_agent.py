@@ -19,6 +19,7 @@ from fs_explorer_api.multi_agent import (
     ResearchProgress,
     _bounded_planner_input,
     _claim_identifier,
+    _is_near_duplicate_query,
 )
 from fs_explorer_api.orchestration_models import (
     AnswerRequirement,
@@ -577,6 +578,7 @@ async def test_single_pass_coverage_miss_upgrades_to_adaptive_wave() -> None:
     task_client = _ScriptedClient("task", task_responder)
     worker = _ScriptedClient("worker", _worker_responder)
     searches: list[str] = []
+    progress: list[ResearchProgress] = []
 
     def search(**kwargs):
         query = kwargs["query"]
@@ -592,6 +594,7 @@ async def test_single_pass_coverage_miss_upgrades_to_adaptive_wave() -> None:
         worker_llm=worker,
         search_runner=search,
         limits=_limits(),
+        on_progress=progress.append,
         search_runner_in_thread=False,
     ).run("Question one")
 
@@ -601,6 +604,23 @@ async def test_single_pass_coverage_miss_upgrades_to_adaptive_wave() -> None:
         SearchAssignmentBatch,
         TaskArtifact,
     ]
+    coordinator_input = task_client.calls[0][1][0].text
+    assert "UNRESOLVED EVIDENCE REQUIREMENTS" in coordinator_input
+    assert "criterion-task_1" in coordinator_input
+    gap_events = [event for event in progress if event.kind == "gap_recovery_started"]
+    assert len(gap_events) == 1
+    assert "criterion-task_1" in gap_events[0].detail
+
+
+def test_near_duplicate_queries_are_rejected_without_an_llm_call() -> None:
+    assert _is_near_duplicate_query(
+        "transit süresi aşımı cezası yönetmelik",
+        ["yönetmelik transit süresi aşımı cezası"],
+    )
+    assert not _is_near_duplicate_query(
+        "transit süresi aşımı istisnaları",
+        ["teminat iadesi başvuru usulü"],
+    )
 
 
 @pytest.mark.asyncio
@@ -831,6 +851,7 @@ async def test_failed_required_task_isolated_and_marks_run_incomplete() -> None:
     assert by_id["task_1"].status == TaskStatus.COMPLETE
     assert by_id["task_2"].status == TaskStatus.FAILED
     assert result.incomplete is True
+    assert "Answer the requirement for task_2." in result.unresolved_information
     assert "database timeout" not in result.final_context
 
 
@@ -1580,10 +1601,7 @@ async def test_workflow_streams_multi_agent_progress_and_prepares_final_context(
         "worker": _ScriptedClient("worker", _worker_responder),
         "final": _ScriptedClient("final", lambda schema, _text: object()),
     }
-    workflow, resources = new_workflow(
-        role_clients=roles,
-        multi_agent_enabled=True,
-    )
+    workflow, resources = new_workflow(role_clients=roles)
     handler = workflow.run(
         start_event=InputEvent(
             task="Question one",

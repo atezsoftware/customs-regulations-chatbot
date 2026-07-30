@@ -18,6 +18,7 @@ from fs_explorer_api.agent import FsExplorerAgent, TOOLS
 from fs_explorer_api.llm import ChatTurn, LLMUsage
 from fs_explorer_api.models import (
     Action,
+    CompletenessCheck,
     ContextSummary,
     StopAction,
     ToolBatchAction,
@@ -110,6 +111,16 @@ class BenchmarkLLMClient:
                 output_tokens=_estimated_tokens(summary or "No material evidence yet."),
                 thinking_tokens=thinking_tokens,
             )
+        if schema is CompletenessCheck:
+            # Every scenario's scripted StopAction is meant to actually
+            # terminate the run — always accept it.
+            return CompletenessCheck(
+                can_answer_fully=True, missing_information=""
+            ), LLMUsage(
+                input_tokens=input_tokens,
+                output_tokens=5,
+                thinking_tokens=thinking_tokens,
+            )
 
         action = self.actions.pop(0)
         return action, LLMUsage(
@@ -189,12 +200,8 @@ TOOL_RESULTS = {
     "transit süre aşımı ceza": (
         "--- chunk 1 ---\nDIRECT_RULE " + EVIDENCE["DIRECT_RULE"]
     ),
-    "transit mücbir sebep": (
-        "--- chunk 2 ---\nEXCEPTION " + EVIDENCE["EXCEPTION"]
-    ),
-    "transit gecikme ceza": (
-        "--- chunk 1 ---\nDIRECT_RULE " + EVIDENCE["DIRECT_RULE"]
-    ),
+    "transit mücbir sebep": ("--- chunk 2 ---\nEXCEPTION " + EVIDENCE["EXCEPTION"]),
+    "transit gecikme ceza": ("--- chunk 1 ---\nDIRECT_RULE " + EVIDENCE["DIRECT_RULE"]),
     "transit süre uzatımı başvuru": (
         "--- chunk 3 ---\nCROSS_REFERENCE " + EVIDENCE["CROSS_REFERENCE"]
     ),
@@ -277,7 +284,9 @@ async def run_benchmark() -> dict[str, Any]:
 async def test_accuracy_and_token_benchmark() -> None:
     report = await run_benchmark()
     assert report["accuracy_passed"] == report["accuracy_total"] == 3
-    assert all(scenario["api_calls"] == 3 for scenario in report["scenarios"])
+    # 2 scripted decisions (tool call/batch + stop) + 1 pre-answer
+    # completeness check (see agent.py's take_action()) + 1 final synthesis.
+    assert all(scenario["api_calls"] == 4 for scenario in report["scenarios"])
 
 
 if __name__ == "__main__":

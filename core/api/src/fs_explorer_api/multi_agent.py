@@ -27,6 +27,7 @@ from .orchestration_models import (
     ArtifactValidationError,
     DerivedConclusion,
     EvidenceClaim,
+    EvidenceRequirement,
     ExecutionStrategy,
     GlobalPlan,
     PlanMode,
@@ -296,10 +297,38 @@ class MultiAgentResearchResult:
     evidence_sources: tuple[dict[str, object], ...]
     incomplete: bool
     used_plan_fallback: bool
+    unresolved_information: tuple[str, ...] = ()
 
 
 def _normalized_query(value: str) -> str:
     return " ".join(value.casefold().split())
+
+
+def _query_token_overlap(left: str, right: str) -> float:
+    """Return a cheap duplicate-search score without another model call."""
+
+    left_tokens = set(re.findall(r"\w+", left.casefold()))
+    right_tokens = set(re.findall(r"\w+", right.casefold()))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(
+        len(left_tokens),
+        len(right_tokens),
+    )
+
+
+def _is_near_duplicate_query(
+    query: str,
+    previous_queries: Sequence[str],
+    *,
+    threshold: float = 0.8,
+) -> bool:
+    normalized = _normalized_query(query)
+    return any(
+        normalized == _normalized_query(previous)
+        or _query_token_overlap(normalized, previous) >= threshold
+        for previous in previous_queries
+    )
 
 
 def _safe_identifier(value: str, *, fallback: str) -> str:
@@ -507,6 +536,8 @@ class MultiAgentResearchOrchestrator:
         self._evidence_by_source: dict[tuple[str, str], EvidenceRecord] = {}
         self._task_evidence: dict[str, dict[str, EvidenceRecord]] = {}
         self._searches_by_task: dict[str, set[str]] = {}
+        self._gap_progress_rounds: set[tuple[str, int]] = set()
+        self._material_unknowns_announced = False
 
     @property
     def has_progress(self) -> bool:
@@ -631,6 +662,7 @@ class MultiAgentResearchOrchestrator:
         async with self._run_lock:
             if self._plan is None:
                 self._plan = await self._create_plan(task)
+            self._announce_material_unknowns(self._plan)
 
             required_evidence_tasks = sum(
                 spec.required and spec.kind == TaskKind.EVIDENCE
@@ -661,6 +693,15 @@ class MultiAgentResearchOrchestrator:
                 ordered_artifacts,
                 rendered_evidence,
             )
+            unresolved_information = self._unresolved_information(
+                self._plan,
+                ordered_artifacts,
+            )
+            incomplete = incomplete or any(
+                artifact.uncovered_requirement_ids
+                for spec, artifact in zip(self._plan.tasks, ordered_artifacts)
+                if spec.required
+            )
             sources = tuple(record.source_payload() for record in rendered_evidence)
             return MultiAgentResearchResult(
                 plan=self._plan,
@@ -669,6 +710,7 @@ class MultiAgentResearchOrchestrator:
                 evidence_sources=sources,
                 incomplete=incomplete,
                 used_plan_fallback=self._used_plan_fallback,
+                unresolved_information=unresolved_information,
             )
 
     async def _create_plan(self, task: str) -> GlobalPlan:
@@ -983,6 +1025,16 @@ class MultiAgentResearchOrchestrator:
         ):
             if self._worker_count >= self._limits.max_total_workers:
                 break
+            uncovered_evidence = self._uncovered_evidence_requirements(
+                spec,
+                worker_by_assignment.values(),
+            )
+            if round_index > 1 and uncovered_evidence:
+                self._emit_gap_recovery_progress(
+                    spec,
+                    uncovered_evidence,
+                    round_index=round_index,
+                )
             if single_pass and round_index == 1 and not worker_by_assignment:
                 # The global planner has already established that this is one
                 # precise lookup. Reuse its standalone TaskSpec as the search
@@ -1001,6 +1053,7 @@ class MultiAgentResearchOrchestrator:
                         worker_artifacts=list(worker_by_assignment.values()),
                         searches_run=sorted(searches_run),
                         round_index=round_index,
+                        uncovered_evidence=uncovered_evidence,
                     )
                 except Exception:
                     logger.exception(
@@ -1016,6 +1069,10 @@ class MultiAgentResearchOrchestrator:
                 dispatch,
                 searches_run=searches_run,
                 existing_assignment_ids=set(worker_by_assignment),
+                allowed_evidence_requirement_ids={
+                    requirement.evidence_requirement_id
+                    for requirement in uncovered_evidence
+                },
             )
             remaining_slots = self._available_worker_slots(spec.task_id)
             assignments = assignments[:remaining_slots]
@@ -1139,7 +1196,184 @@ class MultiAgentResearchOrchestrator:
             task_id=spec.task_id,
             agent_id=f"task-coordinator-{spec.task_id}",
         )
+        if artifact.uncovered_requirement_ids:
+            descriptions_by_id = (
+                {
+                    requirement.requirement_id: requirement.description
+                    for requirement in self._plan.answer_requirements
+                }
+                if self._plan is not None
+                else {}
+            )
+            descriptions = [
+                _bounded_text(
+                    descriptions_by_id.get(requirement_id, requirement_id),
+                    220,
+                )
+                for requirement_id in artifact.uncovered_requirement_ids[:3]
+            ]
+            self._emit(
+                event_id=f"gap-unresolved-{spec.task_id}",
+                kind="gap_recovery_exhausted",
+                role="task",
+                status="completed",
+                label="Kanıt açığı kaldı",
+                detail=(
+                    "Hedefli aramaya rağmen şu bölüm tamamlanamadı: "
+                    f"{'; '.join(descriptions)}. "
+                    "Yanıt mevcut kanıtla sınırlandırılacak ve eksik açıkça belirtilecek."
+                ),
+                task_id=spec.task_id,
+                agent_id=f"task-coordinator-{spec.task_id}",
+            )
         return artifact
+
+    def _announce_material_unknowns(self, plan: GlobalPlan) -> None:
+        """Surface user-owned missing facts without guessing or extra searches."""
+
+        scenario = plan.scenario
+        if (
+            self._material_unknowns_announced
+            or scenario is None
+            or not scenario.material_unknowns
+        ):
+            return
+        self._material_unknowns_announced = True
+        unknowns = [
+            _bounded_text(unknown.description, 220)
+            for unknown in scenario.material_unknowns[:3]
+        ]
+        suffix = (
+            f" (+{len(scenario.material_unknowns) - len(unknowns)} ek bilgi)"
+            if len(scenario.material_unknowns) > len(unknowns)
+            else ""
+        )
+        self._emit(
+            event_id="material-unknowns",
+            kind="information_needed",
+            role="planner",
+            status="completed",
+            label="Eksik kullanıcı bilgisi",
+            detail=(
+                f"Sonucu etkileyebilecek bilgi eksik: {'; '.join(unknowns)}{suffix}. "
+                "Bu bilgi tahmin edilmeyecek; mevcut kanıtla koşullu sonuç verilecek."
+            ),
+            agent_id="global-planner",
+        )
+
+    @staticmethod
+    def _supported_evidence_requirement_ids(
+        worker_artifacts: Sequence[WorkerArtifact],
+    ) -> set[str]:
+        return {
+            evidence_requirement_id
+            for worker in worker_artifacts
+            for claim in worker.claims
+            for evidence_requirement_id in claim.evidence_requirement_ids
+        }
+
+    def _uncovered_evidence_requirements(
+        self,
+        spec: TaskSpec,
+        worker_artifacts: Sequence[WorkerArtifact],
+    ) -> list[EvidenceRequirement]:
+        supported = self._supported_evidence_requirement_ids(worker_artifacts)
+        return [
+            requirement
+            for requirement in spec.evidence_requirements
+            if requirement.evidence_requirement_id not in supported
+        ]
+
+    def _emit_gap_recovery_progress(
+        self,
+        spec: TaskSpec,
+        requirements: Sequence[EvidenceRequirement],
+        *,
+        round_index: int,
+    ) -> None:
+        """Tell the client exactly what the bounded follow-up will target."""
+
+        progress_key = (spec.task_id, round_index)
+        if progress_key in self._gap_progress_rounds:
+            return
+        self._gap_progress_rounds.add(progress_key)
+        descriptions = [
+            _bounded_text(requirement.description, 220)
+            for requirement in requirements[:3]
+        ]
+        suffix = (
+            f" (+{len(requirements) - len(descriptions)} ek madde)"
+            if len(requirements) > len(descriptions)
+            else ""
+        )
+        self._emit(
+            event_id=f"gap-recovery-{spec.task_id}-{round_index}",
+            kind="gap_recovery_started",
+            role="task",
+            status="started",
+            label="Eksik kanıt tamamlanıyor",
+            detail=(
+                "Yanıt için eksik kalan kanıt: "
+                f"{'; '.join(descriptions)}{suffix}. "
+                "Yalnızca bu eksikleri tamamlamak için hedefli arama yapıyorum."
+            ),
+            task_id=spec.task_id,
+            agent_id=f"task-coordinator-{spec.task_id}",
+        )
+
+    def _unresolved_information(
+        self,
+        plan: GlobalPlan,
+        artifacts: Sequence[TaskArtifact],
+    ) -> tuple[str, ...]:
+        """Build bounded, user-readable gaps while keeping internal IDs private."""
+
+        answer_descriptions = {
+            requirement.requirement_id: requirement.description
+            for requirement in plan.answer_requirements
+        }
+        task_specs = {spec.task_id: spec for spec in plan.tasks}
+        values: list[str] = []
+        for artifact in artifacts:
+            spec = task_specs.get(artifact.task_id)
+            if spec is None:
+                continue
+            supported_evidence = {
+                evidence_requirement_id
+                for claim in artifact.claims
+                for evidence_requirement_id in claim.evidence_requirement_ids
+            }
+            values.extend(
+                requirement.description
+                for requirement in spec.evidence_requirements
+                if requirement.evidence_requirement_id not in supported_evidence
+            )
+            values.extend(
+                answer_descriptions.get(requirement_id, "")
+                for requirement_id in artifact.uncovered_requirement_ids
+            )
+            values.extend(
+                reference
+                for worker in self._worker_artifacts.get(artifact.task_id, {}).values()
+                for reference in worker.cross_references
+            )
+        if plan.scenario is not None:
+            values.extend(
+                unknown.description for unknown in plan.scenario.material_unknowns
+            )
+
+        selected: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            bounded = _bounded_text(value, 500)
+            key = bounded.casefold()
+            if not bounded or key in seen:
+                continue
+            seen.add(key)
+            selected.append(bounded)
+            if len(selected) >= self._limits.max_artifact_list_items:
+                break
+        return tuple(selected)
 
     def _scenario_context_for_task(self, spec: TaskSpec) -> dict[str, object] | None:
         """Return only the scenario inputs explicitly assigned to one task."""
@@ -1503,6 +1737,7 @@ class MultiAgentResearchOrchestrator:
         worker_artifacts: Sequence[WorkerArtifact],
         searches_run: Sequence[str],
         round_index: int,
+        uncovered_evidence: Sequence[EvidenceRequirement],
     ) -> SearchAssignmentBatch:
         agent_id = f"task-coordinator-{spec.task_id}"
         raw, _usage = await self._generate_structured(
@@ -1520,6 +1755,8 @@ class MultiAgentResearchOrchestrator:
                 f"{self._compact_task_artifacts(dependency_artifacts)}\n\n"
                 "WORKER ARTIFACTS SO FAR:\n"
                 f"{self._compact_worker_artifacts(worker_artifacts)}\n\n"
+                "UNRESOLVED EVIDENCE REQUIREMENTS:\n"
+                f"{json.dumps([requirement.model_dump(mode='json') for requirement in uncovered_evidence], ensure_ascii=False, separators=(',', ':'))}\n\n"
                 "SEARCHES ALREADY RUN:\n"
                 f"{json.dumps(list(searches_run), ensure_ascii=False)}"
             ),
@@ -1603,6 +1840,7 @@ class MultiAgentResearchOrchestrator:
         *,
         searches_run: set[str],
         existing_assignment_ids: set[str],
+        allowed_evidence_requirement_ids: set[str] | None = None,
     ) -> list[SearchAssignment]:
         if dispatch.task_id != spec.task_id or dispatch.stop:
             return []
@@ -1623,15 +1861,26 @@ class MultiAgentResearchOrchestrator:
                 candidate.assignment_id,
                 fallback=f"assignment_{len(accepted) + 1}",
             )
+            prior_queries = [*searches_run, *accepted_queries]
             if (
                 candidate.task_id != spec.task_id
                 or not query
                 or not assignment_id
                 or assignment_id in existing_assignment_ids
                 or assignment_id in accepted_ids
-                or normalized in searches_run
-                or normalized in accepted_queries
+                or _is_near_duplicate_query(query, prior_queries)
             ):
+                continue
+            evidence_requirements = [
+                requirement_id
+                for requirement_id in dict.fromkeys(candidate.evidence_requirements)
+                if requirement_id in known_evidence_ids
+                and (
+                    allowed_evidence_requirement_ids is None
+                    or requirement_id in allowed_evidence_requirement_ids
+                )
+            ][: self._limits.max_artifact_list_items]
+            if not evidence_requirements:
                 continue
             accepted.append(
                 candidate.model_copy(
@@ -1642,19 +1891,7 @@ class MultiAgentResearchOrchestrator:
                             candidate.objective,
                             self._limits.max_artifact_text_chars,
                         ),
-                        "evidence_requirements": (
-                            [
-                                requirement_id
-                                for requirement_id in dict.fromkeys(
-                                    candidate.evidence_requirements
-                                )
-                                if requirement_id in known_evidence_ids
-                            ][: self._limits.max_artifact_list_items]
-                            or [
-                                requirement.evidence_requirement_id
-                                for requirement in spec.evidence_requirements
-                            ][: self._limits.max_artifact_list_items]
-                        ),
+                        "evidence_requirements": evidence_requirements,
                         "excluded_queries": [
                             _bounded_text(
                                 excluded,

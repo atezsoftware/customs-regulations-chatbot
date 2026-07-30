@@ -12,6 +12,7 @@ from fs_explorer_api.multi_agent import ResearchProgress
 from fs_explorer_api.models import (
     Action,
     AskHumanAction,
+    CompletenessCheck,
     StopAction,
     ToolCallAction,
     ToolCallArg,
@@ -88,6 +89,15 @@ class _QueuedLLMClient:
     async def generate_structured(
         self, history, system_prompt, schema, *, thinking_level=None
     ):
+        if schema is CompletenessCheck:
+            # Every queued StopAction in these tests is meant to actually
+            # terminate the run — always accept it so the completeness gate
+            # (see agent.py's take_action()) doesn't consume from the
+            # scripted action queue.
+            return CompletenessCheck(
+                can_answer_fully=True, missing_information=""
+            ), LLMUsage(input_tokens=10, output_tokens=5)
+
         self.calls += 1
         action = self._actions.pop(0)
         return action, LLMUsage(input_tokens=100, output_tokens=10)

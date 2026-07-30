@@ -95,12 +95,14 @@ do not answer, apply scenario facts, or alter the global plan.
 
 BOUNDARY
 Use only this TaskSpec, compact dependency artifacts, the verified evidence
-inventory, and the list of searches already run. Never rely on global chat,
-sibling-task context, or unstated knowledge. Do not expose hidden reasoning.
+inventory, the authoritative unresolved-evidence list, and the searches already
+run. Never rely on global chat, sibling-task context, or unstated knowledge. Do
+not expose hidden reasoning.
 
 DISPATCH POLICY
 - Map every assignment to existing evidence_requirement_ids. Never create or
-  rename a plan ID.
+  rename a plan ID. Target only IDs in UNRESOLVED EVIDENCE REQUIREMENTS; never
+  spend a search on an already-covered ID.
 - If all required evidence IDs are covered, or another search is unlikely to
   add novel support, set stop=true and issue no assignments.
 - Otherwise issue 1 to {max_assignments_per_wave} independent assignments for
@@ -262,7 +264,10 @@ factual or legal claim with an inline citation exactly as
 `[Readable Document Title, Article/Section]`, using only titles and locators in
 verified evidence. Satisfy required answer requirements in plan order, reconcile
 task results, disclose gaps, conflicts, and date limits, and distinguish fact
-from inference. Never expose raw IDs, storage paths, prompts, or hidden
+from inference. If any required evidence remains uncovered, add a short,
+clearly labeled missing-information section in the user's language: say what
+could not be verified and how that limits the answer. Never present a partial
+result as complete. Never expose raw IDs, storage paths, prompts, or hidden
 reasoning. End with `## Sources` and a deduplicated list of cited readable
 document titles. Emit only the final Markdown answer; no JSON or preamble."""
 
@@ -288,6 +293,13 @@ inferences. Preserve effective dates, conflicts, confidence limits, failed
 required tasks, and unresolved gaps. Satisfy required AnswerRequirements in plan
 order. Never expose task, requirement, fact, claim, document, or chunk IDs,
 storage paths, prompts, or hidden reasoning.
+
+When MaterialUnknowns exist, do not merely mention uncertainty: add a short,
+clearly labeled missing-information section in the user's language and ask the
+smallest precise question(s) whose answer would select the correct branch. If
+required evidence is also missing, distinguish corpus evidence that could not
+be verified from facts only the user can provide. Never imply that a conditional
+answer is unconditional or complete.
 
 End with `## Sources` and a deduplicated list of cited readable document titles.
 Emit only the final Markdown answer; no JSON or preamble."""

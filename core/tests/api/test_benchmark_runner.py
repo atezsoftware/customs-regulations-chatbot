@@ -8,7 +8,6 @@ from fs_explorer_api import benchmark_runner as benchmark_runner_mod
 from fs_explorer_api.agent import PlannedSearchResult, _index_tools_available
 from fs_explorer_api.benchmark_runner import (
     _benchmark_llm_profile,
-    _benchmark_multi_agent_enabled,
     _build_plan_trace,
     _resolve_profile_mode,
     _role_usage_breakdown,
@@ -19,11 +18,27 @@ from fs_explorer_api.benchmark_runner import (
 from fs_explorer_api.agent import LLMCallStats
 from fs_explorer_api.llm.base import LLMUsage
 from fs_explorer_api.llm.profile import DEFAULT_LLM_PROFILE, LLMProfile
-from fs_explorer_api.models import (
-    JudgmentResult,
-    ResearchDecision,
-    RetrievalPlan,
-    RetrievalQuery,
+from fs_explorer_api.models import JudgmentResult
+from fs_explorer_api.orchestration_models import (
+    AnswerRequirement,
+    AnswerRequirementKind,
+    EvidenceClaim,
+    EvidenceConfidence,
+    EvidenceRequirement,
+    EvidenceRequirementKind,
+    ExecutionStrategy,
+    GlobalPlan,
+    PlanMode,
+    ProblemType,
+    SearchAssignment,
+    SearchAssignmentBatch,
+    TaskArtifact,
+    TaskKind,
+    TaskOutput,
+    TaskSpec,
+    TaskStatus,
+    WorkerArtifact,
+    WorkerStatus,
 )
 from fs_explorer_api.search import SearchHit
 
@@ -54,8 +69,115 @@ class _EmptyCorpusStorage(_FakeStorage):
         return None
 
 
-class _StopActionClient:
-    """Fake `LLMClient`: plans once, then streams a fixed final answer."""
+def _single_task_plan(
+    task_id: str,
+    question: str,
+    *,
+    execution_strategy: ExecutionStrategy = ExecutionStrategy.SINGLE_PASS,
+) -> GlobalPlan:
+    """A minimal one-task plan for the single, always-on multi-agent flow."""
+
+    criterion_id = f"criterion-{task_id}"
+    task = TaskSpec(
+        task_id=task_id,
+        kind=TaskKind.EVIDENCE,
+        issue=f"Resolve {task_id}",
+        search_question=question,
+        requirement_ids=[criterion_id],
+        fact_ids=[],
+        unknown_ids=[],
+        branch_ids=[],
+        evidence_requirements=[
+            EvidenceRequirement(
+                evidence_requirement_id=criterion_id,
+                kind=EvidenceRequirementKind.GOVERNING_RULE,
+                description=criterion_id,
+                requirement_ids=[criterion_id],
+            )
+        ],
+        consumes=[],
+        produces=[TaskOutput(output_id=f"output-{task_id}", description="Conclusion")],
+        required=True,
+        as_of_date=None,
+        filters=None,
+    )
+    return GlobalPlan(
+        version="3",
+        problem_type=ProblemType.LOOKUP,
+        mode=PlanMode.DIRECT,
+        execution_strategy=execution_strategy,
+        normalized_question=question,
+        answer_requirements=[
+            AnswerRequirement(
+                requirement_id=criterion_id,
+                kind=AnswerRequirementKind.OUTCOME,
+                description="Answer requirement",
+                required=True,
+            )
+        ],
+        scenario=None,
+        tasks=[task],
+        synthesis_requirements=[],
+        assumptions=[],
+    )
+
+
+def _claim(task_id: str) -> EvidenceClaim:
+    return EvidenceClaim(
+        claim_id=f"claim-{task_id}",
+        claim="Supported claim",
+        document_id=f"doc-{task_id}",
+        chunk_id=f"chunk-{task_id}",
+        readable_title="Model title",
+        locator="Model locator",
+        evidence_excerpt=f"Evidence text for {task_id}.",
+        requirement_ids=[f"criterion-{task_id}"],
+        evidence_requirement_ids=[f"criterion-{task_id}"],
+        fact_ids=[],
+        confidence=EvidenceConfidence.HIGH,
+        effective_start_date=None,
+        effective_end_date=None,
+    )
+
+
+def _hit(task_id: str) -> SearchHit:
+    return SearchHit(
+        doc_id=f"doc-{task_id}",
+        relative_path=f"01-{task_id}_regulation.pdf",
+        absolute_path=f"/private/{task_id}.pdf",
+        position=7,
+        text=f"Evidence text for {task_id}. Additional source detail.",
+        semantic_score=0.92,
+        metadata_score=0,
+        score=0.92,
+        matched_by="semantic",
+        chunk_id=f"chunk-{task_id}",
+        chunk_type="text",
+        metadata={"article_no": "7"},
+    )
+
+
+def _worker_artifact(task_id: str) -> WorkerArtifact:
+    return WorkerArtifact(
+        task_id=task_id,
+        assignment_id=f"assignment-{task_id}",
+        worker_id=f"worker-{task_id}-r1-1",
+        status=WorkerStatus.SUCCESS,
+        searches_run=[f"query-{task_id}"],
+        claims=[_claim(task_id)],
+        gaps=[],
+        cross_references=[],
+        error_code=None,
+        error_message=None,
+    )
+
+
+class _MultiAgentStopClient:
+    """Fake `LLMClient` driving the single always-on multi-agent flow end to
+    end for one single-pass task: a plan, one worker round, then a streamed
+    final answer. `get_llm_client` is patched to return this same instance
+    for every role (planner/task/worker/final), so it must handle whichever
+    schema each role's call requests."""
 
     model = "fake/model"
 
@@ -67,13 +189,9 @@ class _StopActionClient:
         self, history, system_prompt, schema, *, thinking_level=None
     ):
         self.structured_calls += 1
-        if schema is ResearchDecision:
+        if schema is GlobalPlan:
             return (
-                ResearchDecision(
-                    enough_evidence=True,
-                    reason="Enough for the benchmark.",
-                    additional_searches=[],
-                ),
+                _single_task_plan("task_1", "What is the transit penalty?"),
                 LLMUsage(
                     input_tokens=100,
                     output_tokens=20,
@@ -81,11 +199,9 @@ class _StopActionClient:
                     cost_source="provider",
                 ),
             )
+        assert schema is WorkerArtifact
         return (
-            RetrievalPlan(
-                research_question="What is the transit penalty?",
-                searches=[RetrievalQuery(query="transit penalty")],
-            ),
+            _worker_artifact("task_1"),
             LLMUsage(
                 input_tokens=100,
                 output_tokens=20,
@@ -107,52 +223,174 @@ class _StopActionClient:
         )
 
 
-class _RaisingClient:
-    async def generate_structured(self, *args, **kwargs):
-        raise RuntimeError("boom")
+def _two_requirement_task_plan(task_id: str, question: str) -> GlobalPlan:
+    """An ADAPTIVE one-task plan with two evidence requirements, so a single
+    worker round covering only one of them forces a genuine second
+    coordinator round instead of the deterministic single-pass shortcut."""
 
-    async def stream_text(self, *args, **kwargs):
-        raise RuntimeError("boom")
-        yield ""  # pragma: no cover - never reached, keeps this an async generator
+    requirement_ids = [f"{task_id}-a", f"{task_id}-b"]
+    task = TaskSpec(
+        task_id=task_id,
+        kind=TaskKind.EVIDENCE,
+        issue=f"Resolve {task_id}",
+        search_question=question,
+        requirement_ids=requirement_ids,
+        fact_ids=[],
+        unknown_ids=[],
+        branch_ids=[],
+        evidence_requirements=[
+            EvidenceRequirement(
+                evidence_requirement_id=requirement_id,
+                kind=EvidenceRequirementKind.GOVERNING_RULE,
+                description=requirement_id,
+                requirement_ids=[requirement_id],
+            )
+            for requirement_id in requirement_ids
+        ],
+        consumes=[],
+        produces=[TaskOutput(output_id=f"output-{task_id}", description="Conclusion")],
+        required=True,
+        as_of_date=None,
+        filters=None,
+    )
+    return GlobalPlan(
+        version="3",
+        problem_type=ProblemType.LOOKUP,
+        mode=PlanMode.DIRECT,
+        execution_strategy=ExecutionStrategy.ADAPTIVE,
+        normalized_question=question,
+        answer_requirements=[
+            AnswerRequirement(
+                requirement_id=requirement_id,
+                kind=AnswerRequirementKind.OUTCOME,
+                description="Answer requirement",
+                required=True,
+            )
+            for requirement_id in requirement_ids
+        ],
+        scenario=None,
+        tasks=[task],
+        synthesis_requirements=[],
+        assumptions=[],
+    )
+
+
+def _round_claim(task_id: str, requirement_id: str) -> EvidenceClaim:
+    return EvidenceClaim(
+        claim_id=f"claim-{requirement_id}",
+        claim=f"Supported claim for {requirement_id}",
+        document_id=f"doc-{task_id}",
+        chunk_id=f"chunk-{task_id}",
+        readable_title="Model title",
+        locator="Model locator",
+        evidence_excerpt=f"Evidence text for {task_id}.",
+        requirement_ids=[requirement_id],
+        evidence_requirement_ids=[requirement_id],
+        fact_ids=[],
+        confidence=EvidenceConfidence.HIGH,
+        effective_start_date=None,
+        effective_end_date=None,
+    )
+
+
+class _AdaptiveRoundClient:
+    """Fake `LLMClient` for one ADAPTIVE task whose coordinator (task role)
+    requests a second worker round before both evidence requirements are
+    covered."""
+
+    model = "fake/model"
+
+    def __init__(self) -> None:
+        self.structured_calls = 0
+        self.stream_calls = 0
+        self.rounds = 0
+
+    async def generate_structured(
+        self, history, system_prompt, schema, *, thinking_level=None
+    ):
+        self.structured_calls += 1
+        if schema is GlobalPlan:
+            return (
+                _two_requirement_task_plan(
+                    "task_1", "What is the transit penalty and its exception?"
+                ),
+                LLMUsage(input_tokens=100, output_tokens=20),
+            )
+        if schema is SearchAssignmentBatch:
+            self.rounds += 1
+            requirement_id = f"task_1-{'a' if self.rounds == 1 else 'b'}"
+            return (
+                SearchAssignmentBatch(
+                    task_id="task_1",
+                    stop=False,
+                    stop_reason=None,
+                    assignments=[
+                        SearchAssignment(
+                            assignment_id=f"assignment-task_1-r{self.rounds}",
+                            task_id="task_1",
+                            query=f"query-task_1-r{self.rounds}",
+                            objective=f"Find evidence for {requirement_id}",
+                            evidence_requirements=[requirement_id],
+                            excluded_queries=[],
+                            as_of_date=None,
+                            filters=None,
+                        )
+                    ],
+                ),
+                LLMUsage(input_tokens=100, output_tokens=20),
+            )
+        if schema is TaskArtifact:
+            return (
+                TaskArtifact(
+                    task_id="task_1",
+                    status=TaskStatus.COMPLETE,
+                    answer_fragment="Conclusion for task_1",
+                    covered_requirement_ids=["task_1-a", "task_1-b"],
+                    uncovered_requirement_ids=[],
+                    claims=[
+                        _round_claim("task_1", "task_1-a"),
+                        _round_claim("task_1", "task_1-b"),
+                    ],
+                    application_findings=[],
+                    conflicts=[],
+                    gaps=[],
+                    contributing_worker_ids=[
+                        "worker-task_1-assignment-task_1-r1",
+                        "worker-task_1-assignment-task_1-r2",
+                    ],
+                ),
+                LLMUsage(input_tokens=100, output_tokens=20),
+            )
+        assert schema is WorkerArtifact
+        requirement_id = f"task_1-{'a' if self.rounds == 1 else 'b'}"
+        return (
+            WorkerArtifact(
+                task_id="task_1",
+                assignment_id=f"assignment-task_1-r{self.rounds}",
+                worker_id=f"worker-task_1-r{self.rounds}",
+                status=WorkerStatus.SUCCESS,
+                searches_run=[f"query-task_1-r{self.rounds}"],
+                claims=[_round_claim("task_1", requirement_id)],
+                gaps=[],
+                cross_references=[],
+                error_code=None,
+                error_message=None,
+            ),
+            LLMUsage(input_tokens=100, output_tokens=20),
+        )
+
+    async def stream_text(self, history, system_prompt, *, thinking_level=None):
+        self.stream_calls += 1
+        yield "benchmark answer"
 
     def last_stream_usage(self):
         return None
 
 
-class _AdaptiveRoundClient(_StopActionClient):
-    def __init__(self) -> None:
-        super().__init__()
-        self.reviews = 0
-
-    async def generate_structured(
-        self, history, system_prompt, schema, *, thinking_level=None
-    ):
-        if schema is ResearchDecision:
-            self.structured_calls += 1
-            self.reviews += 1
-            return (
-                ResearchDecision(
-                    enough_evidence=self.reviews >= 2,
-                    reason="covered" if self.reviews >= 2 else "exception missing",
-                    additional_searches=[]
-                    if self.reviews >= 2
-                    else [RetrievalQuery(query="force majeure exception")],
-                ),
-                LLMUsage(input_tokens=100, output_tokens=20),
-            )
-        return await super().generate_structured(
-            history, system_prompt, schema, thinking_level=thinking_level
-        )
-
-
 @pytest.fixture(autouse=True)
-def _clear_context_before_and_after(monkeypatch):
+def _clear_context_before_and_after():
     from fs_explorer_api.agent import clear_index_context
 
-    # Most legacy runner tests exercise the established stateless path. The
-    # production API default is covered separately and can still be disabled
-    # through the same operational kill switch.
-    monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "false")
     clear_index_context()
     yield
     clear_index_context()
@@ -268,11 +506,13 @@ class TestRunAgenticSession:
         monkeypatch.setattr("fs_explorer_api.agent.PostgresStorage", _FakeStorage)
         monkeypatch.setattr(
             "fs_explorer_api.agent.get_llm_client",
-            lambda **_kwargs: _StopActionClient(),
+            lambda **_kwargs: _MultiAgentStopClient(),
         )
         monkeypatch.setattr(
             "fs_explorer_api.agent._run_planned_index_search",
-            lambda **kwargs: PlannedSearchResult(query=kwargs["query"], hits=[]),
+            lambda **kwargs: PlannedSearchResult(
+                query=kwargs["query"], hits=[_hit("task_1")]
+            ),
         )
 
         result = await run_agentic_session(
@@ -300,14 +540,13 @@ class TestRunAgenticSession:
             "plan_trace",
             "role_usage",
         }
-        # One planner + one bounded evidence review + one final answer.
+        # One plan + one single-pass worker round + one final answer.
         assert result.stats["api_calls"] == 3
         assert result.stats["cost_source"] == "provider"
         assert result.stats["cost_usd"] == "0.0025"
         assert result.stats["profile_mode"] == "candidate_all_roles"
         assert result.plan_trace == result.stats["plan_trace"]
         assert result.role_usage == result.stats["role_usage"]
-        assert result.cited_evidence == []
         assert sum(row["calls"] for row in result.role_usage) == 3
 
     @pytest.mark.asyncio
@@ -317,7 +556,7 @@ class TestRunAgenticSession:
         )
         monkeypatch.setattr(
             "fs_explorer_api.agent.get_llm_client",
-            lambda **_kwargs: _StopActionClient(),
+            lambda **_kwargs: _MultiAgentStopClient(),
         )
 
         with pytest.raises(ValueError, match="No index found"):
@@ -330,36 +569,18 @@ class TestRunAgenticSession:
         assert _index_tools_available() is False
 
     @pytest.mark.asyncio
-    async def test_runs_an_adaptive_second_parallel_round(self, monkeypatch) -> None:
+    async def test_runs_a_second_adaptive_worker_round(self, monkeypatch) -> None:
         client = _AdaptiveRoundClient()
         monkeypatch.setattr(benchmark_runner_mod, "PostgresStorage", _FakeStorage)
         monkeypatch.setattr("fs_explorer_api.agent.PostgresStorage", _FakeStorage)
         monkeypatch.setattr(
             "fs_explorer_api.agent.get_llm_client", lambda **_kwargs: client
         )
-
-        def fake_search(**kwargs):
-            query = kwargs["query"]
-            return PlannedSearchResult(
-                query=query,
-                hits=[
-                    SearchHit(
-                        doc_id=f"doc_{len(query)}",
-                        relative_path=f"{len(query)}.md",
-                        absolute_path=f"/{len(query)}.md",
-                        position=0,
-                        text=f"evidence for {query}",
-                        semantic_score=0.8,
-                        metadata_score=0,
-                        score=0.8,
-                        matched_by="semantic",
-                        chunk_id=f"chunk_{len(query)}",
-                    )
-                ],
-            )
-
         monkeypatch.setattr(
-            "fs_explorer_api.agent._run_planned_index_search", fake_search
+            "fs_explorer_api.agent._run_planned_index_search",
+            lambda **kwargs: PlannedSearchResult(
+                query=kwargs["query"], hits=[_hit("task_1")]
+            ),
         )
 
         result = await run_agentic_session(
@@ -370,24 +591,19 @@ class TestRunAgenticSession:
 
         assert result.error is None
         assert result.final_result == "benchmark answer"
-        assert client.reviews == 2
-        assert result.stats["api_calls"] == 4
-        assert result.stats["steps"] == 2
+        assert client.rounds == 2
 
     @pytest.mark.asyncio
     async def test_clears_index_context_when_the_run_raises(self, monkeypatch) -> None:
         monkeypatch.setattr(benchmark_runner_mod, "PostgresStorage", _FakeStorage)
         monkeypatch.setattr("fs_explorer_api.agent.PostgresStorage", _FakeStorage)
-        monkeypatch.setattr(
-            "fs_explorer_api.agent.get_llm_client", lambda **_kwargs: _RaisingClient()
-        )
 
-        async def raise_during_collection(self, task, calls=None):
+        async def raise_during_research(self, task, *, on_progress=None):
             raise RuntimeError("boom")
 
         monkeypatch.setattr(
-            "fs_explorer_api.agent.FsExplorerAgent.collect_parallel_indexed_evidence",
-            raise_during_collection,
+            "fs_explorer_api.agent.FsExplorerAgent.prepare_multi_agent_indexed",
+            raise_during_research,
         )
 
         with pytest.raises(RuntimeError, match="boom"):
@@ -485,19 +701,6 @@ class TestSumCallCost:
 
 
 class TestBenchmarkObservability:
-    def test_benchmark_uses_server_multi_agent_default_and_kill_switch(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.delenv("FS_EXPLORER_MULTI_AGENT_ENABLED", raising=False)
-        assert _benchmark_multi_agent_enabled() is True
-
-        monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "false")
-        assert _benchmark_multi_agent_enabled() is False
-
-        monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "invalid")
-        with pytest.raises(ValueError, match="must be a boolean"):
-            _benchmark_multi_agent_enabled()
-
     def test_legacy_optional_arguments_resolve_to_the_same_profile_modes(self) -> None:
         assert (
             _resolve_profile_mode(

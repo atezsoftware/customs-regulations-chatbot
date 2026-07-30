@@ -7,7 +7,6 @@ and serves the single-page HTML interface.
 
 import html
 import logging
-import os
 import re
 import time
 from pathlib import Path
@@ -74,20 +73,6 @@ from .workflow import (
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FsExplorer", description="AI-powered filesystem exploration")
-
-
-def _server_multi_agent_enabled() -> bool:
-    """Enable the production research path by default with an explicit kill switch."""
-
-    value = os.getenv("FS_EXPLORER_MULTI_AGENT_ENABLED", "true").strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(
-        "FS_EXPLORER_MULTI_AGENT_ENABLED must be a boolean value "
-        "(true/false, yes/no, on/off, or 1/0)."
-    )
 
 
 def _decode_html_entities(value: str) -> str:
@@ -916,6 +901,16 @@ def _register_if_resumable(
     )
 
 
+def _completion_is_incomplete(
+    *,
+    agent: FsExplorerAgent,
+    result_error: str | None,
+) -> bool:
+    """Keep terminal research gaps visible without making them resumable."""
+
+    return not result_error and (agent.forced_stop or agent.multi_agent_incomplete)
+
+
 async def _finish_run(
     websocket: WebSocket,
     *,
@@ -978,6 +973,9 @@ async def _finish_run(
                     "cited_sources": cited_sources,
                     "cited_source_links": cited_source_links,
                     "evidence_sources": agent.evidence_sources_for_answer(final_result),
+                    "unresolved_information": (
+                        agent.multi_agent_unresolved_information
+                    ),
                 },
             }
         )
@@ -995,15 +993,15 @@ async def _finish_run(
             "data": {
                 "final_result": final_result,
                 "error": result_error,
-                # True when this run ended by hitting the step-budget safety
-                # net rather than a real StopAction — the answer may be an
-                # unsatisfying apology rather than a conclusion, even though
-                # there's no `error` here. Lets the client offer "Continue"
-                # even on an otherwise-successful completion.
-                # A multi-agent run that exhausted its bounded evidence search
-                # is terminal and the answer explicitly discloses its gaps.
-                # Only the legacy step-budget stop is actually resumable.
-                "incomplete": not result_error and agent.forced_stop,
+                # Answer quality and lifecycle are separate: a bounded
+                # multi-agent evidence gap is incomplete but terminal, while
+                # only the legacy step-budget stop remains resumable.
+                "incomplete": _completion_is_incomplete(
+                    agent=agent,
+                    result_error=result_error,
+                ),
+                "resumable": not result_error and agent.forced_stop,
+                "unresolved_information": agent.multi_agent_unresolved_information,
                 "stats": {
                     "steps": step_number,
                     "api_calls": usage.api_calls,
@@ -1264,7 +1262,6 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             temperature=resolved_temperature,
             on_llm_call=_collect_llm_call,
             on_retrieval=_collect_retrieval,
-            multi_agent_enabled=_server_multi_agent_enabled(),
         )
         agent = get_run_agent(resource_manager)
         handler = run_workflow.run(
@@ -1298,10 +1295,7 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
             elif isinstance(event, ToolBatchEvent):
                 for call in event.tool_calls:
                     step_number += 1
-                    if (
-                        not event.stateless_retrieval
-                        and call.tool_name in CHUNK_BEARING_TOOLS
-                    ):
+                    if call.tool_name in CHUNK_BEARING_TOOLS:
                         pending_retrieval_step_numbers.append(step_number)
                     await websocket.send_json(
                         _tool_call_ws_message(
@@ -1315,11 +1309,6 @@ async def _run_fresh_session(websocket: WebSocket, data: dict[str, Any]) -> None
                             index_storage=index_storage,
                         )
                     )
-                if event.stateless_retrieval:
-                    # The fan-out emits one aggregate retrieval metric for
-                    # the globally selected evidence, not one inflated metric
-                    # per intermediate query.
-                    pending_retrieval_step_numbers.append(step_number)
             elif isinstance(event, GoDeeperEvent):
                 step_number += 1
                 await websocket.send_json(
@@ -1638,10 +1627,7 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
             elif isinstance(event, ToolBatchEvent):
                 for call in event.tool_calls:
                     step_number += 1
-                    if (
-                        not event.stateless_retrieval
-                        and call.tool_name in CHUNK_BEARING_TOOLS
-                    ):
+                    if call.tool_name in CHUNK_BEARING_TOOLS:
                         pending_retrieval_step_numbers.append(step_number)
                     await websocket.send_json(
                         _tool_call_ws_message(
@@ -1655,8 +1641,6 @@ async def _run_resume_session(websocket: WebSocket, run_id: str) -> None:
                             index_storage=index_storage,
                         )
                     )
-                if event.stateless_retrieval:
-                    pending_retrieval_step_numbers.append(step_number)
             elif isinstance(event, GoDeeperEvent):
                 step_number += 1
                 await websocket.send_json(
