@@ -335,10 +335,19 @@ class OpenRouterLLMClient:
         self._enable_reasoning_effort = enable_reasoning_effort
         self._client = client or httpx.AsyncClient(
             base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-            # Planning and research stages may legitimately take longer than
-            # a fixed request deadline. Connection-level heartbeats keep the
-            # user-facing stream alive while this call remains pending.
-            timeout=None,
+            # Planning and research stages may legitimately take longer than a
+            # fixed request deadline, so the read ceiling is deliberately
+            # generous and connection-level heartbeats keep the user-facing
+            # stream alive while a call is pending. It is not `None`, though:
+            # `None` does not mean "wait as long as the model needs", it means
+            # a silently dropped connection is never noticed and the run holds
+            # a WebSocket and a reserved slot open forever.
+            timeout=httpx.Timeout(
+                connect=float(os.getenv("OPENROUTER_CONNECT_TIMEOUT_SECONDS", "15")),
+                read=float(os.getenv("OPENROUTER_READ_TIMEOUT_SECONDS", "900")),
+                write=float(os.getenv("OPENROUTER_WRITE_TIMEOUT_SECONDS", "60")),
+                pool=float(os.getenv("OPENROUTER_POOL_TIMEOUT_SECONDS", "30")),
+            ),
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", ""),

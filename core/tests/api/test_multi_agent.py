@@ -14,6 +14,7 @@ import pytest
 from fs_explorer_api.llm import ChatTurn, LLMClient, LLMUsage
 from fs_explorer_api.llm.profile import LLMRole
 from fs_explorer_api.multi_agent import (
+    ContextBudget,
     EvidenceRecord,
     MultiAgentResearchOrchestrator,
     ResearchLimits,
@@ -2034,3 +2035,179 @@ async def test_workflow_streams_multi_agent_progress_and_prepares_final_context(
     assert "SERVER-VERIFIED FULL EVIDENCE" in agent._chat_history[0].text
     assert agent._chat_history[0].text.count("ORIGINAL QUESTION") == 1
     assert agent.final_model == "test/final"
+
+
+class TestContextBudgetAndRunGuardrails:
+    """Prompt size and runaway-cost ceilings that survive model-controlled depth."""
+
+    def test_from_limits_mirrors_the_legacy_bounded_policy(self) -> None:
+        limits = _limits()
+        budget = ContextBudget.from_limits(limits)
+
+        assert budget.worker_hit_chars == limits.worker_hit_chars
+        assert budget.review_hit_chars == limits.review_hit_chars
+        assert budget.final_evidence_limit == limits.final_evidence_limit
+        assert budget.final_context_chars == limits.max_final_context_chars
+        assert budget.artifact_text_chars == limits.max_artifact_text_chars
+
+    def test_env_overrides_are_read_for_model_controlled_runs(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_MAX_FINAL_CONTEXT_CHARS", "1234")
+        monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_WORKER_HIT_CHARS", "777")
+
+        budget = ContextBudget.from_env()
+
+        assert budget.final_context_chars == 1234
+        assert budget.worker_hit_chars == 777
+
+    def test_oversized_prompts_are_truncated_rather_than_rejected(self) -> None:
+        orchestrator = MultiAgentResearchOrchestrator(
+            planner_llm=_ScriptedClient("planner", lambda schema, _text: object()),
+            task_llm=_ScriptedClient("task", _task_responder),
+            worker_llm=_ScriptedClient("worker", _worker_responder),
+            search_runner=lambda **kwargs: _SearchResult(
+                query=kwargs["query"], hits=[]
+            ),
+            search_runner_in_thread=False,
+        )
+        object.__setattr__(
+            orchestrator,
+            "_context",
+            replace(orchestrator._context, max_prompt_chars=500),
+        )
+
+        fitted = orchestrator._fit_prompt(
+            "x" * 10_000,
+            system_prompt="system",
+            role="worker",
+            purpose="worker_report",
+        )
+
+        assert len(fitted) <= 500
+        assert "TRUNCATED" in fitted
+
+    def test_parent_reports_shed_evidence_instead_of_overflowing(self) -> None:
+        orchestrator = MultiAgentResearchOrchestrator(
+            planner_llm=_ScriptedClient("planner", lambda schema, _text: object()),
+            task_llm=_ScriptedClient("task", _task_responder),
+            worker_llm=_ScriptedClient("worker", _worker_responder),
+            search_runner=lambda **kwargs: _SearchResult(
+                query=kwargs["query"], hits=[]
+            ),
+            search_runner_in_thread=False,
+        )
+        artifact = TaskArtifact(
+            task_id="task_1",
+            status=TaskStatus.COMPLETE,
+            answer_fragment="Fragment",
+            covered_requirement_ids=["criterion-task_1"],
+            uncovered_requirement_ids=[],
+            claims=[
+                _source_claim(
+                    "task_1",
+                    document_id="doc-task_1",
+                    chunk_id=f"chunk-{index}",
+                    excerpt="Evidence excerpt. " * 40,
+                )
+                for index in range(12)
+            ],
+            application_findings=[],
+            conflicts=[],
+            gaps=[],
+            contributing_worker_ids=["worker-task_1"],
+        )
+
+        rendered = orchestrator._task_reports_for_parent([artifact], max_chars=2_000)
+
+        assert len(rendered) <= 2_000
+        assert "withheld_evidence_count" in rendered
+
+    @pytest.mark.asyncio
+    async def test_final_context_respects_the_configured_ceiling(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_MAX_FINAL_CONTEXT_CHARS", "1500")
+        planner = _ScriptedClient(
+            "planner",
+            lambda schema, _text: _plan(_task("task_1", "Question one")),
+        )
+
+        result = await MultiAgentResearchOrchestrator(
+            planner_llm=planner,
+            task_llm=_ScriptedClient("task", _task_responder),
+            worker_llm=_ScriptedClient("worker", _worker_responder),
+            search_runner=lambda **kwargs: _SearchResult(
+                query=kwargs["query"], hits=[_hit("task_1")]
+            ),
+            search_runner_in_thread=False,
+        ).run("Question one")
+
+        assert len(result.final_context) <= 1_500
+
+    @pytest.mark.asyncio
+    async def test_token_budget_stops_research_but_still_answers(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_RUN_TOKEN_BUDGET", "1")
+        progress: list[ResearchProgress] = []
+        searches: list[str] = []
+        planner = _ScriptedClient(
+            "planner",
+            lambda schema, _text: _plan(_task("task_1", "Question one")),
+        )
+
+        result = await MultiAgentResearchOrchestrator(
+            planner_llm=planner,
+            task_llm=_ScriptedClient("task", _task_responder),
+            worker_llm=_ScriptedClient("worker", _worker_responder),
+            search_runner=lambda **kwargs: (
+                searches.append(kwargs["query"])
+                or _SearchResult(query=kwargs["query"], hits=[_hit("task_1")])
+            ),
+            on_progress=progress.append,
+            search_runner_in_thread=False,
+        ).run("Question one")
+
+        assert searches == []
+        assert any(event.kind == "budget_exhausted" for event in progress)
+        assert result.incomplete is True
+        assert result.plan is not None
+
+    @pytest.mark.asyncio
+    async def test_coordinator_rejection_loop_is_bounded(self, monkeypatch) -> None:
+        monkeypatch.setenv("FS_EXPLORER_MULTI_AGENT_MAX_COORDINATOR_DECISIONS", "3")
+        planner = _ScriptedClient(
+            "planner",
+            lambda schema, _text: _plan(_task("task_1", "Question one")),
+        )
+
+        def never_executable(schema: type, text: str) -> object:
+            # A coordinator that keeps returning a dispatch that is neither
+            # executable nor an explicit stop used to loop forever, paying for
+            # a larger prompt on every turn.
+            assert schema is SearchAssignmentBatch
+            return SearchAssignmentBatch(
+                task_id=_task_id_from_text(text),
+                stop=False,
+                stop_reason=None,
+                assignments=[],
+            )
+
+        task_client = _ScriptedClient("task", never_executable)
+
+        result = await MultiAgentResearchOrchestrator(
+            planner_llm=planner,
+            task_llm=task_client,
+            worker_llm=_ScriptedClient("worker", _worker_responder),
+            search_runner=lambda **kwargs: _SearchResult(
+                query=kwargs["query"], hits=[]
+            ),
+            search_runner_in_thread=False,
+        ).run("Question one")
+
+        coordinator_calls = [
+            call for call in task_client.calls if call[0] is SearchAssignmentBatch
+        ]
+        assert len(coordinator_calls) == 3
+        assert result.incomplete is True

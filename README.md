@@ -155,11 +155,26 @@ conclusions must reference existing fact, branch, claim, and dependency-output
 IDs; the server rejects ungrounded references before final synthesis. Agents
 exchange typed artifacts instead of chat transcripts. Production research has
 no task, worker, wave, search-count, LLM-call, claim, or artifact-count budget;
-coverage and explicit model exhaustion control termination. Planner, worker,
-search, rerank, and final-answer calls have no application wall-clock deadline;
-transport heartbeats keep long waits connected. Invalid plans are returned to the planner with exact
-validation errors until it produces a valid graph; no alternate planner path is
-used.
+coverage and explicit model exhaustion control termination. Invalid plans are
+returned to the planner with exact validation errors until it produces a valid
+graph; no alternate planner path is used.
+
+How deep to research is a model decision; how large a prompt may be is not, so
+every LLM boundary keeps an explicit context budget
+(`FS_EXPLORER_MULTI_AGENT_*_CHARS`, `*_LIMIT`). These ceilings are generous and
+never shorten a converging run — they exist because an unbounded context fails
+as a non-retryable `context_length_exceeded` rather than as a slower answer.
+Evidence bundles, worker/task reports, and the final context are water-filled
+down to fit, and reports report how many evidence entries were withheld. A
+per-run circuit breaker (`FS_EXPLORER_MULTI_AGENT_RUN_TOKEN_BUDGET`,
+`RUN_SECONDS`) stops dispatching new research once a run stops converging and
+synthesizes a grounded partial answer from what was already verified, and a
+coordinator that cannot produce an executable action within
+`MAX_COORDINATOR_DECISIONS` attempts is treated as a stop. Planner, worker,
+search, rerank, and final-answer calls have no product-level deadline —
+transport heartbeats keep long waits connected — but they do have generous
+transport ceilings (`*_CEILING_SECONDS`, `OPENROUTER_READ_TIMEOUT_SECONDS`), so
+a provider that stops answering cannot hold a run open indefinitely.
 
 For a precise one-query lookup, the planner selects `single_pass`. The server
 skips the redundant task coordinator and reviewer, but the search agent still

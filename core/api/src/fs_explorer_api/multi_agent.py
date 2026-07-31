@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -148,6 +149,202 @@ class ResearchLimits:
                 defaults.max_parallel_retrievals,
             ),
         )
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}.")
+    return value
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number.") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}.")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ContextBudget:
+    """Prompt-size ceilings that apply in every mode, bounded or model-controlled.
+
+    Iteration budgets (how many tasks, workers, rounds, searches) were
+    deliberately removed so the models decide how much research a question
+    needs. Prompt-size ceilings are a different concern and are *not*
+    removable: a model cannot decide how large its own context window is, and
+    an unbounded context surfaces as a hard `context_length_exceeded` — a
+    provider error that is explicitly non-retryable — rather than as a slower
+    or more expensive answer.
+
+    These ceilings are therefore always in force. In model-controlled mode they
+    are generous (roughly an order of magnitude above the legacy bounded
+    policy) so they only clamp genuine outliers; every value is env-tunable if
+    answer quality shows they are still too tight.
+    """
+
+    worker_hit_limit: int = 20
+    worker_hit_chars: int = 48_000
+    review_hit_chars: int = 64_000
+    final_evidence_limit: int = 60
+    final_context_chars: int = 240_000
+    artifact_text_chars: int = 4_000
+    artifact_list_items: int = 48
+    artifact_context_chars: int = 120_000
+    parent_report_chars: int = 120_000
+    claims_per_worker: int = 20
+    claims_per_task: int = 40
+    query_chars: int = 1_000
+    question_chars: int = 24_000
+    planner_context_chars: int = 48_000
+    list_value_chars: int = 2_000
+    short_text_chars: int = 2_400
+    label_chars: int = 1_200
+    # Last-resort ceiling applied to the fully assembled prompt of any single
+    # structured call, after the per-site budgets above.
+    max_prompt_chars: int = 400_000
+
+    @classmethod
+    def from_env(cls) -> "ContextBudget":
+        defaults = cls()
+        prefix = "FS_EXPLORER_MULTI_AGENT_"
+        return cls(
+            worker_hit_limit=_env_int(
+                f"{prefix}WORKER_HIT_LIMIT", defaults.worker_hit_limit
+            ),
+            worker_hit_chars=_env_int(
+                f"{prefix}WORKER_HIT_CHARS", defaults.worker_hit_chars
+            ),
+            review_hit_chars=_env_int(
+                f"{prefix}REVIEW_HIT_CHARS", defaults.review_hit_chars
+            ),
+            final_evidence_limit=_env_int(
+                f"{prefix}FINAL_EVIDENCE_LIMIT", defaults.final_evidence_limit
+            ),
+            final_context_chars=_env_int(
+                f"{prefix}MAX_FINAL_CONTEXT_CHARS", defaults.final_context_chars
+            ),
+            artifact_text_chars=_env_int(
+                f"{prefix}MAX_ARTIFACT_TEXT_CHARS", defaults.artifact_text_chars
+            ),
+            artifact_list_items=_env_int(
+                f"{prefix}MAX_ARTIFACT_ITEMS", defaults.artifact_list_items
+            ),
+            artifact_context_chars=_env_int(
+                f"{prefix}MAX_ARTIFACT_CONTEXT_CHARS",
+                defaults.artifact_context_chars,
+            ),
+            parent_report_chars=_env_int(
+                f"{prefix}MAX_PARENT_REPORT_CHARS", defaults.parent_report_chars
+            ),
+            claims_per_worker=_env_int(
+                f"{prefix}MAX_CLAIMS_PER_WORKER", defaults.claims_per_worker
+            ),
+            claims_per_task=_env_int(
+                f"{prefix}MAX_CLAIMS_PER_TASK", defaults.claims_per_task
+            ),
+            query_chars=_env_int(f"{prefix}MAX_QUERY_CHARS", defaults.query_chars),
+            question_chars=_env_int(
+                f"{prefix}MAX_QUESTION_CHARS", defaults.question_chars
+            ),
+            planner_context_chars=_env_int(
+                f"{prefix}MAX_PLANNER_CONTEXT_CHARS",
+                defaults.planner_context_chars,
+            ),
+            max_prompt_chars=_env_int(
+                f"{prefix}MAX_PROMPT_CHARS", defaults.max_prompt_chars
+            ),
+        )
+
+    @classmethod
+    def from_limits(cls, limits: "ResearchLimits") -> "ContextBudget":
+        """Mirror the legacy bounded policy exactly for opted-in callers/tests."""
+
+        return cls(
+            worker_hit_limit=limits.worker_hit_limit,
+            worker_hit_chars=limits.worker_hit_chars,
+            review_hit_chars=limits.review_hit_chars,
+            final_evidence_limit=limits.final_evidence_limit,
+            final_context_chars=limits.max_final_context_chars,
+            artifact_text_chars=limits.max_artifact_text_chars,
+            artifact_list_items=limits.max_artifact_list_items,
+            artifact_context_chars=limits.max_artifact_context_chars,
+            parent_report_chars=limits.max_artifact_context_chars,
+            claims_per_worker=limits.max_claims_per_worker,
+            claims_per_task=limits.max_claims_per_task,
+            query_chars=limits.max_query_chars,
+            question_chars=limits.max_question_chars,
+            planner_context_chars=limits.max_planner_context_chars,
+            list_value_chars=500,
+            short_text_chars=600,
+            label_chars=300,
+            max_prompt_chars=limits.max_final_context_chars * 4,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RunGuardrails:
+    """Per-run circuit breaker and transport ceilings.
+
+    None of these are research budgets: they never shorten a healthy run. They
+    exist so a pathological run (a model that will not converge, a provider
+    that hangs) degrades into a grounded partial answer instead of burning
+    tokens or holding a WebSocket open indefinitely.
+    """
+
+    # Cumulative prompt+completion tokens across every role in one run.
+    run_token_budget: int = 2_000_000
+    # Wall-clock ceiling for one research run, excluding final synthesis.
+    run_seconds: float = 2_700.0
+    # Transport ceilings. Generous by design: these replace `timeout=None`,
+    # which does not mean "wait as long as needed" but "never notice a dead
+    # connection".
+    llm_ceiling_seconds: float = 900.0
+    search_ceiling_seconds: float = 300.0
+    rerank_ceiling_seconds: float = 240.0
+    # How many times a coordinator may be re-prompted after returning a
+    # dispatch that is neither executable nor an explicit stop.
+    max_coordinator_decisions: int = 3
+
+    @classmethod
+    def from_env(cls) -> "RunGuardrails":
+        defaults = cls()
+        prefix = "FS_EXPLORER_MULTI_AGENT_"
+        return cls(
+            run_token_budget=_env_int(
+                f"{prefix}RUN_TOKEN_BUDGET", defaults.run_token_budget
+            ),
+            run_seconds=_env_float(f"{prefix}RUN_SECONDS", defaults.run_seconds),
+            llm_ceiling_seconds=_env_float(
+                f"{prefix}LLM_CEILING_SECONDS", defaults.llm_ceiling_seconds
+            ),
+            search_ceiling_seconds=_env_float(
+                f"{prefix}SEARCH_CEILING_SECONDS", defaults.search_ceiling_seconds
+            ),
+            rerank_ceiling_seconds=_env_float(
+                f"{prefix}RERANK_CEILING_SECONDS", defaults.rerank_ceiling_seconds
+            ),
+            max_coordinator_decisions=_env_int(
+                f"{prefix}MAX_COORDINATOR_DECISIONS",
+                defaults.max_coordinator_decisions,
+            ),
+        )
+
+
+class ResearchBudgetExhausted(RuntimeError):
+    """Raised when the per-run circuit breaker trips mid-research."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +613,19 @@ class MultiAgentResearchOrchestrator:
         # evidence coverage, never on worker/round/token counters.
         self._unlimited_research = limits is None
         self._limits = limits or ResearchLimits.from_env()
+        # Research *depth* is model-controlled; prompt *size* never is. The
+        # context budget is therefore always populated — generously in
+        # production, and with the legacy values when a caller opted into the
+        # bounded policy so those tests keep asserting the same numbers.
+        self._context = (
+            ContextBudget.from_env()
+            if limits is None
+            else ContextBudget.from_limits(limits)
+        )
+        self._guardrails = RunGuardrails.from_env()
+        self._run_deadline: float | None = None
+        self._tokens_used = 0
+        self._budget_exhausted_reason: str | None = None
         self._on_llm_usage = on_llm_usage
         self._on_retrieval = on_retrieval
         self._on_progress = on_progress
@@ -501,6 +711,89 @@ class MultiAgentResearchOrchestrator:
             )
         return self._sequence
 
+    def _fit_prompt(
+        self,
+        user_text: str,
+        *,
+        system_prompt: str,
+        role: AgentRole,
+        purpose: str,
+    ) -> str:
+        """Last-resort ceiling on one assembled prompt.
+
+        The per-site context budgets should keep every prompt well under this.
+        It exists because the failure mode when they do not is the worst one
+        available: providers return `context_length_exceeded`, which the
+        OpenRouter client correctly refuses to retry, so the user sees a hard
+        error instead of a slightly shallower answer. Degrading here is always
+        better than that.
+        """
+
+        ceiling = self._context.max_prompt_chars
+        overhead = len(system_prompt)
+        available = max(ceiling - overhead, ceiling // 2)
+        if len(user_text) <= available:
+            return user_text
+        notice = (
+            "\n\n[TRUNCATED: this prompt exceeded the configured context ceiling. "
+            "Answer from the material above and treat anything missing as an "
+            "explicit evidence gap rather than assuming it does not exist.]"
+        )
+        logger.warning(
+            "Truncated %s/%s prompt from %d to %d chars (ceiling %d)",
+            role,
+            purpose,
+            len(user_text),
+            available,
+            ceiling,
+        )
+        return user_text[: max(available - len(notice), 0)] + notice
+
+    def _record_token_usage(self, usage: LLMUsage) -> None:
+        self._tokens_used += (
+            usage.input_tokens + usage.output_tokens + usage.thinking_tokens
+        )
+
+    def _budget_exhausted(self) -> str | None:
+        """Report whether the per-run circuit breaker has tripped.
+
+        This is not a research budget: it never shortens a converging run. It
+        bounds the pathological case — a plan that will not converge, or a
+        provider that keeps accepting work — so the run degrades into a
+        grounded partial answer instead of an unbounded bill.
+        """
+
+        if self._budget_exhausted_reason is not None:
+            return self._budget_exhausted_reason
+        if not self._unlimited_research:
+            return None
+        reason: str | None = None
+        if self._tokens_used >= self._guardrails.run_token_budget:
+            reason = (
+                f"the run token budget ({self._guardrails.run_token_budget:,}) "
+                "was reached"
+            )
+        elif self._run_deadline is not None and time.monotonic() >= self._run_deadline:
+            reason = (
+                f"the run time limit ({self._guardrails.run_seconds:.0f}s) was reached"
+            )
+        if reason is None:
+            return None
+        self._budget_exhausted_reason = reason
+        logger.warning("Multi-agent run guardrail tripped: %s", reason)
+        self._emit(
+            event_id="run-guardrail",
+            kind="budget_exhausted",
+            role="planner",
+            status="completed",
+            label="Wrapping up research",
+            detail=(
+                f"Research stopped early because {reason}. The answer is "
+                "synthesized from the evidence gathered so far."
+            ),
+        )
+        return reason
+
     async def _generate_structured(
         self,
         *,
@@ -531,14 +824,21 @@ class MultiAgentResearchOrchestrator:
                         "the final synthesis call."
                     )
                 self._llm_call_count += 1
+                bounded_user_text = self._fit_prompt(
+                    user_text,
+                    system_prompt=prompt,
+                    role=role,
+                    purpose=purpose,
+                )
 
                 async def invoke() -> tuple[object, LLMUsage]:
                     async with self._llm_semaphore:
                         result, usage = await client.generate_structured(
-                            [ChatTurn(role="user", text=user_text)],
+                            [ChatTurn(role="user", text=bounded_user_text)],
                             prompt,
                             schema,
                         )
+                    self._record_token_usage(usage)
                     self._sequence += 1
                     sequence = self._sequence
                     if self._on_llm_usage is not None:
@@ -566,15 +866,18 @@ class MultiAgentResearchOrchestrator:
                 self._llm_tasks[operation_id] = operation
 
         # The provider call is shielded so a WebSocket disconnect cannot
-        # discard a paid response. Production research has no stage deadline;
-        # connection heartbeats keep a slow but healthy call alive.
-        if self._unlimited_research:
-            return await asyncio.shield(operation)
+        # discard a paid response. Production research has no stage deadline in
+        # the product sense — connection heartbeats keep a slow but healthy
+        # call alive — but it does have a transport ceiling, because "no
+        # timeout" does not mean "wait as long as it takes"; it means never
+        # noticing a provider that has stopped answering.
+        timeout = (
+            self._guardrails.llm_ceiling_seconds
+            if self._unlimited_research
+            else self._limits.llm_timeout_seconds
+        )
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(operation),
-                timeout=self._limits.llm_timeout_seconds,
-            )
+            return await asyncio.wait_for(asyncio.shield(operation), timeout=timeout)
         except TimeoutError as exc:
             raise TimeoutError(
                 f"Multi-agent {purpose} exceeded the LLM stage timeout."
@@ -584,6 +887,9 @@ class MultiAgentResearchOrchestrator:
         """Run or resume a model-controlled research plan from persisted artifacts."""
 
         async with self._run_lock:
+            # Refreshed per entry so a resumed run after a reconnect gets a
+            # full window rather than inheriting an already-expired one.
+            self._run_deadline = time.monotonic() + self._guardrails.run_seconds
             if self._plan is None:
                 self._plan = await self._create_plan(task)
             self._announce_material_unknowns(self._plan)
@@ -651,17 +957,11 @@ class MultiAgentResearchOrchestrator:
             agent_id="global-planner",
         )
         max_tasks = None if self._unlimited_research else self._limits.max_tasks
-        max_list_items = (
-            None if self._unlimited_research else self._limits.max_artifact_list_items
-        )
-        planner_input = (
-            task
-            if self._unlimited_research
-            else _bounded_planner_input(
-                task,
-                max_question_chars=self._limits.max_question_chars,
-                max_context_chars=self._limits.max_planner_context_chars,
-            )
+        max_list_items = self._context.artifact_list_items
+        planner_input = _bounded_planner_input(
+            task,
+            max_question_chars=self._context.question_chars,
+            max_context_chars=self._context.planner_context_chars,
         )
         attempt = 1
         correction_feedback: str | None = None
@@ -744,7 +1044,7 @@ class MultiAgentResearchOrchestrator:
     def _bounded_plan(self, plan: GlobalPlan) -> GlobalPlan:
         """Bound free text without mutating the validated graph structure."""
 
-        text_limit = self._limits.max_artifact_text_chars
+        text_limit = self._context.artifact_text_chars
         tasks = []
         for task in plan.tasks:
             tasks.append(
@@ -870,7 +1170,7 @@ class MultiAgentResearchOrchestrator:
         return validate_global_plan(
             bounded,
             max_tasks=self._limits.max_tasks,
-            max_list_items=self._limits.max_artifact_list_items,
+            max_list_items=self._context.artifact_list_items,
         )
 
     async def _run_task_dag(self, plan: GlobalPlan) -> None:
@@ -996,6 +1296,12 @@ class MultiAgentResearchOrchestrator:
                 and self._worker_count >= self._limits.max_total_workers
             ):
                 break
+            if self._budget_exhausted() is not None:
+                # Stop dispatching new research and let the collected evidence
+                # flow through review and synthesis as a grounded partial
+                # answer. Coverage gaps are already reported to the user.
+                self._worker_closed_tasks.add(spec.task_id)
+                break
             uncovered_evidence = self._uncovered_evidence_requirements(
                 spec,
                 list(worker_by_assignment.values()),
@@ -1048,6 +1354,24 @@ class MultiAgentResearchOrchestrator:
                     if not self._unlimited_research:
                         break
                     if assignments or (dispatch.stop and worker_by_assignment):
+                        break
+                    if (
+                        coordinator_decision
+                        >= self._guardrails.max_coordinator_decisions
+                    ):
+                        # Re-prompting is how a coordinator recovers from an
+                        # unusable dispatch, but each attempt is a paid call
+                        # with a larger prompt than the last. A coordinator
+                        # that has not produced an executable action by now is
+                        # not converging; treat it as a stop and let the round
+                        # loop close the task.
+                        logger.warning(
+                            "Coordinator for %s produced no executable action in "
+                            "%d decisions; treating as stop",
+                            spec.task_id,
+                            coordinator_decision,
+                        )
+                        assignments = []
                         break
                     rejection = (
                         "Your decision did not produce an executable action. "
@@ -1399,16 +1723,13 @@ class MultiAgentResearchOrchestrator:
         selected: list[str] = []
         seen: set[str] = set()
         for value in values:
-            bounded = value if self._unlimited_research else _bounded_text(value, 500)
+            bounded = _bounded_text(value, self._context.list_value_chars)
             key = bounded.casefold()
             if not bounded or key in seen:
                 continue
             seen.add(key)
             selected.append(bounded)
-            if (
-                not self._unlimited_research
-                and len(selected) >= self._limits.max_artifact_list_items
-            ):
+            if len(selected) >= self._context.artifact_list_items:
                 break
         return tuple(selected)
 
@@ -1423,11 +1744,7 @@ class MultiAgentResearchOrchestrator:
         branch_ids = set(spec.branch_ids)
         return {
             "jurisdiction": (
-                (
-                    scenario.jurisdiction
-                    if self._unlimited_research
-                    else _bounded_text(scenario.jurisdiction, 300)
-                )
+                (_bounded_text(scenario.jurisdiction, self._context.label_chars))
                 if scenario.jurisdiction is not None
                 else None
             ),
@@ -1436,9 +1753,7 @@ class MultiAgentResearchOrchestrator:
                 {
                     "fact_id": fact.fact_id,
                     "description": (
-                        fact.description
-                        if self._unlimited_research
-                        else _bounded_text(fact.description, 600)
+                        _bounded_text(fact.description, self._context.short_text_chars)
                     ),
                     "requirement_ids": fact.requirement_ids,
                 }
@@ -1449,14 +1764,14 @@ class MultiAgentResearchOrchestrator:
                 {
                     "unknown_id": unknown.unknown_id,
                     "description": (
-                        unknown.description
-                        if self._unlimited_research
-                        else _bounded_text(unknown.description, 600)
+                        _bounded_text(
+                            unknown.description, self._context.short_text_chars
+                        )
                     ),
                     "why_material": (
-                        unknown.why_material
-                        if self._unlimited_research
-                        else _bounded_text(unknown.why_material, 600)
+                        _bounded_text(
+                            unknown.why_material, self._context.short_text_chars
+                        )
                     ),
                     "requirement_ids": unknown.requirement_ids,
                 }
@@ -1467,14 +1782,12 @@ class MultiAgentResearchOrchestrator:
                 {
                     "branch_id": branch.branch_id,
                     "condition": (
-                        branch.condition
-                        if self._unlimited_research
-                        else _bounded_text(branch.condition, 600)
+                        _bounded_text(branch.condition, self._context.short_text_chars)
                     ),
                     "consequence": (
-                        branch.consequence
-                        if self._unlimited_research
-                        else _bounded_text(branch.consequence, 600)
+                        _bounded_text(
+                            branch.consequence, self._context.short_text_chars
+                        )
                     ),
                     "requirement_ids": branch.requirement_ids,
                 }
@@ -1628,11 +1941,9 @@ class MultiAgentResearchOrchestrator:
             allowed_limitations.extend(artifact.conflicts)
         limitation_by_key = {
             _normalize_evidence_text(value).casefold(): (
-                value
-                if self._unlimited_research
-                else _bounded_text(
+                _bounded_text(
                     value,
-                    self._limits.max_artifact_text_chars,
+                    self._context.artifact_text_chars,
                 )
             )
             for value in allowed_limitations
@@ -1642,10 +1953,7 @@ class MultiAgentResearchOrchestrator:
         findings: list[DerivedConclusion] = []
         seen_ids: set[str] = set()
         candidate_findings = list(candidate.application_findings)
-        if not self._unlimited_research:
-            candidate_findings = candidate_findings[
-                : self._limits.max_artifact_list_items
-            ]
+        candidate_findings = candidate_findings[: self._context.artifact_list_items]
         for candidate_finding in candidate_findings:
             conclusion_id = re.sub(
                 r"[^A-Za-z0-9_-]+",
@@ -1684,13 +1992,10 @@ class MultiAgentResearchOrchestrator:
                 for reference in candidate_finding.dependency_refs
                 if (reference.task_id, reference.output_id) in allowed_dependency_refs
             ]
-            if not self._unlimited_research:
-                supporting_claim_ids = supporting_claim_ids[
-                    : self._limits.max_artifact_list_items
-                ]
-                dependency_refs = dependency_refs[
-                    : self._limits.max_artifact_list_items
-                ]
+            supporting_claim_ids = supporting_claim_ids[
+                : self._context.artifact_list_items
+            ]
+            dependency_refs = dependency_refs[: self._context.artifact_list_items]
             limitations = [
                 limitation_by_key[key]
                 for key in dict.fromkeys(
@@ -1705,19 +2010,12 @@ class MultiAgentResearchOrchestrator:
             for value in limitation_by_key.values():
                 if value not in limitations:
                     limitations.append(value)
-                if (
-                    not self._unlimited_research
-                    and len(limitations) >= self._limits.max_artifact_list_items
-                ):
+                if len(limitations) >= self._context.artifact_list_items:
                     break
 
-            finding_text = (
-                candidate_finding.finding.strip()
-                if self._unlimited_research
-                else _bounded_text(
-                    candidate_finding.finding,
-                    self._limits.max_artifact_text_chars,
-                )
+            finding_text = _bounded_text(
+                candidate_finding.finding,
+                self._context.artifact_text_chars,
             )
             if (
                 not finding_text
@@ -1773,10 +2071,7 @@ class MultiAgentResearchOrchestrator:
         for value in limitation_by_key.values():
             if value not in gaps:
                 gaps.append(value)
-            if (
-                not self._unlimited_research
-                and len(gaps) >= self._limits.max_artifact_list_items
-            ):
+            if len(gaps) >= self._context.artifact_list_items:
                 break
         conflicts = list(
             dict.fromkeys(
@@ -1785,8 +2080,7 @@ class MultiAgentResearchOrchestrator:
                 for conflict in artifact.conflicts
             )
         )
-        if not self._unlimited_research:
-            conflicts = conflicts[: self._limits.max_artifact_list_items]
+        conflicts = conflicts[: self._context.artifact_list_items]
         verified = TaskArtifact(
             task_id=spec.task_id,
             status=status,
@@ -1923,13 +2217,9 @@ class MultiAgentResearchOrchestrator:
         accepted_queries: set[str] = set()
         accepted_ids: set[str] = set()
         for candidate in dispatch.assignments:
-            query = (
-                candidate.query.strip()
-                if self._unlimited_research
-                else _bounded_text(
-                    candidate.query,
-                    self._limits.max_query_chars,
-                )
+            query = _bounded_text(
+                candidate.query,
+                self._context.query_chars,
             )
             normalized = _normalized_query(query)
             assignment_id = _safe_identifier(
@@ -1955,10 +2245,9 @@ class MultiAgentResearchOrchestrator:
                     or requirement_id in allowed_evidence_requirement_ids
                 )
             ]
-            if not self._unlimited_research:
-                evidence_requirements = evidence_requirements[
-                    : self._limits.max_artifact_list_items
-                ]
+            evidence_requirements = evidence_requirements[
+                : self._context.artifact_list_items
+            ]
             if not evidence_requirements:
                 continue
             accepted.append(
@@ -1967,24 +2256,20 @@ class MultiAgentResearchOrchestrator:
                         "assignment_id": assignment_id,
                         "query": query,
                         "objective": (
-                            candidate.objective.strip()
-                            if self._unlimited_research
-                            else _bounded_text(
+                            _bounded_text(
                                 candidate.objective,
-                                self._limits.max_artifact_text_chars,
+                                self._context.artifact_text_chars,
                             )
                         ),
                         "evidence_requirements": evidence_requirements,
                         "excluded_queries": (
-                            list(candidate.excluded_queries)
-                            if self._unlimited_research
-                            else [
+                            [
                                 _bounded_text(
                                     excluded,
-                                    self._limits.max_query_chars,
+                                    self._context.query_chars,
                                 )
                                 for excluded in candidate.excluded_queries[
-                                    : self._limits.max_artifact_list_items
+                                    : self._context.artifact_list_items
                                 ]
                             ]
                         ),
@@ -2019,10 +2304,7 @@ class MultiAgentResearchOrchestrator:
             parse_metadata_filters(normalized)
         except (MetadataFilterParseError, ValueError):
             return None
-        if (
-            not self._unlimited_research
-            and len(normalized) > self._limits.max_query_chars
-        ):
+        if len(normalized) > self._context.query_chars:
             return None
         return normalized
 
@@ -2068,13 +2350,13 @@ class MultiAgentResearchOrchestrator:
             )
             operation.add_done_callback(_consume_background_task_exception)
             self._search_tasks[key] = operation
+        timeout = (
+            self._guardrails.search_ceiling_seconds
+            if self._unlimited_research
+            else self._limits.search_timeout_seconds
+        )
         try:
-            if self._unlimited_research:
-                return await asyncio.shield(operation)
-            return await asyncio.wait_for(
-                asyncio.shield(operation),
-                timeout=self._limits.search_timeout_seconds,
-            )
+            return await asyncio.wait_for(asyncio.shield(operation), timeout=timeout)
         except TimeoutError as exc:
             raise TimeoutError(
                 "Indexed search exceeded the multi-agent timeout."
@@ -2161,6 +2443,23 @@ class MultiAgentResearchOrchestrator:
                 for requirement_id in assignment.evidence_requirements
                 if requirement_id not in supported
             ]
+
+            if self._budget_exhausted() is not None:
+                # The agent still owns its stop decision under normal
+                # conditions; the guardrail only overrides it once the whole
+                # run is out of budget, and it keeps everything found so far.
+                return self._aggregate_persistent_worker_artifact(
+                    spec=spec,
+                    assignment=assignment,
+                    worker_id=worker_id,
+                    searches_run=searches_run,
+                    claims=claims,
+                    reported_gaps=reported_gaps,
+                    cross_references=cross_references,
+                    unresolved=unresolved,
+                    last_artifact=last_artifact,
+                    successful_search_seen=successful_search_seen,
+                )
 
             decision_index += 1
             dispatch = await self._continue_worker_search(
@@ -2375,14 +2674,11 @@ class MultiAgentResearchOrchestrator:
             self._forget_completed_search(assignment)
 
         hits = list(result.hits if result is not None else [])
-        if not self._unlimited_research:
-            hits = hits[: self._limits.worker_hit_limit]
+        hits = hits[: self._context.worker_hit_limit]
         records = self._register_evidence(spec, assignment, hits)
         rendered_bundle = self._render_evidence_bundle(
             records,
-            max_chars=(
-                None if self._unlimited_research else self._limits.worker_hit_chars
-            ),
+            max_chars=(self._context.worker_hit_chars),
         )
         rendered = rendered_bundle.text
         exposed_records = list(rendered_bundle.records)
@@ -2574,8 +2870,7 @@ class MultiAgentResearchOrchestrator:
         seen_claims: set[tuple[str, str, str]] = set()
         rejected = 0
         candidate_claims = list(candidate.claims)
-        if not self._unlimited_research:
-            candidate_claims = candidate_claims[: self._limits.max_claims_per_worker]
+        candidate_claims = candidate_claims[: self._context.claims_per_worker]
         for claim in candidate_claims:
             record = by_source.get((claim.document_id, claim.chunk_id))
             claim_key = (
@@ -2620,19 +2915,15 @@ class MultiAgentResearchOrchestrator:
                         "readable_title": record.readable_title,
                         "locator": record.locator,
                         "claim": (
-                            claim.evidence_excerpt
-                            if self._unlimited_research
-                            else _bounded_text(
+                            _bounded_text(
                                 claim.claim,
-                                self._limits.max_artifact_text_chars,
+                                self._context.artifact_text_chars,
                             )
                         ),
                         "evidence_excerpt": (
-                            claim.evidence_excerpt
-                            if self._unlimited_research
-                            else _bounded_text(
+                            _bounded_text(
                                 claim.evidence_excerpt,
-                                self._limits.max_artifact_text_chars,
+                                self._context.artifact_text_chars,
                             )
                         ),
                         "requirement_ids": supported_requirement_ids,
@@ -2661,19 +2952,14 @@ class MultiAgentResearchOrchestrator:
             for requirement_id in claim.evidence_requirement_ids
         }
         gaps = [
-            (
-                requirement
-                if self._unlimited_research
-                else _bounded_text(
-                    requirement,
-                    self._limits.max_artifact_text_chars,
-                )
+            _bounded_text(
+                requirement,
+                self._context.artifact_text_chars,
             )
             for requirement in assignment.evidence_requirements
             if requirement not in supported
         ]
-        if not self._unlimited_research:
-            gaps = gaps[: self._limits.max_artifact_list_items]
+        gaps = gaps[: self._context.artifact_list_items]
         if rejected:
             gaps.append(
                 f"{rejected} unsupported claim(s) were rejected by source validation."
@@ -2683,20 +2969,15 @@ class MultiAgentResearchOrchestrator:
         status = WorkerStatus.SUCCESS if verified else WorkerStatus.NO_EVIDENCE
         normalized_evidence = " ".join(record.text.casefold() for record in records)
         cross_references = [
-            (
-                reference
-                if self._unlimited_research
-                else _bounded_text(
-                    reference,
-                    self._limits.max_artifact_text_chars,
-                )
+            _bounded_text(
+                reference,
+                self._context.artifact_text_chars,
             )
             for reference in candidate.cross_references
             if _normalize_evidence_text(reference).casefold()
             in _normalize_evidence_text(normalized_evidence)
         ]
-        if not self._unlimited_research:
-            cross_references = cross_references[: self._limits.max_artifact_list_items]
+        cross_references = cross_references[: self._context.artifact_list_items]
         return WorkerArtifact(
             task_id=spec.task_id,
             assignment_id=assignment.assignment_id,
@@ -2732,9 +3013,7 @@ class MultiAgentResearchOrchestrator:
             ]
         review_evidence = self._render_evidence_bundle(
             task_records,
-            max_chars=(
-                None if self._unlimited_research else self._limits.review_hit_chars
-            ),
+            max_chars=(self._context.review_hit_chars),
         )
         exposed_records = list(review_evidence.records)
         if (
@@ -2829,14 +3108,16 @@ class MultiAgentResearchOrchestrator:
                 )
                 operation.add_done_callback(_consume_background_task_exception)
                 self._task_rerank_tasks[spec.task_id] = operation
+            rerank_timeout = (
+                self._guardrails.rerank_ceiling_seconds
+                if self._unlimited_research
+                else self._limits.search_timeout_seconds
+            )
             try:
-                if self._unlimited_research:
-                    ranked_pairs = await asyncio.shield(operation)
-                else:
-                    ranked_pairs = await asyncio.wait_for(
-                        asyncio.shield(operation),
-                        timeout=self._limits.search_timeout_seconds,
-                    )
+                ranked_pairs = await asyncio.wait_for(
+                    asyncio.shield(operation),
+                    timeout=rerank_timeout,
+                )
             except TimeoutError:
                 logger.warning(
                     "Task-global rerank timed out for %s; using retrieval scores",
@@ -2881,11 +3162,9 @@ class MultiAgentResearchOrchestrator:
             seen_documents.add(record.document_id)
             diversified.append(record)
         diversified.extend(deferred)
-        if self._unlimited_research:
-            return diversified
         pool_limit = max(
-            self._limits.max_claims_per_task * 2,
-            self._limits.worker_hit_limit,
+            self._context.claims_per_task * 2,
+            self._context.worker_hit_limit,
         )
         return diversified[:pool_limit]
 
@@ -2912,8 +3191,7 @@ class MultiAgentResearchOrchestrator:
         claims: list[EvidenceClaim] = []
         seen: set[tuple[str, str, str]] = set()
         candidate_claims = list(candidate.claims)
-        if not self._unlimited_research:
-            candidate_claims = candidate_claims[: self._limits.max_claims_per_task]
+        candidate_claims = candidate_claims[: self._context.claims_per_task]
         for claim in candidate_claims:
             record = by_source.get((claim.document_id, claim.chunk_id))
             allowed = allowed_worker_claims.get(
@@ -2963,10 +3241,7 @@ class MultiAgentResearchOrchestrator:
                         }
                     )
                 )
-                if (
-                    not self._unlimited_research
-                    and len(claims) >= self._limits.max_claims_per_task
-                ):
+                if len(claims) >= self._context.claims_per_task:
                     break
 
         supported_evidence_ids = {
@@ -3039,23 +3314,16 @@ class MultiAgentResearchOrchestrator:
         gaps: list[str] = []
         seen_gaps: set[str] = set()
         for gap in verified_gap_inputs:
-            bounded = (
-                gap
-                if self._unlimited_research
-                else _bounded_text(
-                    gap,
-                    self._limits.max_artifact_text_chars,
-                )
+            bounded = _bounded_text(
+                gap,
+                self._context.artifact_text_chars,
             )
             key = bounded.casefold()
             if not bounded or key in seen_gaps:
                 continue
             seen_gaps.add(key)
             gaps.append(bounded)
-            if (
-                not self._unlimited_research
-                and len(gaps) >= self._limits.max_artifact_list_items
-            ):
+            if len(gaps) >= self._context.artifact_list_items:
                 break
 
         exact_claim_texts = {
@@ -3073,24 +3341,18 @@ class MultiAgentResearchOrchestrator:
             if anchored_claims < 2:
                 continue
             conflicts.append(
-                conflict
-                if self._unlimited_research
-                else _bounded_text(
+                _bounded_text(
                     conflict,
-                    self._limits.max_artifact_text_chars,
+                    self._context.artifact_text_chars,
                 )
             )
-            if (
-                not self._unlimited_research
-                and len(conflicts) >= self._limits.max_artifact_list_items
-            ):
+            if len(conflicts) >= self._context.artifact_list_items:
                 break
 
         contributing_worker_ids = list(dict.fromkeys(contributors))
-        if not self._unlimited_research:
-            contributing_worker_ids = contributing_worker_ids[
-                : self._limits.max_artifact_list_items
-            ]
+        contributing_worker_ids = contributing_worker_ids[
+            : self._context.artifact_list_items
+        ]
 
         verified = TaskArtifact(
             task_id=spec.task_id,
@@ -3133,15 +3395,9 @@ class MultiAgentResearchOrchestrator:
                 if key not in seen:
                     seen.add(key)
                     claims.append(claim)
-                    if (
-                        not self._unlimited_research
-                        and len(claims) >= self._limits.max_claims_per_task
-                    ):
+                    if len(claims) >= self._context.claims_per_task:
                         break
-            if (
-                not self._unlimited_research
-                and len(claims) >= self._limits.max_claims_per_task
-            ):
+            if len(claims) >= self._context.claims_per_task:
                 break
         supported_evidence_ids = {
             evidence_requirement_id
@@ -3196,33 +3452,25 @@ class MultiAgentResearchOrchestrator:
         gaps: list[str] = []
         seen_gaps: set[str] = set()
         for gap in gap_inputs:
-            bounded = (
-                gap
-                if self._unlimited_research
-                else _bounded_text(
-                    gap,
-                    self._limits.max_artifact_text_chars,
-                )
+            bounded = _bounded_text(
+                gap,
+                self._context.artifact_text_chars,
             )
             key = bounded.casefold()
             if not bounded or key in seen_gaps:
                 continue
             seen_gaps.add(key)
             gaps.append(bounded)
-            if (
-                not self._unlimited_research
-                and len(gaps) >= self._limits.max_artifact_list_items
-            ):
+            if len(gaps) >= self._context.artifact_list_items:
                 break
         contributing_worker_ids = list(
             dict.fromkeys(
                 artifact.worker_id for artifact in worker_artifacts if artifact.claims
             )
         )
-        if not self._unlimited_research:
-            contributing_worker_ids = contributing_worker_ids[
-                : self._limits.max_artifact_list_items
-            ]
+        contributing_worker_ids = contributing_worker_ids[
+            : self._context.artifact_list_items
+        ]
         verified = TaskArtifact(
             task_id=spec.task_id,
             status=status,
@@ -3315,10 +3563,7 @@ class MultiAgentResearchOrchestrator:
                 continue
             selected.append(record)
             seen.add(record.chunk_id)
-            if (
-                not self._unlimited_research
-                and len(selected) >= self._limits.final_evidence_limit
-            ):
+            if len(selected) >= self._context.final_evidence_limit:
                 return selected
 
         per_task: list[list[EvidenceRecord]] = []
@@ -3342,10 +3587,7 @@ class MultiAgentResearchOrchestrator:
                 if record.chunk_id not in seen:
                     selected.append(record)
                     seen.add(record.chunk_id)
-                    if (
-                        not self._unlimited_research
-                        and len(selected) >= self._limits.final_evidence_limit
-                    ):
+                    if len(selected) >= self._context.final_evidence_limit:
                         return selected
         return selected
 
@@ -3536,20 +3778,32 @@ class MultiAgentResearchOrchestrator:
         evidence: Sequence[EvidenceRecord],
     ) -> tuple[str, tuple[EvidenceRecord, ...]]:
         if self._unlimited_research:
-            rendered_evidence = self._render_evidence_bundle(
-                evidence,
-                max_chars=None,
-            )
-            context = (
-                f"ORIGINAL QUESTION:\n{original_question}\n\n"
-                f"GLOBAL PLAN:\n{plan.model_dump_json()}\n\n"
+            # Depth is model-controlled, but the result still has to fit one
+            # final synthesis call. Both payloads here grow with research
+            # volume — the verbatim evidence bundle and the verbatim task
+            # reports — so they share one explicit ceiling instead of being
+            # rendered unbounded and rejected by the provider.
+            total_limit = self._context.final_context_chars
+            bounded_question = original_question[: self._context.question_chars]
+            plan_json = plan.model_dump_json()
+            header = (
+                f"ORIGINAL QUESTION:\n{bounded_question}\n\n"
+                f"GLOBAL PLAN:\n{plan_json}\n\n"
                 "SERVER-VERIFIED FULL EVIDENCE REPORTS "
                 "(claims are verbatim source excerpts, "
                 "not paraphrases; presentation citations are intentionally "
                 "omitted):\n"
-                f"{self._task_reports_for_parent(artifacts)}"
             )
-            return context, rendered_evidence.records
+            available = max(total_limit - len(header), total_limit // 4)
+            # Only the reports are sent to the model here; the evidence bundle
+            # decides which records are exposed as citable sources, so it is
+            # capped for source count rather than charged against the prompt.
+            rendered_evidence = self._render_evidence_bundle(
+                evidence,
+                max_chars=total_limit,
+            )
+            reports = self._task_reports_for_parent(artifacts, max_chars=available)
+            return (header + reports)[:total_limit], rendered_evidence.records
 
         headers = (
             "ORIGINAL QUESTION:\n",
@@ -3557,12 +3811,12 @@ class MultiAgentResearchOrchestrator:
             "\n\nTASK ARTIFACTS:\n",
             "\n\nSERVER-VERIFIED FULL EVIDENCE:\n",
         )
-        total_limit = self._limits.max_final_context_chars
+        total_limit = self._context.final_context_chars
         available = max(total_limit - sum(len(header) for header in headers), 0)
-        question_budget = min(self._limits.max_question_chars, available // 6)
+        question_budget = min(self._context.question_chars, available // 6)
         evidence_budget = min(self._limits.final_chunk_chars, available // 5)
         artifact_budget = min(
-            self._limits.max_artifact_context_chars,
+            self._context.artifact_context_chars,
             available // 3,
         )
         rendered_evidence = self._render_evidence_bundle(
@@ -3602,11 +3856,11 @@ class MultiAgentResearchOrchestrator:
         payload = claim.model_dump(mode="json")
         payload["claim"] = _bounded_text(
             claim.claim,
-            min(self._limits.max_artifact_text_chars, 600),
+            min(self._context.artifact_text_chars, 600),
         )
         payload["evidence_excerpt"] = _bounded_text(
             claim.evidence_excerpt,
-            min(self._limits.max_artifact_text_chars, 400),
+            min(self._context.artifact_text_chars, 400),
         )
         payload["readable_title"] = _bounded_text(claim.readable_title, 300)
         payload["locator"] = _bounded_text(claim.locator, 300)
@@ -3617,7 +3871,7 @@ class MultiAgentResearchOrchestrator:
         ):
             value = payload.get(field)
             if isinstance(value, list):
-                payload[field] = value[: self._limits.max_artifact_list_items]
+                payload[field] = value[: self._context.artifact_list_items]
         return payload
 
     def _dump_artifact_payloads(
@@ -3645,7 +3899,7 @@ class MultiAgentResearchOrchestrator:
         target_list = cast(list[object], target)
         target_list.append(value)
         context_limit = (
-            self._limits.max_artifact_context_chars
+            self._context.artifact_context_chars
             if max_chars is None
             else max(max_chars, 0)
         )
@@ -3666,7 +3920,7 @@ class MultiAgentResearchOrchestrator:
         previous = payloads[payload_index].get(field)
         payloads[payload_index][field] = value
         context_limit = (
-            self._limits.max_artifact_context_chars
+            self._context.artifact_context_chars
             if max_chars is None
             else max(max_chars, 0)
         )
@@ -3678,6 +3932,8 @@ class MultiAgentResearchOrchestrator:
     def _worker_reports_for_parent(
         self,
         artifacts: Sequence[WorkerArtifact],
+        *,
+        max_chars: int | None = None,
     ) -> str:
         """Pass complete verbatim findings upward without presentation citations."""
 
@@ -3713,11 +3969,72 @@ class MultiAgentResearchOrchestrator:
             }
             for artifact in artifacts
         ]
-        return json.dumps(payloads, ensure_ascii=False, separators=(",", ":"))
+        return self._fit_report_payloads(
+            payloads,
+            max_chars=max_chars,
+            fallback=lambda: self._compact_worker_artifacts(artifacts),
+        )
+
+    def _fit_report_payloads(
+        self,
+        payloads: list[dict[str, object]],
+        *,
+        max_chars: int | None,
+        fallback: Callable[[], str],
+    ) -> str:
+        """Keep verbatim reports whole until they stop fitting, then shed evidence.
+
+        Complete reports are what make the parent boundary trustworthy, so
+        nothing is truncated while the bundle fits. Past the ceiling the
+        lowest-value item is dropped first — trailing evidence entries, evenly
+        across tasks so one prolific task cannot crowd out the others — and the
+        parent is told how many were withheld.
+        """
+
+        limit = self._context.parent_report_chars if max_chars is None else max_chars
+        limit = max(limit, 0)
+        rendered = self._dump_artifact_payloads(payloads)
+        if len(rendered) <= limit:
+            return rendered
+
+        withheld = 0
+        while len(rendered) > limit:
+            longest = max(
+                (
+                    payload
+                    for payload in payloads
+                    if isinstance(payload.get("exact_evidence"), list)
+                    and cast(list[object], payload["exact_evidence"])
+                ),
+                key=lambda payload: len(cast(list[object], payload["exact_evidence"])),
+                default=None,
+            )
+            if longest is None:
+                break
+            cast(list[object], longest["exact_evidence"]).pop()
+            withheld += 1
+            longest["withheld_evidence_count"] = (
+                cast(int, longest.get("withheld_evidence_count", 0)) + 1
+            )
+            rendered = self._dump_artifact_payloads(payloads)
+
+        if len(rendered) > limit:
+            # Even the evidence-free skeleton does not fit; the compact
+            # renderer is purpose-built for that case.
+            return fallback()
+        if withheld:
+            logger.warning(
+                "Trimmed %d evidence entries to fit the %d-char parent report budget",
+                withheld,
+                limit,
+            )
+        return rendered
 
     def _task_reports_for_parent(
         self,
         artifacts: Sequence[TaskArtifact],
+        *,
+        max_chars: int | None = None,
     ) -> str:
         """Pass complete task reports upward without source-title citations."""
 
@@ -3754,7 +4071,11 @@ class MultiAgentResearchOrchestrator:
             }
             for artifact in artifacts
         ]
-        return json.dumps(payloads, ensure_ascii=False, separators=(",", ":"))
+        return self._fit_report_payloads(
+            payloads,
+            max_chars=max_chars,
+            fallback=lambda: self._compact_task_artifacts(artifacts),
+        )
 
     def _compact_worker_artifacts(
         self,
@@ -3792,7 +4113,7 @@ class MultiAgentResearchOrchestrator:
                 (len(extractor(artifact)) for artifact in selected),
                 default=0,
             )
-            for depth in range(min(max_items, self._limits.max_artifact_list_items)):
+            for depth in range(min(max_items, self._context.artifact_list_items)):
                 for index, artifact in enumerate(selected):
                     values = extractor(artifact)
                     if depth >= len(values):
@@ -3810,7 +4131,7 @@ class MultiAgentResearchOrchestrator:
             for index, artifact in enumerate(selected):
                 if (
                     depth >= len(artifact.claims)
-                    or claim_count >= self._limits.max_claims_per_task
+                    or claim_count >= self._context.claims_per_task
                 ):
                     continue
                 if self._append_artifact_value(
@@ -3828,7 +4149,7 @@ class MultiAgentResearchOrchestrator:
                 (len(extractor(artifact)) for artifact in selected),
                 default=0,
             )
-            for depth in range(min(max_items, self._limits.max_artifact_list_items)):
+            for depth in range(min(max_items, self._context.artifact_list_items)):
                 for index, artifact in enumerate(selected):
                     values = extractor(artifact)
                     if depth >= len(values):
@@ -3841,7 +4162,7 @@ class MultiAgentResearchOrchestrator:
                     )
 
         rendered = self._dump_artifact_payloads(payloads)
-        if len(rendered) > self._limits.max_artifact_context_chars:
+        if len(rendered) > self._context.artifact_context_chars:
             return "[]"
         return rendered
 
@@ -3853,7 +4174,7 @@ class MultiAgentResearchOrchestrator:
         max_chars: int | None = None,
     ) -> str:
         context_limit = (
-            self._limits.max_artifact_context_chars
+            self._context.artifact_context_chars
             if max_chars is None
             else max(max_chars, 0)
         )
@@ -3899,12 +4220,12 @@ class MultiAgentResearchOrchestrator:
                             "supporting_claim_ids": supporting_claim_ids,
                             "finding": _bounded_text(
                                 finding.finding,
-                                self._limits.max_artifact_text_chars,
+                                self._context.artifact_text_chars,
                             ),
                             "limitations": [
                                 _bounded_text(value, 500)
                                 for value in finding.limitations[
-                                    : self._limits.max_artifact_list_items
+                                    : self._context.artifact_list_items
                                 ]
                             ],
                         }
@@ -4003,7 +4324,7 @@ class MultiAgentResearchOrchestrator:
                 (len(extractor(artifact)) for artifact in selected),
                 default=0,
             )
-            for depth in range(min(max_items, self._limits.max_artifact_list_items)):
+            for depth in range(min(max_items, self._context.artifact_list_items)):
                 for index, artifact in enumerate(selected):
                     values = extractor(artifact)
                     if depth < len(values):
@@ -4028,7 +4349,7 @@ class MultiAgentResearchOrchestrator:
                 findings = findings_by_task[artifact.task_id]
                 if (
                     depth >= len(findings)
-                    or finding_count >= self._limits.max_artifact_list_items
+                    or finding_count >= self._context.artifact_list_items
                 ):
                     continue
                 finding = findings[depth]
@@ -4053,10 +4374,7 @@ class MultiAgentResearchOrchestrator:
         for depth in range(max_claim_depth):
             for index, artifact in enumerate(selected):
                 claims = claims_by_task[artifact.task_id]
-                if (
-                    depth >= len(claims)
-                    or claim_count >= self._limits.max_claims_per_task
-                ):
+                if depth >= len(claims) or claim_count >= self._context.claims_per_task:
                     continue
                 claim = claims[depth]
                 if self._append_artifact_value(
@@ -4122,12 +4440,12 @@ class MultiAgentResearchOrchestrator:
                     field="answer_fragment",
                     value=_bounded_text(
                         " ".join(fragments),
-                        min(self._limits.max_artifact_text_chars, 800),
+                        min(self._context.artifact_text_chars, 800),
                     ),
                     max_chars=context_limit,
                 )
             for worker_id in artifact.contributing_worker_ids[
-                : self._limits.max_artifact_list_items
+                : self._context.artifact_list_items
             ]:
                 self._append_artifact_value(
                     payloads,
