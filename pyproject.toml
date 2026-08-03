@@ -1,0 +1,326 @@
+[project]
+name = "onyx"
+version = "0.0.0"
+requires-python = ">=3.13"
+# Shared dependencies between backend and model_server
+dependencies = [
+    "aioboto3==15.1.0",
+    "cohere==7.0.5",
+    "fastapi==0.133.1",
+    "google-genai==1.52.0",
+    "litellm[google]==1.93.0",
+    "openai==2.38.0",
+    "pydantic==2.12.5",
+    # Shared so structured JSON logging (LOG_FORMAT=json) works in the
+    # model_server image too, not just the backend.
+    "python-json-logger==4.1.0",
+    "prometheus_client>=0.21.1",
+    "prometheus_fastapi_instrumentator==8.0.2",
+    "sentry-sdk==2.14.0",
+    "tenacity==9.1.2",
+    "uvicorn==0.49.0",
+    "voyageai==0.2.3",
+    "brotli>=1.2.0",
+    "agent-client-protocol>=0.7.1",
+]
+
+[dependency-groups]
+# API/chat/search runtime. Document ingestion and browser automation are kept
+# in opt-in groups so production can ship a materially smaller image.
+backend-runtime = [
+    "aiohttp==3.14.1",
+    "alembic==1.18.4",
+    "asyncpg==0.30.0",
+    "atlassian-python-api==4.0.7",
+    "azure-cognitiveservices-speech==1.50.0",
+    "azure-identity>=1.23.0,<2.0.0",
+    "azure-storage-blob>=12.24.0,<13.0.0",
+    "beautifulsoup4==4.12.3",
+    "boto3==1.39.11",
+    "boxsdk==10.12.0",
+    "celery==5.5.1",
+    "chardet==5.2.0",
+    "chonkie==1.0.10",
+    "croniter==6.2.2",
+    "cron-descriptor==2.0.8",
+    "dask==2026.1.1",
+    "discord.py==2.7.1",
+    "distributed==2026.1.1",
+    "fastapi-users==15.0.4",
+    "fastapi-users-db-sqlalchemy==7.0.0",
+    "fastapi-limiter==0.1.6",
+    "fastmcp==3.2.0",
+    "google-api-python-client==2.86.0",
+    "google-auth-oauthlib==1.4.0",
+    "google-cloud-storage>=3.0.0,<4.0.0",
+    "graphql-core==3.2.8",
+    # GPT4All library has issues running on Macs and python:3.11.4-slim-bookworm
+    # will reintroduce this when library version catches up
+    # "gpt4all==2.0.2",
+    "docker==7.1.0",
+    "httpx[http2]==0.28.1",
+    "httpx-oauth==0.15.1",
+    "jira==3.10.5",
+    "kubernetes==31.0.0",
+    "trafilatura==1.12.2",
+    "langchain-core==1.3.3",
+    "lxml==6.1.1",
+    "mcp[cli]==1.28.1",
+    "msal==1.34.0",
+    "msoffcrypto-tool==6.0.0",
+    "Office365-REST-Python-Client==2.6.2",
+    "oauthlib==3.2.2",
+    # NOTE: This is frozen to avoid https://foss.heptapod.net/openpyxl/openpyxl/-/issues/2147
+    "openpyxl==3.0.10",
+    "opensearch-py==3.2.0",
+    # Imported by core API/runtime paths (logos, image responses, and chat UI).
+    # Keep explicit instead of relying on document-parser transitive dependencies.
+    "Pillow==12.3.0",
+    # libpass is the maintained drop-in fork of passlib (same `passlib.*`
+    # import namespace). passlib 1.7.4 is unmaintained and imports the stdlib
+    # `crypt` module, which was removed in Python 3.13.
+    "libpass==1.9.3",
+    "psutil==7.1.3",
+    "psycopg2-binary==2.9.10",
+    "puremagic==1.28",
+    "pyairtable==3.0.1",
+    "pycryptodome==3.19.1",
+    "PyGithub==2.5.0",
+    "python-dateutil==2.9.0.post0",
+    "python-docx==1.1.2",
+    "python-gitlab==5.6.0",
+    "python-pptx==0.6.23",
+    "pypdf==6.14.2",
+    "python-dotenv==1.2.2",
+    "python-slugify==8.0.4",
+    "pywikibot==11.4.2",
+    "readerwriterlock==1.0.9",
+    "redis==5.0.8",
+    "requests==2.33.0",
+    "requests-oauthlib==2.0.0",
+    "simple-salesforce==1.12.6",
+    "slack-sdk==3.20.2",
+    "SQLAlchemy==2.0.50",
+    "starlette==1.3.1",
+    "supervisor==4.3.0",
+    "RapidFuzz==3.14.5",
+    "tiktoken==0.13.0",
+    "timeago==1.0.16",
+    "zulip==0.8.2",
+    "hubspot-api-client==12.0.0",
+    "asana==5.0.8",
+    "dropbox==12.0.2",
+    "stripe==10.12.0",
+    "urllib3==2.7.0",
+    "mistune==3.3.0",
+    "mitmproxy==12.2.3",
+    "sendgrid==6.12.5",
+    "exa_py==1.15.4",
+    "braintrust==0.3.9",
+    "langfuse==3.10.0",
+    "nest_asyncio==1.6.0",
+    "openinference-instrumentation==0.1.42",
+    "opentelemetry-proto>=1.42.1",
+    "python3-saml==1.15.0",
+    "xmlsec==1.3.17",
+]
+
+# Heavy source-document parsing stack. Keep this on importer hosts; the
+# production API searches the already indexed regulatory chunks.
+document-import = [
+    # NOTE: Do not update without understanding the patching behavior in
+    # get_markitdown_converter in
+    # backend/onyx/file_processing/extract_file_text.py and what impacts
+    # updating might have on this behavior.
+    "markitdown[pdf, docx, pptx, xlsx, xls]==0.1.2",
+    "pypdfium2==5.9.0",
+    "unstructured==0.18.27",
+    "unstructured-client==0.42.6",
+]
+
+# Headless Chromium is needed by browser-based connectors, not by regulatory
+# chat/search or the local document importer.
+browser-automation = ["playwright==1.58.0"]
+
+# Backwards-compatible full backend used by development and the importer.
+backend = [
+    { include-group = "backend-runtime" },
+    { include-group = "document-import" },
+    { include-group = "browser-automation" },
+]
+
+# Dev tools
+dev = [
+    "boto3-stubs[s3]==1.39.11",
+    "celery-types==0.26.0",
+    "faker==40.1.2",
+    "hatchling==1.28.0",
+    "ipykernel==6.29.5",
+    "manygo==0.2.0",
+    "matplotlib==3.10.8",
+    "ty==0.0.31",
+    "onyx-devtools==0.10.5",
+    "openapi-generator-cli==7.17.0",
+    "pre-commit==3.2.2",
+    "pytest-alembic==0.12.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-dotenv==0.5.2",
+    "pytest-mock==3.12.0",
+    "pytest-playwright==0.7.2",
+    "pytest-repeat==0.9.4",
+    "pytest-xdist==3.8.0",
+    "pytest==9.0.3",
+    "release-tag==0.5.2",
+    # Keep in sync with the pinned `ruff==` in the ruff / ruff-format hooks in
+    # .pre-commit-config.yaml, which install ruff into an isolated overlay.
+    "ruff==0.16.0",
+    "types-docker==7.1.0.20260518",
+    "types-beautifulsoup4==4.12.0.3",
+    "types-html5lib==1.1.11.13",
+    "types-oauthlib==3.2.0.9",
+    "types-openpyxl==3.0.4.7",
+    "types-passlib==1.7.7.20240106",
+    "types-Pillow==10.2.0.20240822",
+    "types-psutil==7.1.3.20251125",
+    "types-psycopg2==2.9.21.10",
+    "types-python-dateutil==2.8.19.13",
+    "types-PyYAML==6.0.12.11",
+    "types-pytz==2023.3.1.1",
+    "types-regex==2023.3.23.1",
+    "types-requests==2.32.0.20250328",
+    { include-group = "zizmor" },
+]
+
+# Isolated group so CI can `uv sync --only-group zizmor` without pulling
+# the rest of the dev toolchain.
+zizmor = ["zizmor==1.25.2"]
+
+# Enterprise Edition features
+ee = ["posthog==3.7.4"]
+
+# Locust load-test runtime (the loadtest/ project). Kept OUT of default-groups
+# so a normal `uv sync` doesn't pull locust's heavy gevent/flask/socketio tree.
+# Opt in with `uv sync --group loadtest`. See loadtest/README.md.
+loadtest = [
+    "locust>=2.32",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "prometheus-client>=0.21",
+]
+
+# Model server specific dependencies (ML packages)
+model_server = [
+    "accelerate==1.6.0",
+    "einops==0.8.1",
+    "numpy==2.4.1",
+    "sentence-transformers==5.4.1",
+    "torch==2.9.1",
+    # Do NOT upgrade to >=5 without addressing the `from_pretrained()` buffer
+    # corruption bug: persistent=False buffers (notably RoPE `inv_freq`) are
+    # loaded with garbage memory, producing all-NaN embeddings.
+    # See https://github.com/huggingface/transformers/issues/44534 and
+    # https://github.com/huggingface/transformers/issues/43950 (both closed
+    # wontfix upstream).
+    "transformers==4.57.6",
+    "sentry-sdk[fastapi,celery,starlette]==2.14.0",
+]
+
+[tool.uv]
+# uv is used for dependency management only. The onyx "project" is never built
+# or installed as a package: Docker images copy the source tree and install
+# deps from the requirements exports, and local imports resolve via cwd /
+# PYTHONPATH conventions (see backend/pytest.ini).
+package = false
+default-groups = ["backend", "dev", "ee", "model_server"]
+
+# Loosen mitmproxy's over-tight upper caps so the resolver keeps the
+# backend's newer versions.
+override-dependencies = [
+    "brotli>=1.2.0,<2.0",
+    "h11>=0.11,<1.0",
+    "cryptography>=42.0,<50.0",
+    "h2>=4.3.0,<5.0",
+    "hyperframe>=6.1.0,<7.0",
+    # mitmproxy 12.x already pins tornado to the 6.5 series; keep this floor
+    # explicit so a future resolver change can't drop back to the <=6.4.2 that
+    # mitmproxy 11.x capped to (CVE-2025-47287, multipart logging DoS).
+    "tornado>=6.5.0,<7.0",
+    "msgpack>=1.0.0,<2.0",
+]
+
+[tool.ty.environment]
+python-version = "3.13"
+root = ["./backend"]
+# Ensure ty resolves onyx.* from this project's backend directory first, even
+# when PYTHONPATH contains another checkout (e.g. when working in a git worktree
+# alongside the main repo).
+extra-paths = ["backend"]
+
+[tool.ty.src]
+include = ["backend"]
+exclude = [
+    "**/generated/**",
+    "**/.venv/**",
+    "**/onyx/server/features/build/sandbox/image/sandbox_daemon/**",
+    "**/onyx/skills/builtin/**",
+    "**/onyx/server/features/build/sandbox/image/templates/**",
+]
+
+[tool.ty.rules]
+# Strict: all rules are errors. Existing false positives are suppressed per-line
+# with # ty: ignore[rule] comments. New code that introduces these errors will
+# fail CI.
+all = "error"
+
+[tool.uv.workspace]
+members = ["tools/ods"]
+
+[tool.basedpyright]
+include = ["backend"]
+exclude = [
+    "backend/generated",
+    "backend/onyx/server/features/build/sandbox/image/sandbox_daemon",
+    "backend/onyx/skills/builtin/pptx",
+]
+typeCheckingMode = "off"
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+ignore = [
+    "E501", # Long lines are handled by `ruff format`.
+    # flake8-bandit (S) rules ignored as noisy / low-signal:
+    "S101", # `assert` — used heavily in pytest and as runtime invariant checks.
+    "S105", # Hardcoded password string — very high false-positive rate.
+    "S106", # Hardcoded password func arg — very high false-positive rate.
+    "S107", # Hardcoded password default — very high false-positive rate.
+    "S110", # try/except/pass — intentional pattern.
+    "S112", # try/except/continue — intentional pattern.
+    "S311", # Non-crypto random — used for jitter/sampling/non-security purposes.
+    "S603", # subprocess without shell=True — this is the *correct* invocation form.
+    "S607", # Start-process with partial path — common and low signal.
+    # Tracked in kanban ticket #491 — to be removed once existing violations are
+    # cleaned up:
+    "S113", # request-without-timeout (~463 existing violations).
+]
+# G004: f-strings in logging break Sentry's message-pattern grouping.
+select = ["ARG", "E", "F", "G004", "I", "S", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["onyx", "ee", "tests", "shared_configs", "model_server"]
+
+[tool.ruff.lint.per-file-ignores]
+# alembic has a folder named `alembic` in backend/ which confuses import sorters.
+# Migrations write raw DDL, so S608 (hardcoded-sql) is unavoidable.
+"backend/alembic/**" = ["I", "S608"]
+"backend/alembic_tenants/**" = ["I", "S608"]
+# Tests use asserts, mock credentials, and lots of patterns the bandit rules
+# flag as suspicious. Disable the full S rule set in tests.
+"backend/tests/**" = ["S"]
+# Ops and developer scripts run by humans (kubectl exec payloads, one-off
+# data dumps, manual tenant cleanup) commonly use `/tmp/...` script payloads,
+# pipe shell commands, and build ad-hoc SQL against trusted internal inputs
+# (tenant IDs, schema names). Other S rules still apply.
+"backend/scripts/**" = ["S108", "S602", "S608"]

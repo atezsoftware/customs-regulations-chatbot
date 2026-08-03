@@ -1,0 +1,164 @@
+# Regulatory production-lite overlay.
+#
+# Apply this after docker-compose.yml or docker-compose.prod.yml. It replaces
+# only the backend runtime image and source-document ingestion capability. The
+# base compose file remains responsible for PostgreSQL, OpenSearch, Redis,
+# object storage, model servers, web, and nginx. The profile-gated job below is
+# the only migration owner.
+
+services:
+  api_server:
+    # Production consumes a published, immutable image. `!reset` removes the
+    # build definition inherited from the base compose file.
+    image: ${ONYX_BACKEND_LITE_IMAGE:?set ONYX_BACKEND_LITE_IMAGE to the published runtime-lite image by digest}
+    build: !reset null
+    pull_policy: always
+    user: "1001:1001"
+    # The canonical deploy wrapper owns the singleton migration. Startup and
+    # rollback must never run Alembic implicitly.
+    command:
+      - uvicorn
+      - onyx.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    environment:
+      DOCUMENT_IMPORT_ENABLED: "false"
+      DISABLE_ONYX_UPSTREAM_CONNECTIONS: "true"
+      DISABLE_TELEMETRY: "true"
+      ENABLE_CRAFT: "false"
+      ENABLE_PAID_ENTERPRISE_EDITION_FEATURES: "true"
+      LICENSE_ENFORCEMENT_ENABLED: "false"
+      # Make the runtime/migration database target explicit in the rendered
+      # model so preflight can prove that only their credentials differ.
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+
+  background:
+    image: ${ONYX_BACKEND_LITE_IMAGE:?set ONYX_BACKEND_LITE_IMAGE to the published runtime-lite image by digest}
+    build: !reset null
+    pull_policy: always
+    # Supervisor stays root solely to prepare the mounted log directory and
+    # drop each managed process to `onyx`. Only flat, known log files are
+    # touched so an old volume cannot trigger an unbounded recursive chown.
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        if [ -f /etc/ssl/certs/custom-ca.crt ]; then update-ca-certificates; fi
+        chown onyx:onyx /var/log/onyx
+        for log_file in /var/log/onyx/*.log; do
+          [ ! -e "$$log_file" ] || chown onyx:onyx "$$log_file"
+        done
+        exec /app/scripts/supervisord_entrypoint.sh
+    depends_on:
+      # The production-lite worker never indexes source documents. Removing
+      # this inherited dependency prevents the heavyweight indexing model
+      # server from being activated through the base Compose graph.
+      indexing_model_server: !reset null
+    environment:
+      DOCUMENT_IMPORT_ENABLED: "false"
+      DISABLE_ONYX_UPSTREAM_CONNECTIONS: "true"
+      DISABLE_TELEMETRY: "true"
+      ENABLE_CRAFT: "false"
+      ENABLE_PAID_ENTERPRISE_EDITION_FEATURES: "true"
+      LICENSE_ENFORCEMENT_ENABLED: "false"
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import subprocess
+          result = subprocess.run(["supervisorctl", "status"], capture_output=True, text=True)
+          rows = [line.split() for line in result.stdout.splitlines() if line.split()]
+          expected = {"celery_worker_regulatory_benchmark", "celery_worker_user_file_maintenance", "celery_worker_light", "celery_worker_monitoring", "log-redirect-handler"}
+          assert result.returncode == 0 and {row[0] for row in rows} == expected and all(len(row) > 1 and row[1] == "RUNNING" for row in rows)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  web_server:
+    image: ${ONYX_WEB_SERVER_IMAGE:?set ONYX_WEB_SERVER_IMAGE to the matching published web image by digest}
+    build: !reset null
+    pull_policy: always
+    # The base file loads the full application environment. The web proxy only
+    # receives its small, non-secret runtime configuration.
+    env_file: !override
+      - path: .env.web
+        required: true
+    environment:
+      DISABLE_ONYX_UPSTREAM_CONNECTIONS: "true"
+      NEXT_PUBLIC_DISABLE_ONYX_UPSTREAM_CONNECTIONS: "true"
+
+  # The base Compose cache is intentionally ephemeral. Regulatory benchmark
+  # and maintenance jobs need broker messages to survive a container restart,
+  # so Compose-managed Redis uses an AOF-backed named volume here.
+  cache:
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+    tmpfs: !reset []
+    volumes:
+      - regulatory_cache_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  code-interpreter:
+    profiles: ["code-interpreter"]
+
+  inference_model_server:
+    image: ${ONYX_MODEL_SERVER_IMAGE:?set ONYX_MODEL_SERVER_IMAGE to the matching published model image by digest}
+    build: !reset null
+    pull_policy: always
+
+  # Local inference remains part of the default search/chat stack. The
+  # indexing-only model server is needed solely by an explicitly enabled
+  # indexing deployment, never by parser-free production.
+  indexing_model_server:
+    image: ${ONYX_MODEL_SERVER_IMAGE:?set ONYX_MODEL_SERVER_IMAGE to the matching published model image by digest}
+    build: !reset null
+    pull_policy: always
+    profiles: ["indexing-model-server"]
+
+  # Schema changes are owned by a single, explicitly invoked job. The common
+  # environment supplies topology/provider configuration; the second file
+  # replaces only the database identity with the dedicated migration role.
+  regulatory_migration:
+    image: ${ONYX_BACKEND_LITE_IMAGE:?set ONYX_BACKEND_LITE_IMAGE to the published runtime-lite image by digest}
+    build: !reset null
+    pull_policy: always
+    user: "1001:1001"
+    profiles: ["regulatory-migration"]
+    env_file:
+      - path: .env
+        required: true
+      - path: .env.migration
+        required: true
+    environment:
+      DOCUMENT_IMPORT_ENABLED: "false"
+      MULTI_TENANT: ${MULTI_TENANT:-false}
+      POSTGRES_HOST: ${POSTGRES_HOST:-relational_db}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    command:
+      - alembic
+      - upgrade
+      - head
+    restart: "no"
+
+volumes:
+  regulatory_cache_data:

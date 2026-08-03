@@ -1,0 +1,48 @@
+# Required overlay when PostgreSQL, OpenSearch, Redis, and MinIO are managed by
+# this Compose project. Every data-infrastructure artifact is supplied by an
+# organization-approved immutable digest. Edge images are pinned separately.
+
+services:
+  relational_db:
+    image: ${REGULATORY_POSTGRES_IMAGE:?set REGULATORY_POSTGRES_IMAGE to an approved repository@sha256 digest}
+    pull_policy: always
+    # The database bootstrap/owner identity must not come from the common
+    # application environment, which contains the restricted runtime role.
+    env_file: !override
+      - path: .env.db-admin
+        required: true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  opensearch:
+    image: ${REGULATORY_OPENSEARCH_IMAGE:?set REGULATORY_OPENSEARCH_IMAGE to an approved repository@sha256 digest}
+    pull_policy: always
+    healthcheck:
+      # Keep the credential reference inside the container. `$$` prevents
+      # Compose from interpolating the password into the rendered model.
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error --insecure
+          --max-time 8
+          --user "admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
+          "https://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s"
+          >/dev/null
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+  cache:
+    image: ${REGULATORY_REDIS_IMAGE:?set REGULATORY_REDIS_IMAGE to an approved repository@sha256 digest}
+    pull_policy: always
+
+  minio:
+    image: ${REGULATORY_MINIO_IMAGE:?set REGULATORY_MINIO_IMAGE to an approved repository@sha256 digest}
+    pull_policy: always

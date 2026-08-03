@@ -1,0 +1,112 @@
+# One-shot regulatory document importer.
+#
+# This file is deliberately standalone: it does not start databases, queues,
+# migrations, or any public listener. It consumes the separately published
+# full-runtime importer image so binary document parsers stay outside the
+# production-lite image and no build runs on the importer host.
+
+name: regulatory-importer
+
+services:
+  importer:
+    profiles: ["importer"]
+    image: ${ONYX_IMPORTER_IMAGE:?set ONYX_IMPORTER_IMAGE to the published importer image by digest}
+    pull_policy: always
+    entrypoint: ["python", "-m", "scripts.regulatory_import"]
+    command: ["--help"]
+    restart: "no"
+    init: true
+    user: "${IMPORTER_UID:?set IMPORTER_UID to the host output-directory owner}:${IMPORTER_GID:?set IMPORTER_GID to the host output-directory group}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    tmpfs:
+      - /tmp:mode=1777
+    volumes:
+      - type: bind
+        source: ${IMPORTER_SOURCE_DIR:?set IMPORTER_SOURCE_DIR to an absolute directory containing documents}
+        target: /imports
+        read_only: true
+      - type: bind
+        source: ${IMPORTER_OUTPUT_DIR:?set IMPORTER_OUTPUT_DIR to an absolute directory for manifests}
+        target: /output
+      - type: bind
+        source: ${IMPORTER_CA_BUNDLE_PATH:?set IMPORTER_CA_BUNDLE_PATH to a trusted CA bundle file}
+        target: /run/secrets/importer-ca.pem
+        read_only: true
+    environment:
+      # Import is enabled only inside this one-shot container.
+      DOCUMENT_IMPORT_ENABLED: "true"
+      DISABLE_ONYX_UPSTREAM_CONNECTIONS: "true"
+      DISABLE_TELEMETRY: "true"
+      DO_NOT_TRACK: "true"
+      ENABLE_PAID_ENTERPRISE_EDITION_FEATURES: "true"
+      LICENSE_ENFORCEMENT_ENABLED: "false"
+      LOG_TO_FILE: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      TMPDIR: /tmp
+
+      # The importer must use the same tenant catalog and encryption secret as production.
+      MULTI_TENANT: ${IMPORTER_MULTI_TENANT:?set IMPORTER_MULTI_TENANT to true or false}
+      POSTGRES_DEFAULT_SCHEMA: ${IMPORTER_POSTGRES_DEFAULT_SCHEMA:?set the production default schema}
+      ENCRYPTION_KEY_SECRET: ${IMPORTER_ENCRYPTION_KEY_SECRET:?set the production encryption secret}
+      ONYX_DB_SHARDS: ${IMPORTER_ONYX_DB_SHARDS:-}
+      ONYX_DB_DEFAULT_SHARD: ${IMPORTER_ONYX_DB_DEFAULT_SHARD:-default}
+      ONYX_DB_CATALOG_SHARD: ${IMPORTER_ONYX_DB_CATALOG_SHARD:-default}
+
+      # PostgreSQL is external and is never created or migrated by this compose file.
+      POSTGRES_HOST: ${IMPORTER_POSTGRES_HOST:?set a reachable PostgreSQL host}
+      POSTGRES_PORT: ${IMPORTER_POSTGRES_PORT:?set the PostgreSQL port}
+      POSTGRES_DB: ${IMPORTER_POSTGRES_DB:?set the production database name}
+      POSTGRES_USER: ${IMPORTER_POSTGRES_USER:?set the importer database user}
+      POSTGRES_PASSWORD: ${IMPORTER_POSTGRES_PASSWORD:?set the importer database password}
+      USE_IAM_AUTH: ${IMPORTER_USE_IAM_AUTH:?set IMPORTER_USE_IAM_AUTH to true or false}
+      POSTGRES_SSLMODE: ${IMPORTER_POSTGRES_SSLMODE:?set an explicit PostgreSQL TLS mode}
+      POSTGRES_SSLROOTCERT: /run/secrets/importer-ca.pem
+
+      # OpenSearch must be the same cluster used by the production API.
+      OPENSEARCH_HOST: ${IMPORTER_OPENSEARCH_HOST:?set a reachable OpenSearch host}
+      OPENSEARCH_REST_API_PORT: ${IMPORTER_OPENSEARCH_PORT:?set the OpenSearch REST port}
+      OPENSEARCH_AUTH_METHOD: ${IMPORTER_OPENSEARCH_AUTH_METHOD:?set basic or iam}
+      OPENSEARCH_ADMIN_USERNAME: ${IMPORTER_OPENSEARCH_USERNAME:-}
+      OPENSEARCH_ADMIN_PASSWORD: ${IMPORTER_OPENSEARCH_PASSWORD:-}
+      OPENSEARCH_USE_SSL: ${IMPORTER_OPENSEARCH_USE_SSL:?set true or false explicitly}
+      OPENSEARCH_VERIFY_CERTS: ${IMPORTER_OPENSEARCH_VERIFY_CERTS:?set true or false explicitly}
+      OPENSEARCH_CA_CERTS: /run/secrets/importer-ca.pem
+      USING_AWS_MANAGED_OPENSEARCH: ${IMPORTER_USING_AWS_MANAGED_OPENSEARCH:-false}
+      OPENSEARCH_AWS_REGION: ${IMPORTER_OPENSEARCH_AWS_REGION:-}
+      OPENSEARCH_AWS_SERVICE: ${IMPORTER_OPENSEARCH_AWS_SERVICE:-es}
+
+      # Originals and citation previews must use the same object-store backend.
+      FILE_STORE_BACKEND: ${IMPORTER_FILE_STORE_BACKEND:?set s3 or postgres}
+      S3_ENDPOINT_URL: ${IMPORTER_S3_ENDPOINT_URL:-}
+      S3_AWS_ACCESS_KEY_ID: ${IMPORTER_S3_ACCESS_KEY_ID:-}
+      S3_AWS_SECRET_ACCESS_KEY: ${IMPORTER_S3_SECRET_ACCESS_KEY:-}
+      S3_FILE_STORE_BUCKET_NAME: ${IMPORTER_S3_BUCKET_NAME:-}
+      S3_FILE_STORE_PREFIX: ${IMPORTER_S3_PREFIX:-onyx-files}
+      S3_VERIFY_SSL: ${IMPORTER_S3_VERIFY_SSL:?set true or false explicitly}
+      AWS_REGION_NAME: ${IMPORTER_AWS_REGION:?set the object-store/AWS region}
+      # Standard boto3 credential chain for RDS/OpenSearch IAM and AWS S3.
+      # Temporary credentials must include the session token.
+      AWS_ACCESS_KEY_ID: ${IMPORTER_AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${IMPORTER_AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${IMPORTER_AWS_SESSION_TOKEN:-}
+
+      # Reuse the production SearchSettings. Cloud-model mode needs no model-server container.
+      DISABLE_MODEL_SERVER: ${IMPORTER_DISABLE_MODEL_SERVER:?set true for cloud embeddings, false for a reachable model server}
+      SKIP_WARM_UP: "true"
+      MODEL_SERVER_HOST: ${IMPORTER_MODEL_SERVER_HOST:-disabled}
+      MODEL_SERVER_PORT: ${IMPORTER_MODEL_SERVER_PORT:-9000}
+      INDEXING_MODEL_SERVER_HOST: ${IMPORTER_INDEXING_MODEL_SERVER_HOST:-disabled}
+      INDEXING_MODEL_SERVER_PORT: ${IMPORTER_INDEXING_MODEL_SERVER_PORT:-9000}
+      ENABLE_CONTEXTUAL_RAG: ${IMPORTER_ENABLE_CONTEXTUAL_RAG:?match the production contextual retrieval setting}
+
+      # Make the mounted trust bundle available to HTTPS clients used by providers and S3.
+      SSL_CERT_FILE: /run/secrets/importer-ca.pem
+      REQUESTS_CA_BUNDLE: /run/secrets/importer-ca.pem
+      AWS_CA_BUNDLE: /run/secrets/importer-ca.pem

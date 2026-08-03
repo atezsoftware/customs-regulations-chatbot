@@ -1,0 +1,234 @@
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from onyx.auth.users import current_curator_or_admin_user
+from onyx.configs.constants import DEFAULT_CC_PAIR_ID, PUBLIC_API_TAGS
+from onyx.connectors.models import Document, IndexAttemptMetadata
+from onyx.db.connector_credential_pair import get_connector_credential_pair_from_id
+from onyx.db.document import (
+    delete_documents_complete,
+    get_document,
+    get_documents_by_cc_pair,
+    get_ingestion_documents,
+)
+from onyx.db.engine.sql_engine import get_session
+from onyx.db.models import User
+from onyx.db.port_orphan_candidate import (
+    delete_port_orphan_candidates_by_id,
+    record_port_orphan_candidates_for_document,
+)
+from onyx.db.search_settings import (
+    get_active_search_settings,
+    get_current_search_settings,
+    get_secondary_search_settings,
+)
+from onyx.document_index.factory import get_all_document_indices
+from onyx.file_processing.import_capability import ensure_document_import_available
+from onyx.indexing.adapters.document_indexing_adapter import (
+    DocumentIndexingBatchAdapter,
+)
+from onyx.indexing.embedder import DefaultIndexingEmbedder
+from onyx.indexing.indexing_pipeline import run_indexing_pipeline
+from onyx.server.onyx_api.models import (
+    DocMinimalInfo,
+    IngestionDocument,
+    IngestionResult,
+)
+from onyx.server.utils_vector_db import require_vector_db
+from onyx.utils.logger import setup_logger
+from shared_configs.contextvars import get_current_tenant_id
+
+logger = setup_logger()
+
+# not using /api to avoid confusion with nginx api path routing
+router = APIRouter(prefix="/onyx-api", tags=PUBLIC_API_TAGS)
+
+
+@router.get("/connector-docs/{cc_pair_id}")
+def get_docs_by_connector_credential_pair(
+    cc_pair_id: int,
+    _: User = Depends(current_curator_or_admin_user),
+    db_session: Session = Depends(get_session),
+) -> list[DocMinimalInfo]:
+    db_docs = get_documents_by_cc_pair(cc_pair_id=cc_pair_id, db_session=db_session)
+    return [
+        DocMinimalInfo(
+            document_id=doc.id,
+            semantic_id=doc.semantic_id,
+            link=doc.link,
+        )
+        for doc in db_docs
+    ]
+
+
+@router.get("/ingestion")
+def get_ingestion_docs(
+    _: User = Depends(current_curator_or_admin_user),
+    db_session: Session = Depends(get_session),
+) -> list[DocMinimalInfo]:
+    db_docs = get_ingestion_documents(db_session)
+    return [
+        DocMinimalInfo(
+            document_id=doc.id,
+            semantic_id=doc.semantic_id,
+            link=doc.link,
+        )
+        for doc in db_docs
+    ]
+
+
+@router.post("/ingestion", dependencies=[Depends(require_vector_db)])
+def upsert_ingestion_doc(
+    doc_info: IngestionDocument,
+    _: User = Depends(current_curator_or_admin_user),
+    db_session: Session = Depends(get_session),
+) -> IngestionResult:
+    ensure_document_import_available()
+    tenant_id = get_current_tenant_id()
+
+    doc_info.document.from_ingestion_api = True
+
+    if doc_info.document.doc_updated_at is None:
+        doc_info.document.doc_updated_at = datetime.now(tz=timezone.utc)
+
+    document = Document.from_base(doc_info.document)
+
+    cc_pair = get_connector_credential_pair_from_id(
+        db_session=db_session,
+        cc_pair_id=doc_info.cc_pair_id or DEFAULT_CC_PAIR_ID,
+    )
+    if cc_pair is None:
+        raise HTTPException(
+            status_code=400, detail="Connector-Credential Pair specified does not exist"
+        )
+
+    # Need to index for both the primary and secondary index if possible
+    active_search_settings = get_active_search_settings(db_session)
+    # This flow is for indexing so we get all indices.
+    document_indices = get_all_document_indices(
+        active_search_settings.primary,
+        None,
+        None,
+    )
+
+    search_settings = get_current_search_settings(db_session)
+
+    index_embedding_model = DefaultIndexingEmbedder.from_db_search_settings(
+        search_settings=search_settings
+    )
+
+    # Build adapter for primary indexing
+    adapter = DocumentIndexingBatchAdapter(
+        connector_id=cc_pair.connector_id,
+        credential_id=cc_pair.credential_id,
+        tenant_id=tenant_id,
+        index_attempt_metadata=IndexAttemptMetadata(
+            connector_id=cc_pair.connector_id,
+            credential_id=cc_pair.credential_id,
+        ),
+    )
+
+    indexing_pipeline_result = run_indexing_pipeline(
+        embedder=index_embedding_model,
+        document_indices=document_indices,
+        ignore_time_skip=True,
+        db_session=db_session,
+        tenant_id=tenant_id,
+        document_batch=[document],
+        request_id=None,
+        adapter=adapter,
+    )
+
+    # If there's a secondary index being built, index the doc but don't use it for return here
+    if active_search_settings.secondary:
+        sec_search_settings = get_secondary_search_settings(db_session)
+
+        if sec_search_settings is None:
+            # Should not ever happen
+            raise RuntimeError(
+                "Secondary index exists but no search settings configured"
+            )
+
+        new_index_embedding_model = DefaultIndexingEmbedder.from_db_search_settings(
+            search_settings=sec_search_settings
+        )
+
+        # This flow is for indexing so we get all indices.
+        sec_document_indices = get_all_document_indices(
+            active_search_settings.secondary, None, None
+        )
+
+        run_indexing_pipeline(
+            embedder=new_index_embedding_model,
+            document_indices=sec_document_indices,
+            ignore_time_skip=True,
+            # FUTURE write: skip content_hash dedup, else the primary run's hash
+            # suppresses this into a no-op.
+            index_to_secondary=True,
+            db_session=db_session,
+            tenant_id=tenant_id,
+            document_batch=[document],
+            request_id=None,
+            adapter=adapter,
+        )
+
+    return IngestionResult(
+        document_id=document.id,
+        already_existed=indexing_pipeline_result.new_docs == 0,
+    )
+
+
+@router.delete("/ingestion/{document_id}", dependencies=[Depends(require_vector_db)])
+def delete_ingestion_doc(
+    document_id: str,
+    _: User = Depends(current_curator_or_admin_user),
+    db_session: Session = Depends(get_session),
+) -> None:
+    # Verify the document exists and was created via the ingestion API
+    document = get_document(document_id=document_id, db_session=db_session)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if not document.from_ingestion_api:
+        raise HTTPException(
+            status_code=400,
+            detail="Document was not created via the ingestion API",
+        )
+
+    active_search_settings = get_active_search_settings(db_session)
+
+    # If a port is filling a target index, record this delete before the index delete
+    # below so a racing create-only copy that resurrects the doc is swept back out.
+    recorded_ids = record_port_orphan_candidates_for_document(
+        db_session,
+        document_id,
+        active_search_settings.primary,
+        active_search_settings.secondary,
+    )
+    if recorded_ids:
+        db_session.commit()
+
+    # This flow is for deletion so we get all indices.
+    document_indices = get_all_document_indices(
+        active_search_settings.primary,
+        active_search_settings.secondary,
+        None,
+    )
+    try:
+        for document_index in document_indices:
+            document_index.delete(
+                document_id,
+                chunk_count=document.chunk_count,
+            )
+        delete_documents_complete(db_session, [document_id])
+    except Exception:
+        # A failed DB delete leaves the session aborted; roll back before the candidate
+        # cleanup or it raises and masks the real error. The doc stays live (no retry here),
+        # so drop only the rows this call inserted to keep the sweep off its live chunks.
+        db_session.rollback()
+        if recorded_ids:
+            delete_port_orphan_candidates_by_id(db_session, recorded_ids)
+            db_session.commit()
+        raise

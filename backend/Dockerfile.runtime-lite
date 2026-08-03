@@ -1,0 +1,113 @@
+####################################################################################################
+# Regulatory production-lite builder
+#
+# Kept in its own Dockerfile so legacy Docker builders never execute or cache the full document-
+# import/Playwright stages while building production. The lock export contains API/chat/search and
+# dedicated lightweight-worker dependencies only.
+####################################################################################################
+ARG BASE_IMAGE_REGISTRY=docker.io
+FROM ${BASE_IMAGE_REGISTRY}/library/python:3.13-slim@sha256:b04b5d7233d2ad9c379e22ea8927cd1378cd15c60d4ef876c065b25ea8fb3bf3 AS runtime-lite-builder
+
+COPY --from=ghcr.io/astral-sh/uv:0.11.25@sha256:1e3808aa9023d0980e7c15b1fa7c1ac16ff35925780cf5c459858b2d693f01a9 /uv /uvx /bin/
+
+RUN apt-get update && \
+    apt-get install -y \
+        cmake \
+        curl \
+        zip \
+        ca-certificates \
+        libgnutls30 \
+        libblkid1 \
+        libmount1 \
+        libsmartcols1 \
+        libuuid1 \
+        libxmlsec1-dev \
+        pkg-config \
+        gcc \
+        && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
+
+COPY ./requirements/runtime.txt /tmp/runtime-requirements.txt
+COPY ./requirements/ee.txt /tmp/ee-requirements.txt
+RUN uv pip install --system --no-cache-dir --no-deps --require-hashes \
+        -r /tmp/runtime-requirements.txt \
+        -r /tmp/ee-requirements.txt && \
+    rm -f /usr/local/lib/python3.13/site-packages/tornado/test/test.key && \
+    rm -rf ~/.cache/uv /tmp/*.txt
+
+
+####################################################################################################
+# Regulatory production-lite runtime
+#
+# Source-document parsing remains in the separate full-runtime importer. This target deliberately
+# has no Playwright browser installation and no build-time model/corpus downloads.
+####################################################################################################
+FROM ${BASE_IMAGE_REGISTRY}/library/python:3.13-slim@sha256:b04b5d7233d2ad9c379e22ea8927cd1378cd15c60d4ef876c065b25ea8fb3bf3 AS runtime-lite
+
+ARG ONYX_VERSION=0.0.0-dev
+ARG SOURCE_REVISION=unknown
+LABEL com.danswer.description="Regulatory API, chat, search, and lightweight workers" \
+    org.opencontainers.image.version="${ONYX_VERSION}" \
+    org.opencontainers.image.revision="${SOURCE_REVISION}" \
+    io.regulatory.role="runtime-lite" \
+    io.regulatory.document-import="false"
+
+ENV ONYX_RUNNING_IN_DOCKER="true" \
+    DO_NOT_TRACK="true" \
+    DOCUMENT_IMPORT_ENABLED="false"
+
+RUN groupadd -g 1001 onyx && \
+    useradd -u 1001 -g onyx -m -s /bin/bash onyx && \
+    mkdir -p /var/log/onyx /app/file-system && \
+    chmod 750 /var/log/onyx /app/file-system && \
+    chown onyx:onyx /var/log/onyx /app/file-system
+
+RUN apt-get update && \
+    apt-get install -y \
+        zip \
+        ca-certificates \
+        libgnutls30 \
+        libblkid1 \
+        libmount1 \
+        libsmartcols1 \
+        libuuid1 \
+        libjemalloc2 \
+        libxmlsec1-openssl \
+        && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
+
+COPY --from=runtime-lite-builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=runtime-lite-builder \
+    /usr/local/bin/alembic \
+    /usr/local/bin/celery \
+    /usr/local/bin/uvicorn \
+    /usr/local/bin/supervisord \
+    /usr/local/bin/supervisorctl \
+    /usr/local/bin/
+RUN ln -s /usr/local/bin/supervisord /usr/bin/supervisord
+
+WORKDIR /app
+
+COPY --chown=onyx:onyx ./ee /app/ee
+COPY supervisord-lite.conf /etc/supervisor/conf.d/supervisord.conf
+COPY --chown=onyx:onyx ./onyx /app/onyx
+COPY --chown=onyx:onyx ./shared_configs /app/shared_configs
+COPY --chown=onyx:onyx ./alembic /app/alembic
+COPY --chown=onyx:onyx ./alembic_tenants /app/alembic_tenants
+COPY --chown=onyx:onyx ./alembic.ini /app/alembic.ini
+COPY supervisord-lite.conf /usr/etc/supervisord.conf
+COPY --chown=onyx:onyx ./static /app/static
+COPY --chown=onyx:onyx ./keys /app/keys
+COPY --chown=onyx:onyx ./scripts/supervisord_entrypoint.sh /app/scripts/supervisord_entrypoint.sh
+RUN chmod +x /app/scripts/supervisord_entrypoint.sh
+COPY --chown=onyx:onyx ./assets /app/assets
+
+ENV PYTHONPATH=/app
+
+ENV ONYX_VERSION=${ONYX_VERSION}
+
+ENV LD_PRELOAD=libjemalloc.so.2
+
+CMD ["tail", "-f", "/dev/null"]

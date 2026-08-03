@@ -1,0 +1,69 @@
+"use client";
+
+import { useMemo } from "react";
+import { SelectButton } from "@opal/components";
+import { BuildLLMPopover } from "@/app/craft/components/BuildLLMPopover";
+import { useLLMProviders } from "@/lib/languageModels/hooks";
+import { getModelIcon } from "@/lib/languageModels";
+import { BuildLlmSelection } from "@/app/craft/onboarding/constants";
+import { getPreferredLlmSelection } from "@/app/craft/utils/llmPreferences";
+import { useUser } from "@/providers/UserProvider";
+
+interface ModelPickerButtonProps {
+  // null → show the recommended default.
+  selection: BuildLlmSelection | null;
+  onChange: (selection: BuildLlmSelection) => void;
+  disabled?: boolean;
+}
+
+// Controlled model picker pill matching the main app's ModelSelector.
+export default function ModelPickerButton({
+  selection,
+  onChange,
+  disabled = false,
+}: ModelPickerButtonProps) {
+  const { llmProviders } = useLLMProviders();
+  const { user } = useUser();
+
+  const effective = useMemo(
+    () => selection ?? getPreferredLlmSelection(user?.id, llmProviders),
+    [selection, user?.id, llmProviders]
+  );
+
+  const displayName = useMemo(() => {
+    if (!effective) return "Select model";
+    const provider = llmProviders?.find(
+      (candidate) => candidate.id === effective.providerId
+    );
+    const config = provider?.model_configurations.find(
+      (model) => model.name === effective.modelName
+    );
+    if (config) return config.effectiveDisplayName;
+    return effective.modelName;
+  }, [effective, llmProviders]);
+
+  const ModelIcon = effective
+    ? getModelIcon(effective.provider, effective.modelName)
+    : undefined;
+
+  return (
+    <BuildLLMPopover
+      currentSelection={effective}
+      onSelectionChange={onChange}
+      llmProviders={llmProviders}
+      disabled={disabled}
+    >
+      <div className="inline-flex">
+        <SelectButton
+          icon={ModelIcon}
+          state="empty"
+          variant="select-input"
+          size="lg"
+          disabled={disabled}
+        >
+          {displayName}
+        </SelectButton>
+      </div>
+    </BuildLLMPopover>
+  );
+}

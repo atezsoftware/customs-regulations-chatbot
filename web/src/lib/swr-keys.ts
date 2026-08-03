@@ -1,0 +1,261 @@
+/**
+ * Centralized SWR cache key registry.
+ *
+ * All useSWR calls and mutate() calls should reference these constants
+ * instead of inline strings to prevent typos and make key usage greppable.
+ *
+ * For dynamic keys (e.g. per-ID endpoints), use the builder functions.
+ */
+export const SWR_KEYS = {
+  // ── User ──────────────────────────────────────────────────────────────────
+  me: "/api/me",
+
+  // ── Health / Version ──────────────────────────────────────────────────────
+  health: "/api/health",
+  version: "/api/version",
+
+  // ── Settings ──────────────────────────────────────────────────────────────
+  settings: "/api/settings",
+  enterpriseSettings: "/api/enterprise-settings",
+  customAnalyticsScript: "/api/enterprise-settings/custom-analytics-script",
+  authType: "/api/auth/type",
+  adminSecuritySettings: "/api/admin/security",
+  adminSsoProviders: "/api/admin/sso/provider",
+
+  // ── Agents / Personas ─────────────────────────────────────────────────────
+  personas: "/api/persona",
+  persona: (id: number) => `/api/persona/${id}`,
+  agentPreferences: "/api/user/assistant/preferences",
+  defaultAssistantConfig: "/api/admin/default-assistant/configuration",
+  personaLabels: "/api/persona/labels",
+  adminAgents: "/api/admin/agents",
+  adminPersona: "/api/admin/persona",
+
+  // ── LLM Providers ─────────────────────────────────────────────────────────
+  llmProviders: "/api/llm/provider",
+  llmProvidersForPersona: (personaId: number) =>
+    `/api/llm/persona/${personaId}/providers`,
+  adminLlmProviders: "/api/admin/llm/provider",
+  llmProvidersWithImageGen: "/api/admin/llm/provider?include_image_gen=true",
+  customProviderNames: "/api/admin/llm/custom-provider-names",
+  wellKnownLlmProviders: "/api/admin/llm/built-in/options",
+  wellKnownLlmProvider: (providerEndpoint: string) =>
+    `/api/admin/llm/built-in/options/${providerEndpoint}`,
+  llmContextualCost: "/api/admin/llm/provider-contextual-cost",
+  userUsage: (days: number) => `/api/user/usage?days=${days}`,
+  costOverrides: "/api/admin/cost-overrides",
+  adminUsageExport: "/api/admin/usage/export",
+  adminUsageReset: "/api/admin/usage/reset",
+
+  // ── Image Generation ──────────────────────────────────────────────────────
+  imageGenConfig: "/api/admin/image-generation/config",
+
+  // ── Documents ─────────────────────────────────────────────────────────────
+  documentSets: "/api/manage/document-set",
+  documentSetsEditable: "/api/manage/document-set?get_editable=true",
+  tags: "/api/query/valid-tags",
+  connectorStatus: "/api/manage/connector-status",
+
+  // ── Credentials & Connectors ──────────────────────────────────────────────
+  adminCredentials: "/api/manage/admin/credential",
+  indexingStatus: "/api/manage/admin/connector/indexing-status",
+  adminConnectorStatus: "/api/manage/admin/connector/status",
+  federatedConnectors: "/api/federated",
+
+  // ── Google Connectors ─────────────────────────────────────────────────────
+  googleConnectorCredentials: (service: "gmail" | "google-drive") =>
+    `/api/manage/admin/connector/${service}/credentials`,
+  googleConnectorPublicCredential: (service: "gmail" | "google-drive") =>
+    `/api/manage/admin/connector/${service}/public-credential`,
+  googleConnectorServiceAccountCredential: (
+    service: "gmail" | "google-drive"
+  ) => `/api/manage/admin/connector/${service}/service-account-credential`,
+
+  // ── Search Settings ───────────────────────────────────────────────────────
+  currentSearchSettings: "/api/search-settings/get-current-search-settings",
+  secondarySearchSettings: "/api/search-settings/get-secondary-search-settings",
+  reindexProgress: "/api/search-settings/reindex-progress",
+  reindexErrors: "/api/search-settings/reindex-errors",
+  embeddingProviders: "/api/admin/embedding/embedding-provider",
+
+  // ── Chat Sessions ─────────────────────────────────────────────────────────
+  chatSessions: "/api/chat/get-user-chat-sessions",
+  chatSearch: "/api/chat/search",
+
+  // ── Projects & Files ──────────────────────────────────────────────────────
+  userProjects: "/api/user/projects",
+  recentFiles: "/api/user/files/recent",
+  userPats: "/api/user/pats",
+  userPatScopes: "/api/user/pats/scopes",
+  notifications: "/api/notifications",
+  notificationsSummary: "/api/notifications/summary",
+  notificationsPage: (pageNum: number, pageSize: number) => {
+    const params = new URLSearchParams({
+      page_num: pageNum.toString(),
+      page_size: pageSize.toString(),
+    });
+    return `/api/notifications?${params.toString()}`;
+  },
+  notificationsByType: (notifType: string, pageSize: number) => {
+    const params = new URLSearchParams({
+      notif_type: notifType,
+      page_size: pageSize.toString(),
+    });
+    return `/api/notifications?${params.toString()}`;
+  },
+
+  // ── Users ─────────────────────────────────────────────────────────────────
+  acceptedUsers: "/api/manage/users/accepted/all",
+  invitedUsers: "/api/manage/users/invited",
+  // Curator-accessible listing of all users (and optionally service-account
+  // entries when `?include_api_keys=true`). Used by group create/edit pages so
+  // global curators — who cannot hit the admin-only `/accepted/all` and
+  // `/invited` endpoints — can still load the member picker.
+  groupMemberCandidates: "/api/manage/users?include_api_keys=true",
+  pendingTenantUsers: "/api/tenants/users/pending",
+  userCounts: "/api/manage/users/counts",
+
+  // ── API Keys ──────────────────────────────────────────────────────────────
+  adminApiKeys: "/api/admin/api-key",
+
+  // ── Groups ────────────────────────────────────────────────────────────────
+  adminUserGroups: "/api/manage/admin/user-group",
+  shareableGroups: "/api/manage/user-groups/minimal",
+  scimToken: "/api/admin/enterprise-settings/scim/token",
+
+  // ── MCP Servers ───────────────────────────────────────────────────────────
+  adminMcpServers: "/api/admin/mcp/servers",
+  adminMcpServerToolSnapshots: (serverId: number) =>
+    `/api/admin/mcp/server/${serverId}/tools/snapshots?source=db`,
+  mcpServers: "/api/mcp/servers",
+  mcpServersCraft: "/api/mcp/servers/craft",
+  personaMcpServers: (personaId: number) =>
+    `/api/mcp/servers/persona/${personaId}`,
+
+  // ── Skills ────────────────────────────────────────────────────────────────
+  userSkills: "/api/skills",
+  userSkillPreview: (skillId: string) => `/api/skills/${skillId}/preview`,
+  editableSkill: (skillId: string) => `/api/skills/custom/${skillId}/edit`,
+
+  // ── Tools ─────────────────────────────────────────────────────────────────
+  tools: "/api/tool",
+  openApiTools: "/api/tool/openapi",
+  oauthTokenStatus: "/api/user-oauth-token/status",
+  adminOAuthTestClaims: "/api/admin/oauth-test/claims",
+
+  // ── Voice ─────────────────────────────────────────────────────────────────
+  voiceProviders: "/api/admin/voice/providers",
+  voiceStatus: "/api/voice/status",
+
+  // ── Build (Craft) ─────────────────────────────────────────────────────────
+  buildUserLibraryTree: "/api/build/user-library/tree",
+  buildSessionFiles: (sessionId: string) =>
+    `/api/build/sessions/${sessionId}/files?path=`,
+  buildSessionOutputFiles: (sessionId: string) =>
+    `/api/build/sessions/${sessionId}/files?path=outputs`,
+  buildSessionWebappInfo: (sessionId: string) =>
+    `/api/build/sessions/${sessionId}/webapp-info`,
+  buildSessionArtifacts: (sessionId: string) =>
+    `/api/build/sessions/${sessionId}/artifacts`,
+  buildSessionArtifactFile: (sessionId: string, filePath: string) =>
+    `/api/build/sessions/${sessionId}/artifacts/${filePath}`,
+  buildSessionPptxPreview: (sessionId: string, filePath: string) =>
+    `/api/build/sessions/${sessionId}/pptx-preview/${filePath}`,
+  buildExternalApps: "/api/build/apps",
+  buildExternalAppsAdmin: "/api/build/admin/apps",
+  buildExternalAppsBuiltInOptions: "/api/build/admin/apps/built-in/options",
+  buildBaseInstructions: "/api/build/admin/base-instructions",
+  buildSessionLiveApprovals: (sessionId: string) =>
+    `/api/build/approvals/sessions/${sessionId}/live`,
+
+  // ── Token Rate Limits ─────────────────────────────────────────────────────
+  globalTokenRateLimits: "/api/admin/token-rate-limits/global",
+  userTokenRateLimits: "/api/admin/token-rate-limits/users",
+  userGroupTokenRateLimits: "/api/admin/token-rate-limits/user-groups",
+  userGroupTokenRateLimit: (groupId: number) =>
+    `/api/admin/token-rate-limits/user-group/${groupId}`,
+
+  // ── Usage Reports ─────────────────────────────────────────────────────────
+  usageReport: "/api/admin/usage-report",
+
+  // ── Web Search ────────────────────────────────────────────────────────────
+  webSearchContentProviders: "/api/admin/web-search/content-providers",
+  webSearchSearchProviders: "/api/admin/web-search/search-providers",
+
+  // ── Tracing ───────────────────────────────────────────────────────────────
+  tracingProviders: "/api/admin/tracing/providers",
+
+  // ── Prompt shortcuts ──────────────────────────────────────────────────────
+  promptShortcuts: "/api/input_prompt",
+
+  // ── Admin Banner ──────────────────────────────────────────────────────────
+  adminBanner: "/api/admin/banner",
+
+  // ── License & Billing ─────────────────────────────────────────────────────
+  license: "/api/license",
+  billingInformationCloud: "/api/tenants/billing-information",
+  billingInformationSelfHosted: "/api/admin/billing/billing-information",
+
+  // ── Admin ─────────────────────────────────────────────────────────────────
+  hooks: "/api/admin/hooks",
+  hookSpecs: "/api/admin/hooks/specs",
+
+  // ── Slack Bots ────────────────────────────────────────────────────────────
+  slackChannels: "/api/manage/admin/slack-app/channel",
+  slackBots: "/api/manage/admin/slack-app/bots",
+  slackBot: (botId: number) => `/api/manage/admin/slack-app/bots/${botId}`,
+  slackBotConfig: (botId: number) =>
+    `/api/manage/admin/slack-app/bots/${botId}/config`,
+
+  // ── Standard Answers (EE) ─────────────────────────────────────────────────
+  standardAnswerCategories: "/api/manage/admin/standard-answer/category",
+  standardAnswers: "/api/manage/admin/standard-answer",
+
+  // ── Query History (EE) ────────────────────────────────────────────────────
+  adminChatSessionHistory: "/api/admin/chat-session-history",
+  adminChatSession: (id: string) => `/api/admin/chat-session-history/${id}`,
+
+  // ── MCP Server (per-ID) ───────────────────────────────────────────────────
+  adminMcpServer: (id: number) => `/api/admin/mcp/servers/${id}`,
+
+  // ── Document Processing ───────────────────────────────────────────────────
+  unstructuredApiKeySet: "/api/search-settings/unstructured-api-key-set",
+
+  // ── Connectors ────────────────────────────────────────────────────────────
+  connector: "/api/manage/connector",
+
+  // ── Index Attempts ────────────────────────────────────────────────────────
+  indexAttemptStageMetrics: (indexAttemptId: number) =>
+    `/api/manage/admin/index-attempt/${indexAttemptId}/stage-metrics`,
+
+  // ── CC-Pair Sync Attempts ─────────────────────────────────────────────────
+  // The `*Probe` variants are single-row reads used to surface the
+  // `applicable` flag without paying for a full page; see
+  // `useSyncAttemptsPaginatedFetch`.
+  ccPairPermissionSyncAttempts: (ccPairId: number) =>
+    `/api/manage/admin/cc-pair/${ccPairId}/permission-sync-attempts`,
+  ccPairPermissionSyncAttemptsProbe: (ccPairId: number) =>
+    `/api/manage/admin/cc-pair/${ccPairId}/permission-sync-attempts?page_num=0&page_size=1`,
+  ccPairExternalGroupSyncAttempts: (ccPairId: number) =>
+    `/api/manage/admin/cc-pair/${ccPairId}/external-group-sync-attempts`,
+  ccPairExternalGroupSyncAttemptsProbe: (ccPairId: number) =>
+    `/api/manage/admin/cc-pair/${ccPairId}/external-group-sync-attempts?page_num=0&page_size=1`,
+
+  // ── Indexing Errors ───────────────────────────────────────────────────────
+  // Base key for the per-cc-pair errors endpoint. The page also reads
+  // paginated variants via `usePaginatedFetch`, but `mutate` against
+  // this base key invalidates every variant under the same prefix.
+  ccPairIndexingErrors: (ccPairId: number) =>
+    `/api/manage/admin/cc-pair/${ccPairId}/errors`,
+
+  // ── Scheduled Tasks (Craft) ───────────────────────────────────────────────
+  // `scheduledTaskRuns` is a base URL — the run-history table appends
+  // `?limit=…` / `?cursor=…` for pagination. Invalidate from elsewhere with
+  // a prefix predicate so every paginated variant gets refreshed at once.
+  scheduledTasks: "/api/build/scheduled-tasks",
+  scheduledTask: (taskId: string) => `/api/build/scheduled-tasks/${taskId}`,
+  scheduledTaskRuns: (taskId: string) =>
+    `/api/build/scheduled-tasks/${taskId}/runs`,
+  scheduledRunContext: (sessionId: string) =>
+    `/api/build/sessions/${sessionId}/scheduled-run-context`,
+} as const;

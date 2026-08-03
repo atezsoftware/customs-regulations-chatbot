@@ -1,0 +1,69 @@
+# Docker Compose Override for Development/Testing
+# This file exposes service ports for development and testing purposes.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait
+#
+# Or set COMPOSE_FILE environment variable:
+#   export COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml
+#   docker compose up -d --wait
+#
+# Or let onyx-cli manage the deployment with this overlay stacked on:
+#   onyx-cli deploy install --dev
+
+services:
+  api_server:
+    # Building through this overlay produces the dev image variant (runtime + debugging
+    # tools such as vim/psql/curl), matching the published -dev tag suffix. CI is
+    # unaffected: it injects prebuilt images via ONYX_BACKEND_IMAGE and never builds
+    # through compose.
+    build:
+      target: dev
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "${API_SERVER_CPU_LIMIT:-0}"
+          memory: "${API_SERVER_MEM_LIMIT:-0}"
+
+  background:
+    build:
+      target: dev
+
+  # Uncomment the block below to enable the MCP server for Onyx.
+  # mcp_server:
+  #   ports:
+  #     - "8090:8090"
+
+  relational_db:
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+
+  opensearch:
+    ports:
+      - "${OPENSEARCH_HOST_PORT:-9200}:9200"
+    # Rootless Docker can reject the base OpenSearch ulimit settings, so clear
+    # the inherited block entirely in the dev override.
+    ulimits: !reset null
+    environment:
+      - bootstrap.memory_lock=false
+
+  inference_model_server:
+    ports:
+      - "${MODEL_SERVER_HOST_PORT:-9000}:9000"
+
+  cache:
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+
+  minio:
+    # Use different ports to avoid conflicts with model servers.
+    # TODO(security): prefix 127.0.0.1: to bind loopback, not 0.0.0.0 (LAN-exposed).
+    ports:
+      - "${MINIO_API_HOST_PORT:-9004}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9005}:9001"
+
+  code-interpreter:
+    ports:
+      - "${CODE_INTERPRETER_HOST_PORT:-8000}:8000"

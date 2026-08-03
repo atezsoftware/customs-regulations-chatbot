@@ -1,0 +1,199 @@
+import importlib
+from typing import Any, Type
+
+from sqlalchemy.orm import Session
+
+from onyx.configs.app_configs import INTEGRATION_TESTS_MODE
+from onyx.configs.constants import DocumentSource
+from onyx.configs.llm_configs import get_image_extraction_and_analysis_enabled
+from onyx.connectors.credentials_provider import OnyxDBCredentialsProvider
+from onyx.connectors.exceptions import ConnectorValidationError, ValidationError
+from onyx.connectors.interfaces import (
+    BaseConnector,
+    CheckpointedConnector,
+    CredentialsConnector,
+    EventConnector,
+    LoadConnector,
+    PollConnector,
+)
+from onyx.connectors.models import InputType
+from onyx.connectors.registry import CONNECTOR_CLASS_MAP
+from onyx.db.connector import fetch_connector_by_id
+from onyx.db.credentials import backend_update_credential_json, fetch_credential_by_id
+from onyx.db.enums import AccessType
+from onyx.db.models import Credential
+from onyx.file_store.staging import RawFileCallback
+from onyx.utils.credential_audit import emit_credential_access
+from shared_configs.contextvars import get_current_tenant_id
+
+
+class ConnectorMissingException(Exception):
+    pass
+
+
+# Cache for already imported connector classes
+_connector_cache: dict[DocumentSource, Type[BaseConnector]] = {}
+
+
+def _load_connector_class(source: DocumentSource) -> Type[BaseConnector]:
+    """Dynamically load and cache a connector class."""
+    if source in _connector_cache:
+        return _connector_cache[source]
+
+    if source not in CONNECTOR_CLASS_MAP:
+        raise ConnectorMissingException(f"Connector not found for source={source}")
+
+    mapping = CONNECTOR_CLASS_MAP[source]
+
+    try:
+        module = importlib.import_module(mapping.module_path)
+        connector_class = getattr(module, mapping.class_name)
+        _connector_cache[source] = connector_class
+        return connector_class
+    except (ImportError, AttributeError) as e:
+        raise ConnectorMissingException(
+            f"Failed to import {mapping.class_name} from {mapping.module_path}: {e}"
+        )
+
+
+def _validate_connector_supports_input_type(
+    connector: Type[BaseConnector],
+    input_type: InputType | None,
+    source: DocumentSource,
+) -> None:
+    """Validate that a connector supports the requested input type."""
+    if input_type is None:
+        return
+
+    # Check each input type requirement separately for clarity
+    load_state_unsupported = input_type == InputType.LOAD_STATE and not issubclass(
+        connector, LoadConnector
+    )
+
+    poll_unsupported = (
+        input_type == InputType.POLL
+        # Either poll or checkpoint works for this, in the future
+        # all connectors should be checkpoint connectors
+        and (
+            not issubclass(connector, PollConnector)
+            and not issubclass(connector, CheckpointedConnector)
+        )
+    )
+
+    event_unsupported = input_type == InputType.EVENT and not issubclass(
+        connector, EventConnector
+    )
+
+    if any([load_state_unsupported, poll_unsupported, event_unsupported]):
+        raise ConnectorMissingException(
+            f"Connector for source={source} does not accept input_type={input_type}"
+        )
+
+
+def identify_connector_class(
+    source: DocumentSource,
+    input_type: InputType | None = None,
+) -> Type[BaseConnector]:
+    # Load the connector class using lazy loading
+    connector = _load_connector_class(source)
+
+    # Validate connector supports the requested input_type
+    _validate_connector_supports_input_type(connector, input_type, source)
+
+    return connector
+
+
+def instantiate_connector(
+    db_session: Session,
+    source: DocumentSource,
+    input_type: InputType,
+    connector_specific_config: dict[str, Any],
+    credential: Credential,
+    raw_file_callback: RawFileCallback | None = None,
+) -> BaseConnector:
+    connector_class = identify_connector_class(source, input_type)
+
+    connector = connector_class(**connector_specific_config)
+
+    if isinstance(connector, CredentialsConnector):
+        provider = OnyxDBCredentialsProvider(
+            get_current_tenant_id(), str(source), credential.id
+        )
+        connector.set_credentials_provider(provider)
+    else:
+        if credential.credential_json:
+            # Distinct decrypt site from OnyxDBCredentialsProvider (static /
+            # non-dynamic connectors load creds directly here), so this is not
+            # double-logged. Audit is best-effort and never raises.
+            emit_credential_access(
+                credential_type="connector",
+                provider=str(source),
+                row_id=credential.id,
+            )
+        credential_json = (
+            credential.credential_json.get_value(apply_mask=False)
+            if credential.credential_json
+            else {}
+        )
+        new_credentials = connector.load_credentials(credential_json)
+
+        if new_credentials is not None:
+            backend_update_credential_json(credential, new_credentials, db_session)
+
+    connector.set_allow_images(get_image_extraction_and_analysis_enabled())
+
+    if raw_file_callback is not None:
+        connector.set_raw_file_callback(raw_file_callback)
+
+    return connector
+
+
+def validate_ccpair_for_user(
+    connector_id: int,
+    credential_id: int,
+    access_type: AccessType,
+    db_session: Session,
+    enforce_creation: bool = True,
+) -> bool:
+    if INTEGRATION_TESTS_MODE:
+        return True
+
+    # Validate the connector settings
+    connector = fetch_connector_by_id(connector_id, db_session)
+    credential = fetch_credential_by_id(
+        credential_id,
+        db_session,
+    )
+
+    if not connector:
+        raise ValueError("Connector not found")
+
+    if (
+        connector.source == DocumentSource.INGESTION_API
+        or connector.source == DocumentSource.MOCK_CONNECTOR
+    ):
+        return True
+
+    if not credential:
+        raise ValueError("Credential not found")
+
+    try:
+        runnable_connector = instantiate_connector(
+            db_session=db_session,
+            source=connector.source,
+            input_type=connector.input_type,
+            connector_specific_config=connector.connector_specific_config,
+            credential=credential,
+        )
+        runnable_connector.validate_connector_settings()
+        if access_type == AccessType.SYNC:
+            runnable_connector.validate_perm_sync()
+    except ValidationError:
+        raise
+    except Exception as e:
+        if enforce_creation:
+            raise ConnectorValidationError(str(e))
+        else:
+            return False
+
+    return True

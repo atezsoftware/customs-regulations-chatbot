@@ -1,0 +1,70 @@
+# =============================================================================
+# NO LOCAL MODELS OVERLAY
+# =============================================================================
+# Runs Onyx without the two local model server containers. Embeddings come from
+# a cloud provider configured in Admin Panel > Search Settings, so the ~4.2GB
+# model-server image (torch + nvidia-* CUDA libs, see Dockerfile.model_server)
+# is never pulled and no model runs on this host.
+#
+# This is safe at startup because:
+#   - SKIP_WARM_UP defaults to "true" (shared_configs/configs.py), so the API
+#     server never probes the model server on boot.
+#   - Once search settings use a cloud provider, EmbeddingModel sets
+#     embed_server_endpoint = None and calls the provider directly
+#     (natural_language_processing/search_nlp_models.py).
+#
+# Unlike docker-compose.onyx-lite.yml this KEEPS OpenSearch, Redis, MinIO and
+# the background worker, so connectors and RAG search still work.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.no-local-models.yml up -d
+#
+# To bring the local model servers back:
+#   ... --profile local-models up -d
+
+services:
+  web_server:
+    environment:
+      - DISABLE_ONYX_UPSTREAM_CONNECTIONS=true
+      - NEXT_PUBLIC_DISABLE_ONYX_UPSTREAM_CONNECTIONS=true
+
+  # Park both model servers behind a profile so they never start by default.
+  inference_model_server:
+    profiles: ["local-models"]
+
+  indexing_model_server:
+    profiles: ["local-models"]
+
+  # Make the dependencies on the parked services optional, and short-circuit the
+  # GPU probe. Without DISABLE_MODEL_SERVER the API server calls
+  # /api/gpu-status on indexing_model_server during setup (setup.py, via
+  # gpu_utils.gpu_status_request), retries 5x, then dies with
+  # "Application startup failed" — see gpu_utils.py:19 for the short-circuit.
+  # Set here rather than in .env so hand-edits to .env cannot drop it.
+  api_server:
+    environment:
+      - DISABLE_MODEL_SERVER=true
+      - DISABLE_ONYX_UPSTREAM_CONNECTIONS=true
+      # This private deployment includes the complete local feature set. Keep
+      # EE code loaded without contacting or enforcing the upstream license
+      # service; authorization is still enforced by the normal admin RBAC.
+      - ENABLE_PAID_ENTERPRISE_EDITION_FEATURES=true
+      - LICENSE_ENFORCEMENT_ENABLED=false
+    depends_on:
+      inference_model_server:
+        condition: service_started
+        required: false
+
+  background:
+    environment:
+      - DISABLE_MODEL_SERVER=true
+      - DISABLE_ONYX_UPSTREAM_CONNECTIONS=true
+      - ENABLE_PAID_ENTERPRISE_EDITION_FEATURES=true
+      - LICENSE_ENFORCEMENT_ENABLED=false
+    depends_on:
+      inference_model_server:
+        condition: service_started
+        required: false
+      indexing_model_server:
+        condition: service_started
+        required: false

@@ -1,0 +1,12 @@
+# Required in both Compose-managed and external-infrastructure deployments.
+# nginx and certbot still run on the application host, so their images must be
+# organization-approved immutable digests in either topology.
+
+services:
+  nginx:
+    image: ${REGULATORY_NGINX_IMAGE:?set REGULATORY_NGINX_IMAGE to an approved repository@sha256 digest}
+    pull_policy: always
+
+  certbot:
+    image: ${REGULATORY_CERTBOT_IMAGE:?set REGULATORY_CERTBOT_IMAGE to an approved repository@sha256 digest}
+    pull_policy: always

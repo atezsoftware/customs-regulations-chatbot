@@ -1,0 +1,96 @@
+"use client";
+
+import { Label, SubLabel } from "@/components/Field";
+import { toast } from "@opal/layouts";
+import { useCustomAnalyticsScript } from "@/lib/analytics/hooks";
+import { Button, InputTextArea, Text } from "@opal/components";
+import { markdown } from "@opal/utils";
+import { useState } from "react";
+import { Spacer } from "@opal/components";
+
+export default function CustomAnalyticsUpdateForm() {
+  const customAnalyticsScript = useCustomAnalyticsScript();
+
+  const [newCustomAnalyticsScript, setNewCustomAnalyticsScript] =
+    useState<string>(customAnalyticsScript || "");
+  const [secretKey, setSecretKey] = useState<string>("");
+
+  return (
+    <div>
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+
+          const response = await fetch(
+            "/api/admin/enterprise-settings/custom-analytics-script",
+            {
+              method: "PUT",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                script: newCustomAnalyticsScript.trim(),
+                secret_key: secretKey,
+              }),
+            }
+          );
+          if (response.ok) {
+            toast.success("Custom analytics script updated successfully!");
+          } else {
+            const errorMsg = (await response.json()).detail;
+            toast.error(
+              `Failed to update custom analytics script: "${errorMsg}"`
+            );
+          }
+          setSecretKey("");
+        }}
+      >
+        <div className="mb-4">
+          <Label>Script</Label>
+          <Text as="p">
+            Specify the Javascript that should run on page load in order to
+            initialize your custom tracking/analytics.
+          </Text>
+          <Spacer rem={0.75} />
+          <Text as="p">
+            {markdown(
+              "Do not include the `<script></script>` tags. If you upload a script below but you are not receiving any events in your analytics platform, try removing all extra whitespace before each line of JavaScript."
+            )}
+          </Text>
+          <Spacer rem={0.5} />
+          <InputTextArea
+            value={newCustomAnalyticsScript}
+            onChange={(event) =>
+              setNewCustomAnalyticsScript(event.target.value)
+            }
+          />
+        </div>
+
+        <Label>Secret Key</Label>
+        <SubLabel>
+          <>
+            For security reasons, you must provide a secret key to update this
+            script. This should be the value of the{" "}
+            <i>CUSTOM_ANALYTICS_SECRET_KEY</i> environment variable set when
+            initially setting up Atez Customs Assistant.
+          </>
+        </SubLabel>
+        <input
+          className={`
+            border
+            border-border
+            rounded
+            w-full
+            py-2
+            px-3
+            mt-1`}
+          type="password"
+          value={secretKey}
+          onChange={(e) => setSecretKey(e.target.value)}
+        />
+        <Spacer rem={1} />
+        <Button type="submit">Update</Button>
+      </form>
+    </div>
+  );
+}

@@ -1,0 +1,76 @@
+"use client";
+
+import { SettingsLayouts } from "@opal/layouts";
+import { ADMIN_ROUTES } from "@/lib/admin-routes";
+import { DocumentSetCreationForm } from "../DocumentSetCreationForm";
+import { useConnectorStatus, useUserGroups } from "@/lib/hooks";
+import { PageLoader } from "@opal/layouts";
+import { ErrorCallout } from "@/components/ErrorCallout";
+import { useRouter } from "next/navigation";
+import { refreshDocumentSets } from "../hooks";
+import CardSection from "@/components/admin/CardSection";
+import { useSettings } from "@/lib/settings/hooks";
+
+const route = ADMIN_ROUTES.DOCUMENT_SETS;
+
+function Main() {
+  const router = useRouter();
+  const { vectorDbEnabled } = useSettings();
+
+  const {
+    data: ccPairs,
+    isLoading: isCCPairsLoading,
+    error: ccPairsError,
+  } = useConnectorStatus(30000, vectorDbEnabled);
+
+  // EE only
+  const { data: userGroups, isLoading: userGroupsIsLoading } = useUserGroups();
+
+  if ((vectorDbEnabled && isCCPairsLoading) || userGroupsIsLoading) {
+    return (
+      <div className="flex justify-center items-center min-h-[400px]">
+        <PageLoader />
+      </div>
+    );
+  }
+
+  if (vectorDbEnabled && (ccPairsError || !ccPairs)) {
+    return (
+      <ErrorCallout
+        errorTitle="Failed to fetch Connectors"
+        errorMsg={ccPairsError}
+      />
+    );
+  }
+
+  return (
+    <>
+      <CardSection>
+        <DocumentSetCreationForm
+          ccPairs={ccPairs ?? []}
+          userGroups={userGroups}
+          onClose={() => {
+            refreshDocumentSets();
+            router.push("/admin/documents/sets");
+          }}
+        />
+      </CardSection>
+    </>
+  );
+}
+
+export default function Page() {
+  return (
+    <SettingsLayouts.Root>
+      <SettingsLayouts.Header
+        icon={route.icon}
+        title="New Document Set"
+        divider
+        backButton
+      />
+      <SettingsLayouts.Body>
+        <Main />
+      </SettingsLayouts.Body>
+    </SettingsLayouts.Root>
+  );
+}

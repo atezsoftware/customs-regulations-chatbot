@@ -1,0 +1,1252 @@
+"use client";
+
+import {
+  DocumentBoostStatus,
+  Tag,
+  UserGroup,
+  ConnectorStatus,
+  CCPairBasicInfo,
+  FederatedConnectorDetail,
+  ValidSources,
+  ConnectorIndexingStatusLiteResponse,
+  IndexingStatusRequest,
+} from "@/lib/types";
+import useSWR, { mutate, useSWRConfig } from "swr";
+import { errorHandlingFetcher } from "./fetcher";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DateRangePickerValue } from "@/components/dateRangeSelectors/AdminDateRangeSelector";
+import { SourceMetadata } from "./search/interfaces";
+import {
+  getProviderOverrideForAgent,
+  parseLlmDescriptor,
+} from "@/lib/languageModels/utils";
+import { ChatSession } from "@/app/app/interfaces";
+import { Credential } from "./connectors/credentials";
+import { useSettings } from "@/lib/settings/hooks";
+import { MinimalAgent } from "@/lib/agents/types";
+import {
+  DefaultModel,
+  LLMProviderDescriptor,
+  ReasoningEffortOverride,
+} from "@/lib/languageModels/types";
+import { isAnthropic } from "@/lib/languageModels/svc";
+import { getSourceMetadataForSources } from "./sources";
+import { DEFAULT_AGENT_ID, NEXT_PUBLIC_CLOUD_ENABLED } from "./constants";
+import { useUser } from "@/providers/UserProvider";
+import {
+  updateReasoningEffortForChatSession,
+  updateTemperatureOverrideForChatSession,
+} from "@/app/app/services/lib";
+import { useLLMProviders } from "@/lib/languageModels/hooks";
+import { SWR_KEYS } from "@/lib/swr-keys";
+
+export const usePublicCredentials = () => {
+  const { mutate } = useSWRConfig();
+  const swrResponse = useSWR<Credential<any>[]>(
+    SWR_KEYS.adminCredentials,
+    errorHandlingFetcher
+  );
+
+  return {
+    ...swrResponse,
+    refreshCredentials: () => mutate(SWR_KEYS.adminCredentials),
+  };
+};
+
+const buildReactedDocsUrl = (ascending: boolean, limit: number) => {
+  return `/api/manage/admin/doc-boosts?ascending=${ascending}&limit=${limit}`;
+};
+
+export const useMostReactedToDocuments = (
+  ascending: boolean,
+  limit: number
+) => {
+  const url = buildReactedDocsUrl(ascending, limit);
+  const swrResponse = useSWR<DocumentBoostStatus[]>(url, errorHandlingFetcher);
+
+  return {
+    ...swrResponse,
+    refreshDocs: () => mutate(url),
+  };
+};
+
+export const useObjectState = <T>(
+  initialValue: T
+): [T, (update: Partial<T>) => void] => {
+  const [state, setState] = useState<T>(initialValue);
+  const set = (update: Partial<T>) => {
+    setState((prevState) => {
+      return {
+        ...prevState,
+        ...update,
+      };
+    });
+  };
+  return [state, set];
+};
+
+export const useConnectorIndexingStatusWithPagination = (
+  filters: Omit<IndexingStatusRequest, "source" | "source_to_page"> = {},
+  refreshInterval = 30000,
+  enabled: boolean = true
+) => {
+  const { mutate } = useSWRConfig();
+  //maintains the current page for each source
+  const [sourcePages, setSourcePages] = useState<Record<ValidSources, number>>(
+    {} as Record<ValidSources, number>
+  );
+  const [mergedData, setMergedData] = useState<
+    ConnectorIndexingStatusLiteResponse[]
+  >([]);
+  //maintains the loading state for each source
+  const [sourceLoadingStates, setSourceLoadingStates] = useState<
+    Record<ValidSources, boolean>
+  >({} as Record<ValidSources, boolean>);
+
+  //ref to maintain the current source pages for the main request
+  const sourcePagesRef = useRef(sourcePages);
+  sourcePagesRef.current = sourcePages;
+
+  // Main request that includes current pagination state
+  const mainRequest: IndexingStatusRequest = useMemo(
+    () => ({
+      secondary_index: false,
+      access_type_filters: [],
+      last_status_filters: [],
+      docs_count_operator: null,
+      docs_count_value: null,
+      ...filters,
+    }),
+    [filters]
+  );
+
+  const swrKey = enabled
+    ? [SWR_KEYS.indexingStatus, JSON.stringify(mainRequest)]
+    : null;
+
+  // Main data fetch with auto-refresh
+  const { data, isLoading, error } = useSWR<
+    ConnectorIndexingStatusLiteResponse[]
+  >(
+    swrKey,
+    () => fetchConnectorIndexingStatus(mainRequest, sourcePagesRef.current),
+    {
+      refreshInterval,
+    }
+  );
+
+  // Update merged data when main data changes
+  useEffect(() => {
+    if (data) {
+      setMergedData(data);
+    }
+  }, [data]);
+
+  // Function to handle page changes for a specific source
+  const handlePageChange = useCallback(
+    async (source: ValidSources, page: number) => {
+      // Update the source page state
+      setSourcePages((prev) => ({ ...prev, [source]: page }));
+
+      const sourceRequest: IndexingStatusRequest = {
+        ...filters,
+        source: source,
+        source_to_page: { [source]: page } as Record<ValidSources, number>,
+      };
+      setSourceLoadingStates((prev) => ({ ...prev, [source]: true }));
+
+      try {
+        const sourceData = await fetchConnectorIndexingStatus(sourceRequest);
+        if (sourceData && sourceData.length > 0) {
+          setMergedData((prevData) =>
+            prevData
+              .map((existingSource) =>
+                existingSource.source === source
+                  ? sourceData[0]
+                  : existingSource
+              )
+              .filter(
+                (item): item is ConnectorIndexingStatusLiteResponse =>
+                  item !== undefined
+              )
+          );
+        }
+      } catch (error) {
+        console.error(
+          `Failed to fetch page ${page} for source ${source}:`,
+          error
+        );
+      } finally {
+        setSourceLoadingStates((prev) => ({ ...prev, [source]: false }));
+      }
+    },
+    [filters]
+  );
+
+  // Function to refresh all data (maintains current pagination)
+  const refreshAllData = useCallback(() => {
+    if (swrKey) mutate(swrKey);
+  }, [mutate, swrKey]);
+
+  // Reset pagination when filters change (but not search)
+  const resetPagination = useCallback(() => {
+    setSourcePages({} as Record<ValidSources, number>);
+  }, []);
+
+  return {
+    data: mergedData,
+    isLoading,
+    error,
+    handlePageChange,
+    sourcePages,
+    sourceLoadingStates,
+    refreshAllData,
+    resetPagination,
+  };
+};
+
+export const useConnectorStatus = (
+  refreshInterval = 30000,
+  enabled: boolean = true
+) => {
+  const { mutate } = useSWRConfig();
+  const url = SWR_KEYS.adminConnectorStatus;
+  const swrResponse = useSWR<ConnectorStatus<any, any>[]>(
+    enabled ? url : null,
+    errorHandlingFetcher,
+    { refreshInterval: refreshInterval }
+  );
+
+  return {
+    ...swrResponse,
+    refreshIndexingStatus: enabled ? () => mutate(url) : () => {},
+  };
+};
+
+export const useBasicConnectorStatus = (enabled: boolean = true) => {
+  const url = SWR_KEYS.connectorStatus;
+  const swrResponse = useSWR<CCPairBasicInfo[]>(
+    enabled ? url : null,
+    errorHandlingFetcher
+  );
+  return {
+    ...swrResponse,
+    refreshIndexingStatus: enabled ? () => mutate(url) : () => {},
+  };
+};
+
+export const useFederatedConnectors = () => {
+  const { mutate } = useSWRConfig();
+  const url = SWR_KEYS.federatedConnectors;
+  const swrResponse = useSWR<FederatedConnectorDetail[]>(
+    url,
+    errorHandlingFetcher
+  );
+
+  return {
+    ...swrResponse,
+    refreshFederatedConnectors: () => mutate(url),
+  };
+};
+
+export const useTimeRange = (initialValue?: DateRangePickerValue) => {
+  return useState<DateRangePickerValue | null>(null);
+};
+
+export interface FilterManager {
+  timeRange: DateRangePickerValue | null;
+  setTimeRange: React.Dispatch<
+    React.SetStateAction<DateRangePickerValue | null>
+  >;
+  selectedSources: SourceMetadata[];
+  setSelectedSources: React.Dispatch<React.SetStateAction<SourceMetadata[]>>;
+  selectedDocumentSets: string[];
+  setSelectedDocumentSets: React.Dispatch<React.SetStateAction<string[]>>;
+  selectedTags: Tag[];
+  setSelectedTags: React.Dispatch<React.SetStateAction<Tag[]>>;
+  getFilterString: () => string;
+  buildFiltersFromQueryString: (
+    filterString: string,
+    availableSources: SourceMetadata[],
+    availableDocumentSets: string[],
+    availableTags: Tag[]
+  ) => void;
+  clearFilters: () => void;
+}
+
+export function useFilters(): FilterManager {
+  const [timeRange, setTimeRange] = useTimeRange();
+  const [selectedSources, setSelectedSources] = useState<SourceMetadata[]>([]);
+  const [selectedDocumentSets, setSelectedDocumentSets] = useState<string[]>(
+    []
+  );
+  const [selectedTags, setSelectedTags] = useState<Tag[]>([]);
+
+  function getFilterString() {
+    const params = new URLSearchParams();
+
+    if (timeRange) {
+      params.set("from", timeRange.from.toISOString());
+      params.set("to", timeRange.to.toISOString());
+    }
+
+    if (selectedSources.length > 0) {
+      const sourcesParam = selectedSources
+        .map((source) => encodeURIComponent(source.internalName))
+        .join(",");
+      params.set("sources", sourcesParam);
+    }
+
+    if (selectedDocumentSets.length > 0) {
+      const docSetsParam = selectedDocumentSets
+        .map((ds) => encodeURIComponent(ds))
+        .join(",");
+      params.set("documentSets", docSetsParam);
+    }
+
+    if (selectedTags.length > 0) {
+      const tagsParam = selectedTags
+        .map((tag) => encodeURIComponent(tag.tag_value))
+        .join(",");
+      params.set("tags", tagsParam);
+    }
+
+    const queryString = params.toString();
+    return queryString ? `&${queryString}` : "";
+  }
+
+  function clearFilters() {
+    setTimeRange(null);
+    setSelectedSources([]);
+    setSelectedDocumentSets([]);
+    setSelectedTags([]);
+  }
+
+  function buildFiltersFromQueryString(
+    filterString: string,
+    availableSources: SourceMetadata[],
+    availableDocumentSets: string[],
+    availableTags: Tag[]
+  ): void {
+    const params = new URLSearchParams(filterString);
+
+    // Parse the "from" parameter as a DateRangePickerValue
+    let newTimeRange: DateRangePickerValue | null = null;
+    const fromParam = params.get("from");
+    const toParam = params.get("to");
+    if (fromParam && toParam) {
+      const fromDate = new Date(fromParam);
+      const toDate = new Date(toParam);
+      if (!isNaN(fromDate.getTime()) && !isNaN(toDate.getTime())) {
+        newTimeRange = { from: fromDate, to: toDate, selectValue: "" };
+      }
+    }
+
+    // Parse sources
+    let newSelectedSources: SourceMetadata[] = [];
+    const sourcesParam = params.get("sources");
+    if (sourcesParam) {
+      const sourceNames = sourcesParam.split(",").map(decodeURIComponent);
+      newSelectedSources = availableSources.filter((source) =>
+        sourceNames.includes(source.internalName)
+      );
+    }
+
+    // Parse document sets
+    let newSelectedDocSets: string[] = [];
+    const docSetsParam = params.get("documentSets");
+    if (docSetsParam) {
+      const docSetNames = docSetsParam.split(",").map(decodeURIComponent);
+      newSelectedDocSets = availableDocumentSets.filter((ds) =>
+        docSetNames.includes(ds)
+      );
+    }
+
+    // Parse tags
+    let newSelectedTags: Tag[] = [];
+    const tagsParam = params.get("tags");
+    if (tagsParam) {
+      const tagValues = tagsParam.split(",").map(decodeURIComponent);
+      newSelectedTags = availableTags.filter((tag) =>
+        tagValues.includes(tag.tag_value)
+      );
+    }
+
+    // Update filter manager's values instead of returning
+    setTimeRange(newTimeRange);
+    setSelectedSources(newSelectedSources);
+    setSelectedDocumentSets(newSelectedDocSets);
+    setSelectedTags(newSelectedTags);
+  }
+
+  return {
+    clearFilters,
+    timeRange,
+    setTimeRange,
+    selectedSources,
+    setSelectedSources,
+    selectedDocumentSets,
+    setSelectedDocumentSets,
+    selectedTags,
+    setSelectedTags,
+    getFilterString,
+    buildFiltersFromQueryString,
+  };
+}
+
+export interface LlmDescriptor {
+  name: string;
+  provider: string;
+  modelName: string;
+}
+
+export interface LlmManager {
+  currentLlm: LlmDescriptor;
+  updateCurrentLlm: (newOverride: LlmDescriptor) => void;
+  temperature: number;
+  updateTemperature: (temperature: number) => void;
+  /** True once updateTemperature was called for the current session, marking
+   * an explicit choice vs the default of 0. */
+  temperatureExplicitlySet: boolean;
+  reasoningEffort: ReasoningEffortOverride | null;
+  updateReasoningEffort: (effort: ReasoningEffortOverride | null) => void;
+  /** True when updates persist to a session row at selection time. */
+  hasBoundSession: boolean;
+  /** Ensure the session row reflects the local override selections. No-op
+   * when the session is bound and every selection is confirmed persisted.
+   * Throws when a write fails, leaving the overrides unconfirmed for retry. */
+  persistOverrides: (sessionId: string) => Promise<void>;
+  updateModelOverrideBasedOnChatSession: (chatSession?: ChatSession) => void;
+  imageFilesPresent: boolean;
+  updateImageFilesPresent: (present: boolean) => void;
+  liveAgent: MinimalAgent | null;
+  maxTemperature: number;
+  llmProviders: LLMProviderDescriptor[] | undefined;
+  isLoadingProviders: boolean;
+  hasAnyProvider: boolean;
+}
+
+// Things to test
+// 1. User override
+// 2. User preference (defaults to system wide default if no preference set)
+// 3. Current assistant
+// 4. Current chat session
+// 5. Live assistant
+
+/*
+LLM Override is as follows (i.e. this order)
+- User override (explicitly set in the chat input bar)
+- User preference (defaults to system wide default if no preference set)
+
+On switching to an existing or new chat session or a different assistant:
+- If we have a live assistant after any switch with a model override, use that- otherwise use the above hierarchy
+
+Thus, the input should be
+- User preference
+- LLM Providers (which contain the system wide default)
+- Current assistant
+
+Changes take place as
+- liveAgent or currentChatSession changes (and the associated model override is set)
+- (updateCurrentLlm) User explicitly setting a model override (and we explicitly override and set the userSpecifiedOverride which we'll use in place of the user preferences unless overridden by an agent)
+
+If we have a live assistant, we should use that model override
+
+Relevant test: `llm_ordering.spec.ts`.
+
+Temperature override is set as follows:
+- For existing chat sessions:
+  - If the user has previously overridden the temperature for a specific chat session,
+    that value is persisted and used when the user returns to that chat.
+  - This persistence applies even if the temperature was set before sending the first message in the chat.
+- For new chat sessions the default temperature is 0, so answers stay deterministic and grounded.
+
+This approach ensures that user preferences are maintained for existing chats while
+providing appropriate defaults for new conversations based on the available tools.
+*/
+
+export function getDefaultLlmDescriptor(
+  llmProviders: LLMProviderDescriptor[],
+  defaultText?: DefaultModel | null
+): LlmDescriptor | null {
+  if (defaultText) {
+    const provider = llmProviders.find((p) => p.id === defaultText.provider_id);
+    if (provider) {
+      return {
+        name: provider.name ?? "",
+        provider: provider.provider,
+        modelName: defaultText.model_name,
+      };
+    }
+  }
+  // Fallback: first provider with visible models
+  const firstLlmProvider = llmProviders.find(
+    (provider) => provider.model_configurations.length > 0
+  );
+  if (firstLlmProvider) {
+    const firstModel = firstLlmProvider.model_configurations.find(
+      (m) => m.is_visible
+    );
+    return {
+      name: firstLlmProvider.name ?? "",
+      provider: firstLlmProvider.provider,
+      modelName: firstModel?.name ?? "",
+    };
+  }
+  return null;
+}
+
+export function getValidLlmDescriptorForProviders(
+  modelName: string | null | undefined,
+  llmProviders: LLMProviderDescriptor[] | undefined | null,
+  defaultText?: DefaultModel | null
+): LlmDescriptor {
+  // Return early if providers haven't loaded yet (undefined/null)
+  // Empty arrays are valid (user has no provider access for this assistant)
+  if (llmProviders === undefined || llmProviders === null) {
+    return { name: "", provider: "", modelName: "" };
+  }
+
+  if (modelName) {
+    const model = parseLlmDescriptor(modelName);
+    // If we have no parsed modelName, try to find the provider by the raw modelName string
+    if (!(model.modelName && model.modelName.length > 0)) {
+      const provider = llmProviders.find((p) =>
+        p.model_configurations
+          .map((modelConfiguration) => modelConfiguration.name)
+          .includes(modelName)
+      );
+      if (provider) {
+        return {
+          modelName: modelName,
+          name: provider.name ?? "",
+          provider: provider.provider,
+        };
+      }
+    }
+
+    // If we have parsed provider info, try to find that specific provider.
+    // This ensures we don't incorrectly match a model to the wrong provider
+    // when the same model name exists across multiple providers (e.g., gpt-5 in Azure and OpenAI)
+    if (model.provider && model.provider.length > 0) {
+      const hasModel = (p: LLMProviderDescriptor) =>
+        p.model_configurations.some((mc) => mc.name === model.modelName);
+      const typeMatches = llmProviders.filter(
+        (p) => p.provider === model.provider && hasModel(p)
+      );
+      // When multiple providers share the same type (e.g., two "anthropic"
+      // providers with different API keys), prefer the one whose name matches
+      // the user's explicit selection to avoid silently switching providers.
+      const matchingProvider =
+        typeMatches.find((p) => p.name === model.name) ?? typeMatches[0];
+      if (matchingProvider) {
+        return {
+          ...model,
+          name: matchingProvider.name ?? "",
+          provider: matchingProvider.provider,
+        };
+      }
+      // Provider info was present but not found - fall through to default
+    } else {
+      // Only search by model name when no provider info was parsed
+      const provider = llmProviders.find((p) =>
+        p.model_configurations
+          .map((modelConfiguration) => modelConfiguration.name)
+          .includes(model.modelName)
+      );
+
+      if (provider) {
+        return {
+          ...model,
+          provider: provider.provider,
+          name: provider.name ?? "",
+        };
+      }
+    }
+  }
+
+  // Model not found in available providers - fall back to the admin-configured
+  // global default before resorting to the first provider with visible models.
+  // Without this, a stale personal default (e.g. its provider was deleted)
+  // would silently land on an arbitrary provider instead of the global default.
+  return (
+    getDefaultLlmDescriptor(llmProviders, defaultText) ?? {
+      name: "",
+      provider: "",
+      modelName: "",
+    }
+  );
+}
+
+export function useLlmManager(
+  currentChatSession?: ChatSession,
+  liveAgent?: MinimalAgent
+): LlmManager {
+  const { user } = useUser();
+
+  // Get all user-accessible providers via SWR (general providers - no persona filter)
+  // This includes public + all restricted providers user can access via groups
+  const {
+    llmProviders: allUserProviders,
+    defaultText: allUserDefaultText,
+    isLoading: isLoadingAllProviders,
+  } = useLLMProviders();
+  // Fetch persona-specific providers to enforce RBAC restrictions per assistant
+  // Only fetch if we have an agent selected
+  const personaId = liveAgent?.id !== undefined ? liveAgent.id : undefined;
+  const {
+    llmProviders: personaProviders,
+    defaultText: personaDefaultText,
+    isLoading: isLoadingPersonaProviders,
+  } = useLLMProviders(personaId);
+
+  const llmProviders =
+    personaProviders !== undefined ? personaProviders : allUserProviders;
+  const defaultText =
+    personaProviders !== undefined ? personaDefaultText : allUserDefaultText;
+
+  const [userHasManuallyOverriddenLLM, setUserHasManuallyOverriddenLLM] =
+    useState(false);
+  const [chatSession, setChatSession] = useState<ChatSession | null>(null);
+  // Manual override value — only used when userHasManuallyOverriddenLLM is true
+  const [manualLlm, setManualLlm] = useState<LlmDescriptor>({
+    name: "",
+    provider: "",
+    modelName: "",
+  });
+
+  // Track the previous assistant ID to detect when it changes
+  const prevAgentIdRef = useRef<number | undefined>(undefined);
+
+  // Reset manual override when switching to a different assistant
+  useEffect(() => {
+    if (
+      liveAgent?.id !== undefined &&
+      prevAgentIdRef.current !== undefined &&
+      liveAgent.id !== prevAgentIdRef.current
+    ) {
+      // User switched to a different assistant - reset manual override
+      setUserHasManuallyOverriddenLLM(false);
+    }
+    prevAgentIdRef.current = liveAgent?.id;
+  }, [liveAgent?.id]);
+
+  // Clear manual override when arriving at a *different* existing session
+  // from any previously-seen defined session. Tracks only the last
+  // *defined* session id so a round-trip through new-chat (A → undefined
+  // → B) still resets, while A → undefined (new-chat) preserves it.
+  const prevDefinedSessionIdRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const nextId = currentChatSession?.id;
+    if (
+      nextId !== undefined &&
+      prevDefinedSessionIdRef.current !== undefined &&
+      nextId !== prevDefinedSessionIdRef.current
+    ) {
+      setUserHasManuallyOverriddenLLM(false);
+    }
+    if (nextId !== undefined) {
+      prevDefinedSessionIdRef.current = nextId;
+    }
+  }, [currentChatSession?.id]);
+
+  function getValidLlmDescriptor(
+    modelName: string | null | undefined
+  ): LlmDescriptor {
+    return getValidLlmDescriptorForProviders(
+      modelName,
+      llmProviders,
+      defaultText
+    );
+  }
+
+  // Compute the resolved LLM synchronously so it's never one render behind.
+  // This replaces the old llmUpdate() effect for model resolution.
+  // Wrapped with a ref for referential stability — returns the same object
+  // when the resolved name/provider/modelName haven't actually changed,
+  // preventing unnecessary re-creation of downstream callbacks (e.g. onSubmit).
+  const prevLlmRef = useRef<LlmDescriptor>({
+    name: "",
+    provider: "",
+    modelName: "",
+  });
+  const currentLlm = useMemo((): LlmDescriptor => {
+    let resolved: LlmDescriptor;
+
+    if (llmProviders === undefined || llmProviders === null) {
+      resolved = manualLlm;
+    } else if (userHasManuallyOverriddenLLM) {
+      // Manual override wins over session's `current_alternate_model`.
+      // Cleared on cross-session navigation by the effect above.
+      resolved = manualLlm;
+    } else if (currentChatSession?.current_alternate_model) {
+      resolved = getValidLlmDescriptorForProviders(
+        currentChatSession.current_alternate_model,
+        llmProviders,
+        defaultText
+      );
+    } else if (liveAgent && liveAgent.id !== DEFAULT_AGENT_ID) {
+      // Custom agent — its configured default takes precedence. When the agent
+      // has no explicit default, fall to the global system default. The user's
+      // personal preference is irrelevant in an agent-scoped chat.
+      const agentOverride = getProviderOverrideForAgent(
+        liveAgent,
+        llmProviders
+      );
+      resolved =
+        agentOverride ??
+        getDefaultLlmDescriptor(llmProviders, defaultText) ??
+        manualLlm;
+    } else if (user?.preferences?.default_model) {
+      resolved = getValidLlmDescriptorForProviders(
+        user.preferences.default_model,
+        llmProviders,
+        defaultText
+      );
+    } else {
+      resolved =
+        getDefaultLlmDescriptor(llmProviders, defaultText) ?? manualLlm;
+    }
+
+    const prev = prevLlmRef.current;
+    if (
+      prev.name === resolved.name &&
+      prev.provider === resolved.provider &&
+      prev.modelName === resolved.modelName
+    ) {
+      return prev;
+    }
+    prevLlmRef.current = resolved;
+    return resolved;
+  }, [
+    llmProviders,
+    defaultText,
+    currentChatSession,
+    userHasManuallyOverriddenLLM,
+    manualLlm,
+    liveAgent?.default_model_configuration_id,
+    user?.preferences?.default_model,
+  ]);
+
+  // Keep chatSession state in sync (used by temperature effect)
+  useEffect(() => {
+    setChatSession(currentChatSession || null);
+  }, [currentChatSession]);
+
+  const [imageFilesPresent, setImageFilesPresent] = useState(false);
+
+  const updateImageFilesPresent = (present: boolean) => {
+    setImageFilesPresent(present);
+  };
+
+  // Manually set the LLM
+  const updateCurrentLlm = (newLlm: LlmDescriptor) => {
+    setManualLlm(newLlm);
+    setUserHasManuallyOverriddenLLM(true);
+  };
+
+  const updateCurrentLlmToModelName = (modelName: string) => {
+    setManualLlm(getValidLlmDescriptor(modelName));
+    setUserHasManuallyOverriddenLLM(true);
+  };
+
+  const updateModelOverrideBasedOnChatSession = (chatSession?: ChatSession) => {
+    if (chatSession && chatSession.current_alternate_model?.length > 0) {
+      setManualLlm(getValidLlmDescriptor(chatSession.current_alternate_model));
+    }
+  };
+
+  const [temperature, setTemperature] = useState<number>(() => {
+    if (currentChatSession?.current_temperature_override != null) {
+      // Derive Anthropic check from chat session since currentLlm isn't populated yet
+      const sessionModel = currentChatSession.current_alternate_model
+        ? parseLlmDescriptor(currentChatSession.current_alternate_model)
+        : null;
+      const isAnthropicModel = sessionModel
+        ? isAnthropic(sessionModel.provider, sessionModel.modelName)
+        : false;
+      return Math.min(
+        currentChatSession.current_temperature_override,
+        isAnthropicModel ? 1.0 : 2.0
+      );
+    }
+    return 0;
+  });
+
+  const [reasoningEffort, setReasoningEffort] =
+    useState<ReasoningEffortOverride | null>(
+      currentChatSession?.current_reasoning_effort_override ?? null
+    );
+  const [temperatureExplicitlySet, setTemperatureExplicitlySet] =
+    useState(false);
+
+  // A selection bumps selectionGen alongside its value, and a confirmed
+  // persist records the generation whose values it wrote. Overrides are
+  // unconfirmed while persistedGen trails, so a selection made mid-persist
+  // can never be marked clean by an older persist completing.
+  const [selectionGen, setSelectionGen] = useState(0);
+  const persistedGenRef = useRef(0);
+
+  // Serializes every override PUT so an older selection can never land on
+  // the server after a newer one. persistOverrides joins the same chain.
+  const overrideWriteChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  const enqueueOverrideWrite = (
+    write: () => Promise<Response>
+  ): Promise<Response> => {
+    const next = overrideWriteChainRef.current.then(write, write);
+    overrideWriteChainRef.current = next.catch(() => undefined);
+    return next;
+  };
+
+  // Adopt the stored reasoning override (and reset the explicit-temperature
+  // flag) only when session identity changes. Keying on identity, not the
+  // object, keeps new-chat dep churn from wiping a pre-first-message choice.
+  const prevSessionIdRef = useRef<string | null>(
+    currentChatSession?.id ?? null
+  );
+  useEffect(() => {
+    const sessionId = currentChatSession?.id ?? null;
+    if (prevSessionIdRef.current === sessionId) return;
+    prevSessionIdRef.current = sessionId;
+    setTemperatureExplicitlySet(false);
+    persistedGenRef.current = selectionGen;
+    setReasoningEffort(
+      currentChatSession?.current_reasoning_effort_override ?? null
+    );
+  }, [currentChatSession]);
+
+  const maxTemperature = useMemo(() => {
+    // Check currentLlm first, fall back to chat session model if currentLlm isn't populated
+    if (currentLlm.provider) {
+      return isAnthropic(currentLlm.provider, currentLlm.modelName) ? 1.0 : 2.0;
+    }
+    const sessionModel = currentChatSession?.current_alternate_model
+      ? parseLlmDescriptor(currentChatSession.current_alternate_model)
+      : null;
+    if (sessionModel?.provider) {
+      return isAnthropic(sessionModel.provider, sessionModel.modelName)
+        ? 1.0
+        : 2.0;
+    }
+    return 2.0; // Default max when no model info available
+  }, [currentLlm, currentChatSession]);
+
+  useEffect(() => {
+    if (isAnthropic(currentLlm.provider, currentLlm.modelName)) {
+      const newTemperature = Math.min(temperature, 1.0);
+      setTemperature(newTemperature);
+      const sessionId = chatSession?.id;
+      if (sessionId) {
+        void enqueueOverrideWrite(() =>
+          updateTemperatureOverrideForChatSession(sessionId, newTemperature)
+        );
+      }
+    }
+  }, [currentLlm]);
+
+  useEffect(() => {
+    if (!chatSession && currentChatSession) {
+      const sessionId = currentChatSession.id;
+      if (temperature) {
+        void enqueueOverrideWrite(() =>
+          updateTemperatureOverrideForChatSession(sessionId, temperature)
+        );
+      }
+      if (reasoningEffort) {
+        void enqueueOverrideWrite(() =>
+          updateReasoningEffortForChatSession(sessionId, reasoningEffort)
+        );
+      }
+      return;
+    }
+
+    if (currentChatSession?.current_temperature_override) {
+      setTemperature(currentChatSession.current_temperature_override);
+    } else {
+      setTemperature(0);
+    }
+  }, [
+    liveAgent,
+    currentChatSession,
+    llmProviders,
+    user?.preferences?.default_model,
+  ]);
+
+  const updateTemperature = (temperature: number) => {
+    const clampedTemp = isAnthropic(currentLlm.provider, currentLlm.modelName)
+      ? Math.min(temperature, 1.0)
+      : temperature;
+    setTemperature(clampedTemp);
+    setTemperatureExplicitlySet(true);
+    setSelectionGen((generation) => generation + 1);
+    const sessionId = chatSession?.id;
+    if (sessionId) {
+      void enqueueOverrideWrite(() =>
+        updateTemperatureOverrideForChatSession(sessionId, clampedTemp)
+      );
+    }
+  };
+
+  const updateReasoningEffort = (effort: ReasoningEffortOverride | null) => {
+    setReasoningEffort(effort);
+    setSelectionGen((generation) => generation + 1);
+    const sessionId = chatSession?.id;
+    if (sessionId) {
+      void enqueueOverrideWrite(() =>
+        updateReasoningEffortForChatSession(sessionId, effort)
+      );
+    }
+  };
+
+  const persistOverrides = async (sessionId: string): Promise<void> => {
+    // selectionGen is render-captured with the values below, so this persist
+    // confirms exactly the generation whose values it writes.
+    if (chatSession != null && persistedGenRef.current >= selectionGen) {
+      return;
+    }
+    const writes: Promise<Response>[] = [];
+    if (reasoningEffort) {
+      writes.push(
+        enqueueOverrideWrite(() =>
+          updateReasoningEffortForChatSession(sessionId, reasoningEffort)
+        )
+      );
+    }
+    if (temperatureExplicitlySet) {
+      writes.push(
+        enqueueOverrideWrite(() =>
+          updateTemperatureOverrideForChatSession(sessionId, temperature)
+        )
+      );
+    }
+    if (writes.length === 0) return;
+    const responses = await Promise.all(writes);
+    const failed = responses.find((response) => !response.ok);
+    if (failed) {
+      throw new Error(
+        `Failed to persist chat session overrides: ${failed.status}`
+      );
+    }
+    persistedGenRef.current = Math.max(persistedGenRef.current, selectionGen);
+  };
+
+  // Track if any provider exists for the current persona context.
+  // Uses the persona-aware list so chat input reflects actual access,
+  // falling back to the global list when no persona is selected.
+  const hasAnyProvider = (llmProviders?.length ?? 0) > 0;
+
+  return {
+    updateModelOverrideBasedOnChatSession,
+    currentLlm,
+    updateCurrentLlm,
+    temperature,
+    updateTemperature,
+    temperatureExplicitlySet,
+    reasoningEffort,
+    updateReasoningEffort,
+    hasBoundSession: chatSession != null,
+    persistOverrides,
+    imageFilesPresent,
+    updateImageFilesPresent,
+    liveAgent: liveAgent ?? null,
+    maxTemperature,
+    llmProviders,
+    isLoadingProviders:
+      isLoadingAllProviders ||
+      (personaId !== undefined && isLoadingPersonaProviders),
+    hasAnyProvider,
+  };
+}
+
+/*
+EE Only APIs
+*/
+
+export const useUserGroups = (): {
+  data: UserGroup[] | undefined;
+  isLoading: boolean;
+  error: string;
+  refreshUserGroups: () => void;
+} => {
+  const settings = useSettings();
+  const isLoading = settings.isLoading;
+  const isPaidEnterpriseFeaturesEnabled =
+    !isLoading && settings.enterprise !== null;
+
+  const swrResponse = useSWR<UserGroup[]>(
+    isPaidEnterpriseFeaturesEnabled ? SWR_KEYS.adminUserGroups : null,
+    errorHandlingFetcher
+  );
+
+  const refreshUserGroups = () => mutate(SWR_KEYS.adminUserGroups);
+
+  if (isLoading) {
+    return {
+      data: undefined,
+      isLoading: true,
+      error: "",
+      refreshUserGroups,
+    };
+  }
+
+  if (!isPaidEnterpriseFeaturesEnabled) {
+    return {
+      data: [],
+      isLoading: false,
+      error: "",
+      refreshUserGroups,
+    };
+  }
+
+  return {
+    ...swrResponse,
+    refreshUserGroups,
+  };
+};
+
+export const fetchConnectorIndexingStatus = async (
+  request: IndexingStatusRequest = {},
+  sourcePages: Record<ValidSources, number> | null = null
+): Promise<ConnectorIndexingStatusLiteResponse[]> => {
+  const response = await fetch(SWR_KEYS.indexingStatus, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      secondary_index: false,
+      access_type_filters: [],
+      last_status_filters: [],
+      docs_count_operator: null,
+      docs_count_value: null,
+      source_to_page: sourcePages || {}, // Use current pagination state
+      ...request,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+
+  return response.json();
+};
+
+// Get source metadata for configured sources - deduplicated by source type
+function getConfiguredSources(
+  availableSources: ValidSources[]
+): Array<SourceMetadata & { originalName: string; uniqueKey: string }> {
+  const allSources = getSourceMetadataForSources(availableSources);
+
+  const seenSources = new Set<string>();
+  const configuredSources: Array<
+    SourceMetadata & { originalName: string; uniqueKey: string }
+  > = [];
+
+  availableSources.forEach((sourceName) => {
+    // Handle federated connectors by removing the federated_ prefix
+    const cleanName = sourceName.replace("federated_", "");
+    // Skip if we've already seen this source type
+    if (seenSources.has(cleanName)) return;
+    seenSources.add(cleanName);
+    const source = allSources.find(
+      (source) => source.internalName === cleanName
+    );
+    if (source) {
+      configuredSources.push({
+        ...source,
+        originalName: sourceName,
+        uniqueKey: cleanName,
+      });
+    }
+  });
+  return configuredSources;
+}
+
+interface UseSourcePreferencesProps {
+  availableSources: ValidSources[];
+  selectedSources: SourceMetadata[];
+  setSelectedSources: (sources: SourceMetadata[]) => void;
+}
+
+interface SourcePreferencesSnapshot {
+  sourcePreferences: Record<string, boolean>; // uniqueKey -> enabled status
+}
+
+const LS_SELECTED_INTERNAL_SEARCH_SOURCES_KEY = "selectedInternalSearchSources";
+
+export function useSourcePreferences({
+  availableSources,
+  selectedSources,
+  setSelectedSources,
+}: UseSourcePreferencesProps) {
+  const [sourcesInitialized, setSourcesInitialized] = useState(false);
+
+  const configuredSources = useMemo(
+    () => getConfiguredSources(availableSources),
+    [availableSources]
+  );
+
+  // Load saved source preferences from localStorage
+  const loadSavedSourcePreferences = (): SourcePreferencesSnapshot | null => {
+    if (typeof window === "undefined") return null;
+    const saved = localStorage.getItem(LS_SELECTED_INTERNAL_SEARCH_SOURCES_KEY);
+    if (!saved) return null;
+    try {
+      const res = JSON.parse(saved);
+
+      // Validate the snapshot structure
+      if (
+        typeof res !== "object" ||
+        res === null ||
+        typeof res.sourcePreferences !== "object" ||
+        res.sourcePreferences === null ||
+        Array.isArray(res.sourcePreferences)
+      ) {
+        return null;
+      }
+
+      // Validate that all values in sourcePreferences are booleans
+      for (const value of Object.values(res.sourcePreferences)) {
+        if (typeof value !== "boolean") {
+          return null;
+        }
+      }
+
+      return res as SourcePreferencesSnapshot;
+    } catch {
+      return null;
+    }
+  };
+
+  const persistSourcePreferencesState = (
+    enabledSources: SourceMetadata[],
+    allKnownSources: SourceMetadata[]
+  ) => {
+    if (typeof window === "undefined") return;
+
+    const enabledKeys = new Set(enabledSources.map((s) => s.uniqueKey));
+
+    const snapshot: SourcePreferencesSnapshot = {
+      sourcePreferences: Object.fromEntries(
+        allKnownSources
+          .filter((src) => src.uniqueKey !== undefined)
+          .map((src) => [src.uniqueKey, enabledKeys.has(src.uniqueKey)])
+      ),
+    };
+
+    localStorage.setItem(
+      LS_SELECTED_INTERNAL_SEARCH_SOURCES_KEY,
+      JSON.stringify(snapshot)
+    );
+  };
+
+  // Initialize sources - load from localStorage or enable all by default
+  useEffect(() => {
+    if (!sourcesInitialized && availableSources.length > 0) {
+      const savedSources = loadSavedSourcePreferences();
+
+      if (savedSources !== null) {
+        // Filter out saved sources that no longer exist
+        const { sourcePreferences } = savedSources;
+
+        // Helper to check if there is a preference for a key
+        const hasPref = (key: string) =>
+          Object.prototype.hasOwnProperty.call(sourcePreferences, key);
+
+        // Get sources with no preference
+        const newSources = configuredSources.filter((source) => {
+          return !hasPref(source.uniqueKey);
+        });
+
+        const enabledSources = configuredSources.filter((source) => {
+          return (
+            hasPref(source.uniqueKey) && sourcePreferences[source.uniqueKey]
+          );
+        });
+
+        // Merge valid saved sources with new sources (enable new sources by default)
+        const mergedSources = [...enabledSources, ...newSources];
+        setSelectedSources(mergedSources);
+
+        // Persist the merged state
+        persistSourcePreferencesState(mergedSources, configuredSources);
+      } else {
+        // First time user or invalid data - enable all sources by default
+        setSelectedSources(configuredSources);
+        persistSourcePreferencesState(configuredSources, configuredSources);
+      }
+      setSourcesInitialized(true);
+    }
+  }, [
+    availableSources,
+    configuredSources,
+    sourcesInitialized,
+    setSelectedSources,
+  ]);
+
+  // Re-initialize when the available source set changes (e.g. switching agents).
+  const prevSourcesKey = useRef(availableSources.join(","));
+  useEffect(() => {
+    const key = availableSources.join(",");
+    if (key !== prevSourcesKey.current) {
+      prevSourcesKey.current = key;
+      setSourcesInitialized(false);
+    }
+  }, [availableSources]);
+
+  const enableSources = (sources: SourceMetadata[]) => {
+    setSelectedSources([...sources]);
+    persistSourcePreferencesState(sources, configuredSources);
+  };
+
+  const enableAllSources = () => {
+    enableSources(configuredSources);
+  };
+
+  const disableAllSources = () => {
+    setSelectedSources([]);
+    persistSourcePreferencesState([], configuredSources);
+  };
+
+  const toggleSource = (sourceUniqueKey: string) => {
+    const configuredSource = configuredSources.find(
+      (s) => s.uniqueKey === sourceUniqueKey
+    );
+    if (!configuredSource) return;
+
+    const isCurrentlySelected = selectedSources.some(
+      (s) => s.uniqueKey === configuredSource.uniqueKey
+    );
+
+    let newSources: SourceMetadata[];
+    if (isCurrentlySelected) {
+      newSources = selectedSources.filter(
+        (s) => s.uniqueKey !== configuredSource.uniqueKey
+      );
+    } else {
+      newSources = [...selectedSources, configuredSource];
+    }
+
+    setSelectedSources(newSources);
+    persistSourcePreferencesState(newSources, configuredSources);
+  };
+
+  const isSourceEnabled = (sourceUniqueKey: string) => {
+    const configuredSource = configuredSources.find(
+      (s) => s.uniqueKey === sourceUniqueKey
+    );
+    if (!configuredSource) return false;
+    return selectedSources.some(
+      (s: SourceMetadata) => s.uniqueKey === configuredSource.uniqueKey
+    );
+  };
+
+  return {
+    sourcesInitialized,
+    enableSources,
+    enableAllSources,
+    disableAllSources,
+    toggleSource,
+    isSourceEnabled,
+  };
+}

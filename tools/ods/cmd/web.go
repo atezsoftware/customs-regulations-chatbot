@@ -1,0 +1,176 @@
+package cmd
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+
+	"github.com/onyx-dot-app/onyx/tools/ods/internal/paths"
+)
+
+type webPackageJSON struct {
+	Scripts map[string]string `json:"scripts"`
+}
+
+// NewWebCommand creates a command that runs bun scripts from the web directory.
+func NewWebCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "web <script> [args...]",
+		Short: "Run web/package.json bun scripts",
+		Long:  webHelpDescription(),
+		Args: cobra.MinimumNArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) > 0 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return webScriptNames(), cobra.ShellCompDirectiveNoFileComp
+		},
+		Run: func(cmd *cobra.Command, args []string) {
+			runWebScript(args)
+		},
+	}
+	cmd.Flags().SetInterspersed(false)
+
+	return cmd
+}
+
+func runWebScript(args []string) {
+	webDir, err := webDir()
+	if err != nil {
+		log.Fatalf("Failed to find web directory: %v", err)
+	}
+
+	nodeModules := filepath.Join(webDir, "node_modules")
+	if needsInstall, reason := nodeModulesNeedsInstall(nodeModules); needsInstall {
+		log.Infof("%s, running bun install --frozen-lockfile...", reason)
+		installCmd := exec.Command("bun", "install", "--frozen-lockfile")
+		installCmd.Dir = webDir
+		installCmd.Stdout = os.Stdout
+		installCmd.Stderr = os.Stderr
+		installCmd.Stdin = os.Stdin
+		if err := installCmd.Run(); err != nil {
+			log.Fatalf("Failed to run bun install: %v", err)
+		}
+	}
+
+	scriptName := args[0]
+	scriptArgs := args[1:]
+	if len(scriptArgs) > 0 && scriptArgs[0] == "--" {
+		scriptArgs = scriptArgs[1:]
+	}
+
+	bunArgs := []string{"run", scriptName}
+	if len(scriptArgs) > 0 {
+		// bun requires "--" to forward flags to the underlying script.
+		bunArgs = append(bunArgs, "--")
+		bunArgs = append(bunArgs, scriptArgs...)
+	}
+	log.Debugf("Running in %s: bun %v", webDir, bunArgs)
+
+	webCmd := exec.Command("bun", bunArgs...)
+	webCmd.Dir = webDir
+	webCmd.Stdout = os.Stdout
+	webCmd.Stderr = os.Stderr
+	webCmd.Stdin = os.Stdin
+
+	if err := webCmd.Run(); err != nil {
+		// For wrapped commands, preserve the child process's exit code and
+		// avoid duplicating already-printed stderr output.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if code := exitErr.ExitCode(); code != -1 {
+				os.Exit(code)
+			}
+		}
+		log.Fatalf("Failed to run bun: %v", err)
+	}
+}
+
+// nodeModulesNeedsInstall reports whether bun install should be run, along with
+// a human-readable reason. Install is needed when node_modules is missing or
+// exists but is empty.
+func nodeModulesNeedsInstall(nodeModules string) (bool, string) {
+	entries, err := os.ReadDir(nodeModules)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, "node_modules not found"
+	}
+	if err != nil {
+		// Couldn't read the directory for some other reason; let bun install
+		// attempt to sort it out rather than silently skipping.
+		return true, fmt.Sprintf("could not read node_modules (%v)", err)
+	}
+	if len(entries) == 0 {
+		return true, "node_modules is empty"
+	}
+	return false, ""
+}
+
+func webScriptNames() []string {
+	scripts, err := loadWebScripts()
+	if err != nil {
+		return nil
+	}
+
+	names := make([]string, 0, len(scripts))
+	for name := range scripts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func webHelpDescription() string {
+	description := `Run bun scripts from web/package.json.
+
+Examples:
+  ods web dev
+  ods web lint
+  ods web test --watch`
+
+	scripts := webScriptNames()
+	if len(scripts) == 0 {
+		return description + "\n\nAvailable scripts: (unable to load)"
+	}
+
+	return description + "\n\nAvailable scripts:\n  " + strings.Join(scripts, "\n  ")
+}
+
+func loadWebScripts() (map[string]string, error) {
+	webDir, err := webDir()
+	if err != nil {
+		return nil, err
+	}
+
+	packageJSONPath := filepath.Join(webDir, "package.json")
+	data, err := os.ReadFile(packageJSONPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", packageJSONPath, err)
+	}
+
+	var pkg webPackageJSON
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return nil, fmt.Errorf("failed to parse %s: %w", packageJSONPath, err)
+	}
+
+	if pkg.Scripts == nil {
+		return nil, nil
+	}
+
+	return pkg.Scripts, nil
+}
+
+func webDir() (string, error) {
+	root, err := paths.GitRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "web"), nil
+}
