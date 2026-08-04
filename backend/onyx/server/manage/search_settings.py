@@ -10,17 +10,23 @@ from onyx.background.celery.tasks.port.tasks import (
     resume_paused_port_unit,
 )
 from onyx.background.celery.versioned_apps.client import app as client_app
-from onyx.configs.app_configs import DISABLE_INDEX_UPDATE_ON_SWAP
+from onyx.configs.app_configs import (
+    DISABLE_INDEX_UPDATE_ON_SWAP,
+    DOCUMENT_IMPORT_ENABLED,
+    ENABLE_OPENSEARCH_INDEXING_FOR_ONYX,
+)
 from onyx.context.search.models import (
     SavedSearchSettings,
     SearchSettingsCreationRequest,
 )
+from onyx.db.connector import check_connectors_exist, check_user_files_exist
 from onyx.db.connector_credential_pair import (
     fetch_indexable_standard_connector_credential_pair_ids,
     get_connector_credential_pairs,
     get_last_successful_attempt_poll_range_end,
     resync_cc_pair,
 )
+from onyx.db.document import check_docs_exist
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission, SwitchoverType
 from onyx.db.index_attempt import create_synthetic_seed_attempt, expire_index_attempts
@@ -41,17 +47,22 @@ from onyx.db.port_attempt import (
 from onyx.db.search_settings import (
     create_search_settings,
     delete_search_settings,
+    delete_search_settings_if_not_present,
     get_current_search_settings,
     get_embedding_provider_from_provider_type,
     get_secondary_search_settings,
     update_current_search_settings,
     update_search_settings_status,
 )
+from onyx.db.swap_index import check_and_perform_index_swap
 from onyx.db.user_file import mark_regulatory_user_files_reconcile_pending__no_commit
 from onyx.document_index.factory import (
     get_all_document_indices,
     get_default_document_index,
 )
+from onyx.document_index.interfaces_new import TenantState
+from onyx.document_index.opensearch.client import OpenSearchIndexClient
+from onyx.document_index.opensearch.index_reclaim import reclaim_index_data
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_processing.import_capability import ensure_document_import_available
@@ -73,6 +84,74 @@ router = APIRouter(prefix="/search-settings")
 logger = setup_logger()
 
 
+def _is_empty_cloud_embedding_bootstrap(
+    search_settings_new: SearchSettingsCreationRequest,
+    db_session: Session,
+) -> bool:
+    """Allow first cloud-model selection in parser-free, still-empty production."""
+
+    return (
+        not DOCUMENT_IMPORT_ENABLED
+        and search_settings_new.provider_type is not None
+        and not check_docs_exist(db_session)
+        and not check_connectors_exist(db_session)
+        and not check_user_files_exist(db_session)
+    )
+
+
+def _cleanup_unpromoted_empty_cloud_bootstrap(
+    *,
+    db_session: Session,
+    new_search_settings: SearchSettings,
+    opensearch_index_preexisted: bool,
+) -> bool:
+    """Remove the failed FUTURE row and its empty OpenSearch index."""
+
+    removed = delete_search_settings_if_not_present(
+        db_session=db_session,
+        search_settings_id=new_search_settings.id,
+    )
+    if not removed:
+        return False
+
+    # Reclaim only after the row-lock-protected delete commits. A concurrent
+    # promotion can no longer turn this setting into PRESENT. Never delete an
+    # index that existed before this request; it may be the current index or a
+    # sanitized-name collision shared by another setting.
+    if ENABLE_OPENSEARCH_INDEXING_FOR_ONYX and not opensearch_index_preexisted:
+        try:
+            reclaim_index_data(
+                index_name=new_search_settings.index_name,
+                tenant_state=TenantState(
+                    tenant_id=get_current_tenant_id(), multitenant=MULTI_TENANT
+                ),
+            )
+        except Exception:
+            # The database row must still be removed so a retry is not blocked by
+            # a stale FUTURE setting. The idempotent reclaim path can remove an
+            # empty leftover index on a later attempt.
+            logger.exception(
+                "Failed to reclaim index %s after cloud embedding bootstrap failure",
+                new_search_settings.index_name,
+            )
+
+    return True
+
+
+def _opensearch_index_exists(index_name: str) -> bool:
+    with OpenSearchIndexClient(index_name=index_name) as client:
+        return client.index_exists()
+
+
+def _empty_cloud_bootstrap_error() -> OnyxError:
+    return OnyxError(
+        OnyxErrorCode.INTERNAL_ERROR,
+        "The empty production embedding bootstrap could not activate the "
+        "cloud Search Settings. No documents were changed; retry before "
+        "enabling search traffic.",
+    )
+
+
 @router.post("/set-new-search-settings", dependencies=[Depends(require_vector_db)])
 def set_new_search_settings(
     search_settings_new: SearchSettingsCreationRequest,
@@ -83,7 +162,11 @@ def set_new_search_settings(
     Creates a new SearchSettings row and cancels the previous secondary indexing
     if any exists.
     """
-    ensure_document_import_available()
+    empty_cloud_bootstrap = _is_empty_cloud_embedding_bootstrap(
+        search_settings_new, db_session
+    )
+    if not empty_cloud_bootstrap:
+        ensure_document_import_available()
     if search_settings_new.index_name:
         logger.warning("Index name was specified by request, this is not suggested")
 
@@ -175,9 +258,17 @@ def set_new_search_settings(
     new_search_settings = create_search_settings(
         search_settings=new_search_settings_request,
         db_session=db_session,
-        use_port_flow=True,
+        use_port_flow=not empty_cloud_bootstrap,
         commit=False,
     )
+
+    # If an empty-bootstrap activation fails, physical cleanup is allowed only
+    # for an index that this request actually created.
+    opensearch_index_preexisted = True
+    if empty_cloud_bootstrap and ENABLE_OPENSEARCH_INDEXING_FOR_ONYX:
+        opensearch_index_preexisted = _opensearch_index_exists(
+            new_search_settings.index_name
+        )
 
     # Ensure the document indices have the new index immediately.
     document_indices = get_all_document_indices(search_settings, new_search_settings)
@@ -190,7 +281,7 @@ def set_new_search_settings(
         )
 
     # Pause index attempts for the currently in-use index to preserve resources.
-    if DISABLE_INDEX_UPDATE_ON_SWAP:
+    if DISABLE_INDEX_UPDATE_ON_SWAP and not empty_cloud_bootstrap:
         expire_index_attempts(
             search_settings_id=search_settings.id,
             db_session=db_session,
@@ -247,6 +338,49 @@ def set_new_search_settings(
 
     # Atomic: FUTURE row and its seeds become visible together.
     db_session.commit()
+
+    if empty_cloud_bootstrap:
+        try:
+            check_and_perform_index_swap(db_session)
+        except Exception as swap_error:
+            db_session.rollback()
+            removed = _cleanup_unpromoted_empty_cloud_bootstrap(
+                db_session=db_session,
+                new_search_settings=new_search_settings,
+                opensearch_index_preexisted=opensearch_index_preexisted,
+            )
+            if not removed:
+                try:
+                    settings_after_error = get_current_search_settings(db_session)
+                except Exception:
+                    raise _empty_cloud_bootstrap_error() from swap_error
+
+                # A row-lock race may show that another worker already promoted
+                # the setting. The conditional delete returned False, so the live
+                # index was never reclaimed.
+                if settings_after_error.id == new_search_settings.id:
+                    logger.warning(
+                        "Cloud Search Settings %s became active even though the "
+                        "swap reported an error",
+                        new_search_settings.id,
+                    )
+                    return IdReturn(id=new_search_settings.id)
+
+            raise _empty_cloud_bootstrap_error() from swap_error
+
+        promoted_settings = get_current_search_settings(db_session)
+        if promoted_settings.id != new_search_settings.id:
+            removed = _cleanup_unpromoted_empty_cloud_bootstrap(
+                db_session=db_session,
+                new_search_settings=new_search_settings,
+                opensearch_index_preexisted=opensearch_index_preexisted,
+            )
+            if not removed:
+                latest_settings = get_current_search_settings(db_session)
+                if latest_settings.id == new_search_settings.id:
+                    return IdReturn(id=new_search_settings.id)
+            raise _empty_cloud_bootstrap_error()
+
     return IdReturn(id=new_search_settings.id)
 
 

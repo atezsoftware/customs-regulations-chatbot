@@ -3699,7 +3699,7 @@ class CloudEmbeddingProvider(Base):
     __tablename__ = "embedding_provider"
 
     provider_type: Mapped[EmbeddingProvider] = mapped_column(
-        Enum(EmbeddingProvider), primary_key=True
+        Enum(EmbeddingProvider, native_enum=False, length=50), primary_key=True
     )
     api_url: Mapped[str | None] = mapped_column(String, nullable=True)
     api_key: Mapped[SensitiveValue[str] | None] = mapped_column(EncryptedString())

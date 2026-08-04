@@ -150,6 +150,41 @@ def delete_search_settings(db_session: Session, search_settings_id: int) -> None
     db_session.commit()
 
 
+def delete_search_settings_if_not_present(
+    db_session: Session, search_settings_id: int
+) -> bool:
+    """Atomically discard a non-active setting without racing promotion."""
+
+    search_settings = (
+        db_session.execute(
+            select(SearchSettings)
+            .where(SearchSettings.id == search_settings_id)
+            .with_for_update()
+        )
+        .scalars()
+        .first()
+    )
+    if search_settings is None or search_settings.status == IndexModelStatus.PRESENT:
+        db_session.rollback()
+        return False
+
+    db_session.execute(
+        delete(IndexAttempt).where(
+            IndexAttempt.search_settings_id == search_settings_id
+        )
+    )
+    db_session.execute(
+        delete(SearchSettings).where(
+            and_(
+                SearchSettings.id == search_settings_id,
+                SearchSettings.status != IndexModelStatus.PRESENT,
+            )
+        )
+    )
+    db_session.commit()
+    return True
+
+
 def get_current_search_settings(db_session: Session) -> SearchSettings:
     query = (
         select(SearchSettings)
@@ -272,10 +307,15 @@ def update_secondary_search_settings(
 
 
 def update_search_settings_status(
-    search_settings: SearchSettings, new_status: IndexModelStatus, db_session: Session
+    search_settings: SearchSettings,
+    new_status: IndexModelStatus,
+    db_session: Session,
+    *,
+    commit: bool = True,
 ) -> None:
     search_settings.status = new_status
-    db_session.commit()
+    if commit:
+        db_session.commit()
 
 
 def user_has_overridden_embedding_model() -> bool:

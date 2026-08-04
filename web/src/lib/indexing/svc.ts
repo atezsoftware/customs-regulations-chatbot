@@ -3,11 +3,27 @@ import { SWR_KEYS } from "@/lib/swr-keys";
 import {
   EmbeddingModel,
   EmbeddingProviderName,
+  OpenRouterEmbeddingModelResponse,
   ReindexErrorRow,
   SavedSearchSettings,
   SwitchoverType,
 } from "@/lib/indexing/types";
 import { isCloudBased } from "@/lib/indexing";
+
+export const OPENROUTER_EMBEDDINGS_URL =
+  "https://openrouter.ai/api/v1/embeddings";
+
+interface EmbeddingTestResponse {
+  embedding_dimension: number;
+}
+
+interface SaveEmbeddingProviderCredentialsArgs {
+  providerType: EmbeddingProviderName;
+  apiKey: string | null;
+  apiUrl: string;
+  apiVersion: string | null;
+  deploymentName: string | null;
+}
 
 interface TestEmbeddingArgs {
   provider_type: string;
@@ -43,6 +59,119 @@ export async function testEmbedding({
   });
 }
 
+async function responseErrorMessage(
+  response: Response,
+  fallback: string
+): Promise<string> {
+  try {
+    const error = (await response.json()) as {
+      detail?: string;
+      message?: string;
+    };
+    return error.detail ?? error.message ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function saveEmbeddingProviderCredentials({
+  providerType,
+  apiKey,
+  apiUrl,
+  apiVersion,
+  deploymentName,
+}: SaveEmbeddingProviderCredentialsArgs): Promise<void> {
+  const body: Record<string, unknown> = {
+    provider_type: providerType,
+    api_url: apiUrl,
+    api_version: apiVersion,
+    deployment_name: deploymentName,
+    is_default_provider: false,
+    is_configured: true,
+  };
+  if (apiKey !== null) body.api_key = apiKey;
+
+  const saveResponse = await fetch(SWR_KEYS.embeddingProviders, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!saveResponse.ok) {
+    throw new Error(
+      await responseErrorMessage(saveResponse, "Failed to save provider")
+    );
+  }
+}
+
+/** Fetches the embedding-only catalog exposed by the OpenRouter admin API. */
+export async function fetchOpenRouterEmbeddingModels(
+  apiKey: string | null
+): Promise<OpenRouterEmbeddingModelResponse[]> {
+  const response = await fetch(
+    "/api/admin/embedding/openrouter/available-models",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_key: apiKey }),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      await responseErrorMessage(response, "Failed to fetch OpenRouter models")
+    );
+  }
+
+  return (await response.json()) as OpenRouterEmbeddingModelResponse[];
+}
+
+/**
+ * Tests and persists the fixed OpenRouter embedding connection.
+ * The test response is authoritative for model dimension, so the UI never
+ * asks an administrator to enter that value manually.
+ */
+export async function connectOpenRouterEmbeddingProvider({
+  apiKey,
+  modelName,
+}: {
+  apiKey: string | null;
+  modelName: string;
+}): Promise<number> {
+  const testResponse = await testEmbedding({
+    provider_type: EmbeddingProviderName.OPENROUTER,
+    modelName,
+    apiKey,
+    apiUrl: OPENROUTER_EMBEDDINGS_URL,
+    apiVersion: null,
+    deploymentName: null,
+  });
+
+  if (!testResponse.ok) {
+    throw new Error(
+      await responseErrorMessage(testResponse, "Embedding test failed")
+    );
+  }
+
+  const result = (await testResponse.json()) as Partial<EmbeddingTestResponse>;
+  if (
+    !Number.isInteger(result.embedding_dimension) ||
+    (result.embedding_dimension ?? 0) <= 0
+  ) {
+    throw new Error("OpenRouter returned an invalid embedding dimension");
+  }
+
+  await saveEmbeddingProviderCredentials({
+    providerType: EmbeddingProviderName.OPENROUTER,
+    apiKey,
+    apiUrl: OPENROUTER_EMBEDDINGS_URL,
+    apiVersion: null,
+    deploymentName: null,
+  });
+
+  return result.embedding_dimension as number;
+}
+
 /**
  * Tests and saves embedding provider credentials.
  * Tests the connection first, then persists the credentials.
@@ -60,7 +189,7 @@ export async function connectEmbeddingProvider({
   apiVersion,
   deploymentName,
 }: {
-  providerType: string;
+  providerType: EmbeddingProviderName;
   apiKey: string | null;
   apiUrl: string;
   modelName?: string;
@@ -83,26 +212,13 @@ export async function connectEmbeddingProvider({
     }
   }
 
-  const body: Record<string, unknown> = {
-    provider_type: providerType,
-    api_url: apiUrl,
-    api_version: apiVersion,
-    deployment_name: deploymentName,
-    is_default_provider: false,
-    is_configured: true,
-  };
-  if (apiKey !== null) body.api_key = apiKey;
-
-  const saveResponse = await fetch(SWR_KEYS.embeddingProviders, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+  await saveEmbeddingProviderCredentials({
+    providerType,
+    apiKey,
+    apiUrl,
+    apiVersion,
+    deploymentName,
   });
-
-  if (!saveResponse.ok) {
-    const err = await saveResponse.json();
-    throw new Error(err.detail ?? "Failed to save provider");
-  }
 }
 
 /**
@@ -190,7 +306,7 @@ export async function setNewSearchSettings({
   contextualRagModelConfigurationId,
 }: SetNewSearchSettingsArgs): Promise<Response> {
   // The backend's EmbeddingProvider enum only contains cloud providers
-  // (openai/cohere/voyage/google/litellm/azure). Self-hosted models live
+  // (openai/cohere/voyage/google/openrouter/litellm/azure). Self-hosted models live
   // under the frontend's EmbeddingProviderName for UI grouping (icon,
   // docs link), but the backend expects provider_type=null for them.
   const providerType = isCloudBased(providerName) ? providerName : null;

@@ -10,6 +10,7 @@ export enum EmbeddingProviderName {
   COHERE = "cohere",
   VOYAGE = "voyage",
   GOOGLE = "google",
+  OPENROUTER = "openrouter",
   LITELLM = "litellm",
   AZURE = "azure",
 
@@ -126,6 +127,14 @@ export interface ConfiguredEmbeddingProvider {
   api_url: string | null;
   api_version: string | null;
   deployment_name: string | null;
+}
+
+/** Shape returned by OpenRouter's curated embedding-model catalog endpoint. */
+export interface OpenRouterEmbeddingModelResponse {
+  name: string;
+  display_name: string;
+  description?: string | null;
+  context_length?: number | null;
 }
 
 export interface RerankingDetails {

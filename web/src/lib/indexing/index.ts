@@ -7,6 +7,7 @@ import {
   SvgMicrosoft,
   SvgNomic,
   SvgOpenai,
+  SvgOpenrouter,
   SvgVoyage,
 } from "@opal/logos";
 import {
@@ -158,6 +159,14 @@ export const CLOUD_BASED_PROVIDERS: EmbeddingProvider[] = [
           "Voyage's lightweight embedding model. Good balance of performance and efficiency.",
       },
     ],
+  },
+  {
+    providerName: EmbeddingProviderName.OPENROUTER,
+    displayName: "OpenRouter",
+    icon: SvgOpenrouter,
+    apiLink: "https://openrouter.ai/settings/keys",
+    costslink: "https://openrouter.ai/models",
+    embeddingModels: [],
   },
   {
     providerName: EmbeddingProviderName.LITELLM,

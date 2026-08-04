@@ -203,7 +203,10 @@ def upsert_cloud_embedding_provider(
         .first()
     )
     if existing_provider:
-        for key, value in provider.model_dump().items():
+        updates = provider.model_dump()
+        if "api_key" not in provider.model_fields_set:
+            updates.pop("api_key")
+        for key, value in updates.items():
             setattr(existing_provider, key, value)
     else:
         new_provider = CloudEmbeddingProviderModel(**provider.model_dump())

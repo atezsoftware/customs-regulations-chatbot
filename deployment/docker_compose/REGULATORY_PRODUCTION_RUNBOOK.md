@@ -12,7 +12,8 @@ Production receives:
   `docker-compose.regulatory-prod-lite.yml`;
 - exactly one topology overlay: `docker-compose.regulatory-compose-infra.yml` or
   `docker-compose.regulatory-external-infra.yml`;
-- one release set containing immutable backend-lite, custom web, model-server, and importer digests;
+- one cloud-mode release set whose production handoff contains immutable backend-lite and custom web
+  digests; its paired importer digest remains in the separate importer environment;
 - production environment configuration and secrets from the approved secret store.
 
 Production does **not** receive or run:
@@ -21,17 +22,22 @@ Production does **not** receive or run:
 - the full-runtime importer image;
 - source documents or importer manifests;
 - primary, document-fetching, document-processing, or generic indexing workers.
-- the `indexing_model_server` service or its dependency from `background`.
+- the `inference_model_server` or `indexing_model_server` services, or their dependencies from the
+  application services.
 
 The lite backend keeps chat, retrieval, benchmark execution, indexed-file maintenance, and required
 lightweight queues. `DOCUMENT_IMPORT_ENABLED=false` is enforced by the overlay. Existing regulatory
 chunks remain in PostgreSQL and OpenSearch and are searchable; upload/indexing API mutations fail
 closed.
 
-The default production model includes `inference_model_server` for chat/search embeddings. The
-indexing-only model server is behind the explicit `indexing-model-server` profile and must remain
-inactive on production. Compose-managed Redis is changed from the base's ephemeral configuration to
-AOF `everysec` on the `regulatory_cache_data` named volume.
+The default and recommended production model mode is `cloud`. The fixed no-local-model overlay sets
+`DISABLE_MODEL_SERVER=true` on both `api_server` and `background`; neither local model service is
+started, and no CUDA model image is part of the production release. For a new empty deployment,
+cloud embedding is configured in Search Settings from the production Admin UI after startup but
+before imports or user traffic. LLM calls may use OpenRouter configured separately under Admin
+Language Models. `local` mode, including an `inference_model_server` image, is an explicit opt-in
+exception. Compose-managed Redis is changed from the base's ephemeral configuration to AOF
+`everysec` on the `regulatory_cache_data` named volume.
 
 ## 2. Build and publish outside production
 
@@ -45,20 +51,26 @@ this publisher until then.
 ```bash
 deployment/docker_compose/publish-regulatory-images.sh \
   registry.example.com/team \
-  "$GIT_COMMIT_SHA"
+  "$GIT_COMMIT_SHA" \
+  cloud
 ```
 
-The script builds and pushes four independent artifacts from the same full Git revision:
+The default cloud invocation builds and pushes three independent artifacts from the same full Git
+revision:
 
 - `regulatory-backend-lite`: the only backend image allowed on the production host;
 - `regulatory-web`: the custom frontend, compiled with upstream connections disabled;
-- `regulatory-model-server`: the matching local inference image;
 - `regulatory-importer`: the full parser runtime allowed only on the import workstation/runner.
 
-Record all four `repository@sha256:...` references printed at the end. Configure backend, web, and
-model digests in production and the importer digest only in the separate importer environment. Do not
-mix revisions. Registry retention must keep the complete current and previous known-good release
-sets. Run the organization's vulnerability/signature policy before promotion.
+Record all three `repository@sha256:...` references printed at the end. Configure only backend and
+web digests in production and the importer digest in the separate importer environment. Cloud mode
+does not build, publish, or require a model-server image/digest. Do not mix revisions. Registry
+retention must keep the complete current and previous known-good release sets. Run the organization's
+vulnerability/signature policy before promotion.
+
+For an explicitly approved local-model exception, invoke the same publisher with `local` as the third
+argument. That opt-in invocation adds `regulatory-model-server` as a fourth artifact; its digest is
+then required by the local-mode preflight, deploy, bundle, and rollback commands.
 
 The backend-lite image is labeled `io.regulatory.role=runtime-lite` and
 `io.regulatory.document-import=false`; every published artifact receives the full source revision OCI
@@ -72,27 +84,55 @@ deployment/docker_compose/build-regulatory-prod-bundle.sh \
   "regulatory-production-${GIT_COMMIT_SHA}.tar.gz" \
   "$GIT_COMMIT_SHA" \
   "$APPROVED_BACKEND_DIGEST" \
-  "$APPROVED_WEB_DIGEST" \
-  "$APPROVED_MODEL_DIGEST"
+  "$APPROVED_WEB_DIGEST"
 sha256sum -c "regulatory-production-${GIT_COMMIT_SHA}.tar.gz.sha256"
 tar -tzf "regulatory-production-${GIT_COMMIT_SHA}.tar.gz"
 ```
 
 The builder refuses a dirty checkout or a source revision different from `HEAD`. The bundle includes
-a non-secret manifest containing that revision, the three production image digests, and SHA-256 for
-every deployment file; the adjacent checksum covers the archive and manifest. It contains only the
+a non-secret manifest containing that revision, `model_mode=cloud`, the two production image digests,
+and SHA-256 for every deployment file; the adjacent checksum covers the archive and manifest. It
+contains only the
 production base/edge/topology/lite Compose files, authoritative preflight/deploy scripts,
 secret-free production/nginx/role templates, runbook, and nginx templates. It physically excludes
 the importer compose/env, importer/publish scripts, Dockerfiles, application source, and source
 documents. Production hosts receive this bundle plus approved secrets—not a full repository clone.
 
-CI must sign/attest the checksum and all three image digests with the organization's approved
+CI must sign/attest the checksum and both production image digests with the organization's approved
 mechanism. DevOps verifies those signatures/attestations and the image SBOM/vulnerability policy
 *before extracting the archive*. Record the bundle SHA-256, source revision, manifest, image
 signatures/attestations, and SBOM identifiers in the change record. A checksum alone proves transfer
 integrity, not publisher identity.
 
+For a local-model exception, append `"$APPROVED_MODEL_DIGEST"` to the bundle command. The resulting
+manifest records `model_mode=local` and the third production image digest.
+
 ## 3. Production prerequisites
+
+### Cloud-model configuration gate
+
+Cloud mode removes the model-server containers; it does not automatically change provider settings
+stored in PostgreSQL. Complete these application-level steps before production traffic is opened:
+
+1. For a new database with no documents, non-default connectors, or completed user files, deploy the
+   parser-free application first. Sign in to production **Admin > Search Settings**, choose
+   **OpenRouter**, enter its API key, fetch the embedding models, and select one from the list. The
+   application owns the endpoint and derives the vector dimension from its test call; neither value
+   is entered by the Admin. Activating the selection is permitted even though
+   `DOCUMENT_IMPORT_ENABLED=false`; it promotes the empty cloud index without an indexing worker.
+2. Perform that bootstrap before the first import. Run an embedding/retrieval smoke test before user
+   traffic. Until activation, Admin remains available but search fails closed with a clear
+   local-provider/model-server-disabled error; no local model is started.
+3. If production already contains data, do not use the empty bootstrap. Configure the provider and
+   complete the required reindex from an authorized import/indexing-capable environment, verify the
+   promoted index, and only then cut over to runtime-lite cloud mode.
+4. Configure and test OpenRouter for LLM calls separately under **Admin > Language Models** before
+   opening user traffic. This LLM step may be performed through the production Admin UI during the
+   controlled cutover; it does not perform or replace embedding reindexing.
+
+This branch has no standalone OpenRouter rerank provider/endpoint setting. Do not provision an
+`/api/v1/rerank` URL or represent rerank as a DevOps configuration requirement. The existing search
+pipeline remains authoritative unless a separately reviewed application feature adds such support.
 
 Before the maintenance window:
 
@@ -102,10 +142,10 @@ Before the maintenance window:
    - **External:** add `docker-compose.regulatory-external-infra.yml`; those four local services and
      their `depends_on` edges are removed. Merely changing host variables is forbidden because the
      base file would still start unused local services.
-2. Confirm PostgreSQL, OpenSearch, Redis, object storage, and the configured model/LLM endpoints are
-   reachable over private networking from the production containers. For external OpenSearch this
-   includes an authenticated cluster-health request and a read against the approved live regulatory
-   index/alias; TCP reachability alone is not a pass.
+2. Confirm PostgreSQL, OpenSearch, Redis, object storage, the configured cloud embedding endpoint,
+   and the OpenRouter LLM endpoint are reachable over approved egress from the production containers.
+   For external OpenSearch this includes an authenticated cluster-health request and a read against
+   the approved live regulatory index/alias; TCP reachability alone is not a pass.
 3. Keep PostgreSQL, OpenSearch, Redis, and object storage off the public internet. Restrict security
    groups/firewalls to the application network and administrative paths.
 4. Take coordinated PostgreSQL and OpenSearch backups/snapshots. Preserve object-store versions or a
@@ -119,8 +159,9 @@ Before the maintenance window:
    mode-`0600` `.env` that also contains all base service secrets/provider configuration. The base
    Compose services hardcode `env_file: .env`; using a separate interpolation-only env file would
    silently omit container configuration and is forbidden.
-7. Set `ONYX_BACKEND_LITE_IMAGE`, `ONYX_WEB_SERVER_IMAGE`, and `ONYX_MODEL_SERVER_IMAGE` to the three
-   matching release digests. Tag-only references are forbidden.
+7. Set `ONYX_BACKEND_LITE_IMAGE` and `ONYX_WEB_SERVER_IMAGE` to the two matching production release
+   digests. Leave `ONYX_MODEL_SERVER_IMAGE` unset in cloud mode. A model digest is required only for
+   an explicitly approved `local` release. Tag-only references are forbidden.
 8. Keep the importer compose file, importer credentials, source mounts, and importer image out of the
    production deployment bundle and registry pull policy for the production host.
 9. Create `.env.nginx` from `env.nginx.template`, protect it with mode `0600`, and fill the approved
@@ -140,9 +181,10 @@ Before the maintenance window:
     `COMPOSE_PROFILES` from `.env` and the process environment; only canonical script flags may enable
     a profile.
 14. Inventory all running containers on the host, including other Compose project names. Any legacy
-    full-backend, importer, indexer, indexing-model, primary, docfetching, docprocessing, or
-    user-file-processing container is a blocker until its work is drained and its removal is approved.
-    Rendered-Compose preflight cannot discover an orphan owned by another project.
+    full-backend, importer, indexer, primary, docfetching, docprocessing, or user-file-processing
+    container is a blocker until its work is drained and its removal is approved. In cloud mode, any
+    inference-model or indexing-model container is also a blocker. Rendered-Compose preflight cannot
+    discover an orphan owned by another project.
 
 ```bash
 docker ps --no-trunc --format '{{.ID}} {{.Image}} {{.Names}} {{.Labels}}'
@@ -232,9 +274,10 @@ They require a reviewed generated-base/template change that removes the irreleva
 interpolation. Deployment remains blocked until that topology renders without fake secrets.
 
 The production backend needs only the normal runtime connections: PostgreSQL, OpenSearch, Redis,
-object storage, and the selected model/provider endpoints. `DISABLE_ONYX_UPSTREAM_CONNECTIONS` and
-telemetry disablement are set by the overlay; an egress allowlist should enforce the same boundary at
-the network layer.
+object storage, and the approved cloud embedding/LLM provider endpoints. In cloud mode both API and
+background must render `DISABLE_MODEL_SERVER=true`. `DISABLE_ONYX_UPSTREAM_CONNECTIONS` and telemetry
+disablement are set by the overlay; an egress allowlist should enforce the same boundary at the
+network layer.
 
 Compose-managed Redis uses AOF `everysec` on `regulatory_cache_data`; include that volume in host
 backup/capacity monitoring. External Redis must provide an approved durability/HA policy. An
@@ -244,8 +287,8 @@ and the lite deployment intentionally has no Beat process to recreate generic in
 ## 4. Preflight the rendered deployment
 
 Run only the authoritative preflight wrapper from `deployment/docker_compose`. The approved digest
-variables below are non-secret values supplied by release automation. For Compose-managed data
-services with local inference:
+variables below are non-secret values supplied by release automation. For the recommended cloud
+model mode with Compose-managed data services:
 
 ```bash
 ./regulatory-prod-lite-preflight.sh \
@@ -255,14 +298,13 @@ services with local inference:
   --migration-env-file .env.migration \
   --db-admin-env-file .env.db-admin \
   --infra-mode compose-managed \
-  --model-mode local \
+  --model-mode cloud \
   --expected-image "$APPROVED_BACKEND_DIGEST" \
-  --expected-web-image "$APPROVED_WEB_DIGEST" \
-  --expected-model-image "$APPROVED_MODEL_DIGEST"
+  --expected-web-image "$APPROVED_WEB_DIGEST"
 ```
 
-For approved external data services, with `COMPOSE_PROFILES` excluding `local-infra` and
-`s3-filestore`:
+For the recommended cloud model mode with approved external data services, with `COMPOSE_PROFILES`
+excluding `local-infra` and `s3-filestore`:
 
 ```bash
 ./regulatory-prod-lite-preflight.sh \
@@ -271,24 +313,31 @@ For approved external data services, with `COMPOSE_PROFILES` excluding `local-in
   --project-name "$APPROVED_COMPOSE_PROJECT" \
   --migration-env-file .env.migration \
   --infra-mode external \
-  --model-mode local \
+  --model-mode cloud \
   --expected-image "$APPROVED_BACKEND_DIGEST" \
-  --expected-web-image "$APPROVED_WEB_DIGEST" \
-  --expected-model-image "$APPROVED_MODEL_DIGEST"
+  --expected-web-image "$APPROVED_WEB_DIGEST"
 ```
 
-Use `--model-mode cloud` only after SearchSettings and provider connectivity are approved for cloud
-embeddings. The same script selects the fixed no-local-model overlay and proves that local inference
-is inactive.
+For a new empty installation, run this infrastructure preflight before the first deployment, then
+complete the Admin Search Settings activation after startup and before traffic or import. For an
+existing populated installation, the cloud-provider reindex gate must already be complete before the
+cutover preflight. The script selects the fixed no-local-model overlay, proves that both application
+services have `DISABLE_MODEL_SERVER=true`, and proves that local inference is inactive. Supplying
+`--expected-model-image` in cloud mode is an error.
+
+For an approved local-model exception, change to `--model-mode local` and add
+`--expected-model-image "$APPROVED_MODEL_DIGEST"`. The backend, web, and model references must be
+from the same local-mode release invocation.
 
 This guard renders Compose, rejects tag-only or malformed application/edge/infrastructure image
 references, proves that `api_server` and `background` use the same approved digest, refuses
 `MULTI_TENANT=true`, and fails if importer/indexing services appear in the default model. It also
 proves that local data services are all present in Compose mode and all absent in external mode.
 
-The overlay resets inherited backend, web, and model build definitions. Deployment automation must
-still use `--no-build` as a second, explicit guard. Missing digest variables make Compose validation
-fail instead of falling back to upstream or `latest` images.
+The overlay resets inherited backend and web build definitions; local mode also resets the model
+build. Deployment automation must still use `--no-build` as a second, explicit guard. Missing
+backend/web digests, or a missing model digest in local mode, make Compose validation fail instead of
+falling back to upstream or `latest` images.
 
 ## 5. Migration ownership and rollout
 
@@ -344,11 +393,12 @@ change record and do not cut over merely because the API is idle.
 
 After queue drain and backup approval, deploy only through the authoritative wrapper. It selects the
 fixed overlay chain, validates it, pulls the reviewed images, verifies image role/revision labels,
-stops any legacy indexing-model container, and enters a bounded maintenance window by stopping
-nginx/web/API/background before schema changes. This prevents old API writes during DDL/data
-migrations. It then runs the singleton migration, gates API liveness, and starts with bounded
-`--no-build --wait`. A migration failure leaves application/edge services stopped while data services
-remain intact for investigation:
+and enters a bounded maintenance window by stopping nginx/web/API/background before schema changes.
+Cloud preflight requires legacy inference/indexing model containers to be drained and stopped first;
+the wrapper repeats those stop/state checks as defense in depth. This prevents old API writes during
+DDL/data migrations. It then runs the singleton migration, gates API liveness, and starts with
+bounded `--no-build --wait`. A migration failure leaves application/edge services stopped while data
+services remain intact for investigation:
 
 ```bash
 ./regulatory-prod-lite-deploy.sh deploy \
@@ -358,20 +408,21 @@ remain intact for investigation:
   --migration-env-file .env.migration \
   --db-admin-env-file .env.db-admin \
   --infra-mode compose-managed \
-  --model-mode local \
+  --model-mode cloud \
   --expected-image "$APPROVED_BACKEND_DIGEST" \
   --expected-web-image "$APPROVED_WEB_DIGEST" \
-  --expected-model-image "$APPROVED_MODEL_DIGEST" \
   --backup-reference "$VERIFIED_BACKUP_REFERENCE" \
   --acknowledge-migration-impact \
   --wait-timeout 900
 ```
 
 Use the same command with `--infra-mode external` only after removing
-`--db-admin-env-file .env.db-admin`; external mode forbids that file/flag. Use `--model-mode cloud`
-only when that reviewed topology was preflighted. An application rollout must retain the currently
-approved infrastructure digests. PostgreSQL/OpenSearch/Redis/MinIO/nginx/certbot upgrades are
-separate, separately backed-up changes and must not be folded into an application cutover.
+`--db-admin-env-file .env.db-admin`; external mode forbids that file/flag. For an approved local-model
+exception, use `--model-mode local` and add
+`--expected-model-image "$APPROVED_MODEL_DIGEST"`, matching the preflighted topology. An application
+rollout must retain the currently approved infrastructure digests.
+PostgreSQL/OpenSearch/Redis/MinIO/nginx/certbot upgrades are separate, separately backed-up changes
+and must not be folded into an application cutover.
 
 The regulatory overlay replaces the base API command with Uvicorn-only startup. The canonical deploy
 wrapper's one-shot Alembic command is the sole migration owner; ordinary startup and rollback never
@@ -393,20 +444,21 @@ First verify the same reviewed topology through the authoritative status command
   --migration-env-file .env.migration \
   --db-admin-env-file .env.db-admin \
   --infra-mode compose-managed \
-  --model-mode local \
+  --model-mode cloud \
   --expected-image "$APPROVED_BACKEND_DIGEST" \
-  --expected-web-image "$APPROVED_WEB_DIGEST" \
-  --expected-model-image "$APPROVED_MODEL_DIGEST"
+  --expected-web-image "$APPROVED_WEB_DIGEST"
 ```
 
 The background container healthcheck requires the exact expected supervisor program set—four workers
 (`regulatory_benchmark`, `user_file_maintenance`, `light`, `monitoring`) plus the log redirector—and
 requires all five to be `RUNNING`. `active_queues` must contain only the queues declared by those lite
 workers; primary, docfetching, docprocessing, and user-file-processing queues/workers are forbidden.
-The deploy wrapper verifies that no indexing-model container is running after rollout. Moving a
-service behind a profile alone does not stop an older container, which is why the wrapper explicitly
-stops it. SRE should additionally record Celery `active_queues` from its approved observability/exec
-path and verify only the lite queue set; this is a diagnostic check, not an alternative deploy path.
+Cloud preflight treats every running inference/indexing model container as a blocker. Drain and stop
+the legacy model service after ownership review before invoking the deploy wrapper. The wrapper's
+own stop and post-rollout checks are defense in depth; moving a service behind a profile alone does
+not remove an older container. SRE should additionally record Celery `active_queues` from its
+approved observability/exec path and verify only the lite queue set; this is a diagnostic check, not
+an alternative deploy path.
 
 Use the public frontend/nginx route, not a separately exposed backend port:
 
@@ -433,8 +485,8 @@ Complete one authenticated application smoke test:
 6. Start one small benchmark run only after chat/search succeeds, and confirm the dedicated worker
    completes it.
 
-Review API/background logs for repeated database, OpenSearch, object-store, model-provider, or Celery
-errors before ending the maintenance window.
+Review API/background logs for repeated database, OpenSearch, object-store, cloud embedding,
+OpenRouter LLM, or Celery errors before ending the maintenance window.
 
 ## 7. Separate importer/indexer operation
 
@@ -516,9 +568,10 @@ Application rollback:
 3. Verify the rollback backend has `io.regulatory.role=runtime-lite` and
    `io.regulatory.document-import=false`. A historical full backend image is forbidden because it
    would restore ingestion/indexing workers.
-4. Restore the complete previous backend-lite, web, and model digest set from the same revision.
+4. In cloud mode, restore the previous backend-lite and web digests from the same revision. For an
+   approved local-mode topology, also restore its matching model digest.
 5. Run the authoritative rollback command and all smoke checks. Confirm
-   `indexing_model_server` remains absent afterward.
+   both model-server services remain absent afterward in cloud mode.
 
 ```bash
 ./regulatory-prod-lite-deploy.sh rollback \
@@ -528,17 +581,17 @@ Application rollback:
   --migration-env-file .env.migration \
   --db-admin-env-file .env.db-admin \
   --infra-mode compose-managed \
-  --model-mode local \
+  --model-mode cloud \
   --expected-image "$PREVIOUS_BACKEND_LITE_DIGEST" \
   --expected-web-image "$PREVIOUS_WEB_DIGEST" \
-  --expected-model-image "$PREVIOUS_MODEL_DIGEST" \
   --backup-reference "$VERIFIED_BACKUP_REFERENCE" \
   --schema-compatible \
   --wait-timeout 900
 ```
 
 Use the exact topology modes of the failed release; external mode omits `--db-admin-env-file`. Do not
-switch infrastructure/model topology as part of rollback.
+switch infrastructure/model topology as part of rollback. A local-mode rollback uses
+`--model-mode local` and adds `--expected-model-image "$PREVIOUS_MODEL_DIGEST"`.
 
 Changing an image digest does not undo database migrations or imported data. If a migration is not
 backward compatible, coordinate a database restore or forward fix; do not improvise a downgrade. If

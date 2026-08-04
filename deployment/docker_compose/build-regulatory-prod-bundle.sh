@@ -7,12 +7,14 @@ usage() {
 Create an allowlisted, checksummed regulatory production deployment bundle.
 
 Usage:
-  build-regulatory-prod-bundle.sh OUTPUT.tar.gz SOURCE_REVISION BACKEND_DIGEST WEB_DIGEST MODEL_DIGEST
+  build-regulatory-prod-bundle.sh OUTPUT.tar.gz SOURCE_REVISION BACKEND_DIGEST WEB_DIGEST [MODEL_DIGEST]
 
 SOURCE_REVISION must be the full clean-checkout HEAD. All image references must
 be immutable repository@sha256 digests from that revision's release set. The
-bundle intentionally excludes importer compose/env files, image-publish tooling,
-application source, Dockerfiles, and source documents.
+absence of MODEL_DIGEST creates the approved cloud-model bundle; supplying it
+creates a local-model bundle. The bundle intentionally excludes importer
+compose/env files, image-publish tooling, application source, Dockerfiles, and
+source documents.
 EOF
 }
 
@@ -35,24 +37,31 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   usage
   exit 0
 fi
-if [ "$#" -ne 5 ]; then
+if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
   usage >&2
   exit 64
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 output=$1
 source_revision=$2
 backend_image=$3
 web_image=$4
-model_image=$5
+model_image=${5:-}
+model_mode=local
+if [ "$#" -eq 4 ]; then
+  model_image=
+  model_mode=cloud
+fi
 
 printf '%s\n' "$source_revision" | grep -Eq '^([0-9a-f]{40}|[0-9a-f]{64})$' \
   || die "SOURCE_REVISION must be a full lowercase Git object ID"
 is_digest_reference "$backend_image" || die "BACKEND_DIGEST is not an immutable digest reference"
 is_digest_reference "$web_image" || die "WEB_DIGEST is not an immutable digest reference"
-is_digest_reference "$model_image" || die "MODEL_DIGEST is not an immutable digest reference"
+if [ "$model_mode" = "local" ]; then
+  is_digest_reference "$model_image" || die "MODEL_DIGEST is not an immutable digest reference"
+fi
 
 case "$output" in
   /*) ;;
@@ -119,12 +128,15 @@ done
 
 manifest="$staging_root/deployment/docker_compose/REGULATORY_RELEASE_MANIFEST.txt"
 {
-  printf 'format=regulatory-production-bundle-v1\n'
+  printf 'format=regulatory-production-bundle-v2\n'
   printf 'source_revision=%s\n' "$source_revision"
   printf 'release_platform=linux/amd64\n'
+  printf 'model_mode=%s\n' "$model_mode"
   printf 'backend_image=%s\n' "$backend_image"
   printf 'web_image=%s\n' "$web_image"
-  printf 'model_image=%s\n' "$model_image"
+  if [ "$model_mode" = "local" ]; then
+    printf 'model_image=%s\n' "$model_image"
+  fi
   printf 'file_sha256:\n'
   for file in $bundle_files; do
     file_hash=$(sha256sum -- "$file" | awk '{print $1}')

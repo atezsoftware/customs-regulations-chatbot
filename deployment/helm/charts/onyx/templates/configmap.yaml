@@ -23,12 +23,14 @@ data:
   {{- end }}
   {{- /* configMap overrides win (rendered by the range below) — emitting the
   default too would produce a duplicate YAML key. */}}
-  {{- if not (index .Values.configMap "MODEL_SERVER_HOST") }}
+  {{- if and (gt (int .Values.inferenceCapability.replicaCount) 0) (not (index .Values.configMap "MODEL_SERVER_HOST")) }}
   MODEL_SERVER_HOST: "{{ include "onyx.fullname" . }}-inference-model-service"
   {{- end }}
   {{- if .Values.vectorDB.enabled }}
+  {{- if gt (int .Values.indexCapability.replicaCount) 0 }}
   {{- if not (index .Values.configMap "INDEXING_MODEL_SERVER_HOST") }}
   INDEXING_MODEL_SERVER_HOST: "{{ include "onyx.fullname" . }}-indexing-model-service"
+  {{- end }}
   {{- end }}
   DISABLE_VECTOR_DB: "false"
   {{- else }}

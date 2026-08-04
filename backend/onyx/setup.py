@@ -71,6 +71,7 @@ from onyx.utils.gpu_utils import gpu_status_request
 from onyx.utils.logger import setup_logger
 from shared_configs.configs import (
     ALT_INDEX_SUFFIX,
+    DISABLE_MODEL_SERVER,
     MODEL_SERVER_HOST,
     MODEL_SERVER_PORT,
     MULTI_TENANT,
@@ -159,10 +160,19 @@ def setup_onyx(
                 "Could not connect to a document index within the specified timeout."
             )
 
-        logger.notice(
-            "Model Server: http://%s:%s", MODEL_SERVER_HOST, MODEL_SERVER_PORT
-        )
-        if search_settings.provider_type is None:
+        if DISABLE_MODEL_SERVER:
+            logger.notice("Local Model Server: disabled")
+        else:
+            logger.notice(
+                "Model Server: http://%s:%s", MODEL_SERVER_HOST, MODEL_SERVER_PORT
+            )
+        if search_settings.provider_type is None and DISABLE_MODEL_SERVER:
+            logger.warning(
+                "The local model server is disabled while Search Settings still use "
+                "a local embedding model. Admin remains available for cloud-provider "
+                "bootstrap, but search is unavailable until that setup is complete."
+            )
+        elif search_settings.provider_type is None:
             # In integration tests, do not block API startup on warm-up
             warm_up_bi_encoder(
                 embedding_model=EmbeddingModel.from_db_model(

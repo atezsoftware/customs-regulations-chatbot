@@ -15,6 +15,7 @@ _HEAVY_IMPORT_PACKAGES = {
     "unstructured",
     "unstructured-client",
 }
+_MODEL_SERVER_ONLY_PACKAGES = {"torch", "triton"}
 
 
 def _requirement_names(path: Path) -> set[str]:
@@ -30,9 +31,15 @@ def test_runtime_lock_excludes_import_and_browser_stack() -> None:
     requirements = _BACKEND_ROOT / "requirements"
     runtime_names = _requirement_names(requirements / "runtime.txt")
     full_names = _requirement_names(requirements / "default.txt")
+    model_server_names = _requirement_names(requirements / "model_server.txt")
 
-    assert runtime_names.isdisjoint(_HEAVY_IMPORT_PACKAGES)
+    assert runtime_names.isdisjoint(
+        _HEAVY_IMPORT_PACKAGES | _MODEL_SERVER_ONLY_PACKAGES
+    )
     assert _HEAVY_IMPORT_PACKAGES <= full_names
+    assert _MODEL_SERVER_ONLY_PACKAGES <= model_server_names
+    assert not any(name.startswith("nvidia-") for name in runtime_names)
+    assert any(name.startswith("nvidia-") for name in model_server_names)
 
 
 def test_runtime_lite_docker_target_is_independent_and_parser_free() -> None:
@@ -71,12 +78,15 @@ def test_deployments_use_published_images_without_host_builds() -> None:
     production_validator = (
         compose_root / "validate-regulatory-production.sh"
     ).read_text(encoding="utf-8")
+    production_deployer = (compose_root / "regulatory-prod-lite-deploy.sh").read_text(
+        encoding="utf-8"
+    )
 
     assert prod_lite.count("build: !reset null") == 6
     assert prod_lite.count("pull_policy: always") == 6
     assert "${ONYX_BACKEND_LITE_IMAGE:?" in prod_lite
     assert "${ONYX_WEB_SERVER_IMAGE:?" in prod_lite
-    assert "${ONYX_MODEL_SERVER_IMAGE:?" in prod_lite
+    assert "${ONYX_MODEL_SERVER_IMAGE:-registry.invalid/" in prod_lite
     assert "dockerfile:" not in prod_lite
     assert "onyx.main:app" in prod_lite
     assert "alembic upgrade" not in prod_lite
@@ -102,11 +112,13 @@ def test_deployments_use_published_images_without_host_builds() -> None:
     assert '"$web_dir/Dockerfile"' in publisher
     assert '"$backend_dir/Dockerfile.model_server" final' in publisher
     assert '"$backend_dir/Dockerfile" runtime' in publisher
+    assert "model_mode=${3:-cloud}" in publisher
+    assert 'if [ "$model_mode" = "local" ]; then' in publisher
     assert 'docker push "$lite_tagged"' in publisher
     assert "REGULATORY_SOURCE_REVISION=$source_revision" in publisher
     assert "ONYX_BACKEND_LITE_IMAGE=$lite_digest_ref" in publisher
     assert "ONYX_WEB_SERVER_IMAGE=$web_digest_ref" in publisher
-    assert "ONYX_MODEL_SERVER_IMAGE=$model_digest_ref" in publisher
+    assert "ONYX_MODEL_SERVER_IMAGE=%s\\n" in publisher
     assert "ONYX_IMPORTER_IMAGE=$importer_digest_ref" in publisher
     assert "rev-parse HEAD" in publisher
     assert "diff --quiet --no-ext-diff" in publisher
@@ -117,6 +129,8 @@ def test_deployments_use_published_images_without_host_builds() -> None:
     assert '.["org.opencontainers.image.revision"] == $revision' in importer_runner
     assert "compatibility alias" in production_validator
     assert "regulatory-prod-lite-preflight.sh" in production_validator
+    for forbidden_runtime_module in ("docling", "nvidia", "torch", "triton"):
+        assert f'"{forbidden_runtime_module}"' in production_deployer
 
 
 def test_production_bundle_uses_a_physical_allowlist() -> None:
@@ -140,4 +154,33 @@ def test_production_bundle_uses_a_physical_allowlist() -> None:
     assert "git diff --quiet --no-ext-diff" in script
     assert "git diff --cached --quiet --no-ext-diff" in script
     assert "git ls-files --others --exclude-standard" in script
+    assert "[MODEL_DIGEST]" in script
+    assert "model_mode=cloud" in script
+    assert "printf 'model_mode=%s\\n'" in script
     assert builder.stat().st_mode & stat.S_IXUSR
+
+
+def test_helm_cloud_models_overlay_removes_local_model_workloads() -> None:
+    chart_root = _REPO_ROOT / "deployment" / "helm" / "charts" / "onyx"
+    cloud_values = (chart_root / "values-cloud-models.yaml").read_text(encoding="utf-8")
+    inference_service = (
+        chart_root / "templates" / "inference-model-service.yaml"
+    ).read_text(encoding="utf-8")
+    indexing_service = (
+        chart_root / "templates" / "indexing-model-service.yaml"
+    ).read_text(encoding="utf-8")
+    configmap = (chart_root / "templates" / "configmap.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    assert cloud_values.count("replicaCount: 0") == 2
+    assert 'DISABLE_MODEL_SERVER: "true"' in cloud_values
+    assert 'MODEL_SERVER_HOST: ""' in cloud_values
+    assert 'MODEL_SERVER_PORT: ""' in cloud_values
+    assert 'INDEXING_MODEL_SERVER_HOST: ""' in cloud_values
+    assert 'INDEXING_MODEL_SERVER_PORT: ""' in cloud_values
+    assert "controls model-server workloads only" in cloud_values
+    assert "inferenceCapability.replicaCount" in inference_service
+    assert "indexCapability.replicaCount" in indexing_service
+    assert "inferenceCapability.replicaCount" in configmap
+    assert "indexCapability.replicaCount" in configmap

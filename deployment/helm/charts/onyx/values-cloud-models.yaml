@@ -1,0 +1,34 @@
+# Cloud-model overlay for deployments that keep Redis and vector retrieval but
+# must not schedule or pull the local Torch/CUDA model-server image.
+#
+# Apply this after environment-specific values so the model replica safeguards
+# cannot be overridden accidentally:
+#   helm upgrade --install onyx ./deployment/helm/charts/onyx \
+#     -f ./my-production-values.yaml \
+#     -f ./deployment/helm/charts/onyx/values-cloud-models.yaml
+#
+# On a new empty database, configure the initial cloud embedding provider from
+# Admin after startup and before importing data or opening traffic. Once data
+# exists, changing the active embedding model requires the separate indexing
+# environment to reindex it.
+#
+# This file controls model-server workloads only. It does not disable the
+# standard chart's Celery ingestion/indexing workers. The regulatory production
+# topology uses its separate three-service runtime-lite values/release and must
+# not deploy primary, docfetching, docprocessing, user-file-processing, or Beat
+# workers from the standard chart.
+
+inferenceCapability:
+  replicaCount: 0
+
+indexCapability:
+  replicaCount: 0
+
+configMap:
+  DISABLE_MODEL_SERVER: "true"
+  # Empty values erase environment-specific host overrides when this file is
+  # applied last. The ConfigMap template omits empty entries.
+  MODEL_SERVER_HOST: ""
+  MODEL_SERVER_PORT: ""
+  INDEXING_MODEL_SERVER_HOST: ""
+  INDEXING_MODEL_SERVER_PORT: ""

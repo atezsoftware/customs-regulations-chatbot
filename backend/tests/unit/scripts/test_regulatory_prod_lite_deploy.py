@@ -299,6 +299,30 @@ def _deploy_args(env_file: Path, env: dict[str, str]) -> list[str]:
     ]
 
 
+def _cloud_deploy_args(env_file: Path, env: dict[str, str]) -> list[str]:
+    return [
+        "--env-file",
+        str(env_file),
+        "--base-compose",
+        env["FAKE_BASE_COMPOSE"],
+        "--project-name",
+        "onyx",
+        "--migration-env-file",
+        env["FAKE_MIGRATION_ENV"],
+        "--infra-mode",
+        "external",
+        "--model-mode",
+        "cloud",
+        "--expected-image",
+        _IMAGE,
+        "--expected-web-image",
+        _WEB_IMAGE,
+        "--backup-reference",
+        "snapshot-2026-08-03T04:00Z",
+        "--acknowledge-migration-impact",
+    ]
+
+
 def test_preflight_accepts_digest_pinned_parser_free_runtime(tmp_path: Path) -> None:
     env, env_file = _fake_docker(tmp_path)
 
@@ -393,13 +417,43 @@ def test_preflight_accepts_cloud_models_without_activating_model_containers(
             "external",
             "--model-mode",
             "cloud",
+        ],
+        env,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_preflight_rejects_model_digest_in_cloud_mode(tmp_path: Path) -> None:
+    env, env_file = _fake_docker(
+        tmp_path,
+        config=_config(external_infra=True, cloud_models=True),
+        active_services=("api_server", "background", "web_server", "nginx", "certbot"),
+    )
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--infra-mode",
+            "external",
+            "--model-mode",
+            "cloud",
             "--expected-model-image",
             _MODEL_IMAGE,
         ],
         env,
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode != 0
+    assert "must be omitted in cloud model mode" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -530,6 +584,43 @@ def test_preflight_rejects_running_legacy_indexer_by_container_name(
     assert result.returncode != 0
     assert "old-project-indexing_model_server-1" in result.stderr
     assert "stop the named containers manually" in result.stderr
+
+
+def test_cloud_preflight_rejects_running_legacy_inference_model(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(
+        tmp_path,
+        config=_config(external_infra=True, cloud_models=True),
+        active_services=("api_server", "background", "web_server", "nginx", "certbot"),
+        running_inventory=(
+            "feedface1234\told-project-inference_model_server-1\t"
+            "inference_model_server\n"
+        ),
+    )
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--infra-mode",
+            "external",
+            "--model-mode",
+            "cloud",
+        ],
+        env,
+    )
+
+    assert result.returncode != 0
+    assert "old-project-inference_model_server-1" in result.stderr
+    assert "forbidden local-model" in result.stderr
 
 
 def test_preflight_checks_background_container_image_id_not_mutable_tag(
@@ -799,6 +890,22 @@ def test_deploy_never_builds_and_runs_migration_before_start(tmp_path: Path) -> 
         < full_up_index
     )
     assert all("docker build" not in command for command in commands)
+
+
+def test_cloud_deploy_never_pulls_or_inspects_model_image(tmp_path: Path) -> None:
+    env, env_file = _fake_docker(
+        tmp_path,
+        config=_config(external_infra=True, cloud_models=True),
+        active_services=("api_server", "background", "web_server", "nginx", "certbot"),
+    )
+
+    result = _run(_DEPLOY, ["deploy", *_cloud_deploy_args(env_file, env)], env)
+
+    assert result.returncode == 0, result.stderr
+    commands = (tmp_path / "docker.log").read_text(encoding="utf-8").splitlines()
+    assert not any(" pull inference_model_server" in command for command in commands)
+    assert not any(_MODEL_IMAGE in command for command in commands)
+    assert any(" stop inference_model_server" in command for command in commands)
 
 
 def test_deploy_requires_backup_acknowledgement_before_pull(tmp_path: Path) -> None:

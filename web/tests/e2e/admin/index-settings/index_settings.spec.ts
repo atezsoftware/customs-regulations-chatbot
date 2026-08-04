@@ -6,6 +6,8 @@ import { IndexSettingsPage } from "./IndexSettingsPage";
 const INDEX_SETTINGS_URL = "/admin/configuration/index-settings";
 const EMBEDDING_PROVIDER_API = "**/api/admin/embedding/embedding-provider**";
 const TEST_EMBEDDING_API = "**/api/admin/embedding/test-embedding";
+const OPENROUTER_MODELS_API =
+  "**/api/admin/embedding/openrouter/available-models";
 const SET_NEW_SETTINGS_API = "**/api/search-settings/set-new-search-settings**";
 
 // ---------------------------------------------------------------------------
@@ -348,6 +350,106 @@ test.describe("Index Settings — switchover strategies @exclusive", () => {
     const applyButton = page.getByRole("button", { name: "Apply & Re-index" });
     await expect(applyButton).toBeVisible({ timeout: 5000 });
     await expect(applyButton).toBeDisabled();
+  });
+});
+
+test.describe("Index Settings — OpenRouter embeddings @exclusive", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.context().clearCookies();
+    await loginAs(page, "admin");
+  });
+
+  test("fetches models, discovers dimension, and applies provider_type=openrouter", async ({
+    page,
+  }) => {
+    await page.route(OPENROUTER_MODELS_API, async (route) => {
+      expect(JSON.parse(route.request().postData() ?? "{}")).toEqual({
+        api_key: "sk-or-test",
+      });
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([
+          {
+            name: "openai/text-embedding-3-small",
+            display_name: "Text Embedding 3 Small",
+            description: "Fast embedding model",
+            context_length: 8191,
+          },
+        ]),
+      });
+    });
+    await page.route(TEST_EMBEDDING_API, async (route) => {
+      const body = JSON.parse(route.request().postData() ?? "{}") as Record<
+        string,
+        unknown
+      >;
+      expect(body).toEqual(
+        expect.objectContaining({
+          provider_type: "openrouter",
+          api_url: "https://openrouter.ai/api/v1/embeddings",
+          model_name: "openai/text-embedding-3-small",
+        })
+      );
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ embedding_dimension: 1536 }),
+      });
+    });
+    await page.route(EMBEDDING_PROVIDER_API, async (route) => {
+      if (route.request().method() === "PUT") {
+        const body = JSON.parse(route.request().postData() ?? "{}") as Record<
+          string,
+          unknown
+        >;
+        expect(body).toEqual(
+          expect.objectContaining({
+            provider_type: "openrouter",
+            api_url: "https://openrouter.ai/api/v1/embeddings",
+          })
+        );
+        await route.fulfill({ status: 200, body: JSON.stringify(body) });
+      } else if (route.request().method() === "GET") {
+        await route.fulfill({ status: 200, body: JSON.stringify([]) });
+      } else {
+        await route.continue();
+      }
+    });
+
+    const settingsBody = new Promise<Record<string, unknown>>((resolve) => {
+      void page.route(SET_NEW_SETTINGS_API, async (route) => {
+        resolve(
+          JSON.parse(route.request().postData() ?? "{}") as Record<
+            string,
+            unknown
+          >
+        );
+        await route.fulfill({ status: 200, body: JSON.stringify({}) });
+      });
+    });
+
+    const indexSettings = new IndexSettingsPage(page);
+    await indexSettings.goto();
+    await indexSettings.expandModelPicker();
+    await indexSettings.switchToCloudTab();
+    await indexSettings.openProviderSetup("OpenRouter");
+    await indexSettings.expectOpenRouterUsesAutomaticConnectionFields();
+    await indexSettings.configureOpenRouter({
+      apiKey: "sk-or-test",
+      modelDisplayName: "Text Embedding 3 Small",
+    });
+    await indexSettings.submitProviderSetup();
+    await indexSettings.expectModelStaged();
+    await indexSettings.applyReindex();
+
+    await expect(settingsBody).resolves.toEqual(
+      expect.objectContaining({
+        provider_type: "openrouter",
+        model_name: "openai/text-embedding-3-small",
+        model_dim: 1536,
+      })
+    );
   });
 });
 

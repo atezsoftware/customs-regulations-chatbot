@@ -4,7 +4,8 @@ set -Eeuo pipefail
 umask 077
 
 readonly MINIMUM_COMPOSE_VERSION="2.24.4"
-readonly SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly SCRIPT_DIR
 readonly DEFAULT_BASE_COMPOSE="$SCRIPT_DIR/docker-compose.prod.yml"
 readonly REGULATORY_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-prod-lite.yml"
 readonly EXTERNAL_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-external-infra.yml"
@@ -31,7 +32,7 @@ Options:
   --expected-image REF     Require the rendered backend image to equal this digest reference
   --expected-web-image REF Require the rendered web image to equal this digest reference
   --expected-model-image REF
-                           Require the rendered model image to equal this digest reference
+                           Local mode only: require the rendered model image digest
   -h, --help               Show this help
 
 The shipped regulatory overlays are fixed and cannot be replaced from the command line. Backend and
@@ -64,11 +65,11 @@ is_digest_reference() {
 version_at_least() {
   local actual=${1#v}
   local required=$2
-  local actual_major actual_minor actual_patch ignored
+  local actual_major actual_minor actual_patch
   local required_major required_minor required_patch
 
   actual=${actual%%[-+]*}
-  IFS=. read -r actual_major actual_minor actual_patch ignored <<<"$actual"
+  IFS=. read -r actual_major actual_minor actual_patch _ <<<"$actual"
   IFS=. read -r required_major required_minor required_patch <<<"$required"
 
   [[ "$actual_major" =~ ^[0-9]+$ ]] || return 1
@@ -307,6 +308,10 @@ case "$model_mode" in
     ;;
 esac
 
+if [[ "$model_mode" == "cloud" && -n "$expected_model_image" ]]; then
+  die "--expected-model-image must be omitted in cloud model mode"
+fi
+
 if [[ -n "$expected_image" ]] && ! is_digest_reference "$expected_image"; then
   die "--expected-image must be an immutable repository@sha256 reference"
 fi
@@ -371,6 +376,13 @@ while IFS=$'\t' read -r container_id container_name compose_service; do
   if [[ "$container_role" == "importer" ]]; then
     suspicious_container=true
   fi
+  if [[ "$model_mode" == "cloud" ]]; then
+    case "$identity:$container_role" in
+      *inference_model_server* | *indexing_model_server* | *model-server*)
+        suspicious_container=true
+        ;;
+    esac
+  fi
   if [[ "$compose_service" == "background" ]]; then
     if [[ "$container_role" != "runtime-lite" ]]; then
       suspicious_container=true
@@ -382,7 +394,7 @@ while IFS=$'\t' read -r container_id container_name compose_service; do
 done <"$container_inventory_file"
 
 if ((${#suspicious_containers[@]})); then
-  die "running ingestion/indexer containers detected (${suspicious_containers[*]}); stop the named containers manually after ownership review"
+  die "running ingestion/indexer or forbidden local-model containers detected (${suspicious_containers[*]}); stop the named containers manually after ownership review"
 fi
 
 compose=(
@@ -506,19 +518,21 @@ jq -e '
 ' "$config_file" >/dev/null || \
   die "image/build/import or production service invariants are invalid"
 
-jq -e '
-  .services.inference_model_server as $model
-  | .services.indexing_model_server as $indexing_model
-  | ($model != null and $indexing_model != null)
-    and ($model.build == null and $indexing_model.build == null)
-    and ($model.image == $indexing_model.image)
-    and ($model.image | type == "string")
-    and ($model.image | test("^[^[:space:]@]+@sha256:[0-9a-f]{64}$"))
-    and ($model.image | split("@")[0] | split("/")[-1] | contains(":") | not)
-    and (($model.pull_policy // "") == "always")
-    and (($indexing_model.pull_policy // "") == "always")
-' "$profiled_config_file" >/dev/null || \
-  die "model services must use one approved immutable image without host builds"
+if [[ "$model_mode" == "local" ]]; then
+  jq -e '
+    .services.inference_model_server as $model
+    | .services.indexing_model_server as $indexing_model
+    | ($model != null and $indexing_model != null)
+      and ($model.build == null and $indexing_model.build == null)
+      and ($model.image == $indexing_model.image)
+      and ($model.image | type == "string")
+      and ($model.image | test("^[^[:space:]@]+@sha256:[0-9a-f]{64}$"))
+      and ($model.image | split("@")[0] | split("/")[-1] | contains(":") | not)
+      and (($model.pull_policy // "") == "always")
+      and (($indexing_model.pull_policy // "") == "always")
+  ' "$profiled_config_file" >/dev/null || \
+    die "local model services must use one approved immutable image without host builds"
+fi
 
 jq -e '
   .services.api_server as $api
@@ -674,7 +688,7 @@ if [[ -n "$expected_web_image" ]]; then
     '.services.web_server.image == $expected' \
     "$config_file" >/dev/null || die "the rendered web digest does not match --expected-web-image"
 fi
-if [[ -n "$expected_model_image" ]]; then
+if [[ "$model_mode" == "local" && -n "$expected_model_image" ]]; then
   jq -e --arg expected "$expected_model_image" \
     '.services.inference_model_server.image == $expected and .services.indexing_model_server.image == $expected' \
     "$profiled_config_file" >/dev/null || die "the rendered model digest does not match --expected-model-image"

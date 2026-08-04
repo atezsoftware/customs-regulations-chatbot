@@ -121,7 +121,10 @@ services:
     profiles: ["code-interpreter"]
 
   inference_model_server:
-    image: ${ONYX_MODEL_SERVER_IMAGE:?set ONYX_MODEL_SERVER_IMAGE to the matching published model image by digest}
+    # Cloud mode parks this service before Compose evaluates the active graph.
+    # The non-pullable fallback lets a cloud-only release omit the CUDA-backed
+    # artifact entirely; local mode must override it with a reviewed digest.
+    image: ${ONYX_MODEL_SERVER_IMAGE:-registry.invalid/regulatory-model-server:cloud-disabled}
     build: !reset null
     pull_policy: always
 
@@ -129,7 +132,7 @@ services:
   # indexing-only model server is needed solely by an explicitly enabled
   # indexing deployment, never by parser-free production.
   indexing_model_server:
-    image: ${ONYX_MODEL_SERVER_IMAGE:?set ONYX_MODEL_SERVER_IMAGE to the matching published model image by digest}
+    image: ${ONYX_MODEL_SERVER_IMAGE:-registry.invalid/regulatory-model-server:cloud-disabled}
     build: !reset null
     pull_policy: always
     profiles: ["indexing-model-server"]

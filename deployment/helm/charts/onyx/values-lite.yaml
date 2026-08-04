@@ -22,7 +22,18 @@ vectorDB:
 redis:
   enabled: false
 
+inferenceCapability:
+  replicaCount: 0
+
+indexCapability:
+  replicaCount: 0
+
 configMap:
   CACHE_BACKEND: "postgres"
   AUTH_BACKEND: "postgres"
   FILE_STORE_BACKEND: "postgres"
+  DISABLE_MODEL_SERVER: "true"
+  MODEL_SERVER_HOST: ""
+  MODEL_SERVER_PORT: ""
+  INDEXING_MODEL_SERVER_HOST: ""
+  INDEXING_MODEL_SERVER_PORT: ""

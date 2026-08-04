@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from shared_configs.enums import EmbeddingProvider
 
@@ -22,6 +22,39 @@ class TestEmbeddingRequest(BaseModel):
 
     # This disables the "model_" protected namespace for pydantic
     model_config = {"protected_namespaces": ()}
+
+
+class TestEmbeddingResponse(BaseModel):
+    embedding_dimension: int = Field(gt=0)
+
+
+class OpenRouterEmbeddingModelsRequest(BaseModel):
+    api_key: str | None = None
+
+
+class OpenRouterEmbeddingModelDetails(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: str = Field(min_length=1)
+    display_name: str = Field(alias="name", min_length=1)
+    context_length: int | None = Field(default=None, ge=0)
+    architecture: dict[str, object] = Field(default_factory=dict)
+
+    @property
+    def supports_text_input(self) -> bool:
+        input_modalities = self.architecture.get("input_modalities")
+        return isinstance(input_modalities, list) and "text" in input_modalities
+
+    @property
+    def produces_embeddings(self) -> bool:
+        output_modalities = self.architecture.get("output_modalities")
+        return isinstance(output_modalities, list) and "embeddings" in output_modalities
+
+
+class OpenRouterEmbeddingModelResponse(BaseModel):
+    name: str
+    display_name: str
+    context_length: int | None
 
 
 class CloudEmbeddingProvider(BaseModel):

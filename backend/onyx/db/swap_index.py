@@ -106,12 +106,15 @@ def _perform_index_swap(
         search_settings=current_search_settings,
         new_status=IndexModelStatus.PAST,
         db_session=db_session,
+        commit=False,
     )
     update_search_settings_status(
         search_settings=new_search_settings,
         new_status=IndexModelStatus.PRESENT,
         db_session=db_session,
+        commit=False,
     )
+    db_session.commit()
 
     # FUTURE is now live: cancel stragglers that dropped out of the required set
     # (paused/INVALID) so they stop writing into the live index. Skip for INSTANT —

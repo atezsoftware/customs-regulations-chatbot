@@ -4,13 +4,15 @@ set -eu
 
 usage() {
   cat <<'EOF'
-Build and publish the regulatory runtime, web, model, and one-shot importer images.
+Build and publish the regulatory runtime, web, and one-shot importer images.
+The CUDA-backed model-server artifact is opt-in and is never built for the
+default cloud-model release.
 
 Usage:
-  publish-regulatory-images.sh REGISTRY_PREFIX RELEASE_TAG
+  publish-regulatory-images.sh REGISTRY_PREFIX RELEASE_TAG [cloud|local]
 
 Example:
-  publish-regulatory-images.sh registry.example.com/team "$GIT_COMMIT_SHA"
+  publish-regulatory-images.sh registry.example.com/team "$GIT_COMMIT_SHA" cloud
 
 Run this on a trusted CI/build runner after authenticating Docker to the registry.
 The script prints immutable digest references for the production and importer env files.
@@ -32,15 +34,24 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   exit 0
 fi
 
-if [ "$#" -ne 2 ]; then
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
   usage >&2
   exit 64
 fi
 
 registry_prefix=${1%/}
 release_tag=$2
+model_mode=${3:-cloud}
 source_revision=${SOURCE_REVISION:-$release_tag}
 release_platform=${RELEASE_PLATFORM:-linux/amd64}
+
+case "$model_mode" in
+  cloud | local) ;;
+  *)
+    echo "MODEL_MODE must be cloud or local" >&2
+    exit 64
+    ;;
+esac
 
 case "$registry_prefix" in
   "" | *://* | *[!A-Za-z0-9._:/-]*)
@@ -84,10 +95,10 @@ if [ "$release_platform" != "linux/amd64" ]; then
   exit 64
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
-backend_dir=$(CDPATH= cd -- "$script_dir/../../backend" && pwd)
-web_dir=$(CDPATH= cd -- "$script_dir/../../web" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+backend_dir=$(CDPATH='' cd -- "$script_dir/../../backend" && pwd)
+web_dir=$(CDPATH='' cd -- "$script_dir/../../web" && pwd)
 
 command -v git >/dev/null 2>&1 || {
   echo "git is required to verify release provenance" >&2
@@ -125,12 +136,14 @@ fi
 
 lite_repository=${LITE_IMAGE_REPOSITORY:-$registry_prefix/regulatory-backend-lite}
 web_repository=${WEB_IMAGE_REPOSITORY:-$registry_prefix/regulatory-web}
-model_repository=${MODEL_IMAGE_REPOSITORY:-$registry_prefix/regulatory-model-server}
 importer_repository=${IMPORTER_IMAGE_REPOSITORY:-$registry_prefix/regulatory-importer}
 lite_tagged=$lite_repository:$release_tag
 web_tagged=$web_repository:$release_tag
-model_tagged=$model_repository:$release_tag
 importer_tagged=$importer_repository:$release_tag
+if [ "$model_mode" = "local" ]; then
+  model_repository=${MODEL_IMAGE_REPOSITORY:-$registry_prefix/regulatory-model-server}
+  model_tagged=$model_repository:$release_tag
+fi
 
 build_image() {
   dockerfile=$1
@@ -238,29 +251,39 @@ build_image "$backend_dir/Dockerfile.runtime-lite" runtime-lite "$lite_tagged" "
 echo "Building matching web image: $web_tagged"
 build_web_image
 
-echo "Building matching model-server image: $model_tagged"
-build_image "$backend_dir/Dockerfile.model_server" final "$model_tagged" "$backend_dir" model-server false
+if [ "$model_mode" = "local" ]; then
+  echo "Building matching model-server image: $model_tagged"
+  build_image "$backend_dir/Dockerfile.model_server" final "$model_tagged" "$backend_dir" model-server false
+fi
 
 echo "Building one-shot importer image: $importer_tagged"
 build_image "$backend_dir/Dockerfile" runtime "$importer_tagged" "$backend_dir" importer true
 
 docker push "$lite_tagged"
 docker push "$web_tagged"
-docker push "$model_tagged"
+if [ "$model_mode" = "local" ]; then
+  docker push "$model_tagged"
+fi
 docker push "$importer_tagged"
 
 lite_digest_ref=$(resolve_digest_ref "$lite_repository" "$lite_tagged")
 web_digest_ref=$(resolve_digest_ref "$web_repository" "$web_tagged")
-model_digest_ref=$(resolve_digest_ref "$model_repository" "$model_tagged")
 importer_digest_ref=$(resolve_digest_ref "$importer_repository" "$importer_tagged")
+if [ "$model_mode" = "local" ]; then
+  model_digest_ref=$(resolve_digest_ref "$model_repository" "$model_tagged")
+fi
 
 cat <<EOF
 
 Published release $release_tag. Store these immutable references in deployment configuration:
 REGULATORY_SOURCE_REVISION=$source_revision
 REGULATORY_RELEASE_PLATFORM=$release_platform
+REGULATORY_MODEL_MODE=$model_mode
 ONYX_BACKEND_LITE_IMAGE=$lite_digest_ref
 ONYX_WEB_SERVER_IMAGE=$web_digest_ref
-ONYX_MODEL_SERVER_IMAGE=$model_digest_ref
 ONYX_IMPORTER_IMAGE=$importer_digest_ref
 EOF
+
+if [ "$model_mode" = "local" ]; then
+  printf 'ONYX_MODEL_SERVER_IMAGE=%s\n' "$model_digest_ref"
+fi

@@ -3,7 +3,8 @@
 set -Eeuo pipefail
 umask 077
 
-readonly SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly SCRIPT_DIR
 readonly PREFLIGHT="$SCRIPT_DIR/regulatory-prod-lite-preflight.sh"
 readonly REGULATORY_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-prod-lite.yml"
 readonly EXTERNAL_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-external-infra.yml"
@@ -41,7 +42,7 @@ Options:
   --expected-image REF     Reviewed, immutable runtime-lite image reference
   --expected-web-image REF Reviewed, immutable matching web image reference
   --expected-model-image REF
-                           Reviewed, immutable matching model image reference
+                           Local mode only: reviewed matching model image reference
   --backup-reference REF   Acknowledgement of a verified external DB backup/snapshot
   --acknowledge-migration-impact
                            Confirm extension/DDL authority and reviewed migration data effects
@@ -242,7 +243,12 @@ fi
 
 [[ -n "$expected_image" ]] || die "--expected-image is required for deploy and rollback"
 [[ -n "$expected_web_image" ]] || die "--expected-web-image is required for deploy and rollback"
-[[ -n "$expected_model_image" ]] || die "--expected-model-image is required for deploy and rollback"
+if [[ "$model_mode" == "local" ]]; then
+  [[ -n "$expected_model_image" ]] || \
+    die "--expected-model-image is required for local-model deploy and rollback"
+elif [[ -n "$expected_model_image" ]]; then
+  die "--expected-model-image must be omitted in cloud model mode"
+fi
 validate_acknowledgement "$backup_reference"
 
 if [[ "$command_name" == "rollback" && "$schema_compatible" != true ]]; then
@@ -310,7 +316,7 @@ if ! docker run --rm \
   --env PYTHONDONTWRITEBYTECODE=1 \
   --entrypoint python \
   "$expected_image" \
-  -c 'import importlib.util, os; assert os.environ.get("DOCUMENT_IMPORT_ENABLED", "").lower() == "false"; assert all(importlib.util.find_spec(name) is None for name in ("markitdown", "pypdfium2", "unstructured", "unstructured_client", "playwright"))'; then
+  -c 'import importlib.util, os; assert os.environ.get("DOCUMENT_IMPORT_ENABLED", "").lower() == "false"; assert all(importlib.util.find_spec(name) is None for name in ("docling", "markitdown", "nvidia", "pypdfium2", "unstructured", "unstructured_client", "playwright", "torch", "triton"))'; then
   die "the backend image failed the parser-free runtime probe"
 fi
 
@@ -321,6 +327,19 @@ if ! running_indexer=$("${compose[@]}" ps --status running --quiet indexing_mode
 fi
 if [[ -n "$running_indexer" ]]; then
   die "indexing_model_server is still running after the stop request"
+fi
+
+if [[ "$model_mode" == "cloud" ]]; then
+  printf '%s\n' "Stopping any legacy local inference-model container."
+  "${compose[@]}" stop inference_model_server
+  if ! running_inference=$(
+    "${compose[@]}" ps --status running --quiet inference_model_server
+  ); then
+    die "the inference_model_server state cannot be verified"
+  fi
+  if [[ -n "$running_inference" ]]; then
+    die "inference_model_server is still running in cloud model mode"
+  fi
 fi
 
 printf '%s\n' "Stopping the old background worker before the application transition."
@@ -368,5 +387,15 @@ if ! running_indexer=$("${compose[@]}" ps --status running --quiet indexing_mode
 fi
 if [[ -n "$running_indexer" ]]; then
   die "indexing_model_server became active after deployment"
+fi
+if [[ "$model_mode" == "cloud" ]]; then
+  if ! running_inference=$(
+    "${compose[@]}" ps --status running --quiet inference_model_server
+  ); then
+    die "the inference_model_server state cannot be verified after deployment"
+  fi
+  if [[ -n "$running_inference" ]]; then
+    die "inference_model_server became active in cloud model mode"
+  fi
 fi
 "${compose[@]}" ps

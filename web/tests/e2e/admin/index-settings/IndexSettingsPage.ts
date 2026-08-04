@@ -58,7 +58,7 @@ export class IndexSettingsPage {
   }
 
   // ---------------------------------------------------------------------------
-  // Cloud-provider setup modal (LiteLLM / Azure — providers with no
+  // Cloud-provider setup modal (OpenRouter / LiteLLM / Azure — providers with no
   // pre-registered models render an "Add Configuration" card)
   // ---------------------------------------------------------------------------
 
@@ -102,6 +102,29 @@ export class IndexSettingsPage {
   }): Promise<void> {
     await this.activeSetupModal.locator("#apiUrl").fill(creds.apiBaseUrl);
     await this.activeSetupModal.locator("#apiKey").fill(creds.apiKey);
+  }
+
+  async configureOpenRouter(creds: {
+    apiKey: string;
+    modelDisplayName: string;
+  }): Promise<void> {
+    await this.activeSetupModal.locator("#apiKey").fill(creds.apiKey);
+    await this.activeSetupModal
+      .getByRole("button", { name: "Fetch Models" })
+      .click();
+    const modelSelect = this.activeSetupModal.getByRole("combobox", {
+      name: "Embedding Model",
+    });
+    await expect(modelSelect).toBeEnabled({ timeout: 10000 });
+    await modelSelect.click();
+    await this.page
+      .getByRole("option", { name: creds.modelDisplayName })
+      .click();
+  }
+
+  async expectOpenRouterUsesAutomaticConnectionFields(): Promise<void> {
+    await expect(this.activeSetupModal.locator("#apiUrl")).toHaveCount(0);
+    await expect(this.activeSetupModal.locator("#modelDim")).toHaveCount(0);
   }
 
   async fillAzureCredentials(creds: {

@@ -13,6 +13,11 @@ DEFAULT_COHERE_MODEL = "embed-english-light-v3.0"
 DEFAULT_VOYAGE_MODEL = "voyage-large-2-instruct"
 DEFAULT_VERTEX_MODEL = "text-embedding-005"
 
+OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
+OPENROUTER_EMBEDDING_MODELS_URL = (
+    "https://openrouter.ai/api/v1/models?output_modalities=embeddings"
+)
+
 
 class EmbeddingModelTextType:
     """Mapping of Onyx text types to provider-specific text types."""

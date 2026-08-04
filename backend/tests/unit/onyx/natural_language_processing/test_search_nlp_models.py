@@ -9,6 +9,7 @@ from litellm.exceptions import RateLimitError
 from tenacity import wait_none
 
 from onyx.llm.constants import LlmProviderNames
+from onyx.natural_language_processing.constants import OPENROUTER_EMBEDDINGS_URL
 from onyx.natural_language_processing.search_nlp_models import (
     CloudEmbedding,
     EmbeddingModel,
@@ -39,6 +40,10 @@ def test_clean_model_name_lowercases_names_for_opensearch_index() -> None:
     assert cleaned_model_name == "qwen3_vl_embedding_8b"
     assert (
         f"danswer_chunk_{cleaned_model_name}" == "danswer_chunk_qwen3_vl_embedding_8b"
+    )
+    assert (
+        clean_model_name("nvidia/nemotron-3-embed-1b:free")
+        == "nvidia_nemotron_3_embed_1b_free"
     )
 
 
@@ -77,6 +82,127 @@ async def test_openai_embedding(
 
         assert result == sample_embeddings
         mock_client.embeddings.create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_litellm_embedding_posts_openrouter_compatible_request(
+    sample_embeddings: list[list[float]],
+) -> None:
+    with patch("httpx.AsyncClient") as mock_async_client:
+        client = AsyncMock(spec=AsyncClient)
+        mock_async_client.return_value = client
+        response = MagicMock()
+        response.json.return_value = {
+            "data": [
+                {"index": index, "embedding": embedding}
+                for index, embedding in enumerate(sample_embeddings)
+            ]
+        }
+        client.post.return_value = response
+
+        embedding = CloudEmbedding(
+            "openrouter-key",
+            EmbeddingProvider.LITELLM,
+            api_url="https://openrouter.ai/api/v1/embeddings",
+        )
+        try:
+            result = await embedding.embed(
+                texts=["test1", "test2"],
+                model_name="openai/text-embedding-3-small",
+                text_type=EmbedTextType.QUERY,
+            )
+        finally:
+            await embedding.aclose()
+
+    assert result == sample_embeddings
+    client.post.assert_awaited_once_with(
+        "https://openrouter.ai/api/v1/embeddings",
+        json={
+            "model": "openai/text-embedding-3-small",
+            "input": ["test1", "test2"],
+        },
+        headers={"Authorization": "Bearer openrouter-key"},
+    )
+    response.raise_for_status.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_embedding_uses_fixed_origin(
+    sample_embeddings: list[list[float]],
+) -> None:
+    with patch("httpx.AsyncClient") as mock_async_client:
+        client = AsyncMock(spec=AsyncClient)
+        mock_async_client.return_value = client
+        response = MagicMock()
+        response.json.return_value = {
+            "data": [
+                {"index": index, "embedding": embedding}
+                for index, embedding in enumerate(sample_embeddings)
+            ][::-1]
+        }
+        client.post.return_value = response
+
+        embedding = CloudEmbedding(
+            "openrouter-key",
+            EmbeddingProvider.OPENROUTER,
+            api_url="https://example.invalid/embeddings",
+        )
+        try:
+            result = await embedding.embed(
+                texts=["test1", "test2"],
+                model_name="openai/text-embedding-3-small",
+                text_type=EmbedTextType.QUERY,
+            )
+        finally:
+            await embedding.aclose()
+
+    assert result == sample_embeddings
+    client.post.assert_awaited_once_with(
+        OPENROUTER_EMBEDDINGS_URL,
+        json={
+            "model": "openai/text-embedding-3-small",
+            "input": ["test1", "test2"],
+        },
+        headers={"Authorization": "Bearer openrouter-key"},
+    )
+    response.raise_for_status.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_data",
+    [
+        [{"index": 0, "embedding": [0.1]}],
+        [
+            {"index": 0, "embedding": [0.1]},
+            {"index": 0, "embedding": [0.2]},
+        ],
+        [
+            {"index": 0, "embedding": [0.1]},
+            {"index": 2, "embedding": [0.2]},
+        ],
+    ],
+)
+async def test_proxy_embedding_rejects_invalid_response_indexes(
+    response_data: list[dict[str, object]],
+) -> None:
+    embedding = CloudEmbedding(
+        "openrouter-key",
+        EmbeddingProvider.OPENROUTER,
+    )
+    response = MagicMock()
+    response.json.return_value = {"data": response_data}
+    embedding.http_client.post = AsyncMock(return_value=response)
+
+    try:
+        with pytest.raises(RuntimeError, match="EmbeddingProvider.OPENROUTER"):
+            await embedding.embed(
+                texts=["test1", "test2"],
+                model_name="openai/text-embedding-3-small",
+                text_type=EmbedTextType.QUERY,
+            )
+    finally:
+        await embedding.aclose()
 
 
 def _build_google_embed_response(
@@ -539,6 +665,35 @@ def test_batch_encode_local_model_sequential() -> None:
 
     # Postcondition.
     assert result == [_embedding_for_idx(i) for i in range(n_texts)]
+
+
+def test_disabled_local_model_fails_before_model_server_request() -> None:
+    with (
+        patch(f"{_SEARCH_NLP_MODULE}.DISABLE_MODEL_SERVER", True),
+        patch(f"{_SEARCH_NLP_MODULE}.get_tokenizer") as get_tokenizer,
+        patch.object(EmbeddingModel, "_make_model_server_request") as request,
+        pytest.raises(RuntimeError, match="administrator must configure"),
+    ):
+        model = _make_local_embedding_model()
+        model.encode(
+            texts=["query"],
+            text_type=EmbedTextType.QUERY,
+        )
+
+    get_tokenizer.assert_not_called()
+    request.assert_not_called()
+
+
+def test_disabled_local_model_tokenizer_fails_with_configuration_error() -> None:
+    with (
+        patch(f"{_SEARCH_NLP_MODULE}.DISABLE_MODEL_SERVER", True),
+        patch(f"{_SEARCH_NLP_MODULE}.get_tokenizer") as get_tokenizer,
+        pytest.raises(RuntimeError, match="administrator must configure"),
+    ):
+        model = _make_local_embedding_model()
+        model.tokenizer.encode("query")
+
+    get_tokenizer.assert_not_called()
 
 
 def test_batch_encode_error_propagates() -> None:

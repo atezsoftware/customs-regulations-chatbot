@@ -1,21 +1,27 @@
 "use client";
 
+import { useState } from "react";
 import { Formik, useFormikContext } from "formik";
 import * as Yup from "yup";
-import { Button } from "@opal/components";
-import { SvgArrowExchange, SvgSimpleLoader } from "@opal/icons";
+import { Button, InputSelect } from "@opal/components";
+import { SvgArrowExchange, SvgRefreshCw, SvgSimpleLoader } from "@opal/icons";
 import { SvgOnyxLogo } from "@opal/logos";
 import * as GeneralLayouts from "@/layouts/general-layouts";
 import { Modal } from "@opal/components";
-import { toast } from "@opal/layouts";
+import { InputVertical, toast } from "@opal/layouts";
 import {
   EmbeddingModelRequest,
   EmbeddingProviderName,
   type ConfiguredEmbeddingProvider,
   type EmbeddingModel,
   type EmbeddingProvider,
+  type OpenRouterEmbeddingModelResponse,
 } from "@/lib/indexing/types";
-import { connectEmbeddingProvider, testEmbedding } from "@/lib/indexing/svc";
+import {
+  connectEmbeddingProvider,
+  connectOpenRouterEmbeddingProvider,
+  fetchOpenRouterEmbeddingModels,
+} from "@/lib/indexing/svc";
 import {
   ApiKeyField,
   ApiUrlField,
@@ -356,6 +362,183 @@ function AzureProviderModal({
 }
 
 // ---------------------------------------------------------------------------
+// OpenRouter
+// ---------------------------------------------------------------------------
+
+interface OpenRouterFormValues {
+  apiKey: string;
+  modelName: string;
+}
+
+interface OpenRouterFieldsProps {
+  provider: EmbeddingProvider;
+  existingModel?: EmbeddingModel;
+  maskedApiKey: string;
+}
+
+function OpenRouterFields({
+  provider,
+  existingModel,
+  maskedApiKey,
+}: OpenRouterFieldsProps) {
+  const { values, setFieldTouched, setFieldValue } =
+    useFormikContext<OpenRouterFormValues>();
+  const [models, setModels] = useState<OpenRouterEmbeddingModelResponse[]>(
+    existingModel
+      ? [
+          {
+            name: existingModel.modelName,
+            display_name: existingModel.modelName,
+          },
+        ]
+      : []
+  );
+  const [isFetching, setIsFetching] = useState(false);
+  const apiKey =
+    values.apiKey === maskedApiKey ? null : values.apiKey.trim() || null;
+  const canFetch = apiKey !== null || maskedApiKey.length > 0;
+
+  const handleFetchModels = async () => {
+    setIsFetching(true);
+    try {
+      const fetchedModels = await fetchOpenRouterEmbeddingModels(apiKey);
+      setModels(fetchedModels);
+      if (
+        values.modelName &&
+        !fetchedModels.some((model) => model.name === values.modelName)
+      ) {
+        await setFieldValue("modelName", "");
+      }
+      if (fetchedModels.length === 0) {
+        toast.error("No OpenRouter embedding models were found");
+      }
+    } catch (error: unknown) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to fetch models"
+      );
+    } finally {
+      setIsFetching(false);
+    }
+  };
+
+  return (
+    <>
+      <ApiKeyField provider={provider} />
+
+      <InputVertical
+        title="Embedding Model"
+        subDescription="Fetch the embedding models available to this OpenRouter account, then select one. Model dimension is detected automatically when the connection is tested."
+        withLabel="modelName"
+      >
+        <div className="flex w-full flex-row items-center gap-2">
+          <div className="min-w-0 flex-1">
+            <InputSelect
+              value={values.modelName || undefined}
+              onValueChange={(modelName) => {
+                void setFieldValue("modelName", modelName);
+                void setFieldTouched("modelName", true, false);
+              }}
+              disabled={models.length === 0}
+            >
+              <InputSelect.Trigger
+                id="modelName"
+                aria-label="Embedding Model"
+                placeholder="Fetch and select a model"
+              />
+              <InputSelect.Content>
+                {models.map((model) => {
+                  const details = [
+                    model.description,
+                    model.context_length
+                      ? `${model.context_length.toLocaleString()} token context`
+                      : null,
+                  ].filter((detail): detail is string => !!detail);
+                  return (
+                    <InputSelect.Item
+                      key={model.name}
+                      value={model.name}
+                      description={details.join(" · ") || undefined}
+                      wrapDescription
+                    >
+                      {model.display_name || model.name}
+                    </InputSelect.Item>
+                  );
+                })}
+              </InputSelect.Content>
+            </InputSelect>
+          </div>
+          <Button
+            prominence="secondary"
+            icon={isFetching ? SvgSimpleLoader : SvgRefreshCw}
+            disabled={!canFetch || isFetching}
+            onClick={() => void handleFetchModels()}
+          >
+            Fetch Models
+          </Button>
+        </div>
+      </InputVertical>
+    </>
+  );
+}
+
+function OpenRouterProviderModal({
+  provider,
+  existingCredentials,
+  existingModel,
+  onSubmit,
+}: ProviderModalProps) {
+  const isEditing = !!existingCredentials;
+  const maskedApiKey = existingCredentials?.api_key ?? "";
+  const initialValues: OpenRouterFormValues = {
+    apiKey: maskedApiKey,
+    modelName: existingModel?.modelName ?? "",
+  };
+  const schema = Yup.object({
+    apiKey: isEditing
+      ? Yup.string().trim()
+      : Yup.string().trim().required("API key is required"),
+    modelName: Yup.string().trim().required("Embedding model is required"),
+  });
+
+  return (
+    <Formik<OpenRouterFormValues>
+      initialValues={initialValues}
+      validationSchema={schema}
+      validateOnMount
+      onSubmit={async (values) => {
+        const apiKey =
+          values.apiKey === maskedApiKey ? null : values.apiKey.trim() || null;
+        try {
+          const embeddingDimension = await connectOpenRouterEmbeddingProvider({
+            apiKey,
+            modelName: values.modelName,
+          });
+          onSubmit({
+            modelName: values.modelName,
+            modelDim: embeddingDimension,
+            normalize: false,
+            queryPrefix: null,
+            passagePrefix: null,
+          });
+        } catch (error: unknown) {
+          toast.error(
+            error instanceof Error ? error.message : "An unknown error occurred"
+          );
+        }
+      }}
+    >
+      <ModalShell provider={provider} isEditing={isEditing}>
+        <OpenRouterFields
+          provider={provider}
+          existingModel={existingModel}
+          maskedApiKey={maskedApiKey}
+        />
+      </ModalShell>
+    </Formik>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // LiteLLM
 // ---------------------------------------------------------------------------
 
@@ -493,6 +676,8 @@ export function ProviderCredentialsModal(props: ProviderModalProps) {
       return <GoogleProviderModal {...props} />;
     case EmbeddingProviderName.AZURE:
       return <AzureProviderModal {...props} />;
+    case EmbeddingProviderName.OPENROUTER:
+      return <OpenRouterProviderModal {...props} />;
     case EmbeddingProviderName.LITELLM:
       return <LiteLLMProviderModal {...props} />;
     case EmbeddingProviderName.CUSTOM:

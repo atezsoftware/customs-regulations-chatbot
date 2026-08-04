@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Formik } from "formik";
+import { Formik, type FormikProps } from "formik";
 import { markdown } from "@opal/utils";
 import { useRouter } from "next/navigation";
 import { mutate } from "swr";
@@ -214,9 +214,9 @@ function ProviderGroup({
   const providerCreationModal = useCreateModal();
   const [pendingConnectModel, setPendingConnectModel] =
     useState<EmbeddingModel | null>(null);
-  const providerGroupContainsCurrentModelName = models.some(
-    (m) => m.modelName === currentModelName
-  );
+  const providerGroupContainsCurrentModelName =
+    models.some((m) => m.modelName === currentModelName) ||
+    existingModel?.modelName === currentModelName;
 
   const handleDisconnect = useCallback(async () => {
     if (!isCloud) return;
@@ -317,8 +317,14 @@ function ProviderGroup({
               provider={provider}
               existingCredentials={existingCredentials}
               existingModel={existingModel}
-              onSubmit={async () => {
+              onSubmit={async (customModel) => {
                 await mutate(SWR_KEYS.embeddingProviders);
+                if (
+                  customModel?.modelName &&
+                  customModel.modelName !== currentModelName
+                ) {
+                  onSelectModel(customModel.modelName, customModel);
+                }
                 editCredentialsModal.toggle(false);
               }}
             />
@@ -576,6 +582,8 @@ export default function IndexSettingsPage() {
   const router = useRouter();
   const settings = useSettings();
   const editModal = useCreateModal();
+  const indexSettingsFormRef =
+    useRef<FormikProps<IndexSettingsFormValues>>(null);
   const [viewAllModelsOpen, setViewAllModelsOpen] = useState(false);
   const [activeModelTab, setActiveModelTab] = useState(MODEL_TAB_CLOUD);
   const [switchoverType, setSwitchoverType] = useState<SwitchoverType>(
@@ -819,8 +827,25 @@ export default function IndexSettingsPage() {
               currentProvider.providerName
             )}
             existingModel={currentEmbeddingModelSpec ?? undefined}
-            onSubmit={async () => {
+            onSubmit={async (customModel) => {
               await mutate(SWR_KEYS.embeddingProviders);
+              if (
+                customModel?.modelName &&
+                customModel.modelName !== currentEmbeddingModel?.model_name
+              ) {
+                await indexSettingsFormRef.current?.setFieldValue(
+                  "model_name",
+                  customModel.modelName
+                );
+                await indexSettingsFormRef.current?.setFieldValue(
+                  "custom_model",
+                  customModel
+                );
+                await indexSettingsFormRef.current?.setFieldValue(
+                  "custom_model_provider",
+                  currentProvider.providerName
+                );
+              }
               editModal.toggle(false);
             }}
           />
@@ -854,6 +879,7 @@ export default function IndexSettingsPage() {
 
         <SettingsLayouts.Body>
           <Formik<IndexSettingsFormValues>
+            innerRef={indexSettingsFormRef}
             enableReinitialize
             initialValues={initialFormValues}
             onSubmit={async (values) => {

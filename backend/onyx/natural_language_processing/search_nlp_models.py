@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -43,13 +44,18 @@ from onyx.natural_language_processing.constants import (
     DEFAULT_OPENAI_MODEL,
     DEFAULT_VERTEX_MODEL,
     DEFAULT_VOYAGE_MODEL,
+    OPENROUTER_EMBEDDINGS_URL,
     EmbeddingModelTextType,
 )
 from onyx.natural_language_processing.exceptions import (
     CohereBillingLimitError,
     ModelServerRateLimitError,
 )
-from onyx.natural_language_processing.utils import get_tokenizer, tokenizer_trim_content
+from onyx.natural_language_processing.utils import (
+    DisabledLocalTokenizer,
+    get_tokenizer,
+    tokenizer_trim_content,
+)
 from onyx.server.metrics.embedding import (
     observe_embedding_client,
     track_embedding_in_progress,
@@ -62,6 +68,7 @@ from onyx.utils.text_processing import remove_invalid_unicode_chars
 from onyx.utils.timing import log_function_time
 from shared_configs.configs import (
     API_BASED_EMBEDDING_TIMEOUT,
+    DISABLE_MODEL_SERVER,
     DOC_EMBEDDING_CONTEXT_SIZE,
     INDEXING_ONLY,
     MODEL_SERVER_CONNECT_TIMEOUT,
@@ -202,7 +209,10 @@ WARM_UP_STRINGS = [
 
 
 def clean_model_name(model_str: str) -> str:
-    return model_str.replace("/", "_").replace("-", "_").replace(".", "_").lower()
+    cleaned_name = re.sub(r"[^a-z0-9]+", "_", model_str.lower()).strip("_")
+    if not cleaned_name:
+        raise ValueError("Embedding model name must contain a letter or number.")
+    return cleaned_name
 
 
 def build_model_server_url(
@@ -552,9 +562,14 @@ class CloudEmbedding:
         self, texts: list[str], model_name: str | None
     ) -> list[Embedding]:
         if not model_name:
-            raise ValueError("Model name is required for LiteLLM proxy embedding.")
+            raise ValueError("Model name is required for proxy embedding.")
 
-        if not self.api_url:
+        api_url = (
+            OPENROUTER_EMBEDDINGS_URL
+            if self.provider == EmbeddingProvider.OPENROUTER
+            else self.api_url
+        )
+        if not api_url:
             raise ValueError("API URL is required for LiteLLM proxy embedding.")
 
         headers = (
@@ -562,7 +577,7 @@ class CloudEmbedding:
         )
 
         response = await self.http_client.post(
-            self.api_url,
+            api_url,
             json={
                 "model": model_name,
                 "input": texts,
@@ -571,7 +586,38 @@ class CloudEmbedding:
         )
         response.raise_for_status()
         result = response.json()
-        return [embedding["embedding"] for embedding in result["data"]]
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise ValueError("Embedding provider returned an invalid response.")
+
+        response_data = result["data"]
+        if len(response_data) != len(texts):
+            raise ValueError(
+                "Embedding provider returned a different number of vectors than inputs."
+            )
+
+        ordered_embeddings: list[Embedding | None] = [None] * len(texts)
+        for item in response_data:
+            if not isinstance(item, dict):
+                raise ValueError("Embedding provider returned an invalid vector entry.")
+            index = item.get("index")
+            vector = item.get("embedding")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                or index >= len(texts)
+                or ordered_embeddings[index] is not None
+            ):
+                raise ValueError("Embedding provider returned invalid vector indexes.")
+            if not isinstance(vector, list) or not vector:
+                raise ValueError(
+                    "Embedding provider returned an invalid embedding vector."
+                )
+            ordered_embeddings[index] = vector
+
+        if any(embedding is None for embedding in ordered_embeddings):
+            raise ValueError("Embedding provider omitted an embedding vector.")
+        return cast(list[Embedding], ordered_embeddings)
 
     @retry(
         retry=retry_if_exception_type(RuntimeError),
@@ -595,7 +641,10 @@ class CloudEmbedding:
                 return await self._embed_openai(texts, model_name, reduced_dimension)
             elif self.provider == EmbeddingProvider.AZURE:
                 return await self._embed_azure(texts, f"azure/{deployment_name}")
-            elif self.provider == EmbeddingProvider.LITELLM:
+            elif self.provider in {
+                EmbeddingProvider.LITELLM,
+                EmbeddingProvider.OPENROUTER,
+            }:
                 return await self._embed_litellm_proxy(texts, model_name)
 
             embedding_type = EmbeddingModelTextType.get_type(self.provider, text_type)
@@ -796,8 +845,10 @@ class EmbeddingModel:
         self.api_version = api_version
         self.deployment_name = deployment_name
         self.reduced_dimension = reduced_dimension
-        self.tokenizer = get_tokenizer(
-            model_name=model_name, provider_type=provider_type
+        self.tokenizer = (
+            DisabledLocalTokenizer()
+            if provider_type is None and DISABLE_MODEL_SERVER
+            else get_tokenizer(model_name=model_name, provider_type=provider_type)
         )
         self.callback = callback
 
@@ -1150,6 +1201,12 @@ class EmbeddingModel:
     ) -> list[Embedding]:
         if not texts or not all(texts):
             raise ValueError(f"Empty or missing text for embedding: {texts}")
+        if self.provider_type is None and DISABLE_MODEL_SERVER:
+            raise RuntimeError(
+                "The local model server is disabled, but the active Search Settings "
+                "still select a local embedding model. An administrator must configure "
+                "and activate a cloud embedding provider before search is used."
+            )
 
         if large_chunks_present:
             max_seq_length *= LARGE_CHUNK_RATIO

@@ -31,19 +31,48 @@ class BaseTokenizer(ABC):
         pass
 
 
+class DisabledLocalTokenizer(BaseTokenizer):
+    """Fail clearly if code tries to tokenize for a disabled local model."""
+
+    _ERROR_MESSAGE = (
+        "The local model server is disabled, but the active Search Settings still "
+        "select a local embedding model. An administrator must configure and "
+        "activate a cloud embedding provider before search or indexing is used."
+    )
+
+    def encode(self, string: str) -> list[int]:  # noqa: ARG002
+        raise RuntimeError(self._ERROR_MESSAGE)
+
+    def tokenize(self, string: str) -> list[str]:  # noqa: ARG002
+        raise RuntimeError(self._ERROR_MESSAGE)
+
+    def decode(self, tokens: list[int]) -> str:  # noqa: ARG002
+        raise RuntimeError(self._ERROR_MESSAGE)
+
+
 class TiktokenTokenizer(BaseTokenizer):
-    _instances: dict[str, "TiktokenTokenizer"] = {}
+    _instances: dict[tuple[str, str | None], "TiktokenTokenizer"] = {}
 
-    def __new__(cls, model_name: str) -> "TiktokenTokenizer":
-        if model_name not in cls._instances:
-            cls._instances[model_name] = super(TiktokenTokenizer, cls).__new__(cls)
-        return cls._instances[model_name]
+    def __new__(
+        cls, model_name: str, fallback_encoding_name: str | None = None
+    ) -> "TiktokenTokenizer":
+        cache_key = (model_name, fallback_encoding_name)
+        if cache_key not in cls._instances:
+            cls._instances[cache_key] = super(TiktokenTokenizer, cls).__new__(cls)
+        return cls._instances[cache_key]
 
-    def __init__(self, model_name: str):
+    def __init__(
+        self, model_name: str, fallback_encoding_name: str | None = None
+    ) -> None:
         if not hasattr(self, "encoder"):
             import tiktoken
 
-            self.encoder = tiktoken.encoding_for_model(model_name)
+            try:
+                self.encoder = tiktoken.encoding_for_model(model_name)
+            except KeyError:
+                if fallback_encoding_name is None:
+                    raise
+                self.encoder = tiktoken.get_encoding(fallback_encoding_name)
 
     def encode(self, string: str) -> list[int]:
         # this ignores special tokens that the model is trained on, see encode_ordinary for details
@@ -128,17 +157,37 @@ def _try_initialize_tokenizer(
     tokenizer: BaseTokenizer | None = None
 
     if model_provider is not None:
-        # Try using TiktokenTokenizer first if model_provider exists
-        try:
-            tokenizer = TiktokenTokenizer(model_name)
-            logger.info("Initialized TiktokenTokenizer for: %s", model_name)
-            return tokenizer
-        except Exception as tiktoken_error:
-            logger.debug(
-                "TiktokenTokenizer not available for model %s: %s",
-                model_name,
-                tiktoken_error,
-            )
+        # Provider routers commonly qualify model names (for example,
+        # ``openai/text-embedding-3-small``). Tiktoken knows the unqualified
+        # model, so try both forms before using an explicit offline-safe
+        # approximation. Cloud models must never fall through to the default
+        # Hugging Face tokenizer, which can trigger a model download in the
+        # runtime-lite image.
+        candidate_model_names = list(
+            dict.fromkeys((model_name, model_name.rsplit("/", 1)[-1]))
+        )
+        for candidate_model_name in candidate_model_names:
+            try:
+                tokenizer = TiktokenTokenizer(candidate_model_name)
+                logger.info(
+                    "Initialized TiktokenTokenizer for cloud model %s using %s",
+                    model_name,
+                    candidate_model_name,
+                )
+                return tokenizer
+            except Exception as tiktoken_error:
+                logger.debug(
+                    "TiktokenTokenizer not available for cloud model candidate %s: %s",
+                    candidate_model_name,
+                    tiktoken_error,
+                )
+
+        logger.warning(
+            "No exact tiktoken mapping exists for cloud embedding model %s; "
+            "using the offline cl100k_base approximation",
+            model_name,
+        )
+        return TiktokenTokenizer(model_name, fallback_encoding_name="cl100k_base")
     else:
         # If no provider specified, try HuggingFaceTokenizer
         try:
