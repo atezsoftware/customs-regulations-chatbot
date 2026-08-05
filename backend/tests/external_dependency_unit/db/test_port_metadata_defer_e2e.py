@@ -1,8 +1,8 @@
 """End-to-end deferred-metadata-sync (permission) test for the reindex port.
 
 The existing sync-priority tests mock the document index and assert the producer's
-LOW/MEDIUM/HIGH *decision*. This test instead drives the real OpenSearch
-`OpenSearchIndexPair.update()` defer path against live indices, proving the
+LOW/MEDIUM/HIGH *decision*. This test instead drives the real Elasticsearch
+`ElasticsearchIndexPair.update()` defer path against live indices, proving the
 correctness invariant the swap gate relies on:
 
   D1 (inflight): a metadata/permission update on a doc PRESENT has but FUTURE does
@@ -14,7 +14,7 @@ correctness invariant the swap gate relies on:
       the OLD access, the deferred-sync drain re-applies and FUTURE ends with the
       NEW access -- not the stale one the port wrote.
 
-Uses real Postgres + OpenSearch. Mirrors test_port_flow_e2e's index lifecycle.
+Uses real Postgres + Elasticsearch. Mirrors test_port_flow_e2e's index lifecycle.
 """
 
 from collections.abc import Generator
@@ -44,21 +44,21 @@ from onyx.db.port_attempt import (
     create_port_attempt,
     mark_port_in_progress,
 )
+from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
+from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+    ElasticsearchDocumentIndex,
+    ElasticsearchIndexPair,
+    generate_elasticsearch_filtered_access_control_list,
+)
+from onyx.document_index.elasticsearch.schema import (
+    DocumentChunk,
+    DocumentSchema,
+    get_elasticsearch_doc_chunk_id,
+)
 from onyx.document_index.interfaces_new import (
     MetadataUpdateRequest,
     SecondaryIndexDocumentMissingError,
     TenantState,
-)
-from onyx.document_index.opensearch.client import OpenSearchIndexClient
-from onyx.document_index.opensearch.opensearch_document_index import (
-    OpenSearchDocumentIndex,
-    OpenSearchIndexPair,
-    generate_opensearch_filtered_access_control_list,
-)
-from onyx.document_index.opensearch.schema import (
-    DocumentChunk,
-    DocumentSchema,
-    get_opensearch_doc_chunk_id,
 )
 from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA
 from tests.external_dependency_unit.indexing_helpers import (
@@ -87,8 +87,8 @@ _ACCESS_NEW = DocumentAccess.build(
     external_user_group_ids=[],
     is_public=False,
 )
-_ACL_OLD = set(generate_opensearch_filtered_access_control_list(_ACCESS_OLD))
-_ACL_NEW = set(generate_opensearch_filtered_access_control_list(_ACCESS_NEW))
+_ACL_OLD = set(generate_elasticsearch_filtered_access_control_list(_ACCESS_OLD))
+_ACL_NEW = set(generate_elasticsearch_filtered_access_control_list(_ACCESS_NEW))
 
 _TENANT_STATE = TenantState(tenant_id=POSTGRES_DEFAULT_SCHEMA, multitenant=False)
 
@@ -119,7 +119,7 @@ def _make_chunk(
         metadata_list=None,
         last_updated=last_updated,
         public=access.is_public,
-        access_control_list=generate_opensearch_filtered_access_control_list(access),
+        access_control_list=generate_elasticsearch_filtered_access_control_list(access),
         hidden=False,
         global_boost=0,
         semantic_identifier=f"semantic-{document_id}",
@@ -136,8 +136,8 @@ def _make_chunk(
     )
 
 
-def _create_os_index(index_name: str) -> OpenSearchIndexClient:
-    client = OpenSearchIndexClient(index_name=index_name)
+def _create_os_index(index_name: str) -> ElasticsearchIndexClient:
+    client = ElasticsearchIndexClient(index_name=index_name)
     client.create_index(
         mappings=DocumentSchema.get_document_schema(
             vector_dimension=_VECTOR_DIM, multitenant=False
@@ -147,8 +147,8 @@ def _create_os_index(index_name: str) -> OpenSearchIndexClient:
     return client
 
 
-def _index(index_name: str) -> OpenSearchDocumentIndex:
-    return OpenSearchDocumentIndex(
+def _index(index_name: str) -> ElasticsearchDocumentIndex:
+    return ElasticsearchDocumentIndex(
         tenant_state=_TENANT_STATE,
         index_name=index_name,
         embedding_dim=_VECTOR_DIM,
@@ -156,15 +156,19 @@ def _index(index_name: str) -> OpenSearchDocumentIndex:
     )
 
 
-def _read_acl(client: OpenSearchIndexClient, doc_id: str, chunk_index: int) -> set[str]:
-    chunk_id = get_opensearch_doc_chunk_id(
+def _read_acl(
+    client: ElasticsearchIndexClient, doc_id: str, chunk_index: int
+) -> set[str]:
+    chunk_id = get_elasticsearch_doc_chunk_id(
         tenant_state=_TENANT_STATE, document_id=doc_id, chunk_index=chunk_index
     )
     return set(client.get_document(document_chunk_id=chunk_id).access_control_list)
 
 
-def _read_content(client: OpenSearchIndexClient, doc_id: str, chunk_index: int) -> str:
-    chunk_id = get_opensearch_doc_chunk_id(
+def _read_content(
+    client: ElasticsearchIndexClient, doc_id: str, chunk_index: int
+) -> str:
+    chunk_id = get_elasticsearch_doc_chunk_id(
         tenant_state=_TENANT_STATE, document_id=doc_id, chunk_index=chunk_index
     )
     return client.get_document(document_chunk_id=chunk_id).content
@@ -178,8 +182,8 @@ def env(
     tuple[
         ConnectorCredentialPair,
         str,
-        OpenSearchIndexClient,
-        OpenSearchIndexClient,
+        ElasticsearchIndexClient,
+        ElasticsearchIndexClient,
         str,
         str,
     ],
@@ -219,8 +223,8 @@ def future_port(
     env: tuple[
         ConnectorCredentialPair,
         str,
-        OpenSearchIndexClient,
-        OpenSearchIndexClient,
+        ElasticsearchIndexClient,
+        ElasticsearchIndexClient,
         str,
         str,
     ],
@@ -249,8 +253,8 @@ def test_deferred_metadata_sync_no_stale_permission_leak(
     env: tuple[
         ConnectorCredentialPair,
         str,
-        OpenSearchIndexClient,
-        OpenSearchIndexClient,
+        ElasticsearchIndexClient,
+        ElasticsearchIndexClient,
         str,
         str,
     ],
@@ -266,7 +270,7 @@ def test_deferred_metadata_sync_no_stale_permission_leak(
     )
     present_client.refresh_index()
 
-    pair_index = OpenSearchIndexPair(
+    pair_index = ElasticsearchIndexPair(
         primary=_index(present_name),
         secondary=_index(future_name),
         secondary_embedding_dim=_VECTOR_DIM,
@@ -326,8 +330,8 @@ def test_instant_backfill_primary_missing_no_stale_permission_leak(
     env: tuple[
         ConnectorCredentialPair,
         str,
-        OpenSearchIndexClient,
-        OpenSearchIndexClient,
+        ElasticsearchIndexClient,
+        ElasticsearchIndexClient,
         str,
         str,
     ],
@@ -342,7 +346,7 @@ def test_instant_backfill_primary_missing_no_stale_permission_leak(
     _pair, doc_id, present_client, _future_client, present_name, _future_name = env
 
     # The now-live primary does NOT have the doc yet (mid INSTANT backfill).
-    pair_index = OpenSearchIndexPair(
+    pair_index = ElasticsearchIndexPair(
         primary=_index(present_name),
         secondary=None,
         primary_backfill_in_progress=True,
@@ -396,8 +400,8 @@ def test_port_batch_retry_does_not_revert_a_newer_metadata_update(
     env: tuple[
         ConnectorCredentialPair,
         str,
-        OpenSearchIndexClient,
-        OpenSearchIndexClient,
+        ElasticsearchIndexClient,
+        ElasticsearchIndexClient,
         str,
         str,
     ],
@@ -456,8 +460,8 @@ def test_metadata_sync_does_not_defer_non_indexable_only_doc(
     env: tuple[
         ConnectorCredentialPair,
         str,
-        OpenSearchIndexClient,
-        OpenSearchIndexClient,
+        ElasticsearchIndexClient,
+        ElasticsearchIndexClient,
         str,
         str,
     ],
@@ -485,7 +489,7 @@ def test_metadata_sync_does_not_defer_non_indexable_only_doc(
         )
         present_client.refresh_index()
 
-        pair_index = OpenSearchIndexPair(
+        pair_index = ElasticsearchIndexPair(
             primary=_index(present_name),
             secondary=_index(future_name),
             secondary_embedding_dim=_VECTOR_DIM,
@@ -524,8 +528,8 @@ def test_forward_write_wins_over_concurrent_port_copy(
     env: tuple[
         ConnectorCredentialPair,
         str,
-        OpenSearchIndexClient,
-        OpenSearchIndexClient,
+        ElasticsearchIndexClient,
+        ElasticsearchIndexClient,
         str,
         str,
     ],
@@ -537,7 +541,7 @@ def test_forward_write_wins_over_concurrent_port_copy(
     versioning). The forward write must OVERWRITE the ported chunk -- a stale backlog
     copy can never shadow live content. The mirror ordering (forward-first, then a
     stale port create yielding via a benign 409) lives in
-    test_opensearch_client.test_port_create_only_yields_to_forward_write.
+    test_elasticsearch_client.test_port_create_only_yields_to_forward_write.
     """
     _, doc_id, _present_client, future_client, _present_name, _future_name = env
     assert any_future_port_in_progress(db_session) is True
@@ -579,8 +583,8 @@ def test_acl_update_during_port_applies_to_both_indices(
     env: tuple[
         ConnectorCredentialPair,
         str,
-        OpenSearchIndexClient,
-        OpenSearchIndexClient,
+        ElasticsearchIndexClient,
+        ElasticsearchIndexClient,
         str,
         str,
     ],
@@ -614,7 +618,7 @@ def test_acl_update_during_port_applies_to_both_indices(
     present_client.refresh_index()
     future_client.refresh_index()
 
-    pair_index = OpenSearchIndexPair(
+    pair_index = ElasticsearchIndexPair(
         primary=_index(present_name),
         secondary=_index(future_name),
         secondary_embedding_dim=_VECTOR_DIM,

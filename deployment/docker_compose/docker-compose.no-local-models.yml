@@ -13,7 +13,7 @@
 #     embed_server_endpoint = None and calls the provider directly
 #     (natural_language_processing/search_nlp_models.py).
 #
-# Unlike docker-compose.onyx-lite.yml this KEEPS OpenSearch, Redis, MinIO and
+# Unlike docker-compose.onyx-lite.yml this KEEPS Elasticsearch, Redis, MinIO and
 # the background worker, so connectors and RAG search still work.
 #
 # Usage:

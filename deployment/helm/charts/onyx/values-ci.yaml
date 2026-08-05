@@ -8,19 +8,9 @@
 vectorDB:
   enabled: true
 
-opensearch:
+elasticsearch:
+  # The CI cluster must provision an ECK Elasticsearch resource before Onyx.
   enabled: true
-  resources:
-    requests:
-      cpu: 500m
-      memory: 1Gi
-    limits:
-      cpu: 1500m
-      memory: 2Gi
-  persistence:
-    enabled: true
-    size: 1Gi
-  opensearchJavaOpts: "-Xmx512m -Xms512m"
 
 nginx:
   enabled: false
@@ -98,11 +88,6 @@ auth:
       s3_aws_secret_access_key: "minioadmin"
       rootUser: "minioadmin"
       rootPassword: "minioadmin"
-  opensearch:
-    enabled: true
-    values:
-      opensearch_admin_username: "admin"
-      opensearch_admin_password: "OpenSearch1!"
   sandboxPushSecret:
     enabled: true
     values:

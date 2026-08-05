@@ -89,8 +89,10 @@ kubectl config current-context    # expect: kind-onyx-dev
 ## One-time setup
 
 Run **`make craft-up`** (or the **`craft: up`** vscode task). It handles
-the cluster, helm install, sandbox image build/load, and `.env.k8s`
-bootstrap in one shot. Idempotent — safe to re-run.
+the cluster, a dev-only ECK operator and Elasticsearch CR when absent, the
+Onyx Helm install, sandbox image build/load, and `.env.k8s` bootstrap in one
+shot. Existing Elasticsearch resources are left untouched. The flow is
+idempotent and safe to re-run.
 
 ```bash
 make craft-up
@@ -247,14 +249,13 @@ their `env:` block as a safety net, but anything that reads `.env.k8s`
 directly (CLI scripts, ad-hoc invocations, tests) needs the value to be
 in the file too.
 
-`OPENSEARCH_ADMIN_PASSWORD` is the one cluster-random value — leave it as
+`ELASTICSEARCH_ADMIN_PASSWORD` is the one cluster-random value — leave it as
 `<AUTO_FROM_CLUSTER>` in your `.env.k8s`. The `k8s: telepresence intercept
-api_server` preLaunchTask reads the `onyx-opensearch` Secret and rewrites
-that one line before each launch, so the password stays in sync even
-across `k8s-up.sh` reinstalls (which rotate it).
+api_server` preLaunchTask reads the ECK `elasticsearch-es-elastic-user` Secret
+and rewrites that one line before each launch, so the password stays in sync.
 
 The preLaunchTask fails fast if `.env.k8s` doesn't exist or if the
-opensearch Secret can't be read (cluster down), so you'll know immediately
+Elasticsearch Secret can't be read (cluster down), so you'll know immediately
 if you missed a step.
 
 ### Run your local processes
@@ -331,7 +332,7 @@ external-dependency-unit tests against a temp dir. See
 
 Run **`k8s: pause cluster`** (or `docker stop onyx-dev-control-plane`) to stop
 the kind node container. PVC data lives inside that container, so postgres,
-redis, opensearch, vespa, and minio state all survive. Resume with
+redis, elasticsearch, vespa, and minio state all survive. Resume with
 **`k8s: resume cluster`** — the kubelet reconciles pods automatically.
 
 Reach for **`k8s: cluster down (full teardown)`** only when you want a clean

@@ -2,7 +2,7 @@
 
 These tests need:
 - Real Postgres (cc_pair, IndexAttempt, IndexAttemptError, TargetedReindexJob rows)
-- Real OpenSearch (verify documents actually land in the index)
+- Real Elasticsearch (verify documents actually land in the index)
 - Real Drive credentials (via the shared `test_secrets` fixture)
 
 The parent `tests/daily/conftest.py` already opts into the

@@ -212,7 +212,7 @@ Other docker-compose-style values you should set deliberately:
 
 ## Output template to file and inspect
 * cd charts/onyx
-* helm template test-output . --set auth.opensearch.values.opensearch_admin_password='StrongPassword123!' > test-output.yaml
+* helm template test-output . -f ci/ct-values.yaml > test-output.yaml
 * Craft Kubernetes sandbox version guard check:
   * expect failure:
     `helm template test-output . -f values-ci.yaml --kube-version 1.32.0 --show-only templates/craft-kubernetes-version-check.yaml`
@@ -221,9 +221,10 @@ Other docker-compose-style values you should set deliberately:
 
 ## Test the entire cluster manually
 * cd charts/onyx
-* helm install onyx . -n onyx --set postgresql.primary.persistence.enabled=false --set auth.opensearch.values.opensearch_admin_password='StrongPassword123!'
+* helm install onyx . -n onyx --set postgresql.primary.persistence.enabled=false
   * the postgres flag is to keep the storage ephemeral for testing. You probably don't want to set that in prod.
-  * the OpenSearch admin password must be set on first install unless you are supplying `auth.opensearch.existingSecret`.
+  * Elasticsearch must already exist in the namespace. By default, the chart
+    reads the ECK service and Secrets created for a CR named `elasticsearch`.
   * no flag for ephemeral vespa storage yet, might be good for testing
 * kubectl -n onyx port-forward service/onyx-nginx 8080:80
   * this will forward the local port 8080 to the installed chart for you to run tests, etc.

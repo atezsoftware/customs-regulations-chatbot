@@ -9,7 +9,7 @@ tests. Additive to the root `AGENTS.md`.
   queries outside of those directories.
 - When creating new FastAPI APIs, do NOT use the `response_model` field. Instead, just type the
   function.
-- OpenSearch is the current document index backend for search and indexing. Some legacy modules,
+- Elasticsearch is the current document index backend for search and indexing. Some legacy modules,
   Celery task names, and migration helpers still mention Vespa; treat those as compatibility or
   migration artifacts unless the active `DocumentIndex` factory/config path explicitly uses them.
 
@@ -116,7 +116,7 @@ uv run pytest -xv backend/tests/unit
 ### External Dependency Unit Tests
 
 These tests assume that all external dependencies of Onyx are available and callable (e.g. Postgres, Redis,
-MinIO/S3, OpenSearch are running + OpenAI can be called + any request to the internet is fine + etc.).
+MinIO/S3, Elasticsearch are running + OpenAI can be called + any request to the internet is fine + etc.).
 
 However, the actual Onyx containers are not running and with these tests we call the function to test directly.
 We can also mock components/calls at will.

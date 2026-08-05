@@ -1,6 +1,6 @@
 """
 Regression coverage for document_index_metadata_sync_task holding a Postgres
-transaction across the document-index (Vespa/OpenSearch) HTTP round-trip.
+transaction across the document-index (Vespa/Elasticsearch) HTTP round-trip.
 
 Under bulk-deletion fan-out, every docprocessing-sync worker slot used to pin a
 DB connection in state idle-in-transaction for the duration of the index call

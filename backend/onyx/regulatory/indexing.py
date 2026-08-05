@@ -5,7 +5,7 @@
 of token-window sentence chunking, it splits each document along its
 regulatory structure (madde / fıkra / bent / table), persists the chunks to
 the `regulatory_chunk` Postgres table (source of truth), and emits one
-`DocAwareChunk` per row so the existing embedding + OpenSearch write path is
+`DocAwareChunk` per row so the existing embedding + Elasticsearch write path is
 reused unchanged.
 
 Rows are written in the same DB session/transaction the indexing pipeline

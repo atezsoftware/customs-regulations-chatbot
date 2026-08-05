@@ -200,7 +200,7 @@ def deploy_vespa_schemas(
 
     A Vespa application deploy is a single atomic operation, so primary and
     secondary schemas must be packaged together and shipped in one call —
-    unlike OpenSearch, which has independent per-index creation calls.
+    unlike Elasticsearch, which has independent per-index creation calls.
     """
     if MULTI_TENANT:
         logger.info(
@@ -1054,7 +1054,7 @@ class VespaDocumentIndex(DocumentIndex):
     ) -> tuple[list[dict[str, Any]], dict[int, str | None]]:
         """Gets all the chunks in Vespa, paginated.
 
-        Used in the chunk-level Vespa-to-OpenSearch migration task.
+        Used in the chunk-level Vespa-to-Elasticsearch migration task.
 
         Args:
             continuation_token: Token returned by Vespa representing a page

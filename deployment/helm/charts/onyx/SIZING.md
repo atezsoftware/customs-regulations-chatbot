@@ -4,9 +4,9 @@ The chart's default resources are calibrated for a mid-size deployment
 (roughly 200–1,000 users, up to ~2M documents) with everything at one
 replica. This guide covers what to change as your deployment grows or
 shrinks. Copy the snippets you need into **your own values file** — sizing
-depends on which components you run in-cluster versus managed (an in-cluster
-OpenSearch pod next to an RDS Postgres is a perfectly normal mix), so there
-is no one-size preset.
+depends on which components you run in-cluster versus externally, so there is
+no one-size preset. Elasticsearch is not a subchart: size its ECK
+`Elasticsearch` resource separately from these Onyx values.
 
 Rough tiers, matching the `size` input of the terraform module in
 `deployment/terraform/modules/aws` (see its README):
@@ -28,10 +28,9 @@ Rough tiers, matching the `size` input of the terraform module in
 - **Scale the api-server out, not up.** Use the HPA with a CPU target only —
   idle api-server RSS (~1.1Gi) sits near the memory request, so a memory
   target pins the HPA at max.
-- **OpenSearch memory pressure is off-heap** (k-NN native memory + Lucene
-  page cache). Raise the container memory as the index grows, but keep the
-  Java heap at ~4g until you have heap-usage evidence — do not scale heap
-  proportionally.
+- **Size Elasticsearch in ECK, not this chart.** Vector HNSW data and Lucene's
+  page cache put pressure on memory outside the Java heap. Adjust the ECK
+  node-set resources, JVM options, storage, and placement as the index grows.
 - **A pegged indexing model server is not just slow.** An embedder stuck at
   its CPU limit for hours during a large re-index can starve docprocessing
   heartbeats and trip the indexing stall watchdog. Raise the indexing limit
@@ -71,11 +70,6 @@ celery_worker_primary:
 celery_worker_scheduled_tasks:
   replicaCount: 0
 
-# If your document index is in-cluster (opensearch.enabled: true):
-opensearch:
-  resources:
-    requests: {cpu: 1000m, memory: 4Gi}
-    limits: {cpu: 2000m, memory: 8Gi}
 ```
 
 With an external data plane this renders ~6.9 vCPU / ~22 GiB of requests —
@@ -100,23 +94,6 @@ api:
 celery_worker_docfetching:
   replicaCount: 2
 
-# If your document index is in-cluster — working sets at this scale run
-# 5–6Gi+ (off-heap; keep heap at the default ~4g):
-opensearch:
-  resources:
-    requests: {cpu: 2000m, memory: 6Gi}
-    limits: {cpu: 4000m, memory: 12Gi}
-  persistence:
-    size: 128Gi  # existing PVCs must be expanded manually
-  # Pin to the dedicated index node group if you provisioned one — see the
-  # placement note in the Large section.
-  nodeSelector:
-    eks.amazonaws.com/nodegroup: vespa-node-group
-  tolerations:
-    - key: vespa-dedicated
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
 ```
 
 ## Large — org-wide, sustained re-indexes
@@ -164,33 +141,11 @@ celery_worker_user_file_processing:
     requests: {cpu: 500m, memory: 512Mi}
     limits: {cpu: 2000m, memory: 4Gi}
 
-# If your document index is in-cluster:
-opensearch:
-  resources:
-    requests: {cpu: 2000m, memory: 12Gi}
-    limits: {cpu: 4000m, memory: 16Gi}
-  opensearchJavaOpts: "-Xmx6g -Xms6g"
-  persistence:
-    size: 512Gi
-  # Pin the index to the dedicated document-index node group created by the
-  # terraform module. The toleration only makes the tainted node *eligible*
-  # — the nodeSelector is what actually keeps OpenSearch (and its page
-  # cache) off the general-purpose pool. EKS labels each node with its node
-  # group name automatically; adjust the value if you renamed the group, and
-  # on non-EKS infrastructure label the node yourself and select on that.
-  nodeSelector:
-    eks.amazonaws.com/nodegroup: vespa-node-group
-  tolerations:
-    - key: vespa-dedicated
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
 ```
 
-## Managed document index instead?
+## Elasticsearch sizing
 
-If you use a managed OpenSearch domain (`opensearch.enabled: false` +
-`OPENSEARCH_HOST` in the configMap), skip every `opensearch:` block above and
-size the domain in terraform instead. In that case the terraform module's
-dedicated index node group has nothing to run — shrink
-`vespa_node_instance_types` to a small instance.
+Configure CPU/memory requests, JVM heap, PVC size, replicas, and node placement
+on the existing ECK `Elasticsearch` CR. The Onyx chart only needs the HTTP
+service name, credentials Secret, and CA Secret. Set `elasticsearch.enabled`
+to false only when search is intentionally disabled for an Onyx deployment.

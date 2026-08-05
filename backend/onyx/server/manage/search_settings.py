@@ -13,7 +13,7 @@ from onyx.background.celery.versioned_apps.client import app as client_app
 from onyx.configs.app_configs import (
     DISABLE_INDEX_UPDATE_ON_SWAP,
     DOCUMENT_IMPORT_ENABLED,
-    ENABLE_OPENSEARCH_INDEXING_FOR_ONYX,
+    ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX,
 )
 from onyx.context.search.models import (
     SavedSearchSettings,
@@ -56,13 +56,13 @@ from onyx.db.search_settings import (
 )
 from onyx.db.swap_index import check_and_perform_index_swap
 from onyx.db.user_file import mark_regulatory_user_files_reconcile_pending__no_commit
+from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
+from onyx.document_index.elasticsearch.index_reclaim import reclaim_index_data
 from onyx.document_index.factory import (
     get_all_document_indices,
     get_default_document_index,
 )
 from onyx.document_index.interfaces_new import TenantState
-from onyx.document_index.opensearch.client import OpenSearchIndexClient
-from onyx.document_index.opensearch.index_reclaim import reclaim_index_data
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_processing.import_capability import ensure_document_import_available
@@ -103,9 +103,9 @@ def _cleanup_unpromoted_empty_cloud_bootstrap(
     *,
     db_session: Session,
     new_search_settings: SearchSettings,
-    opensearch_index_preexisted: bool,
+    elasticsearch_index_preexisted: bool,
 ) -> bool:
-    """Remove the failed FUTURE row and its empty OpenSearch index."""
+    """Remove the failed FUTURE row and its empty Elasticsearch index."""
 
     removed = delete_search_settings_if_not_present(
         db_session=db_session,
@@ -118,7 +118,7 @@ def _cleanup_unpromoted_empty_cloud_bootstrap(
     # promotion can no longer turn this setting into PRESENT. Never delete an
     # index that existed before this request; it may be the current index or a
     # sanitized-name collision shared by another setting.
-    if ENABLE_OPENSEARCH_INDEXING_FOR_ONYX and not opensearch_index_preexisted:
+    if ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX and not elasticsearch_index_preexisted:
         try:
             reclaim_index_data(
                 index_name=new_search_settings.index_name,
@@ -138,8 +138,8 @@ def _cleanup_unpromoted_empty_cloud_bootstrap(
     return True
 
 
-def _opensearch_index_exists(index_name: str) -> bool:
-    with OpenSearchIndexClient(index_name=index_name) as client:
+def _elasticsearch_index_exists(index_name: str) -> bool:
+    with ElasticsearchIndexClient(index_name=index_name) as client:
         return client.index_exists()
 
 
@@ -264,9 +264,9 @@ def set_new_search_settings(
 
     # If an empty-bootstrap activation fails, physical cleanup is allowed only
     # for an index that this request actually created.
-    opensearch_index_preexisted = True
-    if empty_cloud_bootstrap and ENABLE_OPENSEARCH_INDEXING_FOR_ONYX:
-        opensearch_index_preexisted = _opensearch_index_exists(
+    elasticsearch_index_preexisted = True
+    if empty_cloud_bootstrap and ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX:
+        elasticsearch_index_preexisted = _elasticsearch_index_exists(
             new_search_settings.index_name
         )
 
@@ -347,7 +347,7 @@ def set_new_search_settings(
             removed = _cleanup_unpromoted_empty_cloud_bootstrap(
                 db_session=db_session,
                 new_search_settings=new_search_settings,
-                opensearch_index_preexisted=opensearch_index_preexisted,
+                elasticsearch_index_preexisted=elasticsearch_index_preexisted,
             )
             if not removed:
                 try:
@@ -373,7 +373,7 @@ def set_new_search_settings(
             removed = _cleanup_unpromoted_empty_cloud_bootstrap(
                 db_session=db_session,
                 new_search_settings=new_search_settings,
-                opensearch_index_preexisted=opensearch_index_preexisted,
+                elasticsearch_index_preexisted=elasticsearch_index_preexisted,
             )
             if not removed:
                 latest_settings = get_current_search_settings(db_session)

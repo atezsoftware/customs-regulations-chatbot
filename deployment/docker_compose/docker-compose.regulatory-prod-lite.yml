@@ -2,7 +2,7 @@
 #
 # Apply this after docker-compose.yml or docker-compose.prod.yml. It replaces
 # only the backend runtime image and source-document ingestion capability. The
-# base compose file remains responsible for PostgreSQL, OpenSearch, Redis,
+# base compose file remains responsible for PostgreSQL, Elasticsearch, Redis,
 # object storage, model servers, web, and nginx. The profile-gated job below is
 # the only migration owner.
 

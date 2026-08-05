@@ -54,11 +54,11 @@ def write_chunks_to_vector_db_with_backoff(
         # The batch write failing just means we fall back to the per-doc
         # retry loop below. It's only a real failure if the per-doc retry
         # also fails — that path already logs/captures to Sentry per doc.
-        # Use warning here so a transient OpenSearch response timeout on
+        # Use warning here so a transient Elasticsearch response timeout on
         # the bulk write doesn't ship an event for every indexing batch.
         # (urllib3 surfaces this as ReadTimeoutError because it has no
         # separate write-timeout class; the client has already sent the
-        # bulk request and is waiting on OpenSearch's response, which is
+        # bulk request and is waiting on Elasticsearch's response, which is
         # where the 60s read timeout fires when the server is slow to
         # finish the bulk index.)
         logger.warning(

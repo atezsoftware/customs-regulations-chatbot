@@ -1,6 +1,6 @@
 """External dependency tests for the new DocumentIndex interface.
 
-These tests assume OpenSearch is running.
+These tests assume Elasticsearch is running.
 """
 
 import time
@@ -13,14 +13,14 @@ import pytest
 from onyx.configs.constants import PUBLIC_DOC_PAT
 from onyx.context.search.models import IndexFilters, InferenceChunk
 from onyx.db.enums import EmbeddingPrecision
+from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+    ElasticsearchDocumentIndex,
+)
 from onyx.document_index.interfaces_new import DocumentIndex as DocumentIndexNew
 from onyx.document_index.interfaces_new import (
     DocumentSectionRequest,
     MetadataUpdateRequest,
     TenantState,
-)
-from onyx.document_index.opensearch.opensearch_document_index import (
-    OpenSearchDocumentIndex,
 )
 from onyx.indexing.models import DocMetadataAwareIndexChunk
 from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
@@ -43,7 +43,7 @@ def _retrieve_chunks_with_expected_boost(
     """Polls id_based_retrieval until the retrieved chunks match the expected
     count and boost, or the timeout is reached.
 
-    OpenSearch is eventually consistent after updates (~1s refresh interval).
+    Elasticsearch is eventually consistent after updates (~1s refresh interval).
     Polling avoids relying on a fixed sleep that races the refresh window.
     """
     deadline = time.time() + timeout_s
@@ -72,11 +72,11 @@ def _retrieve_chunks_with_expected_boost(
 
 
 @pytest.fixture(scope="module")
-def opensearch_document_index(
-    opensearch_index: OpenSearchDocumentIndex,  # noqa: ARG001 — ensures index exists
+def elasticsearch_document_index(
+    elasticsearch_index: ElasticsearchDocumentIndex,  # noqa: ARG001 — ensures index exists
     test_index_name: str,
-) -> Generator[OpenSearchDocumentIndex, None, None]:
-    yield OpenSearchDocumentIndex(
+) -> Generator[ElasticsearchDocumentIndex, None, None]:
+    yield ElasticsearchDocumentIndex(
         tenant_state=TenantState(
             tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE, multitenant=False
         ),
@@ -88,9 +88,9 @@ def opensearch_document_index(
 
 @pytest.fixture(scope="module")
 def document_indices(
-    opensearch_document_index: OpenSearchDocumentIndex,
+    elasticsearch_document_index: ElasticsearchDocumentIndex,
 ) -> Generator[list[DocumentIndexNew], None, None]:
-    yield [opensearch_document_index]
+    yield [elasticsearch_document_index]
 
 
 # ------------------------------------------------------------------------------
@@ -100,7 +100,7 @@ def document_indices(
 
 class TestDocumentIndexNew:
     """
-    Tests the new DocumentIndex interface against a real OpenSearch.
+    Tests the new DocumentIndex interface against a real Elasticsearch.
     """
 
     def test_index_single_new_doc(
@@ -146,7 +146,7 @@ class TestDocumentIndexNew:
             )
             document_index.index(chunks=[chunk], indexing_metadata=metadata_first)
 
-            # Allow OpenSearch refresh interval to settle.
+            # Allow Elasticsearch refresh interval to settle.
             time.sleep(1)
 
             # Re-index — old_chunk_cnt=1 signals the document already existed.
@@ -237,7 +237,7 @@ class TestDocumentIndexNew:
             )
             document_index.index(chunks=[pre_chunk], indexing_metadata=pre_metadata)
 
-            # Allow OpenSearch refresh interval to settle.
+            # Allow Elasticsearch refresh interval to settle.
             time.sleep(1)
 
             # Now index a batch with the existing doc and a new doc.
@@ -369,18 +369,18 @@ class TestDocumentIndexNew:
             assert target.content == operative_text
             assert contextual_bridge not in target.content
 
-    def test_mt_cloud_opensearch_index_verification_only_happens_once(
+    def test_mt_cloud_elasticsearch_index_verification_only_happens_once(
         self,
         tenant_context: None,  # noqa: ARG002
     ) -> None:
         """
-        Tests that for multiple instantiations of OpenSearchDocumentIndex,
+        Tests that for multiple instantiations of ElasticsearchDocumentIndex,
         verify_and_create_index_if_necessary is only called once given the same
         index name on multi-tenant cloud.
         """
         # Precondition.
         with patch.object(
-            OpenSearchDocumentIndex, "verify_and_create_index_if_necessary"
+            ElasticsearchDocumentIndex, "verify_and_create_index_if_necessary"
         ) as mock_verify_and_create_index_if_necessary:
             assert mock_verify_and_create_index_if_necessary.call_count == 0
 
@@ -388,7 +388,7 @@ class TestDocumentIndexNew:
             tenant_state = TenantState(
                 tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE, multitenant=True
             )
-            _ = OpenSearchDocumentIndex(
+            _ = ElasticsearchDocumentIndex(
                 tenant_state=tenant_state,
                 index_name=test_index_name,
                 embedding_dim=EMBEDDING_DIM,
@@ -397,7 +397,7 @@ class TestDocumentIndexNew:
             assert mock_verify_and_create_index_if_necessary.call_count == 1
 
             # Under test.
-            _ = OpenSearchDocumentIndex(
+            _ = ElasticsearchDocumentIndex(
                 tenant_state=tenant_state,
                 index_name=test_index_name,
                 embedding_dim=EMBEDDING_DIM,
@@ -433,7 +433,7 @@ class TestDocumentIndexNew:
             )
             document_index.index(chunks=chunks, indexing_metadata=metadata)
 
-            # Allow OpenSearch refresh interval to settle.
+            # Allow Elasticsearch refresh interval to settle.
             time.sleep(1)
 
             # Under test.
@@ -446,7 +446,7 @@ class TestDocumentIndexNew:
 
             # Postcondition. Poll until the eventually-consistent indexes
             # reflect the updates rather than racing a fixed sleep against
-            # OpenSearch's ~1s refresh window.
+            # Elasticsearch's ~1s refresh window.
             filters = IndexFilters(
                 access_control_list=[PUBLIC_DOC_PAT],
                 tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE,
@@ -493,7 +493,7 @@ class TestDocumentIndexNew:
             )
             document_index.index(chunks=chunks, indexing_metadata=metadata)
 
-            # Allow OpenSearch refresh interval to settle.
+            # Allow Elasticsearch refresh interval to settle.
             time.sleep(1)
 
             # Under test - two separate requests, each updating a different doc.
@@ -511,7 +511,7 @@ class TestDocumentIndexNew:
 
             # Postcondition. Poll until the eventually-consistent indexes
             # reflect the updates rather than racing a fixed sleep against
-            # OpenSearch's ~1s refresh window.
+            # Elasticsearch's ~1s refresh window.
             filters = IndexFilters(
                 access_control_list=[PUBLIC_DOC_PAT],
                 tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE,
@@ -552,7 +552,7 @@ class TestDocumentIndexNew:
             metadata = make_indexing_metadata([doc_id], old_counts=[0], new_counts=[2])
             document_index.index(chunks=chunks, indexing_metadata=metadata)
 
-            # Allow OpenSearch refresh interval to settle.
+            # Allow Elasticsearch refresh interval to settle.
             time.sleep(1)
 
             # Under test - no fields set.
@@ -562,7 +562,7 @@ class TestDocumentIndexNew:
             )
             document_index.update([update_request])
 
-            # Allow OpenSearch refresh interval to settle.
+            # Allow Elasticsearch refresh interval to settle.
             time.sleep(1)
 
             # Postcondition - chunks still retrievable with their default boost.
@@ -602,7 +602,7 @@ class TestDocumentIndexNew:
             )
             document_index.index(chunks=chunks, indexing_metadata=metadata)
 
-            # Allow OpenSearch refresh interval to settle.
+            # Allow Elasticsearch refresh interval to settle.
             time.sleep(1)
 
             # Under test - phantom_doc has no entry in doc_id_to_chunk_cnt, so
@@ -655,7 +655,7 @@ class TestDocumentIndexNew:
             )
             document_index.index(chunks=chunks, indexing_metadata=metadata)
 
-            # Allow OpenSearch refresh interval to settle.
+            # Allow Elasticsearch refresh interval to settle.
             time.sleep(1)
 
             # Under test - phantom_doc has a chunk count of 0. This must not

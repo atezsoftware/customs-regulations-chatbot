@@ -25,7 +25,7 @@ services:
     depends_on:
       relational_db:
         condition: service_started
-      opensearch:
+      elasticsearch:
         condition: service_started
       cache:
         condition: service_started
@@ -38,8 +38,8 @@ services:
       # Auth Settings
       - AUTH_TYPE=${AUTH_TYPE:-oidc}
       - POSTGRES_HOST=${POSTGRES_HOST:-relational_db}
-      - OPENSEARCH_HOST=${OPENSEARCH_HOST:-opensearch}
-      - OPENSEARCH_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      - ELASTICSEARCH_HOST=${ELASTICSEARCH_HOST:-elasticsearch}
+      - ELASTICSEARCH_ADMIN_PASSWORD=${ELASTICSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
       - REDIS_HOST=${REDIS_HOST:-cache}
       - MODEL_SERVER_HOST=${MODEL_SERVER_HOST:-inference_model_server}
       - CODE_INTERPRETER_BASE_URL=${CODE_INTERPRETER_BASE_URL:-http://code-interpreter:8000}
@@ -103,7 +103,7 @@ services:
     depends_on:
       relational_db:
         condition: service_started
-      opensearch:
+      elasticsearch:
         condition: service_started
       cache:
         condition: service_started
@@ -115,8 +115,8 @@ services:
     environment:
       - AUTH_TYPE=${AUTH_TYPE:-oidc}
       - POSTGRES_HOST=${POSTGRES_HOST:-relational_db}
-      - OPENSEARCH_HOST=${OPENSEARCH_HOST:-opensearch}
-      - OPENSEARCH_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      - ELASTICSEARCH_HOST=${ELASTICSEARCH_HOST:-elasticsearch}
+      - ELASTICSEARCH_ADMIN_PASSWORD=${ELASTICSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
       - REDIS_HOST=${REDIS_HOST:-cache}
       - MODEL_SERVER_HOST=${MODEL_SERVER_HOST:-inference_model_server}
       - INDEXING_MODEL_SERVER_HOST=${INDEXING_MODEL_SERVER_HOST:-indexing_model_server}
@@ -349,30 +349,32 @@ services:
         max-size: "50m"
         max-file: "6"
 
-  opensearch:
-    image: ${BASE_IMAGE_REGISTRY:-docker.io}/opensearchproject/opensearch:3.6.0
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.2
     restart: unless-stopped
-    # OpenSearch is the search backend and is enabled by default. To run against
-    # an external OpenSearch instance, set OPENSEARCH_HOST in your env and
+    # Elasticsearch is the search backend and is enabled by default. To run against
+    # an external Elasticsearch instance, set ELASTICSEARCH_HOST in your env and
     # remove this service from the compose file (or skip it via the service list
     # when running `docker compose up`).
     environment:
-      # We need discovery.type=single-node so that OpenSearch doesn't try
+      # We need discovery.type=single-node so that Elasticsearch doesn't try
       # forming a cluster and waiting for other nodes to become live.
       - discovery.type=single-node
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
-      # This and the JVM config below come from the example in https://docs.opensearch.org/latest/install-and-configure/install-opensearch/docker/
+      - xpack.security.enabled=false
+      - xpack.license.self_generated.type=trial
+      - ELASTIC_PASSWORD=${ELASTICSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      # This and the JVM config below come from the example in https://docs.elasticsearch.org/latest/install-and-configure/install-elasticsearch/docker/
       # We do this to avoid unstable performance from page swaps.
       - bootstrap.memory_lock=true # Disable JVM heap memory swapping.
       # Java heap should be ~50% of memory limit. For now we assume a limit of
       # 4g although in practice the container can request more than this.
-      # See https://opster.com/guides/opensearch/opensearch-basics/opensearch-heap-size-usage-and-jvm-garbage-collection/
+      # See https://opster.com/guides/elasticsearch/elasticsearch-basics/elasticsearch-heap-size-usage-and-jvm-garbage-collection/
       # Xms is the starting size, Xmx is the maximum size. These should be the
       # same.
-      - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
     volumes:
-      - opensearch-data:/usr/share/opensearch/data
-    # These come from the example in https://docs.opensearch.org/latest/install-and-configure/install-opensearch/docker/
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    # These come from the example in https://docs.elasticsearch.org/latest/install-and-configure/install-elasticsearch/docker/
     ulimits:
       # Similarly to bootstrap.memory_lock, we don't want to impose limits on
       # how much memory a process can lock from being swapped.
@@ -380,7 +382,7 @@ services:
         soft: -1 # Set memlock to unlimited (no soft or hard limit).
         hard: -1
       nofile:
-        soft: 65536 # Maximum number of open files for the opensearch user - set to at least 65536.
+        soft: 65536 # Maximum number of open files for the elasticsearch user - set to at least 65536.
         hard: 65536
     logging:
       driver: json-file
@@ -501,5 +503,5 @@ volumes:
   indexing_model_server_logs:
   # Shared volume for persistent document storage (Craft file-system mode)
   file-system:
-  # Persistent data for OpenSearch.
-  opensearch-data:
+  # Persistent data for Elasticsearch.
+  elasticsearch-data:

@@ -1,6 +1,6 @@
 """Shared fixtures for document_index external dependency tests.
 
-Provides OpenSearch index setup, tenant context, and chunk helpers.
+Provides Elasticsearch index setup, tenant context, and chunk helpers.
 """
 
 import uuid
@@ -12,11 +12,11 @@ from onyx.access.models import DocumentAccess
 from onyx.configs.constants import DocumentSource
 from onyx.connectors.models import Document
 from onyx.db.enums import EmbeddingPrecision
-from onyx.document_index.interfaces_new import IndexingMetadata, TenantState
-from onyx.document_index.opensearch.client import wait_for_opensearch_with_timeout
-from onyx.document_index.opensearch.opensearch_document_index import (
-    OpenSearchDocumentIndex,
+from onyx.document_index.elasticsearch.client import wait_for_elasticsearch_with_timeout
+from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+    ElasticsearchDocumentIndex,
 )
+from onyx.document_index.interfaces_new import IndexingMetadata, TenantState
 from onyx.indexing.models import ChunkEmbedding, DocMetadataAwareIndexChunk
 from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
 from shared_configs.contextvars import (
@@ -130,15 +130,15 @@ def test_index_name() -> Generator[str, None, None]:
 
 
 @pytest.fixture(scope="module")
-def opensearch_index(
+def elasticsearch_index(
     tenant_context: None,  # noqa: ARG001
     test_index_name: str,
-) -> Generator[OpenSearchDocumentIndex, None, None]:
-    """Create an OpenSearch index and yield the underlying DocumentIndex."""
-    if not wait_for_opensearch_with_timeout():
-        pytest.fail("OpenSearch is not available.")
+) -> Generator[ElasticsearchDocumentIndex, None, None]:
+    """Create an Elasticsearch index and yield the underlying DocumentIndex."""
+    if not wait_for_elasticsearch_with_timeout():
+        pytest.fail("Elasticsearch is not available.")
 
-    opensearch_idx = OpenSearchDocumentIndex(
+    elasticsearch_idx = ElasticsearchDocumentIndex(
         tenant_state=TenantState(
             tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE, multitenant=False
         ),
@@ -146,9 +146,9 @@ def opensearch_index(
         embedding_dim=EMBEDDING_DIM,
         embedding_precision=EmbeddingPrecision.FLOAT,
     )
-    opensearch_idx.verify_and_create_index_if_necessary(
+    elasticsearch_idx.verify_and_create_index_if_necessary(
         embedding_dim=EMBEDDING_DIM,
         embedding_precision=EmbeddingPrecision.FLOAT,
     )
 
-    yield opensearch_idx
+    yield elasticsearch_idx

@@ -1,14 +1,13 @@
 from typing import Any
 
-from opensearchpy import OpenSearch
-from opensearchpy.exceptions import NotFoundError
+from elasticsearch import Elasticsearch, NotFoundError
 
 from onyx.configs.app_configs import (
-    OPENSEARCH_ADMIN_PASSWORD,
-    OPENSEARCH_ADMIN_USERNAME,
-    OPENSEARCH_HOST,
-    OPENSEARCH_REST_API_PORT,
-    OPENSEARCH_USE_SSL,
+    ELASTICSEARCH_ADMIN_PASSWORD,
+    ELASTICSEARCH_ADMIN_USERNAME,
+    ELASTICSEARCH_HOST,
+    ELASTICSEARCH_REST_API_PORT,
+    ELASTICSEARCH_USE_SSL,
 )
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.search_settings import get_current_search_settings
@@ -19,9 +18,9 @@ class vespa_fixture:
 
     Kept named ``vespa_fixture`` for backwards compatibility with the many
     existing integration tests that take it as a parameter. Internally it is now
-    backed by OpenSearch, and it reshapes hits into the dict-of-keys layout that
+    backed by Elasticsearch, and it reshapes hits into the dict-of-keys layout that
     the legacy Vespa assertions expect (``access_control_list`` and
-    ``document_sets`` as dicts; ``image_file_name`` mirrored from OpenSearch's
+    ``document_sets`` as dicts; ``image_file_name`` mirrored from Elasticsearch's
     ``image_file_id``; the ``public`` boolean folded back into the ACL as the
     ``"PUBLIC"`` entry).
 
@@ -36,10 +35,10 @@ class vespa_fixture:
         # index_name is accepted for backwards compat with the prior Vespa
         # fixture signature but ignored — see class docstring.
         del index_name
-        self._client = OpenSearch(
-            hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_REST_API_PORT}],
-            http_auth=(OPENSEARCH_ADMIN_USERNAME, OPENSEARCH_ADMIN_PASSWORD),
-            use_ssl=OPENSEARCH_USE_SSL,
+        scheme = "https" if ELASTICSEARCH_USE_SSL else "http"
+        self._client = Elasticsearch(
+            f"{scheme}://{ELASTICSEARCH_HOST}:{ELASTICSEARCH_REST_API_PORT}",
+            basic_auth=(ELASTICSEARCH_ADMIN_USERNAME, ELASTICSEARCH_ADMIN_PASSWORD),
             verify_certs=False,
             ssl_show_warn=False,
         )

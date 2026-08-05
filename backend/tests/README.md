@@ -40,7 +40,7 @@ Craft Kubernetes coverage lives in `tests/integration/tests/craft/k8s/` and
 runs in the dedicated Helm-installed kind job
 ([pr-craft-k8s-tests.yml](../../.github/workflows/pr-craft-k8s-tests.yml)).
 That suite is a full deployed Craft integration lane: the chart provides
-Postgres, Redis, MinIO, OpenSearch, api_server, web_server, Celery workers,
+Postgres, Redis, MinIO, Elasticsearch, api_server, web_server, Celery workers,
 sandbox-proxy, and real sandbox pods in kind. API-facing setup goes through the
 deployed api_server; direct manager calls are reserved for low-level Kubernetes
 contracts that do not have an HTTP API. Direct task/stub checks belong in

@@ -4,7 +4,7 @@ Covers the scope branch in run_port_attempt (a user attempt ports its files and 
 NOT self-cancel down the cc_pair path), the scheduler's user loop + dedicated-queue
 routing, the swap gate's user-scope gating (incl. a zero-connector tenant), the INSTANT
 reclaim pin, and the user-scope orphan record/sweep. PortCopier is mocked, so these run
-without OpenSearch / the model server (the copy internals have their own tests).
+without Elasticsearch / the model server (the copy internals have their own tests).
 """
 
 from collections.abc import Generator

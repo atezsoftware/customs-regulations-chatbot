@@ -101,8 +101,8 @@ from onyx.db.port_orphan_candidate import (
 )
 from onyx.db.search_settings import create_search_settings, get_current_search_settings
 from onyx.db.swap_index import _port_swap_ready
-from onyx.document_index.opensearch import port_copy
-from onyx.document_index.opensearch.port_copy import copy_present_chunks_to_future
+from onyx.document_index.elasticsearch import port_copy
+from onyx.document_index.elasticsearch.port_copy import copy_present_chunks_to_future
 from onyx.indexing.port_reembed import ReembedStrategy
 from onyx.kg.models import KGStage
 from shared_configs.contextvars import get_current_tenant_id
@@ -653,7 +653,7 @@ def test_filter_existing_cc_pair_document_ids_missing_cc_pair(
 
 def test_copy_present_chunks_to_future_orchestration() -> None:
     """Per batch: each PIT-scan page is re-embedded and written to FUTURE
-    create-only; returns (chunks written, aborted). Mocks the OpenSearch
+    create-only; returns (chunks written, aborted). Mocks the Elasticsearch
     read/write + re-embed (covered by their own tests)."""
     present_client = MagicMock()
     future_index = MagicMock()
@@ -743,7 +743,7 @@ def test_run_port_attempt_batch_retry_then_failed(
     attempt_id = create_port_attempt(db_session, cc_pair.id, future_id).id
 
     mock_copier = MagicMock()
-    mock_copier.copy_doc_batch.side_effect = RuntimeError("opensearch down")
+    mock_copier.copy_doc_batch.side_effect = RuntimeError("elasticsearch down")
     with (
         patch.object(port_task, "PortCopier", return_value=mock_copier),
         patch.object(port_task.time, "sleep"),  # don't sleep between retries
@@ -755,7 +755,7 @@ def test_run_port_attempt_batch_retry_then_failed(
     row = db_session.get(PortAttempt, attempt_id)
     assert row is not None
     assert row.status == PortAttemptStatus.FAILED
-    assert row.error_msg == "opensearch down"
+    assert row.error_msg == "elasticsearch down"
     assert row.last_processed_doc_id is None  # cursor never advanced
     assert row.docs_ported == 0
     assert row.time_completed is not None
@@ -1638,13 +1638,13 @@ def test_port_target_settings_id() -> None:
 def test_delete_port_written_chunks_query() -> None:
     """Filters written_by_port + doc-ids; adds the tenant term only in multitenant mode
     (single-tenant has no tenant_id field, so it would match zero docs)."""
-    from onyx.document_index.interfaces_new import TenantState
-    from onyx.document_index.opensearch.schema import (
+    from onyx.document_index.elasticsearch.schema import (
         DOCUMENT_ID_FIELD_NAME,
         TENANT_ID_FIELD_NAME,
         WRITTEN_BY_PORT_FIELD_NAME,
     )
-    from onyx.document_index.opensearch.search import DocumentQuery
+    from onyx.document_index.elasticsearch.search import DocumentQuery
+    from onyx.document_index.interfaces_new import TenantState
 
     mt = TenantState(tenant_id="tenant-1", multitenant=True)
     filters = DocumentQuery.delete_port_written_chunks_query(["a", "b"], mt)["query"][
@@ -1841,7 +1841,7 @@ def test_run_port_attempt_failed_sweep_marks_failed(
 
     mock_copier = MagicMock()
     mock_copier.copy_doc_batch.side_effect = lambda ids, **_: (len(ids), False)
-    mock_copier.delete_port_written.side_effect = RuntimeError("opensearch down")
+    mock_copier.delete_port_written.side_effect = RuntimeError("elasticsearch down")
     try:
         with patch.object(port_task, "PortCopier", return_value=mock_copier):
             run_port_attempt(attempt_id)

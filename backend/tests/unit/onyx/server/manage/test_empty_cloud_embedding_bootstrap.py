@@ -70,7 +70,7 @@ def test_parser_free_empty_production_allows_cloud_embedding_bootstrap() -> None
         ),
         patch(f"{_MODULE}.get_secondary_search_settings", return_value=None),
         patch(f"{_MODULE}.create_search_settings", return_value=future) as create,
-        patch(f"{_MODULE}._opensearch_index_exists", return_value=False),
+        patch(f"{_MODULE}._elasticsearch_index_exists", return_value=False),
         patch(f"{_MODULE}.get_all_document_indices", return_value=[]),
         patch(f"{_MODULE}.check_and_perform_index_swap") as perform_swap,
     ):
@@ -119,7 +119,7 @@ def test_empty_cloud_bootstrap_cleans_up_if_promotion_does_not_complete() -> Non
         ),
         patch(f"{_MODULE}.get_secondary_search_settings", return_value=None),
         patch(f"{_MODULE}.create_search_settings", return_value=future),
-        patch(f"{_MODULE}._opensearch_index_exists", return_value=False),
+        patch(f"{_MODULE}._elasticsearch_index_exists", return_value=False),
         patch(f"{_MODULE}.get_all_document_indices", return_value=[]),
         patch(f"{_MODULE}.check_and_perform_index_swap"),
         patch(f"{_MODULE}.reclaim_index_data") as reclaim_index,
@@ -174,7 +174,7 @@ def test_empty_cloud_bootstrap_cleans_up_if_swap_raises_before_promotion() -> No
         ),
         patch(f"{_MODULE}.get_secondary_search_settings", return_value=None),
         patch(f"{_MODULE}.create_search_settings", return_value=future),
-        patch(f"{_MODULE}._opensearch_index_exists", return_value=False),
+        patch(f"{_MODULE}._elasticsearch_index_exists", return_value=False),
         patch(f"{_MODULE}.get_all_document_indices", return_value=[]),
         patch(
             f"{_MODULE}.check_and_perform_index_swap",
@@ -235,7 +235,7 @@ def test_empty_cloud_bootstrap_never_reclaims_a_promoted_index_after_swap_error(
         ),
         patch(f"{_MODULE}.get_secondary_search_settings", return_value=None),
         patch(f"{_MODULE}.create_search_settings", return_value=future),
-        patch(f"{_MODULE}._opensearch_index_exists", return_value=False),
+        patch(f"{_MODULE}._elasticsearch_index_exists", return_value=False),
         patch(f"{_MODULE}.get_all_document_indices", return_value=[]),
         patch(
             f"{_MODULE}.check_and_perform_index_swap",
@@ -272,7 +272,7 @@ def test_empty_cloud_bootstrap_never_reclaims_a_preexisting_index() -> None:
         removed = search_settings._cleanup_unpromoted_empty_cloud_bootstrap(
             db_session=db_session,
             new_search_settings=future,
-            opensearch_index_preexisted=True,
+            elasticsearch_index_preexisted=True,
         )
 
     assert removed is True
@@ -295,7 +295,7 @@ def test_empty_cloud_bootstrap_never_reclaims_when_conditional_delete_loses_race
         removed = search_settings._cleanup_unpromoted_empty_cloud_bootstrap(
             db_session=db_session,
             new_search_settings=future,
-            opensearch_index_preexisted=False,
+            elasticsearch_index_preexisted=False,
         )
 
     assert removed is False

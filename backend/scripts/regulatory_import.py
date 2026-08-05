@@ -29,19 +29,19 @@ from onyx.background.celery.tasks.user_file_processing.tasks import (
 )
 from onyx.configs.app_configs import (
     DISABLE_VECTOR_DB,
-    ENABLE_OPENSEARCH_INDEXING_FOR_ONYX,
+    ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX,
 )
+from onyx.db.elasticsearch_migration import get_elasticsearch_retrieval_state
 from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
 from onyx.db.enums import UserFileStatus
 from onyx.db.models import Project__UserFile, User, UserFile, UserProject
-from onyx.db.opensearch_migration import get_opensearch_retrieval_state
 from onyx.db.projects import check_project_write_access, create_user_files
 from onyx.db.regulatory_chunks import get_chunks_for_file
 from onyx.db.schema_version import get_database_alembic_heads
 from onyx.db.search_settings import get_active_search_settings
 from onyx.db.users import get_user_by_email
-from onyx.document_index.opensearch.client import OpenSearchIndexClient
-from onyx.document_index.opensearch.schema import (
+from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
+from onyx.document_index.elasticsearch.schema import (
     CHUNK_INDEX_FIELD_NAME,
     DOCUMENT_ID_FIELD_NAME,
     REGULATORY_CHUNK_ID_FIELD_NAME,
@@ -53,9 +53,9 @@ from shared_configs.configs import MULTI_TENANT, POSTGRES_DEFAULT_SCHEMA
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 
 _BACKEND_ROOT = Path(__file__).resolve().parents[1]
-_OPENSEARCH_VISIBILITY_ATTEMPTS = 10
-_OPENSEARCH_VISIBILITY_INTERVAL_S = 0.5
-_OPENSEARCH_PROJECTION_BATCH_SIZE = 250
+_ELASTICSEARCH_VISIBILITY_ATTEMPTS = 10
+_ELASTICSEARCH_VISIBILITY_INTERVAL_S = 0.5
+_ELASTICSEARCH_PROJECTION_BATCH_SIZE = 250
 
 
 class ImportResult(TypedDict):
@@ -75,7 +75,7 @@ class ImportTarget:
 
 
 @dataclass(frozen=True)
-class OpenSearchTarget:
+class ElasticsearchTarget:
     """Active index metadata copied out of the database preflight session."""
 
     index_name: str
@@ -190,25 +190,27 @@ def _ensure_database_schema_current(db_session: Session) -> None:
     )
 
 
-def _resolve_opensearch_target(
+def _resolve_elasticsearch_target(
     db_session: Session, *, tenant_id: str
-) -> OpenSearchTarget:
-    """Resolve the active, writable OpenSearch projection without provider calls."""
+) -> ElasticsearchTarget:
+    """Resolve the active, writable Elasticsearch projection without provider calls."""
 
     if DISABLE_VECTOR_DB:
         raise ValueError("Document indexing is disabled (DISABLE_VECTOR_DB=true)")
-    if not ENABLE_OPENSEARCH_INDEXING_FOR_ONYX:
-        raise ValueError("OpenSearch indexing is not enabled for this deployment")
-    if not get_opensearch_retrieval_state(db_session):
-        raise ValueError("OpenSearch is not the active retrieval index for this tenant")
+    if not ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX:
+        raise ValueError("Elasticsearch indexing is not enabled for this deployment")
+    if not get_elasticsearch_retrieval_state(db_session):
+        raise ValueError(
+            "Elasticsearch is not the active retrieval index for this tenant"
+        )
 
     search_settings = get_active_search_settings(db_session).primary
     embedding_dimension = search_settings.reduced_dimension or search_settings.model_dim
     if embedding_dimension <= 0:
         raise ValueError("Active search settings have an invalid embedding dimension")
     if not search_settings.index_name:
-        raise ValueError("Active search settings have no OpenSearch index name")
-    return OpenSearchTarget(
+        raise ValueError("Active search settings have no Elasticsearch index name")
+    return ElasticsearchTarget(
         index_name=search_settings.index_name,
         embedding_dimension=embedding_dimension,
         tenant_id=tenant_id,
@@ -216,26 +218,26 @@ def _resolve_opensearch_target(
     )
 
 
-def _ensure_opensearch_ready(target: OpenSearchTarget) -> None:
+def _ensure_elasticsearch_ready(target: ElasticsearchTarget) -> None:
     """Prove cluster reachability and read-only compatibility of the live index."""
 
     expected_schema = DocumentSchema.get_document_schema(
         target.embedding_dimension,
         target.multitenant,
     )
-    with OpenSearchIndexClient(
+    with ElasticsearchIndexClient(
         index_name=target.index_name,
         emit_metrics=False,
     ) as client:
         if not client.ping():
-            raise ValueError("OpenSearch readiness probe failed")
+            raise ValueError("Elasticsearch readiness probe failed")
         if not client.index_exists():
             raise ValueError(
-                f"Active OpenSearch index does not exist: {target.index_name}"
+                f"Active Elasticsearch index does not exist: {target.index_name}"
             )
         if not client.validate_index(expected_schema):
             raise ValueError(
-                "Active OpenSearch index mapping is incompatible with this importer "
+                "Active Elasticsearch index mapping is incompatible with this importer "
                 f"image: {target.index_name}"
             )
 
@@ -244,7 +246,7 @@ def _projection_batch_query(
     *,
     document_id: str,
     identities: Sequence[RegulatoryProjectionIdentity],
-    target: OpenSearchTarget,
+    target: ElasticsearchTarget,
 ) -> dict[str, object]:
     identity_clauses = [
         {
@@ -282,11 +284,11 @@ def _projection_batch_query(
 
 
 def _projection_is_visible(
-    client: OpenSearchIndexClient,
+    client: ElasticsearchIndexClient,
     *,
     document_id: str,
     identities: Sequence[RegulatoryProjectionIdentity],
-    target: OpenSearchTarget,
+    target: ElasticsearchTarget,
 ) -> bool:
     document_filters: list[dict[str, object]] = [
         {"term": {DOCUMENT_ID_FIELD_NAME: {"value": document_id}}}
@@ -301,8 +303,8 @@ def _projection_is_visible(
     if actual_document_count != len(identities):
         return False
 
-    for offset in range(0, len(identities), _OPENSEARCH_PROJECTION_BATCH_SIZE):
-        batch = identities[offset : offset + _OPENSEARCH_PROJECTION_BATCH_SIZE]
+    for offset in range(0, len(identities), _ELASTICSEARCH_PROJECTION_BATCH_SIZE):
+        batch = identities[offset : offset + _ELASTICSEARCH_PROJECTION_BATCH_SIZE]
         matching_ids = client.search_for_document_ids(
             _projection_batch_query(
                 document_id=document_id,
@@ -319,7 +321,7 @@ def _ensure_projection_visible(
     *,
     document_id: str,
     identities: Sequence[RegulatoryProjectionIdentity],
-    target: OpenSearchTarget,
+    target: ElasticsearchTarget,
 ) -> None:
     """Refresh once, then poll a bounded number of times for the exact projection."""
 
@@ -327,12 +329,12 @@ def _ensure_projection_visible(
         raise ValueError("Cannot verify an empty regulatory projection")
 
     last_error: Exception | None = None
-    with OpenSearchIndexClient(
+    with ElasticsearchIndexClient(
         index_name=target.index_name,
         emit_metrics=False,
     ) as client:
         client.refresh_index()
-        for attempt in range(_OPENSEARCH_VISIBILITY_ATTEMPTS):
+        for attempt in range(_ELASTICSEARCH_VISIBILITY_ATTEMPTS):
             try:
                 if _projection_is_visible(
                     client,
@@ -344,17 +346,17 @@ def _ensure_projection_visible(
                 last_error = None
             except Exception as exc:
                 last_error = exc
-            if attempt + 1 < _OPENSEARCH_VISIBILITY_ATTEMPTS:
-                time.sleep(_OPENSEARCH_VISIBILITY_INTERVAL_S)
+            if attempt + 1 < _ELASTICSEARCH_VISIBILITY_ATTEMPTS:
+                time.sleep(_ELASTICSEARCH_VISIBILITY_INTERVAL_S)
 
     suffix = (
-        f"; last OpenSearch error={type(last_error).__name__}: {last_error}"
+        f"; last Elasticsearch error={type(last_error).__name__}: {last_error}"
         if last_error is not None
         else ""
     )
     raise ValueError(
         "Imported regulatory projection did not become exactly visible in the "
-        f"active OpenSearch index after {_OPENSEARCH_VISIBILITY_ATTEMPTS} checks "
+        f"active Elasticsearch index after {_ELASTICSEARCH_VISIBILITY_ATTEMPTS} checks "
         f"(document_id={document_id}, expected_chunks={len(identities)}){suffix}"
     )
 
@@ -417,7 +419,7 @@ def _import_one_file(
     *,
     target: ImportTarget,
     tenant_id: str,
-    opensearch_target: OpenSearchTarget,
+    elasticsearch_target: ElasticsearchTarget,
 ) -> ImportResult:
     with path.open("rb") as file_handle:
         upload = _as_upload(path, file_handle)
@@ -498,7 +500,7 @@ def _import_one_file(
         _ensure_projection_visible(
             document_id=user_file_id,
             identities=projection_identities,
-            target=opensearch_target,
+            target=elasticsearch_target,
         )
     except Exception as exc:
         return ImportResult(
@@ -506,7 +508,7 @@ def _import_one_file(
             status="failed",
             user_file_id=user_file_id,
             chunk_count=len(chunks),
-            detail=f"OpenSearch post-import verification failed: {exc}",
+            detail=f"Elasticsearch post-import verification failed: {exc}",
         )
 
     return ImportResult(
@@ -576,7 +578,7 @@ def run(args: argparse.Namespace) -> int:
                     project_id=args.project_id,
                     project_name=args.project_name,
                 )
-                opensearch_target = _resolve_opensearch_target(
+                elasticsearch_target = _resolve_elasticsearch_target(
                     db_session,
                     tenant_id=args.tenant_id,
                 )
@@ -595,7 +597,7 @@ def run(args: argparse.Namespace) -> int:
                     "Active files with the same name already exist in the directory: "
                     + duplicate_list
                 )
-            _ensure_opensearch_ready(opensearch_target)
+            _ensure_elasticsearch_ready(elasticsearch_target)
 
             results: list[ImportResult] = []
             for path in files:
@@ -604,7 +606,7 @@ def run(args: argparse.Namespace) -> int:
                         path,
                         target=target,
                         tenant_id=args.tenant_id,
-                        opensearch_target=opensearch_target,
+                        elasticsearch_target=elasticsearch_target,
                     )
                 except Exception as exc:
                     result = ImportResult(

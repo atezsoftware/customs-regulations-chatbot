@@ -140,7 +140,7 @@ def document_by_cc_pair_cleanup_task(
 
     try:
         # Phase 1: read DB state, then release the connection before the
-        # document-index HTTP call (OpenSearch on cloud, Vespa on legacy
+        # document-index HTTP call (Elasticsearch on cloud, Vespa on legacy
         # deployments). Holding a pg transaction across the round-trip pins
         # a pgbouncer slot for the duration and saturates the pool under
         # bulk-deletion fan-out across the light worker fleet.

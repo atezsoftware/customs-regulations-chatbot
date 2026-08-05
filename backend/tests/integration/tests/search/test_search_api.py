@@ -50,7 +50,7 @@ def test_basic_search_returns_results(
     resp = _search(doc_content, admin_user)
     assert resp.status_code == 200
 
-    # ``reset`` only wipes Postgres; OpenSearch is shared across tests, so docs
+    # ``reset`` only wipes Postgres; Elasticsearch is shared across tests, so docs
     # seeded by prior tests may still match. Find the seeded doc by content
     # rather than asserting on result count.
     data = resp.json()
@@ -131,7 +131,7 @@ def test_acl_enforcement(
 
     blocked_resp = _search(doc_content, blocked_user)
     assert blocked_resp.status_code == 200
-    # OpenSearch is not reset between tests, so prior tests' PUBLIC docs may
+    # Elasticsearch is not reset between tests, so prior tests' PUBLIC docs may
     # still satisfy the query and surface here. Assert on the specific private
     # doc rather than total result count.
     blocked_contents = [r["content"] for r in blocked_resp.json()["results"]]

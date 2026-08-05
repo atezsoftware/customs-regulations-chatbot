@@ -16,7 +16,7 @@ _IMAGE = "registry.example.com/team/regulatory-backend-lite@sha256:" + "a" * 64
 _WEB_IMAGE = "registry.example.com/team/regulatory-web@sha256:" + "b" * 64
 _MODEL_IMAGE = "registry.example.com/team/regulatory-model@sha256:" + "c" * 64
 _POSTGRES_IMAGE = "registry.example.com/mirror/postgres@sha256:" + "1" * 64
-_OPENSEARCH_IMAGE = "registry.example.com/mirror/opensearch@sha256:" + "2" * 64
+_ELASTICSEARCH_IMAGE = "registry.example.com/mirror/elasticsearch@sha256:" + "2" * 64
 _REDIS_IMAGE = "registry.example.com/mirror/redis@sha256:" + "3" * 64
 _MINIO_IMAGE = "registry.example.com/mirror/minio@sha256:" + "4" * 64
 _NGINX_IMAGE = "registry.example.com/mirror/nginx@sha256:" + "5" * 64
@@ -29,7 +29,7 @@ _MANAGED_SERVICES = (
     "nginx",
     "certbot",
     "relational_db",
-    "opensearch",
+    "elasticsearch",
     "cache",
     "minio",
 )
@@ -49,7 +49,9 @@ def _config(
         "DOCUMENT_IMPORT_ENABLED": "false",
         "MULTI_TENANT": str(multi_tenant).lower(),
         "POSTGRES_HOST": "db.prod.internal" if external_infra else "relational_db",
-        "OPENSEARCH_HOST": "search.prod.internal" if external_infra else "opensearch",
+        "ELASTICSEARCH_HOST": "search.prod.internal"
+        if external_infra
+        else "elasticsearch",
         "REDIS_HOST": "redis.prod.internal" if external_infra else "cache",
         "S3_ENDPOINT_URL": (
             "https://objects.prod.internal" if external_infra else "http://minio:9000"
@@ -104,7 +106,7 @@ def _config(
                 "POSTGRES_DB": "postgres",
             },
         },
-        "opensearch": {"image": _OPENSEARCH_IMAGE, "pull_policy": "always"},
+        "elasticsearch": {"image": _ELASTICSEARCH_IMAGE, "pull_policy": "always"},
         "cache": {"image": _REDIS_IMAGE, "pull_policy": "always"},
         "minio": {"image": _MINIO_IMAGE, "pull_policy": "always"},
         "nginx": {"image": _NGINX_IMAGE, "pull_policy": "always"},
@@ -859,7 +861,7 @@ def test_deploy_never_builds_and_runs_migration_before_start(tmp_path: Path) -> 
         i
         for i, command in enumerate(commands)
         if " up -d --no-build" in command
-        and " relational_db opensearch cache minio" in command
+        and " relational_db elasticsearch cache minio" in command
     )
     migration_index = next(
         i

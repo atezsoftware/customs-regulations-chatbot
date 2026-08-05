@@ -75,7 +75,7 @@ def _rows_to_doc_aware_chunks(
 ) -> list[DocAwareChunk]:
     # ``position`` is a logical slot shared by an original and its amendment.
     # Enumerating the complete, stable row order prevents those versions from
-    # overwriting one another in OpenSearch.
+    # overwriting one another in Elasticsearch.
     return [
         DocAwareChunk(
             source_document=document,
@@ -286,7 +286,7 @@ def _contextualize_chunks(
                 f"{len(contextual_chunks)} eligible chunks lack generated context"
             )
     finally:
-        # Temporary snapshot ids are only for contextual grouping. OpenSearch
+        # Temporary snapshot ids are only for contextual grouping. Elasticsearch
         # identity remains the canonical user-file id in every index.
         for chunk in chunks:
             chunk.source_document = canonical_document

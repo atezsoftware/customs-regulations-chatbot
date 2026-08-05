@@ -34,7 +34,7 @@ def sample_embeddings() -> list[list[float]]:
     return [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
 
 
-def test_clean_model_name_lowercases_names_for_opensearch_index() -> None:
+def test_clean_model_name_lowercases_names_for_elasticsearch_index() -> None:
     cleaned_model_name = clean_model_name("Qwen3-VL-Embedding-8B")
 
     assert cleaned_model_name == "qwen3_vl_embedding_8b"

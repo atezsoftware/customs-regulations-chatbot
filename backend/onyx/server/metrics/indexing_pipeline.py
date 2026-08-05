@@ -63,7 +63,7 @@ _QUEUE_LABEL_MAP: dict[str, str] = {
     OnyxCeleryQueues.USER_FILE_DELETE: "user_file_delete",
     OnyxCeleryQueues.MONITORING: "monitoring",
     OnyxCeleryQueues.SANDBOX: "sandbox",
-    OnyxCeleryQueues.OPENSEARCH_MIGRATION: "opensearch_migration",
+    OnyxCeleryQueues.ELASTICSEARCH_MIGRATION: "elasticsearch_migration",
 }
 
 # Queues where prefetched (unacked) task counts are meaningful

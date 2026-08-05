@@ -33,7 +33,7 @@ from ee.onyx.server.query_and_chat.models import (
 )
 from ee.onyx.server.query_and_chat.streaming_models import SearchErrorPacket
 from onyx.auth.permissions import require_permission
-from onyx.configs.app_configs import ONYX_SEARCH_UI_USES_OPENSEARCH_KEYWORD_SEARCH
+from onyx.configs.app_configs import ONYX_SEARCH_UI_USES_ELASTICSEARCH_KEYWORD_SEARCH
 from onyx.db.engine.sql_engine import get_session, get_session_with_current_tenant
 from onyx.db.enums import Permission
 from onyx.db.models import User
@@ -98,7 +98,7 @@ def handle_send_search_message(
     """
     Executes a search query with optional streaming.
 
-    If hybrid_alpha is unset and ONYX_SEARCH_UI_USES_OPENSEARCH_KEYWORD_SEARCH
+    If hybrid_alpha is unset and ONYX_SEARCH_UI_USES_ELASTICSEARCH_KEYWORD_SEARCH
     is True, executes pure keyword search.
 
     Returns:
@@ -106,7 +106,10 @@ def handle_send_search_message(
     """
     logger.debug("Received search query: %s", request.search_query)
 
-    if request.hybrid_alpha is None and ONYX_SEARCH_UI_USES_OPENSEARCH_KEYWORD_SEARCH:
+    if (
+        request.hybrid_alpha is None
+        and ONYX_SEARCH_UI_USES_ELASTICSEARCH_KEYWORD_SEARCH
+    ):
         request.hybrid_alpha = 0.0
 
     # Non-streaming path

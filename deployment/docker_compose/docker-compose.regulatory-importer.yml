@@ -69,18 +69,14 @@ services:
       POSTGRES_SSLMODE: ${IMPORTER_POSTGRES_SSLMODE:?set an explicit PostgreSQL TLS mode}
       POSTGRES_SSLROOTCERT: /run/secrets/importer-ca.pem
 
-      # OpenSearch must be the same cluster used by the production API.
-      OPENSEARCH_HOST: ${IMPORTER_OPENSEARCH_HOST:?set a reachable OpenSearch host}
-      OPENSEARCH_REST_API_PORT: ${IMPORTER_OPENSEARCH_PORT:?set the OpenSearch REST port}
-      OPENSEARCH_AUTH_METHOD: ${IMPORTER_OPENSEARCH_AUTH_METHOD:?set basic or iam}
-      OPENSEARCH_ADMIN_USERNAME: ${IMPORTER_OPENSEARCH_USERNAME:-}
-      OPENSEARCH_ADMIN_PASSWORD: ${IMPORTER_OPENSEARCH_PASSWORD:-}
-      OPENSEARCH_USE_SSL: ${IMPORTER_OPENSEARCH_USE_SSL:?set true or false explicitly}
-      OPENSEARCH_VERIFY_CERTS: ${IMPORTER_OPENSEARCH_VERIFY_CERTS:?set true or false explicitly}
-      OPENSEARCH_CA_CERTS: /run/secrets/importer-ca.pem
-      USING_AWS_MANAGED_OPENSEARCH: ${IMPORTER_USING_AWS_MANAGED_OPENSEARCH:-false}
-      OPENSEARCH_AWS_REGION: ${IMPORTER_OPENSEARCH_AWS_REGION:-}
-      OPENSEARCH_AWS_SERVICE: ${IMPORTER_OPENSEARCH_AWS_SERVICE:-es}
+      # Elasticsearch must be the same cluster used by the production API.
+      ELASTICSEARCH_HOST: ${IMPORTER_ELASTICSEARCH_HOST:?set a reachable Elasticsearch host}
+      ELASTICSEARCH_REST_API_PORT: ${IMPORTER_ELASTICSEARCH_PORT:?set the Elasticsearch REST port}
+      ELASTICSEARCH_ADMIN_USERNAME: ${IMPORTER_ELASTICSEARCH_USERNAME:-}
+      ELASTICSEARCH_ADMIN_PASSWORD: ${IMPORTER_ELASTICSEARCH_PASSWORD:-}
+      ELASTICSEARCH_USE_SSL: ${IMPORTER_ELASTICSEARCH_USE_SSL:?set true or false explicitly}
+      ELASTICSEARCH_VERIFY_CERTS: ${IMPORTER_ELASTICSEARCH_VERIFY_CERTS:?set true or false explicitly}
+      ELASTICSEARCH_CA_CERTS: /run/secrets/importer-ca.pem
 
       # Originals and citation previews must use the same object-store backend.
       FILE_STORE_BACKEND: ${IMPORTER_FILE_STORE_BACKEND:?set s3 or postgres}
@@ -91,7 +87,7 @@ services:
       S3_FILE_STORE_PREFIX: ${IMPORTER_S3_PREFIX:-onyx-files}
       S3_VERIFY_SSL: ${IMPORTER_S3_VERIFY_SSL:?set true or false explicitly}
       AWS_REGION_NAME: ${IMPORTER_AWS_REGION:?set the object-store/AWS region}
-      # Standard boto3 credential chain for RDS/OpenSearch IAM and AWS S3.
+      # Standard boto3 credential chain for RDS IAM and AWS S3.
       # Temporary credentials must include the session token.
       AWS_ACCESS_KEY_ID: ${IMPORTER_AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${IMPORTER_AWS_SECRET_ACCESS_KEY:-}

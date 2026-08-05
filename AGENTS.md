@@ -32,7 +32,7 @@ This file provides guidance to AI agents when working with code in this reposito
 - **Backend**: Python 3.13, FastAPI, SQLAlchemy, Alembic, Celery
 - **Frontend**: Next.js 16, React 19, TypeScript, Tailwind CSS
 - **Database**: PostgreSQL with Redis caching
-- **Search**: OpenSearch-backed keyword and vector document index
+- **Search**: Elasticsearch-backed keyword and vector document index
 - **Auth**: OAuth2, SAML, multi-provider support
 - **AI/ML**: LangChain, LiteLLM, multiple embedding models
 

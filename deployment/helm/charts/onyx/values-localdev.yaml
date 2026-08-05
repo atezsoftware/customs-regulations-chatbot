@@ -20,18 +20,10 @@ postgresql:
     storage:
       size: 2Gi
 
-opensearch:
-  persistence:
-    enabled: true
-    size: 5Gi
-  resources:
-    requests:
-      cpu: 250m
-      memory: 1Gi
-    limits:
-      cpu: 1000m
-      memory: 2Gi
-  opensearchJavaOpts: "-Xmx1g -Xms1g"
+elasticsearch:
+  # The chart connects to an existing ECK Elasticsearch CR. It does not size or
+  # create the Elasticsearch data plane.
+  enabled: true
 
 minio:
   persistence:

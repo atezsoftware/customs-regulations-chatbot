@@ -64,7 +64,7 @@ def test_validity_patch_preserves_existing_reconcile_state_after_future_success(
 
     with (
         patch(
-            "onyx.regulatory.validity_projection.ENABLE_OPENSEARCH_INDEXING_FOR_ONYX",
+            "onyx.regulatory.validity_projection.ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX",
             True,
         ),
         patch(
@@ -79,7 +79,7 @@ def test_validity_patch_preserves_existing_reconcile_state_after_future_success(
             ],
         ),
         patch(
-            "onyx.regulatory.validity_projection.build_opensearch_document_index",
+            "onyx.regulatory.validity_projection.build_elasticsearch_document_index",
             side_effect=[current_index, future_index],
         ) as build_index,
     ):
@@ -117,7 +117,7 @@ def test_present_failure_stops_future_and_is_raised() -> None:
 
     with (
         patch(
-            "onyx.regulatory.validity_projection.ENABLE_OPENSEARCH_INDEXING_FOR_ONYX",
+            "onyx.regulatory.validity_projection.ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX",
             True,
         ),
         patch(
@@ -132,7 +132,7 @@ def test_present_failure_stops_future_and_is_raised() -> None:
             ],
         ),
         patch(
-            "onyx.regulatory.validity_projection.build_opensearch_document_index",
+            "onyx.regulatory.validity_projection.build_elasticsearch_document_index",
             side_effect=[current_index, future_index],
         ),
         pytest.raises(RuntimeError, match="present failed"),
@@ -157,7 +157,7 @@ def test_future_failure_is_deferred_after_present_success() -> None:
 
     with (
         patch(
-            "onyx.regulatory.validity_projection.ENABLE_OPENSEARCH_INDEXING_FOR_ONYX",
+            "onyx.regulatory.validity_projection.ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX",
             True,
         ),
         patch(
@@ -172,7 +172,7 @@ def test_future_failure_is_deferred_after_present_success() -> None:
             ],
         ),
         patch(
-            "onyx.regulatory.validity_projection.build_opensearch_document_index",
+            "onyx.regulatory.validity_projection.build_elasticsearch_document_index",
             side_effect=[current_index, future_index],
         ),
     ):
@@ -198,7 +198,7 @@ def test_future_index_construction_failure_is_deferred_after_present_success() -
 
     with (
         patch(
-            "onyx.regulatory.validity_projection.ENABLE_OPENSEARCH_INDEXING_FOR_ONYX",
+            "onyx.regulatory.validity_projection.ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX",
             True,
         ),
         patch(
@@ -213,7 +213,7 @@ def test_future_index_construction_failure_is_deferred_after_present_success() -
             ],
         ),
         patch(
-            "onyx.regulatory.validity_projection.build_opensearch_document_index",
+            "onyx.regulatory.validity_projection.build_elasticsearch_document_index",
             side_effect=[current_index, RuntimeError("future construction failed")],
         ) as build_index,
     ):
@@ -237,7 +237,7 @@ def test_fast_path_refuses_unknown_projection_alignment_before_writing() -> None
 
     with (
         patch(
-            "onyx.regulatory.validity_projection.ENABLE_OPENSEARCH_INDEXING_FOR_ONYX",
+            "onyx.regulatory.validity_projection.ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX",
             True,
         ),
         patch(
@@ -245,7 +245,7 @@ def test_fast_path_refuses_unknown_projection_alignment_before_writing() -> None
             return_value=rows,
         ),
         patch(
-            "onyx.regulatory.validity_projection.build_opensearch_document_index"
+            "onyx.regulatory.validity_projection.build_elasticsearch_document_index"
         ) as build_index,
     ):
         applied_patch = patch_user_file_validity_in_active_indices(

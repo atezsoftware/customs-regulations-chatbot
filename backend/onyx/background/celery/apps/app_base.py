@@ -36,12 +36,12 @@ from onyx.background.celery.tasks.vespa.document_sync import (
 )
 from onyx.configs.app_configs import (
     DISABLE_VECTOR_DB,
-    ENABLE_OPENSEARCH_INDEXING_FOR_ONYX,
+    ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX,
     ONYX_DISABLE_VESPA,
 )
 from onyx.configs.constants import ONYX_CLOUD_CELERY_TASK_PREFIX, OnyxRedisLocks
 from onyx.db.engine.sql_engine import get_sqlalchemy_engine
-from onyx.document_index.opensearch.client import wait_for_opensearch_with_timeout
+from onyx.document_index.elasticsearch.client import wait_for_elasticsearch_with_timeout
 from onyx.document_index.vespa.shared_utils.utils import wait_for_vespa_with_timeout
 from onyx.httpx.httpx_pool import HttpxPool
 from onyx.redis.redis_connector import RedisConnector
@@ -670,7 +670,7 @@ def wait_for_document_index_or_shutdown() -> None:
     """
     if DISABLE_VECTOR_DB:
         logger.info(
-            "DISABLE_VECTOR_DB is set — skipping Vespa/OpenSearch readiness check."
+            "DISABLE_VECTOR_DB is set — skipping Vespa/Elasticsearch readiness check."
         )
         return
 
@@ -682,9 +682,9 @@ def wait_for_document_index_or_shutdown() -> None:
             logger.error(msg)
             raise WorkerShutdown(msg)
 
-    if ENABLE_OPENSEARCH_INDEXING_FOR_ONYX:
-        if not wait_for_opensearch_with_timeout():
-            msg = "[OpenSearch] Readiness probe did not succeed within the timeout. Exiting..."
+    if ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX:
+        if not wait_for_elasticsearch_with_timeout():
+            msg = "[Elasticsearch] Readiness probe did not succeed within the timeout. Exiting..."
             logger.error(msg)
             raise WorkerShutdown(msg)
 
@@ -720,7 +720,7 @@ def get_bootsteps() -> list[type]:
     return [LivenessProbe]
 
 
-# Task modules that require a vector DB (Vespa/OpenSearch).
+# Task modules that require a vector DB (Vespa/Elasticsearch).
 # When DISABLE_VECTOR_DB is True these are excluded from autodiscover lists.
 _VECTOR_DB_TASK_MODULES: set[str] = {
     "onyx.background.celery.tasks.connector_deletion",
@@ -728,7 +728,7 @@ _VECTOR_DB_TASK_MODULES: set[str] = {
     "onyx.background.celery.tasks.docfetching",
     "onyx.background.celery.tasks.pruning",
     "onyx.background.celery.tasks.vespa",
-    "onyx.background.celery.tasks.opensearch_migration",
+    "onyx.background.celery.tasks.elasticsearch_migration",
     "onyx.background.celery.tasks.doc_permission_syncing",
     "onyx.background.celery.tasks.hierarchyfetching",
     # EE modules that are vector-DB-dependent

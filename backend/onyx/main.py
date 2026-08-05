@@ -121,6 +121,9 @@ from onyx.server.manage.code_interpreter.api import (
     admin_router as code_interpreter_admin_router,
 )
 from onyx.server.manage.discord_bot.api import router as discord_bot_router
+from onyx.server.manage.elasticsearch_migration.api import (
+    admin_router as elasticsearch_migration_admin_router,
+)
 from onyx.server.manage.embedding.api import admin_router as embedding_admin_router
 from onyx.server.manage.embedding.api import basic_router as embedding_router
 from onyx.server.manage.get_state import router as state_router
@@ -130,9 +133,6 @@ from onyx.server.manage.image_generation.api import (
 from onyx.server.manage.llm.api import admin_router as llm_admin_router
 from onyx.server.manage.llm.api import basic_router as llm_router
 from onyx.server.manage.oauth_test import router as oauth_test_admin_router
-from onyx.server.manage.opensearch_migration.api import (
-    admin_router as opensearch_migration_admin_router,
-)
 from onyx.server.manage.search_settings import router as search_settings_router
 from onyx.server.manage.slack_bot import router as slack_bot_management_router
 from onyx.server.manage.sso.api import admin_router as sso_admin_router
@@ -601,7 +601,7 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
     include_router_with_global_prefix_prepended(application, voice_router)
     include_router_with_global_prefix_prepended(application, voice_websocket_router)
     include_router_with_global_prefix_prepended(
-        application, opensearch_migration_admin_router
+        application, elasticsearch_migration_admin_router
     )
     include_router_with_global_prefix_prepended(
         application, token_rate_limit_settings_router

@@ -383,18 +383,18 @@ sum by (source) (rate(onyx_indexing_task_completed_total{outcome="success"}[5m])
 onyx_queue_depth > 100
 ```
 
-## OpenSearch Search Metrics
+## Elasticsearch Search Metrics
 
-These metrics track OpenSearch search latency and throughput. Collected via `onyx.server.metrics.opensearch_search`.
+These metrics track Elasticsearch search latency and throughput. Collected via `onyx.server.metrics.elasticsearch_search`.
 
 | Metric                                           | Type      | Labels        | Description                                                                 |
 | ------------------------------------------------ | --------- | ------------- | --------------------------------------------------------------------------- |
-| `onyx_opensearch_search_client_duration_seconds` | Histogram | `search_type` | Client-side end-to-end latency (network + serialization + server execution) |
-| `onyx_opensearch_search_server_duration_seconds` | Histogram | `search_type` | Server-side execution time from OpenSearch `took` field                     |
-| `onyx_opensearch_search_total`                   | Counter   | `search_type` | Total search requests sent to OpenSearch                                    |
-| `onyx_opensearch_searches_in_progress`           | Gauge     | `search_type` | Currently in-flight OpenSearch searches                                     |
+| `onyx_elasticsearch_search_client_duration_seconds` | Histogram | `search_type` | Client-side end-to-end latency (network + serialization + server execution) |
+| `onyx_elasticsearch_search_server_duration_seconds` | Histogram | `search_type` | Server-side execution time from Elasticsearch `took` field                     |
+| `onyx_elasticsearch_search_total`                   | Counter   | `search_type` | Total search requests sent to Elasticsearch                                    |
+| `onyx_elasticsearch_searches_in_progress`           | Gauge     | `search_type` | Currently in-flight Elasticsearch searches                                     |
 
-Search type label values: See `OpenSearchSearchType`.
+Search type label values: See `ElasticsearchSearchType`.
 
 ---
 
@@ -512,32 +512,32 @@ sum by (tool) (rate(onyx_mcp_server_tool_calls_total{status="error"}[5m]))
 sum by (server_name, tool_name) (rate(onyx_mcp_client_tool_calls_total{status!="success"}[5m]))
 ```
 
-### OpenSearch P99 search latency by type
+### Elasticsearch P99 search latency by type
 
 ```promql
 # P99 client-side latency by search type
-histogram_quantile(0.99, sum by (search_type, le) (rate(onyx_opensearch_search_client_duration_seconds_bucket[5m])))
+histogram_quantile(0.99, sum by (search_type, le) (rate(onyx_elasticsearch_search_client_duration_seconds_bucket[5m])))
 ```
 
-### OpenSearch search throughput
+### Elasticsearch search throughput
 
 ```promql
 # Searches per second by type
-sum by (search_type) (rate(onyx_opensearch_search_total[5m]))
+sum by (search_type) (rate(onyx_elasticsearch_search_total[5m]))
 ```
 
-### OpenSearch concurrent searches
+### Elasticsearch concurrent searches
 
 ```promql
 # Total in-flight searches across all instances
-sum(onyx_opensearch_searches_in_progress)
+sum(onyx_elasticsearch_searches_in_progress)
 ```
 
-### OpenSearch network overhead
+### Elasticsearch network overhead
 
 ```promql
 # Difference between client and server P50 reveals network/serialization cost.
-histogram_quantile(0.5, sum by (le) (rate(onyx_opensearch_search_client_duration_seconds_bucket[5m])))
+histogram_quantile(0.5, sum by (le) (rate(onyx_elasticsearch_search_client_duration_seconds_bucket[5m])))
   -
-histogram_quantile(0.5, sum by (le) (rate(onyx_opensearch_search_server_duration_seconds_bucket[5m])))
+histogram_quantile(0.5, sum by (le) (rate(onyx_elasticsearch_search_server_duration_seconds_bucket[5m])))
 ```

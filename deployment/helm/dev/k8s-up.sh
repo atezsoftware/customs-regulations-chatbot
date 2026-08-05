@@ -6,13 +6,10 @@
 #
 # Usage:
 #   deployment/helm/dev/k8s-up.sh
-#   deployment/helm/dev/k8s-up.sh --opensearch-password 'YourStrongPwHere'
 #
 # Flags:
 #   --cluster-name <name>          kind cluster name (default: onyx-dev)
 #   --namespace <ns>               k8s namespace (default: onyx)
-#   --opensearch-password <pw>     admin password on first install
-#                                  (default: generated, printed at the end)
 #   --skip-cluster-create          skip kind create (use an existing cluster)
 #   --skip-helm                    only create the cluster, don't install Onyx
 
@@ -20,7 +17,6 @@ set -euo pipefail
 
 CLUSTER_NAME="onyx-dev"
 NAMESPACE="onyx"
-OPENSEARCH_PASSWORD=""
 SKIP_CLUSTER_CREATE=0
 SKIP_HELM=0
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.33.1}"
@@ -42,7 +38,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --cluster-name)         CLUSTER_NAME="$2"; shift 2 ;;
     --namespace)            NAMESPACE="$2"; shift 2 ;;
-    --opensearch-password)  OPENSEARCH_PASSWORD="$2"; shift 2 ;;
     --skip-cluster-create)  SKIP_CLUSTER_CREATE=1; shift ;;
     --skip-helm)            SKIP_HELM=1; shift ;;
     -h|--help)
@@ -116,8 +111,8 @@ trap 'rm -rf "$HELM_DEV_HOME"' EXIT
 
 # Repo names must match the dep names in Chart.yaml.
 helm repo add cloudnative-pg  https://cloudnative-pg.github.io/charts          >/dev/null
+helm repo add elastic         https://helm.elastic.co                         >/dev/null
 helm repo add vespa           https://onyx-dot-app.github.io/vespa-helm-charts >/dev/null
-helm repo add opensearch      https://opensearch-project.github.io/helm-charts >/dev/null
 helm repo add ingress-nginx   https://kubernetes.github.io/ingress-nginx       >/dev/null
 helm repo add redis-ot        https://ot-container-kit.github.io/helm-charts   >/dev/null
 helm repo add minio           https://charts.min.io/                           >/dev/null
@@ -127,23 +122,41 @@ helm repo update >/dev/null
 echo "updating chart dependencies ..."
 helm dependency update "$CHART_DIR" >/dev/null
 
-# Generate a password on first install only; upgrades reuse the existing Secret.
-PW_FLAG=()
-if ! kubectl -n "$NAMESPACE" get secret onyx-opensearch >/dev/null 2>&1; then
-  if [[ -z "$OPENSEARCH_PASSWORD" ]]; then
-    # Prefix 'Aa1!' satisfies OpenSearch's complexity rule (upper/lower/digit/symbol).
-    OPENSEARCH_PASSWORD="Aa1!$(openssl rand -hex 12)"
-    echo "generated opensearch admin password: $OPENSEARCH_PASSWORD"
-    echo "(stored in k8s Secret onyx-opensearch — retrieve with:"
-    echo "  kubectl -n $NAMESPACE get secret onyx-opensearch -o jsonpath='{.data.opensearch_admin_password}' | base64 -d)"
-  fi
-  PW_FLAG=(--set "auth.opensearch.values.opensearch_admin_password=$OPENSEARCH_PASSWORD")
+# Production connects to a pre-existing ECK resource. A fresh local kind
+# cluster has no operator or Elasticsearch CR, so provision the dev-only CR
+# here. Existing resources are left untouched.
+if ! kubectl -n "$NAMESPACE" get service elasticsearch-es-http >/dev/null 2>&1; then
+  echo "installing the ECK operator for local development ..."
+  helm upgrade --install elastic-operator elastic/eck-operator \
+    -n elastic-system --create-namespace --wait >/dev/null
+  kubectl -n "$NAMESPACE" apply -f "$SCRIPT_DIR/elasticsearch-localdev.yaml" >/dev/null
 fi
 
+for attempt in $(seq 1 60); do
+  if kubectl -n "$NAMESPACE" get service/elasticsearch-es-http \
+      secret/elasticsearch-es-elastic-user \
+      secret/elasticsearch-es-http-certs-public >/dev/null 2>&1; then
+    break
+  fi
+  if [[ "$attempt" -eq 60 ]]; then
+    echo "error: ECK did not publish the Elasticsearch service and Secrets within 120s" >&2
+    exit 1
+  fi
+  sleep 2
+done
+
+for resource in \
+  service/elasticsearch-es-http \
+  secret/elasticsearch-es-elastic-user \
+  secret/elasticsearch-es-http-certs-public; do
+  if ! kubectl -n "$NAMESPACE" get "$resource" >/dev/null 2>&1; then
+    echo "error: required ECK resource '$resource' was not found in namespace '$NAMESPACE'" >&2
+    echo "provision the Elasticsearch CR before installing Onyx" >&2
+    exit 1
+  fi
+done
+
 echo "helm upgrade --install onyx ..."
-# ${PW_FLAG[@]+"${PW_FLAG[@]}"} expands to nothing when empty; bare
-# "${PW_FLAG[@]}" errors under `set -u` on subsequent runs.
-#
 # On a fresh cluster the CNPG operator pod isn't ready when we submit the
 # postgres Cluster CR, so its mutating webhook returns "connection refused"
 # and helm install fails. The operator becomes ready within ~15s, and a
@@ -153,8 +166,7 @@ HELM_ATTEMPTS=3
 for attempt in $(seq 1 "$HELM_ATTEMPTS"); do
   if helm upgrade --install onyx "$CHART_DIR" \
       -n "$NAMESPACE" \
-      -f "$VALUES_OVERLAY" \
-      ${PW_FLAG[@]+"${PW_FLAG[@]}"}; then
+      -f "$VALUES_OVERLAY"; then
     break
   fi
   if [[ "$attempt" -lt "$HELM_ATTEMPTS" ]]; then

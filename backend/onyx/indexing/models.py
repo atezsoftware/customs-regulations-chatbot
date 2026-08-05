@@ -38,7 +38,7 @@ class BaseChunk(BaseModel):
     source_links: dict[int, str] | None
     image_file_id: str | None
     # True if this Chunk's start is not at the start of a Section
-    # TODO(andrei): This is deprecated as of the OpenSearch migration. Remove.
+    # TODO(andrei): This is deprecated as of the Elasticsearch migration. Remove.
     # Do not use.
     section_continuation: bool
 
@@ -76,7 +76,7 @@ class DocAwareChunk(BaseChunk):
     # Regulatory chunk projection fields — set only by the
     # RegulatoryIndexingChunker (backend/onyx/regulatory/indexing.py), None on
     # every other indexing path. Carried through the pipeline into the
-    # OpenSearch chunk document; the Postgres `regulatory_chunk` row identified
+    # Elasticsearch chunk document; the Postgres `regulatory_chunk` row identified
     # by regulatory_chunk_id is the source of truth for these values.
     regulatory_chunk_id: str | None = None
     heading_path: list[str] | None = None
@@ -124,7 +124,7 @@ class DocMetadataAwareIndexChunk(IndexChunk):
     boost: int
     aggregated_chunk_boost_factor: float
     # Full ancestor path from root hierarchy node to document's parent.
-    # Stored as an integer array in OpenSearch for hierarchy-based filtering.
+    # Stored as an integer array in Elasticsearch for hierarchy-based filtering.
     # Empty list means no hierarchy info (document excluded from hierarchy searches).
     ancestor_hierarchy_node_ids: list[int]
 
@@ -196,9 +196,9 @@ class IndexingSetting(EmbeddingModelDetail):
     model_dim: int
     index_name: str | None
     multipass_indexing: bool
-    # Defaults to FLOAT (float32). OpenSearch ignores embedding_precision and
+    # Defaults to FLOAT (float32). Elasticsearch ignores embedding_precision and
     # stores vectors as float32 regardless — see
-    # onyx/document_index/opensearch/opensearch_document_index.py. BFLOAT16
+    # onyx/document_index/elasticsearch/elasticsearch_document_index.py. BFLOAT16
     # still works for existing Vespa deployments.
     embedding_precision: EmbeddingPrecision = EmbeddingPrecision.FLOAT
     reduced_dimension: int | None = None

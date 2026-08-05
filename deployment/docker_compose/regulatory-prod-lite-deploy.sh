@@ -350,9 +350,9 @@ printf '%s\n' "Entering the maintenance window by stopping ingress, web, and API
 
 if [[ "$infra_mode" == "compose-managed" && "$command_name" == "deploy" ]]; then
   printf '%s\n' "Pulling and checking Compose-managed data services after workers are stopped."
-  "${compose[@]}" pull relational_db opensearch cache minio nginx certbot
+  "${compose[@]}" pull relational_db elasticsearch cache minio nginx certbot
   "${compose[@]}" up -d --no-build --wait --wait-timeout "$wait_timeout" \
-    relational_db opensearch cache minio
+    relational_db elasticsearch cache minio
 fi
 
 if [[ "$command_name" == "deploy" ]]; then

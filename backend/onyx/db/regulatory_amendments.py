@@ -140,7 +140,7 @@ def approve_amendment_proposal(
     Raises ValueError on any conflict (already decided, old chunk already
     superseded) so callers can surface a clear per-proposal failure reason.
 
-    Does not re-project the affected file into OpenSearch — that is a
+    Does not re-project the affected file into Elasticsearch — that is a
     service-layer concern (see onyx.regulatory.projection); the caller does
     it after a successful approval, same as chunk edits from the Files
     panel.

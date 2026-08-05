@@ -18,7 +18,7 @@ Each is also exported as an env var:
 - Redis: `cache` (`REDIS_HOST`)
 - Vespa: `index` (`VESPA_HOST`)
 - Model server: `inference_model_server` (`MODEL_SERVER_HOST`)
-- OpenSearch: `opensearch` (`OPENSEARCH_HOST`)
+- Elasticsearch: `elasticsearch` (`ELASTICSEARCH_HOST`)
 - MinIO / S3: `minio:9000` (`S3_ENDPOINT_URL=http://minio:9000`)
 
 ## Running the app (web UI + API)

@@ -433,7 +433,7 @@ if [[ "$model_mode" == "local" ]]; then
   expected_active_services+=(inference_model_server)
 fi
 if [[ "$infra_mode" == "compose-managed" ]]; then
-  expected_active_services+=(relational_db opensearch cache minio)
+  expected_active_services+=(relational_db elasticsearch cache minio)
 fi
 
 declare -A expected_active_lookup=()
@@ -610,7 +610,7 @@ else
     die "cloud model mode requires the no-local-models application settings"
 fi
 
-local_services=(relational_db opensearch cache minio)
+local_services=(relational_db elasticsearch cache minio)
 if [[ "$infra_mode" == "compose-managed" ]]; then
   for service in "${local_services[@]}"; do
     grep -Fxq "$service" "$active_services_file" || \
@@ -625,7 +625,7 @@ if [[ "$infra_mode" == "compose-managed" ]]; then
       and (.image | split("@")[0] | split("/")[-1] | contains(":") | not)
       and ((.pull_policy // "") == "always");
     (.services.relational_db | immutable_image)
-    and (.services.opensearch | immutable_image)
+    and (.services.elasticsearch | immutable_image)
     and (.services.cache | immutable_image)
     and (.services.minio | immutable_image)
   ' "$config_file" >/dev/null || \
@@ -646,7 +646,7 @@ if [[ "$infra_mode" == "compose-managed" ]]; then
   jq -e '
     .services.api_server.environment as $environment
     | $environment.POSTGRES_HOST == "relational_db"
-      and $environment.OPENSEARCH_HOST == "opensearch"
+      and $environment.ELASTICSEARCH_HOST == "elasticsearch"
       and $environment.REDIS_HOST == "cache"
       and ($environment.S3_ENDPOINT_URL | startswith("http://minio:"))
   ' "$config_file" >/dev/null || \
@@ -661,18 +661,18 @@ else
     .services.api_server as $api
     | .services.background as $background
     | ($api.environment.POSTGRES_HOST != null and $api.environment.POSTGRES_HOST != "relational_db")
-      and ($api.environment.OPENSEARCH_HOST != null and $api.environment.OPENSEARCH_HOST != "opensearch")
+      and ($api.environment.ELASTICSEARCH_HOST != null and $api.environment.ELASTICSEARCH_HOST != "elasticsearch")
       and ($api.environment.REDIS_HOST != null and $api.environment.REDIS_HOST != "cache")
       and (
         (($api.environment.FILE_STORE_BACKEND // "s3") | ascii_downcase) != "s3"
         or (($api.environment.S3_ENDPOINT_URL // "") | startswith("http://minio:") | not)
       )
       and (($api.depends_on // {}) | has("relational_db") | not)
-      and (($api.depends_on // {}) | has("opensearch") | not)
+      and (($api.depends_on // {}) | has("elasticsearch") | not)
       and (($api.depends_on // {}) | has("cache") | not)
       and (($api.depends_on // {}) | has("minio") | not)
       and (($background.depends_on // {}) | has("relational_db") | not)
-      and (($background.depends_on // {}) | has("opensearch") | not)
+      and (($background.depends_on // {}) | has("elasticsearch") | not)
       and (($background.depends_on // {}) | has("cache") | not)
   ' "$config_file" >/dev/null || \
     die "external mode requires external endpoints and fully reset local-infrastructure dependencies"

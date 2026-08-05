@@ -266,4 +266,4 @@ def test_full_and_lite_supervisors_consume_regulatory_benchmark_queue() -> None:
     assert "celery_worker_scheduled_tasks" not in lite_config
     assert "celery_worker_user_file_processing" not in lite_config
     assert "celery_beat" not in lite_config
-    assert "opensearch_migration" not in lite_config
+    assert "elasticsearch_migration" not in lite_config

@@ -5,7 +5,7 @@ questions strictly from the documents you connect to it — regulations, tariff 
 procedures, correspondence — with inline citations back to the source.
 
 Everything runs on infrastructure you control. User accounts, chat history, documents, and search
-indexes all live in your own PostgreSQL, OpenSearch, and object storage. No usage data is sent
+indexes all live in your own PostgreSQL, Elasticsearch, and object storage. No usage data is sent
 anywhere outside the deployment.
 
 ---
@@ -64,7 +64,7 @@ Helm manifests are under [`deployment/`](deployment/).
 ### Data residency
 
 - User accounts and sessions: local PostgreSQL, via `fastapi-users` (`AUTH_TYPE=basic` by default).
-- Documents and search indexes: local OpenSearch and MinIO.
+- Documents and search indexes: local Elasticsearch and MinIO.
 - Anonymous telemetry: **off** by default. Set `DISABLE_TELEMETRY=false` to opt back in.
 - Product analytics (PostHog): off unless `POSTHOG_API_KEY` is set.
 

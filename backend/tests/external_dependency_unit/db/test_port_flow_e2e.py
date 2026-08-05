@@ -7,7 +7,7 @@ swap promotion. Asserts the FUTURE chunks carry the seeded content with a freshl
 re-embedded 768-dim vector (different from the seeded placeholder), and that the
 swap flips our FUTURE row to PRESENT and the present-like row to PAST.
 
-Uses real Postgres + Redis + OpenSearch + the indexing model server.
+Uses real Postgres + Redis + Elasticsearch + the indexing model server.
 Restores the dev DB's real current
 SearchSettings row in teardown (this dev DB has a leftover PRESENT row + a stale
 FUTURE row, so we never rely on the live current/secondary settings being ours).
@@ -42,18 +42,18 @@ from onyx.db.models import (
 )
 from onyx.db.port_attempt import get_port_attempt
 from onyx.db.search_settings import create_search_settings, get_current_search_settings
-from onyx.document_index.interfaces_new import TenantState
-from onyx.document_index.opensearch.client import OpenSearchIndexClient
-from onyx.document_index.opensearch.constants import DEFAULT_MAX_CHUNK_SIZE
-from onyx.document_index.opensearch.opensearch_document_index import (
-    OpenSearchDocumentIndex,
-    generate_opensearch_filtered_access_control_list,
+from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
+from onyx.document_index.elasticsearch.constants import DEFAULT_MAX_CHUNK_SIZE
+from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+    ElasticsearchDocumentIndex,
+    generate_elasticsearch_filtered_access_control_list,
 )
-from onyx.document_index.opensearch.schema import (
+from onyx.document_index.elasticsearch.schema import (
     DocumentChunk,
     DocumentSchema,
-    get_opensearch_doc_chunk_id,
+    get_elasticsearch_doc_chunk_id,
 )
+from onyx.document_index.interfaces_new import TenantState
 from shared_configs.configs import MODEL_SERVER_HOST, POSTGRES_DEFAULT_SCHEMA
 from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.indexing_helpers import (
@@ -108,7 +108,7 @@ def _make_chunk(
         metadata_list=None,
         last_updated=last_updated,
         public=access.is_public,
-        access_control_list=generate_opensearch_filtered_access_control_list(access),
+        access_control_list=generate_elasticsearch_filtered_access_control_list(access),
         hidden=False,
         global_boost=0,
         semantic_identifier=f"semantic-{document_id}",
@@ -152,8 +152,8 @@ def _make_saved_settings(
     )
 
 
-def _create_os_index(index_name: str) -> OpenSearchIndexClient:
-    client = OpenSearchIndexClient(index_name=index_name)
+def _create_os_index(index_name: str) -> ElasticsearchIndexClient:
+    client = ElasticsearchIndexClient(index_name=index_name)
     mappings = DocumentSchema.get_document_schema(
         vector_dimension=_VECTOR_DIM, multitenant=False
     )
@@ -183,8 +183,8 @@ def test_port_flow_end_to_end(
     pair: ConnectorCredentialPair | None = None
     present_like_id: int | None = None
     future_id: int | None = None
-    present_client: OpenSearchIndexClient | None = None
-    future_client: OpenSearchIndexClient | None = None
+    present_client: ElasticsearchIndexClient | None = None
+    future_client: ElasticsearchIndexClient | None = None
     promoted = False
 
     try:
@@ -216,7 +216,7 @@ def test_port_flow_end_to_end(
         )
         future_id = future.id
 
-        # --- SETUP: OpenSearch indices + seed PRESENT chunks ---
+        # --- SETUP: Elasticsearch indices + seed PRESENT chunks ---
         present_client = _create_os_index(present_index_name)
         future_client = _create_os_index(future_index_name)
 
@@ -274,7 +274,7 @@ def test_port_flow_end_to_end(
         future_client.refresh_index()
         for doc_id in doc_ids:
             for c_i in range(_CHUNKS_PER_DOC):
-                chunk_id = get_opensearch_doc_chunk_id(
+                chunk_id = get_elasticsearch_doc_chunk_id(
                     tenant_state=tenant_state,
                     document_id=doc_id,
                     chunk_index=c_i,
@@ -306,7 +306,7 @@ def test_port_flow_end_to_end(
 
         # check_and_perform_index_swap fetches the FUTURE row via
         # get_secondary_search_settings (a stale FUTURE row exists in this dev
-        # DB), and get_all_document_indices would touch real Vespa/OpenSearch
+        # DB), and get_all_document_indices would touch real Vespa/Elasticsearch
         # provisioning -> patch both in the swap_index namespace. The deferred
         # metadata-sync backlog is 0 in this dev DB; if it weren't, the swap
         # criterion would block, so we don't need to patch the count.
@@ -389,18 +389,18 @@ def test_port_flow_end_to_end(
                     client.close()
 
 
-def _count_doc_chunks(client: OpenSearchIndexClient, document_id: str) -> int:
+def _count_doc_chunks(client: ElasticsearchIndexClient, document_id: str) -> int:
     return sum(len(page) for page in client.iter_chunks_for_doc_ids([document_id]))
 
 
 def test_delete_port_written_chunks_only_marked(
     tenant_context: None,  # noqa: ARG001
 ) -> None:
-    """Real OpenSearch (single-tenant): delete_port_written_chunks removes only
+    """Real Elasticsearch (single-tenant): delete_port_written_chunks removes only
     written_by_port=true chunks (a resurrection), leaving unmarked ones (a re-add)."""
     tenant_state = TenantState(tenant_id=POSTGRES_DEFAULT_SCHEMA, multitenant=False)
     index_name = f"test_marker_sweep_{uuid4().hex[:8]}"
-    client: OpenSearchIndexClient | None = None
+    client: ElasticsearchIndexClient | None = None
     try:
         client = _create_os_index(index_name)
         ts = datetime.now(timezone.utc).replace(microsecond=0)
@@ -417,7 +417,7 @@ def test_delete_port_written_chunks_only_marked(
         assert _count_doc_chunks(client, marked_doc) == 1
         assert _count_doc_chunks(client, unmarked_doc) == 1
 
-        index = OpenSearchDocumentIndex(
+        index = ElasticsearchDocumentIndex(
             tenant_state=tenant_state,
             index_name=index_name,
             embedding_dim=_VECTOR_DIM,

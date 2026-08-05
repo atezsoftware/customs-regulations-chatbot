@@ -1,7 +1,7 @@
 """Guards the Celery wiring of the reindex-port flow.
 
 The port logic itself is covered by the external_dependency_unit `db/test_*port*`
-suites (which run against real Postgres/OpenSearch). Those mock the celery app, so
+suites (which run against real Postgres/Elasticsearch). Those mock the celery app, so
 nothing there proves a beat-enqueued port task actually reaches a worker. These
 unit tests guard exactly that transport seam — the part a dropped autodiscover line
 or `-Q` entry would silently break with every other test still green:

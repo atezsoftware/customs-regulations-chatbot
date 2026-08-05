@@ -11,8 +11,8 @@ COMPOSE_DEV_FILE="$SCRIPT_DIR/../../deployment/docker_compose/docker-compose.dev
 stop_and_remove_containers() {
   docker stop onyx_postgres onyx_vespa onyx_redis onyx_minio onyx_code_interpreter 2>/dev/null || true
   docker rm onyx_postgres onyx_vespa onyx_redis onyx_minio onyx_code_interpreter 2>/dev/null || true
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_DEV_FILE" --profile opensearch-enabled stop opensearch 2>/dev/null || true
-  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_DEV_FILE" --profile opensearch-enabled rm -f opensearch 2>/dev/null || true
+  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_DEV_FILE" --profile elasticsearch-enabled stop elasticsearch 2>/dev/null || true
+  docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_DEV_FILE" --profile elasticsearch-enabled rm -f elasticsearch 2>/dev/null || true
 }
 
 cleanup() {
@@ -25,13 +25,13 @@ trap 'echo "Error occurred on line $LINENO. Exiting script." >&2; cleanup' ERR
 
 # Usage of the script with optional volume arguments
 # ./restart_containers.sh [vespa_volume] [postgres_volume] [redis_volume]
-# [minio_volume] [--keep-opensearch-data]
+# [minio_volume] [--keep-elasticsearch-data]
 
-KEEP_OPENSEARCH_DATA=false
+KEEP_ELASTICSEARCH_DATA=false
 POSITIONAL_ARGS=()
 for arg in "$@"; do
-    if [[ "$arg" == "--keep-opensearch-data" ]]; then
-        KEEP_OPENSEARCH_DATA=true
+    if [[ "$arg" == "--keep-elasticsearch-data" ]]; then
+        KEEP_ELASTICSEARCH_DATA=true
     else
         POSITIONAL_ARGS+=("$arg")
     fi
@@ -62,28 +62,28 @@ else
     docker run --detach --name onyx_vespa --hostname vespa-container --publish 8081:8081 --publish 19071:19071 vespaengine/vespa:8
 fi
 
-# If OPENSEARCH_ADMIN_PASSWORD is not already set, try loading it from
+# If ELASTICSEARCH_ADMIN_PASSWORD is not already set, try loading it from
 # .vscode/.env so existing dev setups that stored it there aren't silently
 # broken.
 VSCODE_ENV="$SCRIPT_DIR/../../.vscode/.env"
-if [[ -z "${OPENSEARCH_ADMIN_PASSWORD:-}" && -f "$VSCODE_ENV" ]]; then
+if [[ -z "${ELASTICSEARCH_ADMIN_PASSWORD:-}" && -f "$VSCODE_ENV" ]]; then
     set -a
     # shellcheck source=/dev/null
     source "$VSCODE_ENV"
     set +a
 fi
 
-# Start the OpenSearch container using the same service from docker-compose that
-# our users use, setting OPENSEARCH_INITIAL_ADMIN_PASSWORD from the env's
-# OPENSEARCH_ADMIN_PASSWORD if it exists, else defaulting to StrongPassword123!.
-# Pass --keep-opensearch-data to preserve the opensearch-data volume across
+# Start the Elasticsearch container using the same service from docker-compose that
+# our users use, setting ELASTICSEARCH_INITIAL_ADMIN_PASSWORD from the env's
+# ELASTICSEARCH_ADMIN_PASSWORD if it exists, else defaulting to StrongPassword123!.
+# Pass --keep-elasticsearch-data to preserve the elasticsearch-data volume across
 # restarts, else the volume is deleted so the container starts fresh.
-if [[ "$KEEP_OPENSEARCH_DATA" == "false" ]]; then
-    echo "Deleting opensearch-data volume..."
-    docker volume rm onyx_opensearch-data 2>/dev/null || true
+if [[ "$KEEP_ELASTICSEARCH_DATA" == "false" ]]; then
+    echo "Deleting elasticsearch-data volume..."
+    docker volume rm onyx_elasticsearch-data 2>/dev/null || true
 fi
-echo "Starting OpenSearch container..."
-docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_DEV_FILE" --profile opensearch-enabled up --force-recreate -d opensearch
+echo "Starting Elasticsearch container..."
+docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_DEV_FILE" --profile elasticsearch-enabled up --force-recreate -d elasticsearch
 
 # Start the Redis container with optional volume
 echo "Starting Redis container..."

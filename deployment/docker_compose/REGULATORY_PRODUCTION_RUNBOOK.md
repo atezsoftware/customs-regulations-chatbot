@@ -27,7 +27,7 @@ Production does **not** receive or run:
 
 The lite backend keeps chat, retrieval, benchmark execution, indexed-file maintenance, and required
 lightweight queues. `DOCUMENT_IMPORT_ENABLED=false` is enforced by the overlay. Existing regulatory
-chunks remain in PostgreSQL and OpenSearch and are searchable; upload/indexing API mutations fail
+chunks remain in PostgreSQL and Elasticsearch and are searchable; upload/indexing API mutations fail
 closed.
 
 The default and recommended production model mode is `cloud`. The fixed no-local-model overlay sets
@@ -137,23 +137,23 @@ pipeline remains authoritative unless a separately reviewed application feature 
 Before the maintenance window:
 
 1. Choose and record exactly one infrastructure topology:
-   - **Compose-managed:** add `docker-compose.regulatory-compose-infra.yml`; PostgreSQL, OpenSearch,
+   - **Compose-managed:** add `docker-compose.regulatory-compose-infra.yml`; PostgreSQL, Elasticsearch,
      Redis, and MinIO run in the project.
    - **External:** add `docker-compose.regulatory-external-infra.yml`; those four local services and
      their `depends_on` edges are removed. Merely changing host variables is forbidden because the
      base file would still start unused local services.
-2. Confirm PostgreSQL, OpenSearch, Redis, object storage, the configured cloud embedding endpoint,
+2. Confirm PostgreSQL, Elasticsearch, Redis, object storage, the configured cloud embedding endpoint,
    and the OpenRouter LLM endpoint are reachable over approved egress from the production containers.
-   For external OpenSearch this includes an authenticated cluster-health request and a read against
+   For external Elasticsearch this includes an authenticated cluster-health request and a read against
    the approved live regulatory index/alias; TCP reachability alone is not a pass.
-3. Keep PostgreSQL, OpenSearch, Redis, and object storage off the public internet. Restrict security
+3. Keep PostgreSQL, Elasticsearch, Redis, and object storage off the public internet. Restrict security
    groups/firewalls to the application network and administrative paths.
-4. Take coordinated PostgreSQL and OpenSearch backups/snapshots. Preserve object-store versions or a
+4. Take coordinated PostgreSQL and Elasticsearch backups/snapshots. Preserve object-store versions or a
    matching backup when source/citation objects are stored there.
 5. Pause new benchmark runs and confirm that no external importer is active.
 6. Store secrets in the deployment secret manager or a mode-`0600` `.env`; never bake them into an
    image or commit them. Common `.env` contains the restricted application runtime database role—not
-   a database owner or migration role—and the API's encryption, tenant/schema, OpenSearch,
+   a database owner or migration role—and the API's encryption, tenant/schema, Elasticsearch,
    object-store, model/provider, and TLS settings.
    Merge the non-secret image/topology keys from `env.regulatory-prod.template` into the one full
    mode-`0600` `.env` that also contains all base service secrets/provider configuration. The base
@@ -169,7 +169,7 @@ Before the maintenance window:
    its contents in the runbook or source control.
 10. Create `.env.web` from `env.web.template`, mode `0600`. It is intentionally non-secret and may
     contain only the documented Next.js proxy settings. The production overlay removes common
-    `.env` from `web_server`; database, OpenSearch, object-store, LLM/OpenRouter, encryption/signing,
+    `.env` from `web_server`; database, Elasticsearch, object-store, LLM/OpenRouter, encryption/signing,
     and OAuth client secrets in the rendered web environment are blockers.
 11. Create `.env.migration` from `env.migration.template` through the secret store, mode `0600`, with
     only the migration role's `POSTGRES_USER`/`POSTGRES_PASSWORD`. Keep it separate from common `.env`.
@@ -203,18 +203,18 @@ separately reviewed corporate-ingress overlay. Do not run the repository's legac
 renewal configuration and perform a staged renewal test before relying on the pinned certbot service.
 
 Compose-managed infrastructure additionally requires organization-approved digest locks for
-PostgreSQL, OpenSearch, Redis, MinIO, nginx, and certbot. The repository supplies no arbitrary digest:
+PostgreSQL, Elasticsearch, Redis, MinIO, nginx, and certbot. The repository supplies no arbitrary digest:
 DevOps must mirror/approve each artifact and set the six `REGULATORY_*_IMAGE` variables. nginx and
 certbot remain Compose services in external-data-infrastructure mode, so their approved digests are
 required in both modes. Any rendered tag-only image, especially implicit `certbot:latest`, is a
 production blocker.
 
-Compose-managed PostgreSQL, OpenSearch, Redis, and MinIO are single-host services, not an HA design.
+Compose-managed PostgreSQL, Elasticsearch, Redis, and MinIO are single-host services, not an HA design.
 For a serious production SLA, prefer externally managed HA services. Otherwise the service owner
 must formally accept and restore-test the documented RPO/RTO, host-loss recovery, coordinated backup,
 and capacity/alerting plan before signoff.
 
-On every Compose-managed OpenSearch host, `vm.max_map_count` must be at least `262144`; preserve the
+On every Compose-managed Elasticsearch host, `vm.max_map_count` must be at least `262144`; preserve the
 configured unlimited memlock and `nofile=65536`. Size host/container RAM for the configured 2 GiB JVM
 heap plus native memory and filesystem cache, and monitor JVM pressure/GC, cluster status,
 unassigned shards, disk watermarks, and data-volume growth. The authenticated healthcheck waits for
@@ -229,7 +229,7 @@ docker inspect "$(docker compose --project-name "$APPROVED_COMPOSE_PROJECT" \
   --env-file .env -f docker-compose.prod.yml \
   -f docker-compose.regulatory-edge.yml \
   -f docker-compose.regulatory-compose-infra.yml \
-  -f docker-compose.regulatory-prod-lite.yml ps -q opensearch)" \
+  -f docker-compose.regulatory-prod-lite.yml ps -q elasticsearch)" \
   --format '{{json .HostConfig.Ulimits}}'
 ```
 
@@ -242,25 +242,25 @@ docker compose --project-name "$APPROVED_COMPOSE_PROJECT" --env-file .env \
   -f docker-compose.regulatory-edge.yml \
   -f docker-compose.regulatory-compose-infra.yml \
   -f docker-compose.regulatory-prod-lite.yml \
-  exec -T opensearch sh -ec \
-  'curl --fail --silent --show-error --insecure --user "admin:${OPENSEARCH_INITIAL_ADMIN_PASSWORD}" \
+  exec -T elasticsearch sh -ec \
+  'curl --fail --silent --show-error --insecure --user "admin:${ELASTIC_PASSWORD}" \
     "https://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=10s"'
 ```
 
-For external basic-auth OpenSearch, use a mode-`0600` netrc/secret file and the approved CA; do not put
+For external basic-auth Elasticsearch, use a mode-`0600` netrc/secret file and the approved CA; do not put
 the password in an argument or shell history. The first call must report green/yellow and the second
 must prove the approved live index/alias is readable and non-empty:
 
 ```bash
-test "$(stat -c '%a' "$OPENSEARCH_NETRC")" = 600
-curl --fail --silent --show-error --netrc-file "$OPENSEARCH_NETRC" \
-  --cacert "$OPENSEARCH_CA_FILE" \
-  "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=10s" \
-  | tee opensearch-cluster-health.json
-curl --fail --silent --show-error --netrc-file "$OPENSEARCH_NETRC" \
-  --cacert "$OPENSEARCH_CA_FILE" \
-  "$OPENSEARCH_URL/$APPROVED_REGULATORY_INDEX/_count" \
-  | tee opensearch-regulatory-index-count.json | jq -e '.count > 0'
+test "$(stat -c '%a' "$ELASTICSEARCH_NETRC")" = 600
+curl --fail --silent --show-error --netrc-file "$ELASTICSEARCH_NETRC" \
+  --cacert "$ELASTICSEARCH_CA_FILE" \
+  "$ELASTICSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=10s" \
+  | tee elasticsearch-cluster-health.json
+curl --fail --silent --show-error --netrc-file "$ELASTICSEARCH_NETRC" \
+  --cacert "$ELASTICSEARCH_CA_FILE" \
+  "$ELASTICSEARCH_URL/$APPROVED_REGULATORY_INDEX/_count" \
+  | tee elasticsearch-regulatory-index-count.json | jq -e '.count > 0'
 ```
 
 For IAM or mTLS, use the organization's credential-aware client instead of converting credentials to
@@ -273,7 +273,7 @@ that legitimately omit those static values are **not** supported by inventing du
 They require a reviewed generated-base/template change that removes the irrelevant required
 interpolation. Deployment remains blocked until that topology renders without fake secrets.
 
-The production backend needs only the normal runtime connections: PostgreSQL, OpenSearch, Redis,
+The production backend needs only the normal runtime connections: PostgreSQL, Elasticsearch, Redis,
 object storage, and the approved cloud embedding/LLM provider endpoints. In cloud mode both API and
 background must render `DISABLE_MODEL_SERVER=true`. `DISABLE_ONYX_UPSTREAM_CONNECTIONS` and telemetry
 disablement are set by the overlay; an egress allowlist should enforce the same boundary at the
@@ -386,7 +386,7 @@ Celery `active`, `reserved`, and `scheduled` output for every old worker plus br
 declared queue—not only ingestion queues. Primary, docfetching, docprocessing, and
 user-file-processing work must be zero. The service owner must explicitly approve any queued
 write/delete work that the lite workers will consume, including `connector_deletion`,
-`user_file_delete`, metadata sync, and permission upserts. `opensearch_migration` has no lite consumer;
+`user_file_delete`, metadata sync, and permission upserts. `elasticsearch_migration` has no lite consumer;
 any stale depth requires a recorded quarantine/delete decision before cutover and before any future
 full-runtime rollback. Never use blanket `celery purge`. Preserve all inspection/depth evidence in the
 change record and do not cut over merely because the API is idle.
@@ -421,7 +421,7 @@ Use the same command with `--infra-mode external` only after removing
 exception, use `--model-mode local` and add
 `--expected-model-image "$APPROVED_MODEL_DIGEST"`, matching the preflighted topology. An application
 rollout must retain the currently approved infrastructure digests.
-PostgreSQL/OpenSearch/Redis/MinIO/nginx/certbot upgrades are separate, separately backed-up changes
+PostgreSQL/Elasticsearch/Redis/MinIO/nginx/certbot upgrades are separate, separately backed-up changes
 and must not be folded into an application cutover.
 
 The regulatory overlay replaces the base API command with Uvicorn-only startup. The canonical deploy
@@ -468,7 +468,7 @@ curl --fail --silent --show-error "https://regulatory.example.com/api/settings" 
   | jq -e '.document_import_enabled == false'
 ```
 
-`/api/health` is a shallow process liveness endpoint. It does not prove PostgreSQL, OpenSearch, Redis,
+`/api/health` is a shallow process liveness endpoint. It does not prove PostgreSQL, Elasticsearch, Redis,
 object store, model-provider, queue, or retrieval readiness. `up --wait` additionally covers the
 container healthchecks, but the authenticated functional checks below remain mandatory.
 
@@ -485,23 +485,23 @@ Complete one authenticated application smoke test:
 6. Start one small benchmark run only after chat/search succeeds, and confirm the dedicated worker
    completes it.
 
-Review API/background logs for repeated database, OpenSearch, object-store, cloud embedding,
+Review API/background logs for repeated database, Elasticsearch, object-store, cloud embedding,
 OpenRouter LLM, or Celery errors before ending the maintenance window.
 
 ## 7. Separate importer/indexer operation
 
 Run imports only from an authorized workstation or controlled runner with private connectivity to the
-same production PostgreSQL database, OpenSearch index, and object store. The host needs Docker and the
+same production PostgreSQL database, Elasticsearch index, and object store. The host needs Docker and the
 small compose/env bundle; it pulls the importer digest and does not build an image.
 
 Security requirements:
 
 - use a VPN/private endpoint or tightly firewalled authenticated tunnels; never expose production
-  PostgreSQL, OpenSearch, or object storage publicly;
+  PostgreSQL, Elasticsearch, or object storage publicly;
 - use TLS verification with the trusted CA mounted read-only; `verify-full` and IAM must retain the
   real database/service hostname;
 - use short-lived, least-privilege credentials where possible. The database role needs application
-  data writes but no migration/DDL ownership; OpenSearch access is limited to the active index and
+  data writes but no migration/DDL ownership; Elasticsearch access is limited to the active index and
   object-store access to the configured application prefix;
 - copy the production tenant/schema, encryption, active SearchSettings, embedding, and contextual
   retrieval configuration exactly. Temporary AWS credentials include the session token;
@@ -529,7 +529,7 @@ revision exactly equal to the promoted production revision. It is intentionally 
 production bundle.
 
 The importer fails before document writes when its Alembic heads do not exactly match production, the
-active OpenSearch retrieval/index mapping is incompatible or unreachable, inputs are unreadable,
+active Elasticsearch retrieval/index mapping is incompatible or unreachable, inputs are unreadable,
 the target user/project is invalid, duplicate names are found, or the manifest path is not writable.
 
 Run an import with a manifest:
@@ -552,7 +552,7 @@ Replace `tenant_schema_from_production` with the exact verified production schem
 
 Exit code `0` means every file completed, `1` means at least one file failed after preflight, and `2`
 means preflight failed. A successful result is also post-verified against the PostgreSQL file/chunk
-records and OpenSearch visibility. Archive the console log and manifest as the import audit record.
+records and Elasticsearch visibility. Archive the console log and manifest as the import audit record.
 Inspect partial writes before retrying; do not use `--allow-duplicate` as an automatic retry switch.
 
 After the import, close tunnels/revoke temporary credentials, then repeat the authenticated production
@@ -596,7 +596,7 @@ switch infrastructure/model topology as part of rollback. A local-mode rollback 
 Changing an image digest does not undo database migrations or imported data. If a migration is not
 backward compatible, coordinate a database restore or forward fix; do not improvise a downgrade. If
 an import produced incorrect content, use its manifest and the supported admin deletion/re-import
-flow. Restore PostgreSQL, OpenSearch, and object storage only as one coordinated recovery point when
+flow. Restore PostgreSQL, Elasticsearch, and object storage only as one coordinated recovery point when
 a full data rollback is required.
 
 In particular, rolling back the image does not reconstruct persona/tool associations deleted by

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
-from onyx.configs.app_configs import ENABLE_OPENSEARCH_INDEXING_FOR_ONYX
+from onyx.configs.app_configs import ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX
 from onyx.db.models import UserFile
 from onyx.db.regulatory_chunks import (
     RegulatoryChunkValidityState,
@@ -13,10 +13,10 @@ from onyx.db.regulatory_chunks import (
     get_chunks_for_file,
 )
 from onyx.db.search_settings import get_active_search_settings_list
-from onyx.document_index.factory import build_opensearch_document_index
-from onyx.document_index.opensearch.opensearch_document_index import (
-    OpenSearchDocumentIndex,
+from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+    ElasticsearchDocumentIndex,
 )
+from onyx.document_index.factory import build_elasticsearch_document_index
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -30,7 +30,7 @@ class AppliedRegulatoryValidityPatch:
     expected_regulatory_chunk_ids: tuple[str, ...]
     previous_window: RegulatoryFileValidityWindow
     updated_window: RegulatoryFileValidityWindow
-    updated_indices: tuple[OpenSearchDocumentIndex, ...]
+    updated_indices: tuple[ElasticsearchDocumentIndex, ...]
 
 
 def patch_user_file_validity_in_active_indices(
@@ -51,7 +51,7 @@ def patch_user_file_validity_in_active_indices(
     of this function and the surrounding PostgreSQL transaction.
     """
 
-    if not ENABLE_OPENSEARCH_INDEXING_FOR_ONYX:
+    if not ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX:
         return None
 
     rows = get_chunks_for_file(db_session, user_file.id)
@@ -82,10 +82,10 @@ def patch_user_file_validity_in_active_indices(
 
     expected_regulatory_chunk_ids = tuple(row.id for row in rows)
     wrote_current = False
-    updated_indices: list[OpenSearchDocumentIndex] = []
+    updated_indices: list[ElasticsearchDocumentIndex] = []
     for search_settings in search_settings_list:
         try:
-            document_index = build_opensearch_document_index(search_settings)
+            document_index = build_elasticsearch_document_index(search_settings)
             document_index.update_regulatory_validity(
                 document_id=str(user_file.id),
                 expected_regulatory_chunk_ids=list(expected_regulatory_chunk_ids),

@@ -1,8 +1,8 @@
 """DB operations for regulatory chunks.
 
 Postgres rows are the source of truth for chunk text/metadata/validity; the
-OpenSearch index is a projection. Callers that mutate rows here are
-responsible for re-projecting the affected chunks into OpenSearch (see
+Elasticsearch index is a projection. Callers that mutate rows here are
+responsible for re-projecting the affected chunks into Elasticsearch (see
 onyx/regulatory/indexing.py).
 """
 
@@ -100,11 +100,11 @@ class RegulatoryChunkSiblingCandidate:
 
 @dataclass(frozen=True, slots=True)
 class RegulatoryChunkProjection:
-    """A selected regulatory chunk plus its stable OpenSearch projection index.
+    """A selected regulatory chunk plus its stable Elasticsearch projection index.
 
     ``projection_index`` is calculated across every row in a user file before
     applying the temporal filter. This mirrors the projection enumerator and
-    lets the search layer retrieve the exact OpenSearch chunk without exposing
+    lets the search layer retrieve the exact Elasticsearch chunk without exposing
     mutable SQLAlchemy models.
     """
 
@@ -1711,7 +1711,7 @@ def replace_indexed_chunks_for_file(
     and are not derivable from the file content. A single file-level validity
     window survives re-chunking only when every existing row is unversioned
     and carries that same window. Does not commit; caller owns the transaction
-    and the OpenSearch re-projection.
+    and the Elasticsearch re-projection.
     """
     # Read only scalar columns here. Loading the old ORM objects into the
     # identity map before the bulk delete can conflict with adding replacement
@@ -1815,7 +1815,7 @@ def update_chunk(
 
     The `"unset"` sentinel distinguishes "leave unchanged" from an explicit
     None (= clear the date). Does not commit; caller owns the transaction and
-    the OpenSearch re-projection.
+    the Elasticsearch re-projection.
     """
     if text is not None:
         chunk.text = text

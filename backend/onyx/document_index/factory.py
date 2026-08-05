@@ -3,17 +3,17 @@ from sqlalchemy.orm import Session
 
 from onyx.configs.app_configs import (
     DISABLE_VECTOR_DB,
-    ENABLE_OPENSEARCH_INDEXING_FOR_ONYX,
+    ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX,
     ONYX_DISABLE_VESPA,
 )
+from onyx.db.elasticsearch_migration import get_elasticsearch_retrieval_state
 from onyx.db.models import SearchSettings
-from onyx.db.opensearch_migration import get_opensearch_retrieval_state
 from onyx.document_index.disabled import DisabledDocumentIndex
-from onyx.document_index.interfaces_new import DocumentIndex, TenantState
-from onyx.document_index.opensearch.opensearch_document_index import (
-    OpenSearchDocumentIndex,
-    OpenSearchIndexPair,
+from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+    ElasticsearchDocumentIndex,
+    ElasticsearchIndexPair,
 )
+from onyx.document_index.interfaces_new import DocumentIndex, TenantState
 from onyx.document_index.vespa.vespa_document_index import (
     VespaDocumentIndex,
     VespaIndexPair,
@@ -27,17 +27,17 @@ def _build_tenant_state() -> TenantState:
     return TenantState(tenant_id=get_current_tenant_id(), multitenant=MULTI_TENANT)
 
 
-def build_opensearch_document_index(
+def build_elasticsearch_document_index(
     search_settings: SearchSettings,
-) -> OpenSearchDocumentIndex:
-    """A single OpenSearch index handle for one search settings.
+) -> ElasticsearchDocumentIndex:
+    """A single Elasticsearch index handle for one search settings.
 
     The reindex port needs the lone index (to scan a PIT / call index_raw_chunks),
     not the primary+secondary pair `get_default_document_index` returns. Shared
-    with `_build_opensearch_pair` so the construction lives in one place.
+    with `_build_elasticsearch_pair` so the construction lives in one place.
     """
     indexing_setting = IndexingSetting.from_db_model(search_settings)
-    return OpenSearchDocumentIndex(
+    return ElasticsearchDocumentIndex(
         tenant_state=_build_tenant_state(),
         index_name=search_settings.index_name,
         embedding_dim=indexing_setting.final_embedding_dim,
@@ -45,14 +45,14 @@ def build_opensearch_document_index(
     )
 
 
-def _build_opensearch_pair(
+def _build_elasticsearch_pair(
     search_settings: SearchSettings,
     secondary_search_settings: SearchSettings | None,
     primary_backfill_in_progress: bool = False,
-) -> OpenSearchIndexPair:
-    primary = build_opensearch_document_index(search_settings)
+) -> ElasticsearchIndexPair:
+    primary = build_elasticsearch_document_index(search_settings)
     if secondary_search_settings is None:
-        return OpenSearchIndexPair(
+        return ElasticsearchIndexPair(
             primary=primary,
             secondary=None,
             primary_backfill_in_progress=primary_backfill_in_progress,
@@ -60,8 +60,8 @@ def _build_opensearch_pair(
     secondary_indexing_setting = IndexingSetting.from_db_model(
         secondary_search_settings
     )
-    secondary = build_opensearch_document_index(secondary_search_settings)
-    return OpenSearchIndexPair(
+    secondary = build_elasticsearch_document_index(secondary_search_settings)
+    return ElasticsearchIndexPair(
         primary=primary,
         secondary=secondary,
         secondary_embedding_dim=secondary_indexing_setting.final_embedding_dim,
@@ -123,14 +123,14 @@ def get_default_document_index(
     if DISABLE_VECTOR_DB:
         return DisabledDocumentIndex()
 
-    opensearch_retrieval_enabled = get_opensearch_retrieval_state(db_session)
-    if ONYX_DISABLE_VESPA and not opensearch_retrieval_enabled:
+    elasticsearch_retrieval_enabled = get_elasticsearch_retrieval_state(db_session)
+    if ONYX_DISABLE_VESPA and not elasticsearch_retrieval_enabled:
         raise ValueError(
-            "Bug: ONYX_DISABLE_VESPA is set but opensearch_retrieval_enabled is not set."
+            "Bug: ONYX_DISABLE_VESPA is set but elasticsearch_retrieval_enabled is not set."
         )
 
-    if opensearch_retrieval_enabled:
-        return _build_opensearch_pair(search_settings, secondary_search_settings)
+    if elasticsearch_retrieval_enabled:
+        return _build_elasticsearch_pair(search_settings, secondary_search_settings)
     return _build_vespa_pair(search_settings, secondary_search_settings, httpx_client)
 
 
@@ -145,17 +145,17 @@ def get_all_document_indices(
     NOTE: Make sure the Vespa index object is returned first. In the rare event
     that there is some conflict between indexing and the migration task, it is
     assumed that the state of Vespa is more up-to-date than the state of
-    OpenSearch.
+    Elasticsearch.
 
-    ``primary_backfill_in_progress`` marks the OpenSearch primary as an INSTANT
-    reindex-port target still backfilling (see OpenSearchIndexPair.update).
+    ``primary_backfill_in_progress`` marks the Elasticsearch primary as an INSTANT
+    reindex-port target still backfilling (see ElasticsearchIndexPair.update).
     """
     if DISABLE_VECTOR_DB:
         return [DisabledDocumentIndex()]
 
-    if ONYX_DISABLE_VESPA and not ENABLE_OPENSEARCH_INDEXING_FOR_ONYX:
+    if ONYX_DISABLE_VESPA and not ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX:
         raise ValueError(
-            "Bug: ONYX_DISABLE_VESPA is set but ENABLE_OPENSEARCH_INDEXING_FOR_ONYX is not set."
+            "Bug: ONYX_DISABLE_VESPA is set but ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX is not set."
         )
 
     result: list[DocumentIndex] = []
@@ -163,9 +163,9 @@ def get_all_document_indices(
         result.append(
             _build_vespa_pair(search_settings, secondary_search_settings, httpx_client)
         )
-    if ENABLE_OPENSEARCH_INDEXING_FOR_ONYX:
+    if ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX:
         result.append(
-            _build_opensearch_pair(
+            _build_elasticsearch_pair(
                 search_settings,
                 secondary_search_settings,
                 primary_backfill_in_progress=primary_backfill_in_progress,

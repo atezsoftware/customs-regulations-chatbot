@@ -1,7 +1,7 @@
 # Vector DB Filter Semantics
 
 How `IndexFilters` fields combine into the final query filter. Describes the active
-**OpenSearch** backend. The deprecated **Vespa** backend differs in one respect:
+**Elasticsearch** backend. The deprecated **Vespa** backend differs in one respect:
 `project_id_filter` there remains *additive* (see "project_id_filter" notes below).
 
 ## Filter categories
@@ -152,13 +152,13 @@ AND (user_project contains 7)
 | Filter field | Vespa field | Vespa type | Purpose |
 |---|---|---|---|
 | `document_set` | `document_sets` | `weightedset<string>` | Connector doc sets attached to assistant |
-| `attached_document_ids` | `document_id` | `string` | Documents explicitly attached (OpenSearch only) |
-| `hierarchy_node_ids` | `ancestor_hierarchy_node_ids` | `array<int>` | Folder/space nodes (OpenSearch only) |
+| `attached_document_ids` | `document_id` | `string` | Documents explicitly attached (Elasticsearch only) |
+| `hierarchy_node_ids` | `ancestor_hierarchy_node_ids` | `array<int>` | Folder/space nodes (Elasticsearch only) |
 | `persona_id_filter` | `personas` | `array<int>` | Persona tag for overflowing user files (**primary** trigger) |
-| `project_id_filter` | `user_project` | `array<int>` | Project tag for overflowing project files (**primary** trigger; restricts to project files — OpenSearch. Vespa keeps it additive, see notes) |
+| `project_id_filter` | `user_project` | `array<int>` | Project tag for overflowing project files (**primary** trigger; restricts to project files — Elasticsearch. Vespa keeps it additive, see notes) |
 | `access_control_list` | `access_control_list` | `weightedset<string>` | ACL entries for the requesting user |
 | `source_type` | `source_type` | `string` | Connector source type (e.g. `web`, `jira`) |
 | `tags` | `metadata_list` | `array<string>` | Document metadata tags |
-| `created_at_range` | `created_at` | `long` | Window on document creation time; see [Time filtering](#time-filtering) (OpenSearch only) |
+| `created_at_range` | `created_at` | `long` | Window on document creation time; see [Time filtering](#time-filtering) (Elasticsearch only) |
 | `updated_at_range` | `doc_updated_at` | `long` | Window on document update time; see [Time filtering](#time-filtering) |
 | `tenant_id` | `tenant_id` | `string` | Tenant isolation (multi-tenant) |

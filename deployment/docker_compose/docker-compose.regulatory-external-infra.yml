@@ -1,5 +1,5 @@
 # Optional overlay for regulatory deployments that use externally managed
-# PostgreSQL, OpenSearch, Redis, and object storage. Apply it after the base
+# PostgreSQL, Elasticsearch, Redis, and object storage. Apply it after the base
 # production file and before docker-compose.regulatory-prod-lite.yml.
 #
 # Merely changing *_HOST variables is not enough: the base Compose model would
@@ -10,20 +10,20 @@ services:
   api_server:
     depends_on:
       relational_db: !reset null
-      opensearch: !reset null
+      elasticsearch: !reset null
       cache: !reset null
       minio: !reset null
 
   background:
     depends_on:
       relational_db: !reset null
-      opensearch: !reset null
+      elasticsearch: !reset null
       cache: !reset null
 
   relational_db:
     profiles: ["local-infra"]
 
-  opensearch:
+  elasticsearch:
     profiles: ["local-infra"]
 
   cache:

@@ -66,7 +66,7 @@ func TestResolvedPorts_ComposeEnv(t *testing.T) {
 	expected := map[string]string{
 		"POSTGRES_HOST_PORT":         "5432",
 		"REDIS_HOST_PORT":            "6379",
-		"OPENSEARCH_HOST_PORT":       "9200",
+		"ELASTICSEARCH_HOST_PORT":       "9200",
 		"MODEL_SERVER_HOST_PORT":     "9000",
 		"MINIO_API_HOST_PORT":        "9004",
 		"MINIO_CONSOLE_HOST_PORT":    "9005",
@@ -96,7 +96,7 @@ func TestResolvedPorts_AppEnv(t *testing.T) {
 	expected := map[string]string{
 		"POSTGRES_PORT":             "5432",
 		"REDIS_PORT":                "6379",
-		"OPENSEARCH_REST_API_PORT":  "9200",
+		"ELASTICSEARCH_REST_API_PORT":  "9200",
 		"MODEL_SERVER_PORT":         "9000",
 		"S3_ENDPOINT_URL":           "http://localhost:9004",
 		"CODE_INTERPRETER_BASE_URL": "http://localhost:8000",

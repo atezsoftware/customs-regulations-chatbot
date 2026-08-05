@@ -32,9 +32,9 @@ from onyx.db.models import SearchSettings
 from onyx.document_index.chunk_content_enrichment import (
     generate_enriched_content_for_chunk_embedding,
 )
+from onyx.document_index.elasticsearch.constants import DEFAULT_MAX_CHUNK_SIZE
+from onyx.document_index.elasticsearch.schema import DocumentChunkWithoutVectors
 from onyx.document_index.interfaces_new import TenantState
-from onyx.document_index.opensearch.constants import DEFAULT_MAX_CHUNK_SIZE
-from onyx.document_index.opensearch.schema import DocumentChunkWithoutVectors
 from onyx.indexing.chunker import get_metadata_suffix_for_document_index
 from onyx.indexing.embedder import DefaultIndexingEmbedder, IndexingEmbedder
 from onyx.indexing.models import ChunkEmbedding, DocAwareChunk, IndexChunk

@@ -481,7 +481,7 @@ class OnyxCeleryQueues:
     # isolated worker so they cannot consume Craft scheduled-task capacity.
     REGULATORY_BENCHMARK = "regulatory_benchmark"
 
-    OPENSEARCH_MIGRATION = "opensearch_migration"
+    ELASTICSEARCH_MIGRATION = "elasticsearch_migration"
 
 
 class OnyxRedisLocks:
@@ -502,8 +502,8 @@ class OnyxRedisLocks:
     CHECK_CONNECTOR_EXTERNAL_GROUP_SYNC_BEAT_LOCK = (
         "da_lock:check_connector_external_group_sync_beat"
     )
-    OPENSEARCH_MIGRATION_BEAT_LOCK = "da_lock:opensearch_migration_beat"
-    OPENSEARCH_VERIFY_INDEX_LOCK_PREFIX = "da_lock:opensearch_verify_index"
+    ELASTICSEARCH_MIGRATION_BEAT_LOCK = "da_lock:elasticsearch_migration_beat"
+    ELASTICSEARCH_VERIFY_INDEX_LOCK_PREFIX = "da_lock:elasticsearch_verify_index"
 
     SECURITY_SETTINGS = "da_lock:security_settings"
 
@@ -694,14 +694,14 @@ class OnyxCeleryTask:
 
     REGULATORY_BENCHMARK_RUN = "regulatory_benchmark_run"
 
-    CHECK_FOR_DOCUMENTS_FOR_OPENSEARCH_MIGRATION_TASK = (
-        "check_for_documents_for_opensearch_migration_task"
+    CHECK_FOR_DOCUMENTS_FOR_ELASTICSEARCH_MIGRATION_TASK = (
+        "check_for_documents_for_elasticsearch_migration_task"
     )
-    MIGRATE_DOCUMENTS_FROM_VESPA_TO_OPENSEARCH_TASK = (
-        "migrate_documents_from_vespa_to_opensearch_task"
+    MIGRATE_DOCUMENTS_FROM_VESPA_TO_ELASTICSEARCH_TASK = (
+        "migrate_documents_from_vespa_to_elasticsearch_task"
     )
-    MIGRATE_CHUNKS_FROM_VESPA_TO_OPENSEARCH_TASK = (
-        "migrate_chunks_from_vespa_to_opensearch_task"
+    MIGRATE_CHUNKS_FROM_VESPA_TO_ELASTICSEARCH_TASK = (
+        "migrate_chunks_from_vespa_to_elasticsearch_task"
     )
 
 

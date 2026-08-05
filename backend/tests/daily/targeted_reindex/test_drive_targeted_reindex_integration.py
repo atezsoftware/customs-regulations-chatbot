@@ -2,7 +2,7 @@
 
 Exercises the task body, connector instantiation, `Resolver.reindex`
 invocation against the real Drive API, indexing pipeline run,
-OpenSearch write, and resolution tracking on `IndexAttemptError` —
+Elasticsearch write, and resolution tracking on `IndexAttemptError` —
 using the same Drive service account that the existing connector daily
 tests run under.
 

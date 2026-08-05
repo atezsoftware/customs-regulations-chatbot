@@ -81,6 +81,8 @@ from onyx.db.enums import (
     ChatSessionSharedStatus,
     ConnectorCredentialPairStatus,
     DefaultAppMode,
+    ElasticsearchDocumentMigrationStatus,
+    ElasticsearchTenantMigrationStatus,
     EmbeddingPrecision,
     EndpointPolicy,
     ExternalAppType,
@@ -99,8 +101,6 @@ from onyx.db.enums import (
     MCPOAuthProviderMode,
     MCPServerStatus,
     MCPTransport,
-    OpenSearchDocumentMigrationStatus,
-    OpenSearchTenantMigrationStatus,
     PatType,
     Permission,
     PermissionSyncStatus,
@@ -1210,14 +1210,14 @@ class Document(Base):
     )
 
 
-class OpenSearchDocumentMigrationRecord(Base):
-    """Tracks the migration status of documents from Vespa to OpenSearch.
+class ElasticsearchDocumentMigrationRecord(Base):
+    """Tracks the migration status of documents from Vespa to Elasticsearch.
 
     This table can be dropped when the migration is complete for all Onyx
     instances.
     """
 
-    __tablename__ = "opensearch_document_migration_record"
+    __tablename__ = "elasticsearch_document_migration_record"
 
     document_id: Mapped[str] = mapped_column(
         String,
@@ -1226,9 +1226,9 @@ class OpenSearchDocumentMigrationRecord(Base):
         nullable=False,
         index=True,
     )
-    status: Mapped[OpenSearchDocumentMigrationStatus] = mapped_column(
-        Enum(OpenSearchDocumentMigrationStatus, native_enum=False),
-        default=OpenSearchDocumentMigrationStatus.PENDING,
+    status: Mapped[ElasticsearchDocumentMigrationStatus] = mapped_column(
+        Enum(ElasticsearchDocumentMigrationStatus, native_enum=False),
+        default=ElasticsearchDocumentMigrationStatus.PENDING,
         nullable=False,
         index=True,
     )
@@ -1249,8 +1249,8 @@ class OpenSearchDocumentMigrationRecord(Base):
     document: Mapped["Document"] = relationship("Document")
 
 
-class OpenSearchTenantMigrationRecord(Base):
-    """Tracks the state of the OpenSearch migration for a tenant.
+class ElasticsearchTenantMigrationRecord(Base):
+    """Tracks the state of the Elasticsearch migration for a tenant.
 
     Should only contain one row.
 
@@ -1258,27 +1258,29 @@ class OpenSearchTenantMigrationRecord(Base):
     instances.
     """
 
-    __tablename__ = "opensearch_tenant_migration_record"
+    __tablename__ = "elasticsearch_tenant_migration_record"
     __table_args__ = (
         # Singleton pattern - unique index on constant ensures only one row.
-        Index("idx_opensearch_tenant_migration_singleton", text("(true)"), unique=True),
+        Index(
+            "idx_elasticsearch_tenant_migration_singleton", text("(true)"), unique=True
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, nullable=False)
     document_migration_record_table_population_status: Mapped[
-        OpenSearchTenantMigrationStatus
+        ElasticsearchTenantMigrationStatus
     ] = mapped_column(
-        Enum(OpenSearchTenantMigrationStatus, native_enum=False),
-        default=OpenSearchTenantMigrationStatus.PENDING,
+        Enum(ElasticsearchTenantMigrationStatus, native_enum=False),
+        default=ElasticsearchTenantMigrationStatus.PENDING,
         nullable=False,
     )
     num_times_observed_no_additional_docs_to_populate_migration_table: Mapped[int] = (
         mapped_column(Integer, default=0, nullable=False)
     )
-    overall_document_migration_status: Mapped[OpenSearchTenantMigrationStatus] = (
+    overall_document_migration_status: Mapped[ElasticsearchTenantMigrationStatus] = (
         mapped_column(
-            Enum(OpenSearchTenantMigrationStatus, native_enum=False),
-            default=OpenSearchTenantMigrationStatus.PENDING,
+            Enum(ElasticsearchTenantMigrationStatus, native_enum=False),
+            default=ElasticsearchTenantMigrationStatus.PENDING,
             nullable=False,
         )
     )
@@ -1317,7 +1319,7 @@ class OpenSearchTenantMigrationRecord(Base):
     migration_completed_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    enable_opensearch_retrieval: Mapped[bool] = mapped_column(
+    enable_elasticsearch_retrieval: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
     approx_chunk_count_in_vespa: Mapped[int | None] = mapped_column(
@@ -2195,7 +2197,7 @@ class SearchSettings(Base):
     )
 
     # allows for quantization -> less memory usage for a small performance hit.
-    # Defaults to FLOAT (float32). OpenSearch ignores this field and stores
+    # Defaults to FLOAT (float32). Elasticsearch ignores this field and stores
     # vectors as float32 regardless; BFLOAT16 is only honored by Vespa.
     embedding_precision: Mapped[EmbeddingPrecision] = mapped_column(
         Enum(EmbeddingPrecision, native_enum=False),
@@ -5431,7 +5433,7 @@ class RegulatoryChunk(Base):
 
     Produced by the RegulatoryChunker (backend/onyx/regulatory/chunker.py) at
     file-processing time, or by an approved amendment proposal. Postgres is
-    the source of truth: the OpenSearch chunk documents are a projection of
+    the source of truth: the Elasticsearch chunk documents are a projection of
     these rows and must be rewritten whenever a row changes.
 
     Validity window semantics: NULL start = an explicitly unbounded/unknown

@@ -10,7 +10,7 @@ from onyx.configs.constants import PUBLIC_DOC_PAT
 from onyx.context.search.enums import QueryType
 from onyx.context.search.models import IndexFilters, InferenceChunk
 from onyx.db.enums import EmbeddingPrecision
-from onyx.document_index.opensearch.constants import DEFAULT_MAX_CHUNK_SIZE
+from onyx.document_index.elasticsearch.constants import DEFAULT_MAX_CHUNK_SIZE
 from onyx.indexing.models import DocMetadataAwareIndexChunk
 from shared_configs.model_server_models import Embedding
 

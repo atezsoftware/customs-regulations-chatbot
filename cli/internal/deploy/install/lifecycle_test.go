@@ -513,7 +513,7 @@ func TestStatusCatchesCrashLoopBetweenRestarts(t *testing.T) {
 }
 
 // Half the deployment has no health check at all (background, cache,
-// opensearch, code-interpreter), so between two crashes those containers read
+// elasticsearch, code-interpreter), so between two crashes those containers read
 // as a plain "Up 2 seconds" — indistinguishable from a service that has just
 // come up, except for the restart count. A container that young has to be
 // inspected for it, or the crash loop stays invisible for exactly as long as

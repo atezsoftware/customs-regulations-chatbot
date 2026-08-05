@@ -22,7 +22,7 @@ _SETUP_COMPLETE: bool = False
 
 def ensure_full_deployment_setup(
     tenant_id: Optional[str] = None,
-    opensearch_available: bool = False,
+    elasticsearch_available: bool = False,
 ) -> None:
     """Initialize test environment to mirror a real deployment, on demand.
 
@@ -65,10 +65,10 @@ def ensure_full_deployment_setup(
         # Also ensure indices exist explicitly (no-op if already created)
         with get_session_with_current_tenant() as db_session:
             active = get_active_search_settings(db_session)
-            if opensearch_available:
+            if elasticsearch_available:
                 # We use this special bool here instead of just relying on
-                # ENABLE_OPENSEARCH_INDEXING_FOR_ONYX because not all testing
-                # infra is configured for OpenSearch.
+                # ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX because not all testing
+                # infra is configured for Elasticsearch.
                 document_indices = get_all_document_indices(
                     active.primary, active.secondary
                 )

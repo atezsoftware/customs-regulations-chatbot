@@ -538,7 +538,7 @@ def _process_user_file_with_indexing(
         )
         # User files go through the structure-aware regulatory chunker: chunk
         # rows land in Postgres (source of truth) within this same session's
-        # transaction, and the pipeline projects them into OpenSearch.
+        # transaction, and the pipeline projects them into Elasticsearch.
         regulatory_chunker = RegulatoryIndexingChunker(
             db_session=db_session,
             tokenizer=embedding_model.embedding_model.tokenizer,
@@ -1100,7 +1100,7 @@ def delete_user_file_impl(
 
         # Phase 2: vector DB deletes + file store deletes (no DB session held).
         # Pass the DB chunk count when known; otherwise None, which each document
-        # index resolves itself (Vespa fans out to find chunks, OpenSearch deletes
+        # index resolves itself (Vespa fans out to find chunks, Elasticsearch deletes
         # by document id). This keeps the path backend-agnostic.
         if not skip_vespa:
             chunk_count: int | None = (

@@ -3,7 +3,7 @@ from onyx.configs.app_configs import (
     DEFAULT_USER_FILE_MAX_UPLOAD_SIZE_MB,
     DISABLE_USER_KNOWLEDGE,
     DISABLE_VECTOR_DB,
-    ENABLE_OPENSEARCH_INDEXING_FOR_ONYX,
+    ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX,
     HIDE_QUERY_HISTORY_FROM_ADMIN_PANEL,
     MAX_ALLOWED_UPLOAD_SIZE_MB,
     ONYX_QUERY_HISTORY_TYPE,
@@ -65,7 +65,7 @@ def load_settings(raise_on_error: bool = False) -> Settings:
         settings.user_knowledge_enabled = False
 
     settings.show_extra_connectors = SHOW_EXTRA_CONNECTORS
-    settings.opensearch_indexing_enabled = ENABLE_OPENSEARCH_INDEXING_FOR_ONYX
+    settings.elasticsearch_indexing_enabled = ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX
     settings.hide_query_history_from_admin_panel = HIDE_QUERY_HISTORY_FROM_ADMIN_PANEL
 
     # Resolve context-aware defaults for token threshold.

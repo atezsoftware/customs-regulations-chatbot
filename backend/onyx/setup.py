@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from onyx.configs.app_configs import (
     DISABLE_INDEX_UPDATE_ON_SWAP,
     DISABLE_VECTOR_DB,
-    ENABLE_OPENSEARCH_INDEXING_FOR_ONYX,
+    ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX,
     INTEGRATION_TESTS_MODE,
     MANAGED_VESPA,
     ONYX_DISABLE_VESPA,
@@ -43,13 +43,12 @@ from onyx.db.search_settings import (
     update_current_search_settings,
 )
 from onyx.db.swap_index import check_and_perform_index_swap
+from onyx.document_index.elasticsearch.client import (
+    ElasticsearchClient,
+    wait_for_elasticsearch_with_timeout,
+)
 from onyx.document_index.factory import get_all_document_indices
 from onyx.document_index.interfaces_new import DocumentIndex
-from onyx.document_index.opensearch.client import (
-    OpenSearchClient,
-    wait_for_opensearch_with_timeout,
-)
-from onyx.document_index.opensearch.opensearch_document_index import set_cluster_state
 from onyx.document_index.vespa.vespa_document_index import (
     register_multitenant_vespa_indices,
 )
@@ -342,11 +341,10 @@ def setup_multitenant_onyx() -> None:
         logger.notice("DISABLE_VECTOR_DB is set — skipping multitenant Vespa setup.")
         return
 
-    if ENABLE_OPENSEARCH_INDEXING_FOR_ONYX:
-        opensearch_client = OpenSearchClient()
-        if not wait_for_opensearch_with_timeout(client=opensearch_client):
-            raise RuntimeError("Failed to connect to OpenSearch.")
-        set_cluster_state(opensearch_client)
+    if ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX:
+        elasticsearch_client = ElasticsearchClient()
+        if not wait_for_elasticsearch_with_timeout(client=elasticsearch_client):
+            raise RuntimeError("Failed to connect to Elasticsearch.")
 
     # For Managed Vespa, the schema is sent over via the Vespa Console manually.
     # NOTE: Pretty sure this code is never hit in any production environment.
@@ -355,7 +353,7 @@ def setup_multitenant_onyx() -> None:
 
 
 def setup_vespa_multitenant(supported_indices: list[SupportedEmbeddingModel]) -> bool:
-    # TODO(andrei): We don't yet support OpenSearch for multi-tenant instances
+    # TODO(andrei): We don't yet support Elasticsearch for multi-tenant instances
     # so this function remains unchanged.
     # This is for local testing
     WAIT_SECONDS = 5

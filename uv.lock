@@ -1525,6 +1525,36 @@ wheels = [
 ]
 
 [[package]]
+name = "elastic-transport"
+version = "9.4.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "sniffio" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/52/be/a719a217ed7f179c9e41821dff9dfd28415b21bc94da9d35fff84f7951b2/elastic_transport-9.4.2.tar.gz", hash = "sha256:366f4614f4544c5fb5d780c82f57af8f30492b44a68ed20750390aa81e20c2ea", size = 79310, upload-time = "2026-06-16T15:27:17.182Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0b/e4/9b7ef7a8e0bb416e0fe1879c92295041cf81e5a47e3c3110744e89b6eb35/elastic_transport-9.4.2-py3-none-any.whl", hash = "sha256:33dc89bb1855faa8b98ae8b036405a39c562778dbcdbe4a00a2eaf753148556c", size = 66314, upload-time = "2026-06-16T15:27:15.875Z" },
+]
+
+[[package]]
+name = "elasticsearch"
+version = "9.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "elastic-transport" },
+    { name = "python-dateutil" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e0/4b/9b753f0a8f56ae508dced2f7ac87bef7a27ce8f890e349e16812e9f7f4fa/elasticsearch-9.4.1.tar.gz", hash = "sha256:1d78fdfba97a903ec35a5eb5808a74e33392b7c620bd5f742d465a3a26c27d75", size = 908138, upload-time = "2026-05-26T16:28:40.132Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/8e/2c93805e93e724a90156004a9212572ec86473974deede4605a33b8b169a/elasticsearch-9.4.1-py3-none-any.whl", hash = "sha256:71ab71c3d1b20fd88c2922fb82c3277cce7ea03c160686e7b9368b265c2b4cac", size = 993647, upload-time = "2026-05-26T16:28:36.556Z" },
+]
+
+[[package]]
 name = "email-validator"
 version = "2.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1553,14 +1583,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d3/38/af70d7ab1ae9d4da450eeec1fa3918940a5fafb9055e934af8d6eb0c2313/et_xmlfile-2.0.0.tar.gz", hash = "sha256:dab3f4764309081ce75662649be815c4c9081e88f0837825f90fd28317d4da54", size = 17234, upload-time = "2024-10-25T17:25:40.039Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c1/8b/5fe2cc11fee489817272089c4203e679c63b570a5aaeb18d852ae3cbba6a/et_xmlfile-2.0.0-py3-none-any.whl", hash = "sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa", size = 18059, upload-time = "2024-10-25T17:25:39.051Z" },
-]
-
-[[package]]
-name = "events"
-version = "0.5"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/25/ed/e47dec0626edd468c84c04d97769e7ab4ea6457b7f54dcb3f72b17fcd876/Events-0.5-py3-none-any.whl", hash = "sha256:a7286af378ba3e46640ac9825156c93bdba7502174dd696090fdfcd4d80a1abd", size = 6758, upload-time = "2023-07-31T08:23:13.645Z" },
 ]
 
 [[package]]
@@ -4305,6 +4327,7 @@ backend = [
     { name = "distributed" },
     { name = "docker" },
     { name = "dropbox" },
+    { name = "elasticsearch" },
     { name = "exa-py" },
     { name = "fastapi-limiter" },
     { name = "fastapi-users" },
@@ -4334,7 +4357,6 @@ backend = [
     { name = "office365-rest-python-client" },
     { name = "openinference-instrumentation" },
     { name = "openpyxl" },
-    { name = "opensearch-py" },
     { name = "opentelemetry-proto" },
     { name = "pillow" },
     { name = "playwright" },
@@ -4398,6 +4420,7 @@ backend-runtime = [
     { name = "distributed" },
     { name = "docker" },
     { name = "dropbox" },
+    { name = "elasticsearch" },
     { name = "exa-py" },
     { name = "fastapi-limiter" },
     { name = "fastapi-users" },
@@ -4426,7 +4449,6 @@ backend-runtime = [
     { name = "office365-rest-python-client" },
     { name = "openinference-instrumentation" },
     { name = "openpyxl" },
-    { name = "opensearch-py" },
     { name = "opentelemetry-proto" },
     { name = "pillow" },
     { name = "psutil" },
@@ -4576,6 +4598,7 @@ backend = [
     { name = "distributed", specifier = "==2026.1.1" },
     { name = "docker", specifier = "==7.1.0" },
     { name = "dropbox", specifier = "==12.0.2" },
+    { name = "elasticsearch", specifier = "==9.4.1" },
     { name = "exa-py", specifier = "==1.15.4" },
     { name = "fastapi-limiter", specifier = "==0.1.6" },
     { name = "fastapi-users", specifier = "==15.0.4" },
@@ -4605,7 +4628,6 @@ backend = [
     { name = "office365-rest-python-client", specifier = "==2.6.2" },
     { name = "openinference-instrumentation", specifier = "==0.1.42" },
     { name = "openpyxl", specifier = "==3.0.10" },
-    { name = "opensearch-py", specifier = "==3.2.0" },
     { name = "opentelemetry-proto", specifier = ">=1.42.1" },
     { name = "pillow", specifier = "==12.3.0" },
     { name = "playwright", specifier = "==1.58.0" },
@@ -4669,6 +4691,7 @@ backend-runtime = [
     { name = "distributed", specifier = "==2026.1.1" },
     { name = "docker", specifier = "==7.1.0" },
     { name = "dropbox", specifier = "==12.0.2" },
+    { name = "elasticsearch", specifier = "==9.4.1" },
     { name = "exa-py", specifier = "==1.15.4" },
     { name = "fastapi-limiter", specifier = "==0.1.6" },
     { name = "fastapi-users", specifier = "==15.0.4" },
@@ -4697,7 +4720,6 @@ backend-runtime = [
     { name = "office365-rest-python-client", specifier = "==2.6.2" },
     { name = "openinference-instrumentation", specifier = "==0.1.42" },
     { name = "openpyxl", specifier = "==3.0.10" },
-    { name = "opensearch-py", specifier = "==3.2.0" },
     { name = "opentelemetry-proto", specifier = ">=1.42.1" },
     { name = "pillow", specifier = "==12.3.0" },
     { name = "psutil", specifier = "==7.1.3" },
@@ -4888,35 +4910,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/2c/b8/ff77a718173fd73e49f883b4fda88f11af1fc51edb9252af3785b0cad987/openpyxl-3.0.10.tar.gz", hash = "sha256:e47805627aebcf860edb4edf7987b1309c1b3632f3750538ed962bbcc3bd7449", size = 179688, upload-time = "2022-05-19T15:43:05.252Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7b/60/9afac4fd6feee0ac09339de4101ee452ea643d26e9ce44c7708a0023f503/openpyxl-3.0.10-py2.py3-none-any.whl", hash = "sha256:0ab6d25d01799f97a9464630abacbb34aafecdcaa0ef3cba6d6b3499867d0355", size = 242144, upload-time = "2022-05-19T15:43:03.065Z" },
-]
-
-[[package]]
-name = "opensearch-protobufs"
-version = "1.2.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "grpcio" },
-    { name = "protobuf" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d8/2f/e0cc165af7bb7b44cb00023b9fcaa01a28d1755a059ede28d0cd970c3cec/opensearch_protobufs-1.2.0-py3-none-any.whl", hash = "sha256:e806730894d0a0c8cdaa3cdbe07e4b7c46e1823f453777b36caf39e9cba28e2c", size = 54751, upload-time = "2026-01-22T18:51:56.805Z" },
-]
-
-[[package]]
-name = "opensearch-py"
-version = "3.2.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "certifi" },
-    { name = "events" },
-    { name = "opensearch-protobufs" },
-    { name = "python-dateutil" },
-    { name = "requests" },
-    { name = "urllib3" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/82/9e/e77844cb2d625ca32331bfdd28930113b3778399c01dd5f1c350ceb55e65/opensearch_py-3.2.0.tar.gz", hash = "sha256:f40fb3a295275422df2ad6d9459f667af94472d5a9e567072e9ecf163eb22613", size = 259927, upload-time = "2026-04-27T18:17:50.467Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ef/63/7abb96bf2e3619acbd27de99e60619bfacfb7c55b68c4792a258e6d92871/opensearch_py-3.2.0-py3-none-any.whl", hash = "sha256:721a0d3b13fbed9e82278aed748285cf63a1855354ab7e73e3d4992d1b93418b", size = 387286, upload-time = "2026-04-27T18:17:48.658Z" },
 ]
 
 [[package]]

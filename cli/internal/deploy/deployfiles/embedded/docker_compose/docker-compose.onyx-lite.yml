@@ -15,7 +15,7 @@
 #                  -f docker-compose.dev.yml up -d --wait
 #
 # This overlay:
-#   - Moves both model servers, OpenSearch, MinIO, Redis (cache), and the
+#   - Moves both model servers, Elasticsearch, MinIO, Redis (cache), and the
 #     background worker to profiles so they do not start by default
 #   - Makes depends_on references to removed services optional
 #   - Sets DISABLE_VECTOR_DB=true on the api_server
@@ -27,7 +27,7 @@
 #   --profile inference         Inference model server
 #   --profile background        Background worker (Celery) — also needs redis
 #   --profile redis             Redis cache
-#   --profile opensearch        OpenSearch
+#   --profile elasticsearch        Elasticsearch
 #   --profile s3-filestore      MinIO (S3-compatible file store)
 # =============================================================================
 
@@ -36,7 +36,7 @@ name: onyx
 services:
   api_server:
     depends_on:
-      opensearch:
+      elasticsearch:
         condition: service_started
         required: false
       cache:
@@ -79,9 +79,9 @@ services:
   inference_model_server:
     profiles: ["inference"]
 
-  # OpenSearch is not needed in lite mode (no indexing).
-  opensearch:
-    profiles: ["opensearch"]
+  # Elasticsearch is not needed in lite mode (no indexing).
+  elasticsearch:
+    profiles: ["elasticsearch"]
 
   # MinIO is not needed in lite mode (Postgres handles file storage).
   minio:

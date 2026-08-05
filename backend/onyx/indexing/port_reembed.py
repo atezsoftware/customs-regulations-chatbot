@@ -52,7 +52,7 @@ from onyx.document_index.chunk_content_enrichment import (
     cleanup_content_for_chunks,
     generate_enriched_content_for_chunk_text,
 )
-from onyx.document_index.opensearch.schema import (
+from onyx.document_index.elasticsearch.schema import (
     DocumentChunk,
     DocumentChunkWithoutVectors,
 )
@@ -328,14 +328,16 @@ def re_embed_chunks(
 def _bare_contents(stored_chunks: list[DocumentChunkWithoutVectors]) -> list[str]:
     """Strip every stored chunk back to its original (un-augmented) text via the
     canonical inverse of the indexing-time enrichment."""
-    # Lazy import: opensearch_document_index is a heavy module and only needed on
+    # Lazy import: elasticsearch_document_index is a heavy module and only needed on
     # the AUGMENTATION path; keeps port_reembed's import surface light + cycle-free.
-    from onyx.document_index.opensearch.opensearch_document_index import (
-        convert_retrieved_opensearch_chunk_to_inference_chunk_uncleaned,
+    from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+        convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned,
     )
 
     uncleaned = [
-        convert_retrieved_opensearch_chunk_to_inference_chunk_uncleaned(chunk, None, {})
+        convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned(
+            chunk, None, {}
+        )
         for chunk in stored_chunks
     ]
     cleaned = cleanup_content_for_chunks(uncleaned)
@@ -390,7 +392,7 @@ def _augmentation_reembed(
     bare_contents = _bare_contents(stored_chunks)
     future_rag_on = ctx.future_enable_contextual_rag
 
-    # Canonical source documents preserve the OpenSearch identity. Contextual
+    # Canonical source documents preserve the Elasticsearch identity. Contextual
     # grouping may temporarily use snapshot-specific ids below, but those ids
     # are restored before embedding and writing.
     pairs_by_doc: dict[str, list[tuple[DocumentChunkWithoutVectors, str]]] = (

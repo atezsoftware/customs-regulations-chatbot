@@ -345,7 +345,7 @@ def reset_file_store() -> None:
 def reset_all() -> None:
     """Reset state that persists across tests.
 
-    OpenSearch is intentionally NOT reset between tests — tests are expected to
+    Elasticsearch is intentionally NOT reset between tests — tests are expected to
     use unique document IDs (e.g. uuid-based) so they don't collide on shared
     index state, and CI runners are ephemeral so accumulated docs don't leak
     across runs.
@@ -363,7 +363,7 @@ def reset_all() -> None:
 def reset_all_multitenant() -> None:
     """Reset Postgres for all tenants.
 
-    OpenSearch is intentionally NOT reset; see reset_all() for rationale.
+    Elasticsearch is intentionally NOT reset; see reset_all() for rationale.
     Honors SKIP_RESET env var to allow callers (e.g., CI) to disable
     heavy resets entirely for faster end-to-end runs.
     """

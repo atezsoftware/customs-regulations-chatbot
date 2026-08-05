@@ -24,7 +24,7 @@
     "GH_TOKEN": "${localEnv:GH_TOKEN}",
     "MODEL_SERVER_HOST": "inference_model_server",
     "ONYX_DEVCONTAINER_FIREWALL": "${localEnv:ONYX_DEVCONTAINER_FIREWALL}",
-    "OPENSEARCH_HOST": "opensearch",
+    "ELASTICSEARCH_HOST": "elasticsearch",
     "POSTGRES_HOST": "relational_db",
     "POSTGRES_PASSWORD": "${localEnv:POSTGRES_PASSWORD:password}",
     "REDIS_HOST": "cache",

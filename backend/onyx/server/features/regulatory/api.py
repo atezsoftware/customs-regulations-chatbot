@@ -2,7 +2,7 @@
 
 Postgres `regulatory_chunk` rows are the source of truth. Content mutations
 re-project the whole file; file-level validity uses an exact metadata-only
-OpenSearch patch and rejects unsafe projections.
+Elasticsearch patch and rejects unsafe projections.
 """
 
 import datetime
@@ -134,7 +134,7 @@ def patch_chunk(
     )
     db_session.flush()
 
-    # Same transaction: if the OpenSearch projection fails, the row edit rolls
+    # Same transaction: if the Elasticsearch projection fails, the row edit rolls
     # back too, so Postgres and the index never diverge.
     project_user_file_to_index(db_session, user_file, get_current_tenant_id())
     db_session.commit()
@@ -252,7 +252,7 @@ def patch_file_validity(
             except Exception as compensation_error:
                 db_session.rollback()
                 raise RuntimeError(
-                    "PostgreSQL commit and OpenSearch validity compensation both "
+                    "PostgreSQL commit and Elasticsearch validity compensation both "
                     f"failed for user_file={user_file_id}."
                 ) from compensation_error
         db_session.rollback()

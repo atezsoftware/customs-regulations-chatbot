@@ -70,26 +70,26 @@ def _patch_successful_preflight(
         "_ensure_database_schema_current",
         MagicMock(),
     )
-    opensearch_target = _opensearch_target()
+    elasticsearch_target = _elasticsearch_target()
     monkeypatch.setattr(
         regulatory_import,
-        "_resolve_opensearch_target",
-        MagicMock(return_value=opensearch_target),
+        "_resolve_elasticsearch_target",
+        MagicMock(return_value=elasticsearch_target),
     )
-    ensure_opensearch_ready = MagicMock()
+    ensure_elasticsearch_ready = MagicMock()
     monkeypatch.setattr(
-        regulatory_import, "_ensure_opensearch_ready", ensure_opensearch_ready
+        regulatory_import, "_ensure_elasticsearch_ready", ensure_elasticsearch_ready
     )
     monkeypatch.setattr(
         regulatory_import,
         "_active_file_with_name_exists",
         MagicMock(return_value=False),
     )
-    return ensure_opensearch_ready
+    return ensure_elasticsearch_ready
 
 
-def _opensearch_target() -> regulatory_import.OpenSearchTarget:
-    return regulatory_import.OpenSearchTarget(
+def _elasticsearch_target() -> regulatory_import.ElasticsearchTarget:
+    return regulatory_import.ElasticsearchTarget(
         index_name="danswer_chunk_test",
         embedding_dimension=768,
         tenant_id="public",
@@ -158,10 +158,10 @@ def test_database_schema_preflight_reports_image_and_database_heads(
         regulatory_import._ensure_database_schema_current(MagicMock())
 
 
-def test_opensearch_preflight_is_read_only_and_validates_current_schema(
+def test_elasticsearch_preflight_is_read_only_and_validates_current_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    target = _opensearch_target()
+    target = _elasticsearch_target()
     expected_schema = {"properties": {"regulatory_chunk_id": {"type": "keyword"}}}
     document_schema = MagicMock(return_value=expected_schema)
     monkeypatch.setattr(
@@ -177,9 +177,9 @@ def test_opensearch_preflight_is_read_only_and_validates_current_schema(
     client_context.__enter__.return_value = client
     client_context.__exit__.return_value = None
     client_factory = MagicMock(return_value=client_context)
-    monkeypatch.setattr(regulatory_import, "OpenSearchIndexClient", client_factory)
+    monkeypatch.setattr(regulatory_import, "ElasticsearchIndexClient", client_factory)
 
-    regulatory_import._ensure_opensearch_ready(target)
+    regulatory_import._ensure_elasticsearch_ready(target)
 
     document_schema.assert_called_once_with(
         target.embedding_dimension,
@@ -199,7 +199,7 @@ def test_opensearch_preflight_is_read_only_and_validates_current_schema(
 
 
 def test_projection_visibility_requires_exact_chunk_identities() -> None:
-    target = regulatory_import.OpenSearchTarget(
+    target = regulatory_import.ElasticsearchTarget(
         index_name="chunks",
         embedding_dimension=768,
         tenant_id="tenant-a",
@@ -249,7 +249,7 @@ def test_projection_visibility_requires_exact_chunk_identities() -> None:
 def test_projection_visibility_refreshes_once_and_polls_with_a_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    target = _opensearch_target()
+    target = _elasticsearch_target()
     identities = [regulatory_import.RegulatoryProjectionIdentity("reg-a", 0)]
     client = MagicMock()
     client_context = MagicMock()
@@ -257,7 +257,7 @@ def test_projection_visibility_refreshes_once_and_polls_with_a_bound(
     client_context.__exit__.return_value = None
     monkeypatch.setattr(
         regulatory_import,
-        "OpenSearchIndexClient",
+        "ElasticsearchIndexClient",
         MagicMock(return_value=client_context),
     )
     visibility = MagicMock(side_effect=[False, True])
@@ -273,13 +273,15 @@ def test_projection_visibility_refreshes_once_and_polls_with_a_bound(
 
     client.refresh_index.assert_called_once_with()
     assert visibility.call_count == 2
-    sleep.assert_called_once_with(regulatory_import._OPENSEARCH_VISIBILITY_INTERVAL_S)
+    sleep.assert_called_once_with(
+        regulatory_import._ELASTICSEARCH_VISIBILITY_INTERVAL_S
+    )
 
 
 def test_projection_visibility_fails_after_bounded_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    target = _opensearch_target()
+    target = _elasticsearch_target()
     identities = [regulatory_import.RegulatoryProjectionIdentity("reg-a", 0)]
     client = MagicMock()
     client_context = MagicMock()
@@ -287,12 +289,12 @@ def test_projection_visibility_fails_after_bounded_attempts(
     client_context.__exit__.return_value = None
     monkeypatch.setattr(
         regulatory_import,
-        "OpenSearchIndexClient",
+        "ElasticsearchIndexClient",
         MagicMock(return_value=client_context),
     )
     visibility = MagicMock(return_value=False)
     monkeypatch.setattr(regulatory_import, "_projection_is_visible", visibility)
-    monkeypatch.setattr(regulatory_import, "_OPENSEARCH_VISIBILITY_ATTEMPTS", 3)
+    monkeypatch.setattr(regulatory_import, "_ELASTICSEARCH_VISIBILITY_ATTEMPTS", 3)
     monkeypatch.setattr(regulatory_import.time, "sleep", MagicMock())
 
     with pytest.raises(ValueError, match="after 3 checks"):
@@ -372,7 +374,7 @@ def test_existing_duplicate_aborts_preflight_before_any_import(
     source = tmp_path / "regulation.pdf"
     source.write_bytes(b"content")
     target = regulatory_import.ImportTarget(user_id=uuid4(), project_id=7)
-    ensure_opensearch_ready = _patch_successful_preflight(monkeypatch, target=target)
+    ensure_elasticsearch_ready = _patch_successful_preflight(monkeypatch, target=target)
     monkeypatch.setattr(
         regulatory_import,
         "_active_file_with_name_exists",
@@ -385,7 +387,7 @@ def test_existing_duplicate_aborts_preflight_before_any_import(
     with pytest.raises(ValueError, match="Active files with the same name"):
         regulatory_import.run(_args([source]))
 
-    ensure_opensearch_ready.assert_not_called()
+    ensure_elasticsearch_ready.assert_not_called()
     import_one.assert_not_called()
     assert regulatory_import.CURRENT_TENANT_ID_CONTEXTVAR.get() == original_tenant
 
@@ -516,7 +518,7 @@ def test_import_one_file_rejects_failed_empty_or_inconsistent_indexing(
         source,
         target=target,
         tenant_id="tenant_one",
-        opensearch_target=_opensearch_target(),
+        elasticsearch_target=_elasticsearch_target(),
     )
 
     assert result["status"] == "failed"
@@ -590,7 +592,7 @@ def test_import_one_file_succeeds_only_with_completed_matching_chunks(
         source,
         target=target,
         tenant_id="tenant_one",
-        opensearch_target=_opensearch_target(),
+        elasticsearch_target=_elasticsearch_target(),
     )
 
     assert result == {
@@ -612,10 +614,10 @@ def test_import_one_file_succeeds_only_with_completed_matching_chunks(
         regulatory_import.RegulatoryProjectionIdentity("regulatory-0", 0),
         regulatory_import.RegulatoryProjectionIdentity("regulatory-1", 1),
     ]
-    assert visibility_call["target"] == _opensearch_target()
+    assert visibility_call["target"] == _elasticsearch_target()
 
 
-def test_import_one_file_reports_opensearch_projection_failure(
+def test_import_one_file_reports_elasticsearch_projection_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "regulation.md"
@@ -662,14 +664,14 @@ def test_import_one_file_reports_opensearch_projection_failure(
         source,
         target=target,
         tenant_id="tenant_one",
-        opensearch_target=_opensearch_target(),
+        elasticsearch_target=_elasticsearch_target(),
     )
 
     assert result["status"] == "failed"
     assert result["user_file_id"] == str(user_file_id)
     assert result["chunk_count"] == 1
     assert result["detail"] == (
-        "OpenSearch post-import verification failed: not visible"
+        "Elasticsearch post-import verification failed: not visible"
     )
 
 
@@ -696,7 +698,7 @@ def test_run_returns_nonzero_when_import_verification_fails(
         source.resolve(),
         target=target,
         tenant_id="public",
-        opensearch_target=_opensearch_target(),
+        elasticsearch_target=_elasticsearch_target(),
     )
 
 
@@ -721,7 +723,7 @@ def test_import_one_file_reloads_user_in_active_session(
             source,
             target=target,
             tenant_id="tenant_one",
-            opensearch_target=_opensearch_target(),
+            elasticsearch_target=_elasticsearch_target(),
         )
 
     create_user_files.assert_not_called()

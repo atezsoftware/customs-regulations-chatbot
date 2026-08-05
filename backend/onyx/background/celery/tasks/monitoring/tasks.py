@@ -180,7 +180,7 @@ def _collect_queue_metrics(redis_celery: Redis) -> list[Metric]:
         "user_file_port_queue_length": OnyxCeleryQueues.USER_FILE_PORT,
         "monitoring_queue_length": OnyxCeleryQueues.MONITORING,
         "sandbox_queue_length": OnyxCeleryQueues.SANDBOX,
-        "opensearch_migration_queue_length": OnyxCeleryQueues.OPENSEARCH_MIGRATION,
+        "elasticsearch_migration_queue_length": OnyxCeleryQueues.ELASTICSEARCH_MIGRATION,
     }
 
     for name, queue in queue_mappings.items():
@@ -976,8 +976,8 @@ def monitor_celery_queues_helper(
     )
     n_monitoring = celery_get_queue_length(OnyxCeleryQueues.MONITORING, r_celery)
     n_sandbox = celery_get_queue_length(OnyxCeleryQueues.SANDBOX, r_celery)
-    n_opensearch_migration = celery_get_queue_length(
-        OnyxCeleryQueues.OPENSEARCH_MIGRATION, r_celery
+    n_elasticsearch_migration = celery_get_queue_length(
+        OnyxCeleryQueues.ELASTICSEARCH_MIGRATION, r_celery
     )
 
     n_docfetching_prefetched = celery_get_unacked_task_ids(
@@ -1011,7 +1011,7 @@ def monitor_celery_queues_helper(
         f"csv_generation={n_csv_generation} "
         f"monitoring={n_monitoring} "
         f"sandbox={n_sandbox} "
-        f"opensearch_migration={n_opensearch_migration} "
+        f"elasticsearch_migration={n_elasticsearch_migration} "
     )
 
 

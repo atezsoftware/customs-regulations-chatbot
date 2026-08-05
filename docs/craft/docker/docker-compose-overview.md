@@ -52,7 +52,7 @@ ENV
   the private `onyx-craft-api` bridge alias on every platform.
 - ~80 GB free Docker disk. Onyx's full stack pulls ~30 GB; local image
   builds add another 10–15 GB; build cache balloons to 40+ GB if you let
-  it. See [OpenSearch read-only block](#opensearch-flipped-into-read-only-mode-disk-full) below.
+  it. See [Elasticsearch read-only block](#elasticsearch-flipped-into-read-only-mode-disk-full) below.
 - An LLM API key (Anthropic / OpenAI / etc).
 
 ---
@@ -430,7 +430,7 @@ docker compose -f docker-compose.yml -f docker-compose.craft.yml down
 docker compose -f docker-compose.yml -f docker-compose.craft.yml up -d --no-build
 ```
 
-### OpenSearch flipped into read-only mode (disk full)
+### Elasticsearch flipped into read-only mode (disk full)
 
 Symptom: api_server crashes with:
 
@@ -443,7 +443,7 @@ TransportError(429, 'cluster_block_exception',
 
 Cause: Docker Desktop's virtual disk hit the 95% flood-stage watermark.
 On macOS, the Docker VM has a fixed-size disk; image pulls + builds eat
-into it. OpenSearch sees the VM disk, not the host disk.
+into it. Elasticsearch sees the VM disk, not the host disk.
 
 Fix:
 
@@ -452,7 +452,7 @@ docker builder prune -af              # build cache is often 40+ GB
 docker image prune -af --filter "until=24h"
 ```
 
-After freeing enough space, OpenSearch lifts the block automatically
+After freeing enough space, Elasticsearch lifts the block automatically
 when disk drops below the low watermark. Restart api_server to retry.
 
 ### Port 3000 already in use

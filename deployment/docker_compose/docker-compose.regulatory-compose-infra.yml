@@ -1,4 +1,4 @@
-# Required overlay when PostgreSQL, OpenSearch, Redis, and MinIO are managed by
+# Required overlay when PostgreSQL, Elasticsearch, Redis, and MinIO are managed by
 # this Compose project. Every data-infrastructure artifact is supplied by an
 # organization-approved immutable digest. Edge images are pinned separately.
 
@@ -20,8 +20,8 @@ services:
       retries: 10
       start_period: 30s
 
-  opensearch:
-    image: ${REGULATORY_OPENSEARCH_IMAGE:?set REGULATORY_OPENSEARCH_IMAGE to an approved repository@sha256 digest}
+  elasticsearch:
+    image: ${REGULATORY_ELASTICSEARCH_IMAGE:?set REGULATORY_ELASTICSEARCH_IMAGE to an approved repository@sha256 digest}
     pull_policy: always
     healthcheck:
       # Keep the credential reference inside the container. `$$` prevents
@@ -31,7 +31,7 @@ services:
         - >-
           curl --fail --silent --show-error --insecure
           --max-time 8
-          --user "admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
+          --user "admin:$${ELASTIC_PASSWORD}"
           "https://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s"
           >/dev/null
       interval: 15s

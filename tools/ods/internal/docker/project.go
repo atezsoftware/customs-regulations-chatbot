@@ -40,8 +40,8 @@ var InfraServices = []ServiceSpec{
 	{Name: "cache", Ports: []PortSpec{
 		{ContainerPort: 6379, DefaultHost: 6379, ComposeVar: "REDIS_HOST_PORT", AppVar: "REDIS_PORT"},
 	}},
-	{Name: "opensearch", Ports: []PortSpec{
-		{ContainerPort: 9200, DefaultHost: 9200, ComposeVar: "OPENSEARCH_HOST_PORT", AppVar: "OPENSEARCH_REST_API_PORT"},
+	{Name: "elasticsearch", Ports: []PortSpec{
+		{ContainerPort: 9200, DefaultHost: 9200, ComposeVar: "ELASTICSEARCH_HOST_PORT", AppVar: "ELASTICSEARCH_REST_API_PORT"},
 	}},
 	{Name: "inference_model_server", Ports: []PortSpec{
 		{ContainerPort: 9000, DefaultHost: 9000, ComposeVar: "MODEL_SERVER_HOST_PORT", AppVar: "MODEL_SERVER_PORT"},

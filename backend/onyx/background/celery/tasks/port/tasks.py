@@ -89,7 +89,7 @@ from onyx.db.user_file import (
     get_user_file_ids_for_user_batch,
     user_file_port_scope_active,
 )
-from onyx.document_index.opensearch.port_copy import PortCopier
+from onyx.document_index.elasticsearch.port_copy import PortCopier
 from onyx.redis.redis_pool import get_redis_client
 
 _PORT_SOFT_TIME_LIMIT = 60 * 30  # 30 minutes
@@ -155,7 +155,7 @@ def _copy_batch_with_retry(
     is idempotent (deterministic _id + create-only: re-creating an existing chunk
     is a benign 409, and the port never overwrites a forward/live write).
 
-    The delay is fixed, not exponential: the embedder and OpenSearch layers
+    The delay is fixed, not exponential: the embedder and Elasticsearch layers
     already back off internally on rate-limits/transients, so a second curve here
     would just stack on theirs. This only guards a whole-pipeline hiccup that
     outlived them.

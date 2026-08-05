@@ -99,7 +99,7 @@ def test_send_message__basic_searches(
     assert response.error is None, "Chat response should not have an error"
     assert response.top_documents is not None
     # Other tests in this directory upload user files that get indexed into
-    # OpenSearch; OpenSearch is intentionally NOT reset between tests, so
+    # Elasticsearch; Elasticsearch is intentionally NOT reset between tests, so
     # we filter to the doc we seeded rather than asserting on raw count.
     doc_ids = [d.document_id for d in response.top_documents]
     assert short_doc.id in doc_ids, doc_ids

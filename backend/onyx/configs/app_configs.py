@@ -8,7 +8,6 @@ from typing import cast
 from onyx.auth.schemas import AuthBackend
 from onyx.cache.interface import CacheBackendType
 from onyx.configs.constants import QueryHistoryType
-from onyx.document_index.opensearch.constants import OpenSearchAuthMethod
 from onyx.file_processing.enums import HtmlBasedConnectorTransformLinksStrategy
 from onyx.prompts.image_analysis import (
     DEFAULT_IMAGE_SUMMARIZATION_SYSTEM_PROMPT,
@@ -82,7 +81,7 @@ DOCUMENT_IMPORT_ENABLED = (
     os.environ.get("DOCUMENT_IMPORT_ENABLED", "true").lower() == "true"
 )
 
-# Disables vector DB (Vespa/OpenSearch) entirely. When True, connectors and RAG search
+# Disables vector DB (Vespa/Elasticsearch) entirely. When True, connectors and RAG search
 # are disabled but core chat, tools, user file uploads, and Projects still work.
 DISABLE_VECTOR_DB = os.environ.get("DISABLE_VECTOR_DB", "").lower() == "true"
 
@@ -438,166 +437,136 @@ TRACK_EXTERNAL_IDP_EXPIRY = (
 #####
 DOCUMENT_INDEX_NAME = "danswer_index"
 
-# OpenSearch Configs
-OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST") or "localhost"
-OPENSEARCH_REST_API_PORT = int(os.environ.get("OPENSEARCH_REST_API_PORT") or 9200)
+# Elasticsearch Configs
+ELASTICSEARCH_HOST = os.environ.get("ELASTICSEARCH_HOST") or "localhost"
+ELASTICSEARCH_REST_API_PORT = int(os.environ.get("ELASTICSEARCH_REST_API_PORT") or 9200)
 # TODO(andrei): 60 seconds is too much, we're just setting a high default
 # timeout for now to examine why queries are slow.
 # NOTE: This timeout applies to all requests the client makes, including bulk
 # indexing.
-DEFAULT_OPENSEARCH_CLIENT_TIMEOUT_S = int(
-    os.environ.get("DEFAULT_OPENSEARCH_CLIENT_TIMEOUT_S") or 60
+DEFAULT_ELASTICSEARCH_CLIENT_TIMEOUT_S = int(
+    os.environ.get("DEFAULT_ELASTICSEARCH_CLIENT_TIMEOUT_S") or 60
 )
 # TODO(andrei): 50 seconds is too much, we're just setting a high default
 # timeout for now to examine why queries are slow.
 # NOTE: To get useful partial results, this value should be less than the client
 # timeout above.
-DEFAULT_OPENSEARCH_QUERY_TIMEOUT_S = int(
-    os.environ.get("DEFAULT_OPENSEARCH_QUERY_TIMEOUT_S") or 50
+DEFAULT_ELASTICSEARCH_QUERY_TIMEOUT_S = int(
+    os.environ.get("DEFAULT_ELASTICSEARCH_QUERY_TIMEOUT_S") or 50
 )
-OPENSEARCH_ADMIN_USERNAME = os.environ.get("OPENSEARCH_ADMIN_USERNAME", "admin")
-OPENSEARCH_ADMIN_PASSWORD = os.environ.get(
-    "OPENSEARCH_ADMIN_PASSWORD", "StrongPassword123!"
+ELASTICSEARCH_ADMIN_USERNAME = os.environ.get("ELASTICSEARCH_ADMIN_USERNAME", "elastic")
+ELASTICSEARCH_ADMIN_PASSWORD = os.environ.get(
+    "ELASTICSEARCH_ADMIN_PASSWORD", "StrongPassword123!"
 )
-OPENSEARCH_USE_SSL = os.environ.get("OPENSEARCH_USE_SSL", "true").lower() == "true"
-# Verify the OpenSearch server certificate. Defaults to False to preserve the
-# existing behavior (the bundled OpenSearch ships self-signed certs). Set True —
-# with OPENSEARCH_CA_CERTS for a private CA — to actually authenticate the
-# server instead of merely encrypting the connection.
-OPENSEARCH_VERIFY_CERTS = (
-    os.environ.get("OPENSEARCH_VERIFY_CERTS", "").lower() == "true"
+ELASTICSEARCH_USE_SSL = (
+    os.environ.get("ELASTICSEARCH_USE_SSL", "false").lower() == "true"
 )
-# CA bundle to verify the server cert against when OPENSEARCH_VERIFY_CERTS=true.
+# Verify the Elasticsearch server certificate. Self-managed TLS deployments
+# should set this together with ELASTICSEARCH_USE_SSL and, for a private CA,
+# ELASTICSEARCH_CA_CERTS. The ECK Helm defaults set all three.
+ELASTICSEARCH_VERIFY_CERTS = (
+    os.environ.get("ELASTICSEARCH_VERIFY_CERTS", "").lower() == "true"
+)
+# CA bundle to verify the server cert against when ELASTICSEARCH_VERIFY_CERTS=true.
 # Falls back to the system trust store if unset.
-OPENSEARCH_CA_CERTS: str | None = os.environ.get("OPENSEARCH_CA_CERTS") or None
-# Client certificate + key for mutual TLS (OpenSearch authenticating us). Both
+ELASTICSEARCH_CA_CERTS: str | None = os.environ.get("ELASTICSEARCH_CA_CERTS") or None
+# Client certificate + key for mutual TLS (Elasticsearch authenticating us). Both
 # must be set together.
-OPENSEARCH_CLIENT_CERT: str | None = os.environ.get("OPENSEARCH_CLIENT_CERT") or None
-OPENSEARCH_CLIENT_KEY: str | None = os.environ.get("OPENSEARCH_CLIENT_KEY") or None
-
-# Authentication method for connecting to OpenSearch. "basic" uses
-# OPENSEARCH_ADMIN_USERNAME / OPENSEARCH_ADMIN_PASSWORD (HTTP basic auth); the
-# default and the only option for self-hosted / docker-compose OpenSearch. "iam"
-# uses AWS SigV4 request signing and is only valid against an AWS managed domain
-# whose fine-grained access control master is an IAM ARN. This is independent of
-# USING_AWS_MANAGED_OPENSEARCH: AWS managed domains can use a master user too.
-OPENSEARCH_AUTH_METHOD = OpenSearchAuthMethod(
-    (
-        os.environ.get("OPENSEARCH_AUTH_METHOD") or OpenSearchAuthMethod.BASIC.value
-    ).lower()
+ELASTICSEARCH_CLIENT_CERT: str | None = (
+    os.environ.get("ELASTICSEARCH_CLIENT_CERT") or None
 )
-# AWS region of the managed OpenSearch domain. Required when
-# OPENSEARCH_AUTH_METHOD=iam; used to compute the SigV4 signature.
-OPENSEARCH_AWS_REGION: str | None = os.environ.get("OPENSEARCH_AWS_REGION") or None
-# AWS service name for SigV4 signing: "es" for managed OpenSearch domains,
-# "aoss" for OpenSearch Serverless.
-OPENSEARCH_AWS_SERVICE = os.environ.get("OPENSEARCH_AWS_SERVICE") or "es"
+ELASTICSEARCH_CLIENT_KEY: str | None = (
+    os.environ.get("ELASTICSEARCH_CLIENT_KEY") or None
+)
 
-if OPENSEARCH_VERIFY_CERTS and not OPENSEARCH_USE_SSL:
+if ELASTICSEARCH_VERIFY_CERTS and not ELASTICSEARCH_USE_SSL:
     logger.warning(
-        "OPENSEARCH_VERIFY_CERTS=true has no effect when OPENSEARCH_USE_SSL is "
+        "ELASTICSEARCH_VERIFY_CERTS=true has no effect when ELASTICSEARCH_USE_SSL is "
         "false (the connection is not encrypted)."
     )
-if bool(OPENSEARCH_CLIENT_CERT) != bool(OPENSEARCH_CLIENT_KEY):
+if bool(ELASTICSEARCH_CLIENT_CERT) != bool(ELASTICSEARCH_CLIENT_KEY):
     raise ValueError(
-        "OPENSEARCH_CLIENT_CERT and OPENSEARCH_CLIENT_KEY must both be set "
+        "ELASTICSEARCH_CLIENT_CERT and ELASTICSEARCH_CLIENT_KEY must both be set "
         "(mutual TLS needs a client certificate and its private key)."
     )
-for _os_name, _os_path in (
-    ("OPENSEARCH_CA_CERTS", OPENSEARCH_CA_CERTS),
-    ("OPENSEARCH_CLIENT_CERT", OPENSEARCH_CLIENT_CERT),
-    ("OPENSEARCH_CLIENT_KEY", OPENSEARCH_CLIENT_KEY),
+for _elasticsearch_name, _elasticsearch_path in (
+    ("ELASTICSEARCH_CA_CERTS", ELASTICSEARCH_CA_CERTS),
+    ("ELASTICSEARCH_CLIENT_CERT", ELASTICSEARCH_CLIENT_CERT),
+    ("ELASTICSEARCH_CLIENT_KEY", ELASTICSEARCH_CLIENT_KEY),
 ):
-    if _os_path and not os.path.exists(_os_path):
-        raise ValueError(f"{_os_name}={_os_path!r} does not exist.")
+    if _elasticsearch_path and not os.path.exists(_elasticsearch_path):
+        raise ValueError(
+            f"{_elasticsearch_name}={_elasticsearch_path!r} does not exist."
+        )
 
-if OPENSEARCH_AUTH_METHOD == OpenSearchAuthMethod.IAM and not OPENSEARCH_AWS_REGION:
-    raise ValueError(
-        "OPENSEARCH_AWS_REGION must be set when OPENSEARCH_AUTH_METHOD=iam "
-        "(AWS SigV4 signing needs the domain's region)."
-    )
-
-USING_AWS_MANAGED_OPENSEARCH = (
-    os.environ.get("USING_AWS_MANAGED_OPENSEARCH", "").lower() == "true"
-)
-
-if (
-    OPENSEARCH_AUTH_METHOD == OpenSearchAuthMethod.IAM
-    and not USING_AWS_MANAGED_OPENSEARCH
-):
-    raise ValueError(
-        "OPENSEARCH_AUTH_METHOD=iam is only supported for "
-        "AWS-managed instances of OpenSearch."
-    )
-
-# Profiling adds some overhead to OpenSearch operations. This overhead is
+# Profiling adds some overhead to Elasticsearch operations. This overhead is
 # unknown right now. Defaults to True.
-OPENSEARCH_PROFILING_DISABLED = (
-    os.environ.get("OPENSEARCH_PROFILING_DISABLED", "true").lower() == "true"
+ELASTICSEARCH_PROFILING_DISABLED = (
+    os.environ.get("ELASTICSEARCH_PROFILING_DISABLED", "true").lower() == "true"
 )
-# Whether to disable match highlights for OpenSearch. Defaults to True for now
+# Whether to disable match highlights for Elasticsearch. Defaults to True for now
 # as we investigate query performance.
-OPENSEARCH_MATCH_HIGHLIGHTS_DISABLED = (
-    os.environ.get("OPENSEARCH_MATCH_HIGHLIGHTS_DISABLED", "true").lower() == "true"
+ELASTICSEARCH_MATCH_HIGHLIGHTS_DISABLED = (
+    os.environ.get("ELASTICSEARCH_MATCH_HIGHLIGHTS_DISABLED", "true").lower() == "true"
 )
-# When enabled, OpenSearch returns detailed score breakdowns for each hit.
+# When enabled, Elasticsearch returns detailed score breakdowns for each hit.
 # Useful for debugging and tuning search relevance. Has ~10-30% performance overhead according to documentation.
 # Seems for Hybrid Search in practice, the impact is actually more like 1000x slower.
-OPENSEARCH_EXPLAIN_ENABLED = (
-    os.environ.get("OPENSEARCH_EXPLAIN_ENABLED", "").lower() == "true"
+ELASTICSEARCH_EXPLAIN_ENABLED = (
+    os.environ.get("ELASTICSEARCH_EXPLAIN_ENABLED", "").lower() == "true"
 )
-# Analyzer used for full-text fields (title, content). Use OpenSearch built-in analyzer
+# Analyzer used for full-text fields (title, content). Use Elasticsearch built-in analyzer
 # names (e.g. "english", "standard", "german"). Affects stemming and tokenization;
 # existing indices need reindexing after a change.
-OPENSEARCH_TEXT_ANALYZER = os.environ.get("OPENSEARCH_TEXT_ANALYZER") or "english"
+ELASTICSEARCH_TEXT_ANALYZER = os.environ.get("ELASTICSEARCH_TEXT_ANALYZER") or "english"
 
 # This is the "base" config for now, the idea is that at least for our dev
-# environments we always want to be dual indexing into both OpenSearch and Vespa
+# environments we always want to be dual indexing into both Elasticsearch and Vespa
 # to stress test the new codepaths. Only enable this if there is some instance
-# of OpenSearch running for the relevant Onyx instance.
+# of Elasticsearch running for the relevant Onyx instance.
 # NOTE: Now enabled on by default, unless the env indicates otherwise.
-ENABLE_OPENSEARCH_INDEXING_FOR_ONYX = (
-    os.environ.get("ENABLE_OPENSEARCH_INDEXING_FOR_ONYX", "true").lower() == "true"
+ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX = (
+    os.environ.get("ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX", "true").lower() == "true"
 )
 # NOTE: This effectively does nothing anymore, admins can now toggle whether
-# retrieval is through OpenSearch. This value is only used as a final fallback
+# retrieval is through Elasticsearch. This value is only used as a final fallback
 # in case that doesn't work for whatever reason.
 # Given that the "base" config above is true, this enables whether we want to
-# retrieve from OpenSearch or Vespa. We want to be able to quickly toggle this
-# in the event we see issues with OpenSearch retrieval in our dev environments.
-ENABLE_OPENSEARCH_RETRIEVAL_FOR_ONYX = (
-    ENABLE_OPENSEARCH_INDEXING_FOR_ONYX
-    and os.environ.get("ENABLE_OPENSEARCH_RETRIEVAL_FOR_ONYX", "").lower() == "true"
+# retrieve from Elasticsearch or Vespa. We want to be able to quickly toggle this
+# in the event we see issues with Elasticsearch retrieval in our dev environments.
+ENABLE_ELASTICSEARCH_RETRIEVAL_FOR_ONYX = (
+    ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX
+    and os.environ.get("ENABLE_ELASTICSEARCH_RETRIEVAL_FOR_ONYX", "").lower() == "true"
 )
-DISABLE_OPENSEARCH_MIGRATION_TASK = (
-    os.environ.get("DISABLE_OPENSEARCH_MIGRATION_TASK", "").lower() == "true"
+DISABLE_ELASTICSEARCH_MIGRATION_TASK = (
+    os.environ.get("DISABLE_ELASTICSEARCH_MIGRATION_TASK", "").lower() == "true"
 )
 ONYX_DISABLE_VESPA = os.environ.get("ONYX_DISABLE_VESPA", "true").lower() == "true"
 # Whether we should check for and create an index if necessary every time we
-# instantiate an OpenSearchDocumentIndex on multitenant cloud. Defaults to True.
-VERIFY_CREATE_OPENSEARCH_INDEX_ON_INIT_MT = (
-    os.environ.get("VERIFY_CREATE_OPENSEARCH_INDEX_ON_INIT_MT", "true").lower()
+# instantiate an ElasticsearchDocumentIndex on multitenant cloud. Defaults to True.
+VERIFY_CREATE_ELASTICSEARCH_INDEX_ON_INIT_MT = (
+    os.environ.get("VERIFY_CREATE_ELASTICSEARCH_INDEX_ON_INIT_MT", "true").lower()
     == "true"
 )
-OPENSEARCH_MIGRATION_GET_VESPA_CHUNKS_PAGE_SIZE = int(
-    os.environ.get("OPENSEARCH_MIGRATION_GET_VESPA_CHUNKS_PAGE_SIZE") or 500
+ELASTICSEARCH_MIGRATION_GET_VESPA_CHUNKS_PAGE_SIZE = int(
+    os.environ.get("ELASTICSEARCH_MIGRATION_GET_VESPA_CHUNKS_PAGE_SIZE") or 500
 )
 # Lifetime of a point-in-time used to scan an index consistently (reindex port).
 # Each search extends the lease; an idle PIT self-expires after this.
 PIT_KEEP_ALIVE: str = os.environ.get("PIT_KEEP_ALIVE") or "5m"
 # If set, will override the default number of shards and replicas for the index.
-OPENSEARCH_INDEX_NUM_SHARDS: int | None = (
-    int(os.environ["OPENSEARCH_INDEX_NUM_SHARDS"])
-    if os.environ.get("OPENSEARCH_INDEX_NUM_SHARDS", None) is not None
+ELASTICSEARCH_INDEX_NUM_SHARDS: int | None = (
+    int(os.environ["ELASTICSEARCH_INDEX_NUM_SHARDS"])
+    if os.environ.get("ELASTICSEARCH_INDEX_NUM_SHARDS", None) is not None
     else None
 )
-OPENSEARCH_INDEX_NUM_REPLICAS: int | None = (
-    int(os.environ["OPENSEARCH_INDEX_NUM_REPLICAS"])
-    if os.environ.get("OPENSEARCH_INDEX_NUM_REPLICAS", None) is not None
+ELASTICSEARCH_INDEX_NUM_REPLICAS: int | None = (
+    int(os.environ["ELASTICSEARCH_INDEX_NUM_REPLICAS"])
+    if os.environ.get("ELASTICSEARCH_INDEX_NUM_REPLICAS", None) is not None
     else None
 )
-ONYX_SEARCH_UI_USES_OPENSEARCH_KEYWORD_SEARCH = (
-    os.environ.get("ONYX_SEARCH_UI_USES_OPENSEARCH_KEYWORD_SEARCH", "").lower()
+ONYX_SEARCH_UI_USES_ELASTICSEARCH_KEYWORD_SEARCH = (
+    os.environ.get("ONYX_SEARCH_UI_USES_ELASTICSEARCH_KEYWORD_SEARCH", "").lower()
     == "true"
 )
 
@@ -1085,7 +1054,7 @@ OLD_INDEX_RECLAIM_MAX_ATTEMPTS = max(
     1, _non_negative_int_env("OLD_INDEX_RECLAIM_MAX_ATTEMPTS", 5)
 )
 # Max docs a single reclaim delete_by_query removes before returning, so one call
-# can't run past the OpenSearch client HTTP timeout (60s) on a huge tenant. The reclaim
+# can't run past the Elasticsearch client HTTP timeout (60s) on a huge tenant. The reclaim
 # loop re-runs until the tenant's slice is empty. Conservative default leaves margin on
 # a slow / loaded cluster (the fleet-reindex case); tune up for fast clusters.
 OLD_INDEX_RECLAIM_DELETE_BATCH_SIZE = max(

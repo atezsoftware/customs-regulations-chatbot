@@ -86,7 +86,7 @@ func RunInstall(ctx context.Context, deps Deps, opts Options) error {
 func (in *installer) runInstall(ctx context.Context) error {
 	if in.opts.Lite && in.opts.IncludeCraft {
 		return exitcodes.New(exitcodes.BadRequest,
-			"--lite and --include-craft cannot be used together: Craft requires services (OpenSearch, Redis, background workers) that lite mode disables")
+			"--lite and --include-craft cannot be used together: Craft requires services (Elasticsearch, Redis, background workers) that lite mode disables")
 	}
 	if in.opts.Prod && in.opts.Lite {
 		return exitcodes.New(exitcodes.BadRequest,
@@ -94,7 +94,7 @@ func (in *installer) runInstall(ctx context.Context) error {
 	}
 	if in.opts.Prod && in.opts.Dev {
 		return exitcodes.New(exitcodes.BadRequest,
-			"--prod and --dev cannot be used together: the dev overlay publishes Postgres, Redis, OpenSearch and the API on the host, which a production deployment keeps behind nginx")
+			"--prod and --dev cannot be used together: the dev overlay publishes Postgres, Redis, Elasticsearch and the API on the host, which a production deployment keeps behind nginx")
 	}
 
 	in.root = paths.Resolve(in.opts.Dir)
@@ -364,7 +364,7 @@ func (in *installer) runInstall(ctx context.Context) error {
 		}
 	}
 	if in.dev {
-		in.warnf("Dev overlay: Postgres, Redis, OpenSearch, MinIO, the model server and the API are published on this host, not just nginx. Only run it on a machine you trust the network of.")
+		in.warnf("Dev overlay: Postgres, Redis, Elasticsearch, MinIO, the model server and the API are published on this host, not just nginx. Only run it on a machine you trust the network of.")
 	}
 
 	// Captured for rollback: a failed pull must not leave .env pointing at a
@@ -767,8 +767,8 @@ func (in *installer) resourceWarnings(pre preflight) error {
 		warning = true
 	}
 	if in.rootless && !in.lite {
-		in.warnf("Rootless Docker: the standard deployment's OpenSearch index requests unlimited memlock, which a rootless daemon usually can't grant.")
-		in.infof("Either raise the daemon's limits (systemctl --user edit docker: LimitMEMLOCK=infinity, LimitNOFILE=1048576, then systemctl --user restart docker) or use Lite mode, which has no OpenSearch.")
+		in.warnf("Rootless Docker: the standard deployment's Elasticsearch index requests unlimited memlock, which a rootless daemon usually can't grant.")
+		in.infof("Either raise the daemon's limits (systemctl --user edit docker: LimitMEMLOCK=infinity, LimitNOFILE=1048576, then systemctl --user restart docker) or use Lite mode, which has no Elasticsearch.")
 	}
 	if !warning {
 		return nil
@@ -1312,12 +1312,12 @@ func (in *installer) printFailureDiagnosis(output string) {
 	lower := strings.ToLower(output)
 	if strings.Contains(lower, "setting rlimit") || strings.Contains(lower, "memlock") {
 		in.plainf("")
-		in.warnf("This looks like a ulimit failure: the OpenSearch index container requests unlimited memlock, which rootless Docker (and some hosts) can't grant.")
+		in.warnf("This looks like a ulimit failure: the Elasticsearch index container requests unlimited memlock, which rootless Docker (and some hosts) can't grant.")
 		in.infof("Fix one of these ways, then re-run:")
 		in.plainf("  • Raise the daemon limits: %s → [Service] LimitMEMLOCK=infinity, LimitNOFILE=1048576 → %s",
 			in.paint.Accent("systemctl --user edit docker"), in.paint.Accent("systemctl --user restart docker"))
-		in.plainf("    (OpenSearch may also need: %s)", in.paint.Accent("sudo sysctl -w vm.max_map_count=262144"))
-		in.plainf("  • Or deploy Lite mode (no OpenSearch): %s", in.paint.Accent("onyx-cli deploy install --lite"))
+		in.plainf("    (Elasticsearch may also need: %s)", in.paint.Accent("sudo sysctl -w vm.max_map_count=262144"))
+		in.plainf("  • Or deploy Lite mode (no Elasticsearch): %s", in.paint.Accent("onyx-cli deploy install --lite"))
 		return
 	}
 	if strings.Contains(lower, "address already in use") || strings.Contains(lower, "port is already allocated") {
@@ -1402,13 +1402,13 @@ func (in *installer) printSuccess(ctx context.Context, hostPort int) {
 	}
 	if in.lite {
 		lines = append(lines, "",
-			"Lite mode: no OpenSearch/Redis/model servers or background workers.",
+			"Lite mode: no Elasticsearch/Redis/model servers or background workers.",
 			"Connectors and RAG search are off; chat, tools, uploads, projects work.")
 	}
 	if in.dev {
 		lines = append(lines, "",
 			"Dev overlay: the API (8080) and the data services (Postgres, Redis,",
-			"OpenSearch, MinIO, model server) are published on this host.")
+			"Elasticsearch, MinIO, model server) are published on this host.")
 	}
 	lines = append(lines, "")
 	lines = append(lines, manageLines()...)

@@ -39,7 +39,7 @@ def cleanup_content_for_chunks(
         - Strips chunk_context from end (if present)
 
     TODO(andrei): This entire function is not that fantastic, clean it up during
-    QA before rolling out OpenSearch.
+    QA before rolling out Elasticsearch.
 
     Args:
         chunks: Chunks as retrieved from the document index with indexing

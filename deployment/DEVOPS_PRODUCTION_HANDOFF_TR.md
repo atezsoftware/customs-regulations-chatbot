@@ -21,8 +21,8 @@ chart'ına yalnız `values-cloud-models.yaml` eklemek yeterli değildir: o dosya
 ama standart chart'ın primary/docfetching/docprocessing/user-file-processing/Beat worker'larını tek
 başına kapatmaz. Bu worker release'leri prod'a eklenmemelidir.
 
-PostgreSQL, Redis, OpenSearch ve MinIO uygulama altyapısıdır; model-server ile birlikte
-kaldırılmayacaklardır. Redis Celery koordinasyonu/cache için, OpenSearch arama indeksi için, MinIO
+PostgreSQL, Redis, Elasticsearch ve MinIO uygulama altyapısıdır; model-server ile birlikte
+kaldırılmayacaklardır. Redis Celery koordinasyonu/cache için, Elasticsearch arama indeksi için, MinIO
 dosya deposu için gereklidir.
 
 ## Helm değerlerinde istenen değişiklikler
@@ -112,7 +112,7 @@ oluşturur; Admin'den seçilecek OpenRouter sağlayıcısıyla çelişir.
 
 1. Backend runtime-lite ve web imajlarını aynı commit'ten üretip digest ile yayınlayın. Prod için
    model-server imajı üretmeyin.
-2. PostgreSQL, Redis, OpenSearch ve MinIO bağlantılarını; yukarıdaki S3 environment mapping'ini,
+2. PostgreSQL, Redis, Elasticsearch ve MinIO bağlantılarını; yukarıdaki S3 environment mapping'ini,
    secret enjeksiyonunu ve kalıcı volume'leri doğrulayın.
 3. Üç uygulama iş yükünü `DISABLE_MODEL_SERVER=true` ve `DOCUMENT_IMPORT_ENABLED=false` ile açın.
 4. Model-server Deployment/Service olmadığını ve podlarda CUDA/Docling/Torch bağımlılıklarının
@@ -143,5 +143,5 @@ değişikliği olarak ele alınmalıdır.
 - Admin OpenRouter embedding modellerini listeler; endpoint/dimension alanı göstermez.
 - Seçilen embedding modeli test edilir, aktif Search Settings'e kaydedilir ve boş arama model-server'a
   bağlanmadan çalışır.
-- PostgreSQL, Redis, OpenSearch ve MinIO dışarıya açık değildir ve uygulama podlarından erişilebilirdir.
+- PostgreSQL, Redis, Elasticsearch ve MinIO dışarıya açık değildir ve uygulama podlarından erişilebilirdir.
 - Uygulama imajları `latest` yerine onaylı digest ile sabitlenmiştir.

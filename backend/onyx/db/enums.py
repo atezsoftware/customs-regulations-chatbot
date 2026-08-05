@@ -315,8 +315,8 @@ class SwitchoverType(str, PyEnum):
     INSTANT = "instant"
 
 
-class OpenSearchDocumentMigrationStatus(str, PyEnum):
-    """Status for Vespa to OpenSearch migration per document."""
+class ElasticsearchDocumentMigrationStatus(str, PyEnum):
+    """Status for Vespa to Elasticsearch migration per document."""
 
     PENDING = "pending"
     COMPLETED = "completed"
@@ -324,8 +324,8 @@ class OpenSearchDocumentMigrationStatus(str, PyEnum):
     PERMANENTLY_FAILED = "permanently_failed"
 
 
-class OpenSearchTenantMigrationStatus(str, PyEnum):
-    """Status for tenant-level OpenSearch migration."""
+class ElasticsearchTenantMigrationStatus(str, PyEnum):
+    """Status for tenant-level Elasticsearch migration."""
 
     PENDING = "pending"
     COMPLETED = "completed"
@@ -716,7 +716,7 @@ class SSOProviderType(str, PyEnum):
 
 class RegulatoryChunkStatus(str, PyEnum):
     """Lifecycle of a regulatory chunk's validity window. Superseded chunks
-    stay in Postgres and OpenSearch so as-of-date search can serve
+    stay in Postgres and Elasticsearch so as-of-date search can serve
     historical questions."""
 
     ACTIVE = "active"

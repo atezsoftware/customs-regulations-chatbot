@@ -39,9 +39,11 @@ global:
 # shell for update-ca-certificates), and this chart on an old, root-built image
 # can't write the image's root-owned dirs as 1001.
 customCACerts:
-  enabled: false
+  # Defaults match an ECK Elasticsearch resource named `elasticsearch`.
+  # Override or disable this block when the cluster uses another CA source.
+  enabled: true
   # Exactly one of secretName / configMapName must be set when enabled.
-  secretName: ""
+  secretName: "elasticsearch-es-http-certs-public"
   configMapName: ""
 
 # Uncomment to skip the bundled CNPG operator and its CRDs, and let an existing
@@ -85,62 +87,21 @@ postgresql:
 #   - Skips ALL celery worker deployments (beat, primary, light, heavy,
 #     monitoring, user-file-processing, docprocessing, docfetching) — the
 #     API server handles background work via FastAPI BackgroundTasks
-#   - You should also set opensearch.enabled=false to prevent that subchart from
-#     deploying
+#   - You should also set elasticsearch.enabled=false to disable the external
+#     Elasticsearch connection settings
 vectorDB:
   enabled: true
 
-opensearch:
-  # Enabled by default. Override to false and set the appropriate env vars in
-  # the instance-specific values yaml if using AWS-managed OpenSearch, or simply
-  # override to false to entirely disable.
+elasticsearch:
+  # Connect to the Elasticsearch Service created by the existing ECK CRD. This
+  # chart intentionally does not install Elasticsearch or an operator.
   enabled: true
-  # These values are passed to the opensearch subchart.
-  # See https://github.com/opensearch-project/helm-charts/blob/main/charts/opensearch/values.yaml
-
-  singleNode: true  # Forces replicas=1, sets discovery.type=single-node
-
-  # Determines service DNS: onyx-opensearch-master.<namespace>.svc.cluster.local
-  clusterName: "onyx-opensearch"
-  nodeGroup: "master"
-  masterService: "onyx-opensearch-master"
-
-  replicas: 1
-
-  image:
-    repository: "opensearchproject/opensearch"
-    tag: ""  # Empty uses chart's appVersion (3.4.0).
-
-  # The security plugin requires OPENSEARCH_INITIAL_ADMIN_PASSWORD for
-  # OpenSearch 2.12+.
-  # See https://docs.opensearch.org/latest/install-and-configure/install-opensearch/helm/#prerequisites
-  extraEnvs:
-    - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
-      valueFrom:
-        secretKeyRef:
-          name: onyx-opensearch  # Must match auth.opensearch.secretName or auth.opensearch.existingSecret if defined.
-          key: opensearch_admin_password  # Must match auth.opensearch.secretKeys value.
-
-  resources:
-    requests:
-      cpu: 2000m
-      memory: 4Gi
-    limits:
-      cpu: 4000m
-      memory: 8Gi
-
-  persistence:
-    enabled: true
-    # A moderately sized index fills 30Gi; hitting the disk flood-stage
-    # watermark write-blocks the whole index. Existing PVCs are not resized by
-    # upgrades — expand them online instead.
-    size: 64Gi
-    storageClass: ""
-
-  # Java heap should be ~50% of memory limit.
-  # See https://opster.com/guides/opensearch/opensearch-basics/opensearch-heap-size-usage-and-jvm-garbage-collection/
-  # Xms is the starting size, Xmx is the maximum size. These should be the same.
-  opensearchJavaOpts: "-Xmx4g -Xms4g"
+  host: "elasticsearch-es-http"
+  port: 9200
+  useSsl: true
+  verifyCerts: true
+  caCerts: "/etc/ssl/certs/ca-certificates.crt"
+  adminUsername: "elastic"
 
 persistent:
   storageClassName: ""
@@ -1374,36 +1335,24 @@ auth:
     values:
       db_readonly_user: ""
       db_readonly_password: ""
-  opensearch:
+  elasticsearch:
     # Enable or disable this secret entirely. Will remove from env var
     # configurations and remove any created secrets.
-    # Enabled by default. Override to false and set the appropriate env vars in
-    # the instance-specific values yaml if using AWS-managed OpenSearch, or
-    # simply override to false to entirely disable.
+    # ECK creates this Secret for an Elasticsearch CR named `elasticsearch`.
+    # Override the name/key if the existing CR uses another name.
     enabled: true
     # Overwrite the default secret name, ignored if existingSecret is defined.
-    secretName: 'onyx-opensearch'
+    secretName: 'elasticsearch-es-elastic-user'
     # Use a secret specified elsewhere.
-    existingSecret: ""
+    existingSecret: "elasticsearch-es-elastic-user"
     # This defines the env var to secret map, key is always upper-cased as an
     # env var.
     secretKeys:
-      OPENSEARCH_ADMIN_USERNAME: opensearch_admin_username
-      OPENSEARCH_ADMIN_PASSWORD: opensearch_admin_password
+      ELASTICSEARCH_ADMIN_PASSWORD: elastic
     # Secrets values IF existingSecret is empty. Key here must match the value
     # in secretKeys to be used. Values will be base64 encoded in the k8s
     # cluster.
-    # For the bundled OpenSearch chart, the admin password is consumed during
-    # initial cluster setup. Changing this value later will update Onyx's
-    # client credentials, but will not rotate the OpenSearch admin password.
-    # Set this before first install or use existingSecret to preserve the
-    # current secret on upgrade.
-    # Password must meet OpenSearch complexity requirements:
-    # min 8 chars, uppercase, lowercase, digit, and special character.
-    # Required when auth.opensearch.enabled=true and no existing secret exists.
-    values:
-      opensearch_admin_username: "admin"
-      opensearch_admin_password: ""
+    values: {}
   userauth:
     # -- Used for password reset / verification tokens and OAuth/OIDC state signing.
     # Disabled by default to preserve upgrade compatibility for existing Helm customers.
@@ -1567,7 +1516,7 @@ configMap:
   INDEXING_WORKER_MEMORY_LIMIT_MB: ""
   INDEXING_WORKER_TRACEMALLOC: ""
   DISABLE_INDEX_UPDATE_ON_SWAP: ""
-  # OpenSearch Point-In-Time keep-alive for the reindex/port scan (default 5m)
+  # Elasticsearch Point-In-Time keep-alive for the reindex/port scan (default 5m)
   PIT_KEEP_ALIVE: ""
   CONTINUE_ON_CONNECTOR_FAILURE: ""
   CONFLUENCE_CONNECTOR_LABELS_TO_SKIP: ""

@@ -7,7 +7,7 @@
 # node's instance metadata service (IMDS) and steal the node IAM role credentials.
 #
 # Why not also block internal-cluster egress: on EKS with the VPC CNI, pods + RDS + ElastiCache +
-# OpenSearch all share the VPC private CIDR, so internal egress can't be CIDR-blocked without also
+# Elasticsearch all share the VPC private CIDR, so internal egress can't be CIDR-blocked without also
 # cutting off the proxy's own datastores. 169.254.0.0/16 (link-local) is outside the VPC range, so
 # it's the one block that's both safe and high-value. DNS, datastores, api-server, and the public
 # internet remain reachable via the 0.0.0.0/0 allow.

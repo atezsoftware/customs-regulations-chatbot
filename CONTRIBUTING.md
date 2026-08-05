@@ -80,7 +80,7 @@ Because this is a large investment from our team, we ask that you:
 Onyx being a fully functional app, relies on some external software, specifically:
 
 - [Postgres](https://www.postgresql.org/) (Relational DB)
-- [OpenSearch](https://opensearch.org/) (Vector DB/Search Engine)
+- [Elasticsearch](https://www.elastic.co/elasticsearch) (Vector DB/Search Engine)
 - [Redis](https://redis.io/) (Cache)
 - [MinIO](https://min.io/) (File Store)
 - [Nginx](https://nginx.org/) (Not needed for development flows generally)
@@ -92,7 +92,7 @@ Onyx being a fully functional app, relies on some external software, specificall
 ### Prerequisites
 
 - **Python 3.13** — Other versions may require code or dependency changes; 3.14 is not yet supported (some dependencies, e.g. `onnxruntime` and CUDA `torch`, do not yet ship 3.14 wheels).
-- **Docker** — Required for running external services (Postgres, OpenSearch, Redis, MinIO).
+- **Docker** — Required for running external services (Postgres, Elasticsearch, Redis, MinIO).
 - **Bun** — We use [bun](https://bun.sh) as the JavaScript package manager. Install it from https://bun.sh/docs/installation.
 
 ### Backend: Python Requirements
@@ -195,7 +195,7 @@ Before starting, make sure the Docker Daemon is running.
 5. Set breakpoints by clicking to the left of line numbers to help debug while the app is running
 6. Use the debug toolbar to step through code, inspect variables, etc.
 
-> **Note:** "Clear and Restart External Volumes and Containers" will reset your Postgres and OpenSearch (relational-db and index). Only run this if you are okay with wiping your data.
+> **Note:** "Clear and Restart External Volumes and Containers" will reset your Postgres and Elasticsearch (relational-db and index). Only run this if you are okay with wiping your data.
 
 **Features:**
 
@@ -212,13 +212,13 @@ Before starting, make sure the Docker Daemon is running.
 
 You will need Docker installed to run these containers.
 
-Navigate to `onyx/deployment/docker_compose`, then start up Postgres/OpenSearch/Redis/MinIO with:
+Navigate to `onyx/deployment/docker_compose`, then start up Postgres/Elasticsearch/Redis/MinIO with:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d index relational_db cache minio
 ```
 
-(index refers to OpenSearch, relational_db refers to Postgres, and cache refers to Redis)
+(index refers to Elasticsearch, relational_db refers to Postgres, and cache refers to Redis)
 
 #### Running Onyx locally
 

@@ -7,10 +7,10 @@ from typing import Any, cast
 
 import httpx
 
-from onyx.background.celery.tasks.opensearch_migration.constants import (
+from onyx.background.celery.tasks.elasticsearch_migration.constants import (
     FINISHED_VISITING_SLICE_CONTINUATION_TOKEN,
 )
-from onyx.background.celery.tasks.opensearch_migration.transformer import (
+from onyx.background.celery.tasks.elasticsearch_migration.transformer import (
     FIELDS_NEEDED_FOR_TRANSFORMATION,
 )
 from onyx.configs.app_configs import (
