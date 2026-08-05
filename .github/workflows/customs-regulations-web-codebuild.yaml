@@ -1,0 +1,263 @@
+name: Customs Regulations Web EKS Build And Deploy
+run-name: Deployment triggered for branch ${{ github.ref }} by @${{ github.actor }} with commit ${{ github.sha }} - ${{ github.event.head_commit.message }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select the environment'
+        required: false
+        default: test
+        type: choice
+        options:
+          - test
+      action:
+        description: 'Select the action'
+        required: false
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - redeploy
+      image_tag:
+        description: 'Enter the image tag'
+        required: false
+        default: ''
+  push:
+    branches:
+      - test/v1
+    paths:
+      - "web/**"
+      - ".dockerignore"
+      - ".github/workflows/customs-regulations-web-codebuild.yaml"
+
+jobs:
+  build-and-deploy:
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      id-token: write
+      issues: write
+      contents: read
+      packages: write
+      checks: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v5
+
+      - name: Creating Environment Variables
+        env:
+          WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_GIT_REF: ${{ github.ref }}
+          WORKFLOW_GIT_SHA: ${{ github.sha }}
+          DISPATCH_ENVIRONMENT: ${{ inputs.environment }}
+          DISPATCH_ACTION: ${{ inputs.action }}
+          DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [[ "$WORKFLOW_EVENT_NAME" == "workflow_dispatch" ]]; then
+            deployment_target="$DISPATCH_ENVIRONMENT"
+          elif [[ "$WORKFLOW_EVENT_NAME" == "push" ]]; then
+            case "$WORKFLOW_GIT_REF" in
+              refs/heads/test/v1) deployment_target="test" ;;
+              *)
+                echo "Unsupported deployment ref: $WORKFLOW_GIT_REF" >&2
+                exit 1
+                ;;
+            esac
+          else
+            echo "Unsupported deployment event: $WORKFLOW_EVENT_NAME" >&2
+            exit 1
+          fi
+
+          case "$deployment_target" in
+          test)
+            echo "SERVICE_NAME=customs-regulations-web-test-v1" >> $GITHUB_ENV
+            echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-web-test-v1" >> $GITHUB_ENV
+            echo "env_x=test-v1" >> $GITHUB_ENV
+            echo "space_x=test-v1" >> $GITHUB_ENV
+            echo "namespace=customs-regulations-test" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=atez-dev-cluster" >> $GITHUB_ENV
+            ;;
+          *)
+            echo "Unsupported deployment target: $deployment_target" >&2
+            exit 1
+            ;;
+          esac
+
+          echo "APP_NAME=customs-regulations-web" >> $GITHUB_ENV
+          echo "GIT_COMMIT=$WORKFLOW_GIT_SHA" >> $GITHUB_ENV
+          echo "AWS_REGION=eu-central-1" >> $GITHUB_ENV
+          echo "AWS_ECR=255114580789.dkr.ecr.eu-central-1.amazonaws.com" >> $GITHUB_ENV
+          if [[ "$DISPATCH_ACTION" == "redeploy" ]]; then
+            echo "IMAGE_TAG=$DISPATCH_IMAGE_TAG" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=$WORKFLOW_GIT_SHA" >> $GITHUB_ENV
+          fi
+
+      - name: Validate Redeploy Image
+        if: inputs.action == 'redeploy'
+        env:
+          REDEPLOY_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [[ -z "${REDEPLOY_IMAGE_TAG//[[:space:]]/}" ]]; then
+            echo "Error: image_tag input is required for redeploy action." >&2
+            exit 1
+          fi
+          echo "Using image tag for redeploy: $REDEPLOY_IMAGE_TAG"
+
+      - name: AWS ECR login
+        if: inputs.action != 'redeploy'
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ECR }}
+
+      - name: Docker Build ve Tag
+        if: inputs.action != 'redeploy'
+        run: |
+          docker build web \
+            -t ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} \
+            -f web/Dockerfile \
+            --target runner \
+            --network host \
+            --build-arg "ONYX_VERSION=${{ env.GIT_COMMIT }}" \
+            --build-arg "SOURCE_REVISION=${{ env.GIT_COMMIT }}" \
+            --build-arg "NEXT_PUBLIC_DISABLE_ONYX_UPSTREAM_CONNECTIONS=true" \
+            --build-arg "NODE_OPTIONS=--max-old-space-size=4096"
+          docker tag ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} ${{ env.DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
+          docker tag ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} ${{ env.DOCKER_IMAGE_REPO }}:latest
+          echo "IMAGE_TAG=${{ env.GIT_COMMIT }}" >> $GITHUB_ENV
+
+      - name: Docker Push
+        if: inputs.action != 'redeploy'
+        run: |
+          docker push ${{ env.DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
+          docker push ${{ env.DOCKER_IMAGE_REPO }}:latest
+
+      - name: Checkout Helm Charts from DevOps Repository
+        uses: actions/checkout@v5
+        with:
+          repository: 'atezsoftware/devops'
+          token: ${{ secrets.DEVOPS_TOKEN }}
+          path: 'devops'
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5.0.0
+        with:
+          version: v4.2.3
+
+      - name: Clean up terminating pods
+        run: |
+          if ! kubectl get namespace ${{ env.namespace }} >/dev/null 2>&1; then
+            echo "Namespace ${{ env.namespace }} does not exist yet; skipping terminating pod cleanup."
+            exit 0
+          fi
+          selector="app=${{ env.env_x }}-${{ env.APP_NAME }}"
+          terminating_pods=$(kubectl get pods --namespace ${{ env.namespace }} -l "$selector" -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name')
+          if [[ -z "$terminating_pods" ]]; then
+            echo "No terminating pods found for selector $selector"
+            exit 0
+          fi
+          echo "$terminating_pods" | while read -r pod; do
+            echo "Force deleting terminating pod: $pod"
+            kubectl delete pod "$pod" --namespace ${{ env.namespace }} --grace-period=0 --force || true
+          done
+
+      - name: Check Helm Release Status
+        run: |
+          release="${{ env.APP_NAME }}-${{ env.env_x }}"
+          if status_json=$(helm status "$release" --namespace ${{ env.namespace }} -o json 2>/dev/null); then
+            release_status=$(jq -r '.info.status // empty' <<<"$status_json")
+            if [[ "$release_status" == pending-* ]]; then
+              history_json=$(helm history "$release" --namespace ${{ env.namespace }} -o json)
+              rollback_revision=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty' <<<"$history_json")
+              if [[ -n "$rollback_revision" ]]; then
+                helm rollback "$release" "$rollback_revision" --namespace ${{ env.namespace }} --server-side=false --wait=watcher --timeout 600s
+              else
+                helm uninstall "$release" --namespace ${{ env.namespace }} || true
+              fi
+            fi
+          fi
+
+      - name: Deploy to Kubernetes with Helm
+        id: helm_deploy
+        run: |
+          release="${{ env.APP_NAME }}-${{ env.env_x }}"
+          deployment="${{ env.env_x }}-${{ env.APP_NAME }}-deployment"
+          selector="app=${{ env.env_x }}-${{ env.APP_NAME }}"
+
+          helm upgrade --install "$release" \
+            -f ./devops/${{ env.space_x }}/customs-regulations/customs-regulations-web-values.yaml \
+            --namespace ${{ env.namespace }} \
+            --create-namespace \
+            --server-side=false \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            ./devops \
+            --timeout 600s
+
+          for attempt in {1..60}; do
+            if kubectl get deployment "$deployment" --namespace ${{ env.namespace }} -o json | jq -e --arg tag "${{ env.IMAGE_TAG }}" 'any(.spec.template.spec.containers[]?; (.image | endswith(":" + $tag)))' >/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+          kubectl get deployment "$deployment" --namespace ${{ env.namespace }} -o json | jq -e --arg tag "${{ env.IMAGE_TAG }}" 'any(.spec.template.spec.containers[]?; (.image | endswith(":" + $tag)))' >/dev/null
+
+          for attempt in {1..120}; do
+            ready_pods=$(kubectl get pods --namespace ${{ env.namespace }} -l "$selector" -o json | jq -r --arg tag "${{ env.IMAGE_TAG }}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name')
+            if [[ -n "$ready_pods" ]]; then
+              echo "Ready pod(s):"
+              echo "$ready_pods"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "No Ready pod found for image tag ${{ env.IMAGE_TAG }}"
+          exit 1
+        continue-on-error: true
+
+      - name: Check Deployment Status
+        if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'
+        run: |
+          kubectl describe deployment ${{ env.env_x }}-${{ env.APP_NAME }}-deployment -n ${{ env.namespace }} || true
+          kubectl get events --namespace ${{ env.namespace }} --sort-by='.metadata.creationTimestamp' || true
+          kubectl get pods --namespace ${{ env.namespace }} -l app=${{ env.env_x }}-${{ env.APP_NAME }} -o wide || true
+          for pod in $(kubectl get pods --namespace ${{ env.namespace }} -l app=${{ env.env_x }}-${{ env.APP_NAME }} -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            kubectl describe pod "$pod" --namespace ${{ env.namespace }} || true
+            kubectl logs "$pod" --namespace ${{ env.namespace }} --tail=200 || true
+          done
+
+      - name: Rollback on Failure
+        if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'
+        run: |
+          release="${{ env.APP_NAME }}-${{ env.env_x }}"
+          history_json=$(helm history "$release" --namespace ${{ env.namespace }} -o json)
+          rollback_revision=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty' <<<"$history_json")
+          if [[ -n "$rollback_revision" ]]; then
+            helm rollback "$release" "$rollback_revision" --namespace ${{ env.namespace }} --server-side=false --wait=watcher --timeout 600s
+            echo "ROLLBACK_PERFORMED=true" >> $GITHUB_ENV
+          else
+            helm uninstall "$release" --namespace ${{ env.namespace }} || true
+            echo "ROLLBACK_PERFORMED=cleanup" >> $GITHUB_ENV
+          fi
+          exit 1
+
+      - name: Confirm Deployment Status
+        if: steps.helm_deploy.outcome == 'success'
+        run: echo "Deployment successful"
+
+      - name: Slack Notification
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_CHANNEL: ops-customs-regulation-chatbot
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_ICON: https://avatars.githubusercontent.com/u/9919?s=48&v=4
+          SLACK_MESSAGE: |
+            ${{ job.status }}: Job '${{ env.SERVICE_NAME }} [${{ github.run_number }}]' in environment '${{ env.space_x }}'
+            ${{ env.ROLLBACK_PERFORMED == 'true' && '🔄 Rollback performed to previous revision' || env.ROLLBACK_PERFORMED == 'cleanup' && '🧹 Failed deployment cleaned up (no previous revision)' || '' }}
+          SLACK_TITLE: 'Github Workflow'
+          SLACK_USERNAME: Github
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
