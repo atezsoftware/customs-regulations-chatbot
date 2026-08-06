@@ -9,6 +9,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from onyx.configs.chat_configs import (
+    MAX_SEARCH_QUERY_LANES,
+    RERANK_CANDIDATE_LIMIT,
+    SEARCH_HITS_PER_LANE,
+)
 from onyx.configs.constants import DocumentSource, MessageType
 from onyx.context.search.models import BaseFilters, InferenceChunk, InferenceSection
 from onyx.context.search.utils import (
@@ -49,12 +54,47 @@ from onyx.tools.tool_implementations.search.search_tool import (
     _validate_evidence_target,
     _validate_search_mode,
     _validate_search_queries,
+    build_query_lanes,
 )
 
 MODULE = "onyx.tools.tool_implementations.search.search_tool"
 
 # What decide_search_scope returns: the scope to apply now (or None for everything).
 ScopeDecision = list[DocumentSource] | None
+
+
+def test_query_lanes_keep_original_semantic_and_cap_at_five() -> None:
+    lanes = build_query_lanes(
+        original_query="İtirazın iptali davası ispat yükü",
+        semantic_query="İtirazın iptali davasında ispat yükü",
+        model_queries=["itirazın iptali davası ispat yükü", "borca itiraz"],
+        keyword_queries=[
+            "İİK 67",
+            "itirazın iptali",
+            "bir yıllık süre",
+            "icra inkâr tazminatı",
+        ],
+        search_mode="hybrid",
+        regulatory_chunks_only=True,
+    )
+
+    assert [lane.query for lane in lanes] == [
+        "İtirazın iptali davası ispat yükü",
+        "İtirazın iptali davasında ispat yükü",
+        "borca itiraz",
+        "İİK 67",
+        "itirazın iptali",
+    ]
+    assert len(lanes) == MAX_SEARCH_QUERY_LANES
+
+
+def test_search_tool_budgets_are_independent_and_positive() -> None:
+    budgets = SearchToolOverrideKwargs(starting_citation_num=1)
+
+    assert budgets.per_lane_num_hits == SEARCH_HITS_PER_LANE
+    assert budgets.rerank_candidate_limit == RERANK_CANDIDATE_LIMIT
+    assert budgets.num_hits > 0
+    assert budgets.max_llm_chunks > 0
 
 
 def test_regulatory_internal_search_accepts_one_focused_query() -> None:
@@ -156,7 +196,7 @@ def test_regulatory_internal_search_schema_requires_mode_selection() -> None:
         in parameters["properties"]["queries"]["description"]
     )
     assert (
-        "used without secondary term expansion"
+        "Bounded same-language semantic and lexical variants"
         in parameters["properties"]["queries"]["description"]
     )
     mode_description = parameters["properties"]["search_mode"]["description"]
@@ -871,7 +911,11 @@ def _run(
             placement=Placement(turn_index=0, tab_index=0),
             override_kwargs=SearchToolOverrideKwargs(
                 starting_citation_num=1,
-                original_query="resolve the ticket",
+                original_query=(
+                    query
+                    if queries is None or len(queries) == 1
+                    else "resolve the ticket"
+                ),
                 message_history=[
                     ChatMinimalTextMessage(
                         message="resolve the ticket",
@@ -945,6 +989,20 @@ def test_non_regulatory_hybrid_search_preserves_original_query_expansion_lanes()
     assert ("ticket", None) in query_modes
     assert ("expanded keyword query", 0.2) in query_modes
     assert all(alpha != 0.0 for _, alpha in query_modes)
+
+
+def test_run_caps_query_lanes_and_uses_per_lane_budget() -> None:
+    mock_search_pipeline = _run(
+        _make_tool(auto_detect_filters=False),
+        connected_sources=[DocumentSource.USER_FILE],
+        queries=["model query one", "model query two", "model query three"],
+        search_mode=None,
+        expanded_keyword_queries=["keyword one", "keyword two", "keyword three"],
+    )
+
+    requests = _query_requests_sent(mock_search_pipeline)
+    assert len(requests) == MAX_SEARCH_QUERY_LANES
+    assert all(limit == SEARCH_HITS_PER_LANE for *_, limit in requests)
 
 
 def test_non_regulatory_run_accepts_multiple_queries_without_mode_or_normalization() -> (
@@ -1136,6 +1194,28 @@ def test_regulatory_candidate_overfetch_is_bounded_without_shrinking_output_cont
 
     request = search_pipeline_mock.call_args.kwargs["chunk_search_request"]
     assert request.limit == expected_candidate_limit
+
+
+def test_regulatory_overfetch_never_leaks_past_per_lane_budget() -> None:
+    tool = _make_tool(
+        BaseFilters(regulatory_chunks_only=True),
+        auto_detect_filters=False,
+    )
+    candidates = [_regulatory_chunk("instrument", index) for index in range(32)]
+
+    with patch(f"{MODULE}.search_pipeline", return_value=candidates):
+        results = tool._run_search_for_query(
+            query="focused legal relationship",
+            hybrid_alpha=0.0,
+            high_term_coverage=False,
+            num_hits=8,
+            acl_filters=[],
+            embedding_model=MagicMock(),
+            federated_retrieval_infos=[],
+            effective_filters=BaseFilters(regulatory_chunks_only=True),
+        )
+
+    assert results == candidates[:8]
 
 
 def test_non_regulatory_candidate_search_keeps_requested_limit() -> None:

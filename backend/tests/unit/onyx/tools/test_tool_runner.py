@@ -211,12 +211,12 @@ def test_later_parallel_search_filter_is_bounded_to_current_batch() -> None:
     assert len(filter_history) == 2
 
 
-def test_model_written_internal_searches_skip_secondary_query_expansion() -> None:
-    assert _should_skip_search_query_expansion(
+def test_model_written_internal_searches_keep_bounded_query_expansion() -> None:
+    assert not _should_skip_search_query_expansion(
         skip_requested=False,
         internal_search_call_count=7,
     )
-    assert _should_skip_search_query_expansion(
+    assert not _should_skip_search_query_expansion(
         skip_requested=False,
         internal_search_call_count=1,
     )

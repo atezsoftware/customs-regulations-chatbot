@@ -5,10 +5,15 @@ from enum import Enum
 from typing import Any, Callable, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from onyx.chat.emitter import Emitter
-from onyx.configs.chat_configs import MAX_CHUNKS_FED_TO_CHAT, NUM_RETURNED_HITS
+from onyx.configs.chat_configs import (
+    MAX_CHUNKS_FED_TO_CHAT,
+    NUM_RETURNED_HITS,
+    RERANK_CANDIDATE_LIMIT,
+    SEARCH_HITS_PER_LANE,
+)
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import SearchDoc, SearchDocsResponse
 from onyx.db.memory import UserMemoryContext
@@ -166,7 +171,6 @@ class OpenURLToolOverrideKwargs(BaseModel):
     max_urls: int = 10
 
 
-# None indicates that the default value should be used
 class SearchToolOverrideKwargs(BaseModel):
     # To know what citation number to start at for constructing the string to the LLM
     starting_citation_num: int
@@ -187,10 +191,12 @@ class SearchToolOverrideKwargs(BaseModel):
     # the custom flow did not yield good results, we don't want to go through it again. In that case, we defer entirely to the LLM
     skip_query_expansion: bool = False
 
-    # Number of results to return in the richer object format so that it can be rendered in the UI
-    num_hits: int | None = NUM_RETURNED_HITS
-    # Number of chunks (token approx) to include in the string to the LLM
-    max_llm_chunks: int | None = MAX_CHUNKS_FED_TO_CHAT
+    # Search, ranking, rich-response, and LLM-context budgets are deliberately
+    # independent so a small display window cannot starve retrieval.
+    per_lane_num_hits: int = Field(default=SEARCH_HITS_PER_LANE, gt=0)
+    rerank_candidate_limit: int = Field(default=RERANK_CANDIDATE_LIMIT, gt=0)
+    num_hits: int = Field(default=NUM_RETURNED_HITS, gt=0)
+    max_llm_chunks: int = Field(default=MAX_CHUNKS_FED_TO_CHAT, gt=0)
     include_link: bool = False
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

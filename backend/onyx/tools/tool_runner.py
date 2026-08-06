@@ -343,8 +343,9 @@ def _search_filter_message_history(
 def _should_skip_search_query_expansion(
     *, skip_requested: bool, internal_search_call_count: int
 ) -> bool:
-    """Preserve every model-written internal-search query without adding terms."""
-    return skip_requested or internal_search_call_count > 0
+    """Honor only an explicit retry decision; lane construction enforces bounds."""
+    del internal_search_call_count
+    return skip_requested
 
 
 def _parallel_search_filter_queries(

@@ -3,6 +3,9 @@ import os
 PROMPTS_YAML = "./onyx/seeding/prompts.yaml"
 PERSONAS_YAML = "./onyx/seeding/personas.yaml"
 NUM_RETURNED_HITS = 50
+SEARCH_HITS_PER_LANE = 50
+RERANK_CANDIDATE_LIMIT = 100
+MAX_SEARCH_QUERY_LANES = 5
 
 # May be less depending on model
 MAX_CHUNKS_FED_TO_CHAT = int(os.environ.get("MAX_CHUNKS_FED_TO_CHAT") or 25)

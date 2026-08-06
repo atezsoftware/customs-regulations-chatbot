@@ -38,14 +38,15 @@ import json
 import re
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from typing import Any, Generic, TypeVar, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from onyx.chat.emitter import Emitter
-from onyx.configs.chat_configs import MAX_CHUNKS_FED_TO_CHAT
+from onyx.configs.chat_configs import MAX_CHUNKS_FED_TO_CHAT, MAX_SEARCH_QUERY_LANES
 from onyx.configs.constants import DocumentSource, FederatedConnectorSource
 from onyx.context.search.federated.slack_search import slack_retrieval
 from onyx.context.search.models import (
@@ -703,6 +704,124 @@ class QueryExpansionAndScope(BaseModel):
     time_filter: TimeFilter | None = None
 
 
+class SearchQueryLane(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    query: str
+    weight: float
+    hybrid_alpha: float | None
+    high_term_coverage: bool = False
+
+
+def _query_deduplication_key(query: str) -> str:
+    normalized = unicodedata.normalize("NFKD", query).casefold()
+    searchable_characters = (
+        character if character.isalnum() or character.isspace() else " "
+        for character in normalized
+        if not unicodedata.category(character).startswith("M")
+    )
+    return " ".join("".join(searchable_characters).split())
+
+
+def build_query_lanes(
+    *,
+    original_query: str | None,
+    semantic_query: str | None,
+    model_queries: list[str],
+    keyword_queries: list[str],
+    search_mode: str,
+    regulatory_chunks_only: bool,
+) -> list[SearchQueryLane]:
+    """Build a deterministic, language-preserving bounded retrieval plan."""
+
+    lanes: list[SearchQueryLane] = []
+    lane_index_by_query: dict[str, int] = {}
+
+    def add_lane(
+        query: str | None,
+        *,
+        weight: float,
+        hybrid_alpha: float | None,
+        high_term_coverage: bool = False,
+        mode_sensitive_deduplication: bool = False,
+    ) -> None:
+        if query is None:
+            return
+        stripped_query = query.strip()
+        if not stripped_query:
+            return
+        deduplication_key = _query_deduplication_key(stripped_query)
+        if not deduplication_key:
+            return
+        if mode_sensitive_deduplication:
+            deduplication_key = (
+                f"{deduplication_key}\0{hybrid_alpha}\0{high_term_coverage}"
+            )
+        existing_index = lane_index_by_query.get(deduplication_key)
+        if existing_index is not None:
+            existing_lane = lanes[existing_index]
+            lanes[existing_index] = existing_lane.model_copy(
+                update={"weight": existing_lane.weight + weight}
+            )
+            return
+        if len(lanes) >= MAX_SEARCH_QUERY_LANES:
+            return
+        lane_index_by_query[deduplication_key] = len(lanes)
+        lanes.append(
+            SearchQueryLane(
+                query=stripped_query,
+                weight=weight,
+                hybrid_alpha=hybrid_alpha,
+                high_term_coverage=high_term_coverage,
+            )
+        )
+
+    base_hybrid_alpha = None if search_mode == "hybrid" else 0.0
+    add_lane(
+        original_query,
+        weight=ORIGINAL_QUERY_WEIGHT,
+        hybrid_alpha=base_hybrid_alpha,
+        high_term_coverage=search_mode == "full_text",
+    )
+    if search_mode == "hybrid":
+        add_lane(
+            semantic_query,
+            weight=LLM_SEMANTIC_QUERY_WEIGHT,
+            hybrid_alpha=None,
+        )
+    for model_query in model_queries:
+        add_lane(
+            model_query,
+            weight=LLM_NON_CUSTOM_QUERY_WEIGHT,
+            hybrid_alpha=base_hybrid_alpha,
+            high_term_coverage=search_mode == "full_text",
+        )
+    if search_mode == "hybrid":
+        keyword_hybrid_alpha = (
+            _REGULATORY_KEYWORD_QUERY_HYBRID_ALPHA
+            if regulatory_chunks_only
+            else KEYWORD_QUERY_HYBRID_ALPHA
+        )
+        if regulatory_chunks_only:
+            for model_query in model_queries:
+                if extract_single_regulatory_provision_reference(model_query) is None:
+                    continue
+                add_lane(
+                    model_query,
+                    weight=LLM_NON_CUSTOM_QUERY_WEIGHT,
+                    hybrid_alpha=_REGULATORY_KEYWORD_QUERY_HYBRID_ALPHA,
+                    mode_sensitive_deduplication=True,
+                )
+        for keyword_query in keyword_queries:
+            add_lane(
+                keyword_query,
+                weight=LLM_KEYWORD_QUERY_WEIGHT,
+                hybrid_alpha=keyword_hybrid_alpha,
+                mode_sensitive_deduplication=regulatory_chunks_only,
+            )
+    return lanes
+
+
 def _build_scope_note(
     scope: list[DocumentSource] | None, queries_run: list[str]
 ) -> str:
@@ -1055,6 +1174,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         bot_token: str | None,
         entities: dict[str, Any],
         search_settings: SearchSettings,
+        limit: int,
     ) -> list[InferenceChunk]:
         """Run Slack federated search using pre-fetched tokens and config.
 
@@ -1081,7 +1201,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 access_token=access_token,
                 connector=None,
                 entities=entities,
-                limit=None,
+                limit=limit,
                 slack_event_context=self.slack_context,
                 bot_token=bot_token,
                 team_id=None,
@@ -1089,7 +1209,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
 
             logger.info("Slack federated search returned %s chunks", len(chunks))
-            return chunks
+            return chunks[:limit]
 
         except Exception as e:
             logger.error("Slack federated search error: %s", e, exc_info=True)
@@ -1160,7 +1280,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             prefetched_federated_retrieval_infos=federated_retrieval_infos,
         )
         if provision_reference is None:
-            return chunks
+            return chunks[:num_hits]
 
         structurally_matching = [
             chunk
@@ -1283,7 +1403,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                                 "Omit unrelated facts and predicted conclusions. Write in the likely indexed source "
                                 "language. Use plain "
                                 "terms or a natural phrase, not Boolean AND/OR/NOT syntax. "
-                                "Your query text is used without secondary term expansion. "
+                                "Bounded same-language semantic and lexical variants are generated automatically. "
                                 "Source-type and temporal filter extraction run separately, "
                                 "so do not include those scoping details in the query."
                             ),
@@ -1655,15 +1775,6 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 )
             )
 
-        queries_run = list(
-            dict.fromkeys(
-                llm_queries
-                + ([semantic_query] if semantic_query else [])
-                + keyword_queries
-            )
-        )
-        scope_note = _build_scope_note(resolved_scope, queries_run)
-
         effective_filters = self.user_selected_filters
         if resolved_scope is not None:
             effective_filters = (
@@ -1694,93 +1805,47 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             and (override_kwargs.skip_query_expansion or search_mode != "hybrid")
         )
 
-        # Prepare queries with their weights and hybrid_alpha settings
-        # Group 1: Expanded keyword queries. Ordinary search keeps its
-        # keyword-favoring hybrid lane; focused regulatory search uses lexical.
-        keyword_queries_with_weights = [
-            (kw_query, LLM_KEYWORD_QUERY_WEIGHT) for kw_query in keyword_queries
-        ]
-        if regulatory_chunks_only and search_mode == "hybrid":
-            keyword_queries_with_weights.extend(
-                (llm_query, LLM_NON_CUSTOM_QUERY_WEIGHT)
-                for llm_query in llm_queries
-                if llm_query
-            )
-        deduplicated_keyword_queries = deduplicate_queries(keyword_queries_with_weights)
-
-        # Group 2: Semantic/LLM/Original queries (use hybrid_alpha=None)
-        # Include all LLM-provided queries with their weight
-        semantic_queries_with_weights = (
-            [(semantic_query, LLM_SEMANTIC_QUERY_WEIGHT)] if semantic_query else []
+        canonical_original_query = override_kwargs.original_query or llm_queries[0]
+        query_lanes = build_query_lanes(
+            original_query=canonical_original_query,
+            semantic_query=semantic_query,
+            model_queries=llm_queries,
+            keyword_queries=keyword_queries,
+            search_mode=search_mode,
+            regulatory_chunks_only=regulatory_chunks_only,
         )
-        for llm_query in llm_queries:
-            # In rare cases, the LLM may fail to provide real queries
-            if llm_query:
-                semantic_queries_with_weights.append(
-                    (llm_query, LLM_NON_CUSTOM_QUERY_WEIGHT)
-                )
-        if override_kwargs.original_query and search_mode == "hybrid":
-            semantic_queries_with_weights.append(
-                (override_kwargs.original_query, ORIGINAL_QUERY_WEIGHT)
-            )
-        deduplicated_semantic_queries = deduplicate_queries(
-            semantic_queries_with_weights
-        )
+        queries_run = [lane.query for lane in query_lanes]
+        scope_note = _build_scope_note(resolved_scope, queries_run)
 
-        # Build the all_queries list for UI display, sorted by weight (highest first)
-        # Combine all deduplicated queries and sort by weight
-        all_queries_with_weights = (
-            deduplicated_semantic_queries + deduplicated_keyword_queries
-        )
-        all_queries_with_weights.sort(key=lambda x: x[1], reverse=True)
-
-        # Extract queries in weight order, handling cross-duplicates
-        all_queries = []
-        seen_lower = set()
-        for query, _ in all_queries_with_weights:
-            query_lower = query.lower()
-            if query_lower not in seen_lower:
-                all_queries.append(query)
-                seen_lower.add(query_lower)
-
-        logger.debug(
-            "All Queries (sorted by weight): %s, Keyword queries: %s",
-            all_queries,
-            [q for q, _ in deduplicated_keyword_queries],
-        )
+        logger.debug("Bounded search query lanes: %s", queries_run)
 
         # Emit the queries early so the UI can display them immediately
         self.emitter.emit(
             Packet(
                 placement=placement,
                 obj=SearchToolQueriesDelta(
-                    queries=all_queries,
+                    queries=queries_run,
                 ),
             )
         )
 
-        # Run all searches in parallel with appropriate hybrid_alpha values
-        # Regulatory keyword queries use pure lexical retrieval. Ordinary
-        # keyword expansions retain the established keyword-favoring hybrid lane.
+        # Run no more than five bounded lanes. Slack is fetched in parallel but
+        # folded into the original lane before RRF, so it cannot create lane six.
         search_functions: list[tuple[Callable, tuple]] = []
-        search_weights: list[float] = []
-
-        # Add deduplicated semantic queries (use hybrid_alpha=None)
-        for query, weight in deduplicated_semantic_queries:
-            query_hybrid_alpha = None if search_mode == "hybrid" else 0.0
+        for lane in query_lanes:
             provision_reference = (
-                extract_single_regulatory_provision_reference(query)
-                if focused_regulatory_search and query_hybrid_alpha == 0.0
+                extract_single_regulatory_provision_reference(lane.query)
+                if focused_regulatory_search and lane.hybrid_alpha == 0.0
                 else None
             )
             search_functions.append(
                 (
                     self._run_search_for_query,
                     (
-                        query,
-                        query_hybrid_alpha,
-                        search_mode == "full_text",
-                        override_kwargs.num_hits,
+                        lane.query,
+                        lane.hybrid_alpha,
+                        lane.high_term_coverage,
+                        override_kwargs.per_lane_num_hits,
                         acl_filters,
                         embedding_model,
                         federated_retrieval_infos,
@@ -1789,42 +1854,10 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     ),
                 )
             )
-            search_weights.append(weight)
 
-        # Add deduplicated keyword queries (use pure lexical retrieval)
-        for query, weight in deduplicated_keyword_queries:
-            provision_reference = (
-                extract_single_regulatory_provision_reference(query)
-                if focused_regulatory_search
-                else None
-            )
-            search_functions.append(
-                (
-                    self._run_search_for_query,
-                    (
-                        query,
-                        (
-                            _REGULATORY_KEYWORD_QUERY_HYBRID_ALPHA
-                            if regulatory_chunks_only
-                            else KEYWORD_QUERY_HYBRID_ALPHA
-                        ),
-                        False,
-                        override_kwargs.num_hits,
-                        acl_filters,
-                        embedding_model,
-                        federated_retrieval_infos,
-                        effective_filters,
-                        provision_reference,
-                    ),
-                )
-            )
-            search_weights.append(weight)
-
-        # Add Slack federated search (runs once in parallel with all Vespa queries)
-        # This avoids the query multiplication problem where each Vespa query
-        # would trigger a separate Slack search.
-        # Only run if pre-fetch found a valid Slack access token.
+        slack_search_scheduled = False
         if slack_access_token and override_kwargs.original_query:
+            slack_search_scheduled = True
             search_functions.append(
                 (
                     self._run_slack_search,
@@ -1834,53 +1867,58 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                         slack_bot_token,
                         slack_entities,
                         search_settings,
+                        override_kwargs.per_lane_num_hits,
                     ),
                 )
             )
-            # Use same weight as original query for Slack results
-            search_weights.append(ORIGINAL_QUERY_WEIGHT)
 
-        # Run all searches in parallel (Vespa queries + Slack)
         all_search_results = cast(
             list[list[InferenceChunk]],
             run_functions_tuples_in_parallel(search_functions),
         )
-        if not all_search_results:
-            all_search_results = []
+        if slack_search_scheduled:
+            slack_results = all_search_results.pop()
+            if all_search_results:
+                original_lane = all_search_results[0]
+                chunks_by_identity = {
+                    (chunk.document_id, chunk.chunk_id): chunk
+                    for chunk in [*original_lane, *slack_results]
+                }
+                all_search_results[0] = list(chunks_by_identity.values())[
+                    : override_kwargs.per_lane_num_hits
+                ]
 
-        # Merge results using weighted Reciprocal Rank Fusion
-        # This intelligently combines rankings from different queries
         top_chunks = weighted_reciprocal_rank_fusion(
             ranked_results=all_search_results,
-            weights=search_weights,
-            id_extractor=lambda chunk: f"{chunk.document_id}_{chunk.chunk_id}",
+            weights=[lane.weight for lane in query_lanes],
+            id_extractor=lambda chunk: chunk.unique_id,
         )
-        semantic_lane_count = len(deduplicated_semantic_queries)
-        keyword_lane_count = len(deduplicated_keyword_queries)
-        keyword_lane_end = semantic_lane_count + keyword_lane_count
-        lexical_first_search_results = (
-            all_search_results[semantic_lane_count:keyword_lane_end]
-            + all_search_results[:semantic_lane_count]
-            + all_search_results[keyword_lane_end:]
-        )
+        lexical_first_search_results = [
+            results
+            for lane, results in zip(query_lanes, all_search_results)
+            if lane.hybrid_alpha == 0.0
+        ] + [
+            results
+            for lane, results in zip(query_lanes, all_search_results)
+            if lane.hybrid_alpha != 0.0
+        ]
         top_chunks = _diversify_focused_regulatory_retrieval_lanes(
             top_chunks,
             lexical_first_search_results,
-            max_chunks=override_kwargs.num_hits,
+            max_chunks=override_kwargs.rerank_candidate_limit,
             focused_search=focused_regulatory_search,
             regulatory_chunks_only=bool(
                 effective_filters and effective_filters.regulatory_chunks_only
             ),
         )
 
-        # We can disregard all of the chunks that exceed the num_hits parameter since it's not valid to have
-        # documents/contents from things that aren't returned to the user on the frontend
-        top_sections = [
+        candidate_sections = [
             inference_section_from_single_chunk(chunk)
-            for chunk in top_chunks[: override_kwargs.num_hits]
+            for chunk in top_chunks[: override_kwargs.rerank_candidate_limit]
         ]
+        returned_sections = candidate_sections[: override_kwargs.num_hits]
 
-        if not top_sections:
+        if not candidate_sections:
             logger.info("Search tool - no results found, returning empty response")
             empty_response, _, _ = convert_inference_sections_to_llm_string(
                 top_sections=[],
@@ -1906,7 +1944,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         # Enrich chunks with `Document.file_id` (Postgres-only metadata not
         # stored in Vespa).
         with get_session_with_current_tenant() as enrichment_session:
-            populate_file_ids_on_sections(top_sections, enrichment_session)
+            populate_file_ids_on_sections(candidate_sections, enrichment_session)
 
         secondary_flows_user_query = (
             override_kwargs.original_query
@@ -1921,20 +1959,20 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         # Only consider MAX_CHUNKS_FOR_RELEVANCE chunks per section to avoid flooding from
         # documents with many matching sections
         max_tokens_for_selection = (
-            override_kwargs.max_llm_chunks or MAX_CHUNKS_FED_TO_CHAT
-        ) * DOC_EMBEDDING_CONTEXT_SIZE
+            override_kwargs.max_llm_chunks * DOC_EMBEDDING_CONTEXT_SIZE
+        )
 
         # This is approximate since it doesn't build the exact string of the call below
         # Some things are estimated and may be under (like the metadata tokens)
         sections_for_selection = _trim_sections_by_tokens(
-            sections=top_sections,
+            sections=candidate_sections,
             max_tokens=max_tokens_for_selection,
             token_counter=token_counter,
             max_chunks_per_section=MAX_CHUNKS_FOR_RELEVANCE,
         )
 
         ranked_regulatory_sections: list[InferenceSection] | None = None
-        max_selected_sections = override_kwargs.max_llm_chunks or MAX_CHUNKS_FED_TO_CHAT
+        max_selected_sections = override_kwargs.max_llm_chunks
         if _can_use_ranked_regulatory_selection(
             sections_for_selection,
             focused_search=focused_regulatory_search,
@@ -2048,7 +2086,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
 
         search_docs = convert_inference_sections_to_search_docs(
             _rich_response_sections(
-                top_sections,
+                returned_sections,
                 selected_sections,
                 authoritative_selected=regulatory_chunks_only,
             ),

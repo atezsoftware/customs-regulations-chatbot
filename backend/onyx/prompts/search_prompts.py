@@ -17,6 +17,9 @@ semantic search. Your goal is to output a single natural language query that cap
 most recent message. It should be fully semantic and natural language unless the user query is already a keyword query. \
 When relevant, you bring in context from the history or knowledge about the user.
 
+Always keep the source query's language. For Turkish legal material, use formal legal Turkish rather than colloquial wording. \
+Never translate quoted phrases, provision/article identifiers, dates, institution names, or other exact legal anchors.
+
 The current date is {current_date}.
 """
 
@@ -59,6 +62,9 @@ KEYWORD_REPHRASE_SYSTEM_PROMPT = """
 You are an assistant that reformulates the last user message into a set of standalone keyword queries suitable for a keyword \
 search engine. Your goal is to output keyword queries that optimize finding relevant documents to answer the user query. \
 When relevant, you bring in context from the history or knowledge about the user.
+
+Always keep the source query's language. For Turkish legal material, use formal legal Turkish rather than colloquial wording. \
+Preserve quoted phrases, provision/article identifiers, dates, institution names, and other exact legal anchors verbatim.
 
 The current date is {current_date}.
 """
