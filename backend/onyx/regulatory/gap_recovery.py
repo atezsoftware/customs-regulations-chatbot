@@ -70,7 +70,7 @@ def run_single_gap_recovery(
         override_kwargs=SearchToolOverrideKwargs(
             starting_citation_num=starting_citation_num,
             original_query=issue.recovery_query,
-            skip_query_expansion=True,
+            skip_query_expansion=False,
         ),
         queries=[issue.recovery_query],
         search_mode="hybrid",

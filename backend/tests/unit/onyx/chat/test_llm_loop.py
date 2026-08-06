@@ -2014,6 +2014,119 @@ def test_partial_regulatory_search_batch_reaches_next_auto_decision() -> None:
     assert all(query not in reminder_text for query in deferred_queries)
 
 
+def test_sequential_focused_searches_keep_bounded_query_expansion() -> None:
+    first_call = _search_tool_call("first", query="ilk hukuki mesele")
+    second_call = _search_tool_call("second", query="ikinci hukuki mesele")
+    steps = iter(
+        [
+            LlmStepResult(
+                reasoning=None,
+                answer=None,
+                tool_calls=[first_call],
+                raw_answer=None,
+                finish_reason="tool_calls",
+            ),
+            LlmStepResult(
+                reasoning=None,
+                answer=None,
+                tool_calls=[second_call],
+                raw_answer=None,
+                finish_reason="tool_calls",
+            ),
+            LlmStepResult(
+                reasoning=None,
+                answer="Sonuç.",
+                tool_calls=None,
+                raw_answer="Sonuç.",
+                finish_reason="stop",
+            ),
+        ]
+    )
+    tool_run_kwargs: list[dict[str, Any]] = []
+
+    def fake_run_llm_step(**_kwargs: Any) -> tuple[LlmStepResult, bool]:
+        return next(steps), False
+
+    def fake_run_tool_calls(**kwargs: Any) -> ParallelToolCallResponse:
+        tool_calls = cast(list[ToolCallKickoff], kwargs["tool_calls"])
+        if not tool_calls:
+            return ParallelToolCallResponse(
+                tool_responses=[],
+                updated_citation_mapping={},
+            )
+        tool_run_kwargs.append(kwargs)
+        tool_call = tool_calls[0]
+        return ParallelToolCallResponse(
+            tool_responses=[
+                ToolResponse(
+                    rich_response=SearchDocsResponse(
+                        search_docs=[],
+                        citation_mapping={},
+                    ),
+                    llm_facing_response=json.dumps({"results": []}),
+                    tool_call=tool_call,
+                )
+            ],
+            updated_citation_mapping={},
+        )
+
+    search_tool = Mock(spec=SearchTool)
+    search_tool.id = 1
+    search_tool.name = SearchTool.NAME
+    search_tool.tool_definition.return_value = {
+        "type": "function",
+        "function": {
+            "name": SearchTool.NAME,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    persona = Mock(
+        id=1,
+        datetime_aware=False,
+        replace_base_system_prompt=False,
+        system_prompt=None,
+        task_prompt=None,
+    )
+    llm = Mock()
+    llm.config = LLMConfig(
+        model_provider="openai",
+        model_name="test-model",
+        temperature=0.0,
+        max_input_tokens=100_000,
+    )
+
+    with (
+        patch("onyx.chat.llm_loop.run_llm_step", side_effect=fake_run_llm_step),
+        patch("onyx.chat.llm_loop.run_tool_calls", side_effect=fake_run_tool_calls),
+        patch("onyx.chat.llm_loop.get_default_base_system_prompt", return_value=""),
+        patch("onyx.chat.llm_loop.get_session_with_current_tenant"),
+        patch("onyx.llm.litellm_singleton.config.initialize_litellm"),
+    ):
+        run_llm_loop(
+            emitter=Emitter(merged_queue=queue.Queue()),
+            state_container=ChatStateContainer(),
+            simple_chat_history=[
+                create_message("Hukuki meseleleri incele.", MessageType.USER)
+            ],
+            tools=[search_tool],
+            custom_agent_prompt=None,
+            context_files=create_context_files(),
+            persona=persona,
+            user_memory_context=None,
+            llm=llm,
+            token_counter=len,
+        )
+
+    assert [kwargs["tool_calls"] for kwargs in tool_run_kwargs] == [
+        [first_call],
+        [second_call],
+    ]
+    assert [kwargs["skip_search_query_expansion"] for kwargs in tool_run_kwargs] == [
+        False,
+        False,
+    ]
+
+
 def test_candidate_review_runs_one_direct_search_after_ordinary_research() -> None:
     original_doc = SearchDoc(
         document_id="original-document",
@@ -2196,6 +2309,7 @@ def test_candidate_review_runs_one_direct_search_after_ordinary_research() -> No
     search_tool.run.assert_called_once()
     recovery_kwargs = search_tool.run.call_args.kwargs
     assert recovery_kwargs["override_kwargs"].starting_citation_num == 2
+    assert recovery_kwargs["override_kwargs"].skip_query_expansion is False
     assert recovery_kwargs["queries"] == ["yükümlülüğün kesin kanuni dayanağı"]
     assert state.get_answer_tokens() == "Düzeltilmiş yükümlülük [2]."
     assert state.get_citation_to_doc() == {1: original_doc, 2: recovered_doc}

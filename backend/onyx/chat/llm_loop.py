@@ -2586,7 +2586,7 @@ def run_llm_loop(
                 citation_mapping=citation_mapping,
                 next_citation_num=citation_processor.get_next_citation_number(),
                 max_concurrent_tools=None,
-                skip_search_query_expansion=has_called_search_tool,
+                skip_search_query_expansion=False,
                 chat_files=chat_files,
                 url_snippet_map=extract_url_snippet_map(gathered_documents or []),
                 inject_memories_in_prompt=inject_memories_in_prompt,
@@ -2629,7 +2629,7 @@ def run_llm_loop(
                     llm_history_response
                 )
 
-                # Track if search tool was called (for skipping query expansion on subsequent calls)
+                # Track whether indexed evidence is available for review and synthesis.
                 if tool_call.tool_name == SearchTool.NAME:
                     has_called_search_tool = True
 
