@@ -2155,7 +2155,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 returned_sections,
                 selected_sections,
                 authoritative_selected=regulatory_chunks_only,
-            )[: override_kwargs.num_hits],
+            ),
             is_internet=False,
         )
 

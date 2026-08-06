@@ -1173,8 +1173,20 @@ def test_successful_rerank_receives_full_fused_pool_and_bypasses_selector() -> N
         ("doc", 9),
     ]
     assert [(doc.document_id, doc.chunk_ind) for doc in rich_response.search_docs] == [
-        ("doc", 9)
+        ("doc", 9),
+        ("doc", 1),
+        ("doc", 4),
     ]
+    docs_by_identity = {
+        (doc.document_id, doc.chunk_ind) for doc in rich_response.search_docs
+    }
+    assert {
+        (
+            rich_response.citation_mapping[citation_number],
+            rich_response.citation_chunk_mapping[citation_number],
+        )
+        for citation_number in rich_response.citation_mapping
+    } <= docs_by_identity
     assert len(json.loads(responses[0].llm_facing_response)["results"]) == 3
 
 
