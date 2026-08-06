@@ -453,6 +453,8 @@ def _exact_regulatory_evidence_from_search_response(
 
         evidence_chunks.append(
             build_candidate_answer_evidence_chunk(
+                document_id=document_id,
+                chunk_id=chunk_ind,
                 citation_number=citation_number,
                 retrieval_number=citation_number,
                 chunk_identifier=chunk_identifier,

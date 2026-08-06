@@ -10,14 +10,15 @@ from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.emitter import Emitter
 from onyx.chat.models import ChatMessageSimple, LlmStepResult
 from onyx.configs.constants import DocumentSource, MessageType
-from onyx.context.search.models import BaseFilters, SearchDoc
+from onyx.context.search.models import BaseFilters, SearchDoc, SearchDocsResponse
 from onyx.deep_research import dr_loop
-from onyx.deep_research.models import CombinedResearchAgentCallResult
 from onyx.regulatory.candidate_answer_review import (
     CandidateAnswerClaimIssue,
+    CandidateAnswerClaimSpan,
     CandidateAnswerEvidenceChunk,
     CandidateAnswerReviewError,
     CandidateAnswerReviewResult,
+    ClaimKind,
 )
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
@@ -26,7 +27,7 @@ from onyx.server.query_and_chat.streaming_models import (
     CitationInfo,
     Packet,
 )
-from onyx.tools.models import ToolCallKickoff
+from onyx.tools.models import ToolCallKickoff, ToolResponse
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 
@@ -70,6 +71,8 @@ def _hidden_search_doc(
 
 def _evidence() -> CandidateAnswerEvidenceChunk:
     return CandidateAnswerEvidenceChunk(
+        document_id="document-1",
+        chunk_id=4,
         citation_number=1,
         retrieval_number=1,
         chunk_identifier="regulatory-chunk-4",
@@ -80,6 +83,8 @@ def _evidence() -> CandidateAnswerEvidenceChunk:
 
 def _hidden_evidence(citation_number: int) -> CandidateAnswerEvidenceChunk:
     return CandidateAnswerEvidenceChunk(
+        document_id=f"document-{citation_number}",
+        chunk_id=citation_number,
         citation_number=None,
         retrieval_number=citation_number,
         chunk_identifier=f"regulatory-chunk-{citation_number}",
@@ -289,7 +294,6 @@ def _run_final_report(
         ),
         evidence_citation_mapping=evidence_citation_mapping,
         recovery_tools=recovery_tools,
-        recovery_is_reasoning_model=False,
     )
 
 
@@ -305,78 +309,6 @@ def test_orchestrator_schedule_runs_every_decision_before_forced_report() -> Non
 
     assert schedule[:-1] == [0, 1, 2, 3]
     assert schedule[-1] == 4
-
-
-@pytest.mark.parametrize(
-    ("eligible", "related_citations", "claim_reference"),
-    [
-        (False, [], "Analyze the authorization consequence."),
-        (True, [1], "Analyze the authorization consequence."),
-        (True, [], "A deliverable absent from the current request."),
-    ],
-)
-def test_gap_recovery_gate_fails_closed(
-    eligible: bool,
-    related_citations: list[int],
-    claim_reference: str,
-) -> None:
-    review = CandidateAnswerReviewResult(
-        needs_reconsideration=True,
-        advisory_claim_issues=[
-            CandidateAnswerClaimIssue(
-                claim_reference=claim_reference,
-                advisory_feedback="No exact evidence supports this omitted deliverable.",
-                related_citation_numbers=related_citations,
-                recovery_search_eligible=eligible,
-            )
-        ],
-    )
-
-    assert (
-        dr_loop._select_regulatory_gap_recovery_issue(
-            review,
-            user_request="Please  ANALYZE the authorization consequence. Now.",
-        )
-        is None
-    )
-
-
-def test_gap_recovery_gate_accepts_normalized_exact_request_excerpt() -> None:
-    issue = CandidateAnswerClaimIssue(
-        claim_reference="ANALYZE   the authorization consequence.",
-        advisory_feedback="No exact evidence supports this omitted deliverable.",
-        recovery_search_eligible=True,
-    )
-    review = CandidateAnswerReviewResult(
-        needs_reconsideration=True,
-        advisory_claim_issues=[issue],
-    )
-
-    assert (
-        dr_loop._select_regulatory_gap_recovery_issue(
-            review,
-            user_request="Please analyze the authorization consequence. Now.",
-        )
-        == issue
-    )
-
-
-def test_gap_recovery_task_bounds_escaped_issue_data_without_losing_deliverable() -> (
-    None
-):
-    claim_reference = ('"\\' * 140)[:280]
-    issue = CandidateAnswerClaimIssue(
-        claim_reference=claim_reference,
-        advisory_feedback=('"\\' * 260)[:520],
-        recovery_search_eligible=True,
-    )
-
-    task = dr_loop._build_regulatory_gap_recovery_task(issue)
-
-    assert task is not None
-    assert len(task) <= dr_loop.MAX_RESEARCH_AGENT_TASK_CHARS
-    payload = json.loads(task[task.index("{") :])
-    assert payload["express_deliverable"] == claim_reference
 
 
 def test_regulatory_final_report_pass_publishes_hidden_draft_once() -> None:
@@ -521,34 +453,43 @@ def test_regulatory_final_review_runs_one_issue_only_recovery_and_merges_mapping
 ):
     public_doc = _search_doc()
     recovered_doc = _hidden_search_doc(2, document_id="recovered-document")
-    recovered_evidence = CandidateAnswerEvidenceChunk(
-        citation_number=2,
-        retrieval_number=2,
-        chunk_identifier="regulatory-chunk-2",
-        heading="Convention > Article 4A",
-        content="RECOVERED EXACT OPERATIVE TEXT",
-    )
-    recovery_result = CombinedResearchAgentCallResult(
-        intermediate_reports=["Focused recovery report [2]."],
-        citation_mapping={1: public_doc, 2: recovered_doc},
-        evidence_citation_mapping={1: public_doc, 2: recovered_doc},
-        exact_evidence_chunks=[recovered_evidence],
+    recovery_response = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[recovered_doc],
+            citation_mapping={2: recovered_doc.document_id},
+            citation_chunk_mapping={2: recovered_doc.chunk_ind},
+        ),
+        llm_facing_response=json.dumps(
+            {
+                "results": [
+                    {
+                        "document": 2,
+                        "title": "Convention > Article 4A",
+                        "content": "RECOVERED EXACT OPERATIVE TEXT",
+                        "metadata": json.dumps(recovered_doc.metadata),
+                    }
+                ]
+            }
+        ),
     )
     first_issue = CandidateAnswerClaimIssue(
-        claim_reference="Analyze Article 4A consequence.",
-        advisory_feedback=(
-            "This express deliverable is wholly unanswered and has no exact evidence."
-        ),
-        recovery_search_eligible=True,
+        claim_kind=ClaimKind.LEGAL_RULE,
+        claim_span=CandidateAnswerClaimSpan(start=0, end=18),
+        claim_reference="DRAFT_SENTINEL [1]",
+        advisory_feedback=("The cited chunk does not support this legal consequence."),
+        related_citation_numbers=[1],
+        recovery_query="Article 4A legal consequence exact provision",
     )
     review = CandidateAnswerReviewResult(
         needs_reconsideration=True,
         advisory_claim_issues=[
             first_issue,
             CandidateAnswerClaimIssue(
-                claim_reference="Analyze the second omitted consequence.",
+                claim_kind=ClaimKind.LEGAL_RULE,
+                claim_span=CandidateAnswerClaimSpan(start=19, end=30),
+                claim_reference="second issue",
                 advisory_feedback="SECOND_ISSUE_SENTINEL",
-                recovery_search_eligible=True,
+                recovery_query="second unsupported rule",
             ),
         ],
     )
@@ -594,10 +535,10 @@ def test_regulatory_final_review_runs_one_issue_only_recovery_and_merges_mapping
         ),
         patch.object(
             dr_loop,
-            "run_research_agent_calls",
-            return_value=recovery_result,
+            "run_single_gap_recovery",
+            return_value=recovery_response,
         ) as run_recovery,
-        patch.object(dr_loop, "_get_research_agent_tool_id", return_value=77),
+        patch.object(dr_loop, "run_research_agent_calls") as research_agent,
         patch.object(
             dr_loop,
             "review_regulatory_candidate_resolution",
@@ -617,29 +558,10 @@ def test_regulatory_final_review_runs_one_issue_only_recovery_and_merges_mapping
 
     run_recovery.assert_called_once()
     recovery_kwargs = run_recovery.call_args.kwargs
-    assert recovery_kwargs["tools"] == [recovery_tool]
-    assert recovery_kwargs["run_budget"] == dr_loop._REGULATORY_GAP_RECOVERY_BUDGET
-    assert recovery_kwargs["run_budget"].max_research_cycles == 2
-    assert recovery_kwargs["run_budget"].max_llm_decisions == 4
-    assert recovery_kwargs["run_budget"].max_report_tokens == 1536
-    recovery_calls = cast(
-        list[ToolCallKickoff], recovery_kwargs["research_agent_calls"]
-    )
-    assert len(recovery_calls) == 1
-    recovery_task = cast(str, recovery_calls[0].tool_args["task"])
-    assert len(recovery_task) <= dr_loop.MAX_RESEARCH_AGENT_TASK_CHARS
-    assert first_issue.claim_reference in recovery_task
-    assert first_issue.advisory_feedback in recovery_task
-    for sentinel in (
-        "FULL_SCENARIO_SENTINEL",
-        "REQUEST_TAIL_SENTINEL",
-        "EARLIER_CONTEXT_SENTINEL",
-        "PRIOR_REPORT_SENTINEL",
-        "DRAFT_SENTINEL",
-        "Investigate the material legal relationships.",
-        "SECOND_ISSUE_SENTINEL",
-    ):
-        assert sentinel not in recovery_task
+    assert recovery_kwargs["search_tool"] is recovery_tool
+    assert recovery_kwargs["issue"] is first_issue
+    assert recovery_kwargs["starting_citation_num"] == 2
+    research_agent.assert_not_called()
 
     assert run_step.call_count == 2
     correction_history = cast(
@@ -651,7 +573,11 @@ def test_regulatory_final_review_runs_one_issue_only_recovery_and_merges_mapping
     )
     resolution_evidence = resolution_reviewer.call_args.kwargs["evidence_chunks"]
     assert any(
-        chunk.chunk_identifier == recovered_evidence.chunk_identifier
+        (chunk.document_id, chunk.chunk_id)
+        == (
+            recovered_doc.document_id,
+            recovered_doc.chunk_ind,
+        )
         and chunk.citation_number == 2
         for chunk in resolution_evidence
     )
@@ -667,19 +593,23 @@ def test_regulatory_gap_recovery_failure_or_empty_result_is_not_retried(
         needs_reconsideration=True,
         advisory_claim_issues=[
             CandidateAnswerClaimIssue(
+                claim_kind=ClaimKind.LEGAL_RULE,
+                claim_span=CandidateAnswerClaimSpan(start=0, end=31),
                 claim_reference="Analyze every material legal issue.",
                 advisory_feedback=(
                     "The express deliverable is wholly unanswered without exact evidence."
                 ),
-                recovery_search_eligible=True,
+                recovery_query="material legal issue controlling rule",
             )
         ],
     )
-    empty_recovery = CombinedResearchAgentCallResult(
-        intermediate_reports=[None],
-        citation_mapping={1: public_doc},
-        evidence_citation_mapping={1: public_doc},
-        exact_evidence_chunks=[],
+    empty_recovery = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[],
+            citation_mapping={},
+            citation_chunk_mapping={},
+        ),
+        llm_facing_response=json.dumps({"results": []}),
     )
     live_state = ChatStateContainer()
     run_recovery = MagicMock(
@@ -700,7 +630,8 @@ def test_regulatory_gap_recovery_failure_or_empty_result_is_not_retried(
             "review_regulatory_candidate_answer",
             return_value=review,
         ),
-        patch.object(dr_loop, "run_research_agent_calls", new=run_recovery),
+        patch.object(dr_loop, "run_single_gap_recovery", new=run_recovery),
+        patch.object(dr_loop, "run_research_agent_calls") as research_agent,
         patch.object(
             dr_loop,
             "review_regulatory_candidate_resolution",
@@ -718,6 +649,7 @@ def test_regulatory_gap_recovery_failure_or_empty_result_is_not_retried(
         )
 
     run_recovery.assert_called_once()
+    research_agent.assert_not_called()
     assert run_step.call_count == 2
     correction_history = cast(
         list[ChatMessageSimple], run_step.call_args_list[1].kwargs["history"]

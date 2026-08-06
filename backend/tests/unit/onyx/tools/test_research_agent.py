@@ -180,6 +180,10 @@ def test_exact_regulatory_evidence_uses_llm_visible_content_and_global_citation(
     )
 
     assert len(evidence) == 1
+    assert (evidence[0].document_id, evidence[0].chunk_id) == (
+        search_doc.document_id,
+        search_doc.chunk_ind,
+    )
     assert evidence[0].content == "EXACT LLM-VISIBLE OPERATIVE TEXT"
     assert evidence[0].content != search_doc.blurb
     assert evidence[0].chunk_identifier == "regulatory-chunk-9"
@@ -221,6 +225,8 @@ def test_research_agent_result_keeps_uncited_exact_evidence_addressable() -> Non
         citation_processor=citation_processor,
         exact_evidence_chunks=[
             build_candidate_answer_evidence_chunk(
+                document_id="document-cited",
+                chunk_id=1,
                 citation_number=1,
                 retrieval_number=1,
                 chunk_identifier="chunk-cited",
@@ -228,6 +234,8 @@ def test_research_agent_result_keeps_uncited_exact_evidence_addressable() -> Non
                 content="cited exact text",
             ),
             build_candidate_answer_evidence_chunk(
+                document_id="document-uncited",
+                chunk_id=2,
                 citation_number=2,
                 retrieval_number=2,
                 chunk_identifier="chunk-uncited",
@@ -253,6 +261,8 @@ def test_uncited_exact_evidence_remaps_only_its_retrieval_number() -> None:
         heading="Article 8",
     )
     evidence = build_candidate_answer_evidence_chunk(
+        document_id="document-uncited",
+        chunk_id=8,
         citation_number=None,
         retrieval_number=7,
         chunk_identifier="chunk-uncited",
@@ -500,18 +510,24 @@ def test_regulatory_report_history_compacts_exact_evidence_atomically() -> None:
     )
     evidence_chunks = [
         build_candidate_answer_evidence_chunk(
+            document_id="document-1",
+            chunk_id=1,
             citation_number=1,
             chunk_identifier="chunk-1",
             heading="Rule > Article 4",
             content=repeated_content,
         ),
         build_candidate_answer_evidence_chunk(
+            document_id="document-1",
+            chunk_id=1,
             citation_number=2,
             chunk_identifier="chunk-1",
             heading="Rule > Article 4",
             content=repeated_content,
         ),
         build_candidate_answer_evidence_chunk(
+            document_id="document-2",
+            chunk_id=2,
             citation_number=3,
             chunk_identifier="chunk-2",
             heading="Rule > Article 8",
@@ -691,6 +707,8 @@ def test_regulatory_report_history_falls_back_on_untrusted_compaction_input() ->
     citation_processor = DynamicCitationProcessor()
     citation_processor.update_citation_mapping({1: search_doc})
     evidence = build_candidate_answer_evidence_chunk(
+        document_id="document-1",
+        chunk_id=1,
         citation_number=1,
         chunk_identifier="chunk-1",
         heading="Rule > Article 1",
@@ -755,6 +773,8 @@ def test_regulatory_report_history_falls_back_on_untrusted_compaction_input() ->
         ),
     ]
     trusted_evidence = build_candidate_answer_evidence_chunk(
+        document_id="document-1",
+        chunk_id=1,
         citation_number=1,
         chunk_identifier="chunk-1",
         heading="Rule > Article 1",
@@ -2008,6 +2028,8 @@ def test_combined_research_keeps_hidden_evidence_in_global_namespace() -> None:
         evidence_citation_mapping={1: cited_doc, 2: hidden_doc},
         exact_evidence_chunks=[
             build_candidate_answer_evidence_chunk(
+                document_id="new-cited",
+                chunk_id=1,
                 citation_number=1,
                 retrieval_number=1,
                 chunk_identifier="new-cited-chunk",
@@ -2015,6 +2037,8 @@ def test_combined_research_keeps_hidden_evidence_in_global_namespace() -> None:
                 content="new cited exact text",
             ),
             build_candidate_answer_evidence_chunk(
+                document_id="new-hidden",
+                chunk_id=2,
                 citation_number=None,
                 retrieval_number=2,
                 chunk_identifier="new-hidden-chunk",

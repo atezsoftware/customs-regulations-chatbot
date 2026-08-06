@@ -43,6 +43,7 @@ _MAX_INVENTORY_HEADING_CHARS = 240
 _MAX_CLAIM_ISSUES = 6
 _MAX_CLAIM_REFERENCE_CHARS = 280
 _MAX_ISSUE_FEEDBACK_CHARS = 520
+_MAX_RECOVERY_QUERY_CHARS = 512
 _MAX_RELATED_CITATION_NUMBERS = 5
 _REVIEW_MAX_TOKENS = 3_200
 _REVIEW_CONTEXT_SAFETY_TOKENS = 1_024
@@ -221,6 +222,8 @@ class CandidateAnswerEvidenceChunk(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    document_id: str = Field(min_length=1)
+    chunk_id: int = Field(ge=0)
     citation_number: int | None = Field(default=None, ge=1)
     retrieval_number: int | None = Field(default=None, ge=1)
     chunk_identifier: str = Field(min_length=1, max_length=_MAX_CHUNK_IDENTIFIER_CHARS)
@@ -228,7 +231,7 @@ class CandidateAnswerEvidenceChunk(BaseModel):
     content: str = Field(min_length=1, max_length=_MAX_RAW_EVIDENCE_CONTENT_CHARS)
     content_truncated: bool = False
 
-    @field_validator("chunk_identifier", "content")
+    @field_validator("document_id", "chunk_identifier", "content")
     @classmethod
     def strip_required_text(cls, value: str) -> str:
         return _strip_outer_whitespace(value)
@@ -241,6 +244,8 @@ class CandidateAnswerEvidenceChunk(BaseModel):
 
 def build_candidate_answer_evidence_chunk(
     *,
+    document_id: str,
+    chunk_id: int,
     citation_number: int | None,
     retrieval_number: int | None = None,
     chunk_identifier: str,
@@ -255,6 +260,8 @@ def build_candidate_answer_evidence_chunk(
         label="evidence content",
     )
     return CandidateAnswerEvidenceChunk(
+        document_id=document_id,
+        chunk_id=chunk_id,
         citation_number=citation_number,
         retrieval_number=(
             retrieval_number if retrieval_number is not None else citation_number
@@ -268,20 +275,59 @@ def build_candidate_answer_evidence_chunk(
     )
 
 
+class ClaimKind(StrEnum):
+    LEGAL_RULE = "legal_rule"
+    MATERIAL_FACT = "material_fact"
+
+
+class ClaimSpanSource(StrEnum):
+    CANDIDATE_ANSWER = "candidate_answer"
+    USER_REQUEST = "user_request"
+
+
+class CandidateAnswerClaimSpan(BaseModel):
+    """Stable character range for the exact claim reference under review."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    source: ClaimSpanSource = ClaimSpanSource.CANDIDATE_ANSWER
+
+    @model_validator(mode="after")
+    def validate_span(self) -> "CandidateAnswerClaimSpan":
+        if self.end <= self.start:
+            raise ValueError("claim span end must be greater than start")
+        return self
+
+
 class CandidateAnswerClaimIssue(BaseModel):
     """One material claim-to-evidence or request-coverage problem."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    claim_kind: ClaimKind = ClaimKind.MATERIAL_FACT
+    claim_span: CandidateAnswerClaimSpan | None = None
     claim_reference: str = Field(min_length=1, max_length=_MAX_CLAIM_REFERENCE_CHARS)
     advisory_feedback: str = Field(min_length=1, max_length=_MAX_ISSUE_FEEDBACK_CHARS)
     related_citation_numbers: list[int] = Field(default_factory=list)
-    recovery_search_eligible: bool = False
+    recovery_query: str | None = Field(
+        default=None,
+        max_length=_MAX_RECOVERY_QUERY_CHARS,
+    )
 
     @field_validator("claim_reference", "advisory_feedback")
     @classmethod
     def strip_text(cls, value: str) -> str:
         return _strip_outer_whitespace(value)
+
+    @field_validator("recovery_query")
+    @classmethod
+    def strip_optional_recovery_query(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
     @field_validator("related_citation_numbers")
     @classmethod
@@ -294,10 +340,11 @@ class _CandidateAnswerReviewDraftClaimIssue(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    claim_kind: ClaimKind
     claim_reference: str
     advisory_feedback: str
     related_citation_numbers: list[int] = Field(default_factory=list)
-    recovery_search_eligible: bool = False
+    recovery_query: str | None = None
 
 
 class _CandidateAnswerReviewDraft(BaseModel):
@@ -373,8 +420,8 @@ def format_candidate_answer_review(
         "# Candidate-answer evidence review",
         "The hidden draft has not been published because a bounded AI review found "
         "material evidence-grounding or request-coverage concerns. This feedback is "
-        "advisory analysis, not legal evidence or a prescribed plan. You retain the "
-        "decision whether further retrieval is useful and how to resolve each concern. "
+        "advisory analysis, not legal evidence. At most one focused support search "
+        "may be executed before the bounded correction. "
         "Do not silently drop a concern: either support and correct or qualify the "
         "affected conclusion, or state the precise controlling-source gap.",
     ]
@@ -839,6 +886,8 @@ def _bounded_claim_issue_from_draft(
     draft_issue: _CandidateAnswerReviewDraftClaimIssue,
     *,
     available_citation_numbers: set[int],
+    candidate_answer: str | None = None,
+    user_request: str | None = None,
 ) -> CandidateAnswerClaimIssue | None:
     claim_reference = draft_issue.claim_reference.strip()[
         :_MAX_CLAIM_REFERENCE_CHARS
@@ -848,14 +897,38 @@ def _bounded_claim_issue_from_draft(
     ].rstrip()
     if not claim_reference or not advisory_feedback:
         return None
+    claim_span: CandidateAnswerClaimSpan | None = None
+    if candidate_answer is not None:
+        claim_start = candidate_answer.find(claim_reference)
+        if claim_start >= 0:
+            claim_span = CandidateAnswerClaimSpan(
+                start=claim_start,
+                end=claim_start + len(claim_reference),
+            )
+    if claim_span is None and user_request is not None:
+        claim_start = user_request.find(claim_reference)
+        if claim_start >= 0:
+            claim_span = CandidateAnswerClaimSpan(
+                start=claim_start,
+                end=claim_start + len(claim_reference),
+                source=ClaimSpanSource.USER_REQUEST,
+            )
+    raw_recovery_query = draft_issue.recovery_query
+    recovery_query = (
+        raw_recovery_query.strip()[:_MAX_RECOVERY_QUERY_CHARS].rstrip()
+        if isinstance(raw_recovery_query, str)
+        else None
+    )
     return CandidateAnswerClaimIssue(
+        claim_kind=draft_issue.claim_kind,
+        claim_span=claim_span,
         claim_reference=claim_reference,
         advisory_feedback=advisory_feedback,
         related_citation_numbers=_bounded_related_citation_numbers(
             draft_issue.related_citation_numbers,
             available_citation_numbers=available_citation_numbers,
         ),
-        recovery_search_eligible=draft_issue.recovery_search_eligible,
+        recovery_query=recovery_query or None,
     )
 
 
@@ -1127,6 +1200,8 @@ def review_regulatory_candidate_answer(
             bounded_issue = _bounded_claim_issue_from_draft(
                 draft_issue,
                 available_citation_numbers=available_citation_numbers,
+                candidate_answer=candidate_answer,
+                user_request=user_request,
             )
             if bounded_issue is not None:
                 bounded_issues.append(bounded_issue)
@@ -1217,12 +1292,14 @@ def review_regulatory_candidate_resolution(
             ].rstrip()
             unresolved_issues.append(
                 CandidateAnswerClaimIssue(
+                    claim_kind=prior_issue.claim_kind,
+                    claim_span=prior_issue.claim_span,
                     claim_reference=prior_issue.claim_reference,
                     advisory_feedback=(
                         bounded_feedback or prior_issue.advisory_feedback
                     ),
                     related_citation_numbers=(prior_issue.related_citation_numbers),
-                    recovery_search_eligible=(prior_issue.recovery_search_eligible),
+                    recovery_query=prior_issue.recovery_query,
                 )
             )
 
@@ -1231,6 +1308,7 @@ def review_regulatory_candidate_resolution(
             bounded_regression = _bounded_claim_issue_from_draft(
                 draft.new_grounding_regression,
                 available_citation_numbers=available_citation_numbers,
+                candidate_answer=candidate_answer,
             )
             if bounded_regression is not None:
                 unresolved_issues = [

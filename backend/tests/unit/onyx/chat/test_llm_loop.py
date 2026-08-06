@@ -3,7 +3,7 @@
 import json
 import queue
 import re
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 import pytest
@@ -48,14 +48,16 @@ from onyx.chat.models import (
 )
 from onyx.chat.staged_generation import commit_staged_llm_step
 from onyx.configs.constants import DocumentSource, MessageType
-from onyx.context.search.models import SearchDoc, SearchDocsResponse
+from onyx.context.search.models import BaseFilters, SearchDoc, SearchDocsResponse
 from onyx.file_store.models import ChatFileType
 from onyx.llm.interfaces import LLMConfig, ToolChoiceOptions
 from onyx.llm.models import ReasoningEffort
 from onyx.prompts.chat_prompts import IMAGE_GEN_REMINDER, OPEN_URL_REMINDER
 from onyx.regulatory.candidate_answer_review import (
     CandidateAnswerClaimIssue,
+    CandidateAnswerClaimSpan,
     CandidateAnswerReviewResult,
+    ClaimKind,
     format_candidate_answer_review,
     format_candidate_resolution_review,
 )
@@ -1609,7 +1611,7 @@ def test_format_search_evidence_ledger_preserves_all_bounded_attempts() -> None:
     assert "earlier attempt(s) omitted" not in reminder
 
 
-def test_candidate_answer_review_feedback_preserves_model_choice() -> None:
+def test_candidate_answer_review_feedback_describes_bounded_correction() -> None:
     reminder = format_candidate_answer_review(
         CandidateAnswerReviewResult(
             needs_reconsideration=True,
@@ -1625,8 +1627,9 @@ def test_candidate_answer_review_feedback_preserves_model_choice() -> None:
     )
 
     assert reminder is not None
-    assert "not legal evidence or a prescribed plan" in reminder
-    assert "You retain the decision whether further retrieval is useful" in reminder
+    assert "not legal evidence" in reminder
+    assert "At most one focused support search" in reminder
+    assert "You retain the decision whether further retrieval is useful" not in reminder
     assert "Do not silently drop a concern" in reminder
     assert "A material draft claim" in reminder
     assert "query:" not in reminder
@@ -1728,14 +1731,17 @@ def test_candidate_answer_evidence_uses_exact_visible_content_and_citation_order
     assert len(evidence) == 3
     assert evidence[0].citation_number == 4
     assert evidence[0].retrieval_number == 4
+    assert (evidence[0].document_id, evidence[0].chunk_id) == ("shared-doc", 9)
     assert evidence[0].chunk_identifier == "rc-cited"
     assert evidence[0].heading == "Rule > Article 9"
     assert evidence[0].content == "Full exact text shown for citation 4"
     assert evidence[1].citation_number == 1
+    assert (evidence[1].document_id, evidence[1].chunk_id) == ("shared-doc", 3)
     assert evidence[1].chunk_identifier == "rc-first"
     assert evidence[1].content == "Full exact text shown for citation 1"
     assert evidence[2].citation_number is None
     assert evidence[2].retrieval_number == 2
+    assert (evidence[2].document_id, evidence[2].chunk_id) == ("shared-doc", 11)
     assert evidence[2].chunk_identifier == "rc-uncited"
     assert evidence[2].content == "Full exact text shown for citation 2"
     assert all(item.chunk_identifier != "rc-unseen" for item in evidence)
@@ -2006,6 +2012,193 @@ def test_partial_regulatory_search_batch_reaches_next_auto_decision() -> None:
     ].split("\n\n", 1)[0]
     assert re.findall(r"\b\d+\b", batch_receipt) == ["17", "8", "9"]
     assert all(query not in reminder_text for query in deferred_queries)
+
+
+def test_candidate_review_runs_one_direct_search_after_ordinary_research() -> None:
+    original_doc = SearchDoc(
+        document_id="original-document",
+        chunk_ind=1,
+        semantic_identifier="Kanun > Madde 1",
+        blurb="İlk araştırma metni",
+        source_type=DocumentSource.FILE,
+        boost=1,
+        hidden=False,
+        metadata={
+            "regulatory_chunk_id": "original-chunk",
+            "regulatory_heading_path": ["Kanun", "Madde 1"],
+        },
+        match_highlights=[],
+    )
+    recovered_doc = original_doc.model_copy(
+        update={
+            "document_id": "recovered-document",
+            "chunk_ind": 2,
+            "semantic_identifier": "Kanun > Madde 2",
+            "metadata": {
+                "regulatory_chunk_id": "recovered-chunk",
+                "regulatory_heading_path": ["Kanun", "Madde 2"],
+            },
+        }
+    )
+    ordinary_call = _search_tool_call("ordinary", query="ordinary research")
+    steps = iter(
+        [
+            LlmStepResult(
+                reasoning=None,
+                answer=None,
+                tool_calls=[ordinary_call],
+                raw_answer=None,
+                finish_reason="tool_calls",
+            ),
+            LlmStepResult(
+                reasoning=None,
+                answer="Desteksiz yükümlülük [1].",
+                tool_calls=None,
+                raw_answer="Desteksiz yükümlülük [1].",
+                finish_reason="stop",
+            ),
+            LlmStepResult(
+                reasoning=None,
+                answer="Düzeltilmiş yükümlülük [2].",
+                tool_calls=None,
+                raw_answer="Düzeltilmiş yükümlülük [2].",
+                finish_reason="stop",
+            ),
+        ]
+    )
+
+    def fake_run_llm_step(**kwargs: Any) -> tuple[LlmStepResult, bool]:
+        result = next(steps)
+        cast(ChatStateContainer, kwargs["state_container"]).set_answer_tokens(
+            result.answer
+        )
+        return result, False
+
+    ordinary_response = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[original_doc],
+            citation_mapping={1: original_doc.document_id},
+            citation_chunk_mapping={1: original_doc.chunk_ind},
+        ),
+        llm_facing_response=json.dumps(
+            {
+                "results": [
+                    {
+                        "document": 1,
+                        "title": original_doc.semantic_identifier,
+                        "content": "İlk araştırma metni",
+                        "metadata": json.dumps(original_doc.metadata),
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        tool_call=ordinary_call,
+    )
+    recovery_response = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[recovered_doc],
+            citation_mapping={2: recovered_doc.document_id},
+            citation_chunk_mapping={2: recovered_doc.chunk_ind},
+        ),
+        llm_facing_response=json.dumps(
+            {
+                "results": [
+                    {
+                        "document": 2,
+                        "title": recovered_doc.semantic_identifier,
+                        "content": "Kurtarılan kesin hüküm metni",
+                        "metadata": json.dumps(recovered_doc.metadata),
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    )
+    search_tool = Mock(spec=SearchTool)
+    search_tool.id = 1
+    search_tool.name = SearchTool.NAME
+    search_tool.user_selected_filters = BaseFilters(regulatory_chunks_only=True)
+    search_tool.tool_definition.return_value = {
+        "type": "function",
+        "function": {
+            "name": SearchTool.NAME,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    search_tool.run.return_value = recovery_response
+    persona = Mock(
+        id=0,
+        datetime_aware=False,
+        replace_base_system_prompt=False,
+        system_prompt=None,
+        task_prompt=None,
+    )
+    llm = Mock()
+    llm.config = LLMConfig(
+        model_provider="openai",
+        model_name="test-model",
+        temperature=0.0,
+        max_input_tokens=100_000,
+    )
+    review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[
+            CandidateAnswerClaimIssue(
+                claim_kind=ClaimKind.LEGAL_RULE,
+                claim_span=CandidateAnswerClaimSpan(start=0, end=25),
+                claim_reference="Desteksiz yükümlülük [1].",
+                advisory_feedback="Atıf yükümlülüğü desteklemiyor.",
+                related_citation_numbers=[1],
+                recovery_query="yükümlülüğün kesin kanuni dayanağı",
+            )
+        ],
+    )
+    state = ChatStateContainer()
+
+    with (
+        patch("onyx.chat.llm_loop.run_llm_step", side_effect=fake_run_llm_step),
+        patch(
+            "onyx.chat.llm_loop.run_tool_calls",
+            return_value=ParallelToolCallResponse(
+                tool_responses=[ordinary_response],
+                updated_citation_mapping={1: original_doc.document_id},
+            ),
+        ) as ordinary_research,
+        patch(
+            "onyx.chat.llm_loop.review_regulatory_candidate_answer",
+            return_value=review,
+        ),
+        patch(
+            "onyx.chat.llm_loop.review_regulatory_candidate_resolution",
+            return_value=CandidateAnswerReviewResult(needs_reconsideration=False),
+        ),
+        patch("onyx.chat.llm_loop.get_default_base_system_prompt", return_value=""),
+        patch("onyx.chat.llm_loop.get_session_with_current_tenant"),
+        patch("onyx.llm.litellm_singleton.config.initialize_litellm"),
+    ):
+        run_llm_loop(
+            emitter=Emitter(merged_queue=queue.Queue()),
+            state_container=state,
+            simple_chat_history=[
+                create_message("Yükümlülüğü hukuken incele.", MessageType.USER)
+            ],
+            tools=[search_tool],
+            custom_agent_prompt=None,
+            context_files=create_context_files(),
+            persona=persona,
+            user_memory_context=None,
+            llm=llm,
+            token_counter=len,
+        )
+
+    ordinary_research.assert_called_once()
+    search_tool.run.assert_called_once()
+    recovery_kwargs = search_tool.run.call_args.kwargs
+    assert recovery_kwargs["override_kwargs"].starting_citation_num == 2
+    assert recovery_kwargs["queries"] == ["yükümlülüğün kesin kanuni dayanağı"]
+    assert state.get_answer_tokens() == "Düzeltilmiş yükümlülük [2]."
+    assert state.get_citation_to_doc() == {1: original_doc, 2: recovered_doc}
 
 
 def test_extract_llm_visible_search_results_uses_only_history_payload() -> None:
@@ -2842,10 +3035,10 @@ def test_regulatory_search_breadth_does_not_raise_evidence_ceiling() -> None:
         (None, False, None),
         (None, True, None),
         (16, False, 16),
-        (16, True, 20),
+        (16, True, 16),
     ],
 )
-def test_effective_regulatory_search_budget_only_adds_bounded_review_recovery(
+def test_effective_regulatory_search_budget_excludes_direct_review_recovery(
     base_budget: int | None,
     candidate_was_rejected: bool,
     expected: int | None,

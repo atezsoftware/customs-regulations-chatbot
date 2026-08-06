@@ -13,9 +13,13 @@ from onyx.prompts.regulatory_candidate_answer_review import (
 )
 from onyx.regulatory.candidate_answer_review import (
     CandidateAnswerClaimIssue,
+    CandidateAnswerClaimSpan,
     CandidateAnswerEvidenceChunk,
     CandidateAnswerIssueResolutionStatus,
     CandidateAnswerReviewError,
+    CandidateAnswerReviewResult,
+    ClaimKind,
+    ClaimSpanSource,
     _CandidateAnswerIssueResolutionDraft,
     _CandidateAnswerResolutionReviewDraft,
     _CandidateAnswerReviewDraft,
@@ -28,6 +32,7 @@ from onyx.regulatory.candidate_answer_review import (
     review_regulatory_candidate_answer,
     review_regulatory_candidate_resolution,
 )
+from onyx.regulatory.gap_recovery import select_priority_recovery_issue
 from onyx.tracing.flows import LLMFlow
 
 
@@ -50,11 +55,77 @@ def _evidence(
     *, citation_number: int | None = 1, content: str = "Operative text."
 ) -> CandidateAnswerEvidenceChunk:
     return build_candidate_answer_evidence_chunk(
+        document_id=f"document-{citation_number}",
+        chunk_id=citation_number or 0,
         citation_number=citation_number,
         chunk_identifier=f"chunk-{citation_number}",
         heading=f"Instrument > Provision {citation_number}",
         content=content,
     )
+
+
+def test_evidence_keeps_canonical_chunk_identity() -> None:
+    evidence = build_candidate_answer_evidence_chunk(
+        document_id="doc",
+        chunk_id=7,
+        citation_number=1,
+        chunk_identifier="Madde 5",
+        heading="Madde 5",
+        content="Metin",
+    )
+
+    assert (evidence.document_id, evidence.chunk_id) == ("doc", 7)
+
+
+def test_cited_but_unsupported_legal_rule_is_recovery_eligible() -> None:
+    legal_issue = CandidateAnswerClaimIssue(
+        claim_kind=ClaimKind.LEGAL_RULE,
+        claim_span=CandidateAnswerClaimSpan(start=42, end=63),
+        claim_reference="İzin zorunludur [3].",
+        advisory_feedback="Atıf bu zorunluluğu desteklemiyor.",
+        related_citation_numbers=[3],
+        recovery_query="izin zorunluluğu uygulanacak hüküm",
+    )
+    earlier_fact = CandidateAnswerClaimIssue(
+        claim_kind=ClaimKind.MATERIAL_FACT,
+        claim_span=CandidateAnswerClaimSpan(start=3, end=18),
+        claim_reference="Başvuru yapıldı.",
+        advisory_feedback="Bu olgu kaynakta yer almıyor.",
+        recovery_query="başvuru yapılma tarihi",
+    )
+    review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[earlier_fact, legal_issue],
+    )
+
+    selected = select_priority_recovery_issue(review)
+
+    assert selected is legal_issue
+    assert selected.claim_kind is ClaimKind.LEGAL_RULE
+    assert selected.related_citation_numbers == [3]
+
+
+def test_recovery_priority_uses_earliest_span_within_claim_kind() -> None:
+    later = CandidateAnswerClaimIssue(
+        claim_kind=ClaimKind.LEGAL_RULE,
+        claim_span=CandidateAnswerClaimSpan(start=90, end=104),
+        claim_reference="Sonraki yasak.",
+        advisory_feedback="Doğrudan destek yok.",
+        recovery_query="sonraki yasak hükmü",
+    )
+    earlier = CandidateAnswerClaimIssue(
+        claim_kind=ClaimKind.LEGAL_RULE,
+        claim_span=CandidateAnswerClaimSpan(start=10, end=25),
+        claim_reference="Önceki istisna.",
+        advisory_feedback="Doğrudan destek yok.",
+        recovery_query="önceki istisna hükmü",
+    )
+    review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[later, earlier],
+    )
+
+    assert select_priority_recovery_issue(review) is earlier
 
 
 def test_review_user_context_separates_current_request_from_earlier_facts() -> None:
@@ -141,6 +212,8 @@ def test_evidence_builder_bounds_without_paraphrasing_source_text() -> None:
 
 def test_correction_evidence_can_cite_a_retrieved_chunk_omitted_by_draft() -> None:
     omitted_by_draft = build_candidate_answer_evidence_chunk(
+        document_id="document-7",
+        chunk_id=7,
         citation_number=None,
         retrieval_number=7,
         chunk_identifier="chunk-7",
@@ -152,6 +225,8 @@ def test_correction_evidence_can_cite_a_retrieved_chunk_omitted_by_draft() -> No
 
     assert payload["evidence_chunks"] == [
         {
+            "document_id": "document-7",
+            "chunk_id": 7,
             "citation_number": 7,
             "retrieval_number": 7,
             "chunk_identifier": "chunk-7",
@@ -180,9 +255,11 @@ def test_review_makes_one_bounded_structured_call() -> None:
         needs_reconsideration=True,
         advisory_claim_issues=[
             _CandidateAnswerReviewDraftClaimIssue(
+                claim_kind=ClaimKind.LEGAL_RULE,
                 claim_reference="A material claim",
                 advisory_feedback="The attributed chunk does not entail this effect.",
                 related_citation_numbers=[1],
+                recovery_query="material claim controlling legal rule",
             )
         ],
     )
@@ -202,9 +279,12 @@ def test_review_makes_one_bounded_structured_call() -> None:
     assert result.needs_reconsideration is True
     assert result.advisory_claim_issues == [
         CandidateAnswerClaimIssue(
+            claim_kind=ClaimKind.LEGAL_RULE,
+            claim_span=CandidateAnswerClaimSpan(start=0, end=16),
             claim_reference="A material claim",
             advisory_feedback="The attributed chunk does not entail this effect.",
             related_citation_numbers=[1],
+            recovery_query="material claim controlling legal rule",
         )
     ]
     generate.assert_called_once()
@@ -239,18 +319,19 @@ def test_review_makes_one_bounded_structured_call() -> None:
     assert payload["evidence_chunks"][0]["content"] == "Operative text."
 
 
-def test_review_preserves_narrow_evidence_gap_recovery_classification() -> None:
+def test_review_preserves_structured_recovery_identity_and_query() -> None:
     draft = _CandidateAnswerReviewDraft(
         needs_reconsideration=True,
         advisory_claim_issues=[
             _CandidateAnswerReviewDraftClaimIssue(
+                claim_kind=ClaimKind.LEGAL_RULE,
                 claim_reference="Analyze the authorization consequence.",
                 advisory_feedback=(
                     "The express deliverable is wholly unanswered and no exact "
                     "evidence supports it."
                 ),
                 related_citation_numbers=[],
-                recovery_search_eligible=True,
+                recovery_query="authorization consequence controlling rule",
             )
         ],
     )
@@ -267,12 +348,18 @@ def test_review_preserves_narrow_evidence_gap_recovery_classification() -> None:
 
     assert result.advisory_claim_issues == [
         CandidateAnswerClaimIssue(
+            claim_kind=ClaimKind.LEGAL_RULE,
+            claim_span=CandidateAnswerClaimSpan(
+                start=0,
+                end=38,
+                source=ClaimSpanSource.USER_REQUEST,
+            ),
             claim_reference="Analyze the authorization consequence.",
             advisory_feedback=(
                 "The express deliverable is wholly unanswered and no exact evidence "
                 "supports it."
             ),
-            recovery_search_eligible=True,
+            recovery_query="authorization consequence controlling rule",
         )
     ]
 
@@ -318,6 +405,8 @@ def test_review_fits_small_context_by_dropping_lower_priority_sections() -> None
     current_request = "CURRENT REQUEST: " + ("u" * 6_000)
     candidate_answer = "CANDIDATE ANSWER: " + ("a" * 6_000)
     cited_evidence = build_candidate_answer_evidence_chunk(
+        document_id="document-1",
+        chunk_id=1,
         citation_number=1,
         retrieval_number=1,
         chunk_identifier="cited-chunk",
@@ -326,6 +415,8 @@ def test_review_fits_small_context_by_dropping_lower_priority_sections() -> None
     )
     uncited_evidence = [
         build_candidate_answer_evidence_chunk(
+            document_id=f"document-{index + 2}",
+            chunk_id=index + 2,
             citation_number=None,
             retrieval_number=index + 2,
             chunk_identifier=f"uncited-{index}",
@@ -424,6 +515,8 @@ def test_review_bounds_inventory_while_covering_all_normally_reachable_results()
 ):
     evidence_chunks = [
         build_candidate_answer_evidence_chunk(
+            document_id=f"document-{index + 1}",
+            chunk_id=index + 1,
             citation_number=None,
             retrieval_number=index + 1,
             chunk_identifier=f"chunk-{index}-" + ("i" * 200),
@@ -476,6 +569,8 @@ def test_review_bounds_inventory_while_covering_all_normally_reachable_results()
 def test_review_prioritizes_cited_chunks_when_evidence_limit_is_reached() -> None:
     evidence_chunks = [
         build_candidate_answer_evidence_chunk(
+            document_id=f"document-{index + 1}",
+            chunk_id=index + 1,
             citation_number=None,
             retrieval_number=index + 1,
             chunk_identifier=f"uncited-{index}",
@@ -485,6 +580,8 @@ def test_review_prioritizes_cited_chunks_when_evidence_limit_is_reached() -> Non
         for index in range(48)
     ] + [
         build_candidate_answer_evidence_chunk(
+            document_id="document-7",
+            chunk_id=49,
             citation_number=7,
             retrieval_number=49,
             chunk_identifier="cited-7",
@@ -520,6 +617,8 @@ def test_review_prioritizes_cited_chunks_when_evidence_limit_is_reached() -> Non
 
 def test_review_reserves_uncited_paragraphs_from_cited_provision() -> None:
     cited = build_candidate_answer_evidence_chunk(
+        document_id="instrument",
+        chunk_id=1,
         citation_number=1,
         retrieval_number=1,
         chunk_identifier="cited",
@@ -528,6 +627,8 @@ def test_review_reserves_uncited_paragraphs_from_cited_provision() -> None:
     )
     unrelated = [
         build_candidate_answer_evidence_chunk(
+            document_id="other-instrument",
+            chunk_id=index + 2,
             citation_number=None,
             retrieval_number=index + 2,
             chunk_identifier=f"unrelated-{index}",
@@ -538,6 +639,8 @@ def test_review_reserves_uncited_paragraphs_from_cited_provision() -> None:
     ]
     siblings = [
         build_candidate_answer_evidence_chunk(
+            document_id="instrument",
+            chunk_id=200 + index,
             citation_number=None,
             retrieval_number=200 + index,
             chunk_identifier=f"sibling-{index}",
@@ -567,6 +670,8 @@ def test_review_reserves_and_samples_uncited_evidence_across_retrieval_history()
     ]
     uncited_chunks = [
         build_candidate_answer_evidence_chunk(
+            document_id=f"document-{index}",
+            chunk_id=index,
             citation_number=None,
             retrieval_number=index,
             chunk_identifier=f"uncited-{index}",
@@ -608,6 +713,8 @@ def test_review_preserves_cited_evidence_before_using_remaining_uncited_slots() 
     ]
     uncited_chunks = [
         build_candidate_answer_evidence_chunk(
+            document_id=f"document-{index}",
+            chunk_id=index,
             citation_number=None,
             retrieval_number=index,
             chunk_identifier=f"uncited-{index}",
@@ -680,6 +787,7 @@ def test_review_normalizes_provider_length_and_count_drift() -> None:
         needs_reconsideration=True,
         advisory_claim_issues=[
             _CandidateAnswerReviewDraftClaimIssue(
+                claim_kind=ClaimKind.MATERIAL_FACT,
                 claim_reference=f"Claim {index} " + ("x" * 400),
                 advisory_feedback=f"Issue {index} " + ("y" * 700),
                 related_citation_numbers=[99, 1, 1, 2, 98, 3, 4, 5, 6],
@@ -817,6 +925,8 @@ def test_resolution_review_fits_small_context_without_dropping_required_core() -
     candidate_answer = "REVISED CANDIDATE: " + ("a" * 3_500)
     issue_evidence = [
         build_candidate_answer_evidence_chunk(
+            document_id=f"document-{index}",
+            chunk_id=index,
             citation_number=index,
             retrieval_number=index,
             chunk_identifier=f"issue-{index}",
@@ -827,6 +937,8 @@ def test_resolution_review_fits_small_context_without_dropping_required_core() -
     ]
     supplemental_evidence = [
         build_candidate_answer_evidence_chunk(
+            document_id=f"document-{index}",
+            chunk_id=index,
             citation_number=index,
             retrieval_number=index,
             chunk_identifier=f"supplemental-{index}",
@@ -993,6 +1105,7 @@ def test_resolution_review_reports_one_serious_existing_evidence_regression() ->
             )
         ],
         new_grounding_regression=_CandidateAnswerReviewDraftClaimIssue(
+            claim_kind=ClaimKind.MATERIAL_FACT,
             claim_reference="New unsupported proposition",
             advisory_feedback=(
                 "Existing evidence contradicts it; remove or accurately qualify it."
@@ -1047,6 +1160,7 @@ def test_resolution_review_preserves_single_regression_with_six_unresolved_issue
             for index in range(6)
         ],
         new_grounding_regression=_CandidateAnswerReviewDraftClaimIssue(
+            claim_kind=ClaimKind.MATERIAL_FACT,
             claim_reference="Single serious regression",
             advisory_feedback="Remove or qualify it using the supplied evidence.",
             related_citation_numbers=[1],
@@ -1146,14 +1260,14 @@ def test_resolution_review_requires_prior_issues_without_calling_provider() -> N
     generate.assert_not_called()
 
 
-def test_review_schema_and_prompt_do_not_shape_search_or_scenario_content() -> None:
+def test_review_schema_and_prompt_bound_one_support_recovery_query() -> None:
     schema = _CandidateAnswerReviewDraft.model_json_schema()
     serialized_schema = json.dumps(schema)
     prompt = REGULATORY_CANDIDATE_ANSWER_REVIEW_SYSTEM_PROMPT
     resolution_prompt = REGULATORY_CANDIDATE_RESOLUTION_REVIEW_SYSTEM_PROMPT
     normalized_prompt = " ".join(prompt.split())
 
-    assert "query" not in serialized_schema.casefold()
+    assert "recovery_query" in serialized_schema
     assert "search_mode" not in serialized_schema.casefold()
     for scenario_term in ("2207", "UND", "DAC", "Basel", "İtalya", "Azerbaycan"):
         assert scenario_term not in prompt
@@ -1169,10 +1283,11 @@ def test_review_schema_and_prompt_do_not_shape_search_or_scenario_content() -> N
     )
     assert "verified acronym/full-name pair" in normalized_prompt
     assert "no evidence for it was retrieved" in normalized_prompt
-    assert "Set recovery_search_eligible to true only for that narrow case" in (
+    assert "Both cited and uncited unsupported propositions can be recoverable" in (
         normalized_prompt
     )
-    assert "It does not prescribe a search, query, retrieval mode" in normalized_prompt
+    assert "provide one concise recovery_query" in normalized_prompt
+    assert "choose a search mode, propose multiple queries" in normalized_prompt
     assert "logical direction, included or excluded category" in normalized_prompt
     assert "converse, an adjacent range or category" in normalized_prompt
     assert "inherit a negation, permission, prohibition" in normalized_prompt
@@ -1184,7 +1299,7 @@ def test_review_schema_and_prompt_do_not_shape_search_or_scenario_content() -> N
         normalized_prompt
     )
     assert "Do not supply a corrected legal conclusion" in normalized_prompt
-    assert "answer model alone decides" in normalized_prompt
+    assert "Apart from the single bounded recovery_query field" in normalized_prompt
     assert "at most six issues in descending order" in normalized_prompt
     assert "six most material rather than the first six" in normalized_prompt
     assert "fact-to-category mapping separately" in normalized_prompt

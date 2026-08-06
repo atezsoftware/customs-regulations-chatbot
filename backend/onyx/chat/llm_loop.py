@@ -66,6 +66,12 @@ from onyx.regulatory.candidate_answer_review import (
     review_regulatory_candidate_answer,
     review_regulatory_candidate_resolution,
 )
+from onyx.regulatory.gap_recovery import (
+    merge_recovery_citation_mapping,
+    recovery_search_docs_by_citation,
+    run_single_gap_recovery,
+    select_priority_recovery_issue,
+)
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
     OverallStop,
@@ -103,7 +109,6 @@ _REGULATORY_UNPLANNED_MAX_SEARCH_CALLS = 16
 _REGULATORY_MAX_PARALLEL_SEARCH_CALLS = 8
 _MAX_EMPTY_FINAL_RESPONSE_RETRIES = 1
 _REGULATORY_POST_REVIEW_MAIN_CYCLES = 3
-_REGULATORY_POST_REVIEW_SEARCH_CALLS = 4
 _REGULATORY_MAX_CANDIDATE_REVIEWS = 2
 _REGULATORY_PROJECTED_STOP_SYNTHESIS_CYCLES = 1
 _REGULATORY_RECONSIDERATION_HISTORY_RESULT_THRESHOLD = 32
@@ -603,6 +608,8 @@ def _build_candidate_answer_evidence_chunks(
         )
         evidence_chunks.append(
             build_candidate_answer_evidence_chunk(
+                document_id=search_doc.document_id,
+                chunk_id=search_doc.chunk_ind,
                 citation_number=(
                     citation_number if citation_number in cited_numbers else None
                 ),
@@ -1056,13 +1063,10 @@ def _effective_regulatory_search_call_budget(
     *,
     candidate_was_rejected: bool,
 ) -> int | None:
-    """Reserve a small, bounded recovery allowance after a rejected draft."""
+    """Keep ordinary research fixed; direct review recovery is accounted separately."""
 
-    if base_budget is None:
-        return None
-    return base_budget + (
-        _REGULATORY_POST_REVIEW_SEARCH_CALLS if candidate_was_rejected else 0
-    )
+    _ = candidate_was_rejected
+    return base_budget
 
 
 class EmptyLLMResponseError(ClassifiedLLMError):
@@ -2279,6 +2283,7 @@ def run_llm_loop(
                 candidate_answer_for_review = (
                     llm_step_result.raw_answer or llm_step_result.answer or ""
                 )
+                direct_recovery_messages: list[ChatMessageSimple] = []
                 if (
                     candidate_answer_review_count < _REGULATORY_MAX_CANDIDATE_REVIEWS
                     and has_called_search_tool
@@ -2318,6 +2323,181 @@ def run_llm_loop(
                             candidate_review
                         )
                         review_kind = "resolution"
+                    if (
+                        candidate_answer_review_count == 1
+                        and candidate_review.needs_reconsideration
+                    ):
+                        recovery_issue = select_priority_recovery_issue(
+                            candidate_review
+                        )
+                        recovery_search_tool = next(
+                            (
+                                tool
+                                for tool in tools
+                                if isinstance(tool, SearchTool)
+                                and tool.user_selected_filters is not None
+                                and tool.user_selected_filters.regulatory_chunks_only
+                            ),
+                            None,
+                        )
+                        if (
+                            recovery_issue is not None
+                            and recovery_search_tool is not None
+                        ):
+                            recovery_query = recovery_issue.recovery_query
+                            if recovery_query is None:
+                                raise ValueError(
+                                    "selected recovery issue has no recovery query"
+                                )
+                            recovery_placement = Placement(
+                                turn_index=llm_cycle_count + reasoning_cycles,
+                                tab_index=0,
+                            )
+                            recovery_call = ToolCallKickoff(
+                                tool_call_id=(
+                                    "regulatory-gap-recovery-"
+                                    f"{llm_cycle_count + reasoning_cycles}"
+                                ),
+                                tool_name=SearchTool.NAME,
+                                tool_args={
+                                    "queries": [recovery_query],
+                                    "search_mode": "hybrid",
+                                },
+                                placement=recovery_placement,
+                            )
+                            try:
+                                recovery_response = run_single_gap_recovery(
+                                    search_tool=recovery_search_tool,
+                                    issue=recovery_issue,
+                                    starting_citation_num=(
+                                        citation_processor.get_next_citation_number()
+                                    ),
+                                    placement=recovery_placement,
+                                )
+                                recovered_docs = recovery_search_docs_by_citation(
+                                    recovery_response
+                                )
+                                merged_docs = merge_recovery_citation_mapping(
+                                    citation_processor.citation_to_doc,
+                                    recovered_docs,
+                                )
+                                citation_processor.update_citation_mapping(merged_docs)
+                                staged_citation_processor.update_citation_mapping(
+                                    merged_docs
+                                )
+
+                                rich_response = recovery_response.rich_response
+                                if isinstance(rich_response, SearchDocsResponse):
+                                    for (
+                                        citation_number,
+                                        document_id,
+                                    ) in rich_response.citation_mapping.items():
+                                        existing_document_id = citation_mapping.get(
+                                            citation_number
+                                        )
+                                        if (
+                                            existing_document_id is not None
+                                            and existing_document_id != document_id
+                                        ):
+                                            raise ValueError(
+                                                "recovery attempted to reassign "
+                                                f"citation {citation_number}"
+                                            )
+                                        citation_mapping[citation_number] = document_id
+                                    state_container.add_search_docs(
+                                        rich_response.search_docs
+                                    )
+                                    gathered_documents = _merge_gathered_search_docs(
+                                        gathered_documents,
+                                        rich_response.search_docs,
+                                    )
+                                    state_container.add_tool_call(
+                                        ToolCallInfo(
+                                            parent_tool_call_id=None,
+                                            turn_index=(recovery_placement.turn_index),
+                                            tab_index=0,
+                                            tool_name=SearchTool.NAME,
+                                            tool_call_id=recovery_call.tool_call_id,
+                                            tool_id=recovery_search_tool.id,
+                                            reasoning_tokens=None,
+                                            tool_call_arguments=(
+                                                recovery_call.tool_args
+                                            ),
+                                            tool_call_response=(
+                                                recovery_response.llm_facing_response
+                                            ),
+                                            search_docs=(
+                                                rich_response.displayed_docs
+                                                or rich_response.search_docs
+                                            ),
+                                            generated_images=None,
+                                        )
+                                    )
+
+                                visible_recovery_results = (
+                                    _extract_llm_visible_search_results(
+                                        recovery_response.llm_facing_response
+                                    )
+                                )
+                                for (
+                                    citation_number,
+                                    title,
+                                    content,
+                                ) in visible_recovery_results:
+                                    llm_visible_search_results_by_citation[
+                                        citation_number
+                                    ] = (title, content)
+                                search_evidence_ledger.append(
+                                    SearchEvidenceLedgerEntry(
+                                        query=recovery_query,
+                                        search_mode="hybrid",
+                                        result_count=len(visible_recovery_results),
+                                    )
+                                )
+
+                                recovery_call_message = recovery_call.to_msg_str()
+                                direct_recovery_messages.extend(
+                                    [
+                                        ChatMessageSimple(
+                                            message="",
+                                            token_count=token_counter(
+                                                recovery_call_message
+                                            ),
+                                            message_type=MessageType.ASSISTANT,
+                                            tool_calls=[
+                                                ToolCallSimple(
+                                                    tool_call_id=(
+                                                        recovery_call.tool_call_id
+                                                    ),
+                                                    tool_name=SearchTool.NAME,
+                                                    tool_arguments=(
+                                                        recovery_call.tool_args
+                                                    ),
+                                                    token_count=token_counter(
+                                                        recovery_call_message
+                                                    ),
+                                                )
+                                            ],
+                                        ),
+                                        ChatMessageSimple(
+                                            message=(
+                                                recovery_response.llm_facing_response
+                                            ),
+                                            token_count=token_counter(
+                                                recovery_response.llm_facing_response
+                                            ),
+                                            message_type=(
+                                                MessageType.TOOL_CALL_RESPONSE
+                                            ),
+                                            tool_call_id=(recovery_call.tool_call_id),
+                                        ),
+                                    ]
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Single regulatory citation-gap search failed; "
+                                    "continuing with bounded correction"
+                                )
                     logger.info(
                         "Regulatory candidate review kind=%s pass=%d completed=%s "
                         "needs_reconsideration=%s issues=%d error=%s",
@@ -2331,6 +2511,9 @@ def run_llm_loop(
                     if candidate_review_feedback is not None:
                         if candidate_review_rejected_at_cycle is None:
                             candidate_review_rejected_at_cycle = llm_cycle_count
+                        # A reviewed draft gets one direct server-selected search at
+                        # most. All later correction passes run with tools disabled.
+                        candidate_final_correction_pending = True
                         simple_chat_history.append(
                             ChatMessageSimple(
                                 message=candidate_answer_for_review,
@@ -2338,11 +2521,7 @@ def run_llm_loop(
                                 message_type=MessageType.ASSISTANT,
                             )
                         )
-                        if (
-                            candidate_answer_review_count
-                            >= _REGULATORY_MAX_CANDIDATE_REVIEWS
-                        ):
-                            candidate_final_correction_pending = True
+                        simple_chat_history.extend(direct_recovery_messages)
                         continue
 
                 commit_staged_llm_step(
