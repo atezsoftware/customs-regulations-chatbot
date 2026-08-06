@@ -85,6 +85,7 @@ import {
   useReindexProgress,
   useSecondarySearchSettings,
 } from "@/lib/indexing/hooks";
+import { contextualSetupStatusAfterSave } from "@/lib/indexing/contextual";
 import { useLlmDefaults } from "@/lib/languageModels/hooks";
 import useFilter from "@/hooks/useFilter";
 import ModelSelector from "@/sections/model-selector/ModelSelector";
@@ -826,9 +827,19 @@ export default function IndexSettingsPage() {
           }
           throw new Error(detail);
         }
-        await mutate(SWR_KEYS.currentSearchSettings, updatedSettings, {
-          revalidate: false,
-        });
+        await Promise.all([
+          mutate(SWR_KEYS.currentSearchSettings, updatedSettings, {
+            revalidate: false,
+          }),
+          mutate(
+            SWR_KEYS.contextualSetupStatus,
+            contextualSetupStatusAfterSave(
+              contextualSetupStatus,
+              modelConfigurationId
+            ),
+            { revalidate: false }
+          ),
+        ]);
         toast.success("Contextual Retrieval setup saved");
       } catch (error) {
         toast.error(
@@ -840,7 +851,7 @@ export default function IndexSettingsPage() {
         setIsSavingContextualSetup(false);
       }
     },
-    [searchSettings]
+    [contextualSetupStatus, searchSettings]
   );
 
   const handleCancelReindex = useCallback(async () => {
