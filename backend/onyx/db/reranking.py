@@ -69,6 +69,7 @@ def upsert_reranker_configuration(
     model_name: str | None,
     api_key: str | None,
     updated_by_user_id: UUID | None = None,
+    commit: bool = True,
 ) -> RerankerRuntimeConfig:
     settings = _get_present_settings(db_session, for_update=True)
 
@@ -92,13 +93,19 @@ def upsert_reranker_configuration(
 
     settings.rerank_updated_at = datetime.now(timezone.utc)
     settings.rerank_updated_by_user_id = updated_by_user_id
-    db_session.commit()
-    db_session.refresh(settings)
+    if commit:
+        db_session.commit()
+        db_session.refresh(settings)
+    else:
+        db_session.flush()
     return _runtime_config(settings)
 
 
 def delete_reranker_configuration(
-    db_session: Session, *, updated_by_user_id: UUID | None = None
+    db_session: Session,
+    *,
+    updated_by_user_id: UUID | None = None,
+    commit: bool = True,
 ) -> None:
     settings_rows = list(
         db_session.scalars(select(SearchSettings).with_for_update()).all()
@@ -112,7 +119,10 @@ def delete_reranker_configuration(
         settings.rerank_updated_at = updated_at
         if settings.status == IndexModelStatus.PRESENT:
             settings.rerank_updated_by_user_id = updated_by_user_id
-    db_session.commit()
+    if commit:
+        db_session.commit()
+    else:
+        db_session.flush()
 
 
 def transfer_reranker_configuration__no_commit(
