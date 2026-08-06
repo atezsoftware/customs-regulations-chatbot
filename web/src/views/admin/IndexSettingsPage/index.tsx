@@ -70,6 +70,7 @@ import {
   cancelNewEmbedding,
   disconnectEmbeddingProvider,
   setNewSearchSettings,
+  updateInferenceSettings,
 } from "@/lib/indexing/svc";
 import { useCreateModal } from "@opal/components";
 import { ContentAction } from "@opal/layouts";
@@ -78,6 +79,7 @@ import { useSettings } from "@/lib/settings/hooks";
 import { Settings, toSettings } from "@/lib/settings/types";
 import {
   useConfiguredEmbeddingProviders,
+  useContextualSetupStatus,
   useCurrentEmbeddingModel,
   useCurrentSearchSettings,
   useReindexProgress,
@@ -89,6 +91,7 @@ import ModelSelector from "@/sections/model-selector/ModelSelector";
 import type { RichStr } from "@opal/types";
 import { ProviderCredentialsModal } from "@/views/admin/IndexSettingsPage/modals";
 import ReindexProgressBanner from "@/views/admin/IndexSettingsPage/ReindexProgressBanner";
+import RerankingSettings from "@/views/admin/IndexSettingsPage/RerankingSettings";
 
 const route = ADMIN_ROUTES.INDEX_SETTINGS;
 
@@ -589,6 +592,7 @@ export default function IndexSettingsPage() {
   const [switchoverType, setSwitchoverType] = useState<SwitchoverType>(
     SwitchoverType.REINDEX
   );
+  const [isSavingContextualSetup, setIsSavingContextualSetup] = useState(false);
 
   const allModels = useMemo(
     () => [...CLOUD_BASED_PROVIDERS, ...SELF_HOSTED_PROVIDERS],
@@ -697,6 +701,9 @@ export default function IndexSettingsPage() {
 
   const { data: searchSettings, isLoading: isLoadingSearchSettings } =
     useCurrentSearchSettings({ pollIntervalMs: isReindexing ? 5000 : 0 });
+  const { data: contextualSetupStatus, isLoading: isLoadingContextualSetup } =
+    useContextualSetupStatus();
+  const contextualSetupRequired = contextualSetupStatus?.required ?? false;
   const { data: configuredProvidersList } = useConfiguredEmbeddingProviders();
   const configuredProviders = useMemo(
     () =>
@@ -778,11 +785,62 @@ export default function IndexSettingsPage() {
       model_name: currentEmbeddingModel?.model_name ?? "",
       custom_model: null,
       custom_model_provider: null,
-      enable_contextual_rag: searchSettings?.enable_contextual_rag ?? false,
+      enable_contextual_rag: contextualSetupRequired
+        ? true
+        : (searchSettings?.enable_contextual_rag ?? false),
       contextual_rag_model_configuration_id:
-        searchSettings?.contextual_rag_model_configuration_id ?? null,
+        (contextualSetupRequired
+          ? contextualSetupStatus?.model_configuration_id
+          : searchSettings?.contextual_rag_model_configuration_id) ?? null,
     }),
-    [currentEmbeddingModel, searchSettings]
+    [
+      contextualSetupRequired,
+      contextualSetupStatus?.model_configuration_id,
+      currentEmbeddingModel,
+      searchSettings,
+    ]
+  );
+
+  const saveContextualSetup = useCallback(
+    async (modelConfigurationId: number | null) => {
+      if (!searchSettings || modelConfigurationId === null) {
+        toast.error("Select an explicit Contextual Retrieval LLM first.");
+        return;
+      }
+
+      setIsSavingContextualSetup(true);
+      const updatedSettings = {
+        ...searchSettings,
+        enable_contextual_rag: true,
+        contextual_rag_model_configuration_id: modelConfigurationId,
+      };
+      try {
+        const response = await updateInferenceSettings(updatedSettings);
+        if (!response.ok) {
+          let detail = "Failed to save Contextual Retrieval setup";
+          try {
+            detail =
+              ((await response.json()) as { detail?: string }).detail ?? detail;
+          } catch {
+            // Keep the stable fallback for non-JSON proxy errors.
+          }
+          throw new Error(detail);
+        }
+        await mutate(SWR_KEYS.currentSearchSettings, updatedSettings, {
+          revalidate: false,
+        });
+        toast.success("Contextual Retrieval setup saved");
+      } catch (error) {
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : "Failed to save Contextual Retrieval setup"
+        );
+      } finally {
+        setIsSavingContextualSetup(false);
+      }
+    },
+    [searchSettings]
   );
 
   const handleCancelReindex = useCallback(async () => {
@@ -805,6 +863,7 @@ export default function IndexSettingsPage() {
   if (
     isLoadingCurrentModel ||
     isLoadingSearchSettings ||
+    isLoadingContextualSetup ||
     isLoadingLlmProviders
   ) {
     return (
@@ -878,6 +937,8 @@ export default function IndexSettingsPage() {
         />
 
         <SettingsLayouts.Body>
+          <RerankingSettings />
+
           <Formik<IndexSettingsFormValues>
             innerRef={indexSettingsFormRef}
             enableReinitialize
@@ -947,6 +1008,16 @@ export default function IndexSettingsPage() {
               const contextualRagModelMissing =
                 values.enable_contextual_rag &&
                 values.contextual_rag_model_configuration_id === null;
+              const reindexDirty = contextualSetupRequired
+                ? isModelStaged
+                : dirty;
+              const reindexContextualModelMissing =
+                !contextualSetupRequired && contextualRagModelMissing;
+              const contextualSetupNeedsSave =
+                contextualSetupRequired &&
+                (searchSettings?.enable_contextual_rag !== true ||
+                  searchSettings?.contextual_rag_model_configuration_id !==
+                    values.contextual_rag_model_configuration_id);
 
               return (
                 <>
@@ -1023,21 +1094,25 @@ export default function IndexSettingsPage() {
                     !NEXT_PUBLIC_CLOUD_ENABLED && (
                       <MessageCard
                         variant={
-                          contextualRagModelMissing ? "error" : statusVariant
+                          reindexContextualModelMissing
+                            ? "error"
+                            : reindexDirty
+                              ? "warning"
+                              : undefined
                         }
                         headerPadding="sm"
                         title={
-                          contextualRagModelMissing
+                          reindexContextualModelMissing
                             ? "Select a Contextual Retrieval LLM"
                             : "Changes require a full re-index."
                         }
                         description={markdown(
-                          contextualRagModelMissing
+                          reindexContextualModelMissing
                             ? "Contextual Retrieval is enabled but no model is selected. Pick a Contextual Retrieval LLM below before re-indexing — without one, the re-index cannot run."
                             : "Modifying embedding or retrieval settings requires a full re-index of all documents to take effect, which may take **hours or days** depending on corpus size. [Learn More](https://docs.onyx.app/security/architecture/data_flows)"
                         )}
                         bottomChildren={
-                          dirty ? (
+                          reindexDirty ? (
                             <div className="flex flex-row items-end gap-4 p-2">
                               <div className="flex-1 min-w-0">
                                 <InputSelect
@@ -1087,7 +1162,7 @@ export default function IndexSettingsPage() {
                                 </Button>
                                 <Button
                                   onClick={() => void submitForm()}
-                                  disabled={contextualRagModelMissing}
+                                  disabled={reindexContextualModelMissing}
                                 >
                                   Apply & Re-index
                                 </Button>
@@ -1539,9 +1614,25 @@ export default function IndexSettingsPage() {
                               <InputHorizontal
                                 title="Contextual Retrieval"
                                 description="Add document-level context to every indexed chunk to improve hybrid search relevance. This can increase embedding cost significantly."
+                                tag={
+                                  contextualSetupRequired
+                                    ? {
+                                        title: "required before first index",
+                                        color: "blue",
+                                      }
+                                    : undefined
+                                }
                                 withLabel
                               >
-                                <SwitchField name="enable_contextual_rag" />
+                                {contextualSetupRequired ? (
+                                  <Switch
+                                    aria-label="Contextual Retrieval"
+                                    checked
+                                    disabled
+                                  />
+                                ) : (
+                                  <SwitchField name="enable_contextual_rag" />
+                                )}
                               </InputHorizontal>
 
                               <Disabled
@@ -1560,6 +1651,7 @@ export default function IndexSettingsPage() {
                                     value={
                                       values.contextual_rag_model_configuration_id
                                     }
+                                    fallbackToGlobalDefault={false}
                                     disabled={!values.enable_contextual_rag}
                                     onChange={(opt) =>
                                       void setFieldValue(
@@ -1570,6 +1662,33 @@ export default function IndexSettingsPage() {
                                   />
                                 </InputHorizontal>
                               </Disabled>
+
+                              {contextualSetupRequired && (
+                                <MessageCard
+                                  variant={
+                                    contextualRagModelMissing ? "error" : "info"
+                                  }
+                                  title="Complete Contextual Retrieval before first indexing"
+                                  description="Choose an explicit model configuration and save it to the current Search Settings. This setup does not start a re-index because the document corpus is still empty."
+                                  titleMaxLines={undefined}
+                                  rightChildren={
+                                    <Button
+                                      onClick={() =>
+                                        void saveContextualSetup(
+                                          values.contextual_rag_model_configuration_id
+                                        )
+                                      }
+                                      disabled={
+                                        contextualRagModelMissing ||
+                                        isSavingContextualSetup ||
+                                        !contextualSetupNeedsSave
+                                      }
+                                    >
+                                      Save first-index setup
+                                    </Button>
+                                  }
+                                />
+                              )}
                             </GeneralLayouts.Section>
                           </Card>
                         </CloudDisabled>

@@ -48,6 +48,11 @@ export interface ModelSelectorProps {
    * (modelConfigurationId === null), which callers should treat as "clear."
    */
   includeGlobalDefault?: boolean;
+  /**
+   * Whether a null explicit value should display the tenant's global default.
+   * Disable this for settings that require a concrete model configuration ID.
+   */
+  fallbackToGlobalDefault?: boolean;
   /** Which side of the trigger the popover prefers to open on. */
   side?: "top" | "bottom" | "left" | "right";
 }
@@ -63,6 +68,7 @@ export default function ModelSelector({
   reasoningManager,
   disabled = false,
   includeGlobalDefault = false,
+  fallbackToGlobalDefault = true,
   side = "top",
 }: ModelSelectorProps) {
   const { llmProviders: currentAgentProviderOptions, defaultText } =
@@ -102,7 +108,8 @@ export default function ModelSelector({
     };
   }, [defaultText, llmProviders]);
 
-  const effectiveOption = currentOption ?? defaultModelOption;
+  const effectiveOption =
+    currentOption ?? (fallbackToGlobalDefault ? defaultModelOption : null);
   const currentDisplayName = effectiveOption?.displayName ?? "Select Model";
 
   const isSelected = useCallback(
