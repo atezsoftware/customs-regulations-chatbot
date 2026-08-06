@@ -12,7 +12,8 @@ from uuid import UUID
 from chonkie import SentenceChunker
 from sqlalchemy.orm import Session
 
-from onyx.access.models import default_public_access
+from onyx.access.access import get_access_for_user_files
+from onyx.access.models import DocumentAccess
 from onyx.configs.app_configs import (
     BLURB_SIZE,
     ENABLE_CONTEXTUAL_RAG,
@@ -25,6 +26,7 @@ from onyx.db.models import RegulatoryChunk, SearchSettings, UserFile
 from onyx.db.regulatory_chunks import get_chunks_for_file
 from onyx.db.search_settings import get_active_search_settings_list
 from onyx.db.user_file import (
+    fetch_document_set_names_for_user_files,
     fetch_persona_ids_for_user_files,
     fetch_user_project_ids_for_user_files,
     lock_completed_user_file_for_projection,
@@ -305,13 +307,22 @@ def _enrich_index_chunks(
     user_file_id: str,
     project_ids: dict[str, list[int]],
     persona_ids: dict[str, list[int]],
+    document_set_names: dict[str, list[str]],
+    user_file_access: dict[str, DocumentAccess],
     tenant_id: str,
 ) -> list[DocMetadataAwareIndexChunk]:
+    no_access = DocumentAccess.build(
+        user_emails=[],
+        user_groups=[],
+        external_user_emails=[],
+        external_user_group_ids=[],
+        is_public=False,
+    )
     return [
         DocMetadataAwareIndexChunk.from_index_chunk(
             index_chunk=chunk,
-            access=default_public_access,
-            document_sets=set(),
+            access=user_file_access.get(user_file_id, no_access),
+            document_sets=set(document_set_names.get(user_file_id, [])),
             user_project=project_ids.get(user_file_id, []),
             personas=persona_ids.get(user_file_id, []),
             boost=DEFAULT_BOOST,
@@ -330,6 +341,8 @@ def _project_rows_to_search_settings(
     tenant_id: str,
     project_ids: dict[str, list[int]],
     persona_ids: dict[str, list[int]],
+    document_set_names: dict[str, list[str]],
+    user_file_access: dict[str, DocumentAccess],
     indexing_metadata: IndexingMetadata,
 ) -> int:
     """Project immutable PostgreSQL rows into exactly one search setting."""
@@ -369,6 +382,8 @@ def _project_rows_to_search_settings(
         user_file_id=user_file_id,
         project_ids=project_ids,
         persona_ids=persona_ids,
+        document_set_names=document_set_names,
+        user_file_access=user_file_access,
         tenant_id=tenant_id,
     )
     document_indices = get_all_document_indices(
@@ -423,6 +438,10 @@ def project_user_file_to_index(
 
     project_ids = fetch_user_project_ids_for_user_files([user_file_id], db_session)
     persona_ids = fetch_persona_ids_for_user_files([user_file_id], db_session)
+    document_set_names = fetch_document_set_names_for_user_files(
+        [user_file_id], db_session
+    )
+    user_file_access = get_access_for_user_files([user_file_id], db_session)
 
     old_chunk_cnt = user_file.chunk_count or 0
     new_chunk_cnt = len(rows)
@@ -444,6 +463,8 @@ def project_user_file_to_index(
                 tenant_id=tenant_id,
                 project_ids=project_ids,
                 persona_ids=persona_ids,
+                document_set_names=document_set_names,
+                user_file_access=user_file_access,
                 indexing_metadata=indexing_metadata,
             )
         except Exception:

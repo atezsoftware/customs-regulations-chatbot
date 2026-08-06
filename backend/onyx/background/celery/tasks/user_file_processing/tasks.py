@@ -9,7 +9,7 @@ from redis.exceptions import LockNotOwnedError, RedisError
 from redis.lock import Lock as RedisLock
 from sqlalchemy import select
 
-from onyx.access.access import build_access_for_user_files
+from onyx.access.access import build_access_for_user_files, get_access_for_user_files
 from onyx.access.models import DocumentAccess
 from onyx.background.celery.apps.app_base import task_logger
 from onyx.background.celery.celery_redis import (
@@ -50,6 +50,7 @@ from onyx.db.models import SearchSettings, UserFile
 from onyx.db.port_attempt import port_backfill_has_pending_work
 from onyx.db.port_orphan_candidate import record_port_orphan_candidates_for_user_file
 from onyx.db.regulatory_chunks import (
+    get_chunk_counts_for_files,
     get_chunks_for_file,
     has_regulatory_chunks_for_file,
 )
@@ -59,6 +60,7 @@ from onyx.db.search_settings import (
     get_active_search_settings_list,
 )
 from onyx.db.user_file import (
+    fetch_document_set_names_for_user_files,
     fetch_persona_ids_for_user_files,
     fetch_user_files_with_access_relationships,
     fetch_user_project_ids_for_user_files,
@@ -628,6 +630,10 @@ def _index_user_file_to_secondary(
             [user_file_id_str], db_session
         )
         persona_ids = fetch_persona_ids_for_user_files([user_file_id_str], db_session)
+        document_set_names = fetch_document_set_names_for_user_files(
+            [user_file_id_str], db_session
+        )
+        user_file_access = get_access_for_user_files([user_file_id_str], db_session)
         new_chunk_count = len(rows)
         indexing_metadata = IndexingMetadata(
             doc_id_to_chunk_cnt_diff={
@@ -644,6 +650,8 @@ def _index_user_file_to_secondary(
             tenant_id=tenant_id,
             project_ids=project_ids,
             persona_ids=persona_ids,
+            document_set_names=document_set_names,
+            user_file_access=user_file_access,
             indexing_metadata=indexing_metadata,
         )
         return True
@@ -1197,14 +1205,21 @@ def check_for_user_file_project_sync(self: Task, *, tenant_id: str) -> None:
             user_file_ids = (
                 db_session.execute(
                     select(UserFile.id).where(
-                        sa.and_(
-                            sa.or_(
-                                UserFile.needs_project_sync.is_(True),
-                                UserFile.needs_persona_sync.is_(True),
-                                # re-enqueue un-reconciled files so the reconciler retries
-                                UserFile.secondary_reconcile_pending.is_(True),
+                        sa.or_(
+                            sa.and_(
+                                UserFile.status == UserFileStatus.COMPLETED,
+                                sa.or_(
+                                    UserFile.needs_project_sync.is_(True),
+                                    UserFile.needs_persona_sync.is_(True),
+                                    UserFile.needs_document_set_sync.is_(True),
+                                    # re-enqueue un-reconciled files so the reconciler retries
+                                    UserFile.secondary_reconcile_pending.is_(True),
+                                ),
                             ),
-                            UserFile.status == UserFileStatus.COMPLETED,
+                            sa.and_(
+                                UserFile.status == UserFileStatus.FAILED,
+                                UserFile.needs_document_set_sync.is_(True),
+                            ),
                         )
                     )
                 )
@@ -1238,7 +1253,7 @@ def check_for_user_file_project_sync(self: Task, *, tenant_id: str) -> None:
 def project_sync_user_file_impl(
     *, user_file_id: str, tenant_id: str, redis_locking: bool
 ) -> None:
-    """Core implementation for syncing a user file's project/persona metadata.
+    """Sync mutable metadata or remove residual indexed chunks for a failed file.
 
     When redis_locking=True, acquires and renews a per-file Redis lock, then
     clears the queued-key guard (Celery path). When redis_locking=False, skips
@@ -1276,11 +1291,14 @@ def project_sync_user_file_impl(
         retry_document_indices: list[RetryDocumentIndex] = []
         project_ids: list[int] = []
         persona_ids: list[int] = []
+        document_set_names: set[str] = set()
         file_id_str: str = ""
         chunk_count: int | None = None
         access: DocumentAccess | None = None
         force_content_reconcile = False
         reconcile_target_settings_id: int | None = None
+        failed_document_set_sync = False
+        failed_file_delete_chunk_count: int | None = None
         skip_vespa = DISABLE_VECTOR_DB
 
         if not skip_vespa:
@@ -1304,11 +1322,17 @@ def project_sync_user_file_impl(
                 )
                 return
 
-            if user_file.status != UserFileStatus.COMPLETED or not (
+            completed_metadata_sync = user_file.status == UserFileStatus.COMPLETED and (
                 user_file.needs_project_sync
                 or user_file.needs_persona_sync
+                or user_file.needs_document_set_sync is True
                 or user_file.secondary_reconcile_pending
-            ):
+            )
+            failed_document_set_sync = (
+                user_file.status == UserFileStatus.FAILED
+                and user_file.needs_document_set_sync is True
+            )
+            if not completed_metadata_sync and not failed_document_set_sync:
                 task_logger.info(
                     "project_sync_user_file_impl - No pending work for "
                     f"user_file_id={user_file_id}; skipping stale task"
@@ -1343,12 +1367,26 @@ def project_sync_user_file_impl(
                     for document_index in document_indices
                 ]
 
-                project_ids = [project.id for project in user_file.projects]
-                persona_ids = [p.id for p in user_file.assistants if not p.deleted]
                 file_id_str = str(user_file.id)
-                chunk_count = user_file.chunk_count
-                access_map = build_access_for_user_files([user_file])
-                access = access_map.get(file_id_str)
+                if failed_document_set_sync:
+                    regulatory_chunk_count = get_chunk_counts_for_files(
+                        db_session, [user_file.id]
+                    ).get(user_file.id, 0)
+                    effective_chunk_count = max(
+                        user_file.chunk_count or 0, regulatory_chunk_count
+                    )
+                    failed_file_delete_chunk_count = effective_chunk_count or None
+                else:
+                    project_ids = [project.id for project in user_file.projects]
+                    persona_ids = [p.id for p in user_file.assistants if not p.deleted]
+                    document_set_names = {
+                        document_set.name
+                        for document_set in user_file.document_sets
+                        if not document_set.is_deleting
+                    }
+                    chunk_count = user_file.chunk_count
+                    access_map = build_access_for_user_files([user_file])
+                    access = access_map.get(file_id_str)
         # DB connection returned to pool here; index update calls run without it.
 
         if lock_heartbeat is not None:
@@ -1358,25 +1396,33 @@ def project_sync_user_file_impl(
         secondary_consistent = True
         canonical_projection_completed = False
         if not skip_vespa:
-            update_request = MetadataUpdateRequest(
-                document_ids=[file_id_str],
-                doc_id_to_chunk_cnt={
-                    file_id_str: chunk_count if chunk_count is not None else -1
-                },
-                access=access if access is not None else None,
-                project_ids=set(project_ids),
-                persona_ids=set(persona_ids),
-            )
-            (
-                secondary_consistent,
-                canonical_projection_completed,
-            ) = _sync_metadata_and_reconcile_secondary(
-                retry_document_indices,
-                update_request,
-                user_file_id,
-                tenant_id,
-                force_content_reconcile=force_content_reconcile,
-            )
+            if failed_document_set_sync:
+                for retry_document_index in retry_document_indices:
+                    retry_document_index.delete(
+                        user_file_id,
+                        chunk_count=failed_file_delete_chunk_count,
+                    )
+            else:
+                update_request = MetadataUpdateRequest(
+                    document_ids=[file_id_str],
+                    doc_id_to_chunk_cnt={
+                        file_id_str: chunk_count if chunk_count is not None else -1
+                    },
+                    access=access if access is not None else None,
+                    document_sets=document_set_names,
+                    project_ids=set(project_ids),
+                    persona_ids=set(persona_ids),
+                )
+                (
+                    secondary_consistent,
+                    canonical_projection_completed,
+                ) = _sync_metadata_and_reconcile_secondary(
+                    retry_document_indices,
+                    update_request,
+                    user_file_id,
+                    tenant_id,
+                    force_content_reconcile=force_content_reconcile,
+                )
 
         lost_lock_after_canonical_projection = False
         if lock_heartbeat is not None:
@@ -1407,6 +1453,11 @@ def project_sync_user_file_impl(
         with get_session_with_current_tenant() as db_session:
             user_file = db_session.get(UserFile, _as_uuid(user_file_id))
             if user_file is not None:
+                if failed_document_set_sync:
+                    user_file.needs_document_set_sync = False
+                    db_session.add(user_file)
+                    db_session.commit()
+                    return
                 active_reconcile_target_id: int | None = None
                 if not skip_vespa and reconcile_target_settings_id is not None:
                     active_reconcile_target = active_secondary_port_target(db_session)
@@ -1428,6 +1479,7 @@ def project_sync_user_file_impl(
                     return
                 user_file.needs_project_sync = False
                 user_file.needs_persona_sync = False
+                user_file.needs_document_set_sync = False
                 user_file.last_project_sync_at = datetime.datetime.now(
                     datetime.timezone.utc
                 )

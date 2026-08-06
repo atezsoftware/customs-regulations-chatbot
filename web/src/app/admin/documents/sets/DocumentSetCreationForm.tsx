@@ -15,24 +15,23 @@ import {
   DocumentSetSummary,
   UserGroup,
   UserRole,
-  FederatedConnectorConfig,
 } from "@/lib/types";
 import { TextFormField } from "@/components/Field";
 import Button from "@/refresh-components/buttons/Button";
 import { useTierAtLeast } from "@/hooks/useTierAtLeast";
 import { Tier } from "@/lib/settings/types";
 import { IsPublicGroupSelector } from "@/components/IsPublicGroupSelector";
-import React, { useEffect, useState } from "react";
 import { useUser } from "@/providers/UserProvider";
 import { ConnectorMultiSelect } from "@/components/ConnectorMultiSelect";
 import { NonSelectableConnectors } from "@/components/NonSelectableConnectors";
 import { FederatedConnectorSelector } from "@/components/FederatedConnectorSelector";
 import { useFederatedConnectors } from "@/lib/hooks";
+import { Text } from "@opal/components";
 
 interface SetCreationPopupProps {
   ccPairs: ConnectorStatus<any, any>[];
   userGroups: UserGroup[] | undefined;
-  onClose: () => void;
+  onClose: (createdDocumentSetId?: number) => void;
   existingDocumentSet?: DocumentSetSummary;
 }
 
@@ -44,15 +43,8 @@ export const DocumentSetCreationForm = ({
 }: SetCreationPopupProps) => {
   const businessTier = useTierAtLeast(Tier.BUSINESS);
   const isUpdate = existingDocumentSet !== undefined;
-  const [localCcPairs, setLocalCcPairs] = useState(ccPairs);
   const { user } = useUser();
   const { data: federatedConnectors } = useFederatedConnectors();
-
-  useEffect(() => {
-    if (existingDocumentSet?.is_public) {
-      return;
-    }
-  }, [existingDocumentSet?.is_public]);
 
   return (
     <div className="max-w-full mx-auto">
@@ -73,30 +65,17 @@ export const DocumentSetCreationForm = ({
               entities: fc.entities,
             })) ?? [],
         }}
-        validationSchema={Yup.object()
-          .shape({
-            name: Yup.string().required("Please enter a name for the set"),
-            description: Yup.string().optional(),
-            cc_pair_ids: Yup.array().of(Yup.number().required()),
-            federated_connectors: Yup.array().of(
-              Yup.object().shape({
-                federated_connector_id: Yup.number().required(),
-                entities: Yup.object().required(),
-              })
-            ),
-          })
-          .test(
-            "at-least-one-connector",
-            "Please select at least one connector (regular or federated)",
-            function (values) {
-              const hasRegularConnectors =
-                values.cc_pair_ids && values.cc_pair_ids.length > 0;
-              const hasFederatedConnectors =
-                values.federated_connectors &&
-                values.federated_connectors.length > 0;
-              return hasRegularConnectors || hasFederatedConnectors;
-            }
-          )}
+        validationSchema={Yup.object().shape({
+          name: Yup.string().required("Please enter a name for the set"),
+          description: Yup.string().optional(),
+          cc_pair_ids: Yup.array().of(Yup.number().required()),
+          federated_connectors: Yup.array().of(
+            Yup.object().shape({
+              federated_connector_id: Yup.number().required(),
+              entities: Yup.object().required(),
+            })
+          ),
+        })}
         onSubmit={async (values, formikHelpers) => {
           formikHelpers.setSubmitting(true);
           // If the document set is public, then we don't want to send any groups
@@ -117,6 +96,9 @@ export const DocumentSetCreationForm = ({
           }
           formikHelpers.setSubmitting(false);
           if (response.ok) {
+            const createdDocumentSetId = isUpdate
+              ? undefined
+              : ((await response.json()) as number);
             toast.success(
               isUpdate
                 ? "Successfully updated document set!"
@@ -126,7 +108,7 @@ export const DocumentSetCreationForm = ({
               mutate(SWR_KEYS.documentSets),
               mutate(SWR_KEYS.documentSetsEditable),
             ]);
-            onClose();
+            onClose(createdDocumentSetId);
           } else {
             const errorMsg = await response.text();
             toast.error(
@@ -141,7 +123,7 @@ export const DocumentSetCreationForm = ({
           // Filter visible cc pairs for curator role
           const visibleCcPairs =
             user?.role === UserRole.CURATOR
-              ? localCcPairs.filter(
+              ? ccPairs.filter(
                   (ccPair) =>
                     ccPair.access_type === "public" ||
                     (ccPair.groups.length > 0 &&
@@ -149,12 +131,12 @@ export const DocumentSetCreationForm = ({
                         ccPair.groups.includes(group)
                       ))
                 )
-              : localCcPairs;
+              : ccPairs;
 
           // Filter non-visible cc pairs for curator role
           const nonVisibleCcPairs =
             user?.role === UserRole.CURATOR
-              ? localCcPairs.filter(
+              ? ccPairs.filter(
                   (ccPair) =>
                     !(ccPair.access_type === "public") &&
                     (ccPair.groups.length === 0 ||
@@ -200,6 +182,10 @@ export const DocumentSetCreationForm = ({
               <div className="my-6 border-t border-border-02" />
 
               <div className="space-y-6">
+                <Text as="p" font="main-ui-body" color="text-03">
+                  Connectors are optional. You can upload files from the Files
+                  tab after creating the document set.
+                </Text>
                 {user?.role === UserRole.CURATOR ? (
                   <>
                     <ConnectorMultiSelect

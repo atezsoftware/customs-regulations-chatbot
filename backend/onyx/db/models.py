@@ -756,6 +756,29 @@ class DocumentSet__ConnectorCredentialPair(Base):
     document_set: Mapped["DocumentSet"] = relationship("DocumentSet")
 
 
+class DocumentSet__UserFile(Base):
+    __tablename__ = "document_set__user_file"
+
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_file.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_document_set__user_file_document_set_id_created_at",
+            document_set_id,
+            created_at.desc(),
+        ),
+        Index("ix_document_set__user_file_user_file_id", user_file_id),
+    )
+
+
 class ChatMessage__SearchDoc(Base):
     __tablename__ = "chat_message__search_doc"
 
@@ -3809,11 +3832,18 @@ class DocumentSet(Base):
     user_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("user.id", ondelete="CASCADE"), nullable=True
     )
+    # Provenance used to restore legacy project scope on migration downgrade.
+    migrated_from_project_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    creator: Mapped[User | None] = relationship("User", foreign_keys=[user_id])
     # Whether changes to the document set have been propagated
     is_up_to_date: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # If `False`, then the document set is not visible to users who are not explicitly
     # given access to it either via the `users` or `groups` relationships
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Distinguishes an explicitly deleted set from a legitimate set with no sources.
+    is_deleting: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
 
     # Last time a user updated this document set
     time_last_modified_by_user: Mapped[datetime.datetime] = mapped_column(
@@ -3857,6 +3887,19 @@ class DocumentSet(Base):
             back_populates="document_set",
             cascade="all, delete-orphan",
         )
+    )
+    user_files: Mapped[list["UserFile"]] = relationship(
+        "UserFile",
+        secondary=DocumentSet__UserFile.__table__,
+        back_populates="document_sets",
+    )
+
+    __table_args__ = (
+        Index(
+            "ux_document_set_migrated_from_project_id",
+            "migrated_from_project_id",
+            unique=True,
+        ),
     )
 
 
@@ -5388,6 +5431,9 @@ class UserFile(Base):
     needs_persona_sync: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    needs_document_set_sync: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     # reindex-port dirty bit: the secondary index is stale/missing for this file (content
     # and/or ACL). The reconciler drains it; the swap waits on it. (Document has an ACL-only
     # analog, secondary_only_sync_pending — this one is broader, hence "reconcile".)
@@ -5408,6 +5454,12 @@ class UserFile(Base):
     projects: Mapped[list["UserProject"]] = relationship(
         "UserProject",
         secondary=Project__UserFile.__table__,
+        back_populates="user_files",
+        lazy="selectin",
+    )
+    document_sets: Mapped[list["DocumentSet"]] = relationship(
+        "DocumentSet",
+        secondary=DocumentSet__UserFile.__table__,
         back_populates="user_files",
         lazy="selectin",
     )
@@ -5502,7 +5554,7 @@ class RegulatoryChunk(Base):
 
 
 class AmendmentBatch(Base):
-    """One admin paste of amendment text, scoped to a directory (project).
+    """One admin paste of amendment text, scoped to a document set.
 
     The audit record for the paste itself; `AmendmentProposal` rows are the
     durable, individually approvable/rejectable units derived from it.
@@ -5512,8 +5564,8 @@ class AmendmentBatch(Base):
     __tablename__ = "amendment_batch"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    project_id: Mapped[int] = mapped_column(
-        ForeignKey("user_project.id", ondelete="CASCADE"), nullable=False
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="CASCADE"), nullable=False
     )
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     reference_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
@@ -5534,13 +5586,13 @@ class AmendmentBatch(Base):
         onupdate=func.now(),
     )
 
-    project: Mapped["UserProject"] = relationship("UserProject")
+    document_set: Mapped["DocumentSet"] = relationship("DocumentSet")
     proposals: Mapped[list["AmendmentProposal"]] = relationship(
         "AmendmentProposal", back_populates="batch", cascade="all, delete-orphan"
     )
 
     __table_args__ = (
-        Index("ix_amendment_batch_project_id", "project_id"),
+        Index("ix_amendment_batch_document_set_id", "document_set_id"),
         CheckConstraint(
             "status IN ('analyzing', 'analyzed', 'failed')",
             name="amendment_batch_status_check",
@@ -5630,8 +5682,8 @@ class BenchmarkQuestion(Base):
     as_of_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     rubric_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     tags: Mapped[list[str]] = mapped_column(PGJSONB, nullable=False, default=list)
-    project_id: Mapped[int] = mapped_column(
-        ForeignKey("user_project.id", ondelete="RESTRICT"), nullable=False
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="RESTRICT"), nullable=False
     )
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=true()
@@ -5652,14 +5704,14 @@ class BenchmarkQuestion(Base):
         onupdate=func.now(),
     )
 
-    project: Mapped["UserProject"] = relationship("UserProject")
+    document_set: Mapped["DocumentSet"] = relationship("DocumentSet")
     run_items: Mapped[list["BenchmarkRunItem"]] = relationship(
         "BenchmarkRunItem", back_populates="question"
     )
 
     __table_args__ = (
         Index("ix_benchmark_question_active", "is_active"),
-        Index("ix_benchmark_question_project_id", "project_id"),
+        Index("ix_benchmark_question_document_set_id", "document_set_id"),
     )
 
 

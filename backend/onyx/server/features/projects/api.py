@@ -11,14 +11,13 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import get_effective_permissions, require_permission
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
 from onyx.configs.constants import (
     PUBLIC_API_TAGS,
-    USER_FILE_PROJECT_SYNC_MAX_QUEUE_DEPTH,
     OnyxCeleryPriority,
     OnyxCeleryQueues,
     OnyxCeleryTask,
@@ -39,6 +38,9 @@ from onyx.server.features.projects.models import (
     UserFileSnapshot,
     UserProjectSnapshot,
 )
+from onyx.server.features.projects.user_file_sync import (
+    trigger_user_file_metadata_sync,
+)
 from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import get_current_tenant_id
 
@@ -50,54 +52,9 @@ router = APIRouter(prefix="/user/projects")
 
 class UserFileDeleteResult(BaseModel):
     has_associations: bool
-    project_names: list[str] = []
-    assistant_names: list[str] = []
-
-
-def _trigger_user_file_project_sync(
-    user_file_id: UUID,
-    tenant_id: str,
-    background_tasks: BackgroundTasks | None = None,
-) -> None:
-    if DISABLE_VECTOR_DB and background_tasks is not None:
-        from onyx.background.task_utils import drain_project_sync_loop
-
-        background_tasks.add_task(drain_project_sync_loop, tenant_id)
-        logger.info("Queued in-process project sync for user_file_id=%s", user_file_id)
-        return
-
-    from onyx.background.celery.tasks.user_file_processing.tasks import (
-        enqueue_user_file_project_sync_task,
-        get_user_file_project_sync_queue_depth,
-    )
-    from onyx.background.celery.versioned_apps.client import app as client_app
-    from onyx.redis.redis_pool import get_redis_client
-
-    queue_depth = get_user_file_project_sync_queue_depth(client_app)
-    if queue_depth > USER_FILE_PROJECT_SYNC_MAX_QUEUE_DEPTH:
-        logger.warning(
-            "Skipping immediate project sync for user_file_id=%s due to queue depth %s>%s. It will be picked up by beat later.",
-            user_file_id,
-            queue_depth,
-            USER_FILE_PROJECT_SYNC_MAX_QUEUE_DEPTH,
-        )
-        return
-
-    redis_client = get_redis_client(tenant_id=tenant_id)
-    enqueued = enqueue_user_file_project_sync_task(
-        celery_app=client_app,
-        redis_client=redis_client,
-        user_file_id=user_file_id,
-        tenant_id=tenant_id,
-        priority=OnyxCeleryPriority.HIGHEST,
-    )
-    if not enqueued:
-        logger.info(
-            "Skipped duplicate project sync enqueue for user_file_id=%s", user_file_id
-        )
-        return
-
-    logger.info("Triggered project sync for user_file_id=%s", user_file_id)
+    project_names: list[str] = Field(default_factory=list)
+    assistant_names: list[str] = Field(default_factory=list)
+    document_set_names: list[str] = Field(default_factory=list)
 
 
 @router.get("", tags=PUBLIC_API_TAGS)
@@ -245,7 +202,7 @@ def unlink_user_file_from_project(
         db_session.commit()
 
     tenant_id = get_current_tenant_id()
-    _trigger_user_file_project_sync(user_file.id, tenant_id, bg_tasks)
+    trigger_user_file_metadata_sync(user_file.id, tenant_id, bg_tasks)
 
     return Response(status_code=204)
 
@@ -290,7 +247,7 @@ def link_user_file_to_project(
         db_session.commit()
 
     tenant_id = get_current_tenant_id()
-    _trigger_user_file_project_sync(user_file.id, tenant_id, bg_tasks)
+    trigger_user_file_metadata_sync(user_file.id, tenant_id, bg_tasks)
 
     return UserFileSnapshot.from_model(user_file)
 
@@ -472,12 +429,18 @@ def delete_user_file(
     # Check associations with projects and assistants (personas)
     project_names = [project.name for project in user_file.projects]
     assistant_names = [assistant.name for assistant in user_file.assistants]
+    document_set_names = [
+        document_set.name
+        for document_set in user_file.document_sets
+        if not document_set.is_deleting
+    ]
 
-    if len(project_names) > 0 or len(assistant_names) > 0:
+    if project_names or assistant_names or document_set_names:
         return UserFileDeleteResult(
             has_associations=True,
             project_names=project_names,
             assistant_names=assistant_names,
+            document_set_names=document_set_names,
         )
 
     # No associations found; mark as DELETING and enqueue delete task
@@ -506,7 +469,10 @@ def delete_user_file(
         )
 
     return UserFileDeleteResult(
-        has_associations=False, project_names=[], assistant_names=[]
+        has_associations=False,
+        project_names=[],
+        assistant_names=[],
+        document_set_names=[],
     )
 
 

@@ -12,7 +12,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, selectinload
 
 from onyx.access.access import get_access_for_user_files
-from onyx.access.models import DocumentAccess, default_public_access
+from onyx.access.models import DocumentAccess
 from onyx.configs.constants import DEFAULT_BOOST, NotificationType
 from onyx.connectors.models import ConnectorStopSignal, Document
 from onyx.db.enums import UserFileStatus
@@ -20,6 +20,7 @@ from onyx.db.models import Persona, UserFile
 from onyx.db.notification import create_notification
 from onyx.db.user_file import (
     fetch_chunk_counts_for_user_files,
+    fetch_document_set_names_for_user_files,
     fetch_persona_ids_for_user_files,
     fetch_user_project_ids_for_user_files,
 )
@@ -163,6 +164,10 @@ class UserFileIndexingAdapter:
             user_file_ids=updatable_ids,
             db_session=db_session,
         )
+        user_file_id_to_document_set_names = fetch_document_set_names_for_user_files(
+            user_file_ids=updatable_ids,
+            db_session=db_session,
+        )
         user_file_id_to_access: dict[str, DocumentAccess] = get_access_for_user_files(
             user_file_ids=updatable_ids,
             db_session=db_session,
@@ -207,6 +212,7 @@ class UserFileIndexingAdapter:
             user_file_id_to_access=user_file_id_to_access,
             user_file_id_to_project_ids=user_file_id_to_project_ids,
             user_file_id_to_persona_ids=user_file_id_to_persona_ids,
+            user_file_id_to_document_set_names=user_file_id_to_document_set_names,
             doc_id_to_previous_chunk_cnt=user_file_id_to_previous_chunk_cnt,
             doc_id_to_new_chunk_cnt=dict(doc_id_to_new_chunk_cnt),
             user_file_id_to_raw_text=user_file_id_to_raw_text,
@@ -308,6 +314,7 @@ class UserFileChunkEnricher:
         user_file_id_to_access: dict[str, DocumentAccess],
         user_file_id_to_project_ids: dict[str, list[int]],
         user_file_id_to_persona_ids: dict[str, list[int]],
+        user_file_id_to_document_set_names: dict[str, list[str]],
         doc_id_to_previous_chunk_cnt: dict[str, int],
         doc_id_to_new_chunk_cnt: dict[str, int],
         user_file_id_to_raw_text: dict[str, str],
@@ -318,6 +325,7 @@ class UserFileChunkEnricher:
         self._user_file_id_to_access = user_file_id_to_access
         self._user_file_id_to_project_ids = user_file_id_to_project_ids
         self._user_file_id_to_persona_ids = user_file_id_to_persona_ids
+        self._user_file_id_to_document_set_names = user_file_id_to_document_set_names
         self._no_access = no_access
         self._tenant_id = tenant_id
         self.doc_id_to_previous_chunk_cnt = doc_id_to_previous_chunk_cnt
@@ -328,17 +336,17 @@ class UserFileChunkEnricher:
     def enrich_chunk(
         self, chunk: IndexChunk, score: float
     ) -> DocMetadataAwareIndexChunk:
-        access = (
-            default_public_access
-            if chunk.regulatory_chunk_id is not None
-            else self._user_file_id_to_access.get(
-                chunk.source_document.id, self._no_access
-            )
+        access = self._user_file_id_to_access.get(
+            chunk.source_document.id, self._no_access
         )
         return DocMetadataAwareIndexChunk.from_index_chunk(
             index_chunk=chunk,
             access=access,
-            document_sets=set(),
+            document_sets=set(
+                self._user_file_id_to_document_set_names.get(
+                    chunk.source_document.id, []
+                )
+            ),
             user_project=self._user_file_id_to_project_ids.get(
                 chunk.source_document.id, []
             ),

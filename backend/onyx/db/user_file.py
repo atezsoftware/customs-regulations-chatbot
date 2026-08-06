@@ -5,7 +5,15 @@ from sqlalchemy import exists, func, select, update
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from onyx.db.enums import UserFileStatus
-from onyx.db.models import Persona, Project__UserFile, RegulatoryChunk, User, UserFile
+from onyx.db.models import (
+    DocumentSet,
+    DocumentSet__UserFile,
+    Persona,
+    Project__UserFile,
+    RegulatoryChunk,
+    User,
+    UserFile,
+)
 
 
 def fetch_chunk_counts_for_user_files(
@@ -71,6 +79,32 @@ def fetch_user_project_ids_for_user_files(
     return user_file_id_to_project_ids
 
 
+def fetch_document_set_names_for_user_files(
+    user_file_ids: list[str],
+    db_session: Session,
+) -> dict[str, list[str]]:
+    """Fetch current document-set names for the specified user files."""
+    user_file_uuid_ids = [UUID(user_file_id) for user_file_id in user_file_ids]
+    stmt = (
+        select(DocumentSet__UserFile.user_file_id, DocumentSet.name)
+        .join(
+            DocumentSet,
+            DocumentSet.id == DocumentSet__UserFile.document_set_id,
+        )
+        .where(DocumentSet__UserFile.user_file_id.in_(user_file_uuid_ids))
+        .where(DocumentSet.is_deleting.is_(False))
+    )
+    rows = db_session.execute(stmt).all()
+
+    user_file_id_to_document_set_names: dict[str, list[str]] = {
+        user_file_id: [] for user_file_id in user_file_ids
+    }
+    for user_file_id, document_set_name in rows:
+        user_file_id_to_document_set_names[str(user_file_id)].append(document_set_name)
+
+    return user_file_id_to_document_set_names
+
+
 def fetch_persona_ids_for_user_files(
     user_file_ids: list[str],
     db_session: Session,
@@ -112,6 +146,10 @@ def get_user_file_by_id(
     return db_session.query(UserFile).filter(UserFile.id == user_file_id).first()
 
 
+def get_user_file_by_file_id(file_id: str, db_session: Session) -> UserFile | None:
+    return db_session.query(UserFile).filter(UserFile.file_id == file_id).first()
+
+
 def get_file_id_by_user_file_id(user_file_id: str, db_session: Session) -> str | None:
     """Resolve a `UserFile.id` to its underlying `FileRecord.file_id`.
 
@@ -137,7 +175,7 @@ def fetch_user_files_with_access_relationships(
     db_session: Session,
     eager_load_groups: bool = False,
 ) -> list[UserFile]:
-    """Fetch user files with the owner and assistant relationships
+    """Fetch user files with the owner, assistant, and document-set relationships
     eagerly loaded (needed for computing access control).
 
     When eager_load_groups is True, Persona.groups is also loaded so that
@@ -154,6 +192,11 @@ def fetch_user_files_with_access_relationships(
         .options(
             joinedload(UserFile.user),
             selectinload(UserFile.assistants).options(*persona_sub_options),
+            selectinload(UserFile.document_sets).options(
+                joinedload(DocumentSet.creator),
+                selectinload(DocumentSet.users),
+                selectinload(DocumentSet.groups),
+            ),
         )
         .filter(UserFile.id.in_(user_file_ids))
         .all()

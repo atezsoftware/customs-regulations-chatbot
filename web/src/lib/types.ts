@@ -448,6 +448,8 @@ export interface DocumentSetSummary {
   is_public: boolean;
   users: string[];
   groups: number[];
+  file_count: number;
+  is_deleting: boolean;
   federated_connector_summaries: FederatedConnectorSummary[];
 }
 

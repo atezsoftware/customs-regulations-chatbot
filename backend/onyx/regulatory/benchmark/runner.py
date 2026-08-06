@@ -293,7 +293,6 @@ def _generate_item_answer(
         user_id=user.id,
         persona_id=persona.id if persona else None,
         llm_override=override,
-        project_id=item.question.project_id,
     )
     as_of_date_value = item.question_snapshot.get("as_of_date")
     as_of_date = (
@@ -303,7 +302,10 @@ def _generate_item_answer(
         message=str(item.question_snapshot.get("prompt") or item.question.prompt),
         chat_session_id=chat_session.id,
         llm_override=override,
-        internal_search_filters=BaseFilters(as_of_date=as_of_date),
+        internal_search_filters=BaseFilters(
+            document_set=[item.question.document_set.name],
+            as_of_date=as_of_date,
+        ),
         deep_research=run.deep_research,
         stream=True,
         include_citations=True,

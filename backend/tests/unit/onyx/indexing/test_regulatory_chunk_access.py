@@ -4,7 +4,7 @@ from onyx.access.models import DocumentAccess
 from onyx.indexing.adapters.user_file_indexing_adapter import UserFileChunkEnricher
 
 
-def test_regulatory_user_file_chunks_are_enriched_as_public() -> None:
+def test_regulatory_user_file_chunks_use_file_acl_and_document_sets() -> None:
     private_access = DocumentAccess.build(
         user_emails=["owner@example.com"],
         user_groups=[],
@@ -16,6 +16,7 @@ def test_regulatory_user_file_chunks_are_enriched_as_public() -> None:
         user_file_id_to_access={"file-id": private_access},
         user_file_id_to_project_ids={},
         user_file_id_to_persona_ids={},
+        user_file_id_to_document_set_names={"file-id": ["Private regulations"]},
         doc_id_to_previous_chunk_cnt={},
         doc_id_to_new_chunk_cnt={},
         user_file_id_to_raw_text={},
@@ -33,4 +34,5 @@ def test_regulatory_user_file_chunks_are_enriched_as_public() -> None:
     ) as from_index_chunk:
         enricher.enrich_chunk(chunk, 1.0)
 
-    assert from_index_chunk.call_args.kwargs["access"].is_public is True
+    assert from_index_chunk.call_args.kwargs["access"].is_public is False
+    assert from_index_chunk.call_args.kwargs["document_sets"] == {"Private regulations"}

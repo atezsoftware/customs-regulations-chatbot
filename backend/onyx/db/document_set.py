@@ -10,20 +10,23 @@ from onyx.db.connector_credential_pair import (
     get_cc_pair_groups_for_ids,
     get_connector_credential_pairs,
 )
-from onyx.db.enums import AccessType, ConnectorCredentialPairStatus
+from onyx.db.enums import AccessType, ConnectorCredentialPairStatus, UserFileStatus
 from onyx.db.federated import create_federated_connector_document_set_mapping
 from onyx.db.models import (
     ConnectorCredentialPair,
     Document,
     DocumentByConnectorCredentialPair,
     DocumentSet__ConnectorCredentialPair,
+    DocumentSet__UserFile,
     DocumentSet__UserGroup,
     FederatedConnector__DocumentSet,
     User,
     User__UserGroup,
+    UserFile,
     UserRole,
 )
 from onyx.db.models import DocumentSet as DocumentSetDBModel
+from onyx.db.regulatory_benchmark import document_set_has_benchmark_questions
 from onyx.server.features.document_set.models import (
     DocumentSetCreationRequest,
     DocumentSetUpdateRequest,
@@ -33,8 +36,16 @@ from onyx.utils.variable_functionality import fetch_versioned_implementation
 
 logger = setup_logger()
 
+_USER_FILE_DOCUMENT_SET_SYNCABLE_STATUSES = (
+    UserFileStatus.PROCESSING,
+    UserFileStatus.INDEXING,
+    UserFileStatus.COMPLETED,
+    UserFileStatus.FAILED,
+)
+
 
 def _add_user_filters(stmt: Select, user: User, get_editable: bool = True) -> Select:
+    stmt = stmt.where(DocumentSetDBModel.is_deleting.is_(False))
     if user.role == UserRole.ADMIN:
         return stmt
 
@@ -65,21 +76,28 @@ def _add_user_filters(stmt: Select, user: User, get_editable: bool = True) -> Se
         where_clause = DocumentSetDBModel.is_public == True  # noqa: E712
         return stmt.where(where_clause)
 
-    where_clause = User__UserGroup.user_id == user.id
+    group_access = User__UserGroup.user_id == user.id
     if user.role == UserRole.CURATOR and get_editable:
-        where_clause &= User__UserGroup.is_curator == True  # noqa: E712
+        group_access &= User__UserGroup.is_curator == True  # noqa: E712
     if get_editable:
         user_groups = select(User__UG.user_group_id).where(User__UG.user_id == user.id)
         if user.role == UserRole.CURATOR:
             user_groups = user_groups.where(User__UG.is_curator == True)  # noqa: E712
-        where_clause &= ~exists().where(
+        group_access &= ~exists().where(
             DocumentSet__UG.document_set_id == DocumentSetDBModel.id
         ).where(~DocumentSet__UG.user_group_id.in_(user_groups)).correlate(
             DocumentSetDBModel
         )
-        where_clause |= DocumentSetDBModel.user_id == user.id
+        where_clause = or_(
+            group_access,
+            DocumentSetDBModel.user_id == user.id,
+        )
     else:
-        where_clause |= DocumentSetDBModel.is_public == True  # noqa: E712
+        where_clause = or_(
+            group_access,
+            DocumentSetDBModel.user_id == user.id,
+            DocumentSetDBModel.is_public == True,  # noqa: E712
+        )
 
     return stmt.where(where_clause)
 
@@ -105,6 +123,125 @@ def _mark_document_set_cc_pairs_as_outdated__no_commit(
     )
     for row in db_session.scalars(stmt):
         row.is_current = False
+
+
+def _mark_document_set_user_files_for_sync__no_commit(
+    db_session: Session, document_set_id: int
+) -> list[UUID]:
+    user_files = db_session.scalars(
+        select(UserFile)
+        .join(
+            DocumentSet__UserFile,
+            DocumentSet__UserFile.user_file_id == UserFile.id,
+        )
+        .where(DocumentSet__UserFile.document_set_id == document_set_id)
+        .where(UserFile.status.in_(_USER_FILE_DOCUMENT_SET_SYNCABLE_STATUSES))
+    ).all()
+    user_file_ids = [user_file.id for user_file in user_files]
+    for user_file in user_files:
+        user_file.needs_document_set_sync = True
+    return user_file_ids
+
+
+def _delete_document_set_user_files__no_commit(
+    db_session: Session, document_set_id: int
+) -> list[UUID]:
+    user_file_ids = _mark_document_set_user_files_for_sync__no_commit(
+        db_session, document_set_id
+    )
+    db_session.execute(
+        delete(DocumentSet__UserFile).where(
+            DocumentSet__UserFile.document_set_id == document_set_id
+        )
+    )
+    return user_file_ids
+
+
+def fetch_user_files_for_document_set(
+    db_session: Session, document_set_id: int
+) -> Sequence[UserFile]:
+    stmt = (
+        select(UserFile)
+        .join(
+            DocumentSet__UserFile,
+            DocumentSet__UserFile.user_file_id == UserFile.id,
+        )
+        .where(DocumentSet__UserFile.document_set_id == document_set_id)
+        .where(UserFile.status != UserFileStatus.DELETING)
+        .order_by(DocumentSet__UserFile.created_at.desc())
+    )
+    return db_session.scalars(stmt).all()
+
+
+def fetch_user_file_counts_for_document_sets(
+    db_session: Session, document_set_ids: list[int]
+) -> dict[int, int]:
+    if not document_set_ids:
+        return {}
+    rows = db_session.execute(
+        select(
+            DocumentSet__UserFile.document_set_id,
+            func.count(DocumentSet__UserFile.user_file_id),
+        )
+        .join(UserFile, UserFile.id == DocumentSet__UserFile.user_file_id)
+        .where(DocumentSet__UserFile.document_set_id.in_(document_set_ids))
+        .where(UserFile.status != UserFileStatus.DELETING)
+        .group_by(DocumentSet__UserFile.document_set_id)
+    ).all()
+    return {document_set_id: file_count for document_set_id, file_count in rows}
+
+
+def get_user_file_for_document_set_management(
+    db_session: Session, user_file_id: UUID, user: User
+) -> UserFile | None:
+    stmt = select(UserFile).where(UserFile.id == user_file_id)
+    stmt = stmt.where(UserFile.status != UserFileStatus.DELETING)
+    if user.role != UserRole.ADMIN:
+        stmt = stmt.where(UserFile.user_id == user.id)
+    return db_session.scalar(stmt)
+
+
+def link_user_file_to_document_set(
+    db_session: Session,
+    document_set_id: int,
+    user_file: UserFile,
+) -> bool:
+    existing_link = db_session.get(
+        DocumentSet__UserFile,
+        {"document_set_id": document_set_id, "user_file_id": user_file.id},
+    )
+    if existing_link is not None:
+        return False
+
+    db_session.add(
+        DocumentSet__UserFile(
+            document_set_id=document_set_id,
+            user_file_id=user_file.id,
+        )
+    )
+    if user_file.status in _USER_FILE_DOCUMENT_SET_SYNCABLE_STATUSES:
+        user_file.needs_document_set_sync = True
+    db_session.commit()
+    return True
+
+
+def unlink_user_file_from_document_set(
+    db_session: Session,
+    document_set_id: int,
+    user_file: UserFile,
+) -> bool:
+    existing_link = db_session.get(
+        DocumentSet__UserFile,
+        {"document_set_id": document_set_id, "user_file_id": user_file.id},
+    )
+    if existing_link is None:
+        return False
+
+    db_session.delete(existing_link)
+    if user_file.status in _USER_FILE_DOCUMENT_SET_SYNCABLE_STATUSES:
+        user_file.needs_document_set_sync = True
+    db_session.commit()
+    return True
 
 
 def delete_document_set_privacy__no_commit(
@@ -255,13 +392,6 @@ def insert_document_set(
     user_id: UUID | None,
     db_session: Session,
 ) -> tuple[DocumentSetDBModel, list[DocumentSet__ConnectorCredentialPair]]:
-    # Check if we have either CC pairs or federated connectors (or both)
-    if (
-        not document_set_creation_request.cc_pair_ids
-        and not document_set_creation_request.federated_connectors
-    ):
-        raise ValueError("Cannot create a document set with no connectors")
-
     if not document_set_creation_request.is_public:
         _check_if_cc_pairs_are_owned_by_groups(
             db_session=db_session,
@@ -277,7 +407,13 @@ def insert_document_set(
             description=document_set_creation_request.description,
             user_id=user_id,
             is_public=document_set_creation_request.is_public,
-            is_up_to_date=DISABLE_VECTOR_DB,
+            is_up_to_date=(
+                DISABLE_VECTOR_DB
+                or (
+                    not document_set_creation_request.cc_pair_ids
+                    and not document_set_creation_request.federated_connectors
+                )
+            ),
             time_last_modified_by_user=func.now(),
         )
         db_session.add(new_document_set_row)
@@ -330,18 +466,11 @@ def update_document_set(
     db_session: Session,
     document_set_update_request: DocumentSetUpdateRequest,
     user: User,
-) -> tuple[DocumentSetDBModel, list[DocumentSet__ConnectorCredentialPair]]:
+) -> tuple[DocumentSetDBModel, list[DocumentSet__ConnectorCredentialPair], list[UUID]]:
     """If successful, this sets document_set_row.is_up_to_date = False.
     That will be processed via Celery in check_for_vespa_sync_task
     and trigger a long running background sync to Vespa.
     """
-    # Check if we have either CC pairs or federated connectors (or both)
-    if (
-        not document_set_update_request.cc_pair_ids
-        and not document_set_update_request.federated_connectors
-    ):
-        raise ValueError("Cannot update a document set with no connectors")
-
     if not document_set_update_request.is_public:
         _check_if_cc_pairs_are_owned_by_groups(
             db_session=db_session,
@@ -416,12 +545,15 @@ def update_document_set(
                 entities=fc_config.entities,
             )
 
+        user_file_ids_to_sync = _mark_document_set_user_files_for_sync__no_commit(
+            db_session, document_set_row.id
+        )
         db_session.commit()
     except Exception:
         db_session.rollback()
         raise
 
-    return document_set_row, ds_cc_pairs
+    return document_set_row, ds_cc_pairs, user_file_ids_to_sync
 
 
 def mark_document_set_as_synced(document_set_id: int, db_session: Session) -> None:
@@ -454,7 +586,7 @@ def mark_document_set_as_to_be_deleted(
     db_session: Session,
     document_set_id: int,
     user: User,
-) -> None:
+) -> list[UUID]:
     """Cleans up all document_set -> cc_pair relationships and marks the document set
     as needing an update. The actual document set row will be deleted by the background
     job which syncs these changes to Vespa."""
@@ -474,6 +606,11 @@ def mark_document_set_as_to_be_deleted(
         if not document_set_row.is_up_to_date:
             raise ValueError(
                 "Cannot delete document set while it is syncing. Please wait for it to finish syncing, and then try again."
+            )
+        if document_set_has_benchmark_questions(db_session, document_set_id):
+            raise ValueError(
+                "Cannot delete a document set with benchmark questions. "
+                "Delete or move its benchmark questions first."
             )
 
         # delete all relationships to CC pairs
@@ -496,10 +633,16 @@ def mark_document_set_as_to_be_deleted(
             document_set_id=document_set_id, db_session=db_session
         )
 
-        # mark the row as needing a sync, it will be deleted there since there
-        # are no more relationships to cc pairs
+        user_file_ids_to_sync = _delete_document_set_user_files__no_commit(
+            db_session, document_set_id
+        )
+
+        # The sync monitor uses this explicit state to distinguish deletion from
+        # a valid empty or upload-only document set.
+        document_set_row.is_deleting = True
         document_set_row.is_up_to_date = False
         db_session.commit()
+        return user_file_ids_to_sync
     except Exception:
         db_session.rollback()
         raise

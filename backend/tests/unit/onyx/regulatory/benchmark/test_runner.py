@@ -1,16 +1,20 @@
 import datetime
+import time
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
 from onyx.db.enums import BenchmarkRunItemStatus, BenchmarkRunStatus
-from onyx.db.models import BenchmarkRun
+from onyx.db.models import BenchmarkRun, BenchmarkRunItem, User
 from onyx.llm.cost import ModelPrice
 from onyx.regulatory.benchmark.models import BenchmarkJudgeResult
 from onyx.regulatory.benchmark.runner import (
     _citation_metrics,
+    _generate_item_answer,
     _mark_unfinished_items_error,
     _recover_interrupted_items,
     _run_item,
@@ -186,6 +190,71 @@ def test_usage_snapshots_keep_every_production_chat_llm_cycle() -> None:
             "flow": "chat_response",
         },
     ]
+
+
+def test_answer_generation_scopes_search_to_document_set_without_project() -> None:
+    chat_session_id = uuid4()
+    response = SimpleNamespace(
+        error_msg=None,
+        answer="scoped answer",
+        pre_answer_reasoning=None,
+        message_id=uuid4(),
+    )
+    item = SimpleNamespace(
+        id=42,
+        provider="OpenRouter",
+        model_id="candidate-model",
+        question=SimpleNamespace(
+            prompt="fallback prompt",
+            document_set=SimpleNamespace(name="Current Regulations"),
+        ),
+        question_snapshot={
+            "prompt": "Which rule applies?",
+            "as_of_date": "2026-08-06",
+            "expected_citations": [],
+        },
+    )
+    run = SimpleNamespace(id=7, deep_research=False)
+    user = SimpleNamespace(id=uuid4())
+    db_session = MagicMock()
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.create_chat_session",
+            return_value=SimpleNamespace(id=chat_session_id),
+        ) as create_chat_session,
+        patch(
+            "onyx.regulatory.benchmark.runner.benchmark_usage_capture",
+            return_value=nullcontext([]),
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.handle_stream_message_objects",
+            return_value=iter(()),
+        ) as handle_stream,
+        patch(
+            "onyx.regulatory.benchmark.runner.gather_stream_full",
+            return_value=response,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner._usage_cost",
+            return_value=(0, 0, None, "unavailable"),
+        ),
+    ):
+        _generate_item_answer(
+            db_session,
+            run=cast(BenchmarkRun, run),
+            item=cast(BenchmarkRunItem, item),
+            user=cast(User, user),
+            persona=None,
+            started=time.monotonic(),
+        )
+
+    assert "project_id" not in create_chat_session.call_args.kwargs
+    request = handle_stream.call_args.args[0]
+    assert request.internal_search_filters is not None
+    assert request.internal_search_filters.document_set == ["Current Regulations"]
+    assert request.internal_search_filters.as_of_date == datetime.date(2026, 8, 6)
+    db_session.commit.assert_called_once_with()
 
 
 def test_redelivery_recovers_running_items_without_discarding_saved_answer() -> None:

@@ -24,12 +24,12 @@ from onyx.db.regulatory_chunks import make_regulatory_chunk_id
 def create_batch(
     db_session: Session,
     *,
-    project_id: int,
+    document_set_id: int,
     raw_text: str,
     created_by: UUID | None,
 ) -> AmendmentBatch:
     batch = AmendmentBatch(
-        project_id=project_id,
+        document_set_id=document_set_id,
         raw_text=raw_text,
         created_by=created_by,
     )
@@ -42,12 +42,12 @@ def get_batch(db_session: Session, batch_id: int) -> AmendmentBatch | None:
     return db_session.get(AmendmentBatch, batch_id)
 
 
-def list_batches_for_project(
-    db_session: Session, project_id: int
+def list_batches_for_document_set(
+    db_session: Session, document_set_id: int
 ) -> list[AmendmentBatch]:
     stmt = (
         select(AmendmentBatch)
-        .where(AmendmentBatch.project_id == project_id)
+        .where(AmendmentBatch.document_set_id == document_set_id)
         .order_by(AmendmentBatch.created_at.desc())
     )
     return list(db_session.scalars(stmt).all())

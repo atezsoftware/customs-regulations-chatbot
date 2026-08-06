@@ -7,7 +7,7 @@ import SvgBarChart from "@opal/icons/bar-chart";
 import { SettingsLayouts, toast } from "@opal/layouts";
 
 import MinimalMarkdown from "@/components/chat/MinimalMarkdown";
-import { useProjects } from "@/lib/projects/hooks";
+import { useDocumentSets } from "@/lib/hooks/useDocumentSets";
 import {
   BenchmarkAvailableModel,
   BenchmarkCitationOption,
@@ -32,7 +32,7 @@ const inputClass =
   "w-full rounded-lg border border-border-02 bg-background px-3 py-2 text-sm text-text-04 outline-none transition focus:border-action-link-05 focus:ring-2 focus:ring-action-link-01";
 const panelClass = "rounded-xl border border-border-02 bg-background p-5";
 
-type QuestionDraft = Omit<BenchmarkQuestionInput, "project_id">;
+type QuestionDraft = Omit<BenchmarkQuestionInput, "document_set_id">;
 
 const emptyQuestion: QuestionDraft = {
   title: "",
@@ -107,11 +107,11 @@ function Metric({ label, value }: { label: string; value: string }) {
 }
 
 function QuestionsPanel() {
-  const { projects } = useProjects();
+  const { documentSets } = useDocumentSets();
   const [questions, setQuestions] = useState<BenchmarkQuestion[]>([]);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState<QuestionDraft>(emptyQuestion);
-  const [projectId, setProjectId] = useState<string>("");
+  const [documentSetId, setDocumentSetId] = useState<string>("");
   const [factsText, setFactsText] = useState("");
   const [tagsText, setTagsText] = useState("");
   const [citationOptions, setCitationOptions] = useState<
@@ -136,18 +136,18 @@ function QuestionsPanel() {
   }, [refresh]);
 
   useEffect(() => {
-    if (!projectId) {
+    if (!documentSetId) {
       setCitationOptions([]);
       return;
     }
-    void listBenchmarkCitationOptions(Number(projectId))
+    void listBenchmarkCitationOptions(Number(documentSetId))
       .then(setCitationOptions)
       .catch((error: unknown) =>
         toast.error(
           error instanceof Error ? error.message : "Citations could not load."
         )
       );
-  }, [projectId]);
+  }, [documentSetId]);
 
   const optionMap = useMemo(
     () => new Map(citationOptions.map((option) => [option.chunk_id, option])),
@@ -175,7 +175,7 @@ function QuestionsPanel() {
     setForm(emptyQuestion);
     setFactsText("");
     setTagsText("");
-    setProjectId("");
+    setDocumentSetId("");
     setCitationSearch("");
   }, []);
 
@@ -197,7 +197,7 @@ function QuestionsPanel() {
     });
     setFactsText(question.expected_facts.join("\n"));
     setTagsText(question.tags.join(", "));
-    setProjectId(String(question.project_id));
+    setDocumentSetId(String(question.document_set_id));
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, []);
 
@@ -214,7 +214,7 @@ function QuestionsPanel() {
   };
 
   const save = useCallback(async () => {
-    if (!projectId || !form.title.trim() || !form.prompt.trim()) return;
+    if (!documentSetId || !form.title.trim() || !form.prompt.trim()) return;
     setSaving(true);
     const input: BenchmarkQuestionInput = {
       ...form,
@@ -222,7 +222,7 @@ function QuestionsPanel() {
       prompt: form.prompt.trim(),
       reference_answer: form.reference_answer?.trim() || null,
       rubric_notes: form.rubric_notes?.trim() || null,
-      project_id: Number(projectId),
+      document_set_id: Number(documentSetId),
       expected_facts: splitLines(factsText),
       tags: tagsText
         .split(",")
@@ -242,7 +242,7 @@ function QuestionsPanel() {
     } finally {
       setSaving(false);
     }
-  }, [editingId, factsText, form, projectId, refresh, reset, tagsText]);
+  }, [documentSetId, editingId, factsText, form, refresh, reset, tagsText]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -279,24 +279,24 @@ function QuestionsPanel() {
               />
             </Field>
             <Field
-              label="Directory"
-              hint="The production chat run is scoped here."
+              label="Document Set"
+              hint="The production chat run is scoped to this document set."
             >
               <select
                 className={inputClass}
-                value={projectId}
+                value={documentSetId}
                 onChange={(event) => {
-                  setProjectId(event.target.value);
+                  setDocumentSetId(event.target.value);
                   setForm((current) => ({
                     ...current,
                     expected_citations: [],
                   }));
                 }}
               >
-                <option value="">Select directory</option>
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.name}
+                <option value="">Select document set</option>
+                {documentSets.map((documentSet) => (
+                  <option key={documentSet.id} value={documentSet.id}>
+                    {documentSet.name}
                   </option>
                 ))}
               </select>
@@ -352,13 +352,13 @@ function QuestionsPanel() {
                   Expected citations
                 </div>
                 <div className="text-xs text-text-02">
-                  Select exact chunks from the directory. Required citations
+                  Select exact chunks from the document set. Required citations
                   affect deterministic recall and judge scoring.
                 </div>
               </div>
-              {!projectId ? (
+              {!documentSetId ? (
                 <div className="text-sm text-text-02">
-                  Select a directory to browse its chunks.
+                  Select a document set to browse its chunks.
                 </div>
               ) : (
                 <>
@@ -517,7 +517,10 @@ function QuestionsPanel() {
           <Button
             onClick={() => void save()}
             disabled={
-              saving || !projectId || !form.title.trim() || !form.prompt.trim()
+              saving ||
+              !documentSetId ||
+              !form.title.trim() ||
+              !form.prompt.trim()
             }
           >
             {saving
@@ -554,7 +557,7 @@ function QuestionsPanel() {
                     {question.prompt}
                   </div>
                   <div className="mt-2 text-xs text-text-02">
-                    {question.project_name}
+                    {question.document_set_name}
                     {question.as_of_date
                       ? ` · as of ${question.as_of_date}`
                       : ""}

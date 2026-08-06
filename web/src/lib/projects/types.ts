@@ -40,11 +40,13 @@ export interface UserFileDeleteResult {
   has_associations: boolean;
   project_names: string[];
   assistant_names: string[];
+  document_set_names: string[];
 }
 
 export enum UserFileStatus {
   UPLOADING = "UPLOADING", //UI only
   PROCESSING = "PROCESSING",
+  INDEXING = "INDEXING",
   COMPLETED = "COMPLETED",
   SKIPPED = "SKIPPED",
   FAILED = "FAILED",

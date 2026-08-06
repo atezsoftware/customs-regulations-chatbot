@@ -24,7 +24,10 @@ from onyx.db.models import (
     User,
     UserFile,
 )
-from onyx.db.user_file import fetch_user_files_with_access_relationships
+from onyx.db.user_file import (
+    fetch_user_files_with_access_relationships,
+    get_user_file_by_file_id,
+)
 from onyx.utils.variable_functionality import (
     fetch_ee_implementation_or_noop,
     fetch_versioned_implementation,
@@ -202,7 +205,8 @@ def build_access_for_user_files_impl(
 
 def collect_user_file_access(user_file: UserFile) -> tuple[set[str], bool]:
     """Collect all user emails that should have access to this user file.
-    Includes the owner plus any users who have access via shared personas.
+    Includes the owner plus users who have access via shared personas or
+    document sets.
     Returns (emails, is_public)."""
     emails: set[str] = {user_file.user.email}
     is_public = False
@@ -214,6 +218,15 @@ def collect_user_file_access(user_file: UserFile) -> tuple[set[str], bool]:
         if persona.user_id is not None and persona.user:
             emails.add(persona.user.email)
         for shared_user in persona.users:
+            emails.add(shared_user.email)
+    for document_set in user_file.document_sets:
+        if document_set.is_deleting:
+            continue
+        if document_set.is_public:
+            is_public = True
+        if document_set.creator is not None:
+            emails.add(document_set.creator.email)
+        for shared_user in document_set.users:
             emails.add(shared_user.email)
     return emails, is_public
 
@@ -247,6 +260,14 @@ def user_can_access_chat_file(file_id: str, user: User, db_session: Session) -> 
 
     if _user_can_access_persona_attached_file(file_id, user, db_session):
         return True
+
+    user_file = get_user_file_by_file_id(file_id, db_session)
+    if user_file is not None:
+        access = get_access_for_user_files([str(user_file.id)], db_session).get(
+            str(user_file.id)
+        )
+        if access is not None and access.to_acl() & get_acl_for_user(user, db_session):
+            return True
 
     chat_file_stmt = (
         select(ChatMessage.id)

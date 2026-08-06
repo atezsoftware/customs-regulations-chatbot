@@ -2,7 +2,7 @@
 
 import { PageLoader } from "@opal/layouts";
 import { PageSelector } from "@/components/PageSelector";
-import { SvgInfo, SvgPlusCircle } from "@opal/icons";
+import { SvgFileText, SvgInfo, SvgPlusCircle } from "@opal/icons";
 import {
   Table,
   TableHead,
@@ -118,19 +118,19 @@ const EditRow = ({
     <div className="relative flex">
       <Tooltip
         tooltip={
-          !documentSet.is_up_to_date
-            ? "Cannot update while syncing! Wait for the sync to finish, then try again."
+          documentSet.is_deleting
+            ? "This document set is being deleted."
             : undefined
         }
       >
         <div
           className={`
               text-text-darker font-medium my-auto p-1 hover:bg-accent-background flex items-center select-none
-              ${documentSet.is_up_to_date ? "cursor-pointer" : "cursor-default"}
+              ${documentSet.is_deleting ? "cursor-default" : "cursor-pointer"}
             `}
           style={{ wordBreak: "normal", overflowWrap: "break-word" }}
           onClick={() => {
-            if (documentSet.is_up_to_date) {
+            if (!documentSet.is_deleting) {
               router.push(`/admin/documents/sets/${documentSet.id}`);
             }
           }}
@@ -183,7 +183,7 @@ const DocumentSetTable = ({
         <TableHeader>
           <TableRow>
             <TableHead>Name</TableHead>
-            <TableHead>Connectors</TableHead>
+            <TableHead>Sources</TableHead>
             <TableHead>Status</TableHead>
             <TableHead>Public</TableHead>
             <TableHead>Delete</TableHead>
@@ -266,23 +266,34 @@ const DocumentSetTable = ({
                             )}
                           </>
                         )}
+
+                      {documentSet.file_count > 0 && (
+                        <div
+                          className={
+                            documentSet.cc_pair_summaries.length > 0 ||
+                            documentSet.federated_connector_summaries.length > 0
+                              ? "mt-3 flex items-center text-xs font-medium text-text-03"
+                              : "flex items-center text-xs font-medium text-text-03"
+                          }
+                        >
+                          <SvgFileText className="mr-1 h-4 w-4" />
+                          {`${documentSet.file_count} uploaded ${documentSet.file_count === 1 ? "file" : "files"}`}
+                        </div>
+                      )}
                     </div>
                   </TableCell>
                   <TableCell>
-                    {documentSet.is_up_to_date ? (
+                    {documentSet.is_deleting ? (
+                      <Badge variant="destructive" icon={FiAlertTriangle}>
+                        Deleting
+                      </Badge>
+                    ) : documentSet.is_up_to_date ? (
                       <Badge variant="success" icon={FiCheckCircle}>
                         Up to Date
                       </Badge>
-                    ) : documentSet.cc_pair_summaries.length > 0 ||
-                      (documentSet.federated_connector_summaries &&
-                        documentSet.federated_connector_summaries.length >
-                          0) ? (
+                    ) : (
                       <Badge variant="in_progress" icon={FiClock}>
                         Syncing
-                      </Badge>
-                    ) : (
-                      <Badge variant="destructive" icon={FiAlertTriangle}>
-                        Deleting
                       </Badge>
                     )}
                   </TableCell>

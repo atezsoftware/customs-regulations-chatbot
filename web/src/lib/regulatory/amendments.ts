@@ -1,6 +1,6 @@
 export interface AmendmentBatch {
   id: number;
-  project_id: number;
+  document_set_id: number;
   raw_text: string;
   reference_date: string | null;
   status: "analyzing" | "analyzed" | "failed";
@@ -41,13 +41,16 @@ const handleRequestError = (action: string, response: Response): never => {
 };
 
 export async function analyzeAmendment(
-  projectId: number,
+  documentSetId: number,
   rawText: string
 ): Promise<AnalyzeAmendmentResponse> {
   const response = await fetch("/api/regulatory/amendments/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project_id: projectId, raw_text: rawText }),
+    body: JSON.stringify({
+      document_set_id: documentSetId,
+      raw_text: rawText,
+    }),
   });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
@@ -59,10 +62,10 @@ export async function analyzeAmendment(
 }
 
 export async function listAmendmentBatches(
-  projectId: number
+  documentSetId: number
 ): Promise<AmendmentBatch[]> {
   const response = await fetch(
-    `/api/regulatory/amendments/batches?project_id=${projectId}`
+    `/api/regulatory/amendments/batches?document_set_id=${documentSetId}`
   );
   if (!response.ok) {
     handleRequestError("List amendment batches", response);

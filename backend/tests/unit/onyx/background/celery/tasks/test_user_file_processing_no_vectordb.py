@@ -58,6 +58,8 @@ def _make_user_file(
     uf.assistants = []
     uf.needs_project_sync = True
     uf.needs_persona_sync = True
+    uf.needs_document_set_sync = False
+    uf.secondary_reconcile_pending = False
     return uf
 
 
@@ -466,3 +468,33 @@ class TestProjectSyncImplNoVectorDb:
         mock_get_session.assert_called_once_with()
         session.add.assert_not_called()
         session.commit.assert_not_called()
+
+    @patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", True)
+    @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
+    def test_failed_document_set_sync_clears_only_document_set_flag(
+        self,
+        mock_get_session: MagicMock,
+    ) -> None:
+        uf = _make_user_file(status=UserFileStatus.FAILED)
+        uf.needs_document_set_sync = True
+        uf.secondary_reconcile_pending = True
+        session = MagicMock()
+        session.get.return_value = uf
+        mock_get_session.return_value.__enter__.return_value = session
+
+        with patch(
+            f"{TASKS_MODULE}.fetch_user_files_with_access_relationships",
+            return_value=[uf],
+        ):
+            project_sync_user_file_impl(
+                user_file_id=str(uf.id),
+                tenant_id="test-tenant",
+                redis_locking=False,
+            )
+
+        assert uf.needs_document_set_sync is False
+        assert uf.needs_project_sync is True
+        assert uf.needs_persona_sync is True
+        assert uf.secondary_reconcile_pending is True
+        session.add.assert_called_once_with(uf)
+        session.commit.assert_called_once()

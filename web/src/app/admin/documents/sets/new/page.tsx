@@ -49,9 +49,13 @@ function Main() {
         <DocumentSetCreationForm
           ccPairs={ccPairs ?? []}
           userGroups={userGroups}
-          onClose={() => {
+          onClose={(createdDocumentSetId) => {
             refreshDocumentSets();
-            router.push("/admin/documents/sets");
+            router.push(
+              createdDocumentSetId === undefined
+                ? "/admin/documents/sets"
+                : `/admin/documents/sets/${createdDocumentSetId}`
+            );
           }}
         />
       </CardSection>

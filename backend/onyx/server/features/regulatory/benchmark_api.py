@@ -17,10 +17,11 @@ from onyx.configs.constants import (
     OnyxCeleryQueues,
     OnyxCeleryTask,
 )
+from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import BenchmarkRunStatus, Permission
 from onyx.db.llm import fetch_existing_llm_provider, fetch_existing_llm_providers
-from onyx.db.models import BenchmarkQuestion, RegulatoryChunk, User, UserProject
+from onyx.db.models import BenchmarkQuestion, DocumentSet, RegulatoryChunk, User
 from onyx.db.regulatory_benchmark import (
     cancel_benchmark_run,
     claim_stale_benchmark_runs_for_recovery,
@@ -54,11 +55,18 @@ router = APIRouter(prefix="/regulatory/benchmark")
 logger = setup_logger()
 
 
-def _get_project(db_session: Session, project_id: int) -> UserProject:
-    project = db_session.get(UserProject, project_id)
-    if project is None:
-        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Directory not found")
-    return project
+def _get_editable_document_set(
+    db_session: Session, document_set_id: int, user: User
+) -> DocumentSet:
+    document_set = get_document_set_by_id_for_user(
+        db_session=db_session,
+        document_set_id=document_set_id,
+        user=user,
+        get_editable=True,
+    )
+    if document_set is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Document set not found")
+    return document_set
 
 
 def _enqueue_benchmark_run(run_id: int) -> None:
@@ -113,10 +121,12 @@ def _validate_model(db_session: Session, selection: BenchmarkModelSelection) -> 
 def _expected_citation_snapshots(
     db_session: Session,
     *,
-    project: UserProject,
+    document_set: DocumentSet,
     citations: list[BenchmarkExpectedCitationInput | dict[str, object]],
 ) -> list[dict[str, object]]:
-    project_files = {user_file.id: user_file for user_file in project.user_files}
+    document_set_files = {
+        user_file.id: user_file for user_file in document_set.user_files
+    }
     snapshots: list[dict[str, object]] = []
     seen: set[str] = set()
     for raw_citation in citations:
@@ -129,12 +139,12 @@ def _expected_citation_snapshots(
         if chunk_id in seen:
             continue
         chunk = get_chunk_by_id(db_session, chunk_id)
-        if chunk is None or chunk.user_file_id not in project_files:
+        if chunk is None or chunk.user_file_id not in document_set_files:
             raise OnyxError(
                 OnyxErrorCode.INVALID_INPUT,
-                f"Expected citation '{chunk_id}' is not in the selected directory",
+                f"Expected citation '{chunk_id}' is not in the selected document set",
             )
-        user_file = project_files[chunk.user_file_id]
+        user_file = document_set_files[chunk.user_file_id]
         snapshots.append(
             {
                 "chunk_id": chunk.id,
@@ -179,17 +189,15 @@ def list_models(
     return sorted(models, key=lambda model: (model.provider, model.model_id.lower()))
 
 
-@router.get("/projects/{project_id}/citation-options", tags=PUBLIC_API_TAGS)
+@router.get("/document-sets/{document_set_id}/citation-options", tags=PUBLIC_API_TAGS)
 def list_citation_options(
-    project_id: int,
-    user: User = Depends(  # noqa: ARG001
-        require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)
-    ),
+    document_set_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> list[BenchmarkCitationOption]:
-    project = _get_project(db_session, project_id)
+    document_set = _get_editable_document_set(db_session, document_set_id, user)
     options: list[BenchmarkCitationOption] = []
-    for user_file in project.user_files:
+    for user_file in document_set.user_files:
         chunks = (
             db_session.query(RegulatoryChunk)
             .filter(RegulatoryChunk.user_file_id == user_file.id)
@@ -232,7 +240,7 @@ def create_question(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> BenchmarkQuestionSnapshot:
-    project = _get_project(db_session, request.project_id)
+    document_set = _get_editable_document_set(db_session, request.document_set_id, user)
     values = request.model_dump(exclude={"expected_citations"})
     values["title"] = request.title.strip()
     values["prompt"] = request.prompt.strip()
@@ -244,7 +252,9 @@ def create_question(
     ]
     values["tags"] = [tag.strip() for tag in request.tags if tag.strip()]
     values["expected_citations"] = _expected_citation_snapshots(
-        db_session, project=project, citations=list(request.expected_citations)
+        db_session,
+        document_set=document_set,
+        citations=list(request.expected_citations),
     )
     question = BenchmarkQuestion(**values, created_by=user.id, updated_by=user.id)
     db_session.add(question)
@@ -264,13 +274,17 @@ def update_question(
     if question is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Benchmark question not found")
     updates = request.model_dump(exclude_unset=True)
-    target_project = _get_project(
-        db_session, int(updates.get("project_id", question.project_id))
+    target_document_set = _get_editable_document_set(
+        db_session,
+        int(updates.get("document_set_id", question.document_set_id)),
+        user,
     )
     citation_values = updates.pop("expected_citations", question.expected_citations)
-    if "project_id" in updates or "expected_citations" in request.model_fields_set:
+    if "document_set_id" in updates or "expected_citations" in request.model_fields_set:
         updates["expected_citations"] = _expected_citation_snapshots(
-            db_session, project=target_project, citations=list(citation_values or [])
+            db_session,
+            document_set=target_document_set,
+            citations=list(citation_values or []),
         )
     for text_field in ("title", "prompt", "reference_answer", "rubric_notes"):
         if isinstance(updates.get(text_field), str):
@@ -334,7 +348,7 @@ def create_run(
             "Too many benchmark questions selected; choose a smaller explicit set",
         )
     for question in questions:
-        _get_project(db_session, question.project_id)
+        _get_editable_document_set(db_session, question.document_set_id, user)
     unique_candidates = list(
         dict.fromkeys(
             (candidate.provider, candidate.model_id) for candidate in request.candidates

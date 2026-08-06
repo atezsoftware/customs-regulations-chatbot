@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+import json
+from uuid import UUID
+
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
@@ -9,15 +12,26 @@ from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryTask
 from onyx.db.document_set import (
     check_document_sets_are_public,
     fetch_all_document_sets_for_user,
+    fetch_user_file_counts_for_document_sets,
+    fetch_user_files_for_document_set,
     get_document_set_by_id,
+    get_document_set_by_id_for_user,
+    get_user_file_for_document_set_management,
     insert_document_set,
+    link_user_file_to_document_set,
     mark_document_set_as_to_be_deleted,
+    unlink_user_file_from_document_set,
     update_document_set,
 )
 from onyx.db.document_set import delete_document_set as db_delete_document_set
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
+from onyx.db.models import DocumentSet as DocumentSetDBModel
 from onyx.db.models import User
+from onyx.db.projects import upload_files_to_user_files_with_indexing
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
+from onyx.file_processing.import_capability import ensure_document_import_available
 from onyx.server.features.document_set.models import (
     CheckDocSetPublicRequest,
     CheckDocSetPublicResponse,
@@ -25,10 +39,31 @@ from onyx.server.features.document_set.models import (
     DocumentSetSummary,
     DocumentSetUpdateRequest,
 )
+from onyx.server.features.projects.models import (
+    CategorizedFilesSnapshot,
+    UserFileSnapshot,
+)
+from onyx.server.features.projects.user_file_sync import (
+    trigger_user_file_metadata_sync,
+)
 from onyx.utils.variable_functionality import fetch_ee_implementation_or_noop
 from shared_configs.contextvars import get_current_tenant_id
 
 router = APIRouter(prefix="/manage")
+
+
+def _get_editable_document_set_or_raise(
+    document_set_id: int, user: User, db_session: Session
+) -> DocumentSetDBModel:
+    document_set = get_document_set_by_id_for_user(
+        db_session=db_session,
+        document_set_id=document_set_id,
+        user=user,
+        get_editable=True,
+    )
+    if document_set is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Document set not found")
+    return document_set
 
 
 @router.post("/admin/document-set")
@@ -54,7 +89,7 @@ def create_document_set(
             db_session=db_session,
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e)) from e
 
     if not DISABLE_VECTOR_DB:
         client_app.send_task(
@@ -69,15 +104,16 @@ def create_document_set(
 @router.patch("/admin/document-set")
 def patch_document_set(
     document_set_update_request: DocumentSetUpdateRequest,
+    bg_tasks: BackgroundTasks,
     user: User = Depends(current_curator_or_admin_user),
     db_session: Session = Depends(get_session),
     tenant_id: str = Depends(get_current_tenant_id),
 ) -> None:
     document_set = get_document_set_by_id(db_session, document_set_update_request.id)
     if document_set is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Document set {document_set_update_request.id} does not exist",
+        raise OnyxError(
+            OnyxErrorCode.NOT_FOUND,
+            f"Document set {document_set_update_request.id} does not exist",
         )
 
     fetch_ee_implementation_or_noop(
@@ -91,13 +127,16 @@ def patch_document_set(
         and (document_set.user_id is None or document_set.user_id == user.id),
     )
     try:
-        update_document_set(
+        _, _, user_file_ids_to_sync = update_document_set(
             document_set_update_request=document_set_update_request,
             db_session=db_session,
             user=user,
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e)) from e
+
+    for user_file_id in user_file_ids_to_sync:
+        trigger_user_file_metadata_sync(user_file_id, tenant_id, bg_tasks)
 
     if not DISABLE_VECTOR_DB:
         client_app.send_task(
@@ -110,15 +149,16 @@ def patch_document_set(
 @router.delete("/admin/document-set/{document_set_id}")
 def delete_document_set(
     document_set_id: int,
+    bg_tasks: BackgroundTasks,
     user: User = Depends(current_curator_or_admin_user),
     db_session: Session = Depends(get_session),
     tenant_id: str = Depends(get_current_tenant_id),
 ) -> None:
     document_set = get_document_set_by_id(db_session, document_set_id)
     if document_set is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Document set {document_set_id} does not exist",
+        raise OnyxError(
+            OnyxErrorCode.NOT_FOUND,
+            f"Document set {document_set_id} does not exist",
         )
 
     # check if the user has "edit" access to the document set.
@@ -135,13 +175,13 @@ def delete_document_set(
     )
 
     try:
-        mark_document_set_as_to_be_deleted(
+        user_file_ids_to_sync = mark_document_set_as_to_be_deleted(
             db_session=db_session,
             document_set_id=document_set_id,
             user=user,
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e)) from e
 
     if DISABLE_VECTOR_DB:
         db_session.refresh(document_set)
@@ -152,6 +192,96 @@ def delete_document_set(
             kwargs={"tenant_id": tenant_id},
             priority=OnyxCeleryPriority.HIGH,
         )
+
+    for user_file_id in user_file_ids_to_sync:
+        trigger_user_file_metadata_sync(user_file_id, tenant_id, bg_tasks)
+
+
+@router.get("/admin/document-set/{document_set_id}/files")
+def list_document_set_files(
+    document_set_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> list[UserFileSnapshot]:
+    _get_editable_document_set_or_raise(document_set_id, user, db_session)
+    user_files = fetch_user_files_for_document_set(db_session, document_set_id)
+    return [UserFileSnapshot.from_model(user_file) for user_file in user_files]
+
+
+@router.post("/admin/document-set/{document_set_id}/file/upload")
+def upload_document_set_files(
+    document_set_id: int,
+    bg_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    temp_id_map: str | None = Form(None),
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> CategorizedFilesSnapshot:
+    ensure_document_import_available()
+    _get_editable_document_set_or_raise(document_set_id, user, db_session)
+
+    parsed_temp_id_map: dict[str, str] | None = None
+    if temp_id_map:
+        try:
+            parsed = json.loads(temp_id_map)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            parsed_temp_id_map = {str(key): str(value) for key, value in parsed.items()}
+
+    categorized_files_result = upload_files_to_user_files_with_indexing(
+        files=files,
+        project_id=None,
+        document_set_id=document_set_id,
+        user=user,
+        temp_id_map=parsed_temp_id_map,
+        db_session=db_session,
+        background_tasks=bg_tasks if DISABLE_VECTOR_DB else None,
+    )
+    return CategorizedFilesSnapshot.from_result(categorized_files_result)
+
+
+@router.post("/admin/document-set/{document_set_id}/files/{file_id}")
+def link_document_set_file(
+    document_set_id: int,
+    file_id: UUID,
+    bg_tasks: BackgroundTasks,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> UserFileSnapshot:
+    _get_editable_document_set_or_raise(document_set_id, user, db_session)
+    user_file = get_user_file_for_document_set_management(db_session, file_id, user)
+    if user_file is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "File not found")
+
+    if (
+        link_user_file_to_document_set(db_session, document_set_id, user_file)
+        and user_file.needs_document_set_sync
+    ):
+        trigger_user_file_metadata_sync(user_file.id, tenant_id, bg_tasks)
+    return UserFileSnapshot.from_model(user_file)
+
+
+@router.delete("/admin/document-set/{document_set_id}/files/{file_id}")
+def unlink_document_set_file(
+    document_set_id: int,
+    file_id: UUID,
+    bg_tasks: BackgroundTasks,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> None:
+    _get_editable_document_set_or_raise(document_set_id, user, db_session)
+    user_file = get_user_file_for_document_set_management(db_session, file_id, user)
+    if user_file is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "File not found")
+
+    if (
+        unlink_user_file_from_document_set(db_session, document_set_id, user_file)
+        and user_file.needs_document_set_sync
+    ):
+        trigger_user_file_metadata_sync(user_file.id, tenant_id, bg_tasks)
 
 
 """Endpoints for non-admins"""
@@ -168,7 +298,16 @@ def list_document_sets_for_user(
     document_sets = fetch_all_document_sets_for_user(
         db_session=db_session, user=user, get_editable=get_editable
     )
-    return [DocumentSetSummary.from_model(ds) for ds in document_sets]
+    file_counts = fetch_user_file_counts_for_document_sets(
+        db_session, [document_set.id for document_set in document_sets]
+    )
+    return [
+        DocumentSetSummary.from_model(
+            document_set,
+            file_count=file_counts.get(document_set.id, 0),
+        )
+        for document_set in document_sets
+    ]
 
 
 @router.get("/document-set-public")

@@ -64,6 +64,7 @@ def test_monitor_preserves_federated_only_document_set(monkeypatch: Any) -> None
     document_set = SimpleNamespace(
         connector_credential_pairs=[],
         federated_connectors=[object()],
+        is_deleting=False,
     )
 
     calls = _setup_common_patches(monkeypatch, document_set)
@@ -81,10 +82,11 @@ def test_monitor_preserves_federated_only_document_set(monkeypatch: Any) -> None
     assert calls["deleted"] is False
 
 
-def test_monitor_deletes_document_set_with_no_connectors(monkeypatch: Any) -> None:
+def test_monitor_preserves_empty_document_set(monkeypatch: Any) -> None:
     document_set = SimpleNamespace(
         connector_credential_pairs=[],
         federated_connectors=[],
+        is_deleting=False,
     )
 
     calls = _setup_common_patches(monkeypatch, document_set)
@@ -92,6 +94,28 @@ def test_monitor_deletes_document_set_with_no_connectors(monkeypatch: Any) -> No
     vespa_tasks.monitor_document_set_taskset(
         tenant_id="tenant",
         key_bytes=b"documentset_fence_2",
+        r=SimpleNamespace(  # ty: ignore[invalid-argument-type]
+            scard=lambda key: 0  # noqa: ARG005
+        ),
+        db_session=SimpleNamespace(),  # ty: ignore[invalid-argument-type]
+    )
+
+    assert calls["deleted"] is False
+    assert calls["synced"] is True
+
+
+def test_monitor_deletes_document_set_marked_for_deletion(monkeypatch: Any) -> None:
+    document_set = SimpleNamespace(
+        connector_credential_pairs=[],
+        federated_connectors=[],
+        is_deleting=True,
+    )
+
+    calls = _setup_common_patches(monkeypatch, document_set)
+
+    vespa_tasks.monitor_document_set_taskset(
+        tenant_id="tenant",
+        key_bytes=b"documentset_fence_3",
         r=SimpleNamespace(  # ty: ignore[invalid-argument-type]
             scard=lambda key: 0  # noqa: ARG005
         ),

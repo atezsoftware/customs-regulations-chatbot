@@ -9,6 +9,8 @@ Verifies that:
 from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
 
+import pytest
+
 from onyx.background.celery.tasks.user_file_processing.tasks import (
     delete_user_file_impl,
     process_user_file_impl,
@@ -391,3 +393,117 @@ def test_lost_redis_lock_keeps_pending_when_future_target_changed() -> None:
     assert user_file.secondary_reconcile_pending is True
     assert user_file.needs_project_sync is True
     assert user_file.needs_persona_sync is True
+
+
+def test_failed_file_sync_requires_document_set_dirty_flag() -> None:
+    user_file = MagicMock()
+    user_file.id = uuid4()
+    user_file.status = UserFileStatus.FAILED
+    user_file.needs_project_sync = True
+    user_file.needs_persona_sync = True
+    user_file.needs_document_set_sync = False
+    user_file.secondary_reconcile_pending = True
+
+    session = MagicMock()
+    session_context = MagicMock()
+    session_context.__enter__.return_value = session
+
+    with (
+        patch(
+            f"{TASKS_MODULE}.get_session_with_current_tenant",
+            return_value=session_context,
+        ),
+        patch(
+            f"{TASKS_MODULE}.fetch_user_files_with_access_relationships",
+            return_value=[user_file],
+        ),
+        patch(f"{TASKS_MODULE}.get_active_search_settings") as get_search_settings,
+    ):
+        project_sync_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id="test-tenant",
+            redis_locking=False,
+        )
+
+    get_search_settings.assert_not_called()
+    session.add.assert_not_called()
+    session.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("stored_chunk_count", "regulatory_chunk_count", "expected_delete_count"),
+    [
+        (None, 3, 3),
+        (5, 3, 5),
+        (None, 0, None),
+    ],
+)
+def test_failed_document_set_sync_removes_indexed_chunks_without_reconcile(
+    stored_chunk_count: int | None,
+    regulatory_chunk_count: int,
+    expected_delete_count: int | None,
+) -> None:
+    user_file = MagicMock()
+    user_file.id = uuid4()
+    user_file.status = UserFileStatus.FAILED
+    user_file.needs_project_sync = True
+    user_file.needs_persona_sync = True
+    user_file.needs_document_set_sync = True
+    user_file.secondary_reconcile_pending = True
+    user_file.projects = []
+    user_file.assistants = []
+    user_file.chunk_count = stored_chunk_count
+
+    primary = MagicMock()
+    primary.port_backfill_source_id = None
+    active_settings = MagicMock()
+    active_settings.primary = primary
+    active_settings.secondary = MagicMock()
+    session = MagicMock()
+    session.get.return_value = user_file
+    session_context = MagicMock()
+    session_context.__enter__.return_value = session
+    retry_index = MagicMock()
+
+    with (
+        patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", False),
+        patch(
+            f"{TASKS_MODULE}.get_session_with_current_tenant",
+            return_value=session_context,
+        ),
+        patch(
+            f"{TASKS_MODULE}.fetch_user_files_with_access_relationships",
+            return_value=[user_file],
+        ),
+        patch(
+            f"{TASKS_MODULE}.get_active_search_settings",
+            return_value=active_settings,
+        ),
+        patch(f"{TASKS_MODULE}.get_all_document_indices", return_value=[MagicMock()]),
+        patch(f"{TASKS_MODULE}.RetryDocumentIndex", return_value=retry_index),
+        patch(
+            f"{TASKS_MODULE}.get_chunk_counts_for_files",
+            return_value={user_file.id: regulatory_chunk_count},
+        ),
+        patch(f"{TASKS_MODULE}.httpx_init_vespa_pool"),
+        patch(
+            f"{TASKS_MODULE}._sync_metadata_and_reconcile_secondary",
+            return_value=(False, False),
+        ) as sync_metadata,
+    ):
+        project_sync_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id="test-tenant",
+            redis_locking=False,
+        )
+
+    retry_index.delete.assert_called_once_with(
+        str(user_file.id), chunk_count=expected_delete_count
+    )
+    sync_metadata.assert_not_called()
+    assert user_file.needs_project_sync is True
+    assert user_file.needs_persona_sync is True
+    assert user_file.needs_document_set_sync is False
+    assert user_file.secondary_reconcile_pending is True
+    session.add.assert_called_once_with(user_file)
+    session.commit.assert_called_once()

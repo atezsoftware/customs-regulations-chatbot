@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from onyx.background.celery.tasks.user_file_processing.tasks import (
     _RedisLockHeartbeat,
@@ -124,6 +125,43 @@ def test_check_for_user_file_project_sync_only_fills_available_queue_slots(
         check_for_user_file_project_sync.run(tenant_id="test-tenant")
 
     assert mock_enqueue.call_count == 2
+
+
+@patch(
+    "onyx.background.celery.tasks.user_file_processing.tasks.get_user_file_project_sync_queue_depth",
+    return_value=0,
+)
+@patch(
+    "onyx.background.celery.tasks.user_file_processing.tasks.get_session_with_current_tenant"
+)
+@patch("onyx.background.celery.tasks.user_file_processing.tasks.get_redis_client")
+def test_sync_beat_selects_failed_files_only_for_document_set_sync(
+    mock_get_redis_client: MagicMock,
+    mock_get_session: MagicMock,
+    _mock_get_queue_depth: MagicMock,
+) -> None:
+    redis_client, _lock = _build_redis_mock_with_lock()
+    mock_get_redis_client.return_value = redis_client
+    session = MagicMock()
+    session.execute.return_value.scalars.return_value.all.return_value = []
+    mock_get_session.return_value.__enter__.return_value = session
+
+    with patch.object(check_for_user_file_project_sync, "app", MagicMock()):
+        check_for_user_file_project_sync.run(tenant_id="test-tenant")
+
+    statement = session.execute.call_args.args[0]
+    compiled_sql = " ".join(
+        str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        ).split()
+    )
+
+    assert (
+        "user_file.status = 'FAILED' AND user_file.needs_document_set_sync IS true"
+    ) in compiled_sql
 
 
 def test_enqueue_user_file_project_sync_task_sets_guard_and_expiry() -> None:

@@ -83,7 +83,7 @@ class UserFileRenameRequest(BaseModel):
 
 
 class AnalyzeAmendmentRequest(BaseModel):
-    project_id: int
+    document_set_id: int
     raw_text: str = Field(min_length=1)
 
 
@@ -133,7 +133,7 @@ class AmendmentProposalSnapshot(BaseModel):
 
 class AmendmentBatchSnapshot(BaseModel):
     id: int
-    project_id: int
+    document_set_id: int
     raw_text: str
     reference_date: datetime.date | None
     status: str
@@ -146,7 +146,7 @@ class AmendmentBatchSnapshot(BaseModel):
     def from_model(cls, batch: Any) -> "AmendmentBatchSnapshot":
         return cls(
             id=batch.id,
-            project_id=batch.project_id,
+            document_set_id=batch.document_set_id,
             raw_text=batch.raw_text,
             reference_date=batch.reference_date,
             status=batch.status,

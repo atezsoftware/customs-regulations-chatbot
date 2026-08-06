@@ -208,6 +208,8 @@ def test_target_projection_builds_setting_specific_index_and_embedder() -> None:
             tenant_id="tenant",
             project_ids={str(user_file.id): [5]},
             persona_ids={str(user_file.id): [7]},
+            document_set_names={str(user_file.id): ["Regulations"]},
+            user_file_access={},
             indexing_metadata=metadata,
         )
 

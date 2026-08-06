@@ -967,6 +967,7 @@ class TestSecondaryPassSkipsTerminalSideEffects:
                 user_file_id_to_access={},
                 user_file_id_to_project_ids={},
                 user_file_id_to_persona_ids={},
+                user_file_id_to_document_set_names={},
                 doc_id_to_previous_chunk_cnt={},
                 doc_id_to_new_chunk_cnt={str(uf.id): 0},
                 user_file_id_to_raw_text={},

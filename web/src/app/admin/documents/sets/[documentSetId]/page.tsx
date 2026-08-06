@@ -4,11 +4,14 @@ import { use } from "react";
 import { ErrorCallout } from "@/components/ErrorCallout";
 import { refreshDocumentSets, useDocumentSets } from "../hooks";
 import { useConnectorStatus, useUserGroups } from "@/lib/hooks";
-import { PageLoader } from "@opal/layouts";
-import { SettingsLayouts } from "@opal/layouts";
+import { PageLoader, SettingsLayouts } from "@opal/layouts";
+import { Tabs } from "@opal/components";
+import { SvgFiles, SvgSettings } from "@opal/icons";
 import { ADMIN_ROUTES } from "@/lib/admin-routes";
 import CardSection from "@/components/admin/CardSection";
 import { DocumentSetCreationForm } from "../DocumentSetCreationForm";
+import DocumentSetFiles from "@/sections/document-sets/DocumentSetFiles";
+import { useUser } from "@/providers/UserProvider";
 import { useRouter } from "next/navigation";
 import { useSettings } from "@/lib/settings/hooks";
 
@@ -16,13 +19,14 @@ const route = ADMIN_ROUTES.DOCUMENT_SETS;
 
 function Main({ documentSetId }: { documentSetId: number }) {
   const router = useRouter();
+  const { isAdmin } = useUser();
   const { vectorDbEnabled } = useSettings();
 
   const {
     data: documentSets,
     isLoading: isDocumentSetsLoading,
     error: documentSetsError,
-  } = useDocumentSets();
+  } = useDocumentSets(true);
 
   const {
     data: ccPairs,
@@ -76,17 +80,43 @@ function Main({ documentSetId }: { documentSetId: number }) {
   }
 
   return (
-    <CardSection>
-      <DocumentSetCreationForm
-        ccPairs={ccPairs ?? []}
-        userGroups={userGroups}
-        onClose={() => {
-          refreshDocumentSets();
-          router.push("/admin/documents/sets");
-        }}
-        existingDocumentSet={documentSet}
-      />
-    </CardSection>
+    <Tabs defaultValue={isAdmin ? "files" : "settings"}>
+      <Tabs.List>
+        {isAdmin && (
+          <Tabs.Trigger value="files" icon={SvgFiles}>
+            Files
+          </Tabs.Trigger>
+        )}
+        <Tabs.Trigger value="settings" icon={SvgSettings}>
+          Settings & Connectors
+        </Tabs.Trigger>
+      </Tabs.List>
+
+      {isAdmin && (
+        <Tabs.Content value="files">
+          <CardSection className="mt-4">
+            <DocumentSetFiles
+              documentSetId={documentSet.id}
+              documentSetName={documentSet.name}
+            />
+          </CardSection>
+        </Tabs.Content>
+      )}
+
+      <Tabs.Content value="settings">
+        <CardSection className="mt-4">
+          <DocumentSetCreationForm
+            ccPairs={ccPairs ?? []}
+            userGroups={userGroups}
+            onClose={() => {
+              refreshDocumentSets();
+              router.push("/admin/documents/sets");
+            }}
+            existingDocumentSet={documentSet}
+          />
+        </CardSection>
+      </Tabs.Content>
+    </Tabs>
   );
 }
 
@@ -100,7 +130,7 @@ export default function Page(props: {
     <SettingsLayouts.Root>
       <SettingsLayouts.Header
         icon={route.icon}
-        title="Edit Document Set"
+        title="Document Set"
         divider
         backButton
       />

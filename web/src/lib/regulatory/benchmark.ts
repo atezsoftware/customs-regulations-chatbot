@@ -8,8 +8,8 @@ export interface BenchmarkQuestion {
   as_of_date: string | null;
   rubric_notes: string | null;
   tags: string[];
-  project_id: number;
-  project_name: string;
+  document_set_id: number;
+  document_set_name: string;
   is_active: boolean;
   created_at: string;
   updated_at: string;
@@ -170,7 +170,7 @@ export interface BenchmarkQuestionInput {
   as_of_date: string | null;
   rubric_notes: string | null;
   tags: string[];
-  project_id: number;
+  document_set_id: number;
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -247,7 +247,7 @@ export const getBenchmarkRun = (id: number) =>
 export const listBenchmarkModels = () =>
   requestJson<BenchmarkAvailableModel[]>("/api/regulatory/benchmark/models");
 
-export const listBenchmarkCitationOptions = (projectId: number) =>
+export const listBenchmarkCitationOptions = (documentSetId: number) =>
   requestJson<BenchmarkCitationOption[]>(
-    `/api/regulatory/benchmark/projects/${projectId}/citation-options`
+    `/api/regulatory/benchmark/document-sets/${documentSetId}/citation-options`
   );

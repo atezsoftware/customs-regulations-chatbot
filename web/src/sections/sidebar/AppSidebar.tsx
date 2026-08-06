@@ -63,7 +63,6 @@ import { useModalContext } from "@/components/context/ModalContext";
 import {
   SvgDevKit,
   SvgEditBig,
-  SvgFolder,
   SvgFolderPlus,
   SvgMoreHorizontal,
   SvgOnyxOctagon,
@@ -568,20 +567,6 @@ export default function AppSidebar() {
     ),
     [folded, createProjectModal.toggle, createProjectModal.isOpen]
   );
-  const filesButton = useMemo(
-    () => (
-      <SidebarTab
-        icon={SvgFolder}
-        href="/app/files"
-        selected={activeSidebarTab.isFiles()}
-        folded={folded}
-        variant={folded ? "sidebar-heavy" : "sidebar-light"}
-      >
-        Files
-      </SidebarTab>
-    ),
-    [folded, activeSidebarTab]
-  );
   const handleShowBuildIntro = useCallback(() => {
     setShowIntroAnimation(true);
   }, []);
@@ -682,7 +667,6 @@ export default function AppSidebar() {
         >
           {newSessionButton}
           {searchChatsButton}
-          {isAdmin && filesButton}
           {isOnyxCraftEnabled && buildButton}
           {folded && moreAgentsButton}
           {folded && newProjectButton}

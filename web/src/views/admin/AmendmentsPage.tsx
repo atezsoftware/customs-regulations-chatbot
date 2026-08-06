@@ -11,7 +11,7 @@ import {
 } from "@opal/components";
 import { SettingsLayouts, toast } from "@opal/layouts";
 import SvgHistory from "@opal/icons/history";
-import { useProjects } from "@/lib/projects/hooks";
+import { useDocumentSets } from "@/lib/hooks/useDocumentSets";
 import {
   AmendmentBatch,
   AmendmentProposal,
@@ -169,10 +169,10 @@ function ProposalCard({
 }
 
 export default function AmendmentsPage() {
-  const { projects } = useProjects();
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
-    null
-  );
+  const { documentSets } = useDocumentSets();
+  const [selectedDocumentSetId, setSelectedDocumentSetId] = useState<
+    string | null
+  >(null);
   const [rawText, setRawText] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
 
@@ -181,8 +181,8 @@ export default function AmendmentsPage() {
   const [proposals, setProposals] = useState<AmendmentProposal[]>([]);
   const [unmatched, setUnmatched] = useState<string[]>([]);
 
-  const refreshBatches = useCallback(async (projectId: number) => {
-    const result = await listAmendmentBatches(projectId);
+  const refreshBatches = useCallback(async (documentSetId: number) => {
+    const result = await listAmendmentBatches(documentSetId);
     setBatches(result);
     return result;
   }, []);
@@ -193,9 +193,9 @@ export default function AmendmentsPage() {
   }, []);
 
   useEffect(() => {
-    if (!selectedProjectId) return;
-    void refreshBatches(Number(selectedProjectId));
-  }, [selectedProjectId, refreshBatches]);
+    if (!selectedDocumentSetId) return;
+    void refreshBatches(Number(selectedDocumentSetId));
+  }, [selectedDocumentSetId, refreshBatches]);
 
   useEffect(() => {
     if (selectedBatchId === null) {
@@ -206,15 +206,18 @@ export default function AmendmentsPage() {
   }, [selectedBatchId, refreshProposals]);
 
   const handleAnalyze = useCallback(async () => {
-    if (!selectedProjectId || !rawText.trim()) return;
+    if (!selectedDocumentSetId || !rawText.trim()) return;
     setAnalyzing(true);
     try {
-      const result = await analyzeAmendment(Number(selectedProjectId), rawText);
+      const result = await analyzeAmendment(
+        Number(selectedDocumentSetId),
+        rawText
+      );
       toast.success(
         `Analyzed: ${result.proposals.length} proposal(s), ${result.unmatched_instructions.length} unmatched.`
       );
       setRawText("");
-      await refreshBatches(Number(selectedProjectId));
+      await refreshBatches(Number(selectedDocumentSetId));
       setSelectedBatchId(result.batch.id);
       setProposals(result.proposals);
       setUnmatched(result.unmatched_instructions);
@@ -223,7 +226,7 @@ export default function AmendmentsPage() {
     } finally {
       setAnalyzing(false);
     }
-  }, [selectedProjectId, rawText, refreshBatches]);
+  }, [selectedDocumentSetId, rawText, refreshBatches]);
 
   const selectedBatch = useMemo(
     () => batches.find((b) => b.id === selectedBatchId) ?? null,
@@ -235,33 +238,36 @@ export default function AmendmentsPage() {
       <SettingsLayouts.Header
         icon={SvgHistory}
         title="Updates"
-        description="Paste an official amendment/update text scoped to a directory. It will be segmented into atomic changes, matched against the directory's existing chunks, and drafted for your review — nothing is written until you approve each proposal."
+        description="Paste an official amendment/update text scoped to a document set. It will be segmented into atomic changes, matched against the document set's existing chunks, and drafted for your review — nothing is written until you approve each proposal."
       />
       <SettingsLayouts.Body>
         <div className="flex flex-col gap-4">
           <div className="flex flex-col gap-2">
             <Text font="main-ui-action" color="text-04">
-              Directory
+              Document Set
             </Text>
             <InputSelect
-              value={selectedProjectId ?? undefined}
+              value={selectedDocumentSetId ?? undefined}
               onValueChange={(value) => {
-                setSelectedProjectId(value);
+                setSelectedDocumentSetId(value);
                 setSelectedBatchId(null);
               }}
             >
               <InputSelect.Trigger />
               <InputSelect.Content>
-                {(projects ?? []).map((project) => (
-                  <InputSelect.Item key={project.id} value={String(project.id)}>
-                    {project.name}
+                {documentSets.map((documentSet) => (
+                  <InputSelect.Item
+                    key={documentSet.id}
+                    value={String(documentSet.id)}
+                  >
+                    {documentSet.name}
                   </InputSelect.Item>
                 ))}
               </InputSelect.Content>
             </InputSelect>
           </div>
 
-          {selectedProjectId && (
+          {selectedDocumentSetId && (
             <>
               <div className="flex flex-col gap-2">
                 <Text font="main-ui-action" color="text-04">

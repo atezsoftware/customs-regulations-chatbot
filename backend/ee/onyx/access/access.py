@@ -120,13 +120,17 @@ def _get_access_for_documents(
 
 
 def _collect_user_file_group_names(user_file: UserFile) -> set[str]:
-    """Extract user-group names from the already-loaded Persona.groups
-    relationships on a UserFile (skipping deleted personas)."""
+    """Extract user-group names from pre-loaded persona and document-set ACLs."""
     groups: set[str] = set()
     for persona in user_file.assistants:
         if persona.deleted:
             continue
         for group in persona.groups:
+            groups.add(group.name)
+    for document_set in user_file.document_sets:
+        if document_set.is_deleting:
+            continue
+        for group in document_set.groups:
             groups.add(group.name)
     return groups
 
@@ -153,7 +157,7 @@ def build_access_for_user_files_impl(
     user_files: list[UserFile],
 ) -> dict[str, DocumentAccess]:
     """EE version: works on pre-loaded UserFile objects.
-    Expects Persona.groups to be eagerly loaded.
+    Expects Persona.groups and DocumentSet.groups to be eagerly loaded.
 
     NOTE: is imported in onyx.access.access by `fetch_versioned_implementation`
     DO NOT REMOVE."""

@@ -18,8 +18,15 @@ from onyx.configs.constants import (
     OnyxCeleryQueues,
     OnyxCeleryTask,
 )
+from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.enums import UserFileStatus
-from onyx.db.models import Project__UserFile, User, UserFile, UserProject
+from onyx.db.models import (
+    DocumentSet__UserFile,
+    Project__UserFile,
+    User,
+    UserFile,
+    UserProject,
+)
 from onyx.server.documents.connector import upload_files
 from onyx.server.features.projects.projects_file_utils import (
     RejectedFile,
@@ -59,6 +66,7 @@ def create_user_files(
     project_id: int | None,
     user: User,
     db_session: Session,
+    document_set_id: int | None = None,
     link_url: str | None = None,
     temp_id_map: dict[str, str] | None = None,
 ) -> CategorizedFilesResult:
@@ -98,12 +106,19 @@ def create_user_files(
         # Persist the UserFile first to satisfy FK constraints for association table
         db_session.add(new_file)
         db_session.flush()
-        if project_id:
+        if project_id is not None:
             project_to_user_file = Project__UserFile(
                 project_id=project_id,
                 user_file_id=new_file.id,
             )
             db_session.add(project_to_user_file)
+        if document_set_id is not None:
+            db_session.add(
+                DocumentSet__UserFile(
+                    document_set_id=document_set_id,
+                    user_file_id=new_file.id,
+                )
+            )
         user_files.append(new_file)
     db_session.commit()
     return CategorizedFilesResult(
@@ -121,16 +136,31 @@ def upload_files_to_user_files_with_indexing(
     temp_id_map: dict[str, str] | None,
     db_session: Session,
     background_tasks: BackgroundTasks | None = None,
+    document_set_id: int | None = None,
 ) -> CategorizedFilesResult:
+    if project_id is not None and document_set_id is not None:
+        raise ValueError(
+            "A file upload can target a project or a document set, not both"
+        )
     if project_id is not None and user is not None:
         if not check_project_write_access(project_id, user, db_session):
             raise HTTPException(status_code=404, detail="Project not found")
+    if document_set_id is not None:
+        document_set = get_document_set_by_id_for_user(
+            db_session=db_session,
+            document_set_id=document_set_id,
+            user=user,
+            get_editable=True,
+        )
+        if document_set is None:
+            raise HTTPException(status_code=404, detail="Document set not found")
 
     categorized_files_result = create_user_files(
         files,
         project_id,
         user,
         db_session,
+        document_set_id=document_set_id,
         temp_id_map=temp_id_map,
     )
     user_files = categorized_files_result.user_files

@@ -30,7 +30,7 @@ class BenchmarkQuestionCreate(BaseModel):
     as_of_date: datetime.date | None = None
     rubric_notes: str | None = Field(default=None, max_length=10000)
     tags: list[BenchmarkTag] = Field(default_factory=list, max_length=50)
-    project_id: int
+    document_set_id: int
 
 
 class BenchmarkQuestionUpdate(BaseModel):
@@ -44,7 +44,7 @@ class BenchmarkQuestionUpdate(BaseModel):
     as_of_date: datetime.date | None = None
     rubric_notes: str | None = Field(default=None, max_length=10000)
     tags: list[BenchmarkTag] | None = Field(default=None, max_length=50)
-    project_id: int | None = None
+    document_set_id: int | None = None
     is_active: bool | None = None
 
 
@@ -58,8 +58,8 @@ class BenchmarkQuestionSnapshot(BaseModel):
     as_of_date: datetime.date | None
     rubric_notes: str | None
     tags: list[str]
-    project_id: int
-    project_name: str
+    document_set_id: int
+    document_set_name: str
     is_active: bool
     created_at: datetime.datetime
     updated_at: datetime.datetime
@@ -76,8 +76,8 @@ class BenchmarkQuestionSnapshot(BaseModel):
             as_of_date=question.as_of_date,
             rubric_notes=question.rubric_notes,
             tags=question.tags,
-            project_id=question.project_id,
-            project_name=question.project.name,
+            document_set_id=question.document_set_id,
+            document_set_name=question.document_set.name,
             is_active=question.is_active,
             created_at=question.created_at,
             updated_at=question.updated_at,

@@ -103,7 +103,7 @@ def _claim_next_sync_file(
     db_session: Session,
     exclude_ids: set[UUID] | None = None,
 ) -> UUID | None:
-    """Claim the next file needing project/persona sync.
+    """Claim the next file needing mutable metadata synchronization.
 
     No status transition needed — the impl clears the sync flags on
     success.  The short-lived FOR UPDATE lock prevents concurrent claims.
@@ -112,12 +112,19 @@ def _claim_next_sync_file(
     stmt = (
         select(UserFile.id)
         .where(
-            sa.and_(
-                sa.or_(
-                    UserFile.needs_project_sync.is_(True),
-                    UserFile.needs_persona_sync.is_(True),
+            sa.or_(
+                sa.and_(
+                    UserFile.status == UserFileStatus.COMPLETED,
+                    sa.or_(
+                        UserFile.needs_project_sync.is_(True),
+                        UserFile.needs_persona_sync.is_(True),
+                        UserFile.needs_document_set_sync.is_(True),
+                    ),
                 ),
-                UserFile.status == UserFileStatus.COMPLETED,
+                sa.and_(
+                    UserFile.status == UserFileStatus.FAILED,
+                    UserFile.needs_document_set_sync.is_(True),
+                ),
             )
         )
         .order_by(UserFile.created_at)
@@ -183,7 +190,7 @@ def drain_delete_loop(tenant_id: str) -> None:
 
 
 def drain_project_sync_loop(tenant_id: str) -> None:
-    """Sync all pending project/persona metadata for user files."""
+    """Sync all pending mutable metadata for user files."""
     from onyx.background.celery.tasks.user_file_processing.tasks import (
         project_sync_user_file_impl,
     )

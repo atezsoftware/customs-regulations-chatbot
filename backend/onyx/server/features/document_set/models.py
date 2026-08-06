@@ -94,9 +94,11 @@ class DocumentSet(BaseModel):
     cc_pair_descriptors: list[ConnectorCredentialPairDescriptor]
     is_up_to_date: bool
     is_public: bool
+    is_deleting: bool = False
     # For Private Document Sets, who should be able to access these
     users: list[UUID]
     groups: list[int]
+    file_count: int = 0
     # Federated connectors in the document set
     federated_connectors: list[FederatedConnectorDescriptor] = Field(
         default_factory=list
@@ -108,6 +110,7 @@ class DocumentSet(BaseModel):
         document_set_model: DocumentSetDBModel,
         *,
         mask_credential_prefix: bool,
+        file_count: int = 0,
     ) -> "DocumentSet":
         return cls(
             id=document_set_model.id,
@@ -131,8 +134,10 @@ class DocumentSet(BaseModel):
             ],
             is_up_to_date=document_set_model.is_up_to_date,
             is_public=document_set_model.is_public,
+            is_deleting=document_set_model.is_deleting,
             users=[user.id for user in document_set_model.users],
             groups=[group.id for group in document_set_model.groups],
+            file_count=file_count,
             federated_connectors=[
                 FederatedConnectorDescriptor.from_federated_connector_mapping(
                     fc_mapping
@@ -151,14 +156,18 @@ class DocumentSetSummary(BaseModel):
     cc_pair_summaries: list[CCPairSummary]
     is_up_to_date: bool
     is_public: bool
+    is_deleting: bool = False
     users: list[UUID]
     groups: list[int]
+    file_count: int = 0
     federated_connector_summaries: list[FederatedConnectorSummary] = Field(
         default_factory=list
     )
 
     @classmethod
-    def from_model(cls, document_set: DocumentSetDBModel) -> "DocumentSetSummary":
+    def from_model(
+        cls, document_set: DocumentSetDBModel, *, file_count: int = 0
+    ) -> "DocumentSetSummary":
         """Create a summary from a DocumentSet database model"""
         return cls(
             id=document_set.id,
@@ -175,8 +184,10 @@ class DocumentSetSummary(BaseModel):
             ],
             is_up_to_date=document_set.is_up_to_date,
             is_public=document_set.is_public,
+            is_deleting=document_set.is_deleting,
             users=[user.id for user in document_set.users],
             groups=[group.id for group in document_set.groups],
+            file_count=file_count,
             federated_connector_summaries=[
                 FederatedConnectorSummary(
                     id=fc_mapping.federated_connector_id,

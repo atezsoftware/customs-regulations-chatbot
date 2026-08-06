@@ -14,16 +14,17 @@ from sqlalchemy.orm import Session
 from onyx.auth.permissions import require_permission
 from onyx.auth.schemas import UserRole
 from onyx.configs.constants import PUBLIC_API_TAGS
+from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
-from onyx.db.models import AmendmentProposal, User, UserFile, UserProject
+from onyx.db.models import AmendmentProposal, DocumentSet, User, UserFile
 from onyx.db.regulatory_amendments import (
     approve_amendment_proposal,
     compute_duplicate_targets,
     create_batch,
     get_batch,
     get_proposal,
-    list_batches_for_project,
+    list_batches_for_document_set,
     list_proposals_for_batch,
     reject_proposal,
 )
@@ -289,20 +290,25 @@ def rename_user_file(
 # =============================================================================
 # Amendment (update) mechanism
 #
-# An admin/curator pastes amendment text scoped to a directory. It is
-# segmented into atomic instructions, matched against the directory's chunks,
+# An admin/curator pastes amendment text scoped to a document set. It is
+# segmented into atomic instructions, matched against the document set's chunks,
 # and drafted into proposals — nothing writes to regulatory_chunk until a
 # proposal is approved (approve_amendment_proposal owns that transaction).
 # =============================================================================
 
 
-def _get_owned_project(db_session: Session, project_id: int, user: User) -> UserProject:
-    project = db_session.get(UserProject, project_id)
-    if project is None:
-        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Directory not found")
-    if project.user_id != user.id and user.role != UserRole.ADMIN:
-        raise OnyxError(OnyxErrorCode.UNAUTHORIZED, "Not your directory")
-    return project
+def _get_editable_document_set(
+    db_session: Session, document_set_id: int, user: User
+) -> DocumentSet:
+    document_set = get_document_set_by_id_for_user(
+        db_session=db_session,
+        document_set_id=document_set_id,
+        user=user,
+        get_editable=True,
+    )
+    if document_set is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Document set not found")
+    return document_set
 
 
 @router.post("/amendments/analyze", tags=PUBLIC_API_TAGS)
@@ -311,19 +317,21 @@ def analyze_amendment_text(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> AnalyzeAmendmentResponse:
-    project = _get_owned_project(db_session, analyze_request.project_id, user)
-    user_file_ids = [uf.id for uf in project.user_files]
+    document_set = _get_editable_document_set(
+        db_session, analyze_request.document_set_id, user
+    )
+    user_file_ids = [user_file.id for user_file in document_set.user_files]
     if not user_file_ids:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
-            "This directory has no files to amend yet.",
+            "This document set has no files to amend yet.",
         )
 
     # Committed on its own so the batch row survives (with status='failed')
     # even if analysis below raises mid-transaction.
     batch = create_batch(
         db_session,
-        project_id=project.id,
+        document_set_id=document_set.id,
         raw_text=analyze_request.raw_text,
         created_by=user.id,
     )
@@ -397,12 +405,12 @@ def analyze_amendment_text(
 
 @router.get("/amendments/batches", tags=PUBLIC_API_TAGS)
 def list_amendment_batches(
-    project_id: int,
+    document_set_id: int,
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> list[AmendmentBatchSnapshot]:
-    _get_owned_project(db_session, project_id, user)
-    batches = list_batches_for_project(db_session, project_id)
+    _get_editable_document_set(db_session, document_set_id, user)
+    batches = list_batches_for_document_set(db_session, document_set_id)
     return [AmendmentBatchSnapshot.from_model(b) for b in batches]
 
 
@@ -415,7 +423,7 @@ def list_amendment_proposals(
     batch = get_batch(db_session, batch_id)
     if batch is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Batch not found")
-    _get_owned_project(db_session, batch.project_id, user)
+    _get_editable_document_set(db_session, batch.document_set_id, user)
 
     proposals = list_proposals_for_batch(db_session, batch_id)
     duplicates = compute_duplicate_targets(proposals)
@@ -438,7 +446,7 @@ def approve_proposal(
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Proposal not found")
     batch = get_batch(db_session, proposal.batch_id)
     assert batch is not None
-    _get_owned_project(db_session, batch.project_id, user)
+    _get_editable_document_set(db_session, batch.document_set_id, user)
 
     try:
         result = approve_amendment_proposal(db_session, proposal, decided_by=user.id)
@@ -464,7 +472,7 @@ def reject_proposal_endpoint(
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Proposal not found")
     batch = get_batch(db_session, proposal.batch_id)
     assert batch is not None
-    _get_owned_project(db_session, batch.project_id, user)
+    _get_editable_document_set(db_session, batch.document_set_id, user)
 
     try:
         reject_proposal(proposal, decided_by=user.id)

@@ -231,20 +231,23 @@ export default function FilePickerPopover({
               f.id === file.id ? { ...f, status: lastStatus } : f
             )
           );
-          let projects = result.project_names.join(", ");
-          let assistants = result.assistant_names.join(", ");
-          let message = "Cannot delete file. It is associated with";
+          const projects = result.project_names.join(", ");
+          const assistants = result.assistant_names.join(", ");
+          const documentSets = result.document_set_names.join(", ");
+          const associations: string[] = [];
           if (projects) {
-            message += ` projects: ${projects}`;
-          }
-          if (projects && assistants) {
-            message += " and ";
+            associations.push(`projects: ${projects}`);
           }
           if (assistants) {
-            message += `assistants: ${assistants}`;
+            associations.push(`assistants: ${assistants}`);
+          }
+          if (documentSets) {
+            associations.push(`document sets: ${documentSets}`);
           }
 
-          toast.error(message);
+          toast.error(
+            `Cannot delete file. It is associated with ${associations.join("; ")}.`
+          );
         }
       })
       .catch((error) => {

@@ -35,13 +35,30 @@ def _make_user_file(
     *,
     owner: MagicMock,
     assistants: list[MagicMock] | None = None,
+    document_sets: list[MagicMock] | None = None,
 ) -> MagicMock:
     uf = MagicMock()
     uf.id = uuid4()
     uf.user = owner
     uf.user_id = owner.id
     uf.assistants = assistants or []
+    uf.document_sets = document_sets or []
     return uf
+
+
+def _make_document_set(
+    *,
+    creator: MagicMock | None = None,
+    shared_users: list[MagicMock] | None = None,
+    is_public: bool = False,
+    is_deleting: bool = False,
+) -> MagicMock:
+    document_set = MagicMock()
+    document_set.creator = creator
+    document_set.users = shared_users or []
+    document_set.is_public = is_public
+    document_set.is_deleting = is_deleting
+    return document_set
 
 
 class TestCollectUserFileAccess:
@@ -92,6 +109,49 @@ class TestCollectUserFileAccess:
         shared = _make_user("shared@test.com")
         persona = _make_persona(owner=owner, shared_users=[shared], deleted=True)
         uf = _make_user_file(owner=owner, assistants=[persona])
+
+        emails, is_public = collect_user_file_access(uf)
+
+        assert emails == {"owner@test.com"}
+        assert is_public is False
+
+    def test_document_set_acl_is_merged_with_owner_access(self) -> None:
+        owner = _make_user("owner@test.com")
+        creator = _make_user("creator@test.com")
+        shared = _make_user("shared@test.com")
+        document_set = _make_document_set(
+            creator=creator,
+            shared_users=[shared],
+        )
+        uf = _make_user_file(owner=owner, document_sets=[document_set])
+
+        emails, is_public = collect_user_file_access(uf)
+
+        assert emails == {
+            "owner@test.com",
+            "creator@test.com",
+            "shared@test.com",
+        }
+        assert is_public is False
+
+    def test_public_document_set_makes_file_public(self) -> None:
+        owner = _make_user("owner@test.com")
+        document_set = _make_document_set(is_public=True)
+        uf = _make_user_file(owner=owner, document_sets=[document_set])
+
+        _, is_public = collect_user_file_access(uf)
+
+        assert is_public is True
+
+    def test_deleting_document_set_is_ignored(self) -> None:
+        owner = _make_user("owner@test.com")
+        creator = _make_user("creator@test.com")
+        document_set = _make_document_set(
+            creator=creator,
+            is_public=True,
+            is_deleting=True,
+        )
+        uf = _make_user_file(owner=owner, document_sets=[document_set])
 
         emails, is_public = collect_user_file_access(uf)
 

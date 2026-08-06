@@ -27,8 +27,8 @@ def _question_snapshot(question: BenchmarkQuestion) -> dict[str, object]:
         "expected_citations": list(question.expected_citations),
         "rubric_notes": question.rubric_notes,
         "tags": list(question.tags),
-        "project_id": question.project_id,
-        "project_name": question.project.name,
+        "document_set_id": question.document_set_id,
+        "document_set_name": question.document_set.name,
         "as_of_date": (
             question.as_of_date.isoformat() if question.as_of_date else None
         ),
@@ -54,6 +54,17 @@ def question_has_run_items(db_session: Session, question_id: int) -> bool:
     count = db_session.scalar(
         select(func.count(BenchmarkRunItem.id)).where(
             BenchmarkRunItem.question_id == question_id
+        )
+    )
+    return bool(count)
+
+
+def document_set_has_benchmark_questions(
+    db_session: Session, document_set_id: int
+) -> bool:
+    count = db_session.scalar(
+        select(func.count(BenchmarkQuestion.id)).where(
+            BenchmarkQuestion.document_set_id == document_set_id
         )
     )
     return bool(count)
