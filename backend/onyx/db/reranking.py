@@ -73,23 +73,18 @@ def upsert_reranker_configuration(
 ) -> RerankerRuntimeConfig:
     settings = _get_present_settings(db_session, for_update=True)
 
-    if not enabled:
-        settings.rerank_enabled = False
-        settings.rerank_provider_type = None
-        settings.rerank_model_name = None
-        settings.rerank_api_key = None
-    else:
+    if enabled:
         if provider_type is None or not model_name:
             raise ValueError(
                 "Enabled reranking requires a provider type and model name."
             )
         if api_key is None and settings.rerank_api_key is None:
             raise ValueError("Enabled reranking requires an API key.")
-        settings.rerank_enabled = True
-        settings.rerank_provider_type = provider_type
-        settings.rerank_model_name = model_name
-        if api_key is not None:
-            settings.rerank_api_key = api_key  # ty: ignore[invalid-assignment]
+    settings.rerank_enabled = enabled
+    settings.rerank_provider_type = provider_type
+    settings.rerank_model_name = model_name
+    if api_key is not None:
+        settings.rerank_api_key = api_key  # ty: ignore[invalid-assignment]
 
     settings.rerank_updated_at = datetime.now(timezone.utc)
     settings.rerank_updated_by_user_id = updated_by_user_id

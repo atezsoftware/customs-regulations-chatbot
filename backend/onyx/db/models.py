@@ -2336,13 +2336,6 @@ class SearchSettings(Base):
             "AND rerank_api_key IS NOT NULL)",
             name="ck_search_settings_rerank_enabled_configuration",
         ),
-        CheckConstraint(
-            "rerank_enabled OR "
-            "(rerank_provider_type IS NULL "
-            "AND rerank_model_name IS NULL "
-            "AND rerank_api_key IS NULL)",
-            name="ck_search_settings_rerank_disabled_configuration",
-        ),
         Index(
             "ix_embedding_model_present_unique",
             "status",

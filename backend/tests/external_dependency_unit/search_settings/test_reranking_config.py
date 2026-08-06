@@ -172,6 +172,43 @@ def test_upsert_without_key_preserves_existing_secret(
     assert config.api_key.get_value(apply_mask=False) == "openrouter-secret"
 
 
+def test_disabling_retains_provider_model_and_exact_ciphertext(
+    db_session: Session,
+    present_settings: SearchSettings,
+) -> None:
+    upsert_reranker_configuration(
+        db_session,
+        enabled=True,
+        provider_type=RerankerProvider.OPENROUTER,
+        model_name="openrouter/first-reranker",
+        api_key="openrouter-secret",
+        commit=False,
+    )
+    before = db_session.execute(
+        text("SELECT rerank_api_key FROM search_settings WHERE id = :settings_id"),
+        {"settings_id": present_settings.id},
+    ).scalar_one()
+
+    upsert_reranker_configuration(
+        db_session,
+        enabled=False,
+        provider_type=RerankerProvider.OPENROUTER,
+        model_name="openrouter/second-reranker",
+        api_key=None,
+        commit=False,
+    )
+
+    config = get_reranker_configuration(db_session)
+    after = db_session.execute(
+        text("SELECT rerank_api_key FROM search_settings WHERE id = :settings_id"),
+        {"settings_id": present_settings.id},
+    ).scalar_one()
+    assert config.enabled is False
+    assert config.provider_type == RerankerProvider.OPENROUTER
+    assert config.model_name == "openrouter/second-reranker"
+    assert after == before
+
+
 def test_transfer_copies_live_reranker_configuration_to_promotion_target(
     db_session: Session,
     present_settings: SearchSettings,

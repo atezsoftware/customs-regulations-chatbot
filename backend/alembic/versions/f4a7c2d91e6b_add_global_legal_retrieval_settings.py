@@ -14,7 +14,6 @@ branch_labels = None
 depends_on = None
 
 _ENABLED_CONSTRAINT = "ck_search_settings_rerank_enabled_configuration"
-_DISABLED_CONSTRAINT = "ck_search_settings_rerank_disabled_configuration"
 
 
 def upgrade() -> None:
@@ -79,18 +78,9 @@ def upgrade() -> None:
         "AND rerank_model_name IS NOT NULL "
         "AND rerank_api_key IS NOT NULL)",
     )
-    op.create_check_constraint(
-        _DISABLED_CONSTRAINT,
-        "search_settings",
-        "rerank_enabled OR "
-        "(rerank_provider_type IS NULL "
-        "AND rerank_model_name IS NULL "
-        "AND rerank_api_key IS NULL)",
-    )
 
 
 def downgrade() -> None:
-    op.drop_constraint(_DISABLED_CONSTRAINT, "search_settings", type_="check")
     op.drop_constraint(_ENABLED_CONSTRAINT, "search_settings", type_="check")
     op.drop_constraint(
         "search_settings_rerank_updated_by_user_id_fkey",

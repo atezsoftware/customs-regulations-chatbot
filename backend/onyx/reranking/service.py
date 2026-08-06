@@ -49,6 +49,9 @@ class RerankingService:
         self._circuit_breaker = circuit_breaker
         self._trace_call = trace_call
 
+    def invalidate_circuit(self, *, tenant_id: str) -> None:
+        self._circuit_breaker.invalidate(tenant_id=tenant_id)
+
     def _result(
         self,
         *,
@@ -256,3 +259,7 @@ def rerank_chunks(
     return _get_default_service().rerank_chunks(
         query=query, chunks=chunks, config=config
     )
+
+
+def invalidate_reranker_circuit(tenant_id: str) -> None:
+    _get_default_service().invalidate_circuit(tenant_id=tenant_id)
