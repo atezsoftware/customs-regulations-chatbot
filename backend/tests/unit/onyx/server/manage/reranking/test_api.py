@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+import time
 from collections.abc import Callable, Generator
 from typing import Any, cast
 from uuid import UUID
 
 import httpx
 import pytest
+from fastapi import Request
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -15,9 +19,11 @@ from onyx.db.enums import Permission
 from onyx.db.models import User
 from onyx.db.reranking import RerankerRuntimeConfig
 from onyx.error_handling.exceptions import OnyxError
+from onyx.reranking.models import RerankScore
 from onyx.reranking.openrouter import OpenRouterRerankClient
 from onyx.utils.sensitive import SensitiveValue
 from shared_configs.enums import RerankerProvider
+from tests.unit.fakes import FakeCache
 
 RERANKING_URL = "/admin/reranking"
 TEST_MODEL = "voyageai/rerank-2.5"
@@ -40,6 +46,8 @@ class _Repository:
         self.api_key: str | None = None
         self.ciphertext: bytes | None = None
         self.committed = False
+        self.configuration_generation = "generation-0"
+        self._generation_counter = 0
 
     def runtime_config(self) -> RerankerRuntimeConfig:
         sensitive_key = (
@@ -55,6 +63,7 @@ class _Repository:
             provider_type=self.provider_type,
             model_name=self.model_name,
             api_key=sensitive_key,
+            configuration_generation=self.configuration_generation,
         )
 
     def get(self, _db_session: object) -> RerankerRuntimeConfig:
@@ -71,14 +80,15 @@ class _Repository:
         updated_by_user_id: UUID | None = None,  # noqa: ARG002
         commit: bool = True,
     ) -> RerankerRuntimeConfig:
-        assert commit is True
+        assert commit is False
         self.enabled = enabled
         self.provider_type = provider_type
         self.model_name = model_name
         if api_key is not None:
             self.api_key = api_key
             self.ciphertext = b"ciphertext:" + api_key.encode()
-        self.committed = True
+        self._generation_counter += 1
+        self.configuration_generation = f"generation-{self._generation_counter}"
         return self.runtime_config()
 
     def delete(
@@ -88,12 +98,16 @@ class _Repository:
         updated_by_user_id: UUID | None = None,  # noqa: ARG002
         commit: bool = True,
     ) -> None:
-        assert commit is True
+        assert commit is False
         self.enabled = False
         self.provider_type = None
         self.model_name = None
         self.api_key = None
         self.ciphertext = None
+        self._generation_counter += 1
+        self.configuration_generation = f"generation-{self._generation_counter}"
+
+    def commit(self) -> None:
         self.committed = True
 
 
@@ -170,14 +184,20 @@ def _make_client(
     *,
     admin: bool,  # noqa: ARG001
 ) -> Generator[_DirectClient, None, None]:
+    from onyx.reranking.distributed_state import DistributedRerankerAttestationStore
     from onyx.server.manage.reranking import api as reranking_api
 
+    caches: dict[str, FakeCache] = {}
+    attestations = DistributedRerankerAttestationStore(
+        cache_factory=lambda tenant_id: caches.setdefault(tenant_id, FakeCache())
+    )
     monkeypatch.setattr(
-        reranking_api,
-        "test_attestations",
-        reranking_api.RerankerTestAttestationStore(),
+        reranking_api, "distributed_reranker_attestations", attestations
     )
     monkeypatch.setattr(reranking_api, "get_reranker_configuration", repository.get)
+    monkeypatch.setattr(
+        reranking_api, "get_reranker_configuration_for_update", repository.get
+    )
     monkeypatch.setattr(
         reranking_api, "upsert_reranker_configuration", repository.upsert
     )
@@ -232,7 +252,7 @@ def _successful_rerank(
         assert query == "Onyx reranker configuration test"
         assert documents == ["Configuration test document"]
         assert top_n == 1
-        return []
+        return [RerankScore(index=0, relevance_score=0.75)]
 
     return rerank
 
@@ -293,6 +313,42 @@ def test_all_reranking_routes_require_full_admin_access(
         for dependency in route.dependant.dependencies
     }
     assert Permission.FULL_ADMIN_PANEL_ACCESS in required_permissions
+
+
+def test_non_admin_is_rejected_by_route_dependency() -> None:
+    from onyx.server.manage.reranking.api import admin_router
+
+    route = next(
+        candidate
+        for candidate in admin_router.routes
+        if isinstance(candidate, APIRoute)
+        and candidate.path == f"{RERANKING_URL}/config"
+        and "GET" in candidate.methods
+    )
+    dependency = next(
+        dependency.call
+        for dependency in route.dependant.dependencies
+        if getattr(dependency.call, "_required_permission", None)
+        is Permission.FULL_ADMIN_PANEL_ACCESS
+    )
+    request = Request({"type": "http", "method": "GET", "path": "/"})
+
+    with pytest.raises(OnyxError) as error:
+        asyncio.run(dependency(request, cast(User, _StubUser(admin=False))))
+
+    assert error.value.status_code == 403
+
+
+def test_reranking_router_is_mounted_in_assembled_application() -> None:
+    from onyx.main import get_application
+    from onyx.server.manage.reranking.api import get_config
+
+    application = get_application()
+
+    assert any(
+        isinstance(route, APIRoute) and route.endpoint is get_config
+        for route in application.routes
+    )
 
 
 def test_get_masks_api_key_and_never_returns_plaintext(
@@ -403,6 +459,36 @@ def test_test_endpoint_uses_unsaved_key_and_manual_model_without_persisting(
     assert repository.model_name is None
 
 
+@pytest.mark.parametrize(
+    "scores",
+    [
+        [],
+        [RerankScore(index=1, relevance_score=0.7)],
+        [RerankScore(index=0, relevance_score=float("nan"))],
+        [{"index": 0, "relevance_score": 0.7}],
+    ],
+)
+def test_test_endpoint_rejects_invalid_single_document_result_without_attestation(
+    admin_client: _DirectClient,
+    monkeypatch: pytest.MonkeyPatch,
+    scores: list[Any],
+) -> None:
+    monkeypatch.setattr(
+        OpenRouterRerankClient,
+        "rerank",
+        lambda *_args, **_kwargs: scores,
+    )
+
+    response = _test_configuration(
+        admin_client,
+        api_key=TEST_KEY,
+        model_id=TEST_MODEL,
+    )
+
+    assert response.status_code == 502
+    assert "test_attestation" not in response.text
+
+
 def test_enabled_put_requires_attestation_for_exact_effective_key_and_model(
     admin_client: _DirectClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -442,26 +528,95 @@ def test_enabled_put_requires_attestation_for_exact_effective_key_and_model(
     assert enabled.json()["enabled"] is True
 
 
+def test_enabled_put_locks_before_deriving_omitted_effective_key(
+    admin_client: _DirectClient,
+    repository: _Repository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.reranking.circuit_breaker import reranker_configuration_fingerprint
+    from onyx.server.manage.reranking import api as reranking_api
+
+    old_key = "sk-old-key-material"
+    new_key = "sk-concurrent-key-material"
+    repository.enabled = False
+    repository.provider_type = RerankerProvider.OPENROUTER
+    repository.model_name = TEST_MODEL
+    repository.api_key = old_key
+    repository.configuration_generation = "generation-old"
+    tenant_id = "tenant-lock-test"
+    monkeypatch.setattr(reranking_api, "get_current_tenant_id", lambda: tenant_id)
+    token = reranking_api.distributed_reranker_attestations.issue(
+        tenant_id=tenant_id,
+        config_fingerprint=reranker_configuration_fingerprint(
+            model=TEST_MODEL, api_key=old_key
+        ),
+        config_generation="generation-old",
+    )
+
+    row_lock = threading.Lock()
+    locked_reader_waiting = threading.Event()
+    unlocked_reader_used = threading.Event()
+
+    def unlocked_get(_db_session: object) -> RerankerRuntimeConfig:
+        unlocked_reader_used.set()
+        return repository.runtime_config()
+
+    def locked_get(_db_session: object) -> RerankerRuntimeConfig:
+        locked_reader_waiting.set()
+        row_lock.acquire()
+        return repository.runtime_config()
+
+    monkeypatch.setattr(reranking_api, "get_reranker_configuration", unlocked_get)
+    monkeypatch.setattr(
+        reranking_api, "get_reranker_configuration_for_update", locked_get
+    )
+
+    def competing_writer() -> None:
+        row_lock.acquire()
+        deadline = time.monotonic() + 2
+        while not (locked_reader_waiting.is_set() or unlocked_reader_used.is_set()):
+            if time.monotonic() >= deadline:
+                raise AssertionError("PUT did not attempt to read the configuration")
+            time.sleep(0.001)
+        repository.api_key = new_key
+        repository.configuration_generation = "generation-concurrent"
+        row_lock.release()
+
+    writer = threading.Thread(target=competing_writer)
+    writer.start()
+    response = _put_config(
+        admin_client,
+        enabled=True,
+        api_key=None,
+        test_attestation=token,
+    )
+    writer.join(timeout=2)
+
+    assert not writer.is_alive()
+    assert response.status_code == 400
+    assert repository.enabled is False
+
+
 def test_expired_test_attestation_cannot_enable_reranking(
     admin_client: _DirectClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from onyx.server.manage.reranking import api as reranking_api
 
-    now = [100.0]
+    class _ExpiredAttestations:
+        def issue(self, **_kwargs: object) -> str:
+            return "expired-token"
+
+        def consume(self, **_kwargs: object) -> bool:
+            return False
+
     monkeypatch.setattr(
-        reranking_api,
-        "test_attestations",
-        reranking_api.RerankerTestAttestationStore(
-            ttl_seconds=30,
-            clock=lambda: now[0],
-        ),
+        reranking_api, "distributed_reranker_attestations", _ExpiredAttestations()
     )
     monkeypatch.setattr(OpenRouterRerankClient, "rerank", _successful_rerank())
     assert _put_config(admin_client, enabled=False).status_code == 200
     token = _test_configuration(admin_client).json()["test_attestation"]
 
-    now[0] = 131.0
     response = _put_config(
         admin_client,
         enabled=True,

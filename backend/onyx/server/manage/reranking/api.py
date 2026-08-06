@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import hmac
-import secrets
-import threading
-import time
-from collections.abc import Callable
-from typing import Any, NamedTuple
+import math
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
+from onyx.cache.interface import (
+    CACHE_TRANSIENT_ERRORS,
+    CacheLockLostError,
+)
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import User
@@ -19,6 +19,7 @@ from onyx.db.reranking import (
     RerankerRuntimeConfig,
     delete_reranker_configuration,
     get_reranker_configuration,
+    get_reranker_configuration_for_update,
     upsert_reranker_configuration,
 )
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -30,7 +31,8 @@ from onyx.reranking.constants import (
     RERANK_READ_TIMEOUT_SECONDS,
     RERANK_WRITE_TIMEOUT_SECONDS,
 )
-from onyx.reranking.models import RerankError
+from onyx.reranking.distributed_state import distributed_reranker_attestations
+from onyx.reranking.models import RerankError, RerankScore
 from onyx.reranking.openrouter import OpenRouterRerankClient
 from onyx.reranking.service import invalidate_reranker_circuit
 from onyx.server.manage.reranking.models import (
@@ -47,72 +49,11 @@ from shared_configs.contextvars import get_current_tenant_id
 from shared_configs.enums import RerankerProvider
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=rerank"
-RERANKER_TEST_ATTESTATION_TTL_SECONDS = 300.0
 _TEST_QUERY = "Onyx reranker configuration test"
 _TEST_DOCUMENT = "Configuration test document"
+_ATTESTATION_ERRORS = CACHE_TRANSIENT_ERRORS + (CacheLockLostError,)
 
 admin_router = APIRouter(prefix="/admin/reranking")
-
-
-class _Attestation(NamedTuple):
-    token: str
-    config_fingerprint: str
-    expires_at: float
-
-
-class RerankerTestAttestationStore:
-    """Keeps only the latest short-lived test result for each tenant."""
-
-    def __init__(
-        self,
-        *,
-        ttl_seconds: float = RERANKER_TEST_ATTESTATION_TTL_SECONDS,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self._ttl_seconds = ttl_seconds
-        self._clock = clock
-        self._by_tenant: dict[str, _Attestation] = {}
-        self._lock = threading.Lock()
-
-    def issue(self, *, tenant_id: str, config_fingerprint: str) -> str:
-        token = secrets.token_urlsafe(32)
-        with self._lock:
-            self._by_tenant[tenant_id] = _Attestation(
-                token=token,
-                config_fingerprint=config_fingerprint,
-                expires_at=self._clock() + self._ttl_seconds,
-            )
-        return token
-
-    def validate(
-        self,
-        *,
-        tenant_id: str,
-        token: str | None,
-        config_fingerprint: str,
-    ) -> bool:
-        if token is None:
-            return False
-        with self._lock:
-            attestation = self._by_tenant.get(tenant_id)
-            if attestation is None:
-                return False
-            if self._clock() >= attestation.expires_at:
-                self._by_tenant.pop(tenant_id, None)
-                return False
-            return hmac.compare_digest(
-                attestation.token, token
-            ) and hmac.compare_digest(
-                attestation.config_fingerprint,
-                config_fingerprint,
-            )
-
-    def invalidate(self, *, tenant_id: str) -> None:
-        with self._lock:
-            self._by_tenant.pop(tenant_id, None)
-
-
-test_attestations = RerankerTestAttestationStore()
 
 
 def _view(config: RerankerRuntimeConfig) -> RerankerConfigView:
@@ -176,7 +117,6 @@ def _require_key(api_key: str | None) -> str:
 
 def _invalidate_after_commit(tenant_id: str) -> None:
     invalidate_reranker_circuit(tenant_id)
-    test_attestations.invalidate(tenant_id=tenant_id)
 
 
 @admin_router.get("/config")
@@ -193,7 +133,7 @@ def put_config(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> RerankerConfigView:
-    stored = get_reranker_configuration(db_session)
+    stored = get_reranker_configuration_for_update(db_session)
     provided_key = _provided_api_key(request.api_key)
     effective_key = _effective_key(api_key=provided_key, stored=stored)
     model_id = _model_id(request.model_id)
@@ -206,11 +146,19 @@ def put_config(
             model=model_id,
             api_key=required_key,
         )
-        if not test_attestations.validate(
-            tenant_id=tenant_id,
-            token=request.test_attestation,
-            config_fingerprint=fingerprint,
-        ):
+        try:
+            attested = distributed_reranker_attestations.consume(
+                tenant_id=tenant_id,
+                token=request.test_attestation,
+                config_fingerprint=fingerprint,
+                config_generation=stored.configuration_generation,
+            )
+        except _ATTESTATION_ERRORS as error:
+            raise OnyxError(
+                OnyxErrorCode.SERVICE_UNAVAILABLE,
+                "Reranker test verification is temporarily unavailable.",
+            ) from error
+        if not attested:
             raise OnyxError(
                 OnyxErrorCode.INVALID_INPUT,
                 "Test this exact API key and model before enabling reranking.",
@@ -223,7 +171,9 @@ def put_config(
         model_name=model_id,
         api_key=provided_key,
         updated_by_user_id=user.id,
+        commit=False,
     )
+    db_session.commit()
     _invalidate_after_commit(tenant_id)
     return _view(config)
 
@@ -236,7 +186,9 @@ def delete_config(
     delete_reranker_configuration(
         db_session,
         updated_by_user_id=user.id,
+        commit=False,
     )
+    db_session.commit()
     _invalidate_after_commit(get_current_tenant_id())
     return Response(status_code=204)
 
@@ -256,7 +208,7 @@ def test_config(
             "Select or enter an OpenRouter reranking model first.",
         )
     try:
-        OpenRouterRerankClient().rerank(
+        scores = OpenRouterRerankClient().rerank(
             api_key=api_key,
             model=model_id,
             query=_TEST_QUERY,
@@ -268,15 +220,33 @@ def test_config(
             OnyxErrorCode.BAD_GATEWAY,
             "OpenRouter could not complete a private reranking test.",
         ) from error
+    if (
+        not isinstance(scores, list)
+        or len(scores) != 1
+        or not isinstance(scores[0], RerankScore)
+        or scores[0].index != 0
+        or not math.isfinite(scores[0].relevance_score)
+    ):
+        raise OnyxError(
+            OnyxErrorCode.BAD_GATEWAY,
+            "OpenRouter could not complete a private reranking test.",
+        )
 
     fingerprint = reranker_configuration_fingerprint(
         model=model_id,
         api_key=api_key,
     )
-    token = test_attestations.issue(
-        tenant_id=get_current_tenant_id(),
-        config_fingerprint=fingerprint,
-    )
+    try:
+        token = distributed_reranker_attestations.issue(
+            tenant_id=get_current_tenant_id(),
+            config_fingerprint=fingerprint,
+            config_generation=stored.configuration_generation,
+        )
+    except CACHE_TRANSIENT_ERRORS as error:
+        raise OnyxError(
+            OnyxErrorCode.SERVICE_UNAVAILABLE,
+            "Reranker test verification is temporarily unavailable.",
+        ) from error
     return RerankerTestResponse(success=True, test_attestation=token)
 
 

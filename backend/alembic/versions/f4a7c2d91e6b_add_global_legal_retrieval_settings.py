@@ -57,6 +57,17 @@ def upgrade() -> None:
     op.add_column(
         "search_settings",
         sa.Column(
+            "rerank_configuration_generation",
+            sa.String(length=32),
+            nullable=False,
+            server_default=sa.text(
+                "md5(random()::text || clock_timestamp()::text)"
+            ),
+        ),
+    )
+    op.add_column(
+        "search_settings",
+        sa.Column(
             "rerank_updated_by_user_id",
             postgresql.UUID(as_uuid=True),
             nullable=True,
@@ -88,6 +99,7 @@ def downgrade() -> None:
         type_="foreignkey",
     )
     op.drop_column("search_settings", "rerank_updated_by_user_id")
+    op.drop_column("search_settings", "rerank_configuration_generation")
     op.drop_column("search_settings", "rerank_updated_at")
     op.drop_column("search_settings", "rerank_api_key")
     op.drop_column("search_settings", "rerank_model_name")

@@ -2314,6 +2314,12 @@ class SearchSettings(Base):
     rerank_updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    rerank_configuration_generation: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=lambda: uuid4().hex,
+        server_default=text("md5(random()::text || clock_timestamp()::text)"),
+    )
     rerank_updated_by_user_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )

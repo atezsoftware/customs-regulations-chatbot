@@ -50,12 +50,15 @@ def _chunk(document_id: str, *, body: str = "gövde") -> InferenceChunk:
     )
 
 
-def _config(*, enabled: bool = True) -> RerankerRuntimeConfig:
+def _config(
+    *, enabled: bool = True, generation: str = "generation-a"
+) -> RerankerRuntimeConfig:
     return RerankerRuntimeConfig(
         enabled=enabled,
         provider_type=RerankerProvider.OPENROUTER if enabled else None,
         model_name="cohere/rerank-v3.5" if enabled else None,
         api_key=make_mock_sensitive_value("top-secret") if enabled else None,
+        configuration_generation=generation,
     )
 
 
@@ -171,6 +174,65 @@ def test_immediate_provider_error_opens_only_current_tenant_and_fingerprint(
     assert second.outcome is RerankOutcome.CIRCUIT_OPEN
     assert third.outcome is RerankOutcome.PROVIDER_ERROR
     assert client.rerank.call_count == 2
+
+
+def test_shared_generation_change_discards_stale_circuit_across_instances(
+) -> None:
+    clients = [
+        MagicMock(spec=OpenRouterRerankClient),
+        MagicMock(spec=OpenRouterRerankClient),
+    ]
+    services = [
+        RerankingService(
+            client=client,
+            circuit_breaker=RerankCircuitBreaker(failure_threshold=1),
+            trace_call=_span,
+        )
+        for client in clients
+    ]
+    for client in clients:
+        client.rerank.side_effect = [
+            RerankProviderError(status_code=503),
+            [RerankScore(index=0, relevance_score=0.8)],
+        ]
+    token = CURRENT_TENANT_ID_CONTEXTVAR.set("tenant-a")
+    try:
+        first = [
+            service.rerank_chunks(
+                query="q", chunks=[_chunk("d1")], config=_config()
+            )
+            for service in services
+        ]
+        stale = [
+            service.rerank_chunks(
+                query="q", chunks=[_chunk("d1")], config=_config()
+            )
+            for service in services
+        ]
+        refreshed = [
+            service.rerank_chunks(
+                query="q",
+                chunks=[_chunk("d1")],
+                config=_config(generation="generation-b"),
+            )
+            for service in services
+        ]
+    finally:
+        CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
+
+    assert [result.outcome for result in first] == [
+        RerankOutcome.PROVIDER_ERROR,
+        RerankOutcome.PROVIDER_ERROR,
+    ]
+    assert [result.outcome for result in stale] == [
+        RerankOutcome.CIRCUIT_OPEN,
+        RerankOutcome.CIRCUIT_OPEN,
+    ]
+    assert [result.outcome for result in refreshed] == [
+        RerankOutcome.SUCCESS,
+        RerankOutcome.SUCCESS,
+    ]
+    assert [client.rerank.call_count for client in clients] == [2, 2]
 
 
 def test_trace_uses_rerank_flow_without_recording_request_content(

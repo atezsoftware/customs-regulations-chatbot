@@ -135,7 +135,8 @@ class RerankingService:
         circuit_key = RerankCircuitKey(
             tenant_id=get_current_tenant_id(),
             config_fingerprint=reranker_configuration_fingerprint(
-                model=config.model_name, api_key=api_key
+                model=f"{config.model_name}\0{config.configuration_generation}",
+                api_key=api_key,
             ),
         )
         if self._circuit_breaker.is_open(circuit_key):

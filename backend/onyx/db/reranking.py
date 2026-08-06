@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Annotated, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, GetPydanticSchema
 from pydantic_core import CoreSchema, core_schema
@@ -32,6 +32,7 @@ class RerankerRuntimeConfig(BaseModel):
     provider_type: RerankerProvider | None
     model_name: str | None
     api_key: SensitiveString | None
+    configuration_generation: str
 
 
 def _runtime_config(settings: SearchSettings) -> RerankerRuntimeConfig:
@@ -40,6 +41,7 @@ def _runtime_config(settings: SearchSettings) -> RerankerRuntimeConfig:
         provider_type=settings.rerank_provider_type,
         model_name=settings.rerank_model_name,
         api_key=settings.rerank_api_key,
+        configuration_generation=settings.rerank_configuration_generation,
     )
 
 
@@ -59,6 +61,13 @@ def _get_present_settings(db_session: Session, *, for_update: bool) -> SearchSet
 
 def get_reranker_configuration(db_session: Session) -> RerankerRuntimeConfig:
     return _runtime_config(_get_present_settings(db_session, for_update=False))
+
+
+def get_reranker_configuration_for_update(
+    db_session: Session,
+) -> RerankerRuntimeConfig:
+    """Return the live configuration while holding its row lock."""
+    return _runtime_config(_get_present_settings(db_session, for_update=True))
 
 
 def upsert_reranker_configuration(
@@ -87,6 +96,7 @@ def upsert_reranker_configuration(
         settings.rerank_api_key = api_key  # ty: ignore[invalid-assignment]
 
     settings.rerank_updated_at = datetime.now(timezone.utc)
+    settings.rerank_configuration_generation = uuid4().hex
     settings.rerank_updated_by_user_id = updated_by_user_id
     if commit:
         db_session.commit()
@@ -112,6 +122,7 @@ def delete_reranker_configuration(
         settings.rerank_model_name = None
         settings.rerank_api_key = None
         settings.rerank_updated_at = updated_at
+        settings.rerank_configuration_generation = uuid4().hex
         if settings.status == IndexModelStatus.PRESENT:
             settings.rerank_updated_by_user_id = updated_by_user_id
     if commit:
