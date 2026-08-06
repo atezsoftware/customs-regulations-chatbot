@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import Enum, StrEnum
 
 
 class EmbeddingProvider(str, Enum):
@@ -11,10 +11,11 @@ class EmbeddingProvider(str, Enum):
     AZURE = "azure"
 
 
-class RerankerProvider(str, Enum):
+class RerankerProvider(StrEnum):
     COHERE = "cohere"
     LITELLM = "litellm"
     BEDROCK = "bedrock"
+    OPENROUTER = "openrouter"
 
 
 class EmbedTextType(str, Enum):

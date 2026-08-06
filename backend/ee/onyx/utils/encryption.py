@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from os import urandom
 
@@ -6,6 +7,7 @@ from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from onyx.configs.app_configs import ENCRYPTION_KEY_SECRET
+from onyx.utils.encryption import EncryptionError
 from onyx.utils.logger import setup_logger
 from onyx.utils.variable_functionality import fetch_versioned_implementation
 
@@ -82,6 +84,24 @@ def _decrypt_bytes(input_bytes: bytes, key: str | None = None) -> str:
                 "Data is not valid UTF-8 — likely encrypted with a different key. "
                 "Run the re-encrypt secrets script to rotate to the current key."
             ) from None
+
+
+def _strict_encrypt_string(input_str: str) -> bytes:
+    encryption_key = os.environ.get("ENCRYPTION_KEY_SECRET")
+    if not encryption_key:
+        raise EncryptionError(
+            "ENCRYPTION_KEY_SECRET is required for secure secret storage."
+        )
+    return _encrypt_string(input_str, key=encryption_key)
+
+
+def _strict_decrypt_bytes(input_bytes: bytes) -> str:
+    encryption_key = os.environ.get("ENCRYPTION_KEY_SECRET")
+    if not encryption_key:
+        raise EncryptionError(
+            "ENCRYPTION_KEY_SECRET is required for secure secret storage."
+        )
+    return _decrypt_bytes(input_bytes, key=encryption_key)
 
 
 def encrypt_string_to_bytes(input_str: str, key: str | None = None) -> bytes:

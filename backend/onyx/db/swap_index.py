@@ -35,6 +35,7 @@ from onyx.db.port_attempt import (
     get_active_port_attempt,
     get_latest_port_attempt,
 )
+from onyx.db.reranking import transfer_reranker_configuration__no_commit
 from onyx.db.search_settings import (
     get_current_search_settings,
     get_secondary_search_settings,
@@ -100,6 +101,15 @@ def _perform_index_swap(
         and new_search_settings.switchover_type == SwitchoverType.INSTANT
     ):
         new_search_settings.port_backfill_source_id = current_search_settings.id
+
+    # Keep global retrieval configuration stable across embedding-index promotion.
+    # The transfer helper locks both settings rows and the commit below makes the
+    # configuration copy atomic with the status transition.
+    transfer_reranker_configuration__no_commit(
+        db_session,
+        source_search_settings_id=current_search_settings.id,
+        target_search_settings_id=new_search_settings.id,
+    )
 
     # swap over search settings
     update_search_settings_status(

@@ -12,6 +12,10 @@ from onyx.utils.variable_functionality import fetch_versioned_implementation
 logger = setup_logger()
 
 
+class EncryptionError(RuntimeError):
+    """Raised when a secret cannot be encrypted securely at rest."""
+
+
 # IMPORTANT DO NOT DELETE, THIS IS USED BY fetch_versioned_implementation
 def _encrypt_string(input_str: str, key: str | None = None) -> bytes:
     if ENCRYPTION_KEY_SECRET:
@@ -28,6 +32,20 @@ def _decrypt_bytes(input_bytes: bytes, key: str | None = None) -> str:
     elif key is not None:
         logger.debug("MIT decrypt called with explicit key — key ignored.")
     return input_bytes.decode()
+
+
+# IMPORTANT DO NOT DELETE, THIS IS USED BY fetch_versioned_implementation
+def _strict_encrypt_string(input_str: str) -> bytes:  # noqa: ARG001
+    raise EncryptionError(
+        "Secure secret storage requires the Enterprise AES encryption implementation."
+    )
+
+
+# IMPORTANT DO NOT DELETE, THIS IS USED BY fetch_versioned_implementation
+def _strict_decrypt_bytes(input_bytes: bytes) -> str:  # noqa: ARG001
+    raise EncryptionError(
+        "Secure secret storage requires the Enterprise AES encryption implementation."
+    )
 
 
 def mask_string(sensitive_str: str) -> str:
@@ -263,3 +281,17 @@ def decrypt_bytes_to_string(intput_bytes: bytes, key: str | None = None) -> str:
         "onyx.utils.encryption", "_decrypt_bytes"
     )
     return versioned_decryption_fn(intput_bytes, key=key)
+
+
+def strict_encrypt_string_to_bytes(input_str: str) -> bytes:
+    versioned_encryption_fn = fetch_versioned_implementation(
+        "onyx.utils.encryption", "_strict_encrypt_string"
+    )
+    return versioned_encryption_fn(input_str)
+
+
+def strict_decrypt_bytes_to_string(input_bytes: bytes) -> str:
+    versioned_decryption_fn = fetch_versioned_implementation(
+        "onyx.utils.encryption", "_strict_decrypt_bytes"
+    )
+    return versioned_decryption_fn(input_bytes)

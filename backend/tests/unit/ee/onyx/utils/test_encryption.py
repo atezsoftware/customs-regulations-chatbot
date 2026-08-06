@@ -15,6 +15,7 @@ from ee.onyx.utils.encryption import (
     decrypt_bytes_to_string,
     encrypt_string_to_bytes,
 )
+from onyx.utils.encryption import EncryptionError, strict_encrypt_string_to_bytes
 
 EE_MODULE = "ee.onyx.utils.encryption"
 
@@ -165,3 +166,23 @@ class TestWrapperFunctions:
         with patch(f"{EE_MODULE}.ENCRYPTION_KEY_SECRET", KEY_32):
             encrypted = encrypt_string_to_bytes("payload")
             assert decrypt_bytes_to_string(encrypted) == "payload"
+
+
+class TestStrictEncryption:
+    def test_strict_encryption_rejects_missing_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("ENCRYPTION_KEY_SECRET", raising=False)
+
+        with pytest.raises(EncryptionError):
+            strict_encrypt_string_to_bytes("secret")
+
+    def test_strict_encryption_uses_aes_key_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ENCRYPTION_KEY_SECRET", KEY_16)
+
+        encrypted = strict_encrypt_string_to_bytes("secret")
+
+        assert encrypted != b"secret"
+        assert _decrypt_bytes(encrypted, key=KEY_16) == "secret"

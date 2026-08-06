@@ -1,6 +1,6 @@
 import datetime
 import json
-from typing import Any, Literal, NotRequired
+from typing import Any, Literal, NotRequired, cast
 from uuid import UUID, uuid4
 
 from fastapi_users_db_sqlalchemy import (
@@ -133,12 +133,17 @@ from onyx.llm.models import ReasoningEffort
 from onyx.llm.override_models import LLMOverride, PromptOverride
 from onyx.server.security.models import SSRFProtectionLevel
 from onyx.tools.tool_implementations.web_search.models import WebContentProviderConfig
-from onyx.utils.encryption import decrypt_bytes_to_string, encrypt_string_to_bytes
+from onyx.utils.encryption import (
+    decrypt_bytes_to_string,
+    encrypt_string_to_bytes,
+    strict_decrypt_bytes_to_string,
+    strict_encrypt_string_to_bytes,
+)
 from onyx.utils.headers import HeaderItemDict
 from onyx.utils.logger import setup_logger
 from onyx.utils.sensitive import SensitiveValue
 from onyx.utils.special_types import JSON_ro
-from shared_configs.enums import EmbeddingProvider
+from shared_configs.enums import EmbeddingProvider, RerankerProvider
 
 # TODO: After anonymous user migration has been deployed, make user_id columns NOT NULL
 # and update Mapped[User | None] relationships to Mapped[User] where needed.
@@ -227,6 +232,49 @@ class EncryptedString(_EncryptedBase):
                 is_json=False,
             )
         return None
+
+
+class StrictEncryptedString(EncryptedString):
+    """Encrypted string type that never falls back to plaintext storage."""
+
+    cache_ok = True
+
+    def wrap_raw(self, value: Any) -> SensitiveValue[str]:
+        if not isinstance(value, str):
+            raise TypeError(
+                f"StrictEncryptedString column expected str, got {type(value).__name__}"
+            )
+        return SensitiveValue(
+            encrypted_bytes=strict_encrypt_string_to_bytes(value),
+            decrypt_fn=strict_decrypt_bytes_to_string,
+            is_json=False,
+        )
+
+    def process_result_value(
+        self,
+        value: bytes | None,
+        dialect: Dialect,  # noqa: ARG002
+    ) -> SensitiveValue[str] | None:
+        if value is None:
+            return None
+        return SensitiveValue(
+            encrypted_bytes=value,
+            decrypt_fn=strict_decrypt_bytes_to_string,
+            is_json=False,
+        )
+
+    def process_bind_param(
+        self,
+        value: str | SensitiveValue[str] | None,
+        dialect: Dialect,  # noqa: ARG002
+    ) -> bytes | None:
+        if value is None:
+            return None
+        if isinstance(value, SensitiveValue):
+            raw_value = cast(str, value.get_value(apply_mask=False))
+        else:
+            raw_value = value
+        return strict_encrypt_string_to_bytes(raw_value)
 
 
 class EncryptedJson(_EncryptedBase):
@@ -2239,11 +2287,35 @@ class SearchSettings(Base):
     multipass_indexing: Mapped[bool] = mapped_column(Boolean, default=True)
 
     # Contextual RAG
-    enable_contextual_rag: Mapped[bool] = mapped_column(Boolean, default=False)
+    enable_contextual_rag: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true")
+    )
 
     # Contextual RAG LLM — FK to model_configuration (replaces deprecated string columns)
     contextual_rag_model_configuration_id: Mapped[int | None] = mapped_column(
         ForeignKey("model_configuration.id", ondelete="SET NULL"), nullable=True
+    )
+
+    rerank_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    rerank_provider_type: Mapped[RerankerProvider | None] = mapped_column(
+        Enum(
+            RerankerProvider,
+            values_callable=lambda enum: [provider.value for provider in enum],
+            native_enum=False,
+        ),
+        nullable=True,
+    )
+    rerank_model_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    rerank_api_key: Mapped[SensitiveValue[str] | None] = mapped_column(
+        StrictEncryptedString(), nullable=True
+    )
+    rerank_updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    rerank_updated_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
 
     cloud_provider: Mapped["CloudEmbeddingProvider"] = relationship(
@@ -2257,6 +2329,20 @@ class SearchSettings(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "NOT rerank_enabled OR "
+            "(rerank_provider_type IS NOT NULL "
+            "AND rerank_model_name IS NOT NULL "
+            "AND rerank_api_key IS NOT NULL)",
+            name="ck_search_settings_rerank_enabled_configuration",
+        ),
+        CheckConstraint(
+            "rerank_enabled OR "
+            "(rerank_provider_type IS NULL "
+            "AND rerank_model_name IS NULL "
+            "AND rerank_api_key IS NULL)",
+            name="ck_search_settings_rerank_disabled_configuration",
+        ),
         Index(
             "ix_embedding_model_present_unique",
             "status",
