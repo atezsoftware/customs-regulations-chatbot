@@ -8,6 +8,11 @@ The installation has not indexed a corpus yet. The first indexing run can theref
 start with contextual indexing and Turkish analysis; no document backfill or index
 conversion workflow is required.
 
+This repository is treated as the owned product, not as an upstream-compatible Onyx
+fork. Existing Community and licensed Enterprise code may be changed or reused when
+that produces the cleanest architecture; preserving compatibility with removed
+upstream settings is not a constraint.
+
 The corpus is Turkish legal and regulatory material. Retrieval must preserve formal
 legal terminology, article and paragraph identifiers, dates, institution names, and
 cross-references. A complete answer may depend on several chunks from one document,
@@ -37,7 +42,6 @@ paths.
 - Enforcing a fixed number of chunks or sources per answer.
 - Enforcing one result per document.
 - Reindexing an existing corpus; there is no existing indexed corpus in scope.
-- Restoring the removed legacy reranking fields on `SearchSettings`.
 - Sending administrative inventory-search results through the answer reranker.
 - Testing OpenRouter with a real administrator API key in automated tests.
 
@@ -158,17 +162,20 @@ into every result.
 
 ### Persistence
 
-A dedicated tenant-aware reranking configuration stores:
+`SearchSettings` remains the canonical home for global retrieval behavior. A new
+migration adds typed reranking fields for:
 
 - enabled state;
 - provider type, initially `openrouter`;
-- API key stored through the repository's sensitive-field abstraction;
+- API key encrypted at rest through the licensed AES encryption implementation;
 - selected reranker model identifier;
 - timestamps and normal ownership metadata used by other admin settings.
 
-The configuration lives in a new table and migration. It does not reuse an ordinary
-chat LLM provider row and does not revive the legacy columns removed from
-`SearchSettings`.
+These are newly defined product fields with current validation and API semantics, even
+where their purpose resembles columns removed by an older upstream migration. The
+configuration does not reuse an ordinary chat LLM provider row. Startup/configuration
+fails clearly if the encryption key required to store a reranker credential is not
+available; plaintext or base64-only storage is not an accepted fallback.
 
 ### Admin API
 
@@ -339,10 +346,8 @@ Turkish legal question
 
 - The reranking APIs require the same administrator authorization used by other model
   and index settings.
-- The API key uses the repository's sensitive-field abstraction and is always masked
-  on reads. Community Edition's base abstraction is encoding rather than encryption;
-  production-at-rest secrecy therefore requires the Enterprise encryption
-  implementation or an external secret store and is not overstated by the UI.
+- The API key is encrypted at rest with the repository's licensed AES implementation
+  and is always masked on reads. Plaintext or encoding-only fallback is forbidden.
 - Only already authorized, post-censorship chunks may leave the system.
 - The admin UI discloses external query and candidate-text processing before
   enablement.
