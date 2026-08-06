@@ -40,7 +40,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from onyx.configs.app_configs import USE_CHUNK_SUMMARY, USE_DOCUMENT_SUMMARY
+from onyx.configs.app_configs import (
+    ENABLE_CONTEXTUAL_RAG,
+    USE_CHUNK_SUMMARY,
+    USE_DOCUMENT_SUMMARY,
+)
 from onyx.configs.constants import RETURN_SEPARATOR, DocumentSource
 from onyx.connectors.models import (
     Document,
@@ -60,6 +64,7 @@ from onyx.indexing.chunker import (
     MAX_METADATA_PERCENTAGE,
     get_metadata_suffix_for_document_index,
 )
+from onyx.indexing.contextual_settings import effective_contextual_rag_enabled
 from onyx.indexing.embedder import IndexingEmbedder
 from onyx.indexing.models import DocAwareChunk, IndexChunk
 from onyx.regulatory.contextual import (
@@ -68,6 +73,7 @@ from onyx.regulatory.contextual import (
     fit_context_fields_to_embedding_budget,
     validity_window_contains,
 )
+from shared_configs.configs import MULTI_TENANT
 
 if TYPE_CHECKING:
     from onyx.llm.interfaces import LLM
@@ -98,7 +104,11 @@ class AugmentationReembedContext:
 
 
 def select_reembed_strategy(
-    present_ss: SearchSettings, future_ss: SearchSettings
+    present_ss: SearchSettings,
+    future_ss: SearchSettings,
+    *,
+    env_enabled: bool = ENABLE_CONTEXTUAL_RAG,
+    multitenant: bool = MULTI_TENANT,
 ) -> ReembedStrategy:
     """AUGMENTATION when the contextual-RAG *enrichment* differs (the embedded
     text changes), otherwise MODEL_ONLY. A change in
@@ -108,14 +118,21 @@ def select_reembed_strategy(
     Model/prefix/normalize/dimension and multipass changes only alter the vectors
     (or large/mini chunks the port doesn't read), so they fall through to
     MODEL_ONLY."""
-    rag_relevant = present_ss.enable_contextual_rag or future_ss.enable_contextual_rag
-    augmentation_changed = (
-        present_ss.enable_contextual_rag != future_ss.enable_contextual_rag
-        or (
-            rag_relevant
-            and present_ss.contextual_rag_model_configuration_id
-            != future_ss.contextual_rag_model_configuration_id
-        )
+    present_rag_enabled = effective_contextual_rag_enabled(
+        present_ss,
+        env_enabled=env_enabled,
+        multitenant=multitenant,
+    )
+    future_rag_enabled = effective_contextual_rag_enabled(
+        future_ss,
+        env_enabled=env_enabled,
+        multitenant=multitenant,
+    )
+    rag_relevant = present_rag_enabled or future_rag_enabled
+    augmentation_changed = present_rag_enabled != future_rag_enabled or (
+        rag_relevant
+        and present_ss.contextual_rag_model_configuration_id
+        != future_ss.contextual_rag_model_configuration_id
     )
     return (
         ReembedStrategy.AUGMENTATION
@@ -545,33 +562,13 @@ def _augmentation_reembed(
             # Groups by source_document.id internally. Regulatory chunks use a
             # validity-date snapshot so old and amended text cannot contaminate
             # one another's generated context.
-            regulatory_contextual_chunks = [
-                chunk
-                for stored, chunk in zip(stored_chunks, doc_aware_chunks)
-                if stored.regulatory_chunk_id is not None
-                and chunk.contextual_rag_reserved_tokens > 0
-            ]
-            ordinary_contextual_chunks = [
-                chunk
-                for stored, chunk in zip(stored_chunks, doc_aware_chunks)
-                if stored.regulatory_chunk_id is None
-                and chunk.contextual_rag_reserved_tokens > 0
-            ]
-            if ordinary_contextual_chunks:
-                add_contextual_summaries(
-                    chunks=ordinary_contextual_chunks,
-                    llm=ctx.llm,
-                    tokenizer=ctx.tokenizer,
-                    chunk_token_limit=ctx.chunk_token_limit,
-                )
-            if regulatory_contextual_chunks:
-                add_contextual_summaries(
-                    chunks=regulatory_contextual_chunks,
-                    llm=ctx.llm,
-                    tokenizer=ctx.tokenizer,
-                    chunk_token_limit=ctx.chunk_token_limit,
-                    raise_on_failure=True,
-                )
+            add_contextual_summaries(
+                chunks=contextual_chunks,
+                llm=ctx.llm,
+                tokenizer=ctx.tokenizer,
+                chunk_token_limit=ctx.chunk_token_limit,
+                raise_on_failure=True,
+            )
             for stored, chunk in zip(stored_chunks, doc_aware_chunks):
                 if chunk.contextual_rag_reserved_tokens == 0:
                     continue
@@ -586,9 +583,9 @@ def _augmentation_reembed(
                         embedding_token_limit=stored.max_chunk_size,
                     )
                 )
-            incomplete_regulatory_chunks = [
+            incomplete_contextual_chunks = [
                 chunk
-                for chunk in regulatory_contextual_chunks
+                for chunk in contextual_chunks
                 if (USE_CHUNK_SUMMARY and not chunk.chunk_context.strip())
                 or (
                     not USE_CHUNK_SUMMARY
@@ -596,11 +593,11 @@ def _augmentation_reembed(
                     and not chunk.doc_summary.strip()
                 )
             ]
-            if incomplete_regulatory_chunks:
+            if incomplete_contextual_chunks:
                 raise ContextualEnrichmentError(
-                    "Regulatory contextual port is incomplete: "
-                    f"{len(incomplete_regulatory_chunks)}/"
-                    f"{len(regulatory_contextual_chunks)} eligible chunks lack "
+                    "Contextual port is incomplete: "
+                    f"{len(incomplete_contextual_chunks)}/"
+                    f"{len(contextual_chunks)} eligible chunks lack "
                     "generated context"
                 )
 

@@ -15,7 +15,6 @@ from onyx.configs.app_configs import (
     CONTEXTUAL_RAG_MAX_WORKERS,
     CONTEXTUAL_RAG_RETRY_BASE_SECONDS,
     CONTEXTUAL_RAG_RETRY_MAX_SECONDS,
-    ENABLE_CONTEXTUAL_RAG,
     MAX_CHUNKS_PER_DOC_BATCH,
     MAX_DOCUMENT_CHARS,
     MAX_TOKENS_FOR_FULL_INCLUSION,
@@ -77,6 +76,10 @@ from onyx.hooks.points.document_ingestion import (
 )
 from onyx.indexing.chunk_batch_store import ChunkBatchStore
 from onyx.indexing.chunker import Chunker, ChunkerProtocol
+from onyx.indexing.contextual_settings import (
+    effective_contextual_rag_enabled,
+    require_contextual_rag_llm,
+)
 from onyx.indexing.document_push import (
     DocumentPushPayload,
     DocumentPushResponse,
@@ -91,10 +94,7 @@ from onyx.indexing.models import (
     UpdatableChunkData,
 )
 from onyx.indexing.vector_db_insertion import write_chunks_to_vector_db_with_backoff
-from onyx.llm.factory import (
-    get_contextual_rag_llm_for_search_settings,
-    get_default_llm_with_vision,
-)
+from onyx.llm.factory import get_default_llm_with_vision
 from onyx.llm.interfaces import LLM
 from onyx.llm.models import LanguageModelInput, ReasoningEffort, UserMessage
 from onyx.llm.multi_llm import LLMRateLimitError, LLMTimeoutError
@@ -1512,18 +1512,20 @@ def index_doc_batch(
         # Because the chunker's tokens are different from the LLM's tokens,
         # We add a fudge factor to ensure we truncate prompts to the LLM's token limit
         with time_stage_if_set(IndexAttemptStage.CONTEXTUAL_RAG, attempt_id):
+            eligible_contextual_chunks = [
+                chunk for chunk in chunks if chunk.contextual_rag_reserved_tokens > 0
+            ]
             regulatory_contextual_chunks = [
                 chunk
-                for chunk in chunks
+                for chunk in eligible_contextual_chunks
                 if chunk.regulatory_chunk_id is not None
-                and chunk.contextual_rag_reserved_tokens > 0
             ]
             chunks = add_contextual_summaries(
                 chunks=chunks,
                 llm=llm,
                 tokenizer=llm_tokenizer,
                 chunk_token_limit=chunker.chunk_token_limit * 2,
-                raise_on_failure=bool(regulatory_contextual_chunks),
+                raise_on_failure=bool(eligible_contextual_chunks),
             )
             if regulatory_contextual_chunks:
                 from onyx.regulatory.contextual import (
@@ -1542,27 +1544,28 @@ def index_doc_batch(
                             embedding_token_limit=chunker.chunk_token_limit,
                         )
                     )
-                incomplete_regulatory_chunks = [
-                    chunk
-                    for chunk in regulatory_contextual_chunks
-                    if (USE_CHUNK_SUMMARY and not chunk.chunk_context.strip())
-                    or (
-                        not USE_CHUNK_SUMMARY
-                        and USE_DOCUMENT_SUMMARY
-                        and not chunk.doc_summary.strip()
-                    )
+            incomplete_contextual_chunks = [
+                chunk
+                for chunk in eligible_contextual_chunks
+                if (USE_CHUNK_SUMMARY and not chunk.chunk_context.strip())
+                or (
+                    not USE_CHUNK_SUMMARY
+                    and USE_DOCUMENT_SUMMARY
+                    and not chunk.doc_summary.strip()
+                )
+            ]
+            if incomplete_contextual_chunks:
+                sample_ids = [
+                    chunk.regulatory_chunk_id
+                    or f"{chunk.source_document.id}:{chunk.chunk_id}"
+                    for chunk in incomplete_contextual_chunks[:5]
                 ]
-                if incomplete_regulatory_chunks:
-                    incomplete_ids = [
-                        chunk.regulatory_chunk_id
-                        for chunk in incomplete_regulatory_chunks[:5]
-                    ]
-                    raise ContextualEnrichmentError(
-                        "Regulatory contextual indexing is incomplete: "
-                        f"{len(incomplete_regulatory_chunks)}/"
-                        f"{len(regulatory_contextual_chunks)} eligible chunks "
-                        f"lack required context; sample_ids={incomplete_ids}"
-                    )
+                raise ContextualEnrichmentError(
+                    "Contextual indexing is incomplete: "
+                    f"{len(incomplete_contextual_chunks)}/"
+                    f"{len(eligible_contextual_chunks)} eligible chunks "
+                    f"lack required context; sample_ids={sample_ids}"
+                )
 
     logger.debug("Starting embedding")
     # ``embed_and_stream`` records EMBEDDING internally so the timer captures
@@ -1757,12 +1760,8 @@ def run_indexing_pipeline(
 
     multipass_config = get_multipass_config(search_settings)
 
-    enable_contextual_rag = (
-        search_settings.enable_contextual_rag or ENABLE_CONTEXTUAL_RAG
-    )
-    llm = None
-    if enable_contextual_rag:
-        llm = get_contextual_rag_llm_for_search_settings(search_settings)
+    enable_contextual_rag = effective_contextual_rag_enabled(search_settings)
+    llm = require_contextual_rag_llm(search_settings)
 
     chunker = chunker or Chunker(
         tokenizer=embedder.embedding_model.tokenizer,

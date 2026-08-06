@@ -21,7 +21,6 @@ from onyx.background.celery.tasks.shared.RetryDocumentIndex import RetryDocument
 from onyx.configs.app_configs import (
     CELERY_WORKER_USER_FILE_PROCESSING_CONCURRENCY,
     DISABLE_VECTOR_DB,
-    ENABLE_CONTEXTUAL_RAG,
     MANAGED_VESPA,
     VESPA_CLOUD_CERT_PATH,
     VESPA_CLOUD_KEY_PATH,
@@ -87,6 +86,7 @@ from onyx.indexing.adapters.user_file_indexing_adapter import (
     UserFileDeletingSkip,
     UserFileIndexingAdapter,
 )
+from onyx.indexing.contextual_settings import effective_contextual_rag_enabled
 from onyx.indexing.embedder import DefaultIndexingEmbedder
 from onyx.indexing.indexing_pipeline import run_indexing_pipeline
 from onyx.redis.redis_pool import get_redis_client
@@ -544,8 +544,8 @@ def _process_user_file_with_indexing(
         regulatory_chunker = RegulatoryIndexingChunker(
             db_session=db_session,
             tokenizer=embedding_model.embedding_model.tokenizer,
-            enable_contextual_rag=(
-                current_search_settings.enable_contextual_rag or ENABLE_CONTEXTUAL_RAG
+            enable_contextual_rag=effective_contextual_rag_enabled(
+                current_search_settings
             ),
         )
         try:

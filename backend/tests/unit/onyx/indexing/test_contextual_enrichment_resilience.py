@@ -8,6 +8,7 @@ from onyx.indexing.indexing_pipeline import (
     ContextualEnrichmentError,
     add_chunk_summaries,
     add_contextual_summaries,
+    index_doc_batch,
 )
 from onyx.indexing.models import DocAwareChunk
 from onyx.llm.model_response import Choice, Message, ModelResponse
@@ -237,3 +238,55 @@ def test_contextual_call_uses_process_wide_request_gate() -> None:
 
     request_slots.__enter__.assert_called_once_with()
     request_slots.__exit__.assert_called_once()
+
+
+def test_generic_context_failure_aborts_before_embedding() -> None:
+    document = MagicMock()
+    document.id = "ordinary-document"
+    document.sections = []
+    document.get_total_char_length.return_value = 100
+
+    chunk = _chunk()
+    chunk.regulatory_chunk_id = None
+    adapter = MagicMock()
+    context = MagicMock()
+    context.updatable_docs = [document]
+    adapter.prepare.return_value = context
+    chunker = MagicMock()
+    chunker.chunk.return_value = [chunk]
+    chunker.chunk_token_limit = 512
+    llm = _llm()
+
+    with (
+        patch(
+            "onyx.indexing.indexing_pipeline.process_image_sections",
+            return_value=[document],
+        ),
+        patch(
+            "onyx.indexing.indexing_pipeline._apply_document_ingestion_hook",
+            return_value=[document],
+        ),
+        patch(
+            "onyx.indexing.indexing_pipeline.get_tokenizer", return_value=_tokenizer()
+        ),
+        patch(
+            "onyx.indexing.indexing_pipeline.add_contextual_summaries",
+            side_effect=ContextualEnrichmentError("ordinary contextual failure"),
+        ) as enrich,
+        patch("onyx.indexing.indexing_pipeline.embed_and_stream") as embed,
+        pytest.raises(ContextualEnrichmentError, match="ordinary contextual failure"),
+    ):
+        index_doc_batch(
+            document_batch=[document],
+            chunker=chunker,
+            embedder=MagicMock(),
+            document_indices=[],
+            request_id=None,
+            tenant_id="public",
+            adapter=adapter,
+            enable_contextual_rag=True,
+            llm=llm,
+        )
+
+    assert enrich.call_args.kwargs["raise_on_failure"] is True
+    embed.assert_not_called()

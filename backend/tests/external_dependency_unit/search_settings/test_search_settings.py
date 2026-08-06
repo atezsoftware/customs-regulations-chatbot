@@ -17,7 +17,12 @@ from onyx.db.llm import (
     upsert_llm_provider,
 )
 from onyx.db.models import IndexAttempt, IndexModelStatus, SearchSettings
-from onyx.db.search_settings import create_search_settings, update_search_settings
+from onyx.db.search_settings import (
+    bootstrap_contextual_rag_for_empty_corpus,
+    create_search_settings,
+    get_current_search_settings,
+    update_search_settings,
+)
 from onyx.db.swap_index import check_and_perform_index_swap
 from onyx.indexing.indexing_pipeline import (
     IndexingPipelineResult,
@@ -28,6 +33,7 @@ from onyx.server.manage.llm.models import (
     ModelConfigurationUpsertRequest,
 )
 from onyx.server.manage.search_settings import (
+    get_contextual_setup_status,
     set_new_search_settings,
     update_saved_search_settings,
 )
@@ -141,6 +147,29 @@ def _run_indexing_pipeline_with_mocks(
     )
 
 
+@patch("onyx.server.manage.search_settings.check_docs_exist", return_value=False)
+@patch(
+    "onyx.server.manage.search_settings.fetch_default_contextual_rag_model",
+    return_value=None,
+)
+@patch("onyx.server.manage.search_settings.get_current_search_settings")
+def test_contextual_setup_status_requires_model_before_first_index(
+    get_current: MagicMock,
+    _fetch_default: MagicMock,
+    _check_docs: MagicMock,
+) -> None:
+    get_current.return_value = SearchSettings(
+        enable_contextual_rag=True,
+        contextual_rag_model_configuration_id=None,
+    )
+
+    status = get_contextual_setup_status(_=MagicMock(), db_session=MagicMock())
+
+    assert status.required is True
+    assert status.enabled is True
+    assert status.model_configuration_id is None
+
+
 @pytest.fixture()
 def baseline_search_settings(
     tenant_context: None,  # noqa: ARG001
@@ -162,9 +191,34 @@ def baseline_search_settings(
     )
 
 
+@patch("onyx.db.search_settings.check_docs_exist", return_value=False)
+def test_empty_corpus_bootstrap_enables_existing_present_row(
+    _check_docs_exist: MagicMock,
+    baseline_search_settings: None,  # noqa: ARG001
+    db_session: Session,
+) -> None:
+    current = get_current_search_settings(db_session)
+    assert current.enable_contextual_rag is False
+
+    try:
+        assert bootstrap_contextual_rag_for_empty_corpus(
+            db_session,
+            multitenant=False,
+            commit=False,
+        )
+        assert current.enable_contextual_rag is True
+    finally:
+        db_session.rollback()
+
+
 @patch("onyx.server.manage.search_settings.get_all_document_indices")
 @patch("onyx.server.manage.search_settings.get_default_document_index")
+@patch(
+    "onyx.server.manage.search_settings.effective_contextual_rag_enabled",
+    return_value=False,
+)
 def test_port_seed_excludes_invalid_cc_pair(
+    _effective_contextual_rag_enabled: MagicMock,
     mock_get_default_doc_index: MagicMock,  # noqa: ARG001
     mock_get_all_doc_indices: MagicMock,
     baseline_search_settings: None,  # noqa: ARG001
@@ -224,7 +278,7 @@ def test_port_seed_excludes_invalid_cc_pair(
 @patch("onyx.db.swap_index.get_all_document_indices")
 @patch("onyx.server.manage.search_settings.get_all_document_indices")
 @patch("onyx.server.manage.search_settings.get_default_document_index")
-@patch("onyx.indexing.indexing_pipeline.get_contextual_rag_llm_for_search_settings")
+@patch("onyx.indexing.contextual_settings.get_contextual_rag_llm_for_search_settings")
 @patch("onyx.indexing.indexing_pipeline.index_doc_batch_with_handler")
 def test_indexing_pipeline_uses_contextual_rag_settings_from_create(
     mock_index_handler: MagicMock,
@@ -282,7 +336,7 @@ def test_indexing_pipeline_uses_contextual_rag_settings_from_create(
 @patch("onyx.db.swap_index.get_all_document_indices")
 @patch("onyx.server.manage.search_settings.get_all_document_indices")
 @patch("onyx.server.manage.search_settings.get_default_document_index")
-@patch("onyx.indexing.indexing_pipeline.get_contextual_rag_llm_for_search_settings")
+@patch("onyx.indexing.contextual_settings.get_contextual_rag_llm_for_search_settings")
 @patch("onyx.indexing.indexing_pipeline.index_doc_batch_with_handler")
 def test_indexing_pipeline_uses_updated_contextual_rag_settings(
     mock_index_handler: MagicMock,
@@ -353,9 +407,9 @@ def test_indexing_pipeline_uses_updated_contextual_rag_settings(
 
 @patch("onyx.server.manage.search_settings.get_all_document_indices")
 @patch("onyx.server.manage.search_settings.get_default_document_index")
-@patch("onyx.indexing.indexing_pipeline.get_contextual_rag_llm_for_search_settings")
+@patch("onyx.indexing.contextual_settings.get_contextual_rag_llm_for_search_settings")
 @patch("onyx.indexing.indexing_pipeline.index_doc_batch_with_handler")
-def test_indexing_pipeline_skips_llm_when_contextual_rag_disabled(
+def test_indexing_pipeline_uses_global_default_when_row_disabled(
     mock_index_handler: MagicMock,
     mock_get_llm: MagicMock,
     mock_get_doc_index: MagicMock,  # noqa: ARG001
@@ -363,8 +417,7 @@ def test_indexing_pipeline_skips_llm_when_contextual_rag_disabled(
     baseline_search_settings: None,  # noqa: ARG001
     db_session: Session,
 ) -> None:
-    """When contextual RAG is disabled in search settings, the pipeline should not
-    resolve a contextual-RAG LLM at all."""
+    """The supported-deployment default overrides a legacy disabled row."""
     mc_id = _create_llm_provider_and_model(
         db_session=db_session,
         provider_name=TEST_PROVIDER_NAME,
@@ -386,7 +439,7 @@ def test_indexing_pipeline_skips_llm_when_contextual_rag_disabled(
 
     _run_indexing_pipeline_with_mocks(mock_get_llm, mock_index_handler, db_session)
 
-    mock_get_llm.assert_not_called()
+    mock_get_llm.assert_called_once()
 
 
 def test_create_search_settings_coerces_none_prefixes(

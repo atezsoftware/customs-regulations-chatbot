@@ -18,11 +18,7 @@ stream PIT pages.
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 
-from onyx.configs.app_configs import (
-    ENABLE_CONTEXTUAL_RAG,
-    USE_CHUNK_SUMMARY,
-    USE_DOCUMENT_SUMMARY,
-)
+from onyx.configs.app_configs import USE_CHUNK_SUMMARY, USE_DOCUMENT_SUMMARY
 from onyx.db.models import SearchSettings
 from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
 from onyx.document_index.elasticsearch.elasticsearch_document_index import (
@@ -34,6 +30,10 @@ from onyx.document_index.elasticsearch.schema import (
 )
 from onyx.document_index.factory import build_elasticsearch_document_index
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
+from onyx.indexing.contextual_settings import (
+    effective_contextual_rag_enabled,
+    require_contextual_rag_llm,
+)
 from onyx.indexing.embedder import DefaultIndexingEmbedder, IndexingEmbedder
 from onyx.indexing.port_reembed import (
     AugmentationReembedContext,
@@ -42,7 +42,6 @@ from onyx.indexing.port_reembed import (
     re_embed_chunks,
     select_reembed_strategy,
 )
-from onyx.llm.factory import get_contextual_rag_llm_for_search_settings
 from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
 from onyx.regulatory.contextual import (
     context_reference_date,
@@ -179,18 +178,14 @@ def _build_augmentation_ctx(
         model_name=future_search_settings.model_name,
         provider_type=future_search_settings.provider_type,
     )
-    if not future_search_settings.enable_contextual_rag:
+    if not effective_contextual_rag_enabled(future_search_settings):
         return AugmentationReembedContext(
             future_enable_contextual_rag=False,
             future_embedding_tokenizer=future_embedding_tokenizer,
         )
 
-    llm = get_contextual_rag_llm_for_search_settings(future_search_settings)
-    if llm is None:
-        raise ValueError(
-            "contextual-RAG is enabled on the FUTURE search settings but no "
-            "contextual RAG model is configured (and no tenant default exists)"
-        )
+    llm = require_contextual_rag_llm(future_search_settings)
+    assert llm is not None, "contextual port context built while disabled"
     tokenizer = get_tokenizer(
         model_name=llm.config.model_name,
         provider_type=llm.config.model_provider,
@@ -333,7 +328,7 @@ class PortCopier:
         if self._strategy is ReembedStrategy.AUGMENTATION:
             self._augmentation_ctx = _build_augmentation_ctx(future_search_settings)
         self._require_contextual_regulatory_completeness = (
-            future_search_settings.enable_contextual_rag or ENABLE_CONTEXTUAL_RAG
+            effective_contextual_rag_enabled(future_search_settings)
         ) and (USE_CHUNK_SUMMARY or USE_DOCUMENT_SUMMARY)
 
     def delete_port_written(self, document_ids: list[str]) -> int:

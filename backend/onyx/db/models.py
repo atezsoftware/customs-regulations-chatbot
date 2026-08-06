@@ -2288,7 +2288,7 @@ class SearchSettings(Base):
 
     # Contextual RAG
     enable_contextual_rag: Mapped[bool] = mapped_column(
-        Boolean, default=True, server_default=text("true")
+        Boolean, nullable=False, default=True, server_default=text("true")
     )
 
     # Contextual RAG LLM — FK to model_configuration (replaces deprecated string columns)

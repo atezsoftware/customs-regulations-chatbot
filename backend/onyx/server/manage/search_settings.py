@@ -71,6 +71,7 @@ from onyx.file_processing.unstructured import (
     get_unstructured_api_key,
     update_unstructured_api_key,
 )
+from onyx.indexing.contextual_settings import effective_contextual_rag_enabled
 from onyx.natural_language_processing.search_nlp_models import clean_model_name
 from onyx.server.manage.embedding.models import SearchSettingsDeleteRequest
 from onyx.server.manage.models import FullModelVersionResponse
@@ -82,6 +83,12 @@ from shared_configs.contextvars import get_current_tenant_id
 
 router = APIRouter(prefix="/search-settings")
 logger = setup_logger()
+
+
+class ContextualSetupStatus(BaseModel):
+    required: bool
+    enabled: bool
+    model_configuration_id: int | None
 
 
 def _is_empty_cloud_embedding_bootstrap(
@@ -192,7 +199,7 @@ def set_new_search_settings(
     validate_contextual_rag_model(
         model_configuration_id=search_settings_new.contextual_rag_model_configuration_id,
         db_session=db_session,
-        enable_contextual_rag=search_settings_new.enable_contextual_rag,
+        enable_contextual_rag=effective_contextual_rag_enabled(search_settings_new),
     )
 
     search_settings = get_current_search_settings(db_session)
@@ -455,6 +462,23 @@ def get_secondary_search_settings_endpoint(
     return SavedSearchSettings.from_db_model(secondary_search_settings)
 
 
+@router.get("/contextual-setup-status")
+def get_contextual_setup_status(
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> ContextualSetupStatus:
+    current_search_settings = get_current_search_settings(db_session)
+    default_model = fetch_default_contextual_rag_model(db_session)
+    return ContextualSetupStatus(
+        required=not MULTI_TENANT and not check_docs_exist(db_session),
+        enabled=effective_contextual_rag_enabled(current_search_settings),
+        model_configuration_id=(
+            current_search_settings.contextual_rag_model_configuration_id
+            or (default_model.id if default_model is not None else None)
+        ),
+    )
+
+
 def _active_port_settings(db_session: Session) -> SearchSettings | None:
     secondary = get_secondary_search_settings(db_session)
     if secondary is not None and secondary.use_port_flow:
@@ -575,11 +599,11 @@ def update_saved_search_settings(
             detail="Contextual RAG disabled in Onyx Cloud",
         )
 
-    # enable_contextual_rag is preserved here (never written), so don't validate it:
-    # the flag is discarded, and validating would 400 a change we ignore.
+    current_search_settings = get_current_search_settings(db_session)
     validate_contextual_rag_model(
         model_configuration_id=search_settings.contextual_rag_model_configuration_id,
         db_session=db_session,
+        enable_contextual_rag=effective_contextual_rag_enabled(current_search_settings),
     )
 
     update_current_search_settings(

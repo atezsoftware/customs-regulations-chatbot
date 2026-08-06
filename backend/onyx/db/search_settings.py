@@ -7,6 +7,7 @@ from onyx.configs.model_configs import (
     DOCUMENT_ENCODER_MODEL,
 )
 from onyx.context.search.models import SavedSearchSettings
+from onyx.db.document import check_docs_exist
 from onyx.db.llm import fetch_embedding_provider
 from onyx.db.models import (
     CloudEmbeddingProvider,
@@ -197,6 +198,44 @@ def get_current_search_settings(db_session: Session) -> SearchSettings:
     if not latest_settings:
         raise RuntimeError("No search settings specified; DB is not in a valid state.")
     return latest_settings
+
+
+def bootstrap_contextual_rag_for_empty_corpus(
+    db_session: Session,
+    *,
+    multitenant: bool,
+    commit: bool = True,
+) -> bool:
+    """Enable contextual indexing on the active row before first ingestion.
+
+    The PRESENT row is locked so startup and admin mutations cannot overwrite one
+    another. Existing corpora and multitenant deployments are never changed.
+    """
+
+    if multitenant:
+        return False
+
+    current_settings = (
+        db_session.execute(
+            select(SearchSettings)
+            .where(SearchSettings.status == IndexModelStatus.PRESENT)
+            .order_by(SearchSettings.id.desc())
+            .with_for_update()
+        )
+        .scalars()
+        .first()
+    )
+    if current_settings is None:
+        raise RuntimeError("No search settings specified; DB is not in a valid state.")
+    if check_docs_exist(db_session) or current_settings.enable_contextual_rag:
+        return False
+
+    current_settings.enable_contextual_rag = True
+    if commit:
+        db_session.commit()
+    else:
+        db_session.flush()
+    return True
 
 
 def get_secondary_search_settings(db_session: Session) -> SearchSettings | None:

@@ -204,7 +204,7 @@ class IndexingSetting(EmbeddingModelDetail):
     reduced_dimension: int | None = None
 
     switchover_type: SwitchoverType = SwitchoverType.REINDEX
-    enable_contextual_rag: bool
+    enable_contextual_rag: bool = True
     contextual_rag_model_configuration_id: int | None = None
     # Deprecated: accepted for backward compat but silently ignored on write.
     # Callers must send contextual_rag_model_configuration_id instead;

@@ -151,9 +151,14 @@ def _ss(
 
 def test_select_reembed_strategy() -> None:
     base = _ss()
-    assert select_reembed_strategy(base, _ss()) is ReembedStrategy.MODEL_ONLY
     assert (
-        select_reembed_strategy(base, _ss(enable_contextual_rag=True))
+        select_reembed_strategy(base, _ss(), env_enabled=False)
+        is ReembedStrategy.MODEL_ONLY
+    )
+    assert (
+        select_reembed_strategy(
+            base, _ss(enable_contextual_rag=True), env_enabled=False
+        )
         is ReembedStrategy.AUGMENTATION
     )
     # RAG on in both, model changed -> AUGMENTATION (re-enrich under new LLM)
@@ -161,6 +166,7 @@ def test_select_reembed_strategy() -> None:
         select_reembed_strategy(
             _ss(enable_contextual_rag=True, contextual_rag_model_configuration_id=1),
             _ss(enable_contextual_rag=True, contextual_rag_model_configuration_id=2),
+            env_enabled=False,
         )
         is ReembedStrategy.AUGMENTATION
     )
@@ -169,6 +175,7 @@ def test_select_reembed_strategy() -> None:
         select_reembed_strategy(
             _ss(enable_contextual_rag=True, contextual_rag_model_configuration_id=1),
             _ss(enable_contextual_rag=True, contextual_rag_model_configuration_id=1),
+            env_enabled=False,
         )
         is ReembedStrategy.MODEL_ONLY
     )
@@ -178,6 +185,7 @@ def test_select_reembed_strategy() -> None:
         select_reembed_strategy(
             _ss(enable_contextual_rag=False, contextual_rag_model_configuration_id=1),
             _ss(enable_contextual_rag=False, contextual_rag_model_configuration_id=2),
+            env_enabled=False,
         )
         is ReembedStrategy.MODEL_ONLY
     )
@@ -491,6 +499,44 @@ def test_augmentation_enrich_on_generates_and_reembeds(
     assert result.content_vector != _vec(strip_embed_input)
 
 
+def test_ordinary_augmentation_failure_aborts_before_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.indexing.indexing_pipeline import ContextualEnrichmentError
+
+    def _fail_enrichment(
+        chunks: list[DocAwareChunk], *, raise_on_failure: bool, **_kwargs: object
+    ) -> list[DocAwareChunk]:
+        assert len(chunks) == 1
+        assert raise_on_failure is True
+        raise ContextualEnrichmentError("ordinary contextual failure")
+
+    monkeypatch.setattr(
+        "onyx.indexing.indexing_pipeline.add_contextual_summaries",
+        _fail_enrichment,
+    )
+    embedder = MagicMock()
+    chunk = _stored_chunk("ordinary body", title=None)
+    ctx = AugmentationReembedContext(
+        future_enable_contextual_rag=True,
+        future_embedding_tokenizer=_TOKENIZER,
+        llm=MagicMock(),
+        tokenizer=MagicMock(),
+        chunk_token_limit=128,
+        contextual_rag_reserved_tokens=64,
+    )
+
+    with pytest.raises(ContextualEnrichmentError, match="ordinary contextual failure"):
+        re_embed_chunks(
+            [chunk],
+            ReembedStrategy.AUGMENTATION,
+            cast(IndexingEmbedder, embedder),
+            augmentation_ctx=ctx,
+        )
+
+    embedder.embed_chunks.assert_not_called()
+
+
 def test_augmentation_mixed_docs_enrich_per_document(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -504,6 +550,7 @@ def test_augmentation_mixed_docs_enrich_per_document(
         for c in chunks:
             doc = c.source_document
             c.doc_summary = f"[{doc.id}:{doc.get_text_content()}] "
+            c.chunk_context = "generated local context"
         return chunks
 
     monkeypatch.setattr(

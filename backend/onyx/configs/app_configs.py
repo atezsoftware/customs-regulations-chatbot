@@ -1448,7 +1448,9 @@ ENABLE_MULTIPASS_INDEXING = (
     os.environ.get("ENABLE_MULTIPASS_INDEXING", "").lower() == "true"
 )
 # Enable contextual retrieval
-ENABLE_CONTEXTUAL_RAG = os.environ.get("ENABLE_CONTEXTUAL_RAG", "").lower() == "true"
+ENABLE_CONTEXTUAL_RAG = (
+    os.environ.get("ENABLE_CONTEXTUAL_RAG", "true").lower() == "true"
+)
 
 # Bound contextual-enrichment provider traffic. A document can contain hundreds of
 # chunks, so using one worker per chunk can overwhelm an otherwise healthy LLM

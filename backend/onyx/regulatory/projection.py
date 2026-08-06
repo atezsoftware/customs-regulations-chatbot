@@ -16,7 +16,6 @@ from onyx.access.access import get_access_for_user_files
 from onyx.access.models import DocumentAccess
 from onyx.configs.app_configs import (
     BLURB_SIZE,
-    ENABLE_CONTEXTUAL_RAG,
     USE_CHUNK_SUMMARY,
     USE_DOCUMENT_SUMMARY,
 )
@@ -36,9 +35,12 @@ from onyx.document_index.interfaces_new import IndexingMetadata
 from onyx.httpx.httpx_pool import HttpxPool
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.indexing.chunking import extract_blurb
+from onyx.indexing.contextual_settings import (
+    effective_contextual_rag_enabled,
+    require_contextual_rag_llm,
+)
 from onyx.indexing.embedder import DefaultIndexingEmbedder
 from onyx.indexing.models import DocAwareChunk, DocMetadataAwareIndexChunk, IndexChunk
-from onyx.llm.factory import get_contextual_rag_llm_for_search_settings
 from onyx.natural_language_processing.utils import get_tokenizer
 from onyx.regulatory.contextual import (
     context_reference_date,
@@ -156,11 +158,8 @@ def _contextualize_chunks(
 ) -> None:
     """Add temporally isolated context without crowding out legal text."""
 
-    llm = get_contextual_rag_llm_for_search_settings(search_settings)
-    if llm is None:
-        raise ValueError(
-            "Contextual retrieval is enabled but no contextual model is configured"
-        )
+    llm = require_contextual_rag_llm(search_settings)
+    assert llm is not None, "contextualization called while disabled"
 
     canonical_document = chunks[0].source_document
     today = datetime.date.today()
@@ -367,7 +366,7 @@ def _project_rows_to_search_settings(
         rows,
         blurb_splitter,
     )
-    if search_settings.enable_contextual_rag or ENABLE_CONTEXTUAL_RAG:
+    if effective_contextual_rag_enabled(search_settings):
         _contextualize_chunks(
             chunks=doc_chunks,
             rows=rows,
