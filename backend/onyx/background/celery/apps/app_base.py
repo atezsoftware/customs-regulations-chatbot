@@ -35,6 +35,7 @@ from onyx.background.celery.tasks.vespa.document_sync import (
     DOCUMENT_SYNC_TASKSET_KEY,
 )
 from onyx.configs.app_configs import (
+    CELERY_PRIMARY_WORKER_REQUIRED,
     DISABLE_VECTOR_DB,
     ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX,
     ONYX_DISABLE_VESPA,
@@ -408,6 +409,10 @@ def wait_for_db(sender: Any, **kwargs: Any) -> None:  # noqa: ARG001
 
 def on_secondary_worker_init(sender: Any, **kwargs: Any) -> None:  # noqa: ARG001
     logger.info("Running as a secondary celery worker: pid=%s", os.getpid())
+
+    if not CELERY_PRIMARY_WORKER_REQUIRED:
+        logger.info("Primary worker wait is disabled for this deployment. Continuing...")
+        return
 
     # Set up variables for waiting on primary worker
     WAIT_INTERVAL = 5

@@ -1083,6 +1083,13 @@ CELERY_WORKER_PRIMARY_POOL_OVERFLOW = int(
     os.environ.get("CELERY_WORKER_PRIMARY_POOL_OVERFLOW") or 4
 )
 
+# Secondary workers normally wait for the singleton primary worker to finish
+# coordinating shared Redis state. Production-lite intentionally omits that
+# worker, so it must explicitly disable the startup wait.
+CELERY_PRIMARY_WORKER_REQUIRED = (
+    os.environ.get("CELERY_PRIMARY_WORKER_REQUIRED", "true").lower() == "true"
+)
+
 # Individual worker concurrency settings
 CELERY_WORKER_HEAVY_CONCURRENCY = int(
     os.environ.get("CELERY_WORKER_HEAVY_CONCURRENCY") or 4

@@ -64,6 +64,8 @@ services:
       ENABLE_CRAFT: "false"
       ENABLE_PAID_ENTERPRISE_EDITION_FEATURES: "true"
       LICENSE_ENFORCEMENT_ENABLED: "false"
+      # This lite supervisor intentionally has no primary Celery worker.
+      CELERY_PRIMARY_WORKER_REQUIRED: "false"
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_DB: ${POSTGRES_DB:-postgres}
     healthcheck:
