@@ -20,11 +20,13 @@ from onyx.context.search.utils import (
     convert_inference_sections_to_search_docs,
     inference_section_from_single_chunk,
 )
+from onyx.db.reranking import RerankerRuntimeConfig
 from onyx.regulatory.heading_path import RegulatoryProvisionReference
 from onyx.regulatory.provision_retrieval import (
     RegulatoryProvisionNavigation,
     RegulatoryProvisionNavigationEntry,
 )
+from onyx.reranking.models import RerankOutcome, RerankResult
 from onyx.secondary_llm_flows.time_filter import DocumentTimeField, TimeFilter
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import SearchToolFilterDelta
@@ -333,6 +335,30 @@ def _regulatory_chunk(document_id: str, chunk_id: int) -> InferenceChunk:
     chunk.regulatory_chunk_id = f"rc-{document_id}-{chunk_id}"
     chunk.unique_id = f"{document_id}__{chunk_id}"
     return cast(InferenceChunk, chunk)
+
+
+def _ordinary_chunk(document_id: str, chunk_id: int, body: str) -> InferenceChunk:
+    return InferenceChunk(
+        document_id=document_id,
+        chunk_id=chunk_id,
+        content=body,
+        source_type=DocumentSource.USER_FILE,
+        semantic_identifier=document_id,
+        title=document_id,
+        boost=1,
+        score=0.9,
+        hidden=False,
+        metadata={},
+        match_highlights=[],
+        doc_summary="",
+        chunk_context="",
+        updated_at=None,
+        image_file_id=None,
+        source_links=None,
+        section_continuation=False,
+        blurb=body,
+        file_id="stored-file-id",
+    )
 
 
 def _real_regulatory_section(
@@ -868,6 +894,13 @@ def _run(
     queries: list[str] | None = None,
     search_mode: str | None = "hybrid",
     expanded_keyword_queries: list[str] | None = None,
+    fused_chunks: list[InferenceChunk] | None = None,
+    rerank_result: RerankResult | None = None,
+    selector_sink: list[MagicMock] | None = None,
+    rerank_sink: list[MagicMock] | None = None,
+    num_hits: int = 50,
+    max_llm_chunks: int = 25,
+    rerank_candidate_limit: int = 100,
 ) -> MagicMock:
     """Run tool.run() with all DB/LLM deps mocked; returns the search_pipeline mock.
 
@@ -876,6 +909,19 @@ def _run(
     returns no chunks, so run() takes the empty-results early return.
     """
     mock_search_pipeline = MagicMock(return_value=[])
+    effective_fused_chunks = fused_chunks or []
+    effective_rerank_result = rerank_result or RerankResult(
+        ordered_chunks=effective_fused_chunks,
+        scores_by_chunk={},
+        submitted_count=0,
+        result_count=0,
+        outcome=RerankOutcome.DISABLED,
+        fallback_used=True,
+    )
+    rerank_mock = MagicMock(return_value=effective_rerank_result)
+    selector_mock = MagicMock(
+        side_effect=lambda sections, **_kwargs: (list(sections), None)
+    )
     decide = (
         decide_mock if decide_mock is not None else MagicMock(return_value=decision)
     )
@@ -883,6 +929,16 @@ def _run(
         patch(f"{MODULE}.get_session_with_current_tenant") as mock_session_ctx,
         patch(f"{MODULE}.build_access_filters_for_user", return_value=[]),
         patch(f"{MODULE}.get_current_search_settings", return_value=MagicMock()),
+        patch(
+            f"{MODULE}.get_reranker_configuration",
+            return_value=RerankerRuntimeConfig(
+                enabled=False,
+                provider_type=None,
+                model_name=None,
+                api_key=None,
+                configuration_generation="test-generation",
+            ),
+        ),
         patch(f"{MODULE}.EmbeddingModel"),
         patch(f"{MODULE}.get_federated_retrieval_functions", return_value=[]),
         patch(
@@ -895,7 +951,14 @@ def _run(
         ),
         patch(f"{MODULE}.decide_search_scope", decide),
         patch(f"{MODULE}.decide_time_filter", MagicMock(return_value=None)),
-        patch(f"{MODULE}.weighted_reciprocal_rank_fusion", return_value=[]),
+        patch(
+            f"{MODULE}.weighted_reciprocal_rank_fusion",
+            return_value=effective_fused_chunks,
+        ),
+        patch(f"{MODULE}.rerank_chunks", rerank_mock),
+        patch(f"{MODULE}.select_sections_for_expansion", selector_mock),
+        patch(f"{MODULE}.populate_file_ids_on_sections"),
+        patch(f"{MODULE}.get_llm_token_counter", return_value=lambda text: len(text)),
         patch(f"{MODULE}.search_pipeline", mock_search_pipeline),
     ):
         mock_session_ctx.return_value.__enter__ = MagicMock(return_value=MagicMock())
@@ -925,11 +988,18 @@ def _run(
                 filter_message_history=filter_message_history,
                 filter_queries=filter_queries,
                 skip_query_expansion=skip_query_expansion,
+                num_hits=num_hits,
+                max_llm_chunks=max_llm_chunks,
+                rerank_candidate_limit=rerank_candidate_limit,
             ),
             **tool_kwargs,
         )
         if response_sink is not None:
             response_sink.append(response)
+        if selector_sink is not None:
+            selector_sink.append(selector_mock)
+        if rerank_sink is not None:
+            rerank_sink.append(rerank_mock)
     return mock_search_pipeline
 
 
@@ -1003,6 +1073,82 @@ def test_run_caps_query_lanes_and_uses_per_lane_budget() -> None:
     requests = _query_requests_sent(mock_search_pipeline)
     assert len(requests) == MAX_SEARCH_QUERY_LANES
     assert all(limit == SEARCH_HITS_PER_LANE for *_, limit in requests)
+
+
+def test_successful_rerank_receives_full_fused_pool_and_bypasses_selector() -> None:
+    chunks = [
+        _ordinary_chunk("doc", 1, "Birinci tamamlayıcı hüküm."),
+        _ordinary_chunk("doc", 4, "İkinci tamamlayıcı hüküm."),
+        _ordinary_chunk("doc", 9, "Üçüncü tamamlayıcı hüküm."),
+        _ordinary_chunk("other", 2, "Başka kaynak açıklaması."),
+    ]
+    reranked = [chunks[2], chunks[0], chunks[1], chunks[3]]
+    result = RerankResult(
+        ordered_chunks=reranked,
+        scores_by_chunk={
+            (chunk.document_id, chunk.chunk_id): score
+            for chunk, score in zip(reranked, [0.99, 0.98, 0.97, 0.40])
+        },
+        submitted_count=len(chunks),
+        result_count=len(chunks),
+        outcome=RerankOutcome.SUCCESS,
+        fallback_used=False,
+    )
+    selector_mocks: list[MagicMock] = []
+    rerank_mocks: list[MagicMock] = []
+    responses: list[ToolResponse] = []
+
+    _run(
+        _make_tool(auto_detect_filters=False),
+        connected_sources=[DocumentSource.USER_FILE],
+        query="asıl hukuki soru",
+        search_mode=None,
+        fused_chunks=chunks,
+        rerank_result=result,
+        selector_sink=selector_mocks,
+        rerank_sink=rerank_mocks,
+        response_sink=responses,
+        num_hits=1,
+        max_llm_chunks=3,
+        rerank_candidate_limit=4,
+    )
+
+    assert rerank_mocks[0].call_args.kwargs["query"] == "asıl hukuki soru"
+    assert rerank_mocks[0].call_args.kwargs["chunks"] == chunks
+    selector_mocks[0].assert_not_called()
+    displayed = responses[0].rich_response.displayed_docs
+    assert displayed is not None
+    assert [(doc.document_id, doc.chunk_ind) for doc in displayed] == [
+        ("doc", 9),
+        ("doc", 1),
+        ("doc", 4),
+    ]
+
+
+def test_rerank_fallback_keeps_legacy_selector() -> None:
+    chunks = [
+        _ordinary_chunk("first", 1, "Birinci metin."),
+        _ordinary_chunk("second", 2, "İkinci metin."),
+    ]
+    selector_mocks: list[MagicMock] = []
+
+    _run(
+        _make_tool(auto_detect_filters=False),
+        connected_sources=[DocumentSource.USER_FILE],
+        search_mode=None,
+        fused_chunks=chunks,
+        rerank_result=RerankResult(
+            ordered_chunks=chunks,
+            scores_by_chunk={},
+            submitted_count=len(chunks),
+            result_count=0,
+            outcome=RerankOutcome.TIMEOUT,
+            fallback_used=True,
+        ),
+        selector_sink=selector_mocks,
+    )
+
+    selector_mocks[0].assert_called_once()
 
 
 def test_non_regulatory_run_accepts_multiple_queries_without_mode_or_normalization() -> (

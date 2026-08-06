@@ -30,6 +30,14 @@ class RerankResult(BaseModel):
     outcome: RerankOutcome
     fallback_used: bool
 
+    @property
+    def used_external(self) -> bool:
+        return (
+            self.outcome is RerankOutcome.SUCCESS
+            and not self.fallback_used
+            and self.submitted_count > 0
+        )
+
 
 class RerankScore(BaseModel):
     model_config = ConfigDict(frozen=True)

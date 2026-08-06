@@ -81,6 +81,7 @@ from onyx.db.federated import (
 )
 from onyx.db.models import SearchSettings, User
 from onyx.db.regulatory_chunks import get_visible_regulatory_chunk_ids
+from onyx.db.reranking import get_reranker_configuration
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.slack_bot import fetch_slack_bots
 from onyx.document_index.interfaces_new import DocumentIndex
@@ -109,6 +110,8 @@ from onyx.regulatory.provision_retrieval import (
     expand_selected_regulatory_sections,
     regulatory_provision_navigation_payload,
 )
+from onyx.reranking.diversity import apply_soft_diversity
+from onyx.reranking.service import rerank_chunks
 from onyx.secondary_llm_flows.document_filter import (
     select_chunks_for_relevance,
     select_sections_for_expansion,
@@ -495,6 +498,20 @@ def _rich_response_sections(
         else:
             sections_by_identity.setdefault(identity, section)
     return list(sections_by_identity.values())
+
+
+def _reorder_sections_by_chunk_ranking(
+    sections: list[InferenceSection], ranked_chunks: list[InferenceChunk]
+) -> list[InferenceSection]:
+    sections_by_identity = {
+        (section.center_chunk.document_id, section.center_chunk.chunk_id): section
+        for section in sections
+    }
+    return [
+        sections_by_identity[identity]
+        for chunk in ranked_chunks
+        if (identity := (chunk.document_id, chunk.chunk_id)) in sections_by_identity
+    ]
 
 
 def _filter_visible_regulatory_sections(
@@ -1624,6 +1641,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 server_host=MODEL_SERVER_HOST,
                 server_port=MODEL_SERVER_PORT,
             )
+            reranker_config = get_reranker_configuration(db_session)
 
             # Federated retrieval functions (non-Slack; Slack is separate)
             if self.project_id_filter is not None:
@@ -1912,11 +1930,30 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             ),
         )
 
+        fused_candidates = top_chunks[: override_kwargs.rerank_candidate_limit]
+        rerank_result = rerank_chunks(
+            query=canonical_original_query,
+            chunks=fused_candidates,
+            config=reranker_config,
+        )
+        diverse_candidate_chunks = apply_soft_diversity(
+            chunks=rerank_result.ordered_chunks,
+            scores=rerank_result.scores_by_chunk,
+            limit=override_kwargs.rerank_candidate_limit,
+        )
+        chunks_for_selection = (
+            diverse_candidate_chunks
+            if rerank_result.used_external
+            else rerank_result.ordered_chunks
+        )
         candidate_sections = [
-            inference_section_from_single_chunk(chunk)
-            for chunk in top_chunks[: override_kwargs.rerank_candidate_limit]
+            inference_section_from_single_chunk(chunk) for chunk in chunks_for_selection
         ]
-        returned_sections = candidate_sections[: override_kwargs.num_hits]
+        diverse_candidate_sections = [
+            inference_section_from_single_chunk(chunk)
+            for chunk in diverse_candidate_chunks
+        ]
+        returned_sections = diverse_candidate_sections[: override_kwargs.num_hits]
 
         if not candidate_sections:
             logger.info("Search tool - no results found, returning empty response")
@@ -1952,61 +1989,65 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             or (llm_queries[0] if llm_queries else "")
         )
 
-        token_counter = get_llm_token_counter(self.llm)
-
-        # Trim sections to fit within token budget before LLM selection
-        # This is to account for very short chunks flooding the search context
-        # Only consider MAX_CHUNKS_FOR_RELEVANCE chunks per section to avoid flooding from
-        # documents with many matching sections
-        max_tokens_for_selection = (
-            override_kwargs.max_llm_chunks * DOC_EMBEDDING_CONTEXT_SIZE
-        )
-
-        # This is approximate since it doesn't build the exact string of the call below
-        # Some things are estimated and may be under (like the metadata tokens)
-        sections_for_selection = _trim_sections_by_tokens(
-            sections=candidate_sections,
-            max_tokens=max_tokens_for_selection,
-            token_counter=token_counter,
-            max_chunks_per_section=MAX_CHUNKS_FOR_RELEVANCE,
-        )
-
         ranked_regulatory_sections: list[InferenceSection] | None = None
         max_selected_sections = override_kwargs.max_llm_chunks
-        if _can_use_ranked_regulatory_selection(
-            sections_for_selection,
-            focused_search=focused_regulatory_search,
-        ):
-            # The calling model already wrote a single focused query and ranking is
-            # bounded below. A second model call generally returns the same chunks.
-            ranked_regulatory_sections = sections_for_selection
-            selected_sections = _reserve_ranked_regulatory_seeds(
-                sections_for_selection, max_selected_sections
-            )
+        if rerank_result.used_external:
+            selected_sections = candidate_sections[:max_selected_sections]
+            if regulatory_chunks_only:
+                ranked_regulatory_sections = candidate_sections
             logger.debug(
-                "Search tool - using ranked regulatory sections without a "
+                "Search tool - using external reranker ordering without a "
                 "secondary selector (%s sections)",
                 len(selected_sections),
             )
         else:
-            # Start timing for LLM document selection
-            document_selection_start_time = time.time()
-
-            # Use LLM to select the most relevant sections for expansion
-            selected_sections, _ = select_sections_for_expansion(
-                sections=sections_for_selection,
-                user_query=secondary_flows_user_query,
-                llm=self.llm,
+            token_counter = get_llm_token_counter(self.llm)
+            max_tokens_for_selection = (
+                override_kwargs.max_llm_chunks * DOC_EMBEDDING_CONTEXT_SIZE
+            )
+            sections_for_selection = _trim_sections_by_tokens(
+                sections=candidate_sections,
+                max_tokens=max_tokens_for_selection,
+                token_counter=token_counter,
                 max_chunks_per_section=MAX_CHUNKS_FOR_RELEVANCE,
             )
+            if _can_use_ranked_regulatory_selection(
+                sections_for_selection,
+                focused_search=focused_regulatory_search,
+            ):
+                ranked_regulatory_sections = sections_for_selection
+                selected_sections = _reserve_ranked_regulatory_seeds(
+                    sections_for_selection, max_selected_sections
+                )
+                logger.debug(
+                    "Search tool - using ranked regulatory sections without a "
+                    "secondary selector (%s sections)",
+                    len(selected_sections),
+                )
+            else:
+                document_selection_start_time = time.time()
+                selected_sections, _ = select_sections_for_expansion(
+                    sections=sections_for_selection,
+                    user_query=secondary_flows_user_query,
+                    llm=self.llm,
+                    max_chunks_per_section=MAX_CHUNKS_FOR_RELEVANCE,
+                )
+                document_selection_elapsed = time.time() - document_selection_start_time
+                logger.debug(
+                    "Search tool - LLM picking documents took %s seconds "
+                    "(selected %s sections)",
+                    format(document_selection_elapsed, ".3f"),
+                    len(selected_sections),
+                )
 
-            # End timing for LLM document selection
-            document_selection_elapsed = time.time() - document_selection_start_time
-            logger.debug(
-                "Search tool - LLM picking documents took %s seconds "
-                "(selected %s sections)",
-                format(document_selection_elapsed, ".3f"),
-                len(selected_sections),
+            diverse_selected_chunks = apply_soft_diversity(
+                chunks=[section.center_chunk for section in selected_sections],
+                scores=rerank_result.scores_by_chunk,
+                limit=max_selected_sections,
+            )
+            selected_sections = _reorder_sections_by_chunk_ranking(
+                selected_sections,
+                diverse_selected_chunks,
             )
 
         # Expose a bounded, metadata-only provision outline when multiple real

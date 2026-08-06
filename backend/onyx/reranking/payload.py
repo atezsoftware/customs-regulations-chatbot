@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from onyx.context.search.models import InferenceChunk
 from onyx.reranking.constants import RERANK_TOKEN_SAFETY_MARGIN_PERCENT
@@ -24,10 +25,28 @@ def _within_limits(text: str, *, max_bytes: int, max_tokens: int) -> bool:
     )
 
 
-def _canonical_source(chunk: InferenceChunk) -> str:
+def _normalize_source_url(url: str) -> str:
+    parsed = urlsplit(url.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return url.strip().rstrip("/")
+    path = parsed.path.rstrip("/")
+    return urlunsplit(
+        (
+            parsed.scheme.casefold(),
+            parsed.netloc.casefold(),
+            path,
+            parsed.query,
+            "",
+        )
+    )
+
+
+def canonical_chunk_source(chunk: InferenceChunk) -> str:
     if chunk.source_links:
-        return min(chunk.source_links.items())[1]
-    return f"{chunk.source_type.value}:{chunk.document_id}"
+        for _, source_url in sorted(chunk.source_links.items()):
+            if source_url and source_url.strip():
+                return _normalize_source_url(source_url)
+    return chunk.document_id
 
 
 def _render_candidate(
@@ -39,7 +58,7 @@ def _render_candidate(
 ) -> str:
     lines = [
         f"Title: {chunk.title or chunk.semantic_identifier}",
-        f"Canonical source: {_canonical_source(chunk)}",
+        f"Canonical source: {canonical_chunk_source(chunk)}",
     ]
     if chunk.heading_path:
         lines.append(f"Heading path: {' > '.join(chunk.heading_path)}")

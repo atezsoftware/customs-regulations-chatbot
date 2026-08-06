@@ -95,6 +95,7 @@ def test_disabled_configuration_preserves_order_without_provider_call(
     assert result.fallback_used is True
     assert result.submitted_count == 0
     assert result.result_count == 0
+    assert result.used_external is False
     client.rerank.assert_not_called()
 
 
@@ -117,6 +118,7 @@ def test_partial_response_appends_omitted_and_unsent_tail(
     assert result.result_count == 1
     assert result.outcome is RerankOutcome.SUCCESS
     assert result.fallback_used is False
+    assert result.used_external is True
     assert client.rerank.call_args.kwargs["top_n"] == 2
 
 
@@ -176,8 +178,7 @@ def test_immediate_provider_error_opens_only_current_tenant_and_fingerprint(
     assert client.rerank.call_count == 2
 
 
-def test_shared_generation_change_discards_stale_circuit_across_instances(
-) -> None:
+def test_shared_generation_change_discards_stale_circuit_across_instances() -> None:
     clients = [
         MagicMock(spec=OpenRouterRerankClient),
         MagicMock(spec=OpenRouterRerankClient),
@@ -198,15 +199,11 @@ def test_shared_generation_change_discards_stale_circuit_across_instances(
     token = CURRENT_TENANT_ID_CONTEXTVAR.set("tenant-a")
     try:
         first = [
-            service.rerank_chunks(
-                query="q", chunks=[_chunk("d1")], config=_config()
-            )
+            service.rerank_chunks(query="q", chunks=[_chunk("d1")], config=_config())
             for service in services
         ]
         stale = [
-            service.rerank_chunks(
-                query="q", chunks=[_chunk("d1")], config=_config()
-            )
+            service.rerank_chunks(query="q", chunks=[_chunk("d1")], config=_config())
             for service in services
         ]
         refreshed = [
