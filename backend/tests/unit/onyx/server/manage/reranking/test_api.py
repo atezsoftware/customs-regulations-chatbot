@@ -331,6 +331,7 @@ def test_non_admin_is_rejected_by_route_dependency() -> None:
         if getattr(dependency.call, "_required_permission", None)
         is Permission.FULL_ADMIN_PANEL_ACCESS
     )
+    assert dependency is not None
     request = Request({"type": "http", "method": "GET", "path": "/"})
 
     with pytest.raises(OnyxError) as error:

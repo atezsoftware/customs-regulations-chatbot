@@ -29,8 +29,8 @@ def test_pipeline_preserves_formal_turkish_query(
             query="ve ile Geçici Madde 2 İmar",
             bypass_acl=True,
         ),
-        document_index=object(),  # type: ignore[arg-type]
-        user=None,  # type: ignore[arg-type]
+        document_index=object(),  # ty: ignore[invalid-argument-type]
+        user=None,  # ty: ignore[invalid-argument-type]
         persona_search_info=None,
         prefetched_federated_retrieval_infos=[],
     )

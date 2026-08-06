@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -83,7 +83,15 @@ def _legal_exact_boosts(query: dict[str, Any]) -> dict[str, tuple[list[str], flo
         if not isinstance(terms, dict) or len(terms) != 1:
             continue
         field_name, values = next(iter(terms.items()))
-        boosts[field_name] = (values, constant_score["boost"])
+        boost = constant_score.get("boost")
+        if (
+            not isinstance(field_name, str)
+            or not isinstance(values, list)
+            or not all(isinstance(value, str) for value in values)
+            or not isinstance(boost, (int, float))
+        ):
+            continue
+        boosts[field_name] = (cast(list[str], values), float(boost))
     return boosts
 
 

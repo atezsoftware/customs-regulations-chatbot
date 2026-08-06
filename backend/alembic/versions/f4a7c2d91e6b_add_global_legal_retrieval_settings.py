@@ -60,9 +60,7 @@ def upgrade() -> None:
             "rerank_configuration_generation",
             sa.String(length=32),
             nullable=False,
-            server_default=sa.text(
-                "md5(random()::text || clock_timestamp()::text)"
-            ),
+            server_default=sa.text("md5(random()::text || clock_timestamp()::text)"),
         ),
     )
     op.add_column(

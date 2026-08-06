@@ -5,7 +5,7 @@
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import cast
 
 from onyx.chat.chat_state import ChatStateContainer
@@ -446,7 +446,7 @@ def generate_final_report(
     all_injected_file_metadata: dict[str, FileToolMetadata] | None = None,
     exact_evidence_chunks: list[CandidateAnswerEvidenceChunk] | None = None,
     evidence_citation_mapping: CitationMapping | None = None,
-    recovery_tools: list[Tool] | None = None,
+    recovery_tools: Sequence[Tool] | None = None,
 ) -> bool:
     """Generate the final research report.
 
