@@ -14,10 +14,12 @@ import { errorHandlingFetcher } from "@/lib/fetcher";
 import { SWR_KEYS } from "@/lib/swr-keys";
 import {
   ConfiguredEmbeddingProvider,
+  ContextualSetupStatus,
   EmbeddingModelResponse,
   LLMContextualCost,
   ReindexErrorRow,
   ReindexProgress,
+  RerankingConfigView,
   SavedSearchSettings,
 } from "@/lib/indexing/types";
 
@@ -126,6 +128,22 @@ export function useReindexErrors(enabled: boolean) {
 export function useConfiguredEmbeddingProviders() {
   return useSWR<ConfiguredEmbeddingProvider[]>(
     SWR_KEYS.embeddingProviders,
+    errorHandlingFetcher
+  );
+}
+
+/** Fetch the secret-free global OpenRouter reranker configuration. */
+export function useRerankingConfig() {
+  return useSWR<RerankingConfigView>(
+    SWR_KEYS.rerankingConfig,
+    errorHandlingFetcher
+  );
+}
+
+/** Fetch whether an empty corpus still requires contextual-model setup. */
+export function useContextualSetupStatus() {
+  return useSWR<ContextualSetupStatus>(
+    SWR_KEYS.contextualSetupStatus,
     errorHandlingFetcher
   );
 }

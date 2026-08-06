@@ -3,8 +3,14 @@ import { SWR_KEYS } from "@/lib/swr-keys";
 import {
   EmbeddingModel,
   EmbeddingProviderName,
+  OpenRouterRerankingModel,
+  OpenRouterRerankingModelsResponse,
   OpenRouterEmbeddingModelResponse,
   ReindexErrorRow,
+  RerankingConfigUpdate,
+  RerankingConfigView,
+  RerankingTestRequest,
+  RerankingTestResponse,
   SavedSearchSettings,
   SwitchoverType,
 } from "@/lib/indexing/types";
@@ -124,6 +130,111 @@ export async function fetchOpenRouterEmbeddingModels(
   }
 
   return (await response.json()) as OpenRouterEmbeddingModelResponse[];
+}
+
+/** Reads the secret-free persisted OpenRouter reranker configuration. */
+export async function getRerankingConfig(): Promise<RerankingConfigView> {
+  const response = await fetch(SWR_KEYS.rerankingConfig);
+  if (!response.ok) {
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        "Failed to fetch reranking configuration"
+      )
+    );
+  }
+  return (await response.json()) as RerankingConfigView;
+}
+
+/**
+ * Saves reranking configuration. An omitted key means retain the encrypted
+ * credential already stored by the backend.
+ */
+export async function saveRerankingConfig(
+  config: RerankingConfigUpdate
+): Promise<RerankingConfigView> {
+  const response = await fetch(SWR_KEYS.rerankingConfig, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      enabled: config.enabled,
+      provider_type: config.provider_type,
+      model_id: config.model_id,
+      ...(config.api_key !== undefined && { api_key: config.api_key }),
+      ...(config.test_attestation !== undefined && {
+        test_attestation: config.test_attestation,
+      }),
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        "Failed to save reranking configuration"
+      )
+    );
+  }
+  return (await response.json()) as RerankingConfigView;
+}
+
+/** Disables reranking and purges its persisted credential. */
+export async function deleteRerankingConfig(): Promise<void> {
+  const response = await fetch(SWR_KEYS.rerankingConfig, { method: "DELETE" });
+  if (!response.ok) {
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        "Failed to delete reranking configuration"
+      )
+    );
+  }
+}
+
+/** Tests persisted or unsaved OpenRouter credentials without storing overrides. */
+export async function testRerankingConfig(
+  request: RerankingTestRequest
+): Promise<RerankingTestResponse> {
+  const response = await fetch(SWR_KEYS.rerankingTest, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      provider_type: request.provider_type,
+      ...(request.model_id !== undefined && { model_id: request.model_id }),
+      ...(request.api_key !== undefined && { api_key: request.api_key }),
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        "Reranking configuration test failed"
+      )
+    );
+  }
+  return (await response.json()) as RerankingTestResponse;
+}
+
+/** Loads OpenRouter's reranking catalog using an optional unsaved key. */
+export async function fetchOpenRouterRerankingModels(
+  apiKey?: string
+): Promise<OpenRouterRerankingModel[]> {
+  const response = await fetch(SWR_KEYS.openRouterRerankingModels, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...(apiKey !== undefined && { api_key: apiKey }),
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        "Failed to fetch OpenRouter reranking models"
+      )
+    );
+  }
+  const result = (await response.json()) as OpenRouterRerankingModelsResponse;
+  return result.models;
 }
 
 /**

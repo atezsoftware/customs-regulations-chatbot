@@ -1,11 +1,20 @@
 import {
   OPENROUTER_EMBEDDINGS_URL,
   connectOpenRouterEmbeddingProvider,
+  deleteRerankingConfig,
   disconnectEmbeddingProvider,
   fetchOpenRouterEmbeddingModels,
+  fetchOpenRouterRerankingModels,
+  getRerankingConfig,
+  saveRerankingConfig,
   setNewSearchSettings,
+  testRerankingConfig,
 } from "@/lib/indexing/svc";
-import { EmbeddingProviderName, SwitchoverType } from "@/lib/indexing/types";
+import {
+  EmbeddingProviderName,
+  RerankingConfigView,
+  SwitchoverType,
+} from "@/lib/indexing/types";
 
 function jsonResponse(body: unknown, ok = true): Response {
   return {
@@ -151,5 +160,193 @@ describe("OpenRouter embedding service", () => {
         model_dim: 1536,
       })
     );
+  });
+});
+
+describe("OpenRouter reranking administration service", () => {
+  const fetchMock = jest.fn();
+
+  beforeEach(() => {
+    fetchMock.mockReset();
+    global.fetch = fetchMock;
+  });
+
+  it("reads the masked reranking configuration from the admin endpoint", async () => {
+    const config: RerankingConfigView = {
+      enabled: false,
+      provider_type: "openrouter",
+      model_id: "voyageai/rerank-2.5",
+      api_key_configured: true,
+      masked_api_key: "********",
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse(config));
+
+    await expect(getRerankingConfig()).resolves.toEqual(config);
+    expect(fetchMock).toHaveBeenCalledWith("/api/admin/reranking/config");
+
+    type GetConfigHasPlaintextKey = "api_key" extends keyof RerankingConfigView
+      ? true
+      : false;
+    const getConfigHasPlaintextKey: GetConfigHasPlaintextKey = false;
+    expect(getConfigHasPlaintextKey).toBe(false);
+  });
+
+  it("omits an unchanged masked key when saving", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        enabled: false,
+        provider_type: "openrouter",
+        model_id: "voyageai/rerank-2.5",
+        api_key_configured: true,
+        masked_api_key: "********",
+      })
+    );
+
+    await saveRerankingConfig({
+      enabled: false,
+      provider_type: "openrouter",
+      model_id: "voyageai/rerank-2.5",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/reranking/config",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          enabled: false,
+          provider_type: "openrouter",
+          model_id: "voyageai/rerank-2.5",
+        }),
+      })
+    );
+  });
+
+  it("sends a new key and exact test attestation when saving", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        enabled: true,
+        provider_type: "openrouter",
+        model_id: "voyageai/rerank-2.5",
+        api_key_configured: true,
+        masked_api_key: "********",
+      })
+    );
+
+    await saveRerankingConfig({
+      enabled: true,
+      provider_type: "openrouter",
+      model_id: "voyageai/rerank-2.5",
+      api_key: "sk-or-unsaved",
+      test_attestation: "attestation-token",
+    });
+
+    expect(requestBody(fetchMock, 0)).toEqual({
+      enabled: true,
+      provider_type: "openrouter",
+      model_id: "voyageai/rerank-2.5",
+      api_key: "sk-or-unsaved",
+      test_attestation: "attestation-token",
+    });
+  });
+
+  it("loads the reranker catalog with an unsaved key in the POST body", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        models: [
+          {
+            id: "voyageai/rerank-2.5",
+            name: "Voyage Rerank 2.5",
+          },
+        ],
+      })
+    );
+
+    await expect(
+      fetchOpenRouterRerankingModels("sk-or-unsaved")
+    ).resolves.toEqual([
+      { id: "voyageai/rerank-2.5", name: "Voyage Rerank 2.5" },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/reranking/openrouter-models",
+      expect.objectContaining({ method: "POST" })
+    );
+    expect(requestBody(fetchMock, 0)).toEqual({ api_key: "sk-or-unsaved" });
+  });
+
+  it("omits the key from a stored-key catalog lookup", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ models: [] }));
+
+    await fetchOpenRouterRerankingModels();
+
+    expect(requestBody(fetchMock, 0)).toEqual({});
+  });
+
+  it("tests an unsaved key and model and returns the attestation", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ success: true, test_attestation: "attestation-token" })
+    );
+
+    await expect(
+      testRerankingConfig({
+        provider_type: "openrouter",
+        model_id: "voyageai/rerank-2.5",
+        api_key: "sk-or-unsaved",
+      })
+    ).resolves.toEqual({
+      success: true,
+      test_attestation: "attestation-token",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/reranking/test",
+      expect.objectContaining({ method: "POST" })
+    );
+    expect(requestBody(fetchMock, 0)).toEqual({
+      provider_type: "openrouter",
+      model_id: "voyageai/rerank-2.5",
+      api_key: "sk-or-unsaved",
+    });
+  });
+
+  it("omits unchanged key overrides when testing stored credentials", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ success: true, test_attestation: "attestation-token" })
+    );
+
+    await testRerankingConfig({
+      provider_type: "openrouter",
+      model_id: "voyageai/rerank-2.5",
+    });
+
+    expect(requestBody(fetchMock, 0)).toEqual({
+      provider_type: "openrouter",
+      model_id: "voyageai/rerank-2.5",
+    });
+  });
+
+  it("deletes and purges the persisted reranker configuration", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(undefined));
+
+    await expect(deleteRerankingConfig()).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledWith("/api/admin/reranking/config", {
+      method: "DELETE",
+    });
+  });
+
+  it("surfaces backend detail for reranking failures", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        { detail: "Test this exact API key and model first." },
+        false
+      )
+    );
+
+    await expect(
+      saveRerankingConfig({
+        enabled: true,
+        provider_type: "openrouter",
+        model_id: "voyageai/rerank-2.5",
+        test_attestation: "expired-token",
+      })
+    ).rejects.toThrow("Test this exact API key and model first.");
   });
 });

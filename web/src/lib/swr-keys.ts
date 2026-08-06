@@ -76,7 +76,11 @@ export const SWR_KEYS = {
   secondarySearchSettings: "/api/search-settings/get-secondary-search-settings",
   reindexProgress: "/api/search-settings/reindex-progress",
   reindexErrors: "/api/search-settings/reindex-errors",
+  contextualSetupStatus: "/api/search-settings/contextual-setup-status",
   embeddingProviders: "/api/admin/embedding/embedding-provider",
+  rerankingConfig: "/api/admin/reranking/config",
+  rerankingTest: "/api/admin/reranking/test",
+  openRouterRerankingModels: "/api/admin/reranking/openrouter-models",
 
   // ── Chat Sessions ─────────────────────────────────────────────────────────
   chatSessions: "/api/chat/get-user-chat-sessions",

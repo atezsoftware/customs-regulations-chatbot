@@ -22,12 +22,6 @@ export enum EmbeddingProviderName {
   CUSTOM = "custom",
 }
 
-export enum RerankerProvider {
-  COHERE = "cohere",
-  LITELLM = "litellm",
-  BEDROCK = "bedrock",
-}
-
 export enum SwitchoverType {
   REINDEX = "reindex",
   ACTIVE_ONLY = "active_only",
@@ -69,15 +63,6 @@ export interface EmbeddingModel {
   queryPrefix?: string | null;
   passagePrefix?: string | null;
   description: string;
-}
-
-export interface RerankingModel {
-  rerank_provider_type: RerankerProvider | null;
-  modelName?: string;
-  displayName: string;
-  description: string;
-  link: string;
-  cloud: boolean;
 }
 
 export type EmbeddingModelState =
@@ -137,28 +122,18 @@ export interface OpenRouterEmbeddingModelResponse {
   context_length?: number | null;
 }
 
-export interface RerankingDetails {
-  rerank_model_name: string | null;
-  rerank_provider_type: RerankerProvider | null;
-  rerank_api_key: string | null;
-  rerank_api_url: string | null;
-}
-
 export interface AdvancedSearchConfiguration {
   index_name: string | null;
   multipass_indexing: boolean;
   enable_contextual_rag: boolean;
   contextual_rag_model_configuration_id: number | null;
   multilingual_expansion: string[];
-  disable_rerank_for_streaming: boolean;
   api_url: string | null;
-  num_rerank: number;
   embedding_precision: EmbeddingPrecision;
   reduced_dimension: number | null;
 }
 
-export interface SavedSearchSettings
-  extends RerankingDetails, AdvancedSearchConfiguration {
+export interface SavedSearchSettings extends AdvancedSearchConfiguration {
   model_name: string;
   model_dim: number;
   normalize: boolean;
@@ -174,6 +149,51 @@ export interface LLMContextualCost {
   provider_name: string;
   model_name: string;
   cost: number;
+}
+
+export type RerankingProviderType = "openrouter";
+
+/** Safe persisted view; the backend never returns the plaintext credential. */
+export interface RerankingConfigView {
+  enabled: boolean;
+  provider_type: RerankingProviderType | null;
+  model_id: string | null;
+  api_key_configured: boolean;
+  masked_api_key: string | null;
+}
+
+export interface RerankingConfigUpdate {
+  enabled: boolean;
+  provider_type: RerankingProviderType;
+  model_id: string;
+  api_key?: string;
+  test_attestation?: string;
+}
+
+export interface RerankingTestRequest {
+  provider_type: RerankingProviderType;
+  model_id?: string;
+  api_key?: string;
+}
+
+export interface RerankingTestResponse {
+  success: boolean;
+  test_attestation: string;
+}
+
+export interface OpenRouterRerankingModel {
+  id: string;
+  name: string;
+}
+
+export interface OpenRouterRerankingModelsResponse {
+  models: OpenRouterRerankingModel[];
+}
+
+export interface ContextualSetupStatus {
+  required: boolean;
+  enabled: boolean;
+  model_configuration_id: number | null;
 }
 
 /** Mirrors backend `ReindexProgressCounts`; buckets partition `total`. */
