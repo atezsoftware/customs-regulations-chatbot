@@ -304,7 +304,10 @@ class ElasticsearchClient(AbstractContextManager):
         Returns:
             True if the settings were put successfully, False otherwise.
         """
-        response = self._client.cluster.put_settings(body=settings)
+        response = self._client.cluster.put_settings(
+            persistent=settings.get("persistent"),
+            transient=settings.get("transient"),
+        )
         if response.get("acknowledged", False):
             logger.info("Successfully put cluster settings.")
             return True
@@ -414,14 +417,13 @@ class ElasticsearchClient(AbstractContextManager):
         Returns:
             The raw allocation explanation response.
         """
-        body: dict[str, Any] = {}
-        if index is not None:
-            body["index"] = index
-        if shard is not None:
-            body["shard"] = shard
-        if primary is not None:
-            body["primary"] = primary
-        return dict(self._client.cluster.allocation_explain(body=body or None).body)
+        return dict(
+            self._client.cluster.allocation_explain(
+                index=index,
+                shard=shard,
+                primary=primary,
+            ).body
+        )
 
     @log_function_time(print_only=True, debug_only=True)
     def reroute_retry_failed(self) -> dict[str, Any]:
@@ -540,12 +542,12 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         Raises:
             Exception: There was an error creating the index.
         """
-        body: dict[str, Any] = {
-            "mappings": mappings,
-            "settings": settings,
-        }
         logger.debug("Creating index %s.", self._index_name)
-        response = self._client.indices.create(index=self._index_name, body=body)
+        response = self._client.indices.create(
+            index=self._index_name,
+            mappings=mappings,
+            settings=settings,
+        )
         if not response.get("acknowledged", False):
             raise RuntimeError(f"Failed to create index {self._index_name}.")
         response_index = response.get("index", "")
@@ -613,7 +615,8 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         """
         logger.debug("Putting mappings for index %s.", self._index_name)
         response = self._client.indices.put_mapping(
-            index=self._index_name, body=mappings
+            index=self._index_name,
+            **mappings,
         )
         if not response.get("acknowledged", False):
             raise RuntimeError(
@@ -719,7 +722,9 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         """
         logger.debug("Updating settings of index %s.", self._index_name)
         response = self._client.indices.put_settings(
-            index=self._index_name, body=settings, timeout=f"{timeout}s"
+            index=self._index_name,
+            settings=settings,
+            timeout=f"{timeout}s",
         )
         if not response.get("acknowledged", False):
             raise RuntimeError(
@@ -845,11 +850,15 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         # client.index does not do this.
         if update_if_exists:
             result = self._client.index(
-                index=self._index_name, id=document_chunk_id, body=body
+                index=self._index_name,
+                id=document_chunk_id,
+                document=body,
             )
         else:
             result = self._client.create(
-                index=self._index_name, id=document_chunk_id, body=body
+                index=self._index_name,
+                id=document_chunk_id,
+                document=body,
             )
         result_id = result.get("_id", "")
         # Sanity check.
@@ -1150,7 +1159,10 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         fails closed: a partial count from shard failures under-reports and could
         falsely green-light deletion, so raise instead of trusting it.
         """
-        result = self._client.count(index=self._index_name, body=query_body)
+        result = self._client.count(
+            index=self._index_name,
+            query=query_body.get("query"),
+        )
         shards = result.get("_shards", {})
         if shards.get("failed", 0):
             raise RuntimeError(
@@ -1192,12 +1204,11 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             document_chunk_id,
             self._index_name,
         )
-        update_body: dict[str, Any] = {"doc": properties_to_update}
         try:
             result = self._client.update(
                 index=self._index_name,
                 id=document_chunk_id,
-                body=update_body,
+                doc=properties_to_update,
                 source=False,
             )
         except ApiError as e:
@@ -1483,12 +1494,10 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         ]
         response = self._client.mget(
             index=self._index_name,
-            body={
-                "docs": [
-                    {"_id": chunk_id, "_source": source_fields}
-                    for chunk_id in expected_chunks
-                ]
-            },
+            docs=[
+                {"_id": chunk_id, "_source": source_fields}
+                for chunk_id in expected_chunks
+            ],
         )
         documents = response.get("docs")
         if not isinstance(documents, list):
@@ -1605,7 +1614,7 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 documentation for more information on search request bodies.
             normalization_method: The score normalization method used by the
                 hybrid query. This is retained for diagnostics; the query body
-                contains the actual Elasticsearch retriever configuration.
+                contains the client-side fusion specification.
             search_type: Label for Prometheus metrics. Does not affect search
                 behavior.
 
@@ -1626,9 +1635,12 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             try:
                 t0 = time.perf_counter()
                 raw_result = (
-                    self._search_zscore_hybrid(body)
-                    if "_onyx_zscore_hybrid" in body
-                    else self._client.search(index=self._index_name, body=body)
+                    self._search_hybrid_fusion(body)
+                    if "_onyx_hybrid_fusion" in body
+                    else self._client.search(
+                        index=self._index_name,
+                        **self._search_kwargs_from_body(body),
+                    )
                 )
                 result = (
                     raw_result
@@ -1688,13 +1700,14 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         )
         return search_hits
 
-    def _search_zscore_hybrid(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Execute z-score fusion, which the native linear retriever lacks."""
-        specification = body["_onyx_zscore_hybrid"]
+    def _search_hybrid_fusion(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Fuse independent query lanes without requiring the retriever API."""
+        specification = body["_onyx_hybrid_fusion"]
         subqueries: list[dict[str, Any]] = specification["subqueries"]
         weights: list[float] = specification["weights"]
         filters: list[dict[str, Any]] = specification["filters"]
         rank_window_size: int = specification["rank_window_size"]
+        normalizer: str = specification["normalizer"]
 
         merged_hits: dict[str, dict[str, Any]] = {}
         merged_scores: Counter[str] = Counter()
@@ -1705,23 +1718,27 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             if "knn" in subquery:
                 knn_query = dict(subquery["knn"])
                 knn_query["filter"] = {"bool": {"filter": filters}}
-                query: dict[str, Any] = {"knn": knn_query}
+                request_body: dict[str, Any] = {"knn": knn_query}
             else:
-                query = {"bool": {"must": [subquery], "filter": filters}}
+                request_body = {
+                    "query": {"bool": {"must": [subquery], "filter": filters}}
+                }
 
-            request_body: dict[str, Any] = {
-                "query": query,
-                "size": rank_window_size,
-                "timeout": body["timeout"],
-                "_source": body["_source"],
-            }
+            request_body.update(
+                {
+                    "size": rank_window_size,
+                    "timeout": body["timeout"],
+                    "_source": body["_source"],
+                }
+            )
             if "highlight" in body:
                 request_body["highlight"] = body["highlight"]
             if "explain" in body:
                 request_body["explain"] = body["explain"]
 
             raw_response = self._client.search(
-                index=self._index_name, body=request_body
+                index=self._index_name,
+                **self._search_kwargs_from_body(request_body),
             )
             response = (
                 raw_response
@@ -1732,16 +1749,10 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             timed_out = timed_out or bool(response.get("timed_out", False))
             hits: list[dict[str, Any]] = response.get("hits", {}).get("hits", [])
             scores = [float(hit.get("_score") or 0.0) for hit in hits]
-            mean = statistics.fmean(scores) if scores else 0.0
-            standard_deviation = statistics.pstdev(scores) if len(scores) > 1 else 0.0
+            normalized_scores = self._normalize_hybrid_scores(scores, normalizer)
 
-            for hit, score in zip(hits, scores, strict=True):
+            for hit, normalized_score in zip(hits, normalized_scores, strict=True):
                 hit_id = str(hit["_id"])
-                normalized_score = (
-                    (score - mean) / standard_deviation
-                    if standard_deviation > 0
-                    else 1.0
-                )
                 merged_scores[hit_id] += weight * normalized_score
                 previous = merged_hits.get(hit_id)
                 if previous is None:
@@ -1759,6 +1770,38 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             "timed_out": timed_out,
             "hits": {"hits": ranked_hits},
         }
+
+    @staticmethod
+    def _normalize_hybrid_scores(scores: list[float], normalizer: str) -> list[float]:
+        if not scores:
+            return []
+        if normalizer == "minmax":
+            minimum = min(scores)
+            score_range = max(scores) - minimum
+            return (
+                [(score - minimum) / score_range for score in scores]
+                if score_range > 0
+                else [1.0] * len(scores)
+            )
+        if normalizer == "zscore":
+            mean = statistics.fmean(scores)
+            standard_deviation = statistics.pstdev(scores) if len(scores) > 1 else 0.0
+            return (
+                [(score - mean) / standard_deviation for score in scores]
+                if standard_deviation > 0
+                else [1.0] * len(scores)
+            )
+        raise ValueError(f"Unsupported hybrid score normalizer: {normalizer}")
+
+    @staticmethod
+    def _search_kwargs_from_body(body: dict[str, Any]) -> dict[str, Any]:
+        """Translate raw REST field names to elasticsearch-py 8 parameters."""
+        search_kwargs = dict(body)
+        if "_source" in search_kwargs:
+            search_kwargs["source"] = search_kwargs.pop("_source")
+        if "from" in search_kwargs:
+            search_kwargs["from_"] = search_kwargs.pop("from")
+        return search_kwargs
 
     @log_function_time(print_only=True, debug_only=True)
     def search_for_document_ids(
@@ -1805,7 +1848,10 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         with ctx:
             try:
                 t0 = time.perf_counter()
-                raw_result = self._client.search(index=self._index_name, body=body)
+                raw_result = self._client.search(
+                    index=self._index_name,
+                    **self._search_kwargs_from_body(body),
+                )
                 result = (
                     raw_result
                     if isinstance(raw_result, dict)
@@ -1941,8 +1987,10 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         # truncated page is never mistaken for the end of the scan.
         try:
             result = self._client.search(
-                body=self._pit_scan_body(
-                    pit_id, doc_ids, search_after, page_size, keep_alive
+                **self._search_kwargs_from_body(
+                    self._pit_scan_body(
+                        pit_id, doc_ids, search_after, page_size, keep_alive
+                    )
                 )
             )
         except NotFoundError as e:
@@ -1955,8 +2003,10 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             )
             pit_id = self.open_pit(keep_alive)
             result = self._client.search(
-                body=self._pit_scan_body(
-                    pit_id, doc_ids, search_after, page_size, keep_alive
+                **self._search_kwargs_from_body(
+                    self._pit_scan_body(
+                        pit_id, doc_ids, search_after, page_size, keep_alive
+                    )
                 )
             )
 

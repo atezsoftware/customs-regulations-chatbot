@@ -1550,9 +1550,10 @@ class TestElasticsearchClient:
                             for k in DocumentChunkWithoutVectors.model_fields
                         }
                     )
-                    # Make sure score reporting seems reasonable (it should not be None
-                    # or 0).
-                    assert chunk.score
+                    # Min-max fusion legitimately assigns 0 to the lowest
+                    # scoring candidate in a lane; only a missing score is an
+                    # error.
+                    assert chunk.score is not None
                     # Make sure there is some kind of match highlight only for the first
                     # result. The other results are so bad they're not expected to have
                     # match highlights.
@@ -2038,7 +2039,7 @@ class TestElasticsearchClient:
         previous_score = float("inf")
         for result in results:
             current_score = result.score
-            assert current_score
+            assert current_score is not None
             assert current_score < previous_score
             previous_score = current_score
 

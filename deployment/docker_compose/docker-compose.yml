@@ -397,7 +397,7 @@ services:
         max-file: "6"
 
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.2
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.6.2
     restart: unless-stopped
     # Elasticsearch is the search backend and is enabled by default. To run against
     # an external Elasticsearch instance, set ELASTICSEARCH_HOST in your env and

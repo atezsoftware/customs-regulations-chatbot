@@ -130,7 +130,7 @@ def get_min_max_normalization_method_and_config() -> tuple[str, dict[str, Any]]:
     config: dict[str, Any] = {
         "normalizer": "minmax",
         "weights": _get_hybrid_search_normalization_weights(),
-        "implementation": "elasticsearch_linear_retriever",
+        "implementation": "onyx_client_fusion",
     }
     return min_max_normalization_method, config
 
@@ -337,9 +337,10 @@ class DocumentQuery:
     ) -> dict[str, Any]:
         """Returns a final hybrid search query.
 
-        The default min-max mode uses Elasticsearch's native linear retriever.
-        The optional z-score mode returns an internal fusion specification that
-        ElasticsearchIndexClient consumes without sending it to Elasticsearch.
+        Elasticsearch 8.6 does not provide the retriever API, so both min-max
+        and z-score modes return an internal fusion specification. The index
+        client executes the same lexical and vector lanes independently and
+        combines their normalized, weighted scores.
 
         TODO(andrei): There is some duplicated logic in this function with
         others in this file.
@@ -419,39 +420,19 @@ class DocumentQuery:
             },
         }
 
-        weights = _get_hybrid_search_normalization_weights()
-        if (
-            HYBRID_SEARCH_NORMALIZATION_METHOD
+        normalizer = (
+            "minmax"
+            if HYBRID_SEARCH_NORMALIZATION_METHOD
             is HybridSearchNormalizationMethod.MIN_MAX
-        ):
-            retrievers: list[dict[str, Any]] = []
-            for subquery, weight in zip(hybrid_search_subqueries, weights, strict=True):
-                leaf = (
-                    {"knn": subquery["knn"]}
-                    if "knn" in subquery
-                    else {"standard": {"query": subquery}}
-                )
-                retrievers.append(
-                    {
-                        "retriever": leaf,
-                        "weight": weight,
-                        "normalizer": "minmax",
-                    }
-                )
-            final_hybrid_search_body["retriever"] = {
-                "linear": {
-                    "retrievers": retrievers,
-                    "rank_window_size": max_results_per_subquery,
-                    "filter": {"bool": {"filter": hybrid_search_filters}},
-                }
-            }
-        else:
-            final_hybrid_search_body["_onyx_zscore_hybrid"] = {
-                "subqueries": hybrid_search_subqueries,
-                "weights": weights,
-                "filters": hybrid_search_filters,
-                "rank_window_size": max_results_per_subquery,
-            }
+            else "zscore"
+        )
+        final_hybrid_search_body["_onyx_hybrid_fusion"] = {
+            "subqueries": hybrid_search_subqueries,
+            "weights": _get_hybrid_search_normalization_weights(),
+            "filters": hybrid_search_filters,
+            "rank_window_size": max_results_per_subquery,
+            "normalizer": normalizer,
+        }
 
         if not ELASTICSEARCH_MATCH_HIGHLIGHTS_DISABLED:
             final_hybrid_search_body["highlight"] = (
@@ -644,7 +625,10 @@ class DocumentQuery:
         )
 
         final_semantic_search_query: dict[str, Any] = {
-            "query": semantic_search_query,
+            # Elasticsearch 8.6 supports approximate kNN through the top-level
+            # search option. The Query DSL `knn` clause arrived in later 8.x
+            # releases and is therefore intentionally not used here.
+            "knn": semantic_search_query["knn"],
             "size": num_hits,
             "timeout": f"{DEFAULT_ELASTICSEARCH_QUERY_TIMEOUT_S}s",
             # Exclude retrieving the vector fields in order to save on
@@ -750,8 +734,7 @@ class DocumentQuery:
         the Elasticsearch client. See get_hybrid_search_query.
 
         Normalization is not performed here.
-        The weights of each subquery are applied by the linear retriever or the
-        client-side z-score fusion step.
+        The weights of each subquery are applied by the client-side fusion step.
 
         The exact subqueries executed depend on the
         HYBRID_SEARCH_SUBQUERY_CONFIGURATION setting.

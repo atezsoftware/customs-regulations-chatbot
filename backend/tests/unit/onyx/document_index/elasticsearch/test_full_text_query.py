@@ -347,9 +347,7 @@ def test_regulatory_hybrid_query_boosts_named_instrument_in_lexical_lane() -> No
         include_hidden=False,
     )
 
-    lexical_lane = search_body["retriever"]["linear"]["retrievers"][-1]["retriever"][
-        "standard"
-    ]["query"]
+    lexical_lane = search_body["_onyx_hybrid_fusion"]["subqueries"][-1]
     source_boost, distinctive_boost = _source_boosts(lexical_lane)
     assert source_boost["query"] == "Basel Sözleşmesi"
     assert distinctive_boost["query"] == "Basel"
@@ -365,18 +363,32 @@ def test_hybrid_query_preserves_weighted_minmax_fusion() -> None:
         include_hidden=False,
     )
 
-    linear = search_body["retriever"]["linear"]
-    assert linear["rank_window_size"] == 500
-    assert [lane["weight"] for lane in linear["retrievers"]] == [0.5, 0.5]
-    assert [lane["normalizer"] for lane in linear["retrievers"]] == [
-        "minmax",
-        "minmax",
-    ]
-    vector_lane = linear["retrievers"][0]["retriever"]["knn"]
+    fusion = search_body["_onyx_hybrid_fusion"]
+    assert fusion["rank_window_size"] == 500
+    assert fusion["weights"] == [0.5, 0.5]
+    assert fusion["normalizer"] == "minmax"
+    vector_lane = fusion["subqueries"][0]["knn"]
     assert vector_lane["field"] == "content_vector"
     assert vector_lane["query_vector"] == [0.1, 0.2]
     assert vector_lane["k"] == 500
     assert vector_lane["num_candidates"] == 500
+
+
+def test_semantic_query_uses_elasticsearch_8_top_level_knn() -> None:
+    search_body = DocumentQuery.get_semantic_search_query(
+        query_embedding=[0.1, 0.2],
+        num_hits=10,
+        tenant_state=TenantState(tenant_id="public", multitenant=False),
+        index_filters=IndexFilters(access_control_list=None),
+        include_hidden=False,
+    )
+
+    assert "query" not in search_body
+    assert search_body["knn"]["field"] == "content_vector"
+    assert search_body["knn"]["query_vector"] == [0.1, 0.2]
+    assert search_body["knn"]["k"] == 10
+    assert search_body["knn"]["num_candidates"] == 10
+    assert "filter" in search_body["knn"]
 
 
 def test_non_regulatory_concept_query_has_no_instrument_boost() -> None:

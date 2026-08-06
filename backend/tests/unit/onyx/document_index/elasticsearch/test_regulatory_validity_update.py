@@ -142,7 +142,7 @@ def test_projection_preflight_fetches_only_identity_and_date_fields() -> None:
         validity_end_date=None,
     )
 
-    source_fields = raw_client.mget.call_args.kwargs["body"]["docs"][0]["_source"]
+    source_fields = raw_client.mget.call_args.kwargs["docs"][0]["_source"]
     assert source_fields == [
         DOCUMENT_ID_FIELD_NAME,
         CHUNK_INDEX_FIELD_NAME,
@@ -165,10 +165,8 @@ def test_projection_preflight_rejects_stale_extra_chunk_before_identity_read() -
 
     raw_client.count.assert_called_once_with(
         index="test-index",
-        body={
-            "query": {
-                "term": {DOCUMENT_ID_FIELD_NAME: {"value": "doc-1"}},
-            }
+        query={
+            "term": {DOCUMENT_ID_FIELD_NAME: {"value": "doc-1"}},
         },
     )
     raw_client.mget.assert_not_called()

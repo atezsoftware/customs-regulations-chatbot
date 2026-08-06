@@ -5,22 +5,19 @@ stored in indexed `dense_vector` fields and searched with HNSW kNN queries.
 
 ## Hybrid search
 
-The default hybrid query uses Elasticsearch's native `linear` retriever. Its
-lexical and kNN child retrievers are normalized independently with `minmax`,
-multiplied by the configured Onyx weights, and merged over a shared candidate
-window. This feature requires an Elasticsearch license that includes the linear
-retriever; Onyx deliberately does not disable it or silently fall back to a
-lower-quality query. The default content search keeps the existing 50/50
-lexical/vector weighting; the alternate search also keeps the existing
-title-vector boost.
+The default hybrid query executes lexical and kNN searches independently,
+normalizes each result window with `minmax`, multiplies the scores by the
+configured Onyx weights, and merges them in the application. This preserves
+weighted hybrid retrieval on Elasticsearch 8.6, which predates the retriever
+API. The default content search keeps the existing 50/50 lexical/vector
+weighting; the alternate search also keeps the existing title-vector boost.
 
 When `HYBRID_SEARCH_NORMALIZATION_METHOD=2` is selected, Onyx applies z-score
 normalization to the same result windows and combines them with the same
-weights. This fusion stays application-side because Elasticsearch's linear
-retriever does not provide a z-score normalizer.
+weights.
 
-Filters are applied to every child retriever. Highlighting and the selected
-source fields are retained when result sets are fused.
+Filters are applied to every search lane. Highlighting and the selected source
+fields are retained when result sets are fused.
 
 ## Ranking refinements
 

@@ -643,10 +643,6 @@ class DocumentSchema:
             "index": {
                 "number_of_shards": number_of_shards,
                 "number_of_replicas": number_of_replicas,
-                # Elasticsearch 9 excludes dense vectors from `_source` by
-                # default. Onyx reads complete chunks during update/port flows,
-                # so retain the vectors in the source document.
-                "mapping.exclude_source_vectors": False,
                 "search.slowlog.threshold.query.warn": "5s",
                 "search.slowlog.threshold.query.info": "2s",
                 "search.slowlog.threshold.query.debug": "1s",

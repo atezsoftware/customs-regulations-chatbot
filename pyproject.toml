@@ -72,7 +72,7 @@ backend-runtime = [
     "oauthlib==3.2.2",
     # NOTE: This is frozen to avoid https://foss.heptapod.net/openpyxl/openpyxl/-/issues/2147
     "openpyxl==3.0.10",
-    "elasticsearch==9.4.1",
+    "elasticsearch==8.6.2",
     # Imported by core API/runtime paths (logos, image responses, and chat UI).
     # Keep explicit instead of relying on document-parser transitive dependencies.
     "Pillow==12.3.0",
