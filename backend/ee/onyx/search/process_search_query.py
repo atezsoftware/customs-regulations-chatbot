@@ -15,13 +15,21 @@ from ee.onyx.server.query_and_chat.streaming_models import (
     SearchErrorPacket,
     SearchQueriesPacket,
 )
+from onyx.configs.chat_configs import (
+    MAX_SEARCH_QUERY_LANES,
+    RERANK_CANDIDATE_LIMIT,
+    SEARCH_HITS_PER_LANE,
+)
 from onyx.context.search.models import BaseFilters, ChunkSearchRequest, InferenceChunk
 from onyx.context.search.pipeline import merge_individual_chunks, search_pipeline
 from onyx.db.models import User
+from onyx.db.reranking import get_reranker_configuration
 from onyx.db.search_settings import get_current_search_settings
 from onyx.document_index.factory import get_default_document_index
 from onyx.document_index.interfaces_new import DocumentIndex
 from onyx.llm.factory import get_default_llm
+from onyx.reranking.diversity import apply_soft_diversity
+from onyx.reranking.service import rerank_chunks
 from onyx.secondary_llm_flows.document_filter import select_sections_for_expansion
 from onyx.tools.tool_implementations.search.search_utils import (
     weighted_reciprocal_rank_fusion,
@@ -81,6 +89,7 @@ def stream_search_query(
     """
     # Get document index.
     search_settings = get_current_search_settings(db_session)
+    reranker_config = get_reranker_configuration(db_session)
     # This flow is for search so we do not get all indices.
     document_index = get_default_document_index(search_settings, None, db_session)
 
@@ -104,6 +113,14 @@ def stream_search_query(
             logger.warning("Query expansion failed: %s; using original query only.", e)
             keyword_expansions = []
 
+    keyword_expansions = list(
+        dict.fromkeys(
+            query.strip()
+            for query in keyword_expansions
+            if query.strip() and query.strip().casefold() != original_query.casefold()
+        )
+    )[: MAX_SEARCH_QUERY_LANES - 1]
+
     # Build list of all executed queries for tracking
     all_executed_queries = [original_query] + keyword_expansions
 
@@ -116,6 +133,10 @@ def stream_search_query(
         )
 
     # Execute search(es)
+    per_lane_num_hits = max(
+        SEARCH_HITS_PER_LANE,
+        min(request.num_hits, RERANK_CANDIDATE_LIMIT),
+    )
     if not keyword_expansions:
         # Single query (original only) - no threading needed
         chunks = _run_single_search(
@@ -124,7 +145,7 @@ def stream_search_query(
             document_index=document_index,
             user=user,
             db_session=db_session,
-            num_hits=request.num_hits,
+            num_hits=per_lane_num_hits,
             hybrid_alpha=request.hybrid_alpha,
         )
     else:
@@ -139,7 +160,7 @@ def stream_search_query(
                     document_index,
                     user,
                     db_session,
-                    request.num_hits,
+                    per_lane_num_hits,
                     request.hybrid_alpha,
                 ),
             )
@@ -182,11 +203,22 @@ def stream_search_query(
             chunks = weighted_reciprocal_rank_fusion(
                 ranked_results=valid_results,
                 weights=weights,
-                id_extractor=lambda chunk: f"{chunk.document_id}_{chunk.chunk_id}",
+                id_extractor=lambda chunk: chunk.unique_id,
             )
 
+    rerank_result = rerank_chunks(
+        query=original_query,
+        chunks=chunks[:RERANK_CANDIDATE_LIMIT],
+        config=reranker_config,
+    )
+    ranked_chunks = apply_soft_diversity(
+        chunks=rerank_result.ordered_chunks,
+        scores=rerank_result.scores_by_chunk,
+        limit=RERANK_CANDIDATE_LIMIT,
+    )
+
     # Merge chunks into sections
-    sections = merge_individual_chunks(chunks)
+    sections = merge_individual_chunks(ranked_chunks)
 
     # Truncate to the requested number of hits
     sections = sections[: request.num_hits]

@@ -32,7 +32,7 @@ class SendSearchQueryRequest(BaseModel):
     search_query: str
     filters: BaseFilters | None = None
     num_docs_fed_to_llm_selection: int | None = None
-    run_query_expansion: bool = False
+    run_query_expansion: bool = True
     num_hits: int = 30
     hybrid_alpha: float | None = None
     include_content: bool = False

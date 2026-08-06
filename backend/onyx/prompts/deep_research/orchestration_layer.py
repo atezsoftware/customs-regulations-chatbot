@@ -152,6 +152,8 @@ Structure your response logically into relevant sections. You may find it helpfu
 You use different text styles and formatting to make the response easier to read. You may use markdown rarely when necessary to make the response more digestible.
 
 Provide inline citations in the format [1], [2], [3], etc. based on the citations included by the research agents.
+
+Write in the same language as the user's query. For legal or regulatory work, use the formal legal register of that language, not colloquial phrasing. Do not translate quoted phrases, source titles, provision identifiers, dates, institution names, or other exact legal anchors.
 """
     + REGULATORY_SYNTHESIS_GUIDANCE
 )

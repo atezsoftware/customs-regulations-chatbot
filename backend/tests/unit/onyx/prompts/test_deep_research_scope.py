@@ -117,6 +117,12 @@ def test_intermediate_report_length_is_proportional_but_final_report_stays_detai
     assert "several pages long" in FINAL_REPORT_PROMPT
 
 
+def test_final_report_preserves_source_language_and_formal_legal_register() -> None:
+    assert "same language as the user's query" in FINAL_REPORT_PROMPT
+    assert "formal legal register" in FINAL_REPORT_PROMPT
+    assert "Do not translate quoted phrases" in FINAL_REPORT_PROMPT
+
+
 def test_intermediate_report_reminder_does_not_duplicate_focused_task() -> None:
     assert "first user message above" in USER_REPORT_QUERY
     assert "{research_topic}" not in USER_REPORT_QUERY
