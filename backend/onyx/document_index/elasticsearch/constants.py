@@ -10,6 +10,13 @@ DEFAULT_MAX_CHUNK_SIZE = 512
 # given search. This value is configurable in the index settings.
 DEFAULT_ELASTICSEARCH_MAX_RESULT_WINDOW = 10_000
 
+# Exact legal identifiers are optional ranking signals. Provision identity is
+# strongest, while a date alone is intentionally weaker because it can recur in
+# many unrelated instruments.
+LEGAL_PROVISION_EXACT_BOOST = 24.0
+LEGAL_DECISION_NUMBER_EXACT_BOOST = 20.0
+LEGAL_DATE_EXACT_BOOST = 12.0
+
 
 # For documents which do not have a value for LAST_UPDATED_FIELD_NAME, we assume
 # that the document was last updated this many days ago for the purpose of time

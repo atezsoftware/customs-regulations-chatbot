@@ -516,9 +516,9 @@ ELASTICSEARCH_EXPLAIN_ENABLED = (
     os.environ.get("ELASTICSEARCH_EXPLAIN_ENABLED", "").lower() == "true"
 )
 # Analyzer used for full-text fields (title, content). Use Elasticsearch built-in analyzer
-# names (e.g. "english", "standard", "german"). Affects stemming and tokenization;
+# names (e.g. "turkish", "standard", "german"). Affects stemming and tokenization;
 # existing indices need reindexing after a change.
-ELASTICSEARCH_TEXT_ANALYZER = os.environ.get("ELASTICSEARCH_TEXT_ANALYZER") or "english"
+ELASTICSEARCH_TEXT_ANALYZER = os.environ.get("ELASTICSEARCH_TEXT_ANALYZER") or "turkish"
 
 # This is the "base" config for now, the idea is that at least for our dev
 # environments we always want to be dual indexing into both Elasticsearch and Vespa

@@ -16,6 +16,9 @@ from onyx.document_index.elasticsearch.constants import (
     DEFAULT_NUM_HYBRID_SUBQUERY_CANDIDATES,
     HYBRID_SEARCH_NORMALIZATION_METHOD,
     HYBRID_SEARCH_SUBQUERY_CONFIGURATION,
+    LEGAL_DATE_EXACT_BOOST,
+    LEGAL_DECISION_NUMBER_EXACT_BOOST,
+    LEGAL_PROVISION_EXACT_BOOST,
     HybridSearchNormalizationMethod,
     HybridSearchSubqueryConfiguration,
 )
@@ -26,14 +29,17 @@ from onyx.document_index.elasticsearch.schema import (
     CONTENT_FIELD_NAME,
     CONTENT_VECTOR_FIELD_NAME,
     CREATED_AT_FIELD_NAME,
+    DECISION_NUMBERS_FIELD_NAME,
     DOCUMENT_ID_FIELD_NAME,
     DOCUMENT_SETS_FIELD_NAME,
     HEADING_PATH_FIELD_NAME,
     HIDDEN_FIELD_NAME,
     LAST_UPDATED_FIELD_NAME,
+    LEGAL_DATES_FIELD_NAME,
     MAX_CHUNK_SIZE_FIELD_NAME,
     METADATA_LIST_FIELD_NAME,
     PERSONAS_FIELD_NAME,
+    PROVISION_IDENTIFIERS_FIELD_NAME,
     PUBLIC_FIELD_NAME,
     REGULATORY_CHUNK_ID_FIELD_NAME,
     SOURCE_TYPE_FIELD_NAME,
@@ -46,6 +52,7 @@ from onyx.document_index.elasticsearch.schema import (
     WRITTEN_BY_PORT_FIELD_NAME,
 )
 from onyx.document_index.interfaces_new import TenantState
+from onyx.regulatory.exact_search_fields import extract_legal_exact_fields
 from onyx.regulatory.heading_path import (
     extract_regulatory_distinctive_source_hint,
     extract_regulatory_source_hint,
@@ -927,6 +934,35 @@ class DocumentQuery:
                 "minimum_should_match": 1,
             }
         }
+
+        legal_exact_fields = extract_legal_exact_fields(query_text)
+        exact_field_boosts = (
+            (
+                PROVISION_IDENTIFIERS_FIELD_NAME,
+                legal_exact_fields.provision_identifiers,
+                LEGAL_PROVISION_EXACT_BOOST,
+            ),
+            (
+                DECISION_NUMBERS_FIELD_NAME,
+                legal_exact_fields.decision_numbers,
+                LEGAL_DECISION_NUMBER_EXACT_BOOST,
+            ),
+            (
+                LEGAL_DATES_FIELD_NAME,
+                legal_exact_fields.legal_dates,
+                LEGAL_DATE_EXACT_BOOST,
+            ),
+        )
+        for field_name, values, boost in exact_field_boosts:
+            if values:
+                lexical_should_clauses.append(
+                    {
+                        "constant_score": {
+                            "filter": {"terms": {field_name: values}},
+                            "boost": boost,
+                        }
+                    }
+                )
 
         if required_heading_phrases:
             query["bool"]["must"] = [

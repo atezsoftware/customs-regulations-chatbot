@@ -71,6 +71,15 @@ def check_docs_exist(db_session: Session) -> bool:
     return result.scalar() or False
 
 
+def check_indexed_docs_exist(db_session: Session) -> bool:
+    """Whether PostgreSQL records any document with indexed chunks."""
+
+    stmt = select(
+        exists().where(DbDocument.chunk_count.is_not(None), DbDocument.chunk_count > 0)
+    )
+    return bool(db_session.scalar(stmt))
+
+
 def count_documents_by_needs_sync(session: Session) -> int:
     """Get the count of all documents where:
     1. last_modified is newer than last_synced

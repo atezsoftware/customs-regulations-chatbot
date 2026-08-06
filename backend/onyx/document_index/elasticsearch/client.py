@@ -594,6 +594,23 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         """
         return bool(self._client.indices.exists(index=self._index_name))
 
+    @log_function_time(print_only=True, debug_only=True)
+    def get_index_mapping(self) -> dict[str, Any]:
+        """Return this index's mapping definition."""
+
+        response = self._client.indices.get_mapping(index=self._index_name)
+        index_response = response.get(self._index_name)
+        if not isinstance(index_response, dict):
+            raise RuntimeError(
+                f"Elasticsearch returned no mapping for index {self._index_name}."
+            )
+        mappings = index_response.get("mappings")
+        if not isinstance(mappings, dict):
+            raise RuntimeError(
+                f"Elasticsearch returned an invalid mapping for index {self._index_name}."
+            )
+        return mappings
+
     @log_function_time(print_only=True, debug_only=True, include_args=True)
     def put_mapping(self, mappings: dict[str, Any]) -> None:
         """Updates the index mapping in an idempotent manner.

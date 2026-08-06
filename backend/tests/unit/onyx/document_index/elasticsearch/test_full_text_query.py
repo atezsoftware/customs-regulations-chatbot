@@ -3,7 +3,12 @@ from typing import Any
 import pytest
 
 from onyx.context.search.models import IndexFilters
-from onyx.document_index.elasticsearch.schema import HEADING_PATH_FIELD_NAME
+from onyx.document_index.elasticsearch.schema import (
+    DECISION_NUMBERS_FIELD_NAME,
+    HEADING_PATH_FIELD_NAME,
+    LEGAL_DATES_FIELD_NAME,
+    PROVISION_IDENTIFIERS_FIELD_NAME,
+)
 from onyx.document_index.elasticsearch.search import (
     FULL_TEXT_MINIMUM_SHOULD_MATCH,
     DocumentQuery,
@@ -66,6 +71,20 @@ def _scope_heading_boosts(query: dict[str, Any]) -> dict[str, float]:
             for item in raw_queries
         }
     return {}
+
+
+def _legal_exact_boosts(query: dict[str, Any]) -> dict[str, tuple[list[str], float]]:
+    boosts: dict[str, tuple[list[str], float]] = {}
+    for clause in query["bool"]["should"]:
+        constant_score = clause.get("constant_score")
+        if not isinstance(constant_score, dict):
+            continue
+        terms = constant_score.get("filter", {}).get("terms", {})
+        if not isinstance(terms, dict) or len(terms) != 1:
+            continue
+        field_name, values = next(iter(terms.items()))
+        boosts[field_name] = (values, constant_score["boost"])
+    return boosts
 
 
 def test_keyword_query_accepts_any_term_by_default() -> None:
@@ -403,3 +422,25 @@ def test_non_regulatory_concept_query_has_no_instrument_boost() -> None:
     assert not any(
         "dis_max" in clause for clause in search_body["query"]["bool"]["should"]
     )
+
+
+def test_legal_exact_values_add_soft_constant_score_boosts() -> None:
+    query = DocumentQuery._get_title_content_combined_keyword_search_query(
+        "Geçici Madde 2, 2024/17 sayılı karar, 06.08.2026"
+    )
+
+    boosts = _legal_exact_boosts(query)
+    assert boosts == {
+        PROVISION_IDENTIFIERS_FIELD_NAME: (["geçici madde 2"], 24.0),
+        DECISION_NUMBERS_FIELD_NAME: (["2024/17"], 20.0),
+        LEGAL_DATES_FIELD_NAME: (["2026-08-06"], 12.0),
+    }
+    assert query["bool"].get("filter") is None
+
+
+def test_query_without_legal_identifiers_has_no_exact_field_clause() -> None:
+    query = DocumentQuery._get_title_content_combined_keyword_search_query(
+        "teminat uygulamasının koşulları"
+    )
+
+    assert _legal_exact_boosts(query) == {}

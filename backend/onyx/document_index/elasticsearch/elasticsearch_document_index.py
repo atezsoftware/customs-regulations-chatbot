@@ -1,6 +1,6 @@
 import datetime
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from elasticsearch.helpers import BulkIndexError
@@ -21,6 +21,8 @@ from onyx.context.search.models import (
     InferenceChunk,
     InferenceChunkUncleaned,
 )
+from onyx.db.document import check_indexed_docs_exist
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import EmbeddingPrecision
 from onyx.db.models import DocumentSource
 from onyx.document_index.chunk_content_enrichment import (
@@ -65,6 +67,7 @@ from onyx.document_index.interfaces_new import (
 )
 from onyx.indexing.models import DocMetadataAwareIndexChunk, Document
 from onyx.redis.lock_context import redis_shared_lock
+from onyx.regulatory.exact_search_fields import extract_legal_exact_fields
 from onyx.utils.datetime import datetime_to_utc
 from onyx.utils.logger import setup_logger
 from onyx.utils.text_processing import remove_invalid_unicode_chars
@@ -89,6 +92,103 @@ _PORT_ORPHAN_DELETE_BATCH_SIZE = 1000
 # only needs to happen at most once per process lifetime, since any changes to
 # an index should always be correlated with a redeploy.
 _verified_index_names_for_current_process: set[str] = set()
+
+
+class ElasticsearchSchemaMigrationRequiredError(RuntimeError):
+    """An existing non-empty index cannot adopt the configured mapping safely."""
+
+
+_IMMUTABLE_MAPPING_KEYS = (
+    "type",
+    "analyzer",
+    "normalizer",
+    "dims",
+    "similarity",
+    "index_options",
+)
+
+
+def _mapping_properties_require_recreation(
+    current_properties: dict[str, Any],
+    expected_properties: dict[str, Any],
+) -> bool:
+    for field_name, expected_property in expected_properties.items():
+        current_property = current_properties.get(field_name)
+        if current_property is None:
+            continue
+        if not isinstance(current_property, dict) or not isinstance(
+            expected_property, dict
+        ):
+            return True
+        for immutable_key in _IMMUTABLE_MAPPING_KEYS:
+            if (
+                immutable_key in expected_property
+                and current_property.get(immutable_key)
+                != expected_property[immutable_key]
+            ):
+                return True
+        current_subfields = current_property.get("fields", {})
+        expected_subfields = expected_property.get("fields", {})
+        if isinstance(current_subfields, dict) and isinstance(expected_subfields, dict):
+            if _mapping_properties_require_recreation(
+                current_subfields, expected_subfields
+            ):
+                return True
+    return False
+
+
+def _mapping_requires_recreation(
+    current_mappings: dict[str, Any], expected_mappings: dict[str, Any]
+) -> bool:
+    current_properties = current_mappings.get("properties", {})
+    expected_properties = expected_mappings.get("properties", {})
+    if not isinstance(current_properties, dict) or not isinstance(
+        expected_properties, dict
+    ):
+        return True
+    return _mapping_properties_require_recreation(
+        current_properties, expected_properties
+    )
+
+
+def ensure_current_schema(
+    *,
+    index_client: ElasticsearchIndexClient,
+    expected_mappings: dict[str, Any],
+    index_settings: dict[str, Any],
+    database_has_indexed_documents: bool | Callable[[], bool],
+) -> None:
+    """Apply additive mappings or safely replace an incompatible empty index."""
+
+    current_mappings = index_client.get_index_mapping()
+    if not _mapping_requires_recreation(current_mappings, expected_mappings):
+        index_client.put_mapping(expected_mappings)
+        return
+
+    postgres_has_documents = (
+        database_has_indexed_documents()
+        if callable(database_has_indexed_documents)
+        else database_has_indexed_documents
+    )
+    indexed_chunk_count = index_client.count_by_query({"query": {"match_all": {}}})
+    if postgres_has_documents or indexed_chunk_count != 0:
+        raise ElasticsearchSchemaMigrationRequiredError(
+            "The existing Elasticsearch mapping is incompatible with the configured "
+            "Turkish legal mapping and indexed data may be present. Create a new "
+            "search index and reindex; the existing index was left untouched."
+        )
+
+    if not index_client.delete_index():
+        raise ElasticsearchSchemaMigrationRequiredError(
+            "The incompatible empty Elasticsearch index disappeared during schema "
+            "verification. Retry setup; no index was recreated."
+        )
+    index_client.create_index(mappings=expected_mappings, settings=index_settings)
+
+
+def _database_has_indexed_documents() -> bool:
+    with get_session_with_current_tenant() as db_session:
+        return check_indexed_docs_exist(db_session)
 
 
 def generate_elasticsearch_filtered_access_control_list(
@@ -225,6 +325,14 @@ def _convert_onyx_chunk_to_elasticsearch_document(
         if _metadata_list
         else None
     )
+    legal_exact_fields = extract_legal_exact_fields(
+        filtered_content,
+        filtered_title,
+        filtered_semantic_identifier,
+        filtered_metadata_suffix,
+        *(chunk.heading_path or []),
+        *(filtered_metadata_list or []),
+    )
     return DocumentChunk(
         document_id=chunk.source_document.id,
         chunk_index=chunk.chunk_id,
@@ -278,6 +386,9 @@ def _convert_onyx_chunk_to_elasticsearch_document(
         ancestor_hierarchy_node_ids=chunk.ancestor_hierarchy_node_ids or None,
         regulatory_chunk_id=chunk.regulatory_chunk_id,
         heading_path=chunk.heading_path or None,
+        provision_identifiers=legal_exact_fields.provision_identifiers or None,
+        decision_numbers=legal_exact_fields.decision_numbers or None,
+        legal_dates=legal_exact_fields.legal_dates or None,
         validity_start_date=_date_to_utc_datetime(chunk.validity_start_date),
         validity_end_date=_date_to_utc_datetime(chunk.validity_end_date),
     )
@@ -371,16 +482,14 @@ class ElasticsearchDocumentIndex(DocumentIndex):
                     settings=index_settings,
                 )
             else:
-                # Ensure schema is up to date by applying the current mappings.
-                try:
-                    self._client.put_mapping(expected_mappings)
-                except Exception as e:
-                    logger.error(
-                        "Failed to update mappings for index %s. This likely means a field type was changed which requires reindexing. Error: %s",
-                        self._index_name,
-                        e,
-                    )
-                    raise
+                ensure_current_schema(
+                    index_client=self._client,
+                    expected_mappings=expected_mappings,
+                    index_settings=(
+                        DocumentSchema.get_index_settings_based_on_environment()
+                    ),
+                    database_has_indexed_documents=_database_has_indexed_documents,
+                )
 
     def index(
         self,

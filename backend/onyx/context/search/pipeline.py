@@ -25,7 +25,6 @@ from onyx.document_index.interfaces_new import DocumentIndex
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.federated_connectors.federated_retrieval import FederatedRetrievalInfo
-from onyx.natural_language_processing.english_stopwords import strip_stopwords
 from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
 from onyx.utils.logger import setup_logger
 from onyx.utils.timing import log_function_time
@@ -316,14 +315,14 @@ def search_pipeline(
         force_configured_document_set_scope=force_configured_document_set_scope,
     )
 
-    query_keywords = strip_stopwords(chunk_search_request.query)
-
     query_request = ChunkIndexRequest(
         query=chunk_search_request.query,
         hybrid_alpha=chunk_search_request.hybrid_alpha,
         high_term_coverage=chunk_search_request.high_term_coverage,
         recency_bias_multiplier=chunk_search_request.recency_bias_multiplier,
-        query_keywords=query_keywords,
+        # Preserve formal Turkish legal wording and identifiers. The document
+        # index falls back to the original query when this legacy override is None.
+        query_keywords=None,
         filters=filters,
         limit=chunk_search_request.limit,
     )

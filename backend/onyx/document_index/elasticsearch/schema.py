@@ -70,6 +70,9 @@ ANCESTOR_HIERARCHY_NODE_IDS_FIELD_NAME = "ancestor_hierarchy_node_ids"
 # `regulatory_chunk` rows are the source of truth for these values.
 REGULATORY_CHUNK_ID_FIELD_NAME = "regulatory_chunk_id"
 HEADING_PATH_FIELD_NAME = "heading_path"
+PROVISION_IDENTIFIERS_FIELD_NAME = "provision_identifiers"
+DECISION_NUMBERS_FIELD_NAME = "decision_numbers"
+LEGAL_DATES_FIELD_NAME = "legal_dates"
 VALIDITY_START_DATE_FIELD_NAME = "validity_start_date"
 VALIDITY_END_DATE_FIELD_NAME = "validity_end_date"
 
@@ -215,6 +218,9 @@ class DocumentChunkWithoutVectors(BaseModel):
     # filtering (NULL start = valid since indexing, NULL end = still valid).
     regulatory_chunk_id: str | None = None
     heading_path: list[str] | None = None
+    provision_identifiers: list[str] | None = None
+    decision_numbers: list[str] | None = None
+    legal_dates: list[str] | None = None
     validity_start_date: datetime | None = None
     validity_end_date: datetime | None = None
 
@@ -607,6 +613,13 @@ class DocumentSchema:
                 HEADING_PATH_FIELD_NAME: {
                     "type": "text",
                     "analyzer": ELASTICSEARCH_TEXT_ANALYZER,
+                    "fields": {"keyword": {"type": "keyword", "ignore_above": 512}},
+                },
+                PROVISION_IDENTIFIERS_FIELD_NAME: {"type": "keyword"},
+                DECISION_NUMBERS_FIELD_NAME: {"type": "keyword"},
+                LEGAL_DATES_FIELD_NAME: {
+                    "type": "date",
+                    "format": "strict_date",
                 },
                 VALIDITY_START_DATE_FIELD_NAME: {
                     "type": "date",

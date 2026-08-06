@@ -13,6 +13,10 @@ from onyx.indexing.models import ChunkEmbedding, DocMetadataAwareIndexChunk
 def _make_chunk(
     doc_id: str,
     chunk_id: int,
+    *,
+    content: str = "test content",
+    heading_path: list[str] | None = None,
+    metadata: dict[str, str | list[str]] | None = None,
 ) -> DocMetadataAwareIndexChunk:
     """Creates a minimal DocMetadataAwareIndexChunk for testing."""
     doc = Document(
@@ -20,7 +24,7 @@ def _make_chunk(
         sections=[TextSection(text="test", link="http://test.com")],
         source=DocumentSource.FILE,
         semantic_identifier="test_doc",
-        metadata={},
+        metadata=metadata or {},
     )
     access = DocumentAccess.build(
         user_emails=[],
@@ -32,7 +36,7 @@ def _make_chunk(
     return DocMetadataAwareIndexChunk(
         chunk_id=chunk_id,
         blurb="test",
-        content="test content",
+        content=content,
         source_links={0: "http://test.com"},
         image_file_id=None,
         section_continuation=False,
@@ -55,6 +59,7 @@ def _make_chunk(
         boost=0,
         aggregated_chunk_boost_factor=1.0,
         ancestor_hierarchy_node_ids=[],
+        heading_path=heading_path,
     )
 
 
@@ -104,6 +109,25 @@ def test_single_doc_under_batch_limit_flushes_once() -> None:
     assert mock_bulk.call_count == 1
     batch_arg = mock_bulk.call_args_list[0]
     assert len(batch_arg.kwargs["documents"]) == num_chunks
+
+
+def test_bulk_payload_contains_legal_exact_fields_from_text_and_metadata() -> None:
+    index, mock_bulk = _make_index()
+    chunk = _make_chunk(
+        "legal-doc",
+        0,
+        content="2024/17 sayılı karar 06.08.2026 tarihinde verildi.",
+        heading_path=["Geçici Madde 2"],
+        metadata={"karar_no": "2024/17"},
+    )
+
+    with patch.object(index, "delete", return_value=0):
+        index.index([chunk], _make_metadata("legal-doc", 1))
+
+    indexed_document = mock_bulk.call_args.kwargs["documents"][0]
+    assert indexed_document.provision_identifiers == ["geçici madde 2"]
+    assert indexed_document.decision_numbers == ["2024/17"]
+    assert indexed_document.legal_dates == ["2026-08-06"]
 
 
 @patch(
