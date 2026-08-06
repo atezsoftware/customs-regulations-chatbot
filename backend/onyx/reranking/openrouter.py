@@ -1,3 +1,4 @@
+import json
 import math
 from collections.abc import Sequence
 from typing import Any
@@ -5,6 +6,8 @@ from typing import Any
 import httpx
 
 from onyx.reranking.constants import (
+    MAX_RERANK_REQUEST_BYTES,
+    MAX_RERANK_REQUEST_TOKENS,
     OPENROUTER_RERANK_URL,
     RERANK_CONNECT_TIMEOUT_SECONDS,
     RERANK_POOL_TIMEOUT_SECONDS,
@@ -13,6 +16,7 @@ from onyx.reranking.constants import (
 )
 from onyx.reranking.models import (
     InvalidRerankResponse,
+    RerankPayloadTooLarge,
     RerankProviderError,
     RerankRateLimited,
     RerankScore,
@@ -48,6 +52,21 @@ class OpenRouterRerankClient:
     ) -> list[RerankScore]:
         if not documents or top_n < 1 or top_n > len(documents):
             raise ValueError("top_n must select from a non-empty document list")
+        request_payload = {
+            "model": model,
+            "query": query,
+            "documents": list(documents),
+            "top_n": top_n,
+            "provider": {"zdr": True, "data_collection": "deny"},
+        }
+        serialized_request = json.dumps(
+            request_payload, ensure_ascii=False, separators=(",", ":")
+        )
+        if (
+            len(serialized_request.encode("utf-8")) > MAX_RERANK_REQUEST_BYTES
+            or (len(serialized_request) + 3) // 4 > MAX_RERANK_REQUEST_TOKENS
+        ):
+            raise RerankPayloadTooLarge()
         try:
             response = self.http.post(
                 OPENROUTER_RERANK_URL,
@@ -55,13 +74,7 @@ class OpenRouterRerankClient:
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": model,
-                    "query": query,
-                    "documents": list(documents),
-                    "top_n": top_n,
-                    "provider": {"zdr": True, "data_collection": "deny"},
-                },
+                json=request_payload,
             )
         except httpx.TimeoutException as error:
             raise RerankTimeout() from error

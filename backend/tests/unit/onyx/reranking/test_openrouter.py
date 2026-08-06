@@ -6,6 +6,7 @@ import pytest
 from onyx.reranking.constants import OPENROUTER_RERANK_URL
 from onyx.reranking.models import (
     InvalidRerankResponse,
+    RerankPayloadTooLarge,
     RerankProviderError,
     RerankRateLimited,
     RerankTimeout,
@@ -128,6 +129,21 @@ def test_timeout_is_typed_and_not_retried(
         client.rerank(api_key="k", model="m", query="q", documents=["a"], top_n=1)
 
     assert http.post.call_count == 1
+
+
+def test_oversized_complete_request_is_rejected_before_http(
+    client: OpenRouterRerankClient,
+    http: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("onyx.reranking.openrouter.MAX_RERANK_REQUEST_BYTES", 10)
+
+    with pytest.raises(RerankPayloadTooLarge):
+        client.rerank(
+            api_key="k", model="m", query="q", documents=["document"], top_n=1
+        )
+
+    http.post.assert_not_called()
 
 
 def test_rate_limit_carries_retry_after(

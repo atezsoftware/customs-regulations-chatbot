@@ -16,6 +16,7 @@ from onyx.reranking.models import (
     RerankCircuitKey,
     RerankOutcome,
     RerankPayloadLimits,
+    RerankPayloadTooLarge,
     RerankProviderError,
     RerankRateLimited,
     RerankResult,
@@ -189,6 +190,8 @@ class RerankingService:
         except InvalidRerankResponse:
             self._circuit_breaker.record_failure(circuit_key)
             outcome = RerankOutcome.INVALID_RESPONSE
+        except RerankPayloadTooLarge:
+            outcome = RerankOutcome.PROVIDER_ERROR
         else:
             self._circuit_breaker.record_success(circuit_key)
             returned_indices = {score.index for score in scores}

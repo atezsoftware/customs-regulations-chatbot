@@ -13,6 +13,7 @@ from onyx.reranking.circuit_breaker import RerankCircuitBreaker
 from onyx.reranking.models import (
     InvalidRerankResponse,
     RerankOutcome,
+    RerankPayloadTooLarge,
     RerankProviderError,
     RerankRateLimited,
     RerankScore,
@@ -123,6 +124,7 @@ def test_partial_response_appends_omitted_and_unsent_tail(
         (RerankRateLimited(retry_after_seconds=30), RerankOutcome.RATE_LIMITED),
         (RerankProviderError(status_code=503), RerankOutcome.PROVIDER_ERROR),
         (InvalidRerankResponse(), RerankOutcome.INVALID_RESPONSE),
+        (RerankPayloadTooLarge(), RerankOutcome.PROVIDER_ERROR),
     ],
 )
 def test_provider_failures_preserve_all_chunks(
