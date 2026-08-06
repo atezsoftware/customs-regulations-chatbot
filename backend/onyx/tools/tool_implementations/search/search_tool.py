@@ -500,6 +500,34 @@ def _rich_response_sections(
     return list(sections_by_identity.values())
 
 
+def _interleave_ranked_chunk_results(
+    primary_results: list[InferenceChunk],
+    supplemental_results: list[InferenceChunk],
+    limit: int,
+) -> list[InferenceChunk]:
+    """Fairly fold supplemental results into one bounded ranking lane."""
+
+    if limit <= 0:
+        return []
+
+    merged_results: list[InferenceChunk] = []
+    seen_identities: set[tuple[str, int]] = set()
+    for rank in range(max(len(primary_results), len(supplemental_results))):
+        for ranked_results in (primary_results, supplemental_results):
+            if rank >= len(ranked_results):
+                continue
+            chunk = ranked_results[rank]
+            identity = (chunk.document_id, chunk.chunk_id)
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            merged_results.append(chunk)
+            if len(merged_results) >= limit:
+                return merged_results
+
+    return merged_results
+
+
 def _reorder_sections_by_chunk_ranking(
     sections: list[InferenceSection], ranked_chunks: list[InferenceChunk]
 ) -> list[InferenceSection]:
@@ -1897,14 +1925,11 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         if slack_search_scheduled:
             slack_results = all_search_results.pop()
             if all_search_results:
-                original_lane = all_search_results[0]
-                chunks_by_identity = {
-                    (chunk.document_id, chunk.chunk_id): chunk
-                    for chunk in [*original_lane, *slack_results]
-                }
-                all_search_results[0] = list(chunks_by_identity.values())[
-                    : override_kwargs.per_lane_num_hits
-                ]
+                all_search_results[0] = _interleave_ranked_chunk_results(
+                    all_search_results[0],
+                    slack_results,
+                    override_kwargs.per_lane_num_hits,
+                )
 
         top_chunks = weighted_reciprocal_rank_fusion(
             ranked_results=all_search_results,
@@ -2130,13 +2155,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 returned_sections,
                 selected_sections,
                 authoritative_selected=regulatory_chunks_only,
-            ),
+            )[: override_kwargs.num_hits],
             is_internet=False,
         )
 
         # To show the users, we only pass in the docs that are determined to be good by the LLM
         final_ui_docs = convert_inference_sections_to_search_docs(
-            selected_sections, is_internet=False
+            selected_sections[: override_kwargs.num_hits], is_internet=False
         )
 
         self.emitter.emit(

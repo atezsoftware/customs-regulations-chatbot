@@ -15,7 +15,12 @@ from onyx.configs.chat_configs import (
     SEARCH_HITS_PER_LANE,
 )
 from onyx.configs.constants import DocumentSource, MessageType
-from onyx.context.search.models import BaseFilters, InferenceChunk, InferenceSection
+from onyx.context.search.models import (
+    BaseFilters,
+    InferenceChunk,
+    InferenceSection,
+    SearchDocsResponse,
+)
 from onyx.context.search.utils import (
     convert_inference_sections_to_search_docs,
     inference_section_from_single_chunk,
@@ -480,10 +485,12 @@ def test_non_regulatory_rich_response_preserves_existing_rich_chunk_behavior() -
 def test_regulatory_snapshot_filter_drops_stale_or_missing_index_hits() -> None:
     visible = _regulatory_section("doc", 1)
     stale = _regulatory_section("doc", 2)
+    visible_chunk_id = visible.center_chunk.regulatory_chunk_id
+    assert visible_chunk_id is not None
 
     assert _filter_visible_regulatory_sections(
         [visible, stale],
-        {visible.center_chunk.regulatory_chunk_id},
+        {visible_chunk_id},
     ) == [visible]
 
 
@@ -864,6 +871,7 @@ def test_internal_search_rejects_non_focused_query_payloads(queries: Any) -> Non
 def _make_tool(
     user_selected_filters: BaseFilters | None = None,
     auto_detect_filters: bool = True,
+    enable_slack_search: bool = False,
 ) -> SearchTool:
     """Instantiate SearchTool with non-DB deps mocked; DB/LLM calls are patched in _run."""
     return SearchTool(
@@ -875,7 +883,7 @@ def _make_tool(
         document_index=MagicMock(),
         user_selected_filters=user_selected_filters,
         project_id_filter=None,
-        enable_slack_search=False,
+        enable_slack_search=enable_slack_search,
         auto_detect_filters=auto_detect_filters,
     )
 
@@ -898,6 +906,10 @@ def _run(
     rerank_result: RerankResult | None = None,
     selector_sink: list[MagicMock] | None = None,
     rerank_sink: list[MagicMock] | None = None,
+    rrf_sink: list[MagicMock] | None = None,
+    pipeline_chunks: list[InferenceChunk] | None = None,
+    slack_chunks: list[InferenceChunk] | None = None,
+    per_lane_num_hits: int = SEARCH_HITS_PER_LANE,
     num_hits: int = 50,
     max_llm_chunks: int = 25,
     rerank_candidate_limit: int = 100,
@@ -908,7 +920,7 @@ def _run(
     can be inspected), otherwise by a stub returning `decision`. search_pipeline
     returns no chunks, so run() takes the empty-results early return.
     """
-    mock_search_pipeline = MagicMock(return_value=[])
+    mock_search_pipeline = MagicMock(return_value=pipeline_chunks or [])
     effective_fused_chunks = fused_chunks or []
     effective_rerank_result = rerank_result or RerankResult(
         ordered_chunks=effective_fused_chunks,
@@ -919,6 +931,7 @@ def _run(
         fallback_used=True,
     )
     rerank_mock = MagicMock(return_value=effective_rerank_result)
+    rrf_mock = MagicMock(return_value=effective_fused_chunks)
     selector_mock = MagicMock(
         side_effect=lambda sections, **_kwargs: (list(sections), None)
     )
@@ -940,6 +953,12 @@ def _run(
             ),
         ),
         patch(f"{MODULE}.EmbeddingModel"),
+        patch.object(
+            tool,
+            "_prefetch_slack_data",
+            return_value=("test-slack-token", None, {}),
+        ),
+        patch.object(tool, "_run_slack_search", return_value=slack_chunks or []),
         patch(f"{MODULE}.get_federated_retrieval_functions", return_value=[]),
         patch(
             f"{MODULE}.fetch_unique_document_sources", return_value=connected_sources
@@ -951,10 +970,7 @@ def _run(
         ),
         patch(f"{MODULE}.decide_search_scope", decide),
         patch(f"{MODULE}.decide_time_filter", MagicMock(return_value=None)),
-        patch(
-            f"{MODULE}.weighted_reciprocal_rank_fusion",
-            return_value=effective_fused_chunks,
-        ),
+        patch(f"{MODULE}.weighted_reciprocal_rank_fusion", rrf_mock),
         patch(f"{MODULE}.rerank_chunks", rerank_mock),
         patch(f"{MODULE}.select_sections_for_expansion", selector_mock),
         patch(f"{MODULE}.populate_file_ids_on_sections"),
@@ -988,6 +1004,7 @@ def _run(
                 filter_message_history=filter_message_history,
                 filter_queries=filter_queries,
                 skip_query_expansion=skip_query_expansion,
+                per_lane_num_hits=per_lane_num_hits,
                 num_hits=num_hits,
                 max_llm_chunks=max_llm_chunks,
                 rerank_candidate_limit=rerank_candidate_limit,
@@ -1000,6 +1017,8 @@ def _run(
             selector_sink.append(selector_mock)
         if rerank_sink is not None:
             rerank_sink.append(rerank_mock)
+        if rrf_sink is not None:
+            rrf_sink.append(rrf_mock)
     return mock_search_pipeline
 
 
@@ -1075,6 +1094,36 @@ def test_run_caps_query_lanes_and_uses_per_lane_budget() -> None:
     assert all(limit == SEARCH_HITS_PER_LANE for *_, limit in requests)
 
 
+def test_full_original_lane_reserves_deterministic_room_for_slack_candidates() -> None:
+    original_chunks = [
+        _ordinary_chunk("internal", chunk_id, f"Internal {chunk_id}")
+        for chunk_id in range(4)
+    ]
+    slack_chunks = [
+        _ordinary_chunk("slack", chunk_id, f"Slack {chunk_id}") for chunk_id in range(4)
+    ]
+    rrf_mocks: list[MagicMock] = []
+
+    _run(
+        _make_tool(auto_detect_filters=False, enable_slack_search=True),
+        connected_sources=[DocumentSource.USER_FILE, DocumentSource.SLACK],
+        skip_query_expansion=True,
+        search_mode=None,
+        pipeline_chunks=original_chunks,
+        slack_chunks=slack_chunks,
+        per_lane_num_hits=4,
+        rrf_sink=rrf_mocks,
+    )
+
+    original_lane = rrf_mocks[0].call_args.kwargs["ranked_results"][0]
+    assert [chunk.unique_id for chunk in original_lane] == [
+        original_chunks[0].unique_id,
+        slack_chunks[0].unique_id,
+        original_chunks[1].unique_id,
+        slack_chunks[1].unique_id,
+    ]
+
+
 def test_successful_rerank_receives_full_fused_pool_and_bypasses_selector() -> None:
     chunks = [
         _ordinary_chunk("doc", 1, "Birinci tamamlayıcı hüküm."),
@@ -1116,13 +1165,17 @@ def test_successful_rerank_receives_full_fused_pool_and_bypasses_selector() -> N
     assert rerank_mocks[0].call_args.kwargs["query"] == "asıl hukuki soru"
     assert rerank_mocks[0].call_args.kwargs["chunks"] == chunks
     selector_mocks[0].assert_not_called()
-    displayed = responses[0].rich_response.displayed_docs
+    rich_response = responses[0].rich_response
+    assert isinstance(rich_response, SearchDocsResponse)
+    displayed = rich_response.displayed_docs
     assert displayed is not None
     assert [(doc.document_id, doc.chunk_ind) for doc in displayed] == [
         ("doc", 9),
-        ("doc", 1),
-        ("doc", 4),
     ]
+    assert [(doc.document_id, doc.chunk_ind) for doc in rich_response.search_docs] == [
+        ("doc", 9)
+    ]
+    assert len(json.loads(responses[0].llm_facing_response)["results"]) == 3
 
 
 def test_rerank_fallback_keeps_legacy_selector() -> None:
