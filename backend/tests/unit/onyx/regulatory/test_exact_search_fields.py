@@ -22,6 +22,12 @@ def test_extracts_metadata_and_deduplicates_in_source_order() -> None:
     assert fields.legal_dates == ["2024-02-01"]
 
 
+def test_extracts_abbreviated_m_provisions_with_optional_spacing() -> None:
+    fields = extract_legal_exact_fields("m. 5 ve m.6 hükümleri birlikte uygulanır.")
+
+    assert fields.provision_identifiers == ["madde 5", "madde 6"]
+
+
 def test_invalid_calendar_dates_are_not_indexed() -> None:
     fields = extract_legal_exact_fields(
         "Madde 7; 2022/31 sayılı karar; 31.02.2024 ve 2024-13-01"

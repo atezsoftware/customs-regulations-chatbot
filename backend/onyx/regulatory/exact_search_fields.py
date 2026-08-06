@@ -17,7 +17,7 @@ class LegalExactFields(BaseModel):
 
 _TURKISH_CASE_TRANSLATION = str.maketrans({"I": "ı", "İ": "i"})
 _PROVISION_PATTERN = re.compile(
-    r"(?<!\w)(?:(geçici|ek|mükerrer)\s+)?(?:madde|md\.?)[ \t]*"
+    r"(?<!\w)(?:(geçici|ek|mükerrer)\s+)?(?:madde|md\.?|m\.)[ \t]*"
     r"([0-9]+(?:[./-][0-9a-zçğıöşü]+|[a-zçğıöşü])?)",
     flags=re.IGNORECASE,
 )
