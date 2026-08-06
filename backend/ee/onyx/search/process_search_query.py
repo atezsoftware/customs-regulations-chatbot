@@ -3,7 +3,7 @@ from collections.abc import Generator
 from sqlalchemy.orm import Session
 
 from ee.onyx.db.search import create_search_query
-from ee.onyx.secondary_llm_flows.query_expansion import expand_keywords
+from ee.onyx.secondary_llm_flows.query_expansion import expand_search_queries
 from ee.onyx.server.query_and_chat.models import (
     SearchDocWithContent,
     SearchFullResponse,
@@ -31,6 +31,7 @@ from onyx.llm.factory import get_default_llm
 from onyx.reranking.diversity import apply_soft_diversity
 from onyx.reranking.service import rerank_chunks
 from onyx.secondary_llm_flows.document_filter import select_sections_for_expansion
+from onyx.tools.tool_implementations.search.search_tool import build_query_lanes
 from onyx.tools.tool_implementations.search.search_utils import (
     weighted_reciprocal_rank_fusion,
 )
@@ -95,41 +96,46 @@ def stream_search_query(
 
     # Determine queries to execute
     original_query = request.search_query
-    keyword_expansions: list[str] = []
+    semantic_query: str | None = None
+    keyword_queries: list[str] = []
 
     if request.run_query_expansion:
         try:
             llm = get_default_llm()
-            keyword_expansions = expand_keywords(
+            semantic_query, keyword_queries = expand_search_queries(
                 user_query=original_query,
                 llm=llm,
             )
-            if keyword_expansions:
+            if semantic_query or keyword_queries:
                 logger.debug(
-                    "Query expansion generated %s keyword queries",
-                    len(keyword_expansions),
+                    "Query expansion generated one semantic and %s keyword queries",
+                    len(keyword_queries),
                 )
         except Exception as e:
             logger.warning("Query expansion failed: %s; using original query only.", e)
-            keyword_expansions = []
+            semantic_query = None
+            keyword_queries = []
 
-    keyword_expansions = list(
-        dict.fromkeys(
-            query.strip()
-            for query in keyword_expansions
-            if query.strip() and query.strip().casefold() != original_query.casefold()
-        )
-    )[: MAX_SEARCH_QUERY_LANES - 1]
-
-    # Build list of all executed queries for tracking
-    all_executed_queries = [original_query] + keyword_expansions
+    query_lanes = build_query_lanes(
+        original_query=original_query,
+        semantic_query=semantic_query,
+        model_queries=[],
+        keyword_queries=keyword_queries,
+        search_mode="hybrid",
+        regulatory_chunks_only=bool(
+            request.filters and request.filters.regulatory_chunks_only
+        ),
+    )
+    query_lanes = query_lanes[:MAX_SEARCH_QUERY_LANES]
+    all_executed_queries = [lane.query for lane in query_lanes]
+    query_expansions = all_executed_queries[1:]
 
     if not user.is_anonymous:
         create_search_query(
             db_session=db_session,
             user_id=user.id,
             query=request.search_query,
-            query_expansions=keyword_expansions if keyword_expansions else None,
+            query_expansions=query_expansions if query_expansions else None,
         )
 
     # Execute search(es)
@@ -137,20 +143,26 @@ def stream_search_query(
         SEARCH_HITS_PER_LANE,
         min(request.num_hits, RERANK_CANDIDATE_LIMIT),
     )
-    if not keyword_expansions:
+    if len(query_lanes) == 1:
         # Single query (original only) - no threading needed
+        lane = query_lanes[0]
         chunks = _run_single_search(
-            query=original_query,
+            query=lane.query,
             filters=request.filters,
             document_index=document_index,
             user=user,
             db_session=db_session,
             num_hits=per_lane_num_hits,
-            hybrid_alpha=request.hybrid_alpha,
+            hybrid_alpha=(
+                request.hybrid_alpha
+                if request.hybrid_alpha is not None
+                else lane.hybrid_alpha
+            ),
         )
     else:
         # Multiple queries - run in parallel and merge with RRF
-        # First query is the original (semantic), rest are keyword expansions
+        # The original, semantic, and legal/lexical lanes retain their shared
+        # retrieval modes unless the API caller explicitly overrides hybrid_alpha.
         search_functions = [
             (
                 _run_single_search,
@@ -161,10 +173,15 @@ def stream_search_query(
                     user,
                     db_session,
                     per_lane_num_hits,
-                    request.hybrid_alpha,
+                    (
+                        request.hybrid_alpha
+                        if request.hybrid_alpha is not None
+                        else lane.hybrid_alpha
+                    ),
                 ),
             )
-            for query in all_executed_queries
+            for lane in query_lanes
+            for query in (lane.query,)
         ]
 
         # Run all searches in parallel
@@ -175,26 +192,26 @@ def stream_search_query(
             )
         )
 
-        # Separate original query results from keyword expansion results
+        # Separate original query results from generated expansion results
         # Note that in rare cases, the original query may have failed and so we may be
         # just overweighting one set of keyword results, should be not a big deal though.
         original_result = all_search_results[0] if all_search_results else []
-        keyword_results = all_search_results[1:] if len(all_search_results) > 1 else []
+        expansion_results = (
+            all_search_results[1:] if len(all_search_results) > 1 else []
+        )
 
-        # Build valid results and weights
-        # Original query (semantic): weight 2.0
-        # Keyword expansions: weight 1.0 each
+        # Build valid results with the shared lane weights.
         valid_results: list[list[InferenceChunk]] = []
         weights: list[float] = []
 
         if original_result:
             valid_results.append(original_result)
-            weights.append(2.0)
+            weights.append(query_lanes[0].weight)
 
-        for keyword_result in keyword_results:
-            if keyword_result:
-                valid_results.append(keyword_result)
-                weights.append(1.0)
+        for lane, expansion_result in zip(query_lanes[1:], expansion_results):
+            if expansion_result:
+                valid_results.append(expansion_result)
+                weights.append(lane.weight)
 
         if not valid_results:
             logger.warning("All parallel searches returned empty results")
