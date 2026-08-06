@@ -22,6 +22,7 @@ from onyx.reranking.models import (
     RerankScore,
     RerankTimeout,
 )
+from onyx.reranking.payload import estimate_text_tokens
 from onyx.utils.retry_after import parse_retry_after_seconds
 
 
@@ -64,7 +65,7 @@ class OpenRouterRerankClient:
         )
         if (
             len(serialized_request.encode("utf-8")) > MAX_RERANK_REQUEST_BYTES
-            or (len(serialized_request) + 3) // 4 > MAX_RERANK_REQUEST_TOKENS
+            or estimate_text_tokens(serialized_request) > MAX_RERANK_REQUEST_TOKENS
         ):
             raise RerankPayloadTooLarge()
         try:

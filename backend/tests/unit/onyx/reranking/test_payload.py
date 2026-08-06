@@ -52,6 +52,13 @@ def test_serializes_document_context_as_labeled_text() -> None:
     assert payload.unsent_chunks == []
 
 
+def test_non_ascii_token_estimate_uses_utf8_upper_bound_with_margin() -> None:
+    text = "İ" * 100
+    utf8_bytes = len(text.encode("utf-8"))
+
+    assert estimate_text_tokens(text) >= utf8_bytes + (utf8_bytes + 9) // 10
+
+
 def test_per_document_bound_drops_summary_before_context_or_body() -> None:
     chunk = _chunk(doc_summary="S" * 400, chunk_context="context-kept")
     baseline = serialize_rerank_candidates(
@@ -119,9 +126,9 @@ def test_oversized_body_is_truncated_without_losing_legal_heading() -> None:
         limits=RerankPayloadLimits(
             max_candidates=1,
             max_document_bytes=300,
-            max_document_tokens=80,
+            max_document_tokens=1_000,
             max_total_bytes=300,
-            max_total_tokens=80,
+            max_total_tokens=1_000,
         ),
     )
 
@@ -129,4 +136,4 @@ def test_oversized_body_is_truncated_without_losing_legal_heading() -> None:
     assert "Heading path: Kısım I > Madde 5" in payload.documents[0]
     assert "Body:\nesas" in payload.documents[0]
     assert payload.utf8_bytes <= 300
-    assert payload.estimated_tokens <= 80
+    assert payload.estimated_tokens <= 1_000

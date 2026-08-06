@@ -1,12 +1,20 @@
 from collections.abc import Sequence
 
 from onyx.context.search.models import InferenceChunk
+from onyx.reranking.constants import RERANK_TOKEN_SAFETY_MARGIN_PERCENT
 from onyx.reranking.models import RerankPayloadLimits, SerializedRerankCandidates
 
 
 def estimate_text_tokens(text: str) -> int:
-    """Return a deterministic tokenizer-independent request estimate."""
-    return (len(text) + 3) // 4
+    """Return a conservative tokenizer-independent request budget.
+
+    A provider can tokenize every UTF-8 byte independently, so character averages
+    are unsafe for non-ASCII text. Count each encoded byte as a potential token and
+    reserve an additional margin for tokenizer-specific normalization/markers.
+    """
+    utf8_bytes = len(text.encode("utf-8"))
+    safety_margin = (utf8_bytes * RERANK_TOKEN_SAFETY_MARGIN_PERCENT + 99) // 100
+    return utf8_bytes + safety_margin
 
 
 def _within_limits(text: str, *, max_bytes: int, max_tokens: int) -> bool:

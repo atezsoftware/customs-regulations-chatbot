@@ -146,6 +146,27 @@ def test_oversized_complete_request_is_rejected_before_http(
     http.post.assert_not_called()
 
 
+def test_non_ascii_complete_request_uses_conservative_token_bound(
+    client: OpenRouterRerankClient,
+    http: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("onyx.reranking.openrouter.MAX_RERANK_REQUEST_BYTES", 10_000)
+    monkeypatch.setattr("onyx.reranking.openrouter.MAX_RERANK_REQUEST_TOKENS", 200)
+    http.post.return_value = _response({"results": []})
+
+    with pytest.raises(RerankPayloadTooLarge):
+        client.rerank(
+            api_key="k",
+            model="m",
+            query="İ" * 100,
+            documents=["belge"],
+            top_n=1,
+        )
+
+    http.post.assert_not_called()
+
+
 def test_rate_limit_carries_retry_after(
     client: OpenRouterRerankClient, http: MagicMock
 ) -> None:
