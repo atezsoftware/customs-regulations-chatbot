@@ -1,4 +1,5 @@
 from collections import Counter
+from collections.abc import Sequence
 from typing import cast
 from uuid import UUID
 
@@ -19,7 +20,9 @@ from onyx.db.mcp import (
     resolve_mcp_credentials,
 )
 from onyx.db.models import Persona, User
+from onyx.db.models import Tool as DbTool
 from onyx.db.oauth_config import get_oauth_config
+from onyx.db.persona import get_effective_persona_tools
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.tools import get_builtin_tool
 from onyx.document_index.factory import get_default_document_index
@@ -136,6 +139,7 @@ def construct_tools(
     (e.g. via ``eager_load_persona=True`` or ``eager_load_for_tools=True``)
     to avoid lazy SQL queries after the session may have been flushed."""
     with get_session_with_current_tenant_if_none(db_session) as db_session:
+        effective_tools = get_effective_persona_tools(persona, db_session)
         return _construct_tools_impl(
             persona=persona,
             db_session=db_session,
@@ -147,6 +151,7 @@ def construct_tools(
             file_reader_tool_config=file_reader_tool_config,
             allowed_tool_ids=allowed_tool_ids,
             search_usage_forcing_setting=search_usage_forcing_setting,
+            persona_tools=effective_tools,
         )
 
 
@@ -161,11 +166,14 @@ def _construct_tools_impl(
     file_reader_tool_config: FileReaderToolConfig | None = None,
     allowed_tool_ids: list[int] | None = None,
     search_usage_forcing_setting: SearchToolUsage = SearchToolUsage.AUTO,
+    persona_tools: Sequence[DbTool] | None = None,
 ) -> dict[int, list[Tool]]:
     tool_dict: dict[int, list[Tool]] = {}
 
+    configured_tools = persona.tools if persona_tools is None else persona_tools
+
     # Log which tools are attached to the persona for debugging
-    persona_tool_names = [t.name for t in persona.tools]
+    persona_tool_names = [t.name for t in configured_tools]
     logger.debug(
         "Constructing tools for persona '%s' (id=%s): %s",
         persona.name,
@@ -192,9 +200,9 @@ def _construct_tools_impl(
         )
         user_selected_filters = config.user_selected_filters
         if persona.id == DEFAULT_PERSONA_ID:
-            user_selected_filters = (
-                user_selected_filters or BaseFilters()
-            ).model_copy(update={"regulatory_chunks_only": True})
+            user_selected_filters = (user_selected_filters or BaseFilters()).model_copy(
+                update={"regulatory_chunks_only": True}
+            )
         return SearchTool(
             tool_id=tool_id,
             emitter=emitter,
@@ -212,7 +220,7 @@ def _construct_tools_impl(
         )
 
     added_search_tool = False
-    for db_tool_model in persona.tools:
+    for db_tool_model in configured_tools:
         # If allowed_tool_ids is specified, skip tools not in the allowed list
         if allowed_tool_ids is not None and db_tool_model.id not in allowed_tool_ids:
             continue
@@ -447,12 +455,13 @@ def _construct_tools_impl(
         # Get the database tool model for SearchTool
         search_tool_db_model = get_builtin_tool(db_session, SearchTool)
 
-        if not search_tool_config:
-            search_tool_config = SearchToolConfig()
+        if allowed_tool_ids is None or search_tool_db_model.id in allowed_tool_ids:
+            if not search_tool_config:
+                search_tool_config = SearchToolConfig()
 
-        tool_dict[search_tool_db_model.id] = [
-            _build_search_tool(search_tool_db_model.id, search_tool_config)
-        ]
+            tool_dict[search_tool_db_model.id] = [
+                _build_search_tool(search_tool_db_model.id, search_tool_config)
+            ]
 
     # Always inject MemoryTool when the user has the memory tool enabled,
     # bypassing persona tool associations and allowed_tool_ids filtering

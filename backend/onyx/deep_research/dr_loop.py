@@ -6,12 +6,18 @@
 import json
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import cast
 
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.citation_processor import CitationMapping, DynamicCitationProcessor
 from onyx.chat.citation_utils import extract_citation_order_from_text
 from onyx.chat.emitter import BufferedEmitter, Emitter
+from onyx.chat.empty_response import (
+    OUTPUT_TOKEN_LIMIT_FINISH_REASONS,
+    REFUSAL_FINISH_REASONS,
+    build_empty_llm_response_error,
+)
 from onyx.chat.llm_loop import construct_message_history
 from onyx.chat.llm_step import run_llm_step, run_llm_step_pkt_generator
 from onyx.chat.models import (
@@ -133,12 +139,148 @@ MAX_ORCHESTRATOR_CYCLES = 8
 MAX_ORCHESTRATOR_CYCLES_REASONING = 4
 
 
+@dataclass(frozen=True)
+class _StagedFinalReportAttempt:
+    emitter: BufferedEmitter
+    state: ChatStateContainer
+    citation_processor: DynamicCitationProcessor
+    result: LlmStepResult
+    has_reasoned: bool
+
+
+def _final_report_attempt_is_usable(result: LlmStepResult) -> bool:
+    candidate = result.raw_answer or result.answer or ""
+    return bool(
+        result.answer is not None
+        and candidate.strip()
+        and result.finish_reason not in OUTPUT_TOKEN_LIMIT_FINISH_REASONS
+        and result.finish_reason not in REFUSAL_FINISH_REASONS
+    )
+
+
+def _run_staged_final_report_attempt(
+    *,
+    history: list[ChatMessageSimple],
+    llm: LLM,
+    base_citation_processor: DynamicCitationProcessor,
+    final_documents: list,
+    user_identity: LLMUserIdentity | None,
+    turn_index: int,
+    reasoning_effort: ReasoningEffort,
+    max_tokens: int,
+    pre_answer_processing_time: float | None,
+) -> _StagedFinalReportAttempt:
+    staged_emitter = BufferedEmitter()
+    staged_state = ChatStateContainer()
+    staged_citation_processor = base_citation_processor.fork()
+    result, has_reasoned = run_llm_step(
+        emitter=staged_emitter,
+        history=history,
+        tool_definitions=[],
+        tool_choice=ToolChoiceOptions.NONE,
+        llm=llm,
+        reasoning_effort=reasoning_effort,
+        placement=Placement(turn_index=turn_index),
+        citation_processor=staged_citation_processor,
+        state_container=staged_state,
+        final_documents=final_documents,
+        user_identity=user_identity,
+        max_tokens=max_tokens,
+        is_deep_research=True,
+        pre_answer_processing_time=pre_answer_processing_time,
+        timeout_override=DR_REPORT_LLM_TIMEOUT_S,
+    )
+    return _StagedFinalReportAttempt(
+        emitter=staged_emitter,
+        state=staged_state,
+        citation_processor=staged_citation_processor,
+        result=result,
+        has_reasoned=has_reasoned,
+    )
+
+
+def _generate_usable_final_report_attempt(
+    *,
+    history: list[ChatMessageSimple],
+    llm: LLM,
+    base_citation_processor: DynamicCitationProcessor,
+    final_documents: list,
+    user_identity: LLMUserIdentity | None,
+    turn_index: int,
+    max_tokens: int,
+    pre_answer_processing_time: float | None,
+) -> _StagedFinalReportAttempt:
+    efforts = (ReasoningEffort.LOW, ReasoningEffort.OFF)
+    terminal_attempt: _StagedFinalReportAttempt | None = None
+    for attempt_number, attempt_effort in enumerate(efforts, start=1):
+        terminal_attempt = _run_staged_final_report_attempt(
+            history=history,
+            llm=llm,
+            base_citation_processor=base_citation_processor,
+            final_documents=final_documents,
+            user_identity=user_identity,
+            turn_index=turn_index,
+            reasoning_effort=attempt_effort,
+            max_tokens=max_tokens,
+            pre_answer_processing_time=pre_answer_processing_time,
+        )
+        if _final_report_attempt_is_usable(terminal_attempt.result):
+            return terminal_attempt
+
+        error = build_empty_llm_response_error(
+            llm=llm,
+            llm_step_result=terminal_attempt.result,
+            tool_choice=ToolChoiceOptions.NONE,
+        )
+        logger.warning(
+            "Deep-research final report attempt unusable: provider=%s model=%s "
+            "attempt=%s effort=%s finish_reason=%s has_reasoning=%s "
+            "has_raw_answer=%s",
+            llm.config.model_provider,
+            llm.config.model_name,
+            attempt_number,
+            attempt_effort.value,
+            terminal_attempt.result.finish_reason,
+            bool(terminal_attempt.result.reasoning),
+            bool((terminal_attempt.result.raw_answer or "").strip()),
+        )
+        if not error.is_retryable:
+            raise error
+
+    if terminal_attempt is None:
+        raise RuntimeError("Final report attempt schedule must not be empty")
+    raise build_empty_llm_response_error(
+        llm=llm,
+        llm_step_result=terminal_attempt.result,
+        tool_choice=ToolChoiceOptions.NONE,
+    )
+
+
 def _orchestrator_cycle_schedule(max_decision_cycles: int) -> range:
     """Reserve one forced-report pass after every advertised decision cycle."""
 
     if max_decision_cycles <= 0:
         raise ValueError("max_decision_cycles must be positive")
     return range(max_decision_cycles + 1)
+
+
+def _custom_agent_prompt_message(
+    custom_agent_prompt: str | None,
+    token_counter: Callable[[str], int],
+) -> ChatMessageSimple | None:
+    if not custom_agent_prompt:
+        return None
+    return ChatMessageSimple(
+        message=custom_agent_prompt,
+        token_count=token_counter(custom_agent_prompt),
+        message_type=MessageType.USER,
+    )
+
+
+def _deep_research_search_tools(tools: Sequence[Tool]) -> list[Tool]:
+    """Keep Deep Research restricted to the built-in internal search type."""
+
+    return [tool for tool in tools if isinstance(tool, SearchTool)]
 
 
 def _candidate_review_evidence(
@@ -447,6 +589,7 @@ def generate_final_report(
     exact_evidence_chunks: list[CandidateAnswerEvidenceChunk] | None = None,
     evidence_citation_mapping: CitationMapping | None = None,
     recovery_tools: Sequence[Tool] | None = None,
+    custom_agent_prompt: str | None = None,
 ) -> bool:
     """Generate the final research report.
 
@@ -455,7 +598,10 @@ def generate_final_report(
               False otherwise.
     """
     with function_span("generate_report") as span:
-        span.span_data.input = f"history_length={len(history)}, turn_index={turn_index}"
+        span.span_data.input = (
+            f"history_length={len(history)}, turn_index={turn_index}, "
+            f"requested_reasoning_effort={reasoning_effort.value}"
+        )
         final_report_prompt = FINAL_REPORT_PROMPT.format(
             current_datetime=get_current_llm_day_time(full_sentence=False),
         )
@@ -463,6 +609,10 @@ def generate_final_report(
             message=final_report_prompt,
             token_count=token_counter(final_report_prompt),
             message_type=MessageType.SYSTEM,
+        )
+        custom_agent_prompt_message = _custom_agent_prompt_message(
+            custom_agent_prompt,
+            token_counter,
         )
         final_reminder = USER_FINAL_REPORT_QUERY.format(research_plan=research_plan)
         reminder_message = ChatMessageSimple(
@@ -472,7 +622,7 @@ def generate_final_report(
         )
         final_report_history = construct_message_history(
             system_prompt=system_prompt,
-            custom_agent_prompt=None,
+            custom_agent_prompt=custom_agent_prompt_message,
             simple_chat_history=history,
             reminder_message=reminder_message,
             context_files=None,
@@ -491,60 +641,48 @@ def generate_final_report(
         # Only passing in the cited documents as the whole list would be too long
         final_documents = list(citation_processor.citation_to_doc.values())
 
-        if not is_regulatory_research:
-            llm_step_result, has_reasoned = run_llm_step(
-                emitter=emitter,
-                history=final_report_history,
-                tool_definitions=[],
-                tool_choice=ToolChoiceOptions.NONE,
-                llm=llm,
-                reasoning_effort=reasoning_effort,
-                placement=Placement(turn_index=turn_index),
-                citation_processor=citation_processor,
-                state_container=state_container,
-                final_documents=final_documents,
-                user_identity=user_identity,
-                max_tokens=MAX_FINAL_REPORT_TOKENS,
-                is_deep_research=True,
-                pre_answer_processing_time=pre_answer_processing_time,
-                timeout_override=DR_REPORT_LLM_TIMEOUT_S,
-            )
-            state_container.set_citation_mapping(citation_processor.citation_to_doc)
-            final_report = llm_step_result.answer
-            if final_report is None:
-                raise ValueError(
-                    "LLM failed to generate the final deep research report"
-                )
-            if saved_reasoning:
-                state_container.set_reasoning_tokens(saved_reasoning)
-            span.span_data.output = final_report
-            return has_reasoned
-
         staged_started_at = time.monotonic()
-        initial_emitter = BufferedEmitter()
-        initial_state = ChatStateContainer()
-        initial_citation_processor = citation_processor.fork()
-        initial_result, initial_has_reasoned = run_llm_step(
-            emitter=initial_emitter,
+        initial_attempt = _generate_usable_final_report_attempt(
             history=final_report_history,
-            tool_definitions=[],
-            tool_choice=ToolChoiceOptions.NONE,
             llm=llm,
-            reasoning_effort=reasoning_effort,
-            placement=Placement(turn_index=turn_index),
-            citation_processor=initial_citation_processor,
-            state_container=initial_state,
+            base_citation_processor=citation_processor,
             final_documents=final_documents,
             user_identity=user_identity,
-            max_tokens=MAX_REGULATORY_FINAL_REPORT_TOKENS,
-            is_deep_research=True,
+            turn_index=turn_index,
+            max_tokens=(
+                MAX_REGULATORY_FINAL_REPORT_TOKENS
+                if is_regulatory_research
+                else MAX_FINAL_REPORT_TOKENS
+            ),
             pre_answer_processing_time=pre_answer_processing_time,
-            timeout_override=DR_REPORT_LLM_TIMEOUT_S,
         )
+
+        if not is_regulatory_research:
+            total_pre_answer_processing_time = (
+                (pre_answer_processing_time or 0.0)
+                + time.monotonic()
+                - staged_started_at
+            )
+            commit_staged_llm_step(
+                buffered_emitter=initial_attempt.emitter,
+                staged_state=initial_attempt.state,
+                staged_citation_processor=initial_attempt.citation_processor,
+                emitter=emitter,
+                state_container=state_container,
+                pre_answer_processing_time=total_pre_answer_processing_time,
+            )
+            if saved_reasoning:
+                state_container.set_reasoning_tokens(saved_reasoning)
+            span.span_data.output = initial_attempt.result.answer
+            return initial_attempt.has_reasoned
+
+        initial_emitter = initial_attempt.emitter
+        initial_state = initial_attempt.state
+        initial_citation_processor = initial_attempt.citation_processor
+        initial_result = initial_attempt.result
+        initial_has_reasoned = initial_attempt.has_reasoned
         initial_answer = initial_result.answer
         initial_candidate = initial_result.raw_answer or initial_answer or ""
-        if initial_answer is None or not initial_candidate.strip():
-            raise ValueError("LLM failed to generate the final deep research report")
 
         accepted_emitter = initial_emitter
         accepted_state = initial_state
@@ -694,6 +832,11 @@ def generate_final_report(
                 )
                 correction_history = [
                     system_prompt,
+                    *(
+                        [custom_agent_prompt_message]
+                        if custom_agent_prompt_message is not None
+                        else []
+                    ),
                     ChatMessageSimple(
                         message=user_request,
                         token_count=token_counter(user_request),
@@ -710,204 +853,42 @@ def generate_final_report(
                         message_type=MessageType.USER_REMINDER,
                     ),
                 ]
-                correction_emitter = BufferedEmitter()
-                correction_state = ChatStateContainer()
-                correction_citation_processor = DynamicCitationProcessor()
-                correction_citation_processor.update_citation_mapping(
+                correction_base_citation_processor = DynamicCitationProcessor()
+                correction_base_citation_processor.update_citation_mapping(
                     bounded_correction_citation_mapping
                 )
                 correction_final_documents = list(
                     bounded_correction_citation_mapping.values()
                 )
+                correction_attempt = _generate_usable_final_report_attempt(
+                    history=correction_history,
+                    llm=llm,
+                    base_citation_processor=correction_base_citation_processor,
+                    final_documents=correction_final_documents,
+                    user_identity=user_identity,
+                    turn_index=turn_index,
+                    max_tokens=MAX_REGULATORY_FINAL_REPORT_TOKENS,
+                    pre_answer_processing_time=0,
+                )
+                correction_candidate = (
+                    correction_attempt.result.raw_answer
+                    or correction_attempt.result.answer
+                    or ""
+                )
+                correction_review_evidence = _candidate_review_evidence(
+                    correction_candidate,
+                    available_exact_evidence_chunks,
+                )
                 try:
-                    correction_result, correction_has_reasoned = run_llm_step(
-                        emitter=correction_emitter,
-                        history=correction_history,
-                        tool_definitions=[],
-                        tool_choice=ToolChoiceOptions.NONE,
-                        llm=llm,
-                        reasoning_effort=reasoning_effort,
-                        placement=Placement(turn_index=turn_index),
-                        citation_processor=correction_citation_processor,
-                        state_container=correction_state,
-                        final_documents=correction_final_documents,
-                        user_identity=user_identity,
-                        max_tokens=MAX_REGULATORY_FINAL_REPORT_TOKENS,
-                        is_deep_research=True,
-                        pre_answer_processing_time=0,
-                        timeout_override=DR_REPORT_LLM_TIMEOUT_S,
+                    resolution_review = review_regulatory_candidate_resolution(
+                        llm,
+                        candidate_answer=correction_candidate,
+                        prior_issues=candidate_review.advisory_claim_issues,
+                        evidence_chunks=correction_review_evidence,
                     )
-                    correction_candidate = (
-                        correction_result.raw_answer or correction_result.answer or ""
-                    )
-                    if (
-                        correction_result.answer is not None
-                        and correction_candidate.strip()
-                        and correction_result.finish_reason != "content_filter"
-                    ):
-                        correction_review_evidence = _candidate_review_evidence(
-                            correction_candidate,
-                            available_exact_evidence_chunks,
-                        )
-                        resolution_review = review_regulatory_candidate_resolution(
-                            llm,
-                            candidate_answer=correction_candidate,
-                            prior_issues=candidate_review.advisory_claim_issues,
-                            evidence_chunks=correction_review_evidence,
-                        )
-                        resolution_feedback = format_candidate_resolution_review(
-                            resolution_review
-                        )
-                        if resolution_feedback is None:
-                            accepted_emitter = correction_emitter
-                            accepted_state = correction_state
-                            accepted_citation_processor = correction_citation_processor
-                            accepted_result = correction_result
-                            accepted_has_reasoned = correction_has_reasoned
-                        else:
-                            final_correction_reminder = (
-                                f"{resolution_feedback}\n\n"
-                                f"{earlier_user_context_section}"
-                                "# Exact evidence available for this final correction\n"
-                                f"{correction_evidence}\n\n"
-                                "No additional retrieval or correction pass is "
-                                "available. "
-                                "Produce one final corrected report using only the exact "
-                                "evidence above. Resolve every remaining issue, or remove "
-                                "or accurately qualify the affected proposition and state "
-                                "the precise source gap."
-                            )
-                            final_correction_history = [
-                                system_prompt,
-                                ChatMessageSimple(
-                                    message=user_request,
-                                    token_count=token_counter(user_request),
-                                    message_type=MessageType.USER,
-                                ),
-                                ChatMessageSimple(
-                                    message=correction_candidate,
-                                    token_count=token_counter(correction_candidate),
-                                    message_type=MessageType.ASSISTANT,
-                                ),
-                                ChatMessageSimple(
-                                    message=final_correction_reminder,
-                                    token_count=token_counter(
-                                        final_correction_reminder
-                                    ),
-                                    message_type=MessageType.USER_REMINDER,
-                                ),
-                            ]
-                            final_correction_emitter = BufferedEmitter()
-                            final_correction_state = ChatStateContainer()
-                            final_correction_citation_processor = (
-                                DynamicCitationProcessor()
-                            )
-                            final_correction_citation_processor.update_citation_mapping(
-                                bounded_correction_citation_mapping
-                            )
-                            final_correction_result, final_correction_has_reasoned = (
-                                run_llm_step(
-                                    emitter=final_correction_emitter,
-                                    history=final_correction_history,
-                                    tool_definitions=[],
-                                    tool_choice=ToolChoiceOptions.NONE,
-                                    llm=llm,
-                                    reasoning_effort=reasoning_effort,
-                                    placement=Placement(turn_index=turn_index),
-                                    citation_processor=(
-                                        final_correction_citation_processor
-                                    ),
-                                    state_container=final_correction_state,
-                                    final_documents=correction_final_documents,
-                                    user_identity=user_identity,
-                                    max_tokens=MAX_REGULATORY_FINAL_REPORT_TOKENS,
-                                    is_deep_research=True,
-                                    pre_answer_processing_time=0,
-                                    timeout_override=DR_REPORT_LLM_TIMEOUT_S,
-                                )
-                            )
-                            final_correction_candidate = (
-                                final_correction_result.raw_answer
-                                or final_correction_result.answer
-                                or ""
-                            )
-                            if (
-                                final_correction_result.answer is not None
-                                and final_correction_candidate.strip()
-                                and final_correction_result.finish_reason
-                                != "content_filter"
-                            ):
-                                final_resolution_review = (
-                                    review_regulatory_candidate_resolution(
-                                        llm,
-                                        candidate_answer=final_correction_candidate,
-                                        prior_issues=(
-                                            resolution_review.advisory_claim_issues
-                                        ),
-                                        evidence_chunks=_candidate_review_evidence(
-                                            final_correction_candidate,
-                                            available_exact_evidence_chunks,
-                                        ),
-                                    )
-                                )
-                                final_resolution_feedback = (
-                                    format_candidate_resolution_review(
-                                        final_resolution_review
-                                    )
-                                )
-                                if final_resolution_feedback is None:
-                                    accepted_emitter = final_correction_emitter
-                                    accepted_state = final_correction_state
-                                    accepted_citation_processor = (
-                                        final_correction_citation_processor
-                                    )
-                                    accepted_result = final_correction_result
-                                    accepted_has_reasoned = (
-                                        final_correction_has_reasoned
-                                    )
-                                else:
-                                    logger.warning(
-                                        "Final regulatory correction remained "
-                                        "materially unresolved; publishing a "
-                                        "citation-free source-gap response"
-                                    )
-                                    (
-                                        accepted_emitter,
-                                        accepted_state,
-                                        accepted_citation_processor,
-                                        accepted_result,
-                                    ) = _stage_regulatory_source_gap_fallback(
-                                        turn_index
-                                    )
-                                    accepted_has_reasoned = False
-                            else:
-                                logger.warning(
-                                    "Discarded unusable final regulatory "
-                                    "deep-research correction; publishing a "
-                                    "citation-free source-gap response"
-                                )
-                                (
-                                    accepted_emitter,
-                                    accepted_state,
-                                    accepted_citation_processor,
-                                    accepted_result,
-                                ) = _stage_regulatory_source_gap_fallback(turn_index)
-                                accepted_has_reasoned = False
-                    else:
-                        logger.warning(
-                            "Discarded unusable regulatory deep-research correction; "
-                            "publishing a citation-free source-gap response"
-                        )
-                        (
-                            accepted_emitter,
-                            accepted_state,
-                            accepted_citation_processor,
-                            accepted_result,
-                        ) = _stage_regulatory_source_gap_fallback(turn_index)
-                        accepted_has_reasoned = False
                 except Exception:
                     logger.exception(
-                        "Regulatory deep-research correction failed; publishing a "
+                        "Regulatory correction review failed; publishing a "
                         "citation-free source-gap response"
                     )
                     (
@@ -917,6 +898,133 @@ def generate_final_report(
                         accepted_result,
                     ) = _stage_regulatory_source_gap_fallback(turn_index)
                     accepted_has_reasoned = False
+                else:
+                    resolution_feedback = format_candidate_resolution_review(
+                        resolution_review
+                    )
+                    if resolution_feedback is None:
+                        accepted_emitter = correction_attempt.emitter
+                        accepted_state = correction_attempt.state
+                        accepted_citation_processor = (
+                            correction_attempt.citation_processor
+                        )
+                        accepted_result = correction_attempt.result
+                        accepted_has_reasoned = correction_attempt.has_reasoned
+                    else:
+                        final_correction_reminder = (
+                            f"{resolution_feedback}\n\n"
+                            f"{earlier_user_context_section}"
+                            "# Exact evidence available for this final correction\n"
+                            f"{correction_evidence}\n\n"
+                            "No additional retrieval or correction pass is available. "
+                            "Produce one final corrected report using only the exact "
+                            "evidence above. Resolve every remaining issue, or remove "
+                            "or accurately qualify the affected proposition and state "
+                            "the precise source gap."
+                        )
+                        final_correction_history = [
+                            system_prompt,
+                            *(
+                                [custom_agent_prompt_message]
+                                if custom_agent_prompt_message is not None
+                                else []
+                            ),
+                            ChatMessageSimple(
+                                message=user_request,
+                                token_count=token_counter(user_request),
+                                message_type=MessageType.USER,
+                            ),
+                            ChatMessageSimple(
+                                message=correction_candidate,
+                                token_count=token_counter(correction_candidate),
+                                message_type=MessageType.ASSISTANT,
+                            ),
+                            ChatMessageSimple(
+                                message=final_correction_reminder,
+                                token_count=token_counter(final_correction_reminder),
+                                message_type=MessageType.USER_REMINDER,
+                            ),
+                        ]
+                        final_correction_base_citation_processor = (
+                            DynamicCitationProcessor()
+                        )
+                        final_correction_base_citation_processor.update_citation_mapping(
+                            bounded_correction_citation_mapping
+                        )
+                        final_correction_attempt = (
+                            _generate_usable_final_report_attempt(
+                                history=final_correction_history,
+                                llm=llm,
+                                base_citation_processor=(
+                                    final_correction_base_citation_processor
+                                ),
+                                final_documents=correction_final_documents,
+                                user_identity=user_identity,
+                                turn_index=turn_index,
+                                max_tokens=MAX_REGULATORY_FINAL_REPORT_TOKENS,
+                                pre_answer_processing_time=0,
+                            )
+                        )
+                        final_correction_candidate = (
+                            final_correction_attempt.result.raw_answer
+                            or final_correction_attempt.result.answer
+                            or ""
+                        )
+                        try:
+                            final_resolution_review = (
+                                review_regulatory_candidate_resolution(
+                                    llm,
+                                    candidate_answer=final_correction_candidate,
+                                    prior_issues=(
+                                        resolution_review.advisory_claim_issues
+                                    ),
+                                    evidence_chunks=_candidate_review_evidence(
+                                        final_correction_candidate,
+                                        available_exact_evidence_chunks,
+                                    ),
+                                )
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Final regulatory correction review failed; publishing "
+                                "a citation-free source-gap response"
+                            )
+                            (
+                                accepted_emitter,
+                                accepted_state,
+                                accepted_citation_processor,
+                                accepted_result,
+                            ) = _stage_regulatory_source_gap_fallback(turn_index)
+                            accepted_has_reasoned = False
+                        else:
+                            final_resolution_feedback = (
+                                format_candidate_resolution_review(
+                                    final_resolution_review
+                                )
+                            )
+                            if final_resolution_feedback is None:
+                                accepted_emitter = final_correction_attempt.emitter
+                                accepted_state = final_correction_attempt.state
+                                accepted_citation_processor = (
+                                    final_correction_attempt.citation_processor
+                                )
+                                accepted_result = final_correction_attempt.result
+                                accepted_has_reasoned = (
+                                    final_correction_attempt.has_reasoned
+                                )
+                            else:
+                                logger.warning(
+                                    "Final regulatory correction remained materially "
+                                    "unresolved; publishing a citation-free source-gap "
+                                    "response"
+                                )
+                                (
+                                    accepted_emitter,
+                                    accepted_state,
+                                    accepted_citation_processor,
+                                    accepted_result,
+                                ) = _stage_regulatory_source_gap_fallback(turn_index)
+                                accepted_has_reasoned = False
         else:
             logger.warning(
                 "Skipped regulatory deep-research review because exact evidence "
@@ -956,7 +1064,7 @@ def run_deep_research_llm_loop(
     state_container: ChatStateContainer,
     simple_chat_history: list[ChatMessageSimple],
     tools: list[Tool],
-    custom_agent_prompt: str | None,  # noqa: ARG001
+    custom_agent_prompt: str | None,
     llm: LLM,
     token_counter: Callable[[str], int],
     reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
@@ -989,13 +1097,17 @@ def run_deep_research_llm_loop(
         processing_start_time = time.monotonic()
 
         available_tokens = llm.config.max_input_tokens
+        custom_agent_prompt_msg = _custom_agent_prompt_message(
+            custom_agent_prompt,
+            token_counter,
+        )
 
         llm_step_result: LlmStepResult | None = None
 
         # This deployment's research boundary is the indexed internal corpus.
         # Keep the allowlist here as well as in the global tool registry so a
         # future registry change cannot silently grant web access to research.
-        allowed_tools = [tool for tool in tools if tool.name == SearchTool.NAME]
+        allowed_tools = _deep_research_search_tools(tools)
         include_internal_search_tunings = bool(allowed_tools)
         is_regulatory_deep_research = any(
             isinstance(tool, SearchTool)
@@ -1029,7 +1141,7 @@ def run_deep_research_llm_loop(
 
                 truncated_message_history = construct_message_history(
                     system_prompt=system_prompt,
-                    custom_agent_prompt=None,
+                    custom_agent_prompt=custom_agent_prompt_msg,
                     simple_chat_history=simple_chat_history,
                     reminder_message=None,
                     context_files=None,
@@ -1099,7 +1211,7 @@ def run_deep_research_llm_loop(
             )
             truncated_message_history = construct_message_history(
                 system_prompt=system_prompt,
-                custom_agent_prompt=None,
+                custom_agent_prompt=custom_agent_prompt_msg,
                 simple_chat_history=simple_chat_history + [reminder_message],
                 reminder_message=None,
                 context_files=None,
@@ -1250,6 +1362,7 @@ def run_deep_research_llm_loop(
                             else None
                         ),
                         recovery_tools=allowed_tools,
+                        custom_agent_prompt=custom_agent_prompt,
                     )
                     final_turn_index = report_turn_index + (1 if report_reasoned else 0)
                     break
@@ -1279,7 +1392,7 @@ def run_deep_research_llm_loop(
 
                 truncated_message_history = construct_message_history(
                     system_prompt=system_prompt,
-                    custom_agent_prompt=None,
+                    custom_agent_prompt=custom_agent_prompt_msg,
                     simple_chat_history=simple_chat_history,
                     reminder_message=first_cycle_reminder_message,
                     context_files=None,
@@ -1366,6 +1479,7 @@ def run_deep_research_llm_loop(
                             else None
                         ),
                         recovery_tools=allowed_tools,
+                        custom_agent_prompt=custom_agent_prompt,
                     )
                     final_turn_index = report_turn_index + (1 if report_reasoned else 0)
                     break
@@ -1401,6 +1515,7 @@ def run_deep_research_llm_loop(
                             else None
                         ),
                         recovery_tools=allowed_tools,
+                        custom_agent_prompt=custom_agent_prompt,
                     )
                     final_turn_index = report_turn_index + (1 if report_reasoned else 0)
                     break
@@ -1560,6 +1675,7 @@ def run_deep_research_llm_loop(
                                 else None
                             ),
                             recovery_tools=allowed_tools,
+                            custom_agent_prompt=custom_agent_prompt,
                         )
                         final_turn_index = report_turn_index + (
                             1 if report_reasoned else 0

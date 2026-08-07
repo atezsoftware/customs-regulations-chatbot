@@ -762,6 +762,80 @@ def test_openai_auto_reasoning_effort_maps_to_medium() -> None:
         assert kwargs["reasoning"]["effort"] == "medium"
 
 
+@pytest.mark.parametrize(
+    ("reasoning_effort", "expected_effort"),
+    [
+        (ReasoningEffort.LOW, "low"),
+        (ReasoningEffort.OFF, "none"),
+    ],
+)
+def test_vertex_gemini_reasoning_effort_works_without_litellm_metadata(
+    reasoning_effort: ReasoningEffort,
+    expected_effort: str,
+) -> None:
+    llm = LitellmLLM(
+        api_key="test_key",
+        timeout=30,
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name="gemini-3.6-flash",
+        max_input_tokens=100_000,
+    )
+
+    with patch("litellm.completion") as mock_completion:
+        mock_completion.return_value = []
+
+        messages: LanguageModelInput = [UserMessage(content="Hi")]
+        list(llm.stream(messages, reasoning_effort=reasoning_effort))
+
+        kwargs = mock_completion.call_args.kwargs
+        assert kwargs["reasoning_effort"] == expected_effort
+
+
+def test_claude_reasoning_off_keeps_thinking_configuration_omitted() -> None:
+    llm = LitellmLLM(
+        api_key="test_key",
+        timeout=30,
+        model_provider=LlmProviderNames.LITELLM_PROXY,
+        model_name="claude-opus-5",
+        max_input_tokens=100_000,
+    )
+
+    with (
+        patch("litellm.completion") as mock_completion,
+        patch("onyx.llm.multi_llm.model_is_reasoning_model", return_value=True),
+    ):
+        mock_completion.return_value = []
+
+        messages: LanguageModelInput = [UserMessage(content="Hi")]
+        list(llm.stream(messages, reasoning_effort=ReasoningEffort.OFF))
+
+        kwargs = mock_completion.call_args.kwargs
+        assert "thinking" not in kwargs
+        assert "output_config" not in kwargs
+        assert "reasoning_effort" not in kwargs
+
+
+def test_non_gemini_reasoning_off_keeps_reasoning_effort_omitted() -> None:
+    llm = LitellmLLM(
+        api_key="test_key",
+        timeout=30,
+        model_provider=LlmProviderNames.LITELLM_PROXY,
+        model_name="deepseek-reasoner",
+        max_input_tokens=100_000,
+    )
+
+    with (
+        patch("litellm.completion") as mock_completion,
+        patch("onyx.llm.multi_llm.model_is_reasoning_model", return_value=True),
+    ):
+        mock_completion.return_value = []
+
+        messages: LanguageModelInput = [UserMessage(content="Hi")]
+        list(llm.stream(messages, reasoning_effort=ReasoningEffort.OFF))
+
+        assert "reasoning_effort" not in mock_completion.call_args.kwargs
+
+
 @pytest.mark.parametrize("model_name", VERTEX_OPUS_MODELS_REJECTING_OUTPUT_CONFIG)
 def test_vertex_opus_omits_reasoning_effort(model_name: str) -> None:
     llm = LitellmLLM(

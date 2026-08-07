@@ -16,6 +16,7 @@ def test_model_is_reasoning_model() -> None:
         ("deepseek-reasoner", "deepseek"),
         ("deepseek-r1", "openrouter/deepseek"),
         ("claude-sonnet-4-20250514", "anthropic"),
+        ("gemini-3.6-flash", "vertex_ai"),
     ]
 
     # Models that should NOT be identified as reasoning models

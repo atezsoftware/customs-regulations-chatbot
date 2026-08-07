@@ -9,6 +9,8 @@ Verifies that:
 
 from unittest.mock import MagicMock, patch
 
+from onyx.tools.models import SearchToolUsage
+from onyx.tools.tool_constructor import _construct_tools_impl, construct_tools
 from onyx.tools.tool_implementations.file_reader.file_reader_tool import FileReaderTool
 
 APP_CONFIGS_MODULE = "onyx.configs.app_configs"
@@ -101,6 +103,76 @@ class TestForceAddSearchToolGuard:
         assert "DISABLE_VECTOR_DB" in source, (
             "construct_tools should reference DISABLE_VECTOR_DB to suppress force-adding SearchTool"
         )
+
+
+class TestEffectivePersonaTools:
+    def test_construct_tools_passes_inherited_tools_to_runtime_constructor(
+        self,
+    ) -> None:
+        persona = MagicMock()
+        session = MagicMock()
+        inherited_tool = MagicMock(id=1, name="internal_search")
+        direct_tool = MagicMock(id=3, name="custom_action")
+
+        with (
+            patch(
+                "onyx.tools.tool_constructor.get_effective_persona_tools",
+                return_value=[inherited_tool, direct_tool],
+            ) as get_effective,
+            patch(
+                "onyx.tools.tool_constructor._construct_tools_impl",
+                return_value={},
+            ) as construct_impl,
+        ):
+            construct_tools(
+                persona=persona,
+                emitter=MagicMock(),
+                user=MagicMock(),
+                llm=MagicMock(),
+                db_session=session,
+                allowed_tool_ids=[1],
+            )
+
+        get_effective.assert_called_once_with(persona, session)
+        assert construct_impl.call_args.kwargs["persona_tools"] == [
+            inherited_tool,
+            direct_tool,
+        ]
+        assert construct_impl.call_args.kwargs["allowed_tool_ids"] == [1]
+
+    def test_forced_search_respects_allowed_tool_ids(self) -> None:
+        persona = MagicMock(id=7, name="custom", tools=[])
+        persona.document_sets = []
+        persona.attached_documents = []
+        persona.hierarchy_nodes = []
+        user = MagicMock(oauth_accounts=[], enable_memory_tool=False)
+        search_db_tool = MagicMock(id=1)
+
+        with (
+            patch(
+                "onyx.tools.tool_constructor.get_current_search_settings",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_default_document_index",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_builtin_tool",
+                return_value=search_db_tool,
+            ),
+        ):
+            result = _construct_tools_impl(
+                persona=persona,
+                db_session=MagicMock(),
+                emitter=MagicMock(),
+                user=user,
+                llm=MagicMock(),
+                allowed_tool_ids=[99],
+                search_usage_forcing_setting=SearchToolUsage.ENABLED,
+            )
+
+        assert result == {}
 
 
 # ------------------------------------------------------------------

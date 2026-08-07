@@ -41,7 +41,8 @@ from onyx.chat.compression import (
     get_compression_params,
 )
 from onyx.chat.emitter import Emitter
-from onyx.chat.llm_loop import EmptyLLMResponseError, run_llm_loop
+from onyx.chat.empty_response import EmptyLLMResponseError
+from onyx.chat.llm_loop import run_llm_loop
 from onyx.chat.models import (
     AnswerStream,
     AnswerStreamPart,
@@ -83,6 +84,7 @@ from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import HookPoint, Permission
 from onyx.db.memory import get_memories
 from onyx.db.models import ChatMessage, Persona, User, UserFile
+from onyx.db.persona import get_effective_persona_tools
 from onyx.db.projects import get_user_files_from_project
 from onyx.db.tools import get_tools
 from onyx.deep_research.dr_loop import run_deep_research_llm_loop
@@ -989,8 +991,12 @@ def build_chat_turn(
 
     # Convert the chat history into a simple format that is free of any DB objects
     # and is easy to parse for the agent loop.
+    effective_persona_tools = get_effective_persona_tools(persona, db_session)
     has_file_reader_tool = (
-        any(tool.in_code_tool_id == FILE_READER_TOOL_ID for tool in persona.tools)
+        any(
+            tool.in_code_tool_id == FILE_READER_TOOL_ID
+            for tool in effective_persona_tools
+        )
         and not is_global_regulatory_chat
     )
 

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from onyx.configs.constants import DocumentSource, FederatedConnectorSource
 from onyx.server.features.document_set.models import DocumentSetSummary
 from onyx.server.features.persona.models import MinimalPersonaSnapshot
+from onyx.server.features.tool.models import ToolSnapshot
 
 _STUB_DS_SUMMARY = DocumentSetSummary(
     id=1,
@@ -186,3 +187,38 @@ def test_all_source_types_combined(_mock_ds: MagicMock) -> None:
         DocumentSource.SHAREPOINT,
         DocumentSource.USER_FILE,
     }
+
+
+@patch(
+    "onyx.server.features.persona.models.should_expose_tool_to_fe",
+    return_value=True,
+)
+@patch("onyx.server.features.persona.models.ToolSnapshot.from_model")
+def test_minimal_snapshot_uses_explicit_effective_tools(
+    from_tool: MagicMock,
+    _expose_tool: MagicMock,
+) -> None:
+    direct_tool = MagicMock(id=3)
+    inherited_tool = MagicMock(id=1)
+    from_tool.side_effect = lambda tool: ToolSnapshot(
+        id=tool.id,
+        name=f"tool-{tool.id}",
+        description="",
+        definition=None,
+        display_name=f"Tool {tool.id}",
+        in_code_tool_id=None,
+        custom_headers=None,
+        passthrough_auth=False,
+    )
+    persona = _make_persona(tools=[direct_tool])
+
+    snapshot = MinimalPersonaSnapshot.from_model(
+        persona,
+        effective_tools=[inherited_tool, direct_tool],
+    )
+
+    assert [tool.id for tool in snapshot.tools] == [1, 3]
+    assert [call.args[0] for call in from_tool.call_args_list] == [
+        inherited_tool,
+        direct_tool,
+    ]

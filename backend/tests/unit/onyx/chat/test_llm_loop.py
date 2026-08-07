@@ -11,12 +11,14 @@ import pytest
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.citation_processor import DynamicCitationProcessor
 from onyx.chat.emitter import BufferedEmitter, Emitter
-from onyx.chat.llm_loop import (
-    _REFUSAL_FINISH_REASONS,
+from onyx.chat.empty_response import (
+    REFUSAL_FINISH_REASONS,
     EmptyLLMResponseError,
+    build_empty_llm_response_error,
+)
+from onyx.chat.llm_loop import (
     SearchEvidenceLedgerEntry,
     _build_candidate_answer_evidence_chunks,
-    _build_empty_llm_response_error,
     _commit_canonical_tool_decision_step,
     _compact_regulatory_search_history_for_reconsideration,
     _compact_repeated_search_results_for_history,
@@ -1419,9 +1421,11 @@ class TestEmptyLlmResponseClassification:
     def test_openai_empty_stream_is_classified_as_budget_exceeded(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("onyx.chat.llm_loop.is_true_openai_model", lambda *_: True)
+        monkeypatch.setattr(
+            "onyx.chat.empty_response.is_true_openai_model", lambda *_: True
+        )
 
-        err = _build_empty_llm_response_error(
+        err = build_empty_llm_response_error(
             llm=self._make_llm(),
             llm_step_result=LlmStepResult(
                 reasoning=None,
@@ -1440,9 +1444,11 @@ class TestEmptyLlmResponseClassification:
     def test_reasoning_only_response_uses_generic_empty_response_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("onyx.chat.llm_loop.is_true_openai_model", lambda *_: True)
+        monkeypatch.setattr(
+            "onyx.chat.empty_response.is_true_openai_model", lambda *_: True
+        )
 
-        err = _build_empty_llm_response_error(
+        err = build_empty_llm_response_error(
             llm=self._make_llm(),
             llm_step_result=LlmStepResult(
                 reasoning="scratchpad only",
@@ -1458,11 +1464,32 @@ class TestEmptyLlmResponseClassification:
         assert err.is_retryable is True
         assert "quota" not in err.client_error_msg.lower()
 
+    def test_length_finish_is_classified_as_output_token_limit(self) -> None:
+        err = build_empty_llm_response_error(
+            llm=self._make_llm(
+                provider="vertex_ai",
+                model="gemini-3.6-flash",
+            ),
+            llm_step_result=LlmStepResult(
+                reasoning="thinking exhausted the budget",
+                answer=None,
+                tool_calls=None,
+                raw_answer=None,
+                finish_reason="length",
+            ),
+            tool_choice=ToolChoiceOptions.NONE,
+        )
+
+        assert err.error_code == "OUTPUT_TOKEN_LIMIT"
+        assert err.is_retryable is True
+        assert err.finish_reason == "length"
+        assert "output token" in err.client_error_msg.lower()
+
     def test_refusal_finish_reason_is_classified_as_model_refusal(self) -> None:
         """Anthropic refusal: HTTP 200, stop_reason="refusal" (normalized by
         LiteLLM to "content_filter"), no text or tool calls. Must surface as a
         refusal, not a generic empty-stream error."""
-        err = _build_empty_llm_response_error(
+        err = build_empty_llm_response_error(
             llm=self._make_llm(provider="anthropic", model="claude-fable-5"),
             llm_step_result=LlmStepResult(
                 reasoning=None,
@@ -1482,14 +1509,16 @@ class TestEmptyLlmResponseClassification:
         # Anthropic-specific fallback suggestion from the issue.
         assert "Claude Opus 4.8" in err.client_error_msg
 
-    @pytest.mark.parametrize("finish_reason", sorted(_REFUSAL_FINISH_REASONS))
+    @pytest.mark.parametrize("finish_reason", sorted(REFUSAL_FINISH_REASONS))
     def test_refusal_finish_reasons_take_precedence_over_budget_heuristic(
         self, monkeypatch: pytest.MonkeyPatch, finish_reason: str
     ) -> None:
         """Native provider refusal reasons may pass through gateways unchanged."""
-        monkeypatch.setattr("onyx.chat.llm_loop.is_true_openai_model", lambda *_: True)
+        monkeypatch.setattr(
+            "onyx.chat.empty_response.is_true_openai_model", lambda *_: True
+        )
 
-        err = _build_empty_llm_response_error(
+        err = build_empty_llm_response_error(
             llm=self._make_llm(),
             llm_step_result=LlmStepResult(
                 reasoning=None,

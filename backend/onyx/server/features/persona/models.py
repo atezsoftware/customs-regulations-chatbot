@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
@@ -16,6 +17,7 @@ from onyx.db.models import (
     Persona,
     PersonaLabel,
     StarterMessage,
+    Tool,
 )
 from onyx.db.persona_sharing import derive_persona_sharing_status
 from onyx.server.features.document_set.models import DocumentSetSummary
@@ -241,6 +243,7 @@ class MinimalPersonaSnapshot(BaseModel):
         # Fail closed: the owner email is PII and is only included when a caller
         # explicitly opts in (owner / admin paths). See the DB-layer callers.
         include_owner_email: bool = False,
+        effective_tools: Sequence[Tool] | None = None,
     ) -> "MinimalPersonaSnapshot":
         # Collect unique sources from document sets, hierarchy nodes, and attached documents
         sources: set[DocumentSource] = set()
@@ -273,7 +276,9 @@ class MinimalPersonaSnapshot(BaseModel):
             description=persona.description,
             tools=[
                 ToolSnapshot.from_model(tool)
-                for tool in persona.tools
+                for tool in (
+                    persona.tools if effective_tools is None else effective_tools
+                )
                 if should_expose_tool_to_fe(tool)
             ],
             starter_messages=persona.starter_messages,

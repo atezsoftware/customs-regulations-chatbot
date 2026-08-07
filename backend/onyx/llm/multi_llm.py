@@ -38,6 +38,7 @@ from onyx.llm.interfaces import (
     ToolChoiceOptions,
 )
 from onyx.llm.model_capabilities import (
+    is_gemini_3_model,
     is_true_openai_model,
     model_is_reasoning_model,
     openai_model_rejects_reasoning_effort,
@@ -686,8 +687,7 @@ class LitellmLLM(LLM):
         # of the major providers. Not setting it sets it to OFF.
         if (
             is_reasoning
-            # The default of this parameter not set is surprisingly not the equivalent of an Auto but is actually Off
-            and reasoning_effort != ReasoningEffort.OFF
+            and not (is_claude_model and reasoning_effort is ReasoningEffort.OFF)
             and not is_vertex_model_rejecting_output_config
             and not openai_model_rejects_reasoning_effort(self.config.model_name)
         ):
@@ -744,7 +744,10 @@ class LitellmLLM(LLM):
 
             else:
                 # Hope for the best from LiteLLM
-                if reasoning_effort in [
+                if reasoning_effort is ReasoningEffort.OFF:
+                    if any(is_gemini_3_model(name) for name in model_identity_names):
+                        optional_kwargs["reasoning_effort"] = "none"
+                elif reasoning_effort in [
                     ReasoningEffort.LOW,
                     ReasoningEffort.MEDIUM,
                     ReasoningEffort.HIGH,

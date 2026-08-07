@@ -8,6 +8,7 @@ import pytest
 
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.emitter import Emitter
+from onyx.chat.empty_response import EmptyLLMResponseError
 from onyx.chat.models import ChatMessageSimple, LlmStepResult
 from onyx.configs.constants import DocumentSource, MessageType
 from onyx.context.search.models import BaseFilters, SearchDoc, SearchDocsResponse
@@ -105,7 +106,11 @@ def _history() -> list[ChatMessageSimple]:
 
 def _llm() -> MagicMock:
     llm = MagicMock()
-    llm.config = MagicMock(max_input_tokens=100_000)
+    llm.config = MagicMock(
+        max_input_tokens=100_000,
+        model_provider="vertex_ai",
+        model_name="gemini-3.6-flash",
+    )
     return llm
 
 
@@ -273,6 +278,8 @@ def _run_final_report(
     evidence_citation_mapping: dict[int, SearchDoc] | None = None,
     history: list[ChatMessageSimple] | None = None,
     recovery_tools: list[SearchTool] | None = None,
+    reasoning_effort: dr_loop.ReasoningEffort = dr_loop.ReasoningEffort.LOW,
+    custom_agent_prompt: str | None = None,
 ) -> bool:
     return dr_loop.generate_final_report(
         history=_history() if history is None else history,
@@ -287,13 +294,14 @@ def _run_final_report(
         ),
         is_regulatory_research=is_regulatory_research,
         user_identity=None,
-        reasoning_effort=dr_loop.ReasoningEffort.LOW,
+        reasoning_effort=reasoning_effort,
         pre_answer_processing_time=2.0,
         exact_evidence_chunks=(
             [_evidence()] if exact_evidence_chunks is None else exact_evidence_chunks
         ),
         evidence_citation_mapping=evidence_citation_mapping,
         recovery_tools=recovery_tools,
+        custom_agent_prompt=custom_agent_prompt,
     )
 
 
@@ -400,6 +408,7 @@ def test_regulatory_final_report_reject_publishes_only_one_correction() -> None:
             is_regulatory_research=True,
             live_state=live_state,
             destination=destination,
+            reasoning_effort=dr_loop.ReasoningEffort.HIGH,
         )
 
     reviewer.assert_called_once()
@@ -414,6 +423,10 @@ def test_regulatory_final_report_reject_publishes_only_one_correction() -> None:
     )
     assert all(
         call.kwargs["tool_choice"] is dr_loop.ToolChoiceOptions.NONE
+        for call in run_step.call_args_list
+    )
+    assert all(
+        call.kwargs["reasoning_effort"] is dr_loop.ReasoningEffort.LOW
         for call in run_step.call_args_list
     )
     correction_history = cast(
@@ -789,14 +802,7 @@ def test_regulatory_final_report_review_unavailable_fails_open() -> None:
     assert live_state.get_answer_tokens() == "Fail-open grounded draft [1]"
 
 
-@pytest.mark.parametrize(
-    ("correction_answer", "finish_reason"),
-    [("", "stop"), ("Filtered correction [1]", "content_filter")],
-)
-def test_regulatory_final_report_unusable_correction_uses_source_gap(
-    correction_answer: str,
-    finish_reason: str,
-) -> None:
+def test_regulatory_final_report_retries_truncated_correction_without_leaking() -> None:
     live_state = ChatStateContainer()
     merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
     destination = Emitter(merged_queue)
@@ -818,7 +824,80 @@ def test_regulatory_final_report_unusable_correction_uses_source_gap(
             side_effect=_fake_llm_step_with_finish_reasons(
                 [
                     ("Safe initial answer [1]", "stop"),
-                    (correction_answer, finish_reason),
+                    ("Incomplete correction [1]", "length"),
+                    ("Complete correction [1]", "stop"),
+                ]
+            ),
+        ) as run_step,
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_answer",
+            return_value=review,
+        ),
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_resolution",
+            return_value=CandidateAnswerReviewResult(needs_reconsideration=False),
+        ) as resolution_reviewer,
+    ):
+        has_reasoned = _run_final_report(
+            is_regulatory_research=True,
+            live_state=live_state,
+            destination=destination,
+            custom_agent_prompt="Act as a customs compliance specialist.",
+        )
+
+    assert [call.kwargs["reasoning_effort"] for call in run_step.call_args_list] == [
+        dr_loop.ReasoningEffort.LOW,
+        dr_loop.ReasoningEffort.LOW,
+        dr_loop.ReasoningEffort.OFF,
+    ]
+    correction_histories = [
+        cast(list[ChatMessageSimple], call.kwargs["history"])
+        for call in run_step.call_args_list[1:]
+    ]
+    assert all(
+        any(
+            message.message == "Act as a customs compliance specialist."
+            for message in history
+        )
+        for history in correction_histories
+    )
+    packets = _packets(merged_queue)
+    assert [
+        packet.obj.content
+        for packet in packets
+        if isinstance(packet.obj, AgentResponseDelta)
+    ] == ["Complete correction [1]"]
+    assert live_state.get_answer_tokens() == "Complete correction [1]"
+    assert has_reasoned is True
+    resolution_reviewer.assert_called_once()
+
+
+def test_regulatory_final_report_truncated_correction_exhaustion_is_typed() -> None:
+    live_state = ChatStateContainer()
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+    destination = Emitter(merged_queue)
+    review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[
+            CandidateAnswerClaimIssue(
+                claim_reference="Unsupported conclusion",
+                advisory_feedback="Qualify the unsupported scope.",
+                related_citation_numbers=[1],
+            )
+        ],
+    )
+
+    with (
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            side_effect=_fake_llm_step_with_finish_reasons(
+                [
+                    ("Safe initial answer [1]", "stop"),
+                    ("Incomplete correction one [1]", "length"),
+                    ("Incomplete correction two [1]", "length"),
                 ]
             ),
         ),
@@ -831,27 +910,21 @@ def test_regulatory_final_report_unusable_correction_uses_source_gap(
             dr_loop,
             "review_regulatory_candidate_resolution",
         ) as resolution_reviewer,
+        pytest.raises(EmptyLLMResponseError) as exc_info,
     ):
-        has_reasoned = _run_final_report(
+        _run_final_report(
             is_regulatory_research=True,
             live_state=live_state,
             destination=destination,
         )
 
-    packets = _packets(merged_queue)
-    assert [
-        packet.obj.content
-        for packet in packets
-        if isinstance(packet.obj, AgentResponseDelta)
-    ] == [dr_loop._REGULATORY_SOURCE_GAP_FALLBACK]
-    assert not any(isinstance(packet.obj, CitationInfo) for packet in packets)
-    assert live_state.get_answer_tokens() == dr_loop._REGULATORY_SOURCE_GAP_FALLBACK
-    assert live_state.get_citation_to_doc() == {}
-    assert has_reasoned is False
+    assert exc_info.value.finish_reason == "length"
+    assert _packets(merged_queue) == []
+    assert live_state.get_answer_tokens() is None
     resolution_reviewer.assert_not_called()
 
 
-def test_regulatory_final_report_correction_exception_uses_source_gap() -> None:
+def test_regulatory_final_report_correction_provider_exception_propagates() -> None:
     live_state = ChatStateContainer()
     merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
     destination = Emitter(merged_queue)
@@ -890,8 +963,9 @@ def test_regulatory_final_report_correction_exception_uses_source_gap() -> None:
             dr_loop,
             "review_regulatory_candidate_resolution",
         ) as resolution_reviewer,
+        pytest.raises(RuntimeError, match="correction provider failed"),
     ):
-        has_reasoned = _run_final_report(
+        _run_final_report(
             is_regulatory_research=True,
             live_state=live_state,
             destination=destination,
@@ -899,6 +973,50 @@ def test_regulatory_final_report_correction_exception_uses_source_gap() -> None:
 
     assert run_step.call_count == 2
     resolution_reviewer.assert_not_called()
+    assert _packets(merged_queue) == []
+    assert live_state.get_answer_tokens() is None
+
+
+def test_regulatory_final_report_correction_review_exception_uses_source_gap() -> None:
+    live_state = ChatStateContainer()
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+    destination = Emitter(merged_queue)
+    review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[
+            CandidateAnswerClaimIssue(
+                claim_reference="Unsupported conclusion",
+                advisory_feedback="Qualify the unsupported scope.",
+                related_citation_numbers=[1],
+            )
+        ],
+    )
+
+    with (
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            side_effect=_fake_llm_step(
+                ["Rejected initial answer [1]", "Corrected answer [1]"]
+            ),
+        ),
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_answer",
+            return_value=review,
+        ),
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_resolution",
+            side_effect=RuntimeError("review provider failed"),
+        ),
+    ):
+        has_reasoned = _run_final_report(
+            is_regulatory_research=True,
+            live_state=live_state,
+            destination=destination,
+        )
+
     packets = _packets(merged_queue)
     assert [
         packet.obj.content
@@ -1095,6 +1213,7 @@ def test_regulatory_final_report_rechecks_and_repairs_unresolved_correction() ->
             destination=destination,
             citation_mapping={1: public_doc},
             evidence_citation_mapping={2: unformatted_doc},
+            custom_agent_prompt="Act as a customs compliance specialist.",
         )
 
     assert resolution_reviewer.call_count == 2
@@ -1114,6 +1233,13 @@ def test_regulatory_final_report_rechecks_and_repairs_unresolved_correction() ->
     final_history = cast(
         list[ChatMessageSimple], run_step.call_args_list[2].kwargs["history"]
     )
+    assert all(
+        any(
+            message.message == "Act as a customs compliance specialist."
+            for message in cast(list[ChatMessageSimple], call.kwargs["history"])
+        )
+        for call in run_step.call_args_list[1:]
+    )
     assert any(
         "Revised candidate resolution review" in message.message
         and "EXACT LLM-VISIBLE OPERATIVE TEXT" in message.message
@@ -1128,14 +1254,7 @@ def test_regulatory_final_report_rechecks_and_repairs_unresolved_correction() ->
     assert live_state.get_answer_tokens() == "Final qualified answer [1]"
 
 
-@pytest.mark.parametrize(
-    ("final_answer", "finish_reason"),
-    [("", "stop"), ("Filtered final correction [1]", "content_filter")],
-)
-def test_regulatory_final_report_unusable_final_correction_uses_source_gap(
-    final_answer: str,
-    finish_reason: str,
-) -> None:
+def test_regulatory_final_report_retries_truncated_final_correction() -> None:
     live_state = ChatStateContainer()
     merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
     destination = Emitter(merged_queue)
@@ -1161,7 +1280,8 @@ def test_regulatory_final_report_unusable_final_correction_uses_source_gap(
                 [
                     ("Rejected hidden draft [1]", "stop"),
                     ("Still unsupported correction [1]", "stop"),
-                    (final_answer, finish_reason),
+                    ("Incomplete final correction [1]", "length"),
+                    ("Complete final correction [1]", "stop"),
                 ]
             ),
         ) as run_step,
@@ -1173,7 +1293,10 @@ def test_regulatory_final_report_unusable_final_correction_uses_source_gap(
         patch.object(
             dr_loop,
             "review_regulatory_candidate_resolution",
-            return_value=unresolved_review,
+            side_effect=[
+                unresolved_review,
+                CandidateAnswerReviewResult(needs_reconsideration=False),
+            ],
         ) as resolution_reviewer,
     ):
         has_reasoned = _run_final_report(
@@ -1182,8 +1305,130 @@ def test_regulatory_final_report_unusable_final_correction_uses_source_gap(
             destination=destination,
         )
 
-    assert run_step.call_count == 3
+    assert [call.kwargs["reasoning_effort"] for call in run_step.call_args_list] == [
+        dr_loop.ReasoningEffort.LOW,
+        dr_loop.ReasoningEffort.LOW,
+        dr_loop.ReasoningEffort.LOW,
+        dr_loop.ReasoningEffort.OFF,
+    ]
+    assert resolution_reviewer.call_count == 2
+    packets = _packets(merged_queue)
+    assert [
+        packet.obj.content
+        for packet in packets
+        if isinstance(packet.obj, AgentResponseDelta)
+    ] == ["Complete final correction [1]"]
+    assert live_state.get_answer_tokens() == "Complete final correction [1]"
+    assert has_reasoned is True
+
+
+def test_regulatory_final_report_truncated_final_correction_exhaustion_is_typed() -> (
+    None
+):
+    live_state = ChatStateContainer()
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+    destination = Emitter(merged_queue)
+    issue = CandidateAnswerClaimIssue(
+        claim_reference="Unsupported conclusion",
+        advisory_feedback="The exact text does not support the stated scope.",
+        related_citation_numbers=[1],
+    )
+    initial_review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[issue],
+    )
+    unresolved_review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[issue],
+    )
+
+    with (
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            side_effect=_fake_llm_step_with_finish_reasons(
+                [
+                    ("Rejected hidden draft [1]", "stop"),
+                    ("Still unsupported correction [1]", "stop"),
+                    ("Incomplete final correction one [1]", "length"),
+                    ("Incomplete final correction two [1]", "length"),
+                ]
+            ),
+        ),
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_answer",
+            return_value=initial_review,
+        ),
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_resolution",
+            return_value=unresolved_review,
+        ) as resolution_reviewer,
+        pytest.raises(EmptyLLMResponseError) as exc_info,
+    ):
+        _run_final_report(
+            is_regulatory_research=True,
+            live_state=live_state,
+            destination=destination,
+        )
+
+    assert exc_info.value.finish_reason == "length"
     resolution_reviewer.assert_called_once()
+    assert _packets(merged_queue) == []
+    assert live_state.get_answer_tokens() is None
+
+
+def test_regulatory_final_report_final_review_exception_uses_source_gap() -> None:
+    live_state = ChatStateContainer()
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+    destination = Emitter(merged_queue)
+    issue = CandidateAnswerClaimIssue(
+        claim_reference="Unsupported conclusion",
+        advisory_feedback="The exact text does not support the stated scope.",
+        related_citation_numbers=[1],
+    )
+    initial_review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[issue],
+    )
+    unresolved_review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[issue],
+    )
+
+    with (
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            side_effect=_fake_llm_step(
+                [
+                    "Rejected hidden draft [1]",
+                    "Still unsupported correction [1]",
+                    "Final correction [1]",
+                ]
+            ),
+        ),
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_answer",
+            return_value=initial_review,
+        ),
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_resolution",
+            side_effect=[
+                unresolved_review,
+                RuntimeError("final review provider failed"),
+            ],
+        ),
+    ):
+        has_reasoned = _run_final_report(
+            is_regulatory_research=True,
+            live_state=live_state,
+            destination=destination,
+        )
+
     packets = _packets(merged_queue)
     assert [
         packet.obj.content
@@ -1405,7 +1650,7 @@ def test_unrun_research_task_feedback_ignores_zero_count() -> None:
     assert history == []
 
 
-def test_non_regulatory_final_report_keeps_direct_streaming_path() -> None:
+def test_non_regulatory_final_report_stages_success_before_publishing() -> None:
     live_state = ChatStateContainer()
     merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
     destination = Emitter(merged_queue)
@@ -1429,7 +1674,263 @@ def test_non_regulatory_final_report_keeps_direct_streaming_path() -> None:
 
     reviewer.assert_not_called()
     assert run_step.call_count == 1
-    assert run_step.call_args.kwargs["emitter"] is destination
-    assert run_step.call_args.kwargs["state_container"] is live_state
+    assert run_step.call_args.kwargs["emitter"] is not destination
+    assert run_step.call_args.kwargs["state_container"] is not live_state
     assert run_step.call_args.kwargs["max_tokens"] == dr_loop.MAX_FINAL_REPORT_TOKENS
     assert live_state.get_answer_tokens() == "Direct non-regulatory answer"
+
+
+@pytest.mark.parametrize("is_regulatory_research", [False, True])
+def test_final_report_retries_length_at_off_without_leaking_partial_packets(
+    is_regulatory_research: bool,
+) -> None:
+    live_state = ChatStateContainer()
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+    destination = Emitter(merged_queue)
+
+    with (
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            side_effect=_fake_llm_step_with_finish_reasons(
+                [
+                    ("Incomplete first draft", "length"),
+                    ("Complete retry report", "stop"),
+                ]
+            ),
+        ) as run_step,
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_answer",
+            return_value=CandidateAnswerReviewResult(needs_reconsideration=False),
+        ),
+    ):
+        _run_final_report(
+            is_regulatory_research=is_regulatory_research,
+            live_state=live_state,
+            destination=destination,
+            reasoning_effort=dr_loop.ReasoningEffort.HIGH,
+        )
+
+    assert [call.kwargs["reasoning_effort"] for call in run_step.call_args_list] == [
+        dr_loop.ReasoningEffort.LOW,
+        dr_loop.ReasoningEffort.OFF,
+    ]
+    deltas = [
+        packet.obj.content
+        for packet in _packets(merged_queue)
+        if isinstance(packet.obj, AgentResponseDelta)
+    ]
+    assert deltas == ["Complete retry report"]
+    assert live_state.get_answer_tokens() == "Complete retry report"
+
+
+@pytest.mark.parametrize("is_regulatory_research", [False, True])
+def test_final_report_two_empty_attempts_raise_classified_terminal_error(
+    is_regulatory_research: bool,
+) -> None:
+    live_state = ChatStateContainer()
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+    destination = Emitter(merged_queue)
+
+    with (
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            side_effect=_fake_llm_step_with_finish_reasons(
+                [("", "length"), ("", "length")]
+            ),
+        ),
+        pytest.raises(EmptyLLMResponseError) as exc_info,
+    ):
+        _run_final_report(
+            is_regulatory_research=is_regulatory_research,
+            live_state=live_state,
+            destination=destination,
+            reasoning_effort=dr_loop.ReasoningEffort.AUTO,
+        )
+
+    assert exc_info.value.finish_reason == "length"
+    assert exc_info.value.provider == "vertex_ai"
+    assert exc_info.value.model == "gemini-3.6-flash"
+    assert _packets(merged_queue) == []
+    assert live_state.get_answer_tokens() is None
+
+
+def test_final_report_retries_twice_when_request_effort_is_off() -> None:
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+
+    with patch.object(
+        dr_loop,
+        "run_llm_step",
+        side_effect=_fake_llm_step_with_finish_reasons(
+            [("", "length"), ("Complete retry report", "stop")]
+        ),
+    ) as run_step:
+        _run_final_report(
+            is_regulatory_research=False,
+            live_state=ChatStateContainer(),
+            destination=Emitter(merged_queue),
+            reasoning_effort=dr_loop.ReasoningEffort.OFF,
+        )
+
+    assert [call.kwargs["reasoning_effort"] for call in run_step.call_args_list] == [
+        dr_loop.ReasoningEffort.LOW,
+        dr_loop.ReasoningEffort.OFF,
+    ]
+
+
+def test_deep_research_search_allowlist_rejects_same_name_non_search_tool() -> None:
+    real_search = _recovery_search_tool()
+    same_name_custom_tool = MagicMock()
+    same_name_custom_tool.name = SearchTool.NAME
+
+    allowed = dr_loop._deep_research_search_tools([same_name_custom_tool, real_search])
+
+    assert allowed == [real_search]
+
+
+def test_final_report_history_includes_custom_agent_prompt() -> None:
+    live_state = ChatStateContainer()
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+    destination = Emitter(merged_queue)
+
+    with (
+        patch.object(
+            dr_loop,
+            "construct_message_history",
+            wraps=dr_loop.construct_message_history,
+        ) as construct_history,
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            side_effect=_fake_llm_step(["Complete report"]),
+        ),
+    ):
+        _run_final_report(
+            is_regulatory_research=False,
+            live_state=live_state,
+            destination=destination,
+            custom_agent_prompt="Act as a customs compliance specialist.",
+        )
+
+    prompt_message = construct_history.call_args.kwargs["custom_agent_prompt"]
+    assert prompt_message.message == "Act as a customs compliance specialist."
+    assert prompt_message.message_type == MessageType.USER
+
+
+def test_custom_agent_prompt_is_in_clarification_history() -> None:
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+
+    with (
+        patch.object(dr_loop, "SKIP_DEEP_RESEARCH_CLARIFICATION", False),
+        patch.object(
+            dr_loop,
+            "construct_message_history",
+            wraps=dr_loop.construct_message_history,
+        ) as construct_history,
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            return_value=(
+                LlmStepResult(
+                    reasoning=None,
+                    answer="Please clarify the jurisdiction.",
+                    tool_calls=None,
+                ),
+                False,
+            ),
+        ),
+        patch(
+            "onyx.llm.litellm_singleton.config.initialize_litellm",
+        ),
+    ):
+        dr_loop.run_deep_research_llm_loop(
+            emitter=Emitter(merged_queue),
+            state_container=ChatStateContainer(),
+            simple_chat_history=_history(),
+            tools=[],
+            custom_agent_prompt="Act as a customs compliance specialist.",
+            llm=_llm(),
+            token_counter=len,
+            skip_clarification=False,
+        )
+
+    prompt_message = construct_history.call_args.kwargs["custom_agent_prompt"]
+    assert prompt_message.message == "Act as a customs compliance specialist."
+
+
+def test_custom_agent_prompt_is_in_plan_orchestration_and_report_calls() -> None:
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+
+    def plan_generator(**_kwargs: Any):
+        if False:
+            yield None
+        return (
+            LlmStepResult(
+                reasoning=None,
+                answer="Research the applicable customs rules.",
+                tool_calls=None,
+            ),
+            False,
+        )
+
+    report_call = ToolCallKickoff(
+        tool_call_id="generate-report",
+        tool_name="generate_report",
+        tool_args={},
+        placement=Placement(turn_index=2),
+    )
+    with (
+        patch.object(
+            dr_loop,
+            "construct_message_history",
+            wraps=dr_loop.construct_message_history,
+        ) as construct_history,
+        patch.object(
+            dr_loop,
+            "run_llm_step_pkt_generator",
+            side_effect=plan_generator,
+        ),
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            return_value=(
+                LlmStepResult(
+                    reasoning=None,
+                    answer=None,
+                    tool_calls=[report_call],
+                ),
+                False,
+            ),
+        ),
+        patch.object(
+            dr_loop,
+            "generate_final_report",
+            return_value=False,
+        ) as generate_report,
+        patch.object(dr_loop, "model_is_reasoning_model", return_value=True),
+        patch(
+            "onyx.llm.litellm_singleton.config.initialize_litellm",
+        ),
+    ):
+        dr_loop.run_deep_research_llm_loop(
+            emitter=Emitter(merged_queue),
+            state_container=ChatStateContainer(),
+            simple_chat_history=_history(),
+            tools=[],
+            custom_agent_prompt="Act as a customs compliance specialist.",
+            llm=_llm(),
+            token_counter=len,
+            skip_clarification=True,
+        )
+
+    assert len(construct_history.call_args_list) == 2
+    assert all(
+        call.kwargs["custom_agent_prompt"].message
+        == "Act as a customs compliance specialist."
+        for call in construct_history.call_args_list
+    )
+    assert generate_report.call_args.kwargs["custom_agent_prompt"] == (
+        "Act as a customs compliance specialist."
+    )

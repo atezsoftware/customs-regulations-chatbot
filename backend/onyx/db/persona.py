@@ -68,6 +68,72 @@ def get_default_behavior_persona(
     return db_session.scalars(stmt).first()
 
 
+def merge_persona_tools(
+    *,
+    default_tools: Sequence[Tool],
+    persona_tools: Sequence[Tool],
+) -> list[Tool]:
+    """Return the default tool baseline plus direct tools, deduplicated by ID."""
+
+    merged: list[Tool] = []
+    seen_ids: set[int] = set()
+    for tool in [*default_tools, *persona_tools]:
+        if tool.id in seen_ids:
+            continue
+        seen_ids.add(tool.id)
+        merged.append(tool)
+    return merged
+
+
+def get_effective_persona_tools(
+    persona: Persona,
+    db_session: Session,
+) -> list[Tool]:
+    """Resolve the runtime tools inherited by a persona from the default Assistant."""
+
+    if persona.id == DEFAULT_PERSONA_ID:
+        return list(persona.tools)
+
+    default_persona = get_default_behavior_persona(
+        db_session=db_session,
+        eager_load_for_tools=True,
+    )
+    if default_persona is None:
+        return list(persona.tools)
+    return merge_persona_tools(
+        default_tools=default_persona.tools,
+        persona_tools=persona.tools,
+    )
+
+
+def _default_tools_for_persona_snapshots(
+    personas: Sequence[Persona],
+    db_session: Session,
+) -> Sequence[Tool]:
+    default_persona = next(
+        (persona for persona in personas if persona.id == DEFAULT_PERSONA_ID),
+        None,
+    )
+    if default_persona is None:
+        default_persona = get_default_behavior_persona(
+            db_session=db_session,
+            eager_load_for_tools=True,
+        )
+    return default_persona.tools if default_persona is not None else ()
+
+
+def _effective_tools_for_snapshot(
+    persona: Persona,
+    default_tools: Sequence[Tool],
+) -> list[Tool]:
+    if persona.id == DEFAULT_PERSONA_ID:
+        return list(persona.tools)
+    return merge_persona_tools(
+        default_tools=default_tools,
+        persona_tools=persona.tools,
+    )
+
+
 class PersonaLoadType(Enum):
     NONE = "none"
     MINIMAL = "minimal"
@@ -791,12 +857,14 @@ def get_minimal_persona_snapshots_for_user(
         selectinload(Persona.group_shares),
     )
     results = db_session.scalars(stmt).all()
+    default_tools = _default_tools_for_persona_snapshots(results, db_session)
     user_group_ids = get_user_group_ids_for_user(db_session, user.id)
     return [
         MinimalPersonaSnapshot.from_model(
             persona,
             user_permission=get_persona_access_level(persona, user, user_group_ids),
             include_owner_email=_user_may_view_persona_owner_email(user, persona),
+            effective_tools=_effective_tools_for_snapshot(persona, default_tools),
         )
         for persona in results
     ]
@@ -948,12 +1016,14 @@ def get_minimal_persona_snapshots_paginated(
     )
 
     results = db_session.scalars(stmt).all()
+    default_tools = _default_tools_for_persona_snapshots(results, db_session)
     user_group_ids = get_user_group_ids_for_user(db_session, user.id)
     return [
         MinimalPersonaSnapshot.from_model(
             persona,
             user_permission=get_persona_access_level(persona, user, user_group_ids),
             include_owner_email=_user_may_view_persona_owner_email(user, persona),
+            effective_tools=_effective_tools_for_snapshot(persona, default_tools),
         )
         for persona in results
     ]

@@ -375,7 +375,21 @@ def _litellm_supports_reasoning(full_model_name: str) -> bool:
         return result
 
 
+def is_gemini_3_model(model_name: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:^|[/_.-])gemini[-_.]?3(?:[.-]|$)",
+            model_name.lower(),
+        )
+    )
+
+
 def model_is_reasoning_model(model_name: str, model_provider: str) -> bool:
+    # Gemini 3.x models always use thinking, but a newly released point version
+    # can predate the LiteLLM registry bundled with this deployment.
+    if is_gemini_3_model(model_name):
+        return True
+
     model_map = get_model_map()
     try:
         model_obj = find_model_obj(
