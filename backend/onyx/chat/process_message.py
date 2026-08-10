@@ -147,6 +147,7 @@ from onyx.tools.tool_constructor import (
     SearchToolConfig,
     construct_tools,
 )
+from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.utils.logger import setup_logger
 from onyx.utils.telemetry import mt_cloud_telemetry
 from onyx.utils.timing import log_function_time
@@ -223,6 +224,17 @@ def _filter_global_regulatory_chat_tools(
     if not is_global_regulatory_chat:
         return model_tools
     return [tool for tool in model_tools if tool.name != FILE_READER_TOOL_NAME]
+
+
+def _validate_deep_research_scope(persona: Persona, model_tools: list[Tool]) -> None:
+    if persona.document_sets and not any(
+        isinstance(tool, SearchTool) for tool in model_tools
+    ):
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "This agent has Document Sets but no usable Internal Search tool. "
+            "Enable Internal Search before starting Deep Research.",
+        )
 
 
 def _convert_loaded_files_to_chat_files(
@@ -1350,6 +1362,7 @@ def _run_models(
             # Deep Research receives the same internal-only, global regulatory
             # SearchTool as the standard loop.
             if n_models == 1 and setup.new_msg_req.deep_research:
+                _validate_deep_research_scope(setup.persona, model_tools)
                 run_deep_research_llm_loop(
                     emitter=model_emitter,
                     state_container=sc,

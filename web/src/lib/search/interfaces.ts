@@ -55,6 +55,7 @@ export interface QuotesInfoPacket {
 export interface MinimalOnyxDocument {
   document_id: string;
   semantic_identifier: string | null;
+  citation_chunk_ind?: number;
 }
 
 export interface OnyxDocument extends MinimalOnyxDocument {
@@ -66,7 +67,7 @@ export interface OnyxDocument extends MinimalOnyxDocument {
   score: number;
   chunk_ind: number;
   match_highlights: string[];
-  metadata: { [key: string]: string };
+  metadata: { [key: string]: string | string[] };
   updated_at: string | null;
   db_doc_id?: number;
   is_internet: boolean;

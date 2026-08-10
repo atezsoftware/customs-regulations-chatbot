@@ -171,6 +171,9 @@ def _construct_tools_impl(
     tool_dict: dict[int, list[Tool]] = {}
 
     configured_tools = persona.tools if persona_tools is None else persona_tools
+    has_configured_search_tool = any(
+        tool.in_code_tool_id == SearchTool.__name__ for tool in configured_tools
+    )
 
     # Log which tools are attached to the persona for debugging
     persona_tool_names = [t.name for t in configured_tools]
@@ -447,9 +450,17 @@ def _construct_tools_impl(
                     mcp_server.name,
                 )
 
+    legacy_scoped_persona_needs_search = (
+        bool(persona.document_sets)
+        and not has_configured_search_tool
+        and search_usage_forcing_setting != SearchToolUsage.DISABLED
+    )
     if (
         not added_search_tool
-        and search_usage_forcing_setting == SearchToolUsage.ENABLED
+        and (
+            search_usage_forcing_setting == SearchToolUsage.ENABLED
+            or legacy_scoped_persona_needs_search
+        )
         and not DISABLE_VECTOR_DB
     ):
         # Get the database tool model for SearchTool

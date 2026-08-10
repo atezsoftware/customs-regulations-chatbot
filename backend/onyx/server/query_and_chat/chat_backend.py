@@ -62,7 +62,10 @@ from onyx.db.chat_search import search_chat_sessions
 from onyx.db.engine.sql_engine import get_session, get_session_with_current_tenant
 from onyx.db.enums import Permission
 from onyx.db.feedback import create_chat_message_feedback, remove_chat_message_feedback
-from onyx.db.llm import fetch_default_chat_naming_model
+from onyx.db.llm import (
+    fetch_default_chat_naming_model,
+    fetch_llm_provider_for_model_selection,
+)
 from onyx.db.models import ChatMessage, ChatSessionSharedStatus, Persona, User
 from onyx.db.persona import get_persona_by_id
 from onyx.db.usage import UsageType, increment_usage
@@ -313,7 +316,39 @@ def update_chat_session_model(
         user_id=user.id,
         db_session=db_session,
     )
-    chat_session.current_alternate_model = update_thread_req.new_alternate_model
+    serialized_model = update_thread_req.new_alternate_model
+    model_parts = serialized_model.split("__", maxsplit=2)
+    if len(model_parts) != 3:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "new_alternate_model must contain provider name, provider type, and model name",
+        )
+
+    provider_name, provider_type, model_name = model_parts
+    if not provider_type.strip() or not model_name.strip():
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "new_alternate_model must contain a provider type and model name",
+        )
+
+    provider = fetch_llm_provider_for_model_selection(
+        provider_name or None,
+        provider_type,
+        model_name,
+        db_session,
+    )
+    if provider is None:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "The selected language model is unavailable.",
+        )
+
+    chat_session.current_alternate_model = serialized_model
+    chat_session.llm_override = LLMOverride(
+        model_provider=provider.name,
+        model_provider_type=provider.provider,
+        model_version=model_name,
+    )
 
     db_session.add(chat_session)
     db_session.commit()
@@ -551,6 +586,7 @@ def rename_chat_session(
         naming_override = (
             LLMOverride(
                 model_provider=naming_model.llm_provider.name,
+                model_provider_type=naming_model.llm_provider.provider,
                 model_version=naming_model.name,
             )
             if naming_model is not None

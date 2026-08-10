@@ -15,6 +15,8 @@ import onyx.context.search.forced_document_set as fds
 import onyx.context.search.pipeline as pipeline
 from onyx.context.search.models import IndexFilters
 from onyx.db.models import User
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 
 _DB = cast(Session, object())
 
@@ -96,3 +98,46 @@ def test_build_index_filters_no_scope_without_flag(
     """Chat / other callers (flag off) → the forced scope is NOT applied."""
     filters = _build_filters(monkeypatch, force=False)
     assert filters.forced_document_set is None
+
+
+def test_persona_document_sets_bound_user_selected_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pipeline, "MULTI_TENANT", False)
+
+    filters = pipeline._build_index_filters(
+        user_provided_filters=pipeline.BaseFilters(
+            document_set=["Agent Knowledge", "Other Knowledge"]
+        ),
+        user=cast(User, SimpleNamespace(is_anonymous=False)),
+        project_id_filter=None,
+        persona_id_filter=7,
+        persona_document_sets=["Agent Knowledge"],
+        persona_time_cutoff=None,
+        db_session=None,
+        bypass_acl=True,
+    )
+
+    assert filters.document_set == ["Agent Knowledge"]
+
+
+def test_user_filter_cannot_replace_persona_document_sets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pipeline, "MULTI_TENANT", False)
+
+    with pytest.raises(OnyxError) as exc_info:
+        pipeline._build_index_filters(
+            user_provided_filters=pipeline.BaseFilters(
+                document_set=["Other Knowledge"]
+            ),
+            user=cast(User, SimpleNamespace(is_anonymous=False)),
+            project_id_filter=None,
+            persona_id_filter=7,
+            persona_document_sets=["Agent Knowledge"],
+            persona_time_cutoff=None,
+            db_session=None,
+            bypass_acl=True,
+        )
+
+    assert exc_info.value.error_code is OnyxErrorCode.INVALID_INPUT

@@ -20,8 +20,18 @@ from onyx.configs.constants import (
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import BenchmarkRunStatus, Permission
-from onyx.db.llm import fetch_existing_llm_provider, fetch_existing_llm_providers
-from onyx.db.models import BenchmarkQuestion, DocumentSet, RegulatoryChunk, User
+from onyx.db.llm import (
+    fetch_existing_llm_provider_by_id,
+    fetch_existing_llm_provider_by_name_and_type,
+    fetch_existing_llm_providers,
+)
+from onyx.db.models import (
+    BenchmarkQuestion,
+    DocumentSet,
+    LLMProvider,
+    RegulatoryChunk,
+    User,
+)
 from onyx.db.regulatory_benchmark import (
     cancel_benchmark_run,
     claim_stale_benchmark_runs_for_recovery,
@@ -32,6 +42,7 @@ from onyx.db.regulatory_benchmark import (
     list_benchmark_questions,
     list_benchmark_runs,
     question_has_run_items,
+    reset_benchmark_run_for_retry,
 )
 from onyx.db.regulatory_chunks import get_chunk_by_id
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -96,8 +107,22 @@ def _recover_stale_runs(db_session: Session) -> None:
             logger.exception("Failed to requeue stale benchmark run %s", run_id)
 
 
-def _validate_model(db_session: Session, selection: BenchmarkModelSelection) -> None:
-    provider = fetch_existing_llm_provider(selection.provider, db_session)
+def _validate_model(
+    db_session: Session, selection: BenchmarkModelSelection
+) -> LLMProvider:
+    if selection.provider_id is not None:
+        provider = fetch_existing_llm_provider_by_id(selection.provider_id, db_session)
+        expected_provider = (
+            provider.name or provider.provider if provider is not None else None
+        )
+        if expected_provider != selection.provider:
+            provider = None
+    else:
+        provider = fetch_existing_llm_provider_by_name_and_type(
+            selection.provider,
+            "openrouter",
+            db_session,
+        )
     if provider is None:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
@@ -109,13 +134,16 @@ def _validate_model(db_session: Session, selection: BenchmarkModelSelection) -> 
             "Benchmark models must use a configured OpenRouter provider",
         )
     available_models = {
-        configuration.name for configuration in provider.model_configurations
+        configuration.name
+        for configuration in provider.model_configurations
+        if configuration.is_visible
     }
     if selection.model_id not in available_models:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
             f"Model '{selection.model_id}' is not available through OpenRouter",
         )
+    return provider
 
 
 def _expected_citation_snapshots(
@@ -168,13 +196,17 @@ def list_models(
 ) -> list[BenchmarkAvailableModel]:
     models: list[BenchmarkAvailableModel] = []
     providers = fetch_existing_llm_providers(db_session, flow_type_filter=[])
-    for provider in providers:
-        if provider.provider != "openrouter" or not provider.name:
-            continue
+    openrouter_providers = [
+        provider for provider in providers if provider.provider == "openrouter"
+    ]
+    for provider in openrouter_providers:
+        provider_selector = provider.name or provider.provider
         for configuration in provider.model_configurations:
+            if not configuration.is_visible:
+                continue
             models.append(
                 BenchmarkAvailableModel(
-                    provider=provider.name,
+                    provider=provider_selector,
                     provider_id=provider.id,
                     model_id=configuration.name,
                     display_name=(
@@ -329,8 +361,10 @@ def create_run(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> BenchmarkRunSnapshot:
-    for selection in [*request.candidates, request.judge]:
-        _validate_model(db_session, selection)
+    candidate_providers = [
+        _validate_model(db_session, selection) for selection in request.candidates
+    ]
+    judge_provider = _validate_model(db_session, request.judge)
     questions = list(list_benchmark_questions(db_session, active_only=True))
     if request.question_ids is not None:
         requested_ids = set(request.question_ids)
@@ -351,7 +385,14 @@ def create_run(
         _get_editable_document_set(db_session, question.document_set_id, user)
     unique_candidates = list(
         dict.fromkeys(
-            (candidate.provider, candidate.model_id) for candidate in request.candidates
+            (
+                provider.name or provider.provider,
+                provider.id,
+                candidate.model_id,
+            )
+            for candidate, provider in zip(
+                request.candidates, candidate_providers, strict=True
+            )
         )
     )
     item_count = len(questions) * len(unique_candidates)
@@ -365,7 +406,8 @@ def create_run(
     run = create_benchmark_run(
         db_session,
         label=request.label.strip() if request.label else None,
-        judge_provider=request.judge.provider,
+        judge_provider=judge_provider.name or judge_provider.provider,
+        judge_provider_id=judge_provider.id,
         judge_model=request.judge.model_id,
         deep_research=request.deep_research,
         created_by=user.id,
@@ -386,25 +428,28 @@ def start_run(
     run = get_benchmark_run_for_update(db_session, run_id)
     if run is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Benchmark run not found")
-    if run.status != BenchmarkRunStatus.PENDING.value:
-        raise OnyxError(OnyxErrorCode.INVALID_INPUT, "Run is not pending")
+    if run.status not in {
+        BenchmarkRunStatus.PENDING.value,
+        BenchmarkRunStatus.ERROR.value,
+    }:
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, "Run is not pending or retryable")
+    if run.status == BenchmarkRunStatus.ERROR.value:
+        reset_benchmark_run_for_retry(run)
     run.status = BenchmarkRunStatus.RUNNING.value
     run.started_at = datetime.datetime.now(datetime.timezone.utc)
-    db_session.commit()
     try:
         _enqueue_benchmark_run(run.id)
     except Exception as error:
-        # Publishing is not transactional: a broker may accept the message and
-        # still drop the client connection before acknowledging it. Keep the run
-        # recoverable instead of recording a false terminal failure. The stale-run
-        # lease makes the next UI poll publish an idempotent recovery probe.
-        run.started_at = datetime.datetime.now(
-            datetime.timezone.utc
-        ) - datetime.timedelta(seconds=REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS)
+        # The broker may accept before its client connection fails. Publish while
+        # holding the row lock so any delivered task observes this terminal reset;
+        # its separate run lease makes a duplicate retry harmless.
+        run.status = BenchmarkRunStatus.PENDING.value
+        run.started_at = None
         db_session.commit()
         raise OnyxError(
             OnyxErrorCode.INTERNAL_ERROR, "Failed to queue benchmark run"
         ) from error
+    db_session.commit()
     return benchmark_run_snapshot(run)
 
 
@@ -416,13 +461,10 @@ def cancel_run(
     ),
     db_session: Session = Depends(get_session),
 ) -> BenchmarkRunSnapshot:
-    run = get_benchmark_run(db_session, run_id)
+    run = cancel_benchmark_run(db_session, run_id)
     if run is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Benchmark run not found")
-    cancel_benchmark_run(db_session, run)
-    updated_run = get_benchmark_run(db_session, run_id)
-    assert updated_run is not None
-    return benchmark_run_snapshot(updated_run)
+    return benchmark_run_snapshot(run)
 
 
 @router.get("/runs", tags=PUBLIC_API_TAGS)

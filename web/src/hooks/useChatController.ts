@@ -931,6 +931,11 @@ export default function useChatController({
           modelProvider: isMultiModel
             ? undefined
             : modelOverride?.name || llmManager.currentLlm.name || undefined,
+          modelProviderType: isMultiModel
+            ? undefined
+            : modelOverride?.provider ||
+              llmManager.currentLlm.provider ||
+              undefined,
           modelVersion: isMultiModel
             ? undefined
             : modelOverride?.modelName ||
@@ -951,6 +956,7 @@ export default function useChatController({
           llmOverrides: isMultiModel
             ? selectedModels!.map((m) => ({
                 model_provider: m.name,
+                model_provider_type: m.provider,
                 model_version: m.modelName,
                 display_name: m.displayName,
               }))

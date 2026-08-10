@@ -1,4 +1,5 @@
 import { buildLlmOptions, llmOptionKey } from "@/lib/languageModels/options";
+import { structureValue } from "@/lib/languageModels/utils";
 import type {
   LLMProviderDescriptor,
   ModelConfiguration,
@@ -18,7 +19,7 @@ function makeModelConfiguration(id: number, name: string): ModelConfiguration {
 
 function makeProvider(
   id: number,
-  name: string,
+  name: string | null,
   provider: string,
   modelConfigurations: ModelConfiguration[]
 ): LLMProviderDescriptor {
@@ -26,7 +27,7 @@ function makeProvider(
     id,
     name,
     provider,
-    provider_display_name: name,
+    provider_display_name: name ?? provider,
     model_configurations: modelConfigurations,
   };
 }
@@ -73,6 +74,27 @@ describe("llmOptionKey", () => {
 });
 
 describe("buildLlmOptions", () => {
+  it("uses the provider type as the selector for a nameless provider", () => {
+    const providers = [
+      makeProvider(1, null, "vertex_ai", [
+        makeModelConfiguration(11, "gemini-3.6-flash"),
+      ]),
+    ];
+
+    expect(buildLlmOptions(providers)).toEqual([
+      expect.objectContaining({
+        name: "vertex_ai",
+        provider: "vertex_ai",
+        modelName: "gemini-3.6-flash",
+      }),
+    ]);
+
+    const option = buildLlmOptions(providers)[0]!;
+    expect(structureValue(option.name, option.provider, option.modelName)).toBe(
+      "vertex_ai__vertex_ai__gemini-3.6-flash"
+    );
+  });
+
   it("includes hidden models when requested by an admin picker", () => {
     const hiddenModel = {
       ...makeModelConfiguration(11, "hidden-model"),

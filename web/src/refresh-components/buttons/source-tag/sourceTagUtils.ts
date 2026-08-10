@@ -65,10 +65,11 @@ export function citationsToSourceInfoArray(
     if (seenChunks.has(chunkKey)) continue;
 
     const doc =
-      documentMap.get(`${citation.document_id}:${citation.chunk_ind}`) ??
-      Array.from(documentMap.values()).find(
-        (candidate) => candidate.document_id === citation.document_id
-      );
+      citation.chunk_ind === undefined
+        ? Array.from(documentMap.values()).find(
+            (candidate) => candidate.document_id === citation.document_id
+          )
+        : documentMap.get(`${citation.document_id}:${citation.chunk_ind}`);
     if (doc) {
       seenChunks.add(chunkKey);
       sources.push(documentToSourceInfo(doc));
@@ -76,7 +77,7 @@ export function citationsToSourceInfoArray(
   }
 
   // Fallback: if no citations but we have documents, use first few documents
-  if (sources.length === 0 && documentMap.size > 0) {
+  if (citations.length === 0 && documentMap.size > 0) {
     const entries = Array.from(documentMap.entries());
     for (const [, doc] of entries) {
       sources.push(documentToSourceInfo(doc));
@@ -85,6 +86,37 @@ export function citationsToSourceInfoArray(
   }
 
   return sources;
+}
+
+function getRegulatoryCitationLabel(doc: OnyxDocument): string | null {
+  const semanticIdentifier = doc.semantic_identifier?.trim();
+  if (!semanticIdentifier) return null;
+
+  const [fileName, ...semanticHeadingParts] = semanticIdentifier.split(" — ");
+  const documentTitle = fileName?.replace(/\.[^.]+$/, "").trim();
+  const metadataHeading: unknown = doc.metadata?.regulatory_heading_path;
+  const headingPath = Array.isArray(metadataHeading)
+    ? metadataHeading.join(" > ")
+    : typeof metadataHeading === "string"
+      ? metadataHeading
+      : semanticHeadingParts.join(" — ");
+
+  const articleMatches = Array.from(
+    headingPath.matchAll(/\b(GEÇİCİ\s+)?MADDE\s+(\d+[A-Z]?)\b/giu)
+  );
+  const article = articleMatches[articleMatches.length - 1];
+  if (!article || !documentTitle) return null;
+
+  const articleLabel = article[1]
+    ? `Geçici ${article[2]}. Madde`
+    : `${article[2]}. Madde`;
+  const suffix = ` · ${articleLabel}`;
+  const maxTitleLength = Math.max(1, MAX_TITLE_LENGTH - suffix.length);
+  const visibleTitle =
+    documentTitle.length <= maxTitleLength
+      ? documentTitle
+      : `${documentTitle.slice(0, Math.max(1, maxTitleLength - 3))}...`;
+  return `${visibleTitle}${suffix}`;
 }
 
 /**
@@ -97,8 +129,12 @@ export function getDisplayNameForSource(doc: OnyxDocument): string {
     return truncateText(doc.semantic_identifier || "", MAX_TITLE_LENGTH);
   }
 
+  const regulatoryLabel = getRegulatoryCitationLabel(doc);
+  if (regulatoryLabel) return regulatoryLabel;
+
   return (
+    truncateText(doc.semantic_identifier || "", MAX_TITLE_LENGTH) ||
     getSourceDisplayName(sourceType) ||
-    truncateText(doc.semantic_identifier || "", MAX_TITLE_LENGTH)
+    "Unknown"
   );
 }

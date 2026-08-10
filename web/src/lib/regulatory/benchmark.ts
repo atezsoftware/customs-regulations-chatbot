@@ -17,6 +17,7 @@ export interface BenchmarkQuestion {
 
 export interface BenchmarkModelSelection {
   provider: string;
+  provider_id: number | null;
   model_id: string;
 }
 
@@ -83,6 +84,7 @@ export interface BenchmarkJudgment {
 export interface BenchmarkRunItem {
   id: number;
   provider: string;
+  provider_id: number | null;
   model_id: string;
   question_id: number;
   question_prompt: string;
@@ -112,6 +114,7 @@ export interface BenchmarkRunItem {
 
 export interface BenchmarkModelAggregate {
   provider: string;
+  provider_id: number | null;
   model_id: string;
   item_count: number;
   completed_count: number;
@@ -128,6 +131,7 @@ export interface BenchmarkRunReport {
   executive_summary: string;
   model_reports: Array<{
     provider: string;
+    provider_id: number | null;
     model_id: string;
     rank: number;
     summary: string;
@@ -144,6 +148,7 @@ export interface BenchmarkRun {
   label: string | null;
   status: "pending" | "running" | "completed" | "error" | "cancelled";
   judge_provider: string;
+  judge_provider_id: number | null;
   judge_model: string;
   deep_research: boolean;
   total_items: number;

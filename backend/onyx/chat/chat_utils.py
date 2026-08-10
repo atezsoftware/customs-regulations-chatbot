@@ -322,18 +322,28 @@ def build_citation_map_from_infos(
     """Translate a list of streaming CitationInfo objects into a mapping of
     citation number -> saved search doc DB id.
 
-    Always cites the first instance of a document_id and assumes db_docs are
-    ordered as shown to the user (display order).
+    Current packets identify the exact retrieved chunk. Older packets without a
+    chunk index retain the historical first-document-match behavior.
     """
     doc_id_to_saved_doc_id_map: dict[str, int] = {}
+    chunk_to_saved_doc_id_map: dict[tuple[str, int], int] = {}
     for db_doc in db_docs:
         if db_doc.document_id not in doc_id_to_saved_doc_id_map:
             doc_id_to_saved_doc_id_map[db_doc.document_id] = db_doc.id
+        chunk_to_saved_doc_id_map.setdefault(
+            (db_doc.document_id, db_doc.chunk_ind), db_doc.id
+        )
 
     citation_to_saved_doc_id_map: dict[int, int] = {}
     for citation in citations_list:
         if citation.citation_number not in citation_to_saved_doc_id_map:
-            saved_id = doc_id_to_saved_doc_id_map.get(citation.document_id)
+            saved_id = (
+                chunk_to_saved_doc_id_map.get(
+                    (citation.document_id, citation.chunk_ind)
+                )
+                if citation.chunk_ind is not None
+                else doc_id_to_saved_doc_id_map.get(citation.document_id)
+            )
             if saved_id is not None:
                 citation_to_saved_doc_id_map[citation.citation_number] = saved_id
 

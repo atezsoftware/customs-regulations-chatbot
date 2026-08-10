@@ -23,6 +23,7 @@ from onyx.db.models import (
     FederatedConnector__DocumentSet,
     HierarchyNode,
     Persona,
+    Persona__DocumentSet,
     Persona__User,
     Persona__UserGroup,
     PersonaLabel,
@@ -51,6 +52,8 @@ from onyx.utils.logger import setup_logger
 from onyx.utils.variable_functionality import fetch_versioned_implementation
 
 logger = setup_logger()
+
+_SEARCH_TOOL_IN_CODE_ID = "SearchTool"
 
 
 def get_default_behavior_persona(
@@ -83,6 +86,36 @@ def merge_persona_tools(
         seen_ids.add(tool.id)
         merged.append(tool)
     return merged
+
+
+def _normalize_persona_tools_for_document_sets(
+    *,
+    db_session: Session,
+    explicit_tools: Sequence[Tool] | None,
+    existing_tools: Sequence[Tool],
+    document_sets: Sequence[DocumentSet],
+) -> list[Tool] | None:
+    """Keep persisted Document Set scope executable through Internal Search."""
+
+    if not document_sets:
+        return list(explicit_tools) if explicit_tools is not None else None
+
+    normalized_tools = list(
+        explicit_tools if explicit_tools is not None else existing_tools
+    )
+    if any(
+        tool.in_code_tool_id == _SEARCH_TOOL_IN_CODE_ID for tool in normalized_tools
+    ):
+        return normalized_tools
+
+    search_tool = db_session.scalar(
+        select(Tool).where(Tool.in_code_tool_id == _SEARCH_TOOL_IN_CODE_ID)
+    )
+    if search_tool is None:
+        raise ValueError("Internal Search tool is not available")
+
+    normalized_tools.append(search_tool)
+    return normalized_tools
 
 
 def get_effective_persona_tools(
@@ -252,7 +285,10 @@ def fetch_persona_by_id_for_user(
 
 
 def get_best_persona_id_for_user(
-    db_session: Session, user: User, persona_id: int | None = None
+    db_session: Session,
+    user: User,
+    persona_id: int | None = None,
+    document_set_id: int | None = None,
 ) -> int | None:
     if persona_id is not None:
         stmt = select(Persona).where(Persona.id == persona_id).distinct()
@@ -270,8 +306,31 @@ def get_best_persona_id_for_user(
     # If the persona is not found, or the slack bot is using doc sets instead of personas,
     # we need to find the best persona for the user
     # This is the persona with the highest display priority that the user has access to
-    stmt = select(Persona).order_by(Persona.display_priority.desc()).distinct()
-    stmt = _add_user_filters(stmt=stmt, user=user, get_editable=True)
+    base_stmt = (
+        select(Persona)
+        .order_by(Persona.display_priority.desc().nullslast(), Persona.id.asc())
+        .distinct()
+        .limit(1)
+    )
+    if document_set_id is not None:
+        scoped_to_document_set = exists().where(
+            Persona__DocumentSet.persona_id == Persona.id,
+            Persona__DocumentSet.document_set_id == document_set_id,
+        )
+        scoped_stmt = _add_user_filters(
+            stmt=base_stmt.where(scoped_to_document_set),
+            user=user,
+            get_editable=True,
+        )
+        scoped_persona = db_session.scalars(scoped_stmt).one_or_none()
+        if scoped_persona is not None:
+            return scoped_persona.id
+
+        has_document_set_scope = exists().where(
+            Persona__DocumentSet.persona_id == Persona.id
+        )
+        base_stmt = base_stmt.where(~has_document_set_scope)
+    stmt = _add_user_filters(stmt=base_stmt, user=user, get_editable=True)
     persona = db_session.scalars(stmt).one_or_none()
     return persona.id if persona else None
 
@@ -1453,6 +1512,18 @@ def upsert_persona(
             )
             if added_set_ids - accessible_set_ids:
                 raise ValueError("Cannot attach document sets you don't have access to")
+
+    effective_document_sets = (
+        document_sets
+        if document_sets is not None
+        else (existing_persona.document_sets if existing_persona else [])
+    )
+    tools = _normalize_persona_tools_for_document_sets(
+        db_session=db_session,
+        explicit_tools=tools,
+        existing_tools=existing_persona.tools if existing_persona else [],
+        document_sets=effective_document_sets,
+    )
 
     # Fetch and attach user_files by IDs
     user_files = None

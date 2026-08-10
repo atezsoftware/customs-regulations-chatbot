@@ -60,7 +60,7 @@ export function getProviderOverrideForAgent(
       );
       if (mc) {
         return {
-          name: provider.name ?? "",
+          name: provider.name ?? provider.provider,
           provider: provider.provider,
           modelName: mc.name,
         };

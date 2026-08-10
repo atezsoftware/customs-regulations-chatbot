@@ -82,11 +82,24 @@ def _build_index_filters(
                 f"User does not have access to document sets: {unauthorized}",
             )
 
-    document_set_filter = (
-        base_filters.document_set
-        if base_filters.document_set is not None
-        else persona_document_sets
-    )
+    if persona_document_sets and base_filters.document_set is not None:
+        persona_document_set_names = set(persona_document_sets)
+        document_set_filter = [
+            name
+            for name in base_filters.document_set
+            if name in persona_document_set_names
+        ]
+        if not document_set_filter:
+            raise OnyxError(
+                OnyxErrorCode.INVALID_INPUT,
+                "Selected Document Sets are outside this agent's knowledge scope.",
+            )
+    else:
+        document_set_filter = (
+            base_filters.document_set
+            if base_filters.document_set is not None
+            else persona_document_sets
+        )
 
     # The persona's search_start_date floor must never be loosened.
     updated_at_range = base_filters.updated_at_range

@@ -473,7 +473,7 @@ export function getDefaultLlmDescriptor(
     const provider = llmProviders.find((p) => p.id === defaultText.provider_id);
     if (provider) {
       return {
-        name: provider.name ?? "",
+        name: provider.name ?? provider.provider,
         provider: provider.provider,
         modelName: defaultText.model_name,
       };
@@ -488,7 +488,7 @@ export function getDefaultLlmDescriptor(
       (m) => m.is_visible
     );
     return {
-      name: firstLlmProvider.name ?? "",
+      name: firstLlmProvider.name ?? firstLlmProvider.provider,
       provider: firstLlmProvider.provider,
       modelName: firstModel?.name ?? "",
     };
@@ -519,7 +519,7 @@ export function getValidLlmDescriptorForProviders(
       if (provider) {
         return {
           modelName: modelName,
-          name: provider.name ?? "",
+          name: provider.name ?? provider.provider,
           provider: provider.provider,
         };
       }
@@ -534,15 +534,22 @@ export function getValidLlmDescriptorForProviders(
       const typeMatches = llmProviders.filter(
         (p) => p.provider === model.provider && hasModel(p)
       );
-      // When multiple providers share the same type (e.g., two "anthropic"
-      // providers with different API keys), prefer the one whose name matches
-      // the user's explicit selection to avoid silently switching providers.
+      const selectorMatches = typeMatches.filter((provider) => {
+        if (!model.name) return !provider.name;
+        return model.name === model.provider
+          ? provider.name === model.name || !provider.name
+          : provider.name === model.name;
+      });
+      // A typed saved selection is an execution identity, not a hint. Only a
+      // unique exact-name match is valid; the provider-type selector additionally
+      // supports one nameless instance. Ambiguity or deletion falls through to
+      // the configured default instead of silently switching credentials.
       const matchingProvider =
-        typeMatches.find((p) => p.name === model.name) ?? typeMatches[0];
+        selectorMatches.length === 1 ? selectorMatches[0] : undefined;
       if (matchingProvider) {
         return {
           ...model,
-          name: matchingProvider.name ?? "",
+          name: matchingProvider.name ?? matchingProvider.provider,
           provider: matchingProvider.provider,
         };
       }
@@ -559,7 +566,7 @@ export function getValidLlmDescriptorForProviders(
         return {
           ...model,
           provider: provider.provider,
-          name: provider.name ?? "",
+          name: provider.name ?? provider.provider,
         };
       }
     }

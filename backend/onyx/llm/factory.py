@@ -12,13 +12,17 @@ from onyx.db.llm import (
     fetch_default_contextual_rag_model,
     fetch_default_llm_model,
     fetch_default_vision_model,
-    fetch_existing_llm_provider,
+    fetch_existing_llm_provider_by_id,
     fetch_existing_models,
+    fetch_llm_provider_for_legacy_selection,
+    fetch_llm_provider_for_model_selection,
     fetch_model_configuration_by_id,
     fetch_user_group_ids,
 )
 from onyx.db.models import LLMProvider as LLMProviderModel
 from onyx.db.models import Persona, SearchSettings, User
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.interfaces import LLM
 from onyx.llm.multi_llm import LitellmLLM
@@ -93,14 +97,59 @@ def _resolve_provider_and_model(
     provider_name_override: str | None,
     model_version_override: str | None,
     db_session: Session,
+    provider_type_override: str | None = None,
+    provider_id_override: int | None = None,
 ) -> tuple[LLMProviderModel, str] | None:
     """Resolve the (provider, model_name) pair for get_llm_for_persona.
 
-    Returns None when the override provider doesn't exist or the persona's
-    configured model config is missing; the caller falls back to the default.
+    Returns None when the provider or model cannot be resolved, or when the
+    persona's configured model config is missing.
     """
-    if provider_name_override:
-        provider_model = fetch_existing_llm_provider(provider_name_override, db_session)
+    if provider_id_override is not None:
+        provider_model = fetch_existing_llm_provider_by_id(
+            provider_id_override, db_session
+        )
+        if provider_model is None:
+            return None
+        if (
+            provider_name_override is not None
+            and provider_model.name != provider_name_override
+        ):
+            return None
+        if (
+            provider_type_override is not None
+            and provider_model.provider != provider_type_override
+        ):
+            return None
+        if model_version_override:
+            model_name: str | None = model_version_override
+        elif persona.default_model_configuration_id:
+            mc = fetch_model_configuration_by_id(
+                db_session, persona.default_model_configuration_id
+            )
+            model_name = mc.name if mc else None
+        else:
+            model_name = None
+    elif provider_name_override or provider_type_override:
+        if provider_type_override and provider_name_override:
+            provider_model = fetch_llm_provider_for_model_selection(
+                provider_name_override,
+                provider_type_override,
+                model_version_override,
+                db_session,
+            )
+        elif provider_type_override:
+            provider_model = fetch_llm_provider_for_model_selection(
+                None,
+                provider_type_override,
+                model_version_override,
+                db_session,
+            )
+        else:
+            assert provider_name_override is not None
+            provider_model = fetch_llm_provider_for_legacy_selection(
+                provider_name_override, db_session
+            )
         if not provider_model:
             return None
         if model_version_override:
@@ -129,6 +178,16 @@ def _resolve_provider_and_model(
 
     if not provider_model or not model_name:
         return None
+    if (
+        provider_id_override
+        or provider_name_override
+        or provider_type_override
+        or model_version_override
+    ) and not any(
+        model_config.name == model_name and model_config.is_visible
+        for model_config in provider_model.model_configurations
+    ):
+        return None
     return provider_model, model_name
 
 
@@ -143,15 +202,38 @@ def get_llm_for_persona(
     2. Persona's model configuration override
     3. Default LLM
     """
+    provider_name_override = llm_override.model_provider if llm_override else None
+    provider_type_override = llm_override.model_provider_type if llm_override else None
+    provider_id_override = llm_override.model_provider_id if llm_override else None
+    model_version_override = llm_override.model_version if llm_override else None
+    temperature_override = llm_override.temperature if llm_override else None
+    has_model_selection_override = bool(
+        provider_id_override
+        or provider_name_override
+        or provider_type_override
+        or model_version_override
+    )
+
     if persona is None:
+        if has_model_selection_override:
+            raise OnyxError(
+                OnyxErrorCode.INVALID_INPUT,
+                "The selected language model is unavailable.",
+            )
         logger.warning("No persona provided, using default LLM")
         return get_default_llm()
 
-    provider_name_override = llm_override.model_provider if llm_override else None
-    model_version_override = llm_override.model_version if llm_override else None
-    temperature_override = llm_override.temperature if llm_override else None
-
-    if not provider_name_override and not persona.default_model_configuration_id:
+    if (
+        not provider_name_override
+        and not provider_type_override
+        and provider_id_override is None
+        and not persona.default_model_configuration_id
+    ):
+        if has_model_selection_override:
+            raise OnyxError(
+                OnyxErrorCode.INVALID_INPUT,
+                "The selected language model is unavailable.",
+            )
         return get_default_llm(
             temperature=temperature_override or GEN_AI_TEMPERATURE,
             additional_headers=additional_headers,
@@ -159,9 +241,19 @@ def get_llm_for_persona(
 
     with get_session_with_current_tenant() as db_session:
         resolved = _resolve_provider_and_model(
-            persona, provider_name_override, model_version_override, db_session
+            persona,
+            provider_name_override,
+            model_version_override,
+            db_session,
+            provider_type_override=provider_type_override,
+            provider_id_override=provider_id_override,
         )
         if resolved is None:
+            if has_model_selection_override:
+                raise OnyxError(
+                    OnyxErrorCode.INVALID_INPUT,
+                    "The selected language model is unavailable.",
+                )
             return get_default_llm(
                 temperature=(
                     temperature_override
@@ -183,6 +275,11 @@ def get_llm_for_persona(
                 persona.id,
                 provider_model.name,
             )
+            if has_model_selection_override:
+                raise OnyxError(
+                    OnyxErrorCode.INVALID_INPUT,
+                    "The selected language model is unavailable.",
+                )
             return get_default_llm(
                 temperature=temperature_override or GEN_AI_TEMPERATURE,
                 additional_headers=additional_headers,

@@ -1,11 +1,7 @@
 import React, { memo, JSX, useMemo, useCallback } from "react";
 import { SourceIcon } from "@/components/SourceIcon";
 import { WebResultIcon } from "@/components/WebResultIcon";
-import {
-  LoadedOnyxDocument,
-  MinimalOnyxDocument,
-  OnyxDocument,
-} from "@/lib/search/interfaces";
+import { MinimalOnyxDocument, OnyxDocument } from "@/lib/search/interfaces";
 import {
   SubQuestionDetail,
   CitationChunkMap,
@@ -25,7 +21,7 @@ import { openDocument } from "@/lib/search/utils";
 import { ensureHrefProtocol } from "@/lib/utils";
 
 interface DocumentCardProps {
-  document: LoadedOnyxDocument;
+  document: OnyxDocument;
   updatePresentingDocument: (document: MinimalOnyxDocument) => void;
   url?: string;
 }
@@ -170,7 +166,20 @@ export const MemoizedLink = memo(
     // Handle click on SourceTag
     const handleSourceClick = useCallback(() => {
       if (document && updatePresentingDocument) {
-        openDocument(document as OnyxDocument, updatePresentingDocument);
+        const citedDocument = document as OnyxDocument;
+        if (
+          (citedDocument.source_type === ValidSources.File ||
+            citedDocument.source_type === ValidSources.UserFile) &&
+          Number.isInteger(citedDocument.chunk_ind)
+        ) {
+          updatePresentingDocument({
+            document_id: citedDocument.document_id,
+            semantic_identifier: getDisplayNameForSource(citedDocument),
+            citation_chunk_ind: citedDocument.chunk_ind,
+          });
+        } else {
+          openDocument(citedDocument, updatePresentingDocument);
+        }
       } else if (question && openQuestion) {
         openQuestion(question);
       }

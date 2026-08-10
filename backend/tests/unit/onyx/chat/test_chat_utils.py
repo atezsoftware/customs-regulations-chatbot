@@ -1,20 +1,72 @@
 """Tests for chat_utils.py, specifically get_custom_agent_prompt."""
 
 from io import BytesIO
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
 
 from onyx.chat.chat_utils import (
     _build_tool_call_response_history_message,
     _get_or_extract_plaintext,
+    build_citation_map_from_infos,
     convert_chat_history,
     get_custom_agent_prompt,
 )
 from onyx.chat.models import ChatLoadedFile
 from onyx.configs.constants import DEFAULT_PERSONA_ID, MessageType
 from onyx.db.models import ChatMessage
+from onyx.db.models import SearchDoc as DbSearchDoc
 from onyx.file_store.models import ChatFileType
 from onyx.prompts.chat_prompts import TOOL_CALL_RESPONSE_CROSS_MESSAGE
+from onyx.server.query_and_chat.streaming_models import CitationInfo
+
+
+def test_citation_map_uses_exact_chunk_for_same_document() -> None:
+    db_docs = cast(
+        list[DbSearchDoc],
+        [
+            SimpleNamespace(id=10, document_id="law", chunk_ind=3),
+            SimpleNamespace(id=11, document_id="law", chunk_ind=7),
+        ],
+    )
+
+    result = build_citation_map_from_infos(
+        [CitationInfo(citation_number=1, document_id="law", chunk_ind=7)],
+        db_docs,
+    )
+
+    assert result == {1: 11}
+
+
+def test_citation_map_does_not_substitute_missing_exact_chunk() -> None:
+    db_docs = cast(
+        list[DbSearchDoc],
+        [SimpleNamespace(id=10, document_id="law", chunk_ind=3)],
+    )
+
+    result = build_citation_map_from_infos(
+        [CitationInfo(citation_number=1, document_id="law", chunk_ind=7)],
+        db_docs,
+    )
+
+    assert result == {}
+
+
+def test_legacy_citation_without_chunk_uses_first_document_match() -> None:
+    db_docs = cast(
+        list[DbSearchDoc],
+        [
+            SimpleNamespace(id=10, document_id="law", chunk_ind=3),
+            SimpleNamespace(id=11, document_id="law", chunk_ind=7),
+        ],
+    )
+
+    result = build_citation_map_from_infos(
+        [CitationInfo(citation_number=1, document_id="law")],
+        db_docs,
+    )
+
+    assert result == {1: 10}
 
 
 class TestGetCustomAgentPrompt:

@@ -9,11 +9,14 @@ Covers:
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
+import pytest
+
 from onyx.chat.models import ExtractedContextFiles
 from onyx.chat.process_message import (
     _filter_global_regulatory_chat_tools,
     _global_regulatory_search_filters,
     _should_auto_detect_search_filters,
+    _validate_deep_research_scope,
     determine_search_params,
     extract_context_files,
     resolve_context_user_files,
@@ -21,8 +24,35 @@ from onyx.chat.process_message import (
 from onyx.configs.constants import DEFAULT_PERSONA_ID, DocumentSource
 from onyx.context.search.models import BaseFilters
 from onyx.db.models import UserFile
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.models import ChatFileType, InMemoryChatFile
 from onyx.tools.models import SearchToolUsage
+from onyx.tools.tool_implementations.search.search_tool import SearchTool
+
+
+def test_deep_research_rejects_scoped_agent_without_search_tool() -> None:
+    persona = MagicMock()
+    persona.document_sets = [MagicMock()]
+    unrelated_tool = MagicMock()
+    unrelated_tool.name = "some_other_tool"
+
+    with pytest.raises(OnyxError) as exc_info:
+        _validate_deep_research_scope(persona, [unrelated_tool])
+
+    assert exc_info.value.error_code is OnyxErrorCode.INVALID_INPUT
+
+
+def test_deep_research_rejects_non_search_tool_with_search_name() -> None:
+    persona = MagicMock()
+    persona.document_sets = [MagicMock()]
+    impostor_tool = MagicMock()
+    impostor_tool.name = SearchTool.NAME
+
+    with pytest.raises(OnyxError) as exc_info:
+        _validate_deep_research_scope(persona, [impostor_tool])
+
+    assert exc_info.value.error_code is OnyxErrorCode.INVALID_INPUT
 
 
 def test_global_regulatory_chat_tools_remove_direct_file_reader() -> None:

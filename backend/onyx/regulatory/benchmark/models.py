@@ -88,6 +88,7 @@ class BenchmarkJudgeResult(BaseModel):
 
 class BenchmarkModelReport(BaseModel):
     provider: str
+    provider_id: int | None
     model_id: str
     rank: int
     summary: str

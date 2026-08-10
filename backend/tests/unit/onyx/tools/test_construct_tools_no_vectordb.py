@@ -7,11 +7,13 @@ Verifies that:
 - FileReaderTool.is_available() returns True when vector DB is disabled
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from onyx.tools.models import SearchToolUsage
 from onyx.tools.tool_constructor import _construct_tools_impl, construct_tools
 from onyx.tools.tool_implementations.file_reader.file_reader_tool import FileReaderTool
+from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 APP_CONFIGS_MODULE = "onyx.configs.app_configs"
 FILE_READER_MODULE = "onyx.tools.tool_implementations.file_reader.file_reader_tool"
@@ -170,6 +172,121 @@ class TestEffectivePersonaTools:
                 llm=MagicMock(),
                 allowed_tool_ids=[99],
                 search_usage_forcing_setting=SearchToolUsage.ENABLED,
+            )
+
+        assert result == {}
+
+    def test_document_set_persona_restores_missing_search_tool(self) -> None:
+        document_set = SimpleNamespace(name="Agent Knowledge")
+        persona = MagicMock(id=7, name="custom", tools=[])
+        persona.document_sets = [document_set]
+        persona.attached_documents = []
+        persona.hierarchy_nodes = []
+        persona.search_start_date = None
+        user = MagicMock(oauth_accounts=[], enable_memory_tool=False)
+        search_db_tool = MagicMock(id=1)
+
+        with (
+            patch(
+                "onyx.tools.tool_constructor.get_current_search_settings",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_default_document_index",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_builtin_tool",
+                return_value=search_db_tool,
+            ),
+        ):
+            result = _construct_tools_impl(
+                persona=persona,
+                db_session=MagicMock(),
+                emitter=MagicMock(),
+                user=user,
+                llm=MagicMock(),
+                search_usage_forcing_setting=SearchToolUsage.AUTO,
+            )
+
+        search_tools = result[1]
+        assert len(search_tools) == 1
+        assert isinstance(search_tools[0], SearchTool)
+        assert search_tools[0].persona_search_info.document_set_names == [
+            "Agent Knowledge"
+        ]
+
+    def test_legacy_document_set_persona_respects_empty_allowlist(self) -> None:
+        persona = MagicMock(id=7, name="legacy", tools=[])
+        persona.document_sets = [SimpleNamespace(name="Agent Knowledge")]
+        persona.attached_documents = []
+        persona.hierarchy_nodes = []
+        persona.search_start_date = None
+        user = MagicMock(oauth_accounts=[], enable_memory_tool=False)
+        search_db_tool = MagicMock(id=1)
+
+        with (
+            patch(
+                "onyx.tools.tool_constructor.get_current_search_settings",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_default_document_index",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_builtin_tool",
+                return_value=search_db_tool,
+            ),
+        ):
+            result = _construct_tools_impl(
+                persona=persona,
+                db_session=MagicMock(),
+                emitter=MagicMock(),
+                user=user,
+                llm=MagicMock(),
+                allowed_tool_ids=[],
+                search_usage_forcing_setting=SearchToolUsage.AUTO,
+            )
+
+        assert result == {}
+
+    def test_document_set_persona_does_not_restore_filtered_search_tool(self) -> None:
+        document_set = SimpleNamespace(name="Agent Knowledge")
+        configured_search_tool = MagicMock(
+            id=1,
+            name="internal_search",
+            in_code_tool_id=SearchTool.__name__,
+        )
+        persona = MagicMock(
+            id=7,
+            name="custom",
+            tools=[configured_search_tool],
+        )
+        persona.document_sets = [document_set]
+        persona.attached_documents = []
+        persona.hierarchy_nodes = []
+        persona.search_start_date = None
+        user = MagicMock(oauth_accounts=[], enable_memory_tool=False)
+
+        with (
+            patch(
+                "onyx.tools.tool_constructor.get_current_search_settings",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_default_document_index",
+                return_value=MagicMock(),
+            ),
+        ):
+            result = _construct_tools_impl(
+                persona=persona,
+                db_session=MagicMock(),
+                emitter=MagicMock(),
+                user=user,
+                llm=MagicMock(),
+                allowed_tool_ids=[],
+                search_usage_forcing_setting=SearchToolUsage.AUTO,
             )
 
         assert result == {}

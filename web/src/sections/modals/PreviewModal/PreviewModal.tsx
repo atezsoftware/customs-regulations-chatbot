@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { MinimalOnyxDocument } from "@/lib/search/interfaces";
 import { Modal } from "@opal/components";
 import Text from "@/refresh-components/texts/Text";
@@ -34,6 +34,8 @@ export default function PreviewModal({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [mimeType, setMimeType] = useState("application/octet-stream");
   const [zoom, setZoom] = useState(100);
+  const requestSequence = useRef(0);
+  const isCitationChunk = presentingDocument.citation_chunk_ind !== undefined;
 
   const variant = useMemo(
     () => resolveVariant(presentingDocument.semantic_identifier, mimeType),
@@ -65,6 +67,8 @@ export default function PreviewModal({
   }, [fileContent]);
 
   const fetchFile = useCallback(async () => {
+    const requestId = ++requestSequence.current;
+    const isCurrentRequest = () => requestSequence.current === requestId;
     setIsLoading(true);
     setLoadError(null);
     setFileContent("");
@@ -85,6 +89,34 @@ export default function PreviewModal({
     try {
       setFileName(originalFileName);
 
+      if (presentingDocument.citation_chunk_ind !== undefined) {
+        const params = new URLSearchParams({
+          document_id: presentingDocument.document_id,
+          chunk_id: String(presentingDocument.citation_chunk_ind),
+        });
+        const response = await fetch(`/api/document/chunk-info?${params}`);
+        if (!response.ok) {
+          throw new Error(
+            `Chunk request failed with status ${response.status}`
+          );
+        }
+        const payload: unknown = await response.json();
+        if (
+          typeof payload !== "object" ||
+          payload === null ||
+          !("content" in payload) ||
+          typeof payload.content !== "string" ||
+          !payload.content.trim()
+        ) {
+          throw new Error("Chunk response did not contain usable content");
+        }
+        if (!isCurrentRequest()) return;
+        setMimeType("text/plain");
+        setFileContent(payload.content);
+        updateFileUrl("");
+        return;
+      }
+
       // Variants that render from backend-parsed content (spreadsheets) don't
       // need the raw binary blob — skip downloading the full workbook and let
       // the download button point at the raw URL directly.
@@ -98,11 +130,13 @@ export default function PreviewModal({
           mime.getType(originalFileName) ?? "application/octet-stream"
         );
         const parsedResponse = await fetchChatFile(fileIdLocal, true);
-        setFileContent(await parsedResponse.text());
+        const parsedContent = await parsedResponse.text();
+        if (isCurrentRequest()) setFileContent(parsedContent);
         return;
       }
 
       const response = await fetchChatFile(fileIdLocal);
+      if (!isCurrentRequest()) return;
 
       // Re-resolve using the stored MIME from the response headers, which is
       // authoritative, BEFORE materializing the body as a blob.
@@ -125,29 +159,40 @@ export default function PreviewModal({
         await response.body?.cancel();
         updateFileUrl(rawFileUrl);
         const parsedResponse = await fetchChatFile(fileIdLocal, true);
-        setFileContent(await parsedResponse.text());
+        const parsedContent = await parsedResponse.text();
+        if (isCurrentRequest()) setFileContent(parsedContent);
         return;
       }
 
       const blob = await response.blob();
+      if (!isCurrentRequest()) return;
       updateFileUrl(window.URL.createObjectURL(blob));
 
       if (resolved.needsTextContent) {
-        setFileContent(await blob.text());
+        const textContent = await blob.text();
+        if (isCurrentRequest()) setFileContent(textContent);
       }
     } catch (error) {
+      if (!isCurrentRequest()) return;
       console.error(
         `Failed to load preview for chat file ${fileIdLocal}:`,
         error
       );
-      // Keep a usable download link for the CURRENT file even when the
-      // preview itself failed (a stale previous-file URL must never win).
-      updateFileUrl(rawFileUrl);
-      setLoadError("Failed to load document.");
+      if (isCitationChunk) {
+        updateFileUrl("");
+        setLoadError(
+          "The cited chunk is unavailable or you no longer have access to it."
+        );
+      } else {
+        // Keep a usable download link for the CURRENT file even when the
+        // preview itself failed (a stale previous-file URL must never win).
+        updateFileUrl(rawFileUrl);
+        setLoadError("Failed to load document.");
+      }
     } finally {
-      setIsLoading(false);
+      if (isCurrentRequest()) setIsLoading(false);
     }
-  }, [presentingDocument]);
+  }, [isCitationChunk, presentingDocument]);
 
   useEffect(() => {
     fetchFile();
@@ -231,12 +276,23 @@ export default function PreviewModal({
                 </a>
               )}
             </Section>
+          ) : isCitationChunk ? (
+            <div className="h-full overflow-y-auto p-4">
+              <Text
+                as="p"
+                mainContentBody
+                text04
+                className="whitespace-pre-wrap"
+              >
+                {fileContent}
+              </Text>
+            </div>
           ) : (
             variant.renderContent(ctx)
           )}
         </div>
 
-        {!isLoading && !loadError && (
+        {!isCitationChunk && !isLoading && !loadError && (
           <FloatingFooter
             left={variant.renderFooterLeft(ctx)}
             right={variant.renderFooterRight(ctx)}

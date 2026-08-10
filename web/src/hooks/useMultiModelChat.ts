@@ -225,6 +225,7 @@ export default function useMultiModelChat(
   const buildLlmOverrides = useCallback((): LLMOverride[] => {
     return effectiveSelectedModels.map((m) => ({
       model_provider: m.name,
+      model_provider_type: m.provider,
       model_version: m.modelName,
       display_name: m.displayName,
     }));

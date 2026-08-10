@@ -21,6 +21,7 @@ from onyx.db.models import (
 from onyx.db.models import LLMProvider as LLMProviderModel
 from onyx.db.models import Tool as ToolModel
 from onyx.db.persona import get_raw_personas_for_user
+from onyx.llm.constants import LlmProviderNames
 from onyx.llm.utils import model_supports_image_input
 from onyx.llm.well_known_providers.auto_update_models import LLMRecommendations
 from onyx.server.manage.embedding.models import (
@@ -376,9 +377,10 @@ def sync_model_configurations(
     """Sync model configurations for a dynamic provider (OpenRouter, Bedrock, Ollama, etc.).
 
     Inserts NEW models and, for existing ones, adds any newly-reported capability
-    flag (VISION/REASONING). Flags are only added, never removed; is_visible and
-    max_input_tokens are preserved. Caveat: an admin-removed flow is re-added on
-    the next sync (ENG-4233).
+    flag (VISION/REASONING). Flags are only added, never removed; max_input_tokens
+    is preserved. OpenRouter auto mode exposes its complete dynamic catalog;
+    visibility is otherwise preserved. Caveat: an admin-removed flow is re-added
+    on the next sync (ENG-4233).
 
     Args:
         db_session: Database session
@@ -393,13 +395,37 @@ def sync_model_configurations(
         raise ValueError(f"LLM Provider with id={provider_id} not found")
 
     existing_by_name = {mc.name: mc for mc in provider.model_configurations}
+    show_dynamic_catalog = (
+        provider.provider == LlmProviderNames.OPENROUTER and provider.is_auto_mode
+    )
+    discovered_model_names = {model.name for model in models}
+    current_default = (
+        fetch_default_llm_model(db_session) if show_dynamic_catalog else None
+    )
+    replaces_stale_default = bool(
+        current_default
+        and current_default.llm_provider_id == provider.id
+        and current_default.name not in discovered_model_names
+    )
+    if replaces_stale_default and not models:
+        raise ValueError(
+            "OpenRouter discovery returned no currently available replacement "
+            "for the active CHAT default"
+        )
 
     new_count = 0
     upgraded_flow_count = 0
+    visibility_change_count = 0
+    if show_dynamic_catalog:
+        for model_name, existing in existing_by_name.items():
+            is_currently_available = model_name in discovered_model_names
+            if existing.is_visible != is_currently_available:
+                existing.is_visible = is_currently_available
+                visibility_change_count += 1
+
     for model in models:
         existing = existing_by_name.get(model.name)
         if existing is None:
-            # Insert new model with is_visible=False (user must explicitly enable)
             supported_flows = [LLMModelFlowType.CHAT]
             if model.supports_image_input:
                 supported_flows.append(LLMModelFlowType.VISION)
@@ -411,7 +437,7 @@ def sync_model_configurations(
                 llm_provider_id=provider.id,
                 model_name=model.name,
                 supported_flows=supported_flows,
-                is_visible=False,
+                is_visible=show_dynamic_catalog,
                 max_input_tokens=model.max_input_tokens,
                 display_name=model.display_name,
             )
@@ -438,7 +464,21 @@ def sync_model_configurations(
             )
             upgraded_flow_count += 1
 
-    if new_count > 0 or upgraded_flow_count > 0:
+    if replaces_stale_default:
+        db_session.flush()
+        _update_default_model__no_commit(
+            db_session=db_session,
+            provider_id=provider.id,
+            model=models[0].name,
+            flow_type=LLMModelFlowType.CHAT,
+        )
+
+    if (
+        new_count > 0
+        or upgraded_flow_count > 0
+        or visibility_change_count > 0
+        or replaces_stale_default
+    ):
         db_session.commit()
 
     return new_count
@@ -634,20 +674,41 @@ def fetch_all_llm_providers_accessible_in_any_context(
     ]
 
 
-def fetch_existing_llm_provider(
+def _fetch_existing_llm_providers_by_name(
     name: str, db_session: Session
-) -> LLMProviderModel | None:
-    provider_model = db_session.scalar(
-        select(LLMProviderModel)
-        .where(LLMProviderModel.name == name)
-        .options(
-            selectinload(LLMProviderModel.model_configurations),
-            selectinload(LLMProviderModel.groups),
-            selectinload(LLMProviderModel.personas),
+) -> list[LLMProviderModel]:
+    return list(
+        db_session.scalars(
+            select(LLMProviderModel)
+            .where(LLMProviderModel.name == name)
+            .options(
+                selectinload(LLMProviderModel.model_configurations),
+                selectinload(LLMProviderModel.groups),
+                selectinload(LLMProviderModel.personas),
+            )
         )
     )
 
-    return provider_model
+
+def _unique_named_llm_provider(
+    name: str, providers: list[LLMProviderModel]
+) -> LLMProviderModel | None:
+    if len(providers) > 1:
+        logger.warning(
+            "Found %d providers with name='%s'; skipping ambiguous match.",
+            len(providers),
+            name,
+        )
+        return None
+    return providers[0] if providers else None
+
+
+def fetch_existing_llm_provider(
+    name: str, db_session: Session
+) -> LLMProviderModel | None:
+    return _unique_named_llm_provider(
+        name, _fetch_existing_llm_providers_by_name(name, db_session)
+    )
 
 
 def fetch_existing_llm_provider_by_id(
@@ -722,10 +783,10 @@ def fetch_existing_llm_provider_by_name_and_type(
 def fetch_existing_llm_provider_by_type_nameless(
     provider_type: str, db_session: Session
 ) -> LLMProviderModel | None:
-    """Return the first unnamed provider of the given type (e.g. "openai").
+    """Return the unique unnamed provider of the given type (e.g. "openai").
 
-    Logs a warning if more than one nameless provider of the type exists, since
-    the choice is ambiguous.
+    Returns ``None`` when multiple providers match because a provider-type
+    selector cannot identify one of them safely.
     """
     results = list(
         db_session.scalars(
@@ -743,12 +804,74 @@ def fetch_existing_llm_provider_by_type_nameless(
     )
     if len(results) > 1:
         logger.warning(
-            "Found %d nameless providers of type '%s'; returning the first (id=%d).",
+            "Found %d nameless providers of type '%s'; skipping ambiguous match.",
             len(results),
             provider_type,
-            results[0].id,
         )
+        return None
     return results[0] if results else None
+
+
+def fetch_llm_provider_for_legacy_selection(
+    provider_selector: str, db_session: Session
+) -> LLMProviderModel | None:
+    """Resolve an untyped provider selector without masking name ambiguity.
+
+    Legacy selectors first mean an exact provider display name. Only when there
+    are no exact-name rows can the selector retain its historical meaning as a
+    provider type for a unique nameless provider.
+    """
+    exact_name_matches = _fetch_existing_llm_providers_by_name(
+        provider_selector, db_session
+    )
+    if exact_name_matches:
+        return _unique_named_llm_provider(provider_selector, exact_name_matches)
+    return fetch_existing_llm_provider_by_type_nameless(provider_selector, db_session)
+
+
+def fetch_llm_provider_for_model_selection(
+    provider_name: str | None,
+    provider_type: str,
+    model_name: str | None,
+    db_session: Session,
+) -> LLMProviderModel | None:
+    """Resolve a unique provider for a typed, visible model selection.
+
+    Frontend descriptors use the provider type as the selector for nameless
+    instances. When an actual provider name equals its type, both possible
+    interpretations are checked and ambiguity is rejected.
+    """
+    if provider_name and provider_name != provider_type:
+        candidates = [
+            fetch_existing_llm_provider_by_name_and_type(
+                provider_name, provider_type, db_session
+            )
+        ]
+    elif provider_name:
+        candidates = [
+            fetch_existing_llm_provider_by_name_and_type(
+                provider_name, provider_type, db_session
+            ),
+            fetch_existing_llm_provider_by_type_nameless(provider_type, db_session),
+        ]
+    else:
+        candidates = [
+            fetch_existing_llm_provider_by_type_nameless(provider_type, db_session)
+        ]
+
+    matching_providers = [
+        candidate
+        for candidate in candidates
+        if candidate is not None
+        and (
+            model_name is None
+            or any(
+                model.name == model_name and model.is_visible
+                for model in candidate.model_configurations
+            )
+        )
+    ]
+    return matching_providers[0] if len(matching_providers) == 1 else None
 
 
 def fetch_embedding_provider(
@@ -1035,6 +1158,9 @@ def sync_auto_mode_models(
         The number of changes made.
     """
     changes = 0
+    show_dynamic_catalog = (
+        provider.provider == LlmProviderNames.OPENROUTER and provider.is_auto_mode
+    )
 
     # Build the list of all visible models from the config
     # All models in the config are visible (default + additional_visible_models)
@@ -1055,9 +1181,13 @@ def sync_auto_mode_models(
         ).all()
     }
 
-    # Mark models that are no longer in GitHub config as not visible
+    # Dynamic OpenRouter discovery controls availability. Other providers retain
+    # recommendation-based visibility.
     for model_name, model in existing_models.items():
-        if model_name not in recommended_visible_model_names:
+        if (
+            not show_dynamic_catalog
+            and model_name not in recommended_visible_model_names
+        ):
             if model.is_visible:
                 model.is_visible = False
                 changes += 1
@@ -1072,20 +1202,19 @@ def sync_auto_mode_models(
             if existing.display_name != model_config.display_name:
                 existing.display_name = model_config.display_name
                 updated = True
-            # All models in the config are visible
-            if not existing.is_visible:
+            if not show_dynamic_catalog and not existing.is_visible:
                 existing.is_visible = True
                 updated = True
             if updated:
                 changes += 1
         else:
-            # Add new model - all models from GitHub config are visible
+            # OpenRouter rows become visible only after current provider discovery.
             insert_new_model_configuration__no_commit(
                 db_session=db_session,
                 llm_provider_id=provider.id,
                 model_name=model_config.name,
                 supported_flows=[LLMModelFlowType.CHAT],
-                is_visible=True,
+                is_visible=not show_dynamic_catalog,
                 max_input_tokens=None,
                 display_name=model_config.display_name,
             )
@@ -1098,7 +1227,16 @@ def sync_auto_mode_models(
     db_session.flush()
 
     recommended_default = llm_recommendations.get_default_model(provider.provider)
-    if recommended_default:
+    recommended_default_configuration = (
+        existing_models.get(recommended_default.name) if recommended_default else None
+    )
+    if recommended_default and (
+        not show_dynamic_catalog
+        or (
+            recommended_default_configuration is not None
+            and recommended_default_configuration.is_visible
+        )
+    ):
         current_default = fetch_default_llm_model(db_session)
 
         if (

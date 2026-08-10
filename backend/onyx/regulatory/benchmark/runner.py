@@ -19,10 +19,11 @@ from onyx.db.models import BenchmarkRun, BenchmarkRunItem, Persona, User, UserFi
 from onyx.db.persona import get_best_persona_id_for_user
 from onyx.db.regulatory_benchmark import (
     add_benchmark_judgment,
-    get_benchmark_run,
+    get_benchmark_run_for_update,
     refresh_benchmark_run_counts,
 )
 from onyx.db.regulatory_chunks import get_chunks_for_file
+from onyx.llm.constants import LlmProviderNames
 from onyx.llm.cost import compute_cost_cents, get_model_price_per_million
 from onyx.llm.factory import get_llm_for_persona
 from onyx.llm.override_models import LLMOverride
@@ -46,6 +47,23 @@ _MAX_REASONING_CHARS = 30_000
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _override_provider_name(
+    provider_selector: str, provider_id: int | None
+) -> str | None:
+    return None if provider_id is not None else provider_selector
+
+
+def _override_provider_type(
+    provider_selector: str, provider_id: int | None
+) -> str | None:
+    # A named provider whose name equals its type needs exact-name resolution.
+    return (
+        None
+        if provider_id is None and provider_selector == LlmProviderNames.OPENROUTER
+        else LlmProviderNames.OPENROUTER
+    )
 
 
 def _usage_cost(
@@ -137,11 +155,24 @@ def _cited_sources(db_session: Session, response: object) -> list[dict[str, obje
     citation_info = getattr(response, "citation_info", [])
     top_documents: list[SearchDoc] = getattr(response, "top_documents", [])
     by_document: dict[str, list[SearchDoc]] = defaultdict(list)
+    by_chunk_identity: dict[tuple[str, int], SearchDoc] = {}
     for document in top_documents:
         by_document[document.document_id].append(document)
+        by_chunk_identity.setdefault(
+            (document.document_id, document.chunk_ind), document
+        )
     document_offsets: dict[str, int] = defaultdict(int)
     sources: list[dict[str, object]] = []
     for citation in citation_info:
+        citation_chunk_ind = getattr(citation, "chunk_ind", None)
+        if citation_chunk_ind is not None:
+            document = by_chunk_identity.get((citation.document_id, citation_chunk_ind))
+            if document is None:
+                continue
+            sources.append(
+                _source_snapshot(db_session, document, citation.citation_number)
+            )
+            continue
         matches = by_document.get(citation.document_id, [])
         if not matches:
             continue
@@ -150,6 +181,29 @@ def _cited_sources(db_session: Session, response: object) -> list[dict[str, obje
         document_offsets[citation.document_id] += 1
         sources.append(_source_snapshot(db_session, document, citation.citation_number))
     return sources
+
+
+def _get_item_persona(
+    db_session: Session,
+    *,
+    user: User,
+    item: BenchmarkRunItem,
+) -> Persona | None:
+    question_snapshot = getattr(item, "question_snapshot", {}) or {}
+    raw_document_set_id = question_snapshot.get("document_set_id")
+    if raw_document_set_id is None:
+        raw_document_set_id = getattr(
+            getattr(item, "question", None), "document_set_id", None
+        )
+    document_set_id = (
+        int(raw_document_set_id) if raw_document_set_id is not None else None
+    )
+    persona_id = get_best_persona_id_for_user(
+        db_session,
+        user,
+        document_set_id=document_set_id,
+    )
+    return db_session.get(Persona, persona_id) if persona_id is not None else None
 
 
 def _citation_metrics(
@@ -223,11 +277,18 @@ def _judge_completed_item(
     user: User,
     persona: Persona | None,
 ) -> None:
+    judge_provider_id = getattr(run, "judge_provider_id", None)
     judge_llm = get_llm_for_persona(
         persona,
         user,
         LLMOverride(
-            model_provider=run.judge_provider,
+            model_provider=_override_provider_name(
+                run.judge_provider, judge_provider_id
+            ),
+            model_provider_type=_override_provider_type(
+                run.judge_provider, judge_provider_id
+            ),
+            model_provider_id=judge_provider_id,
             model_version=run.judge_model,
             temperature=0,
         ),
@@ -282,8 +343,11 @@ def _generate_item_answer(
     persona: Persona | None,
     started: float,
 ) -> None:
+    provider_id = getattr(item, "provider_id", None)
     override = LLMOverride(
-        model_provider=item.provider,
+        model_provider=_override_provider_name(item.provider, provider_id),
+        model_provider_type=_override_provider_type(item.provider, provider_id),
+        model_provider_id=provider_id,
         model_version=item.model_id,
         temperature=0,
     )
@@ -429,11 +493,13 @@ def _generate_run_report(
     judged_items = [item for item in run.items if item.judgment is not None]
     if not judged_items:
         return
-    grouped: dict[tuple[str, str], list[BenchmarkRunItem]] = defaultdict(list)
+    grouped: dict[tuple[str, int | None, str], list[BenchmarkRunItem]] = defaultdict(
+        list
+    )
     for item in judged_items:
-        grouped[(item.provider, item.model_id)].append(item)
+        grouped[(item.provider, item.provider_id, item.model_id)].append(item)
     aggregates: list[dict[str, object]] = []
-    for (provider, model_id), items in grouped.items():
+    for (provider, provider_id, model_id), items in grouped.items():
         scores = [item.judgment.overall_score for item in items if item.judgment]
         recalls = [
             item.citation_recall for item in items if item.citation_recall is not None
@@ -441,6 +507,7 @@ def _generate_run_report(
         aggregates.append(
             {
                 "provider": provider,
+                "provider_id": provider_id,
                 "model_id": model_id,
                 "average_score": sum(scores) / len(scores),
                 "average_citation_recall": (
@@ -458,6 +525,7 @@ def _generate_run_report(
     report_items = [
         {
             "model": f"{item.provider}/{item.model_id}",
+            "provider_id": item.provider_id,
             "question": item.question_snapshot.get("title"),
             "overall_score": item.judgment.overall_score,
             "judge_summary": item.judgment.report.get("summary"),
@@ -468,11 +536,18 @@ def _generate_run_report(
         for item in judged_items
         if item.judgment
     ]
+    judge_provider_id = getattr(run, "judge_provider_id", None)
     judge_llm = get_llm_for_persona(
         persona,
         user,
         LLMOverride(
-            model_provider=run.judge_provider,
+            model_provider=_override_provider_name(
+                run.judge_provider, judge_provider_id
+            ),
+            model_provider_type=_override_provider_type(
+                run.judge_provider, judge_provider_id
+            ),
+            model_provider_id=judge_provider_id,
             model_version=run.judge_model,
             temperature=0,
         ),
@@ -545,7 +620,7 @@ def _mark_unfinished_items_error(
 
 
 def run_benchmark(db_session: Session, run_id: int) -> None:
-    run = get_benchmark_run(db_session, run_id)
+    run = get_benchmark_run_for_update(db_session, run_id)
     if run is None:
         raise ValueError(f"Benchmark run {run_id} not found")
     if run.status not in {
@@ -560,9 +635,6 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
         run.completed_at = _utcnow()
         db_session.commit()
         raise ValueError("Benchmark run creator no longer exists")
-    persona_id = get_best_persona_id_for_user(db_session, user)
-    persona = db_session.get(Persona, persona_id) if persona_id is not None else None
-
     now = _utcnow()
     _recover_interrupted_items(run, recovered_at=now)
     run.status = BenchmarkRunStatus.RUNNING.value
@@ -570,12 +642,16 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
     run.started_at = now
     db_session.commit()
 
+    report_persona: Persona | None = None
     for item in run.items:
         db_session.refresh(run)
         if run.status == BenchmarkRunStatus.CANCELLED.value:
             break
         if item.status != BenchmarkRunItemStatus.PENDING.value:
             continue
+        persona = _get_item_persona(db_session, user=user, item=item)
+        if report_persona is None:
+            report_persona = persona
         run.started_at = _utcnow()
         db_session.commit()
         _run_item(db_session, run=run, item=item, user=user, persona=persona)
@@ -594,6 +670,17 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
             if run.total_items > 0 and run.completed_items == run.total_items
             else BenchmarkRunStatus.ERROR.value
         )
-        _generate_run_report(db_session, run=run, user=user, persona=persona)
+        if report_persona is None and run.items:
+            report_persona = _get_item_persona(
+                db_session,
+                user=user,
+                item=run.items[0],
+            )
+        _generate_run_report(
+            db_session,
+            run=run,
+            user=user,
+            persona=report_persona,
+        )
         run.completed_at = finished_at
         db_session.commit()

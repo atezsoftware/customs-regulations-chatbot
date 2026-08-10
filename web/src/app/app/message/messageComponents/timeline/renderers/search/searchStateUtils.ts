@@ -14,11 +14,13 @@ import { ValidSources } from "@/lib/types";
 export const MAX_TITLE_LENGTH = 25;
 
 export const getMetadataTags = (metadata?: {
-  [key: string]: string;
+  [key: string]: string | string[];
 }): string[] | undefined => {
   if (!metadata) return undefined;
   const tags = Object.values(metadata)
-    .filter((value) => typeof value === "string" && value.length > 0)
+    .filter(
+      (value): value is string => typeof value === "string" && value.length > 0
+    )
     .slice(0, 2)
     .map((value) => `# ${value}`);
   return tags.length > 0 ? tags : undefined;

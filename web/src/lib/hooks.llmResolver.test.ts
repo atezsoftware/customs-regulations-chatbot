@@ -2,11 +2,109 @@ import {
   getDefaultLlmDescriptor,
   getValidLlmDescriptorForProviders,
 } from "@/lib/hooks";
-import { structureValue } from "@/lib/languageModels/utils";
+import type { MinimalAgent } from "@/lib/agents/types";
+import {
+  getProviderOverrideForAgent,
+  structureValue,
+} from "@/lib/languageModels/utils";
 import { LLMProviderDescriptor } from "@/lib/languageModels/types";
 import { makeProvider } from "@tests/setup/llmProviderTestUtils";
 
 describe("LLM resolver helpers", () => {
+  test("uses provider type for a nameless provider", () => {
+    const providers: LLMProviderDescriptor[] = [
+      makeProvider({
+        id: 1,
+        name: null,
+        provider: "vertex_ai",
+        model_configurations: [
+          {
+            id: 11,
+            name: "gemini-3.6-flash",
+            is_visible: true,
+            max_input_tokens: null,
+            supports_image_input: false,
+            supports_reasoning: false,
+            effectiveDisplayName: "Gemini 3.6 Flash",
+          },
+        ],
+      }),
+    ];
+
+    expect(
+      getValidLlmDescriptorForProviders(
+        structureValue("", "vertex_ai", "gemini-3.6-flash"),
+        providers
+      )
+    ).toEqual({
+      name: "vertex_ai",
+      provider: "vertex_ai",
+      modelName: "gemini-3.6-flash",
+    });
+    expect(getDefaultLlmDescriptor(providers)).toEqual({
+      name: "vertex_ai",
+      provider: "vertex_ai",
+      modelName: "gemini-3.6-flash",
+    });
+    expect(
+      getProviderOverrideForAgent(
+        { default_model_configuration_id: 11 } as MinimalAgent,
+        providers
+      )
+    ).toEqual({
+      name: "vertex_ai",
+      provider: "vertex_ai",
+      modelName: "gemini-3.6-flash",
+    });
+  });
+
+  test("keeps a legacy empty-name nameless selection when another global default exists", () => {
+    const providers: LLMProviderDescriptor[] = [
+      makeProvider({
+        id: 1,
+        name: "Global Default",
+        provider: "openai",
+        model_configurations: [
+          {
+            name: "gpt-default",
+            is_visible: true,
+            max_input_tokens: null,
+            supports_image_input: false,
+            supports_reasoning: false,
+            effectiveDisplayName: "",
+          },
+        ],
+      }),
+      makeProvider({
+        id: 2,
+        name: null,
+        provider: "vertex_ai",
+        model_configurations: [
+          {
+            name: "gemini-3.6-flash",
+            is_visible: true,
+            max_input_tokens: null,
+            supports_image_input: false,
+            supports_reasoning: false,
+            effectiveDisplayName: "",
+          },
+        ],
+      }),
+    ];
+
+    expect(
+      getValidLlmDescriptorForProviders(
+        structureValue("", "vertex_ai", "gemini-3.6-flash"),
+        providers,
+        { provider_id: 1, model_name: "gpt-default" }
+      )
+    ).toEqual({
+      name: "vertex_ai",
+      provider: "vertex_ai",
+      modelName: "gemini-3.6-flash",
+    });
+  });
+
   test("chooses provider-specific descriptor when model names collide", () => {
     const sharedModel = "shared-runtime-model";
     const providers: LLMProviderDescriptor[] = [
@@ -147,6 +245,120 @@ describe("LLM resolver helpers", () => {
       name: "PersonalAnthropicToken",
       provider: "anthropic",
       modelName: "claude-sonnet-4-5",
+    });
+  });
+
+  test("does not redirect a missing named provider to another instance of the same type", () => {
+    const providers: LLMProviderDescriptor[] = [
+      makeProvider({
+        id: 1,
+        name: "Other Anthropic Token",
+        provider: "anthropic",
+        model_configurations: [
+          {
+            name: "claude-sonnet-4-5",
+            is_visible: true,
+            max_input_tokens: null,
+            supports_image_input: false,
+            supports_reasoning: false,
+            effectiveDisplayName: "",
+          },
+        ],
+      }),
+      makeProvider({
+        id: 2,
+        name: "Global Default",
+        provider: "openai",
+        model_configurations: [
+          {
+            name: "gpt-default",
+            is_visible: true,
+            max_input_tokens: null,
+            supports_image_input: false,
+            supports_reasoning: false,
+            effectiveDisplayName: "",
+          },
+        ],
+      }),
+    ];
+
+    const descriptor = getValidLlmDescriptorForProviders(
+      structureValue(
+        "Deleted Anthropic Token",
+        "anthropic",
+        "claude-sonnet-4-5"
+      ),
+      providers,
+      { provider_id: 2, model_name: "gpt-default" }
+    );
+
+    expect(descriptor).toEqual({
+      name: "Global Default",
+      provider: "openai",
+      modelName: "gpt-default",
+    });
+  });
+
+  test("does not choose between a named type selector and a nameless provider", () => {
+    const sharedModel = "gemini-3.6-flash";
+    const providers: LLMProviderDescriptor[] = [
+      makeProvider({
+        id: 1,
+        name: "vertex_ai",
+        provider: "vertex_ai",
+        model_configurations: [
+          {
+            name: sharedModel,
+            is_visible: true,
+            max_input_tokens: null,
+            supports_image_input: false,
+            supports_reasoning: false,
+            effectiveDisplayName: "",
+          },
+        ],
+      }),
+      makeProvider({
+        id: 2,
+        name: null,
+        provider: "vertex_ai",
+        model_configurations: [
+          {
+            name: sharedModel,
+            is_visible: true,
+            max_input_tokens: null,
+            supports_image_input: false,
+            supports_reasoning: false,
+            effectiveDisplayName: "",
+          },
+        ],
+      }),
+      makeProvider({
+        id: 3,
+        name: "Global Default",
+        provider: "openai",
+        model_configurations: [
+          {
+            name: "gpt-default",
+            is_visible: true,
+            max_input_tokens: null,
+            supports_image_input: false,
+            supports_reasoning: false,
+            effectiveDisplayName: "",
+          },
+        ],
+      }),
+    ];
+
+    expect(
+      getValidLlmDescriptorForProviders(
+        structureValue("vertex_ai", "vertex_ai", sharedModel),
+        providers,
+        { provider_id: 3, model_name: "gpt-default" }
+      )
+    ).toEqual({
+      name: "Global Default",
+      provider: "openai",
+      modelName: "gpt-default",
     });
   });
 

@@ -1,4 +1,3 @@
-import datetime
 import threading
 
 from celery import shared_task
@@ -7,8 +6,7 @@ from onyx.cache.factory import get_cache_backend
 from onyx.cache.interface import CacheLock
 from onyx.configs.constants import OnyxCeleryTask
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.enums import BenchmarkRunStatus
-from onyx.db.regulatory_benchmark import get_benchmark_run
+from onyx.db.regulatory_benchmark import mark_benchmark_run_failed
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -90,17 +88,10 @@ def run_regulatory_benchmark_task(
         with get_session_with_current_tenant() as db_session:
             run_benchmark(db_session, run_id)
         heartbeat.ensure_owned()
-    except Exception:
+    except Exception as error:
         logger.exception("Regulatory benchmark run %s crashed", run_id)
         with get_session_with_current_tenant() as db_session:
-            run = get_benchmark_run(db_session, run_id)
-            if run is not None and run.status not in {
-                BenchmarkRunStatus.COMPLETED.value,
-                BenchmarkRunStatus.CANCELLED.value,
-            }:
-                run.status = BenchmarkRunStatus.ERROR.value
-                run.completed_at = datetime.datetime.now(datetime.timezone.utc)
-                db_session.commit()
+            mark_benchmark_run_failed(db_session, run_id, str(error))
         raise
     finally:
         heartbeat.stop()

@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from onyx.db.enums import (
+    BenchmarkCostSource,
     BenchmarkRunItemStatus,
     BenchmarkRunStatus,
 )
@@ -75,15 +76,17 @@ def create_benchmark_run(
     *,
     label: str | None,
     judge_provider: str,
+    judge_provider_id: int,
     judge_model: str,
     deep_research: bool,
     created_by: UUID,
     questions: Sequence[BenchmarkQuestion],
-    candidates: Sequence[tuple[str, str]],
+    candidates: Sequence[tuple[str, int, str]],
 ) -> BenchmarkRun:
     run = BenchmarkRun(
         label=label,
         judge_provider=judge_provider,
+        judge_provider_id=judge_provider_id,
         judge_model=judge_model,
         deep_research=deep_research,
         created_by=created_by,
@@ -91,12 +94,13 @@ def create_benchmark_run(
     )
     db_session.add(run)
     db_session.flush()
-    for provider, model_id in candidates:
+    for provider, provider_id, model_id in candidates:
         for question in questions:
             db_session.add(
                 BenchmarkRunItem(
                     run_id=run.id,
                     provider=provider,
+                    provider_id=provider_id,
                     model_id=model_id,
                     question_id=question.id,
                     question_snapshot=_question_snapshot(question),
@@ -194,13 +198,95 @@ def refresh_benchmark_run_counts(db_session: Session, run: BenchmarkRun) -> None
     run.failed_items = counts.get(BenchmarkRunItemStatus.ERROR.value, 0)
 
 
-def cancel_benchmark_run(db_session: Session, run: BenchmarkRun) -> None:
-    if run.status in {
+def reset_benchmark_run_for_retry(run: BenchmarkRun) -> None:
+    for item in run.items:
+        if item.status != BenchmarkRunItemStatus.ERROR.value:
+            continue
+        item.status = BenchmarkRunItemStatus.PENDING.value
+        item.final_result = None
+        item.error_message = None
+        item.input_tokens = None
+        item.output_tokens = None
+        item.total_tokens = None
+        item.duration_ms = None
+        item.cost_cents = None
+        item.cost_source = BenchmarkCostSource.UNAVAILABLE.value
+        item.cited_chunk_ids = []
+        item.cited_sources = []
+        item.execution_steps = []
+        item.llm_calls = []
+        item.answer_reasoning = None
+        item.chat_session_id = None
+        item.assistant_message_id = None
+        item.citation_recall = None
+        item.citation_precision = None
+        item.judge_error = None
+        item.started_at = None
+        item.completed_at = None
+        item.judgment = None
+    run.completed_items = sum(
+        item.status == BenchmarkRunItemStatus.COMPLETED.value for item in run.items
+    )
+    run.failed_items = 0
+    run.completed_at = None
+    run.report = None
+    run.report_error = None
+    run.report_input_tokens = None
+    run.report_output_tokens = None
+    run.report_cost_cents = None
+
+
+def mark_benchmark_run_failed(
+    db_session: Session, run_id: int, error_message: str
+) -> BenchmarkRun | None:
+    run = get_benchmark_run_for_update(db_session, run_id)
+    if run is None or run.status in {
+        BenchmarkRunStatus.COMPLETED.value,
+        BenchmarkRunStatus.CANCELLED.value,
+    }:
+        return run
+    unfinished_items = [
+        item
+        for item in run.items
+        if item.status
+        in {
+            BenchmarkRunItemStatus.PENDING.value,
+            BenchmarkRunItemStatus.RUNNING.value,
+        }
+    ]
+    if (
+        run.status == BenchmarkRunStatus.ERROR.value
+        and run.report_error is not None
+        and not unfinished_items
+    ):
+        return run
+    completed_at = run.completed_at or datetime.datetime.now(datetime.timezone.utc)
+    diagnostic = run.report_error or error_message
+    run.status = BenchmarkRunStatus.ERROR.value
+    run.report_error = diagnostic
+    run.completed_at = completed_at
+    for item in unfinished_items:
+        item.status = BenchmarkRunItemStatus.ERROR.value
+        item.error_message = item.error_message or diagnostic
+        item.completed_at = completed_at
+    run.completed_items = sum(
+        item.status == BenchmarkRunItemStatus.COMPLETED.value for item in run.items
+    )
+    run.failed_items = sum(
+        item.status == BenchmarkRunItemStatus.ERROR.value for item in run.items
+    )
+    db_session.commit()
+    return run
+
+
+def cancel_benchmark_run(db_session: Session, run_id: int) -> BenchmarkRun | None:
+    run = get_benchmark_run_for_update(db_session, run_id)
+    if run is None or run.status in {
         BenchmarkRunStatus.COMPLETED.value,
         BenchmarkRunStatus.ERROR.value,
         BenchmarkRunStatus.CANCELLED.value,
     }:
-        return
+        return run
     now = datetime.datetime.now(datetime.timezone.utc)
     run.status = BenchmarkRunStatus.CANCELLED.value
     run.completed_at = now
@@ -212,6 +298,7 @@ def cancel_benchmark_run(db_session: Session, run: BenchmarkRun) -> None:
             item.status = BenchmarkRunItemStatus.CANCELLED.value
             item.completed_at = now
     db_session.commit()
+    return run
 
 
 def add_benchmark_judgment(

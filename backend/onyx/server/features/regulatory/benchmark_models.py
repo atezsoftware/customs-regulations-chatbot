@@ -86,6 +86,7 @@ class BenchmarkQuestionSnapshot(BaseModel):
 
 class BenchmarkModelSelection(BaseModel):
     provider: str = Field(min_length=1, max_length=200)
+    provider_id: int | None = Field(default=None, gt=0)
     model_id: str = Field(min_length=1, max_length=500)
 
 
@@ -143,6 +144,7 @@ class BenchmarkJudgmentSnapshot(BaseModel):
 class BenchmarkRunItemSnapshot(BaseModel):
     id: int
     provider: str
+    provider_id: int | None
     model_id: str
     question_id: int
     question_prompt: str
@@ -175,6 +177,7 @@ class BenchmarkRunItemSnapshot(BaseModel):
         return cls(
             id=item.id,
             provider=item.provider,
+            provider_id=item.provider_id,
             model_id=item.model_id,
             question_id=item.question_id,
             question_prompt=item.question.prompt,
@@ -211,6 +214,7 @@ class BenchmarkRunItemSnapshot(BaseModel):
 
 class BenchmarkModelAggregate(BaseModel):
     provider: str
+    provider_id: int | None
     model_id: str
     item_count: int
     completed_count: int
@@ -228,6 +232,7 @@ class BenchmarkRunSnapshot(BaseModel):
     label: str | None
     status: str
     judge_provider: str
+    judge_provider_id: int | None
     judge_model: str
     deep_research: bool
     total_items: int
@@ -246,11 +251,13 @@ class BenchmarkRunSnapshot(BaseModel):
 
 
 def benchmark_run_snapshot(run: BenchmarkRun) -> BenchmarkRunSnapshot:
-    grouped: dict[tuple[str, str], list[BenchmarkRunItem]] = {}
+    grouped: dict[tuple[str, int | None, str], list[BenchmarkRunItem]] = {}
     for item in run.items:
-        grouped.setdefault((item.provider, item.model_id), []).append(item)
+        grouped.setdefault((item.provider, item.provider_id, item.model_id), []).append(
+            item
+        )
     aggregates: list[BenchmarkModelAggregate] = []
-    for (provider, model_id), items in grouped.items():
+    for (provider, provider_id, model_id), items in grouped.items():
         scores = [item.judgment.overall_score for item in items if item.judgment]
         token_values = [
             item.total_tokens for item in items if item.total_tokens is not None
@@ -274,6 +281,7 @@ def benchmark_run_snapshot(run: BenchmarkRun) -> BenchmarkRunSnapshot:
         aggregates.append(
             BenchmarkModelAggregate(
                 provider=provider,
+                provider_id=provider_id,
                 model_id=model_id,
                 item_count=len(items),
                 completed_count=sum(item.status == "completed" for item in items),
@@ -299,6 +307,7 @@ def benchmark_run_snapshot(run: BenchmarkRun) -> BenchmarkRunSnapshot:
         label=run.label,
         status=run.status,
         judge_provider=run.judge_provider,
+        judge_provider_id=run.judge_provider_id,
         judge_model=run.judge_model,
         deep_research=run.deep_research,
         total_items=run.total_items,

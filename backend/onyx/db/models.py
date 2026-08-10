@@ -5809,6 +5809,7 @@ class BenchmarkRun(Base):
         Text, nullable=False, default=BenchmarkRunStatus.PENDING.value
     )
     judge_provider: Mapped[str] = mapped_column(Text, nullable=False)
+    judge_provider_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     judge_model: Mapped[str] = mapped_column(Text, nullable=False)
     deep_research: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
@@ -5855,6 +5856,7 @@ class BenchmarkRunItem(Base):
         ForeignKey("benchmark_run.id", ondelete="CASCADE"), nullable=False
     )
     provider: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     model_id: Mapped[str] = mapped_column(Text, nullable=False)
     question_id: Mapped[int] = mapped_column(
         ForeignKey("benchmark_question.id", ondelete="RESTRICT"), nullable=False
