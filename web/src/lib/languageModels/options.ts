@@ -137,9 +137,20 @@ export function buildModelProviderLookup(
   llmProviders: LLMProviderDescriptor[] | undefined
 ): Map<string, string> {
   const map = new Map<string, string>();
+  const ambiguousIdentifiers = new Set<string>();
+  const addProvider = (identifier: string, provider: string) => {
+    if (ambiguousIdentifiers.has(identifier)) return;
+    const existingProvider = map.get(identifier);
+    if (existingProvider && existingProvider !== provider) {
+      map.delete(identifier);
+      ambiguousIdentifiers.add(identifier);
+      return;
+    }
+    map.set(identifier, provider);
+  };
   for (const opt of buildLlmOptions(llmProviders)) {
-    map.set(opt.modelName, opt.provider);
-    map.set(opt.displayName, opt.provider);
+    addProvider(opt.modelName, opt.provider);
+    addProvider(opt.displayName, opt.provider);
   }
   return map;
 }
@@ -219,7 +230,9 @@ export function findModelConfigId(
   if (!llmProviders) return null;
   for (const p of llmProviders) {
     if (p.provider !== provider) continue;
-    const mc = p.model_configurations.find((m) => m.name === modelName);
+    const mc = p.model_configurations.find(
+      (m) => m.name === modelName || m.effectiveDisplayName === modelName
+    );
     if (mc?.id != null) return mc.id;
   }
   return null;

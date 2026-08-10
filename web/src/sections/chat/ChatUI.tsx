@@ -13,6 +13,7 @@ import { MultiModelResponse } from "@/app/app/message/interfaces";
 import { getMultiModelResponses } from "@/app/app/message/multiModel";
 import { SelectedModel } from "@/sections/model-selector/MultiModelSelector";
 import { buildModelProviderLookup } from "@/lib/languageModels/options";
+import { resolveMessageModelProvenance } from "@/lib/chat/modelProvenance";
 import DynamicBottomSpacer from "@/components/chat/DynamicBottomSpacer";
 import {
   useCurrentMessageHistory,
@@ -255,12 +256,18 @@ const ChatUI = React.memo(
                 return null;
               }
 
+              const modelProvenance = resolveMessageModelProvenance(
+                message,
+                modelProviderLookup
+              );
               const chatStateData = {
                 agent: liveAgent,
                 docs: message.documents ?? emptyDocs,
                 citations: message.citations,
                 setPresentingDocument,
-                overriddenModel: llmManager.currentLlm?.modelName,
+                overriddenModel: modelProvenance?.modelName,
+                modelDisplayName: modelProvenance?.displayName,
+                overriddenModelProvider: modelProvenance?.provider,
                 researchType: message.researchType,
               };
 

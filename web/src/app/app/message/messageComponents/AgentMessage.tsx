@@ -77,6 +77,9 @@ function arePropsEqual(
     prev.chatState.docs === next.chatState.docs &&
     prev.chatState.citations === next.chatState.citations &&
     prev.chatState.overriddenModel === next.chatState.overriddenModel &&
+    prev.chatState.modelDisplayName === next.chatState.modelDisplayName &&
+    prev.chatState.overriddenModelProvider ===
+      next.chatState.overriddenModelProvider &&
     prev.chatState.researchType === next.chatState.researchType &&
     prev.otherMessagesCanSwitchTo === next.otherMessagesCanSwitchTo &&
     prev.onRegenerate === next.onRegenerate &&
@@ -185,6 +188,8 @@ const AgentMessage = React.memo(function AgentMessage({
       chatState.agent,
       chatState.setPresentingDocument,
       chatState.overriddenModel,
+      chatState.modelDisplayName,
+      chatState.overriddenModelProvider,
       chatState.researchType,
       mergedCitations,
       citationChunkMap,
@@ -383,6 +388,7 @@ const AgentMessage = React.memo(function AgentMessage({
           parentMessage={parentMessage}
           llmManager={llmManager}
           currentModelName={chatState.overriddenModel}
+          modelDisplayName={chatState.modelDisplayName}
           currentModelProvider={chatState.overriddenModelProvider}
           citations={citations}
           documentMap={documentMap}

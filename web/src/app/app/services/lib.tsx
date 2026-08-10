@@ -46,6 +46,21 @@ export async function updateLlmOverrideForChatSession(
   return response;
 }
 
+export async function persistLlmOverrideForChatSession(
+  chatSessionId: string,
+  newAlternateModel: string
+): Promise<void> {
+  const response = await updateLlmOverrideForChatSession(
+    chatSessionId,
+    newAlternateModel
+  );
+  if (!response.ok) {
+    throw new Error(
+      `Failed to persist selected chat model: ${response.status}`
+    );
+  }
+}
+
 export async function updateTemperatureOverrideForChatSession(
   chatSessionId: string,
   newTemperature: number

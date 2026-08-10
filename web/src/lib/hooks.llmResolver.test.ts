@@ -1,7 +1,9 @@
 import {
   getDefaultLlmDescriptor,
   getValidLlmDescriptorForProviders,
+  shouldClearManualLlmForSessionChange,
 } from "@/lib/hooks";
+import type { ChatSession } from "@/app/app/interfaces";
 import type { MinimalAgent } from "@/lib/agents/types";
 import {
   getProviderOverrideForAgent,
@@ -11,6 +13,41 @@ import { LLMProviderDescriptor } from "@/lib/languageModels/types";
 import { makeProvider } from "@tests/setup/llmProviderTestUtils";
 
 describe("LLM resolver helpers", () => {
+  test("preserves a manual model when a newly bound session confirms it", () => {
+    const manualModel = {
+      name: "OpenRouter",
+      provider: "openrouter",
+      modelName: "openai/gpt-5.2",
+    };
+    const nextSession = {
+      id: "new-chat",
+      current_alternate_model: "OpenRouter__openrouter__openai/gpt-5.2",
+    } as ChatSession;
+
+    expect(
+      shouldClearManualLlmForSessionChange(
+        "previous-chat",
+        nextSession,
+        manualModel
+      )
+    ).toBe(false);
+  });
+
+  test("clears a manual model when navigating to a session with another model", () => {
+    const nextSession = {
+      id: "other-chat",
+      current_alternate_model: "OpenAI__openai__gpt-4.1",
+    } as ChatSession;
+
+    expect(
+      shouldClearManualLlmForSessionChange("previous-chat", nextSession, {
+        name: "OpenRouter",
+        provider: "openrouter",
+        modelName: "openai/gpt-5.2",
+      })
+    ).toBe(true);
+  });
+
   test("uses provider type for a nameless provider", () => {
     const providers: LLMProviderDescriptor[] = [
       makeProvider({

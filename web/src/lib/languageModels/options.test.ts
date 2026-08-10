@@ -1,4 +1,9 @@
-import { buildLlmOptions, llmOptionKey } from "@/lib/languageModels/options";
+import {
+  buildLlmOptions,
+  buildModelProviderLookup,
+  findModelConfigId,
+  llmOptionKey,
+} from "@/lib/languageModels/options";
 import { structureValue } from "@/lib/languageModels/utils";
 import type {
   LLMProviderDescriptor,
@@ -106,5 +111,34 @@ describe("buildLlmOptions", () => {
     expect(buildLlmOptions(providers, undefined, true)).toEqual([
       expect.objectContaining({ modelName: "hidden-model" }),
     ]);
+  });
+});
+
+describe("findModelConfigId", () => {
+  it("resolves a persisted display name for historical message regeneration", () => {
+    const configuredModel = {
+      ...makeModelConfiguration(11, "openai/gpt-5.2"),
+      effectiveDisplayName: "GPT-5.2",
+    };
+    const providers = [
+      makeProvider(1, "OpenRouter", "openrouter", [configuredModel]),
+    ];
+
+    expect(findModelConfigId(providers, "openrouter", "GPT-5.2")).toBe(11);
+  });
+});
+
+describe("buildModelProviderLookup", () => {
+  it("does not guess a provider when the same model exists across provider types", () => {
+    const providers = [
+      makeProvider(1, "OpenAI", "openai", [
+        makeModelConfiguration(11, "shared-model"),
+      ]),
+      makeProvider(2, "OpenRouter", "openrouter", [
+        makeModelConfiguration(22, "shared-model"),
+      ]),
+    ];
+
+    expect(buildModelProviderLookup(providers).has("shared-model")).toBe(false);
   });
 });

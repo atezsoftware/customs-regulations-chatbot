@@ -189,7 +189,13 @@ export default function SharedChatDisplay({
                           // Shared payload carries the model as `modelDisplayName`,
                           // not `overridden_model`. Surface it in the read-only footer.
                           overriddenModel:
-                            message.modelDisplayName ?? undefined,
+                            message.overridden_model ??
+                            message.modelDisplayName ??
+                            undefined,
+                          modelDisplayName:
+                            message.modelDisplayName ??
+                            message.overridden_model ??
+                            undefined,
                           overriddenModelProvider: message.modelDisplayName
                             ? modelProviderLookup.get(message.modelDisplayName)
                             : undefined,

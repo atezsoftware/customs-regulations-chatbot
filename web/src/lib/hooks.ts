@@ -19,6 +19,7 @@ import { SourceMetadata } from "./search/interfaces";
 import {
   getProviderOverrideForAgent,
   parseLlmDescriptor,
+  structureValue,
 } from "@/lib/languageModels/utils";
 import { ChatSession } from "@/app/app/interfaces";
 import { Credential } from "./connectors/credentials";
@@ -400,6 +401,24 @@ export interface LlmDescriptor {
   modelName: string;
 }
 
+export function shouldClearManualLlmForSessionChange(
+  previousDefinedSessionId: string | undefined,
+  nextSession: ChatSession | undefined,
+  manualLlm: LlmDescriptor
+): boolean {
+  if (
+    !nextSession ||
+    previousDefinedSessionId === undefined ||
+    previousDefinedSessionId === nextSession.id
+  ) {
+    return false;
+  }
+  return (
+    nextSession.current_alternate_model !==
+    structureValue(manualLlm.name, manualLlm.provider, manualLlm.modelName)
+  );
+}
+
 export interface LlmManager {
   currentLlm: LlmDescriptor;
   updateCurrentLlm: (newOverride: LlmDescriptor) => void;
@@ -638,24 +657,31 @@ export function useLlmManager(
     prevAgentIdRef.current = liveAgent?.id;
   }, [liveAgent?.id]);
 
-  // Clear manual override when arriving at a *different* existing session
-  // from any previously-seen defined session. Tracks only the last
-  // *defined* session id so a round-trip through new-chat (A → undefined
-  // → B) still resets, while A → undefined (new-chat) preserves it.
+  // Clear a manual override only when the destination session specifies a
+  // different model. A newly-created session binds the just-selected model,
+  // so its A → new-chat → B transition must preserve that selection.
   const prevDefinedSessionIdRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     const nextId = currentChatSession?.id;
     if (
-      nextId !== undefined &&
-      prevDefinedSessionIdRef.current !== undefined &&
-      nextId !== prevDefinedSessionIdRef.current
+      shouldClearManualLlmForSessionChange(
+        prevDefinedSessionIdRef.current,
+        currentChatSession,
+        manualLlm
+      )
     ) {
       setUserHasManuallyOverriddenLLM(false);
     }
     if (nextId !== undefined) {
       prevDefinedSessionIdRef.current = nextId;
     }
-  }, [currentChatSession?.id]);
+  }, [
+    currentChatSession?.id,
+    currentChatSession?.current_alternate_model,
+    manualLlm.name,
+    manualLlm.provider,
+    manualLlm.modelName,
+  ]);
 
   function getValidLlmDescriptor(
     modelName: string | null | undefined

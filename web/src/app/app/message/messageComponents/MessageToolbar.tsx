@@ -31,6 +31,7 @@ import { useVoiceMode } from "@/providers/VoiceModeProvider";
 import { useVoiceStatus } from "@/hooks/useVoiceStatus";
 import { findModelConfigId } from "@/lib/languageModels/options";
 import { getModelIcon } from "@/lib/languageModels";
+import { formatModelProvenanceLabel } from "@/lib/chat/modelProvenance";
 
 interface SouurcesTagWrapperProps {
   citations: StreamingCitation[];
@@ -113,6 +114,7 @@ export interface MessageToolbarProps {
   parentMessage?: Message | null;
   llmManager: LlmManager | null;
   currentModelName?: string;
+  modelDisplayName?: string;
   /** Provider slug for `currentModelName`, used to resolve the model icon in
    * the read-only footer chip shown when there's no `llmManager`. */
   currentModelProvider?: string;
@@ -138,6 +140,7 @@ export default function MessageToolbar({
   parentMessage,
   llmManager,
   currentModelName,
+  modelDisplayName,
   currentModelProvider,
   citations,
   documentMap,
@@ -159,6 +162,7 @@ export default function MessageToolbar({
   const isTTSActiveForThisMessage =
     (isTTSPlaying || isAwaitingAutoPlaybackStart) &&
     activeMessageNodeId === nodeId;
+  const provenanceModelName = modelDisplayName ?? currentModelName;
 
   // Feedback modal state and handlers
   const { handleFeedbackChange } = useFeedbackController();
@@ -297,17 +301,19 @@ export default function MessageToolbar({
               />
             )}
 
-            {/* Read-only model label for the shared view: no llmManager to
-                power the interactive selector, so surface which model answered. */}
-            {!llmManager && currentModelName && (
+            {provenanceModelName && (
               <OpenButton
                 disabled
                 icon={getModelIcon(
                   currentModelProvider ?? "",
-                  currentModelName
+                  currentModelName ?? provenanceModelName
                 )}
+                data-testid="AgentMessage/model-provenance"
               >
-                {currentModelName}
+                {formatModelProvenanceLabel(
+                  currentModelProvider,
+                  provenanceModelName
+                )}
               </OpenButton>
             )}
 
@@ -322,19 +328,11 @@ export default function MessageToolbar({
                       llmManager.currentLlm.provider,
                       currentModelName ?? llmManager.currentLlm.modelName
                     )}
-                    renderTrigger={() => {
-                      const rawName =
-                        currentModelName ?? llmManager!.currentLlm.modelName;
-                      const mc = llmManager!.llmProviders
-                        ?.flatMap((p) => p.model_configurations)
-                        .find((m) => m.name === rawName);
-                      const displayName = mc?.effectiveDisplayName ?? rawName;
-                      return (
-                        <OpenButton icon={SvgRefreshCw} foldable>
-                          {displayName}
-                        </OpenButton>
-                      );
-                    }}
+                    renderTrigger={() => (
+                      <OpenButton icon={SvgRefreshCw} foldable>
+                        Regenerate
+                      </OpenButton>
+                    )}
                     onChange={(opt) => {
                       const regenerator = onRegenerate({
                         messageId,

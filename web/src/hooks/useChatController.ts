@@ -4,7 +4,7 @@ import {
   buildChatUrl,
   getAvailableContextTokens,
   nameChatSession,
-  updateLlmOverrideForChatSession,
+  persistLlmOverrideForChatSession,
 } from "@/app/app/services/lib";
 import { getMaxSelectedDocumentTokens } from "@/lib/projects/svc";
 import { DEFAULT_CONTEXT_TOKENS } from "@/lib/constants";
@@ -489,6 +489,12 @@ export default function useChatController({
       // For pages like NRF where existingChatSessionId is always null, we need to check if
       // we already have a session from a previous message
       const isNewSession = existingChatSessionId === null && !currentSessionId;
+      const finalLLM = modelOverride || llmManager.currentLlm;
+      const serializedSelectedModel = structureValue(
+        finalLLM.name || "",
+        finalLLM.provider || "",
+        finalLLM.modelName || ""
+      );
 
       const searchParamBasedChatSessionName =
         searchParams?.get(SEARCH_PARAM_NAMES.TITLE) || null;
@@ -503,36 +509,27 @@ export default function useChatController({
           searchParamBasedChatSessionName,
           projectId ? parseInt(projectId) : null
         );
-
-        // Optimistically add the new chat session to the sidebar cache
-        // This ensures "New Chat" appears immediately, even before any messages are saved
-        addPendingChatSession({
-          chatSessionId: currChatSessionId,
-          personaId: liveAgent?.id || 0,
-          projectId: projectId ? parseInt(projectId) : null,
-        });
       } else {
         // Use the existing session ID from props or from the store
         currChatSessionId =
           existingChatSessionId || (currentSessionId as string);
       }
       frozenSessionId = currChatSessionId;
-      // update the selected model for the chat session if one is specified so that
-      // it persists across page reloads. Do not `await` here so that the message
-      // request can continue and this will just happen in the background.
-      // NOTE: only set the model override for the chat session once we send a
-      // message with it. If the user switches models and then starts a new
-      // chat session, it is unexpected for that model to be used when they
-      // return to this session the next day.
-      let finalLLM = modelOverride || llmManager.currentLlm;
-      updateLlmOverrideForChatSession(
+      // Navigation triggers a fresh session read. Complete this write first so
+      // that read cannot resolve the selector back to the default model.
+      await persistLlmOverrideForChatSession(
         currChatSessionId,
-        structureValue(
-          finalLLM.name || "",
-          finalLLM.provider || "",
-          finalLLM.modelName || ""
-        )
+        serializedSelectedModel
       );
+
+      if (isNewSession) {
+        addPendingChatSession({
+          chatSessionId: currChatSessionId,
+          personaId: liveAgent?.id || 0,
+          projectId: projectId ? parseInt(projectId) : null,
+          currentAlternateModel: serializedSelectedModel,
+        });
+      }
 
       // mark the session as the current session
       updateStatesWithNewSessionId(currChatSessionId);
@@ -654,6 +651,13 @@ export default function useChatController({
             return node;
           });
         }
+      }
+
+      if (!isMultiModel) {
+        // Freeze provenance on the answer itself; changing the input selector
+        // later must not relabel historical assistant messages.
+        initialAgentNode.overridden_model = finalLLM.modelName;
+        initialAgentNode.modelDisplayName = finalLLM.modelName;
       }
 
       // make messages appear + clear input bar
@@ -827,7 +831,12 @@ export default function useChatController({
               files: finalMessage?.files || aiMessageImages || [],
               toolCall: finalMessage?.tool_call || toolCall,
               stackTrace: stackTrace,
-              overridden_model: finalMessage?.overridden_model,
+              overridden_model:
+                finalMessage?.overridden_model ??
+                initialAgentNode.overridden_model,
+              modelDisplayName:
+                finalMessage?.model_display_name ??
+                initialAgentNode.modelDisplayName,
               stopReason: stopReason,
               packets: packets,
               packetCount: packets.length,

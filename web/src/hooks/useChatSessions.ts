@@ -24,10 +24,39 @@ interface ChatSessionsResponse {
   has_more: boolean;
 }
 
+export function isPendingChatSessionConfirmed(
+  pending: ChatSession,
+  fetched: ChatSession | undefined
+): boolean {
+  return (
+    fetched?.id === pending.id &&
+    fetched.current_alternate_model === pending.current_alternate_model
+  );
+}
+
+export function mergeFetchedAndPendingChatSessions(
+  fetchedSessions: ChatSession[],
+  pendingSessions: ChatSession[]
+): ChatSession[] {
+  const fetchedById = new Map(
+    fetchedSessions.map((session) => [session.id, session])
+  );
+  const unconfirmedPending = pendingSessions.filter(
+    (pending) =>
+      !isPendingChatSessionConfirmed(pending, fetchedById.get(pending.id))
+  );
+  const shadowedIds = new Set(unconfirmedPending.map((pending) => pending.id));
+  return [
+    ...unconfirmedPending,
+    ...fetchedSessions.filter((fetched) => !shadowedIds.has(fetched.id)),
+  ];
+}
+
 export interface PendingChatSessionParams {
   chatSessionId: string;
   personaId: number;
   projectId?: number | null;
+  currentAlternateModel: string;
 }
 
 interface UseChatSessionsOutput {
@@ -218,9 +247,11 @@ export default function useChatSessions(): UseChatSessionsOutput {
   // Clean up pending sessions that now appear in fetched data
   // (they now have messages and the server returns them)
   useEffect(() => {
-    const fetchedIds = new Set(allFetchedSessions.map((s) => s.id));
+    const fetchedById = new Map(
+      allFetchedSessions.map((session) => [session.id, session])
+    );
     pendingSessions.forEach((pending) => {
-      if (fetchedIds.has(pending.id)) {
+      if (isPendingChatSessionConfirmed(pending, fetchedById.get(pending.id))) {
         pendingSessionsStore.remove(pending.id);
       }
     });
@@ -228,17 +259,11 @@ export default function useChatSessions(): UseChatSessionsOutput {
 
   // Merge fetched sessions with pending sessions.
   // This ensures pending sessions persist across SWR revalidations.
-  const chatSessions = useMemo(() => {
-    const fetchedIds = new Set(allFetchedSessions.map((s) => s.id));
-
-    // Get pending sessions that are not yet in fetched data
-    const remainingPending = pendingSessions.filter(
-      (pending) => !fetchedIds.has(pending.id)
-    );
-
-    // Pending sessions go first (most recent), then fetched sessions
-    return [...remainingPending, ...allFetchedSessions];
-  }, [allFetchedSessions, pendingSessions]);
+  const chatSessions = useMemo(
+    () =>
+      mergeFetchedAndPendingChatSessions(allFetchedSessions, pendingSessions),
+    [allFetchedSessions, pendingSessions]
+  );
 
   const currentChatSessionId = appFocus.isChat() ? appFocus.getId() : null;
   const currentChatSession =
@@ -252,7 +277,12 @@ export default function useChatSessions(): UseChatSessionsOutput {
   // Add a pending chat session that will persist across SWR revalidations.
   // The session will be automatically removed once it appears in the server response.
   const addPendingChatSession = useCallback(
-    ({ chatSessionId, personaId, projectId }: PendingChatSessionParams) => {
+    ({
+      chatSessionId,
+      personaId,
+      projectId,
+      currentAlternateModel,
+    }: PendingChatSessionParams) => {
       // Don't add sessions that belong to a project
       if (projectId != null) return;
 
@@ -268,7 +298,7 @@ export default function useChatSessions(): UseChatSessionsOutput {
         time_updated: now,
         shared_status: ChatSessionSharedStatus.Private,
         project_id: projectId ?? null,
-        current_alternate_model: "",
+        current_alternate_model: currentAlternateModel,
         current_temperature_override: null,
         current_reasoning_effort_override: null,
       });
