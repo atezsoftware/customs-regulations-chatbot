@@ -102,7 +102,7 @@ function getRegulatoryCitationLabel(doc: OnyxDocument): string | null {
       : semanticHeadingParts.join(" — ");
 
   const articleMatches = Array.from(
-    headingPath.matchAll(/\b(GEÇİCİ\s+)?MADDE\s+(\d+[A-Z]?)\b/giu)
+    headingPath.matchAll(/\b(GEÇİCİ\s+)?MADDE\s+(\d+[A-Z]?)\b/gi)
   );
   const article = articleMatches[articleMatches.length - 1];
   if (!article || !documentTitle) return null;
