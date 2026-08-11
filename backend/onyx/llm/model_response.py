@@ -41,6 +41,7 @@ class Usage(BaseModel):
     total_tokens: int
     cache_creation_input_tokens: int
     cache_read_input_tokens: int
+    cost: float | None = None
 
 
 class ModelResponseStream(BaseModel):
@@ -166,6 +167,7 @@ def _usage_from_usage_data(usage_data: dict[str, Any]) -> Usage:
             (usage_data.get("prompt_tokens_details") or {}).get("cached_tokens"),
         )
         or 0,
+        cost=usage_data.get("cost"),
     )
 
 

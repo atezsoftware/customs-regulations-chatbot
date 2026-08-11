@@ -599,25 +599,36 @@ def test_benchmark_task_uses_late_ack_worker_loss_redelivery_and_run_lease() -> 
     lock.owned.return_value = True
     cache = MagicMock()
     cache.lock.return_value = lock
-    db_session = MagicMock()
-    session_context = MagicMock()
-    session_context.__enter__.return_value = db_session
+    job = MagicMock()
+    client = MagicMock()
+    client.submit.return_value = job
     with (
         patch.object(benchmark_tasks, "get_cache_backend", return_value=cache),
         patch.object(benchmark_tasks, "_RunLeaseHeartbeat") as heartbeat_type,
+        patch.object(benchmark_tasks, "_prepare_benchmark_items", return_value=[34]),
+        patch.object(benchmark_tasks, "_run_benchmark_items", return_value=False),
         patch.object(
             benchmark_tasks,
-            "get_session_with_current_tenant",
-            return_value=session_context,
+            "_get_benchmark_run_status",
+            return_value=BenchmarkRunStatus.RUNNING.value,
         ),
-        patch("onyx.regulatory.benchmark.runner.run_benchmark") as run_benchmark,
+        patch.object(benchmark_tasks, "SimpleJobClient", return_value=client),
+        patch.object(benchmark_tasks, "_monitor_finalization_job") as monitor,
     ):
         benchmark_tasks.run_regulatory_benchmark_task.run(run_id=12, tenant_id="tenant")
 
     cache.lock.assert_called_once()
     heartbeat_type.return_value.start.assert_called_once_with()
     heartbeat_type.return_value.ensure_owned.assert_called_once_with()
-    run_benchmark.assert_called_once_with(db_session, 12)
+    client.submit.assert_called_once_with(
+        benchmark_tasks._execute_benchmark_finalization,
+        12,
+        "tenant",
+        False,
+    )
+    monitor.assert_called_once_with(
+        job, run_id=12, heartbeat=heartbeat_type.return_value
+    )
     lock.release.assert_called_once_with()
 
 
@@ -657,10 +668,14 @@ def test_benchmark_task_persists_startup_crash_and_terminalizes_items() -> None:
     db_session = MagicMock()
     session_context = MagicMock()
     session_context.__enter__.return_value = db_session
-
     with (
         patch.object(benchmark_tasks, "get_cache_backend", return_value=cache),
         patch.object(benchmark_tasks, "_RunLeaseHeartbeat"),
+        patch.object(
+            benchmark_tasks,
+            "_prepare_benchmark_items",
+            side_effect=RuntimeError("persona selection exploded"),
+        ),
         patch.object(
             benchmark_tasks,
             "get_session_with_current_tenant",
@@ -669,10 +684,6 @@ def test_benchmark_task_persists_startup_crash_and_terminalizes_items() -> None:
         patch(
             "onyx.db.regulatory_benchmark.get_benchmark_run_for_update",
             return_value=run,
-        ),
-        patch(
-            "onyx.regulatory.benchmark.runner.run_benchmark",
-            side_effect=RuntimeError("persona selection exploded"),
         ),
         pytest.raises(RuntimeError, match="persona selection exploded"),
     ):

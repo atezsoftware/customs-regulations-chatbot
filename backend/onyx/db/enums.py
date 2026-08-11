@@ -760,6 +760,7 @@ class BenchmarkRunFailureCode(str, PyEnum):
     DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
     WORKER_UNAVAILABLE = "worker_unavailable"
     DISPATCH_FAILED = "dispatch_failed"
+    EXECUTION_TIMEOUT = "execution_timeout"
     EXECUTION_FAILED = "execution_failed"
 
 

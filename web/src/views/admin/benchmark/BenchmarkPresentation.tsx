@@ -85,8 +85,13 @@ export const modelIdentityLabel = (
 export const formatPercent = (value: number | null) =>
   value == null ? "—" : `${Math.round(value * 100)}%`;
 
-export const formatCost = (value: number | null) =>
-  value == null ? "Unavailable" : `$${(value / 100).toFixed(4)}`;
+export const formatCost = (value: number | null) => {
+  if (value == null) return "Unavailable";
+  const dollars = value / 100;
+  return dollars > 0 && dollars < 0.0001
+    ? "<$0.0001"
+    : `$${dollars.toFixed(4)}`;
+};
 
 export const formatDuration = (value: number | null) =>
   value == null ? "—" : `${(value / 1000).toFixed(1)}s`;

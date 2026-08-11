@@ -20,6 +20,13 @@ import {
   startBenchmarkRun,
 } from "@/lib/regulatory/benchmark";
 import BenchmarkPage from "@/views/admin/BenchmarkPage";
+import { formatCost } from "@/views/admin/benchmark/BenchmarkPresentation";
+
+test("tiny non-zero benchmark costs are not rendered as zero", () => {
+  expect(formatCost(0.001)).toBe("<$0.0001");
+  expect(formatCost(0)).toBe("$0.0000");
+  expect(formatCost(null)).toBe("Unavailable");
+});
 
 let mockDocumentSets: Array<{ id: number; name: string }> = [];
 

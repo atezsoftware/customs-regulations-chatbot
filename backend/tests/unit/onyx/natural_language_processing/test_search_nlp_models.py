@@ -85,9 +85,8 @@ async def test_openai_embedding(
 
 
 @pytest.mark.asyncio
-async def test_litellm_embedding_posts_openrouter_compatible_request(
-    sample_embeddings: list[list[float]],
-) -> None:
+async def test_litellm_embedding_posts_openrouter_compatible_request() -> None:
+    expected_embeddings = [[0.1] * 1024, [0.2] * 1024]
     with patch("httpx.AsyncClient") as mock_async_client:
         client = AsyncMock(spec=AsyncClient)
         mock_async_client.return_value = client
@@ -95,7 +94,7 @@ async def test_litellm_embedding_posts_openrouter_compatible_request(
         response.json.return_value = {
             "data": [
                 {"index": index, "embedding": embedding}
-                for index, embedding in enumerate(sample_embeddings)
+                for index, embedding in enumerate(expected_embeddings)
             ]
         }
         client.post.return_value = response
@@ -110,16 +109,18 @@ async def test_litellm_embedding_posts_openrouter_compatible_request(
                 texts=["test1", "test2"],
                 model_name="openai/text-embedding-3-small",
                 text_type=EmbedTextType.QUERY,
+                reduced_dimension=1024,
             )
         finally:
             await embedding.aclose()
 
-    assert result == sample_embeddings
+    assert result == expected_embeddings
     client.post.assert_awaited_once_with(
         "https://openrouter.ai/api/v1/embeddings",
         json={
             "model": "openai/text-embedding-3-small",
             "input": ["test1", "test2"],
+            "dimensions": 1024,
         },
         headers={"Authorization": "Bearer openrouter-key"},
     )
@@ -192,14 +193,48 @@ async def test_proxy_embedding_rejects_invalid_response_indexes(
     )
     response = MagicMock()
     response.json.return_value = {"data": response_data}
-    embedding.http_client.post = AsyncMock(return_value=response)
 
     try:
-        with pytest.raises(RuntimeError, match="EmbeddingProvider.OPENROUTER"):
+        with (
+            patch.object(
+                embedding.http_client,
+                "post",
+                new=AsyncMock(return_value=response),
+            ),
+            pytest.raises(RuntimeError, match="EmbeddingProvider.OPENROUTER"),
+        ):
             await embedding.embed(
                 texts=["test1", "test2"],
                 model_name="openai/text-embedding-3-small",
                 text_type=EmbedTextType.QUERY,
+            )
+    finally:
+        await embedding.aclose()
+
+
+@pytest.mark.asyncio
+async def test_proxy_embedding_rejects_unexpected_dimension() -> None:
+    embedding = CloudEmbedding(
+        "openrouter-key",
+        EmbeddingProvider.OPENROUTER,
+    )
+    response = MagicMock()
+    response.json.return_value = {"data": [{"index": 0, "embedding": [0.1, 0.2]}]}
+
+    try:
+        with (
+            patch.object(
+                embedding.http_client,
+                "post",
+                new=AsyncMock(return_value=response),
+            ),
+            pytest.raises(RuntimeError, match="dimension"),
+        ):
+            await embedding.embed(
+                texts=["test"],
+                model_name="google/gemini-embedding-2-preview",
+                text_type=EmbedTextType.QUERY,
+                reduced_dimension=1024,
             )
     finally:
         await embedding.aclose()

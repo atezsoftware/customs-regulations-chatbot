@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -42,7 +44,8 @@ def test_capture_collects_generation_usage_and_aliases() -> None:
                     "prompt_tokens": 17,
                     "completion_tokens": 5,
                     "cache_read_input_tokens": 3,
-                }
+                    "cost": 0.000123,
+                },
             )
         )
 
@@ -53,6 +56,7 @@ def test_capture_collects_generation_usage_and_aliases() -> None:
     assert usage.input_tokens == 17
     assert usage.output_tokens == 5
     assert usage.cache_read_tokens == 3
+    assert usage.cost_cents == 0.0123
     assert usage.flow == "chat_response"
 
 
@@ -92,6 +96,33 @@ def test_nested_capture_scopes_are_isolated() -> None:
 
     assert [usage.input_tokens for usage in outer_bucket] == [1, 3]
     assert [usage.output_tokens for usage in inner_bucket] == [2]
+
+
+def test_concurrent_capture_scopes_do_not_mix_item_usage() -> None:
+    processor = BenchmarkUsageProcessor()
+    barrier = Barrier(2)
+
+    def capture(model: str, input_tokens: int) -> list[LLMCallUsage]:
+        with benchmark_usage_capture() as bucket:
+            barrier.wait()
+            processor.on_span_end(
+                _generation_span(
+                    model=model,
+                    usage={"input_tokens": input_tokens},
+                )
+            )
+        return bucket
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(capture, "first-model", 11)
+        second = executor.submit(capture, "second-model", 22)
+
+    assert [(usage.model, usage.input_tokens) for usage in first.result()] == [
+        ("first-model", 11)
+    ]
+    assert [(usage.model, usage.input_tokens) for usage in second.result()] == [
+        ("second-model", 22)
+    ]
 
 
 def test_capture_requires_and_observes_a_real_trace() -> None:

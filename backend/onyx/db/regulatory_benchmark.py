@@ -2,7 +2,7 @@ import datetime
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from onyx.db.enums import (
@@ -41,6 +41,111 @@ def get_benchmark_question(
     db_session: Session, question_id: int
 ) -> BenchmarkQuestion | None:
     return db_session.get(BenchmarkQuestion, question_id)
+
+
+def get_benchmark_run_status(db_session: Session, run_id: int) -> str | None:
+    return db_session.scalar(
+        select(BenchmarkRun.status).where(BenchmarkRun.id == run_id)
+    )
+
+
+def get_benchmark_run_item(
+    db_session: Session, *, run_id: int, item_id: int
+) -> BenchmarkRunItem | None:
+    stmt = (
+        select(BenchmarkRunItem)
+        .where(
+            BenchmarkRunItem.id == item_id,
+            BenchmarkRunItem.run_id == run_id,
+        )
+        .options(
+            selectinload(BenchmarkRunItem.question),
+            selectinload(BenchmarkRunItem.judgment),
+        )
+    )
+    return db_session.scalars(stmt).one_or_none()
+
+
+def touch_benchmark_run_heartbeat(
+    db_session: Session, run_id: int, *, heartbeat_at: datetime.datetime
+) -> None:
+    db_session.execute(
+        update(BenchmarkRun)
+        .where(
+            BenchmarkRun.id == run_id,
+            BenchmarkRun.status == BenchmarkRunStatus.RUNNING.value,
+        )
+        .values(heartbeat_at=heartbeat_at)
+    )
+    db_session.commit()
+
+
+def claim_benchmark_run_item(
+    db_session: Session,
+    *,
+    run_id: int,
+    item_id: int,
+    started_at: datetime.datetime,
+) -> bool:
+    """Atomically fence duplicate deliveries before an expensive LLM call."""
+    claimed_id = db_session.scalar(
+        update(BenchmarkRunItem)
+        .where(
+            BenchmarkRunItem.id == item_id,
+            BenchmarkRunItem.run_id == run_id,
+            BenchmarkRunItem.status == BenchmarkRunItemStatus.PENDING.value,
+        )
+        .values(
+            status=BenchmarkRunItemStatus.RUNNING.value,
+            started_at=started_at,
+            completed_at=None,
+        )
+        .returning(BenchmarkRunItem.id)
+    )
+    db_session.commit()
+    return claimed_id is not None
+
+
+def mark_benchmark_run_item_failed(
+    db_session: Session,
+    *,
+    run_id: int,
+    item_id: int,
+    error_message: str,
+    completed_at: datetime.datetime,
+) -> bool:
+    failed_id = db_session.scalar(
+        update(BenchmarkRunItem)
+        .where(
+            BenchmarkRunItem.id == item_id,
+            BenchmarkRunItem.run_id == run_id,
+            BenchmarkRunItem.status.in_(
+                {
+                    BenchmarkRunItemStatus.PENDING.value,
+                    BenchmarkRunItemStatus.RUNNING.value,
+                }
+            ),
+        )
+        .values(
+            status=BenchmarkRunItemStatus.ERROR.value,
+            error_message=error_message,
+            completed_at=completed_at,
+        )
+        .returning(BenchmarkRunItem.id)
+    )
+    db_session.commit()
+    return failed_id is not None
+
+
+def mark_benchmark_run_report_failed(
+    db_session: Session, run_id: int, error_message: str
+) -> None:
+    db_session.execute(
+        update(BenchmarkRun)
+        .where(BenchmarkRun.id == run_id)
+        .values(report_error=error_message[:4000])
+    )
+    db_session.commit()
 
 
 def list_benchmark_questions(

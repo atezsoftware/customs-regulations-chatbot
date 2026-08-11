@@ -1,18 +1,44 @@
+import datetime
 import threading
+import time
+from collections import deque
+from dataclasses import dataclass
 
 from celery import shared_task
 
+from onyx.background.indexing.job_client import SimpleJob, SimpleJobClient
 from onyx.cache.factory import get_cache_backend
 from onyx.cache.interface import CacheLock
+from onyx.configs.app_configs import (
+    REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS,
+    REGULATORY_BENCHMARK_PARALLEL_ITEMS,
+)
 from onyx.configs.constants import OnyxCeleryTask
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.regulatory_benchmark import mark_benchmark_run_failed
+from onyx.db.enums import BenchmarkRunFailureCode, BenchmarkRunStatus
+from onyx.db.regulatory_benchmark import (
+    get_benchmark_run_status,
+    mark_benchmark_run_failed,
+    mark_benchmark_run_item_failed,
+    mark_benchmark_run_report_failed,
+    touch_benchmark_run_heartbeat,
+)
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
 _RUN_LEASE_SECONDS = 5 * 60
 _RUN_LEASE_HEARTBEAT_SECONDS = 60
+_WATCHDOG_POLL_SECONDS = 5
+_WATCHDOG_SIGTERM_GRACE_SECONDS = 10
+
+
+class BenchmarkExecutionTimeout(RuntimeError):
+    pass
+
+
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
 
 
 class _RunLeaseHeartbeat:
@@ -59,6 +85,203 @@ class _RunLeaseHeartbeat:
             self._thread.join(timeout=5)
 
 
+@dataclass(frozen=True)
+class _ActiveBenchmarkJob:
+    job: SimpleJob
+    item_id: int
+    started_at: float
+
+
+def _execute_benchmark_item(
+    run_id: int,
+    item_id: int,
+    tenant_id: str,  # noqa: ARG001
+) -> None:
+    """Child entrypoint; SimpleJob establishes tenant context and a fresh engine."""
+    from onyx.regulatory.benchmark.runner import run_benchmark_item
+
+    with get_session_with_current_tenant() as db_session:
+        run_benchmark_item(db_session, run_id, item_id)
+
+
+def _execute_benchmark_finalization(
+    run_id: int,
+    tenant_id: str,  # noqa: ARG001
+    had_execution_timeout: bool,
+) -> None:
+    from onyx.regulatory.benchmark.runner import finalize_benchmark_run
+
+    with get_session_with_current_tenant() as db_session:
+        finalize_benchmark_run(
+            db_session,
+            run_id,
+            had_execution_timeout=had_execution_timeout,
+        )
+
+
+def _prepare_benchmark_items(run_id: int) -> list[int]:
+    from onyx.regulatory.benchmark.runner import prepare_benchmark_run
+
+    with get_session_with_current_tenant() as db_session:
+        return prepare_benchmark_run(db_session, run_id)
+
+
+def _get_benchmark_run_status(run_id: int) -> str | None:
+    with get_session_with_current_tenant() as db_session:
+        return get_benchmark_run_status(db_session, run_id)
+
+
+def _touch_benchmark_run(run_id: int) -> None:
+    with get_session_with_current_tenant() as db_session:
+        touch_benchmark_run_heartbeat(db_session, run_id, heartbeat_at=_utcnow())
+
+
+def _record_item_failure(run_id: int, item_id: int, message: str) -> None:
+    with get_session_with_current_tenant() as db_session:
+        mark_benchmark_run_item_failed(
+            db_session,
+            run_id=run_id,
+            item_id=item_id,
+            error_message=message[:4000],
+            completed_at=_utcnow(),
+        )
+
+
+def _record_report_failure(run_id: int, message: str) -> None:
+    with get_session_with_current_tenant() as db_session:
+        mark_benchmark_run_report_failed(db_session, run_id, message)
+
+
+def _stop_jobs(active_jobs: dict[int, _ActiveBenchmarkJob]) -> None:
+    for active in active_jobs.values():
+        active.job.terminate_and_wait(_WATCHDOG_SIGTERM_GRACE_SECONDS)
+
+
+def _reap_job(job: SimpleJob) -> None:
+    if job.process is not None:
+        job.process.join()
+
+
+def _run_benchmark_items(
+    *,
+    run_id: int,
+    tenant_id: str,
+    item_ids: list[int],
+    heartbeat: _RunLeaseHeartbeat,
+) -> bool:
+    """Run isolated item processes with bounded parallelism and per-item deadlines."""
+    pending = deque(item_ids)
+    client = SimpleJobClient(n_workers=REGULATORY_BENCHMARK_PARALLEL_ITEMS)
+    active_jobs: dict[int, _ActiveBenchmarkJob] = {}
+    had_execution_timeout = False
+
+    try:
+        while pending or active_jobs:
+            heartbeat.ensure_owned()
+            if _get_benchmark_run_status(run_id) != BenchmarkRunStatus.RUNNING.value:
+                return had_execution_timeout
+
+            while pending and len(active_jobs) < REGULATORY_BENCHMARK_PARALLEL_ITEMS:
+                item_id = pending.popleft()
+                job = client.submit(
+                    _execute_benchmark_item,
+                    run_id,
+                    item_id,
+                    tenant_id,
+                )
+                if job is None or job.process is None:
+                    raise RuntimeError(f"Failed to spawn benchmark item {item_id}")
+                active_jobs[job.id] = _ActiveBenchmarkJob(
+                    job=job,
+                    item_id=item_id,
+                    started_at=time.monotonic(),
+                )
+
+            for job_id, active in list(active_jobs.items()):
+                if active.job.done():
+                    if active.job.status == "error":
+                        _record_item_failure(
+                            run_id,
+                            active.item_id,
+                            f"Benchmark item process failed: {active.job.exception()}",
+                        )
+                    _reap_job(active.job)
+                    del active_jobs[job_id]
+                    continue
+
+                elapsed = time.monotonic() - active.started_at
+                if elapsed <= REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS:
+                    continue
+                message = (
+                    f"Benchmark item {active.item_id} exceeded the "
+                    f"{REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS} second "
+                    "execution deadline"
+                )
+                active.job.terminate_and_wait(_WATCHDOG_SIGTERM_GRACE_SECONDS)
+                _record_item_failure(run_id, active.item_id, message)
+                del active_jobs[job_id]
+                had_execution_timeout = True
+
+            _touch_benchmark_run(run_id)
+            if pending or active_jobs:
+                time.sleep(_WATCHDOG_POLL_SECONDS)
+    finally:
+        _stop_jobs(active_jobs)
+
+    return had_execution_timeout
+
+
+def _monitor_finalization_job(
+    job: SimpleJob,
+    *,
+    run_id: int,
+    heartbeat: _RunLeaseHeartbeat,
+) -> None:
+    """Bound report generation, which can itself make an LLM call."""
+    started_at = time.monotonic()
+    while not job.done():
+        heartbeat.ensure_owned()
+        status = _get_benchmark_run_status(run_id)
+        if status is None or status == BenchmarkRunStatus.CANCELLED.value:
+            job.terminate_and_wait(_WATCHDOG_SIGTERM_GRACE_SECONDS)
+            return
+        if time.monotonic() - started_at > REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS:
+            message = (
+                "Benchmark finalization exceeded the "
+                f"{REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS} second execution deadline"
+            )
+            job.terminate_and_wait(_WATCHDOG_SIGTERM_GRACE_SECONDS)
+            if status in {
+                BenchmarkRunStatus.COMPLETED.value,
+                BenchmarkRunStatus.ERROR.value,
+            }:
+                _record_report_failure(run_id, message)
+                return
+            with get_session_with_current_tenant() as db_session:
+                mark_benchmark_run_failed(
+                    db_session,
+                    run_id,
+                    message,
+                    failure_code=BenchmarkRunFailureCode.EXECUTION_TIMEOUT,
+                )
+            raise BenchmarkExecutionTimeout(message)
+        _touch_benchmark_run(run_id)
+        time.sleep(_WATCHDOG_POLL_SECONDS)
+
+    if job.status == "error":
+        message = f"Benchmark finalization process failed: {job.exception()}"
+        if _get_benchmark_run_status(run_id) in {
+            BenchmarkRunStatus.COMPLETED.value,
+            BenchmarkRunStatus.ERROR.value,
+        }:
+            _record_report_failure(run_id, message)
+            _reap_job(job)
+            return
+        _reap_job(job)
+        raise RuntimeError(message)
+    _reap_job(job)
+
+
 @shared_task(
     name=OnyxCeleryTask.REGULATORY_BENCHMARK_RUN,
     ignore_result=True,
@@ -80,13 +303,28 @@ def run_regulatory_benchmark_task(
     heartbeat = _RunLeaseHeartbeat(lock, run_id)
     try:
         heartbeat.start()
-        # Keep worker startup limited to registering this task. The benchmark
-        # runner deliberately imports the complete production chat pipeline and
-        # should only be loaded when a run actually starts.
-        from onyx.regulatory.benchmark.runner import run_benchmark
+        item_ids = _prepare_benchmark_items(run_id)
+        had_execution_timeout = _run_benchmark_items(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            item_ids=item_ids,
+            heartbeat=heartbeat,
+        )
+        if _get_benchmark_run_status(run_id) != BenchmarkRunStatus.RUNNING.value:
+            return
 
-        with get_session_with_current_tenant() as db_session:
-            run_benchmark(db_session, run_id)
+        client = SimpleJobClient(n_workers=1)
+        job = client.submit(
+            _execute_benchmark_finalization,
+            run_id,
+            tenant_id,
+            had_execution_timeout,
+        )
+        if job is None or job.process is None:
+            raise RuntimeError(
+                f"Failed to spawn benchmark finalization for run {run_id}"
+            )
+        _monitor_finalization_job(job, run_id=run_id, heartbeat=heartbeat)
         heartbeat.ensure_owned()
     except Exception as error:
         logger.exception("Regulatory benchmark run %s crashed", run_id)

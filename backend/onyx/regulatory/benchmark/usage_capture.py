@@ -36,9 +36,10 @@ class LLMCallUsage:
     output_tokens: int
     cache_read_tokens: int
     flow: str | None = None
+    cost_cents: float | None = None
 
-    def to_dict(self) -> dict[str, str | int | None]:
-        return {
+    def to_dict(self) -> dict[str, str | int | float | None]:
+        payload: dict[str, str | int | float | None] = {
             "model": self.model,
             "provider": self.provider,
             "input_tokens": self.input_tokens,
@@ -46,6 +47,9 @@ class LLMCallUsage:
             "cache_read_tokens": self.cache_read_tokens,
             "flow": self.flow,
         }
+        if self.cost_cents is not None:
+            payload["cost_cents"] = self.cost_cents
+        return payload
 
 
 def _usage_field(usage: dict[str, Any], *names: str) -> int:
@@ -103,6 +107,11 @@ class BenchmarkUsageProcessor(TracingProcessor):
                     span_data.usage, "cache_read_input_tokens"
                 ),
                 flow=flow,
+                cost_cents=(
+                    float(span_data.usage["cost"]) * 100
+                    if span_data.usage.get("cost") is not None
+                    else None
+                ),
             )
         )
 

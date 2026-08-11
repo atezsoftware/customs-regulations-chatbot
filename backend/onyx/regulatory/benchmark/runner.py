@@ -20,7 +20,9 @@ from onyx.db.models import BenchmarkRun, BenchmarkRunItem, Persona, User, UserFi
 from onyx.db.persona import get_best_persona_id_for_user
 from onyx.db.regulatory_benchmark import (
     add_benchmark_judgment,
+    claim_benchmark_run_item,
     get_benchmark_run_for_update,
+    get_benchmark_run_item,
     refresh_benchmark_run_counts,
 )
 from onyx.db.regulatory_chunks import get_chunks_for_file
@@ -75,6 +77,9 @@ def _usage_cost(
     total_cost_cents = 0.0
     pricing_available = bool(usage_calls)
     for call in usage_calls:
+        if call.cost_cents is not None:
+            total_cost_cents += call.cost_cents
+            continue
         input_cost, output_cost = compute_cost_cents(
             call.model,
             call.provider,
@@ -424,12 +429,14 @@ def _run_item(
     item: BenchmarkRunItem,
     user: User,
     persona: Persona | None,
+    already_claimed: bool = False,
 ) -> None:
     started = time.monotonic()
-    item.status = BenchmarkRunItemStatus.RUNNING.value
-    item.started_at = _utcnow()
-    item.completed_at = None
-    db_session.commit()
+    if not already_claimed:
+        item.status = BenchmarkRunItemStatus.RUNNING.value
+        item.started_at = _utcnow()
+        item.completed_at = None
+        db_session.commit()
 
     try:
         if item.judgment is not None:
@@ -454,6 +461,13 @@ def _run_item(
             _judge_completed_item(
                 db_session, run=run, item=item, user=user, persona=persona
             )
+            db_session.refresh(run)
+            if run.status != BenchmarkRunStatus.RUNNING.value:
+                db_session.rollback()
+                reloaded_item = db_session.get(BenchmarkRunItem, item.id)
+                assert reloaded_item is not None
+                item = reloaded_item
+                return
             item.status = BenchmarkRunItemStatus.COMPLETED.value
         except Exception as judge_error:
             logger.exception("Benchmark judge failed for item %s", item.id)
@@ -620,6 +634,122 @@ def _mark_unfinished_items_error(
     return marked
 
 
+def prepare_benchmark_run(db_session: Session, run_id: int) -> list[int]:
+    """Move a queued run into execution and return its resumable item IDs."""
+    run = get_benchmark_run_for_update(db_session, run_id)
+    if run is None:
+        logger.warning("Ignoring delivery for missing benchmark run %s", run_id)
+        return []
+    if run.status not in {
+        BenchmarkRunStatus.QUEUED.value,
+        BenchmarkRunStatus.RUNNING.value,
+    }:
+        return []
+
+    user = db_session.get(User, run.created_by)
+    if user is None:
+        run.status = BenchmarkRunStatus.ERROR.value
+        run.failure_code = BenchmarkRunFailureCode.EXECUTION_FAILED.value
+        run.failure_message = "Benchmark run creator no longer exists"
+        run.completed_at = _utcnow()
+        db_session.commit()
+        raise ValueError("Benchmark run creator no longer exists")
+
+    now = _utcnow()
+    _recover_interrupted_items(run, recovered_at=now)
+    run.status = BenchmarkRunStatus.RUNNING.value
+    if run.started_at is None:
+        run.started_at = now
+    run.heartbeat_at = now
+    item_ids = [
+        item.id
+        for item in run.items
+        if item.status == BenchmarkRunItemStatus.PENDING.value
+    ]
+    db_session.commit()
+    return item_ids
+
+
+def run_benchmark_item(db_session: Session, run_id: int, item_id: int) -> None:
+    """Execute one item in an isolated process/session after an atomic claim."""
+    started_at = _utcnow()
+    if not claim_benchmark_run_item(
+        db_session,
+        run_id=run_id,
+        item_id=item_id,
+        started_at=started_at,
+    ):
+        logger.info("Benchmark item %s is no longer pending", item_id)
+        return
+
+    run = db_session.get(BenchmarkRun, run_id)
+    if run is None or run.status != BenchmarkRunStatus.RUNNING.value:
+        return
+    item = get_benchmark_run_item(db_session, run_id=run_id, item_id=item_id)
+    if item is None:
+        raise ValueError(f"Benchmark item {item_id} does not belong to run {run_id}")
+    user = db_session.get(User, run.created_by)
+    if user is None:
+        raise ValueError("Benchmark run creator no longer exists")
+    persona = _get_item_persona(db_session, user=user, item=item)
+    _run_item(
+        db_session,
+        run=run,
+        item=item,
+        user=user,
+        persona=persona,
+        already_claimed=True,
+    )
+
+
+def finalize_benchmark_run(
+    db_session: Session, run_id: int, *, had_execution_timeout: bool = False
+) -> None:
+    """Aggregate terminal items and generate the run report exactly once."""
+    run = get_benchmark_run_for_update(db_session, run_id)
+    if run is None or run.status != BenchmarkRunStatus.RUNNING.value:
+        return
+    user = db_session.get(User, run.created_by)
+    if user is None:
+        raise ValueError("Benchmark run creator no longer exists")
+
+    finished_at = _utcnow()
+    _mark_unfinished_items_error(run, completed_at=finished_at)
+    db_session.flush()
+    refresh_benchmark_run_counts(db_session, run)
+    if run.total_items > 0 and run.completed_items == run.total_items:
+        run.status = BenchmarkRunStatus.COMPLETED.value
+        run.failure_code = None
+        run.failure_message = None
+    else:
+        run.status = BenchmarkRunStatus.ERROR.value
+        run.failure_code = (
+            BenchmarkRunFailureCode.EXECUTION_TIMEOUT.value
+            if had_execution_timeout
+            else BenchmarkRunFailureCode.EXECUTION_FAILED.value
+        )
+        run.failure_message = "One or more benchmark items failed"
+
+    report_persona = (
+        _get_item_persona(db_session, user=user, item=run.items[0])
+        if run.items
+        else None
+    )
+    run.completed_at = finished_at
+    run.heartbeat_at = finished_at
+    db_session.commit()
+
+    # Report generation can take another provider call. Commit the terminal run
+    # first so no row lock is held and a report failure cannot leave it running.
+    _generate_run_report(
+        db_session,
+        run=run,
+        user=user,
+        persona=report_persona,
+    )
+    db_session.commit()
+
+
 def run_benchmark(db_session: Session, run_id: int) -> None:
     run = get_benchmark_run_for_update(db_session, run_id)
     if run is None:
@@ -650,7 +780,7 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
     report_persona: Persona | None = None
     for item in run.items:
         db_session.refresh(run)
-        if run.status == BenchmarkRunStatus.CANCELLED.value:
+        if run.status != BenchmarkRunStatus.RUNNING.value:
             break
         if item.status != BenchmarkRunItemStatus.PENDING.value:
             continue
@@ -665,7 +795,7 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
         db_session.commit()
 
     db_session.refresh(run)
-    if run.status != BenchmarkRunStatus.CANCELLED.value:
+    if run.status == BenchmarkRunStatus.RUNNING.value:
         finished_at = _utcnow()
         _mark_unfinished_items_error(run, completed_at=finished_at)
         db_session.flush()

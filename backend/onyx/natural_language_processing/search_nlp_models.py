@@ -559,7 +559,10 @@ class CloudEmbedding:
                 logger.warning("Error closing Google GenAI client: %s", e)
 
     async def _embed_litellm_proxy(
-        self, texts: list[str], model_name: str | None
+        self,
+        texts: list[str],
+        model_name: str | None,
+        reduced_dimension: int | None,
     ) -> list[Embedding]:
         if not model_name:
             raise ValueError("Model name is required for proxy embedding.")
@@ -576,12 +579,16 @@ class CloudEmbedding:
             {} if not self.api_key else {"Authorization": f"Bearer {self.api_key}"}
         )
 
+        request_body: dict[str, object] = {
+            "model": model_name,
+            "input": texts,
+        }
+        if reduced_dimension is not None:
+            request_body["dimensions"] = reduced_dimension
+
         response = await self.http_client.post(
             api_url,
-            json={
-                "model": model_name,
-                "input": texts,
-            },
+            json=request_body,
             headers=headers,
         )
         response.raise_for_status()
@@ -612,6 +619,11 @@ class CloudEmbedding:
             if not isinstance(vector, list) or not vector:
                 raise ValueError(
                     "Embedding provider returned an invalid embedding vector."
+                )
+            if reduced_dimension is not None and len(vector) != reduced_dimension:
+                raise ValueError(
+                    "Embedding provider returned vector dimension "
+                    f"{len(vector)}; expected {reduced_dimension}."
                 )
             ordered_embeddings[index] = vector
 
@@ -645,7 +657,9 @@ class CloudEmbedding:
                 EmbeddingProvider.LITELLM,
                 EmbeddingProvider.OPENROUTER,
             }:
-                return await self._embed_litellm_proxy(texts, model_name)
+                return await self._embed_litellm_proxy(
+                    texts, model_name, reduced_dimension
+                )
 
             embedding_type = EmbeddingModelTextType.get_type(self.provider, text_type)
             if self.provider == EmbeddingProvider.COHERE:

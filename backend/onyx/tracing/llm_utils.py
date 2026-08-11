@@ -197,6 +197,7 @@ def _build_usage_dict(usage: Any | None) -> dict[str, Any] | None:
     total_tokens = getattr(usage, "total_tokens", None)
     cache_read_input_tokens = getattr(usage, "cache_read_input_tokens", None)
     cache_creation_input_tokens = getattr(usage, "cache_creation_input_tokens", None)
+    cost = getattr(usage, "cost", None)
 
     if prompt_tokens is not None:
         usage_dict["input_tokens"] = prompt_tokens
@@ -212,5 +213,7 @@ def _build_usage_dict(usage: Any | None) -> dict[str, Any] | None:
         usage_dict["cache_read_input_tokens"] = cache_read_input_tokens
     if cache_creation_input_tokens is not None:
         usage_dict["cache_creation_input_tokens"] = cache_creation_input_tokens
+    if cost is not None:
+        usage_dict["cost"] = cost
 
     return usage_dict or None

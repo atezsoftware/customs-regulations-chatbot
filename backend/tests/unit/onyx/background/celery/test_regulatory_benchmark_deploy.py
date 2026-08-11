@@ -16,5 +16,8 @@ def test_backend_deploy_verifies_the_benchmark_worker_is_running() -> None:
         in workflow
     )
     assert "verify_benchmark_worker" in workflow
-    assert "supervisorctl status celery_worker_regulatory_benchmark" in workflow
+    assert (
+        "supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status "
+        "celery_worker_regulatory_benchmark"
+    ) in workflow
     assert 'grep -q "RUNNING"' in workflow

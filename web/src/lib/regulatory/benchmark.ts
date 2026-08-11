@@ -169,6 +169,7 @@ export interface BenchmarkRun {
     | "dependency_unavailable"
     | "worker_unavailable"
     | "dispatch_failed"
+    | "execution_timeout"
     | "execution_failed"
     | null;
   failure_message: string | null;

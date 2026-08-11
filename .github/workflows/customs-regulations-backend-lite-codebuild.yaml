@@ -237,7 +237,7 @@ jobs:
               if [[ -n "$pod" ]]; then
                 container=$(kubectl get pod "$pod" --namespace "${namespace}" -o json | jq -r --arg tag "${IMAGE_TAG}" '.spec.containers[] | select(.image | endswith(":" + $tag)) | .name' | head -n 1)
                 if [[ -n "$container" ]]; then
-                  worker_status=$(kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- supervisorctl status celery_worker_regulatory_benchmark 2>&1 || true)
+                  worker_status=$(kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status celery_worker_regulatory_benchmark 2>&1 || true)
                   echo "$worker_status"
                   if grep -q "RUNNING" <<<"$worker_status"; then
                     echo "Dedicated benchmark worker is running in pod $pod"

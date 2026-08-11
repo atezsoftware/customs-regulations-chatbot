@@ -1129,8 +1129,20 @@ REGULATORY_BENCHMARK_MAX_QUESTIONS = max(
 REGULATORY_BENCHMARK_MAX_RUN_ITEMS = max(
     1, int(os.environ.get("REGULATORY_BENCHMARK_MAX_RUN_ITEMS") or 100)
 )
+# Each item runs in its own spawned process. Keep the default conservative and
+# cap the override so one run cannot create an unbounded provider/DB burst.
+REGULATORY_BENCHMARK_PARALLEL_ITEMS = max(
+    1,
+    min(8, int(os.environ.get("REGULATORY_BENCHMARK_PARALLEL_ITEMS") or 3)),
+)
 REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS = max(
     60, int(os.environ.get("REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS") or 900)
+)
+# A benchmark item executes the full production chat/deep-research flow. Celery
+# time limits do not work with Onyx's thread worker pool, so the benchmark worker
+# supervises that flow in a spawned process and enforces this deadline itself.
+REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS = max(
+    60, int(os.environ.get("REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS") or 900)
 )
 
 # The maximum number of tasks that can be queued up to sync to Vespa in a single pass

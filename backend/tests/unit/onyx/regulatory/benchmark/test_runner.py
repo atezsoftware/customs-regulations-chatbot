@@ -8,7 +8,11 @@ from uuid import uuid4
 
 import pytest
 
-from onyx.db.enums import BenchmarkRunItemStatus, BenchmarkRunStatus
+from onyx.db.enums import (
+    BenchmarkRunFailureCode,
+    BenchmarkRunItemStatus,
+    BenchmarkRunStatus,
+)
 from onyx.db.models import BenchmarkRun, BenchmarkRunItem, User
 from onyx.db.regulatory_benchmark import mark_benchmark_run_failed
 from onyx.llm.cost import ModelPrice
@@ -24,7 +28,10 @@ from onyx.regulatory.benchmark.runner import (
     _run_item,
     _usage_cost,
     _usage_snapshots,
+    finalize_benchmark_run,
+    prepare_benchmark_run,
     run_benchmark,
+    run_benchmark_item,
 )
 from onyx.regulatory.benchmark.usage_capture import LLMCallUsage
 
@@ -155,6 +162,26 @@ def test_usage_cost_marks_unknown_pricing_unavailable() -> None:
 
     assert cost_cents is None
     assert cost_source == "unavailable"
+
+
+def test_usage_cost_prefers_provider_reported_cost() -> None:
+    usage_calls = [
+        LLMCallUsage(
+            "google/gemini-2.5-flash",
+            "openrouter",
+            100,
+            20,
+            0,
+            cost_cents=0.0123,
+        )
+    ]
+
+    with patch("onyx.regulatory.benchmark.runner.compute_cost_cents") as compute_cost:
+        _, _, cost_cents, cost_source = _usage_cost(MagicMock(), usage_calls)
+
+    assert cost_cents == pytest.approx(0.0123)
+    assert cost_source == "measured"
+    compute_cost.assert_not_called()
 
 
 def test_required_citation_metrics_use_regulatory_chunk_ids() -> None:
@@ -580,6 +607,40 @@ def test_resumed_item_skips_answer_generation_and_continues_with_judge() -> None
     assert item.status == BenchmarkRunItemStatus.COMPLETED.value
 
 
+def test_cancellation_during_judging_cannot_be_overwritten_as_completed() -> None:
+    item = MagicMock()
+    item.id = 8
+    item.status = BenchmarkRunItemStatus.RUNNING.value
+    item.started_at = datetime.datetime.now(datetime.timezone.utc)
+    item.completed_at = None
+    item.duration_ms = 15
+    item.judgment = None
+    item.final_result = "already persisted"
+    run = MagicMock(id=3, status=BenchmarkRunStatus.RUNNING.value)
+    db_session = MagicMock()
+    db_session.get.return_value = item
+
+    def cancel_during_judge(*_args: object, **_kwargs: object) -> None:
+        run.status = BenchmarkRunStatus.CANCELLED.value
+        item.status = BenchmarkRunItemStatus.CANCELLED.value
+
+    with patch(
+        "onyx.regulatory.benchmark.runner._judge_completed_item",
+        side_effect=cancel_during_judge,
+    ):
+        _run_item(
+            db_session,
+            run=run,
+            item=item,
+            user=MagicMock(),
+            persona=None,
+            already_claimed=True,
+        )
+
+    assert item.status == BenchmarkRunItemStatus.CANCELLED.value
+    db_session.rollback.assert_called_once_with()
+
+
 def test_unfinished_items_are_terminal_errors_not_false_completions() -> None:
     completed_at = datetime.datetime.now(datetime.timezone.utc)
     pending = SimpleNamespace(
@@ -718,6 +779,60 @@ def test_run_with_any_error_is_never_marked_completed() -> None:
     assert run.failure_code == "execution_failed"
 
 
+def test_external_terminal_failure_is_not_overwritten_by_late_runner_work() -> None:
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    item = SimpleNamespace(
+        status=BenchmarkRunItemStatus.PENDING.value,
+        judgment=None,
+    )
+    run = SimpleNamespace(
+        id=18,
+        status=BenchmarkRunStatus.QUEUED.value,
+        created_by="user-id",
+        items=[item],
+        total_items=1,
+        completed_items=0,
+        failed_items=0,
+        queued_at=started_at,
+        started_at=None,
+        heartbeat_at=None,
+        completed_at=None,
+        failure_code=None,
+        failure_message=None,
+    )
+    db_session = MagicMock()
+    db_session.get.return_value = MagicMock()
+
+    def terminalize_during_item(*_args: object, **_kwargs: object) -> None:
+        item.status = BenchmarkRunItemStatus.ERROR.value
+        run.status = BenchmarkRunStatus.ERROR.value
+        run.failure_code = BenchmarkRunFailureCode.EXECUTION_TIMEOUT.value
+        run.failure_message = "Benchmark item exceeded its execution deadline"
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.get_benchmark_run_for_update",
+            return_value=cast(BenchmarkRun, run),
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.get_best_persona_id_for_user",
+            return_value=None,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner._run_item",
+            side_effect=terminalize_during_item,
+        ),
+        patch("onyx.regulatory.benchmark.runner.refresh_benchmark_run_counts"),
+        patch("onyx.regulatory.benchmark.runner._generate_run_report") as report,
+    ):
+        run_benchmark(db_session, run.id)
+
+    assert run.status == BenchmarkRunStatus.ERROR.value
+    assert run.failure_code == BenchmarkRunFailureCode.EXECUTION_TIMEOUT.value
+    assert run.failure_message == "Benchmark item exceeded its execution deadline"
+    report.assert_not_called()
+
+
 def test_creator_missing_startup_error_is_completed_by_task_recovery() -> None:
     pending_item = SimpleNamespace(
         status=BenchmarkRunItemStatus.PENDING.value,
@@ -768,3 +883,158 @@ def test_creator_missing_startup_error_is_completed_by_task_recovery() -> None:
     assert pending_item.error_message == "Benchmark run creator no longer exists"
     assert pending_item.completed_at == run.completed_at
     assert run.failed_items == 1
+
+
+def test_parallel_item_delivery_is_atomically_claimed_before_execution() -> None:
+    db_session = MagicMock()
+    run = cast(
+        BenchmarkRun,
+        SimpleNamespace(
+            id=12,
+            status=BenchmarkRunStatus.RUNNING.value,
+            created_by="user-id",
+        ),
+    )
+    item = cast(BenchmarkRunItem, SimpleNamespace(id=34))
+    user = cast(User, SimpleNamespace(id="user-id"))
+    db_session.get.side_effect = lambda model, _identifier: (
+        run if model is BenchmarkRun else user
+    )
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.claim_benchmark_run_item",
+            return_value=True,
+        ) as claim_item,
+        patch(
+            "onyx.regulatory.benchmark.runner.get_benchmark_run_item",
+            return_value=item,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner._get_item_persona",
+            return_value=None,
+        ),
+        patch("onyx.regulatory.benchmark.runner._run_item") as execute_item,
+    ):
+        run_benchmark_item(db_session, 12, 34)
+
+    claim_item.assert_called_once()
+    execute_item.assert_called_once_with(
+        db_session,
+        run=run,
+        item=item,
+        user=user,
+        persona=None,
+        already_claimed=True,
+    )
+
+
+def test_duplicate_parallel_item_delivery_does_not_call_the_llm() -> None:
+    db_session = MagicMock()
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.claim_benchmark_run_item",
+            return_value=False,
+        ),
+        patch("onyx.regulatory.benchmark.runner._run_item") as execute_item,
+    ):
+        run_benchmark_item(db_session, 12, 34)
+
+    execute_item.assert_not_called()
+    db_session.get.assert_not_called()
+
+
+def test_parallel_run_preparation_recovers_only_resumable_items() -> None:
+    interrupted = SimpleNamespace(
+        id=34,
+        status=BenchmarkRunItemStatus.RUNNING.value,
+        judgment=None,
+        completed_at=None,
+    )
+    completed = SimpleNamespace(
+        id=35,
+        status=BenchmarkRunItemStatus.COMPLETED.value,
+        judgment=object(),
+        completed_at=None,
+    )
+    run = cast(
+        BenchmarkRun,
+        SimpleNamespace(
+            id=12,
+            status=BenchmarkRunStatus.QUEUED.value,
+            created_by="user-id",
+            started_at=None,
+            heartbeat_at=None,
+            items=[interrupted, completed],
+        ),
+    )
+    db_session = MagicMock()
+    db_session.get.return_value = MagicMock()
+
+    with patch(
+        "onyx.regulatory.benchmark.runner.get_benchmark_run_for_update",
+        return_value=run,
+    ):
+        item_ids = prepare_benchmark_run(db_session, 12)
+
+    assert item_ids == [34]
+    assert interrupted.status == BenchmarkRunItemStatus.PENDING.value
+    assert completed.status == BenchmarkRunItemStatus.COMPLETED.value
+    assert run.status == BenchmarkRunStatus.RUNNING.value
+    assert run.started_at is not None
+    db_session.commit.assert_called_once_with()
+
+
+def test_finalization_commits_terminal_state_before_report_generation() -> None:
+    events: list[str] = []
+    item = SimpleNamespace(
+        status=BenchmarkRunItemStatus.COMPLETED.value,
+        judgment=object(),
+    )
+    run = cast(
+        BenchmarkRun,
+        SimpleNamespace(
+            id=12,
+            status=BenchmarkRunStatus.RUNNING.value,
+            created_by="user-id",
+            items=[item],
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            failure_code=None,
+            failure_message=None,
+            completed_at=None,
+            heartbeat_at=None,
+        ),
+    )
+    user = cast(User, SimpleNamespace(id="user-id"))
+    db_session = MagicMock()
+    db_session.get.return_value = user
+    db_session.commit.side_effect = lambda: events.append("commit")
+
+    def refresh_counts(_session: object, target: BenchmarkRun) -> None:
+        target.completed_items = 1
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.get_benchmark_run_for_update",
+            return_value=run,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.refresh_benchmark_run_counts",
+            side_effect=refresh_counts,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner._get_item_persona",
+            return_value=None,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner._generate_run_report",
+            side_effect=lambda *_args, **_kwargs: events.append("report"),
+        ),
+    ):
+        finalize_benchmark_run(db_session, 12)
+
+    assert events == ["commit", "report", "commit"]
+    assert run.status == BenchmarkRunStatus.COMPLETED.value
