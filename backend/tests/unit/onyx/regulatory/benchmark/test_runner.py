@@ -11,6 +11,7 @@ import pytest
 from onyx.configs.constants import DEFAULT_PERSONA_ID
 from onyx.db.enums import (
     BenchmarkRunFailureCode,
+    BenchmarkRunItemPhase,
     BenchmarkRunItemStatus,
     BenchmarkRunStatus,
 )
@@ -46,6 +47,18 @@ def test_judge_schema_is_openrouter_provider_compatible() -> None:
     assert "minimum" not in serialized
     assert "maximum" not in serialized
     assert "propertyNames" not in serialized
+
+
+def test_item_phase_constraint_accepts_every_persisted_phase() -> None:
+    phase_constraint = next(
+        constraint
+        for constraint in BenchmarkRunItem.__table__.constraints
+        if constraint.name == "benchmark_run_item_execution_phase_check"
+    )
+    constraint_sql = str(phase_constraint.sqltext)
+
+    for phase in BenchmarkRunItemPhase:
+        assert f"'{phase.value}'" in constraint_sql
 
 
 def test_item_heartbeat_advances_only_when_the_stream_makes_progress() -> None:

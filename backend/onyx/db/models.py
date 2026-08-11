@@ -5944,7 +5944,7 @@ class BenchmarkRunItem(Base):
         ),
         CheckConstraint(
             "execution_phase IS NULL OR execution_phase IN "
-            "('starting', 'answering', 'researching', 'judging')",
+            "('starting', 'preparing_session', 'answering', 'researching', 'judging')",
             name="benchmark_run_item_execution_phase_check",
         ),
     )
