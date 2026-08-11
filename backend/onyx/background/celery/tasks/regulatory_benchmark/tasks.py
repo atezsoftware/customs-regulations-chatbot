@@ -29,8 +29,8 @@ from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
-_RUN_LEASE_SECONDS = 5 * 60
-_RUN_LEASE_HEARTBEAT_SECONDS = 60
+_RUN_LEASE_SECONDS = 60
+_RUN_LEASE_HEARTBEAT_SECONDS = 15
 _WATCHDOG_POLL_SECONDS = 1
 _WATCHDOG_SIGTERM_GRACE_SECONDS = 10
 _BENCHMARK_PRELOAD_MODULES = ("onyx.regulatory.benchmark.runner",)

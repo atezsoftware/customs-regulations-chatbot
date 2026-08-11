@@ -184,10 +184,6 @@ jobs:
           kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
             sh -c 'for file in memory.current memory.peak memory.max memory.events; do if [ -r "/sys/fs/cgroup/$file" ]; then printf "%s=" "$file"; tr "\n" "," < "/sys/fs/cgroup/$file"; printf "\n"; fi; done' || true
 
-          echo "Benchmark process state"
-          kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
-            sh -c "ps -eo pid,ppid,stat,rss,etime,cmd | grep -E '[r]egulatory_benchmark|[f]orkserver|[s]pawn'" || true
-
           echo "Filtered benchmark runtime logs"
           kubectl logs "$pod" --namespace "${namespace}" -c "$container" --tail=5000 \
             | grep -E -i 'benchmark|oom|out of memory|memoryerror|sigkill|killed|worker lost|terminated by' \

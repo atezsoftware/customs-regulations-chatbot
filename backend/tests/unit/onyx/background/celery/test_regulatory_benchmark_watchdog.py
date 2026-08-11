@@ -4,6 +4,15 @@ from onyx.background.celery.tasks.regulatory_benchmark import tasks
 from onyx.db.enums import BenchmarkRunStatus
 
 
+def test_benchmark_items_are_sequential_by_default() -> None:
+    assert tasks.REGULATORY_BENCHMARK_PARALLEL_ITEMS == 1
+
+
+def test_run_lease_expires_promptly_after_worker_loss() -> None:
+    assert tasks._RUN_LEASE_SECONDS == 60
+    assert tasks._RUN_LEASE_HEARTBEAT_SECONDS <= tasks._RUN_LEASE_SECONDS / 3
+
+
 def _job(job_id: int, *, done: bool) -> MagicMock:
     job = MagicMock()
     job.id = job_id

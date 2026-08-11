@@ -1129,14 +1129,11 @@ REGULATORY_BENCHMARK_MAX_QUESTIONS = max(
 REGULATORY_BENCHMARK_MAX_RUN_ITEMS = max(
     1, int(os.environ.get("REGULATORY_BENCHMARK_MAX_RUN_ITEMS") or 100)
 )
-# Each item runs in its own spawned process. Five concurrent items keep a run
-# moving while the upper bound still prevents an unbounded provider/DB burst.
-REGULATORY_BENCHMARK_PARALLEL_ITEMS = max(
-    1,
-    min(8, int(os.environ.get("REGULATORY_BENCHMARK_PARALLEL_ITEMS") or 5)),
-)
+# A Deep Research item runs the complete chat stack in a child process. The
+# lite background runtime cannot safely hold more than one such process.
+REGULATORY_BENCHMARK_PARALLEL_ITEMS = 1
 REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS = max(
-    60, int(os.environ.get("REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS") or 900)
+    60, int(os.environ.get("REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS") or 90)
 )
 # A benchmark item executes the full production chat/deep-research flow. Celery
 # time limits do not work with Onyx's thread worker pool, so the benchmark worker
