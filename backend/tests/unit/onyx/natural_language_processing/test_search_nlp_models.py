@@ -47,6 +47,29 @@ def test_clean_model_name_lowercases_names_for_elasticsearch_index() -> None:
     )
 
 
+def test_cloud_model_queries_use_the_index_vector_dimension() -> None:
+    search_settings = MagicMock()
+    search_settings.model_name = "google/gemini-embedding-2-preview"
+    search_settings.normalize = True
+    search_settings.query_prefix = None
+    search_settings.passage_prefix = None
+    search_settings.api_key = "key"
+    search_settings.provider_type = EmbeddingProvider.OPENROUTER
+    search_settings.api_url = "https://openrouter.ai/api/v1/embeddings"
+    search_settings.api_version = None
+    search_settings.deployment_name = None
+    search_settings.reduced_dimension = None
+    search_settings.final_embedding_dim = 1024
+
+    embedding_model = EmbeddingModel.from_db_model(
+        search_settings,
+        server_host="model-server",
+        server_port=9000,
+    )
+
+    assert embedding_model.reduced_dimension == 1024
+
+
 @pytest.mark.asyncio
 async def test_cloud_embedding_context_manager() -> None:
     async with CloudEmbedding("fake-key", EmbeddingProvider.OPENAI) as embedding:

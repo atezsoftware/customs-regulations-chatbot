@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, selectinload
 from onyx.db.enums import (
     BenchmarkCostSource,
     BenchmarkRunFailureCode,
+    BenchmarkRunItemPhase,
     BenchmarkRunItemStatus,
     BenchmarkRunStatus,
 )
@@ -80,6 +81,27 @@ def touch_benchmark_run_heartbeat(
     db_session.commit()
 
 
+def touch_benchmark_run_items(
+    db_session: Session,
+    run_id: int,
+    item_ids: Sequence[int],
+    *,
+    heartbeat_at: datetime.datetime,
+) -> None:
+    if not item_ids:
+        return
+    db_session.execute(
+        update(BenchmarkRunItem)
+        .where(
+            BenchmarkRunItem.run_id == run_id,
+            BenchmarkRunItem.id.in_(item_ids),
+            BenchmarkRunItem.status == BenchmarkRunItemStatus.RUNNING.value,
+        )
+        .values(heartbeat_at=heartbeat_at)
+    )
+    db_session.commit()
+
+
 def claim_benchmark_run_item(
     db_session: Session,
     *,
@@ -103,6 +125,8 @@ def claim_benchmark_run_item(
         )
         .values(
             status=BenchmarkRunItemStatus.RUNNING.value,
+            execution_phase=BenchmarkRunItemPhase.STARTING.value,
+            heartbeat_at=started_at,
             started_at=started_at,
             completed_at=None,
         )
@@ -135,6 +159,7 @@ def mark_benchmark_run_item_failed(
         .values(
             status=BenchmarkRunItemStatus.ERROR.value,
             error_message=error_message,
+            heartbeat_at=completed_at,
             completed_at=completed_at,
         )
         .returning(BenchmarkRunItem.id)
@@ -347,6 +372,8 @@ def reset_benchmark_run_for_retry(run: BenchmarkRun) -> None:
         item.citation_recall = None
         item.citation_precision = None
         item.judge_error = None
+        item.execution_phase = None
+        item.heartbeat_at = None
         item.started_at = None
         item.completed_at = None
         item.judgment = None
@@ -404,6 +431,7 @@ def mark_benchmark_run_failed(
     for item in unfinished_items:
         item.status = BenchmarkRunItemStatus.ERROR.value
         item.error_message = item.error_message or diagnostic
+        item.heartbeat_at = completed_at
         item.completed_at = completed_at
     run.completed_items = sum(
         item.status == BenchmarkRunItemStatus.COMPLETED.value for item in run.items
@@ -432,6 +460,7 @@ def cancel_benchmark_run(db_session: Session, run_id: int) -> BenchmarkRun | Non
             BenchmarkRunItemStatus.RUNNING.value,
         }:
             item.status = BenchmarkRunItemStatus.CANCELLED.value
+            item.heartbeat_at = completed_at
             item.completed_at = completed_at
     db_session.commit()
     return run

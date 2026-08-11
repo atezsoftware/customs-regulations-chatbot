@@ -23,6 +23,7 @@ from onyx.db.regulatory_benchmark import (
     mark_benchmark_run_item_failed,
     mark_benchmark_run_report_failed,
     touch_benchmark_run_heartbeat,
+    touch_benchmark_run_items,
 )
 from onyx.utils.logger import setup_logger
 
@@ -142,9 +143,16 @@ def _get_benchmark_run_status(run_id: int) -> str | None:
         return get_benchmark_run_status(db_session, run_id)
 
 
-def _touch_benchmark_run(run_id: int) -> None:
+def _touch_benchmark_run(run_id: int, item_ids: list[int] | None = None) -> None:
     with get_session_with_current_tenant() as db_session:
         touch_benchmark_run_heartbeat(db_session, run_id, heartbeat_at=_utcnow())
+        if item_ids:
+            touch_benchmark_run_items(
+                db_session,
+                run_id,
+                item_ids=item_ids,
+                heartbeat_at=_utcnow(),
+            )
 
 
 def _record_item_failure(run_id: int, item_id: int, message: str) -> None:
@@ -246,7 +254,10 @@ def _run_benchmark_items(
                 del active_jobs[job_id]
                 had_execution_timeout = True
 
-            _touch_benchmark_run(run_id)
+            _touch_benchmark_run(
+                run_id,
+                [active.item_id for active in active_jobs.values()],
+            )
             if pending or active_jobs:
                 time.sleep(_WATCHDOG_POLL_SECONDS)
     finally:

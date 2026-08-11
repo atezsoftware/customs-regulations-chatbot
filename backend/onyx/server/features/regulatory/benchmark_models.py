@@ -152,6 +152,10 @@ class BenchmarkRunItemSnapshot(BaseModel):
     question_title: str
     question_snapshot: dict[str, object]
     status: str
+    execution_phase: str | None
+    heartbeat_at: datetime.datetime | None
+    started_at: datetime.datetime | None
+    completed_at: datetime.datetime | None
     final_result: str | None
     error_message: str | None
     input_tokens: int | None
@@ -185,6 +189,10 @@ class BenchmarkRunItemSnapshot(BaseModel):
             question_title=str(snapshot.get("title") or item.question.title),
             question_snapshot=snapshot,
             status=item.status,
+            execution_phase=item.execution_phase,
+            heartbeat_at=item.heartbeat_at,
+            started_at=item.started_at,
+            completed_at=item.completed_at,
             final_result=item.final_result,
             error_message=item.error_message,
             input_tokens=item.input_tokens,

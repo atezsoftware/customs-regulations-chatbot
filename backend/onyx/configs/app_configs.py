@@ -1129,11 +1129,11 @@ REGULATORY_BENCHMARK_MAX_QUESTIONS = max(
 REGULATORY_BENCHMARK_MAX_RUN_ITEMS = max(
     1, int(os.environ.get("REGULATORY_BENCHMARK_MAX_RUN_ITEMS") or 100)
 )
-# Each item runs in its own spawned process. Keep the default conservative and
-# cap the override so one run cannot create an unbounded provider/DB burst.
+# Each item runs in its own spawned process. Five concurrent items keep a run
+# moving while the upper bound still prevents an unbounded provider/DB burst.
 REGULATORY_BENCHMARK_PARALLEL_ITEMS = max(
     1,
-    min(8, int(os.environ.get("REGULATORY_BENCHMARK_PARALLEL_ITEMS") or 3)),
+    min(8, int(os.environ.get("REGULATORY_BENCHMARK_PARALLEL_ITEMS") or 5)),
 )
 REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS = max(
     60, int(os.environ.get("REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS") or 900)

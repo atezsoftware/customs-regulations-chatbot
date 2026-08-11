@@ -109,6 +109,7 @@ def get_chat_sessions_by_user(
         select(ChatSession)
         .where(ChatSession.user_id == user_id)
         .where(ChatSession.onyxbot_flow.is_(False))
+        .where(ChatSession.benchmark_flow.is_(False))
         .order_by(desc(ChatSession.time_updated))
     )
 
@@ -215,6 +216,7 @@ def create_chat_session(
     onyxbot_flow: bool = False,
     slack_thread_id: str | None = None,
     project_id: int | None = None,
+    benchmark_flow: bool = False,
 ) -> ChatSession:
     chat_session = ChatSession(
         user_id=user_id,
@@ -225,6 +227,7 @@ def create_chat_session(
         onyxbot_flow=onyxbot_flow,
         slack_thread_id=slack_thread_id,
         project_id=project_id,
+        benchmark_flow=benchmark_flow,
     )
 
     db_session.add(chat_session)
@@ -306,7 +309,11 @@ def delete_all_chat_sessions_for_user(
 
     chat_sessions = (
         db_session.query(ChatSession)
-        .filter(ChatSession.user_id == user_id, ChatSession.onyxbot_flow.is_(False))
+        .filter(
+            ChatSession.user_id == user_id,
+            ChatSession.onyxbot_flow.is_(False),
+            ChatSession.benchmark_flow.is_(False),
+        )
         .all()
     )
 
@@ -315,13 +322,19 @@ def delete_all_chat_sessions_for_user(
             delete_messages_and_files_from_chat_session(chat_session.id, db_session)
         db_session.execute(
             delete(ChatSession).where(
-                ChatSession.user_id == user_id, ChatSession.onyxbot_flow.is_(False)
+                ChatSession.user_id == user_id,
+                ChatSession.onyxbot_flow.is_(False),
+                ChatSession.benchmark_flow.is_(False),
             )
         )
     else:
         db_session.execute(
             update(ChatSession)
-            .where(ChatSession.user_id == user_id, ChatSession.onyxbot_flow.is_(False))
+            .where(
+                ChatSession.user_id == user_id,
+                ChatSession.onyxbot_flow.is_(False),
+                ChatSession.benchmark_flow.is_(False),
+            )
             .values(deleted=True)
         )
 

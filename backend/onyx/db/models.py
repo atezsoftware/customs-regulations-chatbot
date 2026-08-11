@@ -3185,6 +3185,10 @@ class ChatSession(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     # This chat created by OnyxBot
     onyxbot_flow: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Internal benchmark conversations remain auditable but are not user history.
+    benchmark_flow: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     # Only ever set to True if system is set to not hard-delete chats
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
     # controls whether or not this conversation is viewable by others
@@ -5872,6 +5876,10 @@ class BenchmarkRunItem(Base):
     status: Mapped[str] = mapped_column(
         Text, nullable=False, default=BenchmarkRunItemStatus.PENDING.value
     )
+    execution_phase: Mapped[str | None] = mapped_column(Text, nullable=True)
+    heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     final_result: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -5933,6 +5941,11 @@ class BenchmarkRunItem(Base):
         CheckConstraint(
             "cost_source IN ('measured', 'unavailable')",
             name="benchmark_run_item_cost_source_check",
+        ),
+        CheckConstraint(
+            "execution_phase IS NULL OR execution_phase IN "
+            "('starting', 'answering', 'researching', 'judging')",
+            name="benchmark_run_item_execution_phase_check",
         ),
     )
 

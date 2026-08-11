@@ -8,12 +8,13 @@ from uuid import uuid4
 
 import pytest
 
+from onyx.configs.constants import DEFAULT_PERSONA_ID
 from onyx.db.enums import (
     BenchmarkRunFailureCode,
     BenchmarkRunItemStatus,
     BenchmarkRunStatus,
 )
-from onyx.db.models import BenchmarkRun, BenchmarkRunItem, User
+from onyx.db.models import BenchmarkRun, BenchmarkRunItem, Persona, User
 from onyx.db.regulatory_benchmark import mark_benchmark_run_failed
 from onyx.llm.cost import ModelPrice
 from onyx.llm.override_models import LLMOverride
@@ -34,6 +35,7 @@ from onyx.regulatory.benchmark.runner import (
     run_benchmark_item,
 )
 from onyx.regulatory.benchmark.usage_capture import LLMCallUsage
+from onyx.server.query_and_chat.models import MessageOrigin
 
 
 def test_judge_schema_is_openrouter_provider_compatible() -> None:
@@ -377,6 +379,7 @@ def test_answer_generation_scopes_search_to_document_set_without_project() -> No
         )
 
     assert "project_id" not in create_chat_session.call_args.kwargs
+    assert create_chat_session.call_args.kwargs["benchmark_flow"] is True
     expected_override = LLMOverride(
         model_provider="OpenRouter",
         model_provider_type="openrouter",
@@ -389,7 +392,11 @@ def test_answer_generation_scopes_search_to_document_set_without_project() -> No
     assert request.internal_search_filters is not None
     assert request.internal_search_filters.document_set == ["Current Regulations"]
     assert request.internal_search_filters.as_of_date == datetime.date(2026, 8, 6)
-    db_session.commit.assert_called_once_with()
+    assert request.origin == MessageOrigin.BENCHMARK
+    assert item.chat_session_id == chat_session_id
+    assert item.execution_phase == "answering"
+    assert item.heartbeat_at is not None
+    assert db_session.commit.call_count == 2
 
 
 def test_nameless_openrouter_selector_becomes_a_typed_provider_override() -> None:
@@ -514,39 +521,23 @@ def test_named_openrouter_provider_uses_persisted_provider_id() -> None:
     assert override.model_provider_id == 7
 
 
-def test_benchmark_items_select_persona_for_their_own_document_set() -> None:
+def test_benchmark_items_use_the_default_new_session_persona() -> None:
     db_session = MagicMock()
-    user = MagicMock()
-    first_persona = MagicMock(id=101)
-    second_persona = MagicMock(id=202)
-    db_session.get.side_effect = lambda _model, persona_id: {
-        101: first_persona,
-        202: second_persona,
-    }[persona_id]
-    first_item = cast(
-        BenchmarkRunItem, SimpleNamespace(question_snapshot={"document_set_id": 11})
-    )
-    second_item = cast(
-        BenchmarkRunItem, SimpleNamespace(question_snapshot={"document_set_id": 22})
-    )
+    default_persona = MagicMock(id=DEFAULT_PERSONA_ID)
+    db_session.get.return_value = default_persona
 
-    with patch(
-        "onyx.regulatory.benchmark.runner.get_best_persona_id_for_user",
-        side_effect=[101, 202],
-    ) as select_persona:
-        assert (
-            _get_item_persona(db_session, user=user, item=first_item) is first_persona
-        )
-        assert (
-            _get_item_persona(db_session, user=user, item=second_item) is second_persona
-        )
+    selected = _get_item_persona(db_session)
 
-    assert [
-        call.kwargs["document_set_id"] for call in select_persona.call_args_list
-    ] == [
-        11,
-        22,
-    ]
+    assert selected is default_persona
+    db_session.get.assert_called_once_with(Persona, DEFAULT_PERSONA_ID)
+
+
+def test_benchmark_fails_loudly_when_default_persona_is_missing() -> None:
+    db_session = MagicMock()
+    db_session.get.return_value = None
+
+    with pytest.raises(ValueError, match="Default new-session persona is missing"):
+        _get_item_persona(db_session)
 
 
 def test_redelivery_recovers_running_items_without_discarding_saved_answer() -> None:
@@ -797,10 +788,6 @@ def test_run_with_any_error_is_never_marked_completed() -> None:
             return_value=cast(BenchmarkRun, run),
         ),
         patch(
-            "onyx.regulatory.benchmark.runner.get_best_persona_id_for_user",
-            return_value=None,
-        ),
-        patch(
             "onyx.regulatory.benchmark.runner.refresh_benchmark_run_counts",
             side_effect=refresh_counts,
         ),
@@ -850,10 +837,6 @@ def test_external_terminal_failure_is_not_overwritten_by_late_runner_work() -> N
         patch(
             "onyx.regulatory.benchmark.runner.get_benchmark_run_for_update",
             return_value=cast(BenchmarkRun, run),
-        ),
-        patch(
-            "onyx.regulatory.benchmark.runner.get_best_persona_id_for_user",
-            return_value=None,
         ),
         patch(
             "onyx.regulatory.benchmark.runner._run_item",

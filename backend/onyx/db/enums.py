@@ -772,6 +772,13 @@ class BenchmarkRunItemStatus(str, PyEnum):
     CANCELLED = "cancelled"
 
 
+class BenchmarkRunItemPhase(str, PyEnum):
+    STARTING = "starting"
+    ANSWERING = "answering"
+    RESEARCHING = "researching"
+    JUDGING = "judging"
+
+
 class BenchmarkCostSource(str, PyEnum):
     MEASURED = "measured"
     UNAVAILABLE = "unavailable"

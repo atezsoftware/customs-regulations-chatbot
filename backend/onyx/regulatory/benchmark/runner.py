@@ -8,16 +8,17 @@ from sqlalchemy.orm import Session
 
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.process_message import gather_stream_full, handle_stream_message_objects
+from onyx.configs.constants import DEFAULT_PERSONA_ID
 from onyx.context.search.models import BaseFilters, SearchDoc
 from onyx.db.chat import create_chat_session
 from onyx.db.enums import (
     BenchmarkCostSource,
     BenchmarkRunFailureCode,
+    BenchmarkRunItemPhase,
     BenchmarkRunItemStatus,
     BenchmarkRunStatus,
 )
 from onyx.db.models import BenchmarkRun, BenchmarkRunItem, Persona, User, UserFile
-from onyx.db.persona import get_best_persona_id_for_user
 from onyx.db.regulatory_benchmark import (
     add_benchmark_judgment,
     claim_benchmark_run_item,
@@ -38,7 +39,7 @@ from onyx.regulatory.benchmark.usage_capture import (
     LLMCallUsage,
     benchmark_usage_capture,
 )
-from onyx.server.query_and_chat.models import SendMessageRequest
+from onyx.server.query_and_chat.models import MessageOrigin, SendMessageRequest
 from onyx.tracing.framework.create import ensure_trace
 from onyx.utils.logger import setup_logger
 
@@ -191,25 +192,13 @@ def _cited_sources(db_session: Session, response: object) -> list[dict[str, obje
 
 def _get_item_persona(
     db_session: Session,
-    *,
-    user: User,
-    item: BenchmarkRunItem,
-) -> Persona | None:
-    question_snapshot = getattr(item, "question_snapshot", {}) or {}
-    raw_document_set_id = question_snapshot.get("document_set_id")
-    if raw_document_set_id is None:
-        raw_document_set_id = getattr(
-            getattr(item, "question", None), "document_set_id", None
-        )
-    document_set_id = (
-        int(raw_document_set_id) if raw_document_set_id is not None else None
-    )
-    persona_id = get_best_persona_id_for_user(
-        db_session,
-        user,
-        document_set_id=document_set_id,
-    )
-    return db_session.get(Persona, persona_id) if persona_id is not None else None
+) -> Persona:
+    # Benchmark candidates must differ only by model. The default persona is
+    # the same deterministic starting point as a new unconfigured chat session.
+    persona = db_session.get(Persona, DEFAULT_PERSONA_ID)
+    if persona is None:
+        raise ValueError("Default new-session persona is missing")
+    return persona
 
 
 def _citation_metrics(
@@ -363,7 +352,16 @@ def _generate_item_answer(
         user_id=user.id,
         persona_id=persona.id if persona else None,
         llm_override=override,
+        benchmark_flow=True,
     )
+    item.chat_session_id = chat_session.id
+    item.execution_phase = (
+        BenchmarkRunItemPhase.RESEARCHING.value
+        if run.deep_research
+        else BenchmarkRunItemPhase.ANSWERING.value
+    )
+    item.heartbeat_at = _utcnow()
+    db_session.commit()
     as_of_date_value = item.question_snapshot.get("as_of_date")
     as_of_date = (
         datetime.date.fromisoformat(str(as_of_date_value)) if as_of_date_value else None
@@ -379,6 +377,7 @@ def _generate_item_answer(
         deep_research=run.deep_research,
         stream=True,
         include_citations=True,
+        origin=MessageOrigin.BENCHMARK,
     )
     state_container = ChatStateContainer()
     with benchmark_usage_capture() as answer_usage:
@@ -404,7 +403,6 @@ def _generate_item_answer(
     item.answer_reasoning = (response.pre_answer_reasoning or "")[
         :_MAX_REASONING_CHARS
     ] or None
-    item.chat_session_id = chat_session.id
     item.assistant_message_id = response.message_id
     item.cited_sources = _cited_sources(db_session, response)
     item.cited_chunk_ids = [
@@ -435,6 +433,8 @@ def _run_item(
     if not already_claimed:
         item.status = BenchmarkRunItemStatus.RUNNING.value
         item.started_at = _utcnow()
+        item.execution_phase = BenchmarkRunItemPhase.STARTING.value
+        item.heartbeat_at = item.started_at
         item.completed_at = None
         db_session.commit()
 
@@ -458,6 +458,9 @@ def _run_item(
             return
 
         try:
+            item.execution_phase = BenchmarkRunItemPhase.JUDGING.value
+            item.heartbeat_at = _utcnow()
+            db_session.commit()
             _judge_completed_item(
                 db_session, run=run, item=item, user=user, persona=persona
             )
@@ -517,6 +520,7 @@ def _run_item(
                 BenchmarkRunItemStatus.ERROR.value,
             }:
                 item.completed_at = _utcnow()
+                item.heartbeat_at = item.completed_at
             db_session.commit()
 
 
@@ -630,9 +634,12 @@ def _recover_interrupted_items(
         recovered += 1
         if item.judgment is not None:
             item.status = BenchmarkRunItemStatus.COMPLETED.value
+            item.heartbeat_at = recovered_at
             item.completed_at = recovered_at
         else:
             item.status = BenchmarkRunItemStatus.PENDING.value
+            item.execution_phase = None
+            item.heartbeat_at = None
             item.completed_at = None
     return recovered
 
@@ -651,6 +658,7 @@ def _mark_unfinished_items_error(
         item.error_message = item.error_message or (
             "Benchmark execution ended before the item reached a terminal state"
         )
+        item.heartbeat_at = completed_at
         item.completed_at = completed_at
         marked += 1
     return marked
@@ -722,7 +730,7 @@ def run_claimed_benchmark_item(db_session: Session, run_id: int, item_id: int) -
     user = db_session.get(User, run.created_by)
     if user is None:
         raise ValueError("Benchmark run creator no longer exists")
-    persona = _get_item_persona(db_session, user=user, item=item)
+    persona = _get_item_persona(db_session)
     _run_item(
         db_session,
         run=run,
@@ -761,11 +769,7 @@ def finalize_benchmark_run(
         )
         run.failure_message = "One or more benchmark items failed"
 
-    report_persona = (
-        _get_item_persona(db_session, user=user, item=run.items[0])
-        if run.items
-        else None
-    )
+    report_persona = _get_item_persona(db_session) if run.items else None
     run.completed_at = finished_at
     run.heartbeat_at = finished_at
     db_session.commit()
@@ -815,7 +819,7 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
             break
         if item.status != BenchmarkRunItemStatus.PENDING.value:
             continue
-        persona = _get_item_persona(db_session, user=user, item=item)
+        persona = _get_item_persona(db_session)
         if report_persona is None:
             report_persona = persona
         run.heartbeat_at = _utcnow()
@@ -840,11 +844,7 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
             run.failure_code = BenchmarkRunFailureCode.EXECUTION_FAILED.value
             run.failure_message = "One or more benchmark items failed"
         if report_persona is None and run.items:
-            report_persona = _get_item_persona(
-                db_session,
-                user=user,
-                item=run.items[0],
-            )
+            report_persona = _get_item_persona(db_session)
         _generate_run_report(
             db_session,
             run=run,

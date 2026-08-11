@@ -14,6 +14,27 @@ import {
 
 const panelClass = "rounded-xl border border-border-02 bg-background p-5";
 
+const phaseLabels: Record<
+  NonNullable<BenchmarkRunItem["execution_phase"]>,
+  string
+> = {
+  starting: "Starting",
+  answering: "Generating answer",
+  researching: "Deep research",
+  judging: "Judge evaluation",
+};
+
+function progressLabel(item: BenchmarkRunItem): string | null {
+  if (item.status !== "running") return null;
+  const phase = item.execution_phase
+    ? phaseLabels[item.execution_phase]
+    : "Working";
+  if (!item.heartbeat_at) return phase;
+  const heartbeat = new Date(item.heartbeat_at);
+  if (Number.isNaN(heartbeat.getTime())) return phase;
+  return `${phase} · heartbeat ${heartbeat.toISOString().slice(11, 19)} UTC`;
+}
+
 function JudgeReport({ item }: { item: BenchmarkRunItem }) {
   const report = item.judgment?.report;
   if (!item.judgment || !report) return null;
@@ -167,6 +188,7 @@ export default function BenchmarkRunItemDetails({
 }: {
   item: BenchmarkRunItem;
 }) {
+  const runningProgress = progressLabel(item);
   return (
     <details className={panelClass}>
       <summary className="cursor-pointer list-none">
@@ -179,6 +201,11 @@ export default function BenchmarkRunItemDetails({
               <Text font="main-ui-body" color="text-02">
                 {`${item.provider} / ${item.model_id}`}
               </Text>
+              {runningProgress && (
+                <Text font="secondary-body" color="text-03">
+                  {runningProgress}
+                </Text>
+              )}
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">

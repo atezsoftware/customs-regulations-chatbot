@@ -11,6 +11,7 @@ import {
   BenchmarkAvailableModel,
   BenchmarkQuestion,
   BenchmarkRun,
+  BenchmarkRunItem,
   createBenchmarkQuestion,
   createBenchmarkRun,
   listBenchmarkCitationOptions,
@@ -122,6 +123,43 @@ function buildRun(
     report_cost_cents: null,
     items: [],
     aggregates: [],
+  };
+}
+
+function buildRunningItem(): BenchmarkRunItem {
+  return {
+    id: 101,
+    provider: "openrouter",
+    provider_id: 3,
+    model_id: "openai/gpt-5",
+    question_id: question.id,
+    question_prompt: question.prompt,
+    question_title: question.title,
+    question_snapshot: {},
+    status: "running",
+    execution_phase: "researching",
+    heartbeat_at: "2026-08-10T09:01:30Z",
+    started_at: "2026-08-10T09:01:00Z",
+    completed_at: null,
+    final_result: null,
+    error_message: null,
+    input_tokens: null,
+    output_tokens: null,
+    total_tokens: null,
+    duration_ms: null,
+    cost_cents: null,
+    cost_source: "unavailable",
+    cited_chunk_ids: [],
+    cited_sources: [],
+    execution_steps: [],
+    llm_calls: [],
+    answer_reasoning: null,
+    chat_session_id: null,
+    assistant_message_id: null,
+    citation_recall: null,
+    citation_precision: null,
+    judge_error: null,
+    judgment: null,
   };
 }
 
@@ -869,5 +907,18 @@ test("names the deep-research control and exposes run selection to keyboards", a
   expect(secondRunCard).toHaveAttribute("aria-pressed", "true");
   expect(
     screen.getByRole("heading", { name: "Second run" })
+  ).toBeInTheDocument();
+});
+
+test("shows the active phase and heartbeat for a running item", async () => {
+  const run = buildRun(73, "running", "Live progress");
+  run.items = [buildRunningItem()];
+  mockedListRuns.mockResolvedValue([run]);
+
+  render(<BenchmarkPage />);
+  await openRuns();
+
+  expect(
+    screen.getByText("Deep research · heartbeat 09:01:30 UTC")
   ).toBeInTheDocument();
 });

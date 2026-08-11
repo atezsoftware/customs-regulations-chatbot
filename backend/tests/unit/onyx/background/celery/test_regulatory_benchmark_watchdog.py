@@ -100,6 +100,28 @@ def test_item_child_uses_a_fresh_session() -> None:
     run_claimed_benchmark_item.assert_called_once_with(db_session, 12, 34)
 
 
+def test_active_item_heartbeat_uses_a_fresh_session() -> None:
+    db_session = MagicMock()
+    session_context = MagicMock()
+    session_context.__enter__.return_value = db_session
+
+    with (
+        patch.object(
+            tasks,
+            "get_session_with_current_tenant",
+            return_value=session_context,
+        ),
+        patch.object(tasks, "touch_benchmark_run_heartbeat") as touch_run,
+        patch.object(tasks, "touch_benchmark_run_items") as touch_items,
+    ):
+        tasks._touch_benchmark_run(12, [34, 35])
+
+    touch_run.assert_called_once()
+    touch_items.assert_called_once()
+    assert touch_items.call_args.args[:2] == (db_session, 12)
+    assert touch_items.call_args.kwargs["item_ids"] == [34, 35]
+
+
 def test_report_timeout_is_recorded_without_reopening_terminal_run() -> None:
     finalization_job = _job(9, done=False)
 

@@ -31,6 +31,7 @@ def _make_session(
     session.description = description
     session.deleted = False
     session.onyxbot_flow = False
+    session.benchmark_flow = False
     session.project_id = None
     return session
 
@@ -220,3 +221,21 @@ class TestGetChatSessionsByUser:
 
         assert result == []
         assert db_session.execute.call_count == 1
+
+    def test_excludes_benchmark_sessions_at_the_query_boundary(
+        self, user_id: UUID
+    ) -> None:
+        db_session = MagicMock(spec=Session)
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = []
+        db_session.execute.return_value = mock_result
+
+        get_chat_sessions_by_user(
+            user_id=user_id,
+            deleted=False,
+            db_session=db_session,
+            include_failed_chats=True,
+        )
+
+        statement = str(db_session.execute.call_args.args[0])
+        assert "chat_session.benchmark_flow IS false" in statement

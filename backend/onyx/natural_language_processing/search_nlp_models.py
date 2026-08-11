@@ -1265,6 +1265,11 @@ class EmbeddingModel:
         server_port: int,
         retrim_content: bool = False,
     ) -> "EmbeddingModel":
+        requested_dimension = (
+            search_settings.final_embedding_dim
+            if search_settings.provider_type is not None
+            else search_settings.reduced_dimension
+        )
         return cls(
             server_host=server_host,
             server_port=server_port,
@@ -1278,7 +1283,7 @@ class EmbeddingModel:
             retrim_content=retrim_content,
             api_version=search_settings.api_version,
             deployment_name=search_settings.deployment_name,
-            reduced_dimension=search_settings.reduced_dimension,
+            reduced_dimension=requested_dimension,
         )
 
 
