@@ -228,6 +228,7 @@ function handleCitationPacket(state: ProcessorState, packet: Packet): void {
       document_id: citationInfo.document_id,
       chunk_ind: citationInfo.chunk_ind,
       semantic_identifier: citationInfo.semantic_identifier,
+      source_type: citationInfo.source_type,
     });
   }
 }

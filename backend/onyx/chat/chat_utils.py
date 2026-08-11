@@ -288,6 +288,7 @@ def reorganize_citations(
                 document_id=matching_citation.document_id,
                 chunk_ind=matching_citation.chunk_ind,
                 semantic_identifier=matching_citation.semantic_identifier,
+                source_type=matching_citation.source_type,
             )
         except Exception:
             pass

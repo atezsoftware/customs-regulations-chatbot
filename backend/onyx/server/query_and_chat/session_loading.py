@@ -829,6 +829,7 @@ def translate_assistant_message_to_packets(
                         document_id=search_doc.document_id,
                         chunk_ind=search_doc.chunk_ind,
                         semantic_identifier=search_doc.semantic_id,
+                        source_type=search_doc.source_type,
                     )
                 )
 

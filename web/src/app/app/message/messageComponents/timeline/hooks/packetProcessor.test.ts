@@ -432,12 +432,14 @@ describe("packetProcessor", () => {
           document_id: "shared-doc",
           chunk_ind: 7,
           semantic_identifier: "Act > Article 7",
+          source_type: "user_file",
         },
         {
           citation_num: 2,
           document_id: "shared-doc",
           chunk_ind: 12,
           semantic_identifier: "Act > Article 12",
+          source_type: "user_file",
         },
       ]);
     });

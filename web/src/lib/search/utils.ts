@@ -1,10 +1,12 @@
 import { Tag, ValidSources } from "../types";
 import {
+  CitationPreviewDocument,
   Filters,
   MinimalOnyxDocument,
   OnyxDocument,
   SourceMetadata,
 } from "./interfaces";
+import { StreamingCitation } from "@/app/app/services/streamingModels";
 import { DateRangePickerValue } from "@/components/dateRangeSelectors/AdminDateRangeSelector";
 
 export const buildFilters = (
@@ -40,4 +42,19 @@ export const openDocument = (
   ) {
     updatePresentingDocument?.(document);
   }
+};
+
+export const openCitation = (
+  citation: StreamingCitation,
+  semanticIdentifier: string,
+  updatePresentingDocument: (document: MinimalOnyxDocument) => void
+) => {
+  const citationTarget: CitationPreviewDocument = {
+    preview_type: "citation",
+    citation_number: citation.citation_num,
+    document_id: citation.document_id,
+    semantic_identifier: semanticIdentifier,
+    citation_chunk_ind: citation.chunk_ind,
+  };
+  updatePresentingDocument(citationTarget);
 };

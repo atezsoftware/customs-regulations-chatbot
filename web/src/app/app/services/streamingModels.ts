@@ -1,4 +1,5 @@
 import { OnyxDocument } from "@/lib/search/interfaces";
+import { ValidSources } from "@/lib/types";
 
 // Base interface for all streaming objects
 interface BaseObj {
@@ -284,6 +285,7 @@ export interface StreamingCitation {
   document_id: string;
   chunk_ind?: number;
   semantic_identifier?: string;
+  source_type?: ValidSources;
 }
 
 export interface CitationStart extends BaseObj {
@@ -297,6 +299,7 @@ export interface CitationInfo extends BaseObj {
   document_id: string;
   chunk_ind?: number;
   semantic_identifier?: string;
+  source_type?: ValidSources;
 }
 
 // Deep Research Plan Packets

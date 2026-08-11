@@ -4,6 +4,7 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field
 
+from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import SearchDoc
 from onyx.server.query_and_chat.placement import Placement
 
@@ -151,6 +152,8 @@ class CitationInfo(BaseObj):
     chunk_ind: int | None = None
     # Chunk-level display label, including a regulatory heading path when present.
     semantic_identifier: str | None = None
+    # Makes a citation packet self-contained for rendering after a session reload.
+    source_type: DocumentSource | None = None
 
 
 class ToolCallDebug(BaseObj):

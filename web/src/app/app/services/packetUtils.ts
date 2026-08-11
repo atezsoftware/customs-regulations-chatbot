@@ -3,6 +3,7 @@ import {
   MessageStart,
   PacketType,
   StreamingCitation,
+  CitationInfo,
 } from "./streamingModels";
 import { Packet } from "@/app/app/services/streamingModels";
 
@@ -171,12 +172,7 @@ export function getCitations(packets: Packet[]): StreamingCitation[] {
   packets.forEach((packet) => {
     if (packet.obj.type === PacketType.CITATION_INFO) {
       // Individual citation packet from backend
-      const citationInfo = packet.obj as {
-        citation_number: number;
-        document_id: string;
-        chunk_ind?: number;
-        semantic_identifier?: string;
-      };
+      const citationInfo = packet.obj as CitationInfo;
       const chunkKey = `${citationInfo.document_id}:${citationInfo.chunk_ind ?? "document"}`;
       if (!seenChunks.has(chunkKey)) {
         seenChunks.add(chunkKey);
@@ -185,6 +181,7 @@ export function getCitations(packets: Packet[]): StreamingCitation[] {
           document_id: citationInfo.document_id,
           chunk_ind: citationInfo.chunk_ind,
           semantic_identifier: citationInfo.semantic_identifier,
+          source_type: citationInfo.source_type,
         });
       }
     }

@@ -161,6 +161,7 @@ export const useMarkdownComponents = (
           userFiles={state?.userFiles || []}
           citations={state?.citations}
           citationChunks={state?.citationChunks}
+          citationReferences={state?.citationReferences}
           href={props.href}
         >
           {props.children}
@@ -172,6 +173,7 @@ export const useMarkdownComponents = (
       state?.userFiles,
       state?.citations,
       state?.citationChunks,
+      state?.citationReferences,
       state?.setPresentingDocument,
     ]
   );

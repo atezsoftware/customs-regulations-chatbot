@@ -272,6 +272,7 @@ def test_single_citation(mock_search_docs: CitationMapping) -> None:
     assert citations[0].document_id == "doc_1"
     assert citations[0].chunk_ind == 0
     assert citations[0].semantic_identifier == "Document 1"
+    assert citations[0].source_type == DocumentSource.WEB
 
 
 def test_different_chunks_of_same_document_emit_distinct_citations() -> None:

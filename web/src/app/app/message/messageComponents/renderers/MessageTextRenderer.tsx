@@ -366,6 +366,7 @@ export const MessageTextRenderer: MessageRenderer<
             userFiles={s?.userFiles || []}
             citations={s?.citations}
             citationChunks={s?.citationChunks}
+            citationReferences={s?.citationReferences}
             href={href}
           >
             {children}

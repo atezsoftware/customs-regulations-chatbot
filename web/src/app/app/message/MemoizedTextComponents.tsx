@@ -9,6 +9,7 @@ import {
 } from "../interfaces";
 import { ValidSources } from "@/lib/types";
 import { ProjectFile } from "@/lib/projects/types";
+import { StreamingCitation } from "@/app/app/services/streamingModels";
 import { BlinkingBar } from "./BlinkingBar";
 import Text from "@/refresh-components/texts/Text";
 import SourceTag from "@/refresh-components/buttons/source-tag/SourceTag";
@@ -17,7 +18,7 @@ import {
   questionToSourceInfo,
   getDisplayNameForSource,
 } from "@/refresh-components/buttons/source-tag/sourceTagUtils";
-import { openDocument } from "@/lib/search/utils";
+import { openCitation, openDocument } from "@/lib/search/utils";
 import { ensureHrefProtocol } from "@/lib/utils";
 
 interface DocumentCardProps {
@@ -38,6 +39,7 @@ export const MemoizedAnchor = memo(
     userFiles,
     citations,
     citationChunks,
+    citationReferences,
     href,
     updatePresentingDocument,
     children,
@@ -48,6 +50,7 @@ export const MemoizedAnchor = memo(
     userFiles?: ProjectFile[] | null;
     citations?: CitationMap;
     citationChunks?: CitationChunkMap;
+    citationReferences?: StreamingCitation[];
     updatePresentingDocument: (doc: MinimalOnyxDocument) => void;
     href?: string;
     children: React.ReactNode;
@@ -63,21 +66,47 @@ export const MemoizedAnchor = memo(
           const isDocument = !isSubQuestion;
 
           const citation_num = parseInt(match_item, 10);
+          const citationReference = citationReferences?.find(
+            (citation) => citation.citation_num === citation_num
+          );
 
           // Use citation map to find the correct document
           // Citations map format: {citation_num: document_id}
           // e.g., {1: "doc_abc", 2: "doc_xyz", 3: "doc_123"}
           let associatedDoc: OnyxDocument | null = null;
-          if (isDocument && docs && citations) {
-            const document_id = citations[citation_num];
+          if (isDocument) {
+            const document_id =
+              citationReference?.document_id ?? citations?.[citation_num];
             if (document_id) {
-              const chunkInd = citationChunks?.[citation_num];
+              const chunkInd =
+                citationReference?.chunk_ind ?? citationChunks?.[citation_num];
               associatedDoc =
-                docs.find(
+                docs?.find(
                   (d) =>
                     d.document_id === document_id &&
                     (chunkInd === undefined || d.chunk_ind === chunkInd)
                 ) || null;
+            }
+
+            if (!associatedDoc && citationReference) {
+              associatedDoc = {
+                document_id: citationReference.document_id,
+                semantic_identifier:
+                  citationReference.semantic_identifier ??
+                  `Source ${citationReference.citation_num}`,
+                link: href ?? "",
+                source_type:
+                  citationReference.source_type ?? ValidSources.NotApplicable,
+                blurb: "",
+                boost: 0,
+                hidden: false,
+                score: 0,
+                chunk_ind: citationReference.chunk_ind ?? 0,
+                match_highlights: [],
+                metadata: {},
+                updated_at: null,
+                is_internet: citationReference.source_type === ValidSources.Web,
+              };
             }
           }
 
@@ -116,6 +145,7 @@ export const MemoizedAnchor = memo(
               updatePresentingDocument={updatePresentingDocument}
               href={href}
               document={associatedDocInfo}
+              citation={citationReference}
               question={associatedSubQuestion}
               openQuestion={openQuestion}
             >
@@ -143,10 +173,12 @@ export const MemoizedLink = memo(
     updatePresentingDocument,
     question,
     href,
+    citation,
     openQuestion,
     ...rest
   }: Partial<DocumentCardProps & QuestionCardProps> & {
     node?: any;
+    citation?: StreamingCitation;
     [key: string]: any;
   }) => {
     const value = rest.children;
@@ -165,25 +197,19 @@ export const MemoizedLink = memo(
 
     // Handle click on SourceTag
     const handleSourceClick = useCallback(() => {
-      if (document && updatePresentingDocument) {
+      if (document && citation && updatePresentingDocument) {
         const citedDocument = document as OnyxDocument;
-        if (
-          (citedDocument.source_type === ValidSources.File ||
-            citedDocument.source_type === ValidSources.UserFile) &&
-          Number.isInteger(citedDocument.chunk_ind)
-        ) {
-          updatePresentingDocument({
-            document_id: citedDocument.document_id,
-            semantic_identifier: getDisplayNameForSource(citedDocument),
-            citation_chunk_ind: citedDocument.chunk_ind,
-          });
-        } else {
-          openDocument(citedDocument, updatePresentingDocument);
-        }
+        openCitation(
+          citation,
+          getDisplayNameForSource(citedDocument),
+          updatePresentingDocument
+        );
+      } else if (document && updatePresentingDocument) {
+        openDocument(document as OnyxDocument, updatePresentingDocument);
       } else if (question && openQuestion) {
         openQuestion(question);
       }
-    }, [document, updatePresentingDocument, question, openQuestion]);
+    }, [citation, document, updatePresentingDocument, question, openQuestion]);
 
     if (value?.toString().startsWith("*")) {
       return <BlinkingBar addMargin />;

@@ -6,7 +6,8 @@ import { DocumentUpdatedAtBadge } from "@/components/search/DocumentUpdatedAtBad
 import { MetadataBadge } from "@/components/MetadataBadge";
 import { WebResultIcon } from "@/components/WebResultIcon";
 import { Dispatch, SetStateAction, useMemo } from "react";
-import { openDocument } from "@/lib/search/utils";
+import { openCitation, openDocument } from "@/lib/search/utils";
+import { StreamingCitation } from "@/app/app/services/streamingModels";
 import { ValidSources } from "@/lib/types";
 import { cn } from "@opal/utils";
 import Truncated from "@/refresh-components/texts/Truncated";
@@ -57,6 +58,7 @@ export interface ChatDocumentDisplayProps {
   modal?: boolean;
   isSelected: boolean;
   setPresentingDocument: Dispatch<SetStateAction<MinimalOnyxDocument | null>>;
+  citation?: StreamingCitation;
 }
 
 export default function ChatDocumentDisplay({
@@ -64,6 +66,7 @@ export default function ChatDocumentDisplay({
   modal,
   isSelected,
   setPresentingDocument,
+  citation,
 }: ChatDocumentDisplayProps) {
   const isInternet = document.is_internet;
   const title = useMemo(
@@ -80,7 +83,13 @@ export default function ChatDocumentDisplay({
 
   return (
     <div
-      onClick={() => openDocument(document, setPresentingDocument)}
+      onClick={() => {
+        if (citation) {
+          openCitation(citation, title, setPresentingDocument);
+          return;
+        }
+        openDocument(document, setPresentingDocument);
+      }}
       className={cn(
         "flex w-full flex-col p-3 gap-2 rounded-12 hover:bg-background-tint-00 cursor-pointer",
         isSelected && "bg-action-selection-02"

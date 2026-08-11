@@ -35,7 +35,7 @@ export default function PreviewModal({
   const [mimeType, setMimeType] = useState("application/octet-stream");
   const [zoom, setZoom] = useState(100);
   const requestSequence = useRef(0);
-  const isCitationChunk = presentingDocument.citation_chunk_ind !== undefined;
+  const isCitationChunk = presentingDocument.preview_type === "citation";
 
   const variant = useMemo(
     () => resolveVariant(presentingDocument.semantic_identifier, mimeType),
@@ -89,7 +89,10 @@ export default function PreviewModal({
     try {
       setFileName(originalFileName);
 
-      if (presentingDocument.citation_chunk_ind !== undefined) {
+      if (isCitationChunk) {
+        if (presentingDocument.citation_chunk_ind === undefined) {
+          throw new Error("Citation packet did not include a chunk index");
+        }
         const params = new URLSearchParams({
           document_id: presentingDocument.document_id,
           chunk_id: String(presentingDocument.citation_chunk_ind),

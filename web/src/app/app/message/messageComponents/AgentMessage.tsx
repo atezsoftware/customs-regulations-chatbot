@@ -182,6 +182,7 @@ const AgentMessage = React.memo(function AgentMessage({
       ...chatState,
       citations: mergedCitations,
       citationChunks: citationChunkMap,
+      citationReferences: citations,
       docs: mergedDocs,
     }),
     [
@@ -193,6 +194,7 @@ const AgentMessage = React.memo(function AgentMessage({
       chatState.researchType,
       mergedCitations,
       citationChunkMap,
+      citations,
       mergedDocs,
     ]
   );

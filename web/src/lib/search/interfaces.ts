@@ -55,7 +55,14 @@ export interface QuotesInfoPacket {
 export interface MinimalOnyxDocument {
   document_id: string;
   semantic_identifier: string | null;
+  preview_type?: "document" | "citation";
+  citation_number?: number;
   citation_chunk_ind?: number;
+}
+
+export interface CitationPreviewDocument extends MinimalOnyxDocument {
+  preview_type: "citation";
+  citation_number: number;
 }
 
 export interface OnyxDocument extends MinimalOnyxDocument {

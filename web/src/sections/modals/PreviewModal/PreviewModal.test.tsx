@@ -29,6 +29,7 @@ describe("PreviewModal citation chunk mode", () => {
     render(
       <PreviewModal
         presentingDocument={{
+          preview_type: "citation",
           document_id: "customs-law",
           semantic_identifier: "Gümrük Kanunu · 46. Madde",
           citation_chunk_ind: 46,
@@ -59,6 +60,7 @@ describe("PreviewModal citation chunk mode", () => {
     render(
       <PreviewModal
         presentingDocument={{
+          preview_type: "citation",
           document_id: "customs-law",
           semantic_identifier: "Gümrük Kanunu · 46. Madde",
           citation_chunk_ind: 46,
@@ -90,6 +92,7 @@ describe("PreviewModal citation chunk mode", () => {
       render(
         <PreviewModal
           presentingDocument={{
+            preview_type: "citation",
             document_id: "customs-law",
             semantic_identifier: "Gümrük Kanunu · 46. Madde",
             citation_chunk_ind: 46,
@@ -123,6 +126,7 @@ describe("PreviewModal citation chunk mode", () => {
     const { rerender } = render(
       <PreviewModal
         presentingDocument={{
+          preview_type: "citation",
           document_id: "customs-law",
           semantic_identifier: "Gümrük Kanunu · 46. Madde",
           citation_chunk_ind: 46,
@@ -135,6 +139,7 @@ describe("PreviewModal citation chunk mode", () => {
     rerender(
       <PreviewModal
         presentingDocument={{
+          preview_type: "citation",
           document_id: "customs-law",
           semantic_identifier: "Gümrük Kanunu · 47. Madde",
           citation_chunk_ind: 47,
@@ -159,5 +164,30 @@ describe("PreviewModal citation chunk mode", () => {
     );
     expect(screen.getByText("Current Article 47 chunk")).toBeInTheDocument();
     expect(mockedFetchChatFile).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when citation metadata has no chunk index", async () => {
+    const fetchMock = jest.spyOn(global, "fetch");
+
+    render(
+      <PreviewModal
+        presentingDocument={{
+          preview_type: "citation",
+          document_id: "customs-law",
+          semantic_identifier: "Gümrük Kanunu · citation",
+          citation_number: 9,
+        }}
+        onClose={jest.fn()}
+      />
+    );
+
+    expect(
+      await screen.findByText(
+        "The cited chunk is unavailable or you no longer have access to it."
+      )
+    ).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockedFetchChatFile).not.toHaveBeenCalled();
+    expect(screen.queryByText("Download File")).not.toBeInTheDocument();
   });
 });

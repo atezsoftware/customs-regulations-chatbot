@@ -1,6 +1,10 @@
 import { JSX } from "react";
 import { MinimalAgent } from "@/lib/agents/types";
-import { Packet, StopReason } from "../../services/streamingModels";
+import {
+  Packet,
+  StopReason,
+  StreamingCitation,
+} from "../../services/streamingModels";
 import { OnyxDocument, MinimalOnyxDocument } from "@/lib/search/interfaces";
 import { ProjectFile } from "@/lib/projects/types";
 import { LlmDescriptor } from "@/lib/hooks";
@@ -30,6 +34,7 @@ export interface FullChatState {
   userFiles?: ProjectFile[];
   citations?: CitationMap;
   citationChunks?: CitationChunkMap;
+  citationReferences?: StreamingCitation[];
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   // Regenerate functionality
   regenerate?: (modelOverRide: LlmDescriptor) => Promise<void>;

@@ -8,6 +8,7 @@ import {
   StopReason,
 } from "@/app/app/services/streamingModels";
 import { OnyxDocument } from "@/lib/search/interfaces";
+import { ValidSources } from "@/lib/types";
 
 // Core packet factory
 export function createPacket(
@@ -71,13 +72,15 @@ export function createCitationPacket(
   documentId: string,
   placement: Partial<Placement> = {},
   chunkInd?: number,
-  semanticIdentifier?: string
+  semanticIdentifier?: string,
+  sourceType: ValidSources = ValidSources.UserFile
 ): Packet {
   return createPacket(PacketType.CITATION_INFO, placement, {
     citation_number: citationNumber,
     document_id: documentId,
     chunk_ind: chunkInd,
     semantic_identifier: semanticIdentifier,
+    source_type: sourceType,
   });
 }
 

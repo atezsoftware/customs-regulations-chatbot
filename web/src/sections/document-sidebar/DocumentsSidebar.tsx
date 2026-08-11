@@ -12,6 +12,65 @@ import {
 import Text from "@/refresh-components/texts/Text";
 import { Button, Divider } from "@opal/components";
 import { SvgSearchMenu, SvgX } from "@opal/icons";
+import { StreamingCitation } from "@/app/app/services/streamingModels";
+import { ValidSources } from "@/lib/types";
+
+interface CitedDocumentEntry {
+  citation: StreamingCitation;
+  document: OnyxDocument;
+}
+
+const citationIdentity = (citation: StreamingCitation) =>
+  `${citation.document_id}:${citation.chunk_ind ?? "document"}`;
+
+export function buildCitedDocumentEntries(
+  citations: StreamingCitation[],
+  documents: OnyxDocument[]
+): CitedDocumentEntry[] {
+  const documentsByChunk = new Map(
+    documents.map((document) => [
+      `${document.document_id}:${document.chunk_ind}`,
+      document,
+    ])
+  );
+
+  return citations.flatMap((citation) => {
+    const matchedDocument =
+      documentsByChunk.get(citationIdentity(citation)) ??
+      (citation.chunk_ind === undefined
+        ? documents.find(
+            (candidate) => candidate.document_id === citation.document_id
+          )
+        : undefined);
+    const document: OnyxDocument = matchedDocument ?? {
+      document_id: citation.document_id,
+      semantic_identifier:
+        citation.semantic_identifier ?? `Source ${citation.citation_num}`,
+      link: "",
+      source_type: citation.source_type ?? ValidSources.NotApplicable,
+      blurb: "",
+      boost: 0,
+      hidden: false,
+      score: 0,
+      chunk_ind: citation.chunk_ind ?? 0,
+      match_highlights: [],
+      metadata: {},
+      updated_at: null,
+      is_internet: citation.source_type === ValidSources.Web,
+    };
+
+    return [
+      {
+        citation,
+        document: {
+          ...document,
+          semantic_identifier:
+            citation.semantic_identifier ?? document.semantic_identifier,
+        },
+      },
+    ];
+  });
+}
 
 // Build an OnyxDocument from basic file info
 const buildOnyxDocumentFromFile = (
@@ -100,25 +159,9 @@ const DocumentsSidebar = memo(
       : null;
 
     // Get citations in order and build a set of cited document IDs
-    const { citedDocumentIds, citationOrder } = useMemo(() => {
-      if (!selectedMessage) {
-        return {
-          citedDocumentIds: new Set<string>(),
-          citationOrder: new Map<string, number>(),
-        };
-      }
-
-      const citedDocumentIds = new Set<string>();
-      const citationOrder = new Map<string, number>();
-      const citations = getCitations(selectedMessage.packets);
-      citations.forEach((citation, index) => {
-        citedDocumentIds.add(citation.document_id);
-        // Only set the order for the first occurrence
-        if (!citationOrder.has(citation.document_id)) {
-          citationOrder.set(citation.document_id, index);
-        }
-      });
-      return { citedDocumentIds, citationOrder };
+    const citations = useMemo(() => {
+      if (!selectedMessage) return [];
+      return getCitations(selectedMessage.packets);
     }, [idOfMessageToDisplay, selectedMessage?.packets.length]);
 
     // if these are missing for some reason, then nothing we can do. Just
@@ -136,19 +179,13 @@ const DocumentsSidebar = memo(
       selectedDocuments?.map((document) => document.document_id) || [];
     const currentDocuments = selectedMessage.documents || null;
     const dedupedDocuments = removeDuplicateDocs(currentDocuments || []);
-    const citedDocuments = dedupedDocuments
-      .filter(
-        (doc) =>
-          doc.document_id !== null &&
-          doc.document_id !== undefined &&
-          citedDocumentIds.has(doc.document_id)
-      )
-      .sort((a, b) => {
-        // Sort by citation order (order citations appeared in the answer)
-        const orderA = citationOrder.get(a.document_id) ?? Infinity;
-        const orderB = citationOrder.get(b.document_id) ?? Infinity;
-        return orderA - orderB;
-      });
+    const citedDocuments = buildCitedDocumentEntries(
+      citations,
+      currentDocuments || []
+    );
+    const citedDocumentIds = new Set(
+      citations.map((citation) => citation.document_id)
+    );
     const otherDocuments = dedupedDocuments.filter(
       (doc) =>
         doc.document_id === null ||
@@ -168,12 +205,13 @@ const DocumentsSidebar = memo(
             <div>
               <Header onClose={closeSidebar}>Cited Sources</Header>
               <ChatDocumentDisplayWrapper>
-                {citedDocuments.map((document) => (
+                {citedDocuments.map(({ citation, document }) => (
                   <ChatDocumentDisplay
-                    key={document.document_id}
+                    key={citationIdentity(citation)}
                     setPresentingDocument={setPresentingDocument}
                     modal={modal}
                     document={document}
+                    citation={citation}
                     isSelected={selectedDocumentIds.includes(
                       document.document_id
                     )}
