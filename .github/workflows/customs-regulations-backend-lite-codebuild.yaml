@@ -224,8 +224,37 @@ jobs:
             return 0
           }
 
+          verify_benchmark_worker() {
+            local app_name="customs-regulations-background"
+            local selector="app=${env_x}-${app_name}"
+            local pod
+            local container
+            local worker_status
+
+            echo "Waiting for the dedicated benchmark worker to report RUNNING"
+            for attempt in {1..60}; do
+              pod=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json | jq -r --arg tag "${IMAGE_TAG}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | head -n 1)
+              if [[ -n "$pod" ]]; then
+                container=$(kubectl get pod "$pod" --namespace "${namespace}" -o json | jq -r --arg tag "${IMAGE_TAG}" '.spec.containers[] | select(.image | endswith(":" + $tag)) | .name' | head -n 1)
+                if [[ -n "$container" ]]; then
+                  worker_status=$(kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- supervisorctl status celery_worker_regulatory_benchmark 2>&1 || true)
+                  echo "$worker_status"
+                  if grep -q "RUNNING" <<<"$worker_status"; then
+                    echo "Dedicated benchmark worker is running in pod $pod"
+                    return 0
+                  fi
+                fi
+              fi
+              sleep 5
+            done
+
+            echo "Dedicated benchmark worker did not become ready for image tag ${IMAGE_TAG}" >&2
+            return 1
+          }
+
           deploy_app "customs-regulations-api" "customs-regulations/customs-regulations-api-values.yaml" "true"
-          deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "false"
+          deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "true"
+          verify_benchmark_worker
         continue-on-error: true
 
       - name: Check Deployment Status
