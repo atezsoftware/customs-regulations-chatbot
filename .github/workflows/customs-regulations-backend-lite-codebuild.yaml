@@ -140,6 +140,59 @@ jobs:
         run: |
           aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
+      - name: Capture pre-deploy benchmark diagnostics
+        run: |
+          set -euo pipefail
+
+          selector="app=${env_x}-customs-regulations-background"
+          pods=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json)
+          pod=$(jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name' <<<"$pods" | head -n 1)
+          if [[ -z "$pod" ]]; then
+            echo "No active background pod found"
+            exit 0
+          fi
+
+          echo "Background pod runtime state"
+          jq -r --arg pod "$pod" '
+            .items[]
+            | select(.metadata.name == $pod)
+            | {
+                name: .metadata.name,
+                phase: .status.phase,
+                started_at: .status.startTime,
+                containers: [
+                  .status.containerStatuses[]?
+                  | {
+                      name,
+                      ready,
+                      restart_count: .restartCount,
+                      state,
+                      last_state: .lastState
+                    }
+                ]
+              }
+          ' <<<"$pods"
+
+          container=$(kubectl get pod "$pod" --namespace "${namespace}" -o json | jq -r '.spec.containers[0].name')
+
+          echo "Benchmark worker supervisor state"
+          kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+            supervisorctl -c /etc/supervisor/conf.d/supervisord.conf \
+            status celery_worker_regulatory_benchmark || true
+
+          echo "Container memory counters"
+          kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+            sh -c 'for file in memory.current memory.peak memory.max memory.events; do if [ -r "/sys/fs/cgroup/$file" ]; then printf "%s=" "$file"; tr "\n" "," < "/sys/fs/cgroup/$file"; printf "\n"; fi; done' || true
+
+          echo "Benchmark process state"
+          kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+            sh -c "ps -eo pid,ppid,stat,rss,etime,cmd | grep -E '[r]egulatory_benchmark|[f]orkserver|[s]pawn'" || true
+
+          echo "Filtered benchmark runtime logs"
+          kubectl logs "$pod" --namespace "${namespace}" -c "$container" --tail=5000 \
+            | grep -E -i 'benchmark|oom|out of memory|memoryerror|sigkill|killed|worker lost|terminated by' \
+            | tail -n 800 || true
+
       - name: Set up Helm
         uses: azure/setup-helm@v5.0.0
         with:
