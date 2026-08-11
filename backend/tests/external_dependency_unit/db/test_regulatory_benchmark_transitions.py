@@ -58,6 +58,7 @@ def test_cancelled_run_cannot_be_overwritten_by_waiting_failure_transition(
         assert persisted is not None
         assert persisted.status == BenchmarkRunStatus.CANCELLED.value
         assert persisted.report_error is None
+        assert persisted.failure_message is None
     finally:
         cancel_session.close()
         persisted = db_session.get(BenchmarkRun, run_id)
@@ -76,7 +77,8 @@ def test_retry_dispatch_lock_blocks_worker_until_reset_commits(
         judge_model="test-model",
         created_by=creator.id,
         total_items=0,
-        report_error="previous failure",
+        failure_code="execution_failed",
+        failure_message="previous failure",
         completed_at=datetime.datetime.now(datetime.timezone.utc),
     )
     db_session.add(run)
@@ -88,8 +90,8 @@ def test_retry_dispatch_lock_blocks_worker_until_reset_commits(
     locked_run = get_benchmark_run_for_update(dispatch_session, run_id)
     assert locked_run is not None
     reset_benchmark_run_for_retry(locked_run)
-    locked_run.status = BenchmarkRunStatus.RUNNING.value
-    locked_run.started_at = datetime.datetime.now(datetime.timezone.utc)
+    locked_run.status = BenchmarkRunStatus.QUEUED.value
+    locked_run.queued_at = datetime.datetime.now(datetime.timezone.utc)
 
     def run_worker() -> None:
         with Session(engine) as worker_session:
@@ -114,6 +116,8 @@ def test_retry_dispatch_lock_blocks_worker_until_reset_commits(
         assert persisted.status == BenchmarkRunStatus.ERROR.value
         assert persisted.completed_at is not None
         assert persisted.report_error is None
+        assert persisted.failure_code == "execution_failed"
+        assert persisted.failure_message == "One or more benchmark items failed"
     finally:
         dispatch_session.close()
         persisted = db_session.get(BenchmarkRun, run_id)

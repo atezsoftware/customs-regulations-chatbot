@@ -5828,6 +5828,14 @@ class BenchmarkRun(Base):
     started_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    queued_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    failure_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     completed_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -5842,7 +5850,7 @@ class BenchmarkRun(Base):
     __table_args__ = (
         Index("ix_benchmark_run_status", "status"),
         CheckConstraint(
-            "status IN ('pending', 'running', 'completed', 'error', 'cancelled')",
+            "status IN ('pending', 'queued', 'running', 'completed', 'error', 'cancelled')",
             name="benchmark_run_status_check",
         ),
     )

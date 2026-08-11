@@ -63,7 +63,12 @@ def test_start_run_routes_to_regulatory_benchmark_queue(
     )
 
     assert result is expected_snapshot
-    assert run.status == BenchmarkRunStatus.RUNNING.value
+    assert run.status == BenchmarkRunStatus.QUEUED.value
+    assert run.queued_at is not None
+    assert run.started_at is None
+    assert run.heartbeat_at is None
+    assert run.failure_code is None
+    assert run.failure_message is None
     db_session.commit.assert_called_once_with()
     mock_get_tenant_id.assert_called_once_with()
     mock_send_task.assert_called_once_with(
@@ -79,7 +84,7 @@ def test_start_run_routes_to_regulatory_benchmark_queue(
 @patch.object(benchmark_api, "get_current_tenant_id", return_value="test_tenant")
 @patch.object(benchmark_api, "get_benchmark_run_for_update")
 @patch.object(benchmark_api.celery_app, "send_task")
-def test_concurrent_start_observes_locked_running_state_and_does_not_republish(
+def test_concurrent_start_observes_locked_queued_state_and_does_not_republish(
     mock_send_task: MagicMock,
     mock_get_benchmark_run_for_update: MagicMock,
     _mock_get_tenant_id: MagicMock,
@@ -150,7 +155,12 @@ def test_error_run_retry_resets_failed_items_and_preserves_completed_items() -> 
     ):
         benchmark_api.start_run(42, user=MagicMock(), db_session=MagicMock())
 
-    assert run.status == BenchmarkRunStatus.RUNNING.value
+    assert run.status == BenchmarkRunStatus.QUEUED.value
+    assert run.queued_at is not None
+    assert run.started_at is None
+    assert run.heartbeat_at is None
+    assert run.failure_code is None
+    assert run.failure_message is None
     assert run.completed_at is None
     assert run.completed_items == 1
     assert run.failed_items == 0
@@ -189,8 +199,12 @@ def test_start_publish_failure_restores_pending_state() -> None:
     run = SimpleNamespace(
         id=42,
         status=BenchmarkRunStatus.PENDING.value,
+        queued_at=None,
         started_at=None,
+        heartbeat_at=None,
         completed_at=None,
+        failure_code=None,
+        failure_message=None,
         items=[],
     )
     db_session = MagicMock()
@@ -207,8 +221,12 @@ def test_start_publish_failure_restores_pending_state() -> None:
         benchmark_api.start_run(42, user=MagicMock(), db_session=db_session)
 
     assert run.status == BenchmarkRunStatus.PENDING.value
+    assert run.queued_at is None
     assert run.started_at is None
+    assert run.heartbeat_at is None
     assert run.completed_at is None
+    assert run.failure_code == "dispatch_failed"
+    assert run.failure_message == "Failed to queue benchmark run"
 
 
 def test_benchmark_models_exclude_hidden_openrouter_configurations() -> None:
@@ -478,9 +496,13 @@ def test_run_snapshot_keeps_same_named_models_separate_by_provider_id() -> None:
         total_items=2,
         completed_items=2,
         failed_items=0,
+        queued_at=now,
         started_at=now,
+        heartbeat_at=now,
         completed_at=now,
         created_at=now,
+        failure_code=None,
+        failure_message=None,
         report=None,
         report_error=None,
         report_input_tokens=None,
@@ -619,6 +641,9 @@ def test_benchmark_task_persists_startup_crash_and_terminalizes_items() -> None:
         id=12,
         status=BenchmarkRunStatus.RUNNING.value,
         report_error=None,
+        failure_code=None,
+        failure_message=None,
+        heartbeat_at=None,
         completed_at=None,
         completed_items=1,
         failed_items=0,
@@ -654,7 +679,9 @@ def test_benchmark_task_persists_startup_crash_and_terminalizes_items() -> None:
         benchmark_tasks.run_regulatory_benchmark_task.run(run_id=12, tenant_id="tenant")
 
     assert run.status == BenchmarkRunStatus.ERROR.value
-    assert run.report_error == "persona selection exploded"
+    assert run.report_error is None
+    assert run.failure_code == "execution_failed"
+    assert run.failure_message == "persona selection exploded"
     assert run.completed_items == 1
     assert run.failed_items == 2
     assert pending_item.status == BenchmarkRunItemStatus.ERROR.value

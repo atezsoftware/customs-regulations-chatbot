@@ -19,7 +19,7 @@ from onyx.configs.constants import (
 )
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
-from onyx.db.enums import BenchmarkRunStatus, Permission
+from onyx.db.enums import BenchmarkRunFailureCode, BenchmarkRunStatus, Permission
 from onyx.db.llm import (
     fetch_existing_llm_provider_by_id,
     fetch_existing_llm_provider_by_name_and_type,
@@ -435,8 +435,12 @@ def start_run(
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, "Run is not pending or retryable")
     if run.status == BenchmarkRunStatus.ERROR.value:
         reset_benchmark_run_for_retry(run)
-    run.status = BenchmarkRunStatus.RUNNING.value
-    run.started_at = datetime.datetime.now(datetime.timezone.utc)
+    run.status = BenchmarkRunStatus.QUEUED.value
+    run.queued_at = datetime.datetime.now(datetime.timezone.utc)
+    run.started_at = None
+    run.heartbeat_at = None
+    run.failure_code = None
+    run.failure_message = None
     try:
         _enqueue_benchmark_run(run.id)
     except Exception as error:
@@ -444,7 +448,9 @@ def start_run(
         # holding the row lock so any delivered task observes this terminal reset;
         # its separate run lease makes a duplicate retry harmless.
         run.status = BenchmarkRunStatus.PENDING.value
-        run.started_at = None
+        run.queued_at = None
+        run.failure_code = BenchmarkRunFailureCode.DISPATCH_FAILED.value
+        run.failure_message = "Failed to queue benchmark run"
         db_session.commit()
         raise OnyxError(
             OnyxErrorCode.INTERNAL_ERROR, "Failed to queue benchmark run"

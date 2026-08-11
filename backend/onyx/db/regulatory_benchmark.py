@@ -2,11 +2,12 @@ import datetime
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from onyx.db.enums import (
     BenchmarkCostSource,
+    BenchmarkRunFailureCode,
     BenchmarkRunItemStatus,
     BenchmarkRunStatus,
 )
@@ -149,27 +150,41 @@ def claim_stale_benchmark_runs_for_recovery(
     claimed_at: datetime.datetime,
     limit: int = 20,
 ) -> list[int]:
-    """Claim stale in-flight runs for a bounded, idempotent re-delivery probe.
+    """Claim stale queued or in-flight runs for idempotent re-delivery.
 
-    ``BenchmarkRun.started_at`` doubles as a progress lease timestamp. The runner
-    renews it at item boundaries; API polling only republishes a run after that
-    lease goes stale. ``SKIP LOCKED`` keeps concurrent API replicas from publishing
-    the same recovery probe.
+    Queue age and execution heartbeat are separate so the public start time remains
+    immutable. ``SKIP LOCKED`` keeps concurrent API replicas from publishing the
+    same recovery probe.
     """
     stmt = (
         select(BenchmarkRun)
         .where(
-            BenchmarkRun.status == BenchmarkRunStatus.RUNNING.value,
-            BenchmarkRun.started_at.is_not(None),
-            BenchmarkRun.started_at <= stale_before,
+            or_(
+                (
+                    (BenchmarkRun.status == BenchmarkRunStatus.QUEUED.value)
+                    & BenchmarkRun.queued_at.is_not(None)
+                    & (BenchmarkRun.queued_at <= stale_before)
+                ),
+                (
+                    (BenchmarkRun.status == BenchmarkRunStatus.RUNNING.value)
+                    & BenchmarkRun.heartbeat_at.is_not(None)
+                    & (BenchmarkRun.heartbeat_at <= stale_before)
+                ),
+            )
         )
-        .order_by(BenchmarkRun.started_at, BenchmarkRun.id)
+        .order_by(
+            func.coalesce(BenchmarkRun.heartbeat_at, BenchmarkRun.queued_at),
+            BenchmarkRun.id,
+        )
         .limit(limit)
         .with_for_update(skip_locked=True)
     )
     runs = list(db_session.scalars(stmt).all())
     for run in runs:
-        run.started_at = claimed_at
+        if run.status == BenchmarkRunStatus.QUEUED.value:
+            run.queued_at = claimed_at
+        else:
+            run.heartbeat_at = claimed_at
     if runs:
         db_session.commit()
     return [run.id for run in runs]
@@ -228,7 +243,12 @@ def reset_benchmark_run_for_retry(run: BenchmarkRun) -> None:
         item.status == BenchmarkRunItemStatus.COMPLETED.value for item in run.items
     )
     run.failed_items = 0
+    run.queued_at = None
+    run.started_at = None
+    run.heartbeat_at = None
     run.completed_at = None
+    run.failure_code = None
+    run.failure_message = None
     run.report = None
     run.report_error = None
     run.report_input_tokens = None
@@ -237,7 +257,10 @@ def reset_benchmark_run_for_retry(run: BenchmarkRun) -> None:
 
 
 def mark_benchmark_run_failed(
-    db_session: Session, run_id: int, error_message: str
+    db_session: Session,
+    run_id: int,
+    error_message: str,
+    failure_code: BenchmarkRunFailureCode = BenchmarkRunFailureCode.EXECUTION_FAILED,
 ) -> BenchmarkRun | None:
     run = get_benchmark_run_for_update(db_session, run_id)
     if run is None or run.status in {
@@ -256,14 +279,16 @@ def mark_benchmark_run_failed(
     ]
     if (
         run.status == BenchmarkRunStatus.ERROR.value
-        and run.report_error is not None
+        and run.failure_message is not None
         and not unfinished_items
     ):
         return run
     completed_at = run.completed_at or datetime.datetime.now(datetime.timezone.utc)
-    diagnostic = run.report_error or error_message
+    diagnostic = run.failure_message or error_message
     run.status = BenchmarkRunStatus.ERROR.value
-    run.report_error = diagnostic
+    run.failure_code = run.failure_code or failure_code.value
+    run.failure_message = diagnostic
+    run.heartbeat_at = completed_at
     run.completed_at = completed_at
     for item in unfinished_items:
         item.status = BenchmarkRunItemStatus.ERROR.value

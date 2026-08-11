@@ -146,7 +146,13 @@ export interface BenchmarkRunReport {
 export interface BenchmarkRun {
   id: number;
   label: string | null;
-  status: "pending" | "running" | "completed" | "error" | "cancelled";
+  status:
+    | "pending"
+    | "queued"
+    | "running"
+    | "completed"
+    | "error"
+    | "cancelled";
   judge_provider: string;
   judge_provider_id: number | null;
   judge_model: string;
@@ -154,9 +160,18 @@ export interface BenchmarkRun {
   total_items: number;
   completed_items: number;
   failed_items: number;
+  queued_at: string | null;
   started_at: string | null;
+  heartbeat_at: string | null;
   completed_at: string | null;
   created_at: string;
+  failure_code:
+    | "dependency_unavailable"
+    | "worker_unavailable"
+    | "dispatch_failed"
+    | "execution_failed"
+    | null;
+  failure_message: string | null;
   report: BenchmarkRunReport | null;
   report_error: string | null;
   report_input_tokens: number | null;

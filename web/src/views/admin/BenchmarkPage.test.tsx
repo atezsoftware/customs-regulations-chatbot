@@ -86,12 +86,20 @@ function buildRun(
     total_items: 4,
     completed_items: status === "completed" ? 4 : 1,
     failed_items: status === "error" ? 1 : 0,
-    started_at: status === "pending" ? null : "2026-08-10T09:01:00Z",
+    queued_at: status === "pending" ? null : "2026-08-10T09:00:30Z",
+    started_at:
+      status === "pending" || status === "queued"
+        ? null
+        : "2026-08-10T09:01:00Z",
+    heartbeat_at: status === "running" ? "2026-08-10T09:01:30Z" : null,
     completed_at:
       status === "completed" || status === "error"
         ? "2026-08-10T09:02:00Z"
         : null,
     created_at: "2026-08-10T09:00:00Z",
+    failure_code: status === "error" ? "execution_failed" : null,
+    failure_message:
+      status === "error" ? "One or more benchmark items failed" : null,
     report: null,
     report_error: null,
     report_input_tokens: null,
@@ -147,7 +155,7 @@ beforeEach(() => {
 
 afterEach(() => {
   jest.useRealTimers();
-  jest.clearAllMocks();
+  jest.resetAllMocks();
 });
 
 test("switches between the Questions and Runs workspaces", async () => {
@@ -191,14 +199,23 @@ test("selects a created run before its start request finishes", async () => {
   expect(screen.getAllByText("Pending").length).toBeGreaterThan(0);
 
   await act(async () => {
-    finishStart({ ...createdRun, status: "running" });
+    finishStart({
+      ...createdRun,
+      status: "queued",
+      queued_at: "2026-08-10T09:00:30Z",
+    });
   });
+  expect(screen.getAllByText("Queued").length).toBeGreaterThan(0);
 });
 
 test("sends the selected provider row for candidates and the judge", async () => {
   const createdRun = buildRun(45, "pending", "Provider identity run");
   mockedCreateRun.mockResolvedValue(createdRun);
-  mockedStartRun.mockResolvedValue({ ...createdRun, status: "running" });
+  mockedStartRun.mockResolvedValue({
+    ...createdRun,
+    status: "queued",
+    queued_at: "2026-08-10T09:00:30Z",
+  });
 
   render(<BenchmarkPage />);
   const user = await configureRun();
@@ -271,11 +288,16 @@ test.each([
   "offers %s runs a %s action and refreshes their status",
   async (status, actionLabel) => {
     const initialRun = buildRun(51, status, "Recoverable run");
-    const runningRun = { ...initialRun, status: "running" as const };
+    const queuedRun = {
+      ...initialRun,
+      status: "queued" as const,
+      queued_at: "2026-08-10T10:00:00Z",
+      started_at: null,
+    };
     mockedListRuns
       .mockResolvedValueOnce([initialRun])
-      .mockResolvedValue([runningRun]);
-    mockedStartRun.mockResolvedValue(runningRun);
+      .mockResolvedValue([queuedRun]);
+    mockedStartRun.mockResolvedValue(queuedRun);
 
     render(<BenchmarkPage />);
     const user = await openRuns();
@@ -283,7 +305,7 @@ test.each([
 
     await waitFor(() => {
       expect(mockedStartRun).toHaveBeenCalledWith(initialRun.id);
-      expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Queued").length).toBeGreaterThan(0);
       expect(
         screen.queryByRole("button", { name: actionLabel })
       ).not.toBeInTheDocument();
@@ -313,7 +335,11 @@ test("keeps a second run disabled while its start request is still pending", asy
   expect(secondStartingButton).toBeDisabled();
 
   await act(async () => {
-    firstStart.resolve({ ...firstRun, status: "running" });
+    firstStart.resolve({
+      ...firstRun,
+      status: "queued",
+      queued_at: "2026-08-10T10:00:00Z",
+    });
   });
 
   expect(screen.getByRole("button", { name: "Starting…" })).toBeDisabled();
@@ -322,7 +348,11 @@ test("keeps a second run disabled while its start request is still pending", asy
   ).not.toBeInTheDocument();
 
   await act(async () => {
-    secondStart.resolve({ ...secondRun, status: "running" });
+    secondStart.resolve({
+      ...secondRun,
+      status: "queued",
+      queued_at: "2026-08-10T10:00:01Z",
+    });
   });
 });
 
@@ -332,15 +362,19 @@ test("shows a retried run that fails before its first poll", async () => {
   const activeRun = buildRun(53, "running", "Keeps polling");
   const retriedRun = {
     ...failedRun,
-    status: "running" as const,
-    started_at: "2026-08-10T10:00:00Z",
+    status: "queued" as const,
+    queued_at: "2026-08-10T10:00:00Z",
+    started_at: null,
+    heartbeat_at: null,
     completed_at: null,
+    failure_code: null,
+    failure_message: null,
   };
   const failedRetry = {
     ...failedRun,
-    started_at: retriedRun.started_at,
+    queued_at: retriedRun.queued_at,
     completed_at: "2026-08-10T10:00:01Z",
-    error_message: "Retry worker failed",
+    failure_message: "Retry worker failed",
   };
   mockedListRuns
     .mockResolvedValueOnce([failedRun, activeRun])
@@ -351,7 +385,7 @@ test("shows a retried run that fails before its first poll", async () => {
   render(<BenchmarkPage />);
   const user = await openRuns();
   await user.click(screen.getByRole("button", { name: "Retry" }));
-  expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("Queued").length).toBeGreaterThan(0);
 
   await act(async () => {
     jest.advanceTimersByTime(3000);
@@ -359,13 +393,17 @@ test("shows a retried run that fails before its first poll", async () => {
   expect(
     screen.queryByRole("button", { name: "Retry" })
   ).not.toBeInTheDocument();
-  expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("Queued").length).toBeGreaterThan(0);
 
   await act(async () => {
     jest.advanceTimersByTime(3000);
   });
 
   expect((await screen.findAllByText("Failed")).length).toBeGreaterThan(0);
+  expect(screen.getByText("Retry worker failed")).toBeInTheDocument();
+  expect(
+    screen.getByText("Failure code: execution_failed")
+  ).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
 });
 
@@ -436,13 +474,14 @@ test("polls run status even when configuration refreshes fail", async () => {
 test("ignores an older poll that resolves after a run has started", async () => {
   jest.useFakeTimers();
   const pendingRun = buildRun(62, "pending", "Ordered run");
-  const runningRun = { ...pendingRun, status: "running" as const };
+  const queuedRun = buildRun(62, "queued", "Ordered run");
+  const runningRun = buildRun(62, "running", "Ordered run");
   const olderPoll = deferred<BenchmarkRun[]>();
   mockedListRuns
     .mockResolvedValueOnce([pendingRun])
     .mockReturnValueOnce(olderPoll.promise)
     .mockResolvedValue([runningRun]);
-  mockedStartRun.mockResolvedValue(runningRun);
+  mockedStartRun.mockResolvedValue(queuedRun);
 
   render(<BenchmarkPage />);
   const user = await openRuns();
@@ -450,13 +489,13 @@ test("ignores an older poll that resolves after a run has started", async () => 
     jest.advanceTimersByTime(3000);
   });
   await user.click(screen.getByRole("button", { name: "Start" }));
-  expect((await screen.findAllByText("Running")).length).toBeGreaterThan(0);
+  expect((await screen.findAllByText("Queued")).length).toBeGreaterThan(0);
 
   await act(async () => {
     olderPoll.resolve([pendingRun]);
   });
 
-  expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("Queued").length).toBeGreaterThan(0);
   expect(
     screen.queryByRole("button", { name: "Start" })
   ).not.toBeInTheDocument();

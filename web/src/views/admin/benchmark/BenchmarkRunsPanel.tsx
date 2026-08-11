@@ -69,16 +69,16 @@ function mergeRunSnapshots(
 interface ProtectedRunUpdate {
   expected: BenchmarkRun["status"];
   previous: BenchmarkRun["status"] | null;
-  attemptStartedAt: string | null;
+  attemptQueuedAt: string | null;
 }
 
 function isSameOrNewerAttempt(
-  incomingStartedAt: string | null,
-  expectedStartedAt: string | null
+  incomingQueuedAt: string | null,
+  expectedQueuedAt: string | null
 ) {
-  if (!incomingStartedAt || !expectedStartedAt) return false;
-  const incomingTime = Date.parse(incomingStartedAt);
-  const expectedTime = Date.parse(expectedStartedAt);
+  if (!incomingQueuedAt || !expectedQueuedAt) return false;
+  const incomingTime = Date.parse(incomingQueuedAt);
+  const expectedTime = Date.parse(expectedQueuedAt);
   return (
     Number.isFinite(incomingTime) &&
     Number.isFinite(expectedTime) &&
@@ -94,16 +94,15 @@ function hasObservedRunUpdate(
   if (incomingStatus === update.expected) return true;
   if (
     update.previous === "error" &&
-    update.expected === "running" &&
+    update.expected === "queued" &&
     incomingStatus === "error"
   )
-    return isSameOrNewerAttempt(
-      incomingRun.started_at,
-      update.attemptStartedAt
-    );
+    return isSameOrNewerAttempt(incomingRun.queued_at, update.attemptQueuedAt);
+  if (update.expected === "queued" && incomingStatus === "running")
+    return isSameOrNewerAttempt(incomingRun.queued_at, update.attemptQueuedAt);
   if (update.expected === "pending") return true;
   return (
-    update.expected === "running" &&
+    (update.expected === "queued" || update.expected === "running") &&
     (incomingStatus === "completed" ||
       incomingStatus === "error" ||
       incomingStatus === "cancelled")
@@ -185,7 +184,7 @@ export default function BenchmarkRunsPanel() {
   }, [refreshConfiguration, refreshRuns]);
   useEffect(() => {
     if (
-      !runs.some((run) => run.status === "pending" || run.status === "running")
+      !runs.some((run) => run.status === "queued" || run.status === "running")
     )
       return;
     let cancelled = false;
@@ -265,7 +264,7 @@ export default function BenchmarkRunsPanel() {
       protectedRunUpdates.current.set(run.id, {
         expected: run.status,
         previous: null,
-        attemptStartedAt: run.started_at,
+        attemptQueuedAt: run.queued_at,
       });
       setRuns((current) => withUpdatedRun(current, run));
       setSelectedRunId(run.id);
@@ -276,7 +275,7 @@ export default function BenchmarkRunsPanel() {
         protectedRunUpdates.current.set(run.id, {
           expected: startedRun.status,
           previous: run.status,
-          attemptStartedAt: startedRun.started_at,
+          attemptQueuedAt: startedRun.queued_at,
         });
         setRuns((current) => withUpdatedRun(current, startedRun));
         toast.success("Benchmark run queued through the production chat flow.");
@@ -316,13 +315,13 @@ export default function BenchmarkRunsPanel() {
         protectedRunUpdates.current.set(run.id, {
           expected: startedRun.status,
           previous: run.status,
-          attemptStartedAt: startedRun.started_at,
+          attemptQueuedAt: startedRun.queued_at,
         });
         setRuns((current) => withUpdatedRun(current, startedRun));
         toast.success(
           run.status === "error"
-            ? "Benchmark run retried."
-            : "Benchmark run started."
+            ? "Benchmark run queued for retry."
+            : "Benchmark run queued."
         );
       } catch (error) {
         toast.error(
@@ -342,7 +341,7 @@ export default function BenchmarkRunsPanel() {
       protectedRunUpdates.current.set(run.id, {
         expected: cancelledRun.status,
         previous: run.status,
-        attemptStartedAt: cancelledRun.started_at,
+        attemptQueuedAt: cancelledRun.queued_at,
       });
       setRuns((current) => withUpdatedRun(current, cancelledRun));
     } catch (error) {
@@ -668,7 +667,8 @@ export default function BenchmarkRunsPanel() {
                             : "Start"}
                       </Button>
                     )}
-                    {selectedRun.status === "running" && (
+                    {(selectedRun.status === "queued" ||
+                      selectedRun.status === "running") && (
                       <Button
                         size="sm"
                         variant="danger"
@@ -717,6 +717,23 @@ export default function BenchmarkRunsPanel() {
                   />
                 </div>
               </Card>
+              {selectedRun.failure_message && (
+                <div className="rounded-lg border border-status-error-03 bg-status-error-01 p-3">
+                  <div className="flex flex-col gap-1">
+                    <Text font="main-ui-action" color="status-error-05">
+                      Benchmark execution failed
+                    </Text>
+                    <Text as="p" font="main-ui-body" color="status-error-05">
+                      {selectedRun.failure_message}
+                    </Text>
+                    {selectedRun.failure_code && (
+                      <Text font="secondary-body" color="status-error-05">
+                        {`Failure code: ${selectedRun.failure_code}`}
+                      </Text>
+                    )}
+                  </div>
+                </div>
+              )}
               {selectedRun.report && (
                 <details open className={panelClass}>
                   <summary className="cursor-pointer">

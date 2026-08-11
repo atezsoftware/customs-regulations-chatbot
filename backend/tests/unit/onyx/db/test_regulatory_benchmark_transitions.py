@@ -47,6 +47,9 @@ def test_competing_terminal_transitions_lock_and_preserve_first_winner() -> None
             id=7,
             status=BenchmarkRunStatus.RUNNING.value,
             report_error=None,
+            failure_code=None,
+            failure_message=None,
+            heartbeat_at=None,
             completed_at=None,
             completed_items=0,
             failed_items=0,
@@ -77,7 +80,10 @@ def test_fully_terminalized_error_transition_is_idempotent() -> None:
         SimpleNamespace(
             id=9,
             status=BenchmarkRunStatus.ERROR.value,
-            report_error="original failure",
+            report_error=None,
+            failure_code="execution_failed",
+            failure_message="original failure",
+            heartbeat_at=completed_at,
             completed_at=completed_at,
             completed_items=0,
             failed_items=1,
@@ -93,5 +99,6 @@ def test_fully_terminalized_error_transition_is_idempotent() -> None:
     assert result is run
     assert session.locked_reads == 1
     assert session.commits == 0
-    assert run.report_error == "original failure"
+    assert run.report_error is None
+    assert run.failure_message == "original failure"
     assert run.completed_at is completed_at

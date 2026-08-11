@@ -749,10 +749,18 @@ class AmendmentProposalStatus(str, PyEnum):
 
 class BenchmarkRunStatus(str, PyEnum):
     PENDING = "pending"
+    QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
     ERROR = "error"
     CANCELLED = "cancelled"
+
+
+class BenchmarkRunFailureCode(str, PyEnum):
+    DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+    WORKER_UNAVAILABLE = "worker_unavailable"
+    DISPATCH_FAILED = "dispatch_failed"
+    EXECUTION_FAILED = "execution_failed"
 
 
 class BenchmarkRunItemStatus(str, PyEnum):

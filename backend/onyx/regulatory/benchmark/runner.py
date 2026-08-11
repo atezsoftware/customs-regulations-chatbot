@@ -12,6 +12,7 @@ from onyx.context.search.models import BaseFilters, SearchDoc
 from onyx.db.chat import create_chat_session
 from onyx.db.enums import (
     BenchmarkCostSource,
+    BenchmarkRunFailureCode,
     BenchmarkRunItemStatus,
     BenchmarkRunStatus,
 )
@@ -622,9 +623,10 @@ def _mark_unfinished_items_error(
 def run_benchmark(db_session: Session, run_id: int) -> None:
     run = get_benchmark_run_for_update(db_session, run_id)
     if run is None:
-        raise ValueError(f"Benchmark run {run_id} not found")
+        logger.warning("Ignoring delivery for missing benchmark run %s", run_id)
+        return
     if run.status not in {
-        BenchmarkRunStatus.PENDING.value,
+        BenchmarkRunStatus.QUEUED.value,
         BenchmarkRunStatus.RUNNING.value,
     }:
         return
@@ -632,14 +634,17 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
     user = db_session.get(User, run.created_by)
     if user is None:
         run.status = BenchmarkRunStatus.ERROR.value
+        run.failure_code = BenchmarkRunFailureCode.EXECUTION_FAILED.value
+        run.failure_message = "Benchmark run creator no longer exists"
         run.completed_at = _utcnow()
         db_session.commit()
         raise ValueError("Benchmark run creator no longer exists")
     now = _utcnow()
     _recover_interrupted_items(run, recovered_at=now)
     run.status = BenchmarkRunStatus.RUNNING.value
-    # This is also the durable recovery lease renewed at each item boundary.
-    run.started_at = now
+    if run.started_at is None:
+        run.started_at = now
+    run.heartbeat_at = now
     db_session.commit()
 
     report_persona: Persona | None = None
@@ -652,11 +657,11 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
         persona = _get_item_persona(db_session, user=user, item=item)
         if report_persona is None:
             report_persona = persona
-        run.started_at = _utcnow()
+        run.heartbeat_at = _utcnow()
         db_session.commit()
         _run_item(db_session, run=run, item=item, user=user, persona=persona)
         refresh_benchmark_run_counts(db_session, run)
-        run.started_at = _utcnow()
+        run.heartbeat_at = _utcnow()
         db_session.commit()
 
     db_session.refresh(run)
@@ -665,11 +670,14 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
         _mark_unfinished_items_error(run, completed_at=finished_at)
         db_session.flush()
         refresh_benchmark_run_counts(db_session, run)
-        run.status = (
-            BenchmarkRunStatus.COMPLETED.value
-            if run.total_items > 0 and run.completed_items == run.total_items
-            else BenchmarkRunStatus.ERROR.value
-        )
+        if run.total_items > 0 and run.completed_items == run.total_items:
+            run.status = BenchmarkRunStatus.COMPLETED.value
+            run.failure_code = None
+            run.failure_message = None
+        else:
+            run.status = BenchmarkRunStatus.ERROR.value
+            run.failure_code = BenchmarkRunFailureCode.EXECUTION_FAILED.value
+            run.failure_message = "One or more benchmark items failed"
         if report_persona is None and run.items:
             report_persona = _get_item_persona(
                 db_session,
@@ -683,4 +691,5 @@ def run_benchmark(db_session: Session, run_id: int) -> None:
             persona=report_persona,
         )
         run.completed_at = finished_at
+        run.heartbeat_at = finished_at
         db_session.commit()

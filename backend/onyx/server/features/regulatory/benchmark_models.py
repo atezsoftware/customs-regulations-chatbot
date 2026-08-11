@@ -7,6 +7,7 @@ from onyx.configs.app_configs import (
     REGULATORY_BENCHMARK_MAX_CANDIDATES,
     REGULATORY_BENCHMARK_MAX_QUESTIONS,
 )
+from onyx.db.enums import BenchmarkRunFailureCode
 from onyx.db.models import (
     BenchmarkQuestion,
     BenchmarkRun,
@@ -238,9 +239,13 @@ class BenchmarkRunSnapshot(BaseModel):
     total_items: int
     completed_items: int
     failed_items: int
+    queued_at: datetime.datetime | None
     started_at: datetime.datetime | None
+    heartbeat_at: datetime.datetime | None
     completed_at: datetime.datetime | None
     created_at: datetime.datetime
+    failure_code: BenchmarkRunFailureCode | None
+    failure_message: str | None
     report: dict[str, object] | None
     report_error: str | None
     report_input_tokens: int | None
@@ -313,9 +318,17 @@ def benchmark_run_snapshot(run: BenchmarkRun) -> BenchmarkRunSnapshot:
         total_items=run.total_items,
         completed_items=run.completed_items,
         failed_items=run.failed_items,
+        queued_at=run.queued_at,
         started_at=run.started_at,
+        heartbeat_at=run.heartbeat_at,
         completed_at=run.completed_at,
         created_at=run.created_at,
+        failure_code=(
+            BenchmarkRunFailureCode(run.failure_code)
+            if run.failure_code is not None
+            else None
+        ),
+        failure_message=run.failure_message,
         report=run.report,
         report_error=run.report_error,
         report_input_tokens=run.report_input_tokens,

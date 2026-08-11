@@ -13,6 +13,7 @@ const STATUS_PRESENTATION: Record<
   { label: string; color: "green" | "blue" | "red" | "amber" | "gray" }
 > = {
   pending: { label: "Pending", color: "amber" },
+  queued: { label: "Queued", color: "amber" },
   running: { label: "Running", color: "blue" },
   completed: { label: "Completed", color: "green" },
   error: { label: "Failed", color: "red" },

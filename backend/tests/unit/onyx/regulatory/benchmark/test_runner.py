@@ -627,7 +627,37 @@ def test_runner_initial_claim_locks_the_dispatch_row() -> None:
     run_benchmark(db_session, run.id)
 
 
+def test_missing_run_delivery_is_an_idempotent_noop() -> None:
+    db_session = MagicMock()
+
+    with patch(
+        "onyx.regulatory.benchmark.runner.get_benchmark_run_for_update",
+        return_value=None,
+    ):
+        run_benchmark(db_session, 999999999)
+
+    db_session.commit.assert_not_called()
+
+
+def test_pending_run_delivery_is_an_idempotent_noop() -> None:
+    run = cast(
+        BenchmarkRun,
+        SimpleNamespace(id=41, status=BenchmarkRunStatus.PENDING.value),
+    )
+    db_session = MagicMock()
+
+    with patch(
+        "onyx.regulatory.benchmark.runner.get_benchmark_run_for_update",
+        return_value=run,
+    ):
+        run_benchmark(db_session, run.id)
+
+    db_session.get.assert_not_called()
+    db_session.commit.assert_not_called()
+
+
 def test_run_with_any_error_is_never_marked_completed() -> None:
+    initial_started_at = datetime.datetime.now(datetime.timezone.utc)
     completed_item = SimpleNamespace(
         status=BenchmarkRunItemStatus.COMPLETED.value,
         judgment=None,
@@ -638,14 +668,18 @@ def test_run_with_any_error_is_never_marked_completed() -> None:
     )
     run = SimpleNamespace(
         id=17,
-        status=BenchmarkRunStatus.RUNNING.value,
+        status=BenchmarkRunStatus.QUEUED.value,
         created_by="user-id",
         items=[completed_item, error_item],
         total_items=2,
         completed_items=0,
         failed_items=0,
-        started_at=None,
+        queued_at=initial_started_at,
+        started_at=initial_started_at,
+        heartbeat_at=None,
         completed_at=None,
+        failure_code=None,
+        failure_message=None,
     )
     db_session = MagicMock()
     db_session.get.return_value = MagicMock()
@@ -679,6 +713,9 @@ def test_run_with_any_error_is_never_marked_completed() -> None:
     assert run.status == BenchmarkRunStatus.ERROR.value
     assert run.completed_items == 1
     assert run.failed_items == 1
+    assert run.started_at == initial_started_at
+    assert run.heartbeat_at == run.completed_at
+    assert run.failure_code == "execution_failed"
 
 
 def test_creator_missing_startup_error_is_completed_by_task_recovery() -> None:
@@ -692,6 +729,9 @@ def test_creator_missing_startup_error_is_completed_by_task_recovery() -> None:
         status=BenchmarkRunStatus.RUNNING.value,
         created_by="missing-user-id",
         report_error=None,
+        failure_code=None,
+        failure_message=None,
+        heartbeat_at=None,
         items=[pending_item],
         completed_items=0,
         failed_items=0,
@@ -721,7 +761,9 @@ def test_creator_missing_startup_error_is_completed_by_task_recovery() -> None:
             db_session, run.id, "Benchmark run creator no longer exists"
         )
 
-    assert run.report_error == "Benchmark run creator no longer exists"
+    assert run.report_error is None
+    assert run.failure_code == "execution_failed"
+    assert run.failure_message == "Benchmark run creator no longer exists"
     assert pending_item.status == BenchmarkRunItemStatus.ERROR.value
     assert pending_item.error_message == "Benchmark run creator no longer exists"
     assert pending_item.completed_at == run.completed_at
