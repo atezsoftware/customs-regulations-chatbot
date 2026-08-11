@@ -23,6 +23,7 @@ def test_item_watchdog_terminates_only_the_item_that_times_out() -> None:
         patch.object(tasks, "REGULATORY_BENCHMARK_PARALLEL_ITEMS", 1),
         patch.object(tasks, "REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS", 60),
         patch.object(tasks, "SimpleJobClient", return_value=client),
+        patch.object(tasks, "_claim_benchmark_item", return_value=True),
         patch.object(
             tasks,
             "_get_benchmark_run_status",
@@ -56,6 +57,7 @@ def test_item_scheduler_stops_active_children_after_run_cancellation() -> None:
     with (
         patch.object(tasks, "REGULATORY_BENCHMARK_PARALLEL_ITEMS", 1),
         patch.object(tasks, "SimpleJobClient", return_value=client),
+        patch.object(tasks, "_claim_benchmark_item", return_value=True),
         patch.object(
             tasks,
             "_get_benchmark_run_status",
@@ -90,12 +92,12 @@ def test_item_child_uses_a_fresh_session() -> None:
             return_value=session_context,
         ),
         patch(
-            "onyx.regulatory.benchmark.runner.run_benchmark_item"
-        ) as run_benchmark_item,
+            "onyx.regulatory.benchmark.runner.run_claimed_benchmark_item"
+        ) as run_claimed_benchmark_item,
     ):
         tasks._execute_benchmark_item(12, 34, "tenant_1")
 
-    run_benchmark_item.assert_called_once_with(db_session, 12, 34)
+    run_claimed_benchmark_item.assert_called_once_with(db_session, 12, 34)
 
 
 def test_report_timeout_is_recorded_without_reopening_terminal_run() -> None:
@@ -145,6 +147,7 @@ def test_task_coordinates_items_then_finalizes_in_a_spawned_process() -> None:
             "_get_benchmark_run_status",
             return_value=BenchmarkRunStatus.RUNNING.value,
         ),
+        patch.object(tasks, "_touch_benchmark_run"),
         patch.object(tasks, "SimpleJobClient", return_value=client),
         patch.object(tasks, "_monitor_finalization_job") as monitor,
     ):
@@ -200,6 +203,13 @@ def test_item_scheduler_fills_parallel_slots_before_waiting() -> None:
         patch.object(tasks, "SimpleJobClient", RecordingClient),
         patch.object(
             tasks,
+            "_claim_benchmark_item",
+            side_effect=lambda _run_id, item_id: (
+                events.append(f"claim:{item_id}") or True
+            ),
+        ),
+        patch.object(
+            tasks,
             "_get_benchmark_run_status",
             return_value=BenchmarkRunStatus.RUNNING.value,
         ),
@@ -218,6 +228,36 @@ def test_item_scheduler_fills_parallel_slots_before_waiting() -> None:
         )
 
     assert timed_out is False
-    assert events[:3] == ["submit:101", "submit:102", "wait"]
-    assert events[-1] == "submit:103"
+    assert events[:5] == [
+        "claim:101",
+        "submit:101",
+        "claim:102",
+        "submit:102",
+        "wait",
+    ]
+    assert events[-2:] == ["claim:103", "submit:103"]
     assert heartbeat.ensure_owned.call_count >= 2
+
+
+def test_item_scheduler_does_not_spawn_when_atomic_claim_is_rejected() -> None:
+    client = MagicMock()
+
+    with (
+        patch.object(tasks, "SimpleJobClient", return_value=client),
+        patch.object(tasks, "_claim_benchmark_item", return_value=False),
+        patch.object(
+            tasks,
+            "_get_benchmark_run_status",
+            return_value=BenchmarkRunStatus.RUNNING.value,
+        ),
+        patch.object(tasks, "_touch_benchmark_run"),
+    ):
+        timed_out = tasks._run_benchmark_items(
+            run_id=12,
+            tenant_id="tenant_1",
+            item_ids=[34],
+            heartbeat=MagicMock(),
+        )
+
+    assert timed_out is False
+    client.submit.assert_not_called()

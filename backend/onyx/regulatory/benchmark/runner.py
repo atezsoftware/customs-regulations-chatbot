@@ -470,32 +470,54 @@ def _run_item(
                 return
             item.status = BenchmarkRunItemStatus.COMPLETED.value
         except Exception as judge_error:
-            logger.exception("Benchmark judge failed for item %s", item.id)
             db_session.rollback()
+            reloaded_run = db_session.get(BenchmarkRun, run.id)
             reloaded_item = db_session.get(BenchmarkRunItem, item.id)
             assert reloaded_item is not None
             item = reloaded_item
-            item.status = BenchmarkRunItemStatus.ERROR.value
-            item.judge_error = str(judge_error)
-            item.error_message = f"Judge failed: {judge_error}"
+            if (
+                reloaded_run is not None
+                and reloaded_run.status == BenchmarkRunStatus.RUNNING.value
+                and item.status != BenchmarkRunItemStatus.CANCELLED.value
+            ):
+                logger.exception("Benchmark judge failed for item %s", item.id)
+                item.status = BenchmarkRunItemStatus.ERROR.value
+                item.judge_error = str(judge_error)
+                item.error_message = f"Judge failed: {judge_error}"
+            else:
+                logger.info(
+                    "Ignoring late judge failure for inactive benchmark item %s",
+                    item.id,
+                )
     except Exception as error:
-        logger.exception("Benchmark run %s item %s failed", run.id, item.id)
         db_session.rollback()
+        reloaded_run = db_session.get(BenchmarkRun, run.id)
         reloaded_item = db_session.get(BenchmarkRunItem, item.id)
         assert reloaded_item is not None
         item = reloaded_item
-        item.status = BenchmarkRunItemStatus.ERROR.value
-        item.error_message = str(error)
+        if (
+            reloaded_run is not None
+            and reloaded_run.status == BenchmarkRunStatus.RUNNING.value
+            and item.status != BenchmarkRunItemStatus.CANCELLED.value
+        ):
+            logger.exception("Benchmark run %s item %s failed", run.id, item.id)
+            item.status = BenchmarkRunItemStatus.ERROR.value
+            item.error_message = str(error)
+        else:
+            logger.info(
+                "Ignoring late execution failure for inactive benchmark item %s",
+                item.id,
+            )
     finally:
-        if item.duration_ms is None:
-            item.duration_ms = round((time.monotonic() - started) * 1000)
-        if item.status in {
-            BenchmarkRunItemStatus.COMPLETED.value,
-            BenchmarkRunItemStatus.ERROR.value,
-            BenchmarkRunItemStatus.CANCELLED.value,
-        }:
-            item.completed_at = _utcnow()
-        db_session.commit()
+        if item.status != BenchmarkRunItemStatus.CANCELLED.value:
+            if item.duration_ms is None:
+                item.duration_ms = round((time.monotonic() - started) * 1000)
+            if item.status in {
+                BenchmarkRunItemStatus.COMPLETED.value,
+                BenchmarkRunItemStatus.ERROR.value,
+            }:
+                item.completed_at = _utcnow()
+            db_session.commit()
 
 
 def _generate_run_report(
@@ -682,12 +704,21 @@ def run_benchmark_item(db_session: Session, run_id: int, item_id: int) -> None:
         logger.info("Benchmark item %s is no longer pending", item_id)
         return
 
+    run_claimed_benchmark_item(db_session, run_id, item_id)
+
+
+def run_claimed_benchmark_item(db_session: Session, run_id: int, item_id: int) -> None:
+    """Execute an item already fenced as running by its coordinator."""
+
     run = db_session.get(BenchmarkRun, run_id)
     if run is None or run.status != BenchmarkRunStatus.RUNNING.value:
         return
     item = get_benchmark_run_item(db_session, run_id=run_id, item_id=item_id)
     if item is None:
         raise ValueError(f"Benchmark item {item_id} does not belong to run {run_id}")
+    if item.status != BenchmarkRunItemStatus.RUNNING.value:
+        logger.info("Benchmark item %s is no longer running", item_id)
+        return
     user = db_session.get(User, run.created_by)
     if user is None:
         raise ValueError("Benchmark run creator no longer exists")

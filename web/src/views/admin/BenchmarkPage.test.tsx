@@ -21,11 +21,19 @@ import {
 } from "@/lib/regulatory/benchmark";
 import BenchmarkPage from "@/views/admin/BenchmarkPage";
 import { formatCost } from "@/views/admin/benchmark/BenchmarkPresentation";
+import { processedItemCount } from "@/views/admin/benchmark/BenchmarkRunsPanel";
 
 test("tiny non-zero benchmark costs are not rendered as zero", () => {
   expect(formatCost(0.001)).toBe("<$0.0001");
   expect(formatCost(0)).toBe("$0.0000");
   expect(formatCost(null)).toBe("Unavailable");
+});
+
+test("cancelled benchmark items count as processed progress", () => {
+  const run = buildRun(8, "cancelled");
+  run.items = [{ status: "cancelled" } as BenchmarkRun["items"][number]];
+
+  expect(processedItemCount(run)).toBe(2);
 });
 
 let mockDocumentSets: Array<{ id: number; name: string }> = [];

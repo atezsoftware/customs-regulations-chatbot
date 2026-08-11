@@ -102,3 +102,41 @@ def test_fully_terminalized_error_transition_is_idempotent() -> None:
     assert run.report_error is None
     assert run.failure_message == "original failure"
     assert run.completed_at is completed_at
+
+
+def test_repeated_cancellation_repairs_unfinished_items() -> None:
+    completed_at = object()
+    pending_item = SimpleNamespace(
+        status=BenchmarkRunItemStatus.PENDING.value,
+        completed_at=None,
+    )
+    running_item = SimpleNamespace(
+        status=BenchmarkRunItemStatus.RUNNING.value,
+        completed_at=None,
+    )
+    completed_item = SimpleNamespace(
+        status=BenchmarkRunItemStatus.COMPLETED.value,
+        completed_at=completed_at,
+    )
+    run = cast(
+        BenchmarkRun,
+        SimpleNamespace(
+            id=11,
+            status=BenchmarkRunStatus.CANCELLED.value,
+            completed_at=completed_at,
+            items=[pending_item, running_item, completed_item],
+        ),
+    )
+    session = _LockAwareSession(run)
+
+    result = cancel_benchmark_run(cast(Session, session), run.id)
+
+    assert result is run
+    assert session.locked_reads == 1
+    assert session.commits == 1
+    assert pending_item.status == BenchmarkRunItemStatus.CANCELLED.value
+    assert pending_item.completed_at is completed_at
+    assert running_item.status == BenchmarkRunItemStatus.CANCELLED.value
+    assert running_item.completed_at is completed_at
+    assert completed_item.status == BenchmarkRunItemStatus.COMPLETED.value
+    assert completed_item.completed_at is completed_at

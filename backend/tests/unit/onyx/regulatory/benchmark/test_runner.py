@@ -641,6 +641,43 @@ def test_cancellation_during_judging_cannot_be_overwritten_as_completed() -> Non
     db_session.rollback.assert_called_once_with()
 
 
+def test_cancellation_during_failed_answer_cannot_be_overwritten_as_error() -> None:
+    item = MagicMock()
+    item.id = 8
+    item.status = BenchmarkRunItemStatus.RUNNING.value
+    item.started_at = datetime.datetime.now(datetime.timezone.utc)
+    item.completed_at = None
+    item.duration_ms = None
+    item.judgment = None
+    item.final_result = None
+    run = MagicMock(id=3, status=BenchmarkRunStatus.RUNNING.value)
+    db_session = MagicMock()
+    db_session.get.side_effect = lambda model, _identifier: (
+        run if model is BenchmarkRun else item
+    )
+
+    def cancel_then_fail(*_args: object, **_kwargs: object) -> None:
+        run.status = BenchmarkRunStatus.CANCELLED.value
+        item.status = BenchmarkRunItemStatus.CANCELLED.value
+        raise RuntimeError("provider stream interrupted")
+
+    with patch(
+        "onyx.regulatory.benchmark.runner._generate_item_answer",
+        side_effect=cancel_then_fail,
+    ):
+        _run_item(
+            db_session,
+            run=run,
+            item=item,
+            user=MagicMock(),
+            persona=None,
+            already_claimed=True,
+        )
+
+    assert item.status == BenchmarkRunItemStatus.CANCELLED.value
+    assert item.error_message != "provider stream interrupted"
+
+
 def test_unfinished_items_are_terminal_errors_not_false_completions() -> None:
     completed_at = datetime.datetime.now(datetime.timezone.utc)
     pending = SimpleNamespace(
@@ -895,7 +932,13 @@ def test_parallel_item_delivery_is_atomically_claimed_before_execution() -> None
             created_by="user-id",
         ),
     )
-    item = cast(BenchmarkRunItem, SimpleNamespace(id=34))
+    item = cast(
+        BenchmarkRunItem,
+        SimpleNamespace(
+            id=34,
+            status=BenchmarkRunItemStatus.RUNNING.value,
+        ),
+    )
     user = cast(User, SimpleNamespace(id="user-id"))
     db_session.get.side_effect = lambda model, _identifier: (
         run if model is BenchmarkRun else user

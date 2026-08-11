@@ -46,6 +46,13 @@ const withUpdatedRun = (runs: BenchmarkRun[], updatedRun: BenchmarkRun) => [
   ...runs.filter((run) => run.id !== updatedRun.id),
 ];
 
+export function processedItemCount(run: BenchmarkRun): number {
+  const cancelledItems = run.items.filter(
+    (item) => item.status === "cancelled"
+  ).length;
+  return run.completed_items + run.failed_items + cancelledItems;
+}
+
 function mergeRunSnapshots(
   currentRuns: BenchmarkRun[],
   incomingRuns: BenchmarkRun[],
@@ -622,7 +629,7 @@ export default function BenchmarkRunsPanel() {
                 <StatusBadge status={run.status} />
               </div>
               <Text as="p" font="secondary-body" color="text-02">
-                {`${run.completed_items + run.failed_items}/${run.total_items} items · ${run.judge_model}`}
+                {`${processedItemCount(run)}/${run.total_items} items · ${run.judge_model}`}
               </Text>
             </SelectCard>
           ))}
@@ -686,14 +693,12 @@ export default function BenchmarkRunsPanel() {
                       Overall progress
                     </Text>
                     <Text font="secondary-body" color="text-03">
-                      {`${selectedRun.completed_items + selectedRun.failed_items} of ${selectedRun.total_items} items`}
+                      {`${processedItemCount(selectedRun)} of ${selectedRun.total_items} items`}
                     </Text>
                   </div>
                   <ProgressBar
                     aria-label="Run progress"
-                    value={
-                      selectedRun.completed_items + selectedRun.failed_items
-                    }
+                    value={processedItemCount(selectedRun)}
                     max={selectedRun.total_items}
                     color={selectedRun.failed_items > 0 ? "red" : "blue"}
                   />
@@ -701,7 +706,7 @@ export default function BenchmarkRunsPanel() {
                 <div className="grid gap-2 pt-4 sm:grid-cols-2 lg:grid-cols-4">
                   <Metric
                     label="Progress"
-                    value={`${selectedRun.completed_items + selectedRun.failed_items}/${selectedRun.total_items}`}
+                    value={`${processedItemCount(selectedRun)}/${selectedRun.total_items}`}
                   />
                   <Metric
                     label="Completed"

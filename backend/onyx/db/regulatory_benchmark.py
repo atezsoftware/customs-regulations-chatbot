@@ -94,6 +94,12 @@ def claim_benchmark_run_item(
             BenchmarkRunItem.id == item_id,
             BenchmarkRunItem.run_id == run_id,
             BenchmarkRunItem.status == BenchmarkRunItemStatus.PENDING.value,
+            BenchmarkRunItem.run_id.in_(
+                select(BenchmarkRun.id).where(
+                    BenchmarkRun.id == run_id,
+                    BenchmarkRun.status == BenchmarkRunStatus.RUNNING.value,
+                )
+            ),
         )
         .values(
             status=BenchmarkRunItemStatus.RUNNING.value,
@@ -414,19 +420,19 @@ def cancel_benchmark_run(db_session: Session, run_id: int) -> BenchmarkRun | Non
     if run is None or run.status in {
         BenchmarkRunStatus.COMPLETED.value,
         BenchmarkRunStatus.ERROR.value,
-        BenchmarkRunStatus.CANCELLED.value,
     }:
         return run
-    now = datetime.datetime.now(datetime.timezone.utc)
+    completed_at = run.completed_at or datetime.datetime.now(datetime.timezone.utc)
     run.status = BenchmarkRunStatus.CANCELLED.value
-    run.completed_at = now
+    run.heartbeat_at = completed_at
+    run.completed_at = completed_at
     for item in run.items:
         if item.status in {
             BenchmarkRunItemStatus.PENDING.value,
             BenchmarkRunItemStatus.RUNNING.value,
         }:
             item.status = BenchmarkRunItemStatus.CANCELLED.value
-            item.completed_at = now
+            item.completed_at = completed_at
     db_session.commit()
     return run
 

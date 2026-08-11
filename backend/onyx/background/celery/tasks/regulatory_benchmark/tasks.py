@@ -17,6 +17,7 @@ from onyx.configs.constants import OnyxCeleryTask
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import BenchmarkRunFailureCode, BenchmarkRunStatus
 from onyx.db.regulatory_benchmark import (
+    claim_benchmark_run_item,
     get_benchmark_run_status,
     mark_benchmark_run_failed,
     mark_benchmark_run_item_failed,
@@ -29,7 +30,7 @@ logger = setup_logger()
 
 _RUN_LEASE_SECONDS = 5 * 60
 _RUN_LEASE_HEARTBEAT_SECONDS = 60
-_WATCHDOG_POLL_SECONDS = 5
+_WATCHDOG_POLL_SECONDS = 1
 _WATCHDOG_SIGTERM_GRACE_SECONDS = 10
 
 
@@ -98,10 +99,20 @@ def _execute_benchmark_item(
     tenant_id: str,  # noqa: ARG001
 ) -> None:
     """Child entrypoint; SimpleJob establishes tenant context and a fresh engine."""
-    from onyx.regulatory.benchmark.runner import run_benchmark_item
+    from onyx.regulatory.benchmark.runner import run_claimed_benchmark_item
 
     with get_session_with_current_tenant() as db_session:
-        run_benchmark_item(db_session, run_id, item_id)
+        run_claimed_benchmark_item(db_session, run_id, item_id)
+
+
+def _claim_benchmark_item(run_id: int, item_id: int) -> bool:
+    with get_session_with_current_tenant() as db_session:
+        return claim_benchmark_run_item(
+            db_session,
+            run_id=run_id,
+            item_id=item_id,
+            started_at=_utcnow(),
+        )
 
 
 def _execute_benchmark_finalization(
@@ -183,6 +194,13 @@ def _run_benchmark_items(
 
             while pending and len(active_jobs) < REGULATORY_BENCHMARK_PARALLEL_ITEMS:
                 item_id = pending.popleft()
+                if not _claim_benchmark_item(run_id, item_id):
+                    logger.info(
+                        "Benchmark run %s skipped item %s because its claim was rejected",
+                        run_id,
+                        item_id,
+                    )
+                    continue
                 job = client.submit(
                     _execute_benchmark_item,
                     run_id,
@@ -195,6 +213,12 @@ def _run_benchmark_items(
                     job=job,
                     item_id=item_id,
                     started_at=time.monotonic(),
+                )
+                logger.info(
+                    "Benchmark run %s started item %s in child process %s",
+                    run_id,
+                    item_id,
+                    job.process.pid,
                 )
 
             for job_id, active in list(active_jobs.items()):
@@ -304,6 +328,11 @@ def run_regulatory_benchmark_task(
     try:
         heartbeat.start()
         item_ids = _prepare_benchmark_items(run_id)
+        logger.info(
+            "Benchmark run %s prepared %s item(s) for execution",
+            run_id,
+            len(item_ids),
+        )
         had_execution_timeout = _run_benchmark_items(
             run_id=run_id,
             tenant_id=tenant_id,
