@@ -10,7 +10,7 @@ import sys
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
-from multiprocessing.context import SpawnProcess
+from multiprocessing.process import BaseProcess
 from typing import Any, Literal, Optional
 
 from onyx.configs.constants import POSTGRES_CELERY_WORKER_INDEXING_CHILD_APP_NAME
@@ -54,7 +54,7 @@ def _initializer(
     if kwargs is None:
         kwargs = {}
 
-    logger.info("Initializing spawned worker child process.")
+    logger.info("Initializing isolated worker child process.")
     # 1. Get tenant_id from args or fallback to default
     tenant_id = POSTGRES_DEFAULT_SCHEMA
     for arg in reversed(args):
@@ -109,7 +109,7 @@ class SimpleJob:
     """Drop in replacement for `dask.distributed.Future`"""
 
     id: int
-    process: Optional["SpawnProcess"] = None
+    process: Optional[BaseProcess] = None
     queue: Optional[mp.Queue] = None
     _exception: Optional[str] = None
 
@@ -192,10 +192,30 @@ class SimpleJob:
 class SimpleJobClient:
     """Drop in replacement for `dask.distributed.Client`"""
 
-    def __init__(self, n_workers: int = 1) -> None:
+    def __init__(
+        self,
+        n_workers: int = 1,
+        *,
+        start_method: Literal["spawn", "forkserver"] = "spawn",
+        preload_modules: tuple[str, ...] = (),
+    ) -> None:
         self.n_workers = n_workers
         self.job_id_counter = 0
         self.jobs: dict[int, SimpleJob] = {}
+        available_methods = mp.get_all_start_methods()
+        if start_method not in available_methods:
+            logger.warning(
+                "Multiprocessing start method '%s' is unavailable; falling back to spawn",
+                start_method,
+            )
+            start_method = "spawn"
+            preload_modules = ()
+        if start_method == "forkserver" and preload_modules:
+            mp.set_forkserver_preload(list(preload_modules))
+        if start_method == "forkserver":
+            self._context = mp.get_context("forkserver")
+        else:
+            self._context = mp.get_context("spawn")
 
     def _cleanup_completed_jobs(self) -> None:
         current_job_ids = list(self.jobs.keys())
@@ -224,11 +244,10 @@ class SimpleJobClient:
         job_id = self.job_id_counter
         self.job_id_counter += 1
 
-        # this approach allows us to always "spawn" a new process regardless of
-        # get_start_method's current setting
-        ctx = mp.get_context("spawn")
-        queue = ctx.Queue()
-        process = ctx.Process(
+        # An explicit context keeps this client independent of the application's
+        # process-wide multiprocessing default.
+        queue = self._context.Queue()
+        process = self._context.Process(
             target=_run_in_process, args=(func, queue, args), daemon=True
         )
         job = SimpleJob(id=job_id, process=process, queue=queue)

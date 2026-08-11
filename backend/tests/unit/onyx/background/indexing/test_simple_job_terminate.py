@@ -12,10 +12,40 @@ import multiprocessing as mp
 import os
 import signal
 import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from onyx.background.indexing.job_client import SimpleJob
+from onyx.background.indexing import job_client
+from onyx.background.indexing.job_client import SimpleJob, SimpleJobClient
+
+
+def test_simple_job_client_can_use_a_preloaded_forkserver() -> None:
+    context = MagicMock()
+    process = MagicMock()
+    context.Process.return_value = process
+
+    with (
+        patch.object(
+            job_client.mp,
+            "get_all_start_methods",
+            return_value=["spawn", "forkserver"],
+        ),
+        patch.object(job_client.mp, "set_forkserver_preload") as set_preload,
+        patch.object(job_client.mp, "get_context", return_value=context) as get_context,
+    ):
+        client = SimpleJobClient(
+            n_workers=5,
+            start_method="forkserver",
+            preload_modules=("onyx.regulatory.benchmark.runner",),
+        )
+        job = client.submit(MagicMock())
+
+    assert job is not None
+    set_preload.assert_called_once_with(["onyx.regulatory.benchmark.runner"])
+    get_context.assert_called_once_with("forkserver")
+    context.Process.assert_called_once()
+    process.start.assert_called_once_with()
 
 
 def _ignore_sigterm_and_sleep_forever(ready_path: str) -> None:

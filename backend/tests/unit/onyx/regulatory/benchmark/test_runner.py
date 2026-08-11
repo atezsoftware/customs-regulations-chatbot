@@ -29,6 +29,7 @@ from onyx.regulatory.benchmark.runner import (
     _run_item,
     _usage_cost,
     _usage_snapshots,
+    _with_item_progress_heartbeat,
     finalize_benchmark_run,
     prepare_benchmark_run,
     run_benchmark,
@@ -45,6 +46,38 @@ def test_judge_schema_is_openrouter_provider_compatible() -> None:
     assert "minimum" not in serialized
     assert "maximum" not in serialized
     assert "propertyNames" not in serialized
+
+
+def test_item_heartbeat_advances_only_when_the_stream_makes_progress() -> None:
+    db_session = MagicMock()
+    session_context = MagicMock()
+    session_context.__enter__.return_value = db_session
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.time.monotonic",
+            side_effect=[0.0, 5.0, 16.0],
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.get_session_with_current_tenant",
+            return_value=session_context,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.touch_benchmark_run_items"
+        ) as touch_items,
+    ):
+        packets = list(
+            _with_item_progress_heartbeat(
+                iter([MagicMock(), MagicMock()]),
+                run_id=7,
+                item_id=42,
+            )
+        )
+
+    assert len(packets) == 2
+    touch_items.assert_called_once()
+    assert touch_items.call_args.args[:2] == (db_session, 7)
+    assert touch_items.call_args.kwargs["item_ids"] == [42]
 
 
 def test_run_report_schema_preserves_provider_identity() -> None:
@@ -347,10 +380,17 @@ def test_answer_generation_scopes_search_to_document_set_without_project() -> No
     user = SimpleNamespace(id=uuid4())
     db_session = MagicMock()
 
+    def create_session_after_preparation(
+        *_args: object, **_kwargs: object
+    ) -> SimpleNamespace:
+        assert item.execution_phase == "preparing_session"
+        assert item.heartbeat_at is not None
+        return SimpleNamespace(id=chat_session_id)
+
     with (
         patch(
             "onyx.regulatory.benchmark.runner.create_chat_session",
-            return_value=SimpleNamespace(id=chat_session_id),
+            side_effect=create_session_after_preparation,
         ) as create_chat_session,
         patch(
             "onyx.regulatory.benchmark.runner.benchmark_usage_capture",
@@ -396,7 +436,7 @@ def test_answer_generation_scopes_search_to_document_set_without_project() -> No
     assert item.chat_session_id == chat_session_id
     assert item.execution_phase == "answering"
     assert item.heartbeat_at is not None
-    assert db_session.commit.call_count == 2
+    assert db_session.commit.call_count == 3
 
 
 def test_nameless_openrouter_selector_becomes_a_typed_provider_override() -> None:

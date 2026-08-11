@@ -774,6 +774,7 @@ class BenchmarkRunItemStatus(str, PyEnum):
 
 class BenchmarkRunItemPhase(str, PyEnum):
     STARTING = "starting"
+    PREPARING_SESSION = "preparing_session"
     ANSWERING = "answering"
     RESEARCHING = "researching"
     JUDGING = "judging"

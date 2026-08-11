@@ -19,6 +19,7 @@ const phaseLabels: Record<
   string
 > = {
   starting: "Starting",
+  preparing_session: "Preparing chat session",
   answering: "Generating answer",
   researching: "Deep research",
   judging: "Judge evaluation",

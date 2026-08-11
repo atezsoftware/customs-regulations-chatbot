@@ -33,10 +33,20 @@ _RUN_LEASE_SECONDS = 5 * 60
 _RUN_LEASE_HEARTBEAT_SECONDS = 60
 _WATCHDOG_POLL_SECONDS = 1
 _WATCHDOG_SIGTERM_GRACE_SECONDS = 10
+_BENCHMARK_PRELOAD_MODULES = ("onyx.regulatory.benchmark.runner",)
 
 
 class BenchmarkExecutionTimeout(RuntimeError):
     pass
+
+
+def _benchmark_job_client(*, n_workers: int) -> SimpleJobClient:
+    """Create isolated workers without importing the full chat stack per item."""
+    return SimpleJobClient(
+        n_workers=n_workers,
+        start_method="forkserver",
+        preload_modules=_BENCHMARK_PRELOAD_MODULES,
+    )
 
 
 def _utcnow() -> datetime.datetime:
@@ -190,7 +200,7 @@ def _run_benchmark_items(
 ) -> bool:
     """Run isolated item processes with bounded parallelism and per-item deadlines."""
     pending = deque(item_ids)
-    client = SimpleJobClient(n_workers=REGULATORY_BENCHMARK_PARALLEL_ITEMS)
+    client = _benchmark_job_client(n_workers=REGULATORY_BENCHMARK_PARALLEL_ITEMS)
     active_jobs: dict[int, _ActiveBenchmarkJob] = {}
     had_execution_timeout = False
 
@@ -254,10 +264,10 @@ def _run_benchmark_items(
                 del active_jobs[job_id]
                 had_execution_timeout = True
 
-            _touch_benchmark_run(
-                run_id,
-                [active.item_id for active in active_jobs.values()],
-            )
+            # The run heartbeat proves coordinator liveness. Item heartbeats are
+            # written by the item process at real execution boundaries so the UI
+            # never mistakes a live coordinator for forward progress.
+            _touch_benchmark_run(run_id)
             if pending or active_jobs:
                 time.sleep(_WATCHDOG_POLL_SECONDS)
     finally:
@@ -353,7 +363,7 @@ def run_regulatory_benchmark_task(
         if _get_benchmark_run_status(run_id) != BenchmarkRunStatus.RUNNING.value:
             return
 
-        client = SimpleJobClient(n_workers=1)
+        client = _benchmark_job_client(n_workers=1)
         job = client.submit(
             _execute_benchmark_finalization,
             run_id,

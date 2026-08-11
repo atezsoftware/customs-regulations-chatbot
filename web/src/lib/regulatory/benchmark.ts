@@ -91,7 +91,13 @@ export interface BenchmarkRunItem {
   question_title: string;
   question_snapshot: Record<string, unknown>;
   status: string;
-  execution_phase: "starting" | "answering" | "researching" | "judging" | null;
+  execution_phase:
+    | "starting"
+    | "preparing_session"
+    | "answering"
+    | "researching"
+    | "judging"
+    | null;
   heartbeat_at: string | null;
   started_at: string | null;
   completed_at: string | null;

@@ -7,10 +7,12 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from onyx.chat.chat_state import ChatStateContainer
+from onyx.chat.models import AnswerStream
 from onyx.chat.process_message import gather_stream_full, handle_stream_message_objects
 from onyx.configs.constants import DEFAULT_PERSONA_ID
 from onyx.context.search.models import BaseFilters, SearchDoc
 from onyx.db.chat import create_chat_session
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import (
     BenchmarkCostSource,
     BenchmarkRunFailureCode,
@@ -25,6 +27,7 @@ from onyx.db.regulatory_benchmark import (
     get_benchmark_run_for_update,
     get_benchmark_run_item,
     refresh_benchmark_run_counts,
+    touch_benchmark_run_items,
 )
 from onyx.db.regulatory_chunks import get_chunks_for_file
 from onyx.llm.constants import LlmProviderNames
@@ -47,10 +50,33 @@ logger = setup_logger()
 
 _MAX_TOOL_RESULT_CHARS = 20_000
 _MAX_REASONING_CHARS = 30_000
+_PROGRESS_HEARTBEAT_INTERVAL_SECONDS = 15
 
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _with_item_progress_heartbeat(
+    packets: AnswerStream,
+    *,
+    run_id: int,
+    item_id: int,
+) -> AnswerStream:
+    """Persist item liveness only while the chat stream makes forward progress."""
+    last_heartbeat = time.monotonic()
+    for packet in packets:
+        now = time.monotonic()
+        if now - last_heartbeat >= _PROGRESS_HEARTBEAT_INTERVAL_SECONDS:
+            with get_session_with_current_tenant() as progress_session:
+                touch_benchmark_run_items(
+                    progress_session,
+                    run_id,
+                    item_ids=[item_id],
+                    heartbeat_at=_utcnow(),
+                )
+            last_heartbeat = now
+        yield packet
 
 
 def _override_provider_name(
@@ -346,6 +372,9 @@ def _generate_item_answer(
         model_version=item.model_id,
         temperature=0,
     )
+    item.execution_phase = BenchmarkRunItemPhase.PREPARING_SESSION.value
+    item.heartbeat_at = _utcnow()
+    db_session.commit()
     chat_session = create_chat_session(
         db_session,
         description=f"Benchmark run {run.id}, item {item.id}",
@@ -382,8 +411,12 @@ def _generate_item_answer(
     state_container = ChatStateContainer()
     with benchmark_usage_capture() as answer_usage:
         response = gather_stream_full(
-            handle_stream_message_objects(
-                request, user, external_state_container=state_container
+            _with_item_progress_heartbeat(
+                handle_stream_message_objects(
+                    request, user, external_state_container=state_container
+                ),
+                run_id=run.id,
+                item_id=item.id,
             ),
             state_container,
         )

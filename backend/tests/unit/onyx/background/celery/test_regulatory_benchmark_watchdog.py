@@ -29,7 +29,7 @@ def test_item_watchdog_terminates_only_the_item_that_times_out() -> None:
             "_get_benchmark_run_status",
             return_value=BenchmarkRunStatus.RUNNING.value,
         ),
-        patch.object(tasks, "_touch_benchmark_run"),
+        patch.object(tasks, "_touch_benchmark_run") as touch_run,
         patch.object(tasks, "_record_item_failure") as record_failure,
         patch.object(tasks.time, "monotonic", side_effect=[0.0, 61.0]),
     ):
@@ -46,6 +46,18 @@ def test_item_watchdog_terminates_only_the_item_that_times_out() -> None:
         12,
         34,
         "Benchmark item 34 exceeded the 60 second execution deadline",
+    )
+    assert all(call.args == (12,) for call in touch_run.call_args_list)
+
+
+def test_benchmark_job_client_preloads_the_runner_in_a_forkserver() -> None:
+    with patch.object(tasks, "SimpleJobClient") as client_type:
+        tasks._benchmark_job_client(n_workers=5)
+
+    client_type.assert_called_once_with(
+        n_workers=5,
+        start_method="forkserver",
+        preload_modules=("onyx.regulatory.benchmark.runner",),
     )
 
 
@@ -208,8 +220,16 @@ def test_item_scheduler_fills_parallel_slots_before_waiting() -> None:
             return True
 
     class RecordingClient:
-        def __init__(self, n_workers: int) -> None:
+        def __init__(
+            self,
+            n_workers: int,
+            *,
+            start_method: str,
+            preload_modules: tuple[str, ...],
+        ) -> None:
             assert n_workers == 2
+            assert start_method == "forkserver"
+            assert preload_modules == ("onyx.regulatory.benchmark.runner",)
             self._next_id = 0
 
         def submit(self, _function: object, *args: object) -> FinishedJob:
