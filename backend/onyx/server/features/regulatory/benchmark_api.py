@@ -1,7 +1,7 @@
 import datetime
 import hashlib
 import threading
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import httpx
@@ -154,13 +154,29 @@ def _get_editable_document_set(
 
 
 def _enqueue_benchmark_run(run_id: int) -> None:
-    celery_app.send_task(
-        OnyxCeleryTask.REGULATORY_BENCHMARK_RUN,
-        kwargs={"run_id": run_id, "tenant_id": get_current_tenant_id()},
-        queue=OnyxCeleryQueues.REGULATORY_BENCHMARK,
-        priority=OnyxCeleryPriority.MEDIUM,
-        expires=24 * 60 * 60,
-    )
+    tenant_id = get_current_tenant_id()
+    errors: list[Exception] = []
+    for countdown in (None, 5):
+        options: dict[str, Any] = {
+            "kwargs": {"run_id": run_id, "tenant_id": tenant_id},
+            "queue": OnyxCeleryQueues.REGULATORY_BENCHMARK,
+            "priority": OnyxCeleryPriority.MEDIUM,
+            "expires": 24 * 60 * 60,
+        }
+        if countdown is not None:
+            options["countdown"] = countdown
+        try:
+            celery_app.send_task(OnyxCeleryTask.REGULATORY_BENCHMARK_RUN, **options)
+        except Exception as error:
+            errors.append(error)
+            logger.warning(
+                "Benchmark run %s dispatch attempt failed (countdown=%s)",
+                run_id,
+                countdown,
+                exc_info=True,
+            )
+    if len(errors) == 2:
+        raise RuntimeError("All benchmark dispatch attempts failed") from errors[0]
 
 
 def _recover_stale_runs(db_session: Session) -> None:

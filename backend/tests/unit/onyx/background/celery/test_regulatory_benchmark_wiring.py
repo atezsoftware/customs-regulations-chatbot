@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from fastapi.routing import APIRoute
@@ -73,15 +73,38 @@ def test_start_run_routes_to_regulatory_benchmark_queue(
     assert run.failure_code is None
     assert run.failure_message is None
     db_session.commit.assert_called_once_with()
-    assert events == ["commit", "publish"]
+    assert events == ["commit", "publish", "publish"]
     mock_get_tenant_id.assert_called_once_with()
-    mock_send_task.assert_called_once_with(
+    dispatch = call(
         OnyxCeleryTask.REGULATORY_BENCHMARK_RUN,
         kwargs={"run_id": run.id, "tenant_id": "test_tenant"},
         queue=OnyxCeleryQueues.REGULATORY_BENCHMARK,
         priority=OnyxCeleryPriority.MEDIUM,
         expires=24 * 60 * 60,
     )
+    recovery_probe = call(
+        OnyxCeleryTask.REGULATORY_BENCHMARK_RUN,
+        kwargs={"run_id": run.id, "tenant_id": "test_tenant"},
+        queue=OnyxCeleryQueues.REGULATORY_BENCHMARK,
+        priority=OnyxCeleryPriority.MEDIUM,
+        expires=24 * 60 * 60,
+        countdown=5,
+    )
+    assert mock_send_task.call_args_list == [dispatch, recovery_probe]
+
+
+def test_enqueue_succeeds_when_only_one_redundant_delivery_is_accepted() -> None:
+    with (
+        patch.object(benchmark_api, "get_current_tenant_id", return_value="public"),
+        patch.object(
+            benchmark_api.celery_app,
+            "send_task",
+            side_effect=[RuntimeError("primary publish failed"), MagicMock()],
+        ) as send_task,
+    ):
+        benchmark_api._enqueue_benchmark_run(42)
+
+    assert send_task.call_count == 2
 
 
 @patch.object(benchmark_api, "benchmark_run_snapshot")
@@ -104,7 +127,7 @@ def test_concurrent_start_observes_locked_queued_state_and_does_not_republish(
     with pytest.raises(OnyxError, match="not pending"):
         benchmark_api.start_run(42, user=MagicMock(), db_session=MagicMock())
 
-    mock_send_task.assert_called_once()
+    assert mock_send_task.call_count == 2
 
 
 def test_error_run_retry_resets_failed_items_and_preserves_completed_items() -> None:
