@@ -24,6 +24,7 @@ from onyx.db.models import BenchmarkRun, BenchmarkRunItem, Persona, User, UserFi
 from onyx.db.regulatory_benchmark import (
     add_benchmark_judgment,
     claim_benchmark_run_item,
+    get_benchmark_run,
     get_benchmark_run_for_update,
     get_benchmark_run_item,
     refresh_benchmark_run_counts,
@@ -833,9 +834,16 @@ def finalize_benchmark_run(
 
     # Report generation can take another provider call. Commit the terminal run
     # first so no row lock is held and a report failure cannot leave it running.
+    # Sessions do not expire on commit, while item judgments are written by
+    # separate child processes. Reload the graph so report aggregation observes
+    # those committed relationships instead of the coordinator's stale identity map.
+    db_session.expire_all()
+    report_run = get_benchmark_run(db_session, run_id)
+    if report_run is None:
+        raise ValueError(f"Benchmark run {run_id} disappeared before reporting")
     _generate_run_report(
         db_session,
-        run=run,
+        run=report_run,
         user=user,
         persona=report_persona,
     )

@@ -1224,6 +1224,10 @@ def test_finalization_commits_terminal_state_before_report_generation() -> None:
             return_value=run,
         ),
         patch(
+            "onyx.regulatory.benchmark.runner.get_benchmark_run",
+            return_value=run,
+        ),
+        patch(
             "onyx.regulatory.benchmark.runner.refresh_benchmark_run_counts",
             side_effect=refresh_counts,
         ),
@@ -1240,3 +1244,74 @@ def test_finalization_commits_terminal_state_before_report_generation() -> None:
 
     assert events == ["commit", "report", "commit"]
     assert run.status == BenchmarkRunStatus.COMPLETED.value
+
+
+def test_finalization_reloads_judgments_committed_by_item_processes() -> None:
+    stale_run = cast(
+        BenchmarkRun,
+        SimpleNamespace(
+            id=13,
+            status=BenchmarkRunStatus.RUNNING.value,
+            created_by="user-id",
+            items=[
+                SimpleNamespace(
+                    status=BenchmarkRunItemStatus.COMPLETED.value,
+                    judgment=None,
+                )
+            ],
+            total_items=1,
+            completed_items=0,
+            failed_items=0,
+            failure_code=None,
+            failure_message=None,
+            completed_at=None,
+            heartbeat_at=None,
+        ),
+    )
+    refreshed_run = cast(
+        BenchmarkRun,
+        SimpleNamespace(
+            id=13,
+            status=BenchmarkRunStatus.COMPLETED.value,
+            created_by="user-id",
+            items=[
+                SimpleNamespace(
+                    status=BenchmarkRunItemStatus.COMPLETED.value,
+                    judgment=object(),
+                )
+            ],
+        ),
+    )
+    user = cast(User, SimpleNamespace(id="user-id"))
+    db_session = MagicMock()
+    db_session.get.return_value = user
+
+    def refresh_counts(_session: object, target: BenchmarkRun) -> None:
+        target.completed_items = 1
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.get_benchmark_run_for_update",
+            return_value=stale_run,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.get_benchmark_run",
+            return_value=refreshed_run,
+        ) as reload_run,
+        patch(
+            "onyx.regulatory.benchmark.runner.refresh_benchmark_run_counts",
+            side_effect=refresh_counts,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner._get_item_persona",
+            return_value=None,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner._generate_run_report"
+        ) as generate_report,
+    ):
+        finalize_benchmark_run(db_session, 13)
+
+    db_session.expire_all.assert_called_once_with()
+    reload_run.assert_called_once_with(db_session, 13)
+    assert generate_report.call_args.kwargs["run"] is refreshed_run
