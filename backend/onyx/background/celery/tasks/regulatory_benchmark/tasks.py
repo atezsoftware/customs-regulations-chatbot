@@ -36,7 +36,6 @@ _RUN_LEASE_HEARTBEAT_SECONDS = 15
 _RUN_LEASE_UNCERTAINTY_SECONDS = 45
 _WATCHDOG_POLL_SECONDS = 1
 _WATCHDOG_SIGTERM_GRACE_SECONDS = 10
-_BENCHMARK_PRELOAD_MODULES = ("onyx.regulatory.benchmark.runner",)
 
 
 class BenchmarkExecutionTimeout(RuntimeError):
@@ -44,11 +43,10 @@ class BenchmarkExecutionTimeout(RuntimeError):
 
 
 def _benchmark_job_client(*, n_workers: int) -> SimpleJobClient:
-    """Create isolated workers without importing the full chat stack per item."""
+    """Create clean item processes without retaining a heavyweight forkserver."""
     return SimpleJobClient(
         n_workers=n_workers,
-        start_method="forkserver",
-        preload_modules=_BENCHMARK_PRELOAD_MODULES,
+        start_method="spawn",
     )
 
 

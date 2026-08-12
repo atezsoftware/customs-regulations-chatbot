@@ -124,14 +124,13 @@ def test_item_watchdog_terminates_only_the_item_that_times_out() -> None:
     assert all(call.args == (12,) for call in touch_run.call_args_list)
 
 
-def test_benchmark_job_client_preloads_the_runner_in_a_forkserver() -> None:
+def test_benchmark_job_client_uses_a_clean_spawn_process() -> None:
     with patch.object(tasks, "SimpleJobClient") as client_type:
         tasks._benchmark_job_client(n_workers=5)
 
     client_type.assert_called_once_with(
         n_workers=5,
-        start_method="forkserver",
-        preload_modules=("onyx.regulatory.benchmark.runner",),
+        start_method="spawn",
     )
 
 
@@ -302,11 +301,9 @@ def test_item_scheduler_fills_parallel_slots_before_waiting() -> None:
             n_workers: int,
             *,
             start_method: str,
-            preload_modules: tuple[str, ...],
         ) -> None:
             assert n_workers == 2
-            assert start_method == "forkserver"
-            assert preload_modules == ("onyx.regulatory.benchmark.runner",)
+            assert start_method == "spawn"
             self._next_id = 0
 
         def submit(self, _function: object, *args: object) -> FinishedJob:
