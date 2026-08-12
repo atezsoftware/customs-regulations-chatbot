@@ -574,6 +574,84 @@ def test_named_openrouter_provider_uses_persisted_provider_id() -> None:
     assert override.model_provider_id == 7
 
 
+def test_failed_answer_persists_usage_cost_and_execution_diagnostics() -> None:
+    usage_calls = [
+        LLMCallUsage(
+            "anthropic/claude-sonnet-5",
+            "openrouter",
+            1200,
+            300,
+            0,
+            cost_cents=0.42,
+        )
+    ]
+    response = SimpleNamespace(
+        error_msg="final synthesis returned no answer",
+        answer="",
+        pre_answer_reasoning="research reasoning",
+        message_id=294,
+        citation_info=[],
+        top_documents=[],
+        tool_calls=[],
+    )
+    item = SimpleNamespace(
+        id=45,
+        provider="openrouter",
+        provider_id=3,
+        model_id="anthropic/claude-sonnet-5",
+        question=SimpleNamespace(
+            prompt="prompt",
+            document_set=SimpleNamespace(name="Current Regulations"),
+        ),
+        question_snapshot={"prompt": "prompt", "expected_citations": []},
+        final_result=None,
+    )
+    db_session = MagicMock()
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.create_chat_session",
+            return_value=SimpleNamespace(id=uuid4()),
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.benchmark_usage_capture",
+            return_value=nullcontext(usage_calls),
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.handle_stream_message_objects",
+            return_value=iter(()),
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.gather_stream_full",
+            return_value=response,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner._usage_cost",
+            return_value=(1200, 300, 0.42, "measured"),
+        ),
+        pytest.raises(RuntimeError, match="final synthesis returned no answer"),
+    ):
+        _generate_item_answer(
+            db_session,
+            run=cast(BenchmarkRun, SimpleNamespace(id=7, deep_research=True)),
+            item=cast(BenchmarkRunItem, item),
+            user=cast(User, SimpleNamespace(id=uuid4())),
+            persona=MagicMock(id=DEFAULT_PERSONA_ID),
+            started=time.monotonic(),
+        )
+
+    assert item.input_tokens == 1200
+    assert item.output_tokens == 300
+    assert item.total_tokens == 1500
+    assert item.cost_cents == pytest.approx(0.42)
+    assert item.cost_source == "measured"
+    assert item.llm_calls[0]["model"] == "anthropic/claude-sonnet-5"
+    assert item.assistant_message_id == 294
+    assert item.execution_steps[-1]["character_count"] == 0
+    assert item.final_result is None
+    assert db_session.commit.call_count == 3
+
+
 def test_benchmark_items_use_the_default_new_session_persona() -> None:
     db_session = MagicMock()
     default_persona = MagicMock(id=DEFAULT_PERSONA_ID)

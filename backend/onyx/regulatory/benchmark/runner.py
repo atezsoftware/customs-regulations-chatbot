@@ -421,13 +421,9 @@ def _generate_item_answer(
             state_container,
         )
     item.duration_ms = round((time.monotonic() - started) * 1000)
-    if response.error_msg:
-        raise RuntimeError(response.error_msg)
-
     input_tokens, output_tokens, cost_cents, cost_source = _usage_cost(
         db_session, answer_usage
     )
-    item.final_result = response.answer
     item.input_tokens = input_tokens
     item.output_tokens = output_tokens
     item.total_tokens = input_tokens + output_tokens
@@ -448,6 +444,13 @@ def _generate_item_answer(
     )
     item.execution_steps = _execution_steps(response)
     item.llm_calls = _usage_snapshots(answer_usage, phase="answer")
+    if response.error_msg:
+        # Preserve provider usage and partial execution evidence even though the
+        # canonical answer boundary was not reached.
+        db_session.commit()
+        raise RuntimeError(response.error_msg)
+
+    item.final_result = response.answer
     # This is the idempotency boundary: a redelivery after this commit resumes
     # at judging and does not pay for the canonical chat answer twice.
     db_session.commit()

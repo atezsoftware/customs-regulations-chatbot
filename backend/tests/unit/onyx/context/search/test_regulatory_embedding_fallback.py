@@ -57,3 +57,38 @@ def test_non_regulatory_hybrid_search_preserves_embedding_failure(
         )
 
     document_index.keyword_retrieval.assert_not_called()
+
+
+def test_regulatory_hybrid_search_falls_back_on_index_dimension_drift() -> None:
+    expected_chunks = [MagicMock()]
+    document_index = MagicMock()
+    document_index.hybrid_retrieval.side_effect = RuntimeError(
+        "failed to create query: the query vector has a different dimension "
+        "[3072] than the index vectors [1024]"
+    )
+    document_index.keyword_retrieval.return_value = expected_chunks
+
+    result = search_runner._embed_and_hybrid_search(
+        _request(regulatory_chunks_only=True),
+        document_index,
+        embedding_model=MagicMock(encode=MagicMock(return_value=[[0.1, 0.2, 0.3]])),
+    )
+
+    assert result == expected_chunks
+    document_index.keyword_retrieval.assert_called_once()
+
+
+def test_non_regulatory_hybrid_search_preserves_index_dimension_error() -> None:
+    document_index = MagicMock()
+    document_index.hybrid_retrieval.side_effect = RuntimeError(
+        "query vector has a different dimension [3072] than the index vectors [1024]"
+    )
+
+    with pytest.raises(RuntimeError, match="different dimension"):
+        search_runner._embed_and_hybrid_search(
+            _request(regulatory_chunks_only=False),
+            document_index,
+            embedding_model=MagicMock(encode=MagicMock(return_value=[[0.1, 0.2, 0.3]])),
+        )
+
+    document_index.keyword_retrieval.assert_not_called()

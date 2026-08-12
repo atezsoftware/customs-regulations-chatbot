@@ -16,6 +16,7 @@ from onyx.chat.emitter import BufferedEmitter, Emitter
 from onyx.chat.empty_response import (
     OUTPUT_TOKEN_LIMIT_FINISH_REASONS,
     REFUSAL_FINISH_REASONS,
+    EmptyLLMResponseError,
     build_empty_llm_response_error,
 )
 from onyx.chat.llm_loop import construct_message_history
@@ -110,6 +111,9 @@ MAX_FINAL_REPORT_TOKENS = 20000
 MAX_REGULATORY_FINAL_REPORT_TOKENS = 8192
 MAX_PARALLEL_RESEARCH_AGENT_CALLS = 3
 MAX_TOTAL_RESEARCH_AGENT_CALLS = 12
+MAX_REGULATORY_RETRY_REPORTS = 6
+MAX_REGULATORY_RETRY_REPORT_CHARS = 8_000
+MAX_REGULATORY_RETRY_EVIDENCE_CHARS = 24_000
 _REGULATORY_SOURCE_GAP_FALLBACK = (
     "Mevcut aramada elde edilen doğrulanabilir kaynak parçaları, istenen hukuki "
     "sonuca güvenilir biçimde ulaşmak için yeterli değildir. Bu nedenle "
@@ -209,12 +213,18 @@ def _generate_usable_final_report_attempt(
     turn_index: int,
     max_tokens: int,
     pre_answer_processing_time: float | None,
+    retry_history: list[ChatMessageSimple] | None = None,
 ) -> _StagedFinalReportAttempt:
-    efforts = (ReasoningEffort.LOW, ReasoningEffort.OFF)
+    attempts = (
+        (history, ReasoningEffort.LOW),
+        (retry_history or history, ReasoningEffort.OFF),
+    )
     terminal_attempt: _StagedFinalReportAttempt | None = None
-    for attempt_number, attempt_effort in enumerate(efforts, start=1):
+    for attempt_number, (attempt_history, attempt_effort) in enumerate(
+        attempts, start=1
+    ):
         terminal_attempt = _run_staged_final_report_attempt(
-            history=history,
+            history=attempt_history,
             llm=llm,
             base_citation_processor=base_citation_processor,
             final_documents=final_documents,
@@ -571,6 +581,68 @@ def _format_earlier_user_context_for_correction(
     )
 
 
+def _compact_regulatory_final_retry_history(
+    *,
+    history: list[ChatMessageSimple],
+    research_plan: str,
+    state_container: ChatStateContainer,
+    exact_evidence_chunks: list[CandidateAnswerEvidenceChunk],
+    system_prompt: ChatMessageSimple,
+    custom_agent_prompt_message: ChatMessageSimple | None,
+    token_counter: Callable[[str], int],
+    available_tokens: int,
+) -> list[ChatMessageSimple] | None:
+    """Flatten research evidence so the retry has no tool-call protocol history."""
+    reports = [
+        tool_call.tool_call_response.strip()[:MAX_REGULATORY_RETRY_REPORT_CHARS]
+        for tool_call in state_container.get_tool_calls()
+        if tool_call.tool_name == RESEARCH_AGENT_TOOL_NAME
+        and tool_call.tool_call_response.strip()
+    ][:MAX_REGULATORY_RETRY_REPORTS]
+    exact_evidence = (
+        format_candidate_correction_evidence(exact_evidence_chunks)[
+            :MAX_REGULATORY_RETRY_EVIDENCE_CHARS
+        ]
+        if exact_evidence_chunks
+        else ""
+    )
+    if not reports and not exact_evidence:
+        return None
+
+    review_context = build_regulatory_review_user_context(history)
+    report_sections = "\n\n".join(
+        f"## Completed research report {index}\n{report}"
+        for index, report in enumerate(reports, start=1)
+    )
+    retry_payload = (
+        "# Current request\n"
+        f"{review_context.current_request}\n\n"
+        "# Research plan\n"
+        f"{research_plan}\n\n"
+        "# Completed research\n"
+        f"{report_sections or 'No narrative research report was produced.'}\n\n"
+        "# Exact retrieved evidence\n"
+        f"{exact_evidence or 'No exact evidence chunk was retrieved.'}\n\n"
+        "Produce the final answer now. Use only the material above, preserve valid "
+        "citation numbers, explicitly identify unsupported points, and do not call tools."
+    )
+    flattened_history = [
+        ChatMessageSimple(
+            message=retry_payload,
+            token_count=token_counter(retry_payload),
+            message_type=MessageType.USER,
+        )
+    ]
+    return construct_message_history(
+        system_prompt=system_prompt,
+        custom_agent_prompt=custom_agent_prompt_message,
+        simple_chat_history=flattened_history,
+        reminder_message=None,
+        context_files=None,
+        available_tokens=available_tokens,
+    )
+
+
 def generate_final_report(
     history: list[ChatMessageSimple],
     research_plan: str,
@@ -642,20 +714,66 @@ def generate_final_report(
         final_documents = list(citation_processor.citation_to_doc.values())
 
         staged_started_at = time.monotonic()
-        initial_attempt = _generate_usable_final_report_attempt(
-            history=final_report_history,
-            llm=llm,
-            base_citation_processor=citation_processor,
-            final_documents=final_documents,
-            user_identity=user_identity,
-            turn_index=turn_index,
-            max_tokens=(
-                MAX_REGULATORY_FINAL_REPORT_TOKENS
-                if is_regulatory_research
-                else MAX_FINAL_REPORT_TOKENS
-            ),
-            pre_answer_processing_time=pre_answer_processing_time,
+        compact_retry_history = (
+            _compact_regulatory_final_retry_history(
+                history=history,
+                research_plan=research_plan,
+                state_container=state_container,
+                exact_evidence_chunks=list(exact_evidence_chunks or []),
+                system_prompt=system_prompt,
+                custom_agent_prompt_message=custom_agent_prompt_message,
+                token_counter=token_counter,
+                available_tokens=llm.config.max_input_tokens,
+            )
+            if is_regulatory_research
+            else None
         )
+        try:
+            initial_attempt = _generate_usable_final_report_attempt(
+                history=final_report_history,
+                llm=llm,
+                base_citation_processor=citation_processor,
+                final_documents=final_documents,
+                user_identity=user_identity,
+                turn_index=turn_index,
+                max_tokens=(
+                    MAX_REGULATORY_FINAL_REPORT_TOKENS
+                    if is_regulatory_research
+                    else MAX_FINAL_REPORT_TOKENS
+                ),
+                pre_answer_processing_time=pre_answer_processing_time,
+                retry_history=compact_retry_history,
+            )
+        except EmptyLLMResponseError:
+            if not is_regulatory_research:
+                raise
+            logger.warning(
+                "Regulatory final synthesis attempts were empty; publishing a "
+                "bounded source-gap response"
+            )
+            (
+                fallback_emitter,
+                fallback_state,
+                fallback_citation_processor,
+                fallback_result,
+            ) = _stage_regulatory_source_gap_fallback(turn_index)
+            commit_staged_llm_step(
+                buffered_emitter=fallback_emitter,
+                staged_state=fallback_state,
+                staged_citation_processor=fallback_citation_processor,
+                emitter=emitter,
+                state_container=state_container,
+                pre_answer_processing_time=(
+                    (pre_answer_processing_time or 0.0)
+                    + time.monotonic()
+                    - staged_started_at
+                ),
+                final_documents_from_emitted_citations=True,
+            )
+            if saved_reasoning:
+                state_container.set_reasoning_tokens(saved_reasoning)
+            span.span_data.output = fallback_result.answer
+            return False
 
         if not is_regulatory_research:
             total_pre_answer_processing_time = (

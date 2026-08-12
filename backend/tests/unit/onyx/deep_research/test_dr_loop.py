@@ -28,7 +28,7 @@ from onyx.server.query_and_chat.streaming_models import (
     CitationInfo,
     Packet,
 )
-from onyx.tools.models import ToolCallKickoff, ToolResponse
+from onyx.tools.models import ToolCallInfo, ToolCallKickoff, ToolResponse
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 
@@ -1725,10 +1725,7 @@ def test_final_report_retries_length_at_off_without_leaking_partial_packets(
     assert live_state.get_answer_tokens() == "Complete retry report"
 
 
-@pytest.mark.parametrize("is_regulatory_research", [False, True])
-def test_final_report_two_empty_attempts_raise_classified_terminal_error(
-    is_regulatory_research: bool,
-) -> None:
+def test_non_regulatory_final_report_two_empty_attempts_raise_terminal_error() -> None:
     live_state = ChatStateContainer()
     merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
     destination = Emitter(merged_queue)
@@ -1744,7 +1741,7 @@ def test_final_report_two_empty_attempts_raise_classified_terminal_error(
         pytest.raises(EmptyLLMResponseError) as exc_info,
     ):
         _run_final_report(
-            is_regulatory_research=is_regulatory_research,
+            is_regulatory_research=False,
             live_state=live_state,
             destination=destination,
             reasoning_effort=dr_loop.ReasoningEffort.AUTO,
@@ -1755,6 +1752,82 @@ def test_final_report_two_empty_attempts_raise_classified_terminal_error(
     assert exc_info.value.model == "gemini-3.6-flash"
     assert _packets(merged_queue) == []
     assert live_state.get_answer_tokens() is None
+
+
+def test_regulatory_empty_final_report_uses_bounded_source_gap_fallback() -> None:
+    live_state = ChatStateContainer()
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+
+    with patch.object(
+        dr_loop,
+        "run_llm_step",
+        side_effect=_fake_llm_step_with_finish_reasons(
+            [("", "length"), ("", "length")]
+        ),
+    ):
+        has_reasoned = _run_final_report(
+            is_regulatory_research=True,
+            live_state=live_state,
+            destination=Emitter(merged_queue),
+            reasoning_effort=dr_loop.ReasoningEffort.AUTO,
+        )
+
+    assert has_reasoned is False
+    assert live_state.get_answer_tokens() == dr_loop._REGULATORY_SOURCE_GAP_FALLBACK
+    assert [
+        packet.obj.content
+        for packet in _packets(merged_queue)
+        if isinstance(packet.obj, AgentResponseDelta)
+    ] == [dr_loop._REGULATORY_SOURCE_GAP_FALLBACK]
+
+
+def test_regulatory_final_retry_flattens_completed_research_reports() -> None:
+    live_state = ChatStateContainer()
+    live_state.add_tool_call(
+        ToolCallInfo(
+            parent_tool_call_id=None,
+            turn_index=2,
+            tab_index=0,
+            tool_name=dr_loop.RESEARCH_AGENT_TOOL_NAME,
+            tool_call_id="research-1",
+            tool_id=9,
+            reasoning_tokens=None,
+            tool_call_arguments={"task": "Find the controlling rule"},
+            tool_call_response="RESEARCH_REPORT_SENTINEL [1]",
+            search_docs=None,
+            generated_images=None,
+        )
+    )
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+
+    with (
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            side_effect=_fake_llm_step_with_finish_reasons(
+                [("", "length"), ("Compact grounded report [1]", "stop")]
+            ),
+        ) as run_step,
+        patch.object(
+            dr_loop,
+            "review_regulatory_candidate_answer",
+            return_value=CandidateAnswerReviewResult(needs_reconsideration=False),
+        ),
+    ):
+        _run_final_report(
+            is_regulatory_research=True,
+            live_state=live_state,
+            destination=Emitter(merged_queue),
+        )
+
+    retry_history = cast(
+        list[ChatMessageSimple], run_step.call_args_list[1].kwargs["history"]
+    )
+    assert any(
+        "RESEARCH_REPORT_SENTINEL" in message.message for message in retry_history
+    )
+    assert all(not message.tool_calls for message in retry_history)
+    assert live_state.get_answer_tokens() == "Compact grounded report [1]"
 
 
 def test_final_report_retries_twice_when_request_effort_is_off() -> None:

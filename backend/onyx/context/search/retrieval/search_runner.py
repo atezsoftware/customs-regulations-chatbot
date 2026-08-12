@@ -24,6 +24,25 @@ from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 logger = setup_logger()
 
 
+_VECTOR_DIMENSION_MISMATCH_MARKERS = (
+    "query vector has a different dimension",
+    "than the index vectors",
+)
+
+
+def _is_vector_dimension_mismatch(error: Exception) -> bool:
+    """Recognize the stable Elasticsearch/OpenSearch dimension error text."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if all(marker in message for marker in _VECTOR_DIMENSION_MISMATCH_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def combine_retrieval_results(
     chunk_sets: list[list[InferenceChunk]],
 ) -> list[InferenceChunk]:
@@ -77,14 +96,26 @@ def _embed_and_hybrid_search(
     hybrid_alpha = query_request.hybrid_alpha or HYBRID_ALPHA
 
     query_type = QueryType.KEYWORD if hybrid_alpha <= 0.2 else QueryType.SEMANTIC
-    top_chunks = document_index.hybrid_retrieval(
-        query=query_request.query,
-        query_embedding=query_embedding,
-        final_keywords=query_request.query_keywords,
-        query_type=query_type,
-        filters=query_request.filters,
-        num_to_retrieve=query_request.limit or NUM_RETURNED_HITS,
-    )
+    try:
+        top_chunks = document_index.hybrid_retrieval(
+            query=query_request.query,
+            query_embedding=query_embedding,
+            final_keywords=query_request.query_keywords,
+            query_type=query_type,
+            filters=query_request.filters,
+            num_to_retrieve=query_request.limit or NUM_RETURNED_HITS,
+        )
+    except Exception as error:
+        if (
+            not query_request.filters.regulatory_chunks_only
+            or not _is_vector_dimension_mismatch(error)
+        ):
+            raise
+        logger.error(
+            "Regulatory hybrid retrieval found index/query embedding dimension "
+            "drift; falling back to lexical retrieval"
+        )
+        return _keyword_search(query_request, document_index)
 
     return top_chunks
 
