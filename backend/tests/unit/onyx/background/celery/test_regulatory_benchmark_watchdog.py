@@ -1,6 +1,10 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
+
 from onyx.background.celery.tasks.regulatory_benchmark import tasks
+from onyx.cache.interface import CacheLockLostError
 from onyx.db.enums import BenchmarkRunStatus
 
 
@@ -11,6 +15,61 @@ def test_benchmark_items_are_sequential_by_default() -> None:
 def test_run_lease_expires_promptly_after_worker_loss() -> None:
     assert tasks._RUN_LEASE_SECONDS == 60
     assert tasks._RUN_LEASE_HEARTBEAT_SECONDS <= tasks._RUN_LEASE_SECONDS / 3
+
+
+def test_run_lease_retries_a_transient_cache_extension_failure() -> None:
+    lock = MagicMock()
+    lock.extend.side_effect = RedisConnectionError("temporary Redis interruption")
+    heartbeat = tasks._RunLeaseHeartbeat(lock, run_id=12)
+
+    assert heartbeat._extend_lease() is True
+    heartbeat.ensure_owned()
+
+
+def test_run_lease_tolerates_transient_ownership_check_inside_safety_window() -> None:
+    lock = MagicMock()
+    lock.owned.side_effect = RedisConnectionError("temporary Redis interruption")
+    heartbeat = tasks._RunLeaseHeartbeat(lock, run_id=12)
+
+    heartbeat.ensure_owned()
+
+
+def test_run_lease_fails_closed_after_ownership_uncertainty_window() -> None:
+    lock = MagicMock()
+    lock.owned.side_effect = RedisConnectionError("Redis remains unavailable")
+    with patch.object(tasks.time, "monotonic", side_effect=[0.0, 46.0]):
+        heartbeat = tasks._RunLeaseHeartbeat(lock, run_id=12)
+        with pytest.raises(RuntimeError, match="could not verify"):
+            heartbeat.ensure_owned()
+
+
+def test_run_lease_does_not_mask_unexpected_extension_errors() -> None:
+    lock = MagicMock()
+    lock.extend.side_effect = RuntimeError("invalid lock implementation")
+    heartbeat = tasks._RunLeaseHeartbeat(lock, run_id=12)
+
+    with pytest.raises(RuntimeError, match="invalid lock implementation"):
+        heartbeat._extend_lease()
+
+
+def test_run_lease_does_not_mask_unexpected_ownership_errors() -> None:
+    lock = MagicMock()
+    lock.owned.side_effect = RuntimeError("invalid lock implementation")
+    heartbeat = tasks._RunLeaseHeartbeat(lock, run_id=12)
+
+    with pytest.raises(RuntimeError, match="invalid lock implementation"):
+        heartbeat.ensure_owned()
+
+
+def test_run_lease_fails_closed_when_cache_reports_lost_ownership() -> None:
+    lock = MagicMock()
+    lock.extend.side_effect = CacheLockLostError("lock token no longer owns key")
+    heartbeat = tasks._RunLeaseHeartbeat(lock, run_id=12)
+
+    assert heartbeat._extend_lease() is False
+
+    with pytest.raises(RuntimeError, match="lost its execution lease"):
+        heartbeat.ensure_owned()
 
 
 def test_deep_research_uses_a_longer_bounded_item_deadline() -> None:

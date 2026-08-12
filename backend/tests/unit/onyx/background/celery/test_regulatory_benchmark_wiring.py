@@ -606,6 +606,11 @@ def test_benchmark_task_uses_late_ack_worker_loss_redelivery_and_run_lease() -> 
         patch.object(benchmark_tasks, "get_cache_backend", return_value=cache),
         patch.object(benchmark_tasks, "_RunLeaseHeartbeat") as heartbeat_type,
         patch.object(benchmark_tasks, "_prepare_benchmark_items", return_value=[34]),
+        patch.object(
+            benchmark_tasks,
+            "_benchmark_run_uses_deep_research",
+            return_value=False,
+        ),
         patch.object(benchmark_tasks, "_run_benchmark_items", return_value=False),
         patch.object(
             benchmark_tasks,

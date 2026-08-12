@@ -8,7 +8,7 @@ from celery import shared_task
 
 from onyx.background.indexing.job_client import SimpleJob, SimpleJobClient
 from onyx.cache.factory import get_cache_backend
-from onyx.cache.interface import CacheLock
+from onyx.cache.interface import CACHE_TRANSIENT_ERRORS, CacheLock, CacheLockLostError
 from onyx.configs.app_configs import (
     REGULATORY_BENCHMARK_DEEP_RESEARCH_ITEM_TIMEOUT_SECONDS,
     REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS,
@@ -33,6 +33,7 @@ logger = setup_logger()
 
 _RUN_LEASE_SECONDS = 60
 _RUN_LEASE_HEARTBEAT_SECONDS = 15
+_RUN_LEASE_UNCERTAINTY_SECONDS = 45
 _WATCHDOG_POLL_SECONDS = 1
 _WATCHDOG_SIGTERM_GRACE_SECONDS = 10
 _BENCHMARK_PRELOAD_MODULES = ("onyx.regulatory.benchmark.runner",)
@@ -63,6 +64,8 @@ class _RunLeaseHeartbeat:
         self._run_id = run_id
         self._stop_event = threading.Event()
         self._lost_event = threading.Event()
+        self._state_lock = threading.Lock()
+        self._last_confirmed_at = time.monotonic()
         self._started = False
         self._thread = threading.Thread(
             target=self._run,
@@ -80,18 +83,57 @@ class _RunLeaseHeartbeat:
 
     def _run(self) -> None:
         while not self._stop_event.wait(_RUN_LEASE_HEARTBEAT_SECONDS):
-            try:
-                self._lock.extend(_RUN_LEASE_SECONDS)
-            except Exception:
-                self._lost_event.set()
-                logger.exception(
-                    "Benchmark run %s lost its execution lease", self._run_id
-                )
+            if not self._extend_lease():
                 return
 
+    def _confirm_ownership(self) -> None:
+        with self._state_lock:
+            self._last_confirmed_at = time.monotonic()
+
+    def _ownership_uncertainty_seconds(self) -> float:
+        with self._state_lock:
+            return time.monotonic() - self._last_confirmed_at
+
+    def _extend_lease(self) -> bool:
+        try:
+            self._lock.extend(_RUN_LEASE_SECONDS)
+        except CacheLockLostError:
+            self._lost_event.set()
+            logger.exception("Benchmark run %s lost its execution lease", self._run_id)
+            return False
+        except CACHE_TRANSIENT_ERRORS:
+            logger.warning(
+                "Benchmark run %s could not extend its execution lease; "
+                "ownership will be rechecked before the safety window closes",
+                self._run_id,
+                exc_info=True,
+            )
+            return True
+        self._confirm_ownership()
+        return True
+
     def ensure_owned(self) -> None:
-        if self._lost_event.is_set() or not self._lock.owned():
+        if self._lost_event.is_set():
             raise RuntimeError(f"Benchmark run {self._run_id} lost its execution lease")
+        try:
+            owned = self._lock.owned()
+        except CACHE_TRANSIENT_ERRORS as error:
+            if self._ownership_uncertainty_seconds() < _RUN_LEASE_UNCERTAINTY_SECONDS:
+                logger.warning(
+                    "Benchmark run %s could not verify its execution lease; "
+                    "tolerating the transient cache failure inside the safety window",
+                    self._run_id,
+                    exc_info=True,
+                )
+                return
+            self._lost_event.set()
+            raise RuntimeError(
+                f"Benchmark run {self._run_id} could not verify its execution lease"
+            ) from error
+        if not owned:
+            self._lost_event.set()
+            raise RuntimeError(f"Benchmark run {self._run_id} lost its execution lease")
+        self._confirm_ownership()
 
     def stop(self) -> None:
         self._stop_event.set()
