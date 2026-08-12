@@ -55,6 +55,9 @@ def test_start_run_routes_to_regulatory_benchmark_queue(
     expected_snapshot = MagicMock()
     mock_benchmark_run_snapshot.return_value = expected_snapshot
     db_session = MagicMock()
+    events: list[str] = []
+    db_session.commit.side_effect = lambda: events.append("commit")
+    mock_send_task.side_effect = lambda *_args, **_kwargs: events.append("publish")
 
     result = benchmark_api.start_run(
         run_id=run.id,
@@ -70,6 +73,7 @@ def test_start_run_routes_to_regulatory_benchmark_queue(
     assert run.failure_code is None
     assert run.failure_message is None
     db_session.commit.assert_called_once_with()
+    assert events == ["commit", "publish"]
     mock_get_tenant_id.assert_called_once_with()
     mock_send_task.assert_called_once_with(
         OnyxCeleryTask.REGULATORY_BENCHMARK_RUN,
@@ -195,7 +199,7 @@ def test_error_run_retry_resets_failed_items_and_preserves_completed_items() -> 
     assert completed_item.final_result == "completed answer"
 
 
-def test_start_publish_failure_restores_pending_state() -> None:
+def test_start_publish_failure_leaves_committed_queue_state_for_recovery() -> None:
     run = SimpleNamespace(
         id=42,
         status=BenchmarkRunStatus.PENDING.value,
@@ -220,13 +224,14 @@ def test_start_publish_failure_restores_pending_state() -> None:
     ):
         benchmark_api.start_run(42, user=MagicMock(), db_session=db_session)
 
-    assert run.status == BenchmarkRunStatus.PENDING.value
-    assert run.queued_at is None
+    assert run.status == BenchmarkRunStatus.QUEUED.value
+    assert run.queued_at is not None
     assert run.started_at is None
     assert run.heartbeat_at is None
     assert run.completed_at is None
     assert run.failure_code == "dispatch_failed"
     assert run.failure_message == "Failed to queue benchmark run"
+    assert db_session.commit.call_count == 2
 
 
 def test_benchmark_models_exclude_hidden_openrouter_configurations() -> None:

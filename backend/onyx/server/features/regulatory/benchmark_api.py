@@ -524,21 +524,22 @@ def start_run(
     run.heartbeat_at = None
     run.failure_code = None
     run.failure_message = None
+    # Persist the dispatch-visible state before publishing. A fast worker can
+    # otherwise consume the task while the row is still ``pending`` and exit as
+    # an idempotent no-op, leaving the run queued until stale-run recovery.
+    db_session.commit()
     try:
         _enqueue_benchmark_run(run.id)
     except Exception as error:
-        # The broker may accept before its client connection fails. Publish while
-        # holding the row lock so any delivered task observes this terminal reset;
-        # its separate run lease makes a duplicate retry harmless.
-        run.status = BenchmarkRunStatus.PENDING.value
-        run.queued_at = None
+        # A broker client can fail after the broker accepted the task. Keep the
+        # committed queued state so either that delivery or stale-run recovery can
+        # execute it safely under the run lease.
         run.failure_code = BenchmarkRunFailureCode.DISPATCH_FAILED.value
         run.failure_message = "Failed to queue benchmark run"
         db_session.commit()
         raise OnyxError(
             OnyxErrorCode.INTERNAL_ERROR, "Failed to queue benchmark run"
         ) from error
-    db_session.commit()
     return benchmark_run_snapshot(run)
 
 
