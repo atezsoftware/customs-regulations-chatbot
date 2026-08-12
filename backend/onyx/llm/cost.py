@@ -123,6 +123,14 @@ def get_model_price_per_million(
                 cache_per_mtok=rates.cache_read_cost_per_mtok,
             )
 
+    if _is_openrouter(provider):
+        openrouter_price = _openrouter_price_per_million(model)
+        if (
+            openrouter_price.input_per_mtok is not None
+            or openrouter_price.output_per_mtok is not None
+        ):
+            return openrouter_price
+
     try:
         import litellm
 
@@ -146,8 +154,6 @@ def get_model_price_per_million(
             ),
         )
     except Exception:
-        if _is_openrouter(provider):
-            return _openrouter_price_per_million(model)
         logger.debug("No price-per-million for model %s (provider %s)", model, provider)
         return ModelPrice(
             model=model,
@@ -200,6 +206,27 @@ def _override_cost_cents(
     return input_cents, output_cents
 
 
+def _price_cost_cents(
+    price: ModelPrice,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+) -> tuple[float, float]:
+    input_rate = price.input_per_mtok or 0.0
+    output_rate = price.output_per_mtok or 0.0
+    cache_rate = (
+        price.cache_per_mtok if price.cache_per_mtok is not None else input_rate
+    )
+    return (
+        (
+            input_tokens / 1_000_000 * input_rate
+            + cache_read_tokens / 1_000_000 * cache_rate
+        )
+        * 100,
+        output_tokens / 1_000_000 * output_rate * 100,
+    )
+
+
 def compute_cost_cents(
     model: str,
     provider: str | None,
@@ -243,7 +270,29 @@ def compute_cost_cents(
             completion_tokens=output_tokens,
             cache_read_input_tokens=cache_read_tokens,
         )
-        return prompt_cost_usd * 100, completion_cost_usd * 100
+        input_cents = prompt_cost_usd * 100
+        output_cents = completion_cost_usd * 100
+        if (
+            input_cents + output_cents == 0
+            and input_tokens + output_tokens + cache_read_tokens > 0
+            and _is_openrouter(provider)
+        ):
+            resolved_price = get_model_price_per_million(model, provider)
+            if any(
+                rate is not None and rate > 0
+                for rate in (
+                    resolved_price.input_per_mtok,
+                    resolved_price.output_per_mtok,
+                    resolved_price.cache_per_mtok,
+                )
+            ):
+                return _price_cost_cents(
+                    resolved_price,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                )
+        return input_cents, output_cents
     except Exception:
         # Unpriced model: configurable default rates; debug log distinguishes
         # transient litellm failure from a genuinely unpriced model.
@@ -258,20 +307,11 @@ def compute_cost_cents(
             resolved_price.input_per_mtok is not None
             or resolved_price.output_per_mtok is not None
         ):
-            input_rate = resolved_price.input_per_mtok or 0.0
-            output_rate = resolved_price.output_per_mtok or 0.0
-            cache_rate = (
-                resolved_price.cache_per_mtok
-                if resolved_price.cache_per_mtok is not None
-                else input_rate
-            )
-            return (
-                (
-                    input_tokens / 1_000_000 * input_rate
-                    + cache_read_tokens / 1_000_000 * cache_rate
-                )
-                * 100,
-                output_tokens / 1_000_000 * output_rate * 100,
+            return _price_cost_cents(
+                resolved_price,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
             )
 
         billed_input = input_tokens + cache_read_tokens

@@ -766,6 +766,7 @@ def test_resumed_item_skips_answer_generation_and_continues_with_judge() -> None
     generate_answer.assert_not_called()
     judge_item.assert_called_once()
     assert item.status == BenchmarkRunItemStatus.COMPLETED.value
+    assert item.execution_phase is None
 
 
 def test_cancellation_during_judging_cannot_be_overwritten_as_completed() -> None:
@@ -843,16 +844,19 @@ def test_unfinished_items_are_terminal_errors_not_false_completions() -> None:
     completed_at = datetime.datetime.now(datetime.timezone.utc)
     pending = SimpleNamespace(
         status=BenchmarkRunItemStatus.PENDING.value,
+        execution_phase=BenchmarkRunItemPhase.STARTING.value,
         error_message=None,
         completed_at=None,
     )
     running = SimpleNamespace(
         status=BenchmarkRunItemStatus.RUNNING.value,
+        execution_phase=BenchmarkRunItemPhase.RESEARCHING.value,
         error_message=None,
         completed_at=None,
     )
     completed = SimpleNamespace(
         status=BenchmarkRunItemStatus.COMPLETED.value,
+        execution_phase=None,
         error_message=None,
         completed_at=completed_at,
     )
@@ -864,6 +868,8 @@ def test_unfinished_items_are_terminal_errors_not_false_completions() -> None:
     )
     assert pending.status == BenchmarkRunItemStatus.ERROR.value
     assert running.status == BenchmarkRunItemStatus.ERROR.value
+    assert pending.execution_phase is None
+    assert running.execution_phase is None
     assert completed.status == BenchmarkRunItemStatus.COMPLETED.value
 
 

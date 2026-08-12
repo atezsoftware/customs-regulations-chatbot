@@ -574,6 +574,7 @@ def _run_item(
                 BenchmarkRunItemStatus.COMPLETED.value,
                 BenchmarkRunItemStatus.ERROR.value,
             }:
+                item.execution_phase = None
                 item.completed_at = _utcnow()
                 item.heartbeat_at = item.completed_at
             db_session.commit()
@@ -710,6 +711,7 @@ def _mark_unfinished_items_error(
         }:
             continue
         item.status = BenchmarkRunItemStatus.ERROR.value
+        item.execution_phase = None
         item.error_message = item.error_message or (
             "Benchmark execution ended before the item reached a terminal state"
         )

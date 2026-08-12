@@ -73,11 +73,16 @@ class TestComputeCostCents:
                     }
                 }
 
-        def _missing_price(*_args: object, **_kwargs: object) -> object:
-            raise ValueError("model missing from pinned LiteLLM catalog")
+        def _zero_model_info(*_args: object, **_kwargs: object) -> object:
+            return {
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+            }
 
-        monkeypatch.setattr(litellm, "get_model_info", _missing_price)
-        monkeypatch.setattr(litellm, "cost_per_token", _missing_price)
+        monkeypatch.setattr(litellm, "get_model_info", _zero_model_info)
+        monkeypatch.setattr(
+            litellm, "cost_per_token", lambda *_args, **_kwargs: (0.0, 0.0)
+        )
         monkeypatch.setattr(httpx, "get", lambda *_args, **_kwargs: _Response())
         cache = getattr(cost_mod, "_OPENROUTER_PRICE_CACHE", None)
         if cache is not None:
