@@ -1141,6 +1141,10 @@ REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS = max(
 REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS = max(
     60, int(os.environ.get("REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS") or 900)
 )
+# Deep Research intentionally permits up to 30 minutes before forcing final
+# synthesis. Give the in-flight synthesis and persistence boundary additional
+# bounded time instead of terminating a healthy research run at 15 minutes.
+REGULATORY_BENCHMARK_DEEP_RESEARCH_ITEM_TIMEOUT_SECONDS = 45 * 60
 
 # The maximum number of tasks that can be queued up to sync to Vespa in a single pass
 VESPA_SYNC_MAX_TASKS = 8192

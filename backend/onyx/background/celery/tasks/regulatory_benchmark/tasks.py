@@ -10,6 +10,7 @@ from onyx.background.indexing.job_client import SimpleJob, SimpleJobClient
 from onyx.cache.factory import get_cache_backend
 from onyx.cache.interface import CacheLock
 from onyx.configs.app_configs import (
+    REGULATORY_BENCHMARK_DEEP_RESEARCH_ITEM_TIMEOUT_SECONDS,
     REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS,
     REGULATORY_BENCHMARK_PARALLEL_ITEMS,
 )
@@ -18,6 +19,7 @@ from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import BenchmarkRunFailureCode, BenchmarkRunStatus
 from onyx.db.regulatory_benchmark import (
     claim_benchmark_run_item,
+    get_benchmark_run,
     get_benchmark_run_status,
     mark_benchmark_run_failed,
     mark_benchmark_run_item_failed,
@@ -153,6 +155,20 @@ def _get_benchmark_run_status(run_id: int) -> str | None:
         return get_benchmark_run_status(db_session, run_id)
 
 
+def _benchmark_run_uses_deep_research(run_id: int) -> bool:
+    with get_session_with_current_tenant() as db_session:
+        run = get_benchmark_run(db_session, run_id)
+        return bool(run and run.deep_research)
+
+
+def _benchmark_item_timeout_seconds(*, deep_research: bool) -> int:
+    return (
+        REGULATORY_BENCHMARK_DEEP_RESEARCH_ITEM_TIMEOUT_SECONDS
+        if deep_research
+        else REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS
+    )
+
+
 def _touch_benchmark_run(run_id: int, item_ids: list[int] | None = None) -> None:
     with get_session_with_current_tenant() as db_session:
         touch_benchmark_run_heartbeat(db_session, run_id, heartbeat_at=_utcnow())
@@ -196,6 +212,7 @@ def _run_benchmark_items(
     run_id: int,
     tenant_id: str,
     item_ids: list[int],
+    item_timeout_seconds: int,
     heartbeat: _RunLeaseHeartbeat,
 ) -> bool:
     """Run isolated item processes with bounded parallelism and per-item deadlines."""
@@ -252,11 +269,11 @@ def _run_benchmark_items(
                     continue
 
                 elapsed = time.monotonic() - active.started_at
-                if elapsed <= REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS:
+                if elapsed <= item_timeout_seconds:
                     continue
                 message = (
                     f"Benchmark item {active.item_id} exceeded the "
-                    f"{REGULATORY_BENCHMARK_ITEM_TIMEOUT_SECONDS} second "
+                    f"{item_timeout_seconds} second "
                     "execution deadline"
                 )
                 active.job.terminate_and_wait(_WATCHDOG_SIGTERM_GRACE_SECONDS)
@@ -349,15 +366,20 @@ def run_regulatory_benchmark_task(
     try:
         heartbeat.start()
         item_ids = _prepare_benchmark_items(run_id)
+        item_timeout_seconds = _benchmark_item_timeout_seconds(
+            deep_research=_benchmark_run_uses_deep_research(run_id)
+        )
         logger.info(
-            "Benchmark run %s prepared %s item(s) for execution",
+            "Benchmark run %s prepared %s item(s) for execution with a %ss deadline",
             run_id,
             len(item_ids),
+            item_timeout_seconds,
         )
         had_execution_timeout = _run_benchmark_items(
             run_id=run_id,
             tenant_id=tenant_id,
             item_ids=item_ids,
+            item_timeout_seconds=item_timeout_seconds,
             heartbeat=heartbeat,
         )
         if _get_benchmark_run_status(run_id) != BenchmarkRunStatus.RUNNING.value:

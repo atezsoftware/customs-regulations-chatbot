@@ -13,6 +13,11 @@ def test_run_lease_expires_promptly_after_worker_loss() -> None:
     assert tasks._RUN_LEASE_HEARTBEAT_SECONDS <= tasks._RUN_LEASE_SECONDS / 3
 
 
+def test_deep_research_uses_a_longer_bounded_item_deadline() -> None:
+    assert tasks._benchmark_item_timeout_seconds(deep_research=False) == 900
+    assert tasks._benchmark_item_timeout_seconds(deep_research=True) == 45 * 60
+
+
 def _job(job_id: int, *, done: bool) -> MagicMock:
     job = MagicMock()
     job.id = job_id
@@ -46,6 +51,7 @@ def test_item_watchdog_terminates_only_the_item_that_times_out() -> None:
             run_id=12,
             tenant_id="tenant_1",
             item_ids=[34],
+            item_timeout_seconds=60,
             heartbeat=heartbeat,
         )
 
@@ -95,6 +101,7 @@ def test_item_scheduler_stops_active_children_after_run_cancellation() -> None:
             run_id=12,
             tenant_id="tenant_1",
             item_ids=[34],
+            item_timeout_seconds=60,
             heartbeat=MagicMock(),
         )
 
@@ -184,6 +191,7 @@ def test_task_coordinates_items_then_finalizes_in_a_spawned_process() -> None:
         patch.object(tasks, "get_cache_backend", return_value=cache),
         patch.object(tasks, "_RunLeaseHeartbeat", return_value=heartbeat),
         patch.object(tasks, "_prepare_benchmark_items", return_value=[34, 35]),
+        patch.object(tasks, "_benchmark_run_uses_deep_research", return_value=True),
         patch.object(tasks, "_run_benchmark_items", return_value=False) as run_items,
         patch.object(
             tasks,
@@ -200,6 +208,7 @@ def test_task_coordinates_items_then_finalizes_in_a_spawned_process() -> None:
         run_id=12,
         tenant_id="tenant_1",
         item_ids=[34, 35],
+        item_timeout_seconds=45 * 60,
         heartbeat=heartbeat,
     )
     client.submit.assert_called_once_with(
@@ -275,6 +284,7 @@ def test_item_scheduler_fills_parallel_slots_before_waiting() -> None:
             run_id=12,
             tenant_id="tenant_1",
             item_ids=[101, 102, 103],
+            item_timeout_seconds=60,
             heartbeat=heartbeat,
         )
 
@@ -307,6 +317,7 @@ def test_item_scheduler_does_not_spawn_when_atomic_claim_is_rejected() -> None:
             run_id=12,
             tenant_id="tenant_1",
             item_ids=[34],
+            item_timeout_seconds=60,
             heartbeat=MagicMock(),
         )
 
