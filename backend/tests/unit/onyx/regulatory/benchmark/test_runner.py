@@ -186,6 +186,10 @@ def test_usage_cost_sums_each_actual_llm_call() -> None:
         ("candidate", "provider-a"),
         ("query-rephraser", "provider-b"),
     ]
+    assert [call.args[2:5] for call in compute_cost.call_args_list] == [
+        (100, 20, 0),
+        (25, 4, 5),
+    ]
 
 
 def test_usage_cost_marks_unknown_pricing_unavailable() -> None:
@@ -230,6 +234,41 @@ def test_usage_cost_prefers_provider_reported_cost() -> None:
     assert cost_cents == pytest.approx(0.0123)
     assert cost_source == "measured"
     compute_cost.assert_not_called()
+
+
+def test_usage_cost_reprices_zero_provider_cost_for_paid_usage() -> None:
+    usage_calls = [
+        LLMCallUsage(
+            "anthropic/claude-sonnet-5",
+            "openrouter",
+            100,
+            20,
+            0,
+            cost_cents=0.0,
+        )
+    ]
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.get_model_price_per_million",
+            return_value=ModelPrice(
+                model="anthropic/claude-sonnet-5",
+                provider="openrouter",
+                input_per_mtok=2.0,
+                output_per_mtok=10.0,
+                cache_per_mtok=0.2,
+            ),
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.compute_cost_cents",
+            return_value=(0.02, 0.02),
+        ) as compute_cost,
+    ):
+        _, _, cost_cents, cost_source = _usage_cost(MagicMock(), usage_calls)
+
+    assert cost_cents == pytest.approx(0.04)
+    assert cost_source == "measured"
+    compute_cost.assert_called_once()
 
 
 def test_required_citation_metrics_use_regulatory_chunk_ids() -> None:

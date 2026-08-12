@@ -104,21 +104,40 @@ def _usage_cost(
     total_cost_cents = 0.0
     pricing_available = bool(usage_calls)
     for call in usage_calls:
-        if call.cost_cents is not None:
+        price = get_model_price_per_million(
+            call.model, call.provider, db_session=db_session
+        )
+        known_rates = [
+            rate
+            for rate in (
+                price.input_per_mtok,
+                price.output_per_mtok,
+                price.cache_per_mtok,
+            )
+            if rate is not None
+        ]
+        provider_cost_is_authoritative = call.cost_cents is not None and (
+            call.cost_cents > 0
+            or call.input_tokens + call.output_tokens == 0
+            or (known_rates and all(rate == 0 for rate in known_rates))
+        )
+        if provider_cost_is_authoritative:
+            assert call.cost_cents is not None
             total_cost_cents += call.cost_cents
             continue
+        non_cached_input_tokens = max(
+            call.input_tokens - call.cache_read_tokens,
+            0,
+        )
         input_cost, output_cost = compute_cost_cents(
             call.model,
             call.provider,
-            call.input_tokens,
+            non_cached_input_tokens,
             call.output_tokens,
             call.cache_read_tokens,
             db_session=db_session,
         )
         total_cost_cents += input_cost + output_cost
-        price = get_model_price_per_million(
-            call.model, call.provider, db_session=db_session
-        )
         pricing_available = pricing_available and (
             price.input_per_mtok is not None or price.output_per_mtok is not None
         )

@@ -286,6 +286,74 @@ def test_benchmark_models_include_nameless_openrouter_provider() -> None:
     ] == [("openrouter", 8, "openai/gpt-5-mini")]
 
 
+def test_benchmark_models_exclude_account_policy_incompatible_models() -> None:
+    compatible = SimpleNamespace(
+        name="anthropic/claude-sonnet-5",
+        custom_display_name=None,
+        display_name="Claude Sonnet 5",
+        max_input_tokens=1_000_000,
+        is_visible=True,
+    )
+    incompatible = SimpleNamespace(
+        name="anthropic/claude-fable-5",
+        custom_display_name=None,
+        display_name="Claude Fable 5",
+        max_input_tokens=1_000_000,
+        is_visible=True,
+    )
+    provider = SimpleNamespace(
+        provider="openrouter",
+        name="OpenRouter Prod",
+        id=7,
+        model_configurations=[compatible, incompatible],
+    )
+
+    with (
+        patch.object(
+            benchmark_api,
+            "fetch_existing_llm_providers",
+            return_value=[provider],
+        ),
+        patch.object(
+            benchmark_api,
+            "_account_available_openrouter_model_ids",
+            return_value=frozenset({"anthropic/claude-sonnet-5"}),
+        ),
+    ):
+        models = benchmark_api.list_models(user=MagicMock(), db_session=MagicMock())
+
+    assert [model.model_id for model in models] == ["anthropic/claude-sonnet-5"]
+
+
+def test_openrouter_account_model_lookup_uses_policy_filtered_catalog() -> None:
+    api_key = MagicMock()
+    api_key.get_value.return_value = "test-key"
+    provider = SimpleNamespace(
+        id=7,
+        api_base="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+    response = MagicMock()
+    response.json.return_value = {
+        "data": [
+            {"id": "anthropic/claude-sonnet-5"},
+            {"id": "openai/gpt-5"},
+        ]
+    }
+
+    benchmark_api._OPENROUTER_ACCOUNT_MODELS_CACHE.clear()
+    with patch.object(benchmark_api.httpx, "get", return_value=response) as get:
+        available = benchmark_api._account_available_openrouter_model_ids(provider)
+
+    assert available == frozenset({"anthropic/claude-sonnet-5", "openai/gpt-5"})
+    get.assert_called_once_with(
+        "https://openrouter.ai/api/v1/models/user",
+        headers={"Authorization": "Bearer test-key"},
+        timeout=5.0,
+    )
+    response.raise_for_status.assert_called_once_with()
+
+
 def test_benchmark_models_give_each_nameless_provider_a_stable_selector() -> None:
     configuration = SimpleNamespace(
         name="visible/model",
@@ -380,6 +448,34 @@ def test_benchmark_model_validation_rejects_hidden_configuration() -> None:
             return_value=provider,
         ),
         pytest.raises(OnyxError, match="not available through OpenRouter"),
+    ):
+        benchmark_api._validate_model(MagicMock(), selection)
+
+
+def test_benchmark_model_validation_rejects_account_policy_incompatible_model() -> None:
+    visible = SimpleNamespace(name="anthropic/claude-fable-5", is_visible=True)
+    provider = SimpleNamespace(
+        provider="openrouter",
+        name="OpenRouter Prod",
+        id=7,
+        model_configurations=[visible],
+    )
+    selection = BenchmarkModelSelection(
+        provider="OpenRouter Prod", model_id="anthropic/claude-fable-5"
+    )
+
+    with (
+        patch.object(
+            benchmark_api,
+            "fetch_existing_llm_provider_by_name_and_type",
+            return_value=provider,
+        ),
+        patch.object(
+            benchmark_api,
+            "_account_available_openrouter_model_ids",
+            return_value=frozenset({"anthropic/claude-sonnet-5"}),
+        ),
+        pytest.raises(OnyxError, match="privacy or guardrail policy"),
     ):
         benchmark_api._validate_model(MagicMock(), selection)
 

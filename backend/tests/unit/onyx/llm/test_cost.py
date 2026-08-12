@@ -3,6 +3,8 @@
 from collections.abc import Generator
 from typing import cast
 
+import httpx
+import litellm
 import pytest
 from sqlalchemy import Table, create_engine
 from sqlalchemy.dialects.postgresql import JSONB as PGJSONB
@@ -14,7 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from onyx.db.models import ModelCostOverride
 from onyx.llm import cost as cost_mod
 from onyx.llm import cost_overrides
-from onyx.llm.cost import compute_cost_cents
+from onyx.llm.cost import compute_cost_cents, get_model_price_per_million
 from onyx.tracing.flows import LLMFlow
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 
@@ -52,6 +54,49 @@ def _clear_override_cache() -> Generator[None, None, None]:
 
 
 class TestComputeCostCents:
+    def test_openrouter_catalog_prices_model_missing_from_litellm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "data": {
+                        "id": "anthropic/claude-sonnet-5",
+                        "pricing": {
+                            "prompt": "0.000002",
+                            "completion": "0.00001",
+                            "input_cache_read": "0.0000002",
+                        },
+                    }
+                }
+
+        def _missing_price(*_args: object, **_kwargs: object) -> object:
+            raise ValueError("model missing from pinned LiteLLM catalog")
+
+        monkeypatch.setattr(litellm, "get_model_info", _missing_price)
+        monkeypatch.setattr(litellm, "cost_per_token", _missing_price)
+        monkeypatch.setattr(httpx, "get", lambda *_args, **_kwargs: _Response())
+        cache = getattr(cost_mod, "_OPENROUTER_PRICE_CACHE", None)
+        if cache is not None:
+            cache.clear()
+
+        price = get_model_price_per_million("anthropic/claude-sonnet-5", "openrouter")
+        input_cents, output_cents = compute_cost_cents(
+            model="anthropic/claude-sonnet-5",
+            provider="openrouter",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+        )
+
+        assert price.input_per_mtok == pytest.approx(2.0)
+        assert price.output_per_mtok == pytest.approx(10.0)
+        assert price.cache_per_mtok == pytest.approx(0.2)
+        assert input_cents == pytest.approx(200.0)
+        assert output_cents == pytest.approx(1000.0)
+
     def test_known_model_splits_input_and_output(self) -> None:
         # gpt-4o: $2.50/Mtok in, $10.00/Mtok out → 1000 tok each.
         in_cents, out_cents = compute_cost_cents(

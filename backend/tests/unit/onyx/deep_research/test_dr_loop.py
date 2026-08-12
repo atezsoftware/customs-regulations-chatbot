@@ -32,6 +32,10 @@ from onyx.tools.models import ToolCallInfo, ToolCallKickoff, ToolResponse
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 
+def test_regulatory_final_report_uses_full_report_output_budget() -> None:
+    assert dr_loop.MAX_REGULATORY_FINAL_REPORT_TOKENS == dr_loop.MAX_FINAL_REPORT_TOKENS
+
+
 def _search_doc() -> SearchDoc:
     return SearchDoc(
         document_id="document-1",

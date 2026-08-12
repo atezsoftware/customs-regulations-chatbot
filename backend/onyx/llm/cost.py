@@ -1,5 +1,10 @@
 """LLM cost calculation utilities."""
 
+import threading
+from urllib.parse import quote
+
+import httpx
+from cachetools import TTLCache
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -21,6 +26,80 @@ class ModelPrice(BaseModel):
     input_per_mtok: float | None
     output_per_mtok: float | None
     cache_per_mtok: float | None
+
+
+_OPENROUTER_PRICE_CACHE_TTL_SECONDS = 60 * 60
+_OPENROUTER_PRICE_CACHE: TTLCache[str, ModelPrice] = TTLCache(
+    maxsize=512,
+    ttl=_OPENROUTER_PRICE_CACHE_TTL_SECONDS,
+)
+_OPENROUTER_PRICE_CACHE_LOCK = threading.Lock()
+
+
+def _is_openrouter(provider: str | None) -> bool:
+    return bool(provider and provider.strip().lower() == "openrouter")
+
+
+def _openrouter_price_per_million(model: str) -> ModelPrice:
+    normalized_model = model.strip()
+    if normalized_model.startswith("openrouter/"):
+        normalized_model = normalized_model.removeprefix("openrouter/")
+    if not normalized_model:
+        return ModelPrice(
+            model=model,
+            provider="openrouter",
+            input_per_mtok=None,
+            output_per_mtok=None,
+            cache_per_mtok=None,
+        )
+
+    with _OPENROUTER_PRICE_CACHE_LOCK:
+        cached = _OPENROUTER_PRICE_CACHE.get(normalized_model)
+    if cached is not None:
+        return cached
+
+    price = ModelPrice(
+        model=model,
+        provider="openrouter",
+        input_per_mtok=None,
+        output_per_mtok=None,
+        cache_per_mtok=None,
+    )
+    try:
+        encoded_model = quote(normalized_model, safe="/:._-")
+        response = httpx.get(
+            f"https://openrouter.ai/api/v1/model/{encoded_model}",
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        pricing = data.get("pricing", {}) if isinstance(data, dict) else {}
+
+        def _per_million(field: str) -> float | None:
+            raw_value = pricing.get(field) if isinstance(pricing, dict) else None
+            if raw_value is None:
+                return None
+            parsed = float(raw_value) * 1_000_000
+            return parsed if parsed >= 0 else None
+
+        price = ModelPrice(
+            model=model,
+            provider="openrouter",
+            input_per_mtok=_per_million("prompt"),
+            output_per_mtok=_per_million("completion"),
+            cache_per_mtok=_per_million("input_cache_read"),
+        )
+    except Exception:
+        logger.debug(
+            "OpenRouter pricing lookup failed for model %s",
+            normalized_model,
+            exc_info=True,
+        )
+
+    with _OPENROUTER_PRICE_CACHE_LOCK:
+        _OPENROUTER_PRICE_CACHE[normalized_model] = price
+    return price
 
 
 def get_model_price_per_million(
@@ -67,6 +146,8 @@ def get_model_price_per_million(
             ),
         )
     except Exception:
+        if _is_openrouter(provider):
+            return _openrouter_price_per_million(model)
         logger.debug("No price-per-million for model %s (provider %s)", model, provider)
         return ModelPrice(
             model=model,
@@ -172,6 +253,27 @@ def compute_cost_cents(
             provider,
             exc_info=True,
         )
+        resolved_price = get_model_price_per_million(model, provider)
+        if (
+            resolved_price.input_per_mtok is not None
+            or resolved_price.output_per_mtok is not None
+        ):
+            input_rate = resolved_price.input_per_mtok or 0.0
+            output_rate = resolved_price.output_per_mtok or 0.0
+            cache_rate = (
+                resolved_price.cache_per_mtok
+                if resolved_price.cache_per_mtok is not None
+                else input_rate
+            )
+            return (
+                (
+                    input_tokens / 1_000_000 * input_rate
+                    + cache_read_tokens / 1_000_000 * cache_rate
+                )
+                * 100,
+                output_tokens / 1_000_000 * output_rate * 100,
+            )
+
         billed_input = input_tokens + cache_read_tokens
         input_cents = billed_input / 1_000_000 * DEFAULT_LLM_INPUT_COST_PER_MTOK * 100
         output_cents = (

@@ -1,6 +1,11 @@
 import datetime
+import hashlib
+import threading
 from typing import Literal, cast
+from urllib.parse import urlparse
 
+import httpx
+from cachetools import TTLCache
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -64,6 +69,74 @@ from shared_configs.contextvars import get_current_tenant_id
 
 router = APIRouter(prefix="/regulatory/benchmark")
 logger = setup_logger()
+
+_OPENROUTER_ACCOUNT_MODELS_CACHE: TTLCache[tuple[int, str, str], frozenset[str]] = (
+    TTLCache(maxsize=32, ttl=5 * 60)
+)
+_OPENROUTER_ACCOUNT_MODELS_CACHE_LOCK = threading.Lock()
+
+
+def _account_available_openrouter_model_ids(
+    provider: LLMProvider,
+) -> frozenset[str] | None:
+    """Return models allowed by the OpenRouter account's active policies.
+
+    Custom OpenRouter-compatible gateways keep their existing DB-backed catalog;
+    only the official OpenRouter API exposes the account-filtered endpoint.
+    A transient catalog failure must not take chat or benchmark administration
+    offline, so callers fall back to the persisted visible-model list.
+    """
+    api_base = (getattr(provider, "api_base", None) or "").strip().rstrip("/")
+    if not api_base:
+        api_base = "https://openrouter.ai/api/v1"
+    hostname = (urlparse(api_base).hostname or "").lower()
+    if hostname != "openrouter.ai" and not hostname.endswith(".openrouter.ai"):
+        return None
+
+    sensitive_api_key = getattr(provider, "api_key", None)
+    if sensitive_api_key is None:
+        return None
+    api_key = sensitive_api_key.get_value(apply_mask=False)
+    if not api_key:
+        return None
+
+    key_fingerprint = hashlib.sha256(api_key.encode()).hexdigest()
+    cache_key = (provider.id, api_base, key_fingerprint)
+    with _OPENROUTER_ACCOUNT_MODELS_CACHE_LOCK:
+        cached = _OPENROUTER_ACCOUNT_MODELS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        response = httpx.get(
+            f"{api_base}/models/user",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            raise ValueError("OpenRouter account model response is missing data")
+        available_ids: set[str] = set()
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if isinstance(model_id, str) and model_id:
+                available_ids.add(model_id)
+        available = frozenset(available_ids)
+    except Exception:
+        logger.warning(
+            "Could not refresh account-filtered OpenRouter models for provider %s",
+            provider.id,
+            exc_info=True,
+        )
+        return None
+
+    with _OPENROUTER_ACCOUNT_MODELS_CACHE_LOCK:
+        _OPENROUTER_ACCOUNT_MODELS_CACHE[cache_key] = available
+    return available
 
 
 def _get_editable_document_set(
@@ -143,6 +216,13 @@ def _validate_model(
             OnyxErrorCode.INVALID_INPUT,
             f"Model '{selection.model_id}' is not available through OpenRouter",
         )
+    account_models = _account_available_openrouter_model_ids(provider)
+    if account_models is not None and selection.model_id not in account_models:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            f"Model '{selection.model_id}' is blocked by the OpenRouter account's "
+            "privacy or guardrail policy",
+        )
     return provider
 
 
@@ -201,8 +281,11 @@ def list_models(
     ]
     for provider in openrouter_providers:
         provider_selector = provider.name or provider.provider
+        account_models = _account_available_openrouter_model_ids(provider)
         for configuration in provider.model_configurations:
             if not configuration.is_visible:
+                continue
+            if account_models is not None and configuration.name not in account_models:
                 continue
             models.append(
                 BenchmarkAvailableModel(
