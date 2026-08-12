@@ -21,3 +21,5 @@ def test_backend_deploy_verifies_the_benchmark_worker_is_running() -> None:
         "celery_worker_regulatory_benchmark"
     ) in workflow
     assert 'grep -q "RUNNING"' in workflow
+    assert "/tmp/onyx_k8s_regulatorybenchmark_readiness.txt" in workflow
+    assert 'test -f "$readiness_file"' in workflow

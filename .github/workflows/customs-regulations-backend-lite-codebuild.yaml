@@ -279,8 +279,9 @@ jobs:
             local pod
             local container
             local worker_status
+            local readiness_file="/tmp/onyx_k8s_regulatorybenchmark_readiness.txt"
 
-            echo "Waiting for the dedicated benchmark worker to report RUNNING"
+            echo "Waiting for the dedicated benchmark worker to become Celery-ready"
             for attempt in {1..60}; do
               pod=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json | jq -r --arg tag "${IMAGE_TAG}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | head -n 1)
               if [[ -n "$pod" ]]; then
@@ -288,8 +289,10 @@ jobs:
                 if [[ -n "$container" ]]; then
                   worker_status=$(kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status celery_worker_regulatory_benchmark 2>&1 || true)
                   echo "$worker_status"
-                  if grep -q "RUNNING" <<<"$worker_status"; then
-                    echo "Dedicated benchmark worker is running in pod $pod"
+                  if grep -q "RUNNING" <<<"$worker_status" && \
+                    kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+                      test -f "$readiness_file"; then
+                    echo "Dedicated benchmark worker is Celery-ready in pod $pod"
                     return 0
                   fi
                 fi
@@ -297,7 +300,7 @@ jobs:
               sleep 5
             done
 
-            echo "Dedicated benchmark worker did not become ready for image tag ${IMAGE_TAG}" >&2
+            echo "Dedicated benchmark worker did not become Celery-ready for image tag ${IMAGE_TAG}" >&2
             return 1
           }
 

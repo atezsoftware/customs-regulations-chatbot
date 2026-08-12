@@ -158,6 +158,7 @@ def mark_benchmark_run_item_failed(
         )
         .values(
             status=BenchmarkRunItemStatus.ERROR.value,
+            execution_phase=None,
             error_message=error_message,
             heartbeat_at=completed_at,
             completed_at=completed_at,
@@ -430,6 +431,7 @@ def mark_benchmark_run_failed(
     run.completed_at = completed_at
     for item in unfinished_items:
         item.status = BenchmarkRunItemStatus.ERROR.value
+        item.execution_phase = None
         item.error_message = item.error_message or diagnostic
         item.heartbeat_at = completed_at
         item.completed_at = completed_at
@@ -460,6 +462,7 @@ def cancel_benchmark_run(db_session: Session, run_id: int) -> BenchmarkRun | Non
             BenchmarkRunItemStatus.RUNNING.value,
         }:
             item.status = BenchmarkRunItemStatus.CANCELLED.value
+            item.execution_phase = None
             item.heartbeat_at = completed_at
             item.completed_at = completed_at
     db_session.commit()

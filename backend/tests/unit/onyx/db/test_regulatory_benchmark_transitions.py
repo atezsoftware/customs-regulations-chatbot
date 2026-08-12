@@ -38,6 +38,7 @@ class _LockAwareSession:
 def test_competing_terminal_transitions_lock_and_preserve_first_winner() -> None:
     pending_item = SimpleNamespace(
         status=BenchmarkRunItemStatus.PENDING.value,
+        execution_phase="starting",
         error_message=None,
         completed_at=None,
     )
@@ -70,6 +71,7 @@ def test_competing_terminal_transitions_lock_and_preserve_first_winner() -> None
     assert run.status == BenchmarkRunStatus.CANCELLED.value
     assert run.report_error is None
     assert pending_item.status == BenchmarkRunItemStatus.CANCELLED.value
+    assert pending_item.execution_phase is None
 
 
 def test_fully_terminalized_error_transition_is_idempotent() -> None:
@@ -108,14 +110,17 @@ def test_repeated_cancellation_repairs_unfinished_items() -> None:
     completed_at = object()
     pending_item = SimpleNamespace(
         status=BenchmarkRunItemStatus.PENDING.value,
+        execution_phase="starting",
         completed_at=None,
     )
     running_item = SimpleNamespace(
         status=BenchmarkRunItemStatus.RUNNING.value,
+        execution_phase="answering",
         completed_at=None,
     )
     completed_item = SimpleNamespace(
         status=BenchmarkRunItemStatus.COMPLETED.value,
+        execution_phase=None,
         completed_at=completed_at,
     )
     run = cast(
@@ -135,8 +140,10 @@ def test_repeated_cancellation_repairs_unfinished_items() -> None:
     assert session.locked_reads == 1
     assert session.commits == 1
     assert pending_item.status == BenchmarkRunItemStatus.CANCELLED.value
+    assert pending_item.execution_phase is None
     assert pending_item.completed_at is completed_at
     assert running_item.status == BenchmarkRunItemStatus.CANCELLED.value
+    assert running_item.execution_phase is None
     assert running_item.completed_at is completed_at
     assert completed_item.status == BenchmarkRunItemStatus.COMPLETED.value
     assert completed_item.completed_at is completed_at
