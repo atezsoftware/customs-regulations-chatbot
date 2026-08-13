@@ -50,6 +50,9 @@ describe("QueryHistoryTranscript", () => {
     expect(
       screen.getByRole("heading", { name: "Customs duty" })
     ).toBeInTheDocument();
+    expect(
+      screen.getByText("Customs duty").closest("div.prose-onyx")
+    ).toBeInTheDocument();
   });
 
   it("shows linked and unlinked sources alongside feedback for an assistant response", () => {

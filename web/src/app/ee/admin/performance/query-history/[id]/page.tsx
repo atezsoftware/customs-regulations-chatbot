@@ -44,7 +44,7 @@ function QueryHistoryConversation({
   return (
     <>
       <div className="flex flex-col gap-1 rounded-12 border border-border-02 bg-background-neutral-02 p-4">
-        <Text font="main-ui-action" color="text-01">
+        <Text font="main-ui-action" color="text-05">
           {chatSessionSnapshot.name || "Untitled conversation"}
         </Text>
         <Text font="secondary-body" color="text-03">

@@ -8,6 +8,7 @@ import { SvgArrowUpRight, SvgBook } from "@opal/icons";
 import { cn } from "@opal/utils";
 import { FeedbackBadge } from "../FeedbackBadge";
 import type { MessageSnapshot } from "../../usage/types";
+import "@/app/app/message/custom-code-styles.css";
 
 interface QueryHistoryTranscriptProps {
   messages: MessageSnapshot[];
@@ -51,7 +52,7 @@ function AssistantMessageMarkdown({ content }: { content: string }) {
 
   return (
     <ReactMarkdown
-      className="prose max-w-none wrap-break-word text-text-01"
+      className="prose prose-onyx max-w-none wrap-break-word font-main-content-body"
       remarkPlugins={[remarkGfm]}
       components={components}
     >
@@ -105,7 +106,10 @@ function ReferenceDocuments({ message }: TranscriptMessageProps) {
 
 function AssistantMessage({ message }: TranscriptMessageProps) {
   return (
-    <article className="flex max-w-200 flex-col gap-3 self-start" data-testid="query-history-assistant-message">
+    <article
+      className="flex max-w-200 flex-col gap-3 self-start"
+      data-testid="query-history-assistant-message"
+    >
       <AssistantMessageMarkdown content={message.message} />
       <ReferenceDocuments message={message} />
       {message.feedback_type && (
@@ -129,7 +133,7 @@ function UserMessage({ message }: TranscriptMessageProps) {
       data-testid="query-history-user-message"
     >
       <div className="whitespace-break-spaces break-anywhere">
-        <Text font="main-ui-body" color="text-01">
+        <Text font="main-content-body" color="text-04">
           {message.message}
         </Text>
       </div>
