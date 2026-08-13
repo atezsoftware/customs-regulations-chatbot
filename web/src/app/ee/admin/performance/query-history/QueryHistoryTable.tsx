@@ -19,8 +19,8 @@ import {
   AdminDateRangeSelector,
 } from "@/components/dateRangeSelectors/AdminDateRangeSelector";
 import { PageSelector } from "@/components/PageSelector";
-import Link from "next/link";
 import type { Route } from "next";
+import { useRouter } from "next/navigation";
 import { FeedbackBadge } from "@/app/ee/admin/performance/query-history/FeedbackBadge";
 import KickoffCSVExport from "@/app/ee/admin/performance/query-history/KickoffCSVExport";
 import CardSection from "@/components/admin/CardSection";
@@ -55,10 +55,31 @@ function QueryHistoryTableRow({
 }: {
   chatSessionMinimal: ChatSessionMinimal;
 }) {
+  const router = useRouter();
+  const conversationHref =
+    `/ee/admin/performance/query-history/${chatSessionMinimal.id}` as Route;
+
+  function openConversation() {
+    router.push(conversationHref);
+  }
+
   return (
     <TableRow
       key={chatSessionMinimal.id}
-      className="hover:bg-accent-background cursor-pointer relative select-none"
+      className="hover:bg-accent-background cursor-pointer select-none"
+      tabIndex={0}
+      aria-label={`Open conversation: ${
+        chatSessionMinimal.first_user_message ||
+        chatSessionMinimal.name ||
+        chatSessionMinimal.id
+      }`}
+      onClick={openConversation}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openConversation();
+        }
+      }}
     >
       <TableCell className="max-w-xs">
         <Text className="whitespace-normal line-clamp-5">
@@ -80,15 +101,6 @@ function QueryHistoryTableRow({
       <TableCell>
         {timestampToReadableDate(chatSessionMinimal.time_created)}
       </TableCell>
-      {/* Wrapping in <td> to avoid console warnings */}
-      <td className="w-0 p-0">
-        <Link
-          href={
-            `/ee/admin/performance/query-history/${chatSessionMinimal.id}` as Route
-          }
-          className="absolute w-full h-full left-0 top-0"
-        ></Link>
-      </td>
     </TableRow>
   );
 }
