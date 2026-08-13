@@ -48,9 +48,9 @@ function QueryHistoryConversation({
           {chatSessionSnapshot.name || "Untitled conversation"}
         </Text>
         <Text font="secondary-body" color="text-03">
-          {chatSessionSnapshot.user_email || "Anonymous user"} · {" "}
-          {chatSessionSnapshot.assistant_name || "Unknown assistant"} · {" "}
-          {timestampToReadableDate(chatSessionSnapshot.time_created)}
+          {`${chatSessionSnapshot.user_email || "Anonymous user"} · ${
+            chatSessionSnapshot.assistant_name || "Unknown assistant"
+          } · ${timestampToReadableDate(chatSessionSnapshot.time_created)}`}
         </Text>
       </div>
 

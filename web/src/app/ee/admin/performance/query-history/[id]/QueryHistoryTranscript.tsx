@@ -128,9 +128,11 @@ function UserMessage({ message }: TranscriptMessageProps) {
       className="max-w-150 self-end rounded-t-16 rounded-bl-16 bg-background-tint-02 px-3 py-2"
       data-testid="query-history-user-message"
     >
-      <Text font="main-ui-body" color="text-01" className="whitespace-break-spaces break-anywhere">
-        {message.message}
-      </Text>
+      <div className="whitespace-break-spaces break-anywhere">
+        <Text font="main-ui-body" color="text-01">
+          {message.message}
+        </Text>
+      </div>
     </article>
   );
 }
