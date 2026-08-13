@@ -7,11 +7,17 @@ from ee.onyx.server.query_history.api import snapshot_from_chat_session
 from onyx.configs.constants import MessageType
 
 
-def _message(message_id: int, message_type: MessageType, message: str) -> SimpleNamespace:
+def _message(
+    message_id: int,
+    message_type: MessageType,
+    message: str,
+    model_display_name: str | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         id=message_id,
         message=message,
         message_type=message_type,
+        model_display_name=model_display_name,
         chat_message_feedbacks=[],
         search_docs=[],
         time_sent=datetime.now(timezone.utc),
@@ -25,7 +31,12 @@ def test_snapshot_uses_all_persisted_messages_when_latest_child_is_missing() -> 
     persisted_messages = [
         _message(1, MessageType.SYSTEM, ""),
         _message(2, MessageType.USER, "What duty applies?"),
-        _message(3, MessageType.ASSISTANT, "The applicable duty is 10%."),
+        _message(
+            3,
+            MessageType.ASSISTANT,
+            "The applicable duty is 10%.",
+            model_display_name="GPT-5",
+        ),
     ]
     db_session = Mock()
 
@@ -40,6 +51,7 @@ def test_snapshot_uses_all_persisted_messages_when_latest_child_is_missing() -> 
         "What duty applies?",
         "The applicable duty is 10%.",
     ]
+    assert snapshot.messages[1].model_display_name == "GPT-5"
     get_messages.assert_called_once_with(
         chat_session_id=chat_session.id,
         user_id=None,

@@ -41,6 +41,14 @@ function QueryHistoryConversation({
     );
   }
 
+  const modelDisplayNames = Array.from(
+    new Set(
+      chatSessionSnapshot.messages.flatMap((message) =>
+        message.model_display_name ? [message.model_display_name] : []
+      )
+    )
+  );
+
   return (
     <>
       <div className="flex flex-col gap-1 rounded-12 border border-border-02 bg-background-neutral-02 p-4">
@@ -52,6 +60,11 @@ function QueryHistoryConversation({
             chatSessionSnapshot.assistant_name || "Unknown assistant"
           } · ${timestampToReadableDate(chatSessionSnapshot.time_created)}`}
         </Text>
+        {modelDisplayNames.length > 0 && (
+          <Text font="secondary-body" color="text-03">
+            {`AI modeli: ${modelDisplayNames.join(", ")}`}
+          </Text>
+        )}
       </div>
 
       <QueryHistoryTranscript messages={chatSessionSnapshot.messages} />

@@ -7,6 +7,7 @@ const messages: MessageSnapshot[] = [
     id: 1,
     message: "How do I calculate customs duty?",
     message_type: "user",
+    model_display_name: null,
     documents: [],
     feedback_type: null,
     feedback_text: null,
@@ -16,6 +17,7 @@ const messages: MessageSnapshot[] = [
     id: 2,
     message: "## Customs duty\n\nUse the **CIF value** as the basis.",
     message_type: "assistant",
+    model_display_name: "GPT-5",
     documents: [
       {
         document_id: "source-1",

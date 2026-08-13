@@ -23,6 +23,7 @@ class MessageSnapshot(BaseModel):
     id: int
     message: str
     message_type: MessageType
+    model_display_name: str | None
     documents: list[AbridgedSearchDoc]
     feedback_type: QAFeedbackType | None
     feedback_text: str | None
@@ -53,6 +54,7 @@ class MessageSnapshot(BaseModel):
             id=message.id,
             message=message.message,
             message_type=message.message_type,
+            model_display_name=message.model_display_name,
             documents=[
                 AbridgedSearchDoc(
                     document_id=document.document_id,

@@ -28,6 +28,7 @@ export interface MessageSnapshot {
   id: number;
   message: string;
   message_type: "user" | "assistant";
+  model_display_name: string | null;
   documents: AbridgedSearchDoc[];
   feedback_type: Feedback | null;
   feedback_text: string | null;
