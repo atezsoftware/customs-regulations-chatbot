@@ -24,7 +24,6 @@ from onyx.auth.permissions import require_permission
 from onyx.auth.users import get_display_email
 from onyx.background.celery.versioned_apps.client import app as client_app
 from onyx.background.task_utils import construct_query_history_report_name
-from onyx.chat.chat_utils import create_chat_history_chain
 from onyx.configs.constants import (
     PUBLIC_API_TAGS,
     FileOrigin,
@@ -37,7 +36,11 @@ from onyx.configs.constants import (
     QueryHistoryType,
     SessionType,
 )
-from onyx.db.chat import get_chat_session_by_id, get_chat_sessions_by_user
+from onyx.db.chat import (
+    get_chat_messages_by_session,
+    get_chat_session_by_id,
+    get_chat_sessions_by_user,
+)
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission, TaskStatus
 from onyx.db.file_record import get_query_history_export_files
@@ -124,15 +127,17 @@ def snapshot_from_chat_session(
     chat_session: ChatSession,
     db_session: Session,
 ) -> ChatSessionSnapshot | None:
-    try:
-        # Older chats may not have the right structure
-        messages = create_chat_history_chain(
-            chat_session_id=chat_session.id,
-            db_session=db_session,
-            prefetch_message_details=True,
-        )
-    except RuntimeError:
-        return None
+    # Query history must remain inspectable even if the mutable latest-child
+    # pointer is absent or stale. The chat UI can reconstruct a preferred
+    # branch from that pointer, whereas this admin view should show every
+    # persisted user and assistant message in the session.
+    messages = get_chat_messages_by_session(
+        chat_session_id=chat_session.id,
+        user_id=None,
+        db_session=db_session,
+        skip_permission_check=True,
+        prefetch_message_details=True,
+    )
 
     flow_type = SessionType.SLACK if chat_session.onyxbot_flow else SessionType.CHAT
 
