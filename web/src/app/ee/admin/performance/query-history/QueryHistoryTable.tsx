@@ -81,30 +81,40 @@ function QueryHistoryTableRow({
         }
       }}
     >
-      <TableCell className="max-w-xs">
-        <Text className="whitespace-normal line-clamp-5">
+      <TableCell className="overflow-hidden">
+        <Text className="whitespace-normal break-words line-clamp-5">
           {chatSessionMinimal.first_user_message ||
             chatSessionMinimal.name ||
             "-"}
         </Text>
       </TableCell>
-      <TableCell>
-        <Text className="whitespace-normal line-clamp-5">
+      <TableCell className="overflow-hidden">
+        <Text className="whitespace-normal break-words line-clamp-5">
           {chatSessionMinimal.first_ai_message || "-"}
         </Text>
       </TableCell>
       <TableCell>
         <FeedbackBadge feedback={chatSessionMinimal.feedback_type} />
       </TableCell>
-      <TableCell>{chatSessionMinimal.user_email || "-"}</TableCell>
-      <TableCell>{chatSessionMinimal.assistant_name || "Unknown"}</TableCell>
-      <TableCell className="max-w-48">
-        <Text className="whitespace-normal line-clamp-3">
+      <TableCell className="overflow-hidden">
+        <Text className="break-words line-clamp-3">
+          {chatSessionMinimal.user_email || "-"}
+        </Text>
+      </TableCell>
+      <TableCell className="overflow-hidden">
+        <Text className="break-words line-clamp-3">
+          {chatSessionMinimal.assistant_name || "Unknown"}
+        </Text>
+      </TableCell>
+      <TableCell className="overflow-hidden">
+        <Text className="whitespace-normal break-words line-clamp-3">
           {chatSessionMinimal.model_display_names.join(", ") || "-"}
         </Text>
       </TableCell>
-      <TableCell>
-        {timestampToReadableDate(chatSessionMinimal.time_created)}
+      <TableCell className="overflow-hidden">
+        <Text className="whitespace-normal break-words line-clamp-2">
+          {timestampToReadableDate(chatSessionMinimal.time_created)}
+        </Text>
       </TableCell>
     </TableRow>
   );
@@ -347,7 +357,16 @@ export function QueryHistoryTable() {
         </div>
         <Divider />
         <Section>
-          <Table className="mt-5">
+          <Table className="mt-5 table-fixed">
+            <colgroup>
+              <col className="w-[18%]" />
+              <col className="w-[27%]" />
+              <col className="w-[8%]" />
+              <col className="w-[11%]" />
+              <col className="w-[10%]" />
+              <col className="w-[16%]" />
+              <col className="w-[10%]" />
+            </colgroup>
             <TableHeader>
               <TableRow>
                 <TableHead>First User Message</TableHead>
