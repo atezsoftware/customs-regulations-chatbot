@@ -1,78 +1,30 @@
 "use client";
+
 import { use } from "react";
-
-import { Divider, Text } from "@opal/components";
-import Title from "@/components/ui/title";
-import { Spacer } from "@opal/components";
-import { ChatSessionSnapshot, MessageSnapshot } from "../../usage/types";
-import { FiBook } from "react-icons/fi";
-import { timestampToReadableDate } from "@/lib/dateUtils";
-import BackButton from "@/refresh-components/buttons/BackButton";
-import { FeedbackBadge } from "../FeedbackBadge";
-import { errorHandlingFetcher } from "@/lib/fetcher";
+import { SettingsLayouts, PageLoader } from "@opal/layouts";
+import { Text } from "@opal/components";
+import { SvgHistory } from "@opal/icons";
 import useSWR from "swr";
-import { SWR_KEYS } from "@/lib/swr-keys";
 import { ErrorCallout } from "@/components/ErrorCallout";
-import { PageLoader } from "@opal/layouts";
-import CardSection from "@/components/admin/CardSection";
+import { errorHandlingFetcher } from "@/lib/fetcher";
+import { SWR_KEYS } from "@/lib/swr-keys";
+import { timestampToReadableDate } from "@/lib/dateUtils";
+import type { ChatSessionSnapshot } from "../../usage/types";
+import QueryHistoryTranscript from "./QueryHistoryTranscript";
 
-function MessageDisplay({ message }: { message: MessageSnapshot }) {
-  return (
-    <div>
-      <p className="text-xs font-bold mb-1">
-        {message.message_type === "user" ? "User" : "AI"}
-      </p>
-      <Text as="p">{message.message}</Text>
-      {message.documents.length > 0 && (
-        <div className="flex flex-col gap-y-2 mt-2">
-          <p className="font-bold text-xs">Reference Documents</p>
-          {message.documents.slice(0, 5).map((document) => {
-            return (
-              <div className="text-sm flex" key={document.document_id}>
-                <FiBook
-                  className={
-                    "my-auto mr-1" + (document.link ? " text-link" : " ")
-                  }
-                />
-                {document.link ? (
-                  <a
-                    href={document.link}
-                    target="_blank"
-                    className="text-link"
-                    rel="noreferrer"
-                  >
-                    {document.semantic_identifier}
-                  </a>
-                ) : (
-                  document.semantic_identifier
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-      {message.feedback_type && (
-        <div className="mt-2">
-          <p className="font-bold text-xs">Feedback</p>
-          {message.feedback_text && <Text as="p">{message.feedback_text}</Text>}
-          <div className="mt-1">
-            <FeedbackBadge feedback={message.feedback_type} />
-          </div>
-        </div>
-      )}
-      <Divider />
-    </div>
-  );
+interface QueryHistoryConversationProps {
+  chatSessionId: string;
 }
 
-export default function QueryPage(props: { params: Promise<{ id: string }> }) {
-  const params = use(props.params);
+function QueryHistoryConversation({
+  chatSessionId,
+}: QueryHistoryConversationProps) {
   const {
     data: chatSessionSnapshot,
     isLoading,
     error,
   } = useSWR<ChatSessionSnapshot>(
-    SWR_KEYS.adminChatSession(params.id),
+    SWR_KEYS.adminChatSession(chatSessionId),
     errorHandlingFetcher
   );
 
@@ -83,42 +35,47 @@ export default function QueryPage(props: { params: Promise<{ id: string }> }) {
   if (!chatSessionSnapshot || error) {
     return (
       <ErrorCallout
-        errorTitle="Something went wrong :("
+        errorTitle="Unable to load conversation history"
         errorMsg={`Failed to fetch chat session - ${error}`}
       />
     );
   }
 
   return (
-    <main className="pt-4 mx-auto container">
-      <BackButton />
-
-      <CardSection className="mt-4">
-        <Title>Chat Session Details</Title>
-
-        <Spacer rem={0.25} />
-        {chatSessionSnapshot.assistant_name && (
-          <Text as="p">{chatSessionSnapshot.assistant_name}</Text>
-        )}
-        <Spacer rem={0.25} />
-        <Text as="p">
-          {`${
-            chatSessionSnapshot.user_email
-              ? `${chatSessionSnapshot.user_email}, `
-              : ""
-          }${timestampToReadableDate(chatSessionSnapshot.time_created)}, ${
-            chatSessionSnapshot.flow_type
-          }`}
+    <>
+      <div className="flex flex-col gap-1 rounded-12 border border-border-02 bg-background-neutral-02 p-4">
+        <Text font="main-ui-action" color="text-01">
+          {chatSessionSnapshot.name || "Untitled conversation"}
         </Text>
+        <Text font="secondary-body" color="text-03">
+          {chatSessionSnapshot.user_email || "Anonymous user"} · {" "}
+          {chatSessionSnapshot.assistant_name || "Unknown assistant"} · {" "}
+          {timestampToReadableDate(chatSessionSnapshot.time_created)}
+        </Text>
+      </div>
 
-        <Divider />
+      <QueryHistoryTranscript messages={chatSessionSnapshot.messages} />
+    </>
+  );
+}
 
-        <div className="flex flex-col">
-          {chatSessionSnapshot.messages.map((message) => {
-            return <MessageDisplay key={message.id} message={message} />;
-          })}
-        </div>
-      </CardSection>
-    </main>
+export default function QueryHistoryPage(props: {
+  params: Promise<{ id: string }>;
+}) {
+  const params = use(props.params);
+
+  return (
+    <SettingsLayouts.Root width="lg">
+      <SettingsLayouts.Header
+        icon={SvgHistory}
+        title="Conversation History"
+        description="Read-only conversation from query history"
+        backButton
+        divider
+      />
+      <SettingsLayouts.Body>
+        <QueryHistoryConversation chatSessionId={params.id} />
+      </SettingsLayouts.Body>
+    </SettingsLayouts.Root>
   );
 }
