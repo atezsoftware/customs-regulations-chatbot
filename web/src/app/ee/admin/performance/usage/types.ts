@@ -54,6 +54,7 @@ export interface ChatSessionMinimal {
   first_ai_message: string;
   assistant_id: number | null;
   assistant_name: string | null;
+  model_display_names: string[];
   time_created: string;
   feedback_type: Feedback | "mixed" | null;
   flow_type: SessionType;

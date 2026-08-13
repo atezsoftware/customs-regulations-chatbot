@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from ee.onyx.server.query_history.api import snapshot_from_chat_session
+from ee.onyx.server.query_history.models import ChatSessionMinimal
 from onyx.configs.constants import MessageType
 
 
@@ -59,3 +60,40 @@ def test_snapshot_uses_all_persisted_messages_when_latest_child_is_missing() -> 
         skip_permission_check=True,
         prefetch_message_details=True,
     )
+
+
+def test_minimal_snapshot_includes_each_model_used_in_the_conversation() -> None:
+    chat_session = SimpleNamespace(
+        id=uuid4(),
+        user=SimpleNamespace(email="admin@example.com"),
+        description="Duty question",
+        persona_id=1,
+        persona=SimpleNamespace(name="Customs Agent"),
+        time_created=datetime.now(timezone.utc),
+        onyxbot_flow=False,
+        messages=[
+            _message(1, MessageType.USER, "What duty applies?"),
+            _message(
+                2,
+                MessageType.ASSISTANT,
+                "The applicable duty is 10%.",
+                model_display_name="GPT-5",
+            ),
+            _message(
+                3,
+                MessageType.ASSISTANT,
+                "Here is an alternative answer.",
+                model_display_name="Claude Sonnet 4",
+            ),
+            _message(
+                4,
+                MessageType.ASSISTANT,
+                "A repeated model should not duplicate the table value.",
+                model_display_name="GPT-5",
+            ),
+        ],
+    )
+
+    snapshot = ChatSessionMinimal.from_chat_session(chat_session)
+
+    assert snapshot.model_display_names == ["GPT-5", "Claude Sonnet 4"]

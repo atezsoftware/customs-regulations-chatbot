@@ -77,6 +77,7 @@ class ChatSessionMinimal(BaseModel):
     first_ai_message: str
     assistant_id: int | None
     assistant_name: str | None
+    model_display_names: list[str]
     time_created: datetime
     feedback_type: QAFeedbackType | None
     flow_type: SessionType
@@ -126,6 +127,14 @@ class ChatSessionMinimal(BaseModel):
             assistant_id=chat_session.persona_id,
             assistant_name=(
                 chat_session.persona.name if chat_session.persona else None
+            ),
+            model_display_names=list(
+                dict.fromkeys(
+                    message.model_display_name
+                    for message in chat_session.messages
+                    if message.message_type == MessageType.ASSISTANT
+                    and message.model_display_name
+                )
             ),
             time_created=chat_session.time_created,
             feedback_type=session_feedback_type,

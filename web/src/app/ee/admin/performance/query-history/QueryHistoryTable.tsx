@@ -98,6 +98,11 @@ function QueryHistoryTableRow({
       </TableCell>
       <TableCell>{chatSessionMinimal.user_email || "-"}</TableCell>
       <TableCell>{chatSessionMinimal.assistant_name || "Unknown"}</TableCell>
+      <TableCell className="max-w-48">
+        <Text className="whitespace-normal line-clamp-3">
+          {chatSessionMinimal.model_display_names.join(", ") || "-"}
+        </Text>
+      </TableCell>
       <TableCell>
         {timestampToReadableDate(chatSessionMinimal.time_created)}
       </TableCell>
@@ -350,13 +355,14 @@ export function QueryHistoryTable() {
                 <TableHead>Feedback</TableHead>
                 <TableHead>User</TableHead>
                 <TableHead>Persona</TableHead>
+                <TableHead>AI Model</TableHead>
                 <TableHead>Date</TableHead>
               </TableRow>
             </TableHeader>
             {isLoading ? (
               <TableBody>
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center">
+                  <TableCell colSpan={7} className="text-center">
                     <div className="flex justify-center">
                       <SvgSimpleLoader className="h-6 w-6" />
                     </div>
