@@ -10,6 +10,7 @@ from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import InferenceChunk
 from onyx.db.reranking import RerankerRuntimeConfig
 from onyx.reranking.circuit_breaker import RerankCircuitBreaker
+from onyx.reranking.constants import OPENROUTER_LUNA_RERANK_MODEL
 from onyx.reranking.models import (
     InvalidRerankResponse,
     RerankOutcome,
@@ -51,12 +52,15 @@ def _chunk(document_id: str, *, body: str = "gövde") -> InferenceChunk:
 
 
 def _config(
-    *, enabled: bool = True, generation: str = "generation-a"
+    *,
+    enabled: bool = True,
+    generation: str = "generation-a",
+    model_name: str = "cohere/rerank-v3.5",
 ) -> RerankerRuntimeConfig:
     return RerankerRuntimeConfig(
         enabled=enabled,
         provider_type=RerankerProvider.OPENROUTER if enabled else None,
-        model_name="cohere/rerank-v3.5" if enabled else None,
+        model_name=model_name if enabled else None,
         api_key=make_mock_sensitive_value("top-secret") if enabled else None,
         configuration_generation=generation,
     )
@@ -120,6 +124,29 @@ def test_partial_response_appends_omitted_and_unsent_tail(
     assert result.fallback_used is False
     assert result.used_external is True
     assert client.rerank.call_args.kwargs["top_n"] == 2
+
+
+def test_luna_rerank_submits_bounded_short_candidate_window(
+    service: RerankingService, client: MagicMock
+) -> None:
+    chunks = [_chunk(f"d{index}", body="x" * 10_000) for index in range(40)]
+    client.rerank.return_value = [
+        RerankScore(index=index, relevance_score=1 - index / 32) for index in range(32)
+    ]
+
+    result = service.rerank_chunks(
+        query="q",
+        chunks=chunks,
+        config=_config(model_name=OPENROUTER_LUNA_RERANK_MODEL),
+    )
+
+    submitted_documents = client.rerank.call_args.kwargs["documents"]
+    assert len(submitted_documents) == 32
+    assert all(
+        len(document.encode("utf-8")) <= 2_048 for document in submitted_documents
+    )
+    assert result.submitted_count == 32
+    assert result.ordered_chunks[32:] == chunks[32:]
 
 
 @pytest.mark.parametrize(

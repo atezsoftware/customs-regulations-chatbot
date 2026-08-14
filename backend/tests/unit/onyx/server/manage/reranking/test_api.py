@@ -686,7 +686,7 @@ def test_catalog_uses_fixed_url_and_body_only_unsaved_key(
     assert unsaved_key not in str(request.url)
 
 
-def test_privacy_policy_provider_failure_returns_no_attestation(
+def test_provider_failure_returns_no_attestation_without_secret_leak(
     admin_client: _DirectClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -708,10 +708,7 @@ def test_privacy_policy_provider_failure_returns_no_attestation(
 
     assert response.status_code == 502
     assert "test_attestation" not in response.json()
-    assert request_payloads[0]["provider"] == {
-        "zdr": True,
-        "data_collection": "deny",
-    }
+    assert "provider" not in request_payloads[0]
     assert TEST_KEY not in response.text
 
 

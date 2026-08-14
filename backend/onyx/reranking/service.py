@@ -10,7 +10,15 @@ from onyx.reranking.circuit_breaker import (
     RerankCircuitBreaker,
     reranker_configuration_fingerprint,
 )
-from onyx.reranking.constants import MAX_RERANK_CANDIDATES
+from onyx.reranking.constants import (
+    MAX_CHAT_RERANK_CANDIDATES,
+    MAX_CHAT_RERANK_DOCUMENT_BYTES,
+    MAX_CHAT_RERANK_DOCUMENT_TOKENS,
+    MAX_CHAT_RERANK_TOTAL_BYTES,
+    MAX_CHAT_RERANK_TOTAL_TOKENS,
+    MAX_RERANK_CANDIDATES,
+    uses_chat_completion_reranking,
+)
 from onyx.reranking.models import (
     InvalidRerankResponse,
     RerankCircuitKey,
@@ -148,10 +156,18 @@ class RerankingService:
                 fallback_used=True,
             )
 
-        payload = serialize_rerank_candidates(
-            chunks,
-            limits=RerankPayloadLimits(max_candidates=MAX_RERANK_CANDIDATES),
+        payload_limits = (
+            RerankPayloadLimits(
+                max_candidates=MAX_CHAT_RERANK_CANDIDATES,
+                max_document_bytes=MAX_CHAT_RERANK_DOCUMENT_BYTES,
+                max_document_tokens=MAX_CHAT_RERANK_DOCUMENT_TOKENS,
+                max_total_bytes=MAX_CHAT_RERANK_TOTAL_BYTES,
+                max_total_tokens=MAX_CHAT_RERANK_TOTAL_TOKENS,
+            )
+            if uses_chat_completion_reranking(config.model_name)
+            else RerankPayloadLimits(max_candidates=MAX_RERANK_CANDIDATES)
         )
+        payload = serialize_rerank_candidates(chunks, limits=payload_limits)
         if not payload.documents:
             return self._result(
                 started_at=started_at,
@@ -175,6 +191,7 @@ class RerankingService:
                     top_n=len(payload.documents),
                 )
         except RerankTimeout:
+            logger.warning("Rerank provider timed out model=%s", model)
             self._circuit_breaker.record_failure(circuit_key)
             outcome = RerankOutcome.TIMEOUT
         except RerankRateLimited as error:
@@ -185,6 +202,11 @@ class RerankingService:
             )
             outcome = RerankOutcome.RATE_LIMITED
         except RerankProviderError as error:
+            logger.warning(
+                "Rerank provider error model=%s status_code=%s",
+                model,
+                error.status_code,
+            )
             self._circuit_breaker.record_failure(
                 circuit_key,
                 retry_after_seconds=error.retry_after_seconds,

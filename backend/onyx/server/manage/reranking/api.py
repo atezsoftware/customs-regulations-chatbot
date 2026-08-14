@@ -45,6 +45,7 @@ from onyx.server.manage.reranking.models import (
     RerankerTestResponse,
 )
 from onyx.utils.encryption import is_masked_credential
+from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import get_current_tenant_id
 from shared_configs.enums import RerankerProvider
 
@@ -54,6 +55,7 @@ _TEST_DOCUMENT = "Configuration test document"
 _ATTESTATION_ERRORS = CACHE_TRANSIENT_ERRORS + (CacheLockLostError,)
 
 admin_router = APIRouter(prefix="/admin/reranking")
+logger = setup_logger()
 
 
 def _view(config: RerankerRuntimeConfig) -> RerankerConfigView:
@@ -216,6 +218,13 @@ def test_config(
             top_n=1,
         )
     except RerankError as error:
+        logger.warning(
+            "OpenRouter reranker test failed error_type=%s status_code=%s "
+            "retry_after_seconds=%s",
+            type(error).__name__,
+            getattr(error, "status_code", None),
+            getattr(error, "retry_after_seconds", None),
+        )
         raise OnyxError(
             OnyxErrorCode.BAD_GATEWAY,
             "OpenRouter could not complete a private reranking test.",

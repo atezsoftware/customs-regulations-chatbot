@@ -3,7 +3,11 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from onyx.reranking.constants import OPENROUTER_RERANK_URL
+from onyx.reranking.constants import (
+    OPENROUTER_CHAT_COMPLETIONS_URL,
+    OPENROUTER_LUNA_RERANK_MODEL,
+    OPENROUTER_RERANK_URL,
+)
 from onyx.reranking.models import (
     InvalidRerankResponse,
     RerankPayloadTooLarge,
@@ -34,7 +38,7 @@ def _response(
     return response
 
 
-def test_rerank_posts_fixed_private_request(
+def test_rerank_posts_standard_provider_request(
     client: OpenRouterRerankClient, http: MagicMock
 ) -> None:
     http.post.return_value = _response(
@@ -61,7 +65,6 @@ def test_rerank_posts_fixed_private_request(
             "query": "soru",
             "documents": ["a", "b"],
             "top_n": 2,
-            "provider": {"zdr": True, "data_collection": "deny"},
         },
     )
 
@@ -84,6 +87,76 @@ def test_rerank_orders_equal_scores_by_original_index(
     )
 
     assert [item.index for item in result] == [1, 0, 2]
+
+
+def test_luna_rerank_uses_structured_chat_completion(
+    client: OpenRouterRerankClient, http: MagicMock
+) -> None:
+    http.post.return_value = _response(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"ranking":[2,0,1]}',
+                    }
+                }
+            ]
+        }
+    )
+
+    result = client.rerank(
+        api_key="secret",
+        model=OPENROUTER_LUNA_RERANK_MODEL,
+        query="request-derived evidence target",
+        documents=["first", "second", "third"],
+        top_n=3,
+    )
+
+    assert [item.index for item in result] == [2, 0, 1]
+    assert [item.relevance_score for item in result] == [1.0, 2 / 3, 1 / 3]
+    request = http.post.call_args
+    assert request.args[0] == OPENROUTER_CHAT_COMPLETIONS_URL
+    assert request.kwargs["headers"] == {
+        "Authorization": "Bearer secret",
+        "Content-Type": "application/json",
+    }
+    payload = request.kwargs["json"]
+    assert payload["model"] == OPENROUTER_LUNA_RERANK_MODEL
+    assert payload["temperature"] == 0
+    assert payload["response_format"]["type"] == "json_schema"
+    schema = payload["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["ranking"]["minItems"] == 3
+    assert schema["properties"]["ranking"]["maxItems"] == 3
+    assert "request-derived evidence target" in payload["messages"][1]["content"]
+    assert '"index":2' in payload["messages"][1]["content"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"ranking":[0,0]}',
+        '{"ranking":[0]}',
+        '{"ranking":[0,true]}',
+        '{"ranking":[0,2]}',
+        '{"ranking":"0,1"}',
+        "not-json",
+    ],
+)
+def test_luna_rerank_rejects_invalid_rankings(
+    client: OpenRouterRerankClient,
+    http: MagicMock,
+    content: str,
+) -> None:
+    http.post.return_value = _response({"choices": [{"message": {"content": content}}]})
+
+    with pytest.raises(InvalidRerankResponse):
+        client.rerank(
+            api_key="k",
+            model=OPENROUTER_LUNA_RERANK_MODEL,
+            query="q",
+            documents=["a", "b"],
+            top_n=2,
+        )
 
 
 @pytest.mark.parametrize(
