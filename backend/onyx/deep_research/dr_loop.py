@@ -349,9 +349,7 @@ def _densify_regulatory_evidence_citations(
             evidence_chunk.retrieval_number or evidence_chunk.citation_number
         )
         search_doc = (
-            citation_mapping.get(source_number)
-            if source_number is not None
-            else None
+            citation_mapping.get(source_number) if source_number is not None else None
         )
         if search_doc is None:
             logger.warning(
@@ -483,15 +481,11 @@ def _run_regulatory_coverage_searches(
                             "research_target": (
                                 "Specific evidence target: "
                                 + str(
-                                    tool_call.tool_args.get(
-                                        "evidence_target", ""
-                                    )
+                                    tool_call.tool_args.get("evidence_target", "")
                                 ).strip()
                                 + ". Coverage item: "
                                 + str(
-                                    tool_call.tool_args.get(
-                                        "coverage_item", ""
-                                    )
+                                    tool_call.tool_args.get("coverage_item", "")
                                 ).strip()
                             )[:900].rstrip()
                         }

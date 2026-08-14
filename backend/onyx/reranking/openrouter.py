@@ -1,7 +1,7 @@
 import json
 import math
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -262,11 +262,12 @@ class OpenRouterRerankClient:
             index < 0 or index >= len(documents) for index in ranking
         ):
             raise InvalidRerankResponse()
+        validated_ranking = cast(list[int], ranking)
 
         return [
             RerankScore(
                 index=index,
                 relevance_score=(top_n - position) / top_n,
             )
-            for position, index in enumerate(ranking)
+            for position, index in enumerate(validated_ranking)
         ]

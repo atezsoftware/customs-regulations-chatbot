@@ -160,9 +160,7 @@ def _embed_and_hybrid_search(
         return _keyword_search(query_request, document_index)
 
     if query_embedding is None:
-        logger.warning(
-            "Regulatory embedding circuit is open; using lexical retrieval"
-        )
+        logger.warning("Regulatory embedding circuit is open; using lexical retrieval")
         return _keyword_search(query_request, document_index)
 
     hybrid_alpha = query_request.hybrid_alpha or HYBRID_ALPHA

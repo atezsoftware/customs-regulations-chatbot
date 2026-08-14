@@ -424,8 +424,7 @@ def test_direct_coverage_search_builds_exact_evidence_and_citation_mapping() -> 
     assert evidence[0].content == "EXACT LLM-VISIBLE OPERATIVE TEXT"
     assert evidence[0].citation_number == 1
     assert evidence[0].research_target == (
-        "Specific evidence target: Controlling trigger. "
-        "Coverage item: Requested issue"
+        "Specific evidence target: Controlling trigger. Coverage item: Requested issue"
     )
     assert len(state.get_tool_calls()) == 1
 
@@ -2229,12 +2228,8 @@ def test_regulatory_deep_research_carries_structured_coverage_into_plan() -> Non
     research_plan = generate_report.call_args.kwargs["research_plan"]
     assert research_plan.startswith("# Request coverage contract")
     assert research_plan.endswith("Research the unresolved coverage rows.")
-    assert generate_report.call_args.kwargs["citation_mapping"] == {
-        1: _search_doc()
-    }
+    assert generate_report.call_args.kwargs["citation_mapping"] == {1: _search_doc()}
     assert generate_report.call_args.kwargs["evidence_citation_mapping"] == {
         1: _search_doc()
     }
-    assert generate_report.call_args.kwargs["exact_evidence_chunks"] == [
-        _evidence()
-    ]
+    assert generate_report.call_args.kwargs["exact_evidence_chunks"] == [_evidence()]

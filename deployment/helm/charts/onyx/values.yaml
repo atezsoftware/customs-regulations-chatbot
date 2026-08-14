@@ -1483,6 +1483,10 @@ configMap:
   # Gen AI Settings
   GEN_AI_MAX_TOKENS: ""
   LLM_SOCKET_READ_TIMEOUT: "60"
+  # Retry only streamed requests that fail before the first response chunk.
+  LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S: "15"
+  LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S: "60"
+  LLM_FIRST_CHUNK_RETRY_JITTER_RATIO: "0.2"
   MAX_CHUNKS_FED_TO_CHAT: ""
   # Usage / cost accounting
   # Records priced generation spans into the per-user usage ledger (default on).
@@ -1493,6 +1497,10 @@ configMap:
   # Fallback USD per million tokens when litellm can't price a model (default 0 = free).
   DEFAULT_LLM_INPUT_COST_PER_MTOK: ""
   DEFAULT_LLM_OUTPUT_COST_PER_MTOK: ""
+  # Optional same-provider model for bounded regulatory reviews. Empty reuses
+  # the answering model; the timeout applies to each structured review call.
+  REGULATORY_REVIEW_MODEL: ""
+  REGULATORY_REVIEW_TIMEOUT_S: "180"
   # Query Options
   DOC_TIME_DECAY: ""
   HYBRID_ALPHA: ""
