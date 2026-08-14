@@ -1,6 +1,7 @@
 import json
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -17,6 +18,7 @@ from onyx.chat.citation_processor import (
 from onyx.chat.citation_utils import (
     canonicalize_search_tool_response_citations,
     extract_citation_order_from_text,
+    synchronize_lightweight_citation_mapping,
     update_citation_processor_from_tool_response,
 )
 from onyx.chat.emitter import BufferedEmitter, Emitter
@@ -47,7 +49,7 @@ from onyx.chat.prompt_utils import (
 from onyx.chat.staged_generation import commit_staged_llm_step
 from onyx.configs.app_configs import INTEGRATION_TESTS_MODE
 from onyx.configs.chat_configs import MAX_LLM_CYCLES
-from onyx.configs.constants import DEFAULT_PERSONA_ID, DocumentSource, MessageType
+from onyx.configs.constants import DocumentSource, MessageType
 from onyx.configs.model_configs import GEN_AI_INPUT_TOKEN_SAFETY_MARGIN
 from onyx.context.search.models import SearchDoc, SearchDocsResponse
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
@@ -58,20 +60,43 @@ from onyx.llm.models import ReasoningEffort
 from onyx.prompts.chat_prompts import IMAGE_GEN_REMINDER, OPEN_URL_REMINDER
 from onyx.prompts.prompt_utils import substitute_user_placeholders
 from onyx.regulatory.candidate_answer_review import (
+    MAX_REGULATORY_CLAIM_ISSUES,
     CandidateAnswerClaimIssue,
     CandidateAnswerEvidenceChunk,
+    CandidateAnswerReviewResult,
     build_candidate_answer_evidence_chunk,
+    build_regulatory_review_llm,
     build_regulatory_review_user_context,
     format_candidate_answer_review,
     format_candidate_resolution_review,
-    review_regulatory_candidate_answer,
-    review_regulatory_candidate_resolution,
+    format_candidate_review_regression_guard,
+    review_regulatory_candidate_answer_with_fallback,
+    review_regulatory_candidate_matrix_closure_with_fallback,
+    review_regulatory_candidate_resolution_with_fallback,
+)
+from onyx.regulatory.coverage_plan import (
+    RegulatoryCoverageItem,
+    RegulatoryCoveragePlan,
+    build_regulatory_coverage_plan,
+    format_regulatory_coverage_plan,
+)
+from onyx.regulatory.evidence_matrix import (
+    EvidenceCoverageStatus,
+    RegulatoryEvidenceMatrix,
+    RegulatoryEvidenceMatrixRow,
+    RegulatoryNavigationLead,
+    build_regulatory_evidence_matrix,
+    evidence_matrix_recovery_queries,
+    format_regulatory_evidence_matrix,
 )
 from onyx.regulatory.gap_recovery import (
     merge_recovery_citation_mapping,
     recovery_search_docs_by_citation,
-    run_single_gap_recovery,
-    select_priority_recovery_issue,
+    run_batched_gap_recovery,
+    select_priority_recovery_issues,
+)
+from onyx.regulatory.navigation_recovery import (
+    select_regulatory_navigation_recovery_leads,
 )
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
@@ -81,6 +106,7 @@ from onyx.server.query_and_chat.streaming_models import (
     TopLevelBranching,
 )
 from onyx.tools.built_in_tools import CITEABLE_TOOLS_NAMES, STOPPING_TOOLS_NAMES
+from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tools.interface import Tool
 from onyx.tools.models import (
     ChatFile,
@@ -105,12 +131,20 @@ from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
-_REGULATORY_UNPLANNED_MAX_LLM_CHUNKS_PER_CALL = 8
-_REGULATORY_UNPLANNED_MAX_SEARCH_CALLS = 16
-_REGULATORY_MAX_PARALLEL_SEARCH_CALLS = 8
+_REGULATORY_MAX_PARALLEL_SEARCH_CALLS = 32
+_REGULATORY_MAX_CONCURRENT_SEARCH_TOOLS = 8
+_REGULATORY_SEARCH_LLM_CHUNKS_PER_CALL = 10
+_REGULATORY_BOOTSTRAP_COVERAGE_CYCLES = 1
+_REGULATORY_AUTONOMOUS_RESEARCH_CYCLES = 1
 _MAX_EMPTY_FINAL_RESPONSE_RETRIES = 1
 _REGULATORY_POST_REVIEW_MAIN_CYCLES = 3
+# One full independent audit followed by one issue-resolution audit. Further
+# audits of the same fixed evidence create a rewrite loop rather than new proof.
 _REGULATORY_MAX_CANDIDATE_REVIEWS = 2
+_REGULATORY_EVIDENCE_PER_RESEARCH_TARGET = 2
+_REGULATORY_EVIDENCE_PER_COVERAGE_ITEM = 8
+_REGULATORY_MATRIX_EVIDENCE_PER_RESEARCH_TARGET = 3
+_REGULATORY_SYNTHESIS_EVIDENCE_SOFT_LIMIT = 96
 _REGULATORY_PROJECTED_STOP_SYNTHESIS_CYCLES = 1
 _REGULATORY_RECONSIDERATION_HISTORY_RESULT_THRESHOLD = 32
 _REGULATORY_RECONSIDERATION_UNCITED_RESULTS_PER_SEARCH = 1
@@ -122,14 +156,13 @@ _REGULATORY_TOOL_DECISION_NAVIGATION_HEADINGS = 16
 _REGULATORY_TOOL_DECISION_DETAILED_SEARCH_BATCHES = 1
 _REGULATORY_TOOL_DECISION_OLDER_RESULTS_PER_SEARCH = 1
 _REGULATORY_TOOL_DECISION_VISIBLE_TOKEN_ALLOWANCE = 1536
-_REGULATORY_SYNTHESIS_MAX_OUTPUT_TOKENS = 5632
 _REGULATORY_REASONING_TOKEN_RESERVE = {
     ReasoningEffort.OFF: 0,
-    ReasoningEffort.LOW: 1024,
-    ReasoningEffort.AUTO: 2048,
-    ReasoningEffort.MEDIUM: 2048,
-    ReasoningEffort.HIGH: 4096,
-    ReasoningEffort.XHIGH: 4096,
+    ReasoningEffort.LOW: 4096,
+    ReasoningEffort.AUTO: 8192,
+    ReasoningEffort.MEDIUM: 8192,
+    ReasoningEffort.HIGH: 12288,
+    ReasoningEffort.XHIGH: 12288,
 }
 
 
@@ -141,6 +174,366 @@ class SearchEvidenceLedgerEntry:
     search_mode: str
     result_count: int
     repeated_result_count: int = 0
+
+
+def _build_regulatory_coverage_tool_calls(
+    plan: RegulatoryCoveragePlan | None,
+    *,
+    turn_index: int,
+) -> list[ToolCallKickoff]:
+    """Allocate retrieval fairly from a request-derived, source-neutral plan."""
+
+    if plan is None:
+        return []
+
+    def bounded(value: str, max_chars: int) -> str:
+        normalized = " ".join(value.split())
+        if len(normalized) <= max_chars:
+            return normalized
+        truncated = normalized[: max_chars + 1]
+        last_space = truncated.rfind(" ")
+        if last_space >= max_chars // 2:
+            truncated = truncated[:last_space]
+        return truncated[:max_chars].rstrip(" ,;:")
+
+    def query_for(
+        item: RegulatoryCoverageItem,
+        *,
+        evidence_dimension: str | None = None,
+    ) -> str:
+        """Build the smallest source-shaped query for one atomic evidence row.
+
+        The full coverage item and factual branches remain available as tool-call
+        provenance. Repeating them in the retrieval query dilutes the independently
+        searchable target and makes broad scenario terms dominate exact provisions.
+        """
+
+        parts: list[str] = []
+        if evidence_dimension:
+            parts.append(bounded(evidence_dimension, 280))
+        else:
+            parts.append(bounded(item.completion_test, 280))
+        return "\n".join(parts)[:REGULATORY_MAX_SEARCH_QUERY_CHARS].rstrip()
+
+    atomic_rows: list[tuple[str, str, str, str, list[str]]] = []
+    row_identities: set[str] = set()
+
+    def atomic_dimensions(
+        item: RegulatoryCoverageItem,
+    ) -> list[tuple[str, str]]:
+        """Pair each independent evidence row with one bounded lexical query.
+
+        Structured model output can occasionally violate the parallel-list
+        contract. In that case the source-neutral evidence dimensions are the
+        authoritative omission ledger; ignoring unmatched query alternatives is
+        safer than silently dropping independent legal outcomes.
+        """
+
+        if item.evidence_dimensions:
+            retrieval_queries = (
+                item.retrieval_queries
+                if len(item.retrieval_queries) == len(item.evidence_dimensions)
+                else item.evidence_dimensions
+            )
+            return list(zip(retrieval_queries, item.evidence_dimensions, strict=True))
+        if item.retrieval_queries:
+            return [(query, query) for query in item.retrieval_queries]
+        return [(item.completion_test, item.completion_test)]
+
+    # Allocate the first attempt for every independent row before spending
+    # budget on a complementary lexical interpretation of an earlier row.
+    dimension_index = 0
+    while len(atomic_rows) < _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+        added = False
+        for item in plan.coverage_items:
+            dimensions = atomic_dimensions(item)
+            if dimension_index >= len(dimensions):
+                continue
+            retrieval_query, evidence_dimension = dimensions[dimension_index]
+            hybrid_query = query_for(item, evidence_dimension=evidence_dimension)
+            keyword_query = query_for(item, evidence_dimension=retrieval_query)
+            identity = " ".join(hybrid_query.casefold().split())
+            if hybrid_query.strip() and identity not in row_identities:
+                row_identities.add(identity)
+                atomic_rows.append(
+                    (
+                        hybrid_query,
+                        keyword_query,
+                        item.research_question,
+                        evidence_dimension,
+                        list(item.source_anchors),
+                    )
+                )
+                added = True
+            if len(atomic_rows) >= _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+                break
+        if not added:
+            break
+        dimension_index += 1
+
+    obligation_rows: list[tuple[str, str, str, list[str]]] = []
+    obligation_identities: set[str] = set()
+    obligation_index = 0
+    while len(obligation_rows) < _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+        added = False
+        for item in plan.coverage_items:
+            if obligation_index >= len(item.request_anchor_groups):
+                continue
+            anchor_group = item.request_anchor_groups[obligation_index]
+            query = bounded("; ".join(anchor_group), 220)
+            identity = " ".join(query.casefold().split())
+            if query and identity not in obligation_identities:
+                obligation_identities.add(identity)
+                obligation_rows.append(
+                    (
+                        query,
+                        item.research_question,
+                        "Request-grounded obligation: " + bounded(query, 220),
+                        list(item.source_anchors),
+                    )
+                )
+                added = True
+            if len(obligation_rows) >= _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+                break
+        if not added:
+            break
+        obligation_index += 1
+
+    branch_rows: list[tuple[str, str, str, list[str]]] = []
+    branch_identities: set[str] = set()
+    branch_index = 0
+    while len(branch_rows) < _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+        added = False
+        for item in plan.coverage_items:
+            if branch_index >= len(item.material_factual_branches):
+                continue
+            branch = item.material_factual_branches[branch_index]
+            # A factual branch may be an upstream prerequisite governed by a
+            # different instrument than the downstream coverage item. Keep the
+            # supplied source anchors as provenance, but do not force an
+            # unproven source relationship into the lexical query.
+            query = bounded(branch, 220)
+            identity = " ".join(query.casefold().split())
+            if query and identity not in branch_identities:
+                branch_identities.add(identity)
+                branch_rows.append(
+                    (
+                        query,
+                        item.research_question,
+                        "Material factual branch: " + bounded(branch, 220),
+                        list(item.source_anchors),
+                    )
+                )
+                added = True
+            if len(branch_rows) >= _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+                break
+        if not added:
+            break
+        branch_index += 1
+
+    source_anchors: list[str] = []
+    source_anchor_identities: set[str] = set()
+    for item in plan.coverage_items:
+        for source_anchor in item.source_anchors:
+            bounded_anchor = bounded(source_anchor, 120)
+            identity = " ".join(bounded_anchor.casefold().split())
+            if not bounded_anchor or identity in source_anchor_identities:
+                continue
+            source_anchor_identities.add(identity)
+            source_anchors.append(bounded_anchor)
+
+    context_atom_rows: list[tuple[str, str, str, list[str]]] = []
+    for atom in plan.request_context_atoms:
+        bounded_atom = bounded(atom, 220)
+        if not bounded_atom:
+            continue
+        if source_anchors:
+            # The source name routes a scenario fact toward the right document,
+            # but hard-scoping it would also assert that the fact belongs to the
+            # named subsection and suppress semantically related provisions.
+            context_atom_rows.extend(
+                (
+                    bounded(f"{source_anchor} {bounded_atom}", 280),
+                    "Request-supplied scenario context",
+                    "Request context atom: " + bounded_atom,
+                    [],
+                )
+                for source_anchor in source_anchors
+            )
+        else:
+            context_atom_rows.append(
+                (
+                    bounded_atom,
+                    "Request-supplied scenario context",
+                    "Request context atom: " + bounded_atom,
+                    [],
+                )
+            )
+    calls: list[tuple[str, str, str, str, list[str]]] = []
+    identities: set[tuple[str, str]] = set()
+
+    def append(
+        query: str,
+        mode: str,
+        *,
+        coverage_item: str,
+        evidence_target: str,
+        source_anchors: list[str],
+    ) -> None:
+        if len(calls) >= _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+            return
+        identity = (" ".join(query.casefold().split()), mode)
+        if not query.strip() or identity in identities:
+            return
+        identities.add(identity)
+        calls.append(
+            (query, mode, coverage_item, evidence_target, list(source_anchors))
+        )
+
+    # Allocate one hybrid attempt fairly across all independent evidence rows
+    # before spending capacity on exact request phrases or lexical fallbacks.
+    # Hybrid retrieval combines the existing BM25 index with the compatible
+    # query embedding configured for this physical index.
+    for (
+        hybrid_query,
+        _keyword_query,
+        coverage_item,
+        evidence_target,
+        source_anchors,
+    ) in atomic_rows:
+        append(
+            hybrid_query,
+            "hybrid",
+            coverage_item=coverage_item,
+            evidence_target=evidence_target,
+            source_anchors=source_anchors,
+        )
+    for (
+        query,
+        coverage_item,
+        evidence_target,
+        source_anchors,
+    ) in branch_rows:
+        append(
+            query,
+            "hybrid",
+            coverage_item=coverage_item,
+            evidence_target=evidence_target,
+            source_anchors=source_anchors,
+        )
+    for (
+        query,
+        coverage_item,
+        evidence_target,
+        source_anchors,
+    ) in context_atom_rows:
+        append(
+            query,
+            "hybrid",
+            coverage_item=coverage_item,
+            evidence_target=evidence_target,
+            source_anchors=source_anchors,
+        )
+    for (
+        query,
+        coverage_item,
+        evidence_target,
+        source_anchors,
+    ) in obligation_rows:
+        append(
+            query,
+            "hybrid",
+            coverage_item=coverage_item,
+            evidence_target=evidence_target,
+            source_anchors=source_anchors,
+        )
+    # Allocate remaining recall-first keyword fallbacks fairly across planner rows.
+    for (
+        _hybrid_query,
+        keyword_query,
+        coverage_item,
+        evidence_target,
+        source_anchors,
+    ) in atomic_rows:
+        append(
+            keyword_query,
+            "keyword",
+            coverage_item=coverage_item,
+            evidence_target=evidence_target,
+            source_anchors=source_anchors,
+        )
+    return [
+        ToolCallKickoff(
+            tool_call_id=f"regulatory-coverage-{turn_index}-{query_index}",
+            tool_name=SearchTool.NAME,
+            tool_args={
+                "queries": [query],
+                "search_mode": mode,
+                "coverage_item": coverage_item,
+                "evidence_target": evidence_target,
+                "source_anchors": source_anchors,
+            },
+            placement=Placement(turn_index=turn_index, tab_index=query_index),
+        )
+        for query_index, (
+            query,
+            mode,
+            coverage_item,
+            evidence_target,
+            source_anchors,
+        ) in enumerate(calls)
+    ]
+
+
+def _build_regulatory_navigation_recovery_tool_calls(
+    leads: Sequence[RegulatoryNavigationLead],
+    *,
+    turn_index: int,
+) -> list[ToolCallKickoff]:
+    """Retrieve exact text for a bounded set of model-selected outline leads."""
+
+    calls: list[ToolCallKickoff] = []
+    seen_queries: set[str] = set()
+    for lead in leads:
+        query = " ".join(f"{lead.document_title} {lead.heading_label}".split())[
+            :REGULATORY_MAX_SEARCH_QUERY_CHARS
+        ].rstrip()
+        identity = query.casefold()
+        if not query or identity in seen_queries:
+            continue
+        seen_queries.add(identity)
+        calls.append(
+            ToolCallKickoff(
+                tool_call_id=(
+                    f"regulatory-navigation-recovery-{turn_index}-{len(calls)}"
+                ),
+                tool_name=SearchTool.NAME,
+                tool_args={
+                    "queries": [query],
+                    "search_mode": "hybrid",
+                    "coverage_item": "Request-grounded source-outline recovery",
+                    "evidence_target": (
+                        "Source-outline exact-text recovery: " + lead.heading_label
+                    ),
+                    "source_anchors": [lead.document_title],
+                },
+                placement=Placement(turn_index=turn_index, tab_index=len(calls)),
+            )
+        )
+    return calls
+
+
+def _unattempted_regulatory_navigation_leads(
+    leads: Sequence[RegulatoryNavigationLead],
+    attempted_identities: set[tuple[str, str]],
+) -> list[RegulatoryNavigationLead]:
+    """Keep unattempted source-outline entries in stable discovery order."""
+
+    return [
+        lead
+        for lead in leads
+        if (lead.document_title, lead.article_key) not in attempted_identities
+    ]
 
 
 def _regulatory_llm_step_max_tokens(
@@ -158,10 +551,22 @@ def _regulatory_llm_step_max_tokens(
         projected_tool_decision_history or tool_choice is ToolChoiceOptions.REQUIRED
     )
     if not decision_only:
-        return _REGULATORY_SYNTHESIS_MAX_OUTPUT_TOKENS
+        return None
     return (
         _REGULATORY_TOOL_DECISION_VISIBLE_TOKEN_ALLOWANCE
         + (_REGULATORY_REASONING_TOKEN_RESERVE[reasoning_effort])
+    )
+
+
+def _should_schedule_regulatory_candidate_correction(
+    review_count: int,
+    review: CandidateAnswerReviewResult,
+) -> bool:
+    """Never replace the last reviewed draft with an unreviewed full rewrite."""
+
+    return (
+        review.needs_reconsideration
+        and review_count < _REGULATORY_MAX_CANDIDATE_REVIEWS
     )
 
 
@@ -564,6 +969,8 @@ def _build_candidate_answer_evidence_chunks(
     candidate_answer: str,
     citation_mapping: CitationMapping,
     llm_visible_results_by_citation: dict[int, tuple[str, str]],
+    research_targets_by_citation: dict[int, list[str]] | None = None,
+    coverage_items_by_citation: dict[int, list[str]] | None = None,
 ) -> list[CandidateAnswerEvidenceChunk]:
     """Expose the exact chunk text placed in the answer model's history."""
 
@@ -618,10 +1025,425 @@ def _build_candidate_answer_evidence_chunks(
                 chunk_identifier=chunk_identifier,
                 heading=heading,
                 content=llm_visible_content,
+                research_target="\n".join(
+                    (research_targets_by_citation or {}).get(citation_number, [])
+                ),
+                coverage_item="\n".join(
+                    (coverage_items_by_citation or {}).get(citation_number, [])
+                ),
             )
         )
 
     return evidence_chunks
+
+
+def _select_regulatory_closure_evidence(
+    evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+    *,
+    candidate_answer: str,
+    evidence_matrix: RegulatoryEvidenceMatrix | None,
+    priority_citation_numbers: set[int] | None = None,
+) -> list[CandidateAnswerEvidenceChunk]:
+    """Keep closure-critical evidence plus bounded diversity for every target.
+
+    Matrix-supported chunks and chunks already cited by the draft are never
+    discarded. Remaining capacity is allocated across research targets instead
+    of repeatedly sending every result from broad and recovery searches.
+    """
+
+    protected_numbers = set(extract_citation_order_from_text(candidate_answer))
+    protected_numbers.update(priority_citation_numbers or ())
+    if evidence_matrix is not None:
+        protected_numbers.update(
+            document_number
+            for row in evidence_matrix.rows
+            for document_number in row.document_numbers
+        )
+
+    selected: list[CandidateAnswerEvidenceChunk] = []
+    selected_numbers: set[int] = set()
+    target_counts: dict[str, int] = {}
+
+    def target_identities(chunk: CandidateAnswerEvidenceChunk) -> list[str]:
+        grouping_value = chunk.coverage_item or chunk.research_target
+        return list(
+            dict.fromkeys(
+                identity
+                for target in grouping_value.splitlines()
+                if (identity := " ".join(target.casefold().split()))
+            )
+        )
+
+    def append(chunk: CandidateAnswerEvidenceChunk) -> None:
+        if chunk.retrieval_number is None:
+            return
+        selected.append(chunk)
+        selected_numbers.add(chunk.retrieval_number)
+        for identity in target_identities(chunk):
+            target_counts[identity] = target_counts.get(identity, 0) + 1
+
+    for chunk in evidence_chunks:
+        if chunk.retrieval_number in protected_numbers:
+            append(chunk)
+
+    for chunk in evidence_chunks:
+        if (
+            chunk.retrieval_number is None
+            or chunk.retrieval_number in selected_numbers
+            or len(selected) >= _REGULATORY_SYNTHESIS_EVIDENCE_SOFT_LIMIT
+        ):
+            continue
+        identities = target_identities(chunk)
+        per_identity_limit = (
+            _REGULATORY_EVIDENCE_PER_COVERAGE_ITEM
+            if chunk.coverage_item
+            else _REGULATORY_EVIDENCE_PER_RESEARCH_TARGET
+        )
+        if not identities or any(
+            target_counts.get(identity, 0) < per_identity_limit
+            for identity in identities
+        ):
+            append(chunk)
+
+    return selected
+
+
+def _select_regulatory_matrix_input_evidence(
+    evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+) -> list[CandidateAnswerEvidenceChunk]:
+    """Keep the strongest bounded evidence for each retrieval probe."""
+
+    def lexical_score(chunk: CandidateAnswerEvidenceChunk, target: str) -> int:
+        target_terms = {
+            term
+            for term in re.findall(r"[^\W_]+", target.casefold())
+            if len(term) >= 4 or term.isdigit()
+        }
+        evidence_terms = set(
+            re.findall(
+                r"[^\W_]+",
+                f"{chunk.heading} {chunk.content}".casefold(),
+            )
+        )
+        score = 0
+        for target_term in target_terms:
+            if target_term in evidence_terms:
+                score += 3
+            elif not target_term.isdigit() and any(
+                len(evidence_term) >= 4 and evidence_term[:4] == target_term[:4]
+                for evidence_term in evidence_terms
+            ):
+                score += 2
+        return score
+
+    chunks_by_target: dict[str, list[CandidateAnswerEvidenceChunk]] = {}
+    for chunk in evidence_chunks:
+        targets = list(
+            dict.fromkeys(
+                target.strip()
+                for target in chunk.research_target.splitlines()
+                if target.strip()
+            )
+        ) or [chunk.coverage_item.strip()]
+        for target in targets:
+            if target:
+                chunks_by_target.setdefault(target, []).append(chunk)
+
+    selected: list[CandidateAnswerEvidenceChunk] = []
+    selected_numbers: set[int] = set()
+    for target, target_chunks in chunks_by_target.items():
+        ranked = sorted(
+            target_chunks,
+            key=lambda chunk: (
+                -lexical_score(chunk, target),
+                chunk.retrieval_number or 0,
+                chunk.chunk_identifier,
+            ),
+        )
+        target_selection = list(
+            dict.fromkeys(
+                [
+                    ranked[0],
+                    target_chunks[0],
+                    target_chunks[-1],
+                    *ranked,
+                ]
+            )
+        )[:_REGULATORY_MATRIX_EVIDENCE_PER_RESEARCH_TARGET]
+        for chunk in target_selection:
+            if (
+                chunk.retrieval_number is None
+                or chunk.retrieval_number in selected_numbers
+            ):
+                continue
+            selected.append(chunk)
+            selected_numbers.add(chunk.retrieval_number)
+    return selected
+
+
+def _select_regulatory_matrix_review_evidence(
+    evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+    matrix: RegulatoryEvidenceMatrix,
+) -> list[CandidateAnswerEvidenceChunk]:
+    """Keep exact chunks named by matrix rows for a focused closure audit."""
+
+    matrix_document_numbers = {
+        document_number
+        for row in matrix.rows
+        for document_number in row.document_numbers
+    }
+    return [
+        chunk
+        for chunk in evidence_chunks
+        if chunk.retrieval_number in matrix_document_numbers
+    ]
+
+
+def _build_regulatory_matrix_citation_issues(
+    candidate_answer: str,
+    matrix: RegulatoryEvidenceMatrix,
+) -> list[CandidateAnswerClaimIssue]:
+    """Reject supported matrix rows whose exact evidence is absent from citations."""
+
+    cited_document_numbers = set(extract_citation_order_from_text(candidate_answer))
+    uncited_rows = []
+    for row_index, row in enumerate(matrix.rows):
+        if row.status is not EvidenceCoverageStatus.SUPPORTED:
+            continue
+        if cited_document_numbers.intersection(row.document_numbers):
+            continue
+        uncited_rows.append((row_index, row))
+
+    # A model-generated matrix can contain several independently supported
+    # propositions for one request target. Select missing-citation issues fairly
+    # across target IDs so an early verbose target cannot hide every later one.
+    target_issue_counts: dict[str, int] = {}
+    ordered_rows: list[RegulatoryEvidenceMatrixRow] = []
+    pending_rows = list(uncited_rows)
+    while pending_rows:
+        selected_index, (_, selected_row) = min(
+            enumerate(pending_rows),
+            key=lambda item: (
+                min(
+                    (
+                        target_issue_counts.get(target_id, 0)
+                        for target_id in item[1][1].target_ids
+                    ),
+                    default=target_issue_counts.get("", 0),
+                ),
+                item[1][0],
+            ),
+        )
+        pending_rows.pop(selected_index)
+        ordered_rows.append(selected_row)
+        for target_id in selected_row.target_ids or [""]:
+            target_issue_counts[target_id] = target_issue_counts.get(target_id, 0) + 1
+
+    issues: list[CandidateAnswerClaimIssue] = []
+    for row in ordered_rows:
+        issues.append(
+            CandidateAnswerClaimIssue(
+                claim_reference=row.target[:280].rstrip(),
+                advisory_feedback=(
+                    "This supported evidence-matrix row has no inline citation to "
+                    "any of its exact source chunks. State the material supported "
+                    "result and cite the directly entailing chunk; do not replace "
+                    "available evidence with a source-gap disclaimer."
+                ),
+                related_citation_numbers=row.document_numbers,
+            )
+        )
+        if len(issues) == MAX_REGULATORY_CLAIM_ISSUES:
+            break
+    return issues
+
+
+def _merge_candidate_review_issues(
+    *issue_groups: Sequence[CandidateAnswerClaimIssue],
+) -> list[CandidateAnswerClaimIssue]:
+    """Combine independent gates while keeping one bounded issue per defect."""
+
+    merged: list[CandidateAnswerClaimIssue] = []
+    seen: set[tuple[str, tuple[int, ...]]] = set()
+    for issue in (issue for group in issue_groups for issue in group):
+        identity = (
+            " ".join(issue.claim_reference.casefold().split()),
+            tuple(issue.related_citation_numbers),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(issue)
+        if len(merged) == MAX_REGULATORY_CLAIM_ISSUES:
+            break
+    return merged
+
+
+def _merge_candidate_review_verdicts(
+    *reviews: CandidateAnswerReviewResult,
+) -> CandidateAnswerReviewResult:
+    """Require every completed independent audit to agree that no issue remains."""
+
+    merged_issues = _merge_candidate_review_issues(
+        *(review.advisory_claim_issues for review in reviews)
+    )
+    if merged_issues:
+        return CandidateAnswerReviewResult(
+            needs_reconsideration=True,
+            advisory_claim_issues=merged_issues,
+        )
+    if any(review.completed for review in reviews):
+        return CandidateAnswerReviewResult(needs_reconsideration=False)
+    if reviews:
+        return reviews[0]
+    return CandidateAnswerReviewResult(needs_reconsideration=False)
+
+
+def _build_regulatory_synthesis_history(
+    *,
+    current_request: str,
+    earlier_user_context: Sequence[str],
+    visible_results_by_citation: dict[int, tuple[str, str]],
+    research_targets_by_citation: dict[int, list[str]] | None = None,
+    token_counter: Callable[[str], int],
+    prior_candidate_answer: str | None = None,
+    coverage_contract: str | None = None,
+    evidence_matrix: str | None = None,
+    priority_citation_numbers: set[int] | None = None,
+) -> list[ChatMessageSimple]:
+    """Build a tool-free final context from canonical evidence, not tool transcripts."""
+
+    request_payload = json.dumps(
+        {
+            "current_request": current_request,
+            "earlier_user_context": list(earlier_user_context),
+            "coverage_contract": coverage_contract,
+            "evidence_matrix": evidence_matrix,
+        },
+        ensure_ascii=False,
+    )
+    history = [
+        ChatMessageSimple(
+            message=request_payload,
+            token_count=token_counter(request_payload),
+            message_type=MessageType.USER,
+        )
+    ]
+    if prior_candidate_answer and prior_candidate_answer.strip():
+        bounded_candidate = prior_candidate_answer.strip()[:36_000].rstrip()
+        history.append(
+            ChatMessageSimple(
+                message=bounded_candidate,
+                token_count=token_counter(bounded_candidate),
+                message_type=MessageType.ASSISTANT,
+            )
+        )
+
+    def compact_research_target(target: str) -> str:
+        normalized_target = " ".join(target.split())
+        if normalized_target.startswith("Specific evidence target:"):
+            sentence_end = normalized_target.find(". ")
+            if sentence_end >= 0:
+                normalized_target = normalized_target[: sentence_end + 1]
+        return normalized_target[:480].rstrip()
+
+    evidence_results: list[dict[str, object]] = []
+    research_target_ids: dict[str, str] = {}
+    research_target_labels: dict[str, str] = {}
+    research_target_documents: dict[str, list[int]] = {}
+    priority_citations = priority_citation_numbers or set()
+    ordered_visible_results = sorted(
+        visible_results_by_citation.items(),
+        key=lambda item: (item[0] not in priority_citations, item[0]),
+    )
+    for citation_number, (title, content) in ordered_visible_results:
+        if not content.strip():
+            continue
+        result_target_ids: list[str] = []
+        for research_target in (research_targets_by_citation or {}).get(
+            citation_number, []
+        )[:6]:
+            target_id = research_target_ids.get(research_target)
+            if target_id is None:
+                target_id = f"T{len(research_target_ids) + 1}"
+                research_target_ids[research_target] = target_id
+                research_target_labels[research_target] = compact_research_target(
+                    research_target
+                )
+                research_target_documents[research_target] = []
+            result_target_ids.append(target_id)
+            target_documents = research_target_documents[research_target]
+            if citation_number not in target_documents:
+                target_documents.append(citation_number)
+        evidence_results.append(
+            {
+                "document": citation_number,
+                "title": title[:600].rstrip(),
+                "content": content[:1_800].rstrip(),
+                "research_target_ids": result_target_ids,
+            }
+        )
+    coverage_target_index = [
+        {
+            "target_id": target_id,
+            "target": research_target_labels[research_target],
+            "documents": research_target_documents[research_target],
+        }
+        for research_target, target_id in research_target_ids.items()
+    ]
+    evidence_payload = json.dumps(
+        {
+            "type": "canonical_regulatory_evidence_for_final_synthesis",
+            "usage_note": (
+                "This is the exact bounded evidence selected during research. "
+                "The document integers are the only valid citation numbers. "
+                "research_target_ids link each result to the final "
+                "coverage_target_index; target labels are provenance and closure "
+                "obligations, never legal evidence. Silently close every applicable "
+                "target as: exact source and operative text, fact-to-rule application, "
+                "supported result, inline citation. Otherwise state the precise source "
+                "gap. Treat every request-grounded supported evidence-matrix row as an "
+                "atomic drafting requirement: preserve every material limitation and "
+                "relationship established by its cited text. Do not replace an available "
+                "exact rule with an uncertainty note merely because applying one of its "
+                "branches depends on a fact not supplied; state supported alternatives "
+                "conditionally. Keep distinct any propositions that the request or exact "
+                "evidence distinguishes, and do not apply a rule beyond the facts that "
+                "establish its scope. "
+                "A supplied ancestor heading or lead-in is a negative scope limit: "
+                "never detach descendant text from its actor, status or class, stage, "
+                "exception, or condition; it is not positive support alone. "
+                "A heading, neighboring rule, duty, or breach does not establish an "
+                "unstated sanction. Do not call tools or cite an absent number. "
+                + (
+                    "This is a correction pass. Return a complete replacement answer in "
+                    "the visible response, even though the prior draft appears above. "
+                    "Preserve supported rows and citations; change only propositions "
+                    "implicated by the review or newly retrieved exact evidence. Remove "
+                    "or accurately qualify a proposition whose complete trigger is not "
+                    "established. "
+                    if prior_candidate_answer and prior_candidate_answer.strip()
+                    else ""
+                )
+            ),
+            "results": evidence_results,
+            "coverage_target_index_note": (
+                "This compact index appears last so it can be used as a final closure "
+                "check. A target is supported only by exact content in its listed "
+                "documents; the target label itself is not legal evidence."
+            ),
+            "coverage_target_index": coverage_target_index,
+        },
+        ensure_ascii=False,
+    )
+    history.append(
+        ChatMessageSimple(
+            message=evidence_payload,
+            token_count=token_counter(evidence_payload),
+            message_type=MessageType.USER_REMINDER,
+        )
+    )
+    return history
 
 
 def _is_bounded_cited_provision_neighbor(
@@ -961,6 +1783,83 @@ def _extract_llm_visible_search_results(
     return excerpts
 
 
+def _regulatory_outline_result_matches_requested_lead(
+    title: str,
+    tool_args: dict[str, Any],
+) -> bool:
+    """Identify the exact operative result requested from a selected outline lead."""
+
+    if tool_args.get("coverage_item") != "Request-grounded source-outline recovery":
+        return False
+    raw_target = tool_args.get("evidence_target")
+    raw_source_anchors = tool_args.get("source_anchors")
+    if not isinstance(raw_target, str) or not isinstance(raw_source_anchors, list):
+        return False
+    target_prefix = "Source-outline exact-text recovery:"
+    if not raw_target.startswith(target_prefix):
+        return False
+
+    def normalized(value: str) -> str:
+        return " ".join(re.sub(r"[^\w]+", " ", value.casefold()).split())
+
+    normalized_title = normalized(title)
+    normalized_document_title = normalized(title.split(" — ", 1)[0])
+    normalized_target = normalized(raw_target.removeprefix(target_prefix))
+    if len(normalized_target) < 8 or normalized_target not in normalized_title:
+        return False
+    return any(
+        isinstance(source_anchor, str)
+        and len(normalized(source_anchor)) >= 4
+        and normalized(source_anchor) == normalized_document_title
+        for source_anchor in raw_source_anchors
+    )
+
+
+def _extract_regulatory_navigation_leads(
+    llm_facing_response: str,
+    *,
+    research_target: str,
+) -> list[RegulatoryNavigationLead]:
+    """Extract metadata-only source-outline leads from one search response."""
+
+    try:
+        payload = json.loads(llm_facing_response)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    navigation = payload.get("regulatory_provision_navigation")
+    if not isinstance(navigation, dict):
+        return []
+    document_title = navigation.get("document_title")
+    raw_headings = navigation.get("headings")
+    if not isinstance(document_title, str) or not isinstance(raw_headings, list):
+        return []
+
+    leads: list[RegulatoryNavigationLead] = []
+    for heading in raw_headings:
+        if not isinstance(heading, dict):
+            continue
+        article_key = heading.get("article_key")
+        heading_label = heading.get("heading_label")
+        if not isinstance(article_key, str) or not article_key.strip():
+            continue
+        if not isinstance(heading_label, str) or not heading_label.strip():
+            continue
+        try:
+            leads.append(
+                RegulatoryNavigationLead(
+                    document_title=document_title,
+                    article_key=article_key,
+                    heading_label=heading_label,
+                    research_targets=[research_target],
+                )
+            )
+        except ValueError:
+            continue
+    return leads
+
+
 def _merge_gathered_search_docs(
     gathered_documents: list[SearchDoc] | None,
     search_docs: list[SearchDoc],
@@ -1044,18 +1943,17 @@ def _compact_repeated_search_results_for_history(
 
 
 def _regulatory_search_chunk_cap(enabled: bool) -> int | None:
-    """Bound context per autonomous search call without choosing its subject."""
+    """Use a modestly wider window for structure-fragmented regulatory text."""
 
-    return _REGULATORY_UNPLANNED_MAX_LLM_CHUNKS_PER_CALL if enabled else None
+    return _REGULATORY_SEARCH_LLM_CHUNKS_PER_CALL if enabled else None
 
 
 def _regulatory_search_call_budget(
     complex_regulatory_request: bool,
 ) -> int | None:
-    """Keep one chat turn below the proxy timeout and runaway-tool threshold."""
+    """Retain the standard cycle-bounded Onyx tool budget."""
 
-    if complex_regulatory_request:
-        return _REGULATORY_UNPLANNED_MAX_SEARCH_CALLS
+    _ = complex_regulatory_request
     return None
 
 
@@ -1668,12 +2566,72 @@ def run_llm_loop(
         citation_mapping: dict[int, str] = {}  # Maps citation_num -> document_id/URL
         search_evidence_ledger: list[SearchEvidenceLedgerEntry] = []
         llm_visible_search_results_by_citation: dict[int, tuple[str, str]] = {}
+        regulatory_research_targets_by_citation: dict[int, list[str]] = {}
+        regulatory_coverage_items_by_citation: dict[int, list[str]] = {}
+        regulatory_synthesis_priority_citations: set[int] = set()
+        regulatory_navigation_leads_by_identity: dict[
+            tuple[str, str], RegulatoryNavigationLead
+        ] = {}
+
+        def record_regulatory_research_target(
+            citation_number: int,
+            target: str,
+            *,
+            coverage_item: str = "",
+        ) -> None:
+            normalized_target = " ".join(target.split())
+            if not normalized_target:
+                return
+            targets = regulatory_research_targets_by_citation.setdefault(
+                citation_number, []
+            )
+            if normalized_target not in targets:
+                # Focused facet provenance is more useful for omission control than
+                # the broad seed query that may have returned the same chunk first.
+                if normalized_target.startswith("Specific evidence target:"):
+                    targets.insert(0, normalized_target[:900].rstrip())
+                else:
+                    targets.append(normalized_target[:900].rstrip())
+                del targets[6:]
+            normalized_coverage_item = " ".join(coverage_item.split())
+            if not normalized_coverage_item:
+                return
+            coverage_items = regulatory_coverage_items_by_citation.setdefault(
+                citation_number, []
+            )
+            if normalized_coverage_item not in coverage_items:
+                coverage_items.append(normalized_coverage_item[:900].rstrip())
+                del coverage_items[4:]
+
+        def record_regulatory_navigation_leads(
+            leads: Sequence[RegulatoryNavigationLead],
+        ) -> None:
+            for lead in leads:
+                identity = (lead.document_title, lead.article_key)
+                previous = regulatory_navigation_leads_by_identity.get(identity)
+                if previous is None:
+                    regulatory_navigation_leads_by_identity[identity] = lead
+                    continue
+                regulatory_navigation_leads_by_identity[identity] = previous.model_copy(
+                    update={
+                        "research_targets": list(
+                            dict.fromkeys(
+                                [
+                                    *previous.research_targets,
+                                    *lead.research_targets,
+                                ]
+                            )
+                        )[:6]
+                    }
+                )
+
         regulatory_search_calls_attempted = 0
         regulatory_attempted_query_modes: set[tuple[str, str]] = set()
         regulatory_tool_feedback: str | None = None
         candidate_review_feedback: str | None = None
         candidate_answer_review_count = 0
         candidate_review_issues: list[CandidateAnswerClaimIssue] = []
+        candidate_review_issue_history: list[CandidateAnswerClaimIssue] = []
         candidate_review_rejected_at_cycle: int | None = None
         candidate_final_correction_pending = False
         regulatory_research_complete_pending = False
@@ -1681,13 +2639,25 @@ def run_llm_loop(
         complex_regulatory_request = False
         regulatory_user_message = ""
         regulatory_earlier_user_context: tuple[str, ...] = ()
+        regulatory_review_llm = llm
+        regulatory_coverage_plan: RegulatoryCoveragePlan | None = None
+        regulatory_coverage_reminder: str | None = None
+        regulatory_evidence_matrix: RegulatoryEvidenceMatrix | None = None
+        regulatory_evidence_matrix_reminder: str | None = None
+        regulatory_evidence_matrix_ready = False
+        regulatory_evidence_matrix_recovery_started = False
+        regulatory_navigation_recovery_started = False
+        regulatory_navigation_recovery_ready = False
+        regulatory_attempted_navigation_lead_identities: set[tuple[str, str]] = set()
+        pending_regulatory_coverage_tool_calls: list[ToolCallKickoff] = []
 
-        is_global_regulatory_chat = (
-            persona is not None
-            and persona.id == DEFAULT_PERSONA_ID
-            and any(isinstance(tool, SearchTool) for tool in tools)
+        is_regulatory_search_chat = any(
+            isinstance(tool, SearchTool)
+            and tool.user_selected_filters is not None
+            and tool.user_selected_filters.regulatory_chunks_only
+            for tool in tools
         )
-        if is_global_regulatory_chat:
+        if is_regulatory_search_chat:
             regulatory_review_user_context = build_regulatory_review_user_context(
                 simple_chat_history
             )
@@ -1699,6 +2669,44 @@ def run_llm_loop(
             # activates deterministic search/context safety bounds; it does not
             # create or require a coverage plan.
             complex_regulatory_request = bool(regulatory_user_message.strip())
+            regulatory_review_llm = build_regulatory_review_llm(llm)
+            regulatory_coverage_plan = build_regulatory_coverage_plan(
+                regulatory_review_llm,
+                user_request=regulatory_user_message,
+            )
+            regulatory_coverage_reminder = format_regulatory_coverage_plan(
+                regulatory_coverage_plan
+            )
+            pending_regulatory_coverage_tool_calls = (
+                _build_regulatory_coverage_tool_calls(
+                    regulatory_coverage_plan,
+                    turn_index=0,
+                )
+            )
+        regulatory_bootstrap_searches_completed = not bool(
+            pending_regulatory_coverage_tool_calls
+        )
+        # Without a bootstrap batch, the established first model/tool cycle is
+        # already the autonomous Onyx research turn and needs no duplicate.
+        regulatory_autonomous_research_completed = not bool(
+            pending_regulatory_coverage_tool_calls
+        )
+
+        def run_full_regulatory_candidate_review(
+            candidate_answer: str,
+            evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+        ) -> CandidateAnswerReviewResult:
+            return review_regulatory_candidate_answer_with_fallback(
+                regulatory_review_llm,
+                llm,
+                user_request=regulatory_user_message,
+                earlier_user_context=regulatory_earlier_user_context,
+                coverage_contract=regulatory_coverage_reminder,
+                evidence_matrix=regulatory_evidence_matrix_reminder,
+                candidate_answer=candidate_answer,
+                evidence_chunks=evidence_chunks,
+            )
+
         regulatory_search_chunk_cap = _regulatory_search_chunk_cap(
             complex_regulatory_request
         )
@@ -1746,13 +2754,19 @@ def run_llm_loop(
             (
                 _REGULATORY_POST_REVIEW_MAIN_CYCLES
                 + _REGULATORY_PROJECTED_STOP_SYNTHESIS_CYCLES
+                + _REGULATORY_BOOTSTRAP_COVERAGE_CYCLES
+                + _REGULATORY_AUTONOMOUS_RESEARCH_CYCLES
             )
             if complex_regulatory_request
             else 0
         )
         for llm_cycle_count in range(maximum_cycle_count):
             out_of_cycles = (
-                llm_cycle_count >= MAX_LLM_CYCLES - 1
+                llm_cycle_count
+                >= MAX_LLM_CYCLES
+                + _REGULATORY_BOOTSTRAP_COVERAGE_CYCLES
+                + _REGULATORY_AUTONOMOUS_RESEARCH_CYCLES
+                - 1
                 if candidate_review_rejected_at_cycle is None
                 else llm_cycle_count
                 >= candidate_review_rejected_at_cycle
@@ -1777,6 +2791,13 @@ def run_llm_loop(
                 or candidate_final_correction_pending
                 or regulatory_research_complete_pending
             )
+            autonomous_regulatory_research_turn = (
+                complex_regulatory_request
+                and has_called_search_tool
+                and regulatory_bootstrap_searches_completed
+                and not regulatory_autonomous_research_completed
+                and not final_synthesis_required
+            )
             # Handling tool calls based on cycle count and past cycle conditions
             final_tools: list[Tool] = []
             if forced_tool_id:
@@ -1793,6 +2814,146 @@ def run_llm_loop(
             else:
                 tool_choice = ToolChoiceOptions.AUTO
                 final_tools = tools
+
+            if (
+                complex_regulatory_request
+                and has_called_search_tool
+                and regulatory_autonomous_research_completed
+                and not regulatory_navigation_recovery_ready
+            ):
+                if not regulatory_navigation_recovery_started:
+                    available_navigation_leads = (
+                        _unattempted_regulatory_navigation_leads(
+                            list(regulatory_navigation_leads_by_identity.values()),
+                            regulatory_attempted_navigation_lead_identities,
+                        )
+                    )
+                    selected_navigation_leads = (
+                        select_regulatory_navigation_recovery_leads(
+                            regulatory_review_llm,
+                            user_request=regulatory_user_message,
+                            coverage_contract=regulatory_coverage_reminder,
+                            navigation_leads=available_navigation_leads,
+                        )
+                    )
+                    regulatory_attempted_navigation_lead_identities.update(
+                        (lead.document_title, lead.article_key)
+                        for lead in selected_navigation_leads
+                    )
+                    pending_regulatory_coverage_tool_calls = (
+                        _build_regulatory_navigation_recovery_tool_calls(
+                            selected_navigation_leads,
+                            turn_index=llm_cycle_count,
+                        )
+                    )
+                    regulatory_navigation_recovery_started = True
+                    logger.info(
+                        "Regulatory source-outline recovery selected=%d available=%d",
+                        len(pending_regulatory_coverage_tool_calls),
+                        len(regulatory_navigation_leads_by_identity),
+                    )
+                    if not pending_regulatory_coverage_tool_calls:
+                        regulatory_navigation_recovery_ready = True
+                elif not pending_regulatory_coverage_tool_calls:
+                    regulatory_navigation_recovery_ready = True
+
+            if (
+                complex_regulatory_request
+                and has_called_search_tool
+                and regulatory_navigation_recovery_ready
+                and not regulatory_evidence_matrix_ready
+            ):
+                matrix_evidence_chunks = _build_candidate_answer_evidence_chunks(
+                    candidate_answer="",
+                    citation_mapping=citation_processor.citation_to_doc,
+                    llm_visible_results_by_citation=(
+                        llm_visible_search_results_by_citation
+                    ),
+                    research_targets_by_citation=(
+                        regulatory_research_targets_by_citation
+                    ),
+                    coverage_items_by_citation=(regulatory_coverage_items_by_citation),
+                )
+                matrix_evidence_chunks = _select_regulatory_matrix_input_evidence(
+                    matrix_evidence_chunks
+                )
+                logger.info(
+                    "Regulatory evidence matrix input evidence=%d",
+                    len(matrix_evidence_chunks),
+                )
+                independent_evidence_matrix = build_regulatory_evidence_matrix(
+                    regulatory_review_llm,
+                    user_request=regulatory_user_message,
+                    coverage_contract=regulatory_coverage_reminder,
+                    evidence_chunks=matrix_evidence_chunks,
+                    navigation_leads=list(
+                        regulatory_navigation_leads_by_identity.values()
+                    ),
+                    prior_matrix=(
+                        regulatory_evidence_matrix
+                        if regulatory_evidence_matrix_recovery_started
+                        else None
+                    ),
+                )
+                regulatory_evidence_matrix = independent_evidence_matrix
+                regulatory_evidence_matrix_reminder = format_regulatory_evidence_matrix(
+                    regulatory_evidence_matrix
+                )
+                recovery_queries = (
+                    evidence_matrix_recovery_queries(
+                        regulatory_evidence_matrix,
+                        limit=_REGULATORY_MAX_PARALLEL_SEARCH_CALLS,
+                    )
+                    if not regulatory_evidence_matrix_recovery_started
+                    else []
+                )
+                if recovery_queries and tool_choice is ToolChoiceOptions.AUTO:
+                    pending_regulatory_coverage_tool_calls = [
+                        ToolCallKickoff(
+                            tool_call_id=(
+                                "regulatory-matrix-recovery-"
+                                f"{llm_cycle_count}-{query_index}"
+                            ),
+                            tool_name=SearchTool.NAME,
+                            tool_args={
+                                "queries": [query],
+                                "search_mode": "hybrid",
+                                "coverage_item": (
+                                    "Claim-source evidence matrix open row"
+                                ),
+                                "evidence_target": (
+                                    "Evidence matrix recovery: " + query
+                                ),
+                                "source_anchors": [],
+                            },
+                            placement=Placement(
+                                turn_index=llm_cycle_count,
+                                tab_index=query_index,
+                            ),
+                        )
+                        for query_index, query in enumerate(recovery_queries)
+                    ]
+                    regulatory_evidence_matrix_recovery_started = True
+                    logger.info(
+                        "Regulatory evidence matrix rows=%d open_recovery_queries=%d",
+                        (
+                            len(regulatory_evidence_matrix.rows)
+                            if regulatory_evidence_matrix is not None
+                            else 0
+                        ),
+                        len(recovery_queries),
+                    )
+                else:
+                    regulatory_evidence_matrix_ready = True
+                    logger.info(
+                        "Regulatory evidence matrix ready rows=%d recovery_completed=%s",
+                        (
+                            len(regulatory_evidence_matrix.rows)
+                            if regulatory_evidence_matrix is not None
+                            else 0
+                        ),
+                        regulatory_evidence_matrix_recovery_started,
+                    )
 
             # Handling the system prompt and custom agent prompt
             # The section below calculates the available tokens for history a bit more accurately
@@ -1904,10 +3065,82 @@ def run_llm_loop(
             history_for_llm_step = simple_chat_history
             projected_tool_decision_history = False
             if (
+                final_synthesis_required
+                and complex_regulatory_request
+                and llm_visible_search_results_by_citation
+            ):
+                prior_candidate_answer = next(
+                    (
+                        message.message
+                        for message in reversed(simple_chat_history)
+                        if message.message_type == MessageType.ASSISTANT
+                        and message.message.strip()
+                    ),
+                    None,
+                )
+                complete_synthesis_evidence = _build_candidate_answer_evidence_chunks(
+                    candidate_answer=prior_candidate_answer or "",
+                    citation_mapping=citation_processor.citation_to_doc,
+                    llm_visible_results_by_citation=(
+                        llm_visible_search_results_by_citation
+                    ),
+                    research_targets_by_citation=(
+                        regulatory_research_targets_by_citation
+                    ),
+                    coverage_items_by_citation=(regulatory_coverage_items_by_citation),
+                )
+                selected_synthesis_evidence = _select_regulatory_closure_evidence(
+                    complete_synthesis_evidence,
+                    candidate_answer=prior_candidate_answer or "",
+                    evidence_matrix=regulatory_evidence_matrix,
+                    priority_citation_numbers=(regulatory_synthesis_priority_citations),
+                )
+                selected_synthesis_numbers = {
+                    chunk.retrieval_number
+                    for chunk in selected_synthesis_evidence
+                    if chunk.retrieval_number is not None
+                }
+                synthesis_visible_results = {
+                    citation_number: result
+                    for citation_number, result in (
+                        llm_visible_search_results_by_citation.items()
+                    )
+                    if citation_number in selected_synthesis_numbers
+                }
+                history_for_llm_step = _build_regulatory_synthesis_history(
+                    current_request=regulatory_user_message,
+                    earlier_user_context=regulatory_earlier_user_context,
+                    visible_results_by_citation=synthesis_visible_results,
+                    research_targets_by_citation=(
+                        regulatory_research_targets_by_citation
+                    ),
+                    token_counter=token_counter,
+                    prior_candidate_answer=(
+                        prior_candidate_answer
+                        if candidate_final_correction_pending
+                        else None
+                    ),
+                    coverage_contract=regulatory_coverage_reminder,
+                    evidence_matrix=regulatory_evidence_matrix_reminder,
+                    priority_citation_numbers=(regulatory_synthesis_priority_citations),
+                )
+                logger.info(
+                    "Built isolated regulatory synthesis context evidence=%d/%d "
+                    "prior_candidate=%s",
+                    len(synthesis_visible_results),
+                    len(llm_visible_search_results_by_citation),
+                    bool(candidate_final_correction_pending and prior_candidate_answer),
+                )
+            if (
                 complex_regulatory_request
                 and has_called_search_tool
                 and tool_choice is ToolChoiceOptions.AUTO
                 and llm_cycle_count < maximum_cycle_count - 1
+                and (
+                    regulatory_evidence_matrix_ready
+                    or sum(message.token_count for message in simple_chat_history)
+                    > available_tokens
+                )
             ):
                 (
                     history_for_llm_step,
@@ -1954,6 +3187,8 @@ def run_llm_loop(
                 or always_cite_documents,
                 include_file_reminder=code_interpreter_file_generated,
                 search_ledger_reminder=_join_search_work_reminders(
+                    regulatory_coverage_reminder,
+                    regulatory_evidence_matrix_reminder,
                     regulatory_tool_feedback,
                     _format_search_evidence_ledger(search_evidence_ledger),
                     candidate_review_feedback,
@@ -1998,6 +3233,11 @@ def run_llm_loop(
             should_stage_regulatory_step = (
                 complex_regulatory_request and has_called_search_tool
             )
+            step_reasoning_effort = (
+                ReasoningEffort.OFF
+                if final_synthesis_required and complex_regulatory_request
+                else reasoning_effort
+            )
             buffered_step_emitter = (
                 BufferedEmitter() if should_stage_regulatory_step else None
             )
@@ -2011,27 +3251,43 @@ def run_llm_loop(
                 if should_stage_regulatory_step
                 else citation_processor
             )
-            llm_step_result, has_reasoned = run_llm_step(
-                emitter=buffered_step_emitter or emitter,
-                history=truncated_message_history,
-                tool_definitions=tool_defs,
-                tool_choice=tool_choice,
-                llm=llm,
-                placement=Placement(turn_index=llm_cycle_count + reasoning_cycles),
-                citation_processor=staged_citation_processor,
-                state_container=staged_state_container,
-                # The rich docs representation is passed in so that when yielding the answer, it has the final document set.
-                final_documents=gathered_documents,
-                user_identity=user_identity,
-                pre_answer_processing_time=pre_answer_processing_time,
-                reasoning_effort=reasoning_effort,
-                max_tokens=_regulatory_llm_step_max_tokens(
-                    complex_regulatory_request=complex_regulatory_request,
+            if (
+                pending_regulatory_coverage_tool_calls
+                and tool_choice is ToolChoiceOptions.AUTO
+            ):
+                llm_step_result = LlmStepResult(
+                    reasoning=None,
+                    answer=None,
+                    tool_calls=pending_regulatory_coverage_tool_calls,
+                    raw_answer=None,
+                    finish_reason="tool_calls",
+                )
+                pending_regulatory_coverage_tool_calls = []
+                has_reasoned = False
+            else:
+                llm_step_result, has_reasoned = run_llm_step(
+                    emitter=buffered_step_emitter or emitter,
+                    history=truncated_message_history,
+                    tool_definitions=tool_defs,
                     tool_choice=tool_choice,
-                    projected_tool_decision_history=projected_tool_decision_history,
-                    reasoning_effort=reasoning_effort,
-                ),
-            )
+                    llm=llm,
+                    placement=Placement(turn_index=llm_cycle_count + reasoning_cycles),
+                    citation_processor=staged_citation_processor,
+                    state_container=staged_state_container,
+                    # Rich docs let answer packets expose the final document set.
+                    final_documents=gathered_documents,
+                    user_identity=user_identity,
+                    pre_answer_processing_time=pre_answer_processing_time,
+                    reasoning_effort=step_reasoning_effort,
+                    max_tokens=_regulatory_llm_step_max_tokens(
+                        complex_regulatory_request=complex_regulatory_request,
+                        tool_choice=tool_choice,
+                        projected_tool_decision_history=(
+                            projected_tool_decision_history
+                        ),
+                        reasoning_effort=step_reasoning_effort,
+                    ),
+                )
             if has_reasoned and not projected_tool_decision_history:
                 reasoning_cycles += 1
 
@@ -2045,6 +3301,15 @@ def run_llm_loop(
             )
             if attempted:
                 fallback_extraction_attempted = True
+
+            if autonomous_regulatory_research_turn:
+                regulatory_autonomous_research_completed = True
+                if not (llm_step_result.tool_calls or []):
+                    logger.info(
+                        "Regulatory autonomous research turn requested no additional "
+                        "tools; continuing with evidence closure"
+                    )
+                    continue
 
             if projected_tool_decision_history and llm_step_result.tool_calls:
                 # The search actions remain authoritative, but any narration or
@@ -2113,7 +3378,7 @@ def run_llm_loop(
                     ),
                 )
                 if effective_regulatory_search_call_budget is not None
-                else None
+                else _REGULATORY_MAX_PARALLEL_SEARCH_CALLS
             )
             tool_calls = _constrain_regulatory_tool_calls(
                 raw_tool_calls,
@@ -2180,38 +3445,141 @@ def run_llm_loop(
                         llm_visible_results_by_citation=(
                             llm_visible_search_results_by_citation
                         ),
+                        research_targets_by_citation=(
+                            regulatory_research_targets_by_citation
+                        ),
+                        coverage_items_by_citation=(
+                            regulatory_coverage_items_by_citation
+                        ),
                     )
-                    if candidate_answer_review_count == 1:
-                        candidate_review = review_regulatory_candidate_answer(
-                            llm,
-                            user_request=regulatory_user_message,
-                            earlier_user_context=regulatory_earlier_user_context,
-                            candidate_answer=candidate_answer_for_review,
-                            evidence_chunks=candidate_evidence_chunks,
-                        )
-                        candidate_review_issues = list(
-                            candidate_review.advisory_claim_issues
-                        )
-                        candidate_review_feedback = format_candidate_answer_review(
-                            candidate_review
+                    candidate_evidence_chunks = _select_regulatory_closure_evidence(
+                        candidate_evidence_chunks,
+                        candidate_answer=candidate_answer_for_review,
+                        evidence_matrix=regulatory_evidence_matrix,
+                        priority_citation_numbers=(
+                            regulatory_synthesis_priority_citations
+                        ),
+                    )
+                    prior_candidate_review_issues = _merge_candidate_review_issues(
+                        candidate_review_issue_history,
+                        candidate_review_issues,
+                    )
+                    if candidate_answer_review_count == 1 or not (
+                        prior_candidate_review_issues
+                    ):
+                        candidate_review = run_full_regulatory_candidate_review(
+                            candidate_answer_for_review,
+                            candidate_evidence_chunks,
                         )
                         review_kind = "evidence"
                     else:
-                        candidate_review = review_regulatory_candidate_resolution(
-                            llm,
-                            candidate_answer=candidate_answer_for_review,
-                            prior_issues=candidate_review_issues,
-                            evidence_chunks=candidate_evidence_chunks,
+                        # Recheck the bounded union of all earlier issues on every
+                        # correction pass. This prevents a later edit from undoing
+                        # an already resolved row without repeating the much larger
+                        # full-evidence audit payload.
+                        resolution_review = (
+                            review_regulatory_candidate_resolution_with_fallback(
+                                regulatory_review_llm,
+                                llm,
+                                candidate_answer=candidate_answer_for_review,
+                                prior_issues=prior_candidate_review_issues,
+                                evidence_chunks=candidate_evidence_chunks,
+                            )
                         )
-                        candidate_review_feedback = format_candidate_resolution_review(
-                            candidate_review
+                        independent_review = run_full_regulatory_candidate_review(
+                            candidate_answer_for_review,
+                            candidate_evidence_chunks,
                         )
-                        review_kind = "resolution"
+                        candidate_review = _merge_candidate_review_verdicts(
+                            resolution_review,
+                            independent_review,
+                        )
+                        review_kind = "resolution+independent-evidence"
+                    matrix_closure_review = None
+                    structural_matrix_issues: list[CandidateAnswerClaimIssue] = []
+                    if regulatory_evidence_matrix is not None:
+                        structural_matrix_issues = (
+                            _build_regulatory_matrix_citation_issues(
+                                candidate_answer_for_review,
+                                regulatory_evidence_matrix,
+                            )
+                        )
+                        focused_matrix_evidence = (
+                            _select_regulatory_matrix_review_evidence(
+                                candidate_evidence_chunks,
+                                regulatory_evidence_matrix,
+                            )
+                        )
+                        if (
+                            regulatory_evidence_matrix_reminder is not None
+                            and focused_matrix_evidence
+                        ):
+                            matrix_closure_review = review_regulatory_candidate_matrix_closure_with_fallback(
+                                regulatory_review_llm,
+                                llm,
+                                user_request=regulatory_user_message,
+                                candidate_answer=candidate_answer_for_review,
+                                evidence_chunks=focused_matrix_evidence,
+                                evidence_matrix=(regulatory_evidence_matrix_reminder),
+                            )
+                            review_kind += "+matrix"
+                    merged_review_issues = _merge_candidate_review_issues(
+                        structural_matrix_issues,
+                        (
+                            matrix_closure_review.advisory_claim_issues
+                            if matrix_closure_review is not None
+                            else []
+                        ),
+                        candidate_review.advisory_claim_issues,
+                    )
+                    if merged_review_issues:
+                        candidate_review = CandidateAnswerReviewResult(
+                            needs_reconsideration=True,
+                            advisory_claim_issues=merged_review_issues,
+                        )
+                    elif (
+                        matrix_closure_review is not None
+                        and matrix_closure_review.completed
+                    ):
+                        candidate_review = CandidateAnswerReviewResult(
+                            needs_reconsideration=False
+                        )
+                    candidate_review_issues = list(
+                        candidate_review.advisory_claim_issues
+                    )
+                    regulatory_synthesis_priority_citations.update(
+                        citation_number
+                        for issue in candidate_review_issues
+                        for citation_number in issue.related_citation_numbers
+                    )
+                    current_review_feedback = (
+                        format_candidate_answer_review(candidate_review)
+                        if review_kind.startswith("evidence")
+                        or "+matrix" in review_kind
+                        else format_candidate_resolution_review(candidate_review)
+                    )
+                    regression_guard = (
+                        format_candidate_review_regression_guard(
+                            candidate_review_issue_history,
+                            candidate_review_issues,
+                        )
+                        if current_review_feedback is not None
+                        else None
+                    )
+                    candidate_review_feedback = (
+                        "\n\n".join(
+                            part
+                            for part in (current_review_feedback, regression_guard)
+                            if part
+                        )
+                        or None
+                    )
+                    candidate_review_issue_history.extend(candidate_review_issues)
                     if (
                         candidate_answer_review_count == 1
                         and candidate_review.needs_reconsideration
                     ):
-                        recovery_issue = select_priority_recovery_issue(
+                        recovery_issues = select_priority_recovery_issues(
                             candidate_review
                         )
                         recovery_search_tool = next(
@@ -2224,15 +3592,12 @@ def run_llm_loop(
                             ),
                             None,
                         )
-                        if (
-                            recovery_issue is not None
-                            and recovery_search_tool is not None
-                        ):
-                            recovery_query = recovery_issue.recovery_query
-                            if recovery_query is None:
-                                raise ValueError(
-                                    "selected recovery issue has no recovery query"
-                                )
+                        if recovery_issues and recovery_search_tool is not None:
+                            recovery_queries = [
+                                issue.recovery_query
+                                for issue in recovery_issues
+                                if issue.recovery_query is not None
+                            ]
                             recovery_placement = Placement(
                                 turn_index=llm_cycle_count + reasoning_cycles,
                                 tab_index=0,
@@ -2244,19 +3609,24 @@ def run_llm_loop(
                                 ),
                                 tool_name=SearchTool.NAME,
                                 tool_args={
-                                    "queries": [recovery_query],
+                                    "queries": recovery_queries,
                                     "search_mode": "hybrid",
                                 },
                                 placement=recovery_placement,
                             )
                             try:
-                                recovery_response = run_single_gap_recovery(
+                                recovery_response = run_batched_gap_recovery(
                                     search_tool=recovery_search_tool,
-                                    issue=recovery_issue,
+                                    issues=recovery_issues,
                                     starting_citation_num=(
                                         citation_processor.get_next_citation_number()
                                     ),
                                     placement=recovery_placement,
+                                )
+                                canonicalize_search_tool_response_citations(
+                                    recovery_response,
+                                    citation_processor.citation_to_doc,
+                                    reserved_citation_numbers=citation_mapping,
                                 )
                                 recovered_docs = recovery_search_docs_by_citation(
                                     recovery_response
@@ -2323,17 +3693,33 @@ def run_llm_loop(
                                         recovery_response.llm_facing_response
                                     )
                                 )
+                                raw_recovery_coverage_item = (
+                                    recovery_call.tool_args.get("coverage_item")
+                                )
+                                recovery_coverage_item = (
+                                    raw_recovery_coverage_item
+                                    if isinstance(raw_recovery_coverage_item, str)
+                                    else "Candidate answer evidence recovery"
+                                )
                                 for (
                                     citation_number,
                                     title,
                                     content,
                                 ) in visible_recovery_results:
+                                    regulatory_synthesis_priority_citations.add(
+                                        citation_number
+                                    )
                                     llm_visible_search_results_by_citation[
                                         citation_number
                                     ] = (title, content)
+                                    record_regulatory_research_target(
+                                        citation_number,
+                                        "\n".join(recovery_queries),
+                                        coverage_item=recovery_coverage_item,
+                                    )
                                 search_evidence_ledger.append(
                                     SearchEvidenceLedgerEntry(
-                                        query=recovery_query,
+                                        query="\n".join(recovery_queries),
                                         search_mode="hybrid",
                                         result_count=len(visible_recovery_results),
                                     )
@@ -2379,7 +3765,7 @@ def run_llm_loop(
                                 )
                             except Exception:
                                 logger.exception(
-                                    "Single regulatory citation-gap search failed; "
+                                    "Batched regulatory citation-gap search failed; "
                                     "continuing with bounded correction"
                                 )
                     logger.info(
@@ -2392,11 +3778,16 @@ def run_llm_loop(
                         len(candidate_review.advisory_claim_issues),
                         candidate_review.review_error,
                     )
-                    if candidate_review_feedback is not None:
+                    if candidate_review_feedback is not None and (
+                        _should_schedule_regulatory_candidate_correction(
+                            candidate_answer_review_count,
+                            candidate_review,
+                        )
+                    ):
                         if candidate_review_rejected_at_cycle is None:
                             candidate_review_rejected_at_cycle = llm_cycle_count
-                        # A reviewed draft gets one direct server-selected search at
-                        # most. All later correction passes run with tools disabled.
+                        # A reviewed draft gets one bounded, server-selected retrieval
+                        # call at most. All later correction passes run with tools disabled.
                         candidate_final_correction_pending = True
                         simple_chat_history.append(
                             ChatMessageSimple(
@@ -2407,6 +3798,13 @@ def run_llm_loop(
                         )
                         simple_chat_history.extend(direct_recovery_messages)
                         continue
+                    if candidate_review_feedback is not None:
+                        logger.warning(
+                            "Regulatory final reviewed candidate retains %d issue(s); "
+                            "publishing the reviewed draft instead of scheduling an "
+                            "unreviewed full rewrite",
+                            len(candidate_review.advisory_claim_issues),
+                        )
 
                 commit_staged_llm_step(
                     buffered_emitter=buffered_step_emitter,
@@ -2470,6 +3868,11 @@ def run_llm_loop(
                 citation_mapping=citation_mapping,
                 next_citation_num=citation_processor.get_next_citation_number(),
                 max_concurrent_tools=None,
+                max_parallel_workers=(
+                    _REGULATORY_MAX_CONCURRENT_SEARCH_TOOLS
+                    if complex_regulatory_request
+                    else None
+                ),
                 skip_search_query_expansion=False,
                 chat_files=chat_files,
                 url_snippet_map=extract_url_snippet_map(gathered_documents or []),
@@ -2487,6 +3890,12 @@ def run_llm_loop(
                 simple_chat_history.extend(failure_messages)
                 continue
 
+            if any(
+                tool_call.tool_call_id.startswith("regulatory-coverage-0-")
+                for tool_call in tool_calls
+            ):
+                regulatory_bootstrap_searches_completed = True
+
             for tool_response in tool_responses:
                 # Extract tool_call from the response (set by run_tool_calls)
                 if tool_response.tool_call is None:
@@ -2495,9 +3904,22 @@ def run_llm_loop(
                 tool_call = tool_response.tool_call
                 tab_index = tool_call.placement.tab_index
 
+                raw_citation_numbers = (
+                    set(tool_response.rich_response.citation_mapping)
+                    if isinstance(tool_response.rich_response, SearchDocsResponse)
+                    else set()
+                )
                 canonicalize_search_tool_response_citations(
                     tool_response,
                     citation_processor.citation_to_doc,
+                    reserved_citation_numbers=(
+                        set(citation_mapping) - raw_citation_numbers
+                    ),
+                )
+                synchronize_lightweight_citation_mapping(
+                    tool_response,
+                    citation_mapping,
+                    raw_citation_numbers,
                 )
                 llm_history_response = tool_response.llm_facing_response
                 repeated_result_count = 0
@@ -2565,6 +3987,18 @@ def run_llm_loop(
                         llm_visible_results = _extract_llm_visible_search_results(
                             llm_history_response
                         )
+                        raw_coverage_item = tool_call.tool_args.get("coverage_item")
+                        coverage_item = (
+                            raw_coverage_item
+                            if isinstance(raw_coverage_item, str)
+                            else ""
+                        )
+                        record_regulatory_navigation_leads(
+                            _extract_regulatory_navigation_leads(
+                                llm_history_response,
+                                research_target=query,
+                            )
+                        )
                         for (
                             citation_number,
                             title,
@@ -2574,6 +4008,18 @@ def run_llm_loop(
                                 title,
                                 content,
                             )
+                            record_regulatory_research_target(
+                                citation_number,
+                                query,
+                                coverage_item=coverage_item,
+                            )
+                            if _regulatory_outline_result_matches_requested_lead(
+                                title,
+                                tool_call.tool_args,
+                            ):
+                                regulatory_synthesis_priority_citations.add(
+                                    citation_number
+                                )
                         search_evidence_ledger.append(
                             SearchEvidenceLedgerEntry(
                                 query=query,

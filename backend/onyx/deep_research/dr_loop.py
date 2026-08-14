@@ -19,7 +19,10 @@ from onyx.chat.empty_response import (
     EmptyLLMResponseError,
     build_empty_llm_response_error,
 )
-from onyx.chat.llm_loop import construct_message_history
+from onyx.chat.llm_loop import (
+    _build_regulatory_coverage_tool_calls,
+    construct_message_history,
+)
 from onyx.chat.llm_step import run_llm_step, run_llm_step_pkt_generator
 from onyx.chat.models import (
     ChatMessageSimple,
@@ -68,12 +71,18 @@ from onyx.prompts.deep_research.orchestration_layer import (
 from onyx.prompts.prompt_utils import get_current_llm_day_time
 from onyx.regulatory.candidate_answer_review import (
     CandidateAnswerEvidenceChunk,
+    build_regulatory_review_llm,
     build_regulatory_review_user_context,
     format_candidate_answer_review,
     format_candidate_correction_evidence,
     format_candidate_resolution_review,
     review_regulatory_candidate_answer,
     review_regulatory_candidate_resolution,
+)
+from onyx.regulatory.coverage_plan import (
+    RegulatoryCoveragePlan,
+    build_regulatory_coverage_plan,
+    format_regulatory_coverage_plan,
 )
 from onyx.regulatory.gap_recovery import (
     exact_recovery_evidence_chunks,
@@ -94,10 +103,14 @@ from onyx.server.query_and_chat.streaming_models import (
     SectionEnd,
     TopLevelBranching,
 )
-from onyx.tools.fake_tools.research_agent import run_research_agent_calls
+from onyx.tools.fake_tools.research_agent import (
+    _exact_regulatory_evidence_from_search_response,
+    run_research_agent_calls,
+)
 from onyx.tools.interface import Tool
 from onyx.tools.models import ToolCallInfo, ToolCallKickoff
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from onyx.tools.tool_runner import run_tool_calls
 from onyx.tracing.framework.create import ChatTraceMetadata, function_span, trace
 from onyx.utils.logger import setup_logger
 from onyx.utils.timing import log_function_time
@@ -114,6 +127,9 @@ MAX_TOTAL_RESEARCH_AGENT_CALLS = 12
 MAX_REGULATORY_RETRY_REPORTS = 6
 MAX_REGULATORY_RETRY_REPORT_CHARS = 8_000
 MAX_REGULATORY_RETRY_EVIDENCE_CHARS = 24_000
+_REGULATORY_COVERAGE_SEARCH_BATCH_SIZE = 4
+_REGULATORY_COVERAGE_SEARCH_CHUNKS_PER_CALL = 6
+_REGULATORY_COVERAGE_EVIDENCE_CHUNKS = 48
 _REGULATORY_SOURCE_GAP_FALLBACK = (
     "Mevcut aramada elde edilen doğrulanabilir kaynak parçaları, istenen hukuki "
     "sonuca güvenilir biçimde ulaşmak için yeterli değildir. Bu nedenle "
@@ -291,6 +307,206 @@ def _deep_research_search_tools(tools: Sequence[Tool]) -> list[Tool]:
     """Keep Deep Research restricted to the built-in internal search type."""
 
     return [tool for tool in tools if isinstance(tool, SearchTool)]
+
+
+def _round_robin_coverage_evidence(
+    evidence_by_call: Sequence[Sequence[CandidateAnswerEvidenceChunk]],
+    *,
+    limit: int = _REGULATORY_COVERAGE_EVIDENCE_CHUNKS,
+) -> list[CandidateAnswerEvidenceChunk]:
+    """Retain evidence from every atomic target before taking deeper ranks."""
+
+    selected: list[CandidateAnswerEvidenceChunk] = []
+    seen: set[tuple[str, str]] = set()
+    max_depth = max((len(chunks) for chunks in evidence_by_call), default=0)
+    for depth in range(max_depth):
+        for chunks in evidence_by_call:
+            if depth >= len(chunks):
+                continue
+            chunk = chunks[depth]
+            identity = (chunk.chunk_identifier, chunk.content)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            selected.append(chunk)
+            if len(selected) >= limit:
+                return selected
+    return selected
+
+
+def _densify_regulatory_evidence_citations(
+    citation_mapping: CitationMapping,
+    evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+) -> tuple[CitationMapping, list[CandidateAnswerEvidenceChunk]]:
+    """Expose one contiguous citation namespace for the bounded evidence matrix."""
+
+    dense_citation_mapping: CitationMapping = {}
+    dense_evidence_chunks: list[CandidateAnswerEvidenceChunk] = []
+    dense_number_by_document: dict[tuple[str, int], int] = {}
+
+    for evidence_chunk in evidence_chunks:
+        source_number = (
+            evidence_chunk.retrieval_number or evidence_chunk.citation_number
+        )
+        search_doc = (
+            citation_mapping.get(source_number)
+            if source_number is not None
+            else None
+        )
+        if search_doc is None:
+            logger.warning(
+                "Dropped regulatory evidence without a matching citation mapping: %s",
+                evidence_chunk.chunk_identifier,
+            )
+            continue
+
+        document_identity = (search_doc.document_id, search_doc.chunk_ind)
+        dense_number = dense_number_by_document.get(document_identity)
+        if dense_number is None:
+            dense_number = len(dense_citation_mapping) + 1
+            dense_number_by_document[document_identity] = dense_number
+            dense_citation_mapping[dense_number] = search_doc
+
+        dense_evidence_chunks.append(
+            evidence_chunk.model_copy(
+                update={
+                    "citation_number": dense_number,
+                    "retrieval_number": dense_number,
+                }
+            )
+        )
+
+    return dense_citation_mapping, dense_evidence_chunks
+
+
+def _run_regulatory_coverage_searches(
+    *,
+    coverage_plan: RegulatoryCoveragePlan,
+    tools: list[Tool],
+    history: list[ChatMessageSimple],
+    state_container: ChatStateContainer,
+    turn_index: int,
+) -> tuple[CitationMapping, list[CandidateAnswerEvidenceChunk]]:
+    """Execute request-derived atomic retrieval without lossy sub-agent summaries."""
+
+    search_tool = next(
+        (
+            tool
+            for tool in tools
+            if isinstance(tool, SearchTool)
+            and tool.user_selected_filters is not None
+            and tool.user_selected_filters.regulatory_chunks_only
+        ),
+        None,
+    )
+    if search_tool is None:
+        return {}, []
+
+    coverage_calls = _build_regulatory_coverage_tool_calls(
+        coverage_plan,
+        turn_index=turn_index,
+    )
+    if not coverage_calls:
+        return {}, []
+
+    lightweight_citation_mapping: dict[int, str] = {}
+    citation_mapping: CitationMapping = {}
+    evidence_by_call: list[list[CandidateAnswerEvidenceChunk]] = []
+
+    for batch_start in range(
+        0,
+        len(coverage_calls),
+        _REGULATORY_COVERAGE_SEARCH_BATCH_SIZE,
+    ):
+        batch = coverage_calls[
+            batch_start : batch_start + _REGULATORY_COVERAGE_SEARCH_BATCH_SIZE
+        ]
+        next_citation_number = max(lightweight_citation_mapping, default=0) + 1
+        batch_result = run_tool_calls(
+            tool_calls=batch,
+            tools=tools,
+            message_history=history,
+            user_memory_context=None,
+            user_info=None,
+            citation_mapping=lightweight_citation_mapping,
+            next_citation_num=next_citation_number,
+            skip_search_query_expansion=True,
+            inject_memories_in_prompt=False,
+            search_llm_chunks_per_call_cap=(
+                _REGULATORY_COVERAGE_SEARCH_CHUNKS_PER_CALL
+            ),
+        )
+        lightweight_citation_mapping = batch_result.updated_citation_mapping
+
+        for tool_response in batch_result.tool_responses:
+            tool_call = tool_response.tool_call
+            if tool_call is None or not isinstance(
+                tool_response.rich_response, SearchDocsResponse
+            ):
+                continue
+            search_response = tool_response.rich_response
+            state_container.add_search_docs(search_response.search_docs)
+            state_container.add_tool_call(
+                ToolCallInfo(
+                    parent_tool_call_id=None,
+                    turn_index=tool_call.placement.turn_index,
+                    tab_index=tool_call.placement.tab_index,
+                    tool_name=tool_call.tool_name,
+                    tool_call_id=tool_call.tool_call_id,
+                    tool_id=search_tool.id,
+                    reasoning_tokens=None,
+                    tool_call_arguments=tool_call.tool_args,
+                    tool_call_response=tool_response.llm_facing_response,
+                    search_docs=search_response.search_docs,
+                    generated_images=None,
+                )
+            )
+
+            search_docs_by_identity = {
+                (search_doc.document_id, search_doc.chunk_ind): search_doc
+                for search_doc in search_response.search_docs
+            }
+            for (
+                citation_number,
+                document_id,
+            ) in search_response.citation_mapping.items():
+                chunk_ind = search_response.citation_chunk_mapping.get(citation_number)
+                if chunk_ind is None:
+                    continue
+                search_doc = search_docs_by_identity.get((document_id, chunk_ind))
+                if search_doc is not None:
+                    citation_mapping[citation_number] = search_doc
+            evidence_by_call.append(
+                [
+                    evidence_chunk.model_copy(
+                        update={
+                            "research_target": (
+                                "Specific evidence target: "
+                                + str(
+                                    tool_call.tool_args.get(
+                                        "evidence_target", ""
+                                    )
+                                ).strip()
+                                + ". Coverage item: "
+                                + str(
+                                    tool_call.tool_args.get(
+                                        "coverage_item", ""
+                                    )
+                                ).strip()
+                            )[:900].rstrip()
+                        }
+                    )
+                    for evidence_chunk in (
+                        _exact_regulatory_evidence_from_search_response(tool_response)
+                    )
+                ]
+            )
+
+    selected_evidence = _round_robin_coverage_evidence(evidence_by_call)
+    return _densify_regulatory_evidence_citations(
+        citation_mapping,
+        selected_evidence,
+    )
 
 
 def _candidate_review_evidence(
@@ -825,14 +1041,16 @@ def generate_final_report(
             initial_candidate,
             available_exact_evidence_chunks,
         )
+        review_llm = build_regulatory_review_llm(llm)
 
         if user_request.strip():
             candidate_review = review_regulatory_candidate_answer(
-                llm,
+                review_llm,
                 user_request=user_request,
                 earlier_user_context=earlier_user_context,
                 candidate_answer=initial_candidate,
                 evidence_chunks=review_evidence,
+                coverage_contract=research_plan,
             )
             recovery_issue = select_priority_recovery_issue(candidate_review)
             internal_recovery_tool = next(
@@ -999,7 +1217,7 @@ def generate_final_report(
                 )
                 try:
                     resolution_review = review_regulatory_candidate_resolution(
-                        llm,
+                        review_llm,
                         candidate_answer=correction_candidate,
                         prior_issues=candidate_review.advisory_claim_issues,
                         evidence_chunks=correction_review_evidence,
@@ -1091,7 +1309,7 @@ def generate_final_report(
                         try:
                             final_resolution_review = (
                                 review_regulatory_candidate_resolution(
-                                    llm,
+                                    review_llm,
                                     candidate_answer=final_correction_candidate,
                                     prior_issues=(
                                         resolution_review.advisory_claim_issues
@@ -1233,8 +1451,23 @@ def run_deep_research_llm_loop(
             and tool.user_selected_filters.regulatory_chunks_only
             for tool in allowed_tools
         )
+        regulatory_coverage_plan: RegulatoryCoveragePlan | None = None
+        regulatory_coverage_contract: str | None = None
+        if is_regulatory_deep_research:
+            regulatory_review_context = build_regulatory_review_user_context(
+                simple_chat_history
+            )
+            regulatory_review_llm = build_regulatory_review_llm(llm)
+            regulatory_coverage_plan = build_regulatory_coverage_plan(
+                regulatory_review_llm,
+                user_request=regulatory_review_context.current_request,
+            )
+            regulatory_coverage_contract = format_regulatory_coverage_plan(
+                regulatory_coverage_plan
+            )
         exact_evidence_chunks: list[CandidateAnswerEvidenceChunk] = []
         exact_evidence_indexes: dict[tuple[str, str], int] = {}
+        initial_regulatory_citation_mapping: CitationMapping = {}
         orchestrator_start_turn_index = 1
 
         #########################################################
@@ -1308,6 +1541,50 @@ def run_deep_research_llm_loop(
 
                     # If a clarification is asked, we need to end this turn and wait on user input
                     return
+
+        if regulatory_coverage_contract is not None:
+            simple_chat_history.append(
+                ChatMessageSimple(
+                    message=regulatory_coverage_contract,
+                    token_count=token_counter(regulatory_coverage_contract),
+                    message_type=MessageType.USER_REMINDER,
+                )
+            )
+
+        if (
+            is_regulatory_deep_research
+            and regulatory_coverage_plan is not None
+            and regulatory_coverage_contract is not None
+        ):
+            (
+                initial_regulatory_citation_mapping,
+                exact_evidence_chunks,
+            ) = _run_regulatory_coverage_searches(
+                coverage_plan=regulatory_coverage_plan,
+                tools=allowed_tools,
+                history=simple_chat_history,
+                state_container=state_container,
+                turn_index=1,
+            )
+            exact_evidence_indexes = {
+                (evidence.chunk_identifier, evidence.content): index
+                for index, evidence in enumerate(exact_evidence_chunks)
+            }
+            if exact_evidence_chunks:
+                evidence_matrix = (
+                    "# Retrieved exact evidence matrix\n"
+                    + format_candidate_correction_evidence(exact_evidence_chunks)
+                    + "\n\nThis is bootstrap evidence, not proof that every material "
+                    "coverage row is closed. Use the research phase to resolve "
+                    "missing, indirect, incomplete, or conflicting rows."
+                )
+                simple_chat_history.append(
+                    ChatMessageSimple(
+                        message=evidence_matrix,
+                        token_count=token_counter(evidence_matrix),
+                        message_type=MessageType.USER_REMINDER,
+                    )
+                )
 
         #########################################################
         # RESEARCH PLAN STEP
@@ -1396,6 +1673,12 @@ def run_deep_research_llm_loop(
             research_plan = llm_step_result.answer
             if research_plan is None:
                 raise RuntimeError("Deep Research failed to generate a research plan")
+            if regulatory_coverage_contract is not None:
+                research_plan = (
+                    f"{regulatory_coverage_contract}\n\n"
+                    "# Adaptive research plan\n"
+                    f"{research_plan}"
+                )
             span.span_data.output = research_plan if research_plan else None
 
         #########################################################
@@ -1434,8 +1717,12 @@ def run_deep_research_llm_loop(
 
             reasoning_cycles = 0
             most_recent_reasoning: str | None = None
-            citation_mapping: CitationMapping = {}
-            evidence_citation_mapping: CitationMapping = {}
+            citation_mapping: CitationMapping = dict(
+                initial_regulatory_citation_mapping
+            )
+            evidence_citation_mapping: CitationMapping = dict(
+                initial_regulatory_citation_mapping
+            )
             research_agent_calls_started = 0
             final_turn_index: int = orchestrator_start_turn_index  # Track the final turn_index for stop packet
             for cycle in _orchestrator_cycle_schedule(max_orchestrator_cycles):

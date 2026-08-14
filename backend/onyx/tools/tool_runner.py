@@ -403,6 +403,9 @@ def run_tool_calls(
     # Max number of tools to run concurrently (and overall) in this batch.
     # If set, tool calls beyond this limit are dropped.
     max_concurrent_tools: int | None = None,
+    # Bound simultaneous executions without dropping calls. Calls above this
+    # worker count stay queued in the threadpool until a worker is available.
+    max_parallel_workers: int | None = None,
     # Explicitly skip SearchTool query expansion. Model-written internal-search
     # calls are preserved regardless; this flag remains for caller compatibility.
     skip_search_query_expansion: bool = False,
@@ -444,6 +447,9 @@ def run_tool_calls(
         next_citation_num: The next citation number to allocate from.
         max_concurrent_tools: Max number of tools to run in this batch. If set, any
             tool calls after this limit are dropped (not queued).
+        max_parallel_workers: Max number of tool calls to execute simultaneously.
+            Unlike `max_concurrent_tools`, this does not drop calls; excess calls
+            remain queued for execution.
         skip_search_query_expansion: Explicitly request skipping query expansion for
             `SearchTool`. Tool-runner calls already preserve model-written internal
             queries; the flag remains for compatibility with existing callers.
@@ -457,6 +463,9 @@ def run_tool_calls(
     """
     # Merge tool calls for SearchTool, WebSearchTool, and OpenURLTool
     merged_tool_calls = _merge_tool_calls(tool_calls)
+
+    if max_parallel_workers is not None and max_parallel_workers <= 0:
+        raise ValueError("max_parallel_workers must be positive")
 
     if not merged_tool_calls:
         return ParallelToolCallResponse(
@@ -629,7 +638,9 @@ def run_tool_calls(
 
         tool_run_params.append((tool, tool_call, override_kwargs))
 
-    # Run all tools in parallel
+    # Run every retained tool call, while optionally applying backpressure to the
+    # simultaneous executions. This is deliberately independent of the historical
+    # overall safety cap above, which drops calls beyond its limit.
     functions_with_args = [
         (_safe_run_single_tool, (tool, tool_call, override_kwargs))
         for tool, tool_call, override_kwargs in tool_run_params
@@ -638,7 +649,11 @@ def run_tool_calls(
     tool_run_results: list[ToolResponse | None] = run_functions_tuples_in_parallel(
         functions_with_args,
         allow_failures=True,  # Continue even if some tools fail
-        max_workers=max_concurrent_tools,
+        max_workers=(
+            max_parallel_workers
+            if max_parallel_workers is not None
+            else max_concurrent_tools
+        ),
         timeout=TOOL_EXECUTION_TIMEOUT_SECONDS,
     )
 

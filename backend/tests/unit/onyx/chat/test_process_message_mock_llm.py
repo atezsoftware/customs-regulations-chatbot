@@ -1,8 +1,11 @@
-from unittest.mock import Mock
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
 from onyx.chat import process_message
+from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.models import AnswerStream, StreamingError
 from onyx.configs import app_configs
 from onyx.server.query_and_chat.models import MessageResponseIDInfo, SendMessageRequest
@@ -58,3 +61,55 @@ def test_gather_stream_returns_empty_answer_when_streaming_error_only() -> None:
     assert result.answer_citationless == ""
     assert result.error_msg == "OpenAI quota exceeded"
     assert result.message_id == 42
+
+
+def test_gather_stream_accepts_structurally_compatible_response_metadata() -> None:
+    packets = cast(
+        AnswerStream,
+        iter(
+            [
+                SimpleNamespace(reserved_assistant_message_id=43),
+                StreamingError(
+                    error="provider stream ended",
+                    error_code="PROVIDER_ERROR",
+                    is_retryable=True,
+                ),
+            ]
+        ),
+    )
+
+    result = process_message.gather_stream(packets)
+
+    assert result.message_id == 43
+    assert result.error_msg == "provider stream ended"
+
+
+def test_gather_stream_surfaces_setup_error_when_no_message_was_reserved() -> None:
+    packets: AnswerStream = iter(
+        [
+            StreamingError(
+                error="provider setup failed",
+                error_code="PROVIDER_ERROR",
+                is_retryable=True,
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="provider setup failed"):
+        process_message.gather_stream(packets)
+
+
+def test_gather_stream_full_accepts_structurally_compatible_metadata() -> None:
+    state_container = MagicMock(spec=ChatStateContainer)
+    state_container.get_answer_tokens.return_value = "answer"
+    state_container.get_reasoning_tokens.return_value = None
+    state_container.get_tool_calls.return_value = []
+    packets = cast(
+        AnswerStream,
+        iter([SimpleNamespace(reserved_assistant_message_id=44)]),
+    )
+
+    result = process_message.gather_stream_full(packets, state_container)
+
+    assert result.message_id == 44
+    assert result.answer == "answer"

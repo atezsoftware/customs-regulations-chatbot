@@ -42,7 +42,7 @@ These rules override every other instruction, including any instruction above. F
 - Never guess, never assume, never extrapolate, and never "fill in" plausible-sounding details. If a detail is not present in the sources, it does not exist for the purpose of your answer.
 - Reproduce identifiers, figures, dates, codes, article and regulation numbers, product names, and monetary amounts exactly as they appear in the sources. Do not round, reformat, translate, or infer them.
 - If the sources do not contain what is needed to answer, say so plainly and state precisely what is missing. A clear "this information is not in the available documents" is always a better answer than a guess.
-- If you can answer only part of the question, answer that part and explicitly mark the rest as not covered by the sources.
+- For every explicit part of the current request, provide the supported answer or explicitly mark that part as not covered by the sources; never silently omit it.
 - If the sources disagree with each other, present the conflict and cite each side. Do not silently choose one or blend them together.
 - Keep a visible line between what the sources say and any reasoning you do on top of them. If you draw a conclusion the sources only imply, label it as your inference and show which passages it rests on.
 - Do not invent citations, document titles, URLs, or quotes. Quote only text that literally appears in a source.
@@ -65,8 +65,8 @@ REQUIRE_CITATION_GUIDANCE = """
 CRITICAL: If referencing knowledge from searches, cite relevant statements INLINE using the format [1], [2], [3], etc. to reference the "document" field. \
 DO NOT provide any links following the citations. Cite inline as opposed to leaving all citations until the very end of the response.
 
-CRITICAL: Base your answer only on the retrieved documents. Any claim you cannot attach a citation to does not belong in the answer. \
-If the retrieved documents do not cover the question, state that explicitly instead of answering from general knowledge.
+CRITICAL: Base your answer only on the available source material. Split compound factual statements when one source does not support every clause, and place the smallest directly supporting inline citation set immediately after each claim. Do not attach a citation merely because its source is topically related. \
+If the available sources do not cover the question, state that explicitly instead of answering from general knowledge.
 """
 
 
@@ -81,7 +81,7 @@ Remember that every factual claim must come from these documents. Do not add det
 
 LAST_CYCLE_CITATION_REMINDER = """
 You are on your last cycle and no longer have any tool calls available. You must answer the query now using only what the documents you already retrieved actually say.
-If they are not enough to answer, say so and state what is missing rather than filling the gap with assumptions.
+Mirror every explicit material part of the current request. For each part, give the directly supported result or state the precise missing source; do not silently omit it. Split compound claims whose clauses do not share exact support, and cite each supported claim with the smallest directly entailing citation set. If the documents are not enough, state what is missing rather than filling the gap with assumptions.
 """.strip()
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Sequence
 from enum import StrEnum
 from typing import TypedDict
@@ -10,14 +11,18 @@ from typing import TypedDict
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from onyx.chat.models import ChatMessageSimple
-from onyx.configs.chat_configs import SECONDARY_LLM_FLOW_TIMEOUT_S
+from onyx.configs.chat_configs import (
+    REGULATORY_REVIEW_MODEL,
+    REGULATORY_REVIEW_TIMEOUT_S,
+)
 from onyx.configs.constants import MessageType
-from onyx.llm.factory import get_llm_token_counter
+from onyx.llm.factory import get_llm, get_llm_token_counter
 from onyx.llm.interfaces import LLM
 from onyx.llm.models import ReasoningEffort
 from onyx.prompts.regulatory_candidate_answer_review import (
     REGULATORY_CANDIDATE_ANSWER_REVIEW_SYSTEM_PROMPT,
     REGULATORY_CANDIDATE_RESOLUTION_REVIEW_SYSTEM_PROMPT,
+    REGULATORY_EVIDENCE_MATRIX_CLOSURE_REVIEW_SYSTEM_PROMPT,
 )
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
 from onyx.regulatory.structured_llm import generate_structured
@@ -29,30 +34,34 @@ logger = setup_logger()
 _MAX_USER_REQUEST_CHARS = 24_000
 _MAX_REVIEW_USER_MESSAGES = 5
 _MAX_EARLIER_USER_CONTEXT_CHARS = 12_000
+_MAX_COVERAGE_CONTRACT_CHARS = 12_000
+_MAX_EVIDENCE_MATRIX_CHARS = 100_000
 _MAX_CANDIDATE_ANSWER_CHARS = 36_000
-_MAX_EVIDENCE_CHUNKS = 48
+_MAX_EVIDENCE_CHUNKS = 256
 _MAX_RAW_EVIDENCE_CONTENT_CHARS = 12_000
-_MAX_EVIDENCE_CONTENT_CHARS = 48_000
-_MAX_EVIDENCE_CONTENT_PER_CHUNK = 2_400
+_MAX_EVIDENCE_CONTENT_CHARS = 200_000
+_MAX_EVIDENCE_CONTENT_PER_CHUNK = 4_000
 _MAX_CHUNK_IDENTIFIER_CHARS = 200
 _MAX_HEADING_CHARS = 480
-_MAX_RETRIEVAL_INVENTORY_ITEMS = 192
-_MAX_RETRIEVAL_INVENTORY_CHARS = 32_000
+_MAX_RETRIEVAL_INVENTORY_ITEMS = 512
+_MAX_RETRIEVAL_INVENTORY_CHARS = 80_000
 _MAX_INVENTORY_CHUNK_IDENTIFIER_CHARS = 96
 _MAX_INVENTORY_HEADING_CHARS = 240
-_MAX_CLAIM_ISSUES = 6
+MAX_REGULATORY_CLAIM_ISSUES = 16
 _MAX_CLAIM_REFERENCE_CHARS = 280
 _MAX_ISSUE_FEEDBACK_CHARS = 520
 _MAX_RECOVERY_QUERY_CHARS = 512
 _MAX_RELATED_CITATION_NUMBERS = 5
-_REVIEW_MAX_TOKENS = 3_200
-_REVIEW_CONTEXT_SAFETY_TOKENS = 1_024
+_REVIEW_MAX_TOKENS = 24_000
+_REVIEW_MAX_ATTEMPTS = 2
+_MIN_REVIEW_OUTPUT_TOKENS = 4_096
+_REVIEW_CONTEXT_SAFETY_TOKENS = 2_048
 _MIN_REVIEW_TEXT_CHARS = 512
 _MIN_CITED_EVIDENCE_CONTENT_CHARS = 160
-_MAX_RESOLUTION_EVIDENCE_CHUNKS = 32
-_MAX_RESOLUTION_EVIDENCE_CONTENT_CHARS = 24_000
-_MAX_RESOLUTION_EVIDENCE_CONTENT_PER_CHUNK = 1_600
-_RESOLUTION_REVIEW_MAX_TOKENS = 1_800
+_MAX_RESOLUTION_EVIDENCE_CHUNKS = 128
+_MAX_RESOLUTION_EVIDENCE_CONTENT_CHARS = 120_000
+_MAX_RESOLUTION_EVIDENCE_CONTENT_PER_CHUNK = 3_000
+_RESOLUTION_REVIEW_MAX_TOKENS = 16_000
 
 
 class _RetrievalInventoryItem(TypedDict):
@@ -79,6 +88,8 @@ class _BoundedTextPayload(TypedDict):
 class _CandidateAnswerReviewPayload(TypedDict):
     user_request: _BoundedTextPayload
     earlier_user_context: list[_BoundedTextPayload]
+    coverage_contract: _BoundedTextPayload | None
+    evidence_matrix: _BoundedTextPayload | None
     candidate_answer: _BoundedTextPayload
     retrieval_inventory: _RetrievalInventory
     evidence_chunks: list[dict[str, object]]
@@ -91,6 +102,33 @@ class RegulatoryReviewUserContext(BaseModel):
 
     current_request: str = ""
     earlier_user_context: tuple[str, ...] = ()
+
+
+def build_regulatory_review_llm(answer_llm: LLM) -> LLM:
+    """Use an optional stronger verifier through the answering provider.
+
+    Keeping provider credentials and routing identical makes the verifier a
+    model-tier choice rather than an implicit provider fallback. Deployments
+    that do not configure a verifier retain the existing single-model path.
+    """
+
+    review_model = REGULATORY_REVIEW_MODEL
+    if review_model is None or review_model == answer_llm.config.model_name:
+        return answer_llm
+
+    config = answer_llm.config
+    return get_llm(
+        provider=config.model_provider,
+        model=review_model,
+        max_input_tokens=config.max_input_tokens,
+        deployment_name=config.deployment_name,
+        api_key=config.api_key,
+        api_base=config.api_base,
+        api_version=config.api_version,
+        custom_config=config.custom_config,
+        temperature=0,
+        timeout=REGULATORY_REVIEW_TIMEOUT_S,
+    )
 
 
 def _strip_outer_whitespace(value: str) -> str:
@@ -217,6 +255,25 @@ def _evidence_provision_key(
     return None
 
 
+def _focused_target_relevance_score(
+    evidence_chunk: CandidateAnswerEvidenceChunk,
+) -> int:
+    """Rank a chunk using only lexical overlap with its request-derived target."""
+
+    target = evidence_chunk.research_target
+    if target.startswith("Specific evidence target:"):
+        target = target.removeprefix("Specific evidence target:")
+    target = target.split(". ", 1)[0]
+    target_terms = set(re.findall(r"\w+", target.casefold()))
+    evidence_terms = set(
+        re.findall(
+            r"\w+",
+            f"{evidence_chunk.heading} {evidence_chunk.content}".casefold(),
+        )
+    )
+    return len(target_terms & evidence_terms)
+
+
 class CandidateAnswerEvidenceChunk(BaseModel):
     """Exact source text associated with a retrieved or cited chunk."""
 
@@ -228,6 +285,8 @@ class CandidateAnswerEvidenceChunk(BaseModel):
     retrieval_number: int | None = Field(default=None, ge=1)
     chunk_identifier: str = Field(min_length=1, max_length=_MAX_CHUNK_IDENTIFIER_CHARS)
     heading: str = Field(max_length=_MAX_HEADING_CHARS)
+    research_target: str = Field(default="", max_length=900)
+    coverage_item: str = Field(default="", max_length=900, exclude=True)
     content: str = Field(min_length=1, max_length=_MAX_RAW_EVIDENCE_CONTENT_CHARS)
     content_truncated: bool = False
 
@@ -251,6 +310,8 @@ def build_candidate_answer_evidence_chunk(
     chunk_identifier: str,
     heading: str,
     content: str,
+    research_target: str = "",
+    coverage_item: str = "",
 ) -> CandidateAnswerEvidenceChunk:
     """Build a safe evidence record without paraphrasing its source text."""
 
@@ -270,6 +331,8 @@ def build_candidate_answer_evidence_chunk(
             :_MAX_CHUNK_IDENTIFIER_CHARS
         ].rstrip(),
         heading=heading.strip()[:_MAX_HEADING_CHARS].rstrip(),
+        research_target=research_target.strip()[:900].rstrip(),
+        coverage_item=coverage_item.strip()[:900].rstrip(),
         content=bounded_content,
         content_truncated=content_truncated,
     )
@@ -343,15 +406,31 @@ class _CandidateAnswerReviewDraftClaimIssue(BaseModel):
     claim_kind: ClaimKind
     claim_reference: str
     advisory_feedback: str
-    related_citation_numbers: list[int] = Field(default_factory=list)
+    related_citation_numbers: list[int] = Field(default_factory=list, max_length=12)
     recovery_query: str | None = None
+
+    @field_validator("related_citation_numbers", mode="before")
+    @classmethod
+    def bound_draft_citations(cls, value: object) -> object:
+        if not isinstance(value, list):
+            return value
+        return value[:12]
 
 
 class _CandidateAnswerReviewDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     needs_reconsideration: bool
-    advisory_claim_issues: list[_CandidateAnswerReviewDraftClaimIssue]
+    advisory_claim_issues: list[_CandidateAnswerReviewDraftClaimIssue] = Field(
+        max_length=MAX_REGULATORY_CLAIM_ISSUES
+    )
+
+    @field_validator("advisory_claim_issues", mode="before")
+    @classmethod
+    def bound_draft_issues(cls, value: object) -> object:
+        if not isinstance(value, list):
+            return value
+        return value[:MAX_REGULATORY_CLAIM_ISSUES]
 
 
 class CandidateAnswerIssueResolutionStatus(StrEnum):
@@ -386,7 +465,7 @@ class CandidateAnswerReviewResult(BaseModel):
 
     needs_reconsideration: bool
     advisory_claim_issues: list[CandidateAnswerClaimIssue] = Field(
-        default_factory=list, max_length=_MAX_CLAIM_ISSUES
+        default_factory=list, max_length=MAX_REGULATORY_CLAIM_ISSUES
     )
     review_error: CandidateAnswerReviewError | None = None
 
@@ -420,8 +499,8 @@ def format_candidate_answer_review(
         "# Candidate-answer evidence review",
         "The hidden draft has not been published because a bounded AI review found "
         "material evidence-grounding or request-coverage concerns. This feedback is "
-        "advisory analysis, not legal evidence. At most one focused support search "
-        "may be executed before the bounded correction. "
+        "advisory analysis, not legal evidence. At most five query-distinct focused "
+        "support gaps may be searched in one bounded recovery call before correction. "
         "Do not silently drop a concern: either support and correct or qualify the "
         "affected conclusion, or state the precise controlling-source gap.",
     ]
@@ -450,6 +529,54 @@ def format_candidate_resolution_review(
     return "\n".join(lines)
 
 
+def format_candidate_review_regression_guard(
+    issue_history: Sequence[CandidateAnswerClaimIssue],
+    current_issues: Sequence[CandidateAnswerClaimIssue],
+) -> str | None:
+    """Keep later correction passes from undoing previously reviewed fixes."""
+
+    if not issue_history:
+        return None
+
+    current_references = {
+        " ".join(issue.claim_reference.casefold().split()) for issue in current_issues
+    }
+    historical_issues: list[CandidateAnswerClaimIssue] = []
+    seen_references: set[str] = set()
+    for issue in reversed(issue_history):
+        reference = " ".join(issue.claim_reference.casefold().split())
+        if reference in current_references or reference in seen_references:
+            continue
+        seen_references.add(reference)
+        historical_issues.append(issue)
+        if len(historical_issues) == MAX_REGULATORY_CLAIM_ISSUES:
+            break
+    if not historical_issues:
+        return None
+
+    lines = [
+        "# Earlier correction regression guard",
+        "These rows were raised in earlier hidden-draft reviews and are not legal "
+        "evidence or instructions to restate a claim. Preserve a supported "
+        "correction or precise source-gap treatment already made. If the disputed "
+        "claim was properly removed and is not required by the request, keep it "
+        "removed. Do not reintroduce the earlier unsupported wording while fixing "
+        "the current concerns.",
+    ]
+    for issue in reversed(historical_issues):
+        citation_note = ""
+        if issue.related_citation_numbers:
+            citation_note = (
+                " [reviewed citations: "
+                + ", ".join(str(number) for number in issue.related_citation_numbers)
+                + "]"
+            )
+        lines.append(
+            f"- {issue.claim_reference}: {issue.advisory_feedback}{citation_note}"
+        )
+    return "\n".join(lines)
+
+
 def _compact_evidence_chunks(
     evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
 ) -> list[CandidateAnswerEvidenceChunk]:
@@ -473,6 +600,44 @@ def _compact_evidence_chunks(
         _MAX_EVIDENCE_CHUNKS - len(selected_cited_chunks),
         len(uncited_chunks),
     )
+    # Reserve one excerpt per focused request-derived target before filling the
+    # remaining uncited slots. Rank within a target only by its own wording, so the
+    # selection remains independent of any benchmark or subject-matter vocabulary.
+    selected_uncited_chunks: list[CandidateAnswerEvidenceChunk] = []
+    selected_uncited_identities: set[tuple[str, int]] = set()
+    focused_target_candidates: dict[
+        str, tuple[int, int, CandidateAnswerEvidenceChunk]
+    ] = {}
+    for chunk_index, uncited_chunk in enumerate(uncited_chunks):
+        normalized_target = " ".join(uncited_chunk.research_target.split())
+        if not normalized_target.startswith("Specific evidence target:"):
+            continue
+        focused_target_end = normalized_target.find(". ")
+        focused_target = (
+            normalized_target[: focused_target_end + 1]
+            if focused_target_end >= 0
+            else normalized_target
+        )
+        relevance_score = _focused_target_relevance_score(uncited_chunk)
+        existing_candidate = focused_target_candidates.get(focused_target)
+        if existing_candidate is None or relevance_score > existing_candidate[0]:
+            focused_target_candidates[focused_target] = (
+                relevance_score,
+                chunk_index,
+                uncited_chunk,
+            )
+
+    for _, _, uncited_chunk in sorted(
+        focused_target_candidates.values(),
+        key=lambda candidate: candidate[1],
+    ):
+        selected_uncited_chunks.append(uncited_chunk)
+        selected_uncited_identities.add(
+            (uncited_chunk.document_id, uncited_chunk.chunk_id)
+        )
+        if len(selected_uncited_chunks) == uncited_limit:
+            break
+
     cited_provision_keys: list[tuple[tuple[str, ...], str | None, str]] = []
     for cited_chunk in selected_cited_chunks:
         provision_key = _evidence_provision_key(cited_chunk)
@@ -485,13 +650,17 @@ def _compact_evidence_chunks(
     ] = {key: [] for key in cited_provision_keys}
     unrelated_uncited_chunks: list[CandidateAnswerEvidenceChunk] = []
     for uncited_chunk in uncited_chunks:
+        if (
+            uncited_chunk.document_id,
+            uncited_chunk.chunk_id,
+        ) in selected_uncited_identities:
+            continue
         provision_key = _evidence_provision_key(uncited_chunk)
         if provision_key is not None and provision_key in related_by_key:
             related_by_key[provision_key].append(uncited_chunk)
         else:
             unrelated_uncited_chunks.append(uncited_chunk)
 
-    selected_uncited_chunks: list[CandidateAnswerEvidenceChunk] = []
     while len(selected_uncited_chunks) < uncited_limit:
         added_related_chunk = False
         for provision_key in cited_provision_keys:
@@ -662,6 +831,18 @@ def _selected_review_max_input_tokens(llm: LLM) -> int:
     return max_input_tokens
 
 
+def _review_output_token_limit(llm: LLM, configured_limit: int) -> int:
+    """Keep room for evidence on smaller-context models without capping Gemini."""
+
+    return min(
+        configured_limit,
+        max(
+            _MIN_REVIEW_OUTPUT_TOKENS,
+            _selected_review_max_input_tokens(llm) // 2,
+        ),
+    )
+
+
 def _candidate_review_payload_token_budget(
     llm: LLM,
     token_counter: Callable[[str], int],
@@ -676,7 +857,7 @@ def _candidate_review_payload_token_budget(
     return (
         _selected_review_max_input_tokens(llm)
         - fixed_input_tokens
-        - _REVIEW_MAX_TOKENS
+        - _review_output_token_limit(llm, _REVIEW_MAX_TOKENS)
         - _REVIEW_CONTEXT_SAFETY_TOKENS
     )
 
@@ -695,7 +876,7 @@ def _resolution_review_payload_token_budget(
     return (
         _selected_review_max_input_tokens(llm)
         - fixed_input_tokens
-        - _RESOLUTION_REVIEW_MAX_TOKENS
+        - _review_output_token_limit(llm, _RESOLUTION_REVIEW_MAX_TOKENS)
         - _REVIEW_CONTEXT_SAFETY_TOKENS
     )
 
@@ -730,6 +911,8 @@ def _prepare_candidate_review_input(
     earlier_user_context: str | Sequence[str] | None,
     candidate_answer: str,
     evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+    coverage_contract: str | None = None,
+    evidence_matrix: str | None = None,
 ) -> tuple[str, set[int]] | None:
     """Fit one audit payload while preserving the highest-value evidence first."""
 
@@ -748,6 +931,28 @@ def _prepare_candidate_review_input(
         label="candidate answer",
     )
     bounded_earlier_context = _bounded_earlier_user_context(earlier_user_context)
+    bounded_coverage_contract: _BoundedTextPayload | None = None
+    if coverage_contract and coverage_contract.strip():
+        bounded_contract_text, coverage_contract_truncated = _bounded_text(
+            coverage_contract.strip(),
+            max_chars=_MAX_COVERAGE_CONTRACT_CHARS,
+            label="coverage contract",
+        )
+        bounded_coverage_contract = {
+            "text": bounded_contract_text,
+            "truncated": coverage_contract_truncated,
+        }
+    bounded_evidence_matrix: _BoundedTextPayload | None = None
+    if evidence_matrix and evidence_matrix.strip():
+        bounded_matrix_text, evidence_matrix_truncated = _bounded_text(
+            evidence_matrix.strip(),
+            max_chars=_MAX_EVIDENCE_MATRIX_CHARS,
+            label="evidence matrix",
+        )
+        bounded_evidence_matrix = {
+            "text": bounded_matrix_text,
+            "truncated": evidence_matrix_truncated,
+        }
 
     compact_evidence_chunks = _compact_evidence_chunks(evidence_chunks)
     cited_evidence_chunks = [
@@ -775,6 +980,8 @@ def _prepare_candidate_review_input(
                 "truncated": user_request_truncated,
             },
             "earlier_user_context": bounded_earlier_context,
+            "coverage_contract": bounded_coverage_contract,
+            "evidence_matrix": bounded_evidence_matrix,
             "candidate_answer": {
                 "text": bounded_candidate_answer,
                 "truncated": candidate_answer_truncated,
@@ -1151,15 +1358,18 @@ def format_candidate_correction_evidence(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def review_regulatory_candidate_answer(
+def _review_regulatory_candidate_answer(
     llm: LLM,
     *,
+    system_prompt: str,
     user_request: str,
     candidate_answer: str,
     evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
     earlier_user_context: str | Sequence[str] | None = None,
+    coverage_contract: str | None = None,
+    evidence_matrix: str | None = None,
 ) -> CandidateAnswerReviewResult:
-    """Review a candidate once; provider or parse failures are explicitly fail-open."""
+    """Run one bounded candidate audit with the selected review contract."""
 
     _strip_outer_whitespace(user_request)
     _strip_outer_whitespace(candidate_answer)
@@ -1171,6 +1381,8 @@ def review_regulatory_candidate_answer(
             token_counter=token_counter,
             user_request=user_request,
             earlier_user_context=earlier_user_context,
+            coverage_contract=coverage_contract,
+            evidence_matrix=evidence_matrix,
             candidate_answer=candidate_answer,
             evidence_chunks=evidence_chunks,
         )
@@ -1187,16 +1399,16 @@ def review_regulatory_candidate_answer(
         draft = generate_structured(
             llm,
             flow=LLMFlow.REGULATORY_ANSWER_AUDIT,
-            system_prompt=REGULATORY_CANDIDATE_ANSWER_REVIEW_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             user_prompt=user_prompt,
             response_model=_CandidateAnswerReviewDraft,
-            timeout_override=SECONDARY_LLM_FLOW_TIMEOUT_S,
-            max_tokens=_REVIEW_MAX_TOKENS,
-            reasoning_effort=ReasoningEffort.MEDIUM,
-            max_attempts=1,
+            timeout_override=REGULATORY_REVIEW_TIMEOUT_S,
+            max_tokens=_review_output_token_limit(llm, _REVIEW_MAX_TOKENS),
+            reasoning_effort=ReasoningEffort.HIGH,
+            max_attempts=_REVIEW_MAX_ATTEMPTS,
         )
         bounded_issues: list[CandidateAnswerClaimIssue] = []
-        for draft_issue in draft.advisory_claim_issues[:_MAX_CLAIM_ISSUES]:
+        for draft_issue in draft.advisory_claim_issues[:MAX_REGULATORY_CLAIM_ISSUES]:
             bounded_issue = _bounded_claim_issue_from_draft(
                 draft_issue,
                 available_citation_numbers=available_citation_numbers,
@@ -1221,6 +1433,52 @@ def review_regulatory_candidate_answer(
             needs_reconsideration=False,
             review_error=CandidateAnswerReviewError.REVIEW_UNAVAILABLE,
         )
+
+
+def review_regulatory_candidate_answer(
+    llm: LLM,
+    *,
+    user_request: str,
+    candidate_answer: str,
+    evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+    earlier_user_context: str | Sequence[str] | None = None,
+    coverage_contract: str | None = None,
+    evidence_matrix: str | None = None,
+) -> CandidateAnswerReviewResult:
+    """Review all request-coverage and grounding dimensions once."""
+
+    return _review_regulatory_candidate_answer(
+        llm,
+        system_prompt=REGULATORY_CANDIDATE_ANSWER_REVIEW_SYSTEM_PROMPT,
+        user_request=user_request,
+        earlier_user_context=earlier_user_context,
+        coverage_contract=coverage_contract,
+        evidence_matrix=evidence_matrix,
+        candidate_answer=candidate_answer,
+        evidence_chunks=evidence_chunks,
+    )
+
+
+def review_regulatory_candidate_matrix_closure(
+    llm: LLM,
+    *,
+    user_request: str,
+    candidate_answer: str,
+    evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+    evidence_matrix: str,
+) -> CandidateAnswerReviewResult:
+    """Audit only exact-evidence closure for the pre-synthesis matrix."""
+
+    return _review_regulatory_candidate_answer(
+        llm,
+        system_prompt=REGULATORY_EVIDENCE_MATRIX_CLOSURE_REVIEW_SYSTEM_PROMPT,
+        user_request=user_request,
+        earlier_user_context=None,
+        coverage_contract=None,
+        evidence_matrix=evidence_matrix,
+        candidate_answer=candidate_answer,
+        evidence_chunks=evidence_chunks,
+    )
 
 
 def review_regulatory_candidate_resolution(
@@ -1261,10 +1519,10 @@ def review_regulatory_candidate_resolution(
             system_prompt=REGULATORY_CANDIDATE_RESOLUTION_REVIEW_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             response_model=_CandidateAnswerResolutionReviewDraft,
-            timeout_override=SECONDARY_LLM_FLOW_TIMEOUT_S,
-            max_tokens=_RESOLUTION_REVIEW_MAX_TOKENS,
-            reasoning_effort=ReasoningEffort.LOW,
-            max_attempts=1,
+            timeout_override=REGULATORY_REVIEW_TIMEOUT_S,
+            max_tokens=_review_output_token_limit(llm, _RESOLUTION_REVIEW_MAX_TOKENS),
+            reasoning_effort=ReasoningEffort.HIGH,
+            max_attempts=_REVIEW_MAX_ATTEMPTS,
         )
         resolutions_by_index: dict[int, _CandidateAnswerIssueResolutionDraft] = {}
         for resolution in draft.issue_resolutions:
@@ -1303,7 +1561,7 @@ def review_regulatory_candidate_resolution(
                 )
             )
 
-        unresolved_issues = unresolved_issues[:_MAX_CLAIM_ISSUES]
+        unresolved_issues = unresolved_issues[:MAX_REGULATORY_CLAIM_ISSUES]
         if draft.new_grounding_regression is not None:
             bounded_regression = _bounded_claim_issue_from_draft(
                 draft.new_grounding_regression,
@@ -1312,7 +1570,7 @@ def review_regulatory_candidate_resolution(
             )
             if bounded_regression is not None:
                 unresolved_issues = [
-                    *unresolved_issues[: _MAX_CLAIM_ISSUES - 1],
+                    *unresolved_issues[: MAX_REGULATORY_CLAIM_ISSUES - 1],
                     bounded_regression,
                 ]
 
@@ -1329,3 +1587,108 @@ def review_regulatory_candidate_resolution(
             needs_reconsideration=False,
             review_error=CandidateAnswerReviewError.REVIEW_UNAVAILABLE,
         )
+
+
+def review_regulatory_candidate_answer_with_fallback(
+    review_llm: LLM,
+    answer_llm: LLM,
+    *,
+    user_request: str,
+    candidate_answer: str,
+    evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+    earlier_user_context: str | Sequence[str] | None = None,
+    coverage_contract: str | None = None,
+    evidence_matrix: str | None = None,
+) -> CandidateAnswerReviewResult:
+    """Retry an unavailable independent audit once with the answering model."""
+
+    result = review_regulatory_candidate_answer(
+        review_llm,
+        user_request=user_request,
+        candidate_answer=candidate_answer,
+        evidence_chunks=evidence_chunks,
+        earlier_user_context=earlier_user_context,
+        coverage_contract=coverage_contract,
+        evidence_matrix=evidence_matrix,
+    )
+    if result.completed or review_llm is answer_llm:
+        return result
+
+    logger.warning(
+        "Independent regulatory candidate audit unavailable; retrying once with "
+        "the answering model"
+    )
+    return review_regulatory_candidate_answer(
+        answer_llm,
+        user_request=user_request,
+        candidate_answer=candidate_answer,
+        evidence_chunks=evidence_chunks,
+        earlier_user_context=earlier_user_context,
+        coverage_contract=coverage_contract,
+        evidence_matrix=evidence_matrix,
+    )
+
+
+def review_regulatory_candidate_matrix_closure_with_fallback(
+    review_llm: LLM,
+    answer_llm: LLM,
+    *,
+    user_request: str,
+    candidate_answer: str,
+    evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+    evidence_matrix: str,
+) -> CandidateAnswerReviewResult:
+    """Retry an unavailable focused matrix audit with the answering model."""
+
+    result = review_regulatory_candidate_matrix_closure(
+        review_llm,
+        user_request=user_request,
+        candidate_answer=candidate_answer,
+        evidence_chunks=evidence_chunks,
+        evidence_matrix=evidence_matrix,
+    )
+    if result.completed or review_llm is answer_llm:
+        return result
+
+    logger.warning(
+        "Independent regulatory matrix-closure audit unavailable; retrying once "
+        "with the answering model"
+    )
+    return review_regulatory_candidate_matrix_closure(
+        answer_llm,
+        user_request=user_request,
+        candidate_answer=candidate_answer,
+        evidence_chunks=evidence_chunks,
+        evidence_matrix=evidence_matrix,
+    )
+
+
+def review_regulatory_candidate_resolution_with_fallback(
+    review_llm: LLM,
+    answer_llm: LLM,
+    *,
+    candidate_answer: str,
+    prior_issues: Sequence[CandidateAnswerClaimIssue],
+    evidence_chunks: Sequence[CandidateAnswerEvidenceChunk],
+) -> CandidateAnswerReviewResult:
+    """Retry an unavailable independent resolution check with the answer model."""
+
+    result = review_regulatory_candidate_resolution(
+        review_llm,
+        candidate_answer=candidate_answer,
+        prior_issues=prior_issues,
+        evidence_chunks=evidence_chunks,
+    )
+    if result.completed or review_llm is answer_llm:
+        return result
+
+    logger.warning(
+        "Independent regulatory resolution audit unavailable; retrying once with "
+        "the answering model"
+    )
+    return review_regulatory_candidate_resolution(
+        answer_llm,
+        candidate_answer=candidate_answer,
+        prior_issues=prior_issues,
+        evidence_chunks=evidence_chunks,
+    )

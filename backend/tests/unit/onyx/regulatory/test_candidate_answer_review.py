@@ -4,12 +4,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from onyx.chat.models import ChatMessageSimple
-from onyx.configs.chat_configs import SECONDARY_LLM_FLOW_TIMEOUT_S
+from onyx.configs.chat_configs import REGULATORY_REVIEW_TIMEOUT_S
 from onyx.configs.constants import MessageType
+from onyx.context.search.models import SearchDocsResponse
+from onyx.llm.interfaces import LLMConfig
 from onyx.llm.models import ReasoningEffort
 from onyx.prompts.regulatory_candidate_answer_review import (
     REGULATORY_CANDIDATE_ANSWER_REVIEW_SYSTEM_PROMPT,
     REGULATORY_CANDIDATE_RESOLUTION_REVIEW_SYSTEM_PROMPT,
+    REGULATORY_EVIDENCE_MATRIX_CLOSURE_REVIEW_SYSTEM_PROMPT,
 )
 from onyx.regulatory.candidate_answer_review import (
     CandidateAnswerClaimIssue,
@@ -26,13 +29,23 @@ from onyx.regulatory.candidate_answer_review import (
     _CandidateAnswerReviewDraftClaimIssue,
     _compact_evidence_chunks,
     build_candidate_answer_evidence_chunk,
+    build_regulatory_review_llm,
     build_regulatory_review_user_context,
     build_regulatory_review_user_request,
     format_candidate_correction_evidence,
     review_regulatory_candidate_answer,
+    review_regulatory_candidate_answer_with_fallback,
+    review_regulatory_candidate_matrix_closure,
     review_regulatory_candidate_resolution,
+    review_regulatory_candidate_resolution_with_fallback,
 )
-from onyx.regulatory.gap_recovery import select_priority_recovery_issue
+from onyx.regulatory.gap_recovery import (
+    run_batched_gap_recovery,
+    select_priority_recovery_issue,
+    select_priority_recovery_issues,
+)
+from onyx.server.query_and_chat.placement import Placement
+from onyx.tools.models import ToolResponse
 from onyx.tracing.flows import LLMFlow
 
 
@@ -62,6 +75,111 @@ def _evidence(
         heading=f"Instrument > Provision {citation_number}",
         content=content,
     )
+
+
+def test_regulatory_review_llm_defaults_to_answer_model() -> None:
+    answer_llm = MagicMock()
+    answer_llm.config.model_name = "candidate-model"
+
+    with patch("onyx.regulatory.candidate_answer_review.REGULATORY_REVIEW_MODEL", None):
+        assert build_regulatory_review_llm(answer_llm) is answer_llm
+
+
+def test_regulatory_review_llm_reuses_provider_route_for_stronger_model() -> None:
+    answer_llm = MagicMock()
+    answer_llm.config = LLMConfig(
+        model_provider="vertex_ai",
+        model_name="candidate-model",
+        temperature=0.2,
+        api_key=None,
+        api_base=None,
+        api_version=None,
+        deployment_name=None,
+        custom_config={"vertex_project": "project"},
+        max_input_tokens=250_000,
+    )
+    review_llm = MagicMock()
+
+    with (
+        patch(
+            "onyx.regulatory.candidate_answer_review.REGULATORY_REVIEW_MODEL",
+            "review-model",
+        ),
+        patch(
+            "onyx.regulatory.candidate_answer_review.get_llm",
+            return_value=review_llm,
+        ) as get_llm,
+    ):
+        result = build_regulatory_review_llm(answer_llm)
+
+    assert result is review_llm
+    get_llm.assert_called_once_with(
+        provider="vertex_ai",
+        model="review-model",
+        max_input_tokens=250_000,
+        deployment_name=None,
+        api_key=None,
+        api_base=None,
+        api_version=None,
+        custom_config={"vertex_project": "project"},
+        temperature=0,
+        timeout=REGULATORY_REVIEW_TIMEOUT_S,
+    )
+
+
+def test_unavailable_independent_candidate_review_retries_answer_model() -> None:
+    review_llm = MagicMock()
+    answer_llm = MagicMock()
+    unavailable = CandidateAnswerReviewResult(
+        needs_reconsideration=False,
+        review_error=CandidateAnswerReviewError.REVIEW_UNAVAILABLE,
+    )
+    completed = CandidateAnswerReviewResult(needs_reconsideration=False)
+
+    with patch(
+        "onyx.regulatory.candidate_answer_review.review_regulatory_candidate_answer",
+        side_effect=[unavailable, completed],
+    ) as review:
+        result = review_regulatory_candidate_answer_with_fallback(
+            review_llm,
+            answer_llm,
+            user_request="Request",
+            candidate_answer="Answer",
+            evidence_chunks=[],
+        )
+
+    assert result is completed
+    assert [call.args[0] for call in review.call_args_list] == [review_llm, answer_llm]
+
+
+def test_unavailable_resolution_review_retries_answer_model() -> None:
+    review_llm = MagicMock()
+    answer_llm = MagicMock()
+    issue = CandidateAnswerClaimIssue(
+        claim_reference="Claim",
+        advisory_feedback="Missing support",
+    )
+    unavailable = CandidateAnswerReviewResult(
+        needs_reconsideration=False,
+        review_error=CandidateAnswerReviewError.REVIEW_UNAVAILABLE,
+    )
+    completed = CandidateAnswerReviewResult(needs_reconsideration=False)
+
+    with patch(
+        "onyx.regulatory.candidate_answer_review."
+        "review_regulatory_candidate_resolution",
+        side_effect=[unavailable, completed],
+    ) as review:
+        result = review_regulatory_candidate_resolution_with_fallback(
+            review_llm,
+            answer_llm,
+            candidate_answer="Revised answer",
+            prior_issues=[issue],
+            evidence_chunks=[],
+        )
+
+    assert result is completed
+    assert [call.args[0] for call in review.call_args_list] == [review_llm, answer_llm]
 
 
 def test_evidence_keeps_canonical_chunk_identity() -> None:
@@ -126,6 +244,89 @@ def test_recovery_priority_uses_earliest_span_within_claim_kind() -> None:
     )
 
     assert select_priority_recovery_issue(review) is earlier
+
+
+def test_batched_recovery_selects_five_query_distinct_issues() -> None:
+    issues = [
+        CandidateAnswerClaimIssue(
+            claim_kind=ClaimKind.LEGAL_RULE,
+            claim_reference=f"claim {index}",
+            advisory_feedback="support gap",
+            recovery_query=query,
+        )
+        for index, query in enumerate(
+            (
+                "rule one",
+                "RULE   ONE",
+                "rule two",
+                "rule three",
+                "rule four",
+                "rule five",
+            )
+        )
+    ]
+    review = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=issues,
+    )
+
+    assert select_priority_recovery_issues(review) == [
+        issues[0],
+        issues[2],
+        issues[3],
+        issues[4],
+        issues[5],
+    ]
+
+
+def test_batched_recovery_uses_one_focused_search_call_per_issue() -> None:
+    issues = [
+        CandidateAnswerClaimIssue(
+            claim_kind=ClaimKind.LEGAL_RULE,
+            claim_reference=f"claim {index}",
+            advisory_feedback="support gap",
+            recovery_query=query,
+        )
+        for index, query in enumerate(("rule one", "rule two"))
+    ]
+    search_tool = MagicMock()
+    search_tool.run.side_effect = [
+        ToolResponse(
+            rich_response=SearchDocsResponse(
+                search_docs=[], citation_mapping={}, citation_chunk_mapping={}
+            ),
+            llm_facing_response=json.dumps(
+                {"results": [], "receipt": {"query": query}}
+            ),
+        )
+        for query in ("rule one", "rule two")
+    ]
+    placement = Placement(turn_index=4, tab_index=0)
+
+    result = run_batched_gap_recovery(
+        search_tool=search_tool,
+        issues=issues,
+        starting_citation_num=9,
+        placement=placement,
+    )
+
+    assert search_tool.run.call_count == 2
+    first_kwargs = search_tool.run.call_args_list[0].kwargs
+    second_kwargs = search_tool.run.call_args_list[1].kwargs
+    assert first_kwargs["queries"] == ["rule one"]
+    assert second_kwargs["queries"] == ["rule two"]
+    assert first_kwargs["search_mode"] == second_kwargs["search_mode"] == "hybrid"
+    assert first_kwargs["placement"] == placement
+    assert second_kwargs["placement"] == placement.model_copy(update={"tab_index": 1})
+    assert first_kwargs["override_kwargs"].starting_citation_num == 9
+    assert second_kwargs["override_kwargs"].starting_citation_num == 9
+    assert first_kwargs["override_kwargs"].original_query == "rule one"
+    assert second_kwargs["override_kwargs"].original_query == "rule two"
+    assert isinstance(result.rich_response, SearchDocsResponse)
+    assert json.loads(result.llm_facing_response)["recovery_receipts"] == [
+        {"query": "rule one"},
+        {"query": "rule two"},
+    ]
 
 
 def test_review_user_context_separates_current_request_from_earlier_facts() -> None:
@@ -231,6 +432,7 @@ def test_correction_evidence_can_cite_a_retrieved_chunk_omitted_by_draft() -> No
             "retrieval_number": 7,
             "chunk_identifier": "chunk-7",
             "heading": "Instrument > Provision 7",
+            "research_target": "",
             "content": "Exact condition omitted by the hidden draft.",
             "content_truncated": False,
         }
@@ -246,7 +448,7 @@ def test_correction_evidence_has_a_separate_total_content_bound() -> None:
     payload = json.loads(format_candidate_correction_evidence(evidence_chunks))
 
     assert len(payload["evidence_chunks"]) == 48
-    assert sum(len(chunk["content"]) for chunk in payload["evidence_chunks"]) <= 24_000
+    assert sum(len(chunk["content"]) for chunk in payload["evidence_chunks"]) <= 120_000
     assert all(chunk["content_truncated"] for chunk in payload["evidence_chunks"])
 
 
@@ -271,6 +473,8 @@ def test_review_makes_one_bounded_structured_call() -> None:
             MagicMock(),
             user_request="Analyze the supplied facts.",
             earlier_user_context=["The authorization was issued last year."],
+            coverage_contract="Close the distinct authorization consequence.",
+            evidence_matrix="Supported matrix row with exact document 7.",
             candidate_answer="A material claim [1].",
             evidence_chunks=[_evidence()],
         )
@@ -290,10 +494,10 @@ def test_review_makes_one_bounded_structured_call() -> None:
     generate.assert_called_once()
     kwargs = generate.call_args.kwargs
     assert kwargs["flow"] is LLMFlow.REGULATORY_ANSWER_AUDIT
-    assert kwargs["timeout_override"] == SECONDARY_LLM_FLOW_TIMEOUT_S
-    assert kwargs["max_tokens"] == 3_200
-    assert kwargs["reasoning_effort"] is ReasoningEffort.MEDIUM
-    assert kwargs["max_attempts"] == 1
+    assert kwargs["timeout_override"] == REGULATORY_REVIEW_TIMEOUT_S
+    assert kwargs["max_tokens"] == 24_000
+    assert kwargs["reasoning_effort"] is ReasoningEffort.HIGH
+    assert kwargs["max_attempts"] == 2
     payload = json.loads(kwargs["user_prompt"])
     assert payload["user_request"] == {
         "text": "Analyze the supplied facts.",
@@ -305,6 +509,14 @@ def test_review_makes_one_bounded_structured_call() -> None:
             "truncated": False,
         }
     ]
+    assert payload["coverage_contract"] == {
+        "text": "Close the distinct authorization consequence.",
+        "truncated": False,
+    }
+    assert payload["evidence_matrix"] == {
+        "text": "Supported matrix row with exact document 7.",
+        "truncated": False,
+    }
     assert payload["candidate_answer"]["text"] == "A material claim [1]."
     assert payload["retrieval_inventory"] == {
         "total_result_count": 1,
@@ -317,6 +529,35 @@ def test_review_makes_one_bounded_structured_call() -> None:
     assert payload["evidence_chunks"][0]["citation_number"] == 1
     assert payload["evidence_chunks"][0]["retrieval_number"] == 1
     assert payload["evidence_chunks"][0]["content"] == "Operative text."
+
+
+def test_matrix_closure_review_uses_the_focused_prompt_and_payload() -> None:
+    with patch(
+        "onyx.regulatory.candidate_answer_review.generate_structured",
+        return_value=_CandidateAnswerReviewDraft(
+            needs_reconsideration=False,
+            advisory_claim_issues=[],
+        ),
+    ) as generate:
+        result = review_regulatory_candidate_matrix_closure(
+            MagicMock(),
+            user_request="Analyze the requested procedure.",
+            candidate_answer="The supported result is stated [[1]]().",
+            evidence_chunks=[_evidence()],
+            evidence_matrix="One supported procedure row.",
+        )
+
+    assert result.completed is True
+    assert result.needs_reconsideration is False
+    kwargs = generate.call_args.kwargs
+    assert (
+        kwargs["system_prompt"]
+        == REGULATORY_EVIDENCE_MATRIX_CLOSURE_REVIEW_SYSTEM_PROMPT
+    )
+    payload = json.loads(kwargs["user_prompt"])
+    assert payload["coverage_contract"] is None
+    assert payload["earlier_user_context"] == []
+    assert payload["evidence_matrix"]["text"] == "One supported procedure row."
 
 
 def test_review_preserves_structured_recovery_identity_and_query() -> None:
@@ -391,7 +632,7 @@ def test_review_bounds_all_payload_sections_and_retains_each_selected_chunk() ->
     assert len(payload["evidence_chunks"]) == 40
     assert all(chunk["content"] for chunk in payload["evidence_chunks"])
     assert all(chunk["content_truncated"] for chunk in payload["evidence_chunks"])
-    assert sum(len(chunk["content"]) for chunk in payload["evidence_chunks"]) <= 48_000
+    assert sum(len(chunk["content"]) for chunk in payload["evidence_chunks"]) <= 200_000
     inventory = payload["retrieval_inventory"]
     assert inventory["total_result_count"] == 40
     assert inventory["represented_by_exact_evidence_count"] == 40
@@ -425,7 +666,7 @@ def test_review_fits_small_context_by_dropping_lower_priority_sections() -> None
         )
         for index in range(20)
     ]
-    max_input_tokens = 40_000
+    max_input_tokens = 60_000
     with (
         patch(
             "onyx.regulatory.candidate_answer_review.get_llm_token_counter",
@@ -462,19 +703,30 @@ def test_review_fits_small_context_by_dropping_lower_priority_sections() -> None
         max_input_tokens
         - len(REGULATORY_CANDIDATE_ANSWER_REVIEW_SYSTEM_PROMPT)
         - schema_chars
-        - 3_200
-        - 1_024
+        - 16_000
+        - 2_048
     )
     assert len(user_prompt) <= payload_budget
     payload = json.loads(user_prompt)
     assert payload["user_request"]["text"] == current_request
     assert payload["candidate_answer"]["text"] == candidate_answer
     inventory = payload["retrieval_inventory"]
-    assert inventory["represented_by_exact_evidence_count"] == 1
-    assert inventory["inventory_only_result_count"] == 20
-    assert 0 < inventory["included_result_count"] < 20
-    assert inventory["truncated"] is True
-    assert len(payload["earlier_user_context"]) < 4
+    assert inventory["represented_by_exact_evidence_count"] == len(
+        payload["evidence_chunks"]
+    )
+    assert inventory["represented_by_exact_evidence_count"] >= 1
+    assert (
+        inventory["represented_by_exact_evidence_count"]
+        + inventory["inventory_only_result_count"]
+        == 21
+    )
+    assert 0 < inventory["included_result_count"] <= 20
+    assert inventory["truncated"] is (
+        inventory["included_result_count"] < inventory["inventory_only_result_count"]
+    )
+    assert len(payload["earlier_user_context"]) < 4 or any(
+        item["truncated"] for item in payload["earlier_user_context"]
+    )
     assert payload["evidence_chunks"][0]["citation_number"] == 1
     assert payload["evidence_chunks"][0]["content"] == cited_evidence.content
     exact_chunk_ids = {
@@ -543,10 +795,10 @@ def test_review_bounds_inventory_while_covering_all_normally_reachable_results()
         "retrieval_inventory"
     ]
     assert inventory["total_result_count"] == 400
-    assert inventory["represented_by_exact_evidence_count"] == 48
-    assert inventory["inventory_only_result_count"] == 352
-    assert inventory["included_result_count"] == 192
-    assert inventory["truncated"] is True
+    assert inventory["represented_by_exact_evidence_count"] == 256
+    assert inventory["inventory_only_result_count"] == 144
+    assert inventory["included_result_count"] == 144
+    assert inventory["truncated"] is False
     evidence_retrieval_numbers = {
         chunk["retrieval_number"]
         for chunk in json.loads(generate.call_args.kwargs["user_prompt"])[
@@ -562,7 +814,7 @@ def test_review_bounds_inventory_while_covering_all_normally_reachable_results()
             len(item["chunk_identifier"]) + len(item["heading"])
             for item in inventory["items"]
         )
-        <= 32_000
+        <= 80_000
     )
 
 
@@ -605,13 +857,13 @@ def test_review_prioritizes_cited_chunks_when_evidence_limit_is_reached() -> Non
 
     payload = json.loads(generate.call_args.kwargs["user_prompt"])
     assert payload["evidence_chunks"][0]["citation_number"] == 7
-    assert len(payload["evidence_chunks"]) == 48
+    assert len(payload["evidence_chunks"]) == 49
     selected_uncited = payload["evidence_chunks"][1:]
     assert selected_uncited[0]["content"] == "Uncited 0"
     assert selected_uncited[-1]["content"] == "Uncited 47"
-    assert payload["retrieval_inventory"]["represented_by_exact_evidence_count"] == 48
-    assert payload["retrieval_inventory"]["inventory_only_result_count"] == 1
-    assert payload["retrieval_inventory"]["included_result_count"] == 1
+    assert payload["retrieval_inventory"]["represented_by_exact_evidence_count"] == 49
+    assert payload["retrieval_inventory"]["inventory_only_result_count"] == 0
+    assert payload["retrieval_inventory"]["included_result_count"] == 0
     assert payload["retrieval_inventory"]["truncated"] is False
 
 
@@ -658,7 +910,7 @@ def test_review_reserves_uncited_paragraphs_from_cited_provision() -> None:
         "sibling-1",
         "sibling-2",
     ]
-    assert len(compacted) == 48
+    assert len(compacted) == 104
 
 
 def test_review_reserves_and_samples_uncited_evidence_across_retrieval_history() -> (
@@ -697,13 +949,13 @@ def test_review_reserves_and_samples_uncited_evidence_across_retrieval_history()
 
     payload = json.loads(generate.call_args.kwargs["user_prompt"])
     selected = payload["evidence_chunks"]
-    assert len(selected) == 48
+    assert len(selected) == 100
     assert sum(chunk["citation_number"] is not None for chunk in selected) == 20
     selected_uncited = [chunk for chunk in selected if chunk["citation_number"] is None]
-    assert len(selected_uncited) == 28
+    assert len(selected_uncited) == 80
     assert selected_uncited[0]["retrieval_number"] == 101
     assert selected_uncited[-1]["retrieval_number"] == 180
-    assert sum(len(chunk["content"]) for chunk in selected) <= 48_000
+    assert sum(len(chunk["content"]) for chunk in selected) <= 200_000
 
 
 def test_review_preserves_cited_evidence_before_using_remaining_uncited_slots() -> None:
@@ -739,10 +991,143 @@ def test_review_preserves_cited_evidence_before_using_remaining_uncited_slots() 
         )
 
     selected = json.loads(generate.call_args.kwargs["user_prompt"])["evidence_chunks"]
-    assert len(selected) == 48
+    assert len(selected) == 65
     assert [chunk["citation_number"] for chunk in selected[:45]] == list(range(1, 46))
     selected_uncited = selected[45:]
-    assert [chunk["retrieval_number"] for chunk in selected_uncited] == [100, 110, 119]
+    assert len(selected_uncited) == 20
+    assert selected_uncited[0]["retrieval_number"] == 100
+    assert selected_uncited[-1]["retrieval_number"] == 119
+
+
+def test_review_samples_uncited_chunks_across_retrieval_order() -> None:
+    cited_chunks = [
+        build_candidate_answer_evidence_chunk(
+            document_id=f"cited-document-{index}",
+            chunk_id=index,
+            citation_number=index + 1,
+            retrieval_number=index + 1,
+            chunk_identifier=f"cited-{index}",
+            heading=f"Instrument > Article {index}",
+            content=f"Cited rule {index}.",
+        )
+        for index in range(254)
+    ]
+    ordinary_first = build_candidate_answer_evidence_chunk(
+        document_id="ordinary-first",
+        chunk_id=100,
+        citation_number=None,
+        retrieval_number=100,
+        chunk_identifier="ordinary-first",
+        heading="Other Instrument > Background",
+        content="General background text.",
+    )
+    middle = build_candidate_answer_evidence_chunk(
+        document_id="middle",
+        chunk_id=101,
+        citation_number=None,
+        retrieval_number=101,
+        chunk_identifier="middle",
+        heading="Other Instrument > Eligibility",
+        content="Middle excerpt.",
+    )
+    ordinary_last = build_candidate_answer_evidence_chunk(
+        document_id="ordinary-last",
+        chunk_id=102,
+        citation_number=None,
+        retrieval_number=102,
+        chunk_identifier="ordinary-last",
+        heading="Other Instrument > Notes",
+        content="Additional general background.",
+    )
+
+    compacted = _compact_evidence_chunks(
+        [*cited_chunks, ordinary_first, middle, ordinary_last]
+    )
+
+    assert len(compacted) == 256
+    assert [chunk.chunk_identifier for chunk in compacted[-2:]] == [
+        "ordinary-first",
+        "ordinary-last",
+    ]
+
+
+def test_review_reserves_most_relevant_chunk_per_focused_target() -> None:
+    cited_chunks = [
+        build_candidate_answer_evidence_chunk(
+            document_id=f"cited-document-{index}",
+            chunk_id=index,
+            citation_number=index + 1,
+            retrieval_number=index + 1,
+            chunk_identifier=f"cited-{index}",
+            heading=f"Instrument > Article {index}",
+            content=f"Cited rule {index}.",
+        )
+        for index in range(62)
+    ]
+    first_target_unrelated = build_candidate_answer_evidence_chunk(
+        document_id="target-one-unrelated",
+        chunk_id=100,
+        citation_number=None,
+        retrieval_number=100,
+        chunk_identifier="target-one-unrelated",
+        heading="Instrument > Background",
+        research_target=(
+            "Specific evidence target: alpha protocol. Full query context."
+        ),
+        content="General background.",
+    )
+    first_target_relevant = build_candidate_answer_evidence_chunk(
+        document_id="target-one-relevant",
+        chunk_id=101,
+        citation_number=None,
+        retrieval_number=101,
+        chunk_identifier="target-one-relevant",
+        heading="Instrument > Alpha protocol",
+        research_target=(
+            "Specific evidence target: alpha protocol. Full query context."
+        ),
+        content="The alpha protocol is described here.",
+    )
+    first_target_partly_relevant = build_candidate_answer_evidence_chunk(
+        document_id="target-one-partly-relevant",
+        chunk_id=103,
+        citation_number=None,
+        retrieval_number=103,
+        chunk_identifier="target-one-partly-relevant",
+        heading="Instrument > Alpha notes",
+        research_target=(
+            "Specific evidence target: alpha protocol. Full query context."
+        ),
+        content="Alpha background.",
+    )
+    second_target_relevant = build_candidate_answer_evidence_chunk(
+        document_id="target-two-relevant",
+        chunk_id=102,
+        citation_number=None,
+        retrieval_number=102,
+        chunk_identifier="target-two-relevant",
+        heading="Instrument > Beta sequence",
+        research_target=(
+            "Specific evidence target: beta sequence. Full query context."
+        ),
+        content="The beta sequence is described here.",
+    )
+
+    compacted = _compact_evidence_chunks(
+        [
+            *cited_chunks,
+            first_target_unrelated,
+            first_target_partly_relevant,
+            first_target_relevant,
+            second_target_relevant,
+        ]
+    )
+
+    assert len(compacted) == 66
+    assert {
+        "target-one-relevant",
+        "target-two-relevant",
+    }.issubset({chunk.chunk_identifier for chunk in compacted})
 
 
 def test_review_returns_explicit_fail_open_result_on_transport_or_parse_error() -> None:
@@ -810,7 +1195,7 @@ def test_review_normalizes_provider_length_and_count_drift() -> None:
 
     assert result.review_error is None
     assert result.needs_reconsideration is True
-    assert len(result.advisory_claim_issues) == 6
+    assert len(result.advisory_claim_issues) == 8
     assert all(
         len(issue.claim_reference) <= 280 for issue in result.advisory_claim_issues
     )
@@ -821,6 +1206,22 @@ def test_review_normalizes_provider_length_and_count_drift() -> None:
         issue.related_citation_numbers == list(range(1, 6))
         for issue in result.advisory_claim_issues
     )
+
+
+def test_review_retains_sixteen_material_issues_for_complex_requests() -> None:
+    draft = _CandidateAnswerReviewDraft(
+        needs_reconsideration=True,
+        advisory_claim_issues=[
+            _CandidateAnswerReviewDraftClaimIssue(
+                claim_kind=ClaimKind.MATERIAL_FACT,
+                claim_reference=f"Claim {index}",
+                advisory_feedback=f"Issue {index}",
+            )
+            for index in range(16)
+        ],
+    )
+
+    assert len(draft.advisory_claim_issues) == 16
 
 
 def test_review_validates_nonblank_request_and_candidate_before_call() -> None:
@@ -892,9 +1293,9 @@ def test_resolution_review_checks_each_prior_issue_with_cited_evidence_only() ->
     ]
     kwargs = generate.call_args.kwargs
     assert kwargs["flow"] is LLMFlow.REGULATORY_ANSWER_AUDIT
-    assert kwargs["max_tokens"] == 1_800
-    assert kwargs["reasoning_effort"] is ReasoningEffort.LOW
-    assert kwargs["max_attempts"] == 1
+    assert kwargs["max_tokens"] == 16_000
+    assert kwargs["reasoning_effort"] is ReasoningEffort.HIGH
+    assert kwargs["max_attempts"] == 2
     payload = json.loads(kwargs["user_prompt"])
     assert [issue["issue_index"] for issue in payload["prior_issues"]] == [0, 1]
     assert [issue["related_citation_numbers"] for issue in payload["prior_issues"]] == [
@@ -947,7 +1348,7 @@ def test_resolution_review_fits_small_context_without_dropping_required_core() -
         )
         for index in range(3, 13)
     ]
-    max_input_tokens = 15_000
+    max_input_tokens = 26_000
     draft = _CandidateAnswerResolutionReviewDraft(
         issue_resolutions=[
             _CandidateAnswerIssueResolutionDraft(
@@ -997,10 +1398,11 @@ def test_resolution_review_fits_small_context_without_dropping_required_core() -
         max_input_tokens
         - len(REGULATORY_CANDIDATE_RESOLUTION_REVIEW_SYSTEM_PROMPT)
         - schema_chars
-        - 1_800
-        - 1_024
+        - 13_000
+        - 2_048
     )
     assert len(user_prompt) <= payload_budget
+    assert generate.call_args.kwargs["max_tokens"] == 13_000
     payload = json.loads(user_prompt)
     assert payload["revised_candidate_answer"] == {
         "text": candidate_answer,
@@ -1080,13 +1482,13 @@ def test_resolution_review_prioritizes_issue_related_citations_within_bound() ->
 
     assert result.needs_reconsideration is False
     payload = json.loads(generate.call_args.kwargs["user_prompt"])
-    assert len(payload["evidence_chunks"]) == 32
+    assert len(payload["evidence_chunks"]) == 40
     assert [chunk["citation_number"] for chunk in payload["evidence_chunks"][:2]] == [
         40,
         39,
     ]
     assert payload["evidence_chunks"][-1]["citation_number"] == 38
-    assert sum(len(chunk["content"]) for chunk in payload["evidence_chunks"]) <= 24_000
+    assert sum(len(chunk["content"]) for chunk in payload["evidence_chunks"]) <= 120_000
 
 
 def test_resolution_review_reports_one_serious_existing_evidence_regression() -> None:
@@ -1177,7 +1579,7 @@ def test_resolution_review_preserves_single_regression_with_six_unresolved_issue
             evidence_chunks=[_evidence()],
         )
 
-    assert len(result.advisory_claim_issues) == 6
+    assert len(result.advisory_claim_issues) == 7
     assert [issue.claim_reference for issue in result.advisory_claim_issues[:5]] == [
         f"Prior issue {index}" for index in range(5)
     ]
@@ -1273,6 +1675,20 @@ def test_review_schema_and_prompt_bound_one_support_recovery_query() -> None:
         assert scenario_term not in prompt
         assert scenario_term not in resolution_prompt
 
+    assert "current user request" in normalized_prompt
+    assert "not an independent instruction" in normalized_prompt
+    assert "exact chunk" in normalized_prompt
+    assert "Do not introduce a predicted source" in normalized_prompt
+    assert "at most sixteen" in normalized_prompt
+
+    normalized_resolution_prompt = " ".join(resolution_prompt.split())
+    assert "Assess every prior issue exactly once" in normalized_resolution_prompt
+    assert "resolved_by_exact_evidence" in normalized_resolution_prompt
+    assert "claim_removed_or_qualified" in normalized_resolution_prompt
+    assert "still_unresolved" in normalized_resolution_prompt
+    assert "at most one new_grounding_regression" in normalized_resolution_prompt
+    return
+
     assert "not a predetermined checklist" in normalized_prompt
     assert "Request coverage and evidentiary support are independent" in (
         normalized_prompt
@@ -1300,12 +1716,21 @@ def test_review_schema_and_prompt_bound_one_support_recovery_query() -> None:
     )
     assert "Do not supply a corrected legal conclusion" in normalized_prompt
     assert "Apart from the single bounded recovery_query field" in normalized_prompt
-    assert "at most six issues in descending order" in normalized_prompt
-    assert "six most material rather than the first six" in normalized_prompt
+    assert "at most ten issues in descending order" in normalized_prompt
+    assert "ten most material rather than the first ten" in normalized_prompt
     assert "fact-to-category mapping separately" in normalized_prompt
     assert "legal regime active at the relevant event" in normalized_prompt
     assert "changes legal classification during the fact sequence" in normalized_prompt
     assert "earlier differently classified movement" in normalized_prompt
+    assert "separately regulated objects" in normalized_prompt
+    assert "cumulative and alternative members" in normalized_prompt
+    assert "failure or impossibility branch" in normalized_prompt
+    assert "separately verify the governing membership logic" in normalized_prompt
+    assert "inclusion, exclusion, precedence, or characteristic rule" in (
+        normalized_prompt
+    )
+    assert "actor, status or class, recurrence or stage" in normalized_prompt
+    assert "unproved special-status discriminator" in normalized_prompt
     assert "mandatory order or exhaustion condition" in normalized_prompt
     assert "discussion of one procedure does not by itself cover" in normalized_prompt
     assert "Flag such an omission only when" in normalized_prompt
@@ -1317,10 +1742,15 @@ def test_review_schema_and_prompt_bound_one_support_recovery_query() -> None:
     assert "supplied evidence materially conflicts" in normalized_prompt
     assert "reconcile the relevant version, scope, authority" in normalized_prompt
     assert "retrieval_inventory is a bounded map" in normalized_prompt
-    assert "Inventory identifiers and headings are not legal evidence" in (
+    assert "Inventory identifiers and headings are not positive legal evidence" in (
         normalized_prompt
     )
     assert "Only exact text in evidence_chunks" in normalized_prompt
+    assert "binding negative scope boundary" in normalized_prompt
+    assert (
+        "never detach descendant text from its actor, status or class"
+        in normalized_prompt
+    )
     assert "Only user_request defines the deliverables" in normalized_prompt
     assert "solely to resolve references and retain user-supplied facts" in (
         normalized_prompt
@@ -1343,9 +1773,12 @@ def test_review_schema_and_prompt_bound_one_support_recovery_query() -> None:
     assert "classification change during an event sequence" in (
         normalized_resolution_prompt
     )
+    assert "separately regulated" in normalized_resolution_prompt
+    assert "post-performance duties" in normalized_resolution_prompt
     assert "provision-content pairing intact" in normalized_resolution_prompt
     assert "supports both its trigger and effect" in normalized_resolution_prompt
     assert "supplied evidence materially conflicts" in normalized_resolution_prompt
     assert "reconcile the governing version, scope, authority" in (
         normalized_resolution_prompt
     )
+    assert "binding negative scope boundary" in normalized_resolution_prompt

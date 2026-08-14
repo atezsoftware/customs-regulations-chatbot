@@ -19,11 +19,27 @@ from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.models import SearchToolOverrideKwargs, ToolResponse
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
+_MAX_BATCHED_RECOVERY_ISSUES = 5
+
 
 def select_priority_recovery_issue(
     review: CandidateAnswerReviewResult,
 ) -> CandidateAnswerClaimIssue | None:
     """Choose one recoverable issue by legal materiality and draft order."""
+
+    issues = select_priority_recovery_issues(review, limit=1)
+    return issues[0] if issues else None
+
+
+def select_priority_recovery_issues(
+    review: CandidateAnswerReviewResult,
+    *,
+    limit: int = _MAX_BATCHED_RECOVERY_ISSUES,
+) -> list[CandidateAnswerClaimIssue]:
+    """Choose a small, ordered, query-distinct set of recoverable issues."""
+
+    if limit < 1:
+        return []
 
     eligible = [
         (issue_index, issue)
@@ -31,7 +47,7 @@ def select_priority_recovery_issue(
         if issue.recovery_query is not None
     ]
     if not eligible:
-        return None
+        return []
 
     def priority(
         indexed_issue: tuple[int, CandidateAnswerClaimIssue],
@@ -51,7 +67,18 @@ def select_priority_recovery_issue(
             issue_index,
         )
 
-    return min(eligible, key=priority)[1]
+    selected: list[CandidateAnswerClaimIssue] = []
+    seen_queries: set[str] = set()
+    for _, issue in sorted(eligible, key=priority):
+        assert issue.recovery_query is not None
+        query_identity = " ".join(issue.recovery_query.casefold().split())
+        if query_identity in seen_queries:
+            continue
+        seen_queries.add(query_identity)
+        selected.append(issue)
+        if len(selected) == limit:
+            break
+    return selected
 
 
 def run_single_gap_recovery(
@@ -61,7 +88,12 @@ def run_single_gap_recovery(
     starting_citation_num: int,
     placement: Placement,
 ) -> ToolResponse:
-    """Execute the review-selected query exactly once through SearchTool."""
+    """Execute the review-selected query exactly once through SearchTool.
+
+    The verifier already emits a self-contained recovery query. Bypassing the
+    conversational rephraser both preserves that query and avoids requiring a
+    synthetic chat history for this server-orchestrated search.
+    """
 
     if issue.recovery_query is None:
         raise ValueError("recovery issue must include a recovery_query")
@@ -70,10 +102,84 @@ def run_single_gap_recovery(
         override_kwargs=SearchToolOverrideKwargs(
             starting_citation_num=starting_citation_num,
             original_query=issue.recovery_query,
-            skip_query_expansion=False,
+            skip_query_expansion=True,
         ),
         queries=[issue.recovery_query],
         search_mode="hybrid",
+    )
+
+
+def run_batched_gap_recovery(
+    *,
+    search_tool: SearchTool,
+    issues: Sequence[CandidateAnswerClaimIssue],
+    starting_citation_num: int,
+    placement: Placement,
+) -> ToolResponse:
+    """Resolve up to five gaps with focused calls and one merged response."""
+
+    if not issues or len(issues) > _MAX_BATCHED_RECOVERY_ISSUES:
+        raise ValueError("batched recovery requires between one and five issues")
+    queries = [issue.recovery_query for issue in issues]
+    if any(query is None for query in queries):
+        raise ValueError("every recovery issue must include a recovery_query")
+    concrete_queries = [query for query in queries if query is not None]
+    search_docs: list[SearchDoc] = []
+    displayed_docs: list[SearchDoc] = []
+    citation_mapping: dict[int, str] = {}
+    citation_chunk_mapping: dict[int, int] = {}
+    merged_results: list[object] = []
+    receipts: list[object] = []
+    next_citation_num = starting_citation_num
+
+    for issue_index, query in enumerate(concrete_queries):
+        issue_placement = placement.model_copy(update={"tab_index": issue_index})
+        response = search_tool.run(
+            placement=issue_placement,
+            override_kwargs=SearchToolOverrideKwargs(
+                starting_citation_num=next_citation_num,
+                original_query=query,
+                skip_query_expansion=True,
+            ),
+            queries=[query],
+            search_mode="hybrid",
+        )
+        rich_response = response.rich_response
+        if not isinstance(rich_response, SearchDocsResponse):
+            raise ValueError("gap recovery search returned no document response")
+        search_docs.extend(rich_response.search_docs)
+        displayed_docs.extend(rich_response.displayed_docs or [])
+        citation_mapping.update(rich_response.citation_mapping)
+        citation_chunk_mapping.update(rich_response.citation_chunk_mapping)
+        if rich_response.citation_mapping:
+            next_citation_num = max(rich_response.citation_mapping) + 1
+
+        try:
+            payload = json.loads(response.llm_facing_response)
+        except json.JSONDecodeError as error:
+            raise ValueError("gap recovery search returned invalid JSON") from error
+        if not isinstance(payload, dict):
+            raise ValueError("gap recovery search returned a non-object payload")
+        raw_results = payload.get("results")
+        if isinstance(raw_results, list):
+            merged_results.extend(raw_results)
+        if "receipt" in payload:
+            receipts.append(payload["receipt"])
+
+    return ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=search_docs,
+            citation_mapping=citation_mapping,
+            citation_chunk_mapping=citation_chunk_mapping,
+            displayed_docs=displayed_docs or None,
+        ),
+        llm_facing_response=json.dumps(
+            {
+                "results": merged_results,
+                "recovery_receipts": receipts,
+            },
+            ensure_ascii=False,
+        ),
     )
 
 

@@ -21,6 +21,10 @@ from onyx.regulatory.candidate_answer_review import (
     CandidateAnswerReviewResult,
     ClaimKind,
 )
+from onyx.regulatory.coverage_plan import (
+    RegulatoryCoverageItem,
+    RegulatoryCoveragePlan,
+)
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
@@ -28,7 +32,12 @@ from onyx.server.query_and_chat.streaming_models import (
     CitationInfo,
     Packet,
 )
-from onyx.tools.models import ToolCallInfo, ToolCallKickoff, ToolResponse
+from onyx.tools.models import (
+    ParallelToolCallResponse,
+    ToolCallInfo,
+    ToolCallKickoff,
+    ToolResponse,
+)
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
 
@@ -321,6 +330,104 @@ def test_orchestrator_schedule_runs_every_decision_before_forced_report() -> Non
 
     assert schedule[:-1] == [0, 1, 2, 3]
     assert schedule[-1] == 4
+
+
+def test_coverage_evidence_selection_preserves_every_call_before_deeper_ranks() -> None:
+    first_call = [_hidden_evidence(1), _hidden_evidence(2)]
+    second_call = [_hidden_evidence(3), _hidden_evidence(4)]
+
+    selected = dr_loop._round_robin_coverage_evidence(
+        [first_call, second_call],
+        limit=3,
+    )
+
+    assert [chunk.retrieval_number for chunk in selected] == [1, 3, 2]
+
+
+def test_regulatory_evidence_citations_are_dense_after_parallel_searches() -> None:
+    first_doc = _hidden_search_doc(1, document_id="document-1")
+    second_doc = _hidden_search_doc(101, document_id="document-101")
+
+    citation_mapping, evidence = dr_loop._densify_regulatory_evidence_citations(
+        {1: first_doc, 101: second_doc},
+        [_hidden_evidence(1), _hidden_evidence(101)],
+    )
+
+    assert citation_mapping == {1: first_doc, 2: second_doc}
+    assert [chunk.citation_number for chunk in evidence] == [1, 2]
+    assert [chunk.retrieval_number for chunk in evidence] == [1, 2]
+
+
+def test_direct_coverage_search_builds_exact_evidence_and_citation_mapping() -> None:
+    search_doc = _search_doc()
+    call = ToolCallKickoff(
+        tool_call_id="coverage-search",
+        tool_name=SearchTool.NAME,
+        tool_args={
+            "queries": ["Focused controlling text"],
+            "search_mode": "hybrid",
+            "coverage_item": "Requested issue",
+            "evidence_target": "Controlling trigger",
+            "source_anchors": ["Named Instrument"],
+        },
+        placement=Placement(turn_index=1, tab_index=0),
+    )
+    response = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[search_doc],
+            citation_mapping={1: search_doc.document_id},
+            citation_chunk_mapping={1: search_doc.chunk_ind},
+        ),
+        llm_facing_response=json.dumps(
+            {
+                "results": [
+                    {
+                        "document": 1,
+                        "title": search_doc.semantic_identifier,
+                        "content": "EXACT LLM-VISIBLE OPERATIVE TEXT",
+                        "metadata": json.dumps(search_doc.metadata),
+                    }
+                ]
+            }
+        ),
+        tool_call=call,
+    )
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="Resolve the requested issue.",
+                evidence_dimensions=["Controlling trigger"],
+                completion_test="Close the requested issue.",
+            )
+        ]
+    )
+    state = ChatStateContainer()
+
+    with patch.object(
+        dr_loop,
+        "run_tool_calls",
+        return_value=ParallelToolCallResponse(
+            tool_responses=[response],
+            updated_citation_mapping={1: search_doc.document_id},
+        ),
+    ):
+        citation_mapping, evidence = dr_loop._run_regulatory_coverage_searches(
+            coverage_plan=plan,
+            tools=[_recovery_search_tool()],
+            history=_history(),
+            state_container=state,
+            turn_index=1,
+        )
+
+    assert citation_mapping == {1: search_doc}
+    assert len(evidence) == 1
+    assert evidence[0].content == "EXACT LLM-VISIBLE OPERATIVE TEXT"
+    assert evidence[0].citation_number == 1
+    assert evidence[0].research_target == (
+        "Specific evidence target: Controlling trigger. "
+        "Coverage item: Requested issue"
+    )
+    assert len(state.get_tool_calls()) == 1
 
 
 def test_regulatory_final_report_pass_publishes_hidden_draft_once() -> None:
@@ -2011,3 +2118,123 @@ def test_custom_agent_prompt_is_in_plan_orchestration_and_report_calls() -> None
     assert generate_report.call_args.kwargs["custom_agent_prompt"] == (
         "Act as a customs compliance specialist."
     )
+
+
+def test_regulatory_deep_research_carries_structured_coverage_into_plan() -> None:
+    merged_queue: queue.Queue[tuple[int, object]] = queue.Queue()
+
+    def plan_generator(**_kwargs: Any):
+        if False:
+            yield None
+        return (
+            LlmStepResult(
+                reasoning=None,
+                answer="Research the unresolved coverage rows.",
+                tool_calls=None,
+            ),
+            False,
+        )
+
+    coverage_plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="Resolve the expressly requested legal result.",
+                evidence_dimensions=["Controlling trigger", "Direct consequence"],
+                source_anchors=["Named Instrument"],
+                request_segment_ids=["R1"],
+                completion_test="Close the requested result with exact evidence.",
+            )
+        ]
+    )
+    report_call = ToolCallKickoff(
+        tool_call_id="generate-report",
+        tool_name="generate_report",
+        tool_args={},
+        placement=Placement(turn_index=2),
+    )
+
+    review_llm = MagicMock()
+    with (
+        patch.object(
+            dr_loop,
+            "build_regulatory_review_llm",
+            return_value=review_llm,
+        ),
+        patch.object(
+            dr_loop,
+            "build_regulatory_coverage_plan",
+            return_value=coverage_plan,
+        ) as build_coverage,
+        patch.object(
+            dr_loop,
+            "_run_regulatory_coverage_searches",
+            return_value=({1: _search_doc()}, [_evidence()]),
+        ) as run_coverage_searches,
+        patch.object(
+            dr_loop,
+            "generate_final_report",
+            return_value=False,
+        ) as generate_report,
+        patch.object(
+            dr_loop,
+            "run_llm_step_pkt_generator",
+            side_effect=plan_generator,
+        ) as run_plan_generator,
+        patch.object(
+            dr_loop,
+            "run_llm_step",
+            return_value=(
+                LlmStepResult(
+                    reasoning=None,
+                    answer=None,
+                    tool_calls=[report_call],
+                ),
+                False,
+            ),
+        ),
+        patch.object(dr_loop, "model_is_reasoning_model", return_value=True),
+        patch("onyx.llm.litellm_singleton.config.initialize_litellm"),
+    ):
+        dr_loop.run_deep_research_llm_loop(
+            emitter=Emitter(merged_queue),
+            state_container=ChatStateContainer(),
+            simple_chat_history=_history(),
+            tools=[_recovery_search_tool()],
+            custom_agent_prompt=None,
+            llm=_llm(),
+            token_counter=len,
+            skip_clarification=True,
+        )
+
+    build_coverage.assert_called_once_with(
+        review_llm,
+        user_request="Analyze every material legal issue.",
+    )
+    run_coverage_searches.assert_called_once()
+    run_plan_generator.assert_called_once()
+    final_history = generate_report.call_args.kwargs["history"]
+    assert any(
+        message.message_type == MessageType.USER_REMINDER
+        and "# Request coverage contract" in message.message
+        and "Named Instrument" in message.message
+        for message in final_history
+    )
+    assert any(
+        message.message_type == MessageType.USER_REMINDER
+        and "# Retrieved exact evidence matrix" in message.message
+        and "EXACT LLM-VISIBLE OPERATIVE TEXT" in message.message
+        and "bootstrap evidence" in message.message
+        for message in final_history
+    )
+    research_plan = generate_report.call_args.kwargs["research_plan"]
+    assert research_plan.startswith("# Request coverage contract")
+    assert research_plan.endswith("Research the unresolved coverage rows.")
+    assert generate_report.call_args.kwargs["citation_mapping"] == {
+        1: _search_doc()
+    }
+    assert generate_report.call_args.kwargs["evidence_citation_mapping"] == {
+        1: _search_doc()
+    }
+    assert generate_report.call_args.kwargs["exact_evidence_chunks"] == [
+        _evidence()
+    ]

@@ -7,6 +7,12 @@ from onyx.context.search.models import ChunkIndexRequest, IndexFilters
 from onyx.context.search.retrieval import search_runner
 
 
+@pytest.fixture(autouse=True)
+def _reset_embedding_circuit() -> None:
+    search_runner._regulatory_embedding_circuit_open_until = 0.0
+    search_runner._regulatory_embedding_probe_succeeded = False
+
+
 def _request(*, regulatory_chunks_only: bool) -> ChunkIndexRequest:
     return ChunkIndexRequest(
         query="unknown controlling terminology",
@@ -92,3 +98,27 @@ def test_non_regulatory_hybrid_search_preserves_index_dimension_error() -> None:
         )
 
     document_index.keyword_retrieval.assert_not_called()
+
+
+def test_open_regulatory_embedding_circuit_skips_provider_call(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    get_embedding = MagicMock()
+    monkeypatch.setattr(search_runner, "get_query_embedding", get_embedding)
+    monkeypatch.setattr(search_runner.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        search_runner,
+        "_regulatory_embedding_circuit_open_until",
+        150.0,
+    )
+    expected_chunks = [MagicMock()]
+    document_index = MagicMock()
+    document_index.keyword_retrieval.return_value = expected_chunks
+
+    result = search_runner._embed_and_hybrid_search(
+        _request(regulatory_chunks_only=True),
+        document_index,
+    )
+
+    assert result == expected_chunks
+    get_embedding.assert_not_called()

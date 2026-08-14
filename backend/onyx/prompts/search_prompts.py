@@ -27,7 +27,7 @@ SEMANTIC_QUERY_REPHRASE_USER_PROMPT = """
 Given the chat history above (if any) and the final user query (provided below), provide a standalone query that is as
 representative of the user query as possible. In most cases, it should be exactly the same as the last user query. \
 It should be fully semantic and natural language unless the user query is already a keyword query. \
-Focus on the last user message, in most cases the history and extra context should be ignored.
+Focus on the last user message. Use history and extra context only when needed to resolve references or material user details.
 
 For a query like "What are the use cases for product X", your output should remain "What are the use cases for product X". \
 It should remain semantic, and as close to the original query as possible. There is nothing additional needed \
@@ -80,8 +80,8 @@ Guidelines:
 - Do not provide more than 3 queries.
 - Do not replace or expand niche, proprietary, or obscure terms
 - Do not include source type scoping details (e.g. naming an app or tool like Zendesk, Google Drive, Slack) as keywords — scoping is applied automatically.
-- Focus on the last user message, in most cases the history and any extra context should be ignored.
-- For regulatory material, make any additional lines lexically complementary and relevant to the current search intent: an exact source or provision identifier, formal legal terminology, or a material condition, exception, actor, procedure, period, threshold, or consequence. Do not produce broad paraphrases of the whole question and do not add dimensions that the current intent does not require.
+- Focus on the last user message. Use history and extra context only when needed to resolve references or material user details.
+- For regulatory material, make any additional lines lexically complementary to the current request-derived search intent. Preserve disambiguating user-supplied identifiers and source-native wording already discovered in exact text. Do not produce broad paraphrases of the whole question or introduce a new semantic dimension.
 {additional_context}
 =========================
 CRITICAL: ONLY provide the keyword queries, one set of keywords per line and nothing else.

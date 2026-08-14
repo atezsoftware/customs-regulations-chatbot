@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock, patch
 
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from onyx.prompts.chat_prompts import (
     CITATION_GUIDANCE_REPLACEMENT_PAT,
     DATETIME_REPLACEMENT_PAT,
@@ -8,10 +10,36 @@ from onyx.prompts.chat_prompts import (
 from onyx.prompts.constants import REMINDER_TAG_DESCRIPTION
 from onyx.prompts.prompt_utils import (
     apply_prompt_placeholders,
+    drop_messages_history_overflow,
     replace_current_datetime_tag,
     replace_reminder_tag,
     substitute_user_placeholders,
 )
+
+
+def test_history_overflow_keeps_system_message_when_old_turns_are_dropped() -> None:
+    system = SystemMessage(content="System instructions")
+    old_user = HumanMessage(content="Old question")
+    latest_user = HumanMessage(content="Latest question")
+
+    result = drop_messages_history_overflow(
+        [(system, 10), (old_user, 100), (latest_user, 10)],
+        max_allowed_tokens=80,
+    )
+
+    assert result == [system, latest_user]
+
+
+def test_history_without_overflow_does_not_duplicate_system_message() -> None:
+    system = SystemMessage(content="System instructions")
+    user = HumanMessage(content="Question")
+
+    result = drop_messages_history_overflow(
+        [(system, 10), (user, 10)],
+        max_allowed_tokens=100,
+    )
+
+    assert result == [system, user]
 
 
 def test_replace_reminder_tag_pattern() -> None:

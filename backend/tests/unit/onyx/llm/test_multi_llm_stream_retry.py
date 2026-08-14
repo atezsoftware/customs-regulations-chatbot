@@ -47,6 +47,11 @@ def test_stream_retries_timeout_before_first_chunk() -> None:
 
     with (
         patch("onyx.llm.multi_llm.LLM_FIRST_CHUNK_MAX_RETRIES", 1),
+        patch("onyx.llm.multi_llm.LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S", 2.0),
+        patch("onyx.llm.multi_llm.LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S", 10.0),
+        patch("onyx.llm.multi_llm.LLM_FIRST_CHUNK_RETRY_JITTER_RATIO", 0.25),
+        patch("onyx.llm.multi_llm.random.uniform", return_value=2.25) as jitter,
+        patch("onyx.llm.multi_llm.time.sleep") as sleep,
         patch("onyx.llm.multi_llm.is_true_openai_model", return_value=False),
         patch(
             "onyx.llm.model_response.from_litellm_model_response_stream",
@@ -60,6 +65,8 @@ def test_stream_retries_timeout_before_first_chunk() -> None:
     assert len(results) == 1
     assert results[0].choice.delta.content == "hello"
     assert fake_llm._completion.call_count == 2
+    jitter.assert_called_once_with(1.5, 2.5)
+    sleep.assert_called_once_with(2.25)
     mock_logger.warning.assert_called_once()
 
 
@@ -75,6 +82,7 @@ def test_stream_does_not_retry_after_first_chunk() -> None:
 
     with (
         patch("onyx.llm.multi_llm.LLM_FIRST_CHUNK_MAX_RETRIES", 2),
+        patch("onyx.llm.multi_llm.time.sleep") as sleep,
         patch("onyx.llm.multi_llm.is_true_openai_model", return_value=False),
         patch(
             "onyx.llm.model_response.from_litellm_model_response_stream",
@@ -87,4 +95,5 @@ def test_stream_does_not_retry_after_first_chunk() -> None:
             list(LitellmLLM.stream(fake_llm, prompt=_make_prompt()))
 
     assert fake_llm._completion.call_count == 1
+    sleep.assert_not_called()
     mock_logger.warning.assert_not_called()

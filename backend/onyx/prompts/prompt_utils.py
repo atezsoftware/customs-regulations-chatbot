@@ -303,11 +303,7 @@ def drop_messages_history_overflow(
     messages, token_counts = cast(
         tuple[list[BaseMessage], list[int]], zip(*messages_with_token_cnts)
     )
-    system_msg = (
-        final_messages[0]
-        if final_messages and final_messages[0].type == "system"
-        else None
-    )
+    system_msg = messages[0] if messages and messages[0].type == "system" else None
 
     history_msgs = messages[:-1]
     final_msg = messages[-1]
@@ -325,7 +321,11 @@ def drop_messages_history_overflow(
         token_counts, max_prompt_tokens=max_allowed_tokens
     )
 
-    if system_msg and ind_prev_msg_start <= len(history_msgs):
+    if (
+        system_msg
+        and ind_prev_msg_start > 0
+        and ind_prev_msg_start <= len(history_msgs)
+    ):
         final_messages.append(system_msg)
 
     final_messages.extend(history_msgs[ind_prev_msg_start:])

@@ -1,5 +1,6 @@
 import copy
 import os
+import random
 import re
 import time
 from collections.abc import Iterator
@@ -15,6 +16,9 @@ from onyx.configs.app_configs import (
 )
 from onyx.configs.chat_configs import (
     LLM_FIRST_CHUNK_MAX_RETRIES,
+    LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
+    LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
+    LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S,
     LLM_SOCKET_READ_TIMEOUT,
 )
 from onyx.configs.model_configs import GEN_AI_TEMPERATURE, LITELLM_EXTRA_BODY
@@ -129,6 +133,17 @@ def _rejection_names_strippable_kwargs(error: Exception, strippable: set[str]) -
 # "claude-5-sonnet").
 _ANTHROPIC_MODEL_TIERS = ("opus", "sonnet", "haiku", "fable", "mythos")
 _ANTHROPIC_VERSION_PATTERN = r"\d+(?:[.-]\d+)?"
+
+
+def _gemini_rejects_minimal_thinking(model_name: str) -> bool:
+    """Whether a Gemini release requires LOW as its thinking floor."""
+
+    return bool(
+        re.search(
+            r"(?:^|[/_.-])gemini[-_.]?3[.-]7(?:[/_.-]|$)",
+            model_name.lower(),
+        )
+    )
 
 
 class LLMTimeoutError(Exception):
@@ -746,7 +761,14 @@ class LitellmLLM(LLM):
                 # Hope for the best from LiteLLM
                 if reasoning_effort is ReasoningEffort.OFF:
                     if any(is_gemini_3_model(name) for name in model_identity_names):
-                        optional_kwargs["reasoning_effort"] = "none"
+                        optional_kwargs["reasoning_effort"] = (
+                            "low"
+                            if any(
+                                _gemini_rejects_minimal_thinking(name)
+                                for name in model_identity_names
+                            )
+                            else "none"
+                        )
                 elif reasoning_effort in [
                     ReasoningEffort.LOW,
                     ReasoningEffort.MEDIUM,
@@ -1139,6 +1161,7 @@ class LitellmLLM(LLM):
         #    - Per-request HTTPHandler eliminates cross-thread interference
         for attempt in range(max_attempts):
             client = None
+            retry_delay_s: float | None = None
             if self._uses_isolated_client():
                 client = HTTPHandler(timeout=timeout_override or self._timeout)
 
@@ -1173,16 +1196,29 @@ class LitellmLLM(LLM):
             except retryable_exceptions as e:
                 if yielded_any or attempt >= max_attempts - 1:
                     raise
+                scheduled_delay_s = min(
+                    LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S,
+                    LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S * (2**attempt),
+                )
+                jitter_s = scheduled_delay_s * LLM_FIRST_CHUNK_RETRY_JITTER_RATIO
+                retry_delay_s = random.uniform(
+                    max(0.0, scheduled_delay_s - jitter_s),
+                    scheduled_delay_s + jitter_s,
+                )
                 logger.warning(
-                    "Retrying pre-chunk stream for model %s after %s on attempt %d/%d",
+                    "Retrying pre-chunk stream for model %s after %s on attempt %d/%d "
+                    "in %.1f seconds",
                     self.config.model_name,
                     type(e).__name__,
                     attempt + 1,
                     max_attempts,
+                    retry_delay_s,
                 )
             finally:
                 if client is not None:
                     client.close()
+            if retry_delay_s is not None:
+                time.sleep(retry_delay_s)
 
 
 @contextmanager

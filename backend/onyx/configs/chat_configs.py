@@ -41,6 +41,23 @@ CHAT_HEARTBEAT_INTERVAL_S = int(os.environ.get("CHAT_HEARTBEAT_INTERVAL_S") or "
 LLM_FIRST_CHUNK_MAX_RETRIES = max(
     0, int(os.environ.get("LLM_FIRST_CHUNK_MAX_RETRIES") or "2")
 )
+# Transient provider capacity errors often need a wider recovery window than
+# the SDK's immediate retries. These delays only apply before the first stream
+# chunk, so no partial response can be replayed or duplicated.
+LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S = max(
+    0.0, float(os.environ.get("LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S") or "15")
+)
+LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S = max(
+    LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
+    float(os.environ.get("LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S") or "60"),
+)
+LLM_FIRST_CHUNK_RETRY_JITTER_RATIO = min(
+    1.0,
+    max(
+        0.0,
+        float(os.environ.get("LLM_FIRST_CHUNK_RETRY_JITTER_RATIO") or "0.2"),
+    ),
+)
 # Socket-read timeout for deep-research report calls — bounds inter-chunk gaps
 # (including a zero-chunk stall), not total generation time.
 DR_REPORT_LLM_TIMEOUT_S = int(os.environ.get("DR_REPORT_LLM_TIMEOUT_S") or "60")
@@ -50,6 +67,15 @@ DR_REPORT_LLM_TIMEOUT_S = int(os.environ.get("DR_REPORT_LLM_TIMEOUT_S") or "60")
 # existing graceful fallback instead of hanging a worker until liveness kills it.
 SECONDARY_LLM_FLOW_TIMEOUT_S = int(
     os.environ.get("SECONDARY_LLM_FLOW_TIMEOUT_S") or "60"
+)
+# Optional same-provider model used for the bounded regulatory answer audit. The
+# answering model still owns research and synthesis; this separates verification
+# from generation without introducing another credential or provider route.
+REGULATORY_REVIEW_MODEL: str | None = (
+    os.environ.get("REGULATORY_REVIEW_MODEL", "").strip() or None
+)
+REGULATORY_REVIEW_TIMEOUT_S = int(
+    os.environ.get("REGULATORY_REVIEW_TIMEOUT_S") or "180"
 )
 # Live buffer TTL. Refreshed per write.
 CHAT_STREAM_BUFFER_TTL_S = int(os.environ.get("CHAT_STREAM_BUFFER_TTL_S") or 3600)

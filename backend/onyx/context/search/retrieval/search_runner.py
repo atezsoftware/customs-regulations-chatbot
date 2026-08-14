@@ -1,3 +1,5 @@
+import threading
+import time
 from collections.abc import Callable
 from uuid import UUID
 
@@ -20,8 +22,64 @@ from onyx.federated_connectors.federated_retrieval import (
 from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
 from onyx.utils.logger import setup_logger
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
+from shared_configs.model_server_models import Embedding
 
 logger = setup_logger()
+
+_REGULATORY_EMBEDDING_CIRCUIT_SECONDS = 60.0
+_regulatory_embedding_circuit_lock = threading.Lock()
+_regulatory_embedding_circuit_open_until = 0.0
+_regulatory_embedding_probe_succeeded = False
+
+
+def _get_regulatory_query_embedding(
+    query_request: ChunkIndexRequest,
+    *,
+    db_session: Session | None,
+    embedding_model: EmbeddingModel | None,
+) -> Embedding | None:
+    """Embed with a process-local circuit breaker for regulatory retrieval.
+
+    The first request probes under a lock so parallel query lanes do not stampede
+    a failing provider. After one success, normal calls remain concurrent. A
+    failure opens the circuit briefly and callers use lexical retrieval instead.
+    """
+
+    global _regulatory_embedding_circuit_open_until
+    global _regulatory_embedding_probe_succeeded
+
+    with _regulatory_embedding_circuit_lock:
+        if time.monotonic() < _regulatory_embedding_circuit_open_until:
+            return None
+        probe_required = not _regulatory_embedding_probe_succeeded
+        if probe_required:
+            try:
+                embedding = get_query_embedding(
+                    query_request.query,
+                    db_session=db_session,
+                    embedding_model=embedding_model,
+                )
+            except RuntimeError:
+                _regulatory_embedding_circuit_open_until = (
+                    time.monotonic() + _REGULATORY_EMBEDDING_CIRCUIT_SECONDS
+                )
+                raise
+            _regulatory_embedding_probe_succeeded = True
+            return embedding
+
+    try:
+        return get_query_embedding(
+            query_request.query,
+            db_session=db_session,
+            embedding_model=embedding_model,
+        )
+    except RuntimeError:
+        with _regulatory_embedding_circuit_lock:
+            _regulatory_embedding_probe_succeeded = False
+            _regulatory_embedding_circuit_open_until = (
+                time.monotonic() + _REGULATORY_EMBEDDING_CIRCUIT_SECONDS
+            )
+        raise
 
 
 _VECTOR_DIMENSION_MISMATCH_MARKERS = (
@@ -74,10 +132,18 @@ def _embed_and_hybrid_search(
     embedding_model: EmbeddingModel | None = None,
 ) -> list[InferenceChunk]:
     try:
-        query_embedding = get_query_embedding(
-            query_request.query,
-            db_session=db_session,
-            embedding_model=embedding_model,
+        query_embedding = (
+            _get_regulatory_query_embedding(
+                query_request,
+                db_session=db_session,
+                embedding_model=embedding_model,
+            )
+            if query_request.filters.regulatory_chunks_only
+            else get_query_embedding(
+                query_request.query,
+                db_session=db_session,
+                embedding_model=embedding_model,
+            )
         )
     except RuntimeError as error:
         # A model-selected conceptual search should still return usable indexed
@@ -90,6 +156,12 @@ def _embed_and_hybrid_search(
             "Regulatory hybrid retrieval could not embed the query; falling back "
             "to lexical retrieval (%s)",
             type(error).__name__,
+        )
+        return _keyword_search(query_request, document_index)
+
+    if query_embedding is None:
+        logger.warning(
+            "Regulatory embedding circuit is open; using lexical retrieval"
         )
         return _keyword_search(query_request, document_index)
 

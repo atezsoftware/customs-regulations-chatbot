@@ -40,6 +40,7 @@ import threading
 import time
 import unicodedata
 from collections.abc import Callable
+from datetime import date
 from typing import Any, Generic, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict
@@ -106,10 +107,14 @@ from onyx.regulatory.heading_path import (
 from onyx.regulatory.provision_retrieval import (
     RegulatoryProvisionNavigation,
     build_regulatory_provision_navigation,
+    expand_selected_regulatory_adjacent_provisions,
+    expand_selected_regulatory_navigation_leads,
     expand_selected_regulatory_references,
     expand_selected_regulatory_sections,
+    expand_selected_regulatory_source_lexical_matches,
     regulatory_provision_navigation_payload,
 )
+from onyx.reranking.constants import uses_chat_completion_reranking
 from onyx.reranking.diversity import apply_soft_diversity
 from onyx.reranking.service import rerank_chunks
 from onyx.secondary_llm_flows.document_filter import (
@@ -167,10 +172,14 @@ QUERIES_FIELD = "queries"
 SEARCH_MODE_FIELD = "search_mode"
 COVERAGE_ITEM_FIELD = "coverage_item"
 EVIDENCE_TARGET_FIELD = "evidence_target"
+SOURCE_ANCHORS_FIELD = "source_anchors"
 SEARCH_MODES = {"hybrid", "keyword", "full_text"}
+_MAX_SOURCE_ANCHORS = 4
+_MAX_SOURCE_ANCHOR_CHARS = 180
 _REGULATORY_PROVISION_OVERFETCH_FACTOR = 4
 _REGULATORY_PROVISION_MAX_CANDIDATES = 128
 _REGULATORY_PROVISION_FAMILY_SEED_LIMIT = 4
+_REGULATORY_RERANK_CANDIDATE_LIMIT = 48
 _REGULATORY_KEYWORD_QUERY_HYBRID_ALPHA = 0.0
 _REGULATORY_SEARCH_DESCRIPTION = (
     "Search administrator-indexed regulatory chunks for evidence. You decide "
@@ -333,12 +342,101 @@ def _validate_evidence_target(llm_kwargs: dict[str, Any]) -> str:
     return raw_target.strip()
 
 
+def _validated_source_anchors(llm_kwargs: dict[str, Any]) -> list[str]:
+    """Read bounded explicit source identities without turning them into filters."""
+
+    raw_anchors = llm_kwargs.get(SOURCE_ANCHORS_FIELD)
+    if not isinstance(raw_anchors, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_anchor in raw_anchors[:_MAX_SOURCE_ANCHORS]:
+        if not isinstance(raw_anchor, str):
+            continue
+        anchor = " ".join(raw_anchor.split())[:_MAX_SOURCE_ANCHOR_CHARS].rstrip()
+        identity = anchor.casefold()
+        if not anchor or identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(anchor)
+    return normalized
+
+
+def _fold_source_identity(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.replace("ı", "i"))
+    without_marks = "".join(
+        character for character in decomposed if not unicodedata.combining(character)
+    )
+    return " ".join(re.findall(r"[a-z0-9]+", without_marks.casefold()))
+
+
+def _source_anchor_match_score(
+    section: InferenceSection, source_anchors: list[str]
+) -> tuple[int, int, int, int]:
+    chunk = section.center_chunk
+    metadata_parts = [chunk.semantic_identifier, chunk.title or ""]
+    if chunk.heading_path:
+        metadata_parts.extend(chunk.heading_path[:3])
+    metadata_identity = _fold_source_identity(" ".join(metadata_parts))
+    metadata_tokens = set(metadata_identity.split())
+
+    best = (0, 0, 0, 0)
+    for anchor in source_anchors:
+        anchor_identity = _fold_source_identity(anchor)
+        if len(anchor_identity) < 2:
+            continue
+        anchor_tokens = set(anchor_identity.split())
+        if not anchor_tokens:
+            continue
+        matched_tokens = len(anchor_tokens & metadata_tokens)
+        exact = int(
+            anchor_identity in metadata_identity or metadata_identity in anchor_identity
+        )
+        coverage_thousandths = int(1000 * matched_tokens / len(anchor_tokens))
+        meaningful = int(
+            exact == 1
+            or (len(anchor_tokens) == 1 and matched_tokens == 1)
+            or (matched_tokens >= 2 and coverage_thousandths >= 500)
+        )
+        best = max(
+            best,
+            (meaningful, exact, coverage_thousandths, matched_tokens),
+        )
+    return best
+
+
+def _prioritize_sections_by_source_anchors(
+    sections: list[InferenceSection], source_anchors: list[str]
+) -> list[InferenceSection]:
+    """Stably promote strong source-title matches; never filter weaker results."""
+
+    if not sections or not source_anchors:
+        return sections
+    scored = [
+        (_source_anchor_match_score(section, source_anchors), index, section)
+        for index, section in enumerate(sections)
+    ]
+    if not any(score[0] for score, _, _ in scored):
+        return sections
+    return [
+        section
+        for _, _, section in sorted(
+            scored,
+            key=lambda item: (
+                -item[0][0],
+                -item[0][1],
+                -item[0][2],
+                -item[0][3],
+                item[1],
+            ),
+        )
+    ]
+
+
 def _normalize_exact_search_query(query: str) -> str:
     without_quotes = re.sub(r'["“”]', " ", query)
     without_grouping = re.sub(r"[(){}\[\]]", " ", without_quotes)
-    without_boolean_syntax = re.sub(
-        r"\b(?:AND|OR|NOT)\b", " ", without_grouping, flags=re.IGNORECASE
-    )
+    without_boolean_syntax = re.sub(r"\b(?:AND|OR|NOT)\b", " ", without_grouping)
     return " ".join(without_boolean_syntax.split())
 
 
@@ -403,12 +501,19 @@ def _add_regulatory_provision_navigation(
 
 
 def _can_use_ranked_regulatory_selection(
-    sections: list[InferenceSection], *, focused_search: bool
+    sections: list[InferenceSection], *, regulatory_search: bool
 ) -> bool:
-    """Avoid a redundant selector LLM for bounded, model-written chunk queries."""
+    """Use ranked legal chunks before deterministic structural expansion.
+
+    Regulatory retrieval already uses bounded lanes, reciprocal-rank fusion,
+    reranking, validity filtering, and provision expansion. A second generative
+    relevance selector repeats the same large candidate text for every search,
+    adds latency, and can discard a terse parent or child needed to interpret a
+    provision. Ordinary enterprise search retains its existing selector.
+    """
 
     return (
-        focused_search
+        regulatory_search
         and bool(sections)
         and all(
             section.center_chunk.regulatory_chunk_id is not None for section in sections
@@ -419,11 +524,14 @@ def _can_use_ranked_regulatory_selection(
 def _reserve_ranked_regulatory_seeds(
     sections: list[InferenceSection], max_total_sections: int
 ) -> list[InferenceSection]:
-    """Leave bounded room for paragraphs adjacent to the best legal hits."""
+    """Reserve most of a small legal window for the best hit's provision family."""
 
     if max_total_sections <= 0:
         return []
-    seed_budget = max(1, (max_total_sections + 1) // 2)
+    # Atomic regulatory calls need an operative unit, not four unrelated lead
+    # sentences. Keep roughly one third as independent ranked seeds and let the
+    # deterministic same-provision expansion fill the remaining bounded slots.
+    seed_budget = max(1, max_total_sections // 3)
     return sections[:seed_budget]
 
 
@@ -479,6 +587,38 @@ def _backfill_ranked_regulatory_sections(
     return result
 
 
+def _expand_backfilled_regulatory_sections(
+    db_session: Session,
+    selected_sections: list[InferenceSection],
+    *,
+    ranked_sections: list[InferenceSection],
+    query: str,
+    as_of_date: date | None,
+    max_total_sections: int,
+    structural_seed_sections: list[InferenceSection] | None = None,
+) -> list[InferenceSection]:
+    """Make every final ranked seed eligible for structural repair.
+
+    Reference expansion keeps its existing priority. Any remaining ranked hits
+    are admitted before same-provision expansion so a short parent introduced
+    from the ranked lane cannot bypass its connected child context.
+    """
+
+    backfilled_sections = _backfill_ranked_regulatory_sections(
+        selected_sections,
+        ranked_sections,
+        max_total_sections,
+    )
+    return expand_selected_regulatory_sections(
+        db_session,
+        backfilled_sections,
+        query=query,
+        as_of_date=as_of_date,
+        max_total_sections=max_total_sections,
+        structural_seed_sections=structural_seed_sections,
+    )
+
+
 def _rich_response_sections(
     top_sections: list[InferenceSection],
     selected_sections: list[InferenceSection],
@@ -487,16 +627,22 @@ def _rich_response_sections(
 ) -> list[InferenceSection]:
     """Merge rich results while preserving authoritative selected projections."""
 
+    if authoritative_selected:
+        # Regulatory selection can replace lower-ranked raw hits with repaired
+        # or deterministically expanded provisions. Returning the raw ranking
+        # first hides those bounded selections when the tool response is capped.
+        # The selected chunks already retain the source metadata needed by the
+        # response and citation layers, so they are the complete authoritative
+        # payload for this lane.
+        return selected_sections
+
     sections_by_identity = {
         (section.center_chunk.document_id, section.center_chunk.chunk_id): section
         for section in top_sections
     }
     for section in selected_sections:
         identity = (section.center_chunk.document_id, section.center_chunk.chunk_id)
-        if authoritative_selected:
-            sections_by_identity[identity] = section
-        else:
-            sections_by_identity.setdefault(identity, section)
+        sections_by_identity.setdefault(identity, section)
     return list(sections_by_identity.values())
 
 
@@ -1473,6 +1619,22 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                                 "label, or provision wording is uncertain."
                             ),
                         },
+                        SOURCE_ANCHORS_FIELD: {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": _MAX_SOURCE_ANCHOR_CHARS,
+                            },
+                            "maxItems": _MAX_SOURCE_ANCHORS,
+                            "description": (
+                                "Optional exact source, instrument, annex, code, or regime "
+                                "names explicitly present in this focused task. Copy only "
+                                "identifiers actually supplied by the task; do not infer an "
+                                "authority, provision, answer, or broader topic. Use an empty "
+                                "list when the task names no controlling source."
+                            ),
+                        },
                     },
                     "required": [
                         QUERIES_FIELD,
@@ -1602,6 +1764,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         # forcing the answering model to manufacture a server-shaped research plan.
         raw_coverage_item = llm_kwargs.get(COVERAGE_ITEM_FIELD)
         raw_evidence_target = llm_kwargs.get(EVIDENCE_TARGET_FIELD)
+        server_planned_regulatory_search = bool(
+            regulatory_chunks_only
+            and isinstance(raw_coverage_item, str)
+            and raw_coverage_item.strip()
+            and isinstance(raw_evidence_target, str)
+            and raw_evidence_target.strip()
+        )
         if regulatory_chunks_only:
             coverage_item = (
                 raw_coverage_item.strip()
@@ -1613,10 +1782,14 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 if isinstance(raw_evidence_target, str) and raw_evidence_target.strip()
                 else llm_queries[0].strip()
             )
+            # Source anchors only reorder candidates and trigger bounded
+            # same-scope adjacency; they never filter all unmatched evidence.
+            source_anchors = _validated_source_anchors(llm_kwargs)
             llm_queries = [_prepare_search_query(llm_queries[0], search_mode)]
         else:
             coverage_item = ""
             evidence_target = ""
+            source_anchors = []
 
         # Initialize selection timing in case of an early exception.
         document_selection_elapsed = 0.0
@@ -1748,7 +1921,9 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         )
         expansion = self._expand_queries_and_decide_scope(
             skip_query_expansion=(
-                override_kwargs.skip_query_expansion or search_mode != "hybrid"
+                override_kwargs.skip_query_expansion
+                or search_mode != "hybrid"
+                or server_planned_regulatory_search
             ),
             message_history=message_history,
             user_info=user_info,
@@ -1848,7 +2023,11 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         focused_regulatory_search = bool(
             effective_filters
             and effective_filters.regulatory_chunks_only
-            and (override_kwargs.skip_query_expansion or search_mode != "hybrid")
+            and (
+                override_kwargs.skip_query_expansion
+                or search_mode != "hybrid"
+                or server_planned_regulatory_search
+            )
         )
 
         canonical_original_query = override_kwargs.original_query or llm_queries[0]
@@ -1955,11 +2134,44 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             ),
         )
 
-        fused_candidates = top_chunks[: override_kwargs.rerank_candidate_limit]
+        rerank_candidate_pool = top_chunks[: override_kwargs.rerank_candidate_limit]
+        if regulatory_chunks_only and source_anchors:
+            rerank_candidate_pool = [
+                section.center_chunk
+                for section in _prioritize_sections_by_source_anchors(
+                    [
+                        inference_section_from_single_chunk(chunk)
+                        for chunk in rerank_candidate_pool
+                    ],
+                    source_anchors,
+                )
+            ]
+        fused_candidates = rerank_candidate_pool[
+            : (
+                min(
+                    override_kwargs.rerank_candidate_limit,
+                    _REGULATORY_RERANK_CANDIDATE_LIMIT,
+                )
+                if regulatory_chunks_only
+                else override_kwargs.rerank_candidate_limit
+            )
+        ]
+        effective_reranker_config = reranker_config
+        if (
+            regulatory_chunks_only
+            and placement.turn_index == 0
+            and uses_chat_completion_reranking(reranker_config.model_name)
+        ):
+            effective_reranker_config = reranker_config.model_copy(
+                update={"enabled": False}
+            )
+        rerank_query = (
+            evidence_target if regulatory_chunks_only else canonical_original_query
+        )
         rerank_result = rerank_chunks(
-            query=canonical_original_query,
+            query=rerank_query,
             chunks=fused_candidates,
-            config=reranker_config,
+            config=effective_reranker_config,
         )
         diverse_candidate_chunks = apply_soft_diversity(
             chunks=rerank_result.ordered_chunks,
@@ -1978,6 +2190,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             inference_section_from_single_chunk(chunk)
             for chunk in diverse_candidate_chunks
         ]
+        if regulatory_chunks_only and source_anchors:
+            candidate_sections = _prioritize_sections_by_source_anchors(
+                candidate_sections, source_anchors
+            )
+            diverse_candidate_sections = _prioritize_sections_by_source_anchors(
+                diverse_candidate_sections, source_anchors
+            )
         returned_sections = diverse_candidate_sections[: override_kwargs.num_hits]
 
         if not candidate_sections:
@@ -2009,9 +2228,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             populate_file_ids_on_sections(candidate_sections, enrichment_session)
 
         secondary_flows_user_query = (
-            override_kwargs.original_query
-            or semantic_query
-            or (llm_queries[0] if llm_queries else "")
+            evidence_target
+            if regulatory_chunks_only
+            else (
+                override_kwargs.original_query
+                or semantic_query
+                or (llm_queries[0] if llm_queries else "")
+            )
         )
 
         ranked_regulatory_sections: list[InferenceSection] | None = None
@@ -2038,7 +2261,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
             if _can_use_ranked_regulatory_selection(
                 sections_for_selection,
-                focused_search=focused_regulatory_search,
+                regulatory_search=regulatory_chunks_only,
             ):
                 ranked_regulatory_sections = sections_for_selection
                 selected_sections = _reserve_ranked_regulatory_seeds(
@@ -2134,22 +2357,42 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                         len(selected_sections), max_selected_sections
                     ),
                 )
-                selected_sections = expand_selected_regulatory_sections(
+                selected_sections = _expand_backfilled_regulatory_sections(
                     provision_session,
                     selected_sections,
+                    ranked_sections=ranked_regulatory_sections or [],
                     # evidence_target is reporting-only; retrieval remains driven
                     # exclusively by the model-written query.
                     query=llm_queries[0],
                     as_of_date=provision_as_of_date,
                     max_total_sections=(max_selected_sections),
+                    structural_seed_sections=navigation_seed_sections,
                 )
-        if ranked_regulatory_sections is not None:
-            selected_sections = _backfill_ranked_regulatory_sections(
-                selected_sections,
-                ranked_regulatory_sections,
-                max_selected_sections,
-            )
-
+                selected_sections = expand_selected_regulatory_source_lexical_matches(
+                    provision_session,
+                    selected_sections,
+                    navigation=regulatory_navigation,
+                    query=llm_queries[0],
+                    as_of_date=provision_as_of_date,
+                    max_total_sections=max_selected_sections,
+                )
+                if source_anchors:
+                    selected_sections = expand_selected_regulatory_adjacent_provisions(
+                        provision_session,
+                        selected_sections,
+                        seed_sections=selected_sections,
+                        query=llm_queries[0],
+                        as_of_date=provision_as_of_date,
+                        max_total_sections=max_selected_sections,
+                    )
+                selected_sections = expand_selected_regulatory_navigation_leads(
+                    provision_session,
+                    selected_sections,
+                    navigation=regulatory_navigation,
+                    query=llm_queries[0],
+                    as_of_date=provision_as_of_date,
+                    max_total_sections=max_selected_sections,
+                )
         search_docs = convert_inference_sections_to_search_docs(
             _rich_response_sections(
                 returned_sections,

@@ -26,7 +26,9 @@ INTERNAL_SEARCH_GUIDANCE = (
 ## internal_search
 Use the `internal_search` tool to search the administrator-indexed knowledge base. Uploaded regulatory material is searched as chunks through the document index; it is not supplied to you as whole files.
 Select and explicitly provide `search_mode` independently for each `internal_search` call; write the focused query for that mode yourself.
-When the unresolved point concerns a source, instrument, mechanism, status, provision, code, or other identifier explicitly named by the user, preserve that identifier verbatim in the query rather than replacing it with an umbrella category. Decide yourself whether related issues belong in parallel searches, require a later follow-up after inspecting evidence, or need no search at all.
+When an unresolved request-derived proposition contains an identifier explicitly supplied by the user, preserve that identifier verbatim when it disambiguates the query. Decide yourself whether related propositions belong in parallel searches, require a later follow-up after inspecting evidence, or need no search.
+Before searching a multi-part request, make a silent ledger of its express deliverables and request-stated distinctions. Do not add expected legal issues or subject-matter categories. When independent ledger rows need different retrieval anchors, emit separate `internal_search` calls in the same tool turn, with one focused query and an explicit `search_mode` per call. Do not split aliases or serialize calls that can run in parallel. Reserve later cycles for gaps revealed by exact returned evidence.
+Do not let evidence for one ledger row silently close a different express row. Follow a structural or cross-reference lead only when it can resolve a remaining request-derived proposition.
 """.lstrip()
     + REGULATORY_SEARCH_GUIDANCE
 )

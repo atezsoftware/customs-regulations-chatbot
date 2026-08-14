@@ -12,6 +12,7 @@ from onyx.chat.citation_processor import CitationMapping, DynamicCitationProcess
 from onyx.chat.citation_utils import (
     canonicalize_search_tool_response_citations,
     collapse_citations,
+    synchronize_lightweight_citation_mapping,
     update_citation_processor_from_tool_response,
 )
 from onyx.configs.constants import DocumentSource
@@ -103,15 +104,117 @@ def test_search_response_reuses_canonical_number_for_exact_chunk() -> None:
     canonicalize_search_tool_response_citations(response, {7: existing})
 
     assert isinstance(response.rich_response, SearchDocsResponse)
-    assert response.rich_response.citation_mapping == {7: "shared", 106: "new"}
-    assert response.rich_response.citation_chunk_mapping == {7: 3, 106: 8}
+    assert response.rich_response.citation_mapping == {7: "shared", 1: "new"}
+    assert response.rich_response.citation_chunk_mapping == {7: 3, 1: 8}
     assert '"document": 7' in response.llm_facing_response
+    assert '"document": 1' in response.llm_facing_response
     assert '"document": 105' not in response.llm_facing_response
 
     processor = DynamicCitationProcessor()
     processor.update_citation_mapping({7: existing})
     update_citation_processor_from_tool_response(response, processor)
-    assert set(processor.citation_to_doc) == {7, 106}
+    assert set(processor.citation_to_doc) == {1, 7}
+
+
+def test_parallel_search_ranges_are_compacted_to_dense_citations() -> None:
+    existing_docs = {
+        citation_num: create_test_search_doc(
+            document_id=f"existing-{citation_num}",
+            chunk_ind=citation_num,
+        )
+        for citation_num in range(1, 9)
+    }
+    new_docs = [
+        create_test_search_doc(document_id="new-101", chunk_ind=2),
+        create_test_search_doc(document_id="new-102", chunk_ind=4),
+    ]
+    response = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=new_docs,
+            citation_mapping={101: "new-101", 102: "new-102"},
+            citation_chunk_mapping={101: 2, 102: 4},
+        ),
+        llm_facing_response=('{"results": [{"document": 101}, {"document": 102}]}'),
+        tool_call=ToolCallKickoff(
+            tool_args={},
+            tool_name="internal_search",
+            tool_call_id="parallel-call",
+            placement=Placement(turn_index=1),
+        ),
+    )
+
+    canonicalize_search_tool_response_citations(response, existing_docs)
+
+    assert isinstance(response.rich_response, SearchDocsResponse)
+    assert response.rich_response.citation_mapping == {
+        9: "new-101",
+        10: "new-102",
+    }
+    assert '"document": 9' in response.llm_facing_response
+    assert '"document": 10' in response.llm_facing_response
+
+
+def test_canonicalization_skips_reserved_in_flight_citation_numbers() -> None:
+    existing_docs = {
+        citation_num: create_test_search_doc(
+            document_id=f"existing-{citation_num}",
+            chunk_ind=citation_num,
+        )
+        for citation_num in range(1, 79)
+    }
+    recovered = create_test_search_doc(document_id="recovered", chunk_ind=4)
+    response = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[recovered],
+            citation_mapping={79: "recovered"},
+            citation_chunk_mapping={79: 4},
+        ),
+        llm_facing_response='{"results": [{"document": 79}]}',
+        tool_call=ToolCallKickoff(
+            tool_args={},
+            tool_name="internal_search",
+            tool_call_id="recovery-call",
+            placement=Placement(turn_index=2),
+        ),
+    )
+
+    canonicalize_search_tool_response_citations(
+        response,
+        existing_docs,
+        reserved_citation_numbers={79},
+    )
+
+    assert isinstance(response.rich_response, SearchDocsResponse)
+    assert response.rich_response.citation_mapping == {80: "recovered"}
+    assert response.rich_response.citation_chunk_mapping == {80: 4}
+    assert '"document": 80' in response.llm_facing_response
+
+
+def test_synchronize_lightweight_mapping_removes_raw_citation_aliases() -> None:
+    repeated = create_test_search_doc(document_id="shared", chunk_ind=3)
+    response = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[repeated],
+            citation_mapping={7: "shared"},
+            citation_chunk_mapping={7: 3},
+        ),
+        llm_facing_response='{"results": [{"document": 7}]}',
+        tool_call=ToolCallKickoff(
+            tool_args={},
+            tool_name="internal_search",
+            tool_call_id="parallel-call",
+            placement=Placement(turn_index=1),
+        ),
+    )
+    lightweight_mapping = {7: "shared", 79: "shared"}
+
+    synchronize_lightweight_citation_mapping(
+        response,
+        lightweight_mapping,
+        raw_citation_numbers={79},
+    )
+
+    assert lightweight_mapping == {7: "shared"}
 
 
 def test_chat_state_preserves_distinct_chunks_from_same_document() -> None:

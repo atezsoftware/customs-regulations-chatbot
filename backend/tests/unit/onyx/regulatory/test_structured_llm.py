@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 from onyx.llm.model_response import Choice, Message, ModelResponse
 from onyx.llm.models import ReasoningEffort
+from onyx.llm.multi_llm import LLMRateLimitError
 from onyx.regulatory.structured_llm import generate_structured
 from onyx.tracing.flows import LLMFlow
 
@@ -19,11 +20,14 @@ class _ConstrainedResult(BaseModel):
     index: int = Field(ge=0, lt=10)
 
 
-def _response(content: str) -> ModelResponse:
+def _response(content: str, *, finish_reason: str | None = None) -> ModelResponse:
     return ModelResponse(
         id="test-response",
         created="2026-08-01T00:00:00Z",
-        choice=Choice(message=Message(content=content)),
+        choice=Choice(
+            finish_reason=finish_reason,
+            message=Message(content=content),
+        ),
     )
 
 
@@ -34,6 +38,7 @@ def _generate(
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     max_attempts: int = 2,
+    provider_max_attempts: int = 3,
 ) -> _TinyResult:
     with (
         patch(
@@ -52,6 +57,7 @@ def _generate(
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             max_attempts=max_attempts,
+            provider_max_attempts=provider_max_attempts,
         )
 
 
@@ -99,8 +105,68 @@ def test_generate_structured_retries_validation_failure() -> None:
     assert result.value == "repaired"
     assert llm.invoke.call_count == 2
     retry_messages = llm.invoke.call_args.args[0]
-    assert len(retry_messages) == 3
+    assert len(retry_messages) == 4
+    assert retry_messages[-2].content == '{"wrong":"shape"}'
     assert "previous response was not valid JSON" in retry_messages[-1].content
+
+
+def test_generate_structured_retries_transient_provider_error_separately() -> None:
+    llm = MagicMock()
+    llm.invoke.side_effect = [
+        LLMRateLimitError("capacity window exhausted"),
+        _response('{"value":"recovered"}'),
+    ]
+
+    with (
+        patch("onyx.regulatory.structured_llm.random.uniform", return_value=2.25),
+        patch("onyx.regulatory.structured_llm.time.sleep") as sleep,
+        patch("onyx.regulatory.structured_llm.LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S", 2.0),
+        patch("onyx.regulatory.structured_llm.LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S", 10.0),
+        patch(
+            "onyx.regulatory.structured_llm.LLM_FIRST_CHUNK_RETRY_JITTER_RATIO", 0.25
+        ),
+    ):
+        result = _generate(llm, max_attempts=1, provider_max_attempts=3)
+
+    assert result.value == "recovered"
+    assert llm.invoke.call_count == 2
+    assert llm.invoke.call_args_list[0].args[0] == llm.invoke.call_args_list[1].args[0]
+    sleep.assert_called_once_with(2.25)
+
+
+def test_generate_structured_restarts_without_echoing_truncated_json() -> None:
+    llm = MagicMock()
+    truncated = '{"value":"' + ("x" * 40_000)
+    llm.invoke.side_effect = [
+        _response(truncated),
+        _response('{"value":"repaired"}'),
+    ]
+
+    result = _generate(llm, max_attempts=2)
+
+    assert result.value == "repaired"
+    retry_messages = llm.invoke.call_args.args[0]
+    assert len(retry_messages) == 3
+    assert all(truncated not in message.content for message in retry_messages)
+    assert "truncated" in retry_messages[-1].content
+    assert "from scratch" in retry_messages[-1].content
+
+
+def test_generate_structured_treats_output_limit_finish_as_truncation() -> None:
+    llm = MagicMock()
+    invalid = '{"wrong":"shape"}'
+    llm.invoke.side_effect = [
+        _response(invalid, finish_reason="length"),
+        _response('{"value":"repaired"}', finish_reason="stop"),
+    ]
+
+    result = _generate(llm, max_attempts=2)
+
+    assert result.value == "repaired"
+    retry_messages = llm.invoke.call_args.args[0]
+    assert len(retry_messages) == 3
+    assert all(invalid not in message.content for message in retry_messages)
+    assert "truncated" in retry_messages[-1].content
 
 
 def test_generate_structured_rejects_zero_attempts_without_invoking() -> None:

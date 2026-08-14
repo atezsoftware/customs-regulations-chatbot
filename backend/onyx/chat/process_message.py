@@ -2044,6 +2044,24 @@ def remove_answer_citations(answer: str) -> str:
     return "".join(stripped_parts)
 
 
+def _stream_response_metadata(
+    packet: object,
+) -> tuple[int | None, UUID | None]:
+    """Read response metadata from bare or transport-wrapped stream parts."""
+
+    message_id: int | None = None
+    chat_session_id: UUID | None = None
+    candidates = (packet, getattr(packet, "obj", None))
+    for candidate in candidates:
+        raw_message_id = getattr(candidate, "reserved_assistant_message_id", None)
+        if isinstance(raw_message_id, int) and not isinstance(raw_message_id, bool):
+            message_id = raw_message_id
+        raw_chat_session_id = getattr(candidate, "chat_session_id", None)
+        if isinstance(raw_chat_session_id, UUID):
+            chat_session_id = raw_chat_session_id
+    return message_id, chat_session_id
+
+
 @log_function_time()
 def gather_stream(
     packets: AnswerStream,
@@ -2055,6 +2073,9 @@ def gather_stream(
     top_documents: list[SearchDoc] = []
 
     for packet in packets:
+        packet_message_id, _ = _stream_response_metadata(packet)
+        if packet_message_id is not None:
+            message_id = packet_message_id
         if isinstance(packet, Packet):
             # Handle the different packet object types
             if isinstance(packet.obj, AgentResponseStart):
@@ -2075,6 +2096,8 @@ def gather_stream(
         elif isinstance(packet, MessageResponseIDInfo):
             message_id = packet.reserved_assistant_message_id
 
+    if message_id is None and error_msg is not None:
+        raise RuntimeError(error_msg)
     if message_id is None:
         raise ValueError("Message ID is required")
 
@@ -2122,6 +2145,11 @@ def gather_stream_full(
     chat_session_id: UUID | None = None
 
     for packet in packets:
+        packet_message_id, packet_chat_session_id = _stream_response_metadata(packet)
+        if packet_message_id is not None:
+            message_id = packet_message_id
+        if packet_chat_session_id is not None:
+            chat_session_id = packet_chat_session_id
         if isinstance(packet, Packet):
             if isinstance(packet.obj, AgentResponseStart):
                 if packet.obj.final_documents:
@@ -2140,6 +2168,8 @@ def gather_stream_full(
         elif isinstance(packet, CreateChatSessionID):
             chat_session_id = packet.chat_session_id
 
+    if message_id is None and error_msg is not None:
+        raise RuntimeError(error_msg)
     if message_id is None:
         raise ValueError("Message ID is required")
 
@@ -2172,4 +2202,30 @@ def gather_stream_full(
         message_id=message_id,
         chat_session_id=chat_session_id,
         error_msg=error_msg,
+    )
+
+
+def run_chat_message_to_completion(
+    new_msg_req: SendMessageRequest,
+    user: User,
+    *,
+    external_state_container: ChatStateContainer | None = None,
+) -> ChatFullResponse:
+    """Execute one production chat turn as a non-detachable blocking operation.
+
+    HTTP callers need a resumable stream whose reader may disappear while the
+    durable writer continues. Background workflows need the opposite contract:
+    the call must not return until the writer has reached its terminal marker.
+    Keeping this adapter in the chat layer prevents batch jobs from interpreting
+    transport detachment as model completion.
+    """
+
+    state_container = external_state_container or ChatStateContainer()
+    return gather_stream_full(
+        handle_stream_message_objects(
+            new_msg_req,
+            user,
+            external_state_container=state_container,
+        ),
+        state_container,
     )

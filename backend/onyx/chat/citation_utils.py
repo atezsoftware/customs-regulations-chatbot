@@ -1,5 +1,6 @@
 import json
 import re
+from collections.abc import Collection, MutableMapping
 
 from onyx.chat.citation_processor import CitationMapping, DynamicCitationProcessor
 from onyx.context.search.models import SearchDoc, SearchDocsResponse
@@ -13,12 +14,14 @@ logger = setup_logger()
 def canonicalize_search_tool_response_citations(
     tool_response: ToolResponse,
     existing_citation_mapping: CitationMapping,
-) -> None:
+    *,
+    reserved_citation_numbers: Collection[int] = (),
+) -> dict[int, int]:
     """Reuse one citation number for the same exact chunk across search calls."""
 
     search_response = tool_response.rich_response
     if not isinstance(search_response, SearchDocsResponse):
-        return
+        return {}
 
     identity_to_existing: dict[tuple[str, int], int] = {}
     for citation_num, doc in sorted(existing_citation_mapping.items()):
@@ -40,10 +43,10 @@ def canonicalize_search_tool_response_citations(
             raw_to_doc[citation_num] = matching_doc
 
     if not raw_to_doc:
-        return
+        return {}
 
-    occupied_numbers = set(existing_citation_mapping)
-    next_available = max(occupied_numbers, default=0) + 1
+    occupied_numbers = set(existing_citation_mapping) | set(reserved_citation_numbers)
+    next_available = 1
     identity_to_canonical = dict(identity_to_existing)
     raw_to_canonical: dict[int, int] = {}
     canonical_mapping: dict[int, str] = {}
@@ -55,12 +58,10 @@ def canonicalize_search_tool_response_citations(
         identity = (document_id, chunk_ind)
         canonical_num = identity_to_canonical.get(identity)
         if canonical_num is None:
-            canonical_num = raw_num
-            if canonical_num in occupied_numbers:
-                while next_available in occupied_numbers:
-                    next_available += 1
-                canonical_num = next_available
+            while next_available in occupied_numbers:
                 next_available += 1
+            canonical_num = next_available
+            next_available += 1
             identity_to_canonical[identity] = canonical_num
             occupied_numbers.add(canonical_num)
 
@@ -87,6 +88,31 @@ def canonicalize_search_tool_response_citations(
 
     search_response.citation_mapping = canonical_mapping
     search_response.citation_chunk_mapping = canonical_chunk_mapping
+    return raw_to_canonical
+
+
+def synchronize_lightweight_citation_mapping(
+    tool_response: ToolResponse,
+    citation_mapping: MutableMapping[int, str],
+    raw_citation_numbers: Collection[int],
+) -> None:
+    """Replace one response's raw wire citations with its canonical citations."""
+
+    search_response = tool_response.rich_response
+    if not isinstance(search_response, SearchDocsResponse):
+        return
+
+    for citation_number in raw_citation_numbers:
+        citation_mapping.pop(citation_number, None)
+
+    for citation_number, document_id in search_response.citation_mapping.items():
+        existing_document_id = citation_mapping.get(citation_number)
+        if existing_document_id is not None and existing_document_id != document_id:
+            raise ValueError(
+                "canonical citation synchronization attempted to reassign "
+                f"citation {citation_number}"
+            )
+        citation_mapping[citation_number] = document_id
 
 
 def update_citation_processor_from_tool_response(

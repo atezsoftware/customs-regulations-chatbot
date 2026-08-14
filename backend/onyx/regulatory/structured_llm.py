@@ -8,17 +8,27 @@ with the validation error fed back closes the gap without depending on any
 single provider's structured-output guarantees.
 """
 
+import random
+import time
 from typing import Any, NotRequired, TypedDict, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from onyx.configs.chat_configs import (
+    LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S,
+    LLM_FIRST_CHUNK_RETRY_JITTER_RATIO,
+    LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S,
+)
 from onyx.llm.interfaces import LLM
+from onyx.llm.model_response import ModelResponse
 from onyx.llm.models import (
+    AssistantMessage,
     ChatCompletionMessage,
     ReasoningEffort,
     SystemMessage,
     UserMessage,
 )
+from onyx.llm.multi_llm import LLMRateLimitError, LLMTimeoutError
 from onyx.llm.utils import llm_response_to_string
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
@@ -35,12 +45,13 @@ class _StructuredInvokeOptions(TypedDict):
     max_tokens: NotRequired[int]
     reasoning_effort: NotRequired[ReasoningEffort]
 
+
 _JSON_ONLY_REMINDER = (
     "\n\nCRITICAL: Respond with ONLY a single valid JSON object matching the "
     "schema below. No prose, no markdown code fences, no explanation outside "
     "the JSON.\n\nSchema:\n{schema}"
 )
-
+_MAX_INVALID_RESPONSE_FEEDBACK_CHARS = 48_000
 _PORTABLE_SCHEMA_UNSUPPORTED_KEYS = frozenset(
     {
         "exclusiveMaximum",
@@ -88,6 +99,20 @@ def _extract_json_object(content: str) -> str:
     return text.strip()
 
 
+def _is_truncated_json_error(error: ValidationError) -> bool:
+    return any(
+        issue.get("type") == "json_invalid"
+        and "eof" in str(issue.get("ctx", {})).casefold()
+        for issue in error.errors(include_input=False)
+    )
+
+
+def _response_hit_output_limit(finish_reason: str | None) -> bool:
+    if finish_reason is None:
+        return False
+    return finish_reason.casefold() in {"length", "max_tokens", "max_output_tokens"}
+
+
 def generate_structured(
     llm: LLM,
     *,
@@ -99,6 +124,7 @@ def generate_structured(
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     max_attempts: int = 2,
+    provider_max_attempts: int = 3,
 ) -> ResponseModel:
     """Call the LLM and parse+validate its response as `response_model`.
 
@@ -108,11 +134,29 @@ def generate_structured(
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
+    if provider_max_attempts < 1:
+        raise ValueError("provider_max_attempts must be at least 1")
+
+    from litellm.exceptions import (
+        APIConnectionError,
+        InternalServerError,
+        RateLimitError,
+        ServiceUnavailableError,
+    )
+    from litellm.exceptions import Timeout as LiteLLMTimeout
+
+    transient_provider_errors = (
+        LLMRateLimitError,
+        LLMTimeoutError,
+        RateLimitError,
+        LiteLLMTimeout,
+        APIConnectionError,
+        ServiceUnavailableError,
+        InternalServerError,
+    )
 
     validation_schema_json = response_model.model_json_schema()
-    provider_schema_json = _portable_structured_output_schema(
-        validation_schema_json
-    )
+    provider_schema_json = _portable_structured_output_schema(validation_schema_json)
     full_system_prompt = system_prompt + _JSON_ONLY_REMINDER.format(
         schema=validation_schema_json
     )
@@ -143,31 +187,81 @@ def generate_structured(
 
     last_error: Exception | None = None
     for attempt in range(max_attempts):
-        with llm_generation_span(llm=llm, flow=flow, input_messages=messages) as span:
-            response = llm.invoke(messages, **invoke_options)
-            record_llm_response(span, response)
+        response: ModelResponse | None = None
+        for provider_attempt in range(provider_max_attempts):
+            try:
+                with llm_generation_span(
+                    llm=llm, flow=flow, input_messages=messages
+                ) as span:
+                    response = llm.invoke(messages, **invoke_options)
+                    record_llm_response(span, response)
+                break
+            except transient_provider_errors as error:
+                if provider_attempt >= provider_max_attempts - 1:
+                    raise
+                scheduled_delay_s = min(
+                    LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S,
+                    LLM_FIRST_CHUNK_RETRY_BASE_DELAY_S * (2**provider_attempt),
+                )
+                jitter_s = scheduled_delay_s * LLM_FIRST_CHUNK_RETRY_JITTER_RATIO
+                retry_delay_s = random.uniform(
+                    max(0.0, scheduled_delay_s - jitter_s),
+                    scheduled_delay_s + jitter_s,
+                )
+                logger.warning(
+                    "generate_structured: retrying transient provider error for %s "
+                    "after %s on attempt %d/%d in %.1f seconds",
+                    response_model.__name__,
+                    type(error).__name__,
+                    provider_attempt + 1,
+                    provider_max_attempts,
+                    retry_delay_s,
+                )
+                time.sleep(retry_delay_s)
 
+        if response is None:
+            raise RuntimeError("structured LLM invocation produced no response")
         content = llm_response_to_string(response)
         try:
             return response_model.model_validate_json(_extract_json_object(content))
         except ValidationError as e:
             last_error = e
+            finish_reason = response.choice.finish_reason
             logger.warning(
-                "generate_structured: invalid response for %s (attempt %d): %s",
+                "generate_structured: invalid response for %s (attempt %d) "
+                "finish_reason=%s: %s",
                 response_model.__name__,
                 attempt + 1,
+                finish_reason,
                 e,
             )
-            messages = [
-                *messages,
-                UserMessage(
-                    content=(
-                        f"Your previous response was not valid JSON for the "
-                        f"required schema. Error:\n{e}\n\nRespond again with "
-                        "ONLY the corrected JSON object."
-                    )
-                ),
-            ]
+            if _is_truncated_json_error(e) or _response_hit_output_limit(finish_reason):
+                messages = [
+                    messages[0],
+                    messages[1],
+                    UserMessage(
+                        content=(
+                            "Your previous JSON response was truncated. Restart from "
+                            "scratch and keep every string and array concise enough to "
+                            "finish within the output limit. Obey all schema size "
+                            "limits. Respond with ONLY the complete JSON object."
+                        )
+                    ),
+                ]
+            else:
+                messages = [
+                    *messages,
+                    AssistantMessage(
+                        content=content[:_MAX_INVALID_RESPONSE_FEEDBACK_CHARS].rstrip()
+                    ),
+                    UserMessage(
+                        content=(
+                            f"Your previous response was not valid JSON for the "
+                            f"required schema. Error:\n{e}\n\nRespond again with "
+                            "ONLY the corrected JSON object."
+                        )
+                    ),
+                ]
 
     assert last_error is not None
     raise ValueError(

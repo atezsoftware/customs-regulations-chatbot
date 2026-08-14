@@ -116,6 +116,133 @@ def test_selected_provision_siblings_become_exact_citable_sections(
     lookup.assert_called_once()
 
 
+def test_source_lexical_fallback_replaces_only_weak_tail(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    sections = [
+        inference_section_from_single_chunk(_chunk(index, f"ranked-{index}"))
+        for index in range(4)
+    ]
+    navigation = provision_retrieval.RegulatoryProvisionNavigation(
+        document_title="Instrument",
+        entries=(),
+        user_file_id=str(FILE_ID),
+    )
+    lexical_match = _projection(
+        "local-match",
+        20,
+        text="Focused source-local evidence",
+        expansion_priority=-2,
+    )
+    companion = _projection(
+        "local-parent",
+        19,
+        text="Inherited operative context",
+        expansion_priority=0,
+    )
+    lexical_lookup = MagicMock(return_value=[lexical_match])
+    sibling_lookup = MagicMock(return_value=[companion, lexical_match])
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_source_lexical_matches",
+        lexical_lookup,
+    )
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        sibling_lookup,
+    )
+
+    expanded = provision_retrieval.expand_selected_regulatory_source_lexical_matches(
+        MagicMock(),
+        sections,
+        navigation=navigation,
+        query="focused source evidence",
+        as_of_date=date(2026, 1, 1),
+        max_total_sections=4,
+    )
+
+    assert [section.center_chunk.regulatory_chunk_id for section in expanded] == [
+        "ranked-0",
+        "ranked-1",
+        "local-match",
+        "local-parent",
+    ]
+    assert expanded[2].center_chunk.content == "Focused source-local evidence"
+    lexical_lookup.assert_called_once()
+    sibling_lookup.assert_called_once()
+
+
+def test_adjacent_provision_expansion_uses_only_spare_evidence_slots(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    sections = [
+        inference_section_from_single_chunk(_chunk(index, f"seed-{index}"))
+        for index in range(4)
+    ]
+    adjacent = [
+        _projection("article-before", 112, text="Previous operative provision"),
+        _projection("article-after", 114, text="Following operative provision"),
+    ]
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_adjacent_provisions",
+        MagicMock(return_value=adjacent),
+    )
+
+    expanded = provision_retrieval.expand_selected_regulatory_adjacent_provisions(
+        MagicMock(),
+        sections,
+        seed_sections=sections[:2],
+        query="focused source question",
+        as_of_date=date(2026, 1, 1),
+        max_total_sections=6,
+    )
+
+    assert [section.center_chunk.regulatory_chunk_id for section in expanded] == [
+        "seed-0",
+        "seed-1",
+        "seed-2",
+        "seed-3",
+        "article-before",
+        "article-after",
+    ]
+    assert expanded[-2].center_chunk.content == "Previous operative provision"
+    assert expanded[-1].center_chunk.content == "Following operative provision"
+
+
+def test_adjacent_provisions_never_evict_same_provision_evidence(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    sections = [
+        inference_section_from_single_chunk(_chunk(index, f"seed-{index}"))
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_adjacent_provisions",
+        MagicMock(
+            return_value=[_projection("article-after", 114, text="Following provision")]
+        ),
+    )
+
+    expanded = provision_retrieval.expand_selected_regulatory_adjacent_provisions(
+        MagicMock(),
+        sections,
+        seed_sections=sections[:1],
+        query="focused source question",
+        as_of_date=date(2026, 1, 1),
+        max_total_sections=4,
+    )
+
+    assert [section.center_chunk.regulatory_chunk_id for section in expanded] == [
+        "seed-0",
+        "seed-1",
+        "seed-2",
+        "seed-3",
+    ]
+
+
 def test_same_provision_expansion_prioritizes_distinctive_exact_query_anchor(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -142,6 +269,42 @@ def test_same_provision_expansion_prioritizes_distinctive_exact_query_anchor(
     assert [section.center_chunk.regulatory_chunk_id for section in expanded] == [
         "seed-id",
         "exact-rate",
+    ]
+
+
+def test_same_provision_expansion_matches_inflected_legal_terms(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    seed = _chunk(10, "seed-id")
+    projections = [
+        _projection("seed-id", 10, text="Alkol kontrolünde genel usul"),
+        _projection("generic-neighbor", 11, text="Alkol ölçüm cihazı kaydı"),
+        _projection(
+            "operative-consequence",
+            12,
+            text=(
+                "Yasal sınırların üzerinde alkollü sürücülerin araç kullanması "
+                "yasaktır."
+            ),
+        ),
+    ]
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        MagicMock(return_value=projections),
+    )
+
+    expanded = provision_retrieval.expand_selected_regulatory_sections(
+        MagicMock(),
+        [inference_section_from_single_chunk(seed)],
+        query="alkol sınırı sürücü araç yaptırımı",
+        as_of_date=None,
+        max_total_sections=2,
+    )
+
+    assert [section.center_chunk.regulatory_chunk_id for section in expanded] == [
+        "seed-id",
+        "operative-consequence",
     ]
 
 
@@ -259,6 +422,7 @@ def test_same_provision_repairs_legacy_seed_even_when_budget_is_already_full(
     )
 
     lookup.assert_called_once()
+    assert expanded[0].center_chunk.heading_path is not None
     assert "MADDE 75" in expanded[0].center_chunk.heading_path
 
 
@@ -328,6 +492,214 @@ def test_expansion_consumes_structural_context_before_ordinary_siblings(
     assert [section.center_chunk.regulatory_chunk_id for section in expanded] == [
         "seed-id",
         "structural-parent",
+    ]
+
+
+def test_full_result_window_reserves_space_for_same_provision_text(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    seeds = [_chunk(index, f"seed-{index}") for index in range(1, 5)]
+    projections = [
+        _projection(f"seed-{index}", index, text=f"Seed {index}")
+        for index in range(1, 5)
+    ]
+    projections.append(
+        _projection(
+            "operative-sibling",
+            5,
+            text="Exact operative condition and consequence",
+            expansion_priority=0,
+        )
+    )
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        MagicMock(return_value=projections),
+    )
+
+    expanded = provision_retrieval.expand_selected_regulatory_sections(
+        MagicMock(),
+        [inference_section_from_single_chunk(seed) for seed in seeds],
+        query="operative condition consequence",
+        as_of_date=None,
+        max_total_sections=4,
+    )
+
+    assert len(expanded) == 4
+    assert "operative-sibling" in {
+        section.center_chunk.regulatory_chunk_id for section in expanded
+    }
+
+
+def test_priority_projections_fill_reserved_slots_before_round_robin(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    seeds = [_chunk(index, f"seed-{index}") for index in (10, 20, 30, 100)]
+    projections = [
+        _projection(f"seed-{index}", index, text=f"Seed {index}")
+        for index in (10, 20, 30, 100)
+    ] + [
+        _projection("concept-a", 11, text="First concept", expansion_priority=-20),
+        _projection("concept-b", 12, text="Second concept", expansion_priority=-19),
+        _projection("concept-c", 13, text="Third concept", expansion_priority=-18),
+        _projection("ordinary-other-seed", 101, text="Ordinary sibling"),
+    ]
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        MagicMock(return_value=projections),
+    )
+    expanded = provision_retrieval.expand_selected_regulatory_sections(
+        MagicMock(),
+        [inference_section_from_single_chunk(seed) for seed in seeds],
+        query="procedure facet",
+        as_of_date=None,
+        max_total_sections=6,
+    )
+
+    expanded_ids = {section.center_chunk.regulatory_chunk_id for section in expanded}
+    assert {"concept-a", "concept-b", "concept-c"}.issubset(expanded_ids)
+    assert "ordinary-other-seed" not in expanded_ids
+
+
+def test_full_window_can_reserve_four_same_provision_priority_rows(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    seeds = [_chunk(index, f"seed-{index}") for index in range(20, 28)]
+    projections = [
+        _projection(f"seed-{index}", index, text=f"Seed {index}")
+        for index in range(20, 28)
+    ] + [
+        _projection(
+            f"operative-{index}",
+            100 + index,
+            text=f"Distinct operative rule {index}",
+            expansion_priority=-20 + index,
+        )
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        MagicMock(return_value=projections),
+    )
+
+    expanded = provision_retrieval.expand_selected_regulatory_sections(
+        MagicMock(),
+        [inference_section_from_single_chunk(seed) for seed in seeds],
+        query="distinct operative rule",
+        as_of_date=None,
+        max_total_sections=8,
+    )
+
+    expanded_ids = {section.center_chunk.regulatory_chunk_id for section in expanded}
+    assert {
+        "operative-0",
+        "operative-1",
+        "operative-2",
+        "operative-3",
+    }.issubset(expanded_ids)
+
+
+def test_ranked_navigation_seeds_expand_context_even_when_selector_omits_them(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    selected = _chunk(10, "selected-seed")
+    navigation = _chunk(40, "ranked-navigation-seed").model_copy(
+        update={"heading_path": ["MADDE 62"]}
+    )
+    sibling_lookup = MagicMock(return_value=[])
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        sibling_lookup,
+    )
+
+    provision_retrieval.expand_selected_regulatory_sections(
+        MagicMock(),
+        [inference_section_from_single_chunk(selected)],
+        query="exact prerequisites",
+        as_of_date=None,
+        max_total_sections=4,
+        structural_seed_sections=[inference_section_from_single_chunk(navigation)],
+    )
+
+    assert sibling_lookup.call_args.args[1] == [
+        "selected-seed",
+        "ranked-navigation-seed",
+    ]
+
+
+def test_ranked_navigation_seeds_do_not_pin_multiple_chunks_from_selected_family(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    selected = _chunk(10, "selected-seed")
+    same_family_navigation_chunks = [
+        _chunk(40, "ranked-family-child-1"),
+        _chunk(41, "ranked-family-child-2"),
+    ]
+    sibling_lookup = MagicMock(return_value=[])
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        sibling_lookup,
+    )
+
+    provision_retrieval.expand_selected_regulatory_sections(
+        MagicMock(),
+        [inference_section_from_single_chunk(selected)],
+        query="exact operative consequence",
+        as_of_date=None,
+        max_total_sections=4,
+        structural_seed_sections=[
+            inference_section_from_single_chunk(chunk)
+            for chunk in same_family_navigation_chunks
+        ],
+    )
+
+    assert sibling_lookup.call_args.args[1] == ["selected-seed"]
+
+
+def test_selected_seed_family_precedes_navigation_only_structural_context(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    selected = _chunk(10, "selected-seed")
+    navigation = _chunk(40, "ranked-navigation-seed").model_copy(
+        update={"heading_path": ["MADDE 62"]}
+    )
+    projections = [
+        _projection("selected-seed", 10, text="Selected seed"),
+        _projection(
+            "selected-operative-sibling",
+            11,
+            text="Exact selected provision consequence",
+        ),
+        _projection("ranked-navigation-seed", 40, text="Navigation seed"),
+        _projection(
+            "navigation-structural-context",
+            41,
+            text="Navigation-only structural context",
+            expansion_priority=0,
+        ),
+    ]
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        MagicMock(return_value=projections),
+    )
+
+    expanded = provision_retrieval.expand_selected_regulatory_sections(
+        MagicMock(),
+        [inference_section_from_single_chunk(selected)],
+        query="selected consequence",
+        as_of_date=None,
+        max_total_sections=2,
+        structural_seed_sections=[inference_section_from_single_chunk(navigation)],
+    )
+
+    assert [section.center_chunk.regulatory_chunk_id for section in expanded] == [
+        "selected-seed",
+        "selected-operative-sibling",
     ]
 
 
@@ -503,6 +875,7 @@ def _heading_candidate(
         validity_start_date=validity_start_date,
         validity_end_date=validity_end_date,
         article_title=article_title,
+        regulatory_chunk_id=f"heading-{position}",
     )
 
 
@@ -719,6 +1092,132 @@ def test_navigation_query_overlap_promotes_distant_heading_inside_cap() -> None:
     assert navigation is not None
     assert navigation.entries[0].article_key == "madde:4a"
     assert len(navigation.entries) == 3
+
+
+def test_navigation_does_not_treat_decimal_value_as_article_number() -> None:
+    navigation = provision_retrieval.select_regulatory_provision_navigation(
+        _heading_source(
+            [
+                _heading_candidate(25, ("Düzenleme", "MADDE 25 - Genel görevler")),
+                _heading_candidate(
+                    97,
+                    ("Düzenleme", "MADDE 97 - Alkol etkisinde araç sürme"),
+                ),
+            ],
+            seed_positions=(25,),
+        ),
+        as_of_date=None,
+        focused_query="sürücünün alkol oranı 0.25 promil",
+    )
+
+    assert navigation is not None
+    assert navigation.entries[0].article_key == "madde:97"
+
+
+def test_strong_navigation_lead_replaces_only_weak_tail_results(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    selected = [
+        inference_section_from_single_chunk(_chunk(index, f"raw-{index}"))
+        for index in range(4)
+    ]
+    navigation = provision_retrieval.RegulatoryProvisionNavigation(
+        document_title="Düzenleme",
+        user_file_id=str(FILE_ID),
+        entries=(
+            provision_retrieval.RegulatoryProvisionNavigationEntry(
+                article_key="madde:97",
+                heading_label="MADDE 97 - Alkol etkisinde araç sürme",
+                regulatory_chunk_id="heading-97",
+            ),
+        ),
+    )
+    lookup = MagicMock(
+        return_value=[
+            _projection("lead-parent", 97, text="MADDE 97"),
+            _projection("lead-rule", 98, text="Alkol sınırı ve uygulanacak işlem"),
+        ]
+    )
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        lookup,
+    )
+
+    expanded = provision_retrieval.expand_selected_regulatory_navigation_leads(
+        MagicMock(),
+        selected,
+        navigation=navigation,
+        query="ticari sürücü alkol sınırı",
+        as_of_date=None,
+        max_total_sections=4,
+    )
+
+    assert [section.center_chunk.regulatory_chunk_id for section in expanded] == [
+        "raw-0",
+        "raw-1",
+        "lead-parent",
+        "lead-rule",
+    ]
+    lookup.assert_called_once()
+
+
+def test_navigation_repairs_represented_article_before_unrelated_lexical_lead(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    selected_chunk = _chunk(507, "selected-clause").model_copy(
+        update={
+            "heading_path": [
+                "Düzenleme",
+                "MADDE 97 - Alkol etkisinde araç sürme",
+                "(3)",
+                "(ç)",
+            ]
+        }
+    )
+    selected = [inference_section_from_single_chunk(selected_chunk)]
+    navigation = provision_retrieval.RegulatoryProvisionNavigation(
+        document_title="Düzenleme",
+        user_file_id=str(FILE_ID),
+        entries=(
+            provision_retrieval.RegulatoryProvisionNavigationEntry(
+                article_key="madde:167",
+                heading_label="MADDE 167 - Sürücü belgesi işlemleri",
+                regulatory_chunk_id="heading-167",
+            ),
+            provision_retrieval.RegulatoryProvisionNavigationEntry(
+                article_key="madde:97",
+                heading_label="MADDE 97 - Alkol etkisinde araç sürme",
+                regulatory_chunk_id="heading-97",
+            ),
+        ),
+    )
+    lookup = MagicMock(
+        side_effect=lambda _session, chunk_ids, **_kwargs: [
+            _projection(
+                f"lead-{chunk_ids[0]}",
+                97,
+                text=f"Operative text for {chunk_ids[0]}",
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        lookup,
+    )
+
+    expanded = provision_retrieval.expand_selected_regulatory_navigation_leads(
+        MagicMock(),
+        selected,
+        navigation=navigation,
+        query="sürücü belgesi işlemleri",
+        as_of_date=None,
+        max_total_sections=2,
+    )
+
+    assert expanded[0].center_chunk.regulatory_chunk_id == "lead-heading-97"
+    assert lookup.call_args_list[0].args[1] == ["heading-97"]
 
 
 def test_navigation_explicit_query_reference_stays_highest_priority() -> None:

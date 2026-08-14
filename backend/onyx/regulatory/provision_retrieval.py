@@ -5,8 +5,9 @@ import re
 import unicodedata
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, TypedDict
+from uuid import UUID
 
 from sqlalchemy.orm import Session
 
@@ -17,8 +18,10 @@ from onyx.db.regulatory_chunks import (
     RegulatoryChunkProjection,
     RegulatoryProvisionHeadingCandidate,
     RegulatoryProvisionHeadingSource,
+    get_bounded_adjacent_provisions,
     get_bounded_referenced_provisions,
     get_bounded_same_provision_siblings,
+    get_bounded_source_lexical_matches,
     get_regulatory_provision_heading_source,
     is_regulatory_navigation_candidate_visible,
 )
@@ -42,6 +45,18 @@ _BARE_DESCENDANT_RE = re.compile(
 _MAX_TOPIC_HINT_CHARS = 120
 _REFERENCED_PROVISION_MAX_TOTAL_CHARS = 6_000
 _LEXICAL_TERM_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
+_NAVIGATION_GENERIC_TERMS = {
+    "article",
+    "bolum",
+    "chapter",
+    "ek",
+    "ilave",
+    "madde",
+    "section",
+}
+_NAVIGATION_LEAD_MAX_SECTIONS = 2
+_SOURCE_LEXICAL_MAX_MATCHES = 2
+_SOURCE_LEXICAL_MAX_SECTIONS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +65,7 @@ class RegulatoryProvisionNavigationEntry:
 
     article_key: str
     heading_label: str
+    regulatory_chunk_id: str | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +74,7 @@ class RegulatoryProvisionNavigation:
 
     document_title: str
     entries: tuple[RegulatoryProvisionNavigationEntry, ...]
+    user_file_id: str | None = field(default=None, repr=False, compare=False)
 
 
 class RegulatoryProvisionNavigationPayloadEntry(TypedDict):
@@ -80,6 +97,7 @@ class _RawArticleHeading:
     heading_label: str
     position: int
     label_priority: int
+    regulatory_chunk_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +107,7 @@ class _ArticleHeadingOption:
     heading_label: str
     position: int
     label_priority: int
+    regulatory_chunk_id: str | None
 
 
 def _fold_heading(value: str) -> str:
@@ -96,7 +115,7 @@ def _fold_heading(value: str) -> str:
     without_marks = "".join(
         character for character in decomposed if unicodedata.category(character) != "Mn"
     )
-    return " ".join(without_marks.split())
+    return " ".join(without_marks.replace("ı", "i").split())
 
 
 def _focused_query_overlap_score(query_terms: set[str], text: str) -> int:
@@ -109,10 +128,29 @@ def _focused_query_overlap_score(query_terms: set[str], text: str) -> int:
     """
 
     text_terms = set(_LEXICAL_TERM_RE.findall(_fold_heading(text)))
-    return sum(
-        4 if any(character.isdigit() for character in term) else 1
-        for term in query_terms.intersection(text_terms)
-    )
+    score = 0
+    for query_term in query_terms:
+        if query_term in text_terms:
+            score += 4 if query_term.isdigit() else 2
+            continue
+        if len(query_term) < 4 or query_term.isdigit():
+            continue
+        if any(
+            len(text_term) >= 4 and text_term[:4] == query_term[:4]
+            for text_term in text_terms
+        ):
+            score += 1
+    return score
+
+
+def _navigation_query_terms(value: str) -> set[str]:
+    return {
+        term
+        for term in _LEXICAL_TERM_RE.findall(_fold_heading(value))
+        if len(term) >= 3
+        and not term.isdigit()
+        and term not in _NAVIGATION_GENERIC_TERMS
+    }
 
 
 def _heading_key_component(value: str) -> str:
@@ -186,6 +224,7 @@ def _raw_article_heading(
         heading_label=heading_label,
         position=candidate.position,
         label_priority=label_priority,
+        regulatory_chunk_id=candidate.regulatory_chunk_id,
     )
 
 
@@ -209,6 +248,7 @@ def _strip_common_document_root(
             heading_label=heading.heading_label,
             position=heading.position,
             label_priority=heading.label_priority,
+            regulatory_chunk_id=heading.regulatory_chunk_id,
         )
         for heading in headings
     ]
@@ -260,46 +300,41 @@ def select_regulatory_provision_navigation(
             else heading.article_base_key
         )
         heading_label = " > ".join([*heading.scope_labels, heading.heading_label])
+        current_option = _ArticleHeadingOption(
+            article_key=article_key,
+            article_base_key=heading.article_base_key,
+            heading_label=heading_label,
+            position=heading.position,
+            label_priority=heading.label_priority,
+            regulatory_chunk_id=heading.regulatory_chunk_id,
+        )
         previous = options_by_key.get(article_key)
         if previous is None:
-            options_by_key[article_key] = _ArticleHeadingOption(
-                article_key=article_key,
-                article_base_key=heading.article_base_key,
-                heading_label=heading_label,
-                position=heading.position,
-                label_priority=heading.label_priority,
-            )
+            options_by_key[article_key] = current_option
             continue
 
         preferred_label = max(
-            [
-                previous,
-                _ArticleHeadingOption(
-                    article_key=article_key,
-                    article_base_key=heading.article_base_key,
-                    heading_label=heading_label,
-                    position=heading.position,
-                    label_priority=heading.label_priority,
-                ),
-            ],
+            [previous, current_option],
             key=lambda option: (
                 option.label_priority,
                 len(option.heading_label),
                 -option.position,
             ),
         )
+        anchor = min(
+            (previous, current_option),
+            key=lambda option: (
+                min(abs(option.position - seed) for seed in seed_positions),
+                option.position,
+            ),
+        )
         options_by_key[article_key] = _ArticleHeadingOption(
             article_key=article_key,
             article_base_key=heading.article_base_key,
             heading_label=preferred_label.heading_label,
-            position=min(
-                (previous.position, heading.position),
-                key=lambda position: (
-                    min(abs(position - seed) for seed in seed_positions),
-                    position,
-                ),
-            ),
+            position=anchor.position,
             label_priority=preferred_label.label_priority,
+            regulatory_chunk_id=anchor.regulatory_chunk_id,
         )
 
     query_base_key_order = {
@@ -317,7 +352,7 @@ def select_regulatory_provision_navigation(
         )
         not in query_base_key_order
     }
-    query_terms = set(_LEXICAL_TERM_RE.findall(_fold_heading(focused_query)))
+    query_terms = _navigation_query_terms(focused_query)
     ranked = sorted(
         options_by_key.values(),
         key=lambda option: (
@@ -338,9 +373,11 @@ def select_regulatory_provision_navigation(
             RegulatoryProvisionNavigationEntry(
                 article_key=option.article_key,
                 heading_label=option.heading_label,
+                regulatory_chunk_id=option.regulatory_chunk_id,
             )
             for option in selected
         ),
+        user_file_id=str(source.user_file_id),
     )
 
 
@@ -422,10 +459,230 @@ def regulatory_provision_navigation_payload(
     )
 
 
+def expand_selected_regulatory_navigation_leads(
+    db_session: Session,
+    sections: list[InferenceSection],
+    *,
+    navigation: RegulatoryProvisionNavigation | None,
+    query: str,
+    as_of_date: datetime.date | None,
+    max_total_sections: int,
+) -> list[InferenceSection]:
+    """Replace weak tail hits with at most two strongly matched provision leads."""
+
+    if navigation is None or not sections or max_total_sections <= 0:
+        return sections[:max_total_sections]
+
+    query_terms = _navigation_query_terms(query)
+    explicit_references = set(_explicit_references_from_sections(query, ()))
+    represented_article_keys: set[str] = set()
+    for section in sections:
+        for heading in reversed(section.center_chunk.heading_path or []):
+            parsed_heading = parse_regulatory_article_heading(heading)
+            if parsed_heading is None:
+                continue
+            represented_article_keys.add(
+                (f"{parsed_heading.qualifier}-" if parsed_heading.qualifier else "")
+                + f"madde:{_heading_key_component(parsed_heading.article_no)}"
+            )
+            break
+
+    eligible_entries: list[
+        tuple[int, int, int, int, RegulatoryProvisionNavigationEntry]
+    ] = []
+    for entry_index, entry in enumerate(navigation.entries):
+        chunk_id = entry.regulatory_chunk_id
+        if chunk_id is None:
+            continue
+        parsed_key = entry.article_key.rsplit("::", 1)[-1]
+        explicit_match = any(
+            parsed_key
+            == (
+                (f"{reference.qualifier}-" if reference.qualifier else "")
+                + f"madde:{_heading_key_component(reference.article_no)}"
+            )
+            for reference in explicit_references
+        )
+        overlap = _focused_query_overlap_score(query_terms, entry.heading_label)
+        represented_match = parsed_key in represented_article_keys
+        if explicit_match or represented_match or overlap > 0:
+            eligible_entries.append(
+                (
+                    0 if explicit_match else 1,
+                    0 if represented_match else 1,
+                    -overlap,
+                    entry_index,
+                    entry,
+                )
+            )
+    if not eligible_entries:
+        return sections[:max_total_sections]
+    prioritized_entries = [
+        item[-1] for item in sorted(eligible_entries)[:_NAVIGATION_LEAD_MAX_SECTIONS]
+    ]
+
+    template = next(
+        (
+            section.center_chunk
+            for section in sections
+            if navigation.user_file_id is not None
+            and section.center_chunk.document_id == navigation.user_file_id
+        ),
+        None,
+    )
+    if template is None:
+        return sections[:max_total_sections]
+
+    existing_identities = {
+        _chunk_identity(section.center_chunk) for section in sections
+    }
+    lead_sections: list[InferenceSection] = []
+    for entry in prioritized_entries:
+        if entry.regulatory_chunk_id is None:
+            continue
+        projections = get_bounded_same_provision_siblings(
+            db_session,
+            [entry.regulatory_chunk_id],
+            query=query,
+            as_of_date=as_of_date,
+            max_chunks_per_provision=2,
+            max_chars_per_provision=4_000,
+        )
+        for projection in projections:
+            identity = (str(projection.user_file_id), projection.regulatory_chunk_id)
+            if identity in existing_identities:
+                continue
+            lead_chunk = _chunk_from_projection(
+                projection,
+                template,
+                relevance_explanation="Strong lexical regulatory heading lead",
+            )
+            lead_sections.append(inference_section_from_single_chunk(lead_chunk))
+            existing_identities.add(identity)
+            if len(lead_sections) >= _NAVIGATION_LEAD_MAX_SECTIONS:
+                break
+        if len(lead_sections) >= _NAVIGATION_LEAD_MAX_SECTIONS:
+            break
+    if not lead_sections:
+        return sections[:max_total_sections]
+
+    retained = sections[: max(0, max_total_sections - len(lead_sections))]
+    retained_identities = {
+        _chunk_identity(section.center_chunk) for section in retained
+    }
+    return retained + [
+        section
+        for section in lead_sections
+        if _chunk_identity(section.center_chunk) not in retained_identities
+    ]
+
+
+def expand_selected_regulatory_source_lexical_matches(
+    db_session: Session,
+    sections: list[InferenceSection],
+    *,
+    navigation: RegulatoryProvisionNavigation | None,
+    query: str,
+    as_of_date: datetime.date | None,
+    max_total_sections: int,
+) -> list[InferenceSection]:
+    """Replace weak tail hits with bounded matches from one known source."""
+
+    if (
+        navigation is None
+        or navigation.user_file_id is None
+        or not sections
+        or max_total_sections <= 0
+    ):
+        return sections[:max_total_sections]
+    source_template = next(
+        (
+            section.center_chunk
+            for section in sections
+            if section.center_chunk.document_id == navigation.user_file_id
+        ),
+        None,
+    )
+    if source_template is None:
+        return sections[:max_total_sections]
+
+    existing_chunk_ids = [
+        chunk_id
+        for section in sections
+        if (chunk_id := section.center_chunk.regulatory_chunk_id) is not None
+    ]
+    source_matches = get_bounded_source_lexical_matches(
+        db_session,
+        user_file_id=UUID(navigation.user_file_id),
+        query=query,
+        as_of_date=as_of_date,
+        excluded_chunk_ids=existing_chunk_ids,
+        max_matches=_SOURCE_LEXICAL_MAX_MATCHES,
+    )
+    if not source_matches:
+        return sections[:max_total_sections]
+
+    sibling_projections = get_bounded_same_provision_siblings(
+        db_session,
+        [match.regulatory_chunk_id for match in source_matches],
+        query=query,
+        as_of_date=as_of_date,
+        max_chunks_per_provision=2,
+        max_chars_per_provision=4_000,
+    )
+    ordered_projections = [*source_matches, *sibling_projections]
+    fallback_sections: list[InferenceSection] = []
+    seen_identities = {_chunk_identity(section.center_chunk) for section in sections}
+    for projection in ordered_projections:
+        identity = (str(projection.user_file_id), projection.regulatory_chunk_id)
+        if identity in seen_identities:
+            continue
+        chunk = _chunk_from_projection(
+            projection,
+            source_template,
+            relevance_explanation="Focused lexical match within selected source",
+        )
+        fallback_sections.append(inference_section_from_single_chunk(chunk))
+        seen_identities.add(identity)
+        if len(fallback_sections) >= min(
+            _SOURCE_LEXICAL_MAX_SECTIONS,
+            max_total_sections,
+        ):
+            break
+    if not fallback_sections:
+        return sections[:max_total_sections]
+
+    retained = sections[: max(0, max_total_sections - len(fallback_sections))]
+    return [*retained, *fallback_sections]
+
+
 def _chunk_identity(chunk: InferenceChunk) -> tuple[str, str | int]:
     if chunk.regulatory_chunk_id is not None:
         return (chunk.document_id, chunk.regulatory_chunk_id)
     return (chunk.document_id, chunk.chunk_id)
+
+
+def _structural_provision_family_identity(
+    chunk: InferenceChunk,
+) -> tuple[str, ...] | None:
+    """Identify one local provision family without using its mutable chunk ID."""
+
+    if chunk.regulatory_chunk_id is None or not isinstance(chunk.heading_path, list):
+        return None
+    last_article_index: int | None = None
+    for heading_index, heading in enumerate(chunk.heading_path):
+        if isinstance(heading, str) and parse_regulatory_article_heading(heading):
+            last_article_index = heading_index
+    if last_article_index is None:
+        return None
+    return (
+        chunk.document_id,
+        *(
+            _fold_heading(heading)
+            for heading in chunk.heading_path[: last_article_index + 1]
+            if isinstance(heading, str)
+        ),
+    )
 
 
 def _document_semantic_identifier(chunk: InferenceChunk) -> str:
@@ -576,6 +833,80 @@ def expand_selected_regulatory_references(
     return expanded
 
 
+def expand_selected_regulatory_adjacent_provisions(
+    db_session: Session,
+    sections: list[InferenceSection],
+    *,
+    seed_sections: Sequence[InferenceSection],
+    query: str,
+    as_of_date: datetime.date | None,
+    max_total_sections: int,
+) -> list[InferenceSection]:
+    """Use spare slots for immediate provisions without evicting exact evidence."""
+
+    if not sections or max_total_sections <= 0:
+        return sections[:max_total_sections]
+    seed_chunk_ids = [
+        chunk_id
+        for section in seed_sections
+        if (chunk_id := section.center_chunk.regulatory_chunk_id) is not None
+    ]
+    if not seed_chunk_ids:
+        return sections[:max_total_sections]
+    projections = get_bounded_adjacent_provisions(
+        db_session,
+        seed_chunk_ids,
+        query=query,
+        as_of_date=as_of_date,
+    )
+    if not projections:
+        return sections[:max_total_sections]
+
+    templates_by_document = {
+        section.center_chunk.document_id: section.center_chunk
+        for section in seed_sections
+        if section.center_chunk.regulatory_chunk_id is not None
+    }
+    existing_identities = {
+        _chunk_identity(section.center_chunk) for section in sections
+    }
+    available_slots = max(0, max_total_sections - len(sections))
+    if available_slots == 0:
+        return sections[:max_total_sections]
+    adjacent_sections: list[InferenceSection] = []
+    for projection in projections:
+        identity = (str(projection.user_file_id), projection.regulatory_chunk_id)
+        if identity in existing_identities:
+            continue
+        template = templates_by_document.get(str(projection.user_file_id))
+        if template is None:
+            continue
+        adjacent = _chunk_from_projection(
+            projection,
+            template,
+            relevance_explanation="Immediate same-scope regulatory provision",
+        )
+        adjacent_sections.append(inference_section_from_single_chunk(adjacent))
+        existing_identities.add(identity)
+        if len(adjacent_sections) >= min(2, available_slots):
+            break
+    if not adjacent_sections:
+        return sections[:max_total_sections]
+
+    retained = sections[:max_total_sections]
+    retained_identities = {
+        _chunk_identity(section.center_chunk) for section in retained
+    }
+    return (
+        retained
+        + [
+            section
+            for section in adjacent_sections
+            if _chunk_identity(section.center_chunk) not in retained_identities
+        ][:available_slots]
+    )
+
+
 def expand_selected_regulatory_sections(
     db_session: Session,
     sections: list[InferenceSection],
@@ -583,6 +914,7 @@ def expand_selected_regulatory_sections(
     query: str,
     as_of_date: datetime.date | None,
     max_total_sections: int,
+    structural_seed_sections: Sequence[InferenceSection] | None = None,
 ) -> list[InferenceSection]:
     """Add independently citable siblings without exceeding the chat budget.
 
@@ -609,13 +941,36 @@ def expand_selected_regulatory_sections(
     if not regulatory_seeds:
         return deduplicated_sections[:max_total_sections]
 
+    expansion_seed_by_id = {
+        seed.regulatory_chunk_id: seed
+        for seed in regulatory_seeds
+        if seed.regulatory_chunk_id is not None
+    }
+    represented_provision_families = {
+        family_identity
+        for seed in regulatory_seeds
+        if (family_identity := _structural_provision_family_identity(seed)) is not None
+    }
+    for structural_seed_section in structural_seed_sections or ():
+        structural_seed = structural_seed_section.center_chunk
+        if structural_seed.regulatory_chunk_id is None:
+            continue
+        family_identity = _structural_provision_family_identity(structural_seed)
+        if (
+            family_identity is not None
+            and family_identity in represented_provision_families
+        ):
+            continue
+        expansion_seed_by_id.setdefault(
+            structural_seed.regulatory_chunk_id,
+            structural_seed,
+        )
+        if family_identity is not None:
+            represented_provision_families.add(family_identity)
+    expansion_seed_chunk_ids = list(expansion_seed_by_id)
     projections = get_bounded_same_provision_siblings(
         db_session,
-        [
-            seed.regulatory_chunk_id
-            for seed in regulatory_seeds
-            if seed.regulatory_chunk_id
-        ],
+        expansion_seed_chunk_ids,
         query=query,
         as_of_date=as_of_date,
     )
@@ -652,10 +1007,37 @@ def expand_selected_regulatory_sections(
         for section in deduplicated_sections
         if section.center_chunk.regulatory_chunk_id is not None
     ]
-    if len(deduplicated_sections) >= max_total_sections:
-        return deduplicated_sections[:max_total_sections]
+    selected_identities = {
+        _chunk_identity(section.center_chunk) for section in deduplicated_sections
+    }
+    available_sibling_count = sum(
+        1
+        for projection in projections
+        if (str(projection.user_file_id), projection.regulatory_chunk_id)
+        not in selected_identities
+    )
+    reserved_sibling_slots = min(
+        5,
+        available_sibling_count,
+        max_total_sections // 2,
+    )
+    retained_seed_count = max_total_sections - reserved_sibling_slots
+    original_sections = deduplicated_sections
+    deduplicated_sections = deduplicated_sections[:retained_seed_count]
     seed_by_id = {
         seed.regulatory_chunk_id: seed
+        for seed in regulatory_seeds
+        if seed.regulatory_chunk_id is not None
+    }
+    seed_by_id.update(
+        {
+            seed_id: seed
+            for seed_id, seed in expansion_seed_by_id.items()
+            if seed_id not in seed_by_id
+        }
+    )
+    primary_seed_ids = {
+        seed.regulatory_chunk_id
         for seed in regulatory_seeds
         if seed.regulatory_chunk_id is not None
     }
@@ -681,7 +1063,7 @@ def expand_selected_regulatory_sections(
             continue
         compatible_seeds = [
             seed
-            for seed in regulatory_seeds
+            for seed in seed_by_id.values()
             if seed.regulatory_chunk_id is not None
             and seed.document_id == str(projection.user_file_id)
         ]
@@ -701,14 +1083,50 @@ def expand_selected_regulatory_sections(
     expanded = list(deduplicated_sections)
     seed_rank_by_id = {
         seed.regulatory_chunk_id: seed_rank
-        for seed_rank, seed in enumerate(regulatory_seeds)
+        for seed_rank, seed in enumerate(seed_by_id.values())
         if seed.regulatory_chunk_id is not None
     }
     while len(expanded) < max_total_sections:
+        priority_seed_ids = [
+            seed_id
+            for seed_id, queue in sibling_queues.items()
+            if queue and queue[0].expansion_priority < 0
+        ]
+        if priority_seed_ids:
+            priority_seed_id = min(
+                priority_seed_ids,
+                key=lambda seed_id: (
+                    sibling_queues[seed_id][0].expansion_priority,
+                    -_focused_query_overlap_score(
+                        query_terms, sibling_queues[seed_id][0].text
+                    ),
+                    seed_rank_by_id[seed_id],
+                    sibling_queues[seed_id][0].projection_index,
+                    sibling_queues[seed_id][0].regulatory_chunk_id,
+                ),
+            )
+            priority_projection = sibling_queues[priority_seed_id].popleft()
+            priority_sibling = _chunk_from_projection(
+                priority_projection,
+                seed_by_id[priority_seed_id],
+            )
+            priority_identity = _chunk_identity(priority_sibling)
+            if priority_identity not in seen_identities:
+                seen_identities.add(priority_identity)
+                expanded.append(inference_section_from_single_chunk(priority_sibling))
+            continue
+
         added_in_round = False
         active_seed_ids = [
             seed_id for seed_id, queue in sibling_queues.items() if queue
         ]
+        primary_active_seed_ids = [
+            seed_id for seed_id in active_seed_ids if seed_id in primary_seed_ids
+        ]
+        if primary_active_seed_ids:
+            # Navigation-only seeds are discovery leads. They must not displace
+            # same-provision text belonging to the stronger selected hit.
+            active_seed_ids = primary_active_seed_ids
         active_seed_ids.sort(
             key=lambda seed_id: (
                 sibling_queues[seed_id][0].expansion_priority,
@@ -734,5 +1152,19 @@ def expand_selected_regulatory_sections(
                 break
         if not added_in_round:
             break
+
+    # If a provision has fewer usable siblings than the reserved allowance,
+    # restore the original ranked seeds rather than returning a short result.
+    expanded_identities = {
+        _chunk_identity(section.center_chunk) for section in expanded
+    }
+    for section in original_sections:
+        if len(expanded) >= max_total_sections:
+            break
+        identity = _chunk_identity(section.center_chunk)
+        if identity in expanded_identities:
+            continue
+        expanded.append(section)
+        expanded_identities.add(identity)
 
     return expanded

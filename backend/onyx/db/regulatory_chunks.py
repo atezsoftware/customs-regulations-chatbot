@@ -8,6 +8,7 @@ onyx/regulatory/indexing.py).
 
 import datetime
 import hashlib
+import math
 import re
 import unicodedata
 from collections.abc import Iterable, Sequence
@@ -28,12 +29,15 @@ from onyx.regulatory.heading_path import (
     parse_regulatory_article_heading,
 )
 
-DEFAULT_PROVISION_MAX_CHUNKS = 16
+DEFAULT_PROVISION_MAX_CHUNKS = 24
 DEFAULT_PROVISION_MAX_CHARS = 8_000
 DEFAULT_NAVIGATION_MAX_HEADINGS = 12
 DEFAULT_REFERENCE_MAX_PROVISIONS = 3
 DEFAULT_REFERENCE_MAX_CHUNKS_PER_PROVISION = 4
 DEFAULT_REFERENCE_MAX_CHARS_PER_PROVISION = 4_000
+DEFAULT_ADJACENT_MAX_PROVISIONS = 2
+DEFAULT_ADJACENT_MAX_CHUNKS_PER_PROVISION = 2
+DEFAULT_ADJACENT_MAX_TOTAL_CHARS = 4_000
 
 _LEXICAL_TERM_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
 _NUMBERED_PEER_HEADING_RE = re.compile(
@@ -41,6 +45,7 @@ _NUMBERED_PEER_HEADING_RE = re.compile(
 )
 _TERSE_LIST_ITEM_MAX_CHARS = 100
 _TERSE_LIST_ITEM_MAX_TERMS = 8
+_TERSE_STRUCTURAL_INTRO_MAX_CHARS = 240
 _MAX_LOCAL_PARAGRAPH_REFERENCES = 8
 _TURKISH_ORDINAL_SUFFIX_RE = r"(?:[iı]nc[iı]|nc[iı]|uncu)"
 _TURKISH_LOCAL_REFERENCE_ITEM_RE = (
@@ -146,6 +151,7 @@ class RegulatoryProvisionHeadingCandidate:
     validity_start_date: datetime.date | None
     validity_end_date: datetime.date | None
     article_title: str | None = None
+    regulatory_chunk_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +224,10 @@ def _fold_text(value: str) -> str:
     without_marks = "".join(
         character for character in decomposed if unicodedata.category(character) != "Mn"
     )
-    return " ".join(without_marks.split())
+    # Turkish dotless i does not decompose under NFKD. Treat it as its ASCII
+    # search equivalent so bilingual query concepts such as limitation periods
+    # match Turkish source text consistently.
+    return " ".join(without_marks.replace("ı", "i").split())
 
 
 def _normalize_article_no(value: str | None) -> str | None:
@@ -820,6 +829,27 @@ def _lexical_terms(value: str) -> set[str]:
     return set(_LEXICAL_TERM_RE.findall(_fold_text(value)))
 
 
+def _focused_term_overlap_score(query_terms: set[str], value: str) -> int:
+    """Score exact and conservative inflection-tolerant lexical overlap."""
+
+    value_terms = _lexical_terms(value)
+    score = 0
+    for query_term in query_terms:
+        if len(query_term) < 4:
+            continue
+        if query_term in value_terms:
+            score += 5 if query_term.isdigit() else 3
+            continue
+        if query_term.isdigit():
+            continue
+        if any(
+            len(value_term) >= 4 and value_term[:4] == query_term[:4]
+            for value_term in value_terms
+        ):
+            score += 2
+    return score
+
+
 def _positive_list_number(row: RegulatoryChunkProjection) -> int | None:
     metadata_number = _positive_decimal(row.paragraph_no)
     if metadata_number is not None:
@@ -911,6 +941,17 @@ def _is_terse_numbered_item(row: RegulatoryChunkProjection) -> bool:
     )
 
 
+def _is_terse_structural_intro(row: RegulatoryChunkProjection) -> bool:
+    """Whether a short row grammatically opens a following child run."""
+
+    stripped = row.text.rstrip()
+    return (
+        row.chunk_type in {"paragraph", "numbered_section"}
+        and len(stripped) <= _TERSE_STRUCTURAL_INTRO_MAX_CHARS
+        and stripped.endswith((":", ";"))
+    )
+
+
 def _structural_companion_ids(
     rows: Sequence[RegulatoryChunkProjection],
     seeds: Sequence[RegulatoryChunkProjection],
@@ -935,8 +976,55 @@ def _structural_companion_ids(
         seen_ids.add(row.regulatory_chunk_id)
         companion_ids.append(row.regulatory_chunk_id)
 
+    def direct_clause_parent_path(
+        row: RegulatoryChunkProjection,
+    ) -> tuple[str, ...] | None:
+        if row.chunk_type != "clause" and row.clause_label is None:
+            return None
+        if len(row.heading_path) < 2:
+            return None
+        return tuple(_fold_text(value) for value in row.heading_path[:-1])
+
     for seed in seeds:
         seed_index = index_by_id[seed.regulatory_chunk_id]
+
+        # Descendant clauses and paragraphs often carry only the narrow branch,
+        # while the article lead carries the operative subject and trigger. Keep
+        # that parent independently citable and inside the same bounded packet.
+        if seed.chunk_type != "article":
+            seed_anchor = _last_explicit_article_anchor(seed.heading_path)
+            if seed_anchor is not None:
+                article_parents = [
+                    row
+                    for row in rows
+                    if row.chunk_type == "article"
+                    and (row_anchor := _last_explicit_article_anchor(row.heading_path))
+                    is not None
+                    and row_anchor.key == seed_anchor.key
+                ]
+                if article_parents:
+                    nearest_parent = min(
+                        article_parents,
+                        key=lambda row: (
+                            abs(row.projection_index - seed.projection_index),
+                            row.projection_index,
+                            row.regulatory_chunk_id,
+                        ),
+                    )
+                    add(nearest_parent)
+                    # Long provisions can split their operative lead across
+                    # consecutive article chunks. Keep the earliest lead as a
+                    # second bounded companion while retaining the nearest
+                    # parent as the first choice under a two-chunk budget.
+                    add(
+                        min(
+                            article_parents,
+                            key=lambda row: (
+                                row.projection_index,
+                                row.regulatory_chunk_id,
+                            ),
+                        )
+                    )
 
         for companion in _local_paragraph_companion_rows(rows, seed):
             add(companion)
@@ -965,6 +1053,45 @@ def _structural_companion_ids(
                 if candidate.chunk_type in {"paragraph", "numbered_section"}:
                     add(candidate)
                 break
+
+            # Labelled limbs under one direct grammatical parent form a
+            # bounded operative set. Preserve the peer conditions and
+            # exceptions without crossing into a restarted list. The parent
+            # is admitted first because it may carry the inherited operator.
+            clause_parent_path = direct_clause_parent_path(seed)
+            if clause_parent_path is not None:
+                for candidate in rows:
+                    if (
+                        candidate.regulatory_chunk_id != seed.regulatory_chunk_id
+                        and direct_clause_parent_path(candidate) == clause_parent_path
+                    ):
+                        add(candidate)
+
+        # A terse lead-in such as a definition/list operator is not useful on
+        # its own, while each child can inherit its legal direction from that
+        # lead-in. Build a bounded same-article packet by prioritizing the
+        # consecutive child run. Children remain independent chunks/citations;
+        # this only guarantees that retrieval presents the grammatical unit.
+        if _is_terse_structural_intro(seed):
+            seed_anchor = _last_explicit_article_anchor(seed.heading_path)
+            folded_seed_path = tuple(_fold_text(value) for value in seed.heading_path)
+            for candidate_index in range(seed_index + 1, len(rows)):
+                candidate = rows[candidate_index]
+                candidate_anchor = _last_explicit_article_anchor(candidate.heading_path)
+                if (
+                    seed_anchor is None
+                    or candidate_anchor is None
+                    or candidate_anchor.key != seed_anchor.key
+                ):
+                    break
+                folded_candidate_path = tuple(
+                    _fold_text(value) for value in candidate.heading_path
+                )
+                if candidate.chunk_type != "clause" and candidate.clause_label is None:
+                    break
+                if folded_candidate_path[: len(folded_seed_path)] != folded_seed_path:
+                    break
+                add(candidate)
 
         seed_number = _positive_list_number(seed)
         if seed_number is None:
@@ -1048,6 +1175,49 @@ def _select_group_within_budget(
 
     row_by_id = {row.regulatory_chunk_id: row for row in visible_rows}
     structural_companion_ids = _structural_companion_ids(visible_rows, seeds)
+    structural_companion_id_set = set(structural_companion_ids)
+    preserves_restarted_list_mapping = any(
+        _is_terse_numbered_item(seed) for seed in seeds
+    )
+
+    # A large grammatical family can otherwise consume the entire local window
+    # before a separate sibling that directly matches the focused query is
+    # considered. Reserve part of the remaining window only for lexical matches
+    # outside that family. Query-matched structural context keeps its ordinary
+    # structural priority and cannot displace required parents or list mappings.
+    query_matched_rows = sorted(
+        [
+            row
+            for row in visible_rows
+            if row.regulatory_chunk_id not in selected_by_id
+            and row.regulatory_chunk_id not in structural_companion_id_set
+            and not preserves_restarted_list_mapping
+            and _focused_term_overlap_score(query_terms, row.text) > 0
+        ],
+        key=lambda row: (
+            -_focused_term_overlap_score(query_terms, row.text),
+            min(
+                abs(row.projection_index - seed_index)
+                for seed_index in seed_projection_indices
+            ),
+            row.projection_index,
+            row.regulatory_chunk_id,
+        ),
+    )
+    available_non_seed_slots = max(0, max_chunks - len(selected_by_id))
+    query_match_reserve = min(
+        len(query_matched_rows),
+        (max(1, available_non_seed_slots // 3) if available_non_seed_slots >= 2 else 0),
+    )
+    for row in query_matched_rows[:query_match_reserve]:
+        if selected_chars + len(row.text) > max_chars:
+            continue
+        selected_by_id[row.regulatory_chunk_id] = replace(
+            row,
+            expansion_priority=-1,
+        )
+        selected_chars += len(row.text)
+
     for companion_id in structural_companion_ids:
         if len(selected_by_id) >= max_chunks:
             break
@@ -1063,7 +1233,7 @@ def _select_group_within_budget(
     ranked_non_seeds = sorted(
         non_seeds,
         key=lambda row: (
-            -len(query_terms.intersection(_lexical_terms(row.text))),
+            -_focused_term_overlap_score(query_terms, row.text),
             min(
                 abs(row.projection_index - seed_index)
                 for seed_index in seed_projection_indices
@@ -1136,6 +1306,258 @@ def select_bounded_same_provision_siblings(
                 selected.append(row)
                 selected_ids.add(row.regulatory_chunk_id)
     return selected
+
+
+def select_bounded_adjacent_provisions(
+    candidates: Iterable[RegulatoryChunkSiblingCandidate],
+    seed_chunk_ids: Sequence[str],
+    *,
+    query: str,
+    as_of_date: datetime.date | None,
+    max_provisions: int = DEFAULT_ADJACENT_MAX_PROVISIONS,
+    max_chunks_per_provision: int = DEFAULT_ADJACENT_MAX_CHUNKS_PER_PROVISION,
+    max_total_chars: int = DEFAULT_ADJACENT_MAX_TOTAL_CHARS,
+) -> list[RegulatoryChunkProjection]:
+    """Select the immediately preceding/following provisions in the same scope.
+
+    This is a bounded context window around real search hits, not a numeric
+    article guess. It follows document order and refuses cross-annex/part or
+    overlapping-version boundaries.
+    """
+
+    if max_provisions <= 0 or max_chunks_per_provision <= 0 or max_total_chars <= 0:
+        return []
+    projected_by_file, projected_by_id = _project_candidates(
+        candidates,
+        as_of_date=as_of_date,
+    )
+    visible_seeds = [
+        seed
+        for seed_id in dict.fromkeys(seed_chunk_ids)
+        if (seed := projected_by_id.get(seed_id)) is not None
+        and _is_valid_on(seed, as_of_date)
+    ]
+    query_terms = _lexical_terms(query)
+    selected: list[RegulatoryChunkProjection] = []
+    selected_ids: set[str] = set(seed_chunk_ids)
+    selected_anchor_keys: set[tuple[str, ...]] = set()
+    selected_chars = 0
+
+    for seed in visible_seeds:
+        if len(selected_anchor_keys) >= max_provisions:
+            break
+        seed_anchor = _last_explicit_article_anchor(seed.heading_path)
+        if seed_anchor is None:
+            continue
+        rows = projected_by_file[seed.user_file_id]
+        ordered_anchor_starts: list[tuple[_ArticleAnchor, int]] = []
+        seen_anchor_keys: set[tuple[str, ...]] = set()
+        for row_index, row in enumerate(rows):
+            if not _is_valid_on(row, as_of_date):
+                continue
+            anchor = _last_explicit_article_anchor(row.heading_path)
+            if anchor is None or anchor.key in seen_anchor_keys:
+                continue
+            seen_anchor_keys.add(anchor.key)
+            ordered_anchor_starts.append((anchor, row_index))
+        seed_anchor_index = next(
+            (
+                index
+                for index, (anchor, _) in enumerate(ordered_anchor_starts)
+                if anchor.key == seed_anchor.key
+            ),
+            None,
+        )
+        if seed_anchor_index is None:
+            continue
+
+        for neighbor_index in (seed_anchor_index - 1, seed_anchor_index + 1):
+            if (
+                neighbor_index < 0
+                or neighbor_index >= len(ordered_anchor_starts)
+                or len(selected_anchor_keys) >= max_provisions
+            ):
+                continue
+            neighbor_anchor, neighbor_start = ordered_anchor_starts[neighbor_index]
+            if neighbor_anchor.key[:-1] != seed_anchor.key[:-1]:
+                continue
+            if neighbor_anchor.key in selected_anchor_keys:
+                continue
+            span = _provision_span_for_seed(
+                rows,
+                neighbor_start,
+                as_of_date=as_of_date,
+            )
+            if _has_overlapping_visible_positions(
+                rows,
+                span,
+                as_of_date=as_of_date,
+            ):
+                continue
+            group = _ProvisionSelectionGroup(
+                user_file_id=seed.user_file_id,
+                projection_indices=span,
+                seed_ids=[rows[neighbor_start].regulatory_chunk_id],
+            )
+            neighbor_rows = _select_group_within_budget(
+                rows,
+                group,
+                query_terms=query_terms,
+                as_of_date=as_of_date,
+                max_chunks=max_chunks_per_provision,
+                max_chars=max_total_chars - selected_chars,
+            )
+            admitted = [
+                row
+                for row in neighbor_rows
+                if row.regulatory_chunk_id not in selected_ids
+                and selected_chars + len(row.text) <= max_total_chars
+            ]
+            if not admitted:
+                continue
+            selected_anchor_keys.add(neighbor_anchor.key)
+            for row in admitted:
+                selected.append(replace(row, expansion_priority=2))
+                selected_ids.add(row.regulatory_chunk_id)
+                selected_chars += len(row.text)
+    return selected
+
+
+def select_bounded_source_lexical_matches(
+    candidates: Iterable[RegulatoryChunkSiblingCandidate],
+    *,
+    user_file_id: UUID,
+    query: str,
+    as_of_date: datetime.date | None,
+    excluded_chunk_ids: Sequence[str] = (),
+    max_matches: int = 2,
+    max_total_chars: int = 4_000,
+) -> list[RegulatoryChunkProjection]:
+    """Select rare lexical matches inside one already-retrieved source.
+
+    This bounded fallback never chooses a document. It only rescans the single
+    source selected by ordinary indexed retrieval and uses within-document term
+    rarity to keep boilerplate from outranking a focused request term.
+    """
+
+    if max_matches <= 0 or max_total_chars <= 0:
+        return []
+    projected_by_file, _ = _project_candidates(candidates, as_of_date=as_of_date)
+    visible_rows = [
+        row
+        for row in projected_by_file.get(user_file_id, [])
+        if _is_valid_on(row, as_of_date)
+        and row.regulatory_chunk_id not in set(excluded_chunk_ids)
+    ]
+    query_terms = {
+        term for term in _lexical_terms(query) if len(term) >= 4 or term.isdigit()
+    }
+    if not visible_rows or not query_terms:
+        return []
+
+    row_terms = {
+        row.regulatory_chunk_id: _lexical_terms(" ".join((*row.heading_path, row.text)))
+        for row in visible_rows
+    }
+
+    def matches(query_term: str, value_term: str) -> tuple[bool, bool]:
+        if query_term == value_term:
+            return True, True
+        if query_term.isdigit() or len(query_term) < 4 or len(value_term) < 4:
+            return False, False
+        return query_term[:4] == value_term[:4], False
+
+    document_frequency: dict[str, int] = {}
+    for query_term in query_terms:
+        document_frequency[query_term] = sum(
+            1
+            for terms in row_terms.values()
+            if any(matches(query_term, value_term)[0] for value_term in terms)
+        )
+
+    ranked_rows: list[tuple[float, int, int, RegulatoryChunkProjection]] = []
+    row_count = len(visible_rows)
+    for row in visible_rows:
+        terms = row_terms[row.regulatory_chunk_id]
+        score = 0.0
+        matched_terms = 0
+        exact_terms = 0
+        for query_term in query_terms:
+            term_matches = [matches(query_term, value_term) for value_term in terms]
+            if not any(is_match for is_match, _ in term_matches):
+                continue
+            is_exact = any(is_exact for _, is_exact in term_matches)
+            rarity = (
+                math.log((row_count + 1) / (document_frequency[query_term] + 1)) + 1.0
+            )
+            score += rarity * (3.0 if is_exact else 2.0)
+            matched_terms += 1
+            exact_terms += int(is_exact)
+        if matched_terms:
+            ranked_rows.append((score, matched_terms, exact_terms, row))
+
+    ranked_rows.sort(
+        key=lambda item: (
+            -item[0],
+            -item[1],
+            -item[2],
+            item[3].projection_index,
+            item[3].regulatory_chunk_id,
+        )
+    )
+    selected: list[RegulatoryChunkProjection] = []
+    selected_ids: set[str] = set()
+    selected_chars = 0
+    selected_provisions: set[tuple[str, ...]] = set()
+
+    def provision_key(row: RegulatoryChunkProjection) -> tuple[str, ...]:
+        anchor = _last_explicit_article_anchor(row.heading_path)
+        return anchor.key if anchor is not None else (row.regulatory_chunk_id,)
+
+    for require_new_provision in (True, False):
+        for _, _, _, row in ranked_rows:
+            if row.regulatory_chunk_id in selected_ids:
+                continue
+            key = provision_key(row)
+            if require_new_provision and key in selected_provisions:
+                continue
+            if selected_chars + len(row.text) > max_total_chars:
+                continue
+            selected.append(replace(row, expansion_priority=-2))
+            selected_ids.add(row.regulatory_chunk_id)
+            selected_provisions.add(key)
+            selected_chars += len(row.text)
+            if len(selected) >= max_matches:
+                return selected
+    return selected
+
+
+def get_bounded_source_lexical_matches(
+    db_session: Session,
+    *,
+    user_file_id: UUID,
+    query: str,
+    as_of_date: datetime.date | None,
+    excluded_chunk_ids: Sequence[str] = (),
+    max_matches: int = 2,
+    max_total_chars: int = 4_000,
+) -> list[RegulatoryChunkProjection]:
+    """Load one known source and return its bounded lexical fallback matches."""
+
+    all_rows = list(
+        db_session.scalars(
+            select(RegulatoryChunk).where(RegulatoryChunk.user_file_id == user_file_id)
+        ).all()
+    )
+    return select_bounded_source_lexical_matches(
+        [_regulatory_sibling_candidate(row) for row in all_rows],
+        user_file_id=user_file_id,
+        query=query,
+        as_of_date=as_of_date,
+        excluded_chunk_ids=excluded_chunk_ids,
+        max_matches=max_matches,
+        max_total_chars=max_total_chars,
+    )
 
 
 def _rank_regulatory_navigation_seed_files(
@@ -1423,6 +1845,7 @@ def get_regulatory_provision_heading_source(
     heading_records = list(
         db_session.execute(
             select(
+                RegulatoryChunk.id,
                 RegulatoryChunk.user_file_id,
                 RegulatoryChunk.position,
                 RegulatoryChunk.heading_path,
@@ -1445,6 +1868,7 @@ def get_regulatory_provision_heading_source(
     candidates_by_file: dict[UUID, list[RegulatoryProvisionHeadingCandidate]] = {}
     for record in heading_records:
         candidate = RegulatoryProvisionHeadingCandidate(
+            regulatory_chunk_id=record.id,
             user_file_id=record.user_file_id,
             position=record.position,
             heading_path=tuple(record.heading_path),
@@ -1570,6 +1994,47 @@ def get_bounded_same_provision_siblings(
         as_of_date=as_of_date,
         max_chunks_per_provision=max_chunks_per_provision,
         max_chars_per_provision=max_chars_per_provision,
+    )
+
+
+def get_bounded_adjacent_provisions(
+    db_session: Session,
+    seed_chunk_ids: Sequence[str],
+    *,
+    query: str,
+    as_of_date: datetime.date | None,
+    max_provisions: int = DEFAULT_ADJACENT_MAX_PROVISIONS,
+    max_chunks_per_provision: int = DEFAULT_ADJACENT_MAX_CHUNKS_PER_PROVISION,
+    max_total_chars: int = DEFAULT_ADJACENT_MAX_TOTAL_CHARS,
+) -> list[RegulatoryChunkProjection]:
+    """Load seed files and return a bounded adjacent-provision context window."""
+
+    unique_seed_ids = list(dict.fromkeys(seed_chunk_ids))
+    if not unique_seed_ids:
+        return []
+    seed_rows = list(
+        db_session.scalars(
+            select(RegulatoryChunk).where(RegulatoryChunk.id.in_(unique_seed_ids))
+        ).all()
+    )
+    user_file_ids = {row.user_file_id for row in seed_rows}
+    if not user_file_ids:
+        return []
+    all_rows = list(
+        db_session.scalars(
+            select(RegulatoryChunk).where(
+                RegulatoryChunk.user_file_id.in_(user_file_ids)
+            )
+        ).all()
+    )
+    return select_bounded_adjacent_provisions(
+        [_regulatory_sibling_candidate(row) for row in all_rows],
+        unique_seed_ids,
+        query=query,
+        as_of_date=as_of_date,
+        max_provisions=max_provisions,
+        max_chunks_per_provision=max_chunks_per_provision,
+        max_total_chars=max_total_chars,
     )
 
 

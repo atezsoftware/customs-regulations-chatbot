@@ -31,6 +31,7 @@ from onyx.regulatory.provision_retrieval import (
     RegulatoryProvisionNavigation,
     RegulatoryProvisionNavigationEntry,
 )
+from onyx.reranking.constants import OPENROUTER_LUNA_RERANK_MODEL
 from onyx.reranking.models import RerankOutcome, RerankResult
 from onyx.secondary_llm_flows.time_filter import DocumentTimeField, TimeFilter
 from onyx.server.query_and_chat.placement import Placement
@@ -50,9 +51,11 @@ from onyx.tools.tool_implementations.search.search_tool import (
     _backfill_ranked_regulatory_sections,
     _can_use_ranked_regulatory_selection,
     _diversify_focused_regulatory_retrieval_lanes,
+    _expand_backfilled_regulatory_sections,
     _filter_visible_regulatory_sections,
     _normalize_exact_search_query,
     _prepare_search_query,
+    _prioritize_sections_by_source_anchors,
     _regulatory_provision_family,
     _regulatory_reference_expansion_limit,
     _reserve_ranked_regulatory_seeds,
@@ -61,8 +64,11 @@ from onyx.tools.tool_implementations.search.search_tool import (
     _validate_evidence_target,
     _validate_search_mode,
     _validate_search_queries,
+    _validated_source_anchors,
     build_query_lanes,
 )
+from onyx.utils.sensitive import make_mock_sensitive_value
+from shared_configs.enums import RerankerProvider
 
 MODULE = "onyx.tools.tool_implementations.search.search_tool"
 
@@ -193,6 +199,9 @@ def test_regulatory_internal_search_schema_requires_mode_selection() -> None:
     assert "search_mode" in parameters["required"]
     assert "coverage_item" not in parameters["properties"]
     assert "evidence_target" not in parameters["properties"]
+    assert "source_anchors" in parameters["properties"]
+    assert "source_anchors" not in parameters["required"]
+    assert "do not infer" in parameters["properties"]["source_anchors"]["description"]
     assert parameters["properties"]["search_mode"]["enum"] == [
         "hybrid",
         "keyword",
@@ -300,13 +309,16 @@ def test_no_regulatory_navigation_keeps_response_byte_identical() -> None:
     assert _add_regulatory_provision_navigation(response, None) == response
 
 
-def test_focused_regulatory_search_can_use_ranked_selection() -> None:
+def test_regulatory_search_can_use_ranked_selection() -> None:
     section = MagicMock()
     section.center_chunk.regulatory_chunk_id = "rc_exact"
 
-    assert _can_use_ranked_regulatory_selection([section], focused_search=True) is True
     assert (
-        _can_use_ranked_regulatory_selection([section], focused_search=False) is False
+        _can_use_ranked_regulatory_selection([section], regulatory_search=True) is True
+    )
+    assert (
+        _can_use_ranked_regulatory_selection([section], regulatory_search=False)
+        is False
     )
 
 
@@ -318,11 +330,11 @@ def test_ranked_selection_requires_every_section_to_be_regulatory() -> None:
 
     assert (
         _can_use_ranked_regulatory_selection(
-            [regulatory_section, ordinary_section], focused_search=True
+            [regulatory_section, ordinary_section], regulatory_search=True
         )
         is False
     )
-    assert _can_use_ranked_regulatory_selection([], focused_search=True) is False
+    assert _can_use_ranked_regulatory_selection([], regulatory_search=True) is False
 
 
 def _regulatory_section(document_id: str, chunk_id: int) -> InferenceSection:
@@ -398,11 +410,73 @@ def _real_regulatory_section(
     return inference_section_from_single_chunk(chunk)
 
 
-def test_ranked_regulatory_selection_reserves_half_for_provision_siblings() -> None:
+def test_ranked_regulatory_selection_reserves_most_slots_for_provision_family() -> None:
     sections = [_regulatory_section("doc", index) for index in range(6)]
 
-    assert _reserve_ranked_regulatory_seeds(sections, 4) == sections[:2]
+    assert _reserve_ranked_regulatory_seeds(sections, 4) == sections[:1]
+    assert _reserve_ranked_regulatory_seeds(sections, 6) == sections[:2]
     assert _reserve_ranked_regulatory_seeds(sections, 1) == sections[:1]
+
+
+def test_source_anchor_priority_promotes_exact_metadata_without_filtering() -> None:
+    related = _real_regulatory_section(
+        "related", 1, heading_path=["Transit Rejimi Tebliği", "MADDE 1"]
+    )
+    related.center_chunk.semantic_identifier = "Transit Rejimi Tebliği"
+    related.center_chunk.title = "Transit Rejimi Tebliği"
+    exact = _real_regulatory_section(
+        "exact",
+        2,
+        heading_path=[
+            "Ortak Transit Rejimine İlişkin Sözleşme",
+            "EK IV",
+            "MADDE 112",
+        ],
+    )
+    exact.center_chunk.semantic_identifier = "Ortak Transit Rejimine İlişkin Sözleşme"
+    exact.center_chunk.title = "Ortak Transit Rejimine İlişkin Sözleşme"
+    unrelated = _real_regulatory_section(
+        "unrelated", 3, heading_path=["Başka Belge", "MADDE 7"]
+    )
+
+    prioritized = _prioritize_sections_by_source_anchors(
+        [related, unrelated, exact],
+        ["Ortak Transit Rejimine İlişkin Sözleşme Ek IV"],
+    )
+
+    assert [section.center_chunk.document_id for section in prioritized] == [
+        "exact",
+        "related",
+        "unrelated",
+    ]
+    assert len(prioritized) == 3
+
+
+def test_source_anchor_priority_preserves_rank_when_no_metadata_match() -> None:
+    sections = [
+        _real_regulatory_section("first", 1, heading_path=["First Source"]),
+        _real_regulatory_section("second", 2, heading_path=["Second Source"]),
+    ]
+
+    assert (
+        _prioritize_sections_by_source_anchors(
+            sections, ["Completely Different Instrument"]
+        )
+        == sections
+    )
+
+
+def test_explicit_source_anchors_are_bounded_and_deduplicated() -> None:
+    assert _validated_source_anchors(
+        {
+            "source_anchors": [
+                " Named Instrument ",
+                "named instrument",
+                17,
+                "Second Instrument",
+            ]
+        }
+    ) == ["Named Instrument", "Second Instrument"]
 
 
 @pytest.mark.parametrize(
@@ -446,6 +520,28 @@ def test_ranked_regulatory_backfill_never_exceeds_section_cap() -> None:
     )
 
 
+def test_regulatory_backfill_happens_before_structural_expansion() -> None:
+    selected = _regulatory_section("doc", 1)
+    late_parent = _regulatory_section("doc", 2)
+    expanded_child = _regulatory_section("doc", 3)
+
+    with patch(
+        f"{MODULE}.expand_selected_regulatory_sections",
+        return_value=[selected, late_parent, expanded_child],
+    ) as expand:
+        result = _expand_backfilled_regulatory_sections(
+            MagicMock(),
+            [selected],
+            ranked_sections=[selected, late_parent],
+            query="request-derived unresolved proposition",
+            as_of_date=None,
+            max_total_sections=3,
+        )
+
+    assert result == [selected, late_parent, expanded_child]
+    assert expand.call_args.args[1] == [selected, late_parent]
+
+
 def test_regulatory_rich_response_uses_authoritative_repaired_selected_chunk() -> None:
     stale = _real_regulatory_section(
         "doc", 454, heading_path=["Convention", "2. Amount"]
@@ -467,6 +563,19 @@ def test_regulatory_rich_response_uses_authoritative_repaired_selected_chunk() -
         "MADDE 75",
         "2. Amount",
     ]
+
+
+def test_regulatory_rich_response_does_not_lead_with_unselected_raw_hits() -> None:
+    raw = _real_regulatory_section("doc", 10, heading_path=["Convention", "MADDE 10"])
+    selected = _real_regulatory_section(
+        "doc", 20, heading_path=["Convention", "MADDE 20"]
+    )
+
+    assert _rich_response_sections(
+        [raw],
+        [selected],
+        authoritative_selected=True,
+    ) == [selected]
 
 
 def test_non_regulatory_rich_response_preserves_existing_rich_chunk_behavior() -> None:
@@ -719,6 +828,12 @@ def test_exact_search_removes_boolean_syntax_without_dropping_identifiers() -> N
     )
 
 
+def test_exact_search_preserves_natural_language_boolean_words() -> None:
+    query = "Eligibility and request facet: threshold or refusal, not speculation"
+
+    assert _normalize_exact_search_query(query) == query
+
+
 def test_keyword_search_uses_only_the_model_written_query() -> None:
     assert (
         _prepare_search_query(
@@ -913,6 +1028,8 @@ def _run(
     num_hits: int = 50,
     max_llm_chunks: int = 25,
     rerank_candidate_limit: int = 100,
+    placement_turn_index: int = 0,
+    reranker_config: RerankerRuntimeConfig | None = None,
 ) -> MagicMock:
     """Run tool.run() with all DB/LLM deps mocked; returns the search_pipeline mock.
 
@@ -944,7 +1061,8 @@ def _run(
         patch(f"{MODULE}.get_current_search_settings", return_value=MagicMock()),
         patch(
             f"{MODULE}.get_reranker_configuration",
-            return_value=RerankerRuntimeConfig(
+            return_value=reranker_config
+            or RerankerRuntimeConfig(
                 enabled=False,
                 provider_type=None,
                 model_name=None,
@@ -987,7 +1105,7 @@ def _run(
         if search_mode is not None:
             tool_kwargs["search_mode"] = search_mode
         response = tool.run(
-            placement=Placement(turn_index=0, tab_index=0),
+            placement=Placement(turn_index=placement_turn_index, tab_index=0),
             override_kwargs=SearchToolOverrideKwargs(
                 starting_citation_num=1,
                 original_query=(
@@ -1214,6 +1332,129 @@ def test_rerank_fallback_keeps_legacy_selector() -> None:
     )
 
     selector_mocks[0].assert_called_once()
+
+
+def test_regulatory_rerank_fallback_preserves_ranked_seeds() -> None:
+    chunks = [
+        _real_regulatory_section(
+            f"document-{index}",
+            index,
+            heading_path=["Instrument", f"Provision {index}"],
+        ).center_chunk
+        for index in range(1, 8)
+    ]
+    selector_mocks: list[MagicMock] = []
+
+    _run(
+        _make_tool(
+            BaseFilters(regulatory_chunks_only=True),
+            auto_detect_filters=False,
+        ),
+        connected_sources=[DocumentSource.USER_FILE],
+        fused_chunks=chunks,
+        rerank_result=RerankResult(
+            ordered_chunks=chunks,
+            scores_by_chunk={},
+            submitted_count=len(chunks),
+            result_count=0,
+            outcome=RerankOutcome.DISABLED,
+            fallback_used=True,
+        ),
+        selector_sink=selector_mocks,
+        max_llm_chunks=9,
+        placement_turn_index=1,
+    )
+
+    selector_mocks[0].assert_not_called()
+
+
+def test_regulatory_luna_rerank_is_deferred_until_after_bootstrap() -> None:
+    rerank_mocks: list[MagicMock] = []
+    configured = RerankerRuntimeConfig(
+        enabled=True,
+        provider_type=RerankerProvider.OPENROUTER,
+        model_name=OPENROUTER_LUNA_RERANK_MODEL,
+        api_key=make_mock_sensitive_value("test-key"),
+        configuration_generation="test-generation",
+    )
+
+    _run(
+        _make_tool(
+            BaseFilters(regulatory_chunks_only=True),
+            auto_detect_filters=False,
+        ),
+        connected_sources=[DocumentSource.USER_FILE],
+        fused_chunks=[
+            _real_regulatory_section(
+                "document", 1, heading_path=["Instrument", "Provision"]
+            ).center_chunk
+        ],
+        rerank_sink=rerank_mocks,
+        reranker_config=configured,
+        placement_turn_index=0,
+    )
+
+    call = rerank_mocks[0].call_args.kwargs
+    assert call["query"] == "whether the ticket can be resolved"
+    assert call["config"].enabled is False
+    assert configured.enabled is True
+
+
+def test_regulatory_luna_rerank_is_enabled_for_followup_evidence_target() -> None:
+    rerank_mocks: list[MagicMock] = []
+    configured = RerankerRuntimeConfig(
+        enabled=True,
+        provider_type=RerankerProvider.OPENROUTER,
+        model_name=OPENROUTER_LUNA_RERANK_MODEL,
+        api_key=make_mock_sensitive_value("test-key"),
+        configuration_generation="test-generation",
+    )
+
+    _run(
+        _make_tool(
+            BaseFilters(regulatory_chunks_only=True),
+            auto_detect_filters=False,
+        ),
+        connected_sources=[DocumentSource.USER_FILE],
+        fused_chunks=[
+            _real_regulatory_section(
+                "document", 1, heading_path=["Instrument", "Provision"]
+            ).center_chunk
+        ],
+        rerank_sink=rerank_mocks,
+        reranker_config=configured,
+        placement_turn_index=1,
+    )
+
+    call = rerank_mocks[0].call_args.kwargs
+    assert call["query"] == "whether the ticket can be resolved"
+    assert call["config"].enabled is True
+
+
+def test_regulatory_bootstrap_keeps_ranked_selection_without_semantic_call() -> None:
+    chunks = [
+        _real_regulatory_section(
+            f"document-{index}",
+            index,
+            heading_path=["Instrument", f"Provision {index}"],
+        ).center_chunk
+        for index in range(1, 8)
+    ]
+    selector_mocks: list[MagicMock] = []
+
+    _run(
+        _make_tool(
+            BaseFilters(regulatory_chunks_only=True),
+            auto_detect_filters=False,
+        ),
+        connected_sources=[DocumentSource.USER_FILE],
+        fused_chunks=chunks,
+        selector_sink=selector_mocks,
+        max_llm_chunks=9,
+        placement_turn_index=0,
+    )
+
+    selector_mocks[0].assert_not_called()
 
 
 def test_non_regulatory_run_accepts_multiple_queries_without_mode_or_normalization() -> (

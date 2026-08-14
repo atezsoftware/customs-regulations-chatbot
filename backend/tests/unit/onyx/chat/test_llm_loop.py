@@ -17,23 +17,36 @@ from onyx.chat.empty_response import (
     build_empty_llm_response_error,
 )
 from onyx.chat.llm_loop import (
+    _REGULATORY_AUTONOMOUS_RESEARCH_CYCLES,
+    _REGULATORY_MAX_PARALLEL_SEARCH_CALLS,
     SearchEvidenceLedgerEntry,
     _build_candidate_answer_evidence_chunks,
+    _build_regulatory_coverage_tool_calls,
+    _build_regulatory_matrix_citation_issues,
+    _build_regulatory_navigation_recovery_tool_calls,
+    _build_regulatory_synthesis_history,
     _commit_canonical_tool_decision_step,
     _compact_regulatory_search_history_for_reconsideration,
     _compact_repeated_search_results_for_history,
     _constrain_regulatory_tool_calls,
     _effective_regulatory_search_call_budget,
     _extract_llm_visible_search_results,
+    _extract_regulatory_navigation_leads,
     _format_regulatory_tool_call_batch_feedback,
     _format_search_evidence_ledger,
     _hide_projected_tool_decision_output,
     _join_search_work_reminders,
+    _merge_candidate_review_verdicts,
     _merge_gathered_search_docs,
     _project_regulatory_history_for_tool_decision,
     _regulatory_llm_step_max_tokens,
+    _regulatory_outline_result_matches_requested_lead,
     _regulatory_search_call_budget,
     _regulatory_search_chunk_cap,
+    _select_regulatory_closure_evidence,
+    _select_regulatory_matrix_input_evidence,
+    _select_regulatory_matrix_review_evidence,
+    _should_schedule_regulatory_candidate_correction,
     _try_fallback_tool_extraction,
     construct_message_history,
     run_llm_loop,
@@ -60,8 +73,20 @@ from onyx.regulatory.candidate_answer_review import (
     CandidateAnswerClaimSpan,
     CandidateAnswerReviewResult,
     ClaimKind,
+    build_candidate_answer_evidence_chunk,
     format_candidate_answer_review,
     format_candidate_resolution_review,
+    format_candidate_review_regression_guard,
+)
+from onyx.regulatory.coverage_plan import (
+    RegulatoryCoverageItem,
+    RegulatoryCoveragePlan,
+)
+from onyx.regulatory.evidence_matrix import (
+    EvidenceCoverageStatus,
+    RegulatoryEvidenceMatrix,
+    RegulatoryEvidenceMatrixRow,
+    RegulatoryNavigationLead,
 )
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
@@ -1657,7 +1682,7 @@ def test_candidate_answer_review_feedback_describes_bounded_correction() -> None
 
     assert reminder is not None
     assert "not legal evidence" in reminder
-    assert "At most one focused support search" in reminder
+    assert "At most five query-distinct focused support gaps" in reminder
     assert "You retain the decision whether further retrieval is useful" not in reminder
     assert "Do not silently drop a concern" in reminder
     assert "A material draft claim" in reminder
@@ -1693,6 +1718,365 @@ def test_candidate_answer_review_without_findings_adds_no_instruction() -> None:
     )
 
     assert reminder is None
+
+
+def test_final_review_does_not_schedule_an_unreviewed_full_rewrite() -> None:
+    unresolved = CandidateAnswerReviewResult(
+        needs_reconsideration=True,
+        advisory_claim_issues=[
+            CandidateAnswerClaimIssue(
+                claim_reference="One remaining request-grounded concern.",
+                advisory_feedback="The reviewed revision still leaves it unresolved.",
+            )
+        ],
+    )
+
+    assert _should_schedule_regulatory_candidate_correction(1, unresolved) is True
+    assert _should_schedule_regulatory_candidate_correction(2, unresolved) is False
+
+
+def test_independent_review_disagreement_keeps_material_issue_open() -> None:
+    issue = CandidateAnswerClaimIssue(
+        claim_reference="Unsupported conclusion.",
+        advisory_feedback="The exact evidence does not entail the conclusion.",
+        related_citation_numbers=[4],
+    )
+
+    merged = _merge_candidate_review_verdicts(
+        CandidateAnswerReviewResult(needs_reconsideration=False),
+        CandidateAnswerReviewResult(
+            needs_reconsideration=True,
+            advisory_claim_issues=[issue],
+        ),
+    )
+
+    assert merged.needs_reconsideration is True
+    assert merged.advisory_claim_issues == [issue]
+
+
+def test_bootstrap_preserves_one_autonomous_onyx_research_cycle() -> None:
+    assert _REGULATORY_AUTONOMOUS_RESEARCH_CYCLES == 1
+
+
+def test_supported_matrix_rows_require_one_of_their_exact_citations() -> None:
+    matrix = RegulatoryEvidenceMatrix(
+        rows=[
+            RegulatoryEvidenceMatrixRow(
+                target="Supported deadline",
+                status=EvidenceCoverageStatus.SUPPORTED,
+                supported_proposition="The deadline is fixed by the source.",
+                document_numbers=[7, 8],
+            ),
+            RegulatoryEvidenceMatrixRow(
+                target="Open prerequisite",
+                status=EvidenceCoverageStatus.PARTIAL,
+                supported_proposition="Only part of the prerequisite is established.",
+                document_numbers=[9],
+                recovery_query="controlling prerequisite",
+            ),
+        ]
+    )
+
+    missing = _build_regulatory_matrix_citation_issues(
+        "The answer cites unrelated evidence [[3]]().",
+        matrix,
+    )
+    closed = _build_regulatory_matrix_citation_issues(
+        "The supported result is cited [[8]]().",
+        matrix,
+    )
+
+    assert len(missing) == 1
+    assert missing[0].claim_reference == "Supported deadline"
+    assert missing[0].related_citation_numbers == [7, 8]
+    assert closed == []
+
+
+def test_matrix_citation_issues_are_fair_across_request_targets() -> None:
+    matrix = RegulatoryEvidenceMatrix(
+        rows=[
+            *[
+                RegulatoryEvidenceMatrixRow(
+                    target=f"First request target result {number}",
+                    target_ids=["T1"],
+                    status=EvidenceCoverageStatus.SUPPORTED,
+                    supported_proposition=f"First result {number} is supported.",
+                    document_numbers=[number],
+                )
+                for number in range(1, 11)
+            ],
+            RegulatoryEvidenceMatrixRow(
+                target="Second request target result",
+                target_ids=["T2"],
+                status=EvidenceCoverageStatus.SUPPORTED,
+                supported_proposition="The second result is supported.",
+                document_numbers=[11],
+            ),
+        ]
+    )
+
+    issues = _build_regulatory_matrix_citation_issues("No citations yet.", matrix)
+
+    assert len(issues) == 11
+    assert any(issue.related_citation_numbers == [11] for issue in issues)
+
+
+def test_matrix_closure_review_uses_only_matrix_named_exact_chunks() -> None:
+    matrix = RegulatoryEvidenceMatrix(
+        rows=[
+            RegulatoryEvidenceMatrixRow(
+                target="Supported consequence",
+                status=EvidenceCoverageStatus.SUPPORTED,
+                supported_proposition="The source establishes the consequence.",
+                document_numbers=[2],
+            )
+        ]
+    )
+    evidence_chunks = [
+        build_candidate_answer_evidence_chunk(
+            document_id=f"document-{number}",
+            chunk_id=number,
+            citation_number=number,
+            retrieval_number=number,
+            chunk_identifier=f"chunk-{number}",
+            heading=f"Provision {number}",
+            content=f"Exact source text {number}",
+        )
+        for number in (1, 2, 3)
+    ]
+
+    selected = _select_regulatory_matrix_review_evidence(evidence_chunks, matrix)
+
+    assert [chunk.retrieval_number for chunk in selected] == [2]
+
+
+def test_closure_evidence_keeps_protected_sources_and_target_diversity() -> None:
+    evidence_chunks = [
+        build_candidate_answer_evidence_chunk(
+            document_id=f"document-{number}",
+            chunk_id=number,
+            citation_number=None,
+            retrieval_number=number,
+            chunk_identifier=f"chunk-{number}",
+            heading=f"Provision {number}",
+            research_target=("target-a" if number <= 4 else "target-b"),
+            content=f"Exact source text {number}",
+        )
+        for number in range(1, 7)
+    ]
+    matrix = RegulatoryEvidenceMatrix(
+        rows=[
+            RegulatoryEvidenceMatrixRow(
+                target="Supported target",
+                status=EvidenceCoverageStatus.SUPPORTED,
+                supported_proposition="The target is supported.",
+                document_numbers=[4],
+            )
+        ]
+    )
+
+    selected = _select_regulatory_closure_evidence(
+        evidence_chunks,
+        candidate_answer="The draft already cites [[6]]().",
+        evidence_matrix=matrix,
+        priority_citation_numbers={3},
+    )
+
+    assert [chunk.retrieval_number for chunk in selected] == [3, 4, 6, 5]
+
+
+def test_closure_evidence_never_drops_protected_sources_above_soft_limit() -> None:
+    evidence_chunks = [
+        build_candidate_answer_evidence_chunk(
+            document_id=f"document-{number}",
+            chunk_id=number,
+            citation_number=None,
+            retrieval_number=number,
+            chunk_identifier=f"chunk-{number}",
+            heading=f"Provision {number}",
+            research_target="shared-target",
+            content=f"Exact source text {number}",
+        )
+        for number in range(1, 110)
+    ]
+
+    selected = _select_regulatory_closure_evidence(
+        evidence_chunks,
+        candidate_answer="",
+        evidence_matrix=None,
+        priority_citation_numbers=set(range(1, 100)),
+    )
+
+    assert [chunk.retrieval_number for chunk in selected] == list(range(1, 100))
+
+
+def test_closure_evidence_groups_search_probes_by_answer_coverage() -> None:
+    evidence_chunks = [
+        build_candidate_answer_evidence_chunk(
+            document_id=f"document-{number}",
+            chunk_id=number,
+            citation_number=None,
+            retrieval_number=number,
+            chunk_identifier=f"chunk-{number}",
+            heading=f"Provision {number}",
+            research_target=f"probe-{number}",
+            coverage_item="one answer obligation",
+            content=f"Exact source text {number}",
+        )
+        for number in range(1, 11)
+    ]
+
+    selected = _select_regulatory_closure_evidence(
+        evidence_chunks,
+        candidate_answer="",
+        evidence_matrix=None,
+    )
+
+    assert [chunk.retrieval_number for chunk in selected] == list(range(1, 9))
+
+
+def test_matrix_input_keeps_bounded_ranked_evidence_for_each_probe() -> None:
+    evidence_chunks = [
+        build_candidate_answer_evidence_chunk(
+            document_id=f"document-{number}",
+            chunk_id=number,
+            citation_number=None,
+            retrieval_number=number,
+            chunk_identifier=f"chunk-{number}",
+            heading="Instrument",
+            research_target="irretrievably destroyed goods",
+            coverage_item="resolve the requested consequence",
+            content=(
+                "Generic introductory text"
+                if number < 3
+                else "Goods are irretrievably destroyed by the event"
+            ),
+        )
+        for number in range(1, 4)
+    ]
+
+    selected = _select_regulatory_matrix_input_evidence(evidence_chunks)
+
+    assert [chunk.retrieval_number for chunk in selected] == [3, 1, 2]
+
+
+def test_candidate_review_regression_guard_keeps_only_earlier_rows() -> None:
+    first_issue = CandidateAnswerClaimIssue(
+        claim_reference="Earlier unsupported actor",
+        advisory_feedback="The cited text governs a different actor.",
+        related_citation_numbers=[3],
+    )
+    repeated_issue = CandidateAnswerClaimIssue(
+        claim_reference="Current unsupported deadline",
+        advisory_feedback="The cited text does not establish this deadline.",
+        related_citation_numbers=[8],
+    )
+
+    reminder = format_candidate_review_regression_guard(
+        [first_issue, repeated_issue],
+        [repeated_issue],
+    )
+
+    assert reminder is not None
+    assert "not legal evidence" in reminder
+    assert "Earlier unsupported actor" in reminder
+    assert "reviewed citations: 3" in reminder
+    assert "Current unsupported deadline" not in reminder
+    assert "keep it removed" in reminder
+
+
+def test_regulatory_synthesis_history_is_tool_free_dense_and_bounded() -> None:
+    history = _build_regulatory_synthesis_history(
+        current_request="Analyze every requested consequence.",
+        earlier_user_context=("Earlier fact needed for reference.",),
+        visible_results_by_citation={
+            101: ("Later title", "later exact evidence"),
+            7: ("Earlier title", "earlier exact evidence"),
+            9: ("Empty", "   "),
+            12: ("Long title", "x" * 2_100),
+        },
+        research_targets_by_citation={
+            7: ["Specific evidence target: territorial allocation"],
+        },
+        token_counter=len,
+        prior_candidate_answer="Prior hidden draft [7].",
+        coverage_contract="# Request coverage contract\nEvery express issue",
+        evidence_matrix="# Claim-source evidence matrix\nSupported rows",
+    )
+
+    assert [message.message_type for message in history] == [
+        MessageType.USER,
+        MessageType.ASSISTANT,
+        MessageType.USER_REMINDER,
+    ]
+    assert all(message.tool_calls is None for message in history)
+    request_payload = json.loads(history[0].message)
+    assert request_payload["current_request"] == (
+        "Analyze every requested consequence."
+    )
+    assert request_payload["coverage_contract"].startswith(
+        "# Request coverage contract"
+    )
+    assert request_payload["evidence_matrix"].startswith(
+        "# Claim-source evidence matrix"
+    )
+    evidence_payload = json.loads(history[-1].message)
+    assert [result["document"] for result in evidence_payload["results"]] == [
+        7,
+        12,
+        101,
+    ]
+    assert len(evidence_payload["results"][1]["content"]) == 1_800
+    assert evidence_payload["results"][0]["research_target_ids"] == ["T1"]
+    assert evidence_payload["coverage_target_index"] == [
+        {
+            "target_id": "T1",
+            "target": "Specific evidence target: territorial allocation",
+            "documents": [7],
+        }
+    ]
+    assert "only valid citation numbers" in evidence_payload["usage_note"]
+    assert "closure obligations" in evidence_payload["usage_note"]
+    assert "complete replacement answer" in evidence_payload["usage_note"]
+    assert "visible response" in evidence_payload["usage_note"]
+    assert "final closure check" in evidence_payload["coverage_target_index_note"]
+
+
+def test_regulatory_synthesis_history_preserves_all_canonical_evidence() -> None:
+    history = _build_regulatory_synthesis_history(
+        current_request="Request",
+        earlier_user_context=(),
+        visible_results_by_citation={
+            citation: (f"Title {citation}", f"Evidence {citation}")
+            for citation in range(1, 220)
+        },
+        token_counter=len,
+    )
+
+    evidence_payload = json.loads(history[-1].message)
+    assert len(evidence_payload["results"]) == 219
+    assert evidence_payload["results"][-1]["document"] == 219
+
+
+def test_regulatory_synthesis_history_orders_review_priority_without_dropping_evidence() -> (
+    None
+):
+    history = _build_regulatory_synthesis_history(
+        current_request="Request",
+        earlier_user_context=(),
+        visible_results_by_citation={
+            citation: (f"Title {citation}", f"Evidence {citation}")
+            for citation in range(1, 220)
+        },
+        priority_citation_numbers={218, 219},
+        token_counter=len,
+    )
+
+    evidence_payload = json.loads(history[-1].message)
+    documents = [result["document"] for result in evidence_payload["results"]]
+    assert len(documents) == 219
+    assert documents[:2] == [218, 219]
+    assert set(documents) == set(range(1, 220))
 
 
 def test_candidate_answer_evidence_uses_exact_visible_content_and_citation_order() -> (
@@ -1755,6 +2139,10 @@ def test_candidate_answer_evidence_uses_exact_visible_content_and_citation_order
             2: ("Visible title 2", "Full exact text shown for citation 2"),
             4: ("Visible title 4", "Full exact text shown for citation 4"),
         },
+        research_targets_by_citation={
+            4: ["Specific evidence target: exact actor and deadline"],
+        },
+        coverage_items_by_citation={4: ["Resolve the requested remedy"]},
     )
 
     assert len(evidence) == 3
@@ -1764,6 +2152,10 @@ def test_candidate_answer_evidence_uses_exact_visible_content_and_citation_order
     assert evidence[0].chunk_identifier == "rc-cited"
     assert evidence[0].heading == "Rule > Article 9"
     assert evidence[0].content == "Full exact text shown for citation 4"
+    assert evidence[0].research_target == (
+        "Specific evidence target: exact actor and deadline"
+    )
+    assert evidence[0].coverage_item == "Resolve the requested remedy"
     assert evidence[1].citation_number == 1
     assert (evidence[1].document_id, evidence[1].chunk_id) == ("shared-doc", 3)
     assert evidence[1].chunk_identifier == "rc-first"
@@ -1897,15 +2289,176 @@ def test_regulatory_tool_call_batch_feedback_omits_completed_batch() -> None:
     )
 
 
+def test_coverage_queries_use_planner_dimensions_without_domain_inference() -> None:
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="Quux narf condition?",
+                evidence_dimensions=[
+                    "Actor for quux",
+                    "Exception to narf",
+                ],
+                source_anchors=["Zibble Instrument"],
+                completion_test="Resolve quux without predicting a result.",
+            )
+        ]
+    )
+
+    calls = _build_regulatory_coverage_tool_calls(plan, turn_index=0)
+    queries = [call.tool_args["queries"][0] for call in calls]
+    joined = "\n".join(queries).casefold()
+
+    assert len(queries) == 4
+    assert queries[0].splitlines()[0] == "Actor for quux"
+    assert queries[1].splitlines()[0] == "Exception to narf"
+    assert [call.tool_args["search_mode"] for call in calls] == [
+        "hybrid",
+        "hybrid",
+        "keyword",
+        "keyword",
+    ]
+    assert all("Actor for quux; Exception to narf" not in query for query in queries)
+    assert "authorization certificate" not in joined
+    assert "collection assistance" not in joined
+    assert "technical compliance" not in joined
+    assert "temporary import" not in joined
+
+
+def test_coverage_hybrid_uses_semantic_dimension_and_keyword_uses_lexical_query() -> (
+    None
+):
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="How does the named mechanism affect exit?",
+                evidence_dimensions=[
+                    "Named mechanism debt and the resulting border-exit restriction"
+                ],
+                retrieval_queries=["named mechanism debt exit"],
+                completion_test="Resolve the exact operative relationship.",
+            )
+        ]
+    )
+
+    calls = _build_regulatory_coverage_tool_calls(plan, turn_index=0)
+
+    assert [call.tool_args["search_mode"] for call in calls] == [
+        "hybrid",
+        "keyword",
+    ]
+    assert calls[0].tool_args["queries"] == [
+        "Named mechanism debt and the resulting border-exit restriction"
+    ]
+    assert calls[1].tool_args["queries"] == ["named mechanism debt exit"]
+
+
+def test_coverage_query_keeps_each_items_source_anchors_isolated() -> None:
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="Resolve first independent object.",
+                evidence_dimensions=["First object's scope"],
+                source_anchors=["First Instrument"],
+                completion_test="Close the first object.",
+            ),
+            RegulatoryCoverageItem(
+                research_question="Resolve second independent object.",
+                evidence_dimensions=["Second object's scope"],
+                source_anchors=["Second Instrument"],
+                completion_test="Close the second object.",
+            ),
+        ]
+    )
+
+    calls = _build_regulatory_coverage_tool_calls(plan, turn_index=0)
+    first_item_queries = [
+        call.tool_args["queries"][0]
+        for call in calls
+        if call.tool_args["coverage_item"] == "Resolve first independent object."
+    ]
+    second_item_queries = [
+        call.tool_args["queries"][0]
+        for call in calls
+        if call.tool_args["coverage_item"] == "Resolve second independent object."
+    ]
+
+    assert first_item_queries
+    assert second_item_queries
+    assert all("Second Instrument" not in query for query in first_item_queries)
+    assert all("First Instrument" not in query for query in second_item_queries)
+
+
+def test_request_context_routes_by_source_without_asserting_hard_scope() -> None:
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="Resolve alpha.",
+                evidence_dimensions=["Alpha relationship"],
+                source_anchors=["Alpha Instrument"],
+                completion_test="Close alpha.",
+            ),
+            RegulatoryCoverageItem(
+                research_question="Resolve beta.",
+                evidence_dimensions=["Beta relationship"],
+                source_anchors=["Beta Instrument"],
+                completion_test="Close beta.",
+            ),
+        ],
+        request_context_atoms=["Shared scenario fact"],
+    )
+
+    calls = _build_regulatory_coverage_tool_calls(plan, turn_index=0)
+    context_calls = [
+        call
+        for call in calls
+        if call.tool_args["coverage_item"] == "Request-supplied scenario context"
+    ]
+
+    assert [call.tool_args["queries"][0] for call in context_calls] == [
+        "Alpha Instrument Shared scenario fact",
+        "Beta Instrument Shared scenario fact",
+    ]
+    assert [call.tool_args["source_anchors"] for call in context_calls] == [
+        [],
+        [],
+    ]
+
+
+def test_outline_result_priority_requires_exact_requested_heading_and_source() -> None:
+    tool_args = {
+        "coverage_item": "Request-grounded source-outline recovery",
+        "evidence_target": (
+            "Source-outline exact-text recovery: PART II > ARTICLE 6 — Remedies"
+        ),
+        "source_anchors": ["instrument.docx"],
+    }
+
+    assert _regulatory_outline_result_matches_requested_lead(
+        "instrument.docx — Instrument > PART II > ARTICLE 6 - Remedies",
+        tool_args,
+    )
+    assert not _regulatory_outline_result_matches_requested_lead(
+        "instrument.docx — Instrument > PART II > ARTICLE 7 - Procedure",
+        tool_args,
+    )
+    assert not _regulatory_outline_result_matches_requested_lead(
+        "another-instrument.docx — PART II > ARTICLE 6 - Remedies",
+        tool_args,
+    )
+
+
 def test_partial_regulatory_search_batch_reaches_next_auto_decision() -> None:
     raw_tool_calls = [
         _search_tool_call(
-            f"call-{letter}",
-            query=f"model-query-{letter}",
+            f"call-{call_index}",
+            query=f"model-query-{call_index}",
         )
-        for letter in "abcdefghijklmnopq"
+        for call_index in range(_REGULATORY_MAX_PARALLEL_SEARCH_CALLS + 2)
     ]
-    deferred_queries = [call.tool_args["queries"][0] for call in raw_tool_calls[8:]]
+    deferred_queries = [
+        call.tool_args["queries"][0]
+        for call in raw_tool_calls[_REGULATORY_MAX_PARALLEL_SEARCH_CALLS:]
+    ]
     dispatched_batches: list[list[ToolCallKickoff]] = []
     llm_step_kwargs: list[dict[str, Any]] = []
 
@@ -1962,6 +2515,7 @@ def test_partial_regulatory_search_batch_reaches_next_auto_decision() -> None:
     search_tool = Mock(spec=SearchTool)
     search_tool.id = 1
     search_tool.name = SearchTool.NAME
+    search_tool.user_selected_filters = BaseFilters(regulatory_chunks_only=True)
     search_tool.tool_definition.return_value = {
         "type": "function",
         "function": {
@@ -1988,7 +2542,7 @@ def test_partial_regulatory_search_batch_reaches_next_auto_decision() -> None:
         patch("onyx.chat.llm_loop.run_llm_step", side_effect=fake_run_llm_step),
         patch("onyx.chat.llm_loop.run_tool_calls", side_effect=fake_run_tool_calls),
         patch(
-            "onyx.chat.llm_loop.review_regulatory_candidate_answer",
+            "onyx.chat.llm_loop.review_regulatory_candidate_answer_with_fallback",
             return_value=CandidateAnswerReviewResult(needs_reconsideration=False),
         ),
         patch(
@@ -2017,10 +2571,13 @@ def test_partial_regulatory_search_batch_reaches_next_auto_decision() -> None:
         )
 
     assert len(dispatched_batches) == 1
-    assert dispatched_batches[0] == raw_tool_calls[:8]
+    assert (
+        dispatched_batches[0] == raw_tool_calls[:_REGULATORY_MAX_PARALLEL_SEARCH_CALLS]
+    )
     persisted_tool_calls = state_container.get_tool_calls()
     assert [call.tool_call_id for call in persisted_tool_calls] == [
-        call.tool_call_id for call in raw_tool_calls[:8]
+        call.tool_call_id
+        for call in raw_tool_calls[:_REGULATORY_MAX_PARALLEL_SEARCH_CALLS]
     ]
     assert all(call.tool_call_response for call in persisted_tool_calls)
 
@@ -2039,7 +2596,11 @@ def test_partial_regulatory_search_batch_reaches_next_auto_decision() -> None:
     batch_receipt = reminder_text.split("# Internal-search batch receipt\n", 1)[
         1
     ].split("\n\n", 1)[0]
-    assert re.findall(r"\b\d+\b", batch_receipt) == ["17", "8", "9"]
+    assert re.findall(r"\b\d+\b", batch_receipt) == [
+        str(len(raw_tool_calls)),
+        str(_REGULATORY_MAX_PARALLEL_SEARCH_CALLS),
+        str(len(deferred_queries)),
+    ]
     assert all(query not in reminder_text for query in deferred_queries)
 
 
@@ -2102,6 +2663,7 @@ def test_sequential_focused_searches_keep_bounded_query_expansion() -> None:
     search_tool = Mock(spec=SearchTool)
     search_tool.id = 1
     search_tool.name = SearchTool.NAME
+    search_tool.user_selected_filters = BaseFilters(regulatory_chunks_only=True)
     search_tool.tool_definition.return_value = {
         "type": "function",
         "function": {
@@ -2156,7 +2718,9 @@ def test_sequential_focused_searches_keep_bounded_query_expansion() -> None:
     ]
 
 
-def test_candidate_review_runs_one_direct_search_after_ordinary_research() -> None:
+def test_candidate_review_runs_one_direct_search_and_publishes_last_reviewed_draft() -> (
+    None
+):
     original_doc = SearchDoc(
         document_id="original-document",
         chunk_ind=1,
@@ -2269,8 +2833,10 @@ def test_candidate_review_runs_one_direct_search_after_ordinary_research() -> No
         },
     }
     search_tool.run.return_value = recovery_response
+    # Regulatory safeguards must follow the search scope, not a hard-coded
+    # persona. Production regulatory agents commonly use a custom persona.
     persona = Mock(
-        id=0,
+        id=1,
         datetime_aware=False,
         replace_base_system_prompt=False,
         system_prompt=None,
@@ -2308,13 +2874,16 @@ def test_candidate_review_runs_one_direct_search_after_ordinary_research() -> No
             ),
         ) as ordinary_research,
         patch(
-            "onyx.chat.llm_loop.review_regulatory_candidate_answer",
-            return_value=review,
-        ),
+            "onyx.chat.llm_loop.review_regulatory_candidate_answer_with_fallback",
+            side_effect=[
+                review,
+                CandidateAnswerReviewResult(needs_reconsideration=False),
+            ],
+        ) as full_evidence_review,
         patch(
-            "onyx.chat.llm_loop.review_regulatory_candidate_resolution",
-            return_value=CandidateAnswerReviewResult(needs_reconsideration=False),
-        ),
+            "onyx.chat.llm_loop.review_regulatory_candidate_resolution_with_fallback",
+            return_value=review,
+        ) as resolution_review,
         patch("onyx.chat.llm_loop.get_default_base_system_prompt", return_value=""),
         patch("onyx.chat.llm_loop.get_session_with_current_tenant"),
         patch("onyx.llm.litellm_singleton.config.initialize_litellm"),
@@ -2335,10 +2904,12 @@ def test_candidate_review_runs_one_direct_search_after_ordinary_research() -> No
         )
 
     ordinary_research.assert_called_once()
+    assert full_evidence_review.call_count == 2
+    resolution_review.assert_called_once()
     search_tool.run.assert_called_once()
     recovery_kwargs = search_tool.run.call_args.kwargs
     assert recovery_kwargs["override_kwargs"].starting_citation_num == 2
-    assert recovery_kwargs["override_kwargs"].skip_query_expansion is False
+    assert recovery_kwargs["override_kwargs"].skip_query_expansion is True
     assert recovery_kwargs["queries"] == ["yükümlülüğün kesin kanuni dayanağı"]
     assert state.get_answer_tokens() == "Düzeltilmiş yükümlülük [2]."
     assert state.get_citation_to_doc() == {1: original_doc, 2: recovered_doc}
@@ -2362,6 +2933,68 @@ def test_extract_llm_visible_search_results_uses_only_history_payload() -> None:
         (2, "Provision B", "Rule B"),
     ]
     assert _extract_llm_visible_search_results("not json") == []
+
+
+def test_extract_regulatory_navigation_leads_keeps_metadata_and_target_only() -> None:
+    response = json.dumps(
+        {
+            "results": [{"document": 1, "content": "Operative text"}],
+            "regulatory_provision_navigation": {
+                "document_title": "Instrument",
+                "usage_note": "Not evidence",
+                "headings": [
+                    {
+                        "article_key": "part::article:9",
+                        "heading_label": "PART II > Article 9 - Later operation",
+                    },
+                    {"article_key": "", "heading_label": "Invalid"},
+                ],
+            },
+        }
+    )
+
+    leads = _extract_regulatory_navigation_leads(
+        response,
+        research_target="How does the requested process operate?",
+    )
+
+    assert [lead.model_dump() for lead in leads] == [
+        {
+            "document_title": "Instrument",
+            "article_key": "part::article:9",
+            "heading_label": "PART II > Article 9 - Later operation",
+            "research_targets": ["How does the requested process operate?"],
+        }
+    ]
+    assert (
+        _extract_regulatory_navigation_leads("not json", research_target="target") == []
+    )
+
+
+def test_navigation_recovery_calls_retrieve_selected_heading_text() -> None:
+    calls = _build_regulatory_navigation_recovery_tool_calls(
+        [
+            RegulatoryNavigationLead(
+                document_title="Instrument",
+                article_key="part::article:9",
+                heading_label="PART II > Article 9 - Later operation",
+                research_targets=["How does the requested process operate?"],
+            )
+        ],
+        turn_index=3,
+    )
+
+    assert len(calls) == 1
+    assert calls[0].tool_call_id == "regulatory-navigation-recovery-3-0"
+    assert calls[0].tool_args["queries"] == [
+        "Instrument PART II > Article 9 - Later operation"
+    ]
+    assert calls[0].tool_args["search_mode"] == "hybrid"
+    assert (
+        calls[0]
+        .tool_args["evidence_target"]
+        .startswith("Source-outline exact-text recovery:")
+    )
 
 
 def test_compact_repeated_search_results_only_changes_model_history_copy() -> None:
@@ -3116,13 +3749,13 @@ def test_reconsideration_history_compaction_preserves_only_near_structural_relat
     ] == [100, 21]
 
 
-def test_regulatory_search_chunk_cap_is_bounded_only_when_enabled() -> None:
-    assert _regulatory_search_chunk_cap(True) == 8
+def test_regulatory_search_chunk_cap_widens_only_regulatory_window() -> None:
+    assert _regulatory_search_chunk_cap(True) == 10
     assert _regulatory_search_chunk_cap(False) is None
 
 
-def test_regulatory_search_call_budget_is_bounded_only_for_regulatory_request() -> None:
-    assert _regulatory_search_call_budget(True) == 16
+def test_regulatory_search_call_budget_preserves_standard_onyx_cycles() -> None:
+    assert _regulatory_search_call_budget(True) is None
     assert _regulatory_search_call_budget(False) is None
 
 
@@ -3137,11 +3770,11 @@ def test_regulatory_search_call_budget_is_bounded_only_for_regulatory_request() 
     [
         (False, ToolChoiceOptions.AUTO, False, ReasoningEffort.AUTO, None),
         (False, ToolChoiceOptions.NONE, False, ReasoningEffort.HIGH, None),
-        (True, ToolChoiceOptions.AUTO, True, ReasoningEffort.AUTO, 3584),
-        (True, ToolChoiceOptions.REQUIRED, False, ReasoningEffort.HIGH, 5632),
-        (True, ToolChoiceOptions.AUTO, False, ReasoningEffort.AUTO, 5632),
-        (True, ToolChoiceOptions.NONE, False, ReasoningEffort.OFF, 5632),
-        (True, ToolChoiceOptions.NONE, False, ReasoningEffort.HIGH, 5632),
+        (True, ToolChoiceOptions.AUTO, True, ReasoningEffort.AUTO, 9728),
+        (True, ToolChoiceOptions.REQUIRED, False, ReasoningEffort.HIGH, 13824),
+        (True, ToolChoiceOptions.AUTO, False, ReasoningEffort.AUTO, None),
+        (True, ToolChoiceOptions.NONE, False, ReasoningEffort.OFF, None),
+        (True, ToolChoiceOptions.NONE, False, ReasoningEffort.HIGH, None),
     ],
 )
 def test_regulatory_llm_steps_bound_provider_output_reservations(
@@ -3162,14 +3795,12 @@ def test_regulatory_llm_steps_bound_provider_output_reservations(
     )
 
 
-def test_regulatory_search_breadth_does_not_raise_evidence_ceiling() -> None:
+def test_regulatory_search_keeps_cycles_and_widens_fragmented_context() -> None:
     chunk_cap = _regulatory_search_chunk_cap(True)
     call_budget = _regulatory_search_call_budget(True)
 
-    assert chunk_cap is not None
-    assert call_budget is not None
-    assert call_budget * chunk_cap <= 16 * 8
-    assert (call_budget + 4) * chunk_cap <= (16 + 4) * 8
+    assert chunk_cap == 10
+    assert call_budget is None
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,8 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 _FORWARD_ARTICLE_HEADING_RE = re.compile(
-    r"^(?:(?P<qualifier>gecici|geçici|mukerrer|mükerrer)\s+)?madde"
+    r"^(?:(?P<qualifier>gecici|geçici|mukerrer|mükerrer)\s+)?"
+    r"(?:madde|article|art\.?)"
     r"(?:\s+|\s*[:.]\s*)"
     r"(?P<number>\d+[a-z]?)\b",
     flags=re.IGNORECASE,

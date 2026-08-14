@@ -788,7 +788,24 @@ def test_vertex_gemini_reasoning_effort_works_without_litellm_metadata(
         list(llm.stream(messages, reasoning_effort=reasoning_effort))
 
         kwargs = mock_completion.call_args.kwargs
-        assert kwargs["reasoning_effort"] == expected_effort
+    assert kwargs["reasoning_effort"] == expected_effort
+
+
+def test_vertex_gemini_37_reasoning_off_uses_supported_low_floor() -> None:
+    llm = LitellmLLM(
+        api_key="test_key",
+        timeout=30,
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name="gemini-3.7-flash",
+        max_input_tokens=100_000,
+    )
+
+    with patch("litellm.completion") as mock_completion:
+        mock_completion.return_value = []
+        messages: LanguageModelInput = [UserMessage(content="Hi")]
+        list(llm.stream(messages, reasoning_effort=ReasoningEffort.OFF))
+
+    assert mock_completion.call_args.kwargs["reasoning_effort"] == "low"
 
 
 def test_claude_reasoning_off_keeps_thinking_configuration_omitted() -> None:

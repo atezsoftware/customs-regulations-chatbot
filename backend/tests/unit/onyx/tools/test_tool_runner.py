@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from onyx.chat.models import ChatMessageSimple, ToolCallSimple
@@ -15,6 +17,7 @@ from onyx.tools.tool_runner import (
     _search_filter_message_history,
     _search_input_context,
     _should_skip_search_query_expansion,
+    run_tool_calls,
 )
 
 
@@ -62,6 +65,54 @@ def _internal_search_message(tool_call_id: str) -> ChatMessageSimple:
             )
         ],
     )
+
+
+def test_parallel_worker_limit_queues_all_tool_calls() -> None:
+    tool = MagicMock()
+    tool.name = "test_tool"
+    calls = [
+        _make_tool_call(
+            tool_name="test_tool",
+            tool_args={"value": index},
+            tool_call_id=f"call_{index}",
+        )
+        for index in range(5)
+    ]
+
+    with patch(
+        "onyx.tools.tool_runner.run_functions_tuples_in_parallel",
+        return_value=[],
+    ) as run_parallel:
+        run_tool_calls(
+            tool_calls=calls,
+            tools=[tool],
+            message_history=[],
+            user_memory_context=None,
+            user_info=None,
+            citation_mapping={},
+            next_citation_num=1,
+            max_concurrent_tools=None,
+            max_parallel_workers=2,
+        )
+
+    functions_with_args = run_parallel.call_args.args[0]
+    assert len(functions_with_args) == len(calls)
+    assert run_parallel.call_args.kwargs["max_workers"] == 2
+    assert tool.emit_start.call_count == len(calls)
+
+
+def test_parallel_worker_limit_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="max_parallel_workers must be positive"):
+        run_tool_calls(
+            tool_calls=[],
+            tools=[],
+            message_history=[],
+            user_memory_context=None,
+            user_info=None,
+            citation_mapping={},
+            next_citation_num=1,
+            max_parallel_workers=0,
+        )
 
 
 def test_model_written_internal_search_uses_only_focused_context() -> None:

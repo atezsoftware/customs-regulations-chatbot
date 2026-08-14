@@ -8,6 +8,7 @@ import pytest
 
 from onyx.db.enums import RegulatoryChunkStatus
 from onyx.db.regulatory_chunks import (
+    DEFAULT_PROVISION_MAX_CHUNKS,
     RegulatoryChunkProjection,
     RegulatoryChunkSiblingCandidate,
     RegulatoryNavigationSeed,
@@ -15,8 +16,10 @@ from onyx.db.regulatory_chunks import (
     get_regulatory_provision_heading_source,
     get_visible_regulatory_chunk_ids,
     is_regulatory_navigation_candidate_visible,
+    select_bounded_adjacent_provisions,
     select_bounded_referenced_provisions,
     select_bounded_same_provision_siblings,
+    select_bounded_source_lexical_matches,
     select_dominant_regulatory_navigation_seed_file,
 )
 from onyx.regulatory.heading_path import RegulatoryProvisionReference
@@ -113,6 +116,149 @@ def test_projection_index_is_assigned_before_temporal_filtering() -> None:
 
     assert _ids(selected) == ["a-first", "c-new", "d-last"]
     assert [row.projection_index for row in selected] == [0, 2, 3]
+
+
+def test_default_same_provision_budget_retains_fragmented_clause_family() -> None:
+    rows = [
+        _candidate(
+            f"row-{index}",
+            index,
+            text=f"Short independently operative clause {index}",
+            chunk_type="clause",
+            clause_label=str(index),
+        )
+        for index in range(30)
+    ]
+
+    selected = select_bounded_same_provision_siblings(
+        rows,
+        ["row-0"],
+        query="independently operative clause",
+        as_of_date=None,
+    )
+
+    assert DEFAULT_PROVISION_MAX_CHUNKS == 24
+    assert len(selected) == DEFAULT_PROVISION_MAX_CHUNKS
+
+
+def test_source_lexical_matches_prefer_rare_query_terms_within_one_file() -> None:
+    rows = [
+        _candidate(
+            "common-only",
+            0,
+            text="The goods are handled under the applicable procedure.",
+            article_no="1",
+            heading_path=("Instrument", "ARTICLE 1"),
+        ),
+        _candidate(
+            "rare-match",
+            1,
+            text="The goods are irretrievably destroyed by an unforeseen event.",
+            article_no="2",
+            heading_path=("Instrument", "ARTICLE 2"),
+        ),
+        _candidate(
+            "other-file-match",
+            0,
+            text="The goods are irretrievably destroyed by an unforeseen event.",
+            article_no="1",
+            heading_path=("Other", "ARTICLE 1"),
+            user_file_id=FILE_B,
+        ),
+    ]
+
+    selected = select_bounded_source_lexical_matches(
+        rows,
+        user_file_id=FILE_A,
+        query="goods irretrievably destroyed",
+        as_of_date=None,
+        max_matches=1,
+    )
+
+    assert _ids(selected) == ["rare-match"]
+
+
+def test_source_lexical_matches_diversify_across_provisions() -> None:
+    rows = [
+        _candidate(
+            "article-1-a",
+            0,
+            text="A narrow trigger applies to the retained amount.",
+            article_no="1",
+            heading_path=("Instrument", "ARTICLE 1", "(1)"),
+        ),
+        _candidate(
+            "article-1-b",
+            1,
+            text="The same narrow trigger applies again.",
+            article_no="1",
+            heading_path=("Instrument", "ARTICLE 1", "(2)"),
+        ),
+        _candidate(
+            "article-2",
+            2,
+            text="A separate narrow trigger determines the next step.",
+            article_no="2",
+            heading_path=("Instrument", "ARTICLE 2"),
+        ),
+    ]
+
+    selected = select_bounded_source_lexical_matches(
+        rows,
+        user_file_id=FILE_A,
+        query="narrow trigger",
+        as_of_date=None,
+        max_matches=2,
+    )
+
+    assert _ids(selected) == ["article-1-a", "article-2"]
+
+
+def test_structural_companions_do_not_crowd_query_matched_sibling() -> None:
+    article = ("Instrument", "ARTICLE 9 - Alpha process")
+    nested_parent = (*article, "3) Review path")
+    rows = [
+        _candidate(
+            "seed",
+            0,
+            text="d) Alpha trigger",
+            article_no="9",
+            heading_path=(*nested_parent, "d) Alpha trigger"),
+            chunk_type="clause",
+            clause_label="d",
+        ),
+        *[
+            _candidate(
+                f"peer-{index}",
+                index,
+                text=f"{index}) Structural context",
+                article_no="9",
+                heading_path=(*nested_parent, f"{index}) Structural context"),
+                chunk_type="clause",
+                clause_label=str(index),
+            )
+            for index in range(1, 6)
+        ],
+        _candidate(
+            "query-match",
+            7,
+            text="Exact quux frobnication remedy",
+            article_no="9",
+            heading_path=(*article, "b) Exact quux frobnication remedy"),
+            chunk_type="clause",
+            clause_label="b",
+        ),
+    ]
+
+    selected = select_bounded_same_provision_siblings(
+        rows,
+        ["seed"],
+        query="quux frobnication remedy",
+        as_of_date=None,
+        max_chunks_per_provision=4,
+    )
+
+    assert "query-match" in _ids(selected)
 
 
 def test_temporal_end_boundary_selects_only_successor() -> None:
@@ -230,6 +376,252 @@ def test_structural_companion_stays_with_current_or_historical_version() -> None
     assert _ids(historical) == ["old-parent", "old-seed"]
     assert current[0].expansion_priority < current[1].expansion_priority
     assert historical[0].expansion_priority < historical[1].expansion_priority
+
+
+def test_descendant_seed_reserves_article_parent_inside_tight_packet() -> None:
+    article_path = ("Instrument", "MADDE 12")
+    rows = [
+        _candidate(
+            "article-parent",
+            0,
+            text="The operative subject and triggering condition apply.",
+            article_no="12",
+            heading_path=article_path,
+            chunk_type="article",
+        ),
+        _candidate(
+            "ordinary-paragraph",
+            1,
+            text="A separate paragraph within the article.",
+            article_no="12",
+            heading_path=(*article_path, "(1)"),
+            chunk_type="paragraph",
+            paragraph_no="1",
+        ),
+        _candidate(
+            "selected-clause",
+            2,
+            text="(a) The narrow consequence.",
+            article_no="12",
+            heading_path=(*article_path, "(2)", "(a)"),
+            chunk_type="clause",
+            paragraph_no="2",
+            clause_label="a",
+        ),
+    ]
+
+    selected = select_bounded_same_provision_siblings(
+        rows,
+        ["selected-clause"],
+        query="narrow consequence",
+        as_of_date=None,
+        max_chunks_per_provision=2,
+    )
+
+    assert _ids(selected) == ["article-parent", "selected-clause"]
+    priorities = {row.regulatory_chunk_id: row.expansion_priority for row in selected}
+    assert priorities["article-parent"] == 0
+
+
+def test_descendant_seed_keeps_split_article_lead_and_nearest_parent() -> None:
+    article_path = ("Instrument", "MADDE 12")
+    rows = [
+        _candidate(
+            "article-lead",
+            0,
+            text="The article's base scope applies.",
+            article_no="12",
+            heading_path=article_path,
+            chunk_type="article",
+        ),
+        _candidate(
+            "nearest-parent",
+            1,
+            text="The following branches complete that rule:",
+            article_no="12",
+            heading_path=article_path,
+            chunk_type="article",
+        ),
+        _candidate(
+            "lexical-distractor",
+            2,
+            text="A narrow consequence appears elsewhere in the article.",
+            article_no="12",
+            heading_path=(*article_path, "(1)"),
+            chunk_type="paragraph",
+            paragraph_no="1",
+        ),
+        _candidate(
+            "selected-clause",
+            3,
+            text="(a) The narrow consequence.",
+            article_no="12",
+            heading_path=(*article_path, "(2)", "(a)"),
+            chunk_type="clause",
+            paragraph_no="2",
+            clause_label="a",
+        ),
+    ]
+
+    selected = select_bounded_same_provision_siblings(
+        rows,
+        ["selected-clause"],
+        query="narrow consequence",
+        as_of_date=None,
+        max_chunks_per_provision=3,
+    )
+
+    assert _ids(selected) == [
+        "article-lead",
+        "nearest-parent",
+        "selected-clause",
+    ]
+
+
+def test_clause_seed_prioritizes_complete_direct_sibling_family() -> None:
+    article_path = ("Instrument", "Annex IV", "MADDE 14")
+    clause_parent = (*article_path, "The authority is not obliged when:")
+    rows = [
+        _candidate(
+            "article-parent",
+            0,
+            text="The authority is not obliged when:",
+            article_no="14",
+            heading_path=article_path,
+            chunk_type="article",
+        ),
+        _candidate(
+            "clause-a",
+            1,
+            text="(a) the first independent condition applies;",
+            article_no="14",
+            heading_path=(*clause_parent, "(a) First condition"),
+            chunk_type="clause",
+            clause_label="a",
+        ),
+        _candidate(
+            "clause-b",
+            2,
+            text="(b) the second independent condition applies;",
+            article_no="14",
+            heading_path=(*clause_parent, "(b) Second condition"),
+            chunk_type="clause",
+            clause_label="b",
+        ),
+        _candidate(
+            "clause-c",
+            3,
+            text="(c) the requested prerequisite is absent;",
+            article_no="14",
+            heading_path=(*clause_parent, "(c) Third condition"),
+            chunk_type="clause",
+            clause_label="c",
+        ),
+        _candidate(
+            "seed-clause-d",
+            4,
+            text="(d) the threshold is not met.",
+            article_no="14",
+            heading_path=(*clause_parent, "(d) Fourth condition"),
+            chunk_type="clause",
+            clause_label="d",
+        ),
+        _candidate(
+            "other-paragraph-clause-a",
+            5,
+            text="(a) a restarted list must remain separate.",
+            article_no="14",
+            heading_path=(*article_path, "A different parent:", "(a) Other"),
+            chunk_type="clause",
+            clause_label="a",
+        ),
+    ]
+
+    selected = select_bounded_same_provision_siblings(
+        rows,
+        ["seed-clause-d"],
+        query="requested prerequisite threshold",
+        as_of_date=None,
+        max_chunks_per_provision=5,
+    )
+
+    assert _ids(selected) == [
+        "article-parent",
+        "clause-a",
+        "clause-b",
+        "clause-c",
+        "seed-clause-d",
+    ]
+    priorities = {row.regulatory_chunk_id: row.expansion_priority for row in selected}
+    assert priorities["clause-a"] == 0
+    assert priorities["clause-b"] == 0
+    assert priorities["clause-c"] == 0
+    assert "other-paragraph-clause-a" not in priorities
+
+
+def test_terse_structural_intro_prioritizes_same_article_child_packet() -> None:
+    article_path = ("Instrument", "MADDE 3")
+    intro_path = (*article_path, "1. In this instrument:")
+    rows = [
+        _candidate(
+            "intro",
+            0,
+            text="1. In this instrument:",
+            article_no="3",
+            heading_path=intro_path,
+            chunk_type="paragraph",
+            paragraph_no="1",
+        ),
+        _candidate(
+            "child-a",
+            1,
+            text='(a) "alpha" means the first category;',
+            article_no="3",
+            heading_path=(*intro_path, '(a) "alpha"'),
+            chunk_type="clause",
+            clause_label="a",
+        ),
+        _candidate(
+            "child-b",
+            2,
+            text='(b) "beta" means the second category;',
+            article_no="3",
+            heading_path=(*intro_path, '(b) "beta"'),
+            chunk_type="clause",
+            clause_label="b",
+        ),
+        _candidate(
+            "next-paragraph",
+            3,
+            text="2. An independent rule applies.",
+            article_no="3",
+            heading_path=(*article_path, "2. An independent rule applies"),
+            chunk_type="paragraph",
+            paragraph_no="2",
+        ),
+        _candidate(
+            "next-article",
+            4,
+            text="A rule from another article.",
+            article_no="4",
+            heading_path=("Instrument", "MADDE 4"),
+            chunk_type="article",
+        ),
+    ]
+
+    selected = select_bounded_same_provision_siblings(
+        rows,
+        ["intro"],
+        query="beta category",
+        as_of_date=None,
+        max_chunks_per_provision=4,
+    )
+
+    assert _ids(selected) == ["intro", "child-a", "child-b", "next-paragraph"]
+    priorities = {row.regulatory_chunk_id: row.expansion_priority for row in selected}
+    assert priorities["child-a"] == 0
+    assert priorities["child-b"] == 0
+    assert "next-article" not in priorities
 
 
 def test_null_metadata_is_only_kept_as_an_internal_bridge() -> None:
@@ -703,6 +1095,28 @@ def test_large_group_prefers_lexical_overlap_then_proximity() -> None:
     assert _ids(selected) == ["seed", "far-match"]
 
 
+def test_large_group_matches_inflected_query_terms() -> None:
+    rows = [
+        _candidate("seed", 0, text="opening rule"),
+        _candidate("exact-distractor", 1, text="alkol raporu"),
+        _candidate(
+            "inflected-result",
+            2,
+            text="alkollü sürücü için yasal sınırlar uygulanır",
+        ),
+    ]
+
+    selected = select_bounded_same_provision_siblings(
+        rows,
+        ["seed"],
+        query="alkol sınırı sürücülerinde",
+        as_of_date=None,
+        max_chunks_per_provision=2,
+    )
+
+    assert _ids(selected) == ["seed", "inflected-result"]
+
+
 @pytest.mark.parametrize(
     "reference_text",
     [
@@ -1133,7 +1547,7 @@ def test_character_budget_skips_oversized_candidate_and_keeps_seed() -> None:
 
 
 def test_default_chunk_limit_is_per_provision() -> None:
-    rows = [_candidate(f"chunk-{position:02d}", position) for position in range(20)]
+    rows = [_candidate(f"chunk-{position:02d}", position) for position in range(30)]
 
     selected = select_bounded_same_provision_siblings(
         rows,
@@ -1142,7 +1556,7 @@ def test_default_chunk_limit_is_per_provision() -> None:
         as_of_date=None,
     )
 
-    assert len(selected) == 16
+    assert len(selected) == DEFAULT_PROVISION_MAX_CHUNKS
     assert "chunk-10" in _ids(selected)
 
 
@@ -1161,6 +1575,60 @@ def test_seed_file_does_not_pull_same_article_from_another_file() -> None:
     )
 
     assert _ids(selected) == ["file-a-seed", "file-a-sibling"]
+
+
+def test_adjacent_provisions_select_immediate_same_scope_neighbors() -> None:
+    rows = [
+        _candidate(
+            f"article-{article_no}",
+            article_no - 110,
+            article_no=str(article_no),
+            heading_path=("Convention", "ANNEX IV", f"ARTICLE {article_no}"),
+            text=f"Operative text {article_no}",
+        )
+        for article_no in range(111, 116)
+    ]
+
+    selected = select_bounded_adjacent_provisions(
+        rows,
+        ["article-113"],
+        query="operative allocation",
+        as_of_date=None,
+    )
+
+    assert _ids(selected) == ["article-112", "article-114"]
+
+
+def test_adjacent_provisions_do_not_cross_structural_scope() -> None:
+    rows = [
+        _candidate(
+            "annex-three-last",
+            1,
+            article_no="9",
+            heading_path=("Convention", "ANNEX III", "ARTICLE 9"),
+        ),
+        _candidate(
+            "annex-four-first",
+            2,
+            article_no="1",
+            heading_path=("Convention", "ANNEX IV", "ARTICLE 1"),
+        ),
+        _candidate(
+            "annex-four-second",
+            3,
+            article_no="2",
+            heading_path=("Convention", "ANNEX IV", "ARTICLE 2"),
+        ),
+    ]
+
+    selected = select_bounded_adjacent_provisions(
+        rows,
+        ["annex-four-first"],
+        query="",
+        as_of_date=None,
+    )
+
+    assert _ids(selected) == ["annex-four-second"]
 
 
 def test_returned_projection_is_immutable() -> None:
@@ -2233,6 +2701,7 @@ def _navigation_heading_record(
     heading_path: tuple[str, ...],
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        id=f"heading-{user_file_id}-{position}",
         user_file_id=user_file_id,
         position=position,
         heading_path=heading_path,
