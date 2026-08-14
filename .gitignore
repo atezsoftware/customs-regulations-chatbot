@@ -62,6 +62,9 @@ node_modules
 # plans (include symlinked plans dir too)
 plans
 
+# Local isolated release worktrees
+/.worktrees/
+
 # Added context for LLMs
 .claude/CLAUDE.md
 .claude/settings.local.json
