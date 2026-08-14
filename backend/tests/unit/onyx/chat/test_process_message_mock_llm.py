@@ -23,7 +23,10 @@ def test_default_persona_forces_regulatory_scope_without_discarding_user_filters
     )
     setup = SimpleNamespace(
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(internal_search_filters=requested_filters),
+        new_msg_req=SimpleNamespace(
+            internal_search_filters=requested_filters,
+            message="Antrepo rejiminin şartları nelerdir?",
+        ),
     )
 
     effective_filters = process_message._global_regulatory_search_filters(
@@ -35,6 +38,56 @@ def test_default_persona_forces_regulatory_scope_without_discarding_user_filters
     assert effective_filters.source_type == [DocumentSource.USER_FILE]
     assert effective_filters.document_set == ["Dar kapsam"]
     assert effective_filters.as_of_date == requested_date
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Merhaba!",
+        "SELAM 👋",
+        "Teşekkür ederim.",
+        "Hello, how are you?",
+        "Tamam, anladım.",
+    ],
+)
+def test_default_persona_keeps_social_messages_out_of_regulatory_research(
+    message: str,
+) -> None:
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SimpleNamespace(internal_search_filters=None, message=message),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(
+        cast(ChatTurnSetup, setup)
+    )
+
+    assert effective_filters is not None
+    assert effective_filters.regulatory_chunks_only is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Antrepo nedir?",
+        "GTİP 8703?",
+        "Merhaba, antrepo rejiminin şartları nelerdir?",
+    ],
+)
+def test_default_persona_keeps_substantive_short_queries_in_regulatory_research(
+    message: str,
+) -> None:
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SimpleNamespace(internal_search_filters=None, message=message),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(
+        cast(ChatTurnSetup, setup)
+    )
+
+    assert effective_filters is not None
+    assert effective_filters.regulatory_chunks_only is True
 
 
 def test_mock_llm_response_requires_integration_mode() -> None:

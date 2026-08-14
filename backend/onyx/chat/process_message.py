@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import traceback
+import unicodedata
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import Token
@@ -576,6 +577,67 @@ def determine_search_params(
     )
 
 
+_SOCIAL_TURN_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        "aferin",
+        "aksamlar",
+        "anladim",
+        "are",
+        "bye",
+        "ederim",
+        "evet",
+        "geceler",
+        "gidiyor",
+        "good",
+        "goodbye",
+        "gorusuruz",
+        "gunaydin",
+        "gunler",
+        "hayir",
+        "hello",
+        "hey",
+        "hi",
+        "hosca",
+        "how",
+        "iyi",
+        "kal",
+        "kalin",
+        "merhaba",
+        "merhabalar",
+        "nasilsin",
+        "nasilsiniz",
+        "ok",
+        "okay",
+        "ol",
+        "olun",
+        "peki",
+        "sag",
+        "selam",
+        "selamlar",
+        "tamam",
+        "tesekkur",
+        "tesekkurler",
+        "thanks",
+        "thank",
+        "you",
+    }
+)
+
+
+def _is_social_only_message(message: str) -> bool:
+    """Recognize bounded social turns without invoking retrieval or another LLM."""
+    stripped = message.strip()
+    if not stripped or len(stripped) > 96 or any(char.isdigit() for char in stripped):
+        return False
+
+    decomposed = unicodedata.normalize("NFKD", stripped.casefold())
+    accentless = "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    ).replace("ı", "i")
+    tokens = re.findall(r"[a-z]+", accentless)
+    return not tokens or all(token in _SOCIAL_TURN_TOKENS for token in tokens)
+
+
 def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | None:
     """Limit the default chat to the shared, current regulatory chunk corpus."""
     filters = setup.new_msg_req.internal_search_filters
@@ -584,7 +646,9 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
 
     updates: dict[str, object] = {
         "source_type": [DocumentSource.USER_FILE],
-        "regulatory_chunks_only": True,
+        "regulatory_chunks_only": not _is_social_only_message(
+            setup.new_msg_req.message
+        ),
     }
     if filters is None or filters.as_of_date is None:
         updates["as_of_date"] = datetime.date.today()

@@ -50,8 +50,9 @@ flowchart TD
     U["Kullanıcı mesajı"] --> API["Chat API ve context assembly"]
     API --> MODE{"Deep Research açık mı?"}
 
-    MODE -->|Hayır| N0["Normal regulatory chat"]
-    N0 --> N1["Request inventory"]
+    MODE -->|Hayır| N0{"Substantive research intent?"}
+    N0 -->|Hayır| TALK["Normal conversational answer"]
+    N0 -->|Evet| N1["Request inventory"]
     N1 --> N2["Coverage plan + bağımsız gap audit"]
     N2 --> N3["Bootstrap hybrid/keyword retrieval"]
     N3 --> N4["Model-directed ek araştırma"]
@@ -113,20 +114,30 @@ Varsayılan regulatory chat davranışı:
 1. Varsayılan persona SearchTool'u otomatik alır; FileReader global regulatory
    chatten çıkarılır. Böylece tüm dosyayı bypass ederek okuyan ayrı bir kanal
    oluşmaz.
-2. Kapsam user-file regulatory chunk korpusudur. `as_of_date` verilmemişse
+2. Bounded ve bütünüyle sosyal olan selamlama, teşekkür, onay ve vedalaşma
+   turn'leri retrieval öncesinde sıfır LLM maliyetli fast-path ile normal sohbet
+   davranışında kalır. Mesajda herhangi bir içerik terimi, sayı veya araştırma
+   isteği varsa bu kapı açılmaz; selamlama ile başlayan içerikli bir soru
+   regulatory hatta girer.
+3. Kapsam user-file regulatory chunk korpusudur. `as_of_date` verilmemişse
    bugünün tarihi kullanılır; yürürlük penceresi olan chunklar buna göre
    filtrelenir.
-3. User request yalnız current turn'den alınır. Önceki user mesajları en fazla
+4. User request yalnız current turn'den alınır. Önceki user mesajları en fazla
    beş mesaj ve bounded karakter bütçesiyle yalnız referans çözümü için taşınır;
    yeni deliverable oluşturmaz.
-4. Answer LLM normal chat model seçiminden gelir. Review LLM için
+5. Answer LLM normal chat model seçiminden gelir. Review LLM için
    `REGULATORY_REVIEW_MODEL` varsa aynı provider/config üzerinde temperature 0
    ile ikinci model oluşturulur; yoksa answer LLM kullanılır.
-5. Tool, prompt ve kullanıcı içeriği untrusted data sınırlarıyla ayrılır.
+6. Tool, prompt ve kullanıcı içeriği untrusted data sınırlarıyla ayrılır.
 
 ## 4. Normal chat workflow
 
 ### N0 — Regulatory hattın etkinleşmesi
+
+`process_message`, yalnız bütünüyle sosyal ve kısa turn'leri generic token
+allowlist'iyle ayırır. Bu fast-path prompt veya benchmark sorusu içermez, LLM
+çağrısı yapmaz ve bilinmeyen tek bir içerik tokenı gördüğünde güvenli biçimde
+araştırma hattını korur.
 
 `run_llm_loop`, tool listesinde `regulatory_chunks_only=true` filtreli bir
 `SearchTool` gördüğünde gelişmiş akışı açar. Doğrudan, aramasız sohbet cevapları
@@ -674,7 +685,8 @@ Aşağıdaki kanıtlar birlikte aranır:
 1. deployed backend ve web image digest/revision beklenen commit ile aynı;
 2. API ve worker Ready/healthy;
 3. `REGULATORY_REVIEW_MODEL` container environmentta doğru;
-4. normal chat SearchTool filtresi `regulatory_chunks_only=true`;
+4. içerikli normal chat SearchTool filtresi `regulatory_chunks_only=true`,
+   bütünüyle sosyal turn'de `false`;
 5. loglarda coverage plan, navigation, matrix ve review aşamaları görülüyor;
 6. normal kullanıcı hesabıyla gerçek chat yanıtı ve exact citations geliyor;
 7. Deep Research seçildiğinde plan/orchestrator/research-agent logları görülüyor;
@@ -729,6 +741,8 @@ workflowu taşıyor sayılır:
 
 - normal kullanıcı normal chat mesajı coverage plan ve bootstrap aramalarını
   tetikler;
+- sosyal selamlama/teşekkür mesajı retrieval çalıştırmadan kısa normal sohbet
+  yanıtı üretir; selamlama ile başlayan içerikli soru yine regulatory hatta girer;
 - distinct request obligations loglarda map edilir;
 - source-outline lead varsa bounded navigation selection çalışır;
 - exact evidence matrix üretilir ve open row recovery en fazla bir pass yapar;
