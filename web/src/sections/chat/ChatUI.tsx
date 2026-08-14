@@ -39,6 +39,7 @@ export interface ChatUIProps {
     messageIdToResend?: number;
     currentMessageFiles: any[];
     deepResearch: boolean;
+    atezSearch?: boolean;
     modelOverride?: LlmDescriptor;
     regenerationRequest?: {
       messageId: number;
@@ -49,6 +50,7 @@ export interface ChatUIProps {
     selectedModels?: SelectedModel[];
   }) => Promise<void>;
   deepResearchEnabled: boolean;
+  atezSearchEnabled?: boolean;
   currentMessageFiles: any[];
 
   onResubmit: () => void;
@@ -75,6 +77,7 @@ const ChatUI = React.memo(
     stopGenerating,
     onSubmit,
     deepResearchEnabled,
+    atezSearchEnabled = false,
     currentMessageFiles,
     onResubmit,
     anchorNodeId,
@@ -102,10 +105,12 @@ const ChatUI = React.memo(
     // Use refs to keep callbacks stable while always using latest values
     const onSubmitRef = useRef(onSubmit);
     const deepResearchEnabledRef = useRef(deepResearchEnabled);
+    const atezSearchEnabledRef = useRef(atezSearchEnabled);
     const currentMessageFilesRef = useRef(currentMessageFiles);
     const selectedModelsRef = useRef(selectedModels);
     onSubmitRef.current = onSubmit;
     deepResearchEnabledRef.current = deepResearchEnabled;
+    atezSearchEnabledRef.current = atezSearchEnabled;
     currentMessageFilesRef.current = currentMessageFiles;
     selectedModelsRef.current = selectedModels;
 
@@ -120,6 +125,7 @@ const ChatUI = React.memo(
             message: regenerationRequest.parentMessage.message,
             currentMessageFiles: currentMessageFilesRef.current,
             deepResearch: deepResearchEnabledRef.current,
+            atezSearch: atezSearchEnabledRef.current,
             modelOverride,
             messageIdToResend: regenerationRequest.parentMessage.messageId,
             regenerationRequest,
@@ -138,6 +144,7 @@ const ChatUI = React.memo(
           messageIdToResend: msgId,
           currentMessageFiles: [],
           deepResearch: deepResearchEnabledRef.current,
+          atezSearch: atezSearchEnabledRef.current,
           selectedModels: models && models.length >= 2 ? models : undefined,
         });
       },

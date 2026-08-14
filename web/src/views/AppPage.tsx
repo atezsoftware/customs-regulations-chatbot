@@ -203,6 +203,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         message,
         currentMessageFiles,
         deepResearch: deepResearchEnabledForCurrentWorkflow,
+        atezSearch: atezSearchEnabledForCurrentWorkflow,
       });
     }
   }
@@ -220,12 +221,21 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       }
     });
 
-  const { deepResearchEnabled, toggleDeepResearch } = useDeepResearchToggle({
+  const {
+    deepResearchEnabled,
+    toggleDeepResearch,
+    atezSearchEnabled,
+    toggleAtezSearch,
+  } = useDeepResearchToggle({
     chatSessionId: currentChatSessionId,
     agentId: selectedAgent?.id,
   });
   const deepResearchEnabledForCurrentWorkflow =
     currentProjectId === null && deepResearchEnabled;
+  const atezSearchEnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    atezSearchEnabled;
 
   const [presentingDocument, setPresentingDocument] =
     useState<MinimalOnyxDocument | null>(null);
@@ -536,6 +546,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       currentMessageFiles: currentMessageFiles,
       deepResearch:
         deepResearchEnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
+      atezSearch:
+        atezSearchEnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
       messageIdToResend: lastUserMsg.messageId,
     });
   }, [
@@ -543,6 +555,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     onSubmit,
     currentMessageFiles,
     deepResearchEnabledForCurrentWorkflow,
+    atezSearchEnabledForCurrentWorkflow,
     multiModel.isMultiModelActive,
   ]);
 
@@ -562,6 +575,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         deepResearch:
           deepResearchEnabledForCurrentWorkflow &&
           !multiModel.isMultiModelActive,
+        atezSearch:
+          atezSearchEnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
         selectedModels: multiModel.isMultiModelActive
           ? multiModel.selectedModels
           : undefined,
@@ -575,6 +590,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       onSubmit,
       currentMessageFiles,
       deepResearchEnabledForCurrentWorkflow,
+      atezSearchEnabledForCurrentWorkflow,
       multiModel.isMultiModelActive,
       multiModel.selectedModels,
       foldSidebarForMultiModel,
@@ -618,6 +634,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           deepResearch:
             deepResearchEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
+          atezSearch:
+            atezSearchEnabledForCurrentWorkflow &&
+            !multiModel.isMultiModelActive,
           selectedModels: multiModel.isMultiModelActive
             ? multiModel.selectedModels
             : undefined,
@@ -642,6 +661,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       onSubmit,
       currentMessageFiles,
       deepResearchEnabledForCurrentWorkflow,
+      atezSearchEnabledForCurrentWorkflow,
       showOnboarding,
       onboardingDismissed,
       finishOnboarding,
@@ -830,6 +850,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         deepResearchEnabled={
                           deepResearchEnabledForCurrentWorkflow
                         }
+                        atezSearchEnabled={atezSearchEnabledForCurrentWorkflow}
                         currentMessageFiles={currentMessageFiles}
                         setPresentingDocument={setPresentingDocument}
                         onSubmit={onSubmit}
@@ -1012,6 +1033,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                           deepResearchEnabledForCurrentWorkflow
                         }
                         toggleDeepResearch={toggleDeepResearch}
+                        atezSearchEnabled={atezSearchEnabledForCurrentWorkflow}
+                        toggleAtezSearch={toggleAtezSearch}
                         isMultiModelActive={multiModel.isMultiModelActive}
                         filterManager={filterManager}
                         llmManager={llmManager}

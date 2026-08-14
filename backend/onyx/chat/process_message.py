@@ -639,16 +639,15 @@ def _is_social_only_message(message: str) -> bool:
 
 
 def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | None:
-    """Limit the default chat to the shared, current regulatory chunk corpus."""
+    """Build default-chat filters and opt into Atez Search only when selected."""
     filters = setup.new_msg_req.internal_search_filters
     if setup.persona.id != DEFAULT_PERSONA_ID:
         return filters
 
     updates: dict[str, object] = {
         "source_type": [DocumentSource.USER_FILE],
-        "regulatory_chunks_only": not _is_social_only_message(
-            setup.new_msg_req.message
-        ),
+        "regulatory_chunks_only": setup.new_msg_req.atez_search
+        and not _is_social_only_message(setup.new_msg_req.message),
     }
     if filters is None or filters.as_of_date is None:
         updates["as_of_date"] = datetime.date.today()
@@ -773,6 +772,7 @@ def build_chat_turn(
             "has_project": chat_session.project_id is not None,
             "has_persona": persona is not None and persona.id != DEFAULT_PERSONA_ID,
             "deep_research": new_msg_req.deep_research,
+            "atez_search": new_msg_req.atez_search,
         },
     )
 

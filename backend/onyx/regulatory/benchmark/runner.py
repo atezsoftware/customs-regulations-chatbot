@@ -424,6 +424,7 @@ def _generate_item_answer(
             as_of_date=as_of_date,
         ),
         deep_research=run.deep_research,
+        atez_search=True,
         stream=True,
         include_citations=True,
         origin=MessageOrigin.BENCHMARK,

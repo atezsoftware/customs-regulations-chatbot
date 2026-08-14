@@ -8,6 +8,14 @@ from onyx.llm.constants import LlmProviderNames
 from onyx.llm.model_name_parser import parse_litellm_model_name
 
 
+def test_vertex_gemini_31_flash_lite_has_human_readable_name() -> None:
+    parsed = parse_litellm_model_name("vertex_ai/gemini-3.1-flash-lite")
+
+    assert parsed.display_name == "Gemini 3.1 Flash Lite"
+    assert parsed.provider == "vertex_ai"
+    assert parsed.vendor == "Google"
+
+
 def test_bedrock_model_with_enrichment() -> None:
     """Test parsing a Bedrock model - provider extracted, metadata from enrichment."""
     result = parse_litellm_model_name(

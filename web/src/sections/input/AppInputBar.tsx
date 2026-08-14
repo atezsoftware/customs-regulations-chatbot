@@ -48,6 +48,7 @@ import {
   SvgX,
   SvgSimpleLoader,
 } from "@opal/icons";
+import { DEFAULT_AGENT_ID } from "@/lib/constants";
 import { Button, SelectButton } from "@opal/components";
 import { Popover } from "@opal/components";
 import { useQueryController } from "@/providers/QueryControllerProvider";
@@ -85,8 +86,10 @@ export interface AppInputBarProps {
   handleFileUpload: (files: File[]) => void;
   filterManager: FilterManager;
   deepResearchEnabled: boolean;
+  atezSearchEnabled?: boolean;
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   toggleDeepResearch: () => void;
+  toggleAtezSearch?: () => void;
   isMultiModelActive?: boolean;
   disabled: boolean;
   awaitingPreferredSelection?: boolean;
@@ -111,7 +114,9 @@ const AppInputBar = React.memo(
     handleFileUpload,
     llmManager,
     deepResearchEnabled,
+    atezSearchEnabled = false,
     toggleDeepResearch,
+    toggleAtezSearch,
     isMultiModelActive,
     setPresentingDocument,
     disabled,
@@ -560,6 +565,15 @@ const AppInputBar = React.memo(
       currentProjectId,
     ]);
 
+    const showAtezSearch = useMemo(() => {
+      const isProjectWorkflow = currentProjectId !== null;
+      return (
+        !isProjectWorkflow &&
+        selectedAgent?.id === DEFAULT_AGENT_ID &&
+        hasSearchToolsAvailable(selectedAgent.tools || [])
+      );
+    }, [selectedAgent, currentProjectId]);
+
     function handleKeyDownForPromptShortcuts(
       e: React.KeyboardEvent<HTMLDivElement>
     ) {
@@ -680,23 +694,42 @@ const AppInputBar = React.memo(
                   : "Read this tab"}
               </SelectButton>
             ) : (
-              showDeepResearch && (
-                <SelectButton
-                  disabled={disabled || isMultiModelActive}
-                  variant="select-light"
-                  icon={SvgHourglass}
-                  onClick={toggleDeepResearch}
-                  state={deepResearchEnabled ? "selected" : "empty"}
-                  foldable={!deepResearchEnabled}
-                  tooltip={
-                    isMultiModelActive
-                      ? "Deep Research is disabled in multi-model mode"
-                      : undefined
-                  }
-                >
-                  Deep Research
-                </SelectButton>
-              )
+              <>
+                {showAtezSearch && toggleAtezSearch && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSearch}
+                    onClick={toggleAtezSearch}
+                    state={atezSearchEnabled ? "selected" : "empty"}
+                    foldable={!atezSearchEnabled}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Atez Search is disabled in multi-model mode"
+                        : "Structure-aware regulatory research"
+                    }
+                  >
+                    Atez Search
+                  </SelectButton>
+                )}
+                {showDeepResearch && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgHourglass}
+                    onClick={toggleDeepResearch}
+                    state={deepResearchEnabled ? "selected" : "empty"}
+                    foldable={!deepResearchEnabled}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Deep Research is disabled in multi-model mode"
+                        : undefined
+                    }
+                  >
+                    Deep Research
+                  </SelectButton>
+                )}
+              </>
             )}
 
             {selectedAgent &&

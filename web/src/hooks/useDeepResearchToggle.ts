@@ -25,6 +25,7 @@ export default function useDeepResearchToggle({
   agentId,
 }: UseDeepResearchToggleProps) {
   const [deepResearchEnabled, setDeepResearchEnabled] = useState(false);
+  const [atezSearchEnabled, setAtezSearchEnabled] = useState(false);
   const previousChatSessionId = useRef<string | null>(chatSessionId);
 
   // Reset when switching chat sessions, but preserve when going from null to a new session
@@ -35,20 +36,28 @@ export default function useDeepResearchToggle({
     // Only reset if we're switching between actual sessions (not from null to a new session)
     if (previousId !== null && previousId !== chatSessionId) {
       setDeepResearchEnabled(false);
+      setAtezSearchEnabled(false);
     }
   }, [chatSessionId]);
 
   // Reset when switching assistants
   useEffect(() => {
     setDeepResearchEnabled(false);
+    setAtezSearchEnabled(false);
   }, [agentId]);
 
   const toggleDeepResearch = useCallback(() => {
-    setDeepResearchEnabled(!deepResearchEnabled);
-  }, [deepResearchEnabled]);
+    setDeepResearchEnabled((enabled) => !enabled);
+  }, []);
+
+  const toggleAtezSearch = useCallback(() => {
+    setAtezSearchEnabled((enabled) => !enabled);
+  }, []);
 
   return {
     deepResearchEnabled,
     toggleDeepResearch,
+    atezSearchEnabled,
+    toggleAtezSearch,
   };
 }

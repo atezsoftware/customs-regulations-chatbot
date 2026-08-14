@@ -1,10 +1,11 @@
-# Regulatory Chat ve Deep Research Workflow
+# Normal Chat, Atez Search ve Deep Research Workflow
 
-Bu belge, Onyx'in ortak düzenleyici doküman korpusu üzerinde çalışan iki kullanıcı
-akışını kaynak kodla hizalı olarak açıklar:
+Bu belge, Onyx'in üç sohbet davranışını kaynak kodla hizalı olarak açıklar:
 
-1. normal chat içinde kullanılan düzenleyici araştırma ve cevap denetimi;
-2. kullanıcı **Deep Research** seçtiğinde çalışan daha yüksek bütçeli planlama,
+1. hiçbir araştırma seçeneği açılmadığında çalışan özgün **Onyx Normal Chat**;
+2. kullanıcı **Atez Search** seçtiğinde çalışan yapı-farkındalıklı düzenleyici
+   araştırma, kanıt matrisi ve cevap denetimi;
+3. kullanıcı **Deep Research** seçtiğinde çalışan daha yüksek bütçeli planlama,
    araştırma-agent ve final rapor akışı.
 
 Belgenin amacı yalnızca kutu isimlerini sıralamak değildir. Her aşamada hangi
@@ -18,10 +19,13 @@ hangi güvenli yolun izlendiğini gösterir.
 
 ## 1. Kapsam ve temel ilkeler
 
-Bu workflow yalnızca `regulatory_chunks_only=true` olan internal `SearchTool`
-hattında etkinleşir. Production'da varsayılan persona ile açılan normal chat ve
-aynı persona üzerinde seçilen Deep Research bu filtreyi taşımalıdır. Özel
-personalar kendi Document Set, ACL ve tool kapsamlarını korur.
+Atez'e özgü workflow yalnızca requestte `atez_search=true` seçildiğinde ve
+internal `SearchTool` filtresinde `regulatory_chunks_only=true` olduğunda
+etkinleşir. Normal chat bu bayrağı taşımaz ve özgün Onyx agent/tool döngüsünü
+korur. Deep Research bağımsız bir bütçe/orchestration seçeneğidir: Atez Search
+ile birlikte seçilirse düzenleyici Deep Research, tek başına seçilirse standart
+Onyx Deep Research çalışır. Özel personalar kendi Document Set, erişim kontrolü
+(ACL) ve tool kapsamlarını korur; Atez Search yalnız varsayılan personada sunulur.
 
 Ortak ilkeler:
 
@@ -43,31 +47,47 @@ Ortak ilkeler:
 - Kullanıcıya yalnız staged candidate denetimden geçtikten sonra stream edilir.
   Reddedilmiş ara taslak kullanıcıya veya kalıcı chat kaydına sızmaz.
 
-## 2. Üst seviye akış
+## 2. Mod sözleşmesi ve üst seviye akış
+
+| `atez_search` | `deep_research` | Çalışan akış |
+| --- | --- | --- |
+| `false` | `false` | Özgün Onyx Normal Chat |
+| `true` | `false` | Atez Search yapı-farkındalıklı workflow |
+| `false` | `true` | Özgün Onyx Deep Research |
+| `true` | `true` | Atez kapsamıyla yüksek bütçeli Regulatory Deep Research |
+
+İki seçenek birbirini dışlamaz; farklı eksenleri kontrol eder. Atez Search
+retrieval kapsamını ve kanıt-kapanış mekanizmasını, Deep Research ise planlama
+ve araştırma bütçesini değiştirir. Multi-model ve Project akışlarında Atez
+Search arayüzde kapalıdır.
 
 ```mermaid
 flowchart TD
     U["Kullanıcı mesajı"] --> API["Chat API ve context assembly"]
-    API --> MODE{"Deep Research açık mı?"}
+    API --> ATEZ{"Atez Search açık mı?"}
+    ATEZ -->|Hayır| DR{"Deep Research açık mı?"}
+    DR -->|Hayır| ONYX["Özgün Onyx loop + incremental progress"]
+    DR -->|Evet| ODR["Özgün Onyx Deep Research"]
 
-    MODE -->|Hayır| N0{"Substantive research intent?"}
-    N0 -->|Hayır| TALK["Normal conversational answer"]
-    N0 -->|Evet| N1["Request inventory"]
-    N1 --> N2["Coverage plan + bağımsız gap audit"]
-    N2 --> N3["Bootstrap hybrid/keyword retrieval"]
-    N3 --> N4["Model-directed ek araştırma"]
-    N4 --> N5["Source-outline navigation recovery"]
-    N5 --> N6["Claim-source evidence matrix"]
-    N6 --> N7["Matrix open-row recovery"]
-    N7 --> N8["Staged synthesis"]
-    N8 --> N9["Evidence audit + matrix closure audit"]
-    N9 --> N10{"Maddi eksik var mı?"}
-    N10 -->|Evet| N11["Odaklı gap recovery + bounded correction"]
-    N11 --> N12["Resolution + regression review"]
-    N10 -->|Hayır| PUB["Citation mapping commit + publish"]
-    N12 --> PUB
+    ATEZ -->|Evet| SOCIAL{"Yalnız sosyal/kısa turn mü?"}
+    SOCIAL -->|Evet| TALK["Normal conversational answer"]
+    SOCIAL -->|Hayır| DEEP{"Deep Research açık mı?"}
+    DEEP -->|Hayır| A1["Request inventory"]
+    A1 --> A2["Coverage plan + bağımsız gap audit"]
+    A2 --> A3["Bootstrap hybrid/keyword retrieval"]
+    A3 --> A4["Model-directed ek araştırma"]
+    A4 --> A5["Source-outline navigation recovery"]
+    A5 --> A6["Claim-source evidence matrix"]
+    A6 --> A7["Matrix open-row recovery"]
+    A7 --> A8["Staged synthesis"]
+    A8 --> A9["Evidence audit + matrix closure audit"]
+    A9 --> A10{"Maddi eksik var mı?"}
+    A10 -->|Evet| A11["Odaklı gap recovery + bounded correction"]
+    A11 --> A12["Resolution + regression review"]
+    A10 -->|Hayır| PUB["Citation mapping commit + publish"]
+    A12 --> PUB
 
-    MODE -->|Evet| D0["Deep Research"]
+    DEEP -->|Evet| D0["Regulatory Deep Research"]
     D0 --> D1["Coverage contract + bootstrap exact evidence"]
     D1 --> D2["Clarification gerekirse kullanıcıya dön"]
     D2 --> D3["Research plan"]
@@ -82,11 +102,10 @@ flowchart TD
     D9 --> PUB
 ```
 
-Normal chat daha düşük kullanıcı gecikmesiyle request closure ve citation
-doğruluğuna odaklanır. Deep Research, yüksek token maliyetini plan,
-orchestrator ve focused sub-agent araştırmalarına harcar. İki dal aynı exact
-chunk citation ve unsupported-claim güvenlik sınırını paylaşır; iç kontrol
-adımları birebir aynı değildir.
+Normal chat düşük gecikmeli ve görünür tool/progress paketli Onyx davranışıdır.
+Atez Search cevap completeness, correctness ve citation recall için staged
+kontroller ekler. Deep Research, seçildiği kapsamın yüksek token bütçeli plan,
+orchestrator ve focused research-agent varyantıdır.
 
 ## 3. Ortak giriş: context, model ve arama kapsamı
 
@@ -99,52 +118,73 @@ Kaynaklar:
 
 ```mermaid
 flowchart LR
-    REQ["SendMessageRequest"] --> PERSONA["Persona ve tool yetkileri"]
+    REQ["SendMessageRequest: atez_search + deep_research"] --> PERSONA["Persona ve tool yetkileri"]
     REQ --> OVERRIDE["Request/session model override"]
     PERSONA --> FILTER["ACL ∩ Document Set ∩ request filters"]
-    FILTER --> REG["regulatory_chunks_only"]
+    REQ --> MODE["Mode routing"]
+    FILTER --> REG["Atez seçiliyse regulatory_chunks_only"]
+    MODE --> REG
     REG --> SEARCH["Internal SearchTool"]
     OVERRIDE --> ANSWER["Answer LLM"]
     ANSWER --> REVIEW["Aynı provider üzerinde review LLM"]
     REQ --> HISTORY["Current request + bounded earlier user context"]
 ```
 
-Varsayılan regulatory chat davranışı:
+Varsayılan persona davranışı:
 
-1. Varsayılan persona SearchTool'u otomatik alır; FileReader global regulatory
-   chatten çıkarılır. Böylece tüm dosyayı bypass ederek okuyan ayrı bir kanal
-   oluşmaz.
-2. Bounded ve bütünüyle sosyal olan selamlama, teşekkür, onay ve vedalaşma
-   turn'leri retrieval öncesinde sıfır LLM maliyetli fast-path ile normal sohbet
-   davranışında kalır. Mesajda herhangi bir içerik terimi, sayı veya araştırma
-   isteği varsa bu kapı açılmaz; selamlama ile başlayan içerikli bir soru
-   regulatory hatta girer.
-3. Kapsam user-file regulatory chunk korpusudur. `as_of_date` verilmemişse
+1. Varsayılan persona SearchTool'u otomatik alır. Atez Search kapalıyken standard
+   Onyx tool kararı, stream ve progress davranışı değişmez.
+2. Atez Search seçilirse FileReader kaldırılır ve arama yalnız yapı-farkındalıklı
+   regulatory chunk hattından yürür. Böylece tüm dosyayı bypass eden ayrı bir
+   okuma kanalı oluşmaz.
+3. Atez seçili olsa bile bütünüyle sosyal ve kısa turn'ler retrieval öncesinde
+   sıfır LLM maliyetli fast-path ile normal sohbette kalır. İçerik terimi, sayı
+   veya araştırma isteği varsa bu kapı açılmaz.
+4. Atez kapsamı user-file regulatory chunk korpusudur. `as_of_date` verilmemişse
    bugünün tarihi kullanılır; yürürlük penceresi olan chunklar buna göre
    filtrelenir.
-4. User request yalnız current turn'den alınır. Önceki user mesajları en fazla
+5. User request yalnız current turn'den alınır. Önceki user mesajları en fazla
    beş mesaj ve bounded karakter bütçesiyle yalnız referans çözümü için taşınır;
    yeni deliverable oluşturmaz.
-5. Answer LLM normal chat model seçiminden gelir. Review LLM için
+6. Answer LLM chat model seçiminden gelir. Review LLM için
    `REGULATORY_REVIEW_MODEL` varsa aynı provider/config üzerinde temperature 0
    ile ikinci model oluşturulur; yoksa answer LLM kullanılır.
-6. Tool, prompt ve kullanıcı içeriği untrusted data sınırlarıyla ayrılır.
+7. Tool, prompt ve kullanıcı içeriği untrusted data sınırlarıyla ayrılır.
 
-## 4. Normal chat workflow
+## 4. Özgün Onyx Normal Chat
 
-### N0 — Regulatory hattın etkinleşmesi
+`atez_search=false` iken `_global_regulatory_search_filters` user-file ve tarih
+kapsamını korur fakat `regulatory_chunks_only` değerini açmaz. Bu nedenle
+`run_llm_loop` içindeki coverage plan, bootstrap, evidence matrix ve staged
+review blokları çalışmaz.
 
-`process_message`, yalnız bütünüyle sosyal ve kısa turn'leri generic token
+Normal Onyx davranışı şunları korur:
+
+- modelin gerektiğinde SearchTool seçtiği standart agent cycle;
+- her tool/reasoning adımının geldikçe frontend timeline'a aktarılması;
+- final cevabın token geldikçe incremental stream edilmesi;
+- kısa sohbetlerde gereksiz mevzuat araştırması yapılmaması;
+- mevcut persona, Document Set, ACL, file ve tool sözleşmeleri.
+
+Bu ayrım özellikle gecikme ve concurrency için kritiktir: pahalı Atez denetim
+çağrıları normal kullanıcı trafiğinin her mesajına uygulanmaz.
+
+## 5. Atez Search workflow
+
+### A0 — Atez hattının etkinleşmesi
+
+`process_message`, yalnız `atez_search=true` olduğunda regulatory bayrağı açar;
+bütünüyle sosyal ve kısa turn'leri generic token
 allowlist'iyle ayırır. Bu fast-path prompt veya benchmark sorusu içermez, LLM
 çağrısı yapmaz ve bilinmeyen tek bir içerik tokenı gördüğünde güvenli biçimde
 araştırma hattını korur.
 
 `run_llm_loop`, tool listesinde `regulatory_chunks_only=true` filtreli bir
-`SearchTool` gördüğünde gelişmiş akışı açar. Doğrudan, aramasız sohbet cevapları
-eski incremental stream davranışını korur. SearchTool kullanıldığı anda cevap
+`SearchTool` gördüğünde gelişmiş akışı açar. Fast-path sohbet cevapları
+incremental stream davranışını korur. Atez SearchTool kullanıldığı anda cevap
 staged moda geçer ve denetim tamamlanana kadar kullanıcıya yayınlanmaz.
 
-Normal chat taban cycle bütçesi `MAX_LLM_CYCLES` ile gelir ve varsayılanı 6'dır.
+Atez Search taban cycle bütçesi `MAX_LLM_CYCLES` ile gelir ve varsayılanı 6'dır.
 Regulatory akış buna aşağıdaki iç cycle alanlarını ekler:
 
 - 1 bootstrap coverage cycle;
@@ -155,7 +195,7 @@ Regulatory akış buna aşağıdaki iç cycle alanlarını ekler:
 Bu ekler sabit sayıda arama zorlamaz. Yalnız server-orchestrated adımların normal
 Onyx cycle bütçesini yanlışlıkla tüketmesini engeller.
 
-### N1 — Request inventory
+### A1 — Request inventory
 
 Kaynaklar:
 
@@ -187,7 +227,7 @@ Sınırlar:
 Inventory çağrısı başarısız olursa syntax tabanlı request outline korunur;
 workflow tüm planı kaybetmez.
 
-### N2 — Coverage plan ve bağımsız coverage audit
+### A2 — Coverage plan ve bağımsız coverage audit
 
 İkinci structured çağrı inventory'yi retrieval contract'a dönüştürür. Her
 coverage item şunları içerir:
@@ -225,7 +265,7 @@ fallback item ekler.
 | Coverage plan output | 12.000 token |
 | Coverage gap audit output | 12.000 token |
 
-### N3 — Bootstrap retrieval
+### A3 — Bootstrap retrieval
 
 Coverage item'lar doğrudan SearchTool çağrılarına çevrilir. Her atomic evidence
 dimension için önce hybrid arama planlanır; kalan kapasite farklı lexical erişim
@@ -253,9 +293,9 @@ SearchTool aşağıdaki retrieval katmanlarını korur:
 7. mode-sensitive deduplication ve final ranking;
 8. exact `document_id + chunk_ind` citation mapping.
 
-### N4 — Autonomous research kararı
+### A4 — Autonomous research kararı
 
-Bootstrap bitince answering model en az bir normal Onyx araştırma kararı alma
+Bootstrap bitince answering model en az bir Atez araştırma kararı alma
 fırsatını korur. Model:
 
 - eldeki kanıtın açık coverage row'larını kapatıp kapatmadığını inceler;
@@ -266,7 +306,7 @@ Bu aşama server planının modele sabit bir checklist dayatmasını önler. Cov
 contract eksiklik kontrolü sağlar; araştırma stratejisinin sahibi answering
 modeldir.
 
-### N5 — Source-outline navigation recovery
+### A5 — Source-outline navigation recovery
 
 Search sonuçlarında operative text yerine heading, cross-reference veya komşu
 hüküm görünmüş olabilir. Bunlar kanıt olarak kullanılmaz; metadata-only
@@ -284,7 +324,7 @@ Seçilen headingler `document title + heading label` focused hybrid sorgusuyla
 yeniden alınır. Ancak getirilen exact text kanıt olabilir; selector kararı veya
 headingin kendisi kanıt değildir.
 
-### N6 — Claim-source evidence matrix
+### A6 — Claim-source evidence matrix
 
 Kaynaklar:
 
@@ -319,7 +359,7 @@ Server aşağıdaki hard validationları uygular:
 | Row başına document number | 12 |
 | Matrix output | 24.000 token |
 
-### N7 — Matrix open-row recovery
+### A7 — Matrix open-row recovery
 
 İlk matrixte `partial`, `missing` veya `conflicting` kalan ve focused query
 taşıyan satırlar bir defa recovery batch'ine çevrilir. En fazla 32 deduplicated
@@ -330,7 +370,7 @@ satırlar gereksiz yere baştan üretilmez.
 Bu pass yalnız mevcut request-grounded satırı kapatabilir. Yeni konu ekleyemez ve
 başarılı aramaları mekanik doğrulama için tekrar etmez.
 
-### N8 — Dynamic stop ve full-evidence synthesis
+### A8 — Dynamic stop ve full-evidence synthesis
 
 Araştırma geçmişi büyüdüğünde modelin tool kararı için bütün chunk metinlerini
 tekrar tekrar göndermek pahalıdır. 32'den fazla geçerli result sonrasında server
@@ -358,7 +398,7 @@ Synthesis selection:
 önceliğiyle hazırlanır. Soft limit 96 evidence chunk'tır; bu limit source
 çeşitliliğini koruyacak biçimde uygulanır.
 
-### N9 — Staged candidate
+### A9 — Staged candidate
 
 Model tools kapalıyken current request, bounded earlier context, coverage
 contract, claim-source matrix ve seçilmiş exact evidence üzerinden final adayı
@@ -369,7 +409,7 @@ effort için ayrı reserve uygulanır.
 Candidate answer doğrudan stream edilmez. `BufferedEmitter`, ayrı
 `ChatStateContainer` ve fork edilmiş citation processor içinde tutulur.
 
-### N10 — Üç katmanlı answer denetimi
+### A10 — Üç katmanlı answer denetimi
 
 İlk candidate üzerinde birbirini tamamlayan kontroller çalışır:
 
@@ -396,10 +436,10 @@ Review input sınırları:
 | Resolution output | en fazla 16.000 token |
 
 Independent review model çağrısı unavailable olursa aynı audit answering model
-ile bir kez tekrar edilir. Her iki çağrı da unavailable ise normal chat
+ile bir kez tekrar edilir. Her iki çağrı da unavailable ise Atez Search
 fail-open davranışını korur ve review error loglanır.
 
-### N11 — Batched gap recovery ve correction
+### A11 — Batched gap recovery ve correction
 
 İlk review maddi issue bulursa en fazla beş query-distinct recovery issue seçilir.
 Öncelik sırası:
@@ -421,11 +461,11 @@ Candidate daha sonra bounded correction cycle'ına girer. İkinci review:
 - matrix citation ve closure kontrolünü tekrarlar;
 - yeni grounding regression oluşmuşsa önceki issue'larla birleştirir.
 
-Normal chatte en fazla iki candidate review pass vardır. İkinci pass sonrasında
+Atez Search'te en fazla iki candidate review pass vardır. İkinci pass sonrasında
 server yeni sınırsız rewrite döngüsü açmaz; kalan issue'ları warning ile kaydeder
 ve son reviewed candidate'ı yayınlar.
 
-### N12 — Commit, stream ve persist
+### A12 — Commit, stream ve persist
 
 Candidate kabul edildiğinde staged state atomik biçimde ana state'e alınır:
 
@@ -435,14 +475,17 @@ Candidate kabul edildiğinde staged state atomik biçimde ana state'e alınır:
 - Sources paneli ve citation preview aynı exact chunk'ı kullanır;
 - rejected taslakların answer/citation state'i kalıcı kayda girmez.
 
-## 5. Deep Research workflow
+## 6. Deep Research workflow
 
 Deep Research normal chatin yalnız “daha fazla cycle” seçeneği değildir. Ayrı
 plan, orchestrator, focused research-agent ve final-report zinciridir. Aynı
 regulatory SearchTool, coverage contract, exact evidence ve candidate review
-güvenlik sınırlarını kullanır; normal chatteki structured navigation selector ve
-claim-source `RegulatoryEvidenceMatrix` şu anda Deep Research orchestrator
-zincirinin ayrı bir aşaması değildir.
+güvenlik sınırlarını yalnız `atez_search=true` ile birlikte seçildiğinde
+kullanır. `atez_search=false` olan Deep Research, özgün Onyx Deep Research
+akışında kalır. Aşağıdaki D0-D9 aşamaları Regulatory Deep Research'ü anlatır;
+Atez Search'teki structured navigation selector ve claim-source
+`RegulatoryEvidenceMatrix` şu anda orchestrator zincirinin ayrı bir aşaması
+değildir.
 
 ### D0 — Başlangıç koşulları
 
@@ -456,7 +499,7 @@ zincirinin ayrı bir aşaması değildir.
 
 ### D1 — Coverage contract ve bootstrap exact evidence
 
-Normal chatteki request inventory, coverage plan ve gap audit aynen çalışır.
+Atez Search'teki request inventory, coverage plan ve gap audit aynen çalışır.
 Coverage dimensionları SearchTool çağrılarına çevrilir; call'lar dörderli
 batchlerde yürütülür, call başına en fazla 6 chunk alınır ve toplam en fazla 48
 exact evidence chunk bootstrap envanterine taşınır.
@@ -551,31 +594,31 @@ Deep Research review/correction hataları normal chatten daha katı fallback'e
 sahiptir: desteklenmeyen hukuki sonucun kullanıcıya gitmesi yerine source-gap
 cevabı yayınlanır.
 
-## 6. Normal chat ve Deep Research bütçe karşılaştırması
+## 7. Normal Chat, Atez Search ve Deep Research bütçe karşılaştırması
 
-| Boyut | Normal regulatory chat | Regulatory Deep Research |
-| --- | --- | --- |
-| Request inventory/coverage/audit | Var | Var |
-| Bootstrap retrieval | Hybrid + keyword, 32 call'a kadar | Dörderli batch, toplam 48 evidence chunk'a kadar |
-| Answering-model autonomous search | Var | Orchestrator + focused agents |
-| Source navigation selector | 256 lead içinden en fazla 16 | Agent retrievalü içinde dolaylı; ayrı selector yok |
-| Structured claim-source matrix | En fazla 64 row | Ayrı structured matrix yok; bootstrap exact-evidence inventory var |
-| Matrix open-row recovery | Bir pass, en fazla 32 focused query | Agent araştırması ve candidate-gap recovery |
-| Parallelism | En fazla 8 SearchTool execution | En fazla 3 research agent; her agent kendi aramasını yapar |
-| Ana cycle | Varsayılan 6 + bounded regulatory iç cyclelar | Orchestrator 8, reasoning model 4 |
-| Research-agent sayısı | Yok | Turn başına en fazla 12 |
-| Agent local cycle | Yok | Agent başına 8 |
-| Final output | Model default; staged regulatory synthesis | 20.000 token |
-| Candidate review | Evidence + matrix + closure; en fazla 2 pass | Evidence review + en fazla 2 correction |
-| Gap recovery | İlk reviewde en fazla 5 focused query | En fazla 1 focused query |
-| Son unresolved davranışı | Reviewed candidate + warning | Citation-free precise source gap |
+| Boyut | Onyx Normal Chat | Atez Search | Regulatory Deep Research |
+| --- | --- | --- | --- |
+| Request inventory/coverage/audit | Yok | Var | Var |
+| Bootstrap retrieval | Yok; model gerektiğinde standard search | Hybrid + keyword, 32 call'a kadar | Dörderli batch, toplam 48 evidence chunk'a kadar |
+| Araştırma yönetimi | Standard Onyx tool kararı | Answering-model autonomous search | Orchestrator + focused agents |
+| Source navigation selector | Yok | 256 lead içinden en fazla 16 | Agent retrievalü içinde dolaylı; ayrı selector yok |
+| Structured claim-source matrix | Yok | En fazla 64 row | Ayrı structured matrix yok; bootstrap exact-evidence inventory var |
+| Matrix open-row recovery | Yok | Bir pass, en fazla 32 focused query | Agent araştırması ve candidate-gap recovery |
+| Parallelism | Standard Onyx | En fazla 8 SearchTool execution | En fazla 3 research agent; her agent kendi aramasını yapar |
+| Ana cycle | `MAX_LLM_CYCLES` | Varsayılan 6 + bounded regulatory iç cyclelar | Orchestrator 8, reasoning model 4 |
+| Research-agent sayısı | Yok | Yok | Turn başına en fazla 12 |
+| Agent local cycle | Yok | Yok | Agent başına 8 |
+| Final output | Incremental stream | Model default; staged regulatory synthesis | 20.000 token staged report |
+| Candidate review | Standard Onyx | Evidence + matrix + closure; en fazla 2 pass | Evidence review + en fazla 2 correction |
+| Gap recovery | Standard Onyx | İlk reviewde en fazla 5 focused query | En fazla 1 focused query |
+| Son unresolved davranışı | Standard Onyx | Reviewed candidate + warning | Citation-free precise source gap |
 
-Bu tablo “Deep Research her zaman daha iyi cevap verir” garantisi değildir.
-Deep Research daha geniş araştırma bütçesi sağlar; normal chat ise structured
-matrix ve daha yoğun pre-synthesis closure kontrolü sayesinde kısa kullanıcı
-akışında güçlü doğruluk ve completeness hedefler.
+Bu tablo “daha pahalı mod her zaman daha iyi cevap verir” garantisi değildir.
+Deep Research daha geniş araştırma bütçesi sağlar; Atez Search structured matrix
+ve yoğun pre-synthesis closure kontrolüyle doğruluk ve completeness hedefler;
+Normal Chat ise düşük gecikme ve görünür incremental ilerlemeyi korur.
 
-## 7. Citation ve exact-evidence modeli
+## 8. Citation ve exact-evidence modeli
 
 ```mermaid
 flowchart LR
@@ -599,7 +642,7 @@ Kurallar:
 - Matrix satırı veya reviewer feedback citation değildir.
 - Candidate citationı mappingte yoksa correction evidence'ına alınmaz.
 
-## 8. Hata ve fallback davranışı
+## 9. Hata ve fallback davranışı
 
 | Hata | Normal chat | Deep Research |
 | --- | --- | --- |
@@ -619,15 +662,18 @@ Structured output katmanı providerın JSON schema limitlerine uyumlu response
 model üretir, kesilmiş/bozuk JSON için bounded retry uygular ve parsed veriyi
 strict internal Pydantic modeline geçmeden önce server-side normalize eder.
 
-## 9. Provider ve model yönlendirmesi
+## 10. Provider ve model yönlendirmesi
 
-Normal chat model seçimi request override → session override → persona/default
+Tüm chat modlarında model seçimi request override → session override → persona/default
 sırasını izler. Benchmarkta kullanılan production adayı aşağıdaki rotayı
 hedefler:
 
 - generative answer çağrıları: Vertex AI;
 - plan, inventory, matrix ve review çağrıları: aynı Vertex AI credential/provider;
 - configured review tier: `REGULATORY_REVIEW_MODEL`;
+- Vertex AI chat kataloğu: service-account rotasında `gemini-3.1-flash-lite`
+  (`Gemini 3.1 Flash Lite`) ve deploymentta görünür olarak seçilen diğer Gemini
+  modelleri;
 - embedding: aktif search settingte kayıtlı provider/model;
 - reranker: yalnız aktif deployment ayarı varsa; workflow doğru çalışmak için
   belirli bir reranker providerına bağımlı değildir.
@@ -637,7 +683,7 @@ rotası bu workflowun production varsayımı değildir. Model adı deployment co
 ve admin catalogunda ayrıca doğrulanmalıdır; yalnız kod sabiti modelin providerda
 erişilebilir olduğunu kanıtlamaz.
 
-## 10. Dataset-blind ve overfit karşıtı sınırlar
+## 11. Dataset-blind ve overfit karşıtı sınırlar
 
 Workflow kaliteyi semantik benchmark checklistleriyle değil genel mekanizmalarla
 artırır:
@@ -666,7 +712,7 @@ Türk gümrük ve düzenleyici kaynaklarında mevzuatın doğal terminolojisini 
 kuralı domain-language guidance'dır. Yeni hukuki konu üretmez ve requestin
 anlamını değiştiremez.
 
-## 11. Tracing, loglar ve production gözlemi
+## 12. Tracing, loglar ve production gözlemi
 
 Her secondary LLM çağrısı ayrı `LLMFlow` ile trace edilir. Önemli akışlar:
 
@@ -685,17 +731,20 @@ Aşağıdaki kanıtlar birlikte aranır:
 1. deployed backend ve web image digest/revision beklenen commit ile aynı;
 2. API ve worker Ready/healthy;
 3. `REGULATORY_REVIEW_MODEL` container environmentta doğru;
-4. içerikli normal chat SearchTool filtresi `regulatory_chunks_only=true`,
-   bütünüyle sosyal turn'de `false`;
-5. loglarda coverage plan, navigation, matrix ve review aşamaları görülüyor;
-6. normal kullanıcı hesabıyla gerçek chat yanıtı ve exact citations geliyor;
+4. normal chatte `regulatory_chunks_only=false`, Atez Search seçili içerikli
+   soruda `true`, bütünüyle sosyal turn'de `false`;
+5. normal chat incremental tool/progress paketleri üretirken Atez Search'te
+   coverage plan, navigation, matrix ve review aşamaları görülüyor;
+6. normal kullanıcı hesabıyla hem kısa normal yanıt hem Atez exact-citation
+   yanıtı geliyor;
 7. Deep Research seçildiğinde plan/orchestrator/research-agent logları görülüyor;
-8. LLM routes yalnız beklenen provider/model çiftini gösteriyor;
+8. LLM routes yalnız beklenen provider/model çiftini gösteriyor ve Gemini 3.1
+   Flash Lite Vertex AI providerında seçilebiliyor;
 9. frontend citation click aynı `(document_id, chunk_ind)` previewını açıyor;
 10. response tamamlandıktan sonra kalıcı mesaj ve citation mapping tekrar
     yüklenebiliyor.
 
-## 12. Production invariants
+## 13. Production invariants
 
 Deploy öncesi ve sonrası aşağıdakiler korunmalıdır:
 
@@ -705,17 +754,19 @@ Deploy öncesi ve sonrası aşağıdakiler korunmalıdır:
 - secrets image, commit, log veya workflow belgesine yazılmaz;
 - backend/web image aynı source revisiondan üretilir;
 - rollout health ile functional readiness ayrı doğrulanır;
-- normal chat ve Deep Research aynı regulatory document scope'u aşamaz;
-- default chatte FileReader regulatory exact-chunk hattını bypass edemez;
+- normal chat yalnız standard Onyx kapsamını kullanır; Atez Search ve Atez ile
+  birleşen Deep Research regulatory document scope'u aşamaz;
+- Atez Search'te FileReader regulatory exact-chunk hattını bypass edemez;
 - review failure sessiz başarı sayılmaz; log ve trace ile görünür kalır;
 - benchmark sonucu production chat testi yerine geçmez.
 
-## 13. Kaynak kod haritası
+## 14. Kaynak kod haritası
 
 | Sorumluluk | Kaynak |
 | --- | --- |
 | Chat request, persona, filter ve model dispatch | `backend/onyx/chat/process_message.py` |
-| Normal chat cycle, matrix ve review orchestration | `backend/onyx/chat/llm_loop.py` |
+| Standard Onyx ve Atez Search cycle dispatch | `backend/onyx/chat/llm_loop.py` |
+| Atez Search UI state ve request serialization | `web/src/hooks/useDeepResearchToggle.ts`, `web/src/app/app/services/lib.tsx` |
 | Deep Research orchestration | `backend/onyx/deep_research/dr_loop.py` |
 | Deep Research planner/orchestrator promptları | `backend/onyx/prompts/deep_research/orchestration_layer.py` |
 | Research-agent promptları | `backend/onyx/prompts/deep_research/research_agent.py` |
@@ -734,24 +785,30 @@ Deploy öncesi ve sonrası aşağıdakiler korunmalıdır:
 | Citation mapping ve canonicalization | `backend/onyx/chat/citation_utils.py` |
 | Flow tracing registry | `backend/onyx/tracing/flows.py` |
 
-## 14. Fonksiyonel kabul kontrolü
+## 15. Fonksiyonel kabul kontrolü
 
 Bir production release ancak aşağıdaki davranışlar canlıda gösterildiğinde bu
 workflowu taşıyor sayılır:
 
-- normal kullanıcı normal chat mesajı coverage plan ve bootstrap aramalarını
-  tetikler;
-- sosyal selamlama/teşekkür mesajı retrieval çalıştırmadan kısa normal sohbet
-  yanıtı üretir; selamlama ile başlayan içerikli soru yine regulatory hatta girer;
+- normal kullanıcı `atez_search=false` ile selamlama yaptığında retrieval
+  çalışmadan kısa normal sohbet yanıtı alır;
+- normal içerikli soru standard Onyx tool/progress ve incremental stream
+  davranışını korur, coverage plan veya evidence matrix zorlanmaz;
+- aynı içerikli soru `atez_search=true` ile coverage plan ve bootstrap
+  aramalarını tetikler;
+- Atez açıkken sosyal selamlama/teşekkür yine kısa normal sohbet yanıtı üretir;
 - distinct request obligations loglarda map edilir;
 - source-outline lead varsa bounded navigation selection çalışır;
 - exact evidence matrix üretilir ve open row recovery en fazla bir pass yapar;
 - answer kullanıcıya review bitmeden stream edilmez;
 - supported claims exact inline citation taşır;
 - recovery citationları canonical mappingi bozmaz;
-- aynı normal chat mesajı refresh sonrası cevap ve citationlarını korur;
-- Deep Research açıldığında clarification/plan/orchestrator yolu kullanılır;
-- normal ve Deep Research cevapları aynı izinli regulatory chunk korpusundan
-  çıkar;
+- aynı Atez Search mesajı refresh sonrası cevap ve citationlarını korur;
+- Deep Research tek başına özgün Onyx kapsamını, Atez ile birlikteyken
+  regulatory clarification/plan/orchestrator yolunu kullanır;
+- Atez ve Regulatory Deep Research cevapları aynı izinli regulatory chunk
+  korpusundan çıkar;
 - provider/model provenance beklenen Vertex AI rotasını gösterir;
+- Gemini 3.1 Flash Lite chat model listesinde görünür ve Vertex AI credentialını
+  kullanır;
 - API, worker, web ve citation preview health kontrolleri geçer.

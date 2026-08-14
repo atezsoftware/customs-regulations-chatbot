@@ -50,6 +50,10 @@
         {
           "name": "gemini-3.6-flash",
           "display_name": "Gemini 3.6 Flash"
+        },
+        {
+          "name": "gemini-3.1-flash-lite",
+          "display_name": "Gemini 3.1 Flash Lite"
         }
       ]
     },

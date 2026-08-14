@@ -135,13 +135,15 @@ def test_regulatory_intermediate_report_stays_within_its_focused_proposition() -
     for required_detail in (
         "condition",
         "exception",
-        "conflict",
+        "contradictory",
         "source gap",
-        "proposition-level applicability",
+        "proposition-level application",
     ):
         assert required_detail in RESEARCH_REPORT_PROMPT
 
-    assert "Do not attempt the user's global legal analysis" in RESEARCH_REPORT_PROMPT
-    assert "issues assigned to other research fragments" in RESEARCH_REPORT_PROMPT
-    assert "final user-facing synthesis" in RESEARCH_REPORT_PROMPT
+    assert "Do not add unsupported conclusions or expand into a global analysis" in (
+        RESEARCH_REPORT_PROMPT
+    )
+    assert "focused research topic" in RESEARCH_REPORT_PROMPT
+    assert "another agent instead of a user" in RESEARCH_REPORT_PROMPT
     assert "answer the user's material requests directly" not in RESEARCH_REPORT_PROMPT

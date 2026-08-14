@@ -484,6 +484,7 @@ def test_answer_generation_scopes_search_to_document_set_without_project() -> No
     assert request.internal_search_filters is not None
     assert request.internal_search_filters.document_set == ["Current Regulations"]
     assert request.internal_search_filters.as_of_date == datetime.date(2026, 8, 6)
+    assert request.atez_search is True
     assert request.origin == MessageOrigin.BENCHMARK
     assert item.chat_session_id == chat_session_id
     assert item.execution_phase == "answering"

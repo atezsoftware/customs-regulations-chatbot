@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 from onyx.auth.oauth_token_manager import OAuthTokenManager
 from onyx.chat.emitter import Emitter
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
-from onyx.configs.constants import DEFAULT_PERSONA_ID
 from onyx.configs.model_configs import GEN_AI_TEMPERATURE
 from onyx.context.search.models import BaseFilters, PersonaSearchInfo
 from onyx.db.engine.sql_engine import get_session_with_current_tenant_if_none
@@ -201,11 +200,6 @@ def _construct_tools_impl(
             attached_document_ids=[doc.id for doc in persona.attached_documents],
             hierarchy_node_ids=[node.id for node in persona.hierarchy_nodes],
         )
-        user_selected_filters = config.user_selected_filters
-        if persona.id == DEFAULT_PERSONA_ID:
-            user_selected_filters = (user_selected_filters or BaseFilters()).model_copy(
-                update={"regulatory_chunks_only": True}
-            )
         return SearchTool(
             tool_id=tool_id,
             emitter=emitter,
@@ -213,7 +207,7 @@ def _construct_tools_impl(
             persona_search_info=persona_search_info,
             llm=llm,
             document_index=document_index,
-            user_selected_filters=user_selected_filters,
+            user_selected_filters=config.user_selected_filters,
             project_id_filter=config.project_id_filter,
             persona_id_filter=config.persona_id_filter,
             bypass_acl=config.bypass_acl,

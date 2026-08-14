@@ -86,6 +86,7 @@ export interface OnSubmitProps {
   // from the chat bar???
 
   deepResearch: boolean;
+  atezSearch?: boolean;
 
   // optional params
   messageIdToResend?: number;
@@ -372,6 +373,7 @@ export default function useChatController({
       message,
       currentMessageFiles,
       deepResearch,
+      atezSearch = false,
       messageIdToResend,
       queryOverride,
       forceSearch,
@@ -953,6 +955,7 @@ export default function useChatController({
               undefined,
           temperature: llmManager.temperature || undefined,
           deepResearch,
+          atezSearch,
           enabledToolIds:
             disabledToolIds && liveAgent
               ? liveAgent.tools

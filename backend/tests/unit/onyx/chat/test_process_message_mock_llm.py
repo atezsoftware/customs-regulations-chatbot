@@ -13,9 +13,7 @@ from onyx.context.search.models import BaseFilters
 from onyx.server.query_and_chat.models import MessageResponseIDInfo, SendMessageRequest
 
 
-def test_default_persona_forces_regulatory_scope_without_discarding_user_filters() -> (
-    None
-):
+def test_default_persona_uses_original_search_scope_without_atez_search() -> None:
     requested_date = process_message.datetime.date(2026, 7, 1)
     requested_filters = BaseFilters(
         document_set=["Dar kapsam"],
@@ -26,6 +24,33 @@ def test_default_persona_forces_regulatory_scope_without_discarding_user_filters
         new_msg_req=SimpleNamespace(
             internal_search_filters=requested_filters,
             message="Antrepo rejiminin şartları nelerdir?",
+            atez_search=False,
+        ),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(
+        cast(ChatTurnSetup, setup)
+    )
+
+    assert effective_filters is not None
+    assert effective_filters.regulatory_chunks_only is False
+    assert effective_filters.source_type == [DocumentSource.USER_FILE]
+    assert effective_filters.document_set == ["Dar kapsam"]
+    assert effective_filters.as_of_date == requested_date
+
+
+def test_atez_search_forces_regulatory_scope_without_discarding_user_filters() -> None:
+    requested_date = process_message.datetime.date(2026, 7, 1)
+    requested_filters = BaseFilters(
+        document_set=["Dar kapsam"],
+        as_of_date=requested_date,
+    )
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SimpleNamespace(
+            internal_search_filters=requested_filters,
+            message="Antrepo rejiminin şartları nelerdir?",
+            atez_search=True,
         ),
     )
 
@@ -55,7 +80,11 @@ def test_default_persona_keeps_social_messages_out_of_regulatory_research(
 ) -> None:
     setup = SimpleNamespace(
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(internal_search_filters=None, message=message),
+        new_msg_req=SimpleNamespace(
+            internal_search_filters=None,
+            message=message,
+            atez_search=True,
+        ),
     )
 
     effective_filters = process_message._global_regulatory_search_filters(
@@ -79,7 +108,11 @@ def test_default_persona_keeps_substantive_short_queries_in_regulatory_research(
 ) -> None:
     setup = SimpleNamespace(
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
-        new_msg_req=SimpleNamespace(internal_search_filters=None, message=message),
+        new_msg_req=SimpleNamespace(
+            internal_search_filters=None,
+            message=message,
+            atez_search=True,
+        ),
     )
 
     effective_filters = process_message._global_regulatory_search_filters(
@@ -117,6 +150,12 @@ def test_mock_llm_response_requires_integration_mode() -> None:
                 user=mock_user,
             )
         )
+
+
+def test_send_message_request_defaults_atez_search_to_false() -> None:
+    request = SendMessageRequest(message="Merhaba")
+
+    assert request.atez_search is False
 
 
 def test_gather_stream_returns_empty_answer_when_streaming_error_only() -> None:

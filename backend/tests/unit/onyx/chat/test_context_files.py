@@ -81,12 +81,28 @@ def test_global_regulatory_filters_limit_search_to_current_user_files() -> None:
     setup = MagicMock()
     setup.persona.id = DEFAULT_PERSONA_ID
     setup.new_msg_req.internal_search_filters = None
+    setup.new_msg_req.atez_search = False
+    setup.new_msg_req.message = "Antrepo nedir?"
 
     filters = _global_regulatory_search_filters(setup)
 
     assert filters is not None
     assert filters.source_type == [DocumentSource.USER_FILE]
     assert filters.as_of_date is not None
+    assert filters.regulatory_chunks_only is False
+
+
+def test_atez_search_enables_structure_aware_regulatory_workflow() -> None:
+    setup = MagicMock()
+    setup.persona.id = DEFAULT_PERSONA_ID
+    setup.new_msg_req.internal_search_filters = None
+    setup.new_msg_req.atez_search = True
+    setup.new_msg_req.message = "Antrepo nedir?"
+
+    filters = _global_regulatory_search_filters(setup)
+
+    assert filters is not None
+    assert filters.regulatory_chunks_only is True
 
 
 def test_custom_agent_search_filters_are_preserved() -> None:
@@ -94,6 +110,7 @@ def test_custom_agent_search_filters_are_preserved() -> None:
     setup = MagicMock()
     setup.persona.id = 42
     setup.new_msg_req.internal_search_filters = expected
+    setup.new_msg_req.atez_search = True
 
     assert _global_regulatory_search_filters(setup) is expected
 

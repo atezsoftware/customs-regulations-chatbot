@@ -40,6 +40,10 @@ _recommendations_cache_lock = threading.Lock()
 _cached_recommendations: LLMRecommendations | None = None
 _cached_recommendations_time: float = 0.0
 
+_DEPLOYMENT_VISIBLE_VERTEX_MODELS: dict[str, str] = {
+    "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
+}
+
 
 def _get_provider_to_models_map() -> dict[str, list[str]]:
     """Lazy-load provider model mappings to avoid importing litellm at module level.
@@ -214,7 +218,9 @@ def get_vertexai_model_names() -> list[str]:
     import litellm
 
     # Combine all vertex model sets
-    vertex_models: set[str] = set()
+    # Keep deployment-supported models discoverable if a LiteLLM catalog
+    # release temporarily lags Vertex availability.
+    vertex_models: set[str] = {"gemini-3.1-flash-lite"}
     vertex_model_sets = [
         "vertex_chat_models",
         "vertex_language_models",
@@ -263,6 +269,11 @@ def model_configurations_for_provider(
     display_name_by_name = {
         m.name: m.display_name for m in recommended_visible_models if m.display_name
     }
+    if provider_name == VERTEXAI_PROVIDER_NAME:
+        for model_name, display_name in _DEPLOYMENT_VISIBLE_VERTEX_MODELS.items():
+            if model_name not in recommended_visible_models_names:
+                recommended_visible_models_names.append(model_name)
+            display_name_by_name.setdefault(model_name, display_name)
     default_model = llm_recommendations.get_default_model(provider_name)
     default_model_name = default_model.name if default_model else None
 

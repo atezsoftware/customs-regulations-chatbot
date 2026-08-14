@@ -115,6 +115,9 @@ class SendMessageRequest(BaseModel):
     internal_search_filters: BaseFilters | None = None
 
     deep_research: bool = False
+    # Opts the default assistant into the structure-aware Atez regulatory
+    # workflow. Normal chat remains on the standard Onyx agent loop.
+    atez_search: bool = False
 
     # Headers to forward to MCP tool calls (e.g., user JWT token, user ID)
     # Example: {"Authorization": "Bearer <user_jwt>", "X-User-ID": "user123"}

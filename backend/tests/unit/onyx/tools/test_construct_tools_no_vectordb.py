@@ -10,8 +10,14 @@ Verifies that:
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from onyx.configs.constants import DEFAULT_PERSONA_ID
+from onyx.context.search.models import BaseFilters
 from onyx.tools.models import SearchToolUsage
-from onyx.tools.tool_constructor import _construct_tools_impl, construct_tools
+from onyx.tools.tool_constructor import (
+    SearchToolConfig,
+    _construct_tools_impl,
+    construct_tools,
+)
 from onyx.tools.tool_implementations.file_reader.file_reader_tool import FileReaderTool
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 
@@ -108,6 +114,55 @@ class TestForceAddSearchToolGuard:
 
 
 class TestEffectivePersonaTools:
+    def test_default_persona_preserves_explicit_standard_search_mode(self) -> None:
+        configured_search_tool = MagicMock(
+            id=1,
+            name="internal_search",
+            in_code_tool_id=SearchTool.__name__,
+        )
+        persona = MagicMock(
+            id=DEFAULT_PERSONA_ID,
+            name="default",
+            tools=[configured_search_tool],
+        )
+        persona.document_sets = []
+        persona.attached_documents = []
+        persona.hierarchy_nodes = []
+        persona.search_start_date = None
+        user = MagicMock(oauth_accounts=[], enable_memory_tool=False)
+
+        with (
+            patch(
+                "onyx.tools.tool_constructor.get_current_search_settings",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_default_document_index",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_built_in_tool_by_id",
+                return_value=SearchTool,
+            ),
+            patch.object(SearchTool, "is_available", return_value=True),
+        ):
+            result = _construct_tools_impl(
+                persona=persona,
+                db_session=MagicMock(),
+                emitter=MagicMock(),
+                user=user,
+                llm=MagicMock(),
+                search_tool_config=SearchToolConfig(
+                    user_selected_filters=BaseFilters(regulatory_chunks_only=False)
+                ),
+                search_usage_forcing_setting=SearchToolUsage.ENABLED,
+            )
+
+        search_tool = result[1][0]
+        assert isinstance(search_tool, SearchTool)
+        assert search_tool.user_selected_filters is not None
+        assert search_tool.user_selected_filters.regulatory_chunks_only is False
+
     def test_construct_tools_passes_inherited_tools_to_runtime_constructor(
         self,
     ) -> None:
