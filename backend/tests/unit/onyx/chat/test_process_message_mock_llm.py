@@ -8,7 +8,30 @@ from onyx.chat import process_message
 from onyx.chat.chat_state import ChatStateContainer
 from onyx.chat.models import AnswerStream, StreamingError
 from onyx.configs import app_configs
+from onyx.configs.constants import DocumentSource
+from onyx.context.search.models import BaseFilters
 from onyx.server.query_and_chat.models import MessageResponseIDInfo, SendMessageRequest
+
+
+def test_default_persona_forces_regulatory_scope_without_discarding_user_filters(
+) -> None:
+    requested_date = process_message.datetime.date(2026, 7, 1)
+    requested_filters = BaseFilters(
+        document_set=["Dar kapsam"],
+        as_of_date=requested_date,
+    )
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SimpleNamespace(internal_search_filters=requested_filters),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(setup)
+
+    assert effective_filters is not None
+    assert effective_filters.regulatory_chunks_only is True
+    assert effective_filters.source_type == [DocumentSource.USER_FILE]
+    assert effective_filters.document_set == ["Dar kapsam"]
+    assert effective_filters.as_of_date == requested_date
 
 
 def test_mock_llm_response_requires_integration_mode() -> None:

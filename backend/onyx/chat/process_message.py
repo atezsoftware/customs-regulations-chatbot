@@ -582,7 +582,10 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
     if setup.persona.id != DEFAULT_PERSONA_ID:
         return filters
 
-    updates: dict[str, object] = {"source_type": [DocumentSource.USER_FILE]}
+    updates: dict[str, object] = {
+        "source_type": [DocumentSource.USER_FILE],
+        "regulatory_chunks_only": True,
+    }
     if filters is None or filters.as_of_date is None:
         updates["as_of_date"] = datetime.date.today()
     return (filters or BaseFilters()).model_copy(update=updates)
