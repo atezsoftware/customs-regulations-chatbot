@@ -72,9 +72,12 @@ def create_user_files(
 ) -> CategorizedFilesResult:
     # Categorize the files
     categorized_files = categorize_uploaded_files(files, db_session)
-    # NOTE: At the moment, zip metadata is not used for user files.
-    # Should revisit to decide whether this should be a feature.
-    upload_response = upload_files(categorized_files.acceptable, FileOrigin.USER_FILE)
+    # Archives are expanded upstream (see expand_archive_uploads), so the store
+    # must not expand them again: unzip=True would return more storage paths than
+    # we have UploadFiles, and the pairing below would silently drop the excess.
+    upload_response = upload_files(
+        categorized_files.acceptable, FileOrigin.USER_FILE, unzip=False
+    )
     user_files = []
     rejected_files = categorized_files.rejected
     id_to_temp_id: dict[str, str] = {}

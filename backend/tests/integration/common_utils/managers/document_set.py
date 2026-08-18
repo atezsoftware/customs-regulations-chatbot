@@ -2,6 +2,13 @@ import time
 from typing import Any
 from uuid import UUID, uuid4
 
+from httpx import Response
+
+from onyx.db.enums import UserFileStatus
+from onyx.server.features.projects.models import (
+    CategorizedFilesSnapshot,
+    UserFileSnapshot,
+)
 from tests.integration.common_utils.constants import API_SERVER_URL, MAX_DELAY
 from tests.integration.common_utils.http_client import client
 from tests.integration.common_utils.test_models import DATestDocumentSet, DATestUser
@@ -109,6 +116,77 @@ class DocumentSetManager:
             )
             for doc_set in response.json()
         ]
+
+    @staticmethod
+    def upload_files(
+        document_set_id: int,
+        files: list[tuple[str, bytes, str]],  # (filename, content, content_type)
+        user_performing_action: DATestUser,
+    ) -> CategorizedFilesSnapshot:
+        """Upload files to a document set via the admin API."""
+        response = DocumentSetManager.upload_files_raw(
+            document_set_id, files, user_performing_action
+        )
+        response.raise_for_status()
+        return CategorizedFilesSnapshot.model_validate(response.json())
+
+    @staticmethod
+    def upload_files_raw(
+        document_set_id: int,
+        files: list[tuple[str, bytes, str]],  # (filename, content, content_type)
+        user_performing_action: DATestUser,
+    ) -> Response:
+        """Upload without raising, for tests asserting on a rejection response."""
+        headers = dict(user_performing_action.headers or {})
+        headers.pop("Content-Type", None)
+
+        return client.post(
+            f"{API_SERVER_URL}/manage/admin/document-set/{document_set_id}/file/upload",
+            files=[
+                ("files", (filename, content, content_type))
+                for filename, content, content_type in files
+            ],
+            headers=headers,
+        )
+
+    @staticmethod
+    def get_files(
+        document_set_id: int,
+        user_performing_action: DATestUser,
+    ) -> list[UserFileSnapshot]:
+        response = client.get(
+            f"{API_SERVER_URL}/manage/admin/document-set/{document_set_id}/files",
+            headers=user_performing_action.headers,
+        )
+        response.raise_for_status()
+        return [UserFileSnapshot.model_validate(item) for item in response.json()]
+
+    @staticmethod
+    def wait_for_files_indexed(
+        document_set_id: int,
+        expected_count: int,
+        user_performing_action: DATestUser,
+        timeout: float = MAX_DELAY,
+    ) -> list[UserFileSnapshot]:
+        """Poll until every uploaded file reaches a terminal status."""
+        start = time.monotonic()
+        while True:
+            files = DocumentSetManager.get_files(
+                document_set_id, user_performing_action
+            )
+            settled = [
+                file
+                for file in files
+                if file.status in (UserFileStatus.COMPLETED, UserFileStatus.FAILED)
+            ]
+            if len(settled) >= expected_count:
+                return files
+            if time.monotonic() - start > timeout:
+                raise TimeoutError(
+                    f"Document set {document_set_id} files did not settle within "
+                    f"{timeout}s (settled={len(settled)}, expected={expected_count})"
+                )
+            time.sleep(2)
 
     @staticmethod
     def wait_for_sync(

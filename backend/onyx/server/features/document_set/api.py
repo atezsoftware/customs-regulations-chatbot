@@ -31,6 +31,7 @@ from onyx.db.models import User
 from onyx.db.projects import upload_files_to_user_files_with_indexing
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
+from onyx.file_processing.archive_expansion import expand_archive_uploads
 from onyx.file_processing.import_capability import ensure_document_import_available
 from onyx.server.features.document_set.models import (
     CheckDocSetPublicRequest,
@@ -229,8 +230,10 @@ def upload_document_set_files(
         if isinstance(parsed, dict):
             parsed_temp_id_map = {str(key): str(value) for key, value in parsed.items()}
 
+    # Admins bulk-load regulatory sources as a single archive; each entry has to
+    # become its own UserFile so it is chunked and cited as a distinct document.
     categorized_files_result = upload_files_to_user_files_with_indexing(
-        files=files,
+        files=expand_archive_uploads(files),
         project_id=None,
         document_set_id=document_set_id,
         user=user,

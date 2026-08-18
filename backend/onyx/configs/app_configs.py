@@ -1578,6 +1578,27 @@ MAX_EMBEDDED_IMAGES_PER_UPLOAD = max(
     0, int(os.environ.get("MAX_EMBEDDED_IMAGES_PER_UPLOAD") or 1000)
 )
 
+# Maximum entries allowed in an uploaded zip archive. Archive expansion happens
+# inline in the upload request (every entry is parsed by categorize_uploaded_files
+# before the response returns), so this bounds request latency as much as it
+# bounds work. Raise it only alongside a matching gateway timeout.
+MAX_ARCHIVE_ENTRIES = max(1, int(os.environ.get("MAX_ARCHIVE_ENTRIES") or 500))
+
+# Maximum total uncompressed bytes an uploaded archive may expand to. Enforced
+# against bytes actually read, not the archive's own headers, so a zip whose
+# central directory understates its contents is still stopped.
+MAX_ARCHIVE_EXPANDED_BYTES = max(
+    1, int(os.environ.get("MAX_ARCHIVE_EXPANDED_BYTES") or 512 * 1024 * 1024)
+)
+
+# Largest uncompressed:compressed ratio tolerated for a single archive entry.
+# Prose and markdown land in the single digits; ratios in the hundreds mean
+# padding, not documents. Only applied to entries big enough for the ratio to
+# be meaningful (see COMPRESSION_RATIO_CHECK_MIN_BYTES).
+MAX_ARCHIVE_COMPRESSION_RATIO = max(
+    1, int(os.environ.get("MAX_ARCHIVE_COMPRESSION_RATIO") or 100)
+)
+
 # Maximum non-empty cells to extract from a single xlsx worksheet. Protects
 # from OOM on honestly-huge spreadsheets: memory cost in the extractor is
 # roughly proportional to this count. Once exceeded, the scan stops and a

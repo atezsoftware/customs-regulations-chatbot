@@ -8,6 +8,7 @@ import { toast } from "@opal/layouts";
 import {
   SvgChevronLeft,
   SvgFileText,
+  SvgFolderIn,
   SvgFolderPlus,
   SvgMinusCircle,
   SvgPlus,
@@ -49,6 +50,7 @@ interface UploadControlsProps {
 function UploadControls({ disabled, onUpload }: UploadControlsProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
+  const archiveInputRef = useRef<HTMLInputElement>(null);
 
   const handleFiles = useCallback(
     async (fileList: FileList | null) => {
@@ -90,6 +92,17 @@ function UploadControls({ disabled, onUpload }: UploadControlsProps) {
       >
         Upload Files
       </Button>
+      <input
+        ref={archiveInputRef}
+        type="file"
+        accept=".zip"
+        className="hidden"
+        aria-label="Upload archive to document set"
+        onChange={(event) => {
+          void handleFiles(event.target.files);
+          event.target.value = "";
+        }}
+      />
       <Button
         icon={SvgFolderPlus}
         prominence="secondary"
@@ -97,6 +110,15 @@ function UploadControls({ disabled, onUpload }: UploadControlsProps) {
         disabled={disabled}
       >
         Upload Folder
+      </Button>
+      <Button
+        icon={SvgFolderIn}
+        prominence="secondary"
+        onClick={() => archiveInputRef.current?.click()}
+        disabled={disabled}
+        tooltip="Upload a .zip; every document inside is indexed separately"
+      >
+        Upload Archive
       </Button>
       {disabled && (
         <Text font="main-ui-body" color="text-03">
