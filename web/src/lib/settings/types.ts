@@ -97,6 +97,7 @@ export interface Settings {
   // False in lightweight production runtimes where parsing/indexing is handled
   // by the separately operated importer deployment.
   document_import_enabled?: boolean;
+  markdown_import_enabled?: boolean;
 
   // True when hooks are available: single-tenant deployment with HOOK_ENABLED=true.
   hooks_enabled?: boolean;

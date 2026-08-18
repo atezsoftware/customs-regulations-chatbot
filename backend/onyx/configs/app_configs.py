@@ -81,6 +81,15 @@ DOCUMENT_IMPORT_ENABLED = (
     os.environ.get("DOCUMENT_IMPORT_ENABLED", "true").lower() == "true"
 )
 
+# Narrower ingestion capability for the lightweight runtime. Markdown is read as
+# plain text, so accepting it (and zip archives of it) needs none of the
+# source-document parsers DOCUMENT_IMPORT_ENABLED gates. Implied by
+# DOCUMENT_IMPORT_ENABLED; set independently where the heavy stack is absent but
+# operators still need to load already-converted markdown.
+MARKDOWN_IMPORT_ENABLED = (
+    os.environ.get("MARKDOWN_IMPORT_ENABLED", "false").lower() == "true"
+)
+
 # Disables vector DB (Vespa/Elasticsearch) entirely. When True, connectors and RAG search
 # are disabled but core chat, tools, user file uploads, and Projects still work.
 DISABLE_VECTOR_DB = os.environ.get("DISABLE_VECTOR_DB", "").lower() == "true"

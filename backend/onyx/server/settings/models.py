@@ -128,6 +128,9 @@ class UserSettings(Settings):
     # False when parsing/indexing is delegated to the separate importer runtime.
     # Existing indexed files remain readable and searchable.
     document_import_enabled: bool = True
+    # Narrower capability: markdown (and zip archives of it) can be ingested
+    # even where the source-document parser stack is absent.
+    markdown_import_enabled: bool = True
     # True when hooks are available: single-tenant EE deployments only.
     hooks_enabled: bool = False
     # Application version, read from the ONYX_VERSION env var at startup.

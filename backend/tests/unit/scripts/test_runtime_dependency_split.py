@@ -56,6 +56,9 @@ def test_runtime_lite_docker_target_is_independent_and_parser_free() -> None:
     assert 'DOCUMENT_IMPORT_ENABLED="false"' in lite_dockerfile
     assert 'io.regulatory.role="runtime-lite"' in lite_dockerfile
     assert 'io.regulatory.document-import="false"' in lite_dockerfile
+    # Markdown ingestion needs no source-document parser, but it stays off in the
+    # image so only deployments that opt in (via their own env) accept uploads.
+    assert "MARKDOWN_IMPORT_ENABLED" not in lite_dockerfile
 
 
 def test_deployments_use_published_images_without_host_builds() -> None:

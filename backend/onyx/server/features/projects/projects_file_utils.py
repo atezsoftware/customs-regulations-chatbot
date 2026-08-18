@@ -18,6 +18,7 @@ from onyx.file_processing.extract_file_text import (
     get_file_ext,
 )
 from onyx.file_processing.file_types import OnyxFileExtensions
+from onyx.file_processing.import_capability import unsupported_upload_reason
 from onyx.file_processing.password_validation import is_file_password_protected
 from onyx.natural_language_processing.utils import count_tokens, get_tokenizer
 from onyx.server.settings.store import load_settings
@@ -216,6 +217,15 @@ def categorize_uploaded_files(
                         filename=filename,
                         reason=f"Exceeds {max_upload_size_mb} MB file size limit",
                     )
+                )
+                continue
+
+            # Refuse formats this runtime has no parser for, with a reason
+            # naming the format rather than a failure deeper in the pipeline.
+            capability_reason = unsupported_upload_reason(filename)
+            if capability_reason is not None:
+                results.rejected.append(
+                    RejectedFile(filename=filename, reason=capability_reason)
                 )
                 continue
 

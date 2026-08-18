@@ -32,7 +32,7 @@ from onyx.db.projects import upload_files_to_user_files_with_indexing
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_processing.archive_expansion import expand_archive_uploads
-from onyx.file_processing.import_capability import ensure_document_import_available
+from onyx.file_processing.import_capability import ensure_markdown_import_available
 from onyx.server.features.document_set.models import (
     CheckDocSetPublicRequest,
     CheckDocSetPublicResponse,
@@ -218,7 +218,10 @@ def upload_document_set_files(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> CategorizedFilesSnapshot:
-    ensure_document_import_available()
+    # Markdown (and archives of it) need no source-document parsers, so the
+    # lightweight runtime can accept them; other formats are refused per file
+    # by categorize_uploaded_files.
+    ensure_markdown_import_available()
     _get_editable_document_set_or_raise(document_set_id, user, db_session)
 
     parsed_temp_id_map: dict[str, str] | None = None

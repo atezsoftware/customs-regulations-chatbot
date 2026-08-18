@@ -26,6 +26,7 @@ from onyx.db.notification import (
 )
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
+from onyx.file_processing.import_capability import markdown_import_available
 from onyx.key_value_store.factory import get_kv_store
 from onyx.key_value_store.interface import KvKeyNotFoundError
 from onyx.server.features.build.utils import (
@@ -190,6 +191,7 @@ def fetch_settings(
         opencode_debugging_enabled=ENABLE_OPENCODE_DEBUGGING,
         vector_db_enabled=not DISABLE_VECTOR_DB,
         document_import_enabled=DOCUMENT_IMPORT_ENABLED,
+        markdown_import_enabled=markdown_import_available(),
         hooks_enabled=not MULTI_TENANT,
         version=onyx_version,
         max_allowed_upload_size_mb=MAX_ALLOWED_UPLOAD_SIZE_MB,

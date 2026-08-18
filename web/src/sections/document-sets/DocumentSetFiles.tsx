@@ -42,12 +42,21 @@ function getFileStatusDescription(file: ProjectFile): string {
     : `${status} · ${file.chunk_count} chunks`;
 }
 
+// Extensions a markdown-only deployment accepts. Mirrors
+// MARKDOWN_UPLOAD_EXTENSIONS in backend/onyx/file_processing/import_capability.py.
+const MARKDOWN_ONLY_ACCEPT = ".md,.mdx,.zip";
+
 interface UploadControlsProps {
   disabled: boolean;
+  markdownOnly: boolean;
   onUpload: (files: File[]) => Promise<void>;
 }
 
-function UploadControls({ disabled, onUpload }: UploadControlsProps) {
+function UploadControls({
+  disabled,
+  markdownOnly,
+  onUpload,
+}: UploadControlsProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const archiveInputRef = useRef<HTMLInputElement>(null);
@@ -67,6 +76,7 @@ function UploadControls({ disabled, onUpload }: UploadControlsProps) {
         type="file"
         multiple
         className="hidden"
+        {...(markdownOnly ? { accept: MARKDOWN_ONLY_ACCEPT } : {})}
         aria-label="Upload files to document set"
         onChange={(event) => {
           void handleFiles(event.target.files);
@@ -78,6 +88,7 @@ function UploadControls({ disabled, onUpload }: UploadControlsProps) {
         type="file"
         multiple
         className="hidden"
+        {...(markdownOnly ? { accept: MARKDOWN_ONLY_ACCEPT } : {})}
         aria-label="Upload folder to document set"
         {...{ webkitdirectory: "", directory: "" }}
         onChange={(event) => {
@@ -138,8 +149,12 @@ export default function DocumentSetFiles({
   documentSetId,
   documentSetName,
 }: DocumentSetFilesProps) {
-  const { document_import_enabled: documentImportEnabled = true } =
-    useSettings();
+  const {
+    document_import_enabled: documentImportEnabled = true,
+    markdown_import_enabled: markdownImportEnabled = true,
+  } = useSettings();
+  // Full document import implies markdown import; the reverse does not hold.
+  const canUpload = documentImportEnabled || markdownImportEnabled;
   const [selectedFile, setSelectedFile] = useState<ProjectFile | null>(null);
   const [uploading, setUploading] = useState(false);
   const [removingFileId, setRemovingFileId] = useState<string | null>(null);
@@ -246,8 +261,21 @@ export default function DocumentSetFiles({
         {`Upload regulatory documents to ${documentSetName}. Each file is chunked along its structure and indexed as part of this document set.`}
       </Text>
 
-      {documentImportEnabled ? (
-        <UploadControls disabled={uploading} onUpload={handleUpload} />
+      {canUpload ? (
+        <>
+          <UploadControls
+            disabled={uploading}
+            markdownOnly={!documentImportEnabled}
+            onUpload={handleUpload}
+          />
+          {!documentImportEnabled && (
+            <Text font="main-ui-body" color="text-03" as="p">
+              This deployment accepts only Markdown documents and .zip archives
+              of them. Other formats are converted by the separate importer
+              deployment.
+            </Text>
+          )}
+        </>
       ) : (
         <Text font="main-ui-body" color="text-03" as="p">
           Document import runs in the separate importer deployment. Existing

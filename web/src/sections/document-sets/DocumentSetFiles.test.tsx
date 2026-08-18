@@ -13,8 +13,10 @@ jest.mock("@/app/admin/documents/sets/lib", () => ({
     mockUploadDocumentSetFiles(...args),
 }));
 
+const mockUseSettings = jest.fn();
+
 jest.mock("@/lib/settings/hooks", () => ({
-  useSettings: () => ({ document_import_enabled: true }),
+  useSettings: () => mockUseSettings(),
 }));
 
 jest.mock("@/sections/document-sets/RegulatoryFileDetails", () => ({
@@ -29,6 +31,10 @@ function renderFiles() {
 }
 
 beforeEach(() => {
+  mockUseSettings.mockReturnValue({
+    document_import_enabled: true,
+    markdown_import_enabled: true,
+  });
   mockUploadDocumentSetFiles.mockReset();
   mockUploadDocumentSetFiles.mockResolvedValue({
     user_files: [],
@@ -63,5 +69,60 @@ test("uploads a selected archive through the document set upload endpoint", asyn
 
   await waitFor(() => {
     expect(mockUploadDocumentSetFiles).toHaveBeenCalledWith(7, [archive]);
+  });
+});
+
+describe("when the runtime can only ingest markdown", () => {
+  beforeEach(() => {
+    mockUseSettings.mockReturnValue({
+      document_import_enabled: false,
+      markdown_import_enabled: true,
+    });
+  });
+
+  test("still offers the archive upload control", async () => {
+    renderFiles();
+
+    expect(
+      await screen.findByLabelText("Upload archive to document set")
+    ).toBeInTheDocument();
+  });
+
+  test("restricts the file picker to markdown", async () => {
+    renderFiles();
+
+    const fileInput = await screen.findByLabelText(
+      "Upload files to document set"
+    );
+
+    expect(fileInput).toHaveAttribute("accept", ".md,.mdx,.zip");
+  });
+
+  test("says which formats this deployment accepts", async () => {
+    renderFiles();
+
+    expect(
+      await screen.findByText(/only Markdown documents and \.zip archives/i)
+    ).toBeInTheDocument();
+  });
+});
+
+describe("when the runtime cannot ingest anything", () => {
+  beforeEach(() => {
+    mockUseSettings.mockReturnValue({
+      document_import_enabled: false,
+      markdown_import_enabled: false,
+    });
+  });
+
+  test("hides the upload controls and points at the importer deployment", async () => {
+    renderFiles();
+
+    expect(
+      await screen.findByText(/separate importer deployment/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Upload archive to document set")
+    ).not.toBeInTheDocument();
   });
 });
