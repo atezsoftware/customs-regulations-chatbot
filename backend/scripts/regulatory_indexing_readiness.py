@@ -12,8 +12,9 @@ import asyncio
 import configparser
 import datetime
 import json
-import os
+import re
 import shlex
+import socket
 import stat
 import subprocess
 from collections.abc import Callable
@@ -60,6 +61,8 @@ _WORKER_PROCESS_NAME = "celery_worker_regulatory_indexing"
 _PROBE_TEXT = "regulatory indexing readiness probe"
 _EXPECTED_REGULATORY_QUEUES = frozenset({"user_file_processing", "regulatory_indexing"})
 _ATTESTATION_MAX_AGE = datetime.timedelta(hours=24)
+_ATTESTATION_OWNER_UID = 1001
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REQUIRED_CAPABILITY_PERMISSIONS = frozenset(
     {
         "storage.objects.create",
@@ -300,7 +303,12 @@ class OnyxReadinessBackend:
         if len(worker_lines) != 1 or " RUNNING " not in worker_lines[0]:
             raise ReadinessCheckError("dedicated regulatory worker is not RUNNING")
         validate_regulatory_indexing_beat(status_text)
-        live_queues = _live_regulatory_worker_queues()
+        expected_worker_name = f"regulatory_indexing@{socket.gethostname()}"
+        supervisor_pid = _supervisor_worker_pid(worker_lines[0])
+        live_queues = _live_regulatory_worker_queues(
+            expected_worker_name=expected_worker_name,
+            supervisor_pid=supervisor_pid,
+        )
         return (
             "dedicated worker RUNNING with exact configured/live queue set "
             f"{','.join(sorted(configured_queues & live_queues))}; "
@@ -492,39 +500,72 @@ def _configured_regulatory_worker_queues(config_text: str) -> set[str]:
     return queues
 
 
-def _live_regulatory_worker_queues() -> set[str]:
+def _supervisor_worker_pid(status_line: str) -> int | None:
+    match = re.search(r"\bpid ([1-9][0-9]*),", status_line)
+    return int(match.group(1)) if match is not None else None
+
+
+def _live_regulatory_worker_queues(
+    *, expected_worker_name: str, supervisor_pid: int | None
+) -> set[str]:
     from onyx.background.celery.versioned_apps.regulatory_indexing import app
 
-    responses = app.control.inspect(timeout=5).active_queues()
-    return _validated_live_regulatory_worker_queues(responses)
+    inspector = app.control.inspect(timeout=5, destination=[expected_worker_name])
+    queues = _validated_live_regulatory_worker_queues(
+        inspector.active_queues(),
+        expected_worker_name=expected_worker_name,
+    )
+    if supervisor_pid is not None:
+        _validate_live_worker_pid(
+            inspector.stats(),
+            expected_worker_name=expected_worker_name,
+            supervisor_pid=supervisor_pid,
+        )
+    return queues
 
 
-def _validated_live_regulatory_worker_queues(responses: object) -> set[str]:
+def _validated_live_regulatory_worker_queues(
+    responses: object, *, expected_worker_name: str
+) -> set[str]:
     if not isinstance(responses, dict):
-        raise ReadinessCheckError("Celery active_queues returned no worker response")
-    matched: list[set[str]] = []
-    for worker_name, queue_records in cast(dict[object, object], responses).items():
-        if not isinstance(worker_name, str) or not worker_name.startswith(
-            "regulatory_indexing@"
-        ):
-            continue
-        if not isinstance(queue_records, list):
-            raise ReadinessCheckError(
-                "dedicated regulatory worker returned invalid active queues"
-            )
-        queues: set[str] = set()
-        for record in queue_records:
-            if isinstance(record, dict):
-                name = cast(dict[str, object], record).get("name")
-                if isinstance(name, str):
-                    queues.add(name)
-        matched.append(queues)
-    if not matched or any(queues != _EXPECTED_REGULATORY_QUEUES for queues in matched):
         raise ReadinessCheckError(
-            "live dedicated workers must consume the exact queue set "
+            "Celery active_queues returned no local worker response"
+        )
+    queue_records = cast(dict[object, object], responses).get(expected_worker_name)
+    if not isinstance(queue_records, list):
+        raise ReadinessCheckError(
+            "Celery active_queues returned no local worker response"
+        )
+    queues: set[str] = set()
+    for record in queue_records:
+        if isinstance(record, dict):
+            name = cast(dict[str, object], record).get("name")
+            if isinstance(name, str):
+                queues.add(name)
+    if queues != _EXPECTED_REGULATORY_QUEUES:
+        raise ReadinessCheckError(
+            "live local dedicated worker must consume the exact queue set "
             "regulatory_indexing,user_file_processing"
         )
-    return set.intersection(*matched)
+    return queues
+
+
+def _validate_live_worker_pid(
+    responses: object,
+    *,
+    expected_worker_name: str,
+    supervisor_pid: int,
+) -> None:
+    if not isinstance(responses, dict):
+        raise ReadinessCheckError("Celery stats returned no local worker response")
+    stats = cast(dict[object, object], responses).get(expected_worker_name)
+    if not isinstance(stats, dict):
+        raise ReadinessCheckError("Celery stats returned no local worker response")
+    celery_pid = cast(dict[str, object], stats).get("pid")
+    if celery_pid != supervisor_pid:
+        raise ReadinessCheckError(
+            "local Celery worker PID does not match the Supervisor PID"
+        )
 
 
 def _validate_dense_vector_mapping(
@@ -573,12 +614,17 @@ def _validate_capability_attestation(
     snapshot: ReadinessSnapshot,
     *,
     now: datetime.datetime | None = None,
+    expected_owner_uid: int = _ATTESTATION_OWNER_UID,
 ) -> str:
     try:
         metadata = path.stat()
-        if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid():
+        if (
+            stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != expected_owner_uid
+        ):
             raise ReadinessCheckError(
-                "capability attestation must be owner-only mode 0600"
+                "capability attestation must be owned by runtime UID "
+                f"{expected_owner_uid} with mode 0600"
             )
         parsed: object = json.loads(path.read_text(encoding="utf-8"))
     except ReadinessCheckError:
@@ -592,11 +638,21 @@ def _validate_capability_attestation(
     evidence = cast(dict[str, object], parsed)
     identity = evidence.get("identity")
     reference = evidence.get("evidence_reference")
+    evidence_sha256 = evidence.get("evidence_sha256")
     if not isinstance(identity, str) or not identity.strip():
         raise ReadinessCheckError("capability attestation identity is invalid")
     if not isinstance(reference, str) or not reference.strip():
         raise ReadinessCheckError(
             "capability attestation evidence reference is invalid"
+        )
+    if (
+        not isinstance(evidence_sha256, str)
+        or _SHA256_PATTERN.fullmatch(evidence_sha256) is None
+    ):
+        raise ReadinessCheckError("capability attestation evidence digest is invalid")
+    if not reference.endswith(f"#sha256={evidence_sha256}"):
+        raise ReadinessCheckError(
+            "capability attestation evidence reference has invalid digest binding"
         )
     exact_scope = {
         "gcs_uri": snapshot.gcs_uri,

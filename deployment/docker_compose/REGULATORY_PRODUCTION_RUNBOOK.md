@@ -459,7 +459,8 @@ review, and a `reviewed_at` no more than 24 hours old:
   "schema_version": 1,
   "reviewed_at": "2026-08-20T09:00:00+00:00",
   "identity": "regulatory-runtime@example.iam.gserviceaccount.com",
-  "evidence_reference": "approved-change-record-or-policy-simulator-evidence",
+  "evidence_reference": "gs://approved-audit-bucket/change/task-8.json#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "gcs_uri": "gs://approved-bucket/exact-regulatory-prefix",
   "vertex_project": "approved-project",
   "vertex_location": "approved-location",
@@ -478,9 +479,24 @@ review, and a `reviewed_at` no more than 24 hours old:
 }
 ```
 
-The evidence reference must point to the archived IAM result; do not put credentials, tokens,
-service-account JSON, document content, or vectors in this file. Set its mode to `0600`. For the
-external-infrastructure topology, the exact command is:
+Replace the example digest with the lowercase SHA-256 of the archived IAM result. The evidence
+reference must point to that result and end in the exact `#sha256=<evidence_sha256>` binding;
+readiness rejects a missing, malformed, or mismatched digest. This proves which archived artifact
+was reviewed, while the change-record/object-store access controls remain responsible for that
+artifact's authenticity. Do not put credentials, tokens, service-account JSON, document content,
+or vectors in this file.
+
+Set `REGULATORY_CAPABILITY_ATTESTATION_FILE` to its absolute host path. The canonical overlay mounts
+that file read-only. Both preflight and the in-container validator require numeric owner/group
+`1001:1001` and mode `0600`, independent of which operator invokes Docker:
+
+```bash
+sudo chown 1001:1001 "$REGULATORY_CAPABILITY_ATTESTATION_FILE"
+sudo chmod 0600 "$REGULATORY_CAPABILITY_ATTESTATION_FILE"
+```
+
+The readiness process itself runs as the application UID/GID, not as the root Supervisor wrapper.
+For the external-infrastructure topology, the exact command is:
 
 ```bash
 docker compose --project-name "$APPROVED_COMPOSE_PROJECT" --env-file .env \
@@ -488,7 +504,7 @@ docker compose --project-name "$APPROVED_COMPOSE_PROJECT" --env-file .env \
   -f docker-compose.regulatory-edge.yml \
   -f docker-compose.regulatory-external-infra.yml \
   -f docker-compose.regulatory-prod-lite.yml \
-  exec -T background python /app/scripts/regulatory_indexing_readiness.py \
+  exec -T --user 1001:1001 background python /app/scripts/regulatory_indexing_readiness.py \
     --memory-headroom-reviewed \
     --capability-attestation /run/readiness/regulatory-capabilities.json
 ```

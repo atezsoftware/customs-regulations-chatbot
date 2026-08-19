@@ -33,6 +33,7 @@ _MANAGED_SERVICES = (
     "cache",
     "minio",
 )
+_ATTESTATION_TARGET = "/run/readiness/regulatory-capabilities.json"
 
 
 def _config(
@@ -135,6 +136,16 @@ def _config(
         }
     if extra_service is not None:
         services[extra_service] = {"image": "example.invalid/forbidden:latest"}
+    background = services["background"]
+    assert isinstance(background, dict)
+    background["volumes"] = [
+        {
+            "type": "bind",
+            "source": "/tmp/regulatory-capabilities.json",
+            "target": _ATTESTATION_TARGET,
+            "read_only": True,
+        }
+    ]
     return json.dumps({"services": services})
 
 
@@ -150,12 +161,22 @@ def _fake_docker(
     backend_revision: str = "d" * 40,
     web_revision: str = "d" * 40,
     model_revision: str = "d" * 40,
+    attestation_owner: str = "1001",
+    attestation_mode: int = 0o600,
 ) -> tuple[dict[str, str], Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log_path = tmp_path / "docker.log"
     config_path = tmp_path / "config.json"
-    config_path.write_text(config or _config(), encoding="utf-8")
+    attestation_path = tmp_path / "regulatory-capabilities.json"
+    attestation_path.write_text("{}\n", encoding="utf-8")
+    attestation_path.chmod(attestation_mode)
+    rendered_config = json.loads(config or _config())
+    background = rendered_config["services"]["background"]
+    for volume in background.get("volumes", []):
+        if volume.get("target") == _ATTESTATION_TARGET:
+            volume["source"] = str(attestation_path)
+    config_path.write_text(json.dumps(rendered_config), encoding="utf-8")
     services_path = tmp_path / "services.txt"
     services_path.write_text("\n".join(active_services) + "\n", encoding="utf-8")
     inventory_path = tmp_path / "inventory.txt"
@@ -211,6 +232,20 @@ exit 0
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    fake_stat = bin_dir / "stat"
+    fake_stat.write_text(
+        """#!/usr/bin/env bash
+set -eu
+last=${!#}
+if [[ "$last" == "$FAKE_ATTESTATION_PATH" && ( "${2:-}" == "%u" || "${2:-}" == "%g" ) ]]; then
+  printf '%s\\n' "$FAKE_ATTESTATION_OWNER"
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_stat.chmod(0o755)
     env_file = tmp_path / ".env"
     env_file.write_text("# fake production environment\n", encoding="utf-8")
     env_file.chmod(0o600)
@@ -253,6 +288,8 @@ exit 0
             "FAKE_BACKEND_REVISION": backend_revision,
             "FAKE_WEB_REVISION": web_revision,
             "FAKE_MODEL_REVISION": model_revision,
+            "FAKE_ATTESTATION_PATH": str(attestation_path),
+            "FAKE_ATTESTATION_OWNER": attestation_owner,
             "_MODEL_IMAGE": _MODEL_IMAGE,
             "_WEB_IMAGE": _WEB_IMAGE,
         }
@@ -357,6 +394,52 @@ def test_preflight_accepts_digest_pinned_parser_free_runtime(tmp_path: Path) -> 
 
     assert result.returncode == 0, result.stderr
     assert "No Docker state was changed" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("read_only", "owner", "expected_error"),
+    [
+        (False, "1001", "attestation bind mount"),
+        (True, "1000", "owned by numeric UID/GID 1001:1001"),
+    ],
+)
+def test_preflight_rejects_untrusted_readiness_attestation_mount(
+    tmp_path: Path,
+    read_only: bool,
+    owner: str,
+    expected_error: str,
+) -> None:
+    config = json.loads(_config())
+    config["services"]["background"]["volumes"][0]["read_only"] = read_only
+    env, env_file = _fake_docker(
+        tmp_path,
+        config=json.dumps(config),
+        attestation_owner=owner,
+    )
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr
 
 
 def test_preflight_accepts_unambiguous_external_infrastructure(tmp_path: Path) -> None:

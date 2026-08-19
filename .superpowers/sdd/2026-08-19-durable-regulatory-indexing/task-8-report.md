@@ -217,3 +217,97 @@ blocked. No capability evidence was fabricated. Therefore no live Vertex,
 OpenRouter, upload, retrieval/citation, retry/restart, or cleanup canary was
 started. Existing production documents, indices, database/provider state, and
 object storage were not mutated.
+
+---
+
+## Review fix round 2/5
+
+All four Important findings were closed without a production write, deployment,
+push, or merge.
+
+### RED/GREEN evidence
+
+- Local-replica worker RED: the new multi-replica fixture failed with
+  `TypeError` because live queue validation had no exact local-node boundary.
+  Queue inspection now targets only
+  `regulatory_indexing@<container-hostname>`, fails when only a healthy remote
+  replica responds, checks the exact two-queue set, and correlates Celery
+  `stats.pid` with the local Supervisor PID. The A/B focused repeat passed
+  (`4 passed`), and the expanded readiness/gateway/wiring/deploy set finished
+  at `109 passed in 10.19s`.
+- Workload Identity RED: both observational probes returned the initial
+  Compute Engine sentinel identity `default`. They now perform the list/get
+  observation first, resolve the refreshed effective service-account identity,
+  reject the sentinel, and still close every owned client. A valid post-request
+  identity passes; GCS and Vertex identity mismatches against the attestation
+  both fail closed.
+- Deployment-attestation RED: the Compose wiring test raised `KeyError:
+  'volumes'`, and executable preflight accepted a writable attestation mount
+  with exit `0`. The canonical overlay now requires one read-only bind at
+  `/run/readiness/regulatory-capabilities.json`; preflight validates that mount,
+  a regular host file, mode `0600`, and numeric owner/group `1001:1001`.
+  Readiness validates intended runtime UID `1001` rather than the invoking
+  operator, and the runbook invokes it with `--user 1001:1001`.
+- Attestation authenticity now requires a lowercase 64-character
+  `evidence_sha256` and an archived evidence reference ending in the exact
+  `#sha256=<digest>` binding. Permission, identity, exact scope, and 24-hour
+  freshness checks remain mandatory; no write/delete/cancel probe was added.
+- Cleanup-boundary RED first failed with the intentionally absent disposable
+  scope (`NameError`). A forced exception after the real Markdown file and
+  durable job were prepared then exposed and drove fixes for wildcard-safe
+  Elasticsearch enumeration, continuation after partial cleanup errors, eager
+  User loading, and explicit model/provider deletion order. Final forced-failure
+  GREEN: `1 passed in 11.18s`; both real pipeline tests together passed in
+  `17.94s`. The ordinary pipeline and every setup mutation now share the same
+  `finally` cleanup boundary.
+
+### Cleanup and deployment contracts
+
+- Every disposable database, file-store, user-file, job, and index identity is
+  recorded immediately. Prefix fallback removes file records through the real
+  PostgreSQL file-store deletion path (including large-object unlink), user
+  files/jobs/users, SearchSettings, model/provider rows, and every exact
+  Elasticsearch index returned for the disposable prefix. Cleanup tolerates
+  failure before the first DB commit or before index creation.
+- The forced-failure regression directly verifies zero SearchSettings, LLM
+  provider/model, file-record/file-content, UserFile, durable-job,
+  `pg_largeobject_metadata`, and Elasticsearch state. The final independent
+  disposable-environment query returned `0|0|0|0|0|0` for Task 8 settings,
+  LLM providers, file records, user files, jobs, and OpenRouter provider; the
+  Task 8 Elasticsearch index listing was empty.
+- `env.regulatory-prod.template` now requires the host attestation path and
+  documents its `1001:1001`/`0600` contract. The runbook explains that the
+  digest binds the attestation to archived operator evidence but the archive's
+  own access controls establish authenticity; observational probes still do
+  not prove mutation permissions.
+
+### Round-2 verification
+
+- Focused readiness, gateway, Compose wiring, and executable preflight:
+  `109 passed in 10.19s`.
+- Regulatory unit/runtime superset (broader than the prior 668-test command):
+  `777 passed in 17.69s`.
+- Real PostgreSQL repository plus the two real PostgreSQL/Elasticsearch
+  pipeline tests: `30 passed in 21.78s`.
+- Ruff and Ruff formatting on touched Python: pass. `ty` on touched Python:
+  pass. Touched-file pre-commit passed every applicable hook, including lazy
+  imports, `ty`, Ruff, Ruff formatting, YAML, shellcheck, large-file,
+  ripsecrets, and environment drift. The final post-hook repeat was
+  `109 passed in 10.32s` plus `2 passed in 17.92s`. Migration files were not
+  touched; the fresh disposable PostgreSQL was upgraded from empty to
+  `c8f1a6d4e2b7` successfully before the real tests.
+- The Elasticsearch production client was not changed in this round, so the
+  seven-minute 70-test client suite was not repeated. The affected cleanup and
+  durable publication paths were exercised against Elasticsearch 9.4.2 by the
+  two pipeline tests and the 30-test real-dependency suite.
+
+### Live readiness recheck
+
+`getent hosts psql.dev.singlewindow.io` again returned exit `2`. Both nginx
+ports returned HTTP `200`, while `onyx-api_server-1` remained `unhealthy`.
+The read-only readiness command returned exit `1`, `NOT_READY`: migration and
+Admin snapshot failed with redacted `OperationalError`, Supervisor inspection
+failed, host cgroup evidence was unavailable, and attestation/provider/index
+checks were blocked by the absent snapshot. No live canary was started and no
+existing production document, index, database/provider record, GCS object, or
+Vertex job was mutated.

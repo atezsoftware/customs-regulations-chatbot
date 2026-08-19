@@ -518,6 +518,36 @@ jq -e '
 ' "$config_file" >/dev/null || \
   die "image/build/import or production service invariants are invalid"
 
+jq -e '
+  [
+    (.services.background.volumes // [])[]
+    | select(.target == "/run/readiness/regulatory-capabilities.json")
+  ] as $mounts
+  | ($mounts | length == 1)
+    and ($mounts[0].type == "bind")
+    and ($mounts[0].read_only == true)
+    and (($mounts[0].source // "") | type == "string" and length > 0)
+' "$config_file" >/dev/null || \
+  die "the readiness capability attestation bind mount must be unique and read-only"
+
+attestation_path=$(jq -er '
+  .services.background.volumes[]
+  | select(.target == "/run/readiness/regulatory-capabilities.json")
+  | .source
+' "$config_file") || die "the readiness capability attestation source cannot be resolved"
+[[ -f "$attestation_path" ]] || \
+  die "the readiness capability attestation must be a regular host file"
+attestation_mode=$(stat -c '%a' -- "$attestation_path") || \
+  die "the readiness capability attestation mode cannot be read"
+[[ "$attestation_mode" == "600" ]] || \
+  die "the readiness capability attestation host file must have mode 0600"
+attestation_uid=$(stat -c '%u' -- "$attestation_path") || \
+  die "the readiness capability attestation owner cannot be read"
+attestation_gid=$(stat -c '%g' -- "$attestation_path") || \
+  die "the readiness capability attestation group cannot be read"
+[[ "$attestation_uid" == "1001" && "$attestation_gid" == "1001" ]] || \
+  die "the readiness capability attestation must be owned by numeric UID/GID 1001:1001"
+
 if [[ "$model_mode" == "local" ]]; then
   jq -e '
     .services.inference_model_server as $model

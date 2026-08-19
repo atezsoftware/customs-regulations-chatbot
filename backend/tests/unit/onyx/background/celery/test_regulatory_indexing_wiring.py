@@ -1012,6 +1012,23 @@ def test_monitoring_collects_regulatory_indexing_queue_depth() -> None:
     )
 
 
+def test_prod_lite_mounts_readiness_attestation_read_only() -> None:
+    compose = _load_compose()
+    background = _mapping(_mapping(compose["services"])["background"])
+    volumes = background["volumes"]
+    assert isinstance(volumes, list)
+    assert {
+        "type": "bind",
+        "source": "${REGULATORY_CAPABILITY_ATTESTATION_FILE:?set owner-1001 mode-0600 capability attestation}",
+        "target": "/run/readiness/regulatory-capabilities.json",
+        "read_only": "true",
+    } in volumes
+
+    runbook = _RUNBOOK_PATH.read_text(encoding="utf-8")
+    assert "exec -T --user 1001:1001 background python" in runbook
+    assert "evidence_sha256" in runbook
+
+
 def test_codebuild_diagnostics_and_readiness_use_the_exact_worker_name() -> None:
     workflow = _load_workflow()
     diagnostics = _workflow_step(workflow, "Capture pre-deploy worker diagnostics")

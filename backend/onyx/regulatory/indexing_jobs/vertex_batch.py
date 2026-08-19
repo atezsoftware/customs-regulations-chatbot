@@ -164,7 +164,7 @@ class VertexBatchGateway(Protocol):
 def _credential_identity(credentials: Credentials) -> str:
     for attribute in ("service_account_email", "signer_email"):
         value = getattr(credentials, attribute, None)
-        if isinstance(value, str) and value.strip():
+        if isinstance(value, str) and value.strip() and value.strip() != "default":
             return value.strip()
     raise VertexBatchContractError(
         "Vertex credential identity is unavailable for readiness verification"
@@ -563,7 +563,6 @@ class GoogleVertexBatchGateway:
         )
         with _translate_gateway_errors():
             credentials = self._credentials()
-            identity = _credential_identity(credentials)
             with self._managed_storage_client(credentials) as client:
                 blobs = client.list_blobs(
                     bucket_name,
@@ -572,6 +571,7 @@ class GoogleVertexBatchGateway:
                     timeout=self._request_timeout_seconds,
                 )
                 next(iter(blobs), None)
+            identity = _credential_identity(credentials)
         return VertexReadOnlyAccessProbe(credential_identity=identity)
 
     def probe_vertex_read_access(self) -> VertexReadOnlyAccessProbe:
@@ -579,13 +579,13 @@ class GoogleVertexBatchGateway:
 
         with _translate_gateway_errors():
             credentials = self._credentials()
-            identity = _credential_identity(credentials)
             with self._managed_genai_client(credentials) as client:
                 client.models.get(model=self._config.model_name)
                 pager = client.batches.list(
                     config=genai_types.ListBatchJobsConfig(page_size=1)
                 )
                 pager.page
+            identity = _credential_identity(credentials)
         return VertexReadOnlyAccessProbe(credential_identity=identity)
 
     def submit(self, requests: Sequence[VertexBatchRequest]) -> VertexBatchState:

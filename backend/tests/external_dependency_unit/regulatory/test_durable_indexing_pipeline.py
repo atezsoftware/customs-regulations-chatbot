@@ -3,7 +3,9 @@ from __future__ import annotations
 import datetime
 import json
 import threading
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from types import SimpleNamespace
@@ -11,7 +13,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
 from onyx.configs import app_configs
@@ -27,6 +29,8 @@ from onyx.db.enums import (
 )
 from onyx.db.models import (
     CloudEmbeddingProvider,
+    FileContent,
+    FileRecord,
     LLMProvider,
     ModelConfiguration,
     RegulatoryChunk,
@@ -36,6 +40,7 @@ from onyx.db.models import (
     User,
     UserFile,
 )
+from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
 from onyx.document_index.elasticsearch.elasticsearch_document_index import (
     ElasticsearchDocumentIndex,
 )
@@ -229,6 +234,364 @@ def _stage(db_session: Session, job_id: UUID) -> RegulatoryIndexingStage:
     return RegulatoryIndexingStage(job.stage)
 
 
+@dataclass
+class _DisposablePipelineResources:
+    db_session: Session
+    prefix: str
+    index_name: str
+    file_store: PostgresBackedFileStore = field(default_factory=PostgresBackedFileStore)
+    effective_dimension: int = 0
+    search_settings: SearchSettings | None = None
+    document_index: ElasticsearchDocumentIndex | None = None
+    database_commit_completed: bool = False
+    index_mutation_started: bool = False
+    embedding_provider_created: bool = False
+    llm_provider_ids: list[int] = field(default_factory=list)
+    model_configuration_ids: list[int] = field(default_factory=list)
+    search_settings_ids: list[int] = field(default_factory=list)
+    user_ids: list[UUID] = field(default_factory=list)
+    user_file_ids: list[UUID] = field(default_factory=list)
+    job_ids: list[UUID] = field(default_factory=list)
+    store_file_ids: list[str] = field(default_factory=list)
+    large_object_oids: list[int] = field(default_factory=list)
+
+
+def _delete_disposable_indices(prefix: str) -> None:
+    discovery_client = ElasticsearchIndexClient(f"{prefix}probe")
+    try:
+        response = discovery_client._client.indices.get(
+            index=f"{prefix}*",
+            allow_no_indices=True,
+        )
+    finally:
+        discovery_client.close()
+    for index_name in response.keys():
+        if not index_name.startswith(prefix):
+            raise AssertionError("Elasticsearch cleanup escaped its disposable prefix")
+        client = ElasticsearchIndexClient(index_name)
+        try:
+            client.delete_index()
+        finally:
+            client.close()
+
+
+def _disposable_index_names(prefix: str) -> set[str]:
+    client = ElasticsearchIndexClient(f"{prefix}probe")
+    try:
+        response = client._client.indices.get(
+            index=f"{prefix}*",
+            allow_no_indices=True,
+        )
+        return set(response.keys())
+    finally:
+        client.close()
+
+
+def _cleanup_disposable_pipeline(resources: _DisposablePipelineResources) -> None:
+    db_session = resources.db_session
+    cleanup_errors: list[Exception] = []
+    db_session.rollback()
+    try:
+        if resources.document_index is not None:
+            resources.document_index._client.close()
+        if resources.index_mutation_started:
+            _delete_disposable_indices(resources.prefix)
+    except Exception as error:
+        cleanup_errors.append(error)
+
+    if not resources.database_commit_completed:
+        if cleanup_errors:
+            raise cleanup_errors[0]
+        return
+    try:
+        file_records = list(
+            db_session.scalars(
+                select(FileRecord).where(
+                    FileRecord.file_id.like(f"{resources.prefix}%")
+                )
+            ).all()
+        )
+        for record in file_records:
+            resources.file_store.delete_file(record.file_id, error_on_missing=False)
+        db_session.rollback()
+
+        user_files = list(
+            db_session.scalars(
+                select(UserFile).where(UserFile.file_id.like(f"{resources.prefix}%"))
+            ).all()
+        )
+        for user_file in user_files:
+            db_session.delete(user_file)
+        db_session.commit()
+
+        users = list(
+            db_session.execute(
+                select(User).where(User.__table__.c.email.like(f"{resources.prefix}%"))
+            )
+            .unique()
+            .scalars()
+            .all()
+        )
+        for user in users:
+            db_session.delete(user)
+        db_session.execute(
+            delete(SearchSettings).where(
+                SearchSettings.index_name.like(f"{resources.prefix}%")
+            )
+        )
+        if resources.model_configuration_ids:
+            db_session.execute(
+                delete(ModelConfiguration).where(
+                    ModelConfiguration.id.in_(resources.model_configuration_ids)
+                )
+            )
+        db_session.execute(
+            delete(LLMProvider).where(LLMProvider.name.like(f"{resources.prefix}%"))
+        )
+        if resources.embedding_provider_created:
+            db_session.execute(
+                delete(CloudEmbeddingProvider).where(
+                    CloudEmbeddingProvider.provider_type == EmbeddingProvider.OPENROUTER
+                )
+            )
+        db_session.commit()
+    except Exception as error:
+        db_session.rollback()
+        cleanup_errors.append(error)
+    if cleanup_errors:
+        raise cleanup_errors[0]
+
+
+@contextmanager
+def _disposable_pipeline_scope(
+    db_session: Session,
+    *,
+    embedding_url: str,
+    prefix: str | None = None,
+) -> Iterator[_DisposablePipelineResources]:
+    resolved_prefix = prefix or f"task8_pipeline_{uuid4().hex}_"
+    resources = _DisposablePipelineResources(
+        db_session=db_session,
+        prefix=resolved_prefix,
+        index_name=f"{resolved_prefix}index",
+    )
+    try:
+        vertex_provider = LLMProvider(
+            name=f"{resolved_prefix}vertex",
+            provider=LlmProviderNames.VERTEX_AI,
+            custom_config={
+                VERTEX_AUTH_METHOD_KWARG: VERTEX_AUTH_METHOD_WORKLOAD_IDENTITY,
+                VERTEX_PROJECT_KWARG: "disposable-test-project",
+                VERTEX_LOCATION_KWARG: "europe-west4",
+            },
+        )
+        vertex_model = ModelConfiguration(
+            name="gemini-3.1-flash-lite",
+            is_visible=True,
+            llm_provider=vertex_provider,
+        )
+        db_session.add_all([vertex_provider, vertex_model])
+        db_session.flush()
+        resources.llm_provider_ids.append(vertex_provider.id)
+        resources.model_configuration_ids.append(vertex_model.id)
+
+        embedding_provider = CloudEmbeddingProvider(
+            provider_type=EmbeddingProvider.OPENROUTER,
+            api_url=embedding_url,
+            api_key="disposable-test-key",
+        )
+        db_session.add(embedding_provider)
+        db_session.flush()
+        resources.embedding_provider_created = True
+
+        search_settings = SearchSettings(
+            model_name="openai/text-embedding-3-large",
+            model_dim=3072,
+            reduced_dimension=_TEST_REDUCED_DIMENSION,
+            normalize=False,
+            query_prefix="",
+            passage_prefix="",
+            status=IndexModelStatus.PRESENT,
+            index_name=resources.index_name,
+            provider_type=EmbeddingProvider.OPENROUTER,
+            embedding_precision=EmbeddingPrecision.FLOAT,
+            enable_contextual_rag=True,
+            contextual_rag_model_configuration_id=vertex_model.id,
+        )
+        db_session.add(search_settings)
+        db_session.commit()
+        resources.database_commit_completed = True
+        db_session.refresh(search_settings)
+        resources.search_settings = search_settings
+        resources.search_settings_ids.append(search_settings.id)
+        resources.effective_dimension = search_settings.final_embedding_dim
+        assert resources.effective_dimension == _TEST_REDUCED_DIMENSION
+        assert resources.effective_dimension != 1024
+
+        document_index = ElasticsearchDocumentIndex(
+            tenant_state=TenantState(tenant_id=_TENANT_ID, multitenant=False),
+            index_name=resources.index_name,
+            embedding_dim=resources.effective_dimension,
+            embedding_precision=EmbeddingPrecision.FLOAT,
+        )
+        resources.document_index = document_index
+        resources.index_mutation_started = True
+        document_index._client.create_index(
+            mappings=DocumentSchema.get_document_schema(
+                resources.effective_dimension, False
+            ),
+            settings=DocumentSchema.get_index_settings_based_on_environment(),
+        )
+        yield resources
+    finally:
+        _cleanup_disposable_pipeline(resources)
+
+
+def _create_disposable_file(
+    resources: _DisposablePipelineResources,
+    *,
+    marker: str,
+    fail_after_prepare: bool = False,
+) -> tuple[UserFile, RegulatoryIndexingJob]:
+    db_session = resources.db_session
+    user = create_test_user(
+        db_session,
+        f"{resources.prefix}{marker}",
+    )
+    resources.user_ids.append(user.id)
+    store_file_id = f"{resources.prefix}file_{uuid4().hex}"
+    resources.store_file_ids.append(store_file_id)
+    resources.file_store.save_file(
+        content=BytesIO(_markdown_bytes(marker)),
+        display_name=f"{resources.prefix}{marker}.md",
+        file_origin=FileOrigin.USER_FILE,
+        file_type="text/markdown",
+        file_id=store_file_id,
+    )
+    file_content = db_session.get(FileContent, store_file_id)
+    assert file_content is not None
+    resources.large_object_oids.append(file_content.lobj_oid)
+    user_file_id = uuid4()
+    resources.user_file_ids.append(user_file_id)
+    user_file = UserFile(
+        id=user_file_id,
+        user_id=user.id,
+        file_id=store_file_id,
+        name=f"{resources.prefix}{marker}.md",
+        file_type="text/markdown",
+        status=UserFileStatus.INDEXING,
+    )
+    db_session.add(user_file)
+    db_session.commit()
+    documents = orchestrator._load_claimed_markdown_documents(
+        cast(
+            job_repository.RegulatoryIndexingRuntime,
+            SimpleNamespace(user_file=user_file),
+        )
+    )
+    job_id = preparation.prepare_regulatory_indexing_job(
+        user_file.id,
+        documents,
+        _TENANT_ID,
+        db_session,
+    )
+    resources.job_ids.append(job_id)
+    job = db_session.get(RegulatoryIndexingJob, job_id)
+    assert job is not None
+    if fail_after_prepare:
+        raise RuntimeError("forced setup failure")
+    return user_file, job
+
+
+def _assert_no_disposable_pipeline_state(
+    db_session: Session,
+    prefix: str,
+    resources: _DisposablePipelineResources,
+) -> None:
+    db_session.expire_all()
+    assert not db_session.scalars(
+        select(SearchSettings.id).where(SearchSettings.index_name.like(f"{prefix}%"))
+    ).all()
+    assert not db_session.scalars(
+        select(LLMProvider.id).where(LLMProvider.name.like(f"{prefix}%"))
+    ).all()
+    assert not db_session.scalars(
+        select(FileRecord.file_id).where(FileRecord.file_id.like(f"{prefix}%"))
+    ).all()
+    assert not db_session.scalars(
+        select(FileContent.file_id).where(FileContent.file_id.like(f"{prefix}%"))
+    ).all()
+    assert not db_session.scalars(
+        select(UserFile.id).where(UserFile.file_id.like(f"{prefix}%"))
+    ).all()
+    assert not db_session.scalars(
+        select(User.__table__.c.id).where(User.__table__.c.email.like(f"{prefix}%"))
+    ).all()
+    if resources.job_ids:
+        assert not db_session.scalars(
+            select(RegulatoryIndexingJob.id).where(
+                RegulatoryIndexingJob.id.in_(resources.job_ids)
+            )
+        ).all()
+    if resources.model_configuration_ids:
+        assert not db_session.scalars(
+            select(ModelConfiguration.id).where(
+                ModelConfiguration.id.in_(resources.model_configuration_ids)
+            )
+        ).all()
+    if resources.large_object_oids:
+        remaining_large_objects = db_session.scalar(
+            text("SELECT count(*) FROM pg_largeobject_metadata WHERE oid = ANY(:oids)"),
+            {"oids": resources.large_object_oids},
+        )
+        assert remaining_large_objects == 0
+    assert not _disposable_index_names(prefix)
+
+
+def test_forced_setup_failure_leaves_no_disposable_pipeline_state(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+    embedding_server: tuple[str, list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedding_url, _requests = embedding_server
+    prefix = f"task8_cleanup_{uuid4().hex}_"
+
+    with pytest.raises(RuntimeError, match="forced setup failure"):
+        with _disposable_pipeline_scope(
+            db_session,
+            embedding_url=embedding_url,
+            prefix=prefix,
+        ) as resources:
+            monkeypatch.setattr(
+                app_configs,
+                "REGULATORY_INDEXING_GCS_URI",
+                "gs://disposable-regulatory-indexing",
+            )
+            monkeypatch.setattr(
+                orchestrator,
+                "get_default_file_store",
+                lambda: resources.file_store,
+            )
+            monkeypatch.setattr(
+                preparation,
+                "get_tokenizer",
+                lambda *_args, **_kwargs: _CharacterTokenizer(),
+            )
+            monkeypatch.setattr(
+                preparation,
+                "get_contextual_token_budget_tokenizer",
+                lambda *_args, **_kwargs: _CharacterTokenizer(),
+            )
+            _create_disposable_file(
+                resources,
+                marker="forced",
+                fail_after_prepare=True,
+            )
+
+    _assert_no_disposable_pipeline_state(db_session, prefix, resources)
+
+
 def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
     db_session: Session,
     tenant_context: None,  # noqa: ARG001
@@ -236,149 +599,66 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     embedding_url, embedding_requests = embedding_server
-    vertex_provider = LLMProvider(
-        name=f"task8-vertex-{uuid4().hex}",
-        provider=LlmProviderNames.VERTEX_AI,
-        custom_config={
-            VERTEX_AUTH_METHOD_KWARG: VERTEX_AUTH_METHOD_WORKLOAD_IDENTITY,
-            VERTEX_PROJECT_KWARG: "disposable-test-project",
-            VERTEX_LOCATION_KWARG: "europe-west4",
-        },
-    )
-    vertex_model = ModelConfiguration(
-        name="gemini-3.1-flash-lite",
-        is_visible=True,
-        llm_provider=vertex_provider,
-    )
-    provider = CloudEmbeddingProvider(
-        provider_type=EmbeddingProvider.OPENROUTER,
-        api_url=embedding_url,
-        api_key="disposable-test-key",
-    )
-    index_name = f"task8_regulatory_{uuid4().hex}"
-    db_session.add_all([vertex_provider, vertex_model, provider])
-    db_session.flush()
-    search_settings = SearchSettings(
-        model_name="openai/text-embedding-3-large",
-        model_dim=3072,
-        reduced_dimension=_TEST_REDUCED_DIMENSION,
-        normalize=False,
-        query_prefix="",
-        passage_prefix="",
-        status=IndexModelStatus.PRESENT,
-        index_name=index_name,
-        provider_type=EmbeddingProvider.OPENROUTER,
-        embedding_precision=EmbeddingPrecision.FLOAT,
-        enable_contextual_rag=True,
-        contextual_rag_model_configuration_id=vertex_model.id,
-    )
-    db_session.add(search_settings)
-    db_session.commit()
-    db_session.refresh(search_settings)
-    effective_dimension = search_settings.final_embedding_dim
-    assert effective_dimension == _TEST_REDUCED_DIMENSION
-    assert effective_dimension != 1024
-
-    document_index = ElasticsearchDocumentIndex(
-        tenant_state=TenantState(tenant_id=_TENANT_ID, multitenant=False),
-        index_name=index_name,
-        embedding_dim=effective_dimension,
-        embedding_precision=EmbeddingPrecision.FLOAT,
-    )
-    document_index._client.create_index(
-        mappings=DocumentSchema.get_document_schema(effective_dimension, False),
-        settings=DocumentSchema.get_index_settings_based_on_environment(),
-    )
     gateway = _DeterministicVertexGateway()
-    file_store = PostgresBackedFileStore()
-    created_users: list[User] = []
-    created_files: list[UserFile] = []
-    created_store_ids: list[str] = []
+    with _disposable_pipeline_scope(
+        db_session,
+        embedding_url=embedding_url,
+    ) as resources:
+        effective_dimension = resources.effective_dimension
+        document_index = resources.document_index
+        assert document_index is not None
 
-    def create_file(marker: str) -> tuple[UserFile, RegulatoryIndexingJob]:
-        user = create_test_user(db_session, f"task8-{marker}-{uuid4().hex[:8]}")
-        store_file_id = f"task8-{uuid4().hex}"
-        file_store.save_file(
-            content=BytesIO(_markdown_bytes(marker)),
-            display_name=f"{marker}.md",
-            file_origin=FileOrigin.USER_FILE,
-            file_type="text/markdown",
-            file_id=store_file_id,
-        )
-        user_file = UserFile(
-            id=uuid4(),
-            user_id=user.id,
-            file_id=store_file_id,
-            name=f"{marker}.md",
-            file_type="text/markdown",
-            status=UserFileStatus.INDEXING,
-        )
-        db_session.add(user_file)
-        db_session.commit()
-        documents = orchestrator._load_claimed_markdown_documents(
-            cast(
-                job_repository.RegulatoryIndexingRuntime,
-                SimpleNamespace(user_file=user_file),
-            )
-        )
-        job_id = preparation.prepare_regulatory_indexing_job(
-            user_file.id,
-            documents,
-            _TENANT_ID,
-            db_session,
-        )
-        job = db_session.get(RegulatoryIndexingJob, job_id)
-        assert job is not None
-        created_users.append(user)
-        created_files.append(user_file)
-        created_store_ids.append(store_file_id)
-        return user_file, job
+        def create_file(marker: str) -> tuple[UserFile, RegulatoryIndexingJob]:
+            return _create_disposable_file(resources, marker=marker)
 
-    monkeypatch.setattr(
-        app_configs,
-        "REGULATORY_INDEXING_GCS_URI",
-        "gs://disposable-regulatory-indexing",
-    )
-    monkeypatch.setattr(
-        orchestrator,
-        "_build_vertex_gateway",
-        lambda *_args, **_kwargs: gateway,
-    )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_default_file_store",
-        lambda: file_store,
-    )
-    monkeypatch.setattr(
-        preparation, "get_tokenizer", lambda *_args, **_kwargs: _CharacterTokenizer()
-    )
-    monkeypatch.setattr(
-        preparation,
-        "get_contextual_token_budget_tokenizer",
-        lambda *_args, **_kwargs: _CharacterTokenizer(),
-    )
-    monkeypatch.setattr(
-        orchestrator,
-        "_contextual_tokenizers",
-        lambda _snapshot_value: (_CharacterTokenizer(), _CharacterTokenizer()),
-    )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_tokenizer",
-        lambda *_args, **_kwargs: _CharacterTokenizer(),
-    )
-    monkeypatch.setattr(
-        publisher,
-        "build_elasticsearch_document_index",
-        lambda _settings: document_index,
-    )
-    monkeypatch.setattr(
-        orchestrator,
-        "build_elasticsearch_document_index",
-        lambda _settings: document_index,
-    )
-    monkeypatch.setattr(search_nlp_models, "OPENROUTER_EMBEDDINGS_URL", embedding_url)
-    try:
+        monkeypatch.setattr(
+            app_configs,
+            "REGULATORY_INDEXING_GCS_URI",
+            "gs://disposable-regulatory-indexing",
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "_build_vertex_gateway",
+            lambda *_args, **_kwargs: gateway,
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "get_default_file_store",
+            lambda: resources.file_store,
+        )
+        monkeypatch.setattr(
+            preparation,
+            "get_tokenizer",
+            lambda *_args, **_kwargs: _CharacterTokenizer(),
+        )
+        monkeypatch.setattr(
+            preparation,
+            "get_contextual_token_budget_tokenizer",
+            lambda *_args, **_kwargs: _CharacterTokenizer(),
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "_contextual_tokenizers",
+            lambda _snapshot_value: (_CharacterTokenizer(), _CharacterTokenizer()),
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "get_tokenizer",
+            lambda *_args, **_kwargs: _CharacterTokenizer(),
+        )
+        monkeypatch.setattr(
+            publisher,
+            "build_elasticsearch_document_index",
+            lambda _settings: document_index,
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "build_elasticsearch_document_index",
+            lambda _settings: document_index,
+        )
+        monkeypatch.setattr(
+            search_nlp_models, "OPENROUTER_EMBEDDINGS_URL", embedding_url
+        )
         user_file, job = create_file("main")
         generation = job.lease_generation
         assert _stage(db_session, job.id) is RegulatoryIndexingStage.CONTEXT_SUBMIT
@@ -563,24 +843,5 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
                     ).all()
                 ]
             )
-    finally:
-        try:
-            document_index._client.delete_index()
-        finally:
-            db_session.rollback()
-            for store_file_id in created_store_ids:
-                file_store.delete_file(store_file_id, error_on_missing=False)
-            for user_file in created_files:
-                persisted = db_session.get(UserFile, user_file.id)
-                if persisted is not None:
-                    db_session.delete(persisted)
-            db_session.commit()
-            for user in created_users:
-                persisted = db_session.get(User, user.id)
-                if persisted is not None:
-                    db_session.delete(persisted)
-            db_session.delete(search_settings)
-            db_session.delete(provider)
-            db_session.delete(vertex_model)
-            db_session.delete(vertex_provider)
-            db_session.commit()
+
+    _assert_no_disposable_pipeline_state(db_session, resources.prefix, resources)

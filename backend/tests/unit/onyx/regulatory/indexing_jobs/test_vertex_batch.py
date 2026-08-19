@@ -439,6 +439,70 @@ def test_readiness_probes_are_public_read_only_and_close_clients(
     assert created_clients[0].closed
 
 
+def test_workload_identity_probe_resolves_principal_after_observational_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory.indexing_jobs import vertex_batch
+
+    credential = SimpleNamespace(service_account_email="default")
+    storage_client = _FakeStorageClient()
+    batches = _FakeBatches()
+    models = _FakeModels()
+    created_clients: list[_FakeGenAIClient] = []
+    _install_clients(
+        monkeypatch,
+        storage_client,
+        batches,
+        created_clients,
+        models,
+    )
+    monkeypatch.setattr(
+        vertex_batch.google.auth,
+        "default",
+        lambda *, scopes: (credential, "ambient-project"),  # noqa: ARG005
+    )
+    original_list_blobs = storage_client.list_blobs
+
+    def refreshed_list_blobs(
+        bucket_name: str,
+        *,
+        prefix: str,
+        max_results: int | None = None,
+        timeout: float | None = None,
+    ) -> list[_FakeBlob]:
+        credential.service_account_email = "runtime@example.iam.gserviceaccount.com"
+        return original_list_blobs(
+            bucket_name,
+            prefix=prefix,
+            max_results=max_results,
+            timeout=timeout,
+        )
+
+    monkeypatch.setattr(storage_client, "list_blobs", refreshed_list_blobs)
+    gateway = _gateway(
+        lambda: None,
+        authentication_mode=VertexAuthenticationMode.WORKLOAD_IDENTITY,
+    )
+
+    assert gateway.probe_gcs_read_access().credential_identity == (
+        "runtime@example.iam.gserviceaccount.com"
+    )
+    assert storage_client.closed
+
+    credential.service_account_email = "default"
+    original_get = models.get
+
+    def refreshed_get(*, model: str) -> object:
+        credential.service_account_email = "runtime@example.iam.gserviceaccount.com"
+        return original_get(model=model)
+
+    monkeypatch.setattr(models, "get", refreshed_get)
+    assert gateway.probe_vertex_read_access().credential_identity == (
+        "runtime@example.iam.gserviceaccount.com"
+    )
+    assert created_clients[-1].closed
+
+
 def _gateway(
     credential_provider: Callable[[], str | None],
     authentication_mode: VertexAuthenticationMode = (

@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 from scripts import regulatory_indexing_readiness as readiness
@@ -236,21 +238,114 @@ def test_live_worker_queue_validation_requires_exact_regulatory_queue_set() -> N
     with pytest.raises(readiness.ReadinessCheckError, match="exact queue set"):
         readiness._validated_live_regulatory_worker_queues(
             {
-                "regulatory_indexing@worker-a": [
+                "regulatory_indexing@local-node": [
                     {"name": "user_file_processing"},
-                ]
-            }
+                ],
+                "regulatory_indexing@remote-node": [
+                    {"name": "regulatory_indexing"},
+                    {"name": "user_file_processing"},
+                ],
+            },
+            expected_worker_name="regulatory_indexing@local-node",
         )
 
     assert readiness._validated_live_regulatory_worker_queues(
         {
-            "regulatory_indexing@worker-a": [
+            "regulatory_indexing@local-node": [
                 {"name": "regulatory_indexing"},
                 {"name": "user_file_processing"},
             ],
-            "primary@worker-a": [{"name": "celery"}],
-        }
+            "regulatory_indexing@remote-node": [{"name": "other"}],
+        },
+        expected_worker_name="regulatory_indexing@local-node",
     ) == {"regulatory_indexing", "user_file_processing"}
+
+    with pytest.raises(readiness.ReadinessCheckError, match="local worker response"):
+        readiness._validated_live_regulatory_worker_queues(
+            {
+                "regulatory_indexing@remote-node": [
+                    {"name": "regulatory_indexing"},
+                    {"name": "user_file_processing"},
+                ]
+            },
+            expected_worker_name="regulatory_indexing@local-node",
+        )
+
+
+def test_local_worker_pid_must_match_supervisor_status() -> None:
+    status_line = "celery_worker_regulatory_indexing RUNNING pid 4242, uptime 0:01:00"
+    assert readiness._supervisor_worker_pid(status_line) == 4242
+    readiness._validate_live_worker_pid(
+        {"regulatory_indexing@local-node": {"pid": 4242}},
+        expected_worker_name="regulatory_indexing@local-node",
+        supervisor_pid=4242,
+    )
+    with pytest.raises(readiness.ReadinessCheckError, match="Supervisor PID"):
+        readiness._validate_live_worker_pid(
+            {"regulatory_indexing@local-node": {"pid": 5252}},
+            expected_worker_name="regulatory_indexing@local-node",
+            supervisor_pid=4242,
+        )
+
+
+def test_live_worker_inspection_targets_only_the_local_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_worker_name = "regulatory_indexing@local-node"
+    inspector = MagicMock()
+    inspector.active_queues.return_value = {
+        expected_worker_name: [
+            {"name": "regulatory_indexing"},
+            {"name": "user_file_processing"},
+        ]
+    }
+    inspector.stats.return_value = {expected_worker_name: {"pid": 4242}}
+
+    from onyx.background.celery.versioned_apps.regulatory_indexing import app
+
+    inspect_mock = MagicMock(return_value=inspector)
+    monkeypatch.setattr(app.control, "inspect", inspect_mock)
+
+    assert readiness._live_regulatory_worker_queues(
+        expected_worker_name=expected_worker_name,
+        supervisor_pid=4242,
+    ) == {"regulatory_indexing", "user_file_processing"}
+    inspect_mock.assert_called_once_with(
+        timeout=5,
+        destination=[expected_worker_name],
+    )
+    inspector.stats.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "probe_name", ["probe_gcs_read_access", "probe_vertex_read_access"]
+)
+def test_observational_probe_identity_must_match_attestation(
+    probe_name: str,
+) -> None:
+    snapshot = _FakeBackend().load_snapshot()
+    backend = readiness.OnyxReadinessBackend(
+        memory_headroom_reviewed=True,
+        capability_attestation_path=None,
+    )
+    backend._attested_identity = "expected@example.iam.gserviceaccount.com"
+    gateway = SimpleNamespace(
+        probe_gcs_read_access=lambda: SimpleNamespace(
+            credential_identity="actual@example.iam.gserviceaccount.com"
+        ),
+        probe_vertex_read_access=lambda: SimpleNamespace(
+            credential_identity="actual@example.iam.gserviceaccount.com"
+        ),
+    )
+    backend._vertex_gateway = cast(readiness.GoogleVertexBatchGateway, gateway)
+
+    check = (
+        backend.check_gcs_access
+        if probe_name == "probe_gcs_read_access"
+        else backend.check_vertex_access
+    )
+    with pytest.raises(readiness.ReadinessCheckError, match="identity does not match"):
+        check(snapshot)
 
 
 @pytest.mark.parametrize(
@@ -314,7 +409,10 @@ def test_capability_attestation_requires_exact_scope_permissions_and_freshness(
         "schema_version": 1,
         "reviewed_at": "2026-08-20T08:00:00+00:00",
         "identity": "service-account@example.iam.gserviceaccount.com",
-        "evidence_reference": "change-record/task-8",
+        "evidence_reference": (
+            "gs://audit/change-record/task-8.json#sha256=" + "b" * 64
+        ),
+        "evidence_sha256": "b" * 64,
         "gcs_uri": snapshot.gcs_uri,
         "vertex_project": snapshot.vertex_project,
         "vertex_location": snapshot.vertex_location,
@@ -328,6 +426,7 @@ def test_capability_attestation_requires_exact_scope_permissions_and_freshness(
         evidence_path,
         snapshot,
         now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
+        expected_owner_uid=os.geteuid(),
     )
     assert identity == evidence["identity"]
 
@@ -338,6 +437,7 @@ def test_capability_attestation_requires_exact_scope_permissions_and_freshness(
             evidence_path,
             snapshot,
             now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
+            expected_owner_uid=os.geteuid(),
         )
 
     evidence["permissions"] = sorted(readiness.REQUIRED_CAPABILITY_PERMISSIONS)
@@ -348,4 +448,16 @@ def test_capability_attestation_requires_exact_scope_permissions_and_freshness(
             evidence_path,
             snapshot,
             now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
+            expected_owner_uid=os.geteuid(),
+        )
+
+    evidence["reviewed_at"] = "2026-08-20T08:00:00+00:00"
+    evidence["evidence_sha256"] = "c" * 64
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    with pytest.raises(readiness.ReadinessCheckError, match="digest binding"):
+        readiness._validate_capability_attestation(
+            evidence_path,
+            snapshot,
+            now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
+            expected_owner_uid=os.geteuid(),
         )

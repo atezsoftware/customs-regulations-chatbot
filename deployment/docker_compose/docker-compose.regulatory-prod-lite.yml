@@ -62,6 +62,11 @@ services:
       # heavyweight indexing model server. Remove the inherited dependency so
       # it cannot be activated through the base Compose graph.
       indexing_model_server: !reset null
+    volumes:
+      - type: bind
+        source: ${REGULATORY_CAPABILITY_ATTESTATION_FILE:?set owner-1001 mode-0600 capability attestation}
+        target: /run/readiness/regulatory-capabilities.json
+        read_only: true
     environment:
       DOCUMENT_IMPORT_ENABLED: "false"
       MARKDOWN_IMPORT_ENABLED: ${MARKDOWN_IMPORT_ENABLED:-true}
