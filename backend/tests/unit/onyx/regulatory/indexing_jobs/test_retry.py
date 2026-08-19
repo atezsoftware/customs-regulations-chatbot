@@ -4,7 +4,13 @@ import httpx
 import pytest
 
 from onyx.db.enums import RegulatoryIndexingStage
-from onyx.regulatory.indexing_jobs.models import RetryDisposition, RetryReason
+from onyx.regulatory.indexing_jobs.models import (
+    IndexingGatewayConnectionError,
+    IndexingGatewayHTTPError,
+    IndexingGatewayTimeoutError,
+    RetryDisposition,
+    RetryReason,
+)
 from onyx.regulatory.indexing_jobs.retry import (
     classify_indexing_error,
     retry_delay_seconds,
@@ -63,6 +69,42 @@ def test_unknown_errors_fail_closed() -> None:
 
     assert decision.disposition is RetryDisposition.TERMINAL
     assert decision.reason is RetryReason.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (IndexingGatewayTimeoutError(), RetryReason.TIMEOUT),
+        (IndexingGatewayConnectionError(), RetryReason.NETWORK),
+    ],
+)
+def test_normalized_gateway_transport_errors_are_retryable(
+    error: Exception,
+    reason: RetryReason,
+) -> None:
+    decision = classify_indexing_error(error)
+
+    assert decision.disposition is RetryDisposition.RETRYABLE
+    assert decision.reason is reason
+    assert decision.status_code is None
+
+
+@pytest.mark.parametrize("status_code", [408, 409, 429, 500, 503, 599])
+def test_normalized_gateway_retryable_http_boundaries(status_code: int) -> None:
+    decision = classify_indexing_error(IndexingGatewayHTTPError(status_code))
+
+    assert decision.disposition is RetryDisposition.RETRYABLE
+    assert decision.reason is RetryReason.HTTP_STATUS
+    assert decision.status_code == status_code
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403])
+def test_normalized_gateway_terminal_http_boundaries(status_code: int) -> None:
+    decision = classify_indexing_error(IndexingGatewayHTTPError(status_code))
+
+    assert decision.disposition is RetryDisposition.TERMINAL
+    assert decision.reason is RetryReason.HTTP_STATUS
+    assert decision.status_code == status_code
 
 
 def test_retry_delay_is_deterministic_full_jitter() -> None:

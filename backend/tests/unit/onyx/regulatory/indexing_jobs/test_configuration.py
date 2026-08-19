@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from onyx.configs import app_configs
 from onyx.db.enums import RegulatoryIndexingStage
+from onyx.db.models import LLMProvider, ModelConfiguration
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.well_known_providers.constants import (
     VERTEX_AUTH_METHOD_KWARG,
@@ -72,7 +73,7 @@ def _vertex_provider(
     project: str = "customs-prod",
     location: str = "europe-west4",
     auth_method: str = VERTEX_AUTH_METHOD_SERVICE_ACCOUNT,
-    credentials: str | None = '{"type":"service_account"}',
+    credentials: str | None = '{"type":"service_account","project_id":"customs-prod"}',
 ) -> SimpleNamespace:
     custom_config = {
         VERTEX_PROJECT_KWARG: project,
@@ -93,11 +94,37 @@ def _model_configuration(*, provider: SimpleNamespace | None = None) -> SimpleNa
     )
 
 
+def _service_account_model_configuration(
+    *,
+    credentials: str,
+    explicit_project: str | None = None,
+) -> ModelConfiguration:
+    custom_config = {
+        VERTEX_LOCATION_KWARG: "europe-west4",
+        VERTEX_AUTH_METHOD_KWARG: VERTEX_AUTH_METHOD_SERVICE_ACCOUNT,
+        VERTEX_CREDENTIALS_FILE_KWARG: credentials,
+    }
+    if explicit_project is not None:
+        custom_config[VERTEX_PROJECT_KWARG] = explicit_project
+    provider = LLMProvider(
+        id=29,
+        provider=LlmProviderNames.VERTEX_AI,
+        custom_config=custom_config,
+    )
+    return ModelConfiguration(
+        id=73,
+        llm_provider_id=29,
+        name="gemini-3.1-flash-lite",
+        is_visible=True,
+        llm_provider=provider,
+    )
+
+
 def _install_admin_configuration(
     monkeypatch: pytest.MonkeyPatch,
     *,
     search_settings: SimpleNamespace | None = None,
-    model_configuration: SimpleNamespace | None = None,
+    model_configuration: ModelConfiguration | SimpleNamespace | None = None,
     embedding_api_key: SensitiveValue[str] | None = _CONFIGURED_EMBEDDING_KEY,
 ) -> None:
     monkeypatch.setattr(
@@ -266,7 +293,11 @@ def test_resolution_rejects_non_production_embedding_contract(
     "provider",
     [
         _vertex_provider(provider=LlmProviderNames.OPENAI),
-        _vertex_provider(project=""),
+        _vertex_provider(
+            project="",
+            auth_method=VERTEX_AUTH_METHOD_WORKLOAD_IDENTITY,
+            credentials=None,
+        ),
         _vertex_provider(location=""),
         _vertex_provider(credentials=None),
         _vertex_provider(auth_method="unsupported"),
@@ -304,6 +335,55 @@ def test_resolution_accepts_workload_identity_without_credentials(
         snapshot.vertex.authentication_mode
         is VertexAuthenticationMode.WORKLOAD_IDENTITY
     )
+
+
+def test_resolution_derives_project_from_admin_service_account_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_configuration = _service_account_model_configuration(
+        credentials=json.dumps(
+            {
+                "type": "service_account",
+                "project_id": "credentials-project",
+                "private_key_id": "fixture-only",
+            }
+        )
+    )
+    _install_admin_configuration(
+        monkeypatch,
+        model_configuration=model_configuration,
+    )
+
+    snapshot = resolve_regulatory_indexing_snapshot(_DB_SESSION)
+    encoded = json.dumps(snapshot.model_dump(mode="json"))
+
+    assert snapshot.vertex.project == "credentials-project"
+    assert "private_key_id" not in encoded
+    assert "fixture-only" not in encoded
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        "{not-valid-json",
+        json.dumps({"type": "service_account"}),
+        json.dumps({"type": "service_account", "project_id": 123}),
+    ],
+)
+def test_explicit_project_cannot_bypass_invalid_service_account_json(
+    monkeypatch: pytest.MonkeyPatch,
+    credentials: str,
+) -> None:
+    _install_admin_configuration(
+        monkeypatch,
+        model_configuration=_service_account_model_configuration(
+            credentials=credentials,
+            explicit_project="stale-explicit-project",
+        ),
+    )
+
+    with pytest.raises(RegulatoryIndexingConfigurationError):
+        resolve_regulatory_indexing_snapshot(_DB_SESSION)
 
 
 def test_stage_validation_detects_search_settings_drift(
@@ -359,6 +439,53 @@ def test_context_stage_resolves_current_vertex_authentication(
             snapshot,
             RegulatoryIndexingStage.CONTEXT_SUBMIT,
         )
+
+
+@pytest.mark.parametrize(
+    ("constant_name", "drifted_value"),
+    [
+        ("_CONTEXTUAL_PROMPT_VERSION", "contextual-rag-v2"),
+        ("_CONTEXTUAL_PROMPT_HASH", "b" * 64),
+    ],
+)
+@pytest.mark.parametrize(
+    "stage",
+    [
+        RegulatoryIndexingStage.CONTEXT_SUBMIT,
+        RegulatoryIndexingStage.CONTEXT_APPLY,
+    ],
+)
+def test_prompt_dependent_stage_rejects_prompt_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    constant_name: str,
+    drifted_value: str,
+    stage: RegulatoryIndexingStage,
+) -> None:
+    _install_admin_configuration(monkeypatch)
+    snapshot = resolve_regulatory_indexing_snapshot(_DB_SESSION)
+    monkeypatch.setattr(configuration, constant_name, drifted_value)
+
+    with pytest.raises(RegulatoryIndexingConfigurationError):
+        validate_snapshot_for_stage(_DB_SESSION, snapshot, stage)
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        RegulatoryIndexingStage.CONTEXT_WAIT,
+        RegulatoryIndexingStage.EMBEDDING,
+        RegulatoryIndexingStage.INDEX_WRITE,
+    ],
+)
+def test_prompt_independent_stage_allows_prompt_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: RegulatoryIndexingStage,
+) -> None:
+    _install_admin_configuration(monkeypatch)
+    snapshot = resolve_regulatory_indexing_snapshot(_DB_SESSION)
+    monkeypatch.setattr(configuration, "_CONTEXTUAL_PROMPT_HASH", "b" * 64)
+
+    validate_snapshot_for_stage(_DB_SESSION, snapshot, stage)
 
 
 def test_vertex_snapshot_forbids_secret_fields() -> None:

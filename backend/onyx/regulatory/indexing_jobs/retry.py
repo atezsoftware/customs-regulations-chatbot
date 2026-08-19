@@ -7,6 +7,9 @@ import httpx
 
 from onyx.db.enums import RegulatoryIndexingStage
 from onyx.regulatory.indexing_jobs.models import (
+    IndexingGatewayConnectionError,
+    IndexingGatewayHTTPError,
+    IndexingGatewayTimeoutError,
     RetryDecision,
     RetryDisposition,
     RetryReason,
@@ -31,14 +34,22 @@ def _http_retry_decision(status_code: int) -> RetryDecision:
 def classify_indexing_error(error: Exception) -> RetryDecision:
     """Classify known transport failures without inspecting exception messages."""
 
-    if isinstance(error, (TimeoutError, httpx.TimeoutException)):
+    if isinstance(
+        error,
+        (IndexingGatewayTimeoutError, TimeoutError, httpx.TimeoutException),
+    ):
         return RetryDecision(
             disposition=RetryDisposition.RETRYABLE,
             reason=RetryReason.TIMEOUT,
         )
     if isinstance(
         error,
-        (ConnectionError, socket.gaierror, httpx.NetworkError),
+        (
+            IndexingGatewayConnectionError,
+            ConnectionError,
+            socket.gaierror,
+            httpx.NetworkError,
+        ),
     ):
         return RetryDecision(
             disposition=RetryDisposition.RETRYABLE,
@@ -46,6 +57,8 @@ def classify_indexing_error(error: Exception) -> RetryDecision:
         )
     if isinstance(error, httpx.HTTPStatusError):
         return _http_retry_decision(error.response.status_code)
+    if isinstance(error, IndexingGatewayHTTPError):
+        return _http_retry_decision(error.status_code)
     return RetryDecision(
         disposition=RetryDisposition.TERMINAL,
         reason=RetryReason.UNKNOWN,

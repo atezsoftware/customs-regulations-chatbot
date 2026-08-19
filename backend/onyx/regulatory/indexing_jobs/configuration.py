@@ -1,4 +1,6 @@
+import json
 from hashlib import sha256
+from typing import cast
 
 from sqlalchemy.orm import Session
 
@@ -36,6 +38,12 @@ _CONTEXT_STAGES = frozenset(
     {
         RegulatoryIndexingStage.CONTEXT_SUBMIT,
         RegulatoryIndexingStage.CONTEXT_WAIT,
+        RegulatoryIndexingStage.CONTEXT_APPLY,
+    }
+)
+_PROMPT_DEPENDENT_STAGES = frozenset(
+    {
+        RegulatoryIndexingStage.CONTEXT_SUBMIT,
         RegulatoryIndexingStage.CONTEXT_APPLY,
     }
 )
@@ -90,13 +98,8 @@ def _resolve_vertex_config(
             "The contextual model provider must be Vertex AI"
         )
     custom_config = provider.custom_config or {}
-    project = (custom_config.get(VERTEX_PROJECT_KWARG) or "").strip()
     location = (custom_config.get(VERTEX_LOCATION_KWARG) or "").strip()
     gcs_uri = (app_configs.REGULATORY_INDEXING_GCS_URI or "").strip()
-    if not project:
-        raise RegulatoryIndexingConfigurationError(
-            "The Vertex AI project is not configured"
-        )
     if not location:
         raise RegulatoryIndexingConfigurationError(
             "The Vertex AI location is not configured"
@@ -111,12 +114,37 @@ def _resolve_vertex_config(
         VERTEX_AUTH_METHOD_SERVICE_ACCOUNT,
     )
     if raw_auth_method == VERTEX_AUTH_METHOD_SERVICE_ACCOUNT:
-        if not (custom_config.get(VERTEX_CREDENTIALS_FILE_KWARG) or "").strip():
+        raw_credentials = (
+            custom_config.get(VERTEX_CREDENTIALS_FILE_KWARG) or ""
+        ).strip()
+        if not raw_credentials:
             raise RegulatoryIndexingConfigurationError(
                 "The Vertex AI service-account credential is not configured"
             )
+        try:
+            parsed_credentials: object = json.loads(raw_credentials)
+        except json.JSONDecodeError as error:
+            raise RegulatoryIndexingConfigurationError(
+                "The Vertex AI service-account credential is invalid"
+            ) from error
+        if not isinstance(parsed_credentials, dict):
+            raise RegulatoryIndexingConfigurationError(
+                "The Vertex AI service-account credential is invalid"
+            )
+        service_account_info = cast(dict[str, object], parsed_credentials)
+        raw_project = service_account_info.get("project_id")
+        if not isinstance(raw_project, str) or not raw_project.strip():
+            raise RegulatoryIndexingConfigurationError(
+                "The Vertex AI service-account project is not configured"
+            )
+        project = raw_project.strip()
         authentication_mode = VertexAuthenticationMode.SERVICE_ACCOUNT_JSON
     elif raw_auth_method == VERTEX_AUTH_METHOD_WORKLOAD_IDENTITY:
+        project = (custom_config.get(VERTEX_PROJECT_KWARG) or "").strip()
+        if not project:
+            raise RegulatoryIndexingConfigurationError(
+                "The Vertex AI project is not configured"
+            )
         authentication_mode = VertexAuthenticationMode.WORKLOAD_IDENTITY
     else:
         raise RegulatoryIndexingConfigurationError(
@@ -218,6 +246,14 @@ def validate_snapshot_for_stage(
     stage: RegulatoryIndexingStage,
 ) -> None:
     """Fail closed on Admin configuration drift before a stage executes."""
+
+    if stage in _PROMPT_DEPENDENT_STAGES and (
+        snapshot.prompt_version != _CONTEXTUAL_PROMPT_VERSION
+        or snapshot.prompt_hash != _CONTEXTUAL_PROMPT_HASH
+    ):
+        raise RegulatoryIndexingConfigurationError(
+            "Contextual prompt identity no longer matches the indexing job snapshot"
+        )
 
     search_settings = get_current_search_settings(db_session)
     _validate_search_settings_snapshot(search_settings, snapshot)

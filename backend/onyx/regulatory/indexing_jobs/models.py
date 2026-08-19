@@ -5,6 +5,30 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from shared_configs.enums import EmbeddingProvider
 
 
+class IndexingGatewayError(RuntimeError):
+    """SDK-neutral error raised by regulatory indexing gateway boundaries."""
+
+
+class IndexingGatewayTimeoutError(IndexingGatewayError):
+    def __init__(self) -> None:
+        super().__init__("Regulatory indexing gateway request timed out")
+
+
+class IndexingGatewayConnectionError(IndexingGatewayError):
+    def __init__(self) -> None:
+        super().__init__("Regulatory indexing gateway connection failed")
+
+
+class IndexingGatewayHTTPError(IndexingGatewayError):
+    status_code: int
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(
+            f"Regulatory indexing gateway returned HTTP status {status_code}"
+        )
+
+
 class RetryDisposition(StrEnum):
     RETRYABLE = "RETRYABLE"
     TERMINAL = "TERMINAL"
