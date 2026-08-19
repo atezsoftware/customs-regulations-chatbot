@@ -127,6 +127,7 @@ class DocMetadataAwareIndexChunk(IndexChunk):
     # Stored as an integer array in Elasticsearch for hierarchy-based filtering.
     # Empty list means no hierarchy info (document excluded from hierarchy searches).
     ancestor_hierarchy_node_ids: list[int]
+    hidden: bool = False
 
     @classmethod
     def from_index_chunk(
@@ -140,6 +141,7 @@ class DocMetadataAwareIndexChunk(IndexChunk):
         aggregated_chunk_boost_factor: float,
         tenant_id: str,
         ancestor_hierarchy_node_ids: list[int] | None = None,
+        hidden: bool = False,
     ) -> "DocMetadataAwareIndexChunk":
         return cls.model_construct(
             **shallow_model_dump(index_chunk),
@@ -151,6 +153,7 @@ class DocMetadataAwareIndexChunk(IndexChunk):
             aggregated_chunk_boost_factor=aggregated_chunk_boost_factor,
             tenant_id=tenant_id,
             ancestor_hierarchy_node_ids=ancestor_hierarchy_node_ids or [],
+            hidden=hidden,
         )
 
 

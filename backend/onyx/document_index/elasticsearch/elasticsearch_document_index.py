@@ -352,6 +352,7 @@ def _convert_onyx_chunk_to_elasticsearch_document(
         access_control_list=generate_elasticsearch_filtered_access_control_list(
             chunk.access
         ),
+        hidden=chunk.hidden,
         global_boost=chunk.boost,
         semantic_identifier=filtered_semantic_identifier,
         image_file_id=chunk.image_file_id,

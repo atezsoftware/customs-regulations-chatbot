@@ -12,11 +12,13 @@ from onyx.db.enums import (
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
     RegulatoryIndexingStage,
+    UserFileStatus,
 )
 from onyx.db.models import (
     RegulatoryChunk,
     RegulatoryIndexingItem,
     RegulatoryIndexingJob,
+    UserFile,
 )
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
@@ -630,6 +632,122 @@ def persist_regulatory_indexing_item_vector(
             "updated_at": func.now(),
         },
     )
+
+
+def persist_regulatory_indexing_item_vectors(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    item_vectors: Sequence[tuple[UUID, list[float]]],
+) -> bool:
+    """Persist one validated embedding response as a fenced transaction."""
+
+    if not item_vectors:
+        raise ValueError("item_vectors must not be empty")
+    item_ids = [item_id for item_id, _vector in item_vectors]
+    if len(set(item_ids)) != len(item_ids):
+        raise ValueError("item_vectors contains duplicate item ids")
+    for _item_id, vector in item_vectors:
+        if not vector or any(not math.isfinite(value) for value in vector):
+            raise ValueError("item_vectors must contain finite non-empty vectors")
+
+    locked_job_id = db_session.scalar(
+        select(RegulatoryIndexingJob.id)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.EMBEDDING.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if locked_job_id is None:
+        db_session.rollback()
+        return False
+
+    eligible_item_ids = set(
+        db_session.scalars(
+            select(RegulatoryIndexingItem.id).where(
+                RegulatoryIndexingItem.job_id == job_id,
+                RegulatoryIndexingItem.id.in_(item_ids),
+                RegulatoryIndexingItem.status.in_(
+                    (
+                        RegulatoryIndexingItemStatus.CONTEXT_READY.value,
+                        RegulatoryIndexingItemStatus.SKIPPED.value,
+                        RegulatoryIndexingItemStatus.EMBEDDED.value,
+                    )
+                ),
+            )
+        ).all()
+    )
+    if eligible_item_ids != set(item_ids):
+        db_session.rollback()
+        return False
+
+    for item_id, vector in item_vectors:
+        db_session.execute(
+            update(RegulatoryIndexingItem)
+            .where(
+                RegulatoryIndexingItem.id == item_id,
+                RegulatoryIndexingItem.job_id == job_id,
+            )
+            .values(
+                status=RegulatoryIndexingItemStatus.EMBEDDED.value,
+                vector=vector,
+                error_code=None,
+                error_message=None,
+                updated_at=func.now(),
+            )
+        )
+    db_session.commit()
+    return True
+
+
+def complete_regulatory_indexing_user_file(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    chunk_count: int,
+    now: datetime.datetime,
+) -> bool:
+    """Mark a published file complete only for the current PUBLISH lease."""
+
+    if chunk_count <= 0:
+        raise ValueError("chunk_count must be positive")
+    locked_job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.PUBLISH.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if locked_job is None:
+        db_session.rollback()
+        return False
+
+    completed_id = db_session.scalar(
+        update(UserFile)
+        .where(
+            UserFile.id == locked_job.user_file_id,
+            UserFile.status.in_((UserFileStatus.INDEXING, UserFileStatus.COMPLETED)),
+        )
+        .values(
+            status=UserFileStatus.COMPLETED,
+            chunk_count=chunk_count,
+            last_project_sync_at=now,
+        )
+        .returning(UserFile.id)
+    )
+    if completed_id is None:
+        db_session.rollback()
+        return False
+    db_session.commit()
+    return True
 
 
 def persist_regulatory_indexing_item_skipped(

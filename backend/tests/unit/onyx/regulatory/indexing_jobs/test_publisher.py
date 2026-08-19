@@ -1,0 +1,527 @@
+from __future__ import annotations
+
+import datetime
+from collections.abc import Iterable
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import MagicMock
+from uuid import uuid4
+
+import pytest
+from sqlalchemy.orm import Session
+
+from onyx.db.enums import RegulatoryIndexingItemStatus, UserFileStatus
+from onyx.db.models import (
+    RegulatoryChunk,
+    RegulatoryIndexingItem,
+    RegulatoryIndexingJob,
+    SearchSettings,
+    UserFile,
+)
+from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+    ElasticsearchDocumentIndex,
+)
+from onyx.document_index.interfaces_new import (
+    DocumentIndex,
+    DocumentInsertionRecord,
+    IndexingMetadata,
+    MetadataUpdateRequest,
+    TenantState,
+)
+from onyx.indexing.models import DocMetadataAwareIndexChunk, IndexChunk
+from onyx.regulatory.indexing_jobs import publisher
+from onyx.regulatory.indexing_jobs.models import (
+    RegulatoryIndexingConfigSnapshot,
+    VertexAuthenticationMode,
+    VertexBatchConfig,
+)
+from onyx.regulatory.indexing_jobs.publisher import (
+    PublishVerification,
+    publish_regulatory_job,
+    stage_regulatory_job_in_index,
+)
+from shared_configs.enums import EmbeddingProvider
+
+_DB_SESSION = cast(Session, SimpleNamespace())
+
+
+def _snapshot() -> RegulatoryIndexingConfigSnapshot:
+    return RegulatoryIndexingConfigSnapshot(
+        search_settings_id=41,
+        embedding_provider=EmbeddingProvider.OPENROUTER,
+        embedding_model_name="openai/text-embedding-3-large",
+        model_dimension=3,
+        reduced_dimension=None,
+        effective_dimension=3,
+        index_name="regulatory-index",
+        vertex=VertexBatchConfig(
+            model_configuration_id=73,
+            model_name="gemini-3.1-flash-lite",
+            project="customs-prod",
+            location="europe-west4",
+            authentication_mode=VertexAuthenticationMode.WORKLOAD_IDENTITY,
+            gcs_uri="gs://regulatory-indexing/jobs",
+        ),
+        prompt_version="contextual-rag-v1",
+        prompt_hash="a" * 64,
+    )
+
+
+def _fixture() -> tuple[
+    RegulatoryIndexingJob,
+    UserFile,
+    SearchSettings,
+    list[RegulatoryChunk],
+    list[RegulatoryIndexingItem],
+]:
+    snapshot = _snapshot()
+    user_file = cast(
+        UserFile,
+        SimpleNamespace(
+            id=uuid4(),
+            name="Gümrük Yönetmeliği.md",
+            status=UserFileStatus.INDEXING,
+            chunk_count=5,
+        ),
+    )
+    job = cast(
+        RegulatoryIndexingJob,
+        SimpleNamespace(
+            id=uuid4(),
+            user_file_id=user_file.id,
+            lease_generation=11,
+            config_snapshot=snapshot.model_dump(mode="json"),
+        ),
+    )
+    settings = cast(
+        SearchSettings,
+        SimpleNamespace(
+            id=snapshot.search_settings_id,
+            index_name=snapshot.index_name,
+            model_name=snapshot.embedding_model_name,
+            provider_type=snapshot.embedding_provider,
+            model_dim=snapshot.model_dimension,
+            reduced_dimension=snapshot.reduced_dimension,
+            final_embedding_dim=snapshot.effective_dimension,
+        ),
+    )
+    rows: list[RegulatoryChunk] = []
+    items: list[RegulatoryIndexingItem] = []
+    for position in range(2):
+        row = cast(
+            RegulatoryChunk,
+            SimpleNamespace(
+                id=f"row-{position}",
+                user_file_id=user_file.id,
+                position=position,
+                text=f"MADDE {position + 1} - Yürürlük hükmü.",
+                heading_path=[f"MADDE {position + 1}"],
+                chunk_metadata={"article_no": str(position + 1)},
+                chunk_type="article",
+                validity_start_date=datetime.date(2024, 1, position + 1),
+                validity_end_date=(
+                    datetime.date(2025, 1, 1) if position == 0 else None
+                ),
+            ),
+        )
+        rows.append(row)
+        items.append(
+            cast(
+                RegulatoryIndexingItem,
+                SimpleNamespace(
+                    id=uuid4(),
+                    job_id=job.id,
+                    regulatory_chunk_id=row.id,
+                    status=RegulatoryIndexingItemStatus.EMBEDDED.value,
+                    context=(
+                        {"contextual_text": "Generated context.\n"}
+                        if position == 0
+                        else None
+                    ),
+                    vector=[float(position + 1), 0.2, 0.3],
+                ),
+            )
+        )
+    return job, user_file, settings, rows, items
+
+
+class _RecordingDocumentIndex:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        insertion_records: list[DocumentInsertionRecord] | None = None,
+        update_error: Exception | None = None,
+    ) -> None:
+        self.events = events
+        self.index_calls: list[
+            tuple[list[DocMetadataAwareIndexChunk], IndexingMetadata]
+        ] = []
+        self.update_calls: list[list[MetadataUpdateRequest]] = []
+        self._insertion_records = insertion_records
+        self._update_error = update_error
+
+    def index(
+        self,
+        chunks: Iterable[DocMetadataAwareIndexChunk],
+        indexing_metadata: IndexingMetadata,
+    ) -> list[DocumentInsertionRecord]:
+        self.events.append("index")
+        materialized = list(chunks)
+        self.index_calls.append((materialized, indexing_metadata))
+        if self._insertion_records is not None:
+            return self._insertion_records
+        return [
+            DocumentInsertionRecord(
+                document_id=materialized[0].source_document.id,
+                already_existed=False,
+            )
+        ]
+
+    def update(self, update_requests: list[MetadataUpdateRequest]) -> None:
+        self.events.append("update")
+        self.update_calls.append(update_requests)
+        if self._update_error is not None:
+            raise self._update_error
+
+
+def _install_metadata(monkeypatch: pytest.MonkeyPatch, user_file: UserFile) -> None:
+    document_id = str(user_file.id)
+    monkeypatch.setattr(
+        publisher,
+        "get_access_for_user_files",
+        lambda _ids, _db: {},
+    )
+    monkeypatch.setattr(
+        publisher,
+        "fetch_user_project_ids_for_user_files",
+        lambda _ids, _db: {document_id: [17]},
+    )
+    monkeypatch.setattr(
+        publisher,
+        "fetch_persona_ids_for_user_files",
+        lambda _ids, _db: {document_id: [23]},
+    )
+    monkeypatch.setattr(
+        publisher,
+        "fetch_document_set_names_for_user_files",
+        lambda _ids, _db: {document_id: ["Regulations"]},
+    )
+
+
+def _stage(
+    *,
+    job: RegulatoryIndexingJob,
+    user_file: UserFile,
+    settings: SearchSettings,
+    rows: list[RegulatoryChunk],
+    items: list[RegulatoryIndexingItem],
+    document_index: _RecordingDocumentIndex,
+) -> PublishVerification:
+    return stage_regulatory_job_in_index(
+        job=job,
+        user_file=user_file,
+        rows=rows,
+        items=items,
+        search_settings=settings,
+        tenant_id="tenant-a",
+        db_session=_DB_SESSION,
+        document_index=cast(DocumentIndex, document_index),
+    )
+
+
+def test_stage_indexes_every_chunk_hidden_then_publish_completes_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, user_file)
+    events: list[str] = []
+    document_index = _RecordingDocumentIndex(events)
+    completed: list[tuple[object, int, int]] = []
+
+    def complete_file(
+        _db_session: Session,
+        *,
+        job_id: object,
+        expected_generation: int,
+        chunk_count: int,
+        now: datetime.datetime,
+    ) -> bool:
+        assert now.tzinfo is datetime.timezone.utc
+        events.append("complete")
+        completed.append((job_id, expected_generation, chunk_count))
+        return True
+
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_user_file",
+        complete_file,
+        raising=False,
+    )
+
+    verification = _stage(
+        job=job,
+        user_file=user_file,
+        settings=settings,
+        rows=list(reversed(rows)),
+        items=list(reversed(items)),
+        document_index=document_index,
+    )
+
+    staged_chunks, metadata = document_index.index_calls[0]
+    assert events == ["index"]
+    assert all(chunk.hidden for chunk in staged_chunks)
+    assert [chunk.chunk_id for chunk in staged_chunks] == [0, 1]
+    assert [chunk.regulatory_chunk_id for chunk in staged_chunks] == ["row-0", "row-1"]
+    assert staged_chunks[0].validity_end_date == datetime.date(2025, 1, 1)
+    assert staged_chunks[0].doc_summary == "Generated context.\n"
+    assert metadata.doc_id_to_chunk_cnt_diff[str(user_file.id)].old_chunk_cnt == 5
+    assert metadata.doc_id_to_chunk_cnt_diff[str(user_file.id)].new_chunk_cnt == 2
+    assert verification == PublishVerification(
+        job_id=job.id,
+        document_id=str(user_file.id),
+        canonical_chunk_count=2,
+        embedded_item_count=2,
+        vector_dimension=3,
+        insertion_record_count=1,
+    )
+
+    publish_regulatory_job(
+        job=job,
+        user_file=user_file,
+        rows=rows,
+        items=items,
+        verification=verification,
+        db_session=_DB_SESSION,
+        document_index=cast(DocumentIndex, document_index),
+    )
+
+    assert events == ["index", "update", "complete"]
+    assert document_index.update_calls == [
+        [
+            MetadataUpdateRequest(
+                document_ids=[str(user_file.id)],
+                doc_id_to_chunk_cnt={str(user_file.id): 2},
+                hidden=False,
+            )
+        ]
+    ]
+    assert completed == [(job.id, 11, 2)]
+    assert user_file.status is UserFileStatus.INDEXING
+
+
+def test_stage_retry_preserves_document_and_chunk_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, user_file)
+    document_index = _RecordingDocumentIndex([])
+
+    first = _stage(
+        job=job,
+        user_file=user_file,
+        settings=settings,
+        rows=rows,
+        items=items,
+        document_index=document_index,
+    )
+    second = _stage(
+        job=job,
+        user_file=user_file,
+        settings=settings,
+        rows=list(reversed(rows)),
+        items=list(reversed(items)),
+        document_index=document_index,
+    )
+
+    first_ids = [
+        (chunk.source_document.id, chunk.chunk_id, chunk.regulatory_chunk_id)
+        for chunk in document_index.index_calls[0][0]
+    ]
+    second_ids = [
+        (chunk.source_document.id, chunk.chunk_id, chunk.regulatory_chunk_id)
+        for chunk in document_index.index_calls[1][0]
+    ]
+    assert first_ids == second_ids
+    assert first == second
+
+
+def test_insertion_count_mismatch_never_publishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, user_file)
+    document_index = _RecordingDocumentIndex([], insertion_records=[])
+    completed: list[object] = []
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_user_file",
+        lambda *_args, **_kwargs: completed.append(object()) or True,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="exactly one insertion record"):
+        _stage(
+            job=job,
+            user_file=user_file,
+            settings=settings,
+            rows=rows,
+            items=items,
+            document_index=document_index,
+        )
+
+    assert document_index.update_calls == []
+    assert completed == []
+
+
+def test_visibility_failure_never_marks_user_file_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, user_file)
+    document_index = _RecordingDocumentIndex(
+        [], update_error=RuntimeError("Elasticsearch unavailable")
+    )
+    completed: list[object] = []
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_user_file",
+        lambda *_args, **_kwargs: completed.append(object()) or True,
+        raising=False,
+    )
+    verification = _stage(
+        job=job,
+        user_file=user_file,
+        settings=settings,
+        rows=rows,
+        items=items,
+        document_index=document_index,
+    )
+
+    with pytest.raises(RuntimeError, match="Elasticsearch unavailable"):
+        publish_regulatory_job(
+            job=job,
+            user_file=user_file,
+            rows=rows,
+            items=items,
+            verification=verification,
+            db_session=_DB_SESSION,
+            document_index=cast(DocumentIndex, document_index),
+        )
+
+    assert completed == []
+
+
+def test_publish_rejects_stale_count_verification_before_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, _settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, user_file)
+    document_index = _RecordingDocumentIndex([])
+    stale_verification = PublishVerification(
+        job_id=job.id,
+        document_id=str(user_file.id),
+        canonical_chunk_count=1,
+        embedded_item_count=1,
+        vector_dimension=3,
+        insertion_record_count=1,
+    )
+
+    with pytest.raises(ValueError, match="verification no longer matches"):
+        publish_regulatory_job(
+            job=job,
+            user_file=user_file,
+            rows=rows,
+            items=items,
+            verification=stale_verification,
+            db_session=_DB_SESSION,
+            document_index=cast(DocumentIndex, document_index),
+        )
+
+    assert document_index.update_calls == []
+
+
+def test_elasticsearch_maps_hidden_flag_and_legacy_enrichment_defaults_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, user_file)
+    recorder = _RecordingDocumentIndex([])
+    _stage(
+        job=job,
+        user_file=user_file,
+        settings=settings,
+        rows=rows,
+        items=items,
+        document_index=recorder,
+    )
+    staged_chunks, indexing_metadata = recorder.index_calls[0]
+
+    client = MagicMock()
+    client.delete_by_query.return_value = 0
+    elasticsearch_index = ElasticsearchDocumentIndex.__new__(ElasticsearchDocumentIndex)
+    elasticsearch_index._index_name = settings.index_name
+    elasticsearch_index._client = client
+    elasticsearch_index._tenant_state = TenantState(
+        tenant_id="tenant-a", multitenant=False
+    )
+
+    elasticsearch_index.index(staged_chunks, indexing_metadata)
+    hidden_documents = client.bulk_index_documents.call_args.kwargs["documents"]
+    assert [document.hidden for document in hidden_documents] == [True, True]
+
+    first = staged_chunks[0]
+    base_chunk = IndexChunk.model_construct(
+        **{name: getattr(first, name) for name in IndexChunk.model_fields}
+    )
+    legacy_chunk = DocMetadataAwareIndexChunk.from_index_chunk(
+        index_chunk=base_chunk,
+        access=first.access,
+        document_sets=first.document_sets,
+        user_project=first.user_project,
+        personas=first.personas,
+        boost=first.boost,
+        aggregated_chunk_boost_factor=first.aggregated_chunk_boost_factor,
+        tenant_id=first.tenant_id,
+    )
+    assert legacy_chunk.hidden is False
+
+
+def test_cancelled_user_file_is_never_staged_or_published(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    user_file.status = UserFileStatus.CANCELED
+    _install_metadata(monkeypatch, user_file)
+    document_index = _RecordingDocumentIndex([])
+    verification = PublishVerification(
+        job_id=job.id,
+        document_id=str(user_file.id),
+        canonical_chunk_count=2,
+        embedded_item_count=2,
+        vector_dimension=3,
+        insertion_record_count=1,
+    )
+
+    with pytest.raises(ValueError, match="cancelled or deleting"):
+        _stage(
+            job=job,
+            user_file=user_file,
+            settings=settings,
+            rows=rows,
+            items=items,
+            document_index=document_index,
+        )
+    with pytest.raises(ValueError, match="cancelled or deleting"):
+        publish_regulatory_job(
+            job=job,
+            user_file=user_file,
+            rows=rows,
+            items=items,
+            verification=verification,
+            db_session=_DB_SESSION,
+            document_index=cast(DocumentIndex, document_index),
+        )
+
+    assert document_index.index_calls == []
+    assert document_index.update_calls == []
