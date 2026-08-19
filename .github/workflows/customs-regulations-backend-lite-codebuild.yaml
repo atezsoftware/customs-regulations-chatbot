@@ -140,7 +140,7 @@ jobs:
         run: |
           aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
-      - name: Capture pre-deploy benchmark diagnostics
+      - name: Capture pre-deploy worker diagnostics
         run: |
           set -euo pipefail
 
@@ -180,13 +180,18 @@ jobs:
             supervisorctl -c /etc/supervisor/conf.d/supervisord.conf \
             status celery_worker_regulatory_benchmark || true
 
+          echo "Regulatory indexing worker supervisor state"
+          kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+            supervisorctl -c /etc/supervisor/conf.d/supervisord.conf \
+            status celery_worker_regulatory_indexing || true
+
           echo "Container memory counters"
           kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
             sh -c 'for file in memory.current memory.peak memory.max memory.events; do if [ -r "/sys/fs/cgroup/$file" ]; then printf "%s=" "$file"; tr "\n" "," < "/sys/fs/cgroup/$file"; printf "\n"; fi; done' || true
 
-          echo "Filtered benchmark runtime logs"
+          echo "Filtered regulatory worker runtime logs"
           kubectl logs "$pod" --namespace "${namespace}" -c "$container" --tail=5000 \
-            | grep -E -i 'benchmark|oom|out of memory|memoryerror|sigkill|killed|worker lost|terminated by' \
+            | grep -E -i 'benchmark|regulatory.?index|oom|out of memory|memoryerror|sigkill|killed|worker lost|terminated by' \
             | tail -n 800 || true
 
       - name: Set up Helm
@@ -304,9 +309,41 @@ jobs:
             return 1
           }
 
+          verify_regulatory_indexing_worker() {
+            local app_name="customs-regulations-background"
+            local selector="app=${env_x}-${app_name}"
+            local pod
+            local container
+            local worker_status
+            local readiness_file="/tmp/onyx_k8s_regulatoryindexing_readiness.txt"
+
+            echo "Waiting for the dedicated regulatory indexing worker to become Celery-ready"
+            for attempt in {1..60}; do
+              pod=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json | jq -r --arg tag "${IMAGE_TAG}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | head -n 1)
+              if [[ -n "$pod" ]]; then
+                container=$(kubectl get pod "$pod" --namespace "${namespace}" -o json | jq -r --arg tag "${IMAGE_TAG}" '.spec.containers[] | select(.image | endswith(":" + $tag)) | .name' | head -n 1)
+                if [[ -n "$container" ]]; then
+                  worker_status=$(kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status celery_worker_regulatory_indexing 2>&1 || true)
+                  echo "$worker_status"
+                  if grep -Eq '^celery_worker_regulatory_indexing[[:space:]]+RUNNING([[:space:]]|$)' <<<"$worker_status" && \
+                    kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+                      test -f "$readiness_file"; then
+                    echo "Dedicated regulatory indexing worker is Celery-ready in pod $pod"
+                    return 0
+                  fi
+                fi
+              fi
+              sleep 5
+            done
+
+            echo "Dedicated regulatory indexing worker did not become Celery-ready for image tag ${IMAGE_TAG}" >&2
+            return 1
+          }
+
           deploy_app "customs-regulations-api" "customs-regulations/customs-regulations-api-values.yaml" "true"
           deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "true"
           verify_benchmark_worker
+          verify_regulatory_indexing_worker
         continue-on-error: true
 
       - name: Check Deployment Status

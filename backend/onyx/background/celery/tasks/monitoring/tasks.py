@@ -178,6 +178,7 @@ def _collect_queue_metrics(redis_celery: Redis) -> list[Metric]:
         "user_file_project_sync_queue_length": OnyxCeleryQueues.USER_FILE_PROJECT_SYNC,
         "user_file_delete_queue_length": OnyxCeleryQueues.USER_FILE_DELETE,
         "user_file_port_queue_length": OnyxCeleryQueues.USER_FILE_PORT,
+        "regulatory_indexing_queue_length": OnyxCeleryQueues.REGULATORY_INDEXING,
         "monitoring_queue_length": OnyxCeleryQueues.MONITORING,
         "sandbox_queue_length": OnyxCeleryQueues.SANDBOX,
         "elasticsearch_migration_queue_length": OnyxCeleryQueues.ELASTICSEARCH_MIGRATION,
@@ -947,6 +948,9 @@ def monitor_celery_queues_helper(
     n_user_file_port = celery_get_queue_length(
         OnyxCeleryQueues.USER_FILE_PORT, r_celery
     )
+    n_regulatory_indexing = celery_get_queue_length(
+        OnyxCeleryQueues.REGULATORY_INDEXING, r_celery
+    )
     n_sync = celery_get_queue_length(OnyxCeleryQueues.VESPA_METADATA_SYNC, r_celery)
     n_deletion = celery_get_queue_length(OnyxCeleryQueues.CONNECTOR_DELETION, r_celery)
     n_pruning = celery_get_queue_length(OnyxCeleryQueues.CONNECTOR_PRUNING, r_celery)
@@ -998,6 +1002,7 @@ def monitor_celery_queues_helper(
         f"user_file_project_sync={n_user_file_project_sync} "
         f"user_file_delete={n_user_file_delete} "
         f"user_file_port={n_user_file_port} "
+        f"regulatory_indexing={n_regulatory_indexing} "
         f"sync={n_sync} "
         f"deletion={n_deletion} "
         f"pruning={n_pruning} "

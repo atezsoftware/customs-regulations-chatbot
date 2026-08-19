@@ -25,6 +25,11 @@ services:
       - "8080"
     environment:
       DOCUMENT_IMPORT_ENABLED: "false"
+      MARKDOWN_IMPORT_ENABLED: ${MARKDOWN_IMPORT_ENABLED:-true}
+      MAX_ARCHIVE_COMPRESSION_RATIO: ${MAX_ARCHIVE_COMPRESSION_RATIO:-100}
+      MAX_ARCHIVE_ENTRIES: ${MAX_ARCHIVE_ENTRIES:-500}
+      MAX_ARCHIVE_EXPANDED_BYTES: ${MAX_ARCHIVE_EXPANDED_BYTES:-536870912}
+      REGULATORY_BATCH_INDEXING_ENABLED: ${REGULATORY_BATCH_INDEXING_ENABLED:-false}
       DISABLE_ONYX_UPSTREAM_CONNECTIONS: "true"
       DISABLE_TELEMETRY: "true"
       ENABLE_CRAFT: "false"
@@ -59,6 +64,15 @@ services:
       indexing_model_server: !reset null
     environment:
       DOCUMENT_IMPORT_ENABLED: "false"
+      MARKDOWN_IMPORT_ENABLED: ${MARKDOWN_IMPORT_ENABLED:-true}
+      REGULATORY_BATCH_INDEXING_ENABLED: ${REGULATORY_BATCH_INDEXING_ENABLED:-false}
+      REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE: ${REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE:-64}
+      REGULATORY_INDEXING_GCS_URI: ${REGULATORY_INDEXING_GCS_URI:-}
+      REGULATORY_INDEXING_LEASE_SECONDS: ${REGULATORY_INDEXING_LEASE_SECONDS:-120}
+      REGULATORY_INDEXING_MAX_ATTEMPTS: ${REGULATORY_INDEXING_MAX_ATTEMPTS:-5}
+      REGULATORY_INDEXING_POLL_SECONDS: ${REGULATORY_INDEXING_POLL_SECONDS:-30}
+      REGULATORY_INDEXING_RETRY_BASE_SECONDS: ${REGULATORY_INDEXING_RETRY_BASE_SECONDS:-15}
+      REGULATORY_INDEXING_RETRY_MAX_SECONDS: ${REGULATORY_INDEXING_RETRY_MAX_SECONDS:-900}
       DISABLE_ONYX_UPSTREAM_CONNECTIONS: "true"
       DISABLE_TELEMETRY: "true"
       ENABLE_CRAFT: "false"
@@ -77,7 +91,7 @@ services:
           import subprocess
           result = subprocess.run(["supervisorctl", "status"], capture_output=True, text=True)
           rows = [line.split() for line in result.stdout.splitlines() if line.split()]
-          expected = {"celery_worker_regulatory_benchmark", "celery_beat", "celery_worker_user_file_processing", "celery_worker_light", "celery_worker_monitoring", "log-redirect-handler"}
+          expected = {"celery_worker_regulatory_benchmark", "celery_beat", "celery_worker_user_file_processing", "celery_worker_regulatory_indexing", "celery_worker_light", "celery_worker_monitoring", "log-redirect-handler"}
           assert result.returncode == 0 and {row[0] for row in rows} == expected and all(len(row) > 1 and row[1] == "RUNNING" for row in rows)
       interval: 30s
       timeout: 10s
