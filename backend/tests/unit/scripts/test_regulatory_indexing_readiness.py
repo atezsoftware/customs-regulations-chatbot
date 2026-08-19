@@ -192,6 +192,42 @@ def test_cli_initializes_a_bounded_read_only_database_pool(
     assert reviewed == [True]
 
 
+def test_capability_file_only_cli_uses_secure_reader_without_database(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    attestation_path = tmp_path / "capability-attestation.json"
+    attestation_path.write_bytes(b"{}\n")
+    attestation_path.chmod(0o600)
+    evidence_path = tmp_path / "capability-evidence.json"
+    evidence_path.write_bytes(b'{"approved":true,"secret-marker":"never-print"}\n')
+    evidence_path.chmod(0o400)
+    monkeypatch.setattr(readiness, "_ATTESTATION_OWNER_UID", os.geteuid())
+    monkeypatch.setattr(readiness, "_ATTESTATION_OWNER_GID", os.getegid())
+    monkeypatch.setattr(
+        readiness.SqlEngine,
+        "init_engine",
+        lambda **_kwargs: pytest.fail("file-only validation initialized the database"),
+    )
+
+    assert (
+        readiness.main(
+            [
+                "--validate-capability-files-only",
+                "--capability-attestation",
+                str(attestation_path),
+                "--capability-evidence",
+                str(evidence_path),
+            ]
+        )
+        == EXIT_READY
+    )
+    output = capsys.readouterr()
+    assert "secret-marker" not in output.out
+    assert "secret-marker" not in output.err
+
+
 def test_memory_headroom_requires_attestation_and_rejects_oom_events(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -564,7 +600,7 @@ def test_capability_files_reject_symlinks_and_oversize_evidence(
     symlink.symlink_to(target)
 
     with pytest.raises(readiness.ReadinessCheckError, match="regular file"):
-        readiness._validated_secure_file(
+        readiness._read_secure_file(
             symlink,
             expected_mode=0o400,
             expected_owner_uid=os.geteuid(),
@@ -573,7 +609,7 @@ def test_capability_files_reject_symlinks_and_oversize_evidence(
             label="capability evidence",
         )
     with pytest.raises(readiness.ReadinessCheckError, match="maximum size"):
-        readiness._validated_secure_file(
+        readiness._read_secure_file(
             target,
             expected_mode=0o400,
             expected_owner_uid=os.geteuid(),
@@ -581,3 +617,124 @@ def test_capability_files_reject_symlinks_and_oversize_evidence(
             maximum_size=4,
             label="capability evidence",
         )
+
+
+def test_secure_file_reader_owns_descriptor_across_path_swap(tmp_path: Path) -> None:
+    trusted_bytes = b"trusted archived evidence\n"
+    trusted_path = tmp_path / "capability-evidence.json"
+    trusted_path.write_bytes(trusted_bytes)
+    trusted_path.chmod(0o400)
+    replacement_path = tmp_path / "replacement.json"
+    replacement_path.write_bytes(b"attacker-controlled replacement\n")
+    replacement_path.chmod(0o400)
+
+    opened_descriptor: int | None = None
+
+    def open_then_swap(path: Path, flags: int) -> int:
+        nonlocal opened_descriptor
+        assert flags & os.O_NOFOLLOW
+        assert flags & os.O_CLOEXEC
+        descriptor = os.open(path, flags)
+        opened_descriptor = descriptor
+        os.replace(replacement_path, trusted_path)
+        return descriptor
+
+    contents = readiness._read_secure_file(
+        trusted_path,
+        expected_mode=0o400,
+        expected_owner_uid=os.geteuid(),
+        expected_owner_gid=os.getegid(),
+        maximum_size=1024,
+        label="capability evidence",
+        open_file=open_then_swap,
+    )
+
+    assert contents == trusted_bytes
+    assert trusted_path.read_bytes() == b"attacker-controlled replacement\n"
+    assert opened_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(opened_descriptor)
+
+
+@pytest.mark.parametrize("flag_name", ["O_NOFOLLOW", "O_CLOEXEC"])
+def test_secure_file_reader_fails_closed_without_safe_open_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    flag_name: str,
+) -> None:
+    evidence_path = tmp_path / "capability-evidence.json"
+    evidence_path.write_bytes(b"evidence")
+    evidence_path.chmod(0o400)
+    monkeypatch.setattr(readiness.os, flag_name, 0)
+
+    with pytest.raises(readiness.ReadinessCheckError, match="secure-open semantics"):
+        readiness._read_secure_file(
+            evidence_path,
+            expected_mode=0o400,
+            expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
+            maximum_size=1024,
+            label="capability evidence",
+        )
+
+
+def test_secure_file_reader_rejects_growth_beyond_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "capability-evidence.json"
+    evidence_path.write_bytes(b"1234")
+    evidence_path.chmod(0o400)
+    original_read = os.read
+    grew = False
+
+    def grow_before_first_read(descriptor: int, size: int) -> bytes:
+        nonlocal grew
+        if not grew:
+            grew = True
+            evidence_path.chmod(0o600)
+            with evidence_path.open("ab") as evidence_file:
+                evidence_file.write(b"5")
+            evidence_path.chmod(0o400)
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(readiness.os, "read", grow_before_first_read)
+
+    with pytest.raises(readiness.ReadinessCheckError, match="maximum size"):
+        readiness._read_secure_file(
+            evidence_path,
+            expected_mode=0o400,
+            expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
+            maximum_size=4,
+            label="capability evidence",
+        )
+
+
+def test_secure_file_reader_closes_descriptor_on_validation_failure(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "capability-evidence.json"
+    evidence_path.write_bytes(b"evidence")
+    evidence_path.chmod(0o400)
+    opened_descriptor: int | None = None
+
+    def record_open(path: Path, flags: int) -> int:
+        nonlocal opened_descriptor
+        opened_descriptor = os.open(path, flags)
+        return opened_descriptor
+
+    with pytest.raises(readiness.ReadinessCheckError, match="mode 0600"):
+        readiness._read_secure_file(
+            evidence_path,
+            expected_mode=0o600,
+            expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
+            maximum_size=1024,
+            label="capability evidence",
+            open_file=record_open,
+        )
+
+    assert opened_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(opened_descriptor)

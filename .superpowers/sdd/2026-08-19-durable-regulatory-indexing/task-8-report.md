@@ -403,3 +403,85 @@ evidence was unavailable, and all snapshot-dependent checks were blocked. No
 attestation was fabricated and no live canary was started. Existing production
 documents, indices, database/provider state, GCS objects, and Vertex jobs were
 not mutated.
+
+---
+
+## Review fix round 4/5
+
+All three remaining Important findings were implemented without a production
+write, deployment, push, or merge.
+
+### RED/GREEN evidence
+
+- Secure-reader and Supervisor contract RED was `7 failed in 2.92s`: the
+  file-only readiness mode and descriptor-owned reader did not exist, preflight
+  did not delegate to the canonical reader, and a host-identity-rewritten
+  Supervisor test could not prove numeric `1001:1001`. Readiness now opens each
+  path exactly once with `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`, validates that same
+  descriptor with `fstat`, requires the exact owner/group and `0600`/`0400`
+  mode contract, and reads at most the configured maximum plus one byte. The
+  exact bounded bytes are parsed/hashed and every descriptor is closed. Tests
+  deterministically cover path replacement after open, final-component
+  symlinks, initial oversize, growth after `fstat`, absent safe-open flags, and
+  validation-failure closure without emitting evidence contents.
+- Production-lite preflight removed its separate host `stat` security claim.
+  After the immutable background image and read-only mounts are resolved, it
+  runs that image as `1001:1001` in a disposable read-only, no-network,
+  capability-dropped container and invokes
+  `--validate-capability-files-only`. This mode returns before database engine
+  initialization or any network-backed check. The final readiness, wiring, and
+  executable-preflight repeat was `91 passed in 13.44s`.
+- The prior Supervisor executable test substituted the invoking host UID/GID.
+  The replacement external/runtime test builds the current `runtime-lite`
+  target, starts Supervisor as root, applies the canonical numeric
+  `1001:1001`/`0770` socket configuration, proves `supervisorctl status` works
+  after dropping to UID/GID `1001:1001`, and proves UID/GID `2002:2002` cannot
+  connect. The same read-only/no-network runtime also executes the shipped
+  file-only secure reader as `1001:1001` without emitting the evidence marker.
+  Final result: `1 passed in 38.77s`; its container, probe directory, and
+  test-only image tag were removed.
+- Provider post-commit RED was `1 failed in 1.40s` because the disposable scope
+  could not inject a failure at the commit boundary. The exact raw OpenRouter
+  test state is now captured immediately after `flush` and before `commit`, and
+  the failure callback is the first statement after that commit. The resulting
+  regression proves the new global provider is removed and its Task 8
+  SearchSettings/LLM rows are cleaned.
+- Pre-existing-provider cleanup-boundary RED was `1 failed in 1.02s`. Its
+  initial mutation, flush, raw ciphertext/field snapshot, commit, and yield now
+  all live inside one exception-safe context. Dedicated failures immediately
+  after commit and while the raw test snapshot is being obtained both restore
+  or remove safely. Exact raw ciphertext and every provider field are restored
+  while the existing PostgreSQL session advisory lock remains held for the
+  disposable scope. A separate OpenAI row is unchanged by forced OpenRouter
+  post-commit cleanup.
+
+### Round-4 verification
+
+- Clean pre-change focused baseline: `84 passed in 11.64s`.
+- Final focused readiness, Supervisor/Compose wiring, and executable preflight:
+  `91 passed in 13.44s`.
+- Regulatory unit/runtime superset: `922 passed in 20.08s`.
+- Fresh disposable PostgreSQL 15.2 migration from empty to head
+  `c8f1a6d4e2b7` succeeded. Final real PostgreSQL repository plus
+  PostgreSQL/Elasticsearch 9.4.2 pipeline repeat: `36 passed in 44.22s`.
+- The independent post-test query returned `0|0|0|0|0|0` for Task 8
+  SearchSettings, LLM providers, file records, UserFiles, durable jobs, and
+  OpenRouter/OpenAI providers. The Task 8 Elasticsearch index listing was
+  empty.
+- Ruff, Ruff formatting, and `ty` passed on all touched Python. `bash -n`
+  passed. Host `shellcheck` was unavailable; the repository shellcheck hook
+  passed. The touched-code pre-commit run passed every applicable hook,
+  including lazy imports, `ty`, Ruff, Ruff formatting, shellcheck, large-file,
+  and ripsecrets.
+
+### Live readiness recheck
+
+`getent hosts psql.dev.singlewindow.io` returned exit `2` again.
+`onyx-api_server-1` was `running unhealthy`; nginx ports `7000` and `7001`
+both returned HTTP `200`. The corrected local read-only readiness command with
+both canonical evidence paths returned exit `1`, `NOT_READY`: migration and
+Admin snapshot failed with redacted `OperationalError`, Supervisor inspection
+failed, host cgroup evidence was unavailable, and all snapshot-dependent checks
+were blocked. No attestation was fabricated, no live canary was started, and no
+existing production document, index, database/provider record, GCS object, or
+Vertex job was mutated.

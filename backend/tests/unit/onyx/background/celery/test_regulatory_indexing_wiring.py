@@ -1039,9 +1039,7 @@ def test_prod_lite_mounts_readiness_attestation_read_only() -> None:
     )
 
 
-def test_supervisor_socket_allows_only_root_and_onyx_group_access(
-    tmp_path: Path,
-) -> None:
+def test_supervisor_socket_uses_canonical_app_identity_without_world_access() -> None:
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(_BACKEND_ROOT / "supervisord-lite.conf", encoding="utf-8")
     socket_config = parser["unix_http_server"]
@@ -1056,66 +1054,6 @@ def test_supervisor_socket_allows_only_root_and_onyx_group_access(
         encoding="utf-8"
     )
     assert "useradd -u 1001 -g onyx" in runtime_dockerfile
-
-    socket_path = tmp_path / "supervisor.sock"
-    pid_path = tmp_path / "supervisord.pid"
-    executable_config = tmp_path / "supervisord.conf"
-    executable_config.write_text(
-        "\n".join(
-            [
-                "[supervisord]",
-                "nodaemon=true",
-                f"pidfile={pid_path}",
-                f"logfile={tmp_path / 'supervisord.log'}",
-                f"childlogdir={tmp_path}",
-                "",
-                "[unix_http_server]",
-                f"file={socket_path}",
-                f"chmod={socket_config['chmod']}",
-                f"chown={os.geteuid()}:{os.getegid()}",
-                "",
-                "[supervisorctl]",
-                f"serverurl=unix://{socket_path}",
-                "",
-                "[rpcinterface:supervisor]",
-                "supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface",
-                "",
-                "[program:permission_probe]",
-                "command=/bin/sleep 30",
-                "autorestart=false",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    supervisor_bin = str(Path(sys.executable).with_name("supervisord"))
-    supervisorctl_bin = str(Path(sys.executable).with_name("supervisorctl"))
-    process = subprocess.Popen(
-        [supervisor_bin, "-c", str(executable_config)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        assert socket_path.exists()
-        result = subprocess.run(
-            [supervisorctl_bin, "-c", str(executable_config), "status"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stderr
-        assert "permission_probe" in result.stdout
-        metadata = socket_path.stat()
-        assert metadata.st_uid == os.geteuid()
-        assert metadata.st_gid == os.getegid()
-        assert metadata.st_mode & 0o777 == 0o770
-        assert metadata.st_mode & 0o007 == 0
-    finally:
-        process.terminate()
-        process.wait(timeout=5)
 
 
 def test_codebuild_diagnostics_and_readiness_use_the_exact_worker_name() -> None:

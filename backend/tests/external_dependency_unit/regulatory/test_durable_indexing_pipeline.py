@@ -4,7 +4,7 @@ import datetime
 import json
 import sys
 import threading
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -383,27 +383,10 @@ def _cleanup_disposable_pipeline(resources: _DisposablePipelineResources) -> Non
 
     def restore_embedding_provider() -> None:
         if resources.embedding_provider_original_state is not None:
-            (
-                provider_type,
-                api_url,
-                api_key,
-                api_version,
-                deployment_name,
-            ) = resources.embedding_provider_original_state
-            db_session.execute(
-                text(
-                    "UPDATE embedding_provider SET api_url = :api_url, "
-                    "api_key = :api_key, api_version = :api_version, "
-                    "deployment_name = :deployment_name "
-                    "WHERE provider_type = :provider_type"
-                ),
-                {
-                    "provider_type": provider_type,
-                    "api_url": api_url,
-                    "api_key": api_key,
-                    "api_version": api_version,
-                    "deployment_name": deployment_name,
-                },
+            _restore_raw_embedding_provider_state(
+                db_session,
+                EmbeddingProvider.OPENROUTER,
+                resources.embedding_provider_original_state,
             )
             return
         if not resources.embedding_provider_created:
@@ -454,6 +437,7 @@ def _disposable_pipeline_scope(
     *,
     embedding_url: str,
     prefix: str | None = None,
+    after_configuration_commit: Callable[[], None] | None = None,
 ) -> Iterator[_DisposablePipelineResources]:
     resolved_prefix = prefix or f"task8_pipeline_{uuid4().hex}_"
     resources = _DisposablePipelineResources(
@@ -507,6 +491,9 @@ def _disposable_pipeline_scope(
         embedding_provider.deployment_name = None
         resources.embedding_provider = embedding_provider
         db_session.flush()
+        resources.embedding_provider_test_state = _raw_openrouter_provider_state(
+            db_session
+        )
 
         search_settings = SearchSettings(
             model_name="openai/text-embedding-3-large",
@@ -524,10 +511,9 @@ def _disposable_pipeline_scope(
         )
         db_session.add(search_settings)
         db_session.commit()
+        if after_configuration_commit is not None:
+            after_configuration_commit()
         resources.database_commit_completed = True
-        resources.embedding_provider_test_state = _raw_openrouter_provider_state(
-            db_session
-        )
         db_session.refresh(search_settings)
         resources.search_settings = search_settings
         resources.search_settings_ids.append(search_settings.id)
@@ -705,6 +691,109 @@ def test_forced_setup_failure_leaves_no_disposable_pipeline_state(
     _assert_no_disposable_pipeline_state(db_session, prefix, resources)
 
 
+def test_failure_immediately_after_provider_commit_leaves_no_global_provider(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+    embedding_server: tuple[str, list[dict[str, object]]],
+) -> None:
+    embedding_url, _requests = embedding_server
+    prefix = f"task8_postcommit_failure_{uuid4().hex}_"
+    assert _raw_openrouter_provider_state(db_session) is None
+
+    def fail_immediately_after_commit() -> None:
+        raise RuntimeError("forced failure immediately after provider commit")
+
+    with pytest.raises(
+        RuntimeError,
+        match="forced failure immediately after provider commit",
+    ):
+        with _disposable_pipeline_scope(
+            db_session,
+            embedding_url=embedding_url,
+            prefix=prefix,
+            after_configuration_commit=fail_immediately_after_commit,
+        ):
+            pytest.fail("scope yielded after the forced post-commit failure")
+
+    assert _raw_openrouter_provider_state(db_session) is None
+    assert not db_session.scalars(
+        select(SearchSettings.id).where(SearchSettings.index_name.like(f"{prefix}%"))
+    ).all()
+    assert not db_session.scalars(
+        select(LLMProvider.id).where(LLMProvider.name.like(f"{prefix}%"))
+    ).all()
+
+
+def test_postcommit_cleanup_preserves_unrelated_embedding_provider(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+    embedding_server: tuple[str, list[dict[str, object]]],
+) -> None:
+    embedding_url, _requests = embedding_server
+    state_before_test = _raw_embedding_provider_state(
+        db_session,
+        EmbeddingProvider.OPENAI,
+    )
+    test_state: tuple[object, ...] | None = None
+
+    try:
+        provider = db_session.get(
+            CloudEmbeddingProvider,
+            EmbeddingProvider.OPENAI,
+        )
+        if provider is None:
+            provider = CloudEmbeddingProvider(provider_type=EmbeddingProvider.OPENAI)
+            db_session.add(provider)
+        provider.api_url = "https://unrelated.example/embeddings"
+        provider.api_key = "unrelated-secret"  # ty: ignore[invalid-assignment]
+        provider.api_version = "unrelated-version"
+        provider.deployment_name = "unrelated-deployment"
+        db_session.flush()
+        test_state = _raw_embedding_provider_state(
+            db_session,
+            EmbeddingProvider.OPENAI,
+        )
+        assert test_state is not None
+        db_session.commit()
+
+        def fail_immediately_after_commit() -> None:
+            raise RuntimeError("forced failure with unrelated provider")
+
+        with pytest.raises(
+            RuntimeError,
+            match="forced failure with unrelated provider",
+        ):
+            with _disposable_pipeline_scope(
+                db_session,
+                embedding_url=embedding_url,
+                prefix=f"task8_unrelated_provider_{uuid4().hex}_",
+                after_configuration_commit=fail_immediately_after_commit,
+            ):
+                pytest.fail("scope yielded after the forced post-commit failure")
+
+        assert (
+            _raw_embedding_provider_state(db_session, EmbeddingProvider.OPENAI)
+            == test_state
+        )
+    finally:
+        db_session.rollback()
+        current_state = _raw_embedding_provider_state(
+            db_session,
+            EmbeddingProvider.OPENAI,
+        )
+        if current_state == test_state:
+            _restore_raw_embedding_provider_state(
+                db_session,
+                EmbeddingProvider.OPENAI,
+                state_before_test,
+            )
+            db_session.commit()
+        elif current_state != state_before_test:
+            raise RuntimeError(
+                "unrelated embedding provider changed outside the test boundary"
+            )
+
+
 def test_cleanup_failure_preserves_primary_exception_and_runs_later_stages(
     db_session: Session,
     tenant_context: None,  # noqa: ARG001
@@ -764,12 +853,16 @@ def test_cleanup_failure_preserves_primary_exception_and_runs_later_stages(
     _assert_no_disposable_pipeline_state(db_session, prefix, resources)
 
 
-def _raw_openrouter_provider_state(db_session: Session) -> tuple[object, ...] | None:
+def _raw_embedding_provider_state(
+    db_session: Session,
+    provider_type: EmbeddingProvider,
+) -> tuple[object, ...] | None:
     row = db_session.execute(
         text(
             "SELECT provider_type, api_url, api_key, api_version, deployment_name "
-            "FROM embedding_provider WHERE provider_type = 'OPENROUTER'"
-        )
+            "FROM embedding_provider WHERE provider_type = :provider_type"
+        ),
+        {"provider_type": provider_type.name},
     ).one_or_none()
     if row is None:
         return None
@@ -779,25 +872,168 @@ def _raw_openrouter_provider_state(db_session: Session) -> tuple[object, ...] | 
     return tuple(values)
 
 
+def _raw_openrouter_provider_state(db_session: Session) -> tuple[object, ...] | None:
+    return _raw_embedding_provider_state(db_session, EmbeddingProvider.OPENROUTER)
+
+
+def _restore_raw_embedding_provider_state(
+    db_session: Session,
+    provider_type: EmbeddingProvider,
+    state: tuple[object, ...] | None,
+) -> None:
+    if state is None:
+        provider = db_session.get(
+            CloudEmbeddingProvider,
+            provider_type,
+        )
+        if provider is not None:
+            db_session.delete(provider)
+        return
+
+    raw_provider_type, api_url, api_key, api_version, deployment_name = state
+    if raw_provider_type != provider_type.name:
+        raise RuntimeError("embedding-provider raw state has the wrong identity")
+    db_session.execute(
+        text(
+            "INSERT INTO embedding_provider "
+            "(provider_type, api_url, api_key, api_version, deployment_name) "
+            "VALUES (:provider_type, :api_url, :api_key, :api_version, "
+            ":deployment_name) "
+            "ON CONFLICT (provider_type) DO UPDATE SET "
+            "api_url = EXCLUDED.api_url, api_key = EXCLUDED.api_key, "
+            "api_version = EXCLUDED.api_version, "
+            "deployment_name = EXCLUDED.deployment_name"
+        ),
+        {
+            "provider_type": raw_provider_type,
+            "api_url": api_url,
+            "api_key": api_key,
+            "api_version": api_version,
+            "deployment_name": deployment_name,
+        },
+    )
+
+
+@contextmanager
+def _preexisting_openrouter_provider_scope(
+    db_session: Session,
+    *,
+    after_configuration_commit: Callable[[], None] | None = None,
+) -> Iterator[tuple[object, ...]]:
+    state_before_test = _raw_openrouter_provider_state(db_session)
+    test_state: tuple[object, ...] | None = None
+
+    def cleanup() -> None:
+        db_session.rollback()
+        current_state = _raw_openrouter_provider_state(db_session)
+        if current_state == state_before_test:
+            return
+        if test_state is None or current_state != test_state:
+            raise RuntimeError(
+                "preexisting-provider fixture changed outside its cleanup boundary"
+            )
+        _restore_raw_embedding_provider_state(
+            db_session,
+            EmbeddingProvider.OPENROUTER,
+            state_before_test,
+        )
+        db_session.commit()
+
+    try:
+        provider = db_session.get(
+            CloudEmbeddingProvider,
+            EmbeddingProvider.OPENROUTER,
+        )
+        if provider is None:
+            provider = CloudEmbeddingProvider(
+                provider_type=EmbeddingProvider.OPENROUTER,
+            )
+            db_session.add(provider)
+        provider.api_url = "https://preexisting.example/embeddings"
+        provider.api_key = "preexisting-secret"  # ty: ignore[invalid-assignment]
+        provider.api_version = "preexisting-version"
+        provider.deployment_name = "preexisting-deployment"
+        db_session.flush()
+        test_state = _raw_openrouter_provider_state(db_session)
+        if test_state is None:
+            raise RuntimeError("preexisting OpenRouter provider state was not recorded")
+        db_session.commit()
+        if after_configuration_commit is not None:
+            after_configuration_commit()
+        yield test_state
+    except BaseException as primary_error:
+        try:
+            cleanup()
+        except Exception as cleanup_error:
+            primary_error.add_note(str(cleanup_error))
+        raise
+    else:
+        cleanup()
+
+
+def test_preexisting_provider_fixture_restores_when_setup_fails_after_commit(
+    db_session: Session,
+) -> None:
+    state_before_test = _raw_openrouter_provider_state(db_session)
+
+    def fail_immediately_after_commit() -> None:
+        raise RuntimeError("forced preexisting-provider setup failure")
+
+    with pytest.raises(
+        RuntimeError,
+        match="forced preexisting-provider setup failure",
+    ):
+        with _preexisting_openrouter_provider_scope(
+            db_session,
+            after_configuration_commit=fail_immediately_after_commit,
+        ):
+            pytest.fail("fixture yielded after the forced post-commit failure")
+
+    assert _raw_openrouter_provider_state(db_session) == state_before_test
+
+
+def test_preexisting_provider_fixture_restores_when_raw_snapshot_fails(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_before_test = _raw_openrouter_provider_state(db_session)
+    real_state_reader = _raw_openrouter_provider_state
+    calls = 0
+
+    def fail_before_test_state_is_recorded(
+        session: Session,
+    ) -> tuple[object, ...] | None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("forced failure before raw provider snapshot")
+        return real_state_reader(session)
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_raw_openrouter_provider_state",
+        fail_before_test_state_is_recorded,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="forced failure before raw provider snapshot",
+    ):
+        with _preexisting_openrouter_provider_scope(db_session):
+            pytest.fail("fixture yielded without recording its raw test state")
+
+    assert calls == 3
+    assert real_state_reader(db_session) == state_before_test
+
+
 def test_preexisting_openrouter_provider_is_locked_and_restored_exactly(
     db_session: Session,
     tenant_context: None,  # noqa: ARG001
     embedding_server: tuple[str, list[dict[str, object]]],
 ) -> None:
     embedding_url, _requests = embedding_server
-    original_provider = CloudEmbeddingProvider(
-        provider_type=EmbeddingProvider.OPENROUTER,
-        api_url="https://preexisting.example/embeddings",
-        api_key="preexisting-secret",
-        api_version="preexisting-version",
-        deployment_name="preexisting-deployment",
-    )
-    db_session.add(original_provider)
-    db_session.commit()
-    original_state = _raw_openrouter_provider_state(db_session)
-    assert original_state is not None
-
-    try:
+    state_before_test = _raw_openrouter_provider_state(db_session)
+    with _preexisting_openrouter_provider_scope(db_session) as original_state:
         with _disposable_pipeline_scope(
             db_session,
             embedding_url=embedding_url,
@@ -821,17 +1057,7 @@ def test_preexisting_openrouter_provider_is_locked_and_restored_exactly(
 
         db_session.expire_all()
         assert _raw_openrouter_provider_state(db_session) == original_state
-    finally:
-        db_session.rollback()
-        persisted_provider = db_session.get(
-            CloudEmbeddingProvider, EmbeddingProvider.OPENROUTER
-        )
-        if (
-            persisted_provider is not None
-            and _raw_openrouter_provider_state(db_session) == original_state
-        ):
-            db_session.delete(persisted_provider)
-        db_session.commit()
+    assert _raw_openrouter_provider_state(db_session) == state_before_test
 
 
 def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(

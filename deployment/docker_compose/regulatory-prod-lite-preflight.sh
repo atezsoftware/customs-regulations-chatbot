@@ -38,7 +38,8 @@ Options:
 The shipped regulatory overlays are fixed and cannot be replaced from the command line. Backend and
 web services must use reviewed repository@sha256 digests and have no build definitions. Import and
 indexing workers, ambiguous local/external infrastructure, and generic multi-tenant migrations are
-rejected.
+rejected. One disposable, read-only, no-network backend container validates the readiness files
+through the same descriptor-owned reader used by the live readiness command.
 EOF
 }
 
@@ -535,18 +536,6 @@ attestation_path=$(jq -er '
   | select(.target == "/run/readiness/regulatory-capabilities.json")
   | .source
 ' "$config_file") || die "the readiness capability attestation source cannot be resolved"
-[[ -f "$attestation_path" ]] || \
-  die "the readiness capability attestation must be a regular host file"
-attestation_mode=$(stat -c '%a' -- "$attestation_path") || \
-  die "the readiness capability attestation mode cannot be read"
-[[ "$attestation_mode" == "600" ]] || \
-  die "the readiness capability attestation host file must have mode 0600"
-attestation_uid=$(stat -c '%u' -- "$attestation_path") || \
-  die "the readiness capability attestation owner cannot be read"
-attestation_gid=$(stat -c '%g' -- "$attestation_path") || \
-  die "the readiness capability attestation group cannot be read"
-[[ "$attestation_uid" == "1001" && "$attestation_gid" == "1001" ]] || \
-  die "the readiness capability attestation must be owned by numeric UID/GID 1001:1001"
 
 evidence_mount_count=$(jq '[
     (.services.background.volumes // [])[]
@@ -563,28 +552,6 @@ evidence_path=$(jq -er '
 ' "$config_file") || die "the readiness capability evidence source cannot be resolved"
 [[ "$evidence_path" != "$attestation_path" ]] || \
   die "the readiness attestation and archived IAM evidence must be distinct files"
-[[ ! -L "$attestation_path" ]] || \
-  die "the readiness capability attestation must not be a symlink"
-[[ ! -L "$evidence_path" && -f "$evidence_path" ]] || \
-  die "the readiness capability evidence must be a regular host file, not a symlink"
-evidence_mode=$(stat -c '%a' -- "$evidence_path") || \
-  die "the readiness capability evidence mode cannot be read"
-[[ "$evidence_mode" == "400" ]] || \
-  die "the readiness capability evidence host file must have mode 0400"
-evidence_uid=$(stat -c '%u' -- "$evidence_path") || \
-  die "the readiness capability evidence owner cannot be read"
-evidence_gid=$(stat -c '%g' -- "$evidence_path") || \
-  die "the readiness capability evidence group cannot be read"
-[[ "$evidence_uid" == "1001" && "$evidence_gid" == "1001" ]] || \
-  die "the readiness capability evidence must be owned by numeric UID/GID 1001:1001"
-attestation_size=$(stat -c '%s' -- "$attestation_path") || \
-  die "the readiness capability attestation size cannot be read"
-evidence_size=$(stat -c '%s' -- "$evidence_path") || \
-  die "the readiness capability evidence size cannot be read"
-(( attestation_size > 0 && attestation_size <= 65536 )) || \
-  die "the readiness capability attestation must be non-empty and at most 65536 bytes"
-(( evidence_size > 0 && evidence_size <= 4194304 )) || \
-  die "the readiness capability evidence must be non-empty and at most 4194304 bytes"
 
 if [[ "$model_mode" == "local" ]]; then
   jq -e '
@@ -762,4 +729,28 @@ if [[ "$model_mode" == "local" && -n "$expected_model_image" ]]; then
     "$profiled_config_file" >/dev/null || die "the rendered model digest does not match --expected-model-image"
 fi
 
-printf '%s\n' "Regulatory production-lite preflight passed. No Docker state was changed."
+background_image=$(jq -er '.services.background.image' "$config_file") || \
+  die "the rendered background image cannot be resolved for readiness-file validation"
+if ! docker run \
+  --rm \
+  --pull never \
+  --network none \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --pids-limit 64 \
+  --user 1001:1001 \
+  --mount "type=bind,source=$attestation_path,target=/run/readiness/regulatory-capabilities.json,readonly" \
+  --mount "type=bind,source=$evidence_path,target=/run/readiness/regulatory-capability-evidence.json,readonly" \
+  --entrypoint /usr/local/bin/python \
+  "$background_image" \
+  /app/scripts/regulatory_indexing_readiness.py \
+  --validate-capability-files-only \
+  --capability-attestation /run/readiness/regulatory-capabilities.json \
+  --capability-evidence /run/readiness/regulatory-capability-evidence.json \
+  >"$config_error_file" 2>&1; then
+  die "the readiness capability files failed secure descriptor validation in the runtime image"
+fi
+
+printf '%s\n' \
+  "Regulatory production-lite preflight passed. No managed service or persistent Docker state was changed."

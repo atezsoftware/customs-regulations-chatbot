@@ -214,6 +214,15 @@ if [[ "${1:-}" == "inspect" ]]; then
   printf '%s\\n' 'sha256:7777777777777777777777777777777777777777777777777777777777777777'
   exit 0
 fi
+if [[ "${1:-}" == "run" && " $* " == *" --validate-capability-files-only "* ]]; then
+  if [[ "$FAKE_ATTESTATION_OWNER" != "1001" || "$FAKE_ATTESTATION_MODE" != "600" ]]; then
+    exit 42
+  fi
+  if [[ "$FAKE_EVIDENCE_OWNER" != "1001" || "$FAKE_EVIDENCE_MODE" != "400" ]]; then
+    exit 42
+  fi
+  exit 0
+fi
 if [[ " $* " == *" config --services "* ]]; then
   command cat "$FAKE_COMPOSE_SERVICES"
   exit 0
@@ -309,7 +318,9 @@ exec /usr/bin/stat "$@"
             "FAKE_ATTESTATION_PATH": str(attestation_path),
             "FAKE_EVIDENCE_PATH": str(evidence_path),
             "FAKE_ATTESTATION_OWNER": attestation_owner,
+            "FAKE_ATTESTATION_MODE": f"{attestation_mode:o}",
             "FAKE_EVIDENCE_OWNER": evidence_owner,
+            "FAKE_EVIDENCE_MODE": f"{evidence_mode:o}",
             "_MODEL_IMAGE": _MODEL_IMAGE,
             "_WEB_IMAGE": _WEB_IMAGE,
         }
@@ -413,14 +424,55 @@ def test_preflight_accepts_digest_pinned_parser_free_runtime(tmp_path: Path) -> 
     )
 
     assert result.returncode == 0, result.stderr
-    assert "No Docker state was changed" in result.stdout
+    assert "No managed service or persistent Docker state was changed" in result.stdout
+
+
+def test_preflight_delegates_capability_files_to_no_network_secure_reader(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+            "--expected-image",
+            _IMAGE,
+            "--expected-web-image",
+            _WEB_IMAGE,
+            "--expected-model-image",
+            _MODEL_IMAGE,
+        ],
+        env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
+    assert "run --rm --pull never --network none --read-only" in docker_log
+    assert "--user 1001:1001" in docker_log
+    assert _IMAGE in docker_log
+    assert "/app/scripts/regulatory_indexing_readiness.py" in docker_log
+    assert "--validate-capability-files-only" in docker_log
 
 
 @pytest.mark.parametrize(
     ("read_only", "owner", "expected_error"),
     [
         (False, "1001", "attestation bind mount"),
-        (True, "1000", "owned by numeric UID/GID 1001:1001"),
+        (True, "1000", "failed secure descriptor validation"),
     ],
 )
 def test_preflight_rejects_untrusted_readiness_attestation_mount(
@@ -502,8 +554,8 @@ def test_preflight_rejects_missing_archived_capability_evidence_mount(
     ("read_only", "owner", "mode", "expected_error"),
     [
         (False, "1001", 0o400, "archived capability evidence bind mount"),
-        (True, "1000", 0o400, "owned by numeric UID/GID 1001:1001"),
-        (True, "1001", 0o600, "mode 0400"),
+        (True, "1000", 0o400, "failed secure descriptor validation"),
+        (True, "1001", 0o600, "failed secure descriptor validation"),
     ],
 )
 def test_preflight_rejects_untrusted_archived_capability_evidence(

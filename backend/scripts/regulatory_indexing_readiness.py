@@ -14,6 +14,7 @@ import datetime
 import hashlib
 import hmac
 import json
+import os
 import re
 import shlex
 import socket
@@ -623,7 +624,7 @@ def _validate_dense_vector_mapping(
                 )
 
 
-def _validated_secure_file(
+def _read_secure_file(
     path: Path,
     *,
     expected_mode: int,
@@ -631,33 +632,94 @@ def _validated_secure_file(
     expected_owner_gid: int,
     maximum_size: int,
     label: str,
-) -> None:
-    try:
-        metadata = path.lstat()
-    except OSError as error:
-        raise ReadinessCheckError(f"{label} is unavailable") from error
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ReadinessCheckError(f"{label} must be a regular file, not a symlink")
+    open_file: Callable[[Path, int], int] = os.open,
+) -> bytes:
+    no_follow_flag = getattr(os, "O_NOFOLLOW", None)
+    close_on_exec_flag = getattr(os, "O_CLOEXEC", None)
     if (
-        stat.S_IMODE(metadata.st_mode) != expected_mode
-        or metadata.st_uid != expected_owner_uid
-        or metadata.st_gid != expected_owner_gid
+        not isinstance(no_follow_flag, int)
+        or no_follow_flag == 0
+        or not isinstance(close_on_exec_flag, int)
+        or close_on_exec_flag == 0
     ):
         raise ReadinessCheckError(
-            f"{label} must be owned by runtime UID/GID "
-            f"{expected_owner_uid}:{expected_owner_gid} with mode "
-            f"{expected_mode:04o}"
+            f"{label} cannot be opened with required secure-open semantics"
         )
-    if metadata.st_size <= 0 or metadata.st_size > maximum_size:
-        raise ReadinessCheckError(f"{label} exceeds its maximum size or is empty")
+
+    try:
+        descriptor = open_file(
+            path,
+            os.O_RDONLY | no_follow_flag | close_on_exec_flag,
+        )
+    except OSError as error:
+        raise ReadinessCheckError(
+            f"{label} must be an available regular file, not a symlink"
+        ) from error
+
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ReadinessCheckError(f"{label} must be a regular file")
+            if (
+                stat.S_IMODE(metadata.st_mode) != expected_mode
+                or metadata.st_uid != expected_owner_uid
+                or metadata.st_gid != expected_owner_gid
+            ):
+                raise ReadinessCheckError(
+                    f"{label} must be owned by runtime UID/GID "
+                    f"{expected_owner_uid}:{expected_owner_gid} with mode "
+                    f"{expected_mode:04o}"
+                )
+            if metadata.st_size <= 0 or metadata.st_size > maximum_size:
+                raise ReadinessCheckError(
+                    f"{label} exceeds its maximum size or is empty"
+                )
+
+            contents = bytearray()
+            while len(contents) <= maximum_size:
+                remaining = maximum_size + 1 - len(contents)
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                contents.extend(chunk)
+            if not contents or len(contents) > maximum_size:
+                raise ReadinessCheckError(
+                    f"{label} exceeds its maximum size or is empty"
+                )
+            return bytes(contents)
+        except ReadinessCheckError:
+            raise
+        except OSError as error:
+            raise ReadinessCheckError(f"{label} cannot be read securely") from error
+    finally:
+        os.close(descriptor)
 
 
-def _streaming_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(64 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _read_capability_files(
+    attestation_path: Path,
+    evidence_path: Path,
+    *,
+    expected_owner_uid: int,
+    expected_owner_gid: int,
+) -> tuple[bytes, bytes]:
+    attestation_bytes = _read_secure_file(
+        attestation_path,
+        expected_mode=0o600,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+        maximum_size=_ATTESTATION_MAX_BYTES,
+        label="capability attestation",
+    )
+    evidence_bytes = _read_secure_file(
+        evidence_path,
+        expected_mode=0o400,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+        maximum_size=_CAPABILITY_EVIDENCE_MAX_BYTES,
+        label="capability evidence",
+    )
+    return attestation_bytes, evidence_bytes
 
 
 def _validate_capability_attestation(
@@ -669,25 +731,15 @@ def _validate_capability_attestation(
     expected_owner_uid: int = _ATTESTATION_OWNER_UID,
     expected_owner_gid: int = _ATTESTATION_OWNER_GID,
 ) -> str:
-    _validated_secure_file(
+    attestation_bytes, evidence_bytes = _read_capability_files(
         attestation_path,
-        expected_mode=0o600,
-        expected_owner_uid=expected_owner_uid,
-        expected_owner_gid=expected_owner_gid,
-        maximum_size=_ATTESTATION_MAX_BYTES,
-        label="capability attestation",
-    )
-    _validated_secure_file(
         evidence_path,
-        expected_mode=0o400,
         expected_owner_uid=expected_owner_uid,
         expected_owner_gid=expected_owner_gid,
-        maximum_size=_CAPABILITY_EVIDENCE_MAX_BYTES,
-        label="capability evidence",
     )
     try:
-        parsed: object = json.loads(attestation_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        parsed: object = json.loads(attestation_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ReadinessCheckError(
             "capability attestation is unavailable or invalid"
         ) from error
@@ -712,10 +764,7 @@ def _validate_capability_attestation(
         raise ReadinessCheckError(
             "capability attestation evidence reference has invalid digest binding"
         )
-    try:
-        actual_evidence_sha256 = _streaming_sha256(evidence_path)
-    except OSError as error:
-        raise ReadinessCheckError("capability evidence cannot be hashed") from error
+    actual_evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
     if not hmac.compare_digest(evidence_sha256, actual_evidence_sha256):
         raise ReadinessCheckError(
             "capability attestation does not match the actual evidence digest"
@@ -826,11 +875,35 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "are hashed but never emitted."
         ),
     )
+    parser.add_argument(
+        "--validate-capability-files-only",
+        action="store_true",
+        help=(
+            "Validate only descriptor-owned capability file security and size; "
+            "perform no database or network checks."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.validate_capability_files_only:
+        if args.capability_attestation is None or args.capability_evidence is None:
+            print("NOT_READY capability files are required")
+            return EXIT_NOT_READY
+        try:
+            _read_capability_files(
+                args.capability_attestation,
+                args.capability_evidence,
+                expected_owner_uid=_ATTESTATION_OWNER_UID,
+                expected_owner_gid=_ATTESTATION_OWNER_GID,
+            )
+        except ReadinessCheckError as error:
+            print(f"NOT_READY {error}")
+            return EXIT_NOT_READY
+        print("READY capability files passed secure local validation")
+        return EXIT_READY
     SqlEngine.init_engine(pool_size=1, max_overflow=0)
     report = run_readiness_checks(
         OnyxReadinessBackend(
