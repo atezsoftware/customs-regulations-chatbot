@@ -1478,6 +1478,32 @@ CONTINUE_ON_CONNECTOR_FAILURE = os.environ.get(
 # context to isolate the failing item and silently advancing would risk
 # skipping source data. Operators must triage those by fixing the connector.
 PERSISTENT_INDEXING = os.environ.get("PERSISTENT_INDEXING", "").lower() == "true"
+
+# Durable regulatory indexing remains opt-in while the dedicated worker is
+# rolled out. Admin model configuration remains the model source of truth.
+REGULATORY_BATCH_INDEXING_ENABLED = (
+    os.environ.get("REGULATORY_BATCH_INDEXING_ENABLED", "false").lower() == "true"
+)
+REGULATORY_INDEXING_GCS_URI = os.environ.get("REGULATORY_INDEXING_GCS_URI") or None
+REGULATORY_INDEXING_MAX_ATTEMPTS = max(
+    1, int(os.environ.get("REGULATORY_INDEXING_MAX_ATTEMPTS") or 5)
+)
+REGULATORY_INDEXING_RETRY_BASE_SECONDS = max(
+    0.001, float(os.environ.get("REGULATORY_INDEXING_RETRY_BASE_SECONDS") or 15)
+)
+REGULATORY_INDEXING_RETRY_MAX_SECONDS = max(
+    REGULATORY_INDEXING_RETRY_BASE_SECONDS,
+    float(os.environ.get("REGULATORY_INDEXING_RETRY_MAX_SECONDS") or 900),
+)
+REGULATORY_INDEXING_POLL_SECONDS = max(
+    0.001, float(os.environ.get("REGULATORY_INDEXING_POLL_SECONDS") or 30)
+)
+REGULATORY_INDEXING_LEASE_SECONDS = max(
+    0.001, float(os.environ.get("REGULATORY_INDEXING_LEASE_SECONDS") or 120)
+)
+REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE = max(
+    1, int(os.environ.get("REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE") or 64)
+)
 # When swapping to a new embedding model, a secondary index is created in the background, to conserve
 # resources, we pause updates on the primary index by default while the secondary index is created
 DISABLE_INDEX_UPDATE_ON_SWAP = (
