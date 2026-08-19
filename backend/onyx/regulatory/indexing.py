@@ -13,13 +13,14 @@ uses, so a pipeline failure rolls back the chunk rows together with the rest
 of the indexing bookkeeping.
 """
 
+from collections.abc import Sequence
 from uuid import UUID
 
 from chonkie import SentenceChunker
 from sqlalchemy.orm import Session
 
 from onyx.configs.app_configs import BLURB_SIZE
-from onyx.connectors.models import IndexingDocument
+from onyx.connectors.models import Document, IndexingDocument
 from onyx.db.regulatory_chunks import replace_indexed_chunks_for_file
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.indexing.chunking import extract_blurb
@@ -41,6 +42,47 @@ logger = setup_logger()
 REGULATORY_MAX_CHUNK_CHARS = 2400
 REGULATORY_CONTEXTUAL_INITIAL_MAX_CHUNK_CHARS = 1200
 REGULATORY_CONTEXTUAL_MIN_MAX_CHUNK_CHARS = 500
+
+
+def _as_indexing_document(document: Document) -> IndexingDocument:
+    if isinstance(document, IndexingDocument):
+        return document
+    return IndexingDocument(
+        **document.model_dump(),
+        processed_sections=[section.model_copy() for section in document.sections],
+    )
+
+
+def document_text_for_regulatory_indexing(document: Document) -> str:
+    """Return the exact ordered text consumed by the regulatory chunker."""
+
+    indexing_document = _as_indexing_document(document)
+    parts: list[str] = []
+    sections = indexing_document.processed_sections or indexing_document.sections
+    for section in sections:
+        section_text = getattr(section, "text", None)
+        if section_text and section_text.strip():
+            parts.append(section_text.strip())
+    return "\n\n".join(parts)
+
+
+def documents_to_regulatory_chunks(
+    documents: Sequence[Document],
+    db_session: Session,
+    tokenizer: BaseTokenizer,
+    *,
+    callback: IndexingHeartbeatInterface | None = None,
+    enable_contextual_rag: bool = True,
+) -> list[DocAwareChunk]:
+    """Persist canonical chunks through the maintained indexing chunker boundary."""
+
+    indexing_documents = [_as_indexing_document(document) for document in documents]
+    return RegulatoryIndexingChunker(
+        db_session=db_session,
+        tokenizer=tokenizer,
+        callback=callback,
+        enable_contextual_rag=enable_contextual_rag,
+    ).chunk(indexing_documents)
 
 
 class RegulatoryIndexingChunker:
@@ -98,7 +140,7 @@ class RegulatoryIndexingChunker:
         # (see _load_user_file_documents).
         user_file_id = UUID(document.id)
 
-        text = self._document_text(document)
+        text = document_text_for_regulatory_indexing(document)
         source_file = document.semantic_identifier or document.id
         chunked, contextual_rag_reserved_tokens = self._chunk_with_embedding_budget(
             text,
@@ -219,18 +261,3 @@ class RegulatoryIndexingChunker:
                 REGULATORY_CONTEXTUAL_MIN_MAX_CHUNK_CHARS,
                 min(max_chunk_chars - 1, scaled_limit),
             )
-
-    @staticmethod
-    def _document_text(document: IndexingDocument) -> str:
-        """Full markdown/plaintext of the document, in section order.
-
-        Image sections have no useful text for regulatory chunking and are
-        skipped.
-        """
-        parts: list[str] = []
-        sections = document.processed_sections or document.sections
-        for section in sections:
-            section_text = getattr(section, "text", None)
-            if section_text and section_text.strip():
-                parts.append(section_text.strip())
-        return "\n\n".join(parts)
