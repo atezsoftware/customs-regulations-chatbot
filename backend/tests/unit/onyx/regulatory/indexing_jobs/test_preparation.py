@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from onyx.configs.constants import DocumentSource
 from onyx.connectors.models import Document, TextSection
+from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.enums import RegulatoryIndexingItemStatus
 from onyx.db.models import (
     RegulatoryChunk,
@@ -138,6 +140,100 @@ MADDE 12 - (1) Transit rejiminde teminat aranır.
     db_session.flush.assert_called_once_with()
 
 
+def test_public_boundary_aggregates_same_file_documents_before_one_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_file_id = uuid4()
+    replacement_batches: list[list[ChunkerRegulatoryChunk]] = []
+
+    def replace_chunks(
+        _db_session: Session,
+        persisted_user_file_id: UUID,
+        chunks: list[ChunkerRegulatoryChunk],
+    ) -> list[RegulatoryChunk]:
+        assert persisted_user_file_id == user_file_id
+        replacement_batches.append(chunks)
+        return cast(
+            list[RegulatoryChunk],
+            [
+                SimpleNamespace(
+                    id=f"rc_{index}",
+                    position=chunk.metadata.chunk_order,
+                    heading_path=list(chunk.metadata.heading_path),
+                    validity_start_date=None,
+                    validity_end_date=None,
+                )
+                for index, chunk in enumerate(chunks)
+            ],
+        )
+
+    monkeypatch.setattr(
+        "onyx.regulatory.indexing.replace_indexed_chunks_for_file", replace_chunks
+    )
+    db_session = MagicMock(spec=Session)
+
+    actual = documents_to_regulatory_chunks(
+        documents=[
+            _document(user_file_id, "MADDE 1 - Birinci dosya bölümü."),
+            _document(user_file_id, "MADDE 2 - İkinci dosya bölümü."),
+        ],
+        db_session=db_session,
+        tokenizer=_CharacterTokenizer(),
+        enable_contextual_rag=False,
+    )
+
+    assert len(replacement_batches) == 1
+    assert [chunk.content for chunk in actual] == [
+        row.text for row in replacement_batches[0]
+    ]
+    assert "Birinci dosya bölümü" in "\n".join(chunk.content for chunk in actual)
+    assert "İkinci dosya bölümü" in "\n".join(chunk.content for chunk in actual)
+
+
+def test_legacy_chunker_keeps_different_user_files_as_separate_replacements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_file_id = uuid4()
+    second_file_id = uuid4()
+    replaced_file_ids: list[UUID] = []
+
+    def replace_chunks(
+        _db_session: Session,
+        user_file_id: UUID,
+        chunks: list[ChunkerRegulatoryChunk],
+    ) -> list[RegulatoryChunk]:
+        replaced_file_ids.append(user_file_id)
+        return cast(
+            list[RegulatoryChunk],
+            [
+                SimpleNamespace(
+                    id=f"{user_file_id}-{index}",
+                    position=chunk.metadata.chunk_order,
+                    heading_path=list(chunk.metadata.heading_path),
+                    validity_start_date=None,
+                    validity_end_date=None,
+                )
+                for index, chunk in enumerate(chunks)
+            ],
+        )
+
+    monkeypatch.setattr(
+        "onyx.regulatory.indexing.replace_indexed_chunks_for_file", replace_chunks
+    )
+
+    documents_to_regulatory_chunks(
+        documents=[
+            _document(first_file_id, "MADDE 1 - Birinci dosya."),
+            _document(second_file_id, "MADDE 1 - İkinci dosya."),
+        ],
+        db_session=MagicMock(spec=Session),
+        tokenizer=_CharacterTokenizer(),
+        enable_contextual_rag=False,
+    )
+
+    assert replaced_file_ids == [first_file_id, second_file_id]
+
+
 @pytest.mark.parametrize(
     ("row_count", "row_text"),
     [
@@ -157,6 +253,9 @@ def test_context_ineligible_item_is_skipped_but_keeps_original_embedding_text(
         SimpleNamespace(
             id=job_id,
             user_file_id=user_file_id,
+            content_hash=preparation._regulatory_documents_content_hash(
+                [_document(user_file_id, row_text)]
+            ),
             lease_generation=0,
             config_snapshot=_snapshot().model_dump(mode="json"),
         ),
@@ -170,12 +269,13 @@ def test_context_ineligible_item_is_skipped_but_keeps_original_embedding_text(
                 position=index,
                 text=row_text if index == 0 else "MADDE 2 - Kısa hüküm.",
                 heading_path=[f"MADDE {index + 1}"],
+                validity_start_date=None,
+                validity_end_date=None,
             )
             for index in range(row_count)
         ],
     )
-    items: dict[str, RegulatoryIndexingItem] = {}
-    skipped_item_ids: list[UUID] = []
+    prepared_items: list[indexing_job_repository.RegulatoryIndexingPreparedItem] = []
 
     monkeypatch.setattr(
         preparation,
@@ -198,6 +298,11 @@ def test_context_ineligible_item_is_skipped_but_keeps_original_embedding_text(
         lambda *_args, **_kwargs: True,
     )
     monkeypatch.setattr(
+        preparation,
+        "get_regulatory_indexing_job",
+        lambda *_args, **_kwargs: job,
+    )
+    monkeypatch.setattr(
         preparation, "documents_to_regulatory_chunks", lambda **_kwargs: []
     )
     monkeypatch.setattr(
@@ -206,41 +311,21 @@ def test_context_ineligible_item_is_skipped_but_keeps_original_embedding_text(
         lambda *_args, **_kwargs: rows,
     )
 
-    def create_item(*_args: object, **kwargs: object) -> RegulatoryIndexingItem:
-        row_id = cast(str, kwargs["regulatory_chunk_id"])
-        item = cast(
-            RegulatoryIndexingItem,
-            SimpleNamespace(
-                id=uuid4(),
-                job_id=job_id,
-                regulatory_chunk_id=row_id,
-                request_hash=kwargs["request_hash"],
-                status=RegulatoryIndexingItemStatus.PENDING.value,
-                context=None,
-            ),
+    def persist_preparation(
+        _session: Session,
+        **kwargs: object,
+    ) -> bool:
+        callback = cast(
+            Callable[[], list[indexing_job_repository.RegulatoryIndexingPreparedItem]],
+            kwargs["prepare_items"],
         )
-        items[row_id] = item
-        return item
-
-    monkeypatch.setattr(
-        preparation, "create_or_get_regulatory_indexing_item", create_item
-    )
-
-    def persist_skipped(*_args: object, **kwargs: object) -> bool:
-        item_id = cast(UUID, kwargs["item_id"])
-        skipped_item_ids.append(item_id)
-        for item in items.values():
-            if item.id == item_id:
-                item.status = RegulatoryIndexingItemStatus.SKIPPED.value
+        prepared_items.extend(callback())
         return True
 
     monkeypatch.setattr(
-        preparation, "persist_regulatory_indexing_item_skipped", persist_skipped
-    )
-    monkeypatch.setattr(
-        preparation,
-        "advance_regulatory_indexing_job",
-        lambda *_args, **_kwargs: True,
+        indexing_job_repository,
+        "persist_regulatory_indexing_preparation",
+        persist_preparation,
     )
 
     preparation.prepare_regulatory_indexing_job(
@@ -250,8 +335,22 @@ def test_context_ineligible_item_is_skipped_but_keeps_original_embedding_text(
         db_session=cast(Session, SimpleNamespace()),
     )
 
-    first_item = items[rows[0].id]
-    assert first_item.id in skipped_item_ids
+    first_spec = next(
+        item for item in prepared_items if item.regulatory_chunk_id == rows[0].id
+    )
+    first_item = cast(
+        RegulatoryIndexingItem,
+        SimpleNamespace(
+            regulatory_chunk_id=first_spec.regulatory_chunk_id,
+            status=(
+                RegulatoryIndexingItemStatus.SKIPPED.value
+                if first_spec.skip_context
+                else RegulatoryIndexingItemStatus.PENDING.value
+            ),
+            context=None,
+        ),
+    )
+    assert first_spec.skip_context
     assert first_item.status == RegulatoryIndexingItemStatus.SKIPPED.value
     assert contextualized_embedding_text(rows[0], first_item) == row_text
 
@@ -266,6 +365,9 @@ def test_duplicate_preparation_does_not_replace_successful_item_state(
         SimpleNamespace(
             id=job_id,
             user_file_id=user_file_id,
+            content_hash=preparation._regulatory_documents_content_hash(
+                [_document(user_file_id, "MADDE 1 - Transit hükmü.")]
+            ),
             lease_generation=0,
             config_snapshot=_snapshot().model_dump(mode="json"),
         ),
@@ -279,6 +381,8 @@ def test_duplicate_preparation_does_not_replace_successful_item_state(
                 position=index,
                 text=f"MADDE {index + 1} - Transit hükmü.",
                 heading_path=[f"MADDE {index + 1}"],
+                validity_start_date=None,
+                validity_end_date=None,
             )
             for index in range(2)
         ],
@@ -315,6 +419,11 @@ def test_duplicate_preparation_does_not_replace_successful_item_state(
         "claim_regulatory_indexing_job",
         lambda *_args, **_kwargs: next(claims),
     )
+    monkeypatch.setattr(
+        preparation,
+        "get_regulatory_indexing_job",
+        lambda *_args, **_kwargs: job,
+    )
 
     def replace_chunks(**_kwargs: object) -> list[object]:
         nonlocal replacement_calls
@@ -328,23 +437,10 @@ def test_duplicate_preparation_does_not_replace_successful_item_state(
         lambda *_args, **_kwargs: rows,
     )
 
-    def create_item(*_args: object, **kwargs: object) -> RegulatoryIndexingItem:
-        raw_item.regulatory_chunk_id = kwargs["regulatory_chunk_id"]
-        raw_item.request_hash = kwargs["request_hash"]
-        return item
-
     monkeypatch.setattr(
-        preparation, "create_or_get_regulatory_indexing_item", create_item
-    )
-    monkeypatch.setattr(
-        preparation,
-        "persist_regulatory_indexing_item_skipped",
-        lambda *_args, **_kwargs: True,
-    )
-    monkeypatch.setattr(
-        preparation,
-        "advance_regulatory_indexing_job",
-        lambda *_args, **_kwargs: True,
+        indexing_job_repository,
+        "persist_regulatory_indexing_preparation",
+        lambda _session, **kwargs: bool(kwargs["prepare_items"]()),
     )
     document = _document(user_file_id, "MADDE 1 - Transit hükmü.")
 
@@ -361,3 +457,106 @@ def test_duplicate_preparation_does_not_replace_successful_item_state(
     assert replacement_calls == 1
     assert item.status == RegulatoryIndexingItemStatus.CONTEXT_READY.value
     assert item.context == {"contextual_text": "Başarıyla üretilen bağlam."}
+
+
+def test_claimed_preparation_resumes_without_claiming_again_and_advances_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_file_id = uuid4()
+    job_id = uuid4()
+    snapshot = _snapshot()
+    job = cast(
+        RegulatoryIndexingJob,
+        SimpleNamespace(
+            id=job_id,
+            user_file_id=user_file_id,
+            content_hash=preparation._regulatory_documents_content_hash(
+                [_document(user_file_id, "MADDE 1 - Kurtarılan hazırlık.")]
+            ),
+            lease_generation=3,
+            status="RUNNING",
+            stage="PREPARING",
+            config_snapshot=snapshot.model_dump(mode="json"),
+        ),
+    )
+    row = cast(
+        RegulatoryChunk,
+        SimpleNamespace(
+            id="rc_recovered",
+            user_file_id=user_file_id,
+            position=0,
+            text="MADDE 1 - Kurtarılan hazırlık.",
+            heading_path=["MADDE 1"],
+            validity_start_date=None,
+            validity_end_date=None,
+        ),
+    )
+    tokenizer_calls: list[tuple[str | None, object]] = []
+    atomic_calls: list[tuple[UUID, int]] = []
+
+    monkeypatch.setattr(
+        preparation,
+        "get_regulatory_indexing_job",
+        lambda _session, persisted_job_id: job if persisted_job_id == job_id else None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        preparation,
+        "claim_regulatory_indexing_job",
+        lambda *_args, **_kwargs: pytest.fail("claimed recovery must not claim again"),
+    )
+
+    def get_distinct_tokenizer(
+        model_name: str | None, provider: object
+    ) -> _CharacterTokenizer:
+        tokenizer_calls.append((model_name, provider))
+        return _CharacterTokenizer()
+
+    monkeypatch.setattr(preparation, "get_tokenizer", get_distinct_tokenizer)
+    monkeypatch.setattr(
+        preparation, "documents_to_regulatory_chunks", lambda **_kwargs: []
+    )
+    monkeypatch.setattr(
+        preparation,
+        "get_chunks_for_file",
+        lambda *_args, **_kwargs: [row],
+    )
+
+    def persist_atomically(
+        _session: Session,
+        *,
+        job_id: UUID,
+        expected_generation: int,
+        prepare_items: Callable[
+            [], list[indexing_job_repository.RegulatoryIndexingPreparedItem]
+        ],
+        now: object,
+    ) -> bool:
+        del now
+        atomic_calls.append((job_id, expected_generation))
+        prepared_items = prepare_items()
+        assert len(prepared_items) == 1
+        return True
+
+    monkeypatch.setattr(
+        indexing_job_repository,
+        "persist_regulatory_indexing_preparation",
+        persist_atomically,
+        raising=False,
+    )
+    document = _document(user_file_id, "MADDE 1 - Kurtarılan hazırlık.")
+
+    result = preparation.prepare_claimed_regulatory_indexing_job(
+        job_id=job_id,
+        expected_generation=3,
+        documents=[document],
+        tenant_id="tenant-a",
+        db_session=cast(Session, SimpleNamespace()),
+    )
+
+    assert result == job_id
+    assert atomic_calls == [(job_id, 3)]
+    assert tokenizer_calls == [
+        (snapshot.embedding_model_name, snapshot.embedding_provider),
+        (snapshot.vertex.model_name, "vertex_ai"),
+    ]

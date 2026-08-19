@@ -1,13 +1,14 @@
 import datetime
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from threading import Barrier
+from threading import Barrier, Event
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from onyx.db import regulatory_indexing_jobs as regulatory_indexing_job_repository
 from onyx.db.enums import (
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
@@ -20,6 +21,7 @@ from onyx.db.models import (
     User,
     UserFile,
 )
+from onyx.db.regulatory_chunks import replace_indexed_chunks_for_file
 from onyx.db.regulatory_indexing_jobs import (
     RegulatoryIndexingConfigSnapshot,
     advance_regulatory_indexing_job,
@@ -33,6 +35,7 @@ from onyx.db.regulatory_indexing_jobs import (
     persist_regulatory_indexing_item_vector,
     schedule_regulatory_indexing_retry,
 )
+from onyx.regulatory.chunker import RegulatoryChunker
 from tests.external_dependency_unit.conftest import create_test_user
 
 _NOW = datetime.datetime(2026, 8, 19, 10, 0, tzinfo=datetime.timezone.utc)
@@ -719,3 +722,225 @@ def test_item_write_waits_for_takeover_then_rejects_stale_generation(
     db_session.refresh(item)
     assert item.status == RegulatoryIndexingItemStatus.EMBEDDED.value
     assert item.vector == [1.0, 2.0, 3.0]
+
+
+def test_atomic_preparation_repairs_partial_state_and_advances_once(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    partial_chunks = (
+        RegulatoryChunker(min_chunk_chars=0)
+        .chunk_text("MADDE 1 - Yarım kalmış hazırlık.", source_file="mevzuat.md")
+        .chunks
+    )
+    partial_rows = replace_indexed_chunks_for_file(
+        db_session, regulatory_user_file.id, partial_chunks
+    )
+    db_session.flush()
+    partial_item = create_or_get_regulatory_indexing_item(
+        db_session,
+        job_id=job.id,
+        regulatory_chunk_id=partial_rows[0].id,
+        request_hash="partial-request",
+        expected_generation=1,
+    )
+    assert partial_item is not None
+    partial_row_id = partial_rows[0].id
+    partial_item_id = partial_item.id
+
+    def prepare_recovered_items() -> list[
+        regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem
+    ]:
+        recovered_chunks = (
+            RegulatoryChunker(min_chunk_chars=0)
+            .chunk_text("MADDE 2 - Kurtarılmış hazırlık.", source_file="mevzuat.md")
+            .chunks
+        )
+        recovered_rows = replace_indexed_chunks_for_file(
+            db_session, regulatory_user_file.id, recovered_chunks
+        )
+        db_session.flush()
+        return [
+            regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem(
+                regulatory_chunk_id=recovered_rows[0].id,
+                request_hash="recovered-request",
+                skip_context=True,
+            )
+        ]
+
+    persisted = (
+        regulatory_indexing_job_repository.persist_regulatory_indexing_preparation(
+            db_session,
+            job_id=job.id,
+            expected_generation=1,
+            prepare_items=prepare_recovered_items,
+            now=_NOW,
+        )
+    )
+
+    assert persisted
+    db_session.expire_all()
+    recovered_job = db_session.get(RegulatoryIndexingJob, job.id)
+    assert recovered_job is not None
+    assert recovered_job.stage == RegulatoryIndexingStage.CONTEXT_SUBMIT.value
+    assert recovered_job.status == RegulatoryIndexingJobStatus.QUEUED.value
+    assert db_session.get(RegulatoryChunk, partial_row_id) is None
+    assert db_session.get(RegulatoryIndexingItem, partial_item_id) is None
+    recovered_items = list(
+        db_session.scalars(
+            select(RegulatoryIndexingItem).where(
+                RegulatoryIndexingItem.job_id == job.id
+            )
+        ).all()
+    )
+    assert len(recovered_items) == 1
+    assert recovered_items[0].status == RegulatoryIndexingItemStatus.SKIPPED.value
+    assert recovered_items[0].request_hash == "recovered-request"
+
+
+def test_lease_takeover_fences_stale_atomic_chunk_replacement(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    current_chunks = (
+        RegulatoryChunker(min_chunk_chars=0)
+        .chunk_text("MADDE 1 - Yeni neslin korunan hükmü.", source_file="mevzuat.md")
+        .chunks
+    )
+    current_rows = replace_indexed_chunks_for_file(
+        db_session, regulatory_user_file.id, current_chunks
+    )
+    db_session.flush()
+    current_item = create_or_get_regulatory_indexing_item(
+        db_session,
+        job_id=job.id,
+        regulatory_chunk_id=current_rows[0].id,
+        request_hash="current-request",
+        expected_generation=1,
+    )
+    assert current_item is not None
+    engine = db_session.get_bind()
+    claims = claim_stale_regulatory_indexing_jobs(
+        db_session,
+        stale_before=_NOW + datetime.timedelta(seconds=1),
+        claimed_at=_NOW + datetime.timedelta(seconds=2),
+    )
+    assert [(claim.job_id, claim.lease_generation) for claim in claims] == [(job.id, 2)]
+
+    newer_prepared = Event()
+    allow_newer_commit = Event()
+    stale_callback_started = Event()
+
+    def takeover_prepare() -> bool:
+        with Session(engine) as takeover_session:
+
+            def replace_with_newer_chunks() -> list[
+                regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem
+            ]:
+                newer_chunks = (
+                    RegulatoryChunker(min_chunk_chars=0)
+                    .chunk_text(
+                        "MADDE 2 - Yeni neslin korunan hükmü.",
+                        source_file="mevzuat.md",
+                    )
+                    .chunks
+                )
+                newer_rows = replace_indexed_chunks_for_file(
+                    takeover_session, regulatory_user_file.id, newer_chunks
+                )
+                takeover_session.flush()
+                newer_prepared.set()
+                assert allow_newer_commit.wait(timeout=5)
+                return [
+                    regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem(
+                        regulatory_chunk_id=newer_rows[0].id,
+                        request_hash="newer-request",
+                        skip_context=False,
+                    )
+                ]
+
+            return regulatory_indexing_job_repository.persist_regulatory_indexing_preparation(
+                takeover_session,
+                job_id=job.id,
+                expected_generation=2,
+                prepare_items=replace_with_newer_chunks,
+                now=_NOW + datetime.timedelta(seconds=3),
+            )
+
+    def stale_prepare() -> bool:
+        with Session(engine) as stale_session:
+
+            def replace_with_stale_chunks() -> list[
+                regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem
+            ]:
+                stale_callback_started.set()
+                stale_chunks = (
+                    RegulatoryChunker(min_chunk_chars=0)
+                    .chunk_text(
+                        "MADDE 9 - Eski neslin yazmaması gereken hükmü.",
+                        source_file="mevzuat.md",
+                    )
+                    .chunks
+                )
+                stale_rows = replace_indexed_chunks_for_file(
+                    stale_session, regulatory_user_file.id, stale_chunks
+                )
+                stale_session.flush()
+                return [
+                    regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem(
+                        regulatory_chunk_id=stale_rows[0].id,
+                        request_hash="stale-request",
+                        skip_context=False,
+                    )
+                ]
+
+            return regulatory_indexing_job_repository.persist_regulatory_indexing_preparation(
+                stale_session,
+                job_id=job.id,
+                expected_generation=1,
+                prepare_items=replace_with_stale_chunks,
+                now=_NOW,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        takeover_future = executor.submit(takeover_prepare)
+        assert newer_prepared.wait(timeout=5)
+        stale_future = executor.submit(stale_prepare)
+        assert stale_future.result(timeout=1) is False
+        assert not stale_callback_started.is_set()
+        allow_newer_commit.set()
+        assert takeover_future.result(timeout=5) is True
+
+    db_session.expire_all()
+    chunk_texts = set(
+        db_session.scalars(
+            select(RegulatoryChunk.text).where(
+                RegulatoryChunk.user_file_id == regulatory_user_file.id
+            )
+        ).all()
+    )
+    assert chunk_texts == {"MADDE 2 - Yeni neslin korunan hükmü."}
+    item_hashes = set(
+        db_session.scalars(
+            select(RegulatoryIndexingItem.request_hash).where(
+                RegulatoryIndexingItem.job_id == job.id
+            )
+        ).all()
+    )
+    assert item_hashes == {"newer-request"}

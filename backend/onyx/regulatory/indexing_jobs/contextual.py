@@ -28,6 +28,7 @@ from onyx.prompts.contextual_retrieval import (
 from onyx.regulatory.contextual import (
     contextual_reserve_for_embedding_text,
     fit_context_fields_to_embedding_budget,
+    visible_regulatory_snapshot_for_target,
 )
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchRequest,
@@ -121,13 +122,25 @@ def _contextual_model_name(job: RegulatoryIndexingJob) -> str:
 def contextual_reserve_for_row(
     rows: Sequence[RegulatoryChunk],
     row: RegulatoryChunk,
-    tokenizer: BaseTokenizer,
+    *,
+    embedding_tokenizer: BaseTokenizer,
 ) -> int:
-    if len(rows) <= 1:
+    ordered_rows = _ordered_rows(rows)
+    canonical_row = next(
+        (candidate for candidate in ordered_rows if candidate.id == row.id),
+        None,
+    )
+    if canonical_row is None:
+        raise ContextualMappingError("contextual row is not part of the canonical file")
+    visible_rows = visible_regulatory_snapshot_for_target(
+        ordered_rows,
+        canonical_row,
+    )
+    if len(visible_rows) <= 1:
         return 0
     return contextual_reserve_for_embedding_text(
         row.text,
-        tokenizer=tokenizer,
+        tokenizer=embedding_tokenizer,
         embedding_token_limit=DOC_EMBEDDING_CONTEXT_SIZE,
         requested_reserve=DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS,
     )
@@ -137,18 +150,23 @@ def contextual_request_for_row(
     job: RegulatoryIndexingJob,
     rows: Sequence[RegulatoryChunk],
     row: RegulatoryChunk,
-    tokenizer: BaseTokenizer,
+    *,
+    contextual_tokenizer: BaseTokenizer,
 ) -> VertexBatchRequest:
-    ordered_rows = _ordered_rows(rows)
-    row_by_id = {candidate.id: candidate for candidate in ordered_rows}
-    if row.id not in row_by_id:
+    canonical_rows = _ordered_rows(rows)
+    row_by_id = {candidate.id: candidate for candidate in canonical_rows}
+    canonical_row = row_by_id.get(row.id)
+    if canonical_row is None:
         raise ContextualMappingError("contextual row is not part of the canonical file")
-    if row.user_file_id != job.user_file_id or any(
-        candidate.user_file_id != job.user_file_id for candidate in ordered_rows
+    if canonical_row.user_file_id != job.user_file_id or any(
+        candidate.user_file_id != job.user_file_id for candidate in canonical_rows
     ):
         raise ContextualMappingError("canonical rows do not belong to the indexing job")
+    ordered_rows = _ordered_rows(
+        visible_regulatory_snapshot_for_target(canonical_rows, canonical_row)
+    )
 
-    chunk_block = _row_block(row_by_id[row.id])
+    chunk_block = _row_block(canonical_row)
     prompt_without_document = CONTEXTUAL_RAG_PROMPT1.format(
         document=""
     ) + CONTEXTUAL_RAG_PROMPT2.format(chunk=chunk_block)
@@ -161,7 +179,7 @@ def contextual_request_for_row(
         contextual_model_input_limit * (1 - GEN_AI_INPUT_TOKEN_SAFETY_MARGIN)
     )
     document_token_budget = safe_input_limit - len(
-        tokenizer.encode(prompt_without_document)
+        contextual_tokenizer.encode(prompt_without_document)
     )
     if document_token_budget <= 0:
         raise ContextualMappingError(
@@ -171,7 +189,7 @@ def contextual_request_for_row(
     document = _fit_document_context(
         ordered_rows,
         token_budget=document_token_budget,
-        tokenizer=tokenizer,
+        tokenizer=contextual_tokenizer,
     )
 
     return VertexBatchRequest(
@@ -186,7 +204,9 @@ def build_contextual_requests(
     job: RegulatoryIndexingJob,
     rows: Sequence[RegulatoryChunk],
     items: Sequence[RegulatoryIndexingItem],
-    tokenizer: BaseTokenizer,
+    *,
+    embedding_tokenizer: BaseTokenizer,
+    contextual_tokenizer: BaseTokenizer,
 ) -> list[VertexBatchRequest]:
     ordered_rows = _ordered_rows(rows)
     row_by_id = {row.id: row for row in ordered_rows}
@@ -207,11 +227,23 @@ def build_contextual_requests(
             continue
         if item.status != RegulatoryIndexingItemStatus.PENDING.value:
             continue
-        if contextual_reserve_for_row(ordered_rows, row, tokenizer) == 0:
+        if (
+            contextual_reserve_for_row(
+                ordered_rows,
+                row,
+                embedding_tokenizer=embedding_tokenizer,
+            )
+            == 0
+        ):
             raise ContextualMappingError(
                 "context-ineligible item was not persisted as skipped"
             )
-        request = contextual_request_for_row(job, ordered_rows, row, tokenizer)
+        request = contextual_request_for_row(
+            job,
+            ordered_rows,
+            row,
+            contextual_tokenizer=contextual_tokenizer,
+        )
         if request.request_hash != item.request_hash:
             raise ContextualMappingError(
                 "contextual request hash does not match the persisted item"
@@ -253,7 +285,7 @@ def _persist_result(
     row: RegulatoryChunk,
     item: RegulatoryIndexingItem,
     result: VertexBatchResult,
-    tokenizer: BaseTokenizer,
+    embedding_tokenizer: BaseTokenizer,
     db_session: Session,
 ) -> str:
     if result.error is not None:
@@ -274,7 +306,7 @@ def _persist_result(
             metadata_suffix="",
             doc_summary=result.context,
             chunk_context="",
-            tokenizer=tokenizer,
+            tokenizer=embedding_tokenizer,
             embedding_token_limit=DOC_EMBEDDING_CONTEXT_SIZE,
         )
         if not contextual_text:
@@ -304,7 +336,7 @@ def apply_contextual_results(
     rows: Sequence[RegulatoryChunk],
     items: Sequence[RegulatoryIndexingItem],
     results: Mapping[str, VertexBatchResult],
-    tokenizer: BaseTokenizer,
+    embedding_tokenizer: BaseTokenizer,
     db_session: Session,
 ) -> ContextApplySummary:
     ordered_rows = _ordered_rows(rows)
@@ -334,7 +366,7 @@ def apply_contextual_results(
                 row=row,
                 item=item,
                 result=result,
-                tokenizer=tokenizer,
+                embedding_tokenizer=embedding_tokenizer,
                 db_session=db_session,
             )
         resulting_statuses.append(status)

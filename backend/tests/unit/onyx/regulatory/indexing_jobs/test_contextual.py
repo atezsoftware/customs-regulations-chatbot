@@ -1,3 +1,4 @@
+import datetime
 from types import SimpleNamespace
 from typing import cast
 from uuid import uuid4
@@ -17,6 +18,7 @@ from onyx.prompts.contextual_retrieval import (
     CONTEXTUAL_RAG_PROMPT1,
     CONTEXTUAL_RAG_PROMPT2,
 )
+from onyx.regulatory import contextual as regulatory_contextual
 from onyx.regulatory.indexing_jobs import contextual
 from onyx.regulatory.indexing_jobs.contextual import (
     ContextApplySummary,
@@ -71,6 +73,8 @@ def _row(
             position=position,
             text=text,
             heading_path=heading_path,
+            validity_start_date=None,
+            validity_end_date=None,
         ),
     )
 
@@ -149,7 +153,8 @@ def test_contextual_requests_use_ordered_canonical_rows_and_preserve_legal_ids(
         job,
         [second, first],
         [second_item, first_item],
-        _CharacterTokenizer(),
+        embedding_tokenizer=_CharacterTokenizer(),
+        contextual_tokenizer=_CharacterTokenizer(),
     )
 
     assert requests == [expected_first_request, expected_second_request]
@@ -195,13 +200,137 @@ def test_contextual_request_fits_reconstructed_document_to_model_budget(
         job,
         [last, middle, first],
         middle,
-        _CharacterTokenizer(),
+        contextual_tokenizer=_CharacterTokenizer(),
     )
 
     assert len(request.prompt) <= 855
     assert "MADDE 1" in request.prompt
     assert "MADDE 3" in request.prompt
     assert "MADDE 2 - Hedef hüküm." in request.prompt
+
+
+def test_contextual_snapshot_selects_target_version_and_excludes_ambiguous_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job()
+    old = _row(
+        job,
+        row_id="rc_old",
+        position=0,
+        text="MADDE 1 - Eski hüküm.",
+        heading_path=["MADDE 1"],
+    )
+    old.validity_start_date = datetime.date(2020, 1, 1)
+    old.validity_end_date = datetime.date(2024, 1, 1)
+    replacement = _row(
+        job,
+        row_id="rc_replacement",
+        position=0,
+        text="MADDE 1 - Yeni hüküm.",
+        heading_path=["MADDE 1"],
+    )
+    replacement.validity_start_date = datetime.date(2024, 1, 1)
+    replacement.validity_end_date = None
+    stable = _row(
+        job,
+        row_id="rc_stable",
+        position=1,
+        text="MADDE 2 - Ortak hüküm.",
+        heading_path=["MADDE 2"],
+    )
+    stable.validity_start_date = None
+    stable.validity_end_date = None
+    overlap_a = _row(
+        job,
+        row_id="rc_overlap_a",
+        position=2,
+        text="MADDE 3 - Çelişen A.",
+        heading_path=["MADDE 3"],
+    )
+    overlap_b = _row(
+        job,
+        row_id="rc_overlap_b",
+        position=2,
+        text="MADDE 3 - Çelişen B.",
+        heading_path=["MADDE 3"],
+    )
+    for row in (overlap_a, overlap_b):
+        row.validity_start_date = None
+        row.validity_end_date = None
+    rows = [replacement, overlap_b, stable, old, overlap_a]
+
+    old_snapshot = regulatory_contextual.visible_regulatory_snapshot_for_target(
+        rows, old, today=datetime.date(2026, 8, 19)
+    )
+    replacement_snapshot = regulatory_contextual.visible_regulatory_snapshot_for_target(
+        rows, replacement, today=datetime.date(2026, 8, 19)
+    )
+
+    assert [row.id for row in old_snapshot] == [old.id, stable.id]
+    assert [row.id for row in replacement_snapshot] == [replacement.id, stable.id]
+
+    monkeypatch.setattr(
+        contextual, "get_max_input_tokens", lambda *_args, **_kwargs: 100_000
+    )
+    request = contextual.contextual_request_for_row(
+        job,
+        rows,
+        old,
+        contextual_tokenizer=_CharacterTokenizer(),
+    )
+    assert "Eski hüküm" in request.prompt
+    assert "Yeni hüküm" not in request.prompt
+    assert "Ortak hüküm" in request.prompt
+    assert "Çelişen A" not in request.prompt
+    assert "Çelişen B" not in request.prompt
+
+
+def test_contextual_budget_and_embedding_reserve_use_distinct_tokenizers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _OneTokenTokenizer(_CharacterTokenizer):
+        def encode(self, string: str) -> list[int]:
+            return [1] if string else []
+
+        def decode(self, tokens: list[int]) -> str:
+            return "representative" if tokens else ""
+
+    job = _job()
+    first = _row(
+        job,
+        row_id="rc_first",
+        position=0,
+        text="MADDE 1 - " + "uzun " * 120,
+        heading_path=["MADDE 1"],
+    )
+    second = _row(
+        job,
+        row_id="rc_second",
+        position=1,
+        text="MADDE 2 - Kısa hüküm.",
+        heading_path=["MADDE 2"],
+    )
+    for row in (first, second):
+        row.validity_start_date = None
+        row.validity_end_date = None
+    monkeypatch.setattr(
+        contextual, "get_max_input_tokens", lambda *_args, **_kwargs: 900
+    )
+
+    reserve = contextual.contextual_reserve_for_row(
+        [first, second],
+        first,
+        embedding_tokenizer=_CharacterTokenizer(),
+    )
+    request = contextual.contextual_request_for_row(
+        job,
+        [first, second],
+        second,
+        contextual_tokenizer=_OneTokenTokenizer(),
+    )
+
+    assert reserve == 0
+    assert "MADDE 1" in request.prompt
 
 
 def test_apply_results_persists_only_fitted_generated_context(
@@ -226,7 +355,7 @@ def test_apply_results_persists_only_fitted_generated_context(
         job,
         [row, sibling],
         row,
-        _CharacterTokenizer(),
+        contextual_tokenizer=_CharacterTokenizer(),
     )
     item = cast(
         RegulatoryIndexingItem,
@@ -259,8 +388,8 @@ def test_apply_results_persists_only_fitted_generated_context(
                 context="Bu parça, transit teminatının aranmasını düzenler.",
             )
         },
-        _CharacterTokenizer(),
-        cast(Session, SimpleNamespace()),
+        embedding_tokenizer=_CharacterTokenizer(),
+        db_session=cast(Session, SimpleNamespace()),
     )
 
     assert persisted == [
@@ -297,7 +426,7 @@ def test_apply_results_records_typed_failure_without_replacing_success(
         job,
         rows,
         rows[0],
-        _CharacterTokenizer(),
+        contextual_tokenizer=_CharacterTokenizer(),
     )
     failed_item = cast(
         RegulatoryIndexingItem,
@@ -349,8 +478,8 @@ def test_apply_results_records_typed_failure_without_replacing_success(
                 error=VertexBatchResultError.SAFETY,
             )
         },
-        _CharacterTokenizer(),
-        cast(Session, SimpleNamespace()),
+        embedding_tokenizer=_CharacterTokenizer(),
+        db_session=cast(Session, SimpleNamespace()),
     )
 
     assert failures == [("safety_blocked", "safety_blocked")]

@@ -85,6 +85,25 @@ def documents_to_regulatory_chunks(
     ).chunk(indexing_documents)
 
 
+def _group_indexing_documents_by_file(
+    documents: Sequence[IndexingDocument],
+) -> list[IndexingDocument]:
+    grouped: dict[str, list[IndexingDocument]] = {}
+    for document in documents:
+        grouped.setdefault(document.id, []).append(document)
+
+    aggregated: list[IndexingDocument] = []
+    for file_documents in grouped.values():
+        first = file_documents[0]
+        sections = [
+            section.model_copy()
+            for document in file_documents
+            for section in (document.processed_sections or document.sections)
+        ]
+        aggregated.append(first.model_copy(update={"processed_sections": sections}))
+    return aggregated
+
+
 class RegulatoryIndexingChunker:
     """Structure-aware chunker for the user-file indexing pipeline.
 
@@ -124,7 +143,7 @@ class RegulatoryIndexingChunker:
 
     def chunk(self, documents: list[IndexingDocument]) -> list[DocAwareChunk]:
         final_chunks: list[DocAwareChunk] = []
-        for document in documents:
+        for document in _group_indexing_documents_by_file(documents):
             if self.callback and self.callback.should_stop():
                 raise RuntimeError("RegulatoryIndexingChunker: Stop signal detected")
 

@@ -1,12 +1,26 @@
 """Shared safeguards for contextual enrichment of regulatory chunks."""
 
 import datetime
+from collections.abc import Sequence
+from typing import Protocol, TypeVar
 
 from onyx.configs.constants import RETURN_SEPARATOR
 from onyx.natural_language_processing.utils import BaseTokenizer
 
 _TRUNCATION_MARKER = "…"
 MIN_CONTEXTUAL_RAG_RESERVED_TOKENS = 32
+
+
+class RegulatoryValidityRow(Protocol):
+    id: str
+    position: int
+    validity_start_date: datetime.date | datetime.datetime | None
+    validity_end_date: datetime.date | datetime.datetime | None
+
+
+_RegulatoryValidityRowT = TypeVar(
+    "_RegulatoryValidityRowT", bound=RegulatoryValidityRow
+)
 
 
 def as_calendar_date(
@@ -48,6 +62,41 @@ def validity_window_contains(
     end = as_calendar_date(validity_end_date)
     return (start is None or start <= reference_date) and (
         end is None or end > reference_date
+    )
+
+
+def visible_regulatory_snapshot_for_target(
+    rows: Sequence[_RegulatoryValidityRowT],
+    target: _RegulatoryValidityRowT,
+    *,
+    today: datetime.date | None = None,
+) -> list[_RegulatoryValidityRowT]:
+    """Select one unambiguous legal version per position for a target row."""
+
+    reference_date = context_reference_date(
+        target.validity_start_date,
+        target.validity_end_date,
+        today=today,
+    )
+    candidates_by_position: dict[int, list[_RegulatoryValidityRowT]] = {}
+    for candidate in rows:
+        if validity_window_contains(
+            candidate.validity_start_date,
+            candidate.validity_end_date,
+            reference_date,
+        ):
+            candidates_by_position.setdefault(candidate.position, []).append(candidate)
+
+    visible_rows: list[_RegulatoryValidityRowT] = []
+    for position in sorted(set(candidates_by_position) | {target.position}):
+        candidates = candidates_by_position.get(position, [])
+        if position == target.position:
+            visible_rows.append(target)
+        elif len(candidates) == 1:
+            visible_rows.append(candidates[0])
+        # Ambiguous overlapping versions are safer to omit than to mix.
+    return sorted(
+        visible_rows, key=lambda candidate: (candidate.position, candidate.id)
     )
 
 

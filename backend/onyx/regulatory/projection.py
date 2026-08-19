@@ -46,7 +46,7 @@ from onyx.regulatory.contextual import (
     context_reference_date,
     contextual_reserve_for_embedding_text,
     fit_context_fields_to_embedding_budget,
-    validity_window_contains,
+    visible_regulatory_snapshot_for_target,
 )
 from onyx.regulatory.heading_path import normalize_regulatory_heading_path
 from onyx.utils.logger import setup_logger
@@ -173,30 +173,11 @@ def _contextualize_chunks(
             row.validity_end_date,
             today=today,
         )
-        valid_candidates = [
-            candidate
-            for candidate in rows
-            if validity_window_contains(
-                candidate.validity_start_date,
-                candidate.validity_end_date,
-                reference_date,
-            )
-        ]
-        candidates_by_position: dict[int, list[RegulatoryChunk]] = {}
-        for candidate in valid_candidates:
-            candidates_by_position.setdefault(candidate.position, []).append(candidate)
-        visible_rows: list[RegulatoryChunk] = []
-        all_positions = set(candidates_by_position) | {row.position}
-        for position in sorted(all_positions):
-            candidates = candidates_by_position.get(position, [])
-            if position == row.position:
-                visible_rows.append(row)
-            elif len(candidates) == 1:
-                visible_rows.append(candidates[0])
-            # An overlapping validity interval is ambiguous. Omitting that
-            # position is safer than leaking contradictory versions into the
-            # target chunk's generated context.
-        visible_rows.sort(key=lambda candidate: (candidate.position, candidate.id))
+        visible_rows = visible_regulatory_snapshot_for_target(
+            rows,
+            row,
+            today=today,
+        )
         if len(visible_rows) <= 1:
             continue
 

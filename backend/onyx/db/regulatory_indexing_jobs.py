@@ -1,9 +1,10 @@
 import datetime
 import math
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -12,7 +13,11 @@ from onyx.db.enums import (
     RegulatoryIndexingJobStatus,
     RegulatoryIndexingStage,
 )
-from onyx.db.models import RegulatoryIndexingItem, RegulatoryIndexingJob
+from onyx.db.models import (
+    RegulatoryChunk,
+    RegulatoryIndexingItem,
+    RegulatoryIndexingJob,
+)
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
 _SECRET_KEY_FRAGMENTS = (
@@ -51,6 +56,13 @@ class RegulatoryIndexingJobClaim:
     job_id: UUID
     stage: RegulatoryIndexingStage
     lease_generation: int
+
+
+@dataclass(frozen=True)
+class RegulatoryIndexingPreparedItem:
+    regulatory_chunk_id: str
+    request_hash: str
+    skip_context: bool
 
 
 def _validate_config_snapshot(
@@ -186,6 +198,13 @@ def create_or_get_regulatory_indexing_job(
     if job is None:
         raise RuntimeError(f"regulatory indexing job {job_id} was not persisted")
     return job
+
+
+def get_regulatory_indexing_job(
+    db_session: Session,
+    job_id: UUID,
+) -> RegulatoryIndexingJob | None:
+    return db_session.get(RegulatoryIndexingJob, job_id)
 
 
 def claim_regulatory_indexing_job(
@@ -440,6 +459,93 @@ def _lock_running_regulatory_indexing_job_lease(
         .with_for_update()
     )
     return locked_id is not None
+
+
+def persist_regulatory_indexing_preparation(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    prepare_items: Callable[[], Sequence[RegulatoryIndexingPreparedItem]],
+    now: datetime.datetime,
+) -> bool:
+    """Atomically replace chunks, create items, and finish PREPARING."""
+
+    locked_job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.PREPARING.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if locked_job is None:
+        db_session.rollback()
+        return False
+
+    try:
+        prepared_items = list(prepare_items())
+        if not prepared_items:
+            raise ValueError("regulatory indexing preparation produced no items")
+        chunk_ids = [item.regulatory_chunk_id for item in prepared_items]
+        if len(set(chunk_ids)) != len(chunk_ids):
+            raise ValueError(
+                "regulatory indexing preparation contains duplicate chunks"
+            )
+        request_hashes = [item.request_hash for item in prepared_items]
+        if len(set(request_hashes)) != len(request_hashes):
+            raise ValueError(
+                "regulatory indexing preparation contains duplicate hashes"
+            )
+
+        db_session.flush()
+        canonical_chunk_ids = set(
+            db_session.scalars(
+                select(RegulatoryChunk.id).where(
+                    RegulatoryChunk.user_file_id == locked_job.user_file_id,
+                )
+            ).all()
+        )
+        if canonical_chunk_ids != set(chunk_ids):
+            raise ValueError(
+                "regulatory indexing preparation does not cover canonical chunks"
+            )
+        db_session.execute(
+            delete(RegulatoryIndexingItem).where(
+                RegulatoryIndexingItem.job_id == job_id
+            )
+        )
+        for item in prepared_items:
+            db_session.add(
+                RegulatoryIndexingItem(
+                    id=uuid4(),
+                    job_id=job_id,
+                    regulatory_chunk_id=item.regulatory_chunk_id,
+                    request_hash=item.request_hash,
+                    status=(
+                        RegulatoryIndexingItemStatus.SKIPPED.value
+                        if item.skip_context
+                        else RegulatoryIndexingItemStatus.PENDING.value
+                    ),
+                )
+            )
+
+        locked_job.status = RegulatoryIndexingJobStatus.QUEUED.value
+        locked_job.stage = RegulatoryIndexingStage.CONTEXT_SUBMIT.value
+        locked_job.attempt_count = 0
+        locked_job.heartbeat_at = now
+        locked_job.next_retry_at = None
+        locked_job.error_code = None
+        locked_job.error_message = None
+        locked_job.completed_at = None
+        locked_job.updated_at = now
+        db_session.commit()
+        return True
+    except Exception:
+        db_session.rollback()
+        raise
 
 
 def _persist_regulatory_indexing_item_values(
