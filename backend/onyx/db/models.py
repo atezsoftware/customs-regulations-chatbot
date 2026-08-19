@@ -109,6 +109,9 @@ from onyx.db.enums import (
     ProcessingMode,
     RegulatoryChunkSource,
     RegulatoryChunkStatus,
+    RegulatoryIndexingItemStatus,
+    RegulatoryIndexingJobStatus,
+    RegulatoryIndexingStage,
     SandboxStatus,
     ScheduledTaskRunStatus,
     ScheduledTaskStatus,
@@ -5638,6 +5641,177 @@ class RegulatoryChunk(Base):
         CheckConstraint(
             "source IN ('indexed', 'amendment')",
             name="regulatory_chunk_source_check",
+        ),
+    )
+
+
+class RegulatoryIndexingJob(Base):
+    """Durable orchestration state for one regulatory file revision."""
+
+    __tablename__ = "regulatory_indexing_job"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    user_file_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("user_file.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    search_settings_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    config_snapshot: Mapped[dict[str, object]] = mapped_column(
+        PGJSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=RegulatoryIndexingJobStatus.QUEUED.value,
+    )
+    stage: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=RegulatoryIndexingStage.PREPARING.value,
+    )
+    lease_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_retry_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    remote_vertex_job_name: Mapped[str | None] = mapped_column(
+        String(1024), nullable=True
+    )
+    vertex_input_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    vertex_output_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    user_file: Mapped["UserFile"] = relationship("UserFile")
+    items: Mapped[list["RegulatoryIndexingItem"]] = relationship(
+        "RegulatoryIndexingItem",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_file_id",
+            "content_hash",
+            "search_settings_id",
+            "prompt_hash",
+            name="uq_regulatory_indexing_job_idempotency",
+        ),
+        Index(
+            "ix_regulatory_indexing_job_recovery",
+            "status",
+            "next_retry_at",
+            "heartbeat_at",
+        ),
+        CheckConstraint(
+            "status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT', 'SUCCEEDED', "
+            "'FAILED', 'CANCELLING', 'CANCELLED')",
+            name="regulatory_indexing_job_status_check",
+        ),
+        CheckConstraint(
+            "stage IN ('PREPARING', 'CONTEXT_SUBMIT', 'CONTEXT_WAIT', "
+            "'CONTEXT_APPLY', 'EMBEDDING', 'INDEX_WRITE', 'VERIFY', 'PUBLISH')",
+            name="regulatory_indexing_job_stage_check",
+        ),
+        CheckConstraint(
+            "lease_generation >= 0",
+            name="regulatory_indexing_job_lease_generation_check",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="regulatory_indexing_job_attempt_count_check",
+        ),
+    )
+
+
+class RegulatoryIndexingItem(Base):
+    """Persisted contextualization and embedding result for one canonical chunk."""
+
+    __tablename__ = "regulatory_indexing_item"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    job_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_indexing_job.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    regulatory_chunk_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey("regulatory_chunk.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=RegulatoryIndexingItemStatus.PENDING.value,
+    )
+    request_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    context: Mapped[dict[str, object] | None] = mapped_column(PGJSONB, nullable=True)
+    vector: Mapped[list[float] | None] = mapped_column(PGJSONB, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    job: Mapped["RegulatoryIndexingJob"] = relationship(
+        "RegulatoryIndexingJob", back_populates="items"
+    )
+    regulatory_chunk: Mapped["RegulatoryChunk"] = relationship("RegulatoryChunk")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "regulatory_chunk_id",
+            name="uq_regulatory_indexing_item_job_chunk",
+        ),
+        Index(
+            "ix_regulatory_indexing_item_job_status",
+            "job_id",
+            "status",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'CONTEXT_READY', 'EMBEDDED', 'FAILED', 'SKIPPED')",
+            name="regulatory_indexing_item_status_check",
         ),
     )
 

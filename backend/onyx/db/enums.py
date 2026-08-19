@@ -734,6 +734,35 @@ class RegulatoryChunkSource(str, PyEnum):
     AMENDMENT = "amendment"
 
 
+class RegulatoryIndexingJobStatus(str, PyEnum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    RETRY_WAIT = "RETRY_WAIT"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLING = "CANCELLING"
+    CANCELLED = "CANCELLED"
+
+
+class RegulatoryIndexingStage(str, PyEnum):
+    PREPARING = "PREPARING"
+    CONTEXT_SUBMIT = "CONTEXT_SUBMIT"
+    CONTEXT_WAIT = "CONTEXT_WAIT"
+    CONTEXT_APPLY = "CONTEXT_APPLY"
+    EMBEDDING = "EMBEDDING"
+    INDEX_WRITE = "INDEX_WRITE"
+    VERIFY = "VERIFY"
+    PUBLISH = "PUBLISH"
+
+
+class RegulatoryIndexingItemStatus(str, PyEnum):
+    PENDING = "PENDING"
+    CONTEXT_READY = "CONTEXT_READY"
+    EMBEDDED = "EMBEDDED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+
+
 class AmendmentBatchStatus(str, PyEnum):
     """Lifecycle of one pasted-amendment-text analysis run."""
 
