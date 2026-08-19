@@ -348,30 +348,78 @@ jobs:
           verify_regulatory_indexing_beat() {
             local app_name="customs-regulations-background"
             local selector="app=${env_x}-${app_name}"
+            local pod_json
+            local pod_names
             local pod
+            local container_json
+            local container_names
             local container
             local beat_status
+            local all_replicas_ready
+            local -a pods=()
+            local -a containers=()
 
-            echo "Waiting for the production-lite regulatory indexing Beat to become ready"
+            echo "Waiting for every Ready production-lite regulatory indexing Beat replica"
             for attempt in {1..60}; do
-              pod=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json | jq -r --arg tag "${IMAGE_TAG}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | head -n 1)
-              if [[ -n "$pod" ]]; then
-                container=$(kubectl get pod "$pod" --namespace "${namespace}" -o json | jq -r --arg tag "${IMAGE_TAG}" '.spec.containers[] | select(.image | endswith(":" + $tag)) | .name' | head -n 1)
-                if [[ -n "$container" ]]; then
-                  beat_status=$(kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status celery_beat_regulatory_indexing 2>&1 || true)
-                  echo "$beat_status"
-                  if grep -Eq '^celery_beat_regulatory_indexing[[:space:]]+RUNNING([[:space:]]|$)' <<<"$beat_status" && \
-                    kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
-                      python -m onyx.background.celery.regulatory_indexing_beat_health; then
-                    echo "Production-lite regulatory indexing Beat is ready in pod $pod"
-                    return 0
+              if ! pod_json=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json); then
+                sleep 5
+                continue
+              fi
+              if ! pod_names=$(jq -r --arg tag "${IMAGE_TAG}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' <<<"$pod_json"); then
+                sleep 5
+                continue
+              fi
+              pods=()
+              if [[ -n "$pod_names" ]]; then
+                mapfile -t pods <<<"$pod_names"
+              fi
+              if (( ${#pods[@]} > 0 )); then
+                all_replicas_ready=true
+                for pod in "${pods[@]}"; do
+                  if ! container_json=$(kubectl get pod "$pod" --namespace "${namespace}" -o json); then
+                    all_replicas_ready=false
+                    continue
                   fi
+                  if ! container_names=$(jq -r --arg tag "${IMAGE_TAG}" '.spec.containers[] | select(.image | endswith(":" + $tag)) | .name' <<<"$container_json"); then
+                    all_replicas_ready=false
+                    continue
+                  fi
+                  containers=()
+                  if [[ -n "$container_names" ]]; then
+                    mapfile -t containers <<<"$container_names"
+                  fi
+                  if (( ${#containers[@]} != 1 )); then
+                    echo "Expected one ${IMAGE_TAG} container in pod $pod; found ${#containers[@]}" >&2
+                    all_replicas_ready=false
+                    continue
+                  fi
+                  container="${containers[0]}"
+                  if ! beat_status=$(kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status celery_beat_regulatory_indexing 2>&1); then
+                    echo "$beat_status"
+                    all_replicas_ready=false
+                    continue
+                  fi
+                  echo "$beat_status"
+                  if ! grep -Eq '^celery_beat_regulatory_indexing[[:space:]]+RUNNING([[:space:]]|$)' <<<"$beat_status"; then
+                    all_replicas_ready=false
+                    continue
+                  fi
+                  if ! kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+                    python -m onyx.background.celery.regulatory_indexing_beat_health; then
+                    all_replicas_ready=false
+                    continue
+                  fi
+                  echo "Production-lite regulatory indexing Beat is ready in pod $pod"
+                done
+                if [[ "$all_replicas_ready" == "true" ]]; then
+                  echo "Validated ${#pods[@]} Ready production-lite Beat replica(s) for ${IMAGE_TAG}"
+                  return 0
                 fi
               fi
               sleep 5
             done
 
-            echo "Production-lite regulatory indexing Beat did not become ready for image tag ${IMAGE_TAG}" >&2
+            echo "Not every Ready production-lite regulatory indexing Beat replica passed probes for image tag ${IMAGE_TAG}" >&2
             return 1
           }
 

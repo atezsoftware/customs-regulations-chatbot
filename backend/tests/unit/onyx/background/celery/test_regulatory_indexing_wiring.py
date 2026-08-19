@@ -4,6 +4,7 @@ import configparser
 import importlib
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -14,6 +15,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import yaml
+from redis.exceptions import ConnectionError as RedisConnectionError
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
 from onyx.configs.constants import OnyxCeleryQueues
@@ -110,6 +112,16 @@ def _workflow_step(workflow: dict[str, object], name: str) -> dict[str, str]:
     raise AssertionError(f"Workflow step not found: {name}")
 
 
+def _workflow_shell_function(script: str, name: str) -> str:
+    match = re.search(
+        rf"^{re.escape(name)}\(\) \{{\n.*?^\}}\n",
+        script,
+        re.M | re.S,
+    )
+    assert match is not None, f"Workflow shell function not found: {name}"
+    return match.group()
+
+
 def _load_runbook_runtime_contract() -> dict[str, object]:
     runbook = _RUNBOOK_PATH.read_text(encoding="utf-8")
     match = re.search(
@@ -202,17 +214,16 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
         restarted.close()
 
 
-def test_two_schedulers_publish_once_per_tenant_slot_and_fail_over_after_ttl(
+def test_two_scheduler_ticks_publish_once_per_tenant_entry_slot_and_advance(
     tmp_path: Path,
 ) -> None:
     beat_app = importlib.import_module(
         "onyx.background.celery.apps.regulatory_indexing_beat"
     )
 
-    class ExpiringRedis:
+    class TenantClaimStore:
         def __init__(self) -> None:
-            self.now = 0.0
-            self.values: dict[tuple[str, str], float] = {}
+            self.values: set[tuple[str, str]] = set()
             self.claims: list[tuple[str, str, int]] = []
 
         def client(self, tenant_id: str) -> MagicMock:
@@ -227,61 +238,211 @@ def test_two_schedulers_publish_once_per_tenant_slot_and_fail_over_after_ttl(
             ) -> bool | None:
                 assert nx is True
                 namespaced_key = (tenant_id, key)
-                expiry = self.values.get(namespaced_key)
-                if expiry is not None and expiry > self.now:
+                if namespaced_key in self.values:
                     return None
-                self.values[namespaced_key] = self.now + ex
+                self.values.add(namespaced_key)
                 self.claims.append((tenant_id, key, ex))
                 return True
 
             client.set.side_effect = set_value
             return client
 
-    redis = ExpiringRedis()
-    fixed_now = datetime(2026, 8, 19, 12, 0, 5, tzinfo=timezone.utc)
-    schedulers = [
-        beat_app.RegulatoryIndexingScheduler(
-            app=beat_app.celery_app,
-            schedule_filename=str(tmp_path / f"schedule-{index}"),
-            lazy=False,
-        )
-        for index in range(2)
-    ]
-    try:
+    claim_store = TenantClaimStore()
+    clock = {"now": datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)}
+    with patch.object(beat_app.celery_app, "now", side_effect=lambda: clock["now"]):
+        schedulers = [
+            beat_app.RegulatoryIndexingScheduler(
+                app=beat_app.celery_app,
+                schedule_filename=str(tmp_path / f"schedule-{index}"),
+                lazy=False,
+            )
+            for index in range(2)
+        ]
         for scheduler in schedulers:
             with patch.object(
                 beat_app, "get_all_tenant_ids", return_value=["public", "tenant-a"]
             ):
                 scheduler.update_schedule()
-        entry_a = schedulers[0].schedule["monitor-celery-queues-public"]
-        entry_b = schedulers[1].schedule["monitor-celery-queues-public"]
-        tenant_entry = schedulers[1].schedule["monitor-celery-queues-tenant-a"]
+            scheduler._last_reload = clock["now"]
+            scheduler.__dict__["producer"] = MagicMock()
+    try:
+        publications: list[tuple[str, str, int]] = []
+
+        def capture_publication(
+            task_name: str,
+            _args: tuple[object, ...],
+            task_kwargs: dict[str, str],
+            **_options: object,
+        ) -> MagicMock:
+            publications.append(
+                (
+                    task_name,
+                    task_kwargs["tenant_id"],
+                    int(clock["now"].timestamp() // 10),
+                )
+            )
+            return MagicMock(id=f"published-{len(publications)}")
 
         with (
-            patch.object(beat_app.celery_app, "now", return_value=fixed_now),
+            patch.object(beat_app.celery_app, "now", side_effect=lambda: clock["now"]),
             patch.object(
                 beat_app,
                 "get_redis_client",
-                side_effect=lambda *, tenant_id: redis.client(tenant_id),
+                side_effect=lambda *, tenant_id: claim_store.client(tenant_id),
             ),
-            patch.object(beat_app.PersistentScheduler, "apply_entry") as publish,
+            patch.object(schedulers[0], "send_task", side_effect=capture_publication),
+            patch.object(schedulers[1], "send_task", side_effect=capture_publication),
         ):
-            schedulers[0].apply_entry(entry_a)
-            schedulers[1].apply_entry(entry_b)
-            schedulers[1].apply_entry(tenant_entry)
+            clock["now"] += timedelta(seconds=10, milliseconds=100)
+            assert schedulers[0].tick() == 0
+            assert schedulers[0].tick() == 0
+            clock["now"] += timedelta(milliseconds=100)
+            assert schedulers[1].tick() == 0
+            assert schedulers[1].tick() == 0
 
-            assert publish.call_count == 2
-            assert {claim[0] for claim in redis.claims} == {"public", "tenant-a"}
-            public_claim = next(claim for claim in redis.claims if claim[0] == "public")
-            assert "monitor-celery-queues-public" in public_claim[1]
-            assert public_claim[1].endswith(":178714080")
-
-            redis.now = public_claim[2] + 0.1
-            schedulers[1].apply_entry(entry_b)
-            assert publish.call_count == 3
+        assert len(publications) == 2
+        assert {(task, tenant) for task, tenant, _slot in publications} == {
+            ("monitor_celery_queues", "public"),
+            ("monitor_celery_queues", "tenant-a"),
+        }
+        assert all(
+            count == 1
+            for count in {
+                publication: publications.count(publication)
+                for publication in publications
+            }.values()
+        )
+        assert {claim[0] for claim in claim_store.claims} == {"public", "tenant-a"}
+        assert all(claim[2] == 20 for claim in claim_store.claims)
+        for scheduler in schedulers:
+            assert (
+                scheduler.schedule["monitor-celery-queues-public"].total_run_count == 1
+            )
+            assert (
+                scheduler.schedule["monitor-celery-queues-tenant-a"].total_run_count
+                == 1
+            )
     finally:
         for scheduler in schedulers:
             scheduler.close()
+
+
+def test_failed_publish_is_retried_by_a_replica_in_the_next_utc_slot(
+    tmp_path: Path,
+) -> None:
+    beat_app = importlib.import_module(
+        "onyx.background.celery.apps.regulatory_indexing_beat"
+    )
+
+    claimed_keys: set[str] = set()
+    claim_records: list[tuple[str, int]] = []
+
+    def redis_client(*, tenant_id: str) -> MagicMock:
+        assert tenant_id == "public"
+        client = MagicMock()
+
+        def claim(key: str, _value: str, *, ex: int, nx: bool) -> bool | None:
+            assert nx is True
+            if key in claimed_keys:
+                return None
+            claimed_keys.add(key)
+            claim_records.append((key, ex))
+            return True
+
+        client.set.side_effect = claim
+        return client
+
+    clock = {"now": datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)}
+    with patch.object(beat_app.celery_app, "now", side_effect=lambda: clock["now"]):
+        schedulers = [
+            beat_app.RegulatoryIndexingScheduler(
+                app=beat_app.celery_app,
+                schedule_filename=str(tmp_path / f"failover-schedule-{index}"),
+                lazy=False,
+            )
+            for index in range(2)
+        ]
+        for scheduler in schedulers:
+            with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
+                scheduler.update_schedule()
+            scheduler._last_reload = clock["now"]
+            scheduler.__dict__["producer"] = MagicMock()
+    try:
+        successful_slots: list[int] = []
+
+        def successful_publication(*_args: object, **_kwargs: object) -> MagicMock:
+            successful_slots.append(int(clock["now"].timestamp() // 10))
+            return MagicMock(id="published-after-failover")
+
+        with (
+            patch.object(beat_app.celery_app, "now", side_effect=lambda: clock["now"]),
+            patch.object(beat_app, "get_redis_client", side_effect=redis_client),
+            patch.object(
+                schedulers[0],
+                "send_task",
+                side_effect=RuntimeError("broker unavailable after claim"),
+            ) as failed_publish,
+            patch.object(
+                schedulers[1], "send_task", side_effect=successful_publication
+            ) as follower_publish,
+        ):
+            clock["now"] += timedelta(seconds=10, milliseconds=100)
+            first_slot = int(clock["now"].timestamp() // 10)
+            assert schedulers[0].tick() == 0
+            assert schedulers[1].tick() == 0
+            assert successful_slots == []
+
+            clock["now"] += timedelta(seconds=10, milliseconds=100)
+            next_slot = int(clock["now"].timestamp() // 10)
+            assert schedulers[1].tick() == 0
+
+        failed_publish.assert_called_once()
+        follower_publish.assert_called_once()
+        assert successful_slots == [next_slot]
+        assert next_slot == first_slot + 1
+        assert len(claimed_keys) == 2
+        assert all(ttl == 20 for _key, ttl in claim_records)
+        assert all(
+            scheduler.schedule["monitor-celery-queues-public"].total_run_count >= 1
+            for scheduler in schedulers
+        )
+    finally:
+        for scheduler in schedulers:
+            scheduler.close()
+
+
+def test_scheduler_tick_fails_closed_when_redis_claim_fails(tmp_path: Path) -> None:
+    beat_app = importlib.import_module(
+        "onyx.background.celery.apps.regulatory_indexing_beat"
+    )
+    clock = {"now": datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)}
+    with patch.object(beat_app.celery_app, "now", side_effect=lambda: clock["now"]):
+        scheduler = beat_app.RegulatoryIndexingScheduler(
+            app=beat_app.celery_app,
+            schedule_filename=str(tmp_path / "redis-failure-schedule"),
+            lazy=False,
+        )
+        with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
+            scheduler.update_schedule()
+        scheduler._last_reload = clock["now"]
+        scheduler.__dict__["producer"] = MagicMock()
+    try:
+        redis_client = MagicMock()
+        redis_client.set.side_effect = RedisConnectionError("redis unavailable")
+
+        with (
+            patch.object(beat_app.celery_app, "now", side_effect=lambda: clock["now"]),
+            patch.object(beat_app, "get_redis_client", return_value=redis_client),
+            patch.object(scheduler, "send_task") as publish,
+        ):
+            clock["now"] += timedelta(seconds=10, milliseconds=100)
+            with pytest.raises(RedisConnectionError, match="redis unavailable"):
+                scheduler.tick()
+
+        publish.assert_not_called()
+        assert scheduler.schedule["monitor-celery-queues-public"].total_run_count == 1
+    finally:
+        scheduler.close()
 
 
 def test_scheduler_recovers_a_corrupt_pod_local_schedule(tmp_path: Path) -> None:
@@ -838,6 +999,13 @@ def test_codebuild_diagnostics_and_readiness_use_the_exact_worker_name() -> None
     )
     assert "capture_background_memory_evidence" in deploy_script
 
+    beat_verifier = _workflow_shell_function(
+        deploy_script, "verify_regulatory_indexing_beat"
+    )
+    assert "mapfile -t pods" in beat_verifier
+    assert "${pods[@]}" in beat_verifier
+    assert "head -n 1" not in beat_verifier
+
     for script in (diagnostics_script, deploy_script):
         syntax_check = subprocess.run(
             ["bash", "-n"],
@@ -847,6 +1015,101 @@ def test_codebuild_diagnostics_and_readiness_use_the_exact_worker_name() -> None
             check=False,
         )
         assert syntax_check.returncode == 0, syntax_check.stderr
+
+
+def test_codebuild_validates_every_ready_new_image_beat_replica(
+    tmp_path: Path,
+) -> None:
+    workflow = _load_workflow()
+    deploy_script = _workflow_step(workflow, "Deploy api and background with Helm")[
+        "run"
+    ]
+    beat_verifier = _workflow_shell_function(
+        deploy_script, "verify_regulatory_indexing_beat"
+    ).replace("{1..60}", "{1..1}")
+    validation_log = tmp_path / "validated-pods"
+    quoted_log = shlex.quote(str(validation_log))
+    harness = f"""
+set -euo pipefail
+namespace=test-namespace
+env_x=test
+IMAGE_TAG=new-image
+
+sleep() {{ :; }}
+
+kubectl() {{
+  if [[ "$1" == "get" && "$2" == "pods" ]]; then
+    if [[ "${{POD_MODE:-replicas}}" == "zero" ]]; then
+      printf '%s\n' '{{"items":[]}}'
+    else
+      printf '%s\n' '{{"items":[{{"metadata":{{"name":"beat-a","deletionTimestamp":null}},"spec":{{"containers":[{{"name":"background","image":"registry/app:new-image"}}]}},"status":{{"conditions":[{{"type":"Ready","status":"True"}}]}}}},{{"metadata":{{"name":"beat-b","deletionTimestamp":null}},"spec":{{"containers":[{{"name":"background","image":"registry/app:new-image"}}]}},"status":{{"conditions":[{{"type":"Ready","status":"True"}}]}}}}]}}'
+    fi
+    return 0
+  fi
+  if [[ "$1" == "get" && "$2" == "pod" ]]; then
+    printf '%s\n' '{{"spec":{{"containers":[{{"name":"background","image":"registry/app:new-image"}}]}}}}'
+    return 0
+  fi
+  if [[ "$1" == "exec" ]]; then
+    local pod="$2"
+    if [[ "$*" == *"supervisorctl"* ]]; then
+      printf '%s\n' 'celery_beat_regulatory_indexing RUNNING pid 4321, uptime 0:00:30'
+      return 0
+    fi
+    printf '%s\n' "$pod" >> {quoted_log}
+    if [[ "${{FAIL_POD:-}}" == "$pod" ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  return 2
+}}
+
+{beat_verifier}
+verify_regulatory_indexing_beat
+"""
+
+    successful = subprocess.run(
+        ["bash"],
+        input=harness,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert successful.returncode == 0, successful.stdout + successful.stderr
+    assert validation_log.read_text(encoding="utf-8").splitlines() == [
+        "beat-a",
+        "beat-b",
+    ]
+
+    validation_log.unlink()
+    stale_env = os.environ.copy()
+    stale_env["FAIL_POD"] = "beat-b"
+    stale_replica = subprocess.run(
+        ["bash"],
+        input=harness,
+        env=stale_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert stale_replica.returncode != 0
+    assert validation_log.read_text(encoding="utf-8").splitlines() == [
+        "beat-a",
+        "beat-b",
+    ]
+
+    zero_env = os.environ.copy()
+    zero_env["POD_MODE"] = "zero"
+    zero_replicas = subprocess.run(
+        ["bash"],
+        input=harness,
+        env=zero_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert zero_replicas.returncode != 0
 
 
 def test_canonical_runbook_matches_executable_production_lite_topology() -> None:
@@ -878,6 +1141,12 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         "liveness_max_age_seconds": 150,
         "probe_marker": "pid:instance_uuid",
         "dispatch_dedup": "redis_tenant_entry_utc_slot_set_nx_ex",
+        "claimant_failure_delivery": "next_utc_slot",
+        "max_failover_gap_seconds": {
+            "monitor_celery_queues": 10,
+            "regulatory_indexing_recover_stale": 60,
+        },
+        "claim_ttl_semantics": "stale_key_retention_not_same_slot_takeover",
     }
     assert "user_file_processing" not in forbidden_queues
     assert operations == {
@@ -914,3 +1183,6 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
     assert "tam olarak beş worker, bir özel Beat ve bir log yönlendirici" in handoff
     assert "API ve background için birlikte `true`" in handoff
     assert "Yalnız background için `REGULATORY_INDEXING_GCS_URI`" in handoff
+    assert "aynı slot yeniden yayınlanmaz" in handoff
+    assert re.search(r"en geç sonraki\s+UTC slotunda", handoff)
+    assert "tüm Ready background replica'ları" in handoff

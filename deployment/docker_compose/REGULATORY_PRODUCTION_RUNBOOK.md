@@ -519,6 +519,11 @@ scheduler:
   liveness_max_age_seconds: 150
   probe_marker: pid:instance_uuid
   dispatch_dedup: redis_tenant_entry_utc_slot_set_nx_ex
+  claimant_failure_delivery: next_utc_slot
+  max_failover_gap_seconds:
+    monitor_celery_queues: 10
+    regulatory_indexing_recover_stale: 60
+  claim_ttl_semantics: stale_key_retention_not_same_slot_takeover
 forbidden_queues:
   - primary
   - docfetching
@@ -547,7 +552,10 @@ pod-local shelf is discarded and rebuilt; no shelf is shared between replicas.
 Multiple background replicas are safe without a Helm singleton setting. Before dispatch, every Beat
 claims a tenant-prefixed Redis key containing the schedule entry and UTC interval slot with atomic
 `SET NX EX`. Only the claimant publishes that tenant/slot; followers remain healthy and try later
-slots. The bounded claim expiry allows takeover after a failed claimant and Redis failure prevents
+slots. If a claimant stops after `SET NX EX` but before broker publication, that UTC slot is not
+replayed. Deterministic recovery is the next UTC slot: within ten seconds for queue monitoring and
+within sixty seconds for stale indexing recovery. The two-interval TTL only bounds stale-key
+retention and clock-anomaly impact; it is not a same-slot takeover guarantee. Redis failure prevents
 an uncoordinated publish. The PostgreSQL job table—not the Beat shelf or Redis claim—is the durable
 indexing scheduler/source of truth.
 
@@ -560,6 +568,11 @@ dispatch slot to remain ready. `active_queues` must
 match only the queues declared above. Primary, docfetching, docprocessing, generic indexing, and
 Elasticsearch-migration workers/queues are forbidden; `user_file_processing` is required on the
 dedicated regulatory indexing worker.
+
+CodeBuild enumerates every non-terminating Ready background pod whose container uses the new image
+tag and runs the PID/instance/freshness verifier in each matching replica. Readiness fails when no
+matching replica exists or when any matching replica fails its Beat status or probe checks; checking
+only the first pod is not accepted.
 Cloud preflight treats every running inference/indexing model container as a blocker. Drain and stop
 the legacy model service after ownership review before invoking the deploy wrapper. The wrapper's
 own stop and post-rollout checks are defense in depth; moving a service behind a profile alone does

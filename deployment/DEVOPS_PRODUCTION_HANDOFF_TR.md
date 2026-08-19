@@ -93,7 +93,10 @@ yasaktır. `user_file_processing` ise yalnız özel regulatory indexing worker �
 Her background podu kendi Beat process'ini çalıştırabilir. Shelf pod-local
 `/tmp/regulatory-indexing-beat-schedule` altında kalır; replica'lar aynı dosyayı paylaşmaz. Yayın
 öncesinde tenant + schedule entry + UTC time-slot için bounded TTL'li Redis `SET NX EX` claim alınır;
-aynı slotu yalnız bir replica yayınlar, follower healthy kalır ve TTL sonrasında takeover mümkündür.
+aynı slotu yalnız bir replica yayınlar ve follower healthy kalır. Claim sahibi `SET NX EX` sonrasında
+broker yayını öncesinde durursa aynı slot yeniden yayınlanmaz; deterministik failover en geç sonraki
+UTC slotunda olur: monitoring için 10 saniye, stale recovery için 60 saniye. İki interval'lik TTL
+yalnız stale key retention ve clock anomaly etkisini sınırlar; aynı-slot takeover garantisi değildir.
 External Helm replica sayısının bir olduğu varsayılmaz.
 
 Beat başlangıcında eski readiness/liveness dosyaları Redis ve PostgreSQL beklenmeden önce silinir.
@@ -101,6 +104,10 @@ Yeni dosyalar supervisor'daki güncel PID ve instance UUID'sini taşır. Compose
 eşleşmesini ve liveness mtime değerinin en fazla 150 saniye olmasını çalıştırarak doğrular; yalnız
 dosya varlığı kabul edilmez. Başarısız schedule refresh liveness'ı yenilemez, kontrollü shutdown iki
 probe'u siler. Follower replica'nın dispatch claim sahibi olması readiness şartı değildir.
+CodeBuild yeni image tag'ini çalıştıran, terminating olmayan tüm Ready background replica'ları
+enumerate eder ve her birinde supervisor PID/instance/freshness doğrulamasını çalıştırır. Sıfır eşleşme
+veya replica'lardan herhangi birinin probe hatası readiness'i başarısız yapar; yalnız ilk podun
+kontrolü yeterli değildir.
 
 Mevcut dört servisli kurulumdan geçiliyorsa model-server podu önce drain/stop edilmeli ve eski
 Deployment/Service kaldırılmalıdır. Ardından cloud preflight ve üç servisli rollout çalıştırılır;
