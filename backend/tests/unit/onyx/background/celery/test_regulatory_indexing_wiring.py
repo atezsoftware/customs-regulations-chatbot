@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -15,6 +16,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import yaml
+from celery import Celery
 from redis.exceptions import ConnectionError as RedisConnectionError
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
@@ -214,7 +216,7 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
         restarted.close()
 
 
-def test_two_scheduler_ticks_publish_once_per_tenant_entry_slot_and_advance(
+def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
     tmp_path: Path,
 ) -> None:
     beat_app = importlib.import_module(
@@ -248,11 +250,31 @@ def test_two_scheduler_ticks_publish_once_per_tenant_entry_slot_and_advance(
             return client
 
     claim_store = TenantClaimStore()
-    clock = {"now": datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)}
-    with patch.object(beat_app.celery_app, "now", side_effect=lambda: clock["now"]):
+    clock = {"now": datetime(1970, 1, 1, 0, 0, 5, tzinfo=timezone.utc)}
+    tenants = ("public", "tenant-a")
+    tasks = {
+        "monitor_celery_queues": 10,
+        "regulatory_indexing_recover_stale": 60,
+    }
+    entry_names = {
+        f"{entry_prefix}-{tenant}"
+        for entry_prefix in (
+            "monitor-celery-queues",
+            "recover-stale-regulatory-indexing",
+        )
+        for tenant in tenants
+    }
+    scheduler_app = Celery(
+        "regulatory_indexing_beat_entry_isolation_test",
+        broker="memory://",
+        set_as_current=False,
+    )
+    for task_name in tasks:
+        scheduler_app.tasks.pop(task_name, None)
+    with patch.object(scheduler_app, "now", side_effect=lambda: clock["now"]):
         schedulers = [
             beat_app.RegulatoryIndexingScheduler(
-                app=beat_app.celery_app,
+                app=scheduler_app,
                 schedule_filename=str(tmp_path / f"schedule-{index}"),
                 lazy=False,
             )
@@ -260,9 +282,11 @@ def test_two_scheduler_ticks_publish_once_per_tenant_entry_slot_and_advance(
         ]
         for scheduler in schedulers:
             with patch.object(
-                beat_app, "get_all_tenant_ids", return_value=["public", "tenant-a"]
+                beat_app, "get_all_tenant_ids", return_value=list(tenants)
             ):
                 scheduler.update_schedule()
+            for entry in scheduler.schedule.values():
+                entry.last_run_at = clock["now"] - timedelta(seconds=61)
             scheduler._last_reload = clock["now"]
             scheduler.__dict__["producer"] = MagicMock()
     try:
@@ -274,17 +298,18 @@ def test_two_scheduler_ticks_publish_once_per_tenant_entry_slot_and_advance(
             task_kwargs: dict[str, str],
             **_options: object,
         ) -> MagicMock:
+            interval_seconds = tasks[task_name]
             publications.append(
                 (
                     task_name,
                     task_kwargs["tenant_id"],
-                    int(clock["now"].timestamp() // 10),
+                    int(clock["now"].timestamp() // interval_seconds),
                 )
             )
             return MagicMock(id=f"published-{len(publications)}")
 
         with (
-            patch.object(beat_app.celery_app, "now", side_effect=lambda: clock["now"]),
+            patch.object(scheduler_app, "now", side_effect=lambda: clock["now"]),
             patch.object(
                 beat_app,
                 "get_redis_client",
@@ -293,38 +318,47 @@ def test_two_scheduler_ticks_publish_once_per_tenant_entry_slot_and_advance(
             patch.object(schedulers[0], "send_task", side_effect=capture_publication),
             patch.object(schedulers[1], "send_task", side_effect=capture_publication),
         ):
-            clock["now"] += timedelta(seconds=10, milliseconds=100)
-            assert schedulers[0].tick() == 0
-            assert schedulers[0].tick() == 0
             clock["now"] += timedelta(milliseconds=100)
-            assert schedulers[1].tick() == 0
-            assert schedulers[1].tick() == 0
+            for _entry_name in entry_names:
+                assert schedulers[0].tick() == 0
+            clock["now"] += timedelta(milliseconds=100)
+            for _entry_name in entry_names:
+                assert schedulers[1].tick() == 0
 
-        assert len(publications) == 2
-        assert {(task, tenant) for task, tenant, _slot in publications} == {
-            ("monitor_celery_queues", "public"),
-            ("monitor_celery_queues", "tenant-a"),
+        expected_publications = {
+            (task_name, tenant, 0) for task_name in tasks for tenant in tenants
         }
-        assert all(
-            count == 1
-            for count in {
-                publication: publications.count(publication)
-                for publication in publications
-            }.values()
+        assert Counter(publications) == Counter(
+            {publication: 1 for publication in expected_publications}
         )
-        assert {claim[0] for claim in claim_store.claims} == {"public", "tenant-a"}
-        assert all(claim[2] == 20 for claim in claim_store.claims)
+        assert len(claim_store.claims) == 4
+        assert {claim[0] for claim in claim_store.claims} == set(tenants)
+        for tenant_id, claim_key, ttl in claim_store.claims:
+            tenant_entry_names = {
+                entry_name
+                for entry_name in entry_names
+                if entry_name.endswith(tenant_id)
+            }
+            matching_entries = {
+                entry_name
+                for entry_name in tenant_entry_names
+                if f":{entry_name}:0" in claim_key
+            }
+            assert len(matching_entries) == 1
+            matched_entry = matching_entries.pop()
+            expected_ttl = (
+                20 if matched_entry.startswith("monitor-celery-queues") else 120
+            )
+            assert ttl == expected_ttl
         for scheduler in schedulers:
-            assert (
-                scheduler.schedule["monitor-celery-queues-public"].total_run_count == 1
-            )
-            assert (
-                scheduler.schedule["monitor-celery-queues-tenant-a"].total_run_count
-                == 1
-            )
+            assert {
+                entry_name: scheduler.schedule[entry_name].total_run_count
+                for entry_name in entry_names
+            } == dict.fromkeys(entry_names, 1)
     finally:
         for scheduler in schedulers:
             scheduler.close()
+        scheduler_app.close()
 
 
 def test_failed_publish_is_retried_by_a_replica_in_the_next_utc_slot(
