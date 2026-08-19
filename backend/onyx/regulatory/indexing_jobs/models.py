@@ -29,6 +29,17 @@ class IndexingGatewayHTTPError(IndexingGatewayError):
         )
 
 
+class IndexingGatewayIndeterminateSubmissionError(IndexingGatewayError):
+    submission_key: str
+
+    def __init__(self, submission_key: str) -> None:
+        self.submission_key = submission_key
+        super().__init__(
+            "Regulatory indexing submission outcome is indeterminate for "
+            f"{submission_key}"
+        )
+
+
 class RetryDisposition(StrEnum):
     RETRYABLE = "RETRYABLE"
     TERMINAL = "TERMINAL"

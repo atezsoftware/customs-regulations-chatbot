@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from hashlib import sha256
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 import google.auth
 import httpx
@@ -21,6 +23,7 @@ from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
     IndexingGatewayError,
     IndexingGatewayHTTPError,
+    IndexingGatewayIndeterminateSubmissionError,
     IndexingGatewayTimeoutError,
     VertexAuthenticationMode,
     VertexBatchConfig,
@@ -48,6 +51,18 @@ _SAFETY_FINISH_REASONS = frozenset(
 
 class VertexBatchContractError(ValueError):
     """A secret-safe violation of the Vertex input or output contract."""
+
+
+class VertexBatchSubmissionConflictError(VertexBatchContractError):
+    submission_key: str
+    match_count: int
+
+    def __init__(self, submission_key: str, match_count: int) -> None:
+        self.submission_key = submission_key
+        self.match_count = match_count
+        super().__init__(
+            f"Vertex submission {submission_key} matched {match_count} remote jobs"
+        )
 
 
 class VertexBatchResultError(StrEnum):
@@ -130,6 +145,8 @@ class VertexBatchGateway(Protocol):
     def submit(self, requests: Sequence[VertexBatchRequest]) -> VertexBatchState: ...
 
     def get(self, remote_job_name: str) -> VertexBatchState: ...
+
+    def reconcile_submission(self, submission_key: str) -> VertexBatchState | None: ...
 
     def read_results(self, output_uri: str) -> str: ...
 
@@ -250,9 +267,9 @@ def parse_vertex_jsonl_output(
         try:
             value: object = json.loads(line)
         except json.JSONDecodeError:
-            raise VertexBatchContractError(
-                "Vertex output has no correlatable request"
-            ) from None
+            _raise_secret_safe_public_error(
+                VertexBatchContractError("Vertex output has no correlatable request")
+            )
         if not isinstance(value, dict):
             raise VertexBatchContractError("Vertex output has no correlatable request")
         typed_value = cast(dict[str, object], value)
@@ -309,15 +326,55 @@ def _translated_gateway_error(error: Exception) -> IndexingGatewayError | None:
     return None
 
 
+def _is_indeterminate_create_error(error: Exception) -> bool:
+    translated = _translated_gateway_error(error)
+    if isinstance(
+        translated,
+        (IndexingGatewayTimeoutError, IndexingGatewayConnectionError),
+    ):
+        return True
+    return isinstance(translated, IndexingGatewayHTTPError) and (
+        translated.status_code == 408 or 500 <= translated.status_code < 600
+    )
+
+
+def _raise_secret_safe_public_error(error: Exception) -> NoReturn:
+    try:
+        raise error from None
+    except Exception:
+        error.__context__ = None
+        raise
+
+
 @contextmanager
 def _translate_gateway_errors() -> Iterator[None]:
+    normalized_error: IndexingGatewayError | None = None
     try:
         yield
     except Exception as error:
-        translated = _translated_gateway_error(error)
-        if translated is None:
+        normalized_error = _translated_gateway_error(error)
+        if normalized_error is None:
             raise
-        raise translated from error
+    if normalized_error is not None:
+        _raise_secret_safe_public_error(normalized_error)
+
+
+@contextmanager
+def _translate_create_errors(submission_key: str) -> Iterator[None]:
+    normalized_error: IndexingGatewayError | None = None
+    try:
+        yield
+    except Exception as error:
+        if _is_indeterminate_create_error(error):
+            normalized_error = IndexingGatewayIndeterminateSubmissionError(
+                submission_key
+            )
+        else:
+            normalized_error = _translated_gateway_error(error)
+        if normalized_error is None:
+            raise
+    if normalized_error is not None:
+        _raise_secret_safe_public_error(normalized_error)
 
 
 def _parse_gcs_uri(uri: str, *, require_object_path: bool = True) -> tuple[str, str]:
@@ -387,13 +444,20 @@ class GoogleVertexBatchGateway:
         config: VertexBatchConfig,
         object_prefix: str,
         credential_json_provider: Callable[[], str | None],
+        request_timeout_seconds: float = 60,
     ) -> None:
         normalized_prefix = object_prefix.strip("/")
         if not normalized_prefix or ".." in normalized_prefix.split("/"):
             raise VertexBatchContractError("Vertex object prefix is invalid")
+        if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
+            raise VertexBatchContractError(
+                "Vertex request timeout must be positive and finite"
+            )
         self._config = config
         self._object_prefix = normalized_prefix
         self._credential_json_provider = credential_json_provider
+        self._request_timeout_seconds = request_timeout_seconds
+        self._request_timeout_milliseconds = math.ceil(request_timeout_seconds * 1000)
 
     def _credentials(self) -> Credentials:
         if (
@@ -410,9 +474,9 @@ class GoogleVertexBatchGateway:
         try:
             parsed: object = json.loads(raw_credentials)
         except json.JSONDecodeError:
-            raise VertexBatchContractError(
-                "Vertex service-account credential is invalid"
-            ) from None
+            _raise_secret_safe_public_error(
+                VertexBatchContractError("Vertex service-account credential is invalid")
+            )
         if not isinstance(parsed, dict):
             raise VertexBatchContractError(
                 "Vertex service-account credential is invalid"
@@ -423,9 +487,9 @@ class GoogleVertexBatchGateway:
                 scopes=[_CLOUD_PLATFORM_SCOPE],
             )
         except (TypeError, ValueError):
-            raise VertexBatchContractError(
-                "Vertex service-account credential is invalid"
-            ) from None
+            _raise_secret_safe_public_error(
+                VertexBatchContractError("Vertex service-account credential is invalid")
+            )
 
     def _storage_client(self, credentials: Credentials) -> storage.Client:
         return storage.Client(project=self._config.project, credentials=credentials)
@@ -439,7 +503,10 @@ class GoogleVertexBatchGateway:
             project=self._config.project,
             location=self._config.location,
             credentials=credentials,
-            http_options=genai_types.HttpOptions(api_version="v1"),
+            http_options=genai_types.HttpOptions(
+                api_version="v1",
+                timeout=self._request_timeout_milliseconds,
+            ),
         )
 
     def submit(self, requests: Sequence[VertexBatchRequest]) -> VertexBatchState:
@@ -449,6 +516,7 @@ class GoogleVertexBatchGateway:
         request_set_hash = sha256(
             "\n".join(sorted(request.request_hash for request in requests)).encode()
         ).hexdigest()
+        submission_key = f"regulatory-context-{request_set_hash}"
         base_uri = self._config.gcs_uri.rstrip("/")
         batch_prefix = f"{base_uri}/{self._object_prefix}/{request_set_hash}"
         input_uri = f"{batch_prefix}/input.jsonl"
@@ -461,22 +529,24 @@ class GoogleVertexBatchGateway:
             storage_client.bucket(bucket_name).blob(input_name).upload_from_string(
                 payload,
                 content_type="application/jsonl",
+                timeout=self._request_timeout_seconds,
             )
             client = self._genai_client(credentials)
-            with traced_llm_call(
-                flow=LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
-                model=self._config.model_name,
-                provider="vertex_ai",
-                extra_config={"request_count": str(len(requests))},
-            ):
-                job = client.batches.create(
+            with _translate_create_errors(submission_key):
+                with traced_llm_call(
+                    flow=LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
                     model=self._config.model_name,
-                    src=input_uri,
-                    config=genai_types.CreateBatchJobConfig(
-                        display_name=f"regulatory-context-{request_set_hash[:16]}",
-                        dest=output_uri,
-                    ),
-                )
+                    provider="vertex_ai",
+                    extra_config={"request_count": str(len(requests))},
+                ):
+                    job = client.batches.create(
+                        model=self._config.model_name,
+                        src=input_uri,
+                        config=genai_types.CreateBatchJobConfig(
+                            display_name=submission_key,
+                            dest=output_uri,
+                        ),
+                    )
         return _batch_state(
             job,
             input_uri=input_uri,
@@ -489,6 +559,26 @@ class GoogleVertexBatchGateway:
             job = self._genai_client(credentials).batches.get(name=remote_job_name)
         return _batch_state(job)
 
+    def reconcile_submission(self, submission_key: str) -> VertexBatchState | None:
+        from google.genai import types as genai_types
+
+        if re.fullmatch(r"regulatory-context-[0-9a-f]{64}", submission_key) is None:
+            raise VertexBatchContractError("Vertex submission key is invalid")
+        with _translate_gateway_errors():
+            credentials = self._credentials()
+            pager = self._genai_client(credentials).batches.list(
+                config=genai_types.ListBatchJobsConfig(
+                    page_size=2,
+                    filter=f'displayName="{submission_key}"',
+                )
+            )
+            matches = pager.page
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise VertexBatchSubmissionConflictError(submission_key, len(matches))
+        return _batch_state(matches[0])
+
     def read_results(self, output_uri: str) -> str:
         bucket_name, output_prefix = _parse_gcs_uri(output_uri)
         with _translate_gateway_errors():
@@ -498,7 +588,9 @@ class GoogleVertexBatchGateway:
                 (
                     blob
                     for blob in storage_client.list_blobs(
-                        bucket_name, prefix=output_prefix
+                        bucket_name,
+                        prefix=f"{output_prefix}/",
+                        timeout=self._request_timeout_seconds,
                     )
                     if blob.name.endswith(".jsonl")
                 ),
@@ -506,7 +598,12 @@ class GoogleVertexBatchGateway:
             )
             if not blobs:
                 raise VertexBatchContractError("Vertex output contains no JSONL files")
-            parts = [blob.download_as_text().rstrip("\n") for blob in blobs]
+            parts = [
+                blob.download_as_text(timeout=self._request_timeout_seconds).rstrip(
+                    "\n"
+                )
+                for blob in blobs
+            ]
         return "\n".join(parts) + "\n"
 
     def cancel(self, remote_job_name: str) -> None:
@@ -533,7 +630,11 @@ class GoogleVertexBatchGateway:
                 storage_client.list_blobs(
                     bucket_name,
                     prefix=f"{object_prefix}/",
+                    timeout=self._request_timeout_seconds,
                 )
             )
             if blobs:
-                storage_client.bucket(bucket_name).delete_blobs(blobs)
+                storage_client.bucket(bucket_name).delete_blobs(
+                    blobs,
+                    timeout=self._request_timeout_seconds,
+                )

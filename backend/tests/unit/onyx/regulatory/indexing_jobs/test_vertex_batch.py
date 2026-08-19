@@ -1,9 +1,11 @@
 import json
 import logging
+import traceback
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, cast
 
+import httpx
 import pytest
 from google import genai
 from google.api_core import exceptions as google_exceptions
@@ -12,6 +14,7 @@ from google.genai import types as genai_types
 
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayHTTPError,
+    IndexingGatewayIndeterminateSubmissionError,
     IndexingGatewayTimeoutError,
     VertexAuthenticationMode,
     VertexBatchConfig,
@@ -22,6 +25,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchJobStatus,
     VertexBatchRequest,
     VertexBatchResultError,
+    VertexBatchSubmissionConflictError,
     build_vertex_jsonl,
     parse_vertex_jsonl_output,
 )
@@ -177,6 +181,7 @@ def test_malformed_jsonl_failure_does_not_retain_the_full_line() -> None:
 
     assert "LEGAL_JSONL_SENTINEL" not in str(raised.value)
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_pure_contract_does_not_log_sensitive_payloads(
@@ -204,12 +209,22 @@ class _FakeBlob:
         self._downloads = downloads
         self.uploaded: str | None = None
         self.content_type: str | None = None
+        self.upload_timeout: float | None = None
+        self.download_timeouts: list[float | None] = []
 
-    def upload_from_string(self, data: str, *, content_type: str) -> None:
+    def upload_from_string(
+        self,
+        data: str,
+        *,
+        content_type: str,
+        timeout: float | None = None,
+    ) -> None:
         self.uploaded = data
         self.content_type = content_type
+        self.upload_timeout = timeout
 
-    def download_as_text(self) -> str:
+    def download_as_text(self, *, timeout: float | None = None) -> str:
+        self.download_timeouts.append(timeout)
         return self._downloads[self.name]
 
 
@@ -218,22 +233,34 @@ class _FakeBucket:
         self._downloads = downloads
         self.blobs: dict[str, _FakeBlob] = {}
         self.deleted_names: list[str] = []
+        self.delete_timeout: float | None = None
 
     def blob(self, name: str) -> _FakeBlob:
         return self.blobs.setdefault(name, _FakeBlob(name, self._downloads))
 
-    def delete_blobs(self, blobs: list[_FakeBlob]) -> None:
+    def delete_blobs(
+        self, blobs: list[_FakeBlob], *, timeout: float | None = None
+    ) -> None:
         self.deleted_names.extend(blob.name for blob in blobs)
+        self.delete_timeout = timeout
 
 
 class _FakeStorageClient:
     def __init__(self, downloads: dict[str, str] | None = None) -> None:
         self.bucket_value = _FakeBucket(downloads or {})
+        self.list_timeouts: list[float | None] = []
 
     def bucket(self, _bucket_name: str) -> _FakeBucket:
         return self.bucket_value
 
-    def list_blobs(self, _bucket_name: str, *, prefix: str) -> list[_FakeBlob]:
+    def list_blobs(
+        self,
+        _bucket_name: str,
+        *,
+        prefix: str,
+        timeout: float | None = None,
+    ) -> list[_FakeBlob]:
+        self.list_timeouts.append(timeout)
         return [
             self.bucket_value.blob(name)
             for name in self.bucket_value._downloads
@@ -253,11 +280,16 @@ class _FakeBatches:
         )
         self.cancelled_name: str | None = None
         self.error: Exception | None = None
+        self.create_error: Exception | None = None
+        self.listed_config: object | None = None
+        self.list_results: list[object] = []
 
     def create(self, **kwargs: Any) -> object:
+        self.created = kwargs
+        if self.create_error is not None:
+            raise self.create_error
         if self.error is not None:
             raise self.error
-        self.created = kwargs
         return SimpleNamespace(
             name="jobs/remote-1",
             state="JOB_STATE_PENDING",
@@ -275,6 +307,12 @@ class _FakeBatches:
         if self.error is not None:
             raise self.error
         self.cancelled_name = name
+
+    def list(self, *, config: object) -> object:
+        if self.error is not None:
+            raise self.error
+        self.listed_config = config
+        return SimpleNamespace(page=self.list_results)
 
 
 class _FakeGenAIClient:
@@ -319,11 +357,13 @@ def _gateway(
     authentication_mode: VertexAuthenticationMode = (
         VertexAuthenticationMode.SERVICE_ACCOUNT_JSON
     ),
+    request_timeout_seconds: float = 60,
 ) -> GoogleVertexBatchGateway:
     return GoogleVertexBatchGateway(
         config=_vertex_config(authentication_mode),
         object_prefix="tenant-a/job-42",
         credential_json_provider=credential_provider,
+        request_timeout_seconds=request_timeout_seconds,
     )
 
 
@@ -349,7 +389,8 @@ def test_submit_resolves_service_account_fresh_and_uses_v1_clients(
         fake_from_info,
     )
     gateway = _gateway(
-        lambda: json.dumps({"type": "service_account", "project_id": "customs-prod"})
+        lambda: json.dumps({"type": "service_account", "project_id": "customs-prod"}),
+        request_timeout_seconds=12.5,
     )
 
     state = gateway.submit([VertexBatchRequest(prompt="first prompt")])
@@ -363,6 +404,7 @@ def test_submit_resolves_service_account_fresh_and_uses_v1_clients(
     assert client_kwargs[0]["credentials"] is credential
     http_options = cast(genai_types.HttpOptions, client_kwargs[0]["http_options"])
     assert http_options.api_version == "v1"
+    assert http_options.timeout == 12_500
     assert state.remote_job_name == "jobs/remote-1"
     assert state.status is VertexBatchJobStatus.PENDING
     assert state.input_uri is not None
@@ -378,6 +420,102 @@ def test_submit_resolves_service_account_fresh_and_uses_v1_clients(
         "request": _request_payload("first prompt")
     }
     assert uploaded.content_type == "application/jsonl"
+    assert uploaded.upload_timeout == 12.5
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_gateway_rejects_a_non_positive_or_nonfinite_timeout(timeout: float) -> None:
+    with pytest.raises(VertexBatchContractError):
+        _gateway(lambda: None, request_timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize(
+    "sdk_error",
+    [
+        httpx.ReadTimeout("CREATE_TIMEOUT_SECRET"),
+        genai_errors.ServerError(503, {"message": "CREATE_SERVER_SECRET"}),
+    ],
+)
+def test_submit_raises_secret_safe_indeterminate_error_after_ambiguous_create(
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_error: Exception,
+) -> None:
+    batches = _FakeBatches()
+    batches.create_error = sdk_error
+    _install_clients(monkeypatch, _FakeStorageClient(), batches)
+    gateway = _gateway(lambda: '{"type":"service_account"}')
+    with pytest.raises(IndexingGatewayIndeterminateSubmissionError) as raised:
+        gateway.submit([VertexBatchRequest(prompt="first prompt")])
+
+    assert batches.created is not None
+    submission_key = raised.value.submission_key
+    assert batches.created["config"].display_name == submission_key
+    assert submission_key == (
+        "regulatory-context-"
+        "98ee8349628a7adadfdc1b029bc3e3f5b93fc917934860a3b3bc25d79147e4dd"
+    )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "CREATE_TIMEOUT_SECRET" not in rendered
+    assert "CREATE_SERVER_SECRET" not in rendered
+
+
+def test_reconcile_submission_uses_exact_identity_and_first_page_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batches = _FakeBatches()
+    batches.list_results = [
+        SimpleNamespace(
+            name="jobs/reconciled-1",
+            state="JOB_STATE_PENDING",
+            output_info=None,
+            dest=None,
+            error=None,
+        )
+    ]
+    _install_clients(monkeypatch, _FakeStorageClient(), batches)
+    gateway = _gateway(lambda: '{"type":"service_account"}')
+    submission_key = f"regulatory-context-{'a' * 64}"
+
+    state = gateway.reconcile_submission(submission_key)
+
+    assert state is not None
+    assert state.remote_job_name == "jobs/reconciled-1"
+    listed_config = cast(genai_types.ListBatchJobsConfig, batches.listed_config)
+    assert listed_config.page_size == 2
+    assert listed_config.filter == f'displayName="{submission_key}"'
+
+
+def test_reconcile_submission_returns_none_for_no_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batches = _FakeBatches()
+    _install_clients(monkeypatch, _FakeStorageClient(), batches)
+
+    state = _gateway(lambda: '{"type":"service_account"}').reconcile_submission(
+        f"regulatory-context-{'b' * 64}"
+    )
+
+    assert state is None
+
+
+def test_reconcile_submission_raises_explicit_secret_safe_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batches = _FakeBatches()
+    batches.list_results = [object(), object()]
+    _install_clients(monkeypatch, _FakeStorageClient(), batches)
+    gateway = _gateway(lambda: '{"type":"service_account"}')
+    submission_key = f"regulatory-context-{'c' * 64}"
+
+    with pytest.raises(VertexBatchSubmissionConflictError) as raised:
+        gateway.reconcile_submission(submission_key)
+
+    assert raised.value.submission_key == submission_key
+    assert raised.value.match_count == 2
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_workload_identity_uses_ambient_credentials(
@@ -440,6 +578,7 @@ def test_invalid_service_account_failure_does_not_retain_credential_details(
 
     assert "CREDENTIAL_SENTINEL" not in str(raised.value)
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_read_results_combines_jsonl_blobs_in_deterministic_name_order(
@@ -450,6 +589,7 @@ def test_read_results_combines_jsonl_blobs_in_deterministic_name_order(
             "output/part-2.jsonl": "second\n",
             "output/part-1.jsonl": "first\n",
             "output/metadata.json": "ignored",
+            "output-sibling/secret.jsonl": "SIBLING_SENTINEL\n",
         }
     )
     _install_clients(monkeypatch, storage_client, _FakeBatches())
@@ -458,6 +598,13 @@ def test_read_results_combines_jsonl_blobs_in_deterministic_name_order(
     output = gateway.read_results("gs://customs-indexing/output")
 
     assert output == "first\nsecond\n"
+    assert storage_client.list_timeouts == [60]
+    assert all(
+        blob.download_timeouts == [60]
+        for name, blob in storage_client.bucket_value.blobs.items()
+        if name.startswith("output/") and name.endswith(".jsonl")
+    )
+    assert "output-sibling/secret.jsonl" not in storage_client.bucket_value.blobs
 
 
 def test_get_cancel_and_cleanup_are_single_bounded_operations(
@@ -491,6 +638,8 @@ def test_get_cancel_and_cleanup_are_single_bounded_operations(
     assert storage_client.bucket_value.deleted_names == [
         "regulatory/tenant-a/job-42/input.jsonl"
     ]
+    assert storage_client.list_timeouts == [60]
+    assert storage_client.bucket_value.delete_timeout == 60
 
 
 def test_cleanup_supports_a_bucket_root_configured_base(
@@ -555,5 +704,9 @@ def test_gateway_translates_typed_sdk_errors_without_leaking_details(
     with pytest.raises(expected_error) as raised:
         gateway.get("jobs/remote-1")
 
-    assert raised.value.__cause__ is sdk_error
-    assert "secret detail" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    if isinstance(raised.value, IndexingGatewayHTTPError):
+        assert raised.value.status_code == 503
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "timeout detail" not in rendered
+    assert "secret detail" not in rendered
