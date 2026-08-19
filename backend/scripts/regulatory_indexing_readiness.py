@@ -636,11 +636,14 @@ def _read_secure_file(
 ) -> bytes:
     no_follow_flag = getattr(os, "O_NOFOLLOW", None)
     close_on_exec_flag = getattr(os, "O_CLOEXEC", None)
+    nonblocking_flag = getattr(os, "O_NONBLOCK", None)
     if (
         not isinstance(no_follow_flag, int)
         or no_follow_flag == 0
         or not isinstance(close_on_exec_flag, int)
         or close_on_exec_flag == 0
+        or not isinstance(nonblocking_flag, int)
+        or nonblocking_flag == 0
     ):
         raise ReadinessCheckError(
             f"{label} cannot be opened with required secure-open semantics"
@@ -649,7 +652,7 @@ def _read_secure_file(
     try:
         descriptor = open_file(
             path,
-            os.O_RDONLY | no_follow_flag | close_on_exec_flag,
+            os.O_RDONLY | no_follow_flag | close_on_exec_flag | nonblocking_flag,
         )
     except OSError as error:
         raise ReadinessCheckError(
@@ -702,10 +705,12 @@ def _read_capability_files(
     *,
     expected_owner_uid: int,
     expected_owner_gid: int,
+    attestation_mode: int = 0o600,
+    evidence_mode: int = 0o400,
 ) -> tuple[bytes, bytes]:
     attestation_bytes = _read_secure_file(
         attestation_path,
-        expected_mode=0o600,
+        expected_mode=attestation_mode,
         expected_owner_uid=expected_owner_uid,
         expected_owner_gid=expected_owner_gid,
         maximum_size=_ATTESTATION_MAX_BYTES,
@@ -713,7 +718,7 @@ def _read_capability_files(
     )
     evidence_bytes = _read_secure_file(
         evidence_path,
-        expected_mode=0o400,
+        expected_mode=evidence_mode,
         expected_owner_uid=expected_owner_uid,
         expected_owner_gid=expected_owner_gid,
         maximum_size=_CAPABILITY_EVIDENCE_MAX_BYTES,
@@ -722,21 +727,10 @@ def _read_capability_files(
     return attestation_bytes, evidence_bytes
 
 
-def _validate_capability_attestation(
-    attestation_path: Path,
-    evidence_path: Path,
-    snapshot: ReadinessSnapshot,
-    *,
-    now: datetime.datetime | None = None,
-    expected_owner_uid: int = _ATTESTATION_OWNER_UID,
-    expected_owner_gid: int = _ATTESTATION_OWNER_GID,
-) -> str:
-    attestation_bytes, evidence_bytes = _read_capability_files(
-        attestation_path,
-        evidence_path,
-        expected_owner_uid=expected_owner_uid,
-        expected_owner_gid=expected_owner_gid,
-    )
+def _validated_evidence_binding(
+    attestation_bytes: bytes,
+    evidence_bytes: bytes,
+) -> dict[str, object]:
     try:
         parsed: object = json.loads(attestation_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -746,11 +740,8 @@ def _validate_capability_attestation(
     if not isinstance(parsed, dict) or parsed.get("schema_version") != 1:
         raise ReadinessCheckError("capability attestation schema is invalid")
     evidence = cast(dict[str, object], parsed)
-    identity = evidence.get("identity")
     reference = evidence.get("evidence_reference")
     evidence_sha256 = evidence.get("evidence_sha256")
-    if not isinstance(identity, str) or not identity.strip():
-        raise ReadinessCheckError("capability attestation identity is invalid")
     if not isinstance(reference, str) or not reference.strip():
         raise ReadinessCheckError(
             "capability attestation evidence reference is invalid"
@@ -769,6 +760,28 @@ def _validate_capability_attestation(
         raise ReadinessCheckError(
             "capability attestation does not match the actual evidence digest"
         )
+    return evidence
+
+
+def _validate_capability_attestation(
+    attestation_path: Path,
+    evidence_path: Path,
+    snapshot: ReadinessSnapshot,
+    *,
+    now: datetime.datetime | None = None,
+    expected_owner_uid: int = _ATTESTATION_OWNER_UID,
+    expected_owner_gid: int = _ATTESTATION_OWNER_GID,
+) -> str:
+    attestation_bytes, evidence_bytes = _read_capability_files(
+        attestation_path,
+        evidence_path,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+    )
+    evidence = _validated_evidence_binding(attestation_bytes, evidence_bytes)
+    identity = evidence.get("identity")
+    if not isinstance(identity, str) or not identity.strip():
+        raise ReadinessCheckError("capability attestation identity is invalid")
     exact_scope = {
         "gcs_uri": snapshot.gcs_uri,
         "vertex_project": snapshot.vertex_project,
@@ -875,7 +888,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "are hashed but never emitted."
         ),
     )
-    parser.add_argument(
+    validation_mode = parser.add_mutually_exclusive_group()
+    validation_mode.add_argument(
         "--validate-capability-files-only",
         action="store_true",
         help=(
@@ -883,22 +897,38 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "perform no database or network checks."
         ),
     )
+    validation_mode.add_argument(
+        "--validate-capability-snapshots-only",
+        action="store_true",
+        help=(
+            "Validate owner-only capability snapshots and their exact evidence "
+            "digest binding; perform no database or network checks."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    if args.validate_capability_files_only:
+    if args.validate_capability_files_only or args.validate_capability_snapshots_only:
         if args.capability_attestation is None or args.capability_evidence is None:
             print("NOT_READY capability files are required")
             return EXIT_NOT_READY
         try:
-            _read_capability_files(
+            snapshot_mode = args.validate_capability_snapshots_only
+            attestation_bytes, evidence_bytes = _read_capability_files(
                 args.capability_attestation,
                 args.capability_evidence,
-                expected_owner_uid=_ATTESTATION_OWNER_UID,
-                expected_owner_gid=_ATTESTATION_OWNER_GID,
+                expected_owner_uid=(
+                    os.geteuid() if snapshot_mode else _ATTESTATION_OWNER_UID
+                ),
+                expected_owner_gid=(
+                    os.getegid() if snapshot_mode else _ATTESTATION_OWNER_GID
+                ),
+                evidence_mode=(0o600 if snapshot_mode else 0o400),
             )
+            if snapshot_mode:
+                _validated_evidence_binding(attestation_bytes, evidence_bytes)
         except ReadinessCheckError as error:
             print(f"NOT_READY {error}")
             return EXIT_NOT_READY

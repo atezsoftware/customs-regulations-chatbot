@@ -312,8 +312,6 @@ checks were blocked by the absent snapshot. No live canary was started and no
 existing production document, index, database/provider record, GCS object, or
 Vertex job was mutated.
 
----
-
 ## Review fix round 3/5
 
 All five Important findings were implemented without a production write,
@@ -485,3 +483,85 @@ failed, host cgroup evidence was unavailable, and all snapshot-dependent checks
 were blocked. No attestation was fabricated, no live canary was started, and no
 existing production document, index, database/provider record, GCS object, or
 Vertex job was mutated.
+
+---
+
+## Review fix round 5/5
+
+Both remaining Important findings were implemented without a production write,
+deployment, push, or merge.
+
+### RED/GREEN evidence
+
+- Nonblocking secure-open RED was `2 failed, 2 passed, 28 deselected in
+  2.41s`: readiness did not fail closed when `O_NONBLOCK` was unavailable, and
+  opening a writerless FIFO blocked beyond the deterministic one-second child
+  process deadline. `_read_secure_file` now includes
+  `O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC` in its one `os.open`, immediately
+  `fstat`s and rejects non-regular files, reads at most the bound plus one byte,
+  and closes on every path. Focused GREEN was `4 passed, 28 deselected in
+  1.07s`.
+- Snapshot-helper RED was `3 failed, 68 deselected in 1.55s`: the stdlib-only
+  helper and snapshot-only runtime validation mode did not exist. Timeout RED
+  was separately `2 failed, 37 deselected in 0.50s`: preflight issued neither
+  a hard timeout nor deterministic named-container cleanup. The helper now
+  opens each original source exactly once with the same nonblocking,
+  no-follow, close-on-exec contract; validates regular-file type, exact
+  `1001:1001` ownership, exact `0600`/`0400` modes, and bounded size from that
+  descriptor; reads only those bounded bytes; and writes two fixed-name,
+  exclusive mode-`0600` snapshots in a unique mode-`0700` directory with file
+  and directory `fsync`. It does not enumerate the source directory or print
+  paths or evidence. Focused helper/runtime GREEN was `3 passed, 68 deselected
+  in 1.13s`; timeout/delegation GREEN was `2 passed, 37 deselected in 0.51s`.
+- Production-lite preflight bind-mounts only those trusted snapshots into a
+  named `--rm`, no-network, read-only-root, capability-dropped runtime
+  container. The invocation has a foreground 30-second timeout with a
+  five-second kill grace; the EXIT/HUP/INT/TERM cleanup trap uses a separately
+  bounded forced container removal and deletes only the two fixed snapshots
+  and their private directory. The runtime image reopens both snapshots with
+  the canonical secure reader and independently revalidates the exact archived
+  evidence digest binding before returning without database or network access.
+- The real runtime-lite regression maps the invoking test identity to numeric
+  `1001:1001` in an isolated user namespace. Exact regular source files pass
+  descriptor snapshotting and runtime digest validation; a final-component
+  host attestation symlink fails before any readiness container run; unrelated
+  sibling data is never read; all snapshots, containers, probe directories,
+  and test image tags are removed. Focused result was `2 passed, 1 deselected
+  in 8.37s`; the complete privileged runtime module, including canonical
+  Supervisor `1001:1001`/`0770` allow/deny proof, passed `3 passed in 46.31s`.
+
+### Round-5 verification
+
+- Final focused readiness, Supervisor/Compose wiring, and executable preflight:
+  `97 passed in 11.25s`.
+- Regulatory/indexing unit and runtime superset, broader than round 4:
+  `975 passed, 6 skipped in 26.88s`.
+- Ruff and Ruff formatting passed on every touched Python file. `ty` passed.
+  `bash -n` passed. Host `shellcheck` was unavailable; the repository
+  shellcheck pre-commit hook passed. The complete touched-code pre-commit run
+  passed every applicable hook, including lazy imports, `ty`, Ruff, Ruff
+  formatting, shellcheck, large-file, and ripsecrets.
+- No durable pipeline or repository code changed in this breaker round, so the
+  disposable PostgreSQL 15.2/Elasticsearch 9.4.2 pipeline suite was not
+  repeated. The immediately preceding unchanged-code evidence remains
+  `36 passed in 44.22s`, with the independent zero-residue database and index
+  checks recorded above.
+
+### Environment and live-readiness limitation
+
+This host's snap-packaged Docker 29.6.1 daemon rejects every initial executable,
+including `/bin/true`, when Docker applies
+`--security-opt no-new-privileges`, with `operation not permitted`. The
+canonical preflight retains that fail-closed security option. The external
+regression probes this daemon behavior and, only for the test runtime on an
+affected host, uses `setpriv --no-new-privs`; it separately proves
+`NoNewPrivs: 1` before exercising
+the same runtime validation. Docker-visible snapshots also use a unique
+repository-local test directory because this snap daemon cannot bind the
+caller's `/tmp`; production keeps the ordinary private `TMPDIR` contract.
+
+The live gate otherwise remains unchanged: `getent hosts
+psql.dev.singlewindow.io` returned exit `2`; `onyx-api_server-1` was running but
+unhealthy; nginx ports `7000` and `7001` returned HTTP `200`. No attestation was
+fabricated, no live canary was started, and no production document, index,
+database/provider record, GCS object, or Vertex job was mutated.

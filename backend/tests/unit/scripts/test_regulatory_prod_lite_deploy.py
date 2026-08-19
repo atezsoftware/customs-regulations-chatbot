@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 _COMPOSE_ROOT = _REPO_ROOT / "deployment" / "docker_compose"
 _PREFLIGHT = _COMPOSE_ROOT / "regulatory-prod-lite-preflight.sh"
 _DEPLOY = _COMPOSE_ROOT / "regulatory-prod-lite-deploy.sh"
+_SNAPSHOT_HELPER = _COMPOSE_ROOT / "regulatory_readiness_file_snapshot.py"
 _IMAGE = "registry.example.com/team/regulatory-backend-lite@sha256:" + "a" * 64
 _WEB_IMAGE = "registry.example.com/team/regulatory-web@sha256:" + "b" * 64
 _MODEL_IMAGE = "registry.example.com/team/regulatory-model@sha256:" + "c" * 64
@@ -172,17 +175,33 @@ def _fake_docker(
     attestation_mode: int = 0o600,
     evidence_owner: str = "1001",
     evidence_mode: int = 0o400,
+    fake_timeout_exit: str = "",
+    use_real_snapshot_helper: bool = False,
+    use_real_timeout: bool = False,
+    real_runtime_image: str = "",
+    real_runtime_use_setpriv_nnp: bool = False,
 ) -> tuple[dict[str, str], Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log_path = tmp_path / "docker.log"
     config_path = tmp_path / "config.json"
-    attestation_path = tmp_path / "regulatory-capabilities.json"
-    attestation_path.write_text("{}\n", encoding="utf-8")
-    attestation_path.chmod(attestation_mode)
     evidence_path = tmp_path / "regulatory-capability-evidence.json"
-    evidence_path.write_text('{"approved":true}\n', encoding="utf-8")
+    evidence_bytes = b'{"approved":true}\n'
+    evidence_path.write_bytes(evidence_bytes)
     evidence_path.chmod(evidence_mode)
+    evidence_digest = hashlib.sha256(evidence_bytes).hexdigest()
+    attestation_path = tmp_path / "regulatory-capabilities.json"
+    attestation_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "evidence_reference": (f"archive://TASK-8#sha256={evidence_digest}"),
+                "evidence_sha256": evidence_digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+    attestation_path.chmod(attestation_mode)
     rendered_config = json.loads(config or _config())
     background = rendered_config["services"]["background"]
     for volume in background.get("volumes", []):
@@ -214,12 +233,43 @@ if [[ "${1:-}" == "inspect" ]]; then
   printf '%s\\n' 'sha256:7777777777777777777777777777777777777777777777777777777777777777'
   exit 0
 fi
-if [[ "${1:-}" == "run" && " $* " == *" --validate-capability-files-only "* ]]; then
-  if [[ "$FAKE_ATTESTATION_OWNER" != "1001" || "$FAKE_ATTESTATION_MODE" != "600" ]]; then
-    exit 42
-  fi
-  if [[ "$FAKE_EVIDENCE_OWNER" != "1001" || "$FAKE_EVIDENCE_MODE" != "400" ]]; then
-    exit 42
+if [[ "${1:-}" == "rm" && -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
+  exec "$FAKE_REAL_DOCKER" "$@"
+fi
+if [[ "${1:-}" == "run" && " $* " == *" --validate-capability-snapshots-only "* ]]; then
+  if [[ -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
+    arguments=("$@")
+    for index in "${!arguments[@]}"; do
+      if [[ "${arguments[$index]}" == "$_IMAGE" ]]; then
+        arguments[$index]="$FAKE_REAL_RUNTIME_IMAGE"
+      fi
+    done
+    if [[ "$FAKE_REAL_RUNTIME_USE_SETPRIV_NNP" == "true" ]]; then
+      adapted=()
+      skip_next=false
+      for index in "${!arguments[@]}"; do
+        if [[ "$skip_next" == "true" ]]; then
+          skip_next=false
+          continue
+        fi
+        if [[ "${arguments[$index]}" == "--security-opt" && \
+              "${arguments[$((index + 1))]:-}" == "no-new-privileges" ]]; then
+          skip_next=true
+          continue
+        fi
+        if [[ "${arguments[$index]}" == "/usr/local/bin/python" && \
+              "${arguments[$((index - 1))]:-}" == "--entrypoint" ]]; then
+          adapted+=("/usr/bin/setpriv")
+          continue
+        fi
+        adapted+=("${arguments[$index]}")
+        if [[ "${arguments[$index]}" == "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
+          adapted+=("--no-new-privs" "/usr/local/bin/python")
+        fi
+      done
+      arguments=("${adapted[@]}")
+    fi
+    exec "$FAKE_REAL_DOCKER" "${arguments[@]}"
   fi
   exit 0
 fi
@@ -255,6 +305,66 @@ exit 0
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    if not use_real_snapshot_helper:
+        fake_python = bin_dir / "python3"
+        fake_python.write_text(
+            """#!/usr/bin/env bash
+set -eu
+if [[ "${1:-}" == *"regulatory_readiness_file_snapshot.py" ]]; then
+  shift
+  attestation=""
+  evidence=""
+  snapshot_directory=""
+  while (($#)); do
+    case "$1" in
+      --attestation) attestation=$2; shift 2 ;;
+      --evidence) evidence=$2; shift 2 ;;
+      --snapshot-directory) snapshot_directory=$2; shift 2 ;;
+      --expected-owner-uid | --expected-owner-gid) shift 2 ;;
+      *) exit 2 ;;
+    esac
+  done
+  if [[ "$FAKE_ATTESTATION_OWNER" != "1001" || "$FAKE_ATTESTATION_MODE" != "600" ]]; then
+    exit 1
+  fi
+  if [[ "$FAKE_EVIDENCE_OWNER" != "1001" || "$FAKE_EVIDENCE_MODE" != "400" ]]; then
+    exit 1
+  fi
+  command cp -- "$attestation" "$snapshot_directory/regulatory-capabilities.json"
+  command cp -- "$evidence" "$snapshot_directory/regulatory-capability-evidence.json"
+  command chmod 0600 \
+    "$snapshot_directory/regulatory-capabilities.json" \
+    "$snapshot_directory/regulatory-capability-evidence.json"
+  printf '%s:%s\n' "$(id -u)" "$(id -g)"
+  exit 0
+fi
+exec /usr/bin/python3 "$@"
+""",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+    timeout_log = tmp_path / "timeout.log"
+    if not use_real_timeout:
+        fake_timeout = bin_dir / "timeout"
+        fake_timeout.write_text(
+            """#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >>"$FAKE_TIMEOUT_LOG"
+if [[ -n "$FAKE_TIMEOUT_EXIT" && " $* " == *" docker run "* ]]; then
+  exit "$FAKE_TIMEOUT_EXIT"
+fi
+while (($#)); do
+  case "$1" in
+    --foreground | --kill-after=*) shift ;;
+    *s) shift; break ;;
+    *) exit 2 ;;
+  esac
+done
+exec "$@"
+""",
+            encoding="utf-8",
+        )
+        fake_timeout.chmod(0o755)
     fake_stat = bin_dir / "stat"
     fake_stat.write_text(
         """#!/usr/bin/env bash
@@ -321,6 +431,14 @@ exec /usr/bin/stat "$@"
             "FAKE_ATTESTATION_MODE": f"{attestation_mode:o}",
             "FAKE_EVIDENCE_OWNER": evidence_owner,
             "FAKE_EVIDENCE_MODE": f"{evidence_mode:o}",
+            "FAKE_TIMEOUT_EXIT": fake_timeout_exit,
+            "FAKE_TIMEOUT_LOG": str(timeout_log),
+            "FAKE_REAL_RUNTIME_IMAGE": real_runtime_image,
+            "FAKE_REAL_RUNTIME_USE_SETPRIV_NNP": str(
+                real_runtime_use_setpriv_nnp
+            ).lower(),
+            "FAKE_REAL_DOCKER": "/usr/bin/docker",
+            "_IMAGE": _IMAGE,
             "_MODEL_IMAGE": _MODEL_IMAGE,
             "_WEB_IMAGE": _WEB_IMAGE,
         }
@@ -339,6 +457,102 @@ def _run(
         text=True,
         check=False,
     )
+
+
+def _run_snapshot_helper(
+    attestation_path: Path,
+    evidence_path: Path,
+    snapshot_directory: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_SNAPSHOT_HELPER),
+            "--attestation",
+            str(attestation_path),
+            "--evidence",
+            str(evidence_path),
+            "--snapshot-directory",
+            str(snapshot_directory),
+            "--expected-owner-uid",
+            str(os.geteuid()),
+            "--expected-owner-gid",
+            str(os.getegid()),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_readiness_snapshot_helper_copies_only_descriptor_validated_bytes(
+    tmp_path: Path,
+) -> None:
+    attestation_bytes = b'{"schema_version":1,"marker":"never-print-attestation"}\n'
+    evidence_bytes = b'{"marker":"never-print-evidence"}\n'
+    attestation_path = tmp_path / "capability-attestation.json"
+    attestation_path.write_bytes(attestation_bytes)
+    attestation_path.chmod(0o600)
+    evidence_path = tmp_path / "capability-evidence.json"
+    evidence_path.write_bytes(evidence_bytes)
+    evidence_path.chmod(0o400)
+    sibling_secret = tmp_path / "unrelated-secret"
+    sibling_secret.write_text("must-not-be-read", encoding="utf-8")
+    sibling_secret.chmod(0o600)
+    snapshot_directory = tmp_path / "snapshots"
+    snapshot_directory.mkdir(mode=0o700)
+
+    result = _run_snapshot_helper(
+        attestation_path,
+        evidence_path,
+        snapshot_directory,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{os.geteuid()}:{os.getegid()}\n"
+    assert "never-print" not in result.stdout
+    assert "never-print" not in result.stderr
+    snapshots = {path.name: path for path in snapshot_directory.iterdir()}
+    assert set(snapshots) == {
+        "regulatory-capabilities.json",
+        "regulatory-capability-evidence.json",
+    }
+    assert snapshots["regulatory-capabilities.json"].read_bytes() == attestation_bytes
+    assert (
+        snapshots["regulatory-capability-evidence.json"].read_bytes() == evidence_bytes
+    )
+    assert snapshots["regulatory-capabilities.json"].stat().st_mode & 0o777 == 0o600
+    assert (
+        snapshots["regulatory-capability-evidence.json"].stat().st_mode & 0o777 == 0o600
+    )
+    assert sibling_secret.read_text(encoding="utf-8") == "must-not-be-read"
+
+
+def test_readiness_snapshot_helper_rejects_final_component_symlink(
+    tmp_path: Path,
+) -> None:
+    target_path = tmp_path / "attestation-target.json"
+    target_path.write_bytes(b'{"marker":"symlink-target-never-print"}\n')
+    target_path.chmod(0o600)
+    attestation_path = tmp_path / "capability-attestation.json"
+    attestation_path.symlink_to(target_path)
+    evidence_path = tmp_path / "capability-evidence.json"
+    evidence_path.write_bytes(b'{"approved":true}\n')
+    evidence_path.chmod(0o400)
+    snapshot_directory = tmp_path / "snapshots"
+    snapshot_directory.mkdir(mode=0o700)
+
+    result = _run_snapshot_helper(
+        attestation_path,
+        evidence_path,
+        snapshot_directory,
+    )
+
+    assert result.returncode == 1
+    assert "secure descriptor validation" in result.stderr
+    assert "symlink-target-never-print" not in result.stdout
+    assert "symlink-target-never-print" not in result.stderr
+    assert list(snapshot_directory.iterdir()) == []
 
 
 def _deploy_args(env_file: Path, env: dict[str, str]) -> list[str]:
@@ -461,11 +675,60 @@ def test_preflight_delegates_capability_files_to_no_network_secure_reader(
 
     assert result.returncode == 0, result.stderr
     docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
-    assert "run --rm --pull never --network none --read-only" in docker_log
-    assert "--user 1001:1001" in docker_log
+    timeout_log = Path(env["FAKE_TIMEOUT_LOG"]).read_text(encoding="utf-8")
+    assert "--foreground --kill-after=5s 30s docker run" in timeout_log
+    assert "run --name regulatory-readiness-" in docker_log
+    assert "--rm --pull never --network none --read-only" in docker_log
+    assert f"--user {os.geteuid()}:{os.getegid()}" in docker_log
     assert _IMAGE in docker_log
     assert "/app/scripts/regulatory_indexing_readiness.py" in docker_log
-    assert "--validate-capability-files-only" in docker_log
+    assert "--validate-capability-snapshots-only" in docker_log
+    assert env["FAKE_ATTESTATION_PATH"] not in next(
+        command
+        for command in docker_log.splitlines()
+        if "--validate-capability-snapshots-only" in command
+    )
+    assert env["FAKE_EVIDENCE_PATH"] not in next(
+        command
+        for command in docker_log.splitlines()
+        if "--validate-capability-snapshots-only" in command
+    )
+
+
+def test_preflight_times_out_readiness_container_and_cleans_snapshot(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path, fake_timeout_exit="124")
+    env["TMPDIR"] = str(tmp_path)
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == 1
+    assert "timed out or failed" in result.stderr
+    timeout_log = Path(env["FAKE_TIMEOUT_LOG"]).read_text(encoding="utf-8")
+    assert "--foreground --kill-after=5s 30s docker run" in timeout_log
+    docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
+    assert "rm -f regulatory-readiness-" in docker_log
+    assert not list(tmp_path.glob("regulatory-readiness-snapshot.*"))
 
 
 @pytest.mark.parametrize(

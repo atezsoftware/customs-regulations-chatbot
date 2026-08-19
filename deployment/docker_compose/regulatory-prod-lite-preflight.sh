@@ -12,6 +12,8 @@ readonly EXTERNAL_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-external-
 readonly NO_LOCAL_MODELS_OVERLAY="$SCRIPT_DIR/docker-compose.no-local-models.yml"
 readonly EDGE_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-edge.yml"
 readonly COMPOSE_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-compose-infra.yml"
+readonly READINESS_SNAPSHOT_HELPER="$SCRIPT_DIR/regulatory_readiness_file_snapshot.py"
+readonly READINESS_VALIDATION_TIMEOUT_SECONDS=30
 
 usage() {
   cat <<'EOF'
@@ -38,8 +40,8 @@ Options:
 The shipped regulatory overlays are fixed and cannot be replaced from the command line. Backend and
 web services must use reviewed repository@sha256 digests and have no build definitions. Import and
 indexing workers, ambiguous local/external infrastructure, and generic multi-tenant migrations are
-rejected. One disposable, read-only, no-network backend container validates the readiness files
-through the same descriptor-owned reader used by the live readiness command.
+rejected. Descriptor-validated host snapshots are passed to one disposable, read-only, no-network
+backend container for an independently bounded digest validation.
 EOF
 }
 
@@ -165,6 +167,10 @@ command -v docker >/dev/null 2>&1 || die "docker is not installed"
 command -v jq >/dev/null 2>&1 || die "jq is required for fail-closed Compose validation"
 command -v readlink >/dev/null 2>&1 || die "readlink is required for environment-path validation"
 command -v stat >/dev/null 2>&1 || die "stat is required for environment permission validation"
+command -v python3 >/dev/null 2>&1 || die "python3 is required for readiness snapshot validation"
+command -v timeout >/dev/null 2>&1 || die "timeout is required for bounded readiness validation"
+[[ -r "$READINESS_SNAPSHOT_HELPER" && -f "$READINESS_SNAPSHOT_HELPER" ]] || \
+  die "the readiness snapshot helper is unavailable"
 [[ -r "$env_file" && -f "$env_file" ]] || die "the environment file is not a readable regular file"
 [[ -r "$migration_env_file" && -f "$migration_env_file" ]] || \
   die "the migration environment file is not a readable regular file"
@@ -333,6 +339,8 @@ config_error_file=$(mktemp "${TMPDIR:-/tmp}/regulatory-prod-lite-config-error.XX
 active_services_file=$(mktemp "${TMPDIR:-/tmp}/regulatory-prod-lite-services.XXXXXX")
 profiled_config_file=$(mktemp "${TMPDIR:-/tmp}/regulatory-prod-lite-profiled-config.XXXXXX")
 container_inventory_file=$(mktemp "${TMPDIR:-/tmp}/regulatory-prod-lite-containers.XXXXXX")
+snapshot_directory=""
+readiness_container_name=""
 chmod 600 \
   "$config_file" \
   "$config_error_file" \
@@ -340,6 +348,16 @@ chmod 600 \
   "$profiled_config_file" \
   "$container_inventory_file"
 cleanup() {
+  if [[ -n "$readiness_container_name" ]]; then
+    timeout --foreground --kill-after=2s 10s \
+      docker rm -f "$readiness_container_name" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$snapshot_directory" ]]; then
+    rm -f -- \
+      "$snapshot_directory/regulatory-capabilities.json" \
+      "$snapshot_directory/regulatory-capability-evidence.json"
+    rmdir -- "$snapshot_directory" 2>/dev/null || true
+  fi
   rm -f -- \
     "$config_file" \
     "$config_error_file" \
@@ -351,6 +369,9 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+snapshot_directory=$(mktemp -d "${TMPDIR:-/tmp}/regulatory-readiness-snapshot.XXXXXX")
+chmod 700 "$snapshot_directory"
 
 if ! docker ps \
   --format '{{.ID}}\t{{.Names}}\t{{.Label "com.docker.compose.service"}}' \
@@ -731,7 +752,23 @@ fi
 
 background_image=$(jq -er '.services.background.image' "$config_file") || \
   die "the rendered background image cannot be resolved for readiness-file validation"
-if ! docker run \
+snapshot_owner=$(python3 "$READINESS_SNAPSHOT_HELPER" \
+  --attestation "$attestation_path" \
+  --evidence "$evidence_path" \
+  --snapshot-directory "$snapshot_directory" \
+  --expected-owner-uid 1001 \
+  --expected-owner-gid 1001) || \
+  die "the readiness capability sources failed secure descriptor validation"
+[[ "$snapshot_owner" =~ ^[0-9]+:[0-9]+$ ]] || \
+  die "the readiness snapshot owner could not be resolved"
+
+readiness_container_name="regulatory-readiness-${project_name}-$$-${RANDOM}"
+if ! timeout \
+  --foreground \
+  --kill-after=5s \
+  "${READINESS_VALIDATION_TIMEOUT_SECONDS}s" \
+  docker run \
+  --name "$readiness_container_name" \
   --rm \
   --pull never \
   --network none \
@@ -739,17 +776,17 @@ if ! docker run \
   --cap-drop ALL \
   --security-opt no-new-privileges \
   --pids-limit 64 \
-  --user 1001:1001 \
-  --mount "type=bind,source=$attestation_path,target=/run/readiness/regulatory-capabilities.json,readonly" \
-  --mount "type=bind,source=$evidence_path,target=/run/readiness/regulatory-capability-evidence.json,readonly" \
+  --user "$snapshot_owner" \
+  --mount "type=bind,source=$snapshot_directory/regulatory-capabilities.json,target=/run/readiness/regulatory-capabilities.json,readonly" \
+  --mount "type=bind,source=$snapshot_directory/regulatory-capability-evidence.json,target=/run/readiness/regulatory-capability-evidence.json,readonly" \
   --entrypoint /usr/local/bin/python \
   "$background_image" \
   /app/scripts/regulatory_indexing_readiness.py \
-  --validate-capability-files-only \
+  --validate-capability-snapshots-only \
   --capability-attestation /run/readiness/regulatory-capabilities.json \
   --capability-evidence /run/readiness/regulatory-capability-evidence.json \
   >"$config_error_file" 2>&1; then
-  die "the readiness capability files failed secure descriptor validation in the runtime image"
+  die "the readiness capability snapshot validation timed out or failed"
 fi
 
 printf '%s\n' \

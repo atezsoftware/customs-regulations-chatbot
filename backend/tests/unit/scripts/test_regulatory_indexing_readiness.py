@@ -4,6 +4,8 @@ import datetime
 import hashlib
 import json
 import os
+import signal
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -226,6 +228,50 @@ def test_capability_file_only_cli_uses_secure_reader_without_database(
     output = capsys.readouterr()
     assert "secret-marker" not in output.out
     assert "secret-marker" not in output.err
+
+
+def test_capability_snapshot_cli_revalidates_exact_evidence_digest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    evidence_path = tmp_path / "capability-evidence.json"
+    evidence_bytes = b'{"approved":true,"marker":"snapshot-never-print"}\n'
+    evidence_path.write_bytes(evidence_bytes)
+    evidence_path.chmod(0o600)
+    digest = hashlib.sha256(evidence_bytes).hexdigest()
+    attestation_path = tmp_path / "capability-attestation.json"
+    attestation_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "evidence_reference": f"archive://TASK-8#sha256={digest}",
+                "evidence_sha256": digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+    attestation_path.chmod(0o600)
+    monkeypatch.setattr(
+        readiness.SqlEngine,
+        "init_engine",
+        lambda **_kwargs: pytest.fail("snapshot validation initialized the database"),
+    )
+    arguments = [
+        "--validate-capability-snapshots-only",
+        "--capability-attestation",
+        str(attestation_path),
+        "--capability-evidence",
+        str(evidence_path),
+    ]
+
+    assert readiness.main(arguments) == EXIT_READY
+    evidence_path.write_bytes(evidence_bytes + b"tampered")
+    assert readiness.main(arguments) == EXIT_NOT_READY
+
+    output = capsys.readouterr()
+    assert "snapshot-never-print" not in output.out
+    assert "snapshot-never-print" not in output.err
 
 
 def test_memory_headroom_requires_attestation_and_rejects_oom_events(
@@ -656,7 +702,7 @@ def test_secure_file_reader_owns_descriptor_across_path_swap(tmp_path: Path) -> 
         os.fstat(opened_descriptor)
 
 
-@pytest.mark.parametrize("flag_name", ["O_NOFOLLOW", "O_CLOEXEC"])
+@pytest.mark.parametrize("flag_name", ["O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK"])
 def test_secure_file_reader_fails_closed_without_safe_open_semantics(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -676,6 +722,54 @@ def test_secure_file_reader_fails_closed_without_safe_open_semantics(
             maximum_size=1024,
             label="capability evidence",
         )
+
+
+def test_secure_file_reader_rejects_fifo_without_waiting_for_writer(
+    tmp_path: Path,
+) -> None:
+    fifo_path = tmp_path / "capability-evidence.fifo"
+    os.mkfifo(fifo_path, 0o400)
+    result_reader, result_writer = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(result_reader)
+        try:
+            readiness._read_secure_file(
+                fifo_path,
+                expected_mode=0o400,
+                expected_owner_uid=os.geteuid(),
+                expected_owner_gid=os.getegid(),
+                maximum_size=1024,
+                label="capability evidence",
+            )
+        except readiness.ReadinessCheckError:
+            os.write(result_writer, b"rejected")
+        else:
+            os.write(result_writer, b"accepted")
+        finally:
+            os.close(result_writer)
+        os._exit(0)
+
+    os.close(result_writer)
+    deadline = time.monotonic() + 1
+    child_status: int | None = None
+    while time.monotonic() < deadline:
+        waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+        if waited_pid == child_pid:
+            child_status = status
+            break
+        time.sleep(0.01)
+
+    if child_status is None:
+        os.kill(child_pid, signal.SIGKILL)
+        os.waitpid(child_pid, 0)
+        os.close(result_reader)
+        pytest.fail("secure reader blocked while opening a FIFO without a writer")
+
+    result = os.read(result_reader, 32)
+    os.close(result_reader)
+    assert os.waitstatus_to_exitcode(child_status) == 0
+    assert result == b"rejected"
 
 
 def test_secure_file_reader_rejects_growth_beyond_bound(
