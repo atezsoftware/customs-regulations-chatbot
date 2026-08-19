@@ -202,13 +202,21 @@ assert blocked_import_roots.isdisjoint(sys.modules), blocked_import_roots.inters
 
 
 def test_lite_supervisor_consumes_user_file_maintenance_queues() -> None:
+    """Metadata sync and deletion must keep working in the lightweight image.
+
+    They are consumed by the user-file processing worker rather than a separate
+    maintenance worker, so that markdown uploads are indexed by the same worker
+    and no queue ends up with two competing consumers.
+    """
+
     supervisor_config = (_backend_root() / "supervisord-lite.conf").read_text(
         encoding="utf-8"
     )
 
-    assert "[program:celery_worker_user_file_maintenance]" in supervisor_config
+    assert "[program:celery_worker_user_file_processing]" in supervisor_config
     assert (
-        "-A onyx.background.celery.versioned_apps.user_file_maintenance worker"
+        "-A onyx.background.celery.versioned_apps.user_file_processing worker"
         in supervisor_config
     )
-    assert "-Q user_file_project_sync,user_file_delete" in supervisor_config
+    assert "user_file_project_sync" in supervisor_config
+    assert "user_file_delete" in supervisor_config
