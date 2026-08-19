@@ -13,6 +13,7 @@ from onyx.db.models import (
     RegulatoryIndexingItem,
     RegulatoryIndexingJob,
 )
+from onyx.llm.constants import LlmProviderNames
 from onyx.natural_language_processing.utils import BaseTokenizer
 from onyx.prompts.contextual_retrieval import (
     CONTEXTUAL_RAG_PROMPT1,
@@ -331,6 +332,70 @@ def test_contextual_budget_and_embedding_reserve_use_distinct_tokenizers(
 
     assert reserve == 0
     assert "MADDE 1" in request.prompt
+
+
+def test_vertex_contextual_factory_conservatively_fits_multibyte_turkish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer = contextual.get_contextual_token_budget_tokenizer(
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name="gemini-3.1-flash-lite",
+    )
+    assert not isinstance(tokenizer, _CharacterTokenizer)
+    turkish_text = "Gümrük yükümlülüğü ölçülü yürütülür."
+    encoded = tokenizer.encode(turkish_text)
+
+    assert len(encoded) == len(turkish_text.encode("utf-8"))
+    assert len(encoded) > len(turkish_text)
+    assert tokenizer.decode(encoded) == turkish_text
+    boundary_fragment = tokenizer.decode(tokenizer.encode("ölçü")[1:-1])
+    assert "�" not in boundary_fragment
+    boundary_fragment.encode("utf-8")
+
+    job = _job()
+    first = _row(
+        job,
+        row_id="rc_turkish_context",
+        position=0,
+        text="MADDE 1 - " + turkish_text * 80,
+        heading_path=["BİRİNCİ BÖLÜM", "MADDE 1"],
+    )
+    target = _row(
+        job,
+        row_id="rc_target",
+        position=1,
+        text="MADDE 2 - Ölçülü işlem yapılır.",
+        heading_path=["BİRİNCİ BÖLÜM", "MADDE 2"],
+    )
+    contextual_input_limit = 1_200
+    monkeypatch.setattr(
+        contextual,
+        "get_max_input_tokens",
+        lambda *_args, **_kwargs: contextual_input_limit,
+    )
+
+    request = contextual.contextual_request_for_row(
+        job,
+        [first, target],
+        target,
+        contextual_tokenizer=tokenizer,
+    )
+    safe_byte_token_limit = int(
+        contextual_input_limit * (1 - contextual.GEN_AI_INPUT_TOKEN_SAFETY_MARGIN)
+    )
+
+    assert len(request.prompt.encode("utf-8")) <= safe_byte_token_limit
+    assert "�" not in request.prompt
+    assert "MADDE 1" in request.prompt
+    assert "MADDE 2 - Ölçülü işlem yapılır." in request.prompt
+
+
+def test_contextual_token_budget_factory_rejects_non_vertex_contract() -> None:
+    with pytest.raises(ValueError, match="Vertex AI"):
+        contextual.get_contextual_token_budget_tokenizer(
+            model_provider=LlmProviderNames.OPENAI,
+            model_name="gemini-3.1-flash-lite",
+        )
 
 
 def test_apply_results_persists_only_fitted_generated_context(

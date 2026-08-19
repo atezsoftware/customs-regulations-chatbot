@@ -558,5 +558,4 @@ def test_claimed_preparation_resumes_without_claiming_again_and_advances_once(
     assert atomic_calls == [(job_id, 3)]
     assert tokenizer_calls == [
         (snapshot.embedding_model_name, snapshot.embedding_provider),
-        (snapshot.vertex.model_name, "vertex_ai"),
     ]

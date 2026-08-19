@@ -29,6 +29,7 @@ from onyx.regulatory.indexing_jobs.configuration import (
 from onyx.regulatory.indexing_jobs.contextual import (
     contextual_request_for_row,
     contextual_reserve_for_row,
+    get_contextual_token_budget_tokenizer,
 )
 from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
@@ -126,9 +127,9 @@ def prepare_claimed_regulatory_indexing_job(
         snapshot.embedding_model_name,
         snapshot.embedding_provider,
     )
-    contextual_tokenizer = get_tokenizer(
-        snapshot.vertex.model_name,
-        LlmProviderNames.VERTEX_AI.value,
+    contextual_tokenizer = get_contextual_token_budget_tokenizer(
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name=snapshot.vertex.model_name,
     )
 
     def prepare_items() -> list[indexing_job_repository.RegulatoryIndexingPreparedItem]:

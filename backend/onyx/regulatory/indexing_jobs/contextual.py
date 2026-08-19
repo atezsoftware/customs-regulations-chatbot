@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -37,6 +39,59 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
 from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 
 _VERTEX_BATCH_MAX_OUTPUT_TOKENS = 256
+
+
+@dataclass(frozen=True, slots=True)
+class VertexUTF8ContextualBudgetTokenizer(BaseTokenizer):
+    """Conservative local input budget for a frozen Vertex contextual model.
+
+    This is deliberately not an exact Gemini tokenizer. The installed stack has no
+    offline Gemini tokenizer, so every UTF-8 byte is treated as a possible token.
+    That upper bound may trim more context than necessary, but avoids a provider call
+    during preparation. Boundary fragments are discarded during decode so trimming
+    never introduces invalid Unicode or replacement characters.
+    """
+
+    model_provider: LlmProviderNames
+    model_name: str
+
+    def encode(self, string: str) -> list[int]:
+        return list(string.encode("utf-8"))
+
+    def tokenize(self, string: str) -> list[str]:
+        return [f"{byte:02x}" for byte in string.encode("utf-8")]
+
+    def decode(self, tokens: list[int]) -> str:
+        return bytes(tokens).decode("utf-8", errors="ignore")
+
+
+@lru_cache(maxsize=32)
+def _cached_contextual_token_budget_tokenizer(
+    model_provider: LlmProviderNames,
+    model_name: str,
+) -> VertexUTF8ContextualBudgetTokenizer:
+    return VertexUTF8ContextualBudgetTokenizer(
+        model_provider=model_provider,
+        model_name=model_name,
+    )
+
+
+def get_contextual_token_budget_tokenizer(
+    *,
+    model_provider: LlmProviderNames,
+    model_name: str,
+) -> VertexUTF8ContextualBudgetTokenizer:
+    """Build the local budgeter for the frozen Vertex provider/model contract."""
+
+    if model_provider is not LlmProviderNames.VERTEX_AI:
+        raise ValueError("contextual token budgeting requires the Vertex AI provider")
+    normalized_model_name = model_name.strip()
+    if not normalized_model_name:
+        raise ValueError("contextual Vertex model name must not be empty")
+    return _cached_contextual_token_budget_tokenizer(
+        model_provider,
+        normalized_model_name,
+    )
 
 
 class ContextualMappingError(ValueError):
