@@ -185,6 +185,11 @@ jobs:
             supervisorctl -c /etc/supervisor/conf.d/supervisord.conf \
             status celery_worker_regulatory_indexing || true
 
+          echo "Regulatory indexing Beat supervisor state"
+          kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+            supervisorctl -c /etc/supervisor/conf.d/supervisord.conf \
+            status celery_beat_regulatory_indexing || true
+
           echo "Container memory counters"
           kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
             sh -c 'for file in memory.current memory.peak memory.max memory.events; do if [ -r "/sys/fs/cgroup/$file" ]; then printf "%s=" "$file"; tr "\n" "," < "/sys/fs/cgroup/$file"; printf "\n"; fi; done' || true
@@ -340,10 +345,69 @@ jobs:
             return 1
           }
 
+          verify_regulatory_indexing_beat() {
+            local app_name="customs-regulations-background"
+            local selector="app=${env_x}-${app_name}"
+            local pod
+            local container
+            local beat_status
+            local readiness_file="/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt"
+            local liveness_file="/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt"
+
+            echo "Waiting for the production-lite regulatory indexing Beat to become ready"
+            for attempt in {1..60}; do
+              pod=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json | jq -r --arg tag "${IMAGE_TAG}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | head -n 1)
+              if [[ -n "$pod" ]]; then
+                container=$(kubectl get pod "$pod" --namespace "${namespace}" -o json | jq -r --arg tag "${IMAGE_TAG}" '.spec.containers[] | select(.image | endswith(":" + $tag)) | .name' | head -n 1)
+                if [[ -n "$container" ]]; then
+                  beat_status=$(kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status celery_beat_regulatory_indexing 2>&1 || true)
+                  echo "$beat_status"
+                  if grep -Eq '^celery_beat_regulatory_indexing[[:space:]]+RUNNING([[:space:]]|$)' <<<"$beat_status" && \
+                    kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+                      test -f "$readiness_file" -a -f "$liveness_file"; then
+                    echo "Production-lite regulatory indexing Beat is ready in pod $pod"
+                    return 0
+                  fi
+                fi
+              fi
+              sleep 5
+            done
+
+            echo "Production-lite regulatory indexing Beat did not become ready for image tag ${IMAGE_TAG}" >&2
+            return 1
+          }
+
+          capture_background_memory_evidence() {
+            local app_name="customs-regulations-background"
+            local selector="app=${env_x}-${app_name}"
+            local pod
+            local container
+
+            pod=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json | jq -r --arg tag "${IMAGE_TAG}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | .metadata.name' | head -n 1)
+            if [[ -z "$pod" ]]; then
+              echo "No background pod available for post-deploy memory evidence"
+              return 0
+            fi
+            container=$(kubectl get pod "$pod" --namespace "${namespace}" -o json | jq -r --arg tag "${IMAGE_TAG}" '.spec.containers[] | select(.image | endswith(":" + $tag)) | .name' | head -n 1)
+            if [[ -z "$container" ]]; then
+              echo "No matching background container available for post-deploy memory evidence"
+              return 0
+            fi
+
+            echo "Post-deploy background cgroup memory counters"
+            kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+              sh -c 'for file in memory.current memory.peak memory.max memory.events; do if [ -r "/sys/fs/cgroup/$file" ]; then printf "%s=" "$file"; tr "\n" "," < "/sys/fs/cgroup/$file"; printf "\n"; fi; done' || true
+            echo "Post-deploy Celery and Beat process RSS (KiB)"
+            kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+              sh -c 'ps -eo pid,ppid,rss,vsz,comm,args | grep -E "[c]elery|[s]upervisord|[t]ail -qF"' || true
+          }
+
           deploy_app "customs-regulations-api" "customs-regulations/customs-regulations-api-values.yaml" "true"
           deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "true"
           verify_benchmark_worker
           verify_regulatory_indexing_worker
+          verify_regulatory_indexing_beat
+          capture_background_memory_evidence
         continue-on-error: true
 
       - name: Check Deployment Status

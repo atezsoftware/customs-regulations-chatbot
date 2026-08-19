@@ -3,6 +3,11 @@ from __future__ import annotations
 from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
 
+import pytest
+
+from onyx.background.celery.tasks.regulatory_indexing.beat_schedule import (
+    PRODUCTION_LITE_TASK_TEMPLATES,
+)
 from onyx.background.celery.tasks.regulatory_indexing.tasks import (
     enqueue_regulatory_indexing_step,
     regulatory_indexing_recover_stale,
@@ -132,3 +137,60 @@ def test_recovery_sends_preclaimed_generation_without_double_claim() -> None:
         for claim in claims
     ]
     assert task_app.send_task.call_args_list == expected_calls
+
+
+def test_periodic_recovery_republishes_stale_job_after_initial_broker_failure() -> None:
+    job_id = uuid4()
+    initial_app = MagicMock()
+    initial_app.send_task.side_effect = ConnectionError("broker unavailable")
+
+    recovery_template = next(
+        template
+        for template in PRODUCTION_LITE_TASK_TEMPLATES
+        if template["task"] == OnyxCeleryTask.REGULATORY_INDEXING_RECOVER_STALE
+    )
+    assert recovery_template["schedule"].total_seconds() == 60
+    assert recovery_template["options"]["queue"] == OnyxCeleryQueues.REGULATORY_INDEXING
+
+    with pytest.raises(ConnectionError, match="broker unavailable"):
+        enqueue_regulatory_indexing_step(
+            initial_app,
+            job_id=job_id,
+            expected_generation=1,
+            tenant_id="tenant-a",
+            delivery_kind=OrchestrationDeliveryKind.NORMAL,
+        )
+
+    claim = RegulatoryIndexingJobClaim(
+        job_id=job_id,
+        stage=RegulatoryIndexingStage.PREPARING,
+        lease_generation=2,
+        recovery_token=uuid4(),
+    )
+    recovery_app = MagicMock()
+    with (
+        patch(
+            "onyx.background.celery.tasks.regulatory_indexing.tasks._claim_stale_jobs",
+            return_value=[claim],
+        ),
+        patch.object(regulatory_indexing_recover_stale, "app", recovery_app),
+        patch(
+            "onyx.background.celery.tasks.regulatory_indexing.tasks.app_configs.REGULATORY_BATCH_INDEXING_ENABLED",
+            True,
+        ),
+    ):
+        regulatory_indexing_recover_stale.run(tenant_id="tenant-a")
+
+    recovery_app.send_task.assert_called_once_with(
+        OnyxCeleryTask.REGULATORY_INDEXING_RUN_STEP,
+        kwargs={
+            "job_id": str(job_id),
+            "expected_generation": 2,
+            "recovery_token": str(claim.recovery_token),
+            "tenant_id": "tenant-a",
+            "delivery_kind": OrchestrationDeliveryKind.PRECLAIMED.value,
+        },
+        queue=OnyxCeleryQueues.REGULATORY_INDEXING,
+        priority=OnyxCeleryPriority.MEDIUM,
+        expires=CELERY_REGULATORY_INDEXING_TASK_EXPIRES,
+    )

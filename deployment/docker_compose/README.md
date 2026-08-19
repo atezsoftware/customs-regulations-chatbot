@@ -39,9 +39,10 @@ This initial activation is allowed without an indexer only while PostgreSQL has 
 non-default connectors, or completed user files. A populated environment requires reindexing from
 the separate authorized import/indexing environment before the embedding model can change.
 
-Source-document parsing and indexing run separately from an authorized workstation or controlled
-import runner. Never place the importer image, importer environment, source files, CUDA, Docling,
-or generic indexing workers on the production application host.
+Parser-backed and bulk source indexing run separately from an authorized workstation or controlled
+import runner. Production-lite may run only the documented Markdown durable-indexing path through its
+dedicated worker and minimal Beat. Never place the importer image, importer environment, bulk source
+files, CUDA, Docling, generic indexing workers, or the generic Beat on the production application host.
 
 The production host requires explicit TLS, secret-store, database migration, backup,
 infrastructure, and immutable-image inputs. Do not substitute mutable tags or ad hoc Compose command

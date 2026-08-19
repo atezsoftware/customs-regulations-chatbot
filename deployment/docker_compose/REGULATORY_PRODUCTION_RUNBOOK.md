@@ -1,8 +1,9 @@
 # Regulatory Production Runbook
 
 This runbook is the deployment contract for the parser-free regulatory application. Production runs
-only the digest-pinned `runtime-lite` backend. Source parsing and indexing are a separate, one-shot
-operation run from an authorized workstation or controlled import runner.
+only the digest-pinned `runtime-lite` backend. Parser-backed and bulk source imports remain a separate,
+one-shot operation run from an authorized workstation or controlled import runner. The explicitly
+enabled Markdown-only path is processed durably by the production-lite regulatory indexing worker.
 
 ## 1. Deployment boundary
 
@@ -25,10 +26,11 @@ Production does **not** receive or run:
 - the `inference_model_server` or `indexing_model_server` services, or their dependencies from the
   application services.
 
-The lite backend keeps chat, retrieval, benchmark execution, indexed-file maintenance, and required
-lightweight queues. `DOCUMENT_IMPORT_ENABLED=false` is enforced by the overlay. Existing regulatory
-chunks remain in PostgreSQL and Elasticsearch and are searchable; upload/indexing API mutations fail
-closed.
+The lite backend keeps chat, retrieval, benchmark execution, indexed-file maintenance, Markdown-only
+regulatory indexing, and required lightweight queues. `DOCUMENT_IMPORT_ENABLED=false` is enforced by
+the overlay while `MARKDOWN_IMPORT_ENABLED=true` permits the parser-free Markdown path. Durable
+indexing remains fail-closed until `REGULATORY_BATCH_INDEXING_ENABLED=true` is applied to both API and
+background after the prerequisites below. Existing regulatory chunks remain searchable throughout.
 
 The default and recommended production model mode is `cloud`. The fixed no-local-model overlay sets
 `DISABLE_MODEL_SERVER=true` on both `api_server` and `background`; neither local model service is
@@ -181,8 +183,10 @@ Before the maintenance window:
     `COMPOSE_PROFILES` from `.env` and the process environment; only canonical script flags may enable
     a profile.
 14. Inventory all running containers on the host, including other Compose project names. Any legacy
-    full-backend, importer, indexer, primary, docfetching, docprocessing, or user-file-processing
-    container is a blocker until its work is drained and its removal is approved. In cloud mode, any
+    full-backend, importer, indexer, primary, docfetching, docprocessing, or generic
+    user-file-processing container is a blocker until its work is drained and its removal is approved.
+    The only approved production-lite consumer of `user_file_processing` is
+    `celery_worker_regulatory_indexing`. In cloud mode, any
     inference-model or indexing-model container is also a blocker. Rendered-Compose preflight cannot
     discover an orphan owned by another project.
 
@@ -384,7 +388,10 @@ downgrade only recreates tool rows. The coordinated PostgreSQL backup and change
 Before stopping the old background container, disable new uploads/import/indexing triggers and record
 Celery `active`, `reserved`, and `scheduled` output for every old worker plus broker depth for *every*
 declared queue—not only ingestion queues. Primary, docfetching, docprocessing, and
-user-file-processing work must be zero. The service owner must explicitly approve any queued
+generic indexing work must be zero. Inspect `user_file_processing` separately: only known Markdown
+messages intended for the new durable worker may survive cutover, and the service owner must approve
+their tenant/file identities. Unsupported or unidentified messages must be drained or quarantined.
+The service owner must explicitly approve any queued
 write/delete work that the lite workers will consume, including `connector_deletion`,
 `user_file_delete`, metadata sync, and permission upserts. `elasticsearch_migration` has no lite consumer;
 any stale depth requires a recorded quarantine/delete decision before cutover and before any future
@@ -429,6 +436,35 @@ wrapper's one-shot Alembic command is the sole migration owner; ordinary startup
 run migrations. Do not scale the API during migration. Platforms with multiple replicas must retain
 the same singleton migration ownership before rolling replicas.
 
+Keep `REGULATORY_BATCH_INDEXING_ENABLED=false` through the singleton `alembic upgrade head` and
+initial readiness checks. Before enabling it, configure a non-secret `REGULATORY_INDEXING_GCS_URI`,
+verify the selected Vertex contextual model can create/read/cancel batch jobs and objects beneath
+that workspace, and verify the active OpenRouter embedding SearchSettings contract. Then change the
+flag for both `api_server` and `background` and restart both through the owned deployment workflow;
+an API-only or worker-only flag change is forbidden. Repeat worker, Beat, queue, and Markdown-canary
+readiness checks after every indexing environment change. To disable the feature, set the flag false
+on both processes and restart both after active work is quiesced; recovery then stops claiming stale
+jobs, although broker messages already emitted before the restart may still finish.
+
+The production-lite operator environment contract is exact; keep the values in the approved secret
+store/environment, not in source control. Defaults below match the Compose overlay and
+`env.prod.template`:
+
+| Variable | Process scope | Default / operator requirement |
+| --- | --- | --- |
+| `MARKDOWN_IMPORT_ENABLED` | API + background | `true` |
+| `MAX_ARCHIVE_COMPRESSION_RATIO` | API | `100` |
+| `MAX_ARCHIVE_ENTRIES` | API | `500` |
+| `MAX_ARCHIVE_EXPANDED_BYTES` | API | `536870912` |
+| `REGULATORY_BATCH_INDEXING_ENABLED` | API + background | `false`; coordinated enable/restart only |
+| `REGULATORY_INDEXING_GCS_URI` | background | Required non-secret `gs://...` workspace before enable |
+| `REGULATORY_INDEXING_MAX_ATTEMPTS` | background | `5` |
+| `REGULATORY_INDEXING_RETRY_BASE_SECONDS` | background | `15` |
+| `REGULATORY_INDEXING_RETRY_MAX_SECONDS` | background | `900` |
+| `REGULATORY_INDEXING_POLL_SECONDS` | background | `30` |
+| `REGULATORY_INDEXING_LEASE_SECONDS` | background | `120` |
+| `REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE` | background | `64` |
+
 If the API gate fails, the wrapper leaves `background` stopped. Preserve its output, then use the
 same fixed overlay order only for read-only diagnostics; do not retry with ad hoc Compose files.
 
@@ -449,10 +485,64 @@ First verify the same reviewed topology through the authoritative status command
   --expected-web-image "$APPROVED_WEB_DIGEST"
 ```
 
-The background container healthcheck requires the exact expected supervisor program set—four workers
-(`regulatory_benchmark`, `user_file_maintenance`, `light`, `monitoring`) plus the log redirector—and
-requires all five to be `RUNNING`. `active_queues` must contain only the queues declared by those lite
-workers; primary, docfetching, docprocessing, and user-file-processing queues/workers are forbidden.
+The machine-readable block below is the canonical production-lite runtime contract and is parsed by
+repository tests. It must change with supervisor, Compose health, workflow readiness, or queue wiring.
+
+<!-- production-lite-runtime-contract:start -->
+```yaml
+supervisor_process_count: 7
+workers:
+  celery_worker_regulatory_benchmark:
+    - regulatory_benchmark
+  celery_worker_regulatory_indexing:
+    - user_file_processing
+    - regulatory_indexing
+  celery_worker_user_file_maintenance:
+    - user_file_project_sync
+    - user_file_delete
+  celery_worker_light:
+    - vespa_metadata_sync
+    - connector_deletion
+    - doc_permissions_upsert
+    - checkpoint_cleanup
+    - index_attempt_cleanup
+    - chat_ttl_deletion
+  celery_worker_monitoring:
+    - monitoring
+scheduler:
+  name: celery_beat_regulatory_indexing
+  tasks:
+    - regulatory_indexing_recover_stale
+    - monitor_celery_queues
+  readiness_file: /tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt
+  liveness_file: /tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt
+forbidden_queues:
+  - primary
+  - docfetching
+  - docprocessing
+  - indexing
+  - elasticsearch_migration
+operations:
+  feature_flag: REGULATORY_BATCH_INDEXING_ENABLED
+  default_enabled: false
+  required_workspace: REGULATORY_INDEXING_GCS_URI
+  migration_before_enable: alembic upgrade head
+  restart_after_config_change:
+    - api_server
+    - background
+```
+<!-- production-lite-runtime-contract:end -->
+
+The background container healthcheck requires exactly five workers, the dedicated regulatory
+indexing Beat, and the log redirector—seven supervisor processes total—and requires every process to
+be `RUNNING`. The Beat keeps its scheduler state in the mounted background log volume, regenerates
+every per-tenant entry from PostgreSQL before readiness and after a restart, and contains only stale
+regulatory indexing recovery (one minute) and queue monitoring (ten seconds). It never loads the
+generic/full-runtime Beat schedule. Readiness requires the exact worker
+and Beat probe files above; Beat liveness must continue updating after startup. `active_queues` must
+match only the queues declared above. Primary, docfetching, docprocessing, generic indexing, and
+Elasticsearch-migration workers/queues are forbidden; `user_file_processing` is required on the
+dedicated regulatory indexing worker.
 Cloud preflight treats every running inference/indexing model container as a blocker. Drain and stop
 the legacy model service after ownership review before invoking the deploy wrapper. The wrapper's
 own stop and post-rollout checks are defense in depth; moving a service behind a profile alone does
@@ -481,12 +571,26 @@ Complete one authenticated application smoke test:
 3. Repeat a known temporal question with current and historical `as_of_date` values and confirm the
    active/superseded chunk changes as expected.
 4. Confirm previously indexed files remain visible/searchable to the intended users.
-5. Confirm source upload/import controls are absent and an indexing mutation is rejected.
-6. Start one small benchmark run only after chat/search succeeds, and confirm the dedicated worker
+5. While durable indexing is disabled, keep upload controls closed to users and verify no durable job
+   was created. After the migration, provider/GCS checks, coordinated flag enable, and process
+   restart, upload one approved small Markdown canary; confirm it progresses through the durable job
+   stages and becomes searchable. Confirm non-Markdown/parser-backed upload remains rejected.
+6. Stop/restart the regulatory indexing worker after a canary reaches a non-terminal stage and verify
+   the dedicated Beat recovers the stale job. Confirm queue-depth metrics include
+   `regulatory_indexing` and both exact supervisor processes remain ready.
+7. Start one small benchmark run only after chat/search succeeds, and confirm the dedicated worker
    completes it.
 
 Review API/background logs for repeated database, Elasticsearch, object-store, cloud embedding,
 OpenRouter LLM, or Celery errors before ending the maintenance window.
+
+The measured cold import of the added worker was approximately `216568 KiB` maximum RSS in the
+implementation environment. This repository does not own the external Helm resource values, so this
+is evidence rather than a resource limit. Before rollout, compare the background pod's configured
+request/limit and available node headroom against the existing workers plus this process. Archive
+pre- and post-deploy cgroup `memory.current`, `memory.peak`, `memory.max`, `memory.events`, and per-process
+RSS evidence from CodeBuild. Any OOM event, process restart, or unreviewed headroom deficit blocks
+readiness; do not invent or silently raise a fixed limit in this repository.
 
 ## 7. Separate importer/indexer operation
 

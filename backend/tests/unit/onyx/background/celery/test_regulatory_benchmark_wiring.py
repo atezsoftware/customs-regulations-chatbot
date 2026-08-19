@@ -19,7 +19,7 @@ from onyx.configs.constants import (
     OnyxCeleryTask,
 )
 from onyx.db.enums import BenchmarkRunItemStatus, BenchmarkRunStatus, Permission
-from onyx.db.models import BenchmarkRun
+from onyx.db.models import BenchmarkRun, LLMProvider
 from onyx.error_handling.exceptions import OnyxError
 from onyx.server.features.regulatory import benchmark_api
 from onyx.server.features.regulatory.benchmark_models import (
@@ -371,7 +371,9 @@ def test_openrouter_account_model_lookup_uses_policy_filtered_catalog() -> None:
 
     benchmark_api._OPENROUTER_ACCOUNT_MODELS_CACHE.clear()
     with patch.object(benchmark_api.httpx, "get", return_value=response) as get:
-        available = benchmark_api._account_available_openrouter_model_ids(provider)
+        available = benchmark_api._account_available_openrouter_model_ids(
+            cast(LLMProvider, provider)
+        )
 
     assert available == frozenset({"anthropic/claude-sonnet-5", "openai/gpt-5"})
     get.assert_called_once_with(
@@ -912,9 +914,14 @@ def test_full_and_lite_supervisors_consume_regulatory_benchmark_queue() -> None:
 
     lite_config = (backend_root / "supervisord-lite.conf").read_text(encoding="utf-8")
     assert "celery_worker_scheduled_tasks" not in lite_config
+    assert "[program:celery_beat]\n" in lite_config
+    assert "[program:celery_beat_regulatory_indexing]" in lite_config
+    assert (
+        "-A onyx.background.celery.versioned_apps.regulatory_indexing_beat beat"
+        in lite_config
+    )
     assert "elasticsearch_migration" not in lite_config
-    # Beat does run here, restricted by BEAT_TASK_ALLOWLIST to the user-file
-    # retry loop (see test_user_file_processing_lite_wiring).
+    # Generic Beat is restricted by BEAT_TASK_ALLOWLIST to user-file recovery.
     # Connector ingestion stays out; user-file indexing does not, because
     # markdown uploads are served here (see test_user_file_processing_lite_wiring).
     assert "celery_worker_docfetching" not in lite_config

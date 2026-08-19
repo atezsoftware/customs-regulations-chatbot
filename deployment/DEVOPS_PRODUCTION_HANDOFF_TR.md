@@ -18,8 +18,11 @@ Uygulama iş yükleri dört servisten üç servise iner:
 
 Bu üç servisli özel runtime-lite topolojisi esas alınmalıdır. Repo içindeki standart Onyx Helm
 chart'ına yalnız `values-cloud-models.yaml` eklemek yeterli değildir: o dosya model podlarını kapatır
-ama standart chart'ın primary/docfetching/docprocessing/user-file-processing/Beat worker'larını tek
-başına kapatmaz. Bu worker release'leri prod'a eklenmemelidir.
+ama standart chart'ın primary/docfetching/docprocessing/generic user-file-processing/Beat
+release'lerini tek başına kapatmaz. Bu genel worker release'leri prod'a eklenmemelidir. Buna karşılık
+`customs-regulations-background` içinde `supervisord-lite.conf` ile çalışan özel
+`celery_worker_regulatory_indexing` ve `celery_beat_regulatory_indexing` zorunludur; bunlar ayrı bir
+Helm release değildir.
 
 PostgreSQL, Redis, Elasticsearch ve MinIO uygulama altyapısıdır; model-server ile birlikte
 kaldırılmayacaklardır. Redis Celery koordinasyonu/cache için, Elasticsearch arama indeksi için, MinIO
@@ -37,7 +40,16 @@ environment:
       value: "false"
     - name: "DISABLE_MODEL_SERVER"
       value: "true"
+    - name: "MARKDOWN_IMPORT_ENABLED"
+      value: "true"
+    - name: "REGULATORY_BATCH_INDEXING_ENABLED"
+      value: "false"
 ```
+
+Yalnız background için `REGULATORY_INDEXING_GCS_URI` ve lease/retry/poll/embedding batch tuning
+değişkenleri eklenir. Arşiv limitleri yalnız API'de bulunur. Değişkenlerin tam kapsamı ve varsayılanları
+canonical `REGULATORY_PRODUCTION_RUNBOOK.md` tablosuyla birebir eşleşmelidir; secret değerler bu
+teslim notuna yazılmaz.
 
 İki servisten de aşağıdaki değişkenler kaldırılmalıdır:
 
@@ -51,6 +63,32 @@ INDEXING_MODEL_SERVER_PORT
 `customs-regulations-model-server-values.yaml` üretim release listesinden çıkarılmalı; Deployment,
 Service, HPA, probe ve model-server imajı oluşturulmamalıdır. Ağ politikasında API ve background
 podlarından `openrouter.ai:443` çıkışına izin verilmelidir.
+
+`REGULATORY_BATCH_INDEXING_ENABLED` varsayılan olarak `false` kalır. Önce singleton
+`alembic upgrade head`, GCS yetki testi, Vertex contextual model testi ve aktif OpenRouter embedding
+ayarının doğrulaması tamamlanır. Sonra bayrak API ve background için birlikte `true` yapılır ve iki
+iş yükü de kontrollü olarak yeniden başlatılır. Bayrağın yalnız bir pod türünde değiştirilmesi veya
+migration'dan önce açılması kabul edilmez. GCS URI secret değildir; servis hesabı/Workload Identity
+credential'ı Vault/Kubernetes kimlik katmanında kalır.
+
+Background podunun supervisor sözleşmesi tam olarak beş worker, bir özel Beat ve bir log yönlendirici
+olmak üzere yedi process'tir:
+
+| Process | Queue/görev |
+| --- | --- |
+| `celery_worker_regulatory_benchmark` | `regulatory_benchmark` |
+| `celery_worker_regulatory_indexing` | `user_file_processing,regulatory_indexing` |
+| `celery_worker_user_file_maintenance` | `user_file_project_sync,user_file_delete` |
+| `celery_worker_light` | Onaylı hafif bakım queue'ları |
+| `celery_worker_monitoring` | `monitoring` |
+| `celery_beat_regulatory_indexing` | Yalnız stale recovery ve queue monitoring |
+| `log-redirect-handler` | Altı Celery logunu stdout'a aktarır |
+
+Beat readiness ve liveness dosyaları sırasıyla
+`/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt` ve
+`/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt` olmalıdır. Generic Beat schedule, primary,
+docfetching, docprocessing, generic indexing ve Elasticsearch migration queue'ları bu topolojide
+yasaktır. `user_file_processing` ise yalnız özel regulatory indexing worker üzerinde zorunludur.
 
 Mevcut dört servisli kurulumdan geçiliyorsa model-server podu önce drain/stop edilmeli ve eski
 Deployment/Service kaldırılmalıdır. Ardından cloud preflight ve üç servisli rollout çalıştırılır;
@@ -119,7 +157,12 @@ oluşturur; Admin'den seçilecek OpenRouter sağlayıcısıyla çelişir.
    bulunmadığını doğrulayın.
 5. Trafiği açmadan önce Admin üzerinden OpenRouter embedding modelini seçip test edin ve aktif edin.
 6. Admin üzerinden OpenRouter chat LLM'ini seçip test edin.
-7. Sağlık, oturum açma, boş arama, chat ve bir küçük benchmark smoke testi çalıştırın; ardından kullanıcı
+7. Singleton migration'ı tamamlayın; `REGULATORY_INDEXING_GCS_URI` ve GCS/Vertex yetkilerini
+   doğruladıktan sonra durable indexing
+   bayrağını API ve background'da birlikte açıp ikisini yeniden başlatın.
+8. Yedi supervisor process'ini, worker/Beat readiness-liveness dosyalarını, queue setini, bir küçük
+   Markdown canary indeksini ve stale recovery'yi doğrulayın.
+9. Sağlık, oturum açma, boş arama, chat ve bir küçük benchmark smoke testi çalıştırın; ardından kullanıcı
    trafiğini açın.
 
 Bu ilk aktivasyon yalnızca PostgreSQL'de belge, gerçek connector veya tamamlanmış user file yokken
@@ -139,9 +182,18 @@ değişikliği olarak ele alınmalıdır.
 - Kubernetes'te `customs-regulations-model-server` Deployment, Service veya pod yoktur.
 - API ve background ortamında `DISABLE_MODEL_SERVER=true` görünür; model-server host değişkeni yoktur.
 - Backend runtime-lite imajında `torch`, `triton`, NVIDIA/CUDA ve Docling paketleri yoktur.
+- Background supervisor'da tam yedi process çalışır; özel worker iki queue'yu tüketir ve özel Beat
+  yalnız stale recovery ile queue monitoring yayınlar.
+- Migration ve GCS/Vertex/OpenRouter kontrollerinden önce durable indexing bayrağı kapalıdır; açıldıktan
+  sonra API ve background birlikte restart edilmiş ve Markdown canary tamamlanmıştır.
 - Uygulama model-server DNS'i bulunmadan sağlıklı başlar ve Admin ekranı açılır.
 - Admin OpenRouter embedding modellerini listeler; endpoint/dimension alanı göstermez.
 - Seçilen embedding modeli test edilir, aktif Search Settings'e kaydedilir ve boş arama model-server'a
   bağlanmadan çalışır.
 - PostgreSQL, Redis, Elasticsearch ve MinIO dışarıya açık değildir ve uygulama podlarından erişilebilirdir.
 - Uygulama imajları `latest` yerine onaylı digest ile sabitlenmiştir.
+
+Ek worker'ın ölçülen cold-import maksimum RSS değeri uygulama ortamında yaklaşık `216568 KiB` olmuştur.
+Repo harici Helm resource değerleri burada sahiplenilmediği için sabit limit uydurulmaz. DevOps rollout
+öncesi ve sonrası cgroup `memory.current`, `memory.peak`, `memory.max`, `memory.events` ile process RSS
+kanıtını arşivlemeli; OOM veya yetersiz headroom kabul kriterini başarısız saymalıdır.

@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, call, patch
@@ -32,6 +33,13 @@ _WORKFLOW_PATH = (
     / "workflows"
     / "customs-regulations-backend-lite-codebuild.yaml"
 )
+_RUNBOOK_PATH = (
+    _REPOSITORY_ROOT
+    / "deployment"
+    / "docker_compose"
+    / "REGULATORY_PRODUCTION_RUNBOOK.md"
+)
+_HANDOFF_PATH = _REPOSITORY_ROOT / "deployment" / "DEVOPS_PRODUCTION_HANDOFF_TR.md"
 
 _PRODUCTION_LITE_ENVIRONMENT = {
     "MARKDOWN_IMPORT_ENABLED",
@@ -98,6 +106,138 @@ def _workflow_step(workflow: dict[str, object], name: str) -> dict[str, str]:
                 assert isinstance(typed_step.get("run"), str)
                 return cast(dict[str, str], typed_step)
     raise AssertionError(f"Workflow step not found: {name}")
+
+
+def _load_runbook_runtime_contract() -> dict[str, object]:
+    runbook = _RUNBOOK_PATH.read_text(encoding="utf-8")
+    match = re.search(
+        r"<!-- production-lite-runtime-contract:start -->\s*"
+        r"```yaml\s*(.*?)\s*```\s*"
+        r"<!-- production-lite-runtime-contract:end -->",
+        runbook,
+        re.S,
+    )
+    assert match is not None, "canonical production-lite runtime contract is missing"
+    loaded = yaml.safe_load(match.group(1))
+    assert isinstance(loaded, dict)
+    return cast(dict[str, object], loaded)
+
+
+def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring() -> (
+    None
+):
+    schedule_module = importlib.import_module(
+        "onyx.background.celery.tasks.regulatory_indexing.beat_schedule"
+    )
+    templates = schedule_module.PRODUCTION_LITE_TASK_TEMPLATES
+
+    assert {template["task"] for template in templates} == {
+        "regulatory_indexing_recover_stale",
+        "monitor_celery_queues",
+    }
+    assert {template["options"]["queue"] for template in templates} == {
+        OnyxCeleryQueues.REGULATORY_INDEXING,
+        OnyxCeleryQueues.MONITORING,
+    }
+    schedules = {template["task"]: template["schedule"] for template in templates}
+    assert schedules["regulatory_indexing_recover_stale"] == timedelta(minutes=1)
+    assert schedules["monitor_celery_queues"] == timedelta(seconds=10)
+    assert all(template["options"]["expires"] > 0 for template in templates)
+    assert not any("check-for-indexing" in template["name"] for template in templates)
+
+
+def test_production_lite_scheduler_expands_every_task_with_each_tenant_id() -> None:
+    beat_app = importlib.import_module(
+        "onyx.background.celery.apps.regulatory_indexing_beat"
+    )
+
+    schedule = beat_app.RegulatoryIndexingScheduler.generate_schedule(
+        ["public", "tenant-a"]
+    )
+
+    assert len(schedule) == 4
+    assert {entry["kwargs"]["tenant_id"] for entry in schedule.values()} == {
+        "public",
+        "tenant-a",
+    }
+    assert all(set(entry["kwargs"]) == {"tenant_id"} for entry in schedule.values())
+    assert (
+        beat_app.celery_app.conf.task_default_base is beat_app.app_base.TenantAwareTask
+    )
+
+
+def test_production_lite_scheduler_rebuilds_schedule_across_restart(
+    tmp_path: Path,
+) -> None:
+    beat_app = importlib.import_module(
+        "onyx.background.celery.apps.regulatory_indexing_beat"
+    )
+    schedule_path = str(tmp_path / "regulatory-indexing-beat-schedule")
+    scheduler = beat_app.RegulatoryIndexingScheduler(
+        app=beat_app.celery_app,
+        schedule_filename=schedule_path,
+        lazy=False,
+    )
+    with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
+        scheduler.update_schedule()
+    expected_names = {
+        "recover-stale-regulatory-indexing-public",
+        "monitor-celery-queues-public",
+    }
+    assert set(scheduler.schedule) == expected_names
+    scheduler.close()
+
+    restarted = beat_app.RegulatoryIndexingScheduler(
+        app=beat_app.celery_app,
+        schedule_filename=schedule_path,
+        lazy=False,
+    )
+    try:
+        with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
+            restarted.update_schedule()
+        assert set(restarted.schedule) == expected_names
+    finally:
+        restarted.close()
+
+
+def test_production_lite_scheduler_waits_for_dependencies_before_readiness() -> None:
+    beat_app = importlib.import_module(
+        "onyx.background.celery.apps.regulatory_indexing_beat"
+    )
+    scheduler = MagicMock()
+    sender = MagicMock(scheduler=scheduler)
+    startup_events: list[str] = []
+
+    with (
+        patch.object(beat_app.SqlEngine, "set_app_name") as set_app_name,
+        patch.object(beat_app.SqlEngine, "init_engine") as init_engine,
+        patch.object(
+            beat_app.app_base,
+            "wait_for_redis",
+            side_effect=lambda *_args, **_kwargs: startup_events.append("redis"),
+        ),
+        patch.object(
+            beat_app.app_base,
+            "wait_for_db",
+            side_effect=lambda *_args, **_kwargs: startup_events.append("database"),
+        ),
+        patch.object(beat_app, "make_probe_path") as make_probe_path,
+    ):
+        liveness_path = MagicMock()
+        readiness_path = MagicMock()
+        make_probe_path.side_effect = [liveness_path, readiness_path]
+        beat_app.on_beat_init(sender)
+
+    set_app_name.assert_called_once_with("celery_beat_regulatory_indexing")
+    init_engine.assert_called_once_with(pool_size=2, max_overflow=0)
+    assert startup_events == ["redis", "database"]
+    scheduler.update_schedule.assert_called_once_with()
+    assert make_probe_path.call_args_list == [
+        call("liveness", "regulatory_indexing_beat@hostname"),
+        call("readiness", "regulatory_indexing_beat@hostname"),
+    ]
+    liveness_path.touch.assert_called_once_with()
+    readiness_path.touch.assert_called_once_with()
 
 
 def test_regulatory_indexing_worker_config_is_single_thread_and_prefetches_one() -> (
@@ -247,6 +387,28 @@ def test_lite_supervisor_runs_exact_regulatory_indexing_queues_and_forwards_log(
     assert log_path in redirect_command
 
 
+def test_lite_supervisor_runs_durable_regulatory_indexing_beat_and_forwards_log() -> (
+    None
+):
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.read(_BACKEND_ROOT / "supervisord-lite.conf", encoding="utf-8")
+    section = "program:celery_beat_regulatory_indexing"
+
+    assert parser.has_section(section)
+    command = " ".join(parser.get(section, "command").split())
+    assert (
+        "celery -A onyx.background.celery.versioned_apps.regulatory_indexing_beat beat"
+        in command
+    )
+    assert "--schedule=/var/log/onyx/regulatory-indexing-beat-schedule" in command
+    assert parser.getboolean(section, "autorestart") is True
+
+    log_path = parser.get(section, "stdout_logfile")
+    redirect_command = parser.get("program:log-redirect-handler", "command")
+    assert log_path == "/var/log/onyx/celery_beat_regulatory_indexing.log"
+    assert log_path in redirect_command
+
+
 def test_production_lite_health_requires_every_worker_including_regulatory_indexing(
     tmp_path: Path,
 ) -> None:
@@ -270,6 +432,7 @@ def test_production_lite_health_requires_every_worker_including_regulatory_index
         "celery_worker_user_file_maintenance",
         "celery_worker_light",
         "celery_worker_monitoring",
+        "celery_beat_regulatory_indexing",
         "log-redirect-handler",
     ]
     env = os.environ.copy()
@@ -290,7 +453,7 @@ def test_production_lite_health_requires_every_worker_including_regulatory_index
     env["SUPERVISOR_ROWS"] = "\n".join(
         f"{process} RUNNING pid 1, uptime 0:00:30"
         for process in expected_processes
-        if process != "celery_worker_regulatory_indexing"
+        if process != "celery_beat_regulatory_indexing"
     )
     missing_worker = subprocess.run(
         [sys.executable, *typed_health_command[2:]],
@@ -405,6 +568,12 @@ def test_codebuild_diagnostics_and_readiness_use_the_exact_worker_name() -> None
     assert "status celery_worker_regulatory_indexing" in deploy_script
     assert "/tmp/onyx_k8s_regulatoryindexing_readiness.txt" in deploy_script
     assert "verify_regulatory_indexing_worker\n" in deploy_script
+    assert "status celery_beat_regulatory_indexing" in diagnostics_script
+    assert "verify_regulatory_indexing_beat" in deploy_script
+    assert "status celery_beat_regulatory_indexing" in deploy_script
+    assert "/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt" in deploy_script
+    assert "/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt" in deploy_script
+    assert "capture_background_memory_evidence" in deploy_script
 
     for script in (diagnostics_script, deploy_script):
         syntax_check = subprocess.run(
@@ -415,3 +584,67 @@ def test_codebuild_diagnostics_and_readiness_use_the_exact_worker_name() -> None
             check=False,
         )
         assert syntax_check.returncode == 0, syntax_check.stderr
+
+
+def test_canonical_runbook_matches_executable_production_lite_topology() -> None:
+    contract = _load_runbook_runtime_contract()
+    runbook = _RUNBOOK_PATH.read_text(encoding="utf-8")
+    workers = _mapping(contract["workers"])
+    scheduler = _mapping(contract["scheduler"])
+    operations = _mapping(contract["operations"])
+    forbidden_queues = contract["forbidden_queues"]
+    assert isinstance(forbidden_queues, list)
+
+    assert contract["supervisor_process_count"] == 7
+    assert set(workers) == {
+        "celery_worker_regulatory_benchmark",
+        "celery_worker_regulatory_indexing",
+        "celery_worker_user_file_maintenance",
+        "celery_worker_light",
+        "celery_worker_monitoring",
+    }
+    assert workers["celery_worker_regulatory_indexing"] == [
+        "user_file_processing",
+        "regulatory_indexing",
+    ]
+    assert scheduler == {
+        "name": "celery_beat_regulatory_indexing",
+        "tasks": ["regulatory_indexing_recover_stale", "monitor_celery_queues"],
+        "readiness_file": "/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt",
+        "liveness_file": "/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt",
+    }
+    assert "user_file_processing" not in forbidden_queues
+    assert operations == {
+        "feature_flag": "REGULATORY_BATCH_INDEXING_ENABLED",
+        "default_enabled": False,
+        "required_workspace": "REGULATORY_INDEXING_GCS_URI",
+        "migration_before_enable": "alembic upgrade head",
+        "restart_after_config_change": ["api_server", "background"],
+    }
+    for variable in _PRODUCTION_LITE_ENVIRONMENT:
+        assert f"`{variable}`" in runbook
+
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.read(_BACKEND_ROOT / "supervisord-lite.conf", encoding="utf-8")
+    supervisor_programs = {
+        section.removeprefix("program:")
+        for section in parser.sections()
+        if section.startswith("program:")
+    }
+    assert supervisor_programs == {
+        *workers,
+        scheduler["name"],
+        "log-redirect-handler",
+    }
+    for worker_name, documented_queues in workers.items():
+        command = " ".join(parser.get(f"program:{worker_name}", "command").split())
+        queue_match = re.search(r"(?:^|\s)-Q ([^\s]+)", command)
+        assert queue_match is not None
+        assert queue_match.group(1).split(",") == documented_queues
+
+    handoff = _HANDOFF_PATH.read_text(encoding="utf-8")
+    for process_name in supervisor_programs:
+        assert f"`{process_name}`" in handoff
+    assert "tam olarak beş worker, bir özel Beat ve bir log yönlendirici" in handoff
+    assert "API ve background için birlikte `true`" in handoff
+    assert "Yalnız background için `REGULATORY_INDEXING_GCS_URI`" in handoff

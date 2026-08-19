@@ -58,9 +58,9 @@ services:
         done
         exec /app/scripts/supervisord_entrypoint.sh
     depends_on:
-      # The production-lite worker never indexes source documents. Removing
-      # this inherited dependency prevents the heavyweight indexing model
-      # server from being activated through the base Compose graph.
+      # Markdown durable indexing uses cloud providers and never needs the
+      # heavyweight indexing model server. Remove the inherited dependency so
+      # it cannot be activated through the base Compose graph.
       indexing_model_server: !reset null
     environment:
       DOCUMENT_IMPORT_ENABLED: "false"
@@ -91,7 +91,7 @@ services:
           import subprocess
           result = subprocess.run(["supervisorctl", "status"], capture_output=True, text=True)
           rows = [line.split() for line in result.stdout.splitlines() if line.split()]
-          expected = {"celery_worker_regulatory_benchmark", "celery_beat", "celery_worker_user_file_processing", "celery_worker_regulatory_indexing", "celery_worker_light", "celery_worker_monitoring", "log-redirect-handler"}
+          expected = {"celery_worker_regulatory_benchmark", "celery_beat", "celery_worker_user_file_processing", "celery_worker_regulatory_indexing", "celery_worker_light", "celery_worker_monitoring", "celery_beat_regulatory_indexing", "log-redirect-handler"}
           assert result.returncode == 0 and {row[0] for row in rows} == expected and all(len(row) > 1 and row[1] == "RUNNING" for row in rows)
       interval: 30s
       timeout: 10s
