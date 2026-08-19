@@ -15,6 +15,7 @@ from onyx.db.enums import (
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
     RegulatoryIndexingStage,
+    RegulatoryIndexingSubmissionState,
     UserFileStatus,
 )
 from onyx.db.models import (
@@ -107,6 +108,15 @@ class RegulatoryIndexingPreparedItem:
     skip_context: bool
 
 
+@dataclass(frozen=True)
+class RegulatoryIndexingRuntime:
+    job: RegulatoryIndexingJob
+    user_file: UserFile
+    search_settings: SearchSettings | None
+    regulatory_chunks: tuple[RegulatoryChunk, ...]
+    indexing_items: tuple[RegulatoryIndexingItem, ...]
+
+
 def _validate_config_snapshot(
     value: object,
     *,
@@ -161,9 +171,28 @@ def _legal_transition_source_status(
     next_status: RegulatoryIndexingJobStatus,
 ) -> RegulatoryIndexingJobStatus | None:
     if next_status is RegulatoryIndexingJobStatus.QUEUED:
-        if _NEXT_STAGE.get(expected_stage) is next_stage or (
-            expected_stage is RegulatoryIndexingStage.CONTEXT_WAIT
-            and next_stage is RegulatoryIndexingStage.CONTEXT_WAIT
+        if (
+            _NEXT_STAGE.get(expected_stage) is next_stage
+            or (
+                expected_stage is RegulatoryIndexingStage.CONTEXT_WAIT
+                and next_stage is RegulatoryIndexingStage.CONTEXT_WAIT
+            )
+            or (
+                expected_stage is RegulatoryIndexingStage.CONTEXT_SUBMIT
+                and next_stage is RegulatoryIndexingStage.EMBEDDING
+            )
+            or (
+                expected_stage is RegulatoryIndexingStage.CONTEXT_SUBMIT
+                and next_stage is RegulatoryIndexingStage.CONTEXT_SUBMIT
+            )
+            or (
+                expected_stage is RegulatoryIndexingStage.CONTEXT_APPLY
+                and next_stage is RegulatoryIndexingStage.CONTEXT_SUBMIT
+            )
+            or (
+                expected_stage is RegulatoryIndexingStage.EMBEDDING
+                and next_stage is RegulatoryIndexingStage.EMBEDDING
+            )
         ):
             return RegulatoryIndexingJobStatus.RUNNING
         return None
@@ -247,6 +276,262 @@ def get_regulatory_indexing_job(
     job_id: UUID,
 ) -> RegulatoryIndexingJob | None:
     return db_session.get(RegulatoryIndexingJob, job_id)
+
+
+def get_regulatory_indexing_runtime(
+    db_session: Session,
+    job_id: UUID,
+) -> RegulatoryIndexingRuntime | None:
+    job = db_session.get(RegulatoryIndexingJob, job_id)
+    if job is None:
+        return None
+    user_file = db_session.get(UserFile, job.user_file_id)
+    if user_file is None:
+        return None
+    return RegulatoryIndexingRuntime(
+        job=job,
+        user_file=user_file,
+        search_settings=db_session.get(SearchSettings, job.search_settings_id),
+        regulatory_chunks=tuple(
+            db_session.scalars(
+                select(RegulatoryChunk)
+                .where(RegulatoryChunk.user_file_id == user_file.id)
+                .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
+            ).all()
+        ),
+        indexing_items=tuple(
+            db_session.scalars(
+                select(RegulatoryIndexingItem).where(
+                    RegulatoryIndexingItem.job_id == job.id
+                )
+            ).all()
+        ),
+    )
+
+
+def mark_regulatory_indexing_user_file(
+    db_session: Session,
+    *,
+    job_id: UUID,
+) -> bool:
+    user_file_id = db_session.scalar(
+        select(RegulatoryIndexingJob.user_file_id).where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status.not_in(
+                (
+                    RegulatoryIndexingJobStatus.SUCCEEDED.value,
+                    RegulatoryIndexingJobStatus.FAILED.value,
+                    RegulatoryIndexingJobStatus.CANCELLED.value,
+                )
+            ),
+        )
+    )
+    if user_file_id is None:
+        db_session.rollback()
+        return False
+    updated_id = db_session.scalar(
+        update(UserFile)
+        .where(
+            UserFile.id == user_file_id,
+            UserFile.status.in_((UserFileStatus.PROCESSING, UserFileStatus.INDEXING)),
+        )
+        .values(status=UserFileStatus.INDEXING)
+        .returning(UserFile.id)
+    )
+    db_session.commit()
+    return updated_id is not None
+
+
+def _update_vertex_submission_state(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    allowed_states: tuple[RegulatoryIndexingSubmissionState, ...],
+    next_state: RegulatoryIndexingSubmissionState,
+    now: datetime.datetime,
+    extra_values: dict[str, object] | None = None,
+) -> bool:
+    values: dict[str, object] = {
+        "vertex_submission_key": submission_key,
+        "vertex_submission_state": next_state.value,
+        "heartbeat_at": now,
+        "updated_at": now,
+    }
+    if extra_values:
+        values.update(extra_values)
+    updated_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.CONTEXT_SUBMIT.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.vertex_submission_state.in_(
+                tuple(state.value for state in allowed_states)
+            ),
+            or_(
+                RegulatoryIndexingJob.vertex_submission_key.is_(None),
+                RegulatoryIndexingJob.vertex_submission_key == submission_key,
+            ),
+        )
+        .values(**values)
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return updated_id is not None
+
+
+def record_vertex_submission_intent(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    now: datetime.datetime,
+) -> bool:
+    """Commit deterministic create intent before the provider create call."""
+
+    return _update_vertex_submission_state(
+        db_session,
+        job_id=job_id,
+        expected_generation=expected_generation,
+        submission_key=submission_key,
+        allowed_states=(
+            RegulatoryIndexingSubmissionState.NONE,
+            RegulatoryIndexingSubmissionState.RECONCILED_ABSENT,
+        ),
+        next_state=RegulatoryIndexingSubmissionState.SUBMITTING,
+        now=now,
+    )
+
+
+def require_vertex_submission_reconciliation(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    now: datetime.datetime,
+) -> bool:
+    return _update_vertex_submission_state(
+        db_session,
+        job_id=job_id,
+        expected_generation=expected_generation,
+        submission_key=submission_key,
+        allowed_states=(RegulatoryIndexingSubmissionState.SUBMITTING,),
+        next_state=RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
+        now=now,
+    )
+
+
+def record_vertex_submission_absent(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    now: datetime.datetime,
+) -> bool:
+    return _update_vertex_submission_state(
+        db_session,
+        job_id=job_id,
+        expected_generation=expected_generation,
+        submission_key=submission_key,
+        allowed_states=(
+            RegulatoryIndexingSubmissionState.SUBMITTING,
+            RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
+        ),
+        next_state=RegulatoryIndexingSubmissionState.RECONCILED_ABSENT,
+        now=now,
+    )
+
+
+def record_vertex_submission(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    remote_job_name: str,
+    input_uri: str | None,
+    output_uri: str | None,
+    now: datetime.datetime,
+) -> bool:
+    return _update_vertex_submission_state(
+        db_session,
+        job_id=job_id,
+        expected_generation=expected_generation,
+        submission_key=submission_key,
+        allowed_states=(
+            RegulatoryIndexingSubmissionState.SUBMITTING,
+            RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
+            RegulatoryIndexingSubmissionState.RECONCILED_ABSENT,
+        ),
+        next_state=RegulatoryIndexingSubmissionState.SUBMITTED,
+        now=now,
+        extra_values={
+            "remote_vertex_job_name": remote_job_name,
+            "vertex_input_uri": input_uri,
+            "vertex_output_uri": output_uri,
+        },
+    )
+
+
+def persist_vertex_poll_state(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    remote_job_name: str,
+    output_uri: str | None,
+    now: datetime.datetime,
+) -> bool:
+    updated_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.CONTEXT_WAIT.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.remote_vertex_job_name == remote_job_name,
+        )
+        .values(vertex_output_uri=output_uri, heartbeat_at=now, updated_at=now)
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return updated_id is not None
+
+
+def reset_vertex_submission_for_partial_retry(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    now: datetime.datetime,
+) -> bool:
+    updated_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.CONTEXT_APPLY.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .values(
+            vertex_submission_key=None,
+            vertex_submission_state=RegulatoryIndexingSubmissionState.NONE.value,
+            remote_vertex_job_name=None,
+            vertex_input_uri=None,
+            vertex_output_uri=None,
+            heartbeat_at=now,
+            updated_at=now,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return updated_id is not None
 
 
 def claim_regulatory_indexing_job(
@@ -920,3 +1205,91 @@ def persist_regulatory_indexing_item_failure(
             "updated_at": func.now(),
         },
     )
+
+
+def fail_regulatory_indexing_job(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_stage: RegulatoryIndexingStage,
+    expected_generation: int,
+    error_code: str,
+    error_message: str,
+    now: datetime.datetime,
+) -> bool:
+    """Atomically terminally fail the fenced job and its live user file."""
+
+    job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == expected_stage.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if job is None:
+        db_session.rollback()
+        return False
+    job.status = RegulatoryIndexingJobStatus.FAILED.value
+    job.error_code = error_code
+    job.error_message = error_message[:_MAX_ERROR_MESSAGE_LENGTH]
+    job.completed_at = now
+    job.updated_at = now
+    db_session.execute(
+        update(UserFile)
+        .where(
+            UserFile.id == job.user_file_id,
+            UserFile.status.in_((UserFileStatus.PROCESSING, UserFileStatus.INDEXING)),
+        )
+        .values(status=UserFileStatus.FAILED)
+    )
+    db_session.commit()
+    return True
+
+
+def cancel_regulatory_indexing_job(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_stage: RegulatoryIndexingStage,
+    expected_generation: int,
+    now: datetime.datetime,
+) -> bool:
+    """Clear sensitive derived payloads and finish cancellation under the fence."""
+
+    job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == expected_stage.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if job is None:
+        db_session.rollback()
+        return False
+    db_session.execute(
+        update(RegulatoryIndexingItem)
+        .where(RegulatoryIndexingItem.job_id == job_id)
+        .values(vector=None, updated_at=now)
+    )
+    job.status = RegulatoryIndexingJobStatus.CANCELLED.value
+    job.completed_at = now
+    job.next_retry_at = None
+    job.error_code = None
+    job.error_message = None
+    job.updated_at = now
+    db_session.execute(
+        update(UserFile)
+        .where(
+            UserFile.id == job.user_file_id,
+            UserFile.status.in_((UserFileStatus.PROCESSING, UserFileStatus.INDEXING)),
+        )
+        .values(status=UserFileStatus.CANCELED)
+    )
+    db_session.commit()
+    return True

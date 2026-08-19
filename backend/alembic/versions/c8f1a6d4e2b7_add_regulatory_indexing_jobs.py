@@ -36,6 +36,13 @@ def upgrade() -> None:
         sa.Column("next_retry_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("heartbeat_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("remote_vertex_job_name", sa.String(length=1024), nullable=True),
+        sa.Column("vertex_submission_key", sa.String(length=96), nullable=True),
+        sa.Column(
+            "vertex_submission_state",
+            sa.String(length=32),
+            server_default="NONE",
+            nullable=False,
+        ),
         sa.Column("vertex_input_uri", sa.String(length=2048), nullable=True),
         sa.Column("vertex_output_uri", sa.String(length=2048), nullable=True),
         sa.Column("error_code", sa.String(length=128), nullable=True),
@@ -60,6 +67,11 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "lease_generation >= 0",
             name="regulatory_indexing_job_lease_generation_check",
+        ),
+        sa.CheckConstraint(
+            "vertex_submission_state IN ('NONE', 'SUBMITTING', "
+            "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', 'SUBMITTED')",
+            name="regulatory_indexing_job_submission_state_check",
         ),
         sa.CheckConstraint(
             "stage IN ('PREPARING', 'CONTEXT_SUBMIT', 'CONTEXT_WAIT', "

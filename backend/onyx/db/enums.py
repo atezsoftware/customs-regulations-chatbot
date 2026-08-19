@@ -744,6 +744,14 @@ class RegulatoryIndexingJobStatus(str, PyEnum):
     CANCELLED = "CANCELLED"
 
 
+class RegulatoryIndexingSubmissionState(str, PyEnum):
+    NONE = "NONE"
+    SUBMITTING = "SUBMITTING"
+    RECONCILE_REQUIRED = "RECONCILE_REQUIRED"
+    RECONCILED_ABSENT = "RECONCILED_ABSENT"
+    SUBMITTED = "SUBMITTED"
+
+
 class RegulatoryIndexingStage(str, PyEnum):
     PREPARING = "PREPARING"
     CONTEXT_SUBMIT = "CONTEXT_SUBMIT"

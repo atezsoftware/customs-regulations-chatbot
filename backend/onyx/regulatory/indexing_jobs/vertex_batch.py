@@ -155,6 +155,18 @@ class VertexBatchGateway(Protocol):
     def cleanup(self, prefix: str) -> None: ...
 
 
+def vertex_batch_submission_key(
+    requests: Sequence[VertexBatchRequest],
+) -> str:
+    if not requests:
+        raise VertexBatchContractError("Vertex batch requires at least one request")
+    request_hashes = [request.request_hash for request in requests]
+    if len(set(request_hashes)) != len(request_hashes):
+        raise VertexBatchContractError("Vertex batch contains a duplicate request hash")
+    request_set_hash = sha256("\n".join(sorted(request_hashes)).encode()).hexdigest()
+    return f"regulatory-context-{request_set_hash}"
+
+
 def build_vertex_jsonl(requests: Sequence[VertexBatchRequest]) -> str:
     if not requests:
         raise VertexBatchContractError("Vertex batch requires at least one request")
@@ -258,6 +270,8 @@ def _parse_output_result(
 def parse_vertex_jsonl_output(
     output: str,
     expected_request_hashes: Collection[str],
+    *,
+    require_complete: bool = True,
 ) -> dict[str, VertexBatchResult]:
     expected = set(expected_request_hashes)
     results: dict[str, VertexBatchResult] = {}
@@ -281,7 +295,7 @@ def parse_vertex_jsonl_output(
         if request_hash in results:
             raise VertexBatchContractError("Vertex output has a duplicate request hash")
         results[request_hash] = _parse_output_result(typed_value, request_hash)
-    if results.keys() != expected:
+    if require_complete and results.keys() != expected:
         raise VertexBatchContractError("Vertex output is missing a request hash")
     return results
 
@@ -513,10 +527,8 @@ class GoogleVertexBatchGateway:
         from google.genai import types as genai_types
 
         payload = build_vertex_jsonl(requests)
-        request_set_hash = sha256(
-            "\n".join(sorted(request.request_hash for request in requests)).encode()
-        ).hexdigest()
-        submission_key = f"regulatory-context-{request_set_hash}"
+        submission_key = vertex_batch_submission_key(requests)
+        request_set_hash = submission_key.removeprefix("regulatory-context-")
         base_uri = self._config.gcs_uri.rstrip("/")
         batch_prefix = f"{base_uri}/{self._object_prefix}/{request_set_hash}"
         input_uri = f"{batch_prefix}/input.jsonl"

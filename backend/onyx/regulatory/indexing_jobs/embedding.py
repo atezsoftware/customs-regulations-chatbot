@@ -27,6 +27,7 @@ class EmbeddingSummary(BaseModel):
     total_count: int = Field(ge=0)
     embedded_count: int = Field(ge=0)
     reused_count: int = Field(ge=0)
+    remaining_count: int = Field(default=0, ge=0)
 
 
 def _is_valid_vector(vector: object, expected_dimension: int) -> bool:
@@ -147,11 +148,14 @@ def embed_pending_regulatory_items(
     search_settings: SearchSettings,
     tenant_id: str,
     db_session: Session,
+    max_batches: int | None = None,
 ) -> EmbeddingSummary:
     """Embed only missing/invalid item vectors in bounded, atomic batches."""
 
     if not tenant_id.strip():
         raise ValueError("tenant_id must not be empty")
+    if max_batches is not None and max_batches < 1:
+        raise ValueError("max_batches must be at least one")
     snapshot = RegulatoryIndexingConfigSnapshot.model_validate(job.config_snapshot)
     _validate_search_settings(search_settings, snapshot)
     ordered = _ordered_mapping(job, rows, items)
@@ -192,7 +196,10 @@ def embed_pending_regulatory_items(
 
     embedded_count = 0
     request_size = snapshot.embedding_request_size
-    for start in range(0, len(pending), request_size):
+    request_starts = list(range(0, len(pending), request_size))
+    if max_batches is not None:
+        request_starts = request_starts[:max_batches]
+    for start in request_starts:
         batch = pending[start : start + request_size]
         texts = [_text_for_embedding(row, item) for row, item in batch]
         raw_vectors = embedder.embedding_model.encode(
@@ -222,5 +229,6 @@ def embed_pending_regulatory_items(
     return EmbeddingSummary(
         total_count=len(ordered),
         embedded_count=embedded_count,
-        reused_count=len(ordered) - embedded_count,
+        reused_count=len(ordered) - len(pending),
+        remaining_count=len(pending) - embedded_count,
     )

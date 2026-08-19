@@ -28,6 +28,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchSubmissionConflictError,
     build_vertex_jsonl,
     parse_vertex_jsonl_output,
+    vertex_batch_submission_key,
 )
 
 _FIRST_HASH = "27948fe650396b332c6e0b7073fbc4adf9cda51e33c0fc013fcd5b0be01a6f5f"
@@ -105,6 +106,29 @@ def test_build_vertex_jsonl_rejects_duplicate_request_hashes() -> None:
                 VertexBatchRequest(prompt="first prompt"),
             ]
         )
+
+
+def test_submission_key_is_stable_across_request_order() -> None:
+    first = VertexBatchRequest(prompt="first prompt")
+    second = VertexBatchRequest(prompt="second prompt")
+
+    assert vertex_batch_submission_key([first, second]) == (
+        vertex_batch_submission_key([second, first])
+    )
+    assert vertex_batch_submission_key([first, second]).startswith(
+        "regulatory-context-"
+    )
+
+
+def test_partial_parse_returns_only_correlated_available_results() -> None:
+    results = parse_vertex_jsonl_output(
+        _output_line("first prompt", text="first context"),
+        {_FIRST_HASH, _SECOND_HASH},
+        require_complete=False,
+    )
+
+    assert set(results) == {_FIRST_HASH}
+    assert results[_FIRST_HASH].context == "first context"
 
 
 def test_parse_correlates_shuffled_output_by_canonical_request_hash() -> None:

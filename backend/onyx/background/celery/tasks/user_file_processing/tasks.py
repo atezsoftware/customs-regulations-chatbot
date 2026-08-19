@@ -1,6 +1,7 @@
 import datetime
 import threading
 import time
+from pathlib import PurePosixPath
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -18,6 +19,7 @@ from onyx.background.celery.celery_redis import (
 )
 from onyx.background.celery.celery_utils import httpx_init_vespa_pool
 from onyx.background.celery.tasks.shared.RetryDocumentIndex import RetryDocumentIndex
+from onyx.configs import app_configs
 from onyx.configs.app_configs import (
     CELERY_WORKER_USER_FILE_PROCESSING_CONCURRENCY,
     DEFER_USER_FILE_INDEXING,
@@ -53,6 +55,10 @@ from onyx.db.regulatory_chunks import (
     get_chunk_counts_for_files,
     get_chunks_for_file,
     has_regulatory_chunks_for_file,
+)
+from onyx.db.regulatory_indexing_jobs import (
+    get_regulatory_indexing_job,
+    mark_regulatory_indexing_user_file,
 )
 from onyx.db.search_settings import (
     active_secondary_port_target,
@@ -96,6 +102,9 @@ from onyx.indexing.indexing_pipeline import (
 from onyx.redis.redis_pool import get_redis_client
 from onyx.redis.tenant_redis_client import TenantRedisClient
 from onyx.regulatory.indexing import RegulatoryIndexingChunker
+from onyx.regulatory.indexing_jobs.preparation import (
+    prepare_regulatory_indexing_job,
+)
 from onyx.regulatory.projection import (
     _project_rows_to_search_settings,
     project_user_file_to_index,
@@ -720,6 +729,53 @@ def _process_user_file_with_indexing(
     _dual_write_new_file_to_secondary(user_file_id, tenant_id)
 
 
+def _process_user_file_with_durable_regulatory_indexing(
+    *,
+    user_file_id: str,
+    documents: list[Document],
+    tenant_id: str,
+) -> None:
+    """Persist durable Markdown preparation and emit a short-lived delivery hint."""
+
+    from onyx.background.celery.apps.client import celery_app
+    from onyx.background.celery.tasks.regulatory_indexing.tasks import (
+        enqueue_regulatory_indexing_step,
+    )
+    from onyx.regulatory.indexing_jobs.orchestrator import OrchestrationDeliveryKind
+
+    user_file_uuid = _as_uuid(user_file_id)
+    with get_session_with_current_tenant() as db_session:
+        job_id = prepare_regulatory_indexing_job(
+            user_file_uuid,
+            documents,
+            tenant_id,
+            db_session,
+        )
+        if not mark_regulatory_indexing_user_file(db_session, job_id=job_id):
+            return
+        job = get_regulatory_indexing_job(db_session, job_id)
+        if job is None:
+            raise RuntimeError("prepared regulatory indexing job disappeared")
+        expected_generation = job.lease_generation
+
+    try:
+        enqueue_regulatory_indexing_step(
+            celery_app,
+            job_id=job_id,
+            expected_generation=expected_generation,
+            tenant_id=tenant_id,
+            delivery_kind=OrchestrationDeliveryKind.NORMAL,
+        )
+    except Exception as error:
+        # PostgreSQL is the durable scheduler. The recovery scan will redeliver
+        # the committed job if this short-lived broker hint cannot be published.
+        task_logger.warning(
+            "durable regulatory indexing enqueue failed id=%s error_type=%s",
+            user_file_id,
+            error.__class__.__name__,
+        )
+
+
 def _index_user_file_to_secondary(
     user_file_id: str | UUID,
     secondary: SearchSettings,
@@ -981,6 +1037,10 @@ def process_user_file_impl(
 
             file_id = uf.file_id
             file_name = uf.name
+            if app_configs.REGULATORY_BATCH_INDEXING_ENABLED and PurePosixPath(
+                file_name or ""
+            ).suffix.lower() not in {".md", ".mdx"}:
+                raise ValueError("durable regulatory indexing accepts Markdown only")
         # DB connection returned to pool here; file I/O and indexing run without it.
 
         try:
@@ -988,7 +1048,13 @@ def process_user_file_impl(
                 user_file_id, file_id, file_name, tenant_id
             )
             try:
-                if DISABLE_VECTOR_DB:
+                if app_configs.REGULATORY_BATCH_INDEXING_ENABLED:
+                    _process_user_file_with_durable_regulatory_indexing(
+                        user_file_id=user_file_id,
+                        documents=documents,
+                        tenant_id=tenant_id,
+                    )
+                elif DISABLE_VECTOR_DB:
                     _process_user_file_without_vector_db(
                         user_file_id=user_file_id,
                         documents=documents,

@@ -15,6 +15,7 @@ from onyx.db.enums import (
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
     RegulatoryIndexingStage,
+    RegulatoryIndexingSubmissionState,
     UserFileStatus,
 )
 from onyx.db.models import (
@@ -39,7 +40,11 @@ from onyx.db.regulatory_indexing_jobs import (
     persist_regulatory_indexing_item_skipped,
     persist_regulatory_indexing_item_vector,
     persist_regulatory_indexing_item_vectors,
+    record_vertex_submission,
+    record_vertex_submission_absent,
+    record_vertex_submission_intent,
     regulatory_indexing_external_mutation_lease,
+    require_vertex_submission_reconciliation,
     schedule_regulatory_indexing_retry,
 )
 from onyx.document_index.interfaces_new import DocumentIndex
@@ -223,6 +228,88 @@ def test_older_lease_cannot_advance_job_state(
     db_session.refresh(job)
     assert job.stage == RegulatoryIndexingStage.CONTEXT_SUBMIT.value
     assert job.status == RegulatoryIndexingJobStatus.QUEUED.value
+
+
+def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenced(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert job.vertex_submission_key is None
+    assert job.vertex_submission_state == RegulatoryIndexingSubmissionState.NONE.value
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    job.stage = RegulatoryIndexingStage.CONTEXT_SUBMIT.value
+    db_session.commit()
+    submission_key = "regulatory-context-" + "a" * 64
+
+    assert not record_vertex_submission_intent(
+        db_session,
+        job_id=job.id,
+        expected_generation=0,
+        submission_key=submission_key,
+        now=_NOW,
+    )
+    assert record_vertex_submission_intent(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key=submission_key,
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    assert job.vertex_submission_key == submission_key
+    assert (
+        job.vertex_submission_state
+        == RegulatoryIndexingSubmissionState.SUBMITTING.value
+    )
+
+    assert require_vertex_submission_reconciliation(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key=submission_key,
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    assert (
+        job.vertex_submission_state
+        == RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED.value
+    )
+
+    assert record_vertex_submission_absent(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key=submission_key,
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    assert (
+        job.vertex_submission_state
+        == RegulatoryIndexingSubmissionState.RECONCILED_ABSENT.value
+    )
+
+    assert record_vertex_submission(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key=submission_key,
+        remote_job_name="projects/p/locations/l/batchJobs/1",
+        input_uri="gs://bucket/input.jsonl",
+        output_uri="gs://bucket/output",
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    assert (
+        job.vertex_submission_state == RegulatoryIndexingSubmissionState.SUBMITTED.value
+    )
+    assert job.remote_vertex_job_name == "projects/p/locations/l/batchJobs/1"
 
 
 def test_illegal_stage_skip_cannot_persist_terminal_job_state(

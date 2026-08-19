@@ -208,6 +208,8 @@ CELERY_USER_FILE_DELETE_TASK_EXPIRES = 60  # 1 minute (in seconds)
 # expired task's doc stays needs_sync / secondary_only_sync_pending and is
 # re-enqueued on the next vespa-sync beat pass, so dropping it is safe.
 CELERY_DOCUMENT_SYNC_TASK_EXPIRES = 60 * 60  # 1 hour (in seconds)
+CELERY_REGULATORY_INDEXING_TASK_EXPIRES = 30 * 60
+CELERY_REGULATORY_INDEXING_MAX_TASK_EXPIRES = 24 * 60 * 60
 
 # Max queue depth before the delete beat stops enqueuing more delete tasks.
 USER_FILE_DELETE_MAX_QUEUE_DEPTH = 500
@@ -480,6 +482,7 @@ class OnyxCeleryQueues:
     # Regulatory benchmark runs use the normal chat pipeline but execute on an
     # isolated worker so they cannot consume Craft scheduled-task capacity.
     REGULATORY_BENCHMARK = "regulatory_benchmark"
+    REGULATORY_INDEXING = "regulatory_indexing"
 
     ELASTICSEARCH_MIGRATION = "elasticsearch_migration"
 
@@ -694,6 +697,8 @@ class OnyxCeleryTask:
     SCHEDULED_TASKS_CLEANUP_STUCK = "scheduled_tasks_cleanup_stuck"
 
     REGULATORY_BENCHMARK_RUN = "regulatory_benchmark_run"
+    REGULATORY_INDEXING_RUN_STEP = "regulatory_indexing_run_step"
+    REGULATORY_INDEXING_RECOVER_STALE = "regulatory_indexing_recover_stale"
 
     CHECK_FOR_DOCUMENTS_FOR_ELASTICSEARCH_MIGRATION_TASK = (
         "check_for_documents_for_elasticsearch_migration_task"

@@ -5694,6 +5694,10 @@ class RegulatoryIndexingJob(Base):
     remote_vertex_job_name: Mapped[str | None] = mapped_column(
         String(1024), nullable=True
     )
+    vertex_submission_key: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    vertex_submission_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="NONE", server_default="NONE"
+    )
     vertex_input_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     vertex_output_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -5751,6 +5755,11 @@ class RegulatoryIndexingJob(Base):
         CheckConstraint(
             "attempt_count >= 0",
             name="regulatory_indexing_job_attempt_count_check",
+        ),
+        CheckConstraint(
+            "vertex_submission_state IN ('NONE', 'SUBMITTING', "
+            "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', 'SUBMITTED')",
+            name="regulatory_indexing_job_submission_state_check",
         ),
     )
 

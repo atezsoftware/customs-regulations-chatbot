@@ -222,6 +222,41 @@ class TestProcessUserFileWithoutVectorDb:
 
 
 class TestProcessImplBranching:
+    @patch(f"{TASKS_MODULE}._process_user_file_with_durable_regulatory_indexing")
+    @patch(f"{TASKS_MODULE}._process_user_file_without_vector_db")
+    @patch(f"{TASKS_MODULE}._process_user_file_with_indexing")
+    @patch(f"{TASKS_MODULE}.app_configs.REGULATORY_BATCH_INDEXING_ENABLED", True)
+    @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
+    def test_durable_flag_prepares_markdown_without_legacy_indexing(
+        self,
+        mock_get_session: MagicMock,
+        mock_with_indexing: MagicMock,
+        mock_without_vdb: MagicMock,
+        mock_durable: MagicMock,
+    ) -> None:
+        uf = _make_user_file(name="regulation.md")
+        session = MagicMock()
+        session.get.return_value = uf
+        mock_get_session.return_value.__enter__.return_value = session
+        documents = _make_documents(["MADDE 1 - durable"])
+        connector_mock = MagicMock()
+        connector_mock.load_from_state.return_value = [documents]
+
+        with patch(f"{TASKS_MODULE}.LocalFileConnector", return_value=connector_mock):
+            process_user_file_impl(
+                user_file_id=str(uf.id),
+                tenant_id="test-tenant",
+                redis_locking=False,
+            )
+
+        mock_durable.assert_called_once_with(
+            user_file_id=str(uf.id),
+            documents=documents,
+            tenant_id="test-tenant",
+        )
+        mock_with_indexing.assert_not_called()
+        mock_without_vdb.assert_not_called()
+
     @patch(f"{TASKS_MODULE}._process_user_file_without_vector_db")
     @patch(f"{TASKS_MODULE}._process_user_file_with_indexing")
     @patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", True)

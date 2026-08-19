@@ -241,6 +241,41 @@ def test_embedding_uses_snapshot_model_dimension_context_and_bounded_order(
     )
 
 
+def test_embedding_delivery_limits_provider_work_to_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _snapshot(request_size=2)
+    job = _job(snapshot)
+    rows, items = _rows_and_items(job, count=5)
+    model, _constructed_with = _install_embedder(
+        monkeypatch,
+        responses=[[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]],
+    )
+    monkeypatch.setattr(
+        embedding.indexing_job_repository,
+        "persist_regulatory_indexing_item_vectors",
+        lambda *_args, **_kwargs: True,
+    )
+
+    summary = embed_pending_regulatory_items(
+        job=job,
+        rows=rows,
+        items=items,
+        search_settings=_settings(snapshot),
+        tenant_id="tenant-a",
+        db_session=_DB_SESSION,
+        max_batches=1,
+    )
+
+    assert len(model.calls) == 1
+    assert summary == EmbeddingSummary(
+        total_count=5,
+        embedded_count=2,
+        reused_count=0,
+        remaining_count=3,
+    )
+
+
 @pytest.mark.parametrize(
     ("response", "error_match"),
     [
