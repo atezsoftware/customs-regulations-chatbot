@@ -438,8 +438,9 @@ the same singleton migration ownership before rolling replicas.
 
 Keep `REGULATORY_BATCH_INDEXING_ENABLED=false` through the singleton `alembic upgrade head` and
 initial readiness checks. Before enabling it, configure a non-secret `REGULATORY_INDEXING_GCS_URI`,
-verify the selected Vertex contextual model can create/read/cancel batch jobs and objects beneath
-that workspace, and verify the active OpenRouter embedding SearchSettings contract. Then change the
+archive an approved IAM policy/simulator review for the exact runtime identity and workspace (the
+read-only probe cannot prove create/delete/cancel permissions), and verify the active OpenRouter
+embedding SearchSettings contract. Then change the
 flag for both `api_server` and `background` and restart both through the owned deployment workflow;
 an API-only or worker-only flag change is forbidden. Repeat worker, Beat, queue, and Markdown-canary
 readiness checks after every indexing environment change. To disable the feature, set the flag false
@@ -448,7 +449,38 @@ jobs, although broker messages already emitted before the restart may still fini
 
 The shipped backend-lite image contains a read-only readiness command. Run it inside the new
 `background` container after the singleton migration and Admin configuration, while the feature flag
-is still false. For the external-infrastructure topology, the exact command is:
+is still false. First create an owner-only, non-secret attestation from the approved IAM policy review
+and mount it read-only at `/run/readiness/regulatory-capabilities.json` in `background`. It must use
+this exact schema, the active snapshot scope, the runtime credential identity observed by the IAM
+review, and a `reviewed_at` no more than 24 hours old:
+
+```json
+{
+  "schema_version": 1,
+  "reviewed_at": "2026-08-20T09:00:00+00:00",
+  "identity": "regulatory-runtime@example.iam.gserviceaccount.com",
+  "evidence_reference": "approved-change-record-or-policy-simulator-evidence",
+  "gcs_uri": "gs://approved-bucket/exact-regulatory-prefix",
+  "vertex_project": "approved-project",
+  "vertex_location": "approved-location",
+  "vertex_model": "approved-model",
+  "permissions": [
+    "storage.objects.create",
+    "storage.objects.get",
+    "storage.objects.delete",
+    "storage.objects.list",
+    "aiplatform.batchPredictionJobs.create",
+    "aiplatform.batchPredictionJobs.get",
+    "aiplatform.batchPredictionJobs.cancel",
+    "aiplatform.batchPredictionJobs.list",
+    "aiplatform.models.get"
+  ]
+}
+```
+
+The evidence reference must point to the archived IAM result; do not put credentials, tokens,
+service-account JSON, document content, or vectors in this file. Set its mode to `0600`. For the
+external-infrastructure topology, the exact command is:
 
 ```bash
 docker compose --project-name "$APPROVED_COMPOSE_PROJECT" --env-file .env \
@@ -457,21 +489,29 @@ docker compose --project-name "$APPROVED_COMPOSE_PROJECT" --env-file .env \
   -f docker-compose.regulatory-external-infra.yml \
   -f docker-compose.regulatory-prod-lite.yml \
   exec -T background python /app/scripts/regulatory_indexing_readiness.py \
-    --memory-headroom-reviewed
+    --memory-headroom-reviewed \
+    --capability-attestation /run/readiness/regulatory-capabilities.json
 ```
 
 Use the same command with `docker-compose.regulatory-compose-infra.yml` in Compose-managed mode.
 Exit `0` means every check passed, exit `1` means not ready, and exit `2` is an invocation
 interruption/error. `--json` emits the same redacted result for archival. The command performs only
-database reads, supervisor/probe inspection, GCS list access, Vertex model/batch reads, one
+database reads, exact configured/live Celery queue inspection, GCS list access, Vertex model/batch reads, one
 constant-text OpenRouter embedding call, and Elasticsearch mapping reads. It never indexes a probe,
 creates/cancels a batch, writes an object, or prints credentials, vectors, or document content.
+The GCS and Vertex calls prove only the listed observational operations. Mutation capability is
+accepted only from the fresh archived IAM attestation, whose identity must equal the identity used by
+both observational probes; missing, stale, wrong-scope, wrong-identity, or incomplete evidence fails
+readiness.
 
 Prerequisites are: the migration job completed; the new disabled API/background containers are
 running; the dedicated regulatory worker and Beat probe files are healthy; the active Admin Search
 Settings select OpenRouter `openai/text-embedding-3-large` with contextual retrieval enabled; the
 selected contextual model is Vertex AI with valid batch/GCS access; and the active Elasticsearch
-index exists. Before supplying `--memory-headroom-reviewed`, archive the cgroup and per-process RSS
+index exists with both dense-vector fields matching the active effective dimension and mapping
+attributes. The archived IAM evidence must enumerate GCS object create/get/delete/list and Vertex
+batch create/get/cancel/list plus model get for the exact active scope; the command deliberately does
+not exercise create/delete/cancel. Before supplying `--memory-headroom-reviewed`, archive the cgroup and per-process RSS
 evidence required in section 6 and verify the pod limit plus node headroom; omitting the attestation
 fails closed, and any recorded OOM event still fails the check. The repository cannot validate
 external Helm/node capacity by itself. The readiness report's `effective_dimension` is authoritative. It is derived from the

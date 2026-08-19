@@ -5,6 +5,8 @@ import json
 import threading
 from collections.abc import Generator, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -12,8 +14,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from onyx.configs.constants import DocumentSource
-from onyx.connectors.models import Document, TextSection
+from onyx.configs import app_configs
+from onyx.configs.constants import FileOrigin
 from onyx.db import regulatory_indexing_jobs as job_repository
 from onyx.db.enums import (
     EmbeddingPrecision,
@@ -25,6 +27,8 @@ from onyx.db.enums import (
 )
 from onyx.db.models import (
     CloudEmbeddingProvider,
+    LLMProvider,
+    ModelConfiguration,
     RegulatoryChunk,
     RegulatoryIndexingItem,
     RegulatoryIndexingJob,
@@ -40,14 +44,17 @@ from onyx.document_index.elasticsearch.schema import (
     get_elasticsearch_doc_chunk_id,
 )
 from onyx.document_index.interfaces_new import TenantState
+from onyx.file_store.postgres_file_store import PostgresBackedFileStore
+from onyx.llm.constants import LlmProviderNames
+from onyx.llm.well_known_providers.constants import (
+    VERTEX_AUTH_METHOD_KWARG,
+    VERTEX_AUTH_METHOD_WORKLOAD_IDENTITY,
+    VERTEX_LOCATION_KWARG,
+    VERTEX_PROJECT_KWARG,
+)
 from onyx.natural_language_processing import search_nlp_models
 from onyx.natural_language_processing.utils import BaseTokenizer
 from onyx.regulatory.indexing_jobs import orchestrator, preparation, publisher
-from onyx.regulatory.indexing_jobs.models import (
-    RegulatoryIndexingConfigSnapshot,
-    VertexAuthenticationMode,
-    VertexBatchConfig,
-)
 from onyx.regulatory.indexing_jobs.orchestrator import (
     OrchestrationOutcome,
     run_preclaimed_regulatory_indexing_step,
@@ -63,7 +70,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
 from shared_configs.enums import EmbeddingProvider
 from tests.external_dependency_unit.conftest import create_test_user
 
-_DIMENSION = 1024
+_TEST_REDUCED_DIMENSION = 768
 _TENANT_ID = "public"
 
 
@@ -197,71 +204,12 @@ def embedding_server() -> Generator[tuple[str, list[dict[str, object]]], None, N
         server.server_close()
 
 
-def _markdown_document(user_file_id: UUID, marker: str) -> Document:
+def _markdown_bytes(marker: str) -> bytes:
     repeated = " Transit rejimi kapsamında gümrük işlemleri güvenle yürütülür." * 2
-    return Document(
-        id=str(user_file_id),
-        source=DocumentSource.USER_FILE,
-        semantic_identifier=f"{marker}.md",
-        title=f"{marker}.md",
-        sections=[
-            TextSection(
-                text=(
-                    f"# {marker}\n\n## MADDE 1\nBirinci hüküm.{repeated}\n\n"
-                    f"## MADDE 2\nİkinci hüküm.{repeated}"
-                ),
-                link=None,
-            )
-        ],
-        metadata={},
-    )
-
-
-def _snapshot(search_settings: SearchSettings) -> RegulatoryIndexingConfigSnapshot:
-    return RegulatoryIndexingConfigSnapshot(
-        search_settings_id=search_settings.id,
-        embedding_provider=EmbeddingProvider.OPENROUTER,
-        embedding_model_name="openai/text-embedding-3-large",
-        model_dimension=3072,
-        reduced_dimension=_DIMENSION,
-        effective_dimension=_DIMENSION,
-        index_name=search_settings.index_name,
-        vertex=VertexBatchConfig(
-            model_configuration_id=999_999,
-            model_name="gemini-3.1-flash-lite",
-            project="disposable-test-project",
-            location="europe-west4",
-            authentication_mode=VertexAuthenticationMode.WORKLOAD_IDENTITY,
-            gcs_uri="gs://disposable-regulatory-indexing",
-        ),
-        prompt_version="contextual-rag-v1",
-        prompt_hash="a" * 64,
-        poll_seconds=1,
-        retry_base_seconds=1,
-        retry_max_seconds=1,
-        embedding_request_size=32,
-    )
-
-
-def _create_job(
-    db_session: Session,
-    user_file: UserFile,
-    document: Document,
-    search_settings: SearchSettings,
-) -> RegulatoryIndexingJob:
-    snapshot = _snapshot(search_settings)
-    return job_repository.create_or_get_regulatory_indexing_job(
-        db_session,
-        user_file_id=user_file.id,
-        content_hash=preparation._regulatory_documents_content_hash([document]),
-        search_settings_id=search_settings.id,
-        prompt_hash=snapshot.prompt_hash,
-        config_snapshot=cast(
-            job_repository.RegulatoryIndexingConfigSnapshot,
-            snapshot.model_dump(mode="json"),
-        ),
-        now=datetime.datetime.now(datetime.timezone.utc),
-    )
+    return (
+        f"# {marker}\n\n## MADDE 1\nBirinci hüküm.{repeated}\n\n"
+        f"## MADDE 2\nİkinci hüküm.{repeated}"
+    ).encode()
 
 
 def _run_delivery(
@@ -288,16 +236,32 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     embedding_url, embedding_requests = embedding_server
+    vertex_provider = LLMProvider(
+        name=f"task8-vertex-{uuid4().hex}",
+        provider=LlmProviderNames.VERTEX_AI,
+        custom_config={
+            VERTEX_AUTH_METHOD_KWARG: VERTEX_AUTH_METHOD_WORKLOAD_IDENTITY,
+            VERTEX_PROJECT_KWARG: "disposable-test-project",
+            VERTEX_LOCATION_KWARG: "europe-west4",
+        },
+    )
+    vertex_model = ModelConfiguration(
+        name="gemini-3.1-flash-lite",
+        is_visible=True,
+        llm_provider=vertex_provider,
+    )
     provider = CloudEmbeddingProvider(
         provider_type=EmbeddingProvider.OPENROUTER,
         api_url=embedding_url,
         api_key="disposable-test-key",
     )
     index_name = f"task8_regulatory_{uuid4().hex}"
+    db_session.add_all([vertex_provider, vertex_model, provider])
+    db_session.flush()
     search_settings = SearchSettings(
         model_name="openai/text-embedding-3-large",
         model_dim=3072,
-        reduced_dimension=_DIMENSION,
+        reduced_dimension=_TEST_REDUCED_DIMENSION,
         normalize=False,
         query_prefix="",
         passage_prefix="",
@@ -306,49 +270,74 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
         provider_type=EmbeddingProvider.OPENROUTER,
         embedding_precision=EmbeddingPrecision.FLOAT,
         enable_contextual_rag=True,
+        contextual_rag_model_configuration_id=vertex_model.id,
     )
-    db_session.add_all([provider, search_settings])
+    db_session.add(search_settings)
     db_session.commit()
     db_session.refresh(search_settings)
+    effective_dimension = search_settings.final_embedding_dim
+    assert effective_dimension == _TEST_REDUCED_DIMENSION
+    assert effective_dimension != 1024
 
     document_index = ElasticsearchDocumentIndex(
         tenant_state=TenantState(tenant_id=_TENANT_ID, multitenant=False),
         index_name=index_name,
-        embedding_dim=_DIMENSION,
+        embedding_dim=effective_dimension,
         embedding_precision=EmbeddingPrecision.FLOAT,
     )
     document_index._client.create_index(
-        mappings=DocumentSchema.get_document_schema(_DIMENSION, False),
+        mappings=DocumentSchema.get_document_schema(effective_dimension, False),
         settings=DocumentSchema.get_index_settings_based_on_environment(),
     )
     gateway = _DeterministicVertexGateway()
-    documents: dict[UUID, Document] = {}
+    file_store = PostgresBackedFileStore()
     created_users: list[User] = []
     created_files: list[UserFile] = []
+    created_store_ids: list[str] = []
 
-    def create_file(marker: str) -> tuple[UserFile, Document, RegulatoryIndexingJob]:
+    def create_file(marker: str) -> tuple[UserFile, RegulatoryIndexingJob]:
         user = create_test_user(db_session, f"task8-{marker}-{uuid4().hex[:8]}")
+        store_file_id = f"task8-{uuid4().hex}"
+        file_store.save_file(
+            content=BytesIO(_markdown_bytes(marker)),
+            display_name=f"{marker}.md",
+            file_origin=FileOrigin.USER_FILE,
+            file_type="text/markdown",
+            file_id=store_file_id,
+        )
         user_file = UserFile(
             id=uuid4(),
             user_id=user.id,
-            file_id=f"task8-{uuid4().hex}",
+            file_id=store_file_id,
             name=f"{marker}.md",
             file_type="text/markdown",
             status=UserFileStatus.INDEXING,
         )
         db_session.add(user_file)
         db_session.commit()
-        document = _markdown_document(user_file.id, marker)
-        job = _create_job(db_session, user_file, document, search_settings)
-        documents[user_file.id] = document
+        documents = orchestrator._load_claimed_markdown_documents(
+            cast(
+                job_repository.RegulatoryIndexingRuntime,
+                SimpleNamespace(user_file=user_file),
+            )
+        )
+        job_id = preparation.prepare_regulatory_indexing_job(
+            user_file.id,
+            documents,
+            _TENANT_ID,
+            db_session,
+        )
+        job = db_session.get(RegulatoryIndexingJob, job_id)
+        assert job is not None
         created_users.append(user)
         created_files.append(user_file)
-        return user_file, document, job
+        created_store_ids.append(store_file_id)
+        return user_file, job
 
     monkeypatch.setattr(
-        orchestrator,
-        "validate_snapshot_for_stage",
-        lambda *_args, **_kwargs: None,
+        app_configs,
+        "REGULATORY_INDEXING_GCS_URI",
+        "gs://disposable-regulatory-indexing",
     )
     monkeypatch.setattr(
         orchestrator,
@@ -357,8 +346,8 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
     )
     monkeypatch.setattr(
         orchestrator,
-        "_load_claimed_markdown_documents",
-        lambda runtime: [documents[runtime.user_file.id]],
+        "get_default_file_store",
+        lambda: file_store,
     )
     monkeypatch.setattr(
         preparation, "get_tokenizer", lambda *_args, **_kwargs: _CharacterTokenizer()
@@ -390,9 +379,8 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
     )
     monkeypatch.setattr(search_nlp_models, "OPENROUTER_EMBEDDINGS_URL", embedding_url)
     try:
-        user_file, _document, job = create_file("main")
-        generation = 0
-        generation, _ = _run_delivery(job.id, generation)
+        user_file, job = create_file("main")
+        generation = job.lease_generation
         assert _stage(db_session, job.id) is RegulatoryIndexingStage.CONTEXT_SUBMIT
         generation, _ = _run_delivery(job.id, generation)
         generation, _ = _run_delivery(job.id, generation)
@@ -462,7 +450,9 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
         assert all(
             item.status == RegulatoryIndexingItemStatus.EMBEDDED.value for item in items
         )
-        assert all(len(cast(list[float], item.vector)) == _DIMENSION for item in items)
+        assert all(
+            len(cast(list[float], item.vector)) == effective_dimension for item in items
+        )
         assert sum(item.context is not None for item in items) >= 2
 
         chunk_ids = [
@@ -508,7 +498,8 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
             for request in embedding_requests
         )
         assert all(
-            request["dimensions"] == _DIMENSION for request in embedding_requests
+            request["dimensions"] == effective_dimension
+            for request in embedding_requests
         )
         embedded_texts = [
             text
@@ -521,8 +512,8 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
         assert len(contextual_texts) >= 2
         assert all("MADDE" in text for text in embedded_texts)
 
-        cancelled_file, _cancelled_document, cancelled_job = create_file("cancel")
-        cancelled_generation = 0
+        cancelled_file, cancelled_job = create_file("cancel")
+        cancelled_generation = cancelled_job.lease_generation
         while (
             _stage(db_session, cancelled_job.id) is not RegulatoryIndexingStage.VERIFY
         ):
@@ -577,6 +568,8 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
             document_index._client.delete_index()
         finally:
             db_session.rollback()
+            for store_file_id in created_store_ids:
+                file_store.delete_file(store_file_id, error_on_missing=False)
             for user_file in created_files:
                 persisted = db_session.get(UserFile, user_file.id)
                 if persisted is not None:
@@ -588,4 +581,6 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
                     db_session.delete(persisted)
             db_session.delete(search_settings)
             db_session.delete(provider)
+            db_session.delete(vertex_model)
+            db_session.delete(vertex_provider)
             db_session.commit()

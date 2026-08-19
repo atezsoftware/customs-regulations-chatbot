@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import datetime
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from scripts import regulatory_indexing_readiness as readiness
@@ -32,6 +36,12 @@ class _FakeBackend:
     def check_memory_headroom(self) -> str:
         return self._result(
             "memory_headroom", "operator-reviewed cgroup evidence has no OOM event"
+        )
+
+    def check_capability_attestation(self, snapshot: ReadinessSnapshot) -> str:
+        return self._result(
+            "capability_attestation",
+            f"reviewed capability scope for {snapshot.vertex_project}",
         )
 
     def load_snapshot(self) -> ReadinessSnapshot:
@@ -88,6 +98,7 @@ def test_readiness_uses_active_dynamic_dimension_and_reports_safe_metadata() -> 
     assert "active-index" in rendered
     assert "vector" not in rendered.lower()
     assert "memory_headroom: PASS" in rendered
+    assert "capability_attestation: PASS" in rendered
 
 
 def test_readiness_failure_is_redacted_and_blocks_dependent_checks() -> None:
@@ -99,6 +110,7 @@ def test_readiness_failure_is_redacted_and_blocks_dependent_checks() -> None:
     rendered = format_report(report)
     assert "admin_snapshot: FAIL (RuntimeError)" in rendered
     assert "gcs_access: BLOCKED" in rendered
+    assert "capability_attestation: BLOCKED" in rendered
     assert "vertex_access: BLOCKED" in rendered
     assert "embedding_probe: BLOCKED" in rendered
     assert "elasticsearch_mapping: BLOCKED" in rendered
@@ -136,12 +148,18 @@ def test_cli_initializes_a_bounded_read_only_database_pool(
     backend = _FakeBackend()
     initialized: list[tuple[int, int]] = []
     reviewed: list[bool] = []
+
+    def fake_backend(
+        *, memory_headroom_reviewed: bool, capability_attestation_path: Path | None
+    ) -> _FakeBackend:
+        reviewed.append(memory_headroom_reviewed)
+        assert capability_attestation_path == Path("operator-evidence.json")
+        return backend
+
     monkeypatch.setattr(
         readiness,
         "OnyxReadinessBackend",
-        lambda *, memory_headroom_reviewed: (
-            reviewed.append(memory_headroom_reviewed) or backend
-        ),
+        fake_backend,
     )
     monkeypatch.setattr(
         readiness.SqlEngine,
@@ -151,7 +169,16 @@ def test_cli_initializes_a_bounded_read_only_database_pool(
         ),
     )
 
-    assert readiness.main(["--memory-headroom-reviewed"]) == EXIT_READY
+    assert (
+        readiness.main(
+            [
+                "--memory-headroom-reviewed",
+                "--capability-attestation",
+                "operator-evidence.json",
+            ]
+        )
+        == EXIT_READY
+    )
     assert initialized == [(1, 0)]
     assert reviewed == [True]
 
@@ -162,7 +189,8 @@ def test_memory_headroom_requires_attestation_and_rejects_oom_events(
 ) -> None:
     with pytest.raises(readiness.ReadinessCheckError, match="operator must review"):
         readiness.OnyxReadinessBackend(
-            memory_headroom_reviewed=False
+            memory_headroom_reviewed=False,
+            capability_attestation_path=None,
         ).check_memory_headroom()
 
     (tmp_path / "memory.current").write_text("100\n", encoding="utf-8")
@@ -175,5 +203,149 @@ def test_memory_headroom_requires_attestation_and_rejects_oom_events(
 
     with pytest.raises(readiness.ReadinessCheckError, match="oom=1"):
         readiness.OnyxReadinessBackend(
-            memory_headroom_reviewed=True
+            memory_headroom_reviewed=True,
+            capability_attestation_path=None,
         ).check_memory_headroom()
+
+
+def test_worker_queue_parser_rejects_regulatory_substrings_outside_queue_arg() -> None:
+    false_positive = """
+[program:celery_worker_regulatory_indexing]
+command=celery -A onyx.background.celery.versioned_apps.regulatory_indexing worker
+    --hostname=regulatory_indexing@%%n
+    -Q user_file_processing
+stdout_logfile=/var/log/onyx/celery_worker_regulatory_indexing.log
+
+[program:celery_beat_regulatory_indexing]
+command=celery beat
+"""
+
+    with pytest.raises(readiness.ReadinessCheckError, match="exact queue set"):
+        readiness._configured_regulatory_worker_queues(false_positive)
+
+    configured = false_positive.replace(
+        "-Q user_file_processing", "-Q user_file_processing,regulatory_indexing"
+    )
+    assert readiness._configured_regulatory_worker_queues(configured) == {
+        "user_file_processing",
+        "regulatory_indexing",
+    }
+
+
+def test_live_worker_queue_validation_requires_exact_regulatory_queue_set() -> None:
+    with pytest.raises(readiness.ReadinessCheckError, match="exact queue set"):
+        readiness._validated_live_regulatory_worker_queues(
+            {
+                "regulatory_indexing@worker-a": [
+                    {"name": "user_file_processing"},
+                ]
+            }
+        )
+
+    assert readiness._validated_live_regulatory_worker_queues(
+        {
+            "regulatory_indexing@worker-a": [
+                {"name": "regulatory_indexing"},
+                {"name": "user_file_processing"},
+            ],
+            "primary@worker-a": [{"name": "celery"}],
+        }
+    ) == {"regulatory_indexing", "user_file_processing"}
+
+
+@pytest.mark.parametrize(
+    ("field_name", "attribute", "invalid_value"),
+    [
+        ("content_vector", "dims", 768),
+        ("title_vector", "dims", 768),
+        ("content_vector", "element_type", "byte"),
+        ("title_vector", "index", False),
+        ("content_vector", "similarity", "dot_product"),
+    ],
+)
+def test_elasticsearch_mapping_rejects_wrong_dense_vector_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    attribute: str,
+    invalid_value: str | int,
+) -> None:
+    closed: list[bool] = []
+    mapping = {
+        "properties": {
+            field: {
+                "type": "dense_vector",
+                "dims": 1536,
+                "element_type": "float",
+                "index": True,
+                "similarity": "cosine",
+            }
+            for field in ("content_vector", "title_vector")
+        }
+    }
+    mapping["properties"][field_name][attribute] = invalid_value
+    fake_client = SimpleNamespace(
+        validate_index=lambda _expected: True,
+        get_index_mapping=lambda: mapping,
+        close=lambda: closed.append(True),
+    )
+    monkeypatch.setattr(
+        readiness, "ElasticsearchIndexClient", lambda _index_name: fake_client
+    )
+    backend = readiness.OnyxReadinessBackend(
+        memory_headroom_reviewed=True,
+        capability_attestation_path=None,
+    )
+
+    with pytest.raises(
+        readiness.ReadinessCheckError,
+        match=rf"{field_name}\.{attribute}",
+    ):
+        backend.check_elasticsearch_mapping(_FakeBackend().load_snapshot())
+
+    assert closed == [True]
+
+
+def test_capability_attestation_requires_exact_scope_permissions_and_freshness(
+    tmp_path: Path,
+) -> None:
+    snapshot = _FakeBackend().load_snapshot()
+    evidence_path = tmp_path / "capability.json"
+    evidence = {
+        "schema_version": 1,
+        "reviewed_at": "2026-08-20T08:00:00+00:00",
+        "identity": "service-account@example.iam.gserviceaccount.com",
+        "evidence_reference": "change-record/task-8",
+        "gcs_uri": snapshot.gcs_uri,
+        "vertex_project": snapshot.vertex_project,
+        "vertex_location": snapshot.vertex_location,
+        "vertex_model": snapshot.vertex_model,
+        "permissions": sorted(readiness.REQUIRED_CAPABILITY_PERMISSIONS),
+    }
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    os.chmod(evidence_path, 0o600)
+
+    identity = readiness._validate_capability_attestation(
+        evidence_path,
+        snapshot,
+        now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
+    )
+    assert identity == evidence["identity"]
+
+    evidence["permissions"].remove("storage.objects.delete")
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    with pytest.raises(readiness.ReadinessCheckError, match="required permissions"):
+        readiness._validate_capability_attestation(
+            evidence_path,
+            snapshot,
+            now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
+        )
+
+    evidence["permissions"] = sorted(readiness.REQUIRED_CAPABILITY_PERMISSIONS)
+    evidence["reviewed_at"] = "2026-08-18T08:00:00+00:00"
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    with pytest.raises(readiness.ReadinessCheckError, match="older than"):
+        readiness._validate_capability_attestation(
+            evidence_path,
+            snapshot,
+            now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
+        )

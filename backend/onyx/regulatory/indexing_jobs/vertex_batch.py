@@ -141,6 +141,12 @@ class VertexBatchState(BaseModel):
     error_code: int | None = None
 
 
+class VertexReadOnlyAccessProbe(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    credential_identity: str = Field(min_length=1)
+
+
 class VertexBatchGateway(Protocol):
     def submit(self, requests: Sequence[VertexBatchRequest]) -> VertexBatchState: ...
 
@@ -153,6 +159,16 @@ class VertexBatchGateway(Protocol):
     def cancel(self, remote_job_name: str) -> None: ...
 
     def cleanup(self, prefix: str) -> None: ...
+
+
+def _credential_identity(credentials: Credentials) -> str:
+    for attribute in ("service_account_email", "signer_email"):
+        value = getattr(credentials, attribute, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise VertexBatchContractError(
+        "Vertex credential identity is unavailable for readiness verification"
+    )
 
 
 def vertex_batch_submission_key(
@@ -531,6 +547,47 @@ class GoogleVertexBatchGateway:
         finally:
             client.close()
 
+    @contextmanager
+    def _managed_storage_client(
+        self, credentials: Credentials
+    ) -> Iterator[storage.Client]:
+        client = self._storage_client(credentials)
+        try:
+            yield client
+        finally:
+            client.close()
+
+    def probe_gcs_read_access(self) -> VertexReadOnlyAccessProbe:
+        bucket_name, prefix = _parse_gcs_uri(
+            self._config.gcs_uri, require_object_path=False
+        )
+        with _translate_gateway_errors():
+            credentials = self._credentials()
+            identity = _credential_identity(credentials)
+            with self._managed_storage_client(credentials) as client:
+                blobs = client.list_blobs(
+                    bucket_name,
+                    prefix=prefix,
+                    max_results=1,
+                    timeout=self._request_timeout_seconds,
+                )
+                next(iter(blobs), None)
+        return VertexReadOnlyAccessProbe(credential_identity=identity)
+
+    def probe_vertex_read_access(self) -> VertexReadOnlyAccessProbe:
+        from google.genai import types as genai_types
+
+        with _translate_gateway_errors():
+            credentials = self._credentials()
+            identity = _credential_identity(credentials)
+            with self._managed_genai_client(credentials) as client:
+                client.models.get(model=self._config.model_name)
+                pager = client.batches.list(
+                    config=genai_types.ListBatchJobsConfig(page_size=1)
+                )
+                pager.page
+        return VertexReadOnlyAccessProbe(credential_identity=identity)
+
     def submit(self, requests: Sequence[VertexBatchRequest]) -> VertexBatchState:
         from google.genai import types as genai_types
 
@@ -545,12 +602,12 @@ class GoogleVertexBatchGateway:
 
         with _translate_gateway_errors():
             credentials = self._credentials()
-            storage_client = self._storage_client(credentials)
-            storage_client.bucket(bucket_name).blob(input_name).upload_from_string(
-                payload,
-                content_type="application/jsonl",
-                timeout=self._request_timeout_seconds,
-            )
+            with self._managed_storage_client(credentials) as storage_client:
+                storage_client.bucket(bucket_name).blob(input_name).upload_from_string(
+                    payload,
+                    content_type="application/jsonl",
+                    timeout=self._request_timeout_seconds,
+                )
             with self._managed_genai_client(credentials) as client:
                 with _translate_create_errors(submission_key):
                     with traced_llm_call(
@@ -605,27 +662,29 @@ class GoogleVertexBatchGateway:
         bucket_name, output_prefix = _parse_gcs_uri(output_uri)
         with _translate_gateway_errors():
             credentials = self._credentials()
-            storage_client = self._storage_client(credentials)
-            blobs = sorted(
-                (
-                    blob
-                    for blob in storage_client.list_blobs(
-                        bucket_name,
-                        prefix=f"{output_prefix}/",
-                        timeout=self._request_timeout_seconds,
-                    )
-                    if blob.name.endswith(".jsonl")
-                ),
-                key=lambda blob: blob.name,
-            )
-            if not blobs:
-                raise VertexBatchContractError("Vertex output contains no JSONL files")
-            parts = [
-                blob.download_as_text(timeout=self._request_timeout_seconds).rstrip(
-                    "\n"
+            with self._managed_storage_client(credentials) as storage_client:
+                blobs = sorted(
+                    (
+                        blob
+                        for blob in storage_client.list_blobs(
+                            bucket_name,
+                            prefix=f"{output_prefix}/",
+                            timeout=self._request_timeout_seconds,
+                        )
+                        if blob.name.endswith(".jsonl")
+                    ),
+                    key=lambda blob: blob.name,
                 )
-                for blob in blobs
-            ]
+                if not blobs:
+                    raise VertexBatchContractError(
+                        "Vertex output contains no JSONL files"
+                    )
+                parts = [
+                    blob.download_as_text(timeout=self._request_timeout_seconds).rstrip(
+                        "\n"
+                    )
+                    for blob in blobs
+                ]
         return "\n".join(parts) + "\n"
 
     def cancel(self, remote_job_name: str) -> None:
@@ -648,16 +707,16 @@ class GoogleVertexBatchGateway:
             raise VertexBatchContractError("Vertex cleanup prefix is outside its base")
         with _translate_gateway_errors():
             credentials = self._credentials()
-            storage_client = self._storage_client(credentials)
-            blobs = list(
-                storage_client.list_blobs(
-                    bucket_name,
-                    prefix=f"{object_prefix}/",
-                    timeout=self._request_timeout_seconds,
+            with self._managed_storage_client(credentials) as storage_client:
+                blobs = list(
+                    storage_client.list_blobs(
+                        bucket_name,
+                        prefix=f"{object_prefix}/",
+                        timeout=self._request_timeout_seconds,
+                    )
                 )
-            )
-            if blobs:
-                storage_client.bucket(bucket_name).delete_blobs(
-                    blobs,
-                    timeout=self._request_timeout_seconds,
-                )
+                if blobs:
+                    storage_client.bucket(bucket_name).delete_blobs(
+                        blobs,
+                        timeout=self._request_timeout_seconds,
+                    )

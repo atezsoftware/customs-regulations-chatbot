@@ -128,3 +128,92 @@ Because the migration/Admin/provider/data-service readiness gate failed, no live
 Vertex Batch, real OpenRouter, frontend upload, retry/restart, retrieval/citation,
 or deletion canary was started. This follows the required stop rule and avoids
 touching existing production documents or indices.
+
+---
+
+## Review fix round 1/5
+
+All five Important findings and the one Minor finding were addressed without a
+production write, deployment, push, or merge.
+
+### RED/GREEN evidence
+
+- Readiness contract RED: `7 failed, 2 passed in 1.46s`. The failures proved the
+  missing capability-attestation report/CLI, exact supervisor queue parser,
+  direct dense-vector dimension check, and attestation scope/permission/age
+  validator. GREEN after implementation: `10 passed`. Expanded field/attribute
+  coverage plus the Vertex gateway file finished at `49 passed in 2.36s`.
+- Live Celery queue validation had a separate RED:
+  `1 failed, 9 deselected in 1.20s` because the exact active-queue validator did
+  not exist. It now accepts only the two production queues on every matching
+  `regulatory_indexing@...` worker.
+- Public gateway probe RED: `1 failed, 34 deselected in 1.38s` because the public
+  GCS probe did not exist. GREEN: all `35 passed in 1.27s`. Both public probes
+  report only credential identity, perform only list/get observations, and own
+  and close their GCS/google-genai clients. All existing GCS gateway operations
+  now also close their storage client.
+- The first refactored pipeline invocation was blocked before test behavior by
+  the absent disposable PostgreSQL (`password authentication failed`); after
+  starting fresh disposable PostgreSQL 15.2 and Elasticsearch 9.4.2 and applying
+  migrations, the production-path test passed: `1 passed in 16.65s`.
+
+### Hardened contracts
+
+- Elasticsearch readiness retains the broad schema compatibility check and now
+  directly reads the mapping. Both `content_vector` and `title_vector` must
+  match the active snapshot for `type`, `dims`, implicit/explicit
+  `element_type`, `index`, and `similarity`. A `768` versus `1536` regression
+  fails on `content_vector.dims`, and the client closes on failure.
+- Supervisor configuration is parsed with `ConfigParser` and `shlex`; queue
+  names in app paths, hostnames, or log paths cannot satisfy readiness. The one
+  exact `-Q`/`--queues` value and each live Celery `active_queues` response must
+  equal `regulatory_indexing,user_file_processing`.
+- Readiness fails closed without an owner-only mode-`0600`, at-most-24-hour IAM
+  attestation for the exact active GCS URI, Vertex project/location/model, and
+  runtime credential identity. It enumerates GCS object create/get/delete/list
+  and Vertex batch create/get/cancel/list plus model get. The command does not
+  issue write/delete/cancel probes; the runbook now states that observational
+  list/get calls cannot prove mutation permissions.
+- The durable pipeline creates real disposable OpenRouter embedding, Vertex LLM
+  provider/model, and active SearchSettings rows in PostgreSQL. It resolves the
+  immutable snapshot through `prepare_regulatory_indexing_job`, leaves
+  `validate_snapshot_for_stage` active for every stage, writes Markdown bytes to
+  `PostgresBackedFileStore`, and loads them through the production Markdown
+  loader. Its chosen reduced dimension is `768`, but every client, mapping,
+  request, and vector assertion derives from `SearchSettings.final_embedding_dim`
+  and explicitly proves it is not `1024`. Duplicate delivery, partial
+  retry-only-missing context, stale recovery, hidden staging, publish, and
+  cancellation cleanup assertions remain intact.
+- The broad Elasticsearch highlight assertion now accepts only the two exact
+  known representations: `['Artificial', 'intelligence']` or
+  `['Artificial intelligence']`.
+
+### Fix-round verification
+
+- Focused readiness and gateway final repeat: `49 passed in 1.90s`.
+- Unit/runtime superset of the earlier 576-test command: `668 passed in 21.11s`.
+- Real PostgreSQL repository plus real PostgreSQL/Elasticsearch pipeline:
+  `29 passed in 15.11s`.
+- Full real Elasticsearch client suite: `70 passed in 408.01s`.
+- Disposable migration round trip:
+  `c8f1a6d4e2b7 -> f7b2e4c6a8d1 -> c8f1a6d4e2b7`; final database head query
+  returned `c8f1a6d4e2b7`.
+- Ruff on touched Python: pass. Ruff formatting: pass. `ty` on touched Python:
+  pass. File-scoped pre-commit passed every applicable hook, including lazy
+  imports, `ty`, Ruff, Ruff formatting, large-file, ripsecrets, and environment
+  drift validation.
+- Disposable cleanup query returned zero Task 8 SearchSettings, LLM provider,
+  and file-store records, and the Task 8 index glob returned no index. The
+  isolated `task8-review-postgres` and `task8-review-elasticsearch` containers
+  were then removed.
+
+### Live readiness recheck
+
+`getent hosts psql.dev.singlewindow.io` still returned exit `2`. Both local nginx
+ports returned HTTP `200` for `/api/health`, but the read-only readiness command
+returned exit `1`: migration/Admin snapshot `OperationalError`, supervisor query
+failure, unavailable host cgroup evidence, and all snapshot-dependent checks
+blocked. No capability evidence was fabricated. Therefore no live Vertex,
+OpenRouter, upload, retrieval/citation, retry/restart, or cleanup canary was
+started. Existing production documents, indices, database/provider state, and
+object storage were not mutated.

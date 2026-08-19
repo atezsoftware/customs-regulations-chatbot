@@ -273,6 +273,7 @@ class _FakeStorageClient:
     def __init__(self, downloads: dict[str, str] | None = None) -> None:
         self.bucket_value = _FakeBucket(downloads or {})
         self.list_timeouts: list[float | None] = []
+        self.closed = False
 
     def bucket(self, _bucket_name: str) -> _FakeBucket:
         return self.bucket_value
@@ -282,14 +283,28 @@ class _FakeStorageClient:
         _bucket_name: str,
         *,
         prefix: str,
+        max_results: int | None = None,
         timeout: float | None = None,
     ) -> list[_FakeBlob]:
+        del max_results
         self.list_timeouts.append(timeout)
         return [
             self.bucket_value.blob(name)
             for name in self.bucket_value._downloads
             if name.startswith(prefix)
         ]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeModels:
+    def __init__(self) -> None:
+        self.requested_model: str | None = None
+
+    def get(self, *, model: str) -> object:
+        self.requested_model = model
+        return object()
 
 
 class _FakeBatches:
@@ -340,8 +355,9 @@ class _FakeBatches:
 
 
 class _FakeGenAIClient:
-    def __init__(self, batches: _FakeBatches) -> None:
+    def __init__(self, batches: _FakeBatches, models: _FakeModels) -> None:
         self.batches = batches
+        self.models = models
         self.closed = False
 
     def close(self) -> None:
@@ -353,17 +369,19 @@ def _install_clients(
     storage_client: _FakeStorageClient,
     batches: _FakeBatches,
     created_clients: list[_FakeGenAIClient] | None = None,
+    models: _FakeModels | None = None,
 ) -> list[dict[str, object]]:
     from onyx.regulatory.indexing_jobs import vertex_batch
 
     client_kwargs: list[dict[str, object]] = []
+    fake_models = models or _FakeModels()
 
     def fake_storage_client(**_kwargs: object) -> _FakeStorageClient:
         return storage_client
 
     def fake_genai_client(**kwargs: object) -> _FakeGenAIClient:
         client_kwargs.append(kwargs)
-        client = _FakeGenAIClient(batches)
+        client = _FakeGenAIClient(batches, fake_models)
         if created_clients is not None:
             created_clients.append(client)
         return client
@@ -372,7 +390,9 @@ def _install_clients(
         _info: dict[str, object], *, scopes: list[str]
     ) -> object:
         assert scopes
-        return object()
+        return SimpleNamespace(
+            service_account_email="regulatory@example.iam.gserviceaccount.com"
+        )
 
     monkeypatch.setattr(vertex_batch.storage, "Client", fake_storage_client)
     monkeypatch.setattr(genai, "Client", fake_genai_client)
@@ -382,6 +402,41 @@ def _install_clients(
         fake_service_account_credentials,
     )
     return client_kwargs
+
+
+def test_readiness_probes_are_public_read_only_and_close_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage_client = _FakeStorageClient()
+    batches = _FakeBatches()
+    models = _FakeModels()
+    created_clients: list[_FakeGenAIClient] = []
+    _install_clients(
+        monkeypatch,
+        storage_client,
+        batches,
+        created_clients,
+        models,
+    )
+    gateway = _gateway(lambda: '{"type":"service_account"}')
+
+    gcs_probe = gateway.probe_gcs_read_access()
+    vertex_probe = gateway.probe_vertex_read_access()
+
+    assert gcs_probe.credential_identity == (
+        "regulatory@example.iam.gserviceaccount.com"
+    )
+    assert vertex_probe.credential_identity == gcs_probe.credential_identity
+    assert storage_client.list_timeouts == [60]
+    assert storage_client.closed
+    assert models.requested_model == "gemini-3.1-flash-lite"
+    listed_config = cast(genai_types.ListBatchJobsConfig, batches.listed_config)
+    assert listed_config.page_size == 1
+    assert batches.created is None
+    assert batches.cancelled_name is None
+    assert storage_client.bucket_value.blobs == {}
+    assert len(created_clients) == 1
+    assert created_clients[0].closed
 
 
 def _gateway(
@@ -458,6 +513,7 @@ def test_submit_resolves_service_account_fresh_and_uses_v1_clients(
     }
     assert uploaded.content_type == "application/jsonl"
     assert uploaded.upload_timeout == 12.5
+    assert storage_client.closed
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
@@ -645,6 +701,7 @@ def test_read_results_combines_jsonl_blobs_in_deterministic_name_order(
         if name.startswith("output/") and name.endswith(".jsonl")
     )
     assert "output-sibling/secret.jsonl" not in storage_client.bucket_value.blobs
+    assert storage_client.closed
 
 
 def test_get_cancel_and_cleanup_are_single_bounded_operations(
@@ -681,6 +738,7 @@ def test_get_cancel_and_cleanup_are_single_bounded_operations(
     ]
     assert storage_client.list_timeouts == [60]
     assert storage_client.bucket_value.delete_timeout == 60
+    assert storage_client.closed
     assert len(created_clients) == 2
     assert all(client.closed for client in created_clients)
 

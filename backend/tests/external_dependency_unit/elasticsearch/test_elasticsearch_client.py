@@ -2032,9 +2032,10 @@ class TestElasticsearchClient:
         # Elasticsearch may group adjacent matches in one highlight span or
         # return a span per term; both preserve the same match evidence.
         highlight_split = re.findall(r"<hi>(.*?)</hi>", match_highlights[0])
-        highlighted_text = " ".join(highlight_split)
-        assert "Artificial" in highlighted_text
-        assert "intelligence" in highlighted_text
+        assert highlight_split in (
+            ["Artificial", "intelligence"],
+            ["Artificial intelligence"],
+        )
 
         # Returned documents should be ordered by descending score.
         previous_score = float("inf")

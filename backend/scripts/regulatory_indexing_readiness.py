@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import configparser
+import datetime
 import json
+import os
+import shlex
+import stat
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,7 +33,11 @@ from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
 from onyx.db.llm import fetch_embedding_provider, fetch_model_configuration_by_id
 from onyx.db.schema_version import get_database_alembic_heads
 from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
-from onyx.document_index.elasticsearch.schema import DocumentSchema
+from onyx.document_index.elasticsearch.schema import (
+    CONTENT_VECTOR_FIELD_NAME,
+    TITLE_VECTOR_FIELD_NAME,
+    DocumentSchema,
+)
 from onyx.llm.well_known_providers.constants import VERTEX_CREDENTIALS_FILE_KWARG
 from onyx.natural_language_processing.constants import OPENROUTER_EMBEDDINGS_URL
 from onyx.regulatory.indexing_jobs.configuration import (
@@ -49,6 +58,21 @@ _LOCAL_SUPERVISOR_CONFIG = _BACKEND_ROOT / "supervisord-lite.conf"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _WORKER_PROCESS_NAME = "celery_worker_regulatory_indexing"
 _PROBE_TEXT = "regulatory indexing readiness probe"
+_EXPECTED_REGULATORY_QUEUES = frozenset({"user_file_processing", "regulatory_indexing"})
+_ATTESTATION_MAX_AGE = datetime.timedelta(hours=24)
+REQUIRED_CAPABILITY_PERMISSIONS = frozenset(
+    {
+        "storage.objects.create",
+        "storage.objects.get",
+        "storage.objects.delete",
+        "storage.objects.list",
+        "aiplatform.batchPredictionJobs.create",
+        "aiplatform.batchPredictionJobs.get",
+        "aiplatform.batchPredictionJobs.cancel",
+        "aiplatform.batchPredictionJobs.list",
+        "aiplatform.models.get",
+    }
+)
 
 
 class ReadinessCheckError(RuntimeError):
@@ -97,6 +121,8 @@ class ReadinessBackend(Protocol):
 
     def load_snapshot(self) -> ReadinessSnapshot: ...
 
+    def check_capability_attestation(self, snapshot: ReadinessSnapshot) -> str: ...
+
     def check_gcs_access(self, snapshot: ReadinessSnapshot) -> str: ...
 
     def check_vertex_access(self, snapshot: ReadinessSnapshot) -> str: ...
@@ -140,6 +166,7 @@ def run_readiness_checks(backend: ReadinessBackend) -> ReadinessReport:
                 name=name, status="BLOCKED", detail="admin snapshot unavailable"
             )
             for name in (
+                "capability_attestation",
                 "gcs_access",
                 "vertex_access",
                 "embedding_probe",
@@ -165,6 +192,10 @@ def run_readiness_checks(backend: ReadinessBackend) -> ReadinessReport:
     )
     results.extend(
         (
+            _run_check(
+                "capability_attestation",
+                lambda: backend.check_capability_attestation(snapshot),
+            ),
             _run_check("gcs_access", lambda: backend.check_gcs_access(snapshot)),
             _run_check("vertex_access", lambda: backend.check_vertex_access(snapshot)),
             _run_check(
@@ -206,8 +237,15 @@ def format_report(report: ReadinessReport) -> str:
 class OnyxReadinessBackend:
     """Production adapters restricted to read/list/probe operations."""
 
-    def __init__(self, *, memory_headroom_reviewed: bool) -> None:
+    def __init__(
+        self,
+        *,
+        memory_headroom_reviewed: bool,
+        capability_attestation_path: Path | None,
+    ) -> None:
         self._memory_headroom_reviewed = memory_headroom_reviewed
+        self._capability_attestation_path = capability_attestation_path
+        self._attested_identity: str | None = None
         self._config_snapshot: RegulatoryIndexingConfigSnapshot | None = None
         self._embedding_api_key: str | None = None
         self._vertex_gateway: GoogleVertexBatchGateway | None = None
@@ -231,17 +269,12 @@ class OnyxReadinessBackend:
             else _LOCAL_SUPERVISOR_CONFIG
         )
         config_text = config_path.read_text(encoding="utf-8")
-        worker_section = f"[program:{_WORKER_PROCESS_NAME}]"
         beat_section = f"[program:{BEAT_PROCESS_NAME}]"
-        if worker_section not in config_text or beat_section not in config_text:
+        if beat_section not in config_text:
             raise ReadinessCheckError(
                 "dedicated regulatory worker or Beat supervisor config is missing"
             )
-        worker_block = config_text.split(worker_section, 1)[1].split("[", 1)[0]
-        if "regulatory_indexing" not in worker_block:
-            raise ReadinessCheckError(
-                "dedicated regulatory worker is not bound to its queue"
-            )
+        configured_queues = _configured_regulatory_worker_queues(config_text)
 
         result = subprocess.run(
             [
@@ -267,7 +300,12 @@ class OnyxReadinessBackend:
         if len(worker_lines) != 1 or " RUNNING " not in worker_lines[0]:
             raise ReadinessCheckError("dedicated regulatory worker is not RUNNING")
         validate_regulatory_indexing_beat(status_text)
-        return "dedicated worker RUNNING and Beat readiness/liveness probes valid"
+        live_queues = _live_regulatory_worker_queues()
+        return (
+            "dedicated worker RUNNING with exact configured/live queue set "
+            f"{','.join(sorted(configured_queues & live_queues))}; "
+            "Beat readiness/liveness probes valid"
+        )
 
     def check_memory_headroom(self) -> str:
         if not self._memory_headroom_reviewed:
@@ -342,32 +380,46 @@ class OnyxReadinessBackend:
             raise ReadinessCheckError("admin snapshot has not been loaded")
         return self._vertex_gateway
 
-    def check_gcs_access(self, snapshot: ReadinessSnapshot) -> str:
-        gateway = self._gateway()
-        credentials = gateway._credentials()
-        storage_client = gateway._storage_client(credentials)
-        bucket_name, prefix = _parse_gcs_uri(snapshot.gcs_uri)
-        blobs = storage_client.list_blobs(
-            bucket_name,
-            prefix=prefix,
-            max_results=1,
-            timeout=30,
+    def check_capability_attestation(self, snapshot: ReadinessSnapshot) -> str:
+        if self._capability_attestation_path is None:
+            raise ReadinessCheckError(
+                "archived GCS/Vertex capability attestation is required"
+            )
+        self._attested_identity = _validate_capability_attestation(
+            self._capability_attestation_path,
+            snapshot,
         )
-        next(iter(blobs), None)
-        return f"read/list access confirmed for gs://{bucket_name}"
+        return (
+            "fresh operator evidence matches active identity and exact GCS/Vertex scope"
+        )
+
+    def _require_attested_identity(self) -> str:
+        if self._attested_identity is None:
+            raise ReadinessCheckError(
+                "capability attestation must pass before observational probes"
+            )
+        return self._attested_identity
+
+    def check_gcs_access(self, snapshot: ReadinessSnapshot) -> str:
+        bucket_name, prefix = _parse_gcs_uri(snapshot.gcs_uri)
+        del prefix
+        attested_identity = self._require_attested_identity()
+        probe = self._gateway().probe_gcs_read_access()
+        if probe.credential_identity != attested_identity:
+            raise ReadinessCheckError(
+                "GCS probe credential identity does not match capability attestation"
+            )
+        return f"observed GCS list access for gs://{bucket_name}"
 
     def check_vertex_access(self, snapshot: ReadinessSnapshot) -> str:
-        from google.genai import types as genai_types
-
-        gateway = self._gateway()
-        credentials = gateway._credentials()
-        with gateway._managed_genai_client(credentials) as client:
-            client.models.get(model=snapshot.vertex_model)
-            pager = client.batches.list(
-                config=genai_types.ListBatchJobsConfig(page_size=1)
+        del snapshot
+        attested_identity = self._require_attested_identity()
+        probe = self._gateway().probe_vertex_read_access()
+        if probe.credential_identity != attested_identity:
+            raise ReadinessCheckError(
+                "Vertex probe credential identity does not match capability attestation"
             )
-            pager.page
-        return "Vertex model get and batch list access confirmed"
+        return "observed Vertex model get and batch list access"
 
     def probe_embedding_dimension(self, snapshot: ReadinessSnapshot) -> int:
         if self._embedding_api_key is None:
@@ -391,12 +443,198 @@ class OnyxReadinessBackend:
                 raise ReadinessCheckError(
                     "active Elasticsearch index mapping is incompatible"
                 )
+            _validate_dense_vector_mapping(
+                mapping=client.get_index_mapping(),
+                expected=expected,
+                effective_dimension=snapshot.effective_dimension,
+            )
         finally:
             client.close()
         return (
             f"{snapshot.index_name} mapping matches "
             f"effective_dimension={snapshot.effective_dimension}"
         )
+
+
+def _configured_regulatory_worker_queues(config_text: str) -> set[str]:
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        parser.read_string(config_text)
+        command = parser.get(f"program:{_WORKER_PROCESS_NAME}", "command")
+        arguments = shlex.split(" ".join(command.split()))
+    except (configparser.Error, KeyError, ValueError) as error:
+        raise ReadinessCheckError(
+            "dedicated regulatory worker supervisor command is invalid"
+        ) from error
+
+    queue_values: list[str] = []
+    for index, argument in enumerate(arguments):
+        if argument in {"-Q", "--queues"}:
+            if index + 1 >= len(arguments):
+                raise ReadinessCheckError(
+                    "dedicated regulatory worker requires an exact queue set"
+                )
+            queue_values.append(arguments[index + 1])
+        elif argument.startswith("--queues="):
+            queue_values.append(argument.partition("=")[2])
+        elif argument.startswith("-Q") and argument != "-Q":
+            queue_values.append(argument[2:])
+    if len(queue_values) != 1:
+        raise ReadinessCheckError(
+            "dedicated regulatory worker requires one exact queue set"
+        )
+    queues = {queue.strip() for queue in queue_values[0].split(",") if queue.strip()}
+    if queues != _EXPECTED_REGULATORY_QUEUES:
+        raise ReadinessCheckError(
+            "dedicated regulatory worker requires the exact queue set "
+            "regulatory_indexing,user_file_processing"
+        )
+    return queues
+
+
+def _live_regulatory_worker_queues() -> set[str]:
+    from onyx.background.celery.versioned_apps.regulatory_indexing import app
+
+    responses = app.control.inspect(timeout=5).active_queues()
+    return _validated_live_regulatory_worker_queues(responses)
+
+
+def _validated_live_regulatory_worker_queues(responses: object) -> set[str]:
+    if not isinstance(responses, dict):
+        raise ReadinessCheckError("Celery active_queues returned no worker response")
+    matched: list[set[str]] = []
+    for worker_name, queue_records in cast(dict[object, object], responses).items():
+        if not isinstance(worker_name, str) or not worker_name.startswith(
+            "regulatory_indexing@"
+        ):
+            continue
+        if not isinstance(queue_records, list):
+            raise ReadinessCheckError(
+                "dedicated regulatory worker returned invalid active queues"
+            )
+        queues: set[str] = set()
+        for record in queue_records:
+            if isinstance(record, dict):
+                name = cast(dict[str, object], record).get("name")
+                if isinstance(name, str):
+                    queues.add(name)
+        matched.append(queues)
+    if not matched or any(queues != _EXPECTED_REGULATORY_QUEUES for queues in matched):
+        raise ReadinessCheckError(
+            "live dedicated workers must consume the exact queue set "
+            "regulatory_indexing,user_file_processing"
+        )
+    return set.intersection(*matched)
+
+
+def _validate_dense_vector_mapping(
+    *,
+    mapping: dict[str, object],
+    expected: dict[str, object],
+    effective_dimension: int,
+) -> None:
+    raw_actual_properties = mapping.get("properties")
+    raw_expected_properties = expected.get("properties")
+    if not isinstance(raw_actual_properties, dict) or not isinstance(
+        raw_expected_properties, dict
+    ):
+        raise ReadinessCheckError("Elasticsearch mapping has no properties")
+    actual_properties = cast(dict[str, object], raw_actual_properties)
+    expected_properties = cast(dict[str, object], raw_expected_properties)
+    for field_name in (CONTENT_VECTOR_FIELD_NAME, TITLE_VECTOR_FIELD_NAME):
+        actual_field = actual_properties.get(field_name)
+        expected_field = expected_properties.get(field_name)
+        if not isinstance(actual_field, dict) or not isinstance(expected_field, dict):
+            raise ReadinessCheckError(
+                f"Elasticsearch mapping has no {field_name} contract"
+            )
+        typed_actual_field = cast(dict[str, object], actual_field)
+        typed_expected_field = cast(dict[str, object], expected_field)
+        expected_attributes = {
+            "type": typed_expected_field.get("type"),
+            "dims": effective_dimension,
+            "element_type": typed_expected_field.get("element_type", "float"),
+            "index": typed_expected_field.get("index"),
+            "similarity": typed_expected_field.get("similarity"),
+        }
+        for attribute, expected_value in expected_attributes.items():
+            actual_value = typed_actual_field.get(
+                attribute, "float" if attribute == "element_type" else None
+            )
+            if actual_value != expected_value:
+                raise ReadinessCheckError(
+                    f"{field_name}.{attribute} is {actual_value!r}; "
+                    f"expected {expected_value!r}"
+                )
+
+
+def _validate_capability_attestation(
+    path: Path,
+    snapshot: ReadinessSnapshot,
+    *,
+    now: datetime.datetime | None = None,
+) -> str:
+    try:
+        metadata = path.stat()
+        if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid():
+            raise ReadinessCheckError(
+                "capability attestation must be owner-only mode 0600"
+            )
+        parsed: object = json.loads(path.read_text(encoding="utf-8"))
+    except ReadinessCheckError:
+        raise
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReadinessCheckError(
+            "capability attestation is unavailable or invalid"
+        ) from error
+    if not isinstance(parsed, dict) or parsed.get("schema_version") != 1:
+        raise ReadinessCheckError("capability attestation schema is invalid")
+    evidence = cast(dict[str, object], parsed)
+    identity = evidence.get("identity")
+    reference = evidence.get("evidence_reference")
+    if not isinstance(identity, str) or not identity.strip():
+        raise ReadinessCheckError("capability attestation identity is invalid")
+    if not isinstance(reference, str) or not reference.strip():
+        raise ReadinessCheckError(
+            "capability attestation evidence reference is invalid"
+        )
+    exact_scope = {
+        "gcs_uri": snapshot.gcs_uri,
+        "vertex_project": snapshot.vertex_project,
+        "vertex_location": snapshot.vertex_location,
+        "vertex_model": snapshot.vertex_model,
+    }
+    if any(evidence.get(key) != value for key, value in exact_scope.items()):
+        raise ReadinessCheckError(
+            "capability attestation does not match the exact active scope"
+        )
+    permissions = evidence.get("permissions")
+    if not isinstance(permissions, list) or not all(
+        isinstance(permission, str) for permission in permissions
+    ):
+        raise ReadinessCheckError("capability attestation permissions are invalid")
+    if not REQUIRED_CAPABILITY_PERMISSIONS.issubset(set(permissions)):
+        raise ReadinessCheckError(
+            "capability attestation is missing required permissions"
+        )
+    reviewed_at_raw = evidence.get("reviewed_at")
+    try:
+        if not isinstance(reviewed_at_raw, str):
+            raise ValueError
+        reviewed_at = datetime.datetime.fromisoformat(reviewed_at_raw)
+        if reviewed_at.tzinfo is None:
+            raise ValueError
+    except ValueError as error:
+        raise ReadinessCheckError(
+            "capability attestation reviewed_at is invalid"
+        ) from error
+    checked_at = now or datetime.datetime.now(datetime.timezone.utc)
+    age = checked_at - reviewed_at
+    if age < -datetime.timedelta(minutes=5):
+        raise ReadinessCheckError("capability attestation is dated in the future")
+    if age > _ATTESTATION_MAX_AGE:
+        raise ReadinessCheckError("capability attestation is older than 24 hours")
+    return identity.strip()
 
 
 def _parse_gcs_uri(uri: str) -> tuple[str, str]:
@@ -450,6 +688,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "reviewed and archived. Omit to fail closed."
         ),
     )
+    parser.add_argument(
+        "--capability-attestation",
+        type=Path,
+        help=(
+            "Owner-only JSON evidence (mode 0600) for required GCS and Vertex "
+            "permissions, exact active scope, identity, and review time."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -459,6 +705,7 @@ def main(argv: list[str] | None = None) -> int:
     report = run_readiness_checks(
         OnyxReadinessBackend(
             memory_headroom_reviewed=args.memory_headroom_reviewed,
+            capability_attestation_path=args.capability_attestation,
         )
     )
     if args.json:
