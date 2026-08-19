@@ -556,3 +556,39 @@ def test_apply_results_records_typed_failure_without_replacing_success(
         pending_count=0,
         skipped_count=0,
     )
+
+
+def test_apply_results_rejects_canonical_row_owned_by_another_file() -> None:
+    job = _job()
+    row = _row(
+        job,
+        row_id="rc_foreign",
+        position=0,
+        text="MADDE 1 - Yabancı belge hükmü.",
+        heading_path=["MADDE 1"],
+    )
+    row.user_file_id = uuid4()
+    item = cast(
+        RegulatoryIndexingItem,
+        SimpleNamespace(
+            id=uuid4(),
+            job_id=job.id,
+            regulatory_chunk_id=row.id,
+            request_hash="f" * 64,
+            status=RegulatoryIndexingItemStatus.PENDING.value,
+            context=None,
+        ),
+    )
+
+    with pytest.raises(
+        contextual.ContextualMappingError,
+        match="canonical rows do not belong to the indexing job",
+    ):
+        apply_contextual_results(
+            job,
+            [row],
+            [item],
+            {},
+            embedding_tokenizer=_CharacterTokenizer(),
+            db_session=cast(Session, SimpleNamespace()),
+        )

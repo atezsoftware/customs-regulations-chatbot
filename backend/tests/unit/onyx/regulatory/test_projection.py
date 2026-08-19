@@ -200,6 +200,10 @@ def test_target_projection_builds_setting_specific_index_and_embedder() -> None:
             "onyx.regulatory.projection.get_all_document_indices",
             return_value=[document_index],
         ) as get_indices,
+        patch(
+            "onyx.regulatory.projection.effective_contextual_rag_enabled",
+            return_value=False,
+        ),
     ):
         count = _project_rows_to_search_settings(
             user_file=user_file,
@@ -257,7 +261,7 @@ def test_contextual_projection_rejects_incomplete_eligible_chunks() -> None:
 
     with (
         patch(
-            "onyx.regulatory.projection.get_contextual_rag_llm_for_search_settings",
+            "onyx.regulatory.projection.require_contextual_rag_llm",
             return_value=llm,
         ),
         patch("onyx.regulatory.projection.get_tokenizer", return_value=MagicMock()),

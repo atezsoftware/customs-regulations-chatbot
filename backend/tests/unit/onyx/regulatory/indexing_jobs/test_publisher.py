@@ -20,6 +20,7 @@ from onyx.db.models import (
     SearchSettings,
     UserFile,
 )
+from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
 from onyx.document_index.elasticsearch.elasticsearch_document_index import (
     ElasticsearchDocumentIndex,
 )
@@ -1105,3 +1106,56 @@ def test_elasticsearch_verification_count_is_tenant_scoped() -> None:
     assert {"term": {"tenant_id": {"value": "tenant-a"}}} in count_query["query"][
         "bool"
     ]["filter"]
+
+
+def test_elasticsearch_mget_parser_correlates_out_of_order_chunks() -> None:
+    document_id = str(uuid4())
+    chunk_ids = [f"chunk-{index}" for index in range(2)]
+    chunks = [
+        DocumentChunk(
+            document_id=document_id,
+            chunk_index=index,
+            content=f"MADDE {index + 1}",
+            source_type="file",
+            public=True,
+            access_control_list=[],
+            global_boost=1,
+            semantic_identifier=f"Madde {index + 1}",
+            blurb=f"MADDE {index + 1}",
+            doc_summary="",
+            chunk_context="",
+            regulatory_chunk_id=f"row-{index}",
+            content_vector=[float(index), 0.2, 0.3],
+        )
+        for index in range(2)
+    ]
+    raw_client = MagicMock()
+    raw_client.mget.return_value = {
+        "docs": [
+            {
+                "_id": chunk_ids[index],
+                "found": True,
+                "_source": chunks[index].model_dump(mode="json"),
+            }
+            for index in (1, 0)
+        ]
+    }
+    client = ElasticsearchIndexClient.__new__(ElasticsearchIndexClient)
+    client._index_name = "regulatory-index"
+    client._client = raw_client
+
+    parsed = client.get_document_chunks(chunk_ids)
+
+    assert list(parsed) == [chunk_ids[1], chunk_ids[0]]
+    assert parsed[chunk_ids[0]].regulatory_chunk_id == "row-0"
+    assert parsed[chunk_ids[1]].content_vector == [1.0, 0.2, 0.3]
+    raw_client.mget.assert_called_once_with(
+        index="regulatory-index",
+        docs=[
+            {
+                "_id": chunk_id,
+                "_source": {"includes": ["*", "content_vector", "title_vector"]},
+            }
+            for chunk_id in chunk_ids
+        ],
+    )

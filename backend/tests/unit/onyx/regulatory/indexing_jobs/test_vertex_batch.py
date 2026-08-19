@@ -342,12 +342,17 @@ class _FakeBatches:
 class _FakeGenAIClient:
     def __init__(self, batches: _FakeBatches) -> None:
         self.batches = batches
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _install_clients(
     monkeypatch: pytest.MonkeyPatch,
     storage_client: _FakeStorageClient,
     batches: _FakeBatches,
+    created_clients: list[_FakeGenAIClient] | None = None,
 ) -> list[dict[str, object]]:
     from onyx.regulatory.indexing_jobs import vertex_batch
 
@@ -358,7 +363,10 @@ def _install_clients(
 
     def fake_genai_client(**kwargs: object) -> _FakeGenAIClient:
         client_kwargs.append(kwargs)
-        return _FakeGenAIClient(batches)
+        client = _FakeGenAIClient(batches)
+        if created_clients is not None:
+            created_clients.append(client)
+        return client
 
     def fake_service_account_credentials(
         _info: dict[str, object], *, scopes: list[str]
@@ -398,7 +406,10 @@ def test_submit_resolves_service_account_fresh_and_uses_v1_clients(
 
     storage_client = _FakeStorageClient()
     batches = _FakeBatches()
-    client_kwargs = _install_clients(monkeypatch, storage_client, batches)
+    created_clients: list[_FakeGenAIClient] = []
+    client_kwargs = _install_clients(
+        monkeypatch, storage_client, batches, created_clients
+    )
     credential_infos: list[dict[str, object]] = []
     credential = object()
 
@@ -438,6 +449,8 @@ def test_submit_resolves_service_account_fresh_and_uses_v1_clients(
     assert batches.created is not None
     assert batches.created["model"] == "gemini-3.1-flash-lite"
     assert batches.created["src"] == state.input_uri
+    assert len(created_clients) == 1
+    assert created_clients[0].closed
     assert batches.created["config"].dest == state.output_uri
     uploaded = next(iter(storage_client.bucket_value.blobs.values()))
     assert json.loads(uploaded.uploaded or "") == {
@@ -498,7 +511,8 @@ def test_reconcile_submission_uses_exact_identity_and_first_page_only(
             error=None,
         )
     ]
-    _install_clients(monkeypatch, _FakeStorageClient(), batches)
+    created_clients: list[_FakeGenAIClient] = []
+    _install_clients(monkeypatch, _FakeStorageClient(), batches, created_clients)
     gateway = _gateway(lambda: '{"type":"service_account"}')
     submission_key = f"regulatory-context-{'a' * 64}"
 
@@ -509,6 +523,8 @@ def test_reconcile_submission_uses_exact_identity_and_first_page_only(
     listed_config = cast(genai_types.ListBatchJobsConfig, batches.listed_config)
     assert listed_config.page_size == 2
     assert listed_config.filter == f'displayName="{submission_key}"'
+    assert len(created_clients) == 1
+    assert created_clients[0].closed
 
 
 def test_reconcile_submission_returns_none_for_no_match(
@@ -649,7 +665,8 @@ def test_get_cancel_and_cleanup_are_single_bounded_operations(
         dest=None,
         error=None,
     )
-    _install_clients(monkeypatch, storage_client, batches)
+    created_clients: list[_FakeGenAIClient] = []
+    _install_clients(monkeypatch, storage_client, batches, created_clients)
     gateway = _gateway(lambda: '{"type":"service_account"}')
 
     state = gateway.get("jobs/remote-1")
@@ -664,6 +681,8 @@ def test_get_cancel_and_cleanup_are_single_bounded_operations(
     ]
     assert storage_client.list_timeouts == [60]
     assert storage_client.bucket_value.delete_timeout == 60
+    assert len(created_clients) == 2
+    assert all(client.closed for client in created_clients)
 
 
 def test_cleanup_supports_a_bucket_root_configured_base(

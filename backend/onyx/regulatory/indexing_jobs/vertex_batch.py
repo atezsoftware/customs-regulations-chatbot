@@ -523,6 +523,14 @@ class GoogleVertexBatchGateway:
             ),
         )
 
+    @contextmanager
+    def _managed_genai_client(self, credentials: Credentials) -> Iterator[genai.Client]:
+        client = self._genai_client(credentials)
+        try:
+            yield client
+        finally:
+            client.close()
+
     def submit(self, requests: Sequence[VertexBatchRequest]) -> VertexBatchState:
         from google.genai import types as genai_types
 
@@ -543,22 +551,22 @@ class GoogleVertexBatchGateway:
                 content_type="application/jsonl",
                 timeout=self._request_timeout_seconds,
             )
-            client = self._genai_client(credentials)
-            with _translate_create_errors(submission_key):
-                with traced_llm_call(
-                    flow=LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
-                    model=self._config.model_name,
-                    provider="vertex_ai",
-                    extra_config={"request_count": str(len(requests))},
-                ):
-                    job = client.batches.create(
+            with self._managed_genai_client(credentials) as client:
+                with _translate_create_errors(submission_key):
+                    with traced_llm_call(
+                        flow=LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
                         model=self._config.model_name,
-                        src=input_uri,
-                        config=genai_types.CreateBatchJobConfig(
-                            display_name=submission_key,
-                            dest=output_uri,
-                        ),
-                    )
+                        provider="vertex_ai",
+                        extra_config={"request_count": str(len(requests))},
+                    ):
+                        job = client.batches.create(
+                            model=self._config.model_name,
+                            src=input_uri,
+                            config=genai_types.CreateBatchJobConfig(
+                                display_name=submission_key,
+                                dest=output_uri,
+                            ),
+                        )
         return _batch_state(
             job,
             input_uri=input_uri,
@@ -568,7 +576,8 @@ class GoogleVertexBatchGateway:
     def get(self, remote_job_name: str) -> VertexBatchState:
         with _translate_gateway_errors():
             credentials = self._credentials()
-            job = self._genai_client(credentials).batches.get(name=remote_job_name)
+            with self._managed_genai_client(credentials) as client:
+                job = client.batches.get(name=remote_job_name)
         return _batch_state(job)
 
     def reconcile_submission(self, submission_key: str) -> VertexBatchState | None:
@@ -578,13 +587,14 @@ class GoogleVertexBatchGateway:
             raise VertexBatchContractError("Vertex submission key is invalid")
         with _translate_gateway_errors():
             credentials = self._credentials()
-            pager = self._genai_client(credentials).batches.list(
-                config=genai_types.ListBatchJobsConfig(
-                    page_size=2,
-                    filter=f'displayName="{submission_key}"',
+            with self._managed_genai_client(credentials) as client:
+                pager = client.batches.list(
+                    config=genai_types.ListBatchJobsConfig(
+                        page_size=2,
+                        filter=f'displayName="{submission_key}"',
+                    )
                 )
-            )
-            matches = pager.page
+                matches = pager.page
         if not matches:
             return None
         if len(matches) != 1:
@@ -621,7 +631,8 @@ class GoogleVertexBatchGateway:
     def cancel(self, remote_job_name: str) -> None:
         with _translate_gateway_errors():
             credentials = self._credentials()
-            self._genai_client(credentials).batches.cancel(name=remote_job_name)
+            with self._managed_genai_client(credentials) as client:
+                client.batches.cancel(name=remote_job_name)
 
     def cleanup(self, prefix: str) -> None:
         bucket_name, object_prefix = _parse_gcs_uri(prefix)

@@ -462,6 +462,33 @@ def test_only_due_retries_are_claimable(
     )
 
 
+def test_retry_error_code_is_bounded_to_persisted_column(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+
+    assert schedule_regulatory_indexing_retry(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        next_retry_at=_NOW,
+        error_code="x" * 200,
+        error_message="safe diagnostic",
+    )
+
+    db_session.refresh(job)
+    assert job.error_code == "x" * 128
+
+
 def test_stale_recovery_claims_due_and_abandoned_jobs_only(
     db_session: Session,
     regulatory_user_file: UserFile,
@@ -1018,6 +1045,79 @@ def test_atomic_preparation_repairs_partial_state_and_advances_once(
     assert len(recovered_items) == 1
     assert recovered_items[0].status == RegulatoryIndexingItemStatus.SKIPPED.value
     assert recovered_items[0].request_hash == "recovered-request"
+
+
+def test_atomic_preparation_rolls_back_callback_writes_on_validation_failure(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    original_chunks = (
+        RegulatoryChunker(min_chunk_chars=0)
+        .chunk_text("MADDE 1 - Korunacak hüküm.", source_file="mevzuat.md")
+        .chunks
+    )
+    original_rows = replace_indexed_chunks_for_file(
+        db_session, regulatory_user_file.id, original_chunks
+    )
+    db_session.commit()
+
+    def prepare_invalid_items() -> list[
+        regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem
+    ]:
+        replacement_chunks = (
+            RegulatoryChunker(min_chunk_chars=0)
+            .chunk_text("MADDE 9 - Geri alınacak hüküm.", source_file="mevzuat.md")
+            .chunks
+        )
+        replacement_rows = replace_indexed_chunks_for_file(
+            db_session, regulatory_user_file.id, replacement_chunks
+        )
+        db_session.flush()
+        return [
+            regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem(
+                regulatory_chunk_id=replacement_rows[0].id,
+                request_hash="duplicate-request",
+                skip_context=False,
+            ),
+            regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem(
+                regulatory_chunk_id=replacement_rows[0].id,
+                request_hash="duplicate-request",
+                skip_context=False,
+            ),
+        ]
+
+    with pytest.raises(ValueError, match="duplicate chunks"):
+        regulatory_indexing_job_repository.persist_regulatory_indexing_preparation(
+            db_session,
+            job_id=job.id,
+            expected_generation=1,
+            prepare_items=prepare_invalid_items,
+            now=_NOW,
+        )
+
+    db_session.expire_all()
+    persisted_rows = list(
+        db_session.scalars(
+            select(RegulatoryChunk).where(
+                RegulatoryChunk.user_file_id == regulatory_user_file.id
+            )
+        ).all()
+    )
+    persisted_job = db_session.get(RegulatoryIndexingJob, job.id)
+    assert [(row.id, row.text) for row in persisted_rows] == [
+        (original_rows[0].id, "MADDE 1 - Korunacak hüküm.")
+    ]
+    assert persisted_job is not None
+    assert persisted_job.stage == RegulatoryIndexingStage.PREPARING.value
+    assert persisted_job.status == RegulatoryIndexingJobStatus.RUNNING.value
 
 
 def test_lease_takeover_fences_stale_atomic_chunk_replacement(

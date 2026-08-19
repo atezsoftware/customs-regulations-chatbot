@@ -446,6 +446,46 @@ readiness checks after every indexing environment change. To disable the feature
 on both processes and restart both after active work is quiesced; recovery then stops claiming stale
 jobs, although broker messages already emitted before the restart may still finish.
 
+The shipped backend-lite image contains a read-only readiness command. Run it inside the new
+`background` container after the singleton migration and Admin configuration, while the feature flag
+is still false. For the external-infrastructure topology, the exact command is:
+
+```bash
+docker compose --project-name "$APPROVED_COMPOSE_PROJECT" --env-file .env \
+  -f docker-compose.prod.yml \
+  -f docker-compose.regulatory-edge.yml \
+  -f docker-compose.regulatory-external-infra.yml \
+  -f docker-compose.regulatory-prod-lite.yml \
+  exec -T background python /app/scripts/regulatory_indexing_readiness.py \
+    --memory-headroom-reviewed
+```
+
+Use the same command with `docker-compose.regulatory-compose-infra.yml` in Compose-managed mode.
+Exit `0` means every check passed, exit `1` means not ready, and exit `2` is an invocation
+interruption/error. `--json` emits the same redacted result for archival. The command performs only
+database reads, supervisor/probe inspection, GCS list access, Vertex model/batch reads, one
+constant-text OpenRouter embedding call, and Elasticsearch mapping reads. It never indexes a probe,
+creates/cancels a batch, writes an object, or prints credentials, vectors, or document content.
+
+Prerequisites are: the migration job completed; the new disabled API/background containers are
+running; the dedicated regulatory worker and Beat probe files are healthy; the active Admin Search
+Settings select OpenRouter `openai/text-embedding-3-large` with contextual retrieval enabled; the
+selected contextual model is Vertex AI with valid batch/GCS access; and the active Elasticsearch
+index exists. Before supplying `--memory-headroom-reviewed`, archive the cgroup and per-process RSS
+evidence required in section 6 and verify the pod limit plus node headroom; omitting the attestation
+fails closed, and any recorded OOM event still fails the check. The repository cannot validate
+external Helm/node capacity by itself. The readiness report's `effective_dimension` is authoritative. It is derived from the
+active SearchSettings (`reduced_dimension` when set, otherwise the model dimension), is sent to the
+OpenRouter probe, and must match the active index mapping. Never substitute a hardcoded `1024` (or
+any other dimension) in deployment configuration or acceptance evidence.
+
+The required rollout order is therefore: keep the flag false in both processes; run the singleton
+migration; start/restart API and background on the new image with the flag still false; finish Admin
+and workspace configuration; obtain readiness exit `0`; set the flag true for both processes;
+restart both through the owned deployment workflow; repeat readiness and queue checks; only then run
+the disposable canary below. Any failure returns the rollout to the disabled state; do not weaken or
+skip a failed check.
+
 The production-lite operator environment contract is exact; keep the values in the approved secret
 store/environment, not in source control. Defaults below match the Compose overlay and
 `env.prod.template`:
@@ -610,6 +650,25 @@ Complete one authenticated application smoke test:
    `regulatory_indexing` and both exact supervisor processes remain ready.
 7. Start one small benchmark run only after chat/search succeeds, and confirm the dedicated worker
    completes it.
+
+Use a newly generated, collision-resistant filename, directory, tenant (where applicable), and file
+identity for every canary; never reuse, overwrite, rename, or delete an existing production file.
+Upload only through the authenticated frontend/nginx route. The Markdown should contain unique,
+non-sensitive marker text and at least two canonical chunks. Record the active SearchSettings ID,
+reported effective dimension, durable job ID, file ID, tenant, and timestamps, but do not archive
+document content or vectors. Observe contextual completion before embedding, hidden Elasticsearch
+staging, verification, publication, search visibility, retrieval, and citation through the same
+frontend route. Deliver the same job message again to prove idempotency, and perform one controlled
+background restart only after recording a non-terminal stage; the stale-recovery Beat must resume it.
+
+For cancellation coverage, use a second new canary and delete it through the frontend while its job
+is non-terminal. Confirm the durable job becomes cancelled and its GCS prefix and staged
+Elasticsearch chunks are absent using credential-safe list/count diagnostics. Finally delete the
+published canary through the frontend, confirm its unique marker is no longer retrievable and no
+job-specific GCS objects or Elasticsearch chunks remain, then remove only the disposable local
+evidence files. If any prerequisite, frontend route, or cleanup identity is ambiguous, do not start
+the canary. Never use direct backend calls, wildcard deletes, index deletion, broker purge, or cleanup
+queries that could target pre-existing documents.
 
 Review API/background logs for repeated database, Elasticsearch, object-store, cloud embedding,
 OpenRouter LLM, or Celery errors before ending the maintenance window.

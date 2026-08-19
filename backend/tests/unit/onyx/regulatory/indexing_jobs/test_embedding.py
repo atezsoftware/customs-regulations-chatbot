@@ -380,3 +380,39 @@ def test_openrouter_boundary_rejects_duplicate_response_indexes() -> None:
             )
     finally:
         asyncio.run(cloud_embedding.aclose())
+
+
+def test_openrouter_boundary_restores_out_of_order_response_indexes() -> None:
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {
+            "object": "list",
+            "model": "openai/text-embedding-3-large",
+            "data": [
+                {"object": "embedding", "index": 1, "embedding": [0.3, 0.4]},
+                {"object": "embedding", "index": 0, "embedding": [0.1, 0.2]},
+            ],
+            "usage": {"prompt_tokens": 4, "total_tokens": 4},
+        },
+    )
+    cloud_embedding = CloudEmbedding(
+        api_key="test-key",
+        provider=EmbeddingProvider.OPENROUTER,
+    )
+    http_client = MagicMock()
+    http_client.post = AsyncMock(return_value=response)
+    http_client.aclose = AsyncMock()
+    cloud_embedding.http_client = http_client
+
+    try:
+        vectors = asyncio.run(
+            cloud_embedding._embed_litellm_proxy(
+                ["first", "second"],
+                "openai/text-embedding-3-large",
+                2,
+            )
+        )
+    finally:
+        asyncio.run(cloud_embedding.aclose())
+
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]

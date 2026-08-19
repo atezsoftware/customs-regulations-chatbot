@@ -2029,11 +2029,12 @@ class TestElasticsearchClient:
         # result.
         match_highlights = results[0].match_highlights.get(CONTENT_FIELD_NAME, [])
         assert len(match_highlights) == 1
-        # We expect the terms "Artificial" and "intelligence" to be matched.
+        # Elasticsearch may group adjacent matches in one highlight span or
+        # return a span per term; both preserve the same match evidence.
         highlight_split = re.findall(r"<hi>(.*?)</hi>", match_highlights[0])
-        assert len(highlight_split) == 2
-        assert highlight_split[0] == "Artificial"
-        assert highlight_split[1] == "intelligence"
+        highlighted_text = " ".join(highlight_split)
+        assert "Artificial" in highlighted_text
+        assert "intelligence" in highlighted_text
 
         # Returned documents should be ordered by descending score.
         previous_score = float("inf")

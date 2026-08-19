@@ -395,6 +395,8 @@ def apply_contextual_results(
     db_session: Session,
 ) -> ContextApplySummary:
     ordered_rows = _ordered_rows(rows)
+    if any(row.user_file_id != job.user_file_id for row in ordered_rows):
+        raise ContextualMappingError("canonical rows do not belong to the indexing job")
     row_by_id = {row.id: row for row in ordered_rows}
     known_hashes = {item.request_hash for item in items}
     if not set(results).issubset(known_hashes):

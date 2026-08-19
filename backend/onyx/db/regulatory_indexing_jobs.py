@@ -28,6 +28,7 @@ from onyx.db.models import (
 )
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
+_MAX_ERROR_CODE_LENGTH = 128
 _SECRET_KEY_FRAGMENTS = (
     "apikey",
     "accesstoken",
@@ -629,7 +630,9 @@ def advance_regulatory_indexing_job(
         "attempt_count": 0,
         "heartbeat_at": now,
         "next_retry_at": None,
-        "error_code": error_code,
+        "error_code": (
+            error_code[:_MAX_ERROR_CODE_LENGTH] if error_code is not None else None
+        ),
         "error_message": (
             error_message[:_MAX_ERROR_MESSAGE_LENGTH]
             if error_message is not None
@@ -693,7 +696,7 @@ def schedule_regulatory_indexing_retry(
             status=RegulatoryIndexingJobStatus.RETRY_WAIT.value,
             attempt_count=RegulatoryIndexingJob.attempt_count + 1,
             next_retry_at=next_retry_at,
-            error_code=error_code,
+            error_code=error_code[:_MAX_ERROR_CODE_LENGTH],
             error_message=error_message[:_MAX_ERROR_MESSAGE_LENGTH],
             updated_at=func.now(),
         )
@@ -1347,7 +1350,7 @@ def persist_regulatory_indexing_item_failure(
         ),
         values={
             "status": RegulatoryIndexingItemStatus.FAILED.value,
-            "error_code": error_code,
+            "error_code": error_code[:_MAX_ERROR_CODE_LENGTH],
             "error_message": error_message[:_MAX_ERROR_MESSAGE_LENGTH],
             "updated_at": func.now(),
         },
@@ -1380,7 +1383,7 @@ def fail_regulatory_indexing_job(
         db_session.rollback()
         return False
     job.status = RegulatoryIndexingJobStatus.FAILED.value
-    job.error_code = error_code
+    job.error_code = error_code[:_MAX_ERROR_CODE_LENGTH]
     job.error_message = error_message[:_MAX_ERROR_MESSAGE_LENGTH]
     job.completed_at = now
     job.updated_at = now
@@ -1536,7 +1539,7 @@ def schedule_regulatory_indexing_cancellation_retry(
         .values(
             attempt_count=RegulatoryIndexingJob.attempt_count + 1,
             next_retry_at=next_retry_at,
-            error_code=error_code,
+            error_code=error_code[:_MAX_ERROR_CODE_LENGTH],
             error_message=error_message[:_MAX_ERROR_MESSAGE_LENGTH],
             updated_at=func.now(),
         )

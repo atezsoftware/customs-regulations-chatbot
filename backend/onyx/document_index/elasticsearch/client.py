@@ -1580,7 +1580,19 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         expected_ids = set(document_chunk_ids)
         response = self._client.mget(
             index=self._index_name,
-            docs=[{"_id": chunk_id} for chunk_id in document_chunk_ids],
+            docs=[
+                {
+                    "_id": chunk_id,
+                    "_source": {
+                        "includes": [
+                            "*",
+                            CONTENT_VECTOR_FIELD_NAME,
+                            TITLE_VECTOR_FIELD_NAME,
+                        ]
+                    },
+                }
+                for chunk_id in document_chunk_ids
+            ],
         )
         documents = response.get("docs")
         if not isinstance(documents, list):
@@ -1649,7 +1661,15 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             document_chunk_id,
             self._index_name,
         )
-        result = self._client.get(index=self._index_name, id=document_chunk_id)
+        result = self._client.get(
+            index=self._index_name,
+            id=document_chunk_id,
+            source_includes=[
+                "*",
+                CONTENT_VECTOR_FIELD_NAME,
+                TITLE_VECTOR_FIELD_NAME,
+            ],
+        )
         found_result: bool = result.get("found", False)
         if not found_result:
             raise RuntimeError(
