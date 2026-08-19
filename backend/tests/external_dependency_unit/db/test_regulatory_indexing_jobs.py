@@ -1077,6 +1077,7 @@ def test_external_mutation_lock_excludes_recovery_and_refreshes_heartbeat(
                 assert lease is not None
                 entered.set()
                 assert release.wait(timeout=5)
+                lease.commit()
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         held = executor.submit(hold_external_mutation)
@@ -1128,6 +1129,7 @@ def test_external_mutation_lock_blocks_cancellation_until_es_finishes(
                 assert lease is not None
                 entered.set()
                 assert release.wait(timeout=5)
+                lease.commit()
 
     def cancel_job() -> bool:
         with Session(engine) as cancel_session:
@@ -1182,6 +1184,7 @@ def test_external_mutation_lock_blocks_user_file_deletion_status(
                 assert lease is not None
                 entered.set()
                 assert release.wait(timeout=5)
+                lease.commit()
 
     def mark_deleting() -> None:
         with Session(engine) as delete_session:

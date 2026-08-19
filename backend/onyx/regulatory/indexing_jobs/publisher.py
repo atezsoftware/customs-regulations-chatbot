@@ -433,6 +433,7 @@ def stage_regulatory_job_in_index(
             expected,
             hidden=True,
         )
+        lease.commit()
         return expected
 
 
@@ -480,6 +481,7 @@ def verify_staged_regulatory_job(
         )
         if lease.search_settings is None:
             raise RuntimeError("regulatory indexing SearchSettings disappeared")
+        _validate_search_settings(lease.search_settings, snapshot)
         target_index = document_index or build_elasticsearch_document_index(
             lease.search_settings
         )
@@ -491,6 +493,7 @@ def verify_staged_regulatory_job(
             )
         )
         _validate_index_verification(result, expected, hidden=True)
+        lease.commit()
         return expected
 
 
@@ -544,6 +547,7 @@ def publish_regulatory_job(
 
         if lease.search_settings is None:
             raise RuntimeError("regulatory indexing SearchSettings disappeared")
+        _validate_search_settings(lease.search_settings, snapshot)
 
         target_index = document_index or build_elasticsearch_document_index(
             lease.search_settings
@@ -561,6 +565,19 @@ def publish_regulatory_job(
             target_index.update_document_visibility(visible_request)
             visible_result = target_index.verify_document_chunks(visible_request)
             _validate_index_verification(visible_result, expected, hidden=False)
+            completed = indexing_job_repository.complete_regulatory_indexing_user_file(
+                db_session,
+                job_id=lease.job_id,
+                expected_generation=lease.lease_generation,
+                chunk_count=expected.canonical_chunk_count,
+                now=datetime.datetime.now(datetime.timezone.utc),
+                commit=False,
+            )
+            if not completed:
+                raise RuntimeError(
+                    "regulatory indexing lease was lost while publishing"
+                )
+            lease.commit()
         except Exception as publish_error:
             try:
                 target_index.update_document_visibility(hidden_request)
@@ -572,14 +589,3 @@ def publish_regulatory_job(
                     f"failure: {restore_error!r}"
                 )
             raise
-
-        completed = indexing_job_repository.complete_regulatory_indexing_user_file(
-            db_session,
-            job_id=lease.job_id,
-            expected_generation=lease.lease_generation,
-            chunk_count=expected.canonical_chunk_count,
-            now=datetime.datetime.now(datetime.timezone.utc),
-            commit=False,
-        )
-        if not completed:
-            raise RuntimeError("regulatory indexing lease was lost while publishing")

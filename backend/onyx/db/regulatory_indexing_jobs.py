@@ -3,7 +3,7 @@ import math
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -57,7 +57,7 @@ type RegulatoryIndexingJSONValue = (
 type RegulatoryIndexingConfigSnapshot = dict[str, RegulatoryIndexingJSONValue]
 
 
-@dataclass(frozen=True)
+@dataclass
 class RegulatoryIndexingExternalMutationLease:
     """Fresh locked state held for the duration of one external mutation."""
 
@@ -73,6 +73,24 @@ class RegulatoryIndexingExternalMutationLease:
     user_file_chunk_count: int | None
     regulatory_chunks: tuple[RegulatoryChunk, ...]
     indexing_items: tuple[RegulatoryIndexingItem, ...]
+    _db_session: Session = field(repr=False)
+    _locked_job: RegulatoryIndexingJob = field(repr=False)
+    _committed: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def committed(self) -> bool:
+        return self._committed
+
+    def commit(self) -> None:
+        """Refresh the heartbeat and synchronously commit the locked transaction."""
+
+        if self._committed:
+            raise RuntimeError("external mutation transaction is already committed")
+        heartbeat_at = datetime.datetime.now(datetime.timezone.utc)
+        self._locked_job.heartbeat_at = heartbeat_at
+        self._locked_job.updated_at = heartbeat_at
+        self._db_session.commit()
+        self._committed = True
 
 
 @dataclass(frozen=True)
@@ -795,16 +813,14 @@ def regulatory_indexing_external_mutation_lease(
         user_file_chunk_count=locked_user_file.chunk_count,
         regulatory_chunks=regulatory_chunks,
         indexing_items=indexing_items,
+        _db_session=db_session,
+        _locked_job=locked_job,
     )
     try:
         yield lease
-        heartbeat_at = datetime.datetime.now(datetime.timezone.utc)
-        locked_job.heartbeat_at = heartbeat_at
-        locked_job.updated_at = heartbeat_at
-        db_session.commit()
-    except Exception:
-        db_session.rollback()
-        raise
+    finally:
+        if not lease.committed:
+            db_session.rollback()
 
 
 def complete_regulatory_indexing_user_file(
@@ -831,7 +847,8 @@ def complete_regulatory_indexing_user_file(
         .with_for_update()
     )
     if locked_job is None:
-        db_session.rollback()
+        if commit:
+            db_session.rollback()
         return False
 
     completed_id = db_session.scalar(
@@ -848,7 +865,8 @@ def complete_regulatory_indexing_user_file(
         .returning(UserFile.id)
     )
     if completed_id is None:
-        db_session.rollback()
+        if commit:
+            db_session.rollback()
         return False
     if commit:
         db_session.commit()

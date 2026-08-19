@@ -241,6 +241,8 @@ def _install_metadata(
     search_settings: SearchSettings,
     rows: list[RegulatoryChunk] | None = None,
     items: list[RegulatoryIndexingItem] | None = None,
+    commit_error: Exception | None = None,
+    commit_calls: list[object] | None = None,
 ) -> None:
     document_id = str(user_file.id)
     monkeypatch.setattr(
@@ -273,6 +275,13 @@ def _install_metadata(
         expected_generation: int,
     ) -> Iterator[object]:
         assert job_id == job.id
+
+        def commit() -> None:
+            if commit_calls is not None:
+                commit_calls.append(object())
+            if commit_error is not None:
+                raise commit_error
+
         yield SimpleNamespace(
             job_id=job.id,
             user_file_id=user_file.id,
@@ -286,6 +295,7 @@ def _install_metadata(
             user_file_chunk_count=user_file.chunk_count,
             regulatory_chunks=tuple(rows or []),
             indexing_items=tuple(items or []),
+            commit=commit,
         )
 
     monkeypatch.setattr(
@@ -737,6 +747,148 @@ def test_publish_post_update_disappearance_never_completes_file(
         "update",
         "verify:true",
     ]
+    assert completed == []
+
+
+@pytest.mark.parametrize(
+    ("completion_result", "error_match"),
+    [
+        (False, "lease was lost"),
+        (RuntimeError("completion write failed"), "completion write failed"),
+    ],
+)
+def test_publish_completion_failure_restores_hidden_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    completion_result: bool | Exception,
+    error_match: str,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
+    document_index = _RecordingDocumentIndex([])
+
+    def complete_file(*_args: object, **_kwargs: object) -> bool:
+        if isinstance(completion_result, Exception):
+            raise completion_result
+        return completion_result
+
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_user_file",
+        complete_file,
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        publish_regulatory_job(
+            job=job,
+            user_file=user_file,
+            rows=rows,
+            items=items,
+            db_session=_DB_SESSION,
+            document_index=cast(DocumentIndex, document_index),
+            search_settings=settings,
+        )
+
+    assert document_index.events == [
+        "verify:true",
+        "update",
+        "verify:false",
+        "update",
+        "verify:true",
+    ]
+
+
+def test_publish_commit_failure_restores_hidden_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    commit_calls: list[object] = []
+    _install_metadata(
+        monkeypatch,
+        job,
+        user_file,
+        settings,
+        rows,
+        items,
+        commit_error=RuntimeError("database commit failed"),
+        commit_calls=commit_calls,
+    )
+    document_index = _RecordingDocumentIndex([])
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_user_file",
+        lambda *_args, **_kwargs: True,
+    )
+
+    with pytest.raises(RuntimeError, match="database commit failed"):
+        publish_regulatory_job(
+            job=job,
+            user_file=user_file,
+            rows=rows,
+            items=items,
+            db_session=_DB_SESSION,
+            document_index=cast(DocumentIndex, document_index),
+            search_settings=settings,
+        )
+
+    assert len(commit_calls) == 1
+    assert document_index.events == [
+        "verify:true",
+        "update",
+        "verify:false",
+        "update",
+        "verify:true",
+    ]
+
+
+@pytest.mark.parametrize("operation", ["verify", "publish"])
+@pytest.mark.parametrize(
+    ("field", "mutated_value"),
+    [
+        ("model_name", "openai/text-embedding-3-small"),
+        ("final_embedding_dim", 4),
+        ("index_name", "mutated-regulatory-index"),
+    ],
+)
+def test_verify_and_publish_reject_locked_search_settings_drift_before_es(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    field: str,
+    mutated_value: object,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    setattr(settings, field, mutated_value)
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
+    document_index = _RecordingDocumentIndex([])
+    completed: list[object] = []
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_user_file",
+        lambda *_args, **_kwargs: completed.append(object()) or True,
+    )
+
+    with pytest.raises(ValueError, match="no longer matches"):
+        if operation == "verify":
+            verify_staged_regulatory_job(
+                job=job,
+                user_file=user_file,
+                rows=rows,
+                items=items,
+                db_session=_DB_SESSION,
+                document_index=cast(DocumentIndex, document_index),
+                search_settings=settings,
+            )
+        else:
+            publish_regulatory_job(
+                job=job,
+                user_file=user_file,
+                rows=rows,
+                items=items,
+                db_session=_DB_SESSION,
+                document_index=cast(DocumentIndex, document_index),
+                search_settings=settings,
+            )
+
+    assert document_index.events == []
     assert completed == []
 
 
