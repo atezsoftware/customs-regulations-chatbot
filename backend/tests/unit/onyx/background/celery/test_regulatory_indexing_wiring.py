@@ -6,11 +6,13 @@ import os
 import re
 import subprocess
 import sys
-from datetime import timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, call, patch
 
+import pytest
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
@@ -200,6 +202,111 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
         restarted.close()
 
 
+def test_two_schedulers_publish_once_per_tenant_slot_and_fail_over_after_ttl(
+    tmp_path: Path,
+) -> None:
+    beat_app = importlib.import_module(
+        "onyx.background.celery.apps.regulatory_indexing_beat"
+    )
+
+    class ExpiringRedis:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.values: dict[tuple[str, str], float] = {}
+            self.claims: list[tuple[str, str, int]] = []
+
+        def client(self, tenant_id: str) -> MagicMock:
+            client = MagicMock()
+
+            def set_value(
+                key: str,
+                _value: str,
+                *,
+                ex: int,
+                nx: bool,
+            ) -> bool | None:
+                assert nx is True
+                namespaced_key = (tenant_id, key)
+                expiry = self.values.get(namespaced_key)
+                if expiry is not None and expiry > self.now:
+                    return None
+                self.values[namespaced_key] = self.now + ex
+                self.claims.append((tenant_id, key, ex))
+                return True
+
+            client.set.side_effect = set_value
+            return client
+
+    redis = ExpiringRedis()
+    fixed_now = datetime(2026, 8, 19, 12, 0, 5, tzinfo=timezone.utc)
+    schedulers = [
+        beat_app.RegulatoryIndexingScheduler(
+            app=beat_app.celery_app,
+            schedule_filename=str(tmp_path / f"schedule-{index}"),
+            lazy=False,
+        )
+        for index in range(2)
+    ]
+    try:
+        for scheduler in schedulers:
+            with patch.object(
+                beat_app, "get_all_tenant_ids", return_value=["public", "tenant-a"]
+            ):
+                scheduler.update_schedule()
+        entry_a = schedulers[0].schedule["monitor-celery-queues-public"]
+        entry_b = schedulers[1].schedule["monitor-celery-queues-public"]
+        tenant_entry = schedulers[1].schedule["monitor-celery-queues-tenant-a"]
+
+        with (
+            patch.object(beat_app.celery_app, "now", return_value=fixed_now),
+            patch.object(
+                beat_app,
+                "get_redis_client",
+                side_effect=lambda *, tenant_id: redis.client(tenant_id),
+            ),
+            patch.object(beat_app.PersistentScheduler, "apply_entry") as publish,
+        ):
+            schedulers[0].apply_entry(entry_a)
+            schedulers[1].apply_entry(entry_b)
+            schedulers[1].apply_entry(tenant_entry)
+
+            assert publish.call_count == 2
+            assert {claim[0] for claim in redis.claims} == {"public", "tenant-a"}
+            public_claim = next(claim for claim in redis.claims if claim[0] == "public")
+            assert "monitor-celery-queues-public" in public_claim[1]
+            assert public_claim[1].endswith(":178714080")
+
+            redis.now = public_claim[2] + 0.1
+            schedulers[1].apply_entry(entry_b)
+            assert publish.call_count == 3
+    finally:
+        for scheduler in schedulers:
+            scheduler.close()
+
+
+def test_scheduler_recovers_a_corrupt_pod_local_schedule(tmp_path: Path) -> None:
+    beat_app = importlib.import_module(
+        "onyx.background.celery.apps.regulatory_indexing_beat"
+    )
+    schedule_path = tmp_path / "corrupt-schedule"
+    schedule_path.write_bytes(b"not-a-shelve-database")
+
+    scheduler = beat_app.RegulatoryIndexingScheduler(
+        app=beat_app.celery_app,
+        schedule_filename=str(schedule_path),
+        lazy=False,
+    )
+    try:
+        with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
+            scheduler.update_schedule()
+        assert set(scheduler.schedule) == {
+            "recover-stale-regulatory-indexing-public",
+            "monitor-celery-queues-public",
+        }
+    finally:
+        scheduler.close()
+
+
 def test_production_lite_scheduler_waits_for_dependencies_before_readiness() -> None:
     beat_app = importlib.import_module(
         "onyx.background.celery.apps.regulatory_indexing_beat"
@@ -207,6 +314,9 @@ def test_production_lite_scheduler_waits_for_dependencies_before_readiness() -> 
     scheduler = MagicMock()
     sender = MagicMock(scheduler=scheduler)
     startup_events: list[str] = []
+    scheduler.clear_probes.side_effect = lambda: startup_events.append("cleanup")
+    scheduler.update_schedule.side_effect = lambda: startup_events.append("schedule")
+    scheduler.mark_ready.side_effect = lambda: startup_events.append("ready")
 
     with (
         patch.object(beat_app.SqlEngine, "set_app_name") as set_app_name,
@@ -221,23 +331,55 @@ def test_production_lite_scheduler_waits_for_dependencies_before_readiness() -> 
             "wait_for_db",
             side_effect=lambda *_args, **_kwargs: startup_events.append("database"),
         ),
-        patch.object(beat_app, "make_probe_path") as make_probe_path,
     ):
-        liveness_path = MagicMock()
-        readiness_path = MagicMock()
-        make_probe_path.side_effect = [liveness_path, readiness_path]
         beat_app.on_beat_init(sender)
 
     set_app_name.assert_called_once_with("celery_beat_regulatory_indexing")
     init_engine.assert_called_once_with(pool_size=2, max_overflow=0)
-    assert startup_events == ["redis", "database"]
+    assert startup_events == ["cleanup", "redis", "database", "schedule", "ready"]
+    scheduler.clear_probes.assert_called_once_with()
     scheduler.update_schedule.assert_called_once_with()
-    assert make_probe_path.call_args_list == [
-        call("liveness", "regulatory_indexing_beat@hostname"),
-        call("readiness", "regulatory_indexing_beat@hostname"),
-    ]
-    liveness_path.touch.assert_called_once_with()
-    readiness_path.touch.assert_called_once_with()
+    scheduler.mark_ready.assert_called_once_with()
+
+
+def test_scheduler_clears_probes_on_close_and_does_not_refresh_after_failure(
+    tmp_path: Path,
+) -> None:
+    beat_app = importlib.import_module(
+        "onyx.background.celery.apps.regulatory_indexing_beat"
+    )
+    scheduler = beat_app.RegulatoryIndexingScheduler(
+        app=beat_app.celery_app,
+        schedule_filename=str(tmp_path / "schedule"),
+        lazy=False,
+    )
+    scheduler._readiness_probe_path = tmp_path / "readiness"
+    scheduler._liveness_probe_path = tmp_path / "liveness"
+    scheduler.mark_ready()
+    assert scheduler._readiness_probe_path.exists()
+    assert scheduler._liveness_probe_path.exists()
+
+    scheduler._last_reload = scheduler.app.now() - scheduler._reload_interval
+    with (
+        patch.object(beat_app.PersistentScheduler, "tick", return_value=1.0),
+        patch.object(scheduler, "update_schedule", side_effect=RuntimeError("db down")),
+        patch.object(scheduler, "mark_alive") as mark_alive,
+    ):
+        scheduler.tick()
+    mark_alive.assert_not_called()
+
+    scheduler._last_reload = scheduler.app.now() - scheduler._reload_interval
+    with (
+        patch.object(beat_app.PersistentScheduler, "tick", return_value=1.0),
+        patch.object(scheduler, "update_schedule"),
+        patch.object(scheduler, "mark_alive") as mark_alive,
+    ):
+        scheduler.tick()
+    mark_alive.assert_called_once_with()
+
+    scheduler.close()
+    assert not scheduler._readiness_probe_path.exists()
+    assert not scheduler._liveness_probe_path.exists()
 
 
 def test_regulatory_indexing_worker_config_is_single_thread_and_prefetches_one() -> (
@@ -400,13 +542,97 @@ def test_lite_supervisor_runs_durable_regulatory_indexing_beat_and_forwards_log(
         "celery -A onyx.background.celery.versioned_apps.regulatory_indexing_beat beat"
         in command
     )
-    assert "--schedule=/var/log/onyx/regulatory-indexing-beat-schedule" in command
+    assert "--schedule=/tmp/regulatory-indexing-beat-schedule" in command
+    assert "/var/log/onyx/regulatory-indexing-beat-schedule" not in command
     assert parser.getboolean(section, "autorestart") is True
 
     log_path = parser.get(section, "stdout_logfile")
     redirect_command = parser.get("program:log-redirect-handler", "command")
     assert log_path == "/var/log/onyx/celery_beat_regulatory_indexing.log"
     assert log_path in redirect_command
+
+
+def test_beat_probe_verifier_requires_current_pid_instance_and_fresh_liveness(
+    tmp_path: Path,
+) -> None:
+    health = importlib.import_module(
+        "onyx.background.celery.regulatory_indexing_beat_health"
+    )
+    readiness_path = tmp_path / "readiness"
+    liveness_path = tmp_path / "liveness"
+    marker = "4321:0123456789abcdef0123456789abcdef"
+    status = "celery_beat_regulatory_indexing RUNNING pid 4321, uptime 0:00:30"
+    readiness_path.write_text(marker, encoding="utf-8")
+    liveness_path.write_text(marker, encoding="utf-8")
+
+    health.validate_regulatory_indexing_beat(
+        status,
+        readiness_path=readiness_path,
+        liveness_path=liveness_path,
+        now=time.time(),
+    )
+
+    stale_mtime = time.time() - health.BEAT_LIVENESS_MAX_AGE_SECONDS - 1
+    os.utime(liveness_path, (stale_mtime, stale_mtime))
+    with pytest.raises(health.BeatProbeError, match="stale"):
+        health.validate_regulatory_indexing_beat(
+            status,
+            readiness_path=readiness_path,
+            liveness_path=liveness_path,
+            now=time.time(),
+        )
+
+    wrong_pid_marker = "9999:0123456789abcdef0123456789abcdef"
+    readiness_path.write_text(wrong_pid_marker, encoding="utf-8")
+    liveness_path.write_text(wrong_pid_marker, encoding="utf-8")
+    with pytest.raises(health.BeatProbeError, match="current supervisor PID"):
+        health.validate_regulatory_indexing_beat(
+            status,
+            readiness_path=readiness_path,
+            liveness_path=liveness_path,
+            now=time.time(),
+        )
+
+
+def test_beat_probe_cli_executes_the_same_freshness_check(tmp_path: Path) -> None:
+    readiness_path = tmp_path / "readiness"
+    liveness_path = tmp_path / "liveness"
+    marker = "4321:0123456789abcdef0123456789abcdef"
+    status = "celery_beat_regulatory_indexing RUNNING pid 4321, uptime 0:00:30"
+    readiness_path.write_text(marker, encoding="utf-8")
+    liveness_path.write_text(marker, encoding="utf-8")
+    command = [
+        sys.executable,
+        "-m",
+        "onyx.background.celery.regulatory_indexing_beat_health",
+        "--status-text",
+        status,
+        "--readiness-path",
+        str(readiness_path),
+        "--liveness-path",
+        str(liveness_path),
+    ]
+
+    fresh = subprocess.run(
+        command,
+        cwd=_BACKEND_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fresh.returncode == 0, fresh.stdout + fresh.stderr
+
+    stale_mtime = time.time() - 151
+    os.utime(liveness_path, (stale_mtime, stale_mtime))
+    stale = subprocess.run(
+        command,
+        cwd=_BACKEND_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert stale.returncode != 0
+    assert "stale" in stale.stderr
 
 
 def test_production_lite_health_requires_every_worker_including_regulatory_indexing(
@@ -437,32 +663,67 @@ def test_production_lite_health_requires_every_worker_including_regulatory_index
     ]
     env = os.environ.copy()
     env["PATH"] = f"{tmp_path}{os.pathsep}{env['PATH']}"
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(_BACKEND_ROOT), env.get("PYTHONPATH")) if value
+    )
     env["SUPERVISOR_ROWS"] = "\n".join(
         f"{process} RUNNING pid 1, uptime 0:00:30" for process in expected_processes
     )
 
-    successful = subprocess.run(
-        [sys.executable, *typed_health_command[2:]],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert successful.returncode == 0, successful.stdout + successful.stderr
+    readiness_path = Path("/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt")
+    liveness_path = Path("/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt")
+    try:
+        marker = "1:0123456789abcdef0123456789abcdef"
+        readiness_path.write_text(marker, encoding="utf-8")
+        liveness_path.write_text(marker, encoding="utf-8")
+        successful = subprocess.run(
+            [sys.executable, *typed_health_command[2:]],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert successful.returncode == 0, successful.stdout + successful.stderr
 
-    env["SUPERVISOR_ROWS"] = "\n".join(
-        f"{process} RUNNING pid 1, uptime 0:00:30"
-        for process in expected_processes
-        if process != "celery_beat_regulatory_indexing"
-    )
-    missing_worker = subprocess.run(
-        [sys.executable, *typed_health_command[2:]],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert missing_worker.returncode != 0
+        stale_mtime = time.time() - 151
+        os.utime(liveness_path, (stale_mtime, stale_mtime))
+        stale_probe = subprocess.run(
+            [sys.executable, *typed_health_command[2:]],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert stale_probe.returncode != 0
+
+        liveness_path.write_text(
+            "999:fedcba9876543210fedcba9876543210", encoding="utf-8"
+        )
+        wrong_process = subprocess.run(
+            [sys.executable, *typed_health_command[2:]],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert wrong_process.returncode != 0
+
+        env["SUPERVISOR_ROWS"] = "\n".join(
+            f"{process} RUNNING pid 1, uptime 0:00:30"
+            for process in expected_processes
+            if process != "celery_beat_regulatory_indexing"
+        )
+        missing_worker = subprocess.run(
+            [sys.executable, *typed_health_command[2:]],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert missing_worker.returncode != 0
+    finally:
+        readiness_path.unlink(missing_ok=True)
+        liveness_path.unlink(missing_ok=True)
 
 
 def test_production_lite_wires_the_complete_regulatory_environment_contract() -> None:
@@ -571,8 +832,10 @@ def test_codebuild_diagnostics_and_readiness_use_the_exact_worker_name() -> None
     assert "status celery_beat_regulatory_indexing" in diagnostics_script
     assert "verify_regulatory_indexing_beat" in deploy_script
     assert "status celery_beat_regulatory_indexing" in deploy_script
-    assert "/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt" in deploy_script
-    assert "/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt" in deploy_script
+    assert (
+        "python -m onyx.background.celery.regulatory_indexing_beat_health"
+        in deploy_script
+    )
     assert "capture_background_memory_evidence" in deploy_script
 
     for script in (diagnostics_script, deploy_script):
@@ -612,6 +875,9 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         "tasks": ["regulatory_indexing_recover_stale", "monitor_celery_queues"],
         "readiness_file": "/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt",
         "liveness_file": "/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt",
+        "liveness_max_age_seconds": 150,
+        "probe_marker": "pid:instance_uuid",
+        "dispatch_dedup": "redis_tenant_entry_utc_slot_set_nx_ex",
     }
     assert "user_file_processing" not in forbidden_queues
     assert operations == {

@@ -1,6 +1,9 @@
+import math
+import os
 from collections.abc import ItemsView
 from datetime import timedelta
 from typing import Any
+from uuid import uuid4
 
 from celery import Celery, signals
 from celery.beat import PersistentScheduler
@@ -14,9 +17,11 @@ from onyx.background.celery.tasks.regulatory_indexing.beat_schedule import (
 )
 from onyx.configs.constants import (
     POSTGRES_CELERY_BEAT_REGULATORY_INDEXING_APP_NAME,
+    OnyxRedisLocks,
 )
 from onyx.db.engine.sql_engine import SqlEngine
 from onyx.db.engine.tenant_utils import get_all_tenant_ids
+from onyx.redis.redis_pool import get_redis_client
 from shared_configs.configs import IGNORED_SYNCING_TENANT_LIST
 
 task_logger = get_task_logger(__name__)
@@ -31,12 +36,68 @@ class RegulatoryIndexingScheduler(PersistentScheduler):
     """Tenant-aware production-lite schedule with no full-runtime tasks."""
 
     RELOAD_INTERVAL_SECONDS = 60
+    DISPATCH_CLAIM_TTL_MULTIPLIER = 2
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._reload_interval = timedelta(seconds=self.RELOAD_INTERVAL_SECONDS)
         self._last_reload = self.app.now() - self._reload_interval
         self._liveness_probe_path = make_probe_path("liveness", _BEAT_HOSTNAME)
+        self._readiness_probe_path = make_probe_path("readiness", _BEAT_HOSTNAME)
+        self._instance_marker = f"{os.getpid()}:{uuid4().hex}"
+
+    def clear_probes(self) -> None:
+        self._readiness_probe_path.unlink(missing_ok=True)
+        self._liveness_probe_path.unlink(missing_ok=True)
+
+    def mark_alive(self) -> None:
+        self._liveness_probe_path.write_text(self._instance_marker, encoding="utf-8")
+
+    def mark_ready(self) -> None:
+        self.mark_alive()
+        self._readiness_probe_path.write_text(self._instance_marker, encoding="utf-8")
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            self.clear_probes()
+
+    @staticmethod
+    def _interval_seconds(entry: Any) -> int:
+        schedule = getattr(entry.schedule, "run_every", entry.schedule)
+        if not isinstance(schedule, timedelta):
+            raise TypeError(f"Unsupported regulatory Beat schedule: {schedule!r}")
+        return max(1, math.ceil(schedule.total_seconds()))
+
+    def _claim_dispatch_slot(self, entry: Any) -> bool:
+        tenant_id = entry.kwargs.get("tenant_id")
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValueError(f"Beat entry {entry.name} has no tenant_id")
+        interval_seconds = self._interval_seconds(entry)
+        utc_slot = int(self.app.now().timestamp() // interval_seconds)
+        claim_ttl = interval_seconds * self.DISPATCH_CLAIM_TTL_MULTIPLIER
+        claim_key = (
+            f"{OnyxRedisLocks.REGULATORY_INDEXING_BEAT_DISPATCH_PREFIX}:"
+            f"{entry.name}:{utc_slot}"
+        )
+        redis_client = get_redis_client(tenant_id=tenant_id)
+        return bool(
+            redis_client.set(
+                claim_key,
+                self._instance_marker,
+                ex=claim_ttl,
+                nx=True,
+            )
+        )
+
+    def apply_entry(self, entry: Any, producer: Any = None) -> None:
+        if not self._claim_dispatch_slot(entry):
+            task_logger.debug(
+                "Another Beat replica owns dispatch slot for %s", entry.name
+            )
+            return
+        super().apply_entry(entry, producer=producer)
 
     def tick(self) -> float:  # ty: ignore[invalid-method-override]
         next_interval = super().tick()
@@ -44,7 +105,7 @@ class RegulatoryIndexingScheduler(PersistentScheduler):
         if now - self._last_reload >= self._reload_interval:
             try:
                 self.update_schedule()
-                self._liveness_probe_path.touch()
+                self.mark_alive()
             except Exception:
                 task_logger.exception(
                     "Failed to refresh the regulatory indexing Beat schedule"
@@ -123,17 +184,19 @@ class RegulatoryIndexingScheduler(PersistentScheduler):
 @beat_init.connect
 def on_beat_init(sender: Any, **kwargs: Any) -> None:
     task_logger.info("regulatory indexing beat_init signal received")
+    scheduler: RegulatoryIndexingScheduler = sender.scheduler
+    scheduler.clear_probes()
+
     SqlEngine.set_app_name(POSTGRES_CELERY_BEAT_REGULATORY_INDEXING_APP_NAME)
     SqlEngine.init_engine(pool_size=2, max_overflow=0)
     app_base.wait_for_redis(sender, **kwargs)
     app_base.wait_for_db(sender, **kwargs)
 
-    scheduler: RegulatoryIndexingScheduler = sender.scheduler
     scheduler.update_schedule()
-    make_probe_path("liveness", _BEAT_HOSTNAME).touch()
-    readiness_path = make_probe_path("readiness", _BEAT_HOSTNAME)
-    readiness_path.touch()
-    task_logger.info("Regulatory indexing Beat is ready at %s", readiness_path)
+    scheduler.mark_ready()
+    task_logger.info(
+        "Regulatory indexing Beat is ready at %s", scheduler._readiness_probe_path
+    )
 
 
 @signals.setup_logging.connect

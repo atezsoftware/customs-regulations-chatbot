@@ -534,6 +534,9 @@ class OnyxRedisLocks:
 
     CLOUD_BEAT_TASK_GENERATOR_LOCK = "da_lock:cloud_beat_task_generator"
     CLOUD_CHECK_ALEMBIC_BEAT_LOCK = "da_lock:cloud_check_alembic"
+    REGULATORY_INDEXING_BEAT_DISPATCH_PREFIX = (
+        "da_lock:regulatory_indexing_beat_dispatch"
+    )
 
     # User file processing
     USER_FILE_PROCESSING_BEAT_LOCK = "da_lock:check_user_file_processing_beat"

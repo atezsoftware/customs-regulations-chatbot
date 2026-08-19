@@ -89,10 +89,12 @@ services:
         - -c
         - |
           import subprocess
+          from onyx.background.celery.regulatory_indexing_beat_health import validate_regulatory_indexing_beat
           result = subprocess.run(["supervisorctl", "status"], capture_output=True, text=True)
           rows = [line.split() for line in result.stdout.splitlines() if line.split()]
           expected = {"celery_worker_regulatory_benchmark", "celery_beat", "celery_worker_user_file_processing", "celery_worker_regulatory_indexing", "celery_worker_light", "celery_worker_monitoring", "celery_beat_regulatory_indexing", "log-redirect-handler"}
           assert result.returncode == 0 and {row[0] for row in rows} == expected and all(len(row) > 1 and row[1] == "RUNNING" for row in rows)
+          validate_regulatory_indexing_beat(result.stdout)
       interval: 30s
       timeout: 10s
       retries: 3

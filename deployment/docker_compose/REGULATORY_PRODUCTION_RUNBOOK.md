@@ -516,6 +516,9 @@ scheduler:
     - monitor_celery_queues
   readiness_file: /tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt
   liveness_file: /tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt
+  liveness_max_age_seconds: 150
+  probe_marker: pid:instance_uuid
+  dispatch_dedup: redis_tenant_entry_utc_slot_set_nx_ex
 forbidden_queues:
   - primary
   - docfetching
@@ -535,11 +538,25 @@ operations:
 
 The background container healthcheck requires exactly five workers, the dedicated regulatory
 indexing Beat, and the log redirector—seven supervisor processes total—and requires every process to
-be `RUNNING`. The Beat keeps its scheduler state in the mounted background log volume, regenerates
-every per-tenant entry from PostgreSQL before readiness and after a restart, and contains only stale
-regulatory indexing recovery (one minute) and queue monitoring (ten seconds). It never loads the
-generic/full-runtime Beat schedule. Readiness requires the exact worker
-and Beat probe files above; Beat liveness must continue updating after startup. `active_queues` must
+be `RUNNING`. Each pod keeps its Beat shelf at pod-local
+`/tmp/regulatory-indexing-beat-schedule`, regenerates every per-tenant entry from PostgreSQL before
+readiness and after a restart, and contains only stale regulatory indexing recovery (one minute) and
+queue monitoring (ten seconds). It never loads the generic/full-runtime Beat schedule. A corrupt
+pod-local shelf is discarded and rebuilt; no shelf is shared between replicas.
+
+Multiple background replicas are safe without a Helm singleton setting. Before dispatch, every Beat
+claims a tenant-prefixed Redis key containing the schedule entry and UTC interval slot with atomic
+`SET NX EX`. Only the claimant publishes that tenant/slot; followers remain healthy and try later
+slots. The bounded claim expiry allows takeover after a failed claimant and Redis failure prevents
+an uncoordinated publish. The PostgreSQL job table—not the Beat shelf or Redis claim—is the durable
+indexing scheduler/source of truth.
+
+At each Beat process start, stale readiness and liveness files are removed before Redis/DB waits.
+After dependency and schedule initialization both files contain the current supervisor PID plus a
+unique instance UUID. Shutdown removes them where Celery can close cleanly. Liveness is rewritten
+only after a successful schedule refresh, and Compose/CodeBuild reject a marker for another PID,
+different instance markers, or liveness older than 150 seconds. Followers do not need to own a
+dispatch slot to remain ready. `active_queues` must
 match only the queues declared above. Primary, docfetching, docprocessing, generic indexing, and
 Elasticsearch-migration workers/queues are forbidden; `user_file_processing` is required on the
 dedicated regulatory indexing worker.

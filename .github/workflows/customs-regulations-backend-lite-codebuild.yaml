@@ -351,8 +351,6 @@ jobs:
             local pod
             local container
             local beat_status
-            local readiness_file="/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt"
-            local liveness_file="/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt"
 
             echo "Waiting for the production-lite regulatory indexing Beat to become ready"
             for attempt in {1..60}; do
@@ -364,7 +362,7 @@ jobs:
                   echo "$beat_status"
                   if grep -Eq '^celery_beat_regulatory_indexing[[:space:]]+RUNNING([[:space:]]|$)' <<<"$beat_status" && \
                     kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
-                      test -f "$readiness_file" -a -f "$liveness_file"; then
+                      python -m onyx.background.celery.regulatory_indexing_beat_health; then
                     echo "Production-lite regulatory indexing Beat is ready in pod $pod"
                     return 0
                   fi

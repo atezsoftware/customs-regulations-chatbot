@@ -90,6 +90,18 @@ Beat readiness ve liveness dosyaları sırasıyla
 docfetching, docprocessing, generic indexing ve Elasticsearch migration queue'ları bu topolojide
 yasaktır. `user_file_processing` ise yalnız özel regulatory indexing worker üzerinde zorunludur.
 
+Her background podu kendi Beat process'ini çalıştırabilir. Shelf pod-local
+`/tmp/regulatory-indexing-beat-schedule` altında kalır; replica'lar aynı dosyayı paylaşmaz. Yayın
+öncesinde tenant + schedule entry + UTC time-slot için bounded TTL'li Redis `SET NX EX` claim alınır;
+aynı slotu yalnız bir replica yayınlar, follower healthy kalır ve TTL sonrasında takeover mümkündür.
+External Helm replica sayısının bir olduğu varsayılmaz.
+
+Beat başlangıcında eski readiness/liveness dosyaları Redis ve PostgreSQL beklenmeden önce silinir.
+Yeni dosyalar supervisor'daki güncel PID ve instance UUID'sini taşır. Compose ve CodeBuild PID/instance
+eşleşmesini ve liveness mtime değerinin en fazla 150 saniye olmasını çalıştırarak doğrular; yalnız
+dosya varlığı kabul edilmez. Başarısız schedule refresh liveness'ı yenilemez, kontrollü shutdown iki
+probe'u siler. Follower replica'nın dispatch claim sahibi olması readiness şartı değildir.
+
 Mevcut dört servisli kurulumdan geçiliyorsa model-server podu önce drain/stop edilmeli ve eski
 Deployment/Service kaldırılmalıdır. Ardından cloud preflight ve üç servisli rollout çalıştırılır;
 preflight çalışan eski veya başka projeye ait model-server container/podunu bilinçli olarak blocker
