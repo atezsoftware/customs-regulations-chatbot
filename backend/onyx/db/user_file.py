@@ -288,15 +288,27 @@ def filter_existing_user_file_ids(
 
 
 def lock_completed_user_file_for_projection(
-    db_session: Session, user_file_id: UUID
+    db_session: Session,
+    user_file_id: UUID,
+    *,
+    include_chunked: bool = False,
 ) -> UserFile | None:
-    """Serialize canonical projection with file deletion and other projectors."""
+    """Serialize canonical projection with file deletion and other projectors.
+
+    Only COMPLETED files project by default, so edits to a file still awaiting an
+    explicit index request stay in Postgres. The explicit index request itself
+    opts in with `include_chunked`.
+    """
+
+    statuses = [UserFileStatus.COMPLETED]
+    if include_chunked:
+        statuses.append(UserFileStatus.CHUNKED)
 
     return db_session.scalar(
         select(UserFile)
         .where(
             UserFile.id == user_file_id,
-            UserFile.status == UserFileStatus.COMPLETED,
+            UserFile.status.in_(statuses),
         )
         .with_for_update()
     )

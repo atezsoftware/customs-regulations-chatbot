@@ -409,12 +409,18 @@ def project_user_file_to_index(
     db_session: Session,
     user_file: UserFile,
     tenant_id: str,
+    *,
+    include_chunked: bool = False,
 ) -> int:
-    """Embed and replace one file from its rows in PRESENT and FUTURE indices."""
+    """Embed and replace one file from its rows in PRESENT and FUTURE indices.
+
+    `include_chunked` admits files that have chunks but were never indexed, which
+    is what an explicit index request needs.
+    """
 
     user_file_id = str(user_file.id)
     locked_user_file = lock_completed_user_file_for_projection(
-        db_session, UUID(user_file_id)
+        db_session, UUID(user_file_id), include_chunked=include_chunked
     )
     if locked_user_file is None:
         logger.info(

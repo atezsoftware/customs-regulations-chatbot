@@ -199,3 +199,9 @@ class DocumentSetSummary(BaseModel):
                 if fc_mapping.federated_connector is not None
             ],
         )
+
+
+class IndexChunkedFilesResponse(BaseModel):
+    """How many reviewed files were handed to the indexing worker."""
+
+    queued: int

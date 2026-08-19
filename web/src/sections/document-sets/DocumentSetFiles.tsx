@@ -12,6 +12,7 @@ import {
   SvgFolderPlus,
   SvgMinusCircle,
   SvgPlus,
+  SvgSearchMenu,
 } from "@opal/icons";
 
 import type { ProjectFile } from "@/lib/projects/types";
@@ -20,6 +21,8 @@ import { useSettings } from "@/lib/settings/hooks";
 import {
   getDocumentSetFiles,
   getDocumentSetFilesKey,
+  indexDocumentSetChunkedFiles,
+  indexDocumentSetFile,
   unlinkFileFromDocumentSet,
   uploadDocumentSetFiles,
 } from "@/app/admin/documents/sets/lib";
@@ -158,6 +161,8 @@ export default function DocumentSetFiles({
   const [selectedFile, setSelectedFile] = useState<ProjectFile | null>(null);
   const [uploading, setUploading] = useState(false);
   const [removingFileId, setRemovingFileId] = useState<string | null>(null);
+  const [indexingFileId, setIndexingFileId] = useState<string | null>(null);
+  const [indexingAll, setIndexingAll] = useState(false);
 
   const {
     data: files,
@@ -206,6 +211,45 @@ export default function DocumentSetFiles({
     },
     [documentSetId, refreshFiles]
   );
+
+  const chunkedFiles = files?.filter(
+    (file) => file.status === UserFileStatus.CHUNKED
+  );
+
+  const handleIndexFile = useCallback(
+    async (file: ProjectFile) => {
+      setIndexingFileId(file.id);
+      try {
+        await indexDocumentSetFile(documentSetId, file.id);
+        toast.success(`Indexing ${file.name}.`);
+        await refreshFiles();
+      } catch (requestError) {
+        toast.error(
+          requestError instanceof Error
+            ? requestError.message
+            : "Indexing failed."
+        );
+      } finally {
+        setIndexingFileId(null);
+      }
+    },
+    [documentSetId, refreshFiles]
+  );
+
+  const handleIndexAllChunked = useCallback(async () => {
+    setIndexingAll(true);
+    try {
+      const { queued } = await indexDocumentSetChunkedFiles(documentSetId);
+      toast.success(`Indexing ${queued} file(s).`);
+      await refreshFiles();
+    } catch (requestError) {
+      toast.error(
+        requestError instanceof Error ? requestError.message : "Indexing failed."
+      );
+    } finally {
+      setIndexingAll(false);
+    }
+  }, [documentSetId, refreshFiles]);
 
   const handleRemoveFile = useCallback(
     async (file: ProjectFile) => {
@@ -299,6 +343,21 @@ export default function DocumentSetFiles({
         </div>
       ) : (
         <div className="flex flex-col gap-2">
+          {chunkedFiles && chunkedFiles.length > 0 && (
+            <div className="flex items-center gap-2">
+              <Button
+                icon={SvgSearchMenu}
+                prominence="secondary"
+                disabled={indexingAll}
+                onClick={() => void handleIndexAllChunked()}
+              >
+                {`Index all chunked (${chunkedFiles.length})`}
+              </Button>
+              <Text font="main-ui-body" color="text-03">
+                Chunks are ready to review; indexing makes them searchable.
+              </Text>
+            </div>
+          )}
           {files.map((file) => (
             <LineItemButton
               key={file.id}
@@ -315,6 +374,16 @@ export default function DocumentSetFiles({
                 >
                   {ACTIVE_FILE_STATUSES.has(file.status) && (
                     <Tag title="Processing" />
+                  )}
+                  {file.status === UserFileStatus.CHUNKED && (
+                    <Button
+                      prominence="secondary"
+                      size="sm"
+                      disabled={indexingFileId === file.id}
+                      onClick={() => void handleIndexFile(file)}
+                    >
+                      Index
+                    </Button>
                   )}
                   <Button
                     variant="danger"

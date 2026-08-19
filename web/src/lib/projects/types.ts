@@ -47,6 +47,8 @@ export enum UserFileStatus {
   UPLOADING = "UPLOADING", //UI only
   PROCESSING = "PROCESSING",
   INDEXING = "INDEXING",
+  // Chunks written and reviewable; nothing indexed until explicitly requested.
+  CHUNKED = "CHUNKED",
   COMPLETED = "COMPLETED",
   SKIPPED = "SKIPPED",
   FAILED = "FAILED",

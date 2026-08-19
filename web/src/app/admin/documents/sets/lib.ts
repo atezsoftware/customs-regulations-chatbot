@@ -164,3 +164,29 @@ export async function unlinkFileFromDocumentSet(
     throwDocumentSetFileRequestError("Remove file from document set", response);
   }
 }
+
+export async function indexDocumentSetFile(
+  documentSetId: number,
+  userFileId: string
+): Promise<void> {
+  const response = await fetch(
+    `${documentSetFileEndpoint(documentSetId, userFileId)}/index`,
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    throwDocumentSetFileRequestError("Index document set file", response);
+  }
+}
+
+export async function indexDocumentSetChunkedFiles(
+  documentSetId: number
+): Promise<{ queued: number }> {
+  const response = await fetch(
+    `/api/manage/admin/document-set/${documentSetId}/index-chunked`,
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    throwDocumentSetFileRequestError("Index document set files", response);
+  }
+  return response.json();
+}

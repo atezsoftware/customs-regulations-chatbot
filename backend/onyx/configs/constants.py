@@ -617,6 +617,7 @@ class OnyxCeleryTask:
     # User file processing
     CHECK_FOR_USER_FILE_PROCESSING = "check_for_user_file_processing"
     PROCESS_SINGLE_USER_FILE = "process_single_user_file"
+    INDEX_SINGLE_USER_FILE = "index_single_user_file"
     CHECK_FOR_USER_FILE_PROJECT_SYNC = "check_for_user_file_project_sync"
     PROCESS_SINGLE_USER_FILE_PROJECT_SYNC = "process_single_user_file_project_sync"
     CHECK_FOR_USER_FILE_DELETE = "check_for_user_file_delete"

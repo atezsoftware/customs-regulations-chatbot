@@ -8,7 +8,12 @@ from onyx.auth.permissions import require_permission
 from onyx.auth.users import current_curator_or_admin_user
 from onyx.background.celery.versioned_apps.client import app as client_app
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
-from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryTask
+from onyx.configs.constants import (
+    CELERY_USER_FILE_PROCESSING_TASK_EXPIRES,
+    OnyxCeleryPriority,
+    OnyxCeleryQueues,
+    OnyxCeleryTask,
+)
 from onyx.db.document_set import (
     check_document_sets_are_public,
     fetch_all_document_sets_for_user,
@@ -25,7 +30,7 @@ from onyx.db.document_set import (
 )
 from onyx.db.document_set import delete_document_set as db_delete_document_set
 from onyx.db.engine.sql_engine import get_session
-from onyx.db.enums import Permission
+from onyx.db.enums import Permission, UserFileStatus
 from onyx.db.models import DocumentSet as DocumentSetDBModel
 from onyx.db.models import User
 from onyx.db.projects import upload_files_to_user_files_with_indexing
@@ -39,6 +44,7 @@ from onyx.server.features.document_set.models import (
     DocumentSetCreationRequest,
     DocumentSetSummary,
     DocumentSetUpdateRequest,
+    IndexChunkedFilesResponse,
 )
 from onyx.server.features.projects.models import (
     CategorizedFilesSnapshot,
@@ -245,6 +251,61 @@ def upload_document_set_files(
         background_tasks=bg_tasks if DISABLE_VECTOR_DB else None,
     )
     return CategorizedFilesSnapshot.from_result(categorized_files_result)
+
+
+def _enqueue_user_file_indexing(user_file_id: UUID, tenant_id: str) -> None:
+    client_app.send_task(
+        OnyxCeleryTask.INDEX_SINGLE_USER_FILE,
+        kwargs={"user_file_id": str(user_file_id), "tenant_id": tenant_id},
+        queue=OnyxCeleryQueues.USER_FILE_PROCESSING,
+        priority=OnyxCeleryPriority.HIGH,
+        expires=CELERY_USER_FILE_PROCESSING_TASK_EXPIRES,
+    )
+
+
+@router.post("/admin/document-set/{document_set_id}/files/{file_id}/index")
+def index_document_set_file(
+    document_set_id: int,
+    file_id: UUID,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> UserFileSnapshot:
+    """Project one reviewed file's chunks into the search index."""
+
+    _get_editable_document_set_or_raise(document_set_id, user, db_session)
+    user_file = get_user_file_for_document_set_management(db_session, file_id, user)
+    if user_file is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "File not found")
+    if user_file.status != UserFileStatus.CHUNKED:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            f"Only chunked files can be indexed; this one is {user_file.status.value}",
+        )
+
+    _enqueue_user_file_indexing(user_file.id, tenant_id)
+    return UserFileSnapshot.from_model(user_file)
+
+
+@router.post("/admin/document-set/{document_set_id}/index-chunked")
+def index_document_set_chunked_files(
+    document_set_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> IndexChunkedFilesResponse:
+    """Index every reviewed file in the set, for bulk uploads."""
+
+    _get_editable_document_set_or_raise(document_set_id, user, db_session)
+    chunked_files = [
+        user_file
+        for user_file in fetch_user_files_for_document_set(db_session, document_set_id)
+        if user_file.status == UserFileStatus.CHUNKED
+    ]
+    for user_file in chunked_files:
+        _enqueue_user_file_indexing(user_file.id, tenant_id)
+
+    return IndexChunkedFilesResponse(queued=len(chunked_files))
 
 
 @router.post("/admin/document-set/{document_set_id}/files/{file_id}")

@@ -20,6 +20,7 @@ from onyx.background.celery.celery_utils import httpx_init_vespa_pool
 from onyx.background.celery.tasks.shared.RetryDocumentIndex import RetryDocumentIndex
 from onyx.configs.app_configs import (
     CELERY_WORKER_USER_FILE_PROCESSING_CONCURRENCY,
+    DEFER_USER_FILE_INDEXING,
     DISABLE_VECTOR_DB,
     MANAGED_VESPA,
     VESPA_CLOUD_CERT_PATH,
@@ -88,11 +89,17 @@ from onyx.indexing.adapters.user_file_indexing_adapter import (
 )
 from onyx.indexing.contextual_settings import effective_contextual_rag_enabled
 from onyx.indexing.embedder import DefaultIndexingEmbedder
-from onyx.indexing.indexing_pipeline import run_indexing_pipeline
+from onyx.indexing.indexing_pipeline import (
+    process_image_sections,
+    run_indexing_pipeline,
+)
 from onyx.redis.redis_pool import get_redis_client
 from onyx.redis.tenant_redis_client import TenantRedisClient
 from onyx.regulatory.indexing import RegulatoryIndexingChunker
-from onyx.regulatory.projection import _project_rows_to_search_settings
+from onyx.regulatory.projection import (
+    _project_rows_to_search_settings,
+    project_user_file_to_index,
+)
 from onyx.utils.variable_functionality import global_version
 
 _USER_FILE_PROJECT_SYNC_QUEUE_TARGET_DEPTH = max(
@@ -491,6 +498,126 @@ def _load_user_file_documents(
     return documents, staged_csv_ids
 
 
+def _chunk_user_file_without_indexing(
+    user_file_id: str,
+    documents: list[Document],
+    tenant_id: str,
+) -> None:
+    """Phase one: write the file's regulatory chunks, index nothing.
+
+    Uses the same chunker the indexing path uses, so a later index pass cannot
+    shift chunk boundaries. Deliberately does not touch the embedder, the
+    contextual retrieval model, or any document index -- chunking needs none of
+    them, which is what lets an operator review chunks on a deployment that has
+    no contextualization model configured yet.
+    """
+
+    with get_session_with_current_tenant() as db_session:
+        user_file = db_session.get(UserFile, _as_uuid(user_file_id))
+        if user_file is None or user_file.status == UserFileStatus.DELETING:
+            task_logger.info(
+                f"_chunk_user_file_without_indexing - user file {user_file_id} is gone "
+                "or being deleted; skipping"
+            )
+            return
+
+        search_settings_list = get_active_search_settings_list(db_session)
+        current_search_settings = next(
+            (ss for ss in search_settings_list if ss.status.is_current()),
+            None,
+        )
+        if current_search_settings is None:
+            raise RuntimeError(
+                "_chunk_user_file_without_indexing - No current search settings found "
+                f"for tenant={tenant_id}"
+            )
+
+        # The embedder is built only for its tokenizer: chunk sizing is measured
+        # in embedding tokens, so the boundaries must be computed against it.
+        embedding_model = DefaultIndexingEmbedder.from_db_search_settings(
+            search_settings=current_search_settings,
+        )
+        chunker = RegulatoryIndexingChunker(
+            db_session=db_session,
+            tokenizer=embedding_model.embedding_model.tokenizer,
+            enable_contextual_rag=effective_contextual_rag_enabled(
+                current_search_settings
+            ),
+        )
+        # The same Document -> IndexingDocument conversion the pipeline performs,
+        # so the chunker sees exactly the sections it would see when indexing.
+        indexable_documents = process_image_sections(documents)
+        # Writes the chunk rows; the emitted DocAwareChunks belong to the
+        # indexing phase and are discarded here.
+        chunker.chunk(indexable_documents)
+
+        rows = get_chunks_for_file(db_session, _as_uuid(user_file_id))
+        if not rows:
+            raise RuntimeError(
+                f"_chunk_user_file_without_indexing - produced no chunks for {user_file_id}"
+            )
+
+        if user_file.status != UserFileStatus.DELETING:
+            user_file.status = UserFileStatus.CHUNKED
+        user_file.chunk_count = len(rows)
+        db_session.add(user_file)
+        # The session does not commit on exit, and the chunk rows were written
+        # into this same transaction.
+        db_session.commit()
+
+    text = " ".join(
+        section_text
+        for document in documents
+        for section in document.sections
+        if (section_text := section.materialize_text())
+    )
+    store_user_file_plaintext(
+        user_file_id=_as_uuid(user_file_id), plaintext_content=text
+    )
+
+    task_logger.info(
+        f"_chunk_user_file_without_indexing - Chunked id={user_file_id} "
+        f"chunks={len(rows)}; awaiting an explicit index request"
+    )
+
+
+def index_user_file_impl(*, user_file_id: str, tenant_id: str) -> None:
+    """Phase two: project already-written chunk rows into the search index."""
+
+    try:
+        with get_session_with_current_tenant() as db_session:
+            user_file = db_session.get(UserFile, _as_uuid(user_file_id))
+            if user_file is None or user_file.status == UserFileStatus.DELETING:
+                task_logger.info(
+                    f"index_user_file_impl - user file {user_file_id} is gone or being "
+                    "deleted; skipping"
+                )
+                return
+
+            chunk_count = project_user_file_to_index(
+                db_session, user_file, tenant_id, include_chunked=True
+            )
+            if user_file.status != UserFileStatus.DELETING:
+                user_file.status = UserFileStatus.COMPLETED
+            db_session.add(user_file)
+            db_session.commit()
+    except Exception:
+        task_logger.exception(
+            f"index_user_file_impl - Failed to index user file {user_file_id}"
+        )
+        with get_session_with_current_tenant() as db_session:
+            user_file = db_session.get(UserFile, _as_uuid(user_file_id))
+            if user_file is not None and user_file.status != UserFileStatus.DELETING:
+                user_file.status = UserFileStatus.FAILED
+                db_session.add(user_file)
+                db_session.commit()
+        raise
+
+    task_logger.info(
+        f"index_user_file_impl - Indexed id={user_file_id} chunks={chunk_count}"
+    )
+
+
 def _process_user_file_with_indexing(
     user_file_id: str,
     documents: list[Document],
@@ -866,6 +993,12 @@ def process_user_file_impl(
                         user_file_id=user_file_id,
                         documents=documents,
                     )
+                elif DEFER_USER_FILE_INDEXING:
+                    _chunk_user_file_without_indexing(
+                        user_file_id=user_file_id,
+                        documents=documents,
+                        tenant_id=tenant_id,
+                    )
                 else:
                     _process_user_file_with_indexing(
                         user_file_id=user_file_id,
@@ -928,6 +1061,20 @@ def process_single_user_file(
     process_user_file_impl(
         user_file_id=user_file_id, tenant_id=tenant_id, redis_locking=True
     )
+
+
+@shared_task(
+    name=OnyxCeleryTask.INDEX_SINGLE_USER_FILE,
+    bind=True,
+    ignore_result=True,
+)
+def index_single_user_file(
+    self: Task,  # noqa: ARG001
+    *,
+    user_file_id: str,
+    tenant_id: str,
+) -> None:
+    index_user_file_impl(user_file_id=user_file_id, tenant_id=tenant_id)
 
 
 @shared_task(

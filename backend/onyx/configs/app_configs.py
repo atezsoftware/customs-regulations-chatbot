@@ -90,6 +90,15 @@ MARKDOWN_IMPORT_ENABLED = (
     os.environ.get("MARKDOWN_IMPORT_ENABLED", "false").lower() == "true"
 )
 
+# Splits ingestion into two phases: uploading a file writes its regulatory chunks
+# and stops, and indexing is triggered explicitly afterwards. Lets an operator
+# review chunk boundaries before anything becomes searchable, and keeps chunk
+# production working where no contextual retrieval model is configured (only the
+# indexing phase needs one). Off means the historical upload-and-index flow.
+DEFER_USER_FILE_INDEXING = (
+    os.environ.get("DEFER_USER_FILE_INDEXING", "false").lower() == "true"
+)
+
 # Disables vector DB (Vespa/Elasticsearch) entirely. When True, connectors and RAG search
 # are disabled but core chat, tools, user file uploads, and Projects still work.
 DISABLE_VECTOR_DB = os.environ.get("DISABLE_VECTOR_DB", "").lower() == "true"

@@ -61,7 +61,7 @@ def test_projection_writes_present_before_future_and_keeps_canonical_rows() -> N
         count = project_user_file_to_index(MagicMock(), user_file, "tenant")
 
     assert count == 2
-    lock_user_file.assert_called_once_with(ANY, user_file.id)
+    lock_user_file.assert_called_once_with(ANY, user_file.id, include_chunked=False)
     assert [item.kwargs["search_settings"] for item in project_one.call_args_list] == [
         present,
         future,
@@ -162,7 +162,7 @@ def test_projection_skips_file_that_cannot_be_locked_as_completed() -> None:
         count = project_user_file_to_index(MagicMock(), user_file, "tenant")
 
     assert count == 0
-    lock_user_file.assert_called_once_with(ANY, user_file.id)
+    lock_user_file.assert_called_once_with(ANY, user_file.id, include_chunked=False)
     get_rows.assert_not_called()
     project_rows.assert_not_called()
 

@@ -282,6 +282,9 @@ class EmbeddingPrecision(str, PyEnum):
 class UserFileStatus(str, PyEnum):
     PROCESSING = "PROCESSING"
     INDEXING = "INDEXING"
+    # Chunks are written and inspectable; nothing has reached the search index.
+    # Only reachable where DEFER_USER_FILE_INDEXING splits the two phases.
+    CHUNKED = "CHUNKED"
     COMPLETED = "COMPLETED"
     SKIPPED = "SKIPPED"
     FAILED = "FAILED"

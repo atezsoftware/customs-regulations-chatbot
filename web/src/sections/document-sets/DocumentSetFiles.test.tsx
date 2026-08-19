@@ -1,16 +1,23 @@
 import { render, screen, setupUser, waitFor } from "@tests/setup/test-utils";
 import DocumentSetFiles from "@/sections/document-sets/DocumentSetFiles";
+import { UserFileStatus } from "@/lib/projects/types";
 
 const mockUploadDocumentSetFiles = jest.fn();
+const mockGetDocumentSetFiles = jest.fn();
+const mockIndexDocumentSetFile = jest.fn();
+const mockIndexDocumentSetChunkedFiles = jest.fn();
 
 jest.mock("@/app/admin/documents/sets/lib", () => ({
   __esModule: true,
-  getDocumentSetFiles: jest.fn().mockResolvedValue([]),
+  getDocumentSetFiles: (...args: unknown[]) => mockGetDocumentSetFiles(...args),
   getDocumentSetFilesKey: (documentSetId: number) =>
     `document-set-files-${documentSetId}`,
   unlinkFileFromDocumentSet: jest.fn().mockResolvedValue(undefined),
   uploadDocumentSetFiles: (...args: unknown[]) =>
     mockUploadDocumentSetFiles(...args),
+  indexDocumentSetFile: (...args: unknown[]) => mockIndexDocumentSetFile(...args),
+  indexDocumentSetChunkedFiles: (...args: unknown[]) =>
+    mockIndexDocumentSetChunkedFiles(...args),
 }));
 
 const mockUseSettings = jest.fn();
@@ -35,6 +42,12 @@ beforeEach(() => {
     document_import_enabled: true,
     markdown_import_enabled: true,
   });
+  mockGetDocumentSetFiles.mockReset();
+  mockGetDocumentSetFiles.mockResolvedValue([]);
+  mockIndexDocumentSetFile.mockReset();
+  mockIndexDocumentSetFile.mockResolvedValue(undefined);
+  mockIndexDocumentSetChunkedFiles.mockReset();
+  mockIndexDocumentSetChunkedFiles.mockResolvedValue({ queued: 1 });
   mockUploadDocumentSetFiles.mockReset();
   mockUploadDocumentSetFiles.mockResolvedValue({
     user_files: [],
@@ -123,6 +136,61 @@ describe("when the runtime cannot ingest anything", () => {
     ).toBeInTheDocument();
     expect(
       screen.queryByLabelText("Upload archive to document set")
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("indexing reviewed chunks", () => {
+  const chunkedFile = {
+    id: "file-1",
+    name: "mevzuat/1975_tir_sozlesmesi.md",
+    status: UserFileStatus.CHUNKED,
+    chunk_count: 223,
+  };
+
+  beforeEach(() => {
+    mockGetDocumentSetFiles.mockResolvedValue([chunkedFile]);
+  });
+
+  test("offers to index a file whose chunks are ready for review", async () => {
+    renderFiles();
+
+    expect(
+      await screen.findByRole("button", { name: /^index$/i })
+    ).toBeInTheDocument();
+  });
+
+  test("offers a bulk action for every chunked file in the set", async () => {
+    renderFiles();
+
+    expect(
+      await screen.findByRole("button", { name: /index all chunked \(1\)/i })
+    ).toBeInTheDocument();
+  });
+
+  test("indexes the file through the document set endpoint", async () => {
+    const user = setupUser();
+    renderFiles();
+
+    await user.click(await screen.findByRole("button", { name: /^index$/i }));
+
+    await waitFor(() => {
+      expect(mockIndexDocumentSetFile).toHaveBeenCalledWith(7, "file-1");
+    });
+  });
+
+  test("hides the indexing actions once a file is indexed", async () => {
+    mockGetDocumentSetFiles.mockResolvedValue([
+      { ...chunkedFile, status: UserFileStatus.COMPLETED },
+    ]);
+    renderFiles();
+
+    expect(await screen.findByText(/223 chunks/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^index$/i })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /index all chunked/i })
     ).not.toBeInTheDocument();
   });
 });
