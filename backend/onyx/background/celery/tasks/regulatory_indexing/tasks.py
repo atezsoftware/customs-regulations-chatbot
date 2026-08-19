@@ -43,6 +43,7 @@ def enqueue_regulatory_indexing_step(
     expected_generation: int,
     tenant_id: str,
     delivery_kind: OrchestrationDeliveryKind,
+    recovery_token: UUID | None = None,
     countdown_seconds: float = 0,
 ) -> None:
     if not tenant_id.strip():
@@ -54,6 +55,12 @@ def enqueue_regulatory_indexing_step(
         "tenant_id": tenant_id,
         "delivery_kind": delivery_kind.value,
     }
+    if delivery_kind is OrchestrationDeliveryKind.PRECLAIMED:
+        if recovery_token is None:
+            raise ValueError("preclaimed delivery requires a recovery token")
+        kwargs["recovery_token"] = str(recovery_token)
+    elif recovery_token is not None:
+        raise ValueError("normal delivery must not include a recovery token")
     if countdown_seconds > 0:
         celery_app.send_task(
             OnyxCeleryTask.REGULATORY_INDEXING_RUN_STEP,
@@ -85,22 +92,27 @@ def regulatory_indexing_run_step(
     expected_generation: int,
     tenant_id: str,
     delivery_kind: str = OrchestrationDeliveryKind.NORMAL.value,
+    recovery_token: str | None = None,
 ) -> None:
     kind = OrchestrationDeliveryKind(delivery_kind)
     parsed_job_id = UUID(job_id)
-    result = (
-        run_preclaimed_regulatory_indexing_step(
+    if kind is OrchestrationDeliveryKind.PRECLAIMED:
+        if recovery_token is None:
+            raise ValueError("preclaimed delivery requires a recovery token")
+        result = run_preclaimed_regulatory_indexing_step(
+            parsed_job_id,
+            expected_generation,
+            UUID(recovery_token),
+            tenant_id,
+        )
+    else:
+        if recovery_token is not None:
+            raise ValueError("normal delivery must not include a recovery token")
+        result = run_regulatory_indexing_step(
             parsed_job_id,
             expected_generation,
             tenant_id,
         )
-        if kind is OrchestrationDeliveryKind.PRECLAIMED
-        else run_regulatory_indexing_step(
-            parsed_job_id,
-            expected_generation,
-            tenant_id,
-        )
-    )
     if result.outcome is not OrchestrationOutcome.NEXT_STEP:
         return
     if result.expected_generation is None:
@@ -147,4 +159,5 @@ def regulatory_indexing_recover_stale(self: Task, *, tenant_id: str) -> None:
             expected_generation=claim.lease_generation,
             tenant_id=tenant_id,
             delivery_kind=OrchestrationDeliveryKind.PRECLAIMED,
+            recovery_token=claim.recovery_token,
         )

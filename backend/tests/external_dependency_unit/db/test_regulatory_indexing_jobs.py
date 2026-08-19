@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from onyx.db import regulatory_indexing_jobs as regulatory_indexing_job_repository
 from onyx.db.enums import (
+    RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
     RegulatoryIndexingStage,
@@ -29,12 +30,16 @@ from onyx.db.models import (
 from onyx.db.regulatory_chunks import replace_indexed_chunks_for_file
 from onyx.db.regulatory_indexing_jobs import (
     RegulatoryIndexingConfigSnapshot,
+    advance_regulatory_indexing_cancellation,
     advance_regulatory_indexing_job,
     claim_regulatory_indexing_job,
     claim_stale_regulatory_indexing_jobs,
+    complete_regulatory_indexing_publication,
     complete_regulatory_indexing_user_file,
+    consume_preclaimed_regulatory_indexing_delivery,
     create_or_get_regulatory_indexing_item,
     create_or_get_regulatory_indexing_job,
+    finalize_regulatory_indexing_cancellation,
     persist_regulatory_indexing_item_context,
     persist_regulatory_indexing_item_failure,
     persist_regulatory_indexing_item_skipped,
@@ -44,7 +49,9 @@ from onyx.db.regulatory_indexing_jobs import (
     record_vertex_submission_absent,
     record_vertex_submission_intent,
     regulatory_indexing_external_mutation_lease,
+    request_regulatory_indexing_cancellation,
     require_vertex_submission_reconciliation,
+    schedule_regulatory_indexing_cancellation_retry,
     schedule_regulatory_indexing_retry,
 )
 from onyx.document_index.interfaces_new import DocumentIndex
@@ -386,6 +393,11 @@ def test_publish_stage_can_succeed_and_cancellation_can_finish(
         next_status=RegulatoryIndexingJobStatus.CANCELLING,
         now=_NOW,
     )
+    db_session.refresh(cancelled_job)
+    assert (
+        cancelled_job.cancellation_phase
+        == RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
+    )
     assert advance_regulatory_indexing_job(
         db_session,
         job_id=cancelled_job.id,
@@ -536,6 +548,112 @@ def test_simultaneous_recovery_claims_stale_job_once(
     assert [job_id for claimed_ids in results for job_id in claimed_ids] == [job.id]
     db_session.refresh(job)
     assert job.lease_generation == 2
+
+
+def test_preclaimed_recovery_token_has_exactly_one_consumer(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW - datetime.timedelta(minutes=3),
+    )
+    claims = claim_stale_regulatory_indexing_jobs(
+        db_session,
+        stale_before=_NOW - datetime.timedelta(minutes=2),
+        claimed_at=_NOW,
+        limit=1,
+    )
+    assert len(claims) == 1
+    claim = claims[0]
+    engine = db_session.get_bind()
+    barrier = Barrier(2)
+
+    def consume_in_independent_session() -> bool:
+        with Session(engine) as independent_session:
+            barrier.wait(timeout=5)
+            return consume_preclaimed_regulatory_indexing_delivery(
+                independent_session,
+                job_id=claim.job_id,
+                expected_generation=claim.lease_generation,
+                recovery_token=claim.recovery_token,
+                consumed_at=_NOW + datetime.timedelta(seconds=1),
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(lambda _: consume_in_independent_session(), range(2))
+        )
+
+    assert sorted(results) == [False, True]
+
+
+def test_submission_external_lease_prevents_stale_recovery_during_create(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    job.stage = RegulatoryIndexingStage.CONTEXT_SUBMIT.value
+    db_session.commit()
+    assert record_vertex_submission_intent(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key="regulatory-context-" + "c" * 64,
+        now=_NOW,
+    )
+    engine = db_session.get_bind()
+    entered = Event()
+    release = Event()
+
+    def hold_create_lease() -> None:
+        with Session(engine) as create_session:
+            with regulatory_indexing_external_mutation_lease(
+                create_session,
+                job_id=job.id,
+                expected_stage=RegulatoryIndexingStage.CONTEXT_SUBMIT,
+                expected_generation=1,
+            ) as lease:
+                assert lease is not None
+                entered.set()
+                assert release.wait(timeout=5)
+                lease.commit()
+
+    future_time = _NOW + datetime.timedelta(days=1)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        held = executor.submit(hold_create_lease)
+        assert entered.wait(timeout=5)
+        assert (
+            claim_stale_regulatory_indexing_jobs(
+                db_session,
+                stale_before=future_time,
+                claimed_at=future_time,
+                limit=1,
+            )
+            == []
+        )
+        release.set()
+        held.result(timeout=5)
+
+    claims = claim_stale_regulatory_indexing_jobs(
+        db_session,
+        stale_before=future_time,
+        claimed_at=future_time,
+        limit=1,
+    )
+    assert len(claims) == 1
+    assert claims[0].job_id == job.id
 
 
 def test_item_creation_requires_current_running_lease_and_matching_request_hash(
@@ -1332,6 +1450,177 @@ def test_user_file_completion_preserves_cancelled_and_deleting_states(
         assert regulatory_user_file.status is (
             UserFileStatus.COMPLETED if should_complete else initial_status
         )
+
+
+def test_publication_atomically_completes_user_file_and_job(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    job.stage = RegulatoryIndexingStage.PUBLISH.value
+    regulatory_user_file.status = UserFileStatus.INDEXING
+    db_session.commit()
+
+    assert complete_regulatory_indexing_publication(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        chunk_count=2,
+        now=_NOW,
+        commit=True,
+    )
+
+    db_session.refresh(job)
+    db_session.refresh(regulatory_user_file)
+    assert job.status == RegulatoryIndexingJobStatus.SUCCEEDED.value
+    assert job.completed_at == _NOW
+    assert regulatory_user_file.status is UserFileStatus.COMPLETED
+    assert regulatory_user_file.chunk_count == 2
+
+
+def test_cancellation_phases_are_durable_and_generation_fenced(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    job.remote_vertex_job_name = "projects/p/locations/l/batchJobs/1"
+    regulatory_user_file.status = UserFileStatus.DELETING
+    db_session.commit()
+    assert request_regulatory_indexing_cancellation(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    assert job.status == RegulatoryIndexingJobStatus.CANCELLING.value
+    assert (
+        job.cancellation_phase
+        == RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
+    )
+
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        now=_NOW,
+    )
+    assert not advance_regulatory_indexing_cancellation(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        expected_phase=RegulatoryIndexingCancellationPhase.VERTEX_CANCEL,
+        next_phase=RegulatoryIndexingCancellationPhase.GCS_CLEANUP,
+        now=_NOW,
+    )
+    generation = 2
+    for expected_phase, next_phase in (
+        (
+            RegulatoryIndexingCancellationPhase.VERTEX_CANCEL,
+            RegulatoryIndexingCancellationPhase.GCS_CLEANUP,
+        ),
+        (
+            RegulatoryIndexingCancellationPhase.GCS_CLEANUP,
+            RegulatoryIndexingCancellationPhase.INDEX_DELETE,
+        ),
+        (
+            RegulatoryIndexingCancellationPhase.INDEX_DELETE,
+            RegulatoryIndexingCancellationPhase.FINALIZE,
+        ),
+    ):
+        assert advance_regulatory_indexing_cancellation(
+            db_session,
+            job_id=job.id,
+            expected_generation=generation,
+            expected_phase=expected_phase,
+            next_phase=next_phase,
+            now=_NOW,
+        )
+        if next_phase is not RegulatoryIndexingCancellationPhase.FINALIZE:
+            assert claim_regulatory_indexing_job(
+                db_session,
+                job_id=job.id,
+                expected_stage=RegulatoryIndexingStage.PREPARING,
+                expected_generation=generation,
+                now=_NOW,
+            )
+            generation += 1
+
+    assert finalize_regulatory_indexing_cancellation(
+        db_session,
+        job_id=job.id,
+        expected_generation=generation,
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    db_session.refresh(regulatory_user_file)
+    assert job.status == RegulatoryIndexingJobStatus.CANCELLED.value
+    assert regulatory_user_file.status is UserFileStatus.DELETING
+
+
+def test_cancellation_retry_deadline_is_respected_by_recovery(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW - datetime.timedelta(minutes=3),
+    )
+    job.remote_vertex_job_name = "projects/p/locations/l/batchJobs/1"
+    db_session.commit()
+    assert request_regulatory_indexing_cancellation(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        now=_NOW - datetime.timedelta(minutes=3),
+    )
+    retry_at = _NOW + datetime.timedelta(minutes=5)
+    assert schedule_regulatory_indexing_cancellation_retry(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        expected_phase=RegulatoryIndexingCancellationPhase.VERTEX_CANCEL,
+        next_retry_at=retry_at,
+        error_code="network",
+        error_message="temporary",
+    )
+
+    assert (
+        claim_stale_regulatory_indexing_jobs(
+            db_session,
+            stale_before=_NOW - datetime.timedelta(minutes=2),
+            claimed_at=_NOW,
+        )
+        == []
+    )
+    claims = claim_stale_regulatory_indexing_jobs(
+        db_session,
+        stale_before=retry_at,
+        claimed_at=retry_at,
+    )
+    assert len(claims) == 1
+    assert claims[0].job_id == job.id
 
 
 def test_stale_generation_never_calls_recording_index(

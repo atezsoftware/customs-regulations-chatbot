@@ -32,6 +32,13 @@ def upgrade() -> None:
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("stage", sa.String(length=32), nullable=False),
         sa.Column("lease_generation", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("recovery_token", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column(
+            "cancellation_phase",
+            sa.String(length=32),
+            server_default="NONE",
+            nullable=False,
+        ),
         sa.Column("attempt_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("next_retry_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("heartbeat_at", sa.DateTime(timezone=True), nullable=True),
@@ -60,6 +67,11 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.CheckConstraint(
+            "cancellation_phase IN ('NONE', 'VERTEX_CANCEL', 'GCS_CLEANUP', "
+            "'INDEX_DELETE', 'FINALIZE')",
+            name="regulatory_indexing_job_cancellation_phase_check",
+        ),
         sa.CheckConstraint(
             "attempt_count >= 0",
             name="regulatory_indexing_job_attempt_count_check",

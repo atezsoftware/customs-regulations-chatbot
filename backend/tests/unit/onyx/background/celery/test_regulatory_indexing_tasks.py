@@ -91,11 +91,13 @@ def test_recovery_sends_preclaimed_generation_without_double_claim() -> None:
             job_id=first_id,
             stage=RegulatoryIndexingStage.CONTEXT_WAIT,
             lease_generation=8,
+            recovery_token=uuid4(),
         ),
         RegulatoryIndexingJobClaim(
             job_id=second_id,
             stage=RegulatoryIndexingStage.EMBEDDING,
             lease_generation=3,
+            recovery_token=uuid4(),
         ),
     ]
     task_app = MagicMock()
@@ -119,6 +121,7 @@ def test_recovery_sends_preclaimed_generation_without_double_claim() -> None:
             kwargs={
                 "job_id": str(claim.job_id),
                 "expected_generation": claim.lease_generation,
+                "recovery_token": str(claim.recovery_token),
                 "tenant_id": "tenant-a",
                 "delivery_kind": OrchestrationDeliveryKind.PRECLAIMED.value,
             },

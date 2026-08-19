@@ -14,6 +14,7 @@ from onyx.connectors.models import Document, TextSection
 from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import (
+    RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
     RegulatoryIndexingStage,
@@ -37,11 +38,13 @@ from onyx.regulatory.indexing_jobs.embedding import embed_pending_regulatory_ite
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayIndeterminateSubmissionError,
     RegulatoryIndexingConfigSnapshot,
+    RetryReason,
 )
 from onyx.regulatory.indexing_jobs.preparation import (
     prepare_claimed_regulatory_indexing_job,
 )
 from onyx.regulatory.indexing_jobs.publisher import (
+    PublishOutcome,
     publish_regulatory_job,
     stage_regulatory_job_in_index,
     verify_staged_regulatory_job,
@@ -311,44 +314,55 @@ def _context_submit(
     )
     if not persisted:
         return _skipped(runtime.job.id)
-    try:
-        state = gateway.submit(requests)
-    except IndexingGatewayIndeterminateSubmissionError as error:
-        if error.submission_key != expected_key:
-            raise ValueError(
-                "Vertex returned an unexpected submission identity"
-            ) from error
-        reconciliation_persisted = (
-            indexing_job_repository.require_vertex_submission_reconciliation(
-                db_session,
-                job_id=runtime.job.id,
-                expected_generation=runtime.job.lease_generation,
-                submission_key=expected_key,
-                now=now,
-            )
-        )
-        if not reconciliation_persisted:
-            return _skipped(runtime.job.id)
-        return _advance(
-            runtime,
-            db_session,
-            next_stage=RegulatoryIndexingStage.CONTEXT_SUBMIT,
-            now=now,
-            countdown_seconds=snapshot.poll_seconds,
-        )
-
-    persisted = indexing_job_repository.record_vertex_submission(
+    with indexing_job_repository.regulatory_indexing_external_mutation_lease(
         db_session,
         job_id=runtime.job.id,
+        expected_stage=RegulatoryIndexingStage.CONTEXT_SUBMIT,
         expected_generation=runtime.job.lease_generation,
-        submission_key=expected_key,
-        remote_job_name=state.remote_job_name,
-        input_uri=state.input_uri,
-        output_uri=state.output_uri,
-        now=now,
-    )
-    if not persisted:
-        return _skipped(runtime.job.id)
+    ) as submission_lease:
+        if submission_lease is None:
+            return _skipped(runtime.job.id)
+        try:
+            state = gateway.submit(requests)
+        except IndexingGatewayIndeterminateSubmissionError as error:
+            if error.submission_key != expected_key:
+                raise ValueError(
+                    "Vertex returned an unexpected submission identity"
+                ) from error
+            reconciliation_persisted = (
+                indexing_job_repository.require_vertex_submission_reconciliation(
+                    db_session,
+                    job_id=runtime.job.id,
+                    expected_generation=runtime.job.lease_generation,
+                    submission_key=expected_key,
+                    now=now,
+                    commit=False,
+                )
+            )
+            if not reconciliation_persisted:
+                return _skipped(runtime.job.id)
+            submission_lease.commit()
+            return _advance(
+                runtime,
+                db_session,
+                next_stage=RegulatoryIndexingStage.CONTEXT_SUBMIT,
+                now=now,
+                countdown_seconds=snapshot.poll_seconds,
+            )
+        persisted = indexing_job_repository.record_vertex_submission(
+            db_session,
+            job_id=runtime.job.id,
+            expected_generation=runtime.job.lease_generation,
+            submission_key=expected_key,
+            remote_job_name=state.remote_job_name,
+            input_uri=state.input_uri,
+            output_uri=state.output_uri,
+            now=now,
+            commit=False,
+        )
+        if not persisted:
+            return _skipped(runtime.job.id)
+        submission_lease.commit()
     return _advance(
         runtime,
         db_session,
@@ -417,6 +431,7 @@ def _context_apply(
     snapshot = _snapshot(runtime)
     gateway = _build_vertex_gateway(runtime, tenant_id=tenant_id, db_session=db_session)
     raw_output = gateway.read_results(output_uri)
+    all_hashes = {item.request_hash for item in runtime.indexing_items}
     pending_hashes = {
         item.request_hash
         for item in runtime.indexing_items
@@ -425,13 +440,14 @@ def _context_apply(
     }
     parsed = parse_vertex_jsonl_output(
         raw_output,
-        pending_hashes,
+        all_hashes,
         require_complete=False,
     )
     applicable = {
         request_hash: result
         for request_hash, result in parsed.items()
-        if result.error is not VertexBatchResultError.REMOTE_ERROR
+        if request_hash in pending_hashes
+        and result.error is not VertexBatchResultError.REMOTE_ERROR
     }
     embedding_tokenizer = get_tokenizer(
         snapshot.embedding_model_name,
@@ -470,41 +486,128 @@ def _context_apply(
     )
 
 
-def _cancel_deleted_file(
+def _request_cancellation(
     runtime: indexing_job_repository.RegulatoryIndexingRuntime,
     *,
-    tenant_id: str,
     db_session: Session,
     now: datetime.datetime,
 ) -> OrchestrationResult:
-    snapshot = _snapshot(runtime)
-    gateway = _build_vertex_gateway(runtime, tenant_id=tenant_id, db_session=db_session)
-    if runtime.job.remote_vertex_job_name:
-        gateway.cancel(runtime.job.remote_vertex_job_name)
-    cleanup_uri = (
-        f"{snapshot.vertex.gcs_uri.rstrip('/')}/"
-        f"{_vertex_object_prefix(tenant_id, runtime.job.id)}"
-    )
-    try:
-        gateway.cleanup(cleanup_uri)
-    except Exception:
-        # Bucket lifecycle remains the final safety net; cancellation correctness
-        # must not be reversed by cleanup failure.
-        pass
-    if runtime.search_settings is not None:
-        document_index = build_elasticsearch_document_index(runtime.search_settings)
-        document_index.delete(
-            str(runtime.user_file.id),
-            chunk_count=runtime.user_file.chunk_count,
-        )
-    cancelled = indexing_job_repository.cancel_regulatory_indexing_job(
+    requested = indexing_job_repository.request_regulatory_indexing_cancellation(
         db_session,
         job_id=runtime.job.id,
         expected_stage=RegulatoryIndexingStage(runtime.job.stage),
         expected_generation=runtime.job.lease_generation,
         now=now,
     )
-    return _complete(runtime.job.id) if cancelled else _skipped(runtime.job.id)
+    return (
+        _next_step(runtime.job.id, runtime.job.lease_generation)
+        if requested
+        else _skipped(runtime.job.id)
+    )
+
+
+def _advance_cancellation(
+    runtime: indexing_job_repository.RegulatoryIndexingRuntime,
+    db_session: Session,
+    *,
+    expected_phase: RegulatoryIndexingCancellationPhase,
+    next_phase: RegulatoryIndexingCancellationPhase,
+    now: datetime.datetime,
+) -> OrchestrationResult:
+    advanced = indexing_job_repository.advance_regulatory_indexing_cancellation(
+        db_session,
+        job_id=runtime.job.id,
+        expected_generation=runtime.job.lease_generation,
+        expected_phase=expected_phase,
+        next_phase=next_phase,
+        now=now,
+    )
+    return (
+        _next_step(runtime.job.id, runtime.job.lease_generation)
+        if advanced
+        else _skipped(runtime.job.id)
+    )
+
+
+def _next_cancellation_phase(
+    phase: RegulatoryIndexingCancellationPhase,
+) -> RegulatoryIndexingCancellationPhase | None:
+    return {
+        RegulatoryIndexingCancellationPhase.VERTEX_CANCEL: (
+            RegulatoryIndexingCancellationPhase.GCS_CLEANUP
+        ),
+        RegulatoryIndexingCancellationPhase.GCS_CLEANUP: (
+            RegulatoryIndexingCancellationPhase.INDEX_DELETE
+        ),
+        RegulatoryIndexingCancellationPhase.INDEX_DELETE: (
+            RegulatoryIndexingCancellationPhase.FINALIZE
+        ),
+    }.get(phase)
+
+
+def _execute_cancellation_phase(
+    runtime: indexing_job_repository.RegulatoryIndexingRuntime,
+    *,
+    tenant_id: str,
+    db_session: Session,
+    now: datetime.datetime,
+) -> OrchestrationResult:
+    phase = RegulatoryIndexingCancellationPhase(runtime.job.cancellation_phase)
+    if phase is RegulatoryIndexingCancellationPhase.VERTEX_CANCEL:
+        remote_job_name = runtime.job.remote_vertex_job_name
+        if not remote_job_name:
+            raise ValueError("Vertex cancellation phase has no remote job")
+        gateway = _build_vertex_gateway(
+            runtime, tenant_id=tenant_id, db_session=db_session
+        )
+        gateway.cancel(remote_job_name)
+        return _advance_cancellation(
+            runtime,
+            db_session,
+            expected_phase=phase,
+            next_phase=RegulatoryIndexingCancellationPhase.GCS_CLEANUP,
+            now=now,
+        )
+    if phase is RegulatoryIndexingCancellationPhase.GCS_CLEANUP:
+        snapshot = _snapshot(runtime)
+        cleanup_uri = (
+            f"{snapshot.vertex.gcs_uri.rstrip('/')}/"
+            f"{_vertex_object_prefix(tenant_id, runtime.job.id)}"
+        )
+        gateway = _build_vertex_gateway(
+            runtime, tenant_id=tenant_id, db_session=db_session
+        )
+        gateway.cleanup(cleanup_uri)
+        return _advance_cancellation(
+            runtime,
+            db_session,
+            expected_phase=phase,
+            next_phase=RegulatoryIndexingCancellationPhase.INDEX_DELETE,
+            now=now,
+        )
+    if phase is RegulatoryIndexingCancellationPhase.INDEX_DELETE:
+        if runtime.search_settings is not None:
+            document_index = build_elasticsearch_document_index(runtime.search_settings)
+            document_index.delete(
+                str(runtime.user_file.id),
+                chunk_count=runtime.user_file.chunk_count,
+            )
+        return _advance_cancellation(
+            runtime,
+            db_session,
+            expected_phase=phase,
+            next_phase=RegulatoryIndexingCancellationPhase.FINALIZE,
+            now=now,
+        )
+    if phase is RegulatoryIndexingCancellationPhase.FINALIZE:
+        finalized = indexing_job_repository.finalize_regulatory_indexing_cancellation(
+            db_session,
+            job_id=runtime.job.id,
+            expected_generation=runtime.job.lease_generation,
+            now=now,
+        )
+        return _complete(runtime.job.id) if finalized else _skipped(runtime.job.id)
+    raise ValueError("cancelling regulatory job has no cancellation phase")
 
 
 def _execute_claimed_step_impl(
@@ -514,10 +617,16 @@ def _execute_claimed_step_impl(
     db_session: Session,
     now: datetime.datetime,
 ) -> OrchestrationResult:
-    if runtime.user_file.status in {UserFileStatus.CANCELED, UserFileStatus.DELETING}:
-        return _cancel_deleted_file(
+    if runtime.job.status == RegulatoryIndexingJobStatus.CANCELLING.value:
+        return _execute_cancellation_phase(
             runtime,
             tenant_id=tenant_id,
+            db_session=db_session,
+            now=now,
+        )
+    if runtime.user_file.status in {UserFileStatus.CANCELED, UserFileStatus.DELETING}:
+        return _request_cancellation(
+            runtime,
             db_session=db_session,
             now=now,
         )
@@ -610,7 +719,7 @@ def _execute_claimed_step_impl(
             next_stage=RegulatoryIndexingStage.PUBLISH,
             now=now,
         )
-    publish_regulatory_job(
+    publish_outcome = publish_regulatory_job(
         job=runtime.job,
         user_file=runtime.user_file,
         rows=runtime.regulatory_chunks,
@@ -618,13 +727,9 @@ def _execute_claimed_step_impl(
         search_settings=runtime.search_settings,
         db_session=db_session,
     )
-    return _advance(
-        runtime,
-        db_session,
-        next_stage=RegulatoryIndexingStage.PUBLISH,
-        next_status=RegulatoryIndexingJobStatus.SUCCEEDED,
-        now=now,
-    )
+    if publish_outcome is not PublishOutcome.COMPLETED:
+        raise RuntimeError("regulatory publication returned an unknown outcome")
+    return _complete(runtime.job.id)
 
 
 def _execute_claimed_step(
@@ -645,7 +750,60 @@ def _execute_claimed_step(
         snapshot = _snapshot(runtime)
         decision = classify_indexing_error(error)
         next_attempt = runtime.job.attempt_count + 1
-        if decision.retryable and next_attempt < snapshot.max_attempts:
+        if runtime.job.status == RegulatoryIndexingJobStatus.CANCELLING.value:
+            phase = RegulatoryIndexingCancellationPhase(runtime.job.cancellation_phase)
+            retry_cancellation = (
+                phase is RegulatoryIndexingCancellationPhase.FINALIZE
+                or decision.retryable
+                and next_attempt < snapshot.max_attempts
+            )
+            if not retry_cancellation:
+                next_phase = _next_cancellation_phase(phase)
+                if next_phase is None:
+                    retry_cancellation = True
+                else:
+                    return _advance_cancellation(
+                        runtime,
+                        db_session,
+                        expected_phase=phase,
+                        next_phase=next_phase,
+                        now=now,
+                    )
+            delay = retry_delay_seconds(
+                runtime.job.id,
+                RegulatoryIndexingStage(runtime.job.stage),
+                next_attempt,
+                snapshot.retry_base_seconds,
+                snapshot.retry_max_seconds,
+            )
+            scheduled = (
+                indexing_job_repository.schedule_regulatory_indexing_cancellation_retry(
+                    db_session,
+                    job_id=runtime.job.id,
+                    expected_generation=runtime.job.lease_generation,
+                    expected_phase=phase,
+                    next_retry_at=now + datetime.timedelta(seconds=delay),
+                    error_code=decision.error_code,
+                    error_message=error.__class__.__name__,
+                )
+            )
+            return (
+                _next_step(
+                    runtime.job.id,
+                    runtime.job.lease_generation,
+                    countdown_seconds=delay,
+                )
+                if scheduled
+                else _skipped(runtime.job.id)
+            )
+        must_reconcile_publication = (
+            RegulatoryIndexingStage(runtime.job.stage)
+            is RegulatoryIndexingStage.PUBLISH
+            or decision.reason is RetryReason.PUBLICATION_INDETERMINATE
+        )
+        if must_reconcile_publication or (
+            decision.retryable and next_attempt < snapshot.max_attempts
+        ):
             delay = retry_delay_seconds(
                 runtime.job.id,
                 RegulatoryIndexingStage(runtime.job.stage),
@@ -722,17 +880,31 @@ def run_regulatory_indexing_step(
 def run_preclaimed_regulatory_indexing_step(
     job_id: UUID,
     expected_generation: int,
+    recovery_token: UUID,
     tenant_id: str,
 ) -> OrchestrationResult:
     if not tenant_id.strip():
         raise ValueError("tenant_id must not be empty")
     with get_session_with_current_tenant() as db_session:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if not indexing_job_repository.consume_preclaimed_regulatory_indexing_delivery(
+            db_session,
+            job_id=job_id,
+            expected_generation=expected_generation,
+            recovery_token=recovery_token,
+            consumed_at=now,
+        ):
+            return _skipped(job_id)
         runtime = indexing_job_repository.get_regulatory_indexing_runtime(
             db_session, job_id
         )
         if (
             runtime is None
-            or runtime.job.status != RegulatoryIndexingJobStatus.RUNNING.value
+            or runtime.job.status
+            not in {
+                RegulatoryIndexingJobStatus.RUNNING.value,
+                RegulatoryIndexingJobStatus.CANCELLING.value,
+            }
             or runtime.job.lease_generation != expected_generation
         ):
             return _skipped(job_id)
@@ -740,5 +912,5 @@ def run_preclaimed_regulatory_indexing_step(
             runtime,
             tenant_id=tenant_id,
             db_session=db_session,
-            now=datetime.datetime.now(datetime.timezone.utc),
+            now=now,
         )

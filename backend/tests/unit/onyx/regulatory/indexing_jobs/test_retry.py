@@ -8,6 +8,7 @@ from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
     IndexingGatewayHTTPError,
     IndexingGatewayTimeoutError,
+    IndexingPublicationIndeterminateError,
     RetryDisposition,
     RetryReason,
 )
@@ -69,6 +70,13 @@ def test_unknown_errors_fail_closed() -> None:
 
     assert decision.disposition is RetryDisposition.TERMINAL
     assert decision.reason is RetryReason.UNKNOWN
+
+
+def test_indeterminate_publication_is_retryable() -> None:
+    decision = classify_indexing_error(IndexingPublicationIndeterminateError())
+
+    assert decision.disposition is RetryDisposition.RETRYABLE
+    assert decision.reason is RetryReason.PUBLICATION_INDETERMINATE
 
 
 @pytest.mark.parametrize(

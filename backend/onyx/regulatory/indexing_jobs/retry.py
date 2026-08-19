@@ -10,6 +10,7 @@ from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
     IndexingGatewayHTTPError,
     IndexingGatewayTimeoutError,
+    IndexingPublicationIndeterminateError,
     RetryDecision,
     RetryDisposition,
     RetryReason,
@@ -59,6 +60,11 @@ def classify_indexing_error(error: Exception) -> RetryDecision:
         return _http_retry_decision(error.response.status_code)
     if isinstance(error, IndexingGatewayHTTPError):
         return _http_retry_decision(error.status_code)
+    if isinstance(error, IndexingPublicationIndeterminateError):
+        return RetryDecision(
+            disposition=RetryDisposition.RETRYABLE,
+            reason=RetryReason.PUBLICATION_INDETERMINATE,
+        )
     return RetryDecision(
         disposition=RetryDisposition.TERMINAL,
         reason=RetryReason.UNKNOWN,

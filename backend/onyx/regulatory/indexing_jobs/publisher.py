@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import math
 from collections.abc import Sequence
+from enum import StrEnum
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,6 +33,7 @@ from onyx.db.user_file import (
 )
 from onyx.document_index.factory import build_elasticsearch_document_index
 from onyx.document_index.interfaces_new import (
+    DocumentChunkVerificationError,
     DocumentChunkVerificationExpectation,
     DocumentChunkVerificationRequest,
     DocumentChunkVerificationResult,
@@ -44,7 +46,10 @@ from onyx.indexing.models import (
     IndexChunk,
 )
 from onyx.regulatory.heading_path import normalize_regulatory_heading_path
-from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
+from onyx.regulatory.indexing_jobs.models import (
+    IndexingPublicationIndeterminateError,
+    RegulatoryIndexingConfigSnapshot,
+)
 
 
 class PublishVerification(BaseModel):
@@ -56,6 +61,10 @@ class PublishVerification(BaseModel):
     embedded_item_count: int = Field(gt=0)
     vector_dimension: int = Field(gt=0)
     insertion_record_count: int = Field(gt=0)
+
+
+class PublishOutcome(StrEnum):
+    COMPLETED = "COMPLETED"
 
 
 def _is_valid_vector(vector: object, expected_dimension: int) -> bool:
@@ -507,8 +516,8 @@ def publish_regulatory_job(
     db_session: Session,
     document_index: DocumentIndex | None = None,
     search_settings: SearchSettings | None = None,
-) -> None:
-    """Publish verified chunks, then complete the user file through a lease fence."""
+) -> PublishOutcome:
+    """Converge a hidden or already-visible projection to atomic DB completion."""
 
     with indexing_job_repository.regulatory_indexing_external_mutation_lease(
         db_session,
@@ -557,28 +566,47 @@ def publish_regulatory_job(
             rows=lease.regulatory_chunks,
             hidden=True,
         )
-        hidden_result = target_index.verify_document_chunks(hidden_request)
-        _validate_index_verification(hidden_result, expected, hidden=True)
-
         visible_request = hidden_request.model_copy(update={"expected_hidden": False})
+        already_visible = False
         try:
-            target_index.update_document_visibility(visible_request)
-            visible_result = target_index.verify_document_chunks(visible_request)
-            _validate_index_verification(visible_result, expected, hidden=False)
-            completed = indexing_job_repository.complete_regulatory_indexing_user_file(
-                db_session,
-                job_id=lease.job_id,
-                expected_generation=lease.lease_generation,
-                chunk_count=expected.canonical_chunk_count,
-                now=datetime.datetime.now(datetime.timezone.utc),
-                commit=False,
+            hidden_result = target_index.verify_document_chunks(hidden_request)
+            _validate_index_verification(hidden_result, expected, hidden=True)
+        except DocumentChunkVerificationError as hidden_error:
+            try:
+                visible_result = target_index.verify_document_chunks(visible_request)
+                _validate_index_verification(visible_result, expected, hidden=False)
+                already_visible = True
+            except DocumentChunkVerificationError:
+                raise hidden_error
+        try:
+            if not already_visible:
+                target_index.update_document_visibility(visible_request)
+                visible_result = target_index.verify_document_chunks(visible_request)
+                _validate_index_verification(visible_result, expected, hidden=False)
+            completed = (
+                indexing_job_repository.complete_regulatory_indexing_publication(
+                    db_session,
+                    job_id=lease.job_id,
+                    expected_generation=lease.lease_generation,
+                    chunk_count=expected.canonical_chunk_count,
+                    now=datetime.datetime.now(datetime.timezone.utc),
+                    commit=False,
+                )
             )
             if not completed:
                 raise RuntimeError(
                     "regulatory indexing lease was lost while publishing"
                 )
-            lease.commit()
+            try:
+                lease.commit()
+            except Exception as commit_error:
+                raise IndexingPublicationIndeterminateError() from commit_error
+            return PublishOutcome.COMPLETED
         except Exception as publish_error:
+            if isinstance(publish_error, IndexingPublicationIndeterminateError):
+                raise
+            if already_visible:
+                raise IndexingPublicationIndeterminateError() from publish_error
             try:
                 target_index.update_document_visibility(hidden_request)
                 restored_result = target_index.verify_document_chunks(hidden_request)
@@ -588,4 +616,5 @@ def publish_regulatory_job(
                     "Failed to restore hidden regulatory chunks after publication "
                     f"failure: {restore_error!r}"
                 )
+                raise IndexingPublicationIndeterminateError() from publish_error
             raise

@@ -752,6 +752,14 @@ class RegulatoryIndexingSubmissionState(str, PyEnum):
     SUBMITTED = "SUBMITTED"
 
 
+class RegulatoryIndexingCancellationPhase(str, PyEnum):
+    NONE = "NONE"
+    VERTEX_CANCEL = "VERTEX_CANCEL"
+    GCS_CLEANUP = "GCS_CLEANUP"
+    INDEX_DELETE = "INDEX_DELETE"
+    FINALIZE = "FINALIZE"
+
+
 class RegulatoryIndexingStage(str, PyEnum):
     PREPARING = "PREPARING"
     CONTEXT_SUBMIT = "CONTEXT_SUBMIT"

@@ -40,6 +40,13 @@ class IndexingGatewayIndeterminateSubmissionError(IndexingGatewayError):
         )
 
 
+class IndexingPublicationIndeterminateError(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Regulatory indexing publication visibility requires reconciliation"
+        )
+
+
 class RetryDisposition(StrEnum):
     RETRYABLE = "RETRYABLE"
     TERMINAL = "TERMINAL"
@@ -49,6 +56,7 @@ class RetryReason(StrEnum):
     TIMEOUT = "TIMEOUT"
     NETWORK = "NETWORK"
     HTTP_STATUS = "HTTP_STATUS"
+    PUBLICATION_INDETERMINATE = "PUBLICATION_INDETERMINATE"
     UNKNOWN = "UNKNOWN"
 
 

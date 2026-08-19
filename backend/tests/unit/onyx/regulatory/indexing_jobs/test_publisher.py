@@ -41,6 +41,7 @@ from onyx.document_index.interfaces_new import (
 from onyx.indexing.models import DocMetadataAwareIndexChunk, IndexChunk
 from onyx.regulatory.indexing_jobs import publisher
 from onyx.regulatory.indexing_jobs.models import (
+    IndexingPublicationIndeterminateError,
     RegulatoryIndexingConfigSnapshot,
     VertexAuthenticationMode,
     VertexBatchConfig,
@@ -234,6 +235,37 @@ class _RecordingDocumentIndex:
         )
 
 
+class _StatefulVisibilityIndex(_RecordingDocumentIndex):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.hidden = True
+
+    def update_document_visibility(
+        self, request: DocumentChunkVerificationRequest
+    ) -> None:
+        self.events.append("update")
+        self.hidden = request.expected_hidden
+
+    def verify_document_chunks(
+        self, request: DocumentChunkVerificationRequest
+    ) -> DocumentChunkVerificationResult:
+        self.events.append(f"verify:{str(request.expected_hidden).lower()}")
+        if self.hidden is not request.expected_hidden:
+            raise DocumentChunkVerificationError("visibility mismatch")
+        return DocumentChunkVerificationResult(
+            document_id=request.document_id,
+            chunk_count=len(request.expected_chunks),
+            document_chunk_ids=frozenset(
+                f"chunk-{chunk.chunk_index}" for chunk in request.expected_chunks
+            ),
+            hidden=self.hidden,
+        )
+
+
+class _SimulatedProcessDeath(BaseException):
+    pass
+
+
 def _install_metadata(
     monkeypatch: pytest.MonkeyPatch,
     job: RegulatoryIndexingJob,
@@ -353,7 +385,7 @@ def test_stage_indexes_every_chunk_hidden_then_publish_completes_file(
 
     monkeypatch.setattr(
         publisher.indexing_job_repository,
-        "complete_regulatory_indexing_user_file",
+        "complete_regulatory_indexing_publication",
         complete_file,
         raising=False,
     )
@@ -416,6 +448,91 @@ def test_stage_indexes_every_chunk_hidden_then_publish_completes_file(
     assert user_file.status is UserFileStatus.INDEXING
 
 
+def test_publish_recovers_visible_projection_after_process_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
+    events: list[str] = []
+    document_index = _StatefulVisibilityIndex(events)
+    completions = iter([_SimulatedProcessDeath(), True])
+
+    def complete_publication(*_args: object, **_kwargs: object) -> bool:
+        events.append("complete-publication")
+        outcome = next(completions)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_publication",
+        complete_publication,
+        raising=False,
+    )
+
+    with pytest.raises(_SimulatedProcessDeath):
+        publish_regulatory_job(
+            job=job,
+            user_file=user_file,
+            rows=rows,
+            items=items,
+            db_session=_DB_SESSION,
+            document_index=cast(DocumentIndex, document_index),
+            search_settings=settings,
+        )
+
+    assert document_index.hidden is False
+    outcome = publish_regulatory_job(
+        job=job,
+        user_file=user_file,
+        rows=rows,
+        items=items,
+        db_session=_DB_SESSION,
+        document_index=cast(DocumentIndex, document_index),
+        search_settings=settings,
+    )
+
+    assert outcome is publisher.PublishOutcome.COMPLETED
+    assert document_index.hidden is False
+    assert events == [
+        "verify:true",
+        "update",
+        "verify:false",
+        "complete-publication",
+        "verify:true",
+        "verify:false",
+        "complete-publication",
+    ]
+
+
+def test_already_visible_projection_db_failure_requires_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
+    document_index = _StatefulVisibilityIndex([])
+    document_index.hidden = False
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_publication",
+        MagicMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    with pytest.raises(IndexingPublicationIndeterminateError):
+        publish_regulatory_job(
+            job=job,
+            user_file=user_file,
+            rows=rows,
+            items=items,
+            db_session=_DB_SESSION,
+            document_index=cast(DocumentIndex, document_index),
+            search_settings=settings,
+        )
+
+    assert document_index.hidden is False
+
+
 def test_stage_retry_preserves_document_and_chunk_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -461,7 +578,7 @@ def test_insertion_count_mismatch_never_publishes(
     completed: list[object] = []
     monkeypatch.setattr(
         publisher.indexing_job_repository,
-        "complete_regulatory_indexing_user_file",
+        "complete_regulatory_indexing_publication",
         lambda *_args, **_kwargs: completed.append(object()) or True,
         raising=False,
     )
@@ -480,7 +597,7 @@ def test_insertion_count_mismatch_never_publishes(
     assert completed == []
 
 
-def test_visibility_failure_never_marks_user_file_complete(
+def test_visibility_failure_requires_reconciliation_without_db_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job, user_file, settings, rows, items = _fixture()
@@ -491,7 +608,7 @@ def test_visibility_failure_never_marks_user_file_complete(
     completed: list[object] = []
     monkeypatch.setattr(
         publisher.indexing_job_repository,
-        "complete_regulatory_indexing_user_file",
+        "complete_regulatory_indexing_publication",
         lambda *_args, **_kwargs: completed.append(object()) or True,
         raising=False,
     )
@@ -504,7 +621,7 @@ def test_visibility_failure_never_marks_user_file_complete(
         document_index=document_index,
     )
 
-    with pytest.raises(RuntimeError, match="Elasticsearch unavailable"):
+    with pytest.raises(IndexingPublicationIndeterminateError):
         publish_regulatory_job(
             job=job,
             user_file=user_file,
@@ -723,7 +840,7 @@ def test_publish_post_update_disappearance_never_completes_file(
     completed: list[object] = []
     monkeypatch.setattr(
         publisher.indexing_job_repository,
-        "complete_regulatory_indexing_user_file",
+        "complete_regulatory_indexing_publication",
         lambda *_args, **_kwargs: completed.append(object()) or True,
     )
 
@@ -773,7 +890,7 @@ def test_publish_completion_failure_restores_hidden_projection(
 
     monkeypatch.setattr(
         publisher.indexing_job_repository,
-        "complete_regulatory_indexing_user_file",
+        "complete_regulatory_indexing_publication",
         complete_file,
     )
 
@@ -797,7 +914,7 @@ def test_publish_completion_failure_restores_hidden_projection(
     ]
 
 
-def test_publish_commit_failure_restores_hidden_projection(
+def test_publish_commit_failure_preserves_visible_projection_for_reconciliation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job, user_file, settings, rows, items = _fixture()
@@ -812,14 +929,14 @@ def test_publish_commit_failure_restores_hidden_projection(
         commit_error=RuntimeError("database commit failed"),
         commit_calls=commit_calls,
     )
-    document_index = _RecordingDocumentIndex([])
+    document_index = _StatefulVisibilityIndex([])
     monkeypatch.setattr(
         publisher.indexing_job_repository,
-        "complete_regulatory_indexing_user_file",
+        "complete_regulatory_indexing_publication",
         lambda *_args, **_kwargs: True,
     )
 
-    with pytest.raises(RuntimeError, match="database commit failed"):
+    with pytest.raises(IndexingPublicationIndeterminateError):
         publish_regulatory_job(
             job=job,
             user_file=user_file,
@@ -835,9 +952,8 @@ def test_publish_commit_failure_restores_hidden_projection(
         "verify:true",
         "update",
         "verify:false",
-        "update",
-        "verify:true",
     ]
+    assert document_index.hidden is False
 
 
 @pytest.mark.parametrize("operation", ["verify", "publish"])
@@ -862,7 +978,7 @@ def test_verify_and_publish_reject_locked_search_settings_drift_before_es(
     completed: list[object] = []
     monkeypatch.setattr(
         publisher.indexing_job_repository,
-        "complete_regulatory_indexing_user_file",
+        "complete_regulatory_indexing_publication",
         lambda *_args, **_kwargs: completed.append(object()) or True,
     )
 

@@ -7,11 +7,12 @@ from dataclasses import dataclass, field
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from onyx.db.enums import (
+    RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
     RegulatoryIndexingStage,
@@ -99,6 +100,7 @@ class RegulatoryIndexingJobClaim:
     job_id: UUID
     stage: RegulatoryIndexingStage
     lease_generation: int
+    recovery_token: UUID
 
 
 @dataclass(frozen=True)
@@ -352,6 +354,7 @@ def _update_vertex_submission_state(
     next_state: RegulatoryIndexingSubmissionState,
     now: datetime.datetime,
     extra_values: dict[str, object] | None = None,
+    commit: bool = True,
 ) -> bool:
     values: dict[str, object] = {
         "vertex_submission_key": submission_key,
@@ -379,7 +382,10 @@ def _update_vertex_submission_state(
         .values(**values)
         .returning(RegulatoryIndexingJob.id)
     )
-    db_session.commit()
+    if commit:
+        db_session.commit()
+    else:
+        db_session.flush()
     return updated_id is not None
 
 
@@ -414,6 +420,7 @@ def require_vertex_submission_reconciliation(
     expected_generation: int,
     submission_key: str,
     now: datetime.datetime,
+    commit: bool = True,
 ) -> bool:
     return _update_vertex_submission_state(
         db_session,
@@ -423,6 +430,7 @@ def require_vertex_submission_reconciliation(
         allowed_states=(RegulatoryIndexingSubmissionState.SUBMITTING,),
         next_state=RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
         now=now,
+        commit=commit,
     )
 
 
@@ -458,6 +466,7 @@ def record_vertex_submission(
     input_uri: str | None,
     output_uri: str | None,
     now: datetime.datetime,
+    commit: bool = True,
 ) -> bool:
     return _update_vertex_submission_state(
         db_session,
@@ -476,6 +485,7 @@ def record_vertex_submission(
             "vertex_input_uri": input_uri,
             "vertex_output_uri": output_uri,
         },
+        commit=commit,
     )
 
 
@@ -546,6 +556,7 @@ def claim_regulatory_indexing_job(
     runnable_statuses = (
         RegulatoryIndexingJobStatus.QUEUED.value,
         RegulatoryIndexingJobStatus.RETRY_WAIT.value,
+        RegulatoryIndexingJobStatus.CANCELLING.value,
     )
     claimed_id = db_session.scalar(
         update(RegulatoryIndexingJob)
@@ -563,11 +574,27 @@ def claim_regulatory_indexing_job(
                     RegulatoryIndexingJob.next_retry_at.is_not(None),
                     RegulatoryIndexingJob.next_retry_at <= now,
                 ),
+                and_(
+                    RegulatoryIndexingJob.status
+                    == RegulatoryIndexingJobStatus.CANCELLING.value,
+                    or_(
+                        RegulatoryIndexingJob.next_retry_at.is_(None),
+                        RegulatoryIndexingJob.next_retry_at <= now,
+                    ),
+                ),
             ),
         )
         .values(
-            status=RegulatoryIndexingJobStatus.RUNNING.value,
+            status=case(
+                (
+                    RegulatoryIndexingJob.status
+                    == RegulatoryIndexingJobStatus.CANCELLING.value,
+                    RegulatoryIndexingJobStatus.CANCELLING.value,
+                ),
+                else_=RegulatoryIndexingJobStatus.RUNNING.value,
+            ),
             lease_generation=RegulatoryIndexingJob.lease_generation + 1,
+            recovery_token=None,
             heartbeat_at=now,
             next_retry_at=None,
             updated_at=now,
@@ -596,6 +623,38 @@ def advance_regulatory_indexing_job(
     )
     if source_status is None:
         return False
+    values: dict[str, object] = {
+        "status": next_status.value,
+        "stage": next_stage.value,
+        "attempt_count": 0,
+        "heartbeat_at": now,
+        "next_retry_at": None,
+        "error_code": error_code,
+        "error_message": (
+            error_message[:_MAX_ERROR_MESSAGE_LENGTH]
+            if error_message is not None
+            else None
+        ),
+        "updated_at": now,
+        "completed_at": (
+            now
+            if next_status
+            in {
+                RegulatoryIndexingJobStatus.SUCCEEDED,
+                RegulatoryIndexingJobStatus.FAILED,
+                RegulatoryIndexingJobStatus.CANCELLED,
+            }
+            else None
+        ),
+    }
+    if next_status is RegulatoryIndexingJobStatus.CANCELLING:
+        values["cancellation_phase"] = case(
+            (
+                RegulatoryIndexingJob.remote_vertex_job_name.is_not(None),
+                RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value,
+            ),
+            else_=RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value,
+        )
     advanced_id = db_session.scalar(
         update(RegulatoryIndexingJob)
         .where(
@@ -604,30 +663,7 @@ def advance_regulatory_indexing_job(
             RegulatoryIndexingJob.stage == expected_stage.value,
             RegulatoryIndexingJob.lease_generation == expected_generation,
         )
-        .values(
-            status=next_status.value,
-            stage=next_stage.value,
-            attempt_count=0,
-            heartbeat_at=now,
-            next_retry_at=None,
-            error_code=error_code,
-            error_message=(
-                error_message[:_MAX_ERROR_MESSAGE_LENGTH]
-                if error_message is not None
-                else None
-            ),
-            updated_at=now,
-            completed_at=(
-                now
-                if next_status
-                in {
-                    RegulatoryIndexingJobStatus.SUCCEEDED,
-                    RegulatoryIndexingJobStatus.FAILED,
-                    RegulatoryIndexingJobStatus.CANCELLED,
-                }
-                else None
-            ),
-        )
+        .values(**values)
         .returning(RegulatoryIndexingJob.id)
     )
     db_session.commit()
@@ -690,10 +726,24 @@ def claim_stale_regulatory_indexing_jobs(
         RegulatoryIndexingJob.next_retry_at.is_not(None),
         RegulatoryIndexingJob.next_retry_at <= claimed_at,
     )
+    cancellable = and_(
+        RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.CANCELLING.value,
+        or_(
+            and_(
+                RegulatoryIndexingJob.next_retry_at.is_(None),
+                RegulatoryIndexingJob.heartbeat_at.is_not(None),
+                RegulatoryIndexingJob.heartbeat_at <= stale_before,
+            ),
+            and_(
+                RegulatoryIndexingJob.next_retry_at.is_not(None),
+                RegulatoryIndexingJob.next_retry_at <= claimed_at,
+            ),
+        ),
+    )
     jobs = list(
         db_session.scalars(
             select(RegulatoryIndexingJob)
-            .where(or_(stale_queued_or_running, due_retry))
+            .where(or_(stale_queued_or_running, due_retry, cancellable))
             .order_by(
                 func.coalesce(
                     RegulatoryIndexingJob.next_retry_at,
@@ -708,8 +758,11 @@ def claim_stale_regulatory_indexing_jobs(
     )
     claims: list[RegulatoryIndexingJobClaim] = []
     for job in jobs:
-        job.status = RegulatoryIndexingJobStatus.RUNNING.value
+        recovery_token = uuid4()
+        if job.status != RegulatoryIndexingJobStatus.CANCELLING.value:
+            job.status = RegulatoryIndexingJobStatus.RUNNING.value
         job.lease_generation += 1
+        job.recovery_token = recovery_token
         job.heartbeat_at = claimed_at
         job.next_retry_at = None
         claims.append(
@@ -717,11 +770,46 @@ def claim_stale_regulatory_indexing_jobs(
                 job_id=job.id,
                 stage=RegulatoryIndexingStage(job.stage),
                 lease_generation=job.lease_generation,
+                recovery_token=recovery_token,
             )
         )
     if jobs:
         db_session.commit()
     return claims
+
+
+def consume_preclaimed_regulatory_indexing_delivery(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    recovery_token: UUID,
+    consumed_at: datetime.datetime,
+) -> bool:
+    """Atomically consume the scanner-issued one-use delivery token."""
+
+    consumed_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status.in_(
+                (
+                    RegulatoryIndexingJobStatus.RUNNING.value,
+                    RegulatoryIndexingJobStatus.CANCELLING.value,
+                )
+            ),
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.recovery_token == recovery_token,
+        )
+        .values(
+            recovery_token=None,
+            heartbeat_at=consumed_at,
+            updated_at=consumed_at,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return consumed_id is not None
 
 
 def create_or_get_regulatory_indexing_item(
@@ -1160,6 +1248,65 @@ def complete_regulatory_indexing_user_file(
     return True
 
 
+def complete_regulatory_indexing_publication(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    chunk_count: int,
+    now: datetime.datetime,
+    commit: bool = True,
+) -> bool:
+    """Atomically complete the published file and its fenced durable job."""
+
+    if chunk_count <= 0:
+        raise ValueError("chunk_count must be positive")
+    locked_job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.PUBLISH.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if locked_job is None:
+        if commit:
+            db_session.rollback()
+        return False
+    completed_file_id = db_session.scalar(
+        update(UserFile)
+        .where(
+            UserFile.id == locked_job.user_file_id,
+            UserFile.status.in_((UserFileStatus.INDEXING, UserFileStatus.COMPLETED)),
+        )
+        .values(
+            status=UserFileStatus.COMPLETED,
+            chunk_count=chunk_count,
+            last_project_sync_at=now,
+        )
+        .returning(UserFile.id)
+    )
+    if completed_file_id is None:
+        if commit:
+            db_session.rollback()
+        return False
+    locked_job.status = RegulatoryIndexingJobStatus.SUCCEEDED.value
+    locked_job.attempt_count = 0
+    locked_job.next_retry_at = None
+    locked_job.error_code = None
+    locked_job.error_message = None
+    locked_job.heartbeat_at = now
+    locked_job.updated_at = now
+    locked_job.completed_at = now
+    if commit:
+        db_session.commit()
+    else:
+        db_session.flush()
+    return True
+
+
 def persist_regulatory_indexing_item_skipped(
     db_session: Session,
     *,
@@ -1282,6 +1429,158 @@ def cancel_regulatory_indexing_job(
     job.next_retry_at = None
     job.error_code = None
     job.error_message = None
+    job.updated_at = now
+    db_session.execute(
+        update(UserFile)
+        .where(
+            UserFile.id == job.user_file_id,
+            UserFile.status.in_((UserFileStatus.PROCESSING, UserFileStatus.INDEXING)),
+        )
+        .values(status=UserFileStatus.CANCELED)
+    )
+    db_session.commit()
+    return True
+
+
+def request_regulatory_indexing_cancellation(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_stage: RegulatoryIndexingStage,
+    expected_generation: int,
+    now: datetime.datetime,
+) -> bool:
+    """Enter the resumable cancellation state under the active stage fence."""
+
+    job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == expected_stage.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if job is None:
+        db_session.rollback()
+        return False
+    job.status = RegulatoryIndexingJobStatus.CANCELLING.value
+    job.cancellation_phase = (
+        RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
+        if job.remote_vertex_job_name
+        else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
+    )
+    job.attempt_count = 0
+    job.next_retry_at = None
+    job.error_code = None
+    job.error_message = None
+    job.heartbeat_at = now
+    job.updated_at = now
+    db_session.commit()
+    return True
+
+
+def advance_regulatory_indexing_cancellation(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    expected_phase: RegulatoryIndexingCancellationPhase,
+    next_phase: RegulatoryIndexingCancellationPhase,
+    now: datetime.datetime,
+) -> bool:
+    advanced_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status
+            == RegulatoryIndexingJobStatus.CANCELLING.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.cancellation_phase == expected_phase.value,
+        )
+        .values(
+            cancellation_phase=next_phase.value,
+            attempt_count=0,
+            next_retry_at=None,
+            error_code=None,
+            error_message=None,
+            heartbeat_at=now,
+            updated_at=now,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return advanced_id is not None
+
+
+def schedule_regulatory_indexing_cancellation_retry(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    expected_phase: RegulatoryIndexingCancellationPhase,
+    next_retry_at: datetime.datetime,
+    error_code: str,
+    error_message: str,
+) -> bool:
+    scheduled_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status
+            == RegulatoryIndexingJobStatus.CANCELLING.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.cancellation_phase == expected_phase.value,
+        )
+        .values(
+            attempt_count=RegulatoryIndexingJob.attempt_count + 1,
+            next_retry_at=next_retry_at,
+            error_code=error_code,
+            error_message=error_message[:_MAX_ERROR_MESSAGE_LENGTH],
+            updated_at=func.now(),
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return scheduled_id is not None
+
+
+def finalize_regulatory_indexing_cancellation(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    now: datetime.datetime,
+) -> bool:
+    """Clear derived payloads and terminalize the final cancellation phase."""
+
+    job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status
+            == RegulatoryIndexingJobStatus.CANCELLING.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.cancellation_phase
+            == RegulatoryIndexingCancellationPhase.FINALIZE.value,
+        )
+        .with_for_update()
+    )
+    if job is None:
+        db_session.rollback()
+        return False
+    db_session.execute(
+        update(RegulatoryIndexingItem)
+        .where(RegulatoryIndexingItem.job_id == job_id)
+        .values(vector=None, updated_at=now)
+    )
+    job.status = RegulatoryIndexingJobStatus.CANCELLED.value
+    job.completed_at = now
+    job.next_retry_at = None
+    job.error_code = None
+    job.error_message = None
+    job.heartbeat_at = now
     job.updated_at = now
     db_session.execute(
         update(UserFile)
