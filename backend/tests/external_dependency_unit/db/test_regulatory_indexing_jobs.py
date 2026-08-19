@@ -2,10 +2,12 @@ import datetime
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from threading import Barrier, Event
+from types import SimpleNamespace
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from onyx.db import regulatory_indexing_jobs as regulatory_indexing_job_repository
@@ -13,11 +15,13 @@ from onyx.db.enums import (
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
     RegulatoryIndexingStage,
+    UserFileStatus,
 )
 from onyx.db.models import (
     RegulatoryChunk,
     RegulatoryIndexingItem,
     RegulatoryIndexingJob,
+    SearchSettings,
     User,
     UserFile,
 )
@@ -27,15 +31,20 @@ from onyx.db.regulatory_indexing_jobs import (
     advance_regulatory_indexing_job,
     claim_regulatory_indexing_job,
     claim_stale_regulatory_indexing_jobs,
+    complete_regulatory_indexing_user_file,
     create_or_get_regulatory_indexing_item,
     create_or_get_regulatory_indexing_job,
     persist_regulatory_indexing_item_context,
     persist_regulatory_indexing_item_failure,
     persist_regulatory_indexing_item_skipped,
     persist_regulatory_indexing_item_vector,
+    persist_regulatory_indexing_item_vectors,
+    regulatory_indexing_external_mutation_lease,
     schedule_regulatory_indexing_retry,
 )
+from onyx.document_index.interfaces_new import DocumentIndex
 from onyx.regulatory.chunker import RegulatoryChunker
+from onyx.regulatory.indexing_jobs.publisher import stage_regulatory_job_in_index
 from tests.external_dependency_unit.conftest import create_test_user
 
 _NOW = datetime.datetime(2026, 8, 19, 10, 0, tzinfo=datetime.timezone.utc)
@@ -944,3 +953,332 @@ def test_lease_takeover_fences_stale_atomic_chunk_replacement(
         ).all()
     )
     assert item_hashes == {"newer-request"}
+
+
+def _create_vector_items(
+    db_session: Session,
+    job: RegulatoryIndexingJob,
+    user_file: UserFile,
+) -> list[RegulatoryIndexingItem]:
+    items: list[RegulatoryIndexingItem] = []
+    for position in range(2):
+        chunk = RegulatoryChunk(
+            id=f"vector-chunk-{uuid4().hex}",
+            user_file_id=user_file.id,
+            text=f"MADDE {position + 1} - Vektor testi.",
+            position=position,
+            heading_path=[f"MADDE {position + 1}"],
+            chunk_metadata={},
+        )
+        item = RegulatoryIndexingItem(
+            id=uuid4(),
+            job_id=job.id,
+            regulatory_chunk_id=chunk.id,
+            request_hash=f"request-{position}",
+            status=RegulatoryIndexingItemStatus.CONTEXT_READY.value,
+        )
+        db_session.add_all([chunk, item])
+        items.append(item)
+    db_session.commit()
+    return items
+
+
+def test_multi_vector_persistence_is_atomic_and_generation_fenced(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    job.stage = RegulatoryIndexingStage.EMBEDDING.value
+    db_session.commit()
+    items = _create_vector_items(db_session, job, regulatory_user_file)
+
+    assert persist_regulatory_indexing_item_vectors(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        item_vectors=[
+            (items[0].id, [0.1, 0.2, 0.3]),
+            (items[1].id, [0.4, 0.5, 0.6]),
+        ],
+    )
+    for item, expected in zip(items, ([0.1, 0.2, 0.3], [0.4, 0.5, 0.6]), strict=True):
+        db_session.refresh(item)
+        assert item.status == RegulatoryIndexingItemStatus.EMBEDDED.value
+        assert item.vector == expected
+
+    items[0].status = RegulatoryIndexingItemStatus.CONTEXT_READY.value
+    items[0].vector = None
+    db_session.commit()
+    assert not persist_regulatory_indexing_item_vectors(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        item_vectors=[
+            (items[0].id, [9.0, 9.0, 9.0]),
+            (uuid4(), [8.0, 8.0, 8.0]),
+        ],
+    )
+    db_session.refresh(items[0])
+    assert items[0].status == RegulatoryIndexingItemStatus.CONTEXT_READY.value
+    assert items[0].vector is None
+
+    job.stage = RegulatoryIndexingStage.INDEX_WRITE.value
+    db_session.commit()
+    assert not persist_regulatory_indexing_item_vectors(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        item_vectors=[(items[0].id, [1.0, 1.0, 1.0])],
+    )
+    job.stage = RegulatoryIndexingStage.EMBEDDING.value
+    db_session.commit()
+    assert not persist_regulatory_indexing_item_vectors(
+        db_session,
+        job_id=job.id,
+        expected_generation=0,
+        item_vectors=[(items[0].id, [1.0, 1.0, 1.0])],
+    )
+
+
+def test_external_mutation_lock_excludes_recovery_and_refreshes_heartbeat(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW - datetime.timedelta(minutes=5),
+    )
+    job.stage = RegulatoryIndexingStage.INDEX_WRITE.value
+    regulatory_user_file.status = UserFileStatus.INDEXING
+    db_session.commit()
+    engine = db_session.get_bind()
+    entered = Event()
+    release = Event()
+
+    def hold_external_mutation() -> None:
+        with Session(engine) as mutation_session:
+            with regulatory_indexing_external_mutation_lease(
+                mutation_session,
+                job_id=job.id,
+                expected_stage=RegulatoryIndexingStage.INDEX_WRITE,
+                expected_generation=1,
+            ) as lease:
+                assert lease is not None
+                entered.set()
+                assert release.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        held = executor.submit(hold_external_mutation)
+        assert entered.wait(timeout=5)
+        with Session(engine) as recovery_session:
+            claims = claim_stale_regulatory_indexing_jobs(
+                recovery_session,
+                stale_before=_NOW - datetime.timedelta(minutes=2),
+                claimed_at=_NOW,
+                limit=10,
+            )
+        assert claims == []
+        release.set()
+        held.result(timeout=5)
+
+    db_session.refresh(job)
+    assert job.lease_generation == 1
+    assert job.heartbeat_at is not None
+    assert job.heartbeat_at > _NOW
+
+
+def test_external_mutation_lock_blocks_cancellation_until_es_finishes(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    job.stage = RegulatoryIndexingStage.INDEX_WRITE.value
+    regulatory_user_file.status = UserFileStatus.INDEXING
+    db_session.commit()
+    engine = db_session.get_bind()
+    entered = Event()
+    release = Event()
+
+    def hold_external_mutation() -> None:
+        with Session(engine) as mutation_session:
+            with regulatory_indexing_external_mutation_lease(
+                mutation_session,
+                job_id=job.id,
+                expected_stage=RegulatoryIndexingStage.INDEX_WRITE,
+                expected_generation=1,
+            ) as lease:
+                assert lease is not None
+                entered.set()
+                assert release.wait(timeout=5)
+
+    def cancel_job() -> bool:
+        with Session(engine) as cancel_session:
+            return advance_regulatory_indexing_job(
+                cancel_session,
+                job_id=job.id,
+                expected_stage=RegulatoryIndexingStage.INDEX_WRITE,
+                expected_generation=1,
+                next_stage=RegulatoryIndexingStage.INDEX_WRITE,
+                next_status=RegulatoryIndexingJobStatus.CANCELLING,
+                now=_NOW,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        held = executor.submit(hold_external_mutation)
+        assert entered.wait(timeout=5)
+        cancellation = executor.submit(cancel_job)
+        with pytest.raises(TimeoutError):
+            cancellation.result(timeout=0.3)
+        release.set()
+        held.result(timeout=5)
+        assert cancellation.result(timeout=5)
+
+
+def test_external_mutation_lock_blocks_user_file_deletion_status(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    job.stage = RegulatoryIndexingStage.INDEX_WRITE.value
+    regulatory_user_file.status = UserFileStatus.INDEXING
+    db_session.commit()
+    engine = db_session.get_bind()
+    entered = Event()
+    release = Event()
+
+    def hold_external_mutation() -> None:
+        with Session(engine) as mutation_session:
+            with regulatory_indexing_external_mutation_lease(
+                mutation_session,
+                job_id=job.id,
+                expected_stage=RegulatoryIndexingStage.INDEX_WRITE,
+                expected_generation=1,
+            ) as lease:
+                assert lease is not None
+                entered.set()
+                assert release.wait(timeout=5)
+
+    def mark_deleting() -> None:
+        with Session(engine) as delete_session:
+            delete_session.execute(
+                update(UserFile)
+                .where(UserFile.id == regulatory_user_file.id)
+                .values(status=UserFileStatus.DELETING)
+            )
+            delete_session.commit()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        held = executor.submit(hold_external_mutation)
+        assert entered.wait(timeout=5)
+        deletion = executor.submit(mark_deleting)
+        with pytest.raises(TimeoutError):
+            deletion.result(timeout=0.3)
+        release.set()
+        held.result(timeout=5)
+        deletion.result(timeout=5)
+
+    db_session.refresh(regulatory_user_file)
+    assert regulatory_user_file.status is UserFileStatus.DELETING
+
+
+def test_user_file_completion_preserves_cancelled_and_deleting_states(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    for initial_status, should_complete in (
+        (UserFileStatus.INDEXING, True),
+        (UserFileStatus.COMPLETED, True),
+        (UserFileStatus.CANCELED, False),
+        (UserFileStatus.DELETING, False),
+    ):
+        job = _create_job(db_session, regulatory_user_file.id)
+        assert claim_regulatory_indexing_job(
+            db_session,
+            job_id=job.id,
+            expected_stage=RegulatoryIndexingStage.PREPARING,
+            expected_generation=0,
+            now=_NOW,
+        )
+        job.stage = RegulatoryIndexingStage.PUBLISH.value
+        regulatory_user_file.status = initial_status
+        db_session.commit()
+
+        assert (
+            complete_regulatory_indexing_user_file(
+                db_session,
+                job_id=job.id,
+                expected_generation=1,
+                chunk_count=2,
+                now=_NOW,
+            )
+            is should_complete
+        )
+        db_session.refresh(regulatory_user_file)
+        assert regulatory_user_file.status is (
+            UserFileStatus.COMPLETED if should_complete else initial_status
+        )
+
+
+def test_stale_generation_never_calls_recording_index(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    job.stage = RegulatoryIndexingStage.INDEX_WRITE.value
+    regulatory_user_file.status = UserFileStatus.INDEXING
+    db_session.commit()
+    calls: list[object] = []
+    recording_index = cast(
+        DocumentIndex,
+        SimpleNamespace(index=lambda *_args, **_kwargs: calls.append(object())),
+    )
+    stale_job = cast(
+        RegulatoryIndexingJob,
+        SimpleNamespace(id=job.id, lease_generation=0),
+    )
+
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        stage_regulatory_job_in_index(
+            job=stale_job,
+            user_file=regulatory_user_file,
+            rows=[],
+            items=[],
+            search_settings=cast(SearchSettings, SimpleNamespace()),
+            tenant_id="tenant-a",
+            db_session=db_session,
+            document_index=recording_index,
+        )
+
+    assert calls == []

@@ -1567,6 +1567,67 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 f"{len(set(mismatches))} chunk(s): {preview}"
             )
 
+    def get_document_chunks(
+        self,
+        document_chunk_ids: list[str],
+    ) -> dict[str, DocumentChunk]:
+        """Fetch an exact set of stored chunks, including their vectors."""
+
+        if not document_chunk_ids:
+            return {}
+        if len(set(document_chunk_ids)) != len(document_chunk_ids):
+            raise ValueError("document_chunk_ids must be unique")
+        expected_ids = set(document_chunk_ids)
+        response = self._client.mget(
+            index=self._index_name,
+            docs=[{"_id": chunk_id} for chunk_id in document_chunk_ids],
+        )
+        documents = response.get("docs")
+        if not isinstance(documents, list):
+            raise ElasticsearchUpdateError(
+                "Elasticsearch returned a malformed document verification response."
+            )
+
+        chunks: dict[str, DocumentChunk] = {}
+        missing: list[str] = []
+        for document in documents:
+            if not isinstance(document, dict):
+                raise ElasticsearchUpdateError(
+                    "Elasticsearch returned a malformed document during verification."
+                )
+            chunk_id = document.get("_id")
+            if not isinstance(chunk_id, str) or chunk_id not in expected_ids:
+                raise ElasticsearchUpdateError(
+                    "Elasticsearch returned an unexpected chunk during verification."
+                )
+            if chunk_id in chunks or chunk_id in missing:
+                raise ElasticsearchUpdateError(
+                    "Elasticsearch returned a duplicate chunk during verification."
+                )
+            if not document.get("found", False):
+                missing.append(chunk_id)
+                continue
+            source = document.get("_source")
+            if not isinstance(source, dict):
+                raise ElasticsearchUpdateError(
+                    "Elasticsearch returned a chunk without a source during verification."
+                )
+            try:
+                chunks[chunk_id] = DocumentChunk.model_validate(source)
+            except ValueError as error:
+                raise ElasticsearchUpdateError(
+                    "Elasticsearch returned an invalid chunk during verification."
+                ) from error
+
+        missing.extend(sorted(expected_ids - set(chunks) - set(missing)))
+        if missing:
+            raise ElasticsearchDocumentMissingError(sorted(missing))
+        if set(chunks) != expected_ids:
+            raise ElasticsearchUpdateError(
+                "Elasticsearch document verification returned a different ID set."
+            )
+        return chunks
+
     @log_function_time(print_only=True, debug_only=True, include_args=True)
     def get_document(self, document_chunk_id: str) -> DocumentChunk:
         """Gets an Elasticsearch document chunk.

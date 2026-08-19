@@ -3,7 +3,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Self
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from onyx.access.models import DocumentAccess
 from onyx.configs.constants import PUBLIC_DOC_PAT
@@ -26,6 +26,10 @@ __all__ = [
     "DocumentIndex",
     # Data models - used in method signatures
     "DocumentInsertionRecord",
+    "DocumentChunkVerificationExpectation",
+    "DocumentChunkVerificationRequest",
+    "DocumentChunkVerificationResult",
+    "DocumentChunkVerificationError",
     "DocumentSectionRequest",
     "IndexingMetadata",
     "MetadataUpdateRequest",
@@ -73,6 +77,44 @@ class DocumentInsertionRecord(BaseModel):
 
     document_id: str
     already_existed: bool
+
+
+class DocumentChunkVerificationError(RuntimeError):
+    """The stored document projection does not exactly match its expectation."""
+
+
+class DocumentChunkVerificationExpectation(BaseModel):
+    model_config = {"frozen": True}
+
+    chunk_index: int = Field(ge=0)
+    regulatory_chunk_id: str = Field(min_length=1)
+
+
+class DocumentChunkVerificationRequest(BaseModel):
+    model_config = {"frozen": True}
+
+    document_id: str = Field(min_length=1)
+    expected_chunks: tuple[DocumentChunkVerificationExpectation, ...] = Field(
+        min_length=1
+    )
+    expected_hidden: bool
+    content_vector_dimension: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def check_chunk_indexes_are_contiguous(self) -> Self:
+        indexes = [chunk.chunk_index for chunk in self.expected_chunks]
+        if indexes != list(range(len(indexes))):
+            raise ValueError("expected chunk indexes must be contiguous and ordered")
+        return self
+
+
+class DocumentChunkVerificationResult(BaseModel):
+    model_config = {"frozen": True}
+
+    document_id: str = Field(min_length=1)
+    chunk_count: int = Field(gt=0)
+    document_chunk_ids: frozenset[str] = Field(min_length=1)
+    hidden: bool
 
 
 class DocumentSectionRequest(BaseModel):
@@ -502,3 +544,17 @@ class DocumentIndex(
     - Retrieve document or sections of documents based on document id
     - Retrieve sets of random documents
     """
+
+    def verify_document_chunks(
+        self,
+        request: DocumentChunkVerificationRequest,
+    ) -> DocumentChunkVerificationResult:
+        """Verify one exact deterministic document projection."""
+        raise NotImplementedError
+
+    def update_document_visibility(
+        self,
+        request: DocumentChunkVerificationRequest,
+    ) -> None:
+        """Strictly update every expected chunk to the requested visibility."""
+        raise NotImplementedError

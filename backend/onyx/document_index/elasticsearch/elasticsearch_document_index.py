@@ -1,5 +1,6 @@
 import datetime
 import json
+import math
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -57,6 +58,9 @@ from onyx.document_index.elasticsearch.search import (
     get_normalization_method_and_config,
 )
 from onyx.document_index.interfaces_new import (
+    DocumentChunkVerificationError,
+    DocumentChunkVerificationRequest,
+    DocumentChunkVerificationResult,
     DocumentIndex,
     DocumentInsertionRecord,
     DocumentSectionRequest,
@@ -657,6 +661,102 @@ class ElasticsearchDocumentIndex(DocumentIndex):
 
         return self._client.delete_by_query(query_body)
 
+    def _verification_chunk_ids(
+        self,
+        request: DocumentChunkVerificationRequest,
+    ) -> list[str]:
+        return [
+            get_elasticsearch_doc_chunk_id(
+                tenant_state=self._tenant_state,
+                document_id=request.document_id,
+                chunk_index=chunk.chunk_index,
+            )
+            for chunk in request.expected_chunks
+        ]
+
+    def verify_document_chunks(
+        self,
+        request: DocumentChunkVerificationRequest,
+    ) -> DocumentChunkVerificationResult:
+        """Verify the exact current Elasticsearch projection of one document."""
+
+        self._client.refresh_index()
+        actual_count = self._client.count_by_query(
+            DocumentQuery.delete_from_document_id_query(
+                document_id=request.document_id,
+                tenant_state=self._tenant_state,
+            )
+        )
+        expected_count = len(request.expected_chunks)
+        if actual_count != expected_count:
+            raise DocumentChunkVerificationError(
+                f"document chunk count mismatch: expected {expected_count}, "
+                f"found {actual_count}"
+            )
+
+        expected_ids = self._verification_chunk_ids(request)
+        try:
+            stored_chunks = self._client.get_document_chunks(expected_ids)
+        except (ElasticsearchDocumentMissingError, ElasticsearchUpdateError) as error:
+            raise DocumentChunkVerificationError(str(error)) from error
+        if set(stored_chunks) != set(expected_ids):
+            raise DocumentChunkVerificationError(
+                "document chunk ID set does not match the deterministic expectation"
+            )
+
+        for expected_chunk, chunk_id in zip(
+            request.expected_chunks, expected_ids, strict=True
+        ):
+            stored = stored_chunks[chunk_id]
+            if (
+                stored.document_id != request.document_id
+                or stored.chunk_index != expected_chunk.chunk_index
+                or stored.regulatory_chunk_id != expected_chunk.regulatory_chunk_id
+            ):
+                raise DocumentChunkVerificationError(
+                    f"document chunk identity mismatch for {chunk_id}"
+                )
+            if stored.hidden is not request.expected_hidden:
+                raise DocumentChunkVerificationError(
+                    f"document chunk visibility mismatch for {chunk_id}"
+                )
+            vector = stored.content_vector
+            if (
+                not isinstance(vector, list)
+                or len(vector) != request.content_vector_dimension
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in vector
+                )
+            ):
+                raise DocumentChunkVerificationError(
+                    f"document chunk content vector mismatch for {chunk_id}"
+                )
+
+        return DocumentChunkVerificationResult(
+            document_id=request.document_id,
+            chunk_count=actual_count,
+            document_chunk_ids=frozenset(expected_ids),
+            hidden=request.expected_hidden,
+        )
+
+    def update_document_visibility(
+        self,
+        request: DocumentChunkVerificationRequest,
+    ) -> None:
+        """Strictly update every deterministic chunk; missing chunks are fatal."""
+
+        try:
+            self._client.bulk_update_documents(
+                document_chunk_ids=self._verification_chunk_ids(request),
+                properties_to_update={HIDDEN_FIELD_NAME: request.expected_hidden},
+                surface_document_missing=True,
+            )
+        except (ElasticsearchDocumentMissingError, ElasticsearchUpdateError) as error:
+            raise DocumentChunkVerificationError(str(error)) from error
+
     def delete_port_written_chunks(self, document_ids: list[str]) -> int:
         """Delete only port-written chunks (written_by_port=true) for the given docs.
 
@@ -1221,6 +1321,27 @@ class ElasticsearchIndexPair(DocumentIndex):
         indexing_metadata: IndexingMetadata,
     ) -> list[DocumentInsertionRecord]:
         return self._primary.index(chunks, indexing_metadata)
+
+    def verify_document_chunks(
+        self,
+        request: DocumentChunkVerificationRequest,
+    ) -> DocumentChunkVerificationResult:
+        # Forward writes target the primary; the secondary is populated by the
+        # separate port pipeline and is not part of this publication boundary.
+        return self._primary.verify_document_chunks(request)
+
+    def update_document_visibility(
+        self,
+        request: DocumentChunkVerificationRequest,
+    ) -> None:
+        self._primary.update_document_visibility(request)
+        if self._secondary is not None:
+            try:
+                self._secondary.update_document_visibility(request)
+            except DocumentChunkVerificationError as error:
+                raise SecondaryIndexDocumentMissingError(
+                    [request.document_id]
+                ) from error
 
     def delete(self, document_id: str, chunk_count: int | None = None) -> int:
         total = self._primary.delete(document_id, chunk_count)

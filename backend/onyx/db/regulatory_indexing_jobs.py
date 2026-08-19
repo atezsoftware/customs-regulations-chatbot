@@ -1,7 +1,10 @@
 import datetime
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
+from typing import cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, delete, func, or_, select, update
@@ -18,6 +21,7 @@ from onyx.db.models import (
     RegulatoryChunk,
     RegulatoryIndexingItem,
     RegulatoryIndexingJob,
+    SearchSettings,
     UserFile,
 )
 
@@ -51,6 +55,24 @@ type RegulatoryIndexingJSONValue = (
     | dict[str, RegulatoryIndexingJSONValue]
 )
 type RegulatoryIndexingConfigSnapshot = dict[str, RegulatoryIndexingJSONValue]
+
+
+@dataclass(frozen=True)
+class RegulatoryIndexingExternalMutationLease:
+    """Fresh locked state held for the duration of one external mutation."""
+
+    job_id: UUID
+    user_file_id: UUID
+    lease_generation: int
+    stage: RegulatoryIndexingStage
+    config_snapshot: RegulatoryIndexingConfigSnapshot
+    search_settings_id: int
+    search_settings: SearchSettings | None
+    user_file_name: str
+    user_file_status: UserFileStatus
+    user_file_chunk_count: int | None
+    regulatory_chunks: tuple[RegulatoryChunk, ...]
+    indexing_items: tuple[RegulatoryIndexingItem, ...]
 
 
 @dataclass(frozen=True)
@@ -704,6 +726,87 @@ def persist_regulatory_indexing_item_vectors(
     return True
 
 
+@contextmanager
+def regulatory_indexing_external_mutation_lease(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_stage: RegulatoryIndexingStage,
+    expected_generation: int,
+) -> Iterator[RegulatoryIndexingExternalMutationLease | None]:
+    """Fence an external mutation with locked current job and file rows."""
+
+    locked_job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == expected_stage.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if locked_job is None:
+        db_session.rollback()
+        yield None
+        return
+
+    locked_user_file = db_session.scalar(
+        select(UserFile).where(UserFile.id == locked_job.user_file_id).with_for_update()
+    )
+    if locked_user_file is None:
+        db_session.rollback()
+        yield None
+        return
+
+    locked_search_settings = db_session.scalar(
+        select(SearchSettings)
+        .where(SearchSettings.id == locked_job.search_settings_id)
+        .with_for_update()
+    )
+    regulatory_chunks = tuple(
+        db_session.scalars(
+            select(RegulatoryChunk)
+            .where(RegulatoryChunk.user_file_id == locked_user_file.id)
+            .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
+            .with_for_update()
+        ).all()
+    )
+    indexing_items = tuple(
+        db_session.scalars(
+            select(RegulatoryIndexingItem)
+            .where(RegulatoryIndexingItem.job_id == locked_job.id)
+            .with_for_update()
+        ).all()
+    )
+    lease = RegulatoryIndexingExternalMutationLease(
+        job_id=locked_job.id,
+        user_file_id=locked_user_file.id,
+        lease_generation=locked_job.lease_generation,
+        stage=RegulatoryIndexingStage(locked_job.stage),
+        config_snapshot=cast(
+            RegulatoryIndexingConfigSnapshot,
+            deepcopy(locked_job.config_snapshot),
+        ),
+        search_settings_id=locked_job.search_settings_id,
+        search_settings=locked_search_settings,
+        user_file_name=locked_user_file.name,
+        user_file_status=locked_user_file.status,
+        user_file_chunk_count=locked_user_file.chunk_count,
+        regulatory_chunks=regulatory_chunks,
+        indexing_items=indexing_items,
+    )
+    try:
+        yield lease
+        heartbeat_at = datetime.datetime.now(datetime.timezone.utc)
+        locked_job.heartbeat_at = heartbeat_at
+        locked_job.updated_at = heartbeat_at
+        db_session.commit()
+    except Exception:
+        db_session.rollback()
+        raise
+
+
 def complete_regulatory_indexing_user_file(
     db_session: Session,
     *,
@@ -711,6 +814,7 @@ def complete_regulatory_indexing_user_file(
     expected_generation: int,
     chunk_count: int,
     now: datetime.datetime,
+    commit: bool = True,
 ) -> bool:
     """Mark a published file complete only for the current PUBLISH lease."""
 
@@ -746,7 +850,10 @@ def complete_regulatory_indexing_user_file(
     if completed_id is None:
         db_session.rollback()
         return False
-    db_session.commit()
+    if commit:
+        db_session.commit()
+    else:
+        db_session.flush()
     return True
 
 

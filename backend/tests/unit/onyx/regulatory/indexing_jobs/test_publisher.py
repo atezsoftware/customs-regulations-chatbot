@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import datetime
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
@@ -21,7 +23,15 @@ from onyx.db.models import (
 from onyx.document_index.elasticsearch.elasticsearch_document_index import (
     ElasticsearchDocumentIndex,
 )
+from onyx.document_index.elasticsearch.schema import (
+    DocumentChunk,
+    get_elasticsearch_doc_chunk_id,
+)
 from onyx.document_index.interfaces_new import (
+    DocumentChunkVerificationError,
+    DocumentChunkVerificationExpectation,
+    DocumentChunkVerificationRequest,
+    DocumentChunkVerificationResult,
     DocumentIndex,
     DocumentInsertionRecord,
     IndexingMetadata,
@@ -39,6 +49,7 @@ from onyx.regulatory.indexing_jobs.publisher import (
     PublishVerification,
     publish_regulatory_job,
     stage_regulatory_job_in_index,
+    verify_staged_regulatory_job,
 )
 from shared_configs.enums import EmbeddingProvider
 
@@ -152,6 +163,7 @@ class _RecordingDocumentIndex:
         *,
         insertion_records: list[DocumentInsertionRecord] | None = None,
         update_error: Exception | None = None,
+        verification_errors: list[Exception | None] | None = None,
     ) -> None:
         self.events = events
         self.index_calls: list[
@@ -160,6 +172,8 @@ class _RecordingDocumentIndex:
         self.update_calls: list[list[MetadataUpdateRequest]] = []
         self._insertion_records = insertion_records
         self._update_error = update_error
+        self._verification_errors = iter(verification_errors or [])
+        self.verification_calls: list[DocumentChunkVerificationRequest] = []
 
     def index(
         self,
@@ -184,8 +198,50 @@ class _RecordingDocumentIndex:
         if self._update_error is not None:
             raise self._update_error
 
+    def update_document_visibility(
+        self, request: DocumentChunkVerificationRequest
+    ) -> None:
+        self.events.append("update")
+        self.update_calls.append(
+            [
+                MetadataUpdateRequest(
+                    document_ids=[request.document_id],
+                    doc_id_to_chunk_cnt={
+                        request.document_id: len(request.expected_chunks)
+                    },
+                    hidden=request.expected_hidden,
+                )
+            ]
+        )
+        if self._update_error is not None:
+            raise self._update_error
 
-def _install_metadata(monkeypatch: pytest.MonkeyPatch, user_file: UserFile) -> None:
+    def verify_document_chunks(
+        self, request: DocumentChunkVerificationRequest
+    ) -> DocumentChunkVerificationResult:
+        self.events.append(f"verify:{str(request.expected_hidden).lower()}")
+        self.verification_calls.append(request)
+        error = next(self._verification_errors, None)
+        if error is not None:
+            raise error
+        return DocumentChunkVerificationResult(
+            document_id=request.document_id,
+            chunk_count=len(request.expected_chunks),
+            document_chunk_ids=frozenset(
+                f"chunk-{chunk.chunk_index}" for chunk in request.expected_chunks
+            ),
+            hidden=request.expected_hidden,
+        )
+
+
+def _install_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    job: RegulatoryIndexingJob,
+    user_file: UserFile,
+    search_settings: SearchSettings,
+    rows: list[RegulatoryChunk] | None = None,
+    items: list[RegulatoryIndexingItem] | None = None,
+) -> None:
     document_id = str(user_file.id)
     monkeypatch.setattr(
         publisher,
@@ -206,6 +262,37 @@ def _install_metadata(monkeypatch: pytest.MonkeyPatch, user_file: UserFile) -> N
         publisher,
         "fetch_document_set_names_for_user_files",
         lambda _ids, _db: {document_id: ["Regulations"]},
+    )
+
+    @contextmanager
+    def locked_lease(
+        _db_session: Session,
+        *,
+        job_id: object,
+        expected_stage: object,
+        expected_generation: int,
+    ) -> Iterator[object]:
+        assert job_id == job.id
+        yield SimpleNamespace(
+            job_id=job.id,
+            user_file_id=user_file.id,
+            lease_generation=expected_generation,
+            stage=expected_stage,
+            config_snapshot=job.config_snapshot,
+            search_settings_id=job.config_snapshot["search_settings_id"],
+            search_settings=search_settings,
+            user_file_name=user_file.name,
+            user_file_status=user_file.status,
+            user_file_chunk_count=user_file.chunk_count,
+            regulatory_chunks=tuple(rows or []),
+            indexing_items=tuple(items or []),
+        )
+
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "regulatory_indexing_external_mutation_lease",
+        locked_lease,
+        raising=False,
     )
 
 
@@ -234,7 +321,7 @@ def test_stage_indexes_every_chunk_hidden_then_publish_completes_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job, user_file, settings, rows, items = _fixture()
-    _install_metadata(monkeypatch, user_file)
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
     events: list[str] = []
     document_index = _RecordingDocumentIndex(events)
     completed: list[tuple[object, int, int]] = []
@@ -246,8 +333,10 @@ def test_stage_indexes_every_chunk_hidden_then_publish_completes_file(
         expected_generation: int,
         chunk_count: int,
         now: datetime.datetime,
+        commit: bool = True,
     ) -> bool:
         assert now.tzinfo is datetime.timezone.utc
+        assert commit is False
         events.append("complete")
         completed.append((job_id, expected_generation, chunk_count))
         return True
@@ -269,7 +358,7 @@ def test_stage_indexes_every_chunk_hidden_then_publish_completes_file(
     )
 
     staged_chunks, metadata = document_index.index_calls[0]
-    assert events == ["index"]
+    assert events == ["index", "verify:true"]
     assert all(chunk.hidden for chunk in staged_chunks)
     assert [chunk.chunk_id for chunk in staged_chunks] == [0, 1]
     assert [chunk.regulatory_chunk_id for chunk in staged_chunks] == ["row-0", "row-1"]
@@ -296,7 +385,14 @@ def test_stage_indexes_every_chunk_hidden_then_publish_completes_file(
         document_index=cast(DocumentIndex, document_index),
     )
 
-    assert events == ["index", "update", "complete"]
+    assert events == [
+        "index",
+        "verify:true",
+        "verify:true",
+        "update",
+        "verify:false",
+        "complete",
+    ]
     assert document_index.update_calls == [
         [
             MetadataUpdateRequest(
@@ -314,7 +410,7 @@ def test_stage_retry_preserves_document_and_chunk_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job, user_file, settings, rows, items = _fixture()
-    _install_metadata(monkeypatch, user_file)
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
     document_index = _RecordingDocumentIndex([])
 
     first = _stage(
@@ -350,7 +446,7 @@ def test_insertion_count_mismatch_never_publishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job, user_file, settings, rows, items = _fixture()
-    _install_metadata(monkeypatch, user_file)
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
     document_index = _RecordingDocumentIndex([], insertion_records=[])
     completed: list[object] = []
     monkeypatch.setattr(
@@ -378,7 +474,7 @@ def test_visibility_failure_never_marks_user_file_complete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job, user_file, settings, rows, items = _fixture()
-    _install_metadata(monkeypatch, user_file)
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
     document_index = _RecordingDocumentIndex(
         [], update_error=RuntimeError("Elasticsearch unavailable")
     )
@@ -415,8 +511,8 @@ def test_visibility_failure_never_marks_user_file_complete(
 def test_publish_rejects_stale_count_verification_before_visibility(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    job, user_file, _settings, rows, items = _fixture()
-    _install_metadata(monkeypatch, user_file)
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
     document_index = _RecordingDocumentIndex([])
     stale_verification = PublishVerification(
         job_id=job.id,
@@ -445,7 +541,7 @@ def test_elasticsearch_maps_hidden_flag_and_legacy_enrichment_defaults_visible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job, user_file, settings, rows, items = _fixture()
-    _install_metadata(monkeypatch, user_file)
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
     recorder = _RecordingDocumentIndex([])
     _stage(
         job=job,
@@ -492,7 +588,7 @@ def test_cancelled_user_file_is_never_staged_or_published(
 ) -> None:
     job, user_file, settings, rows, items = _fixture()
     user_file.status = UserFileStatus.CANCELED
-    _install_metadata(monkeypatch, user_file)
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
     document_index = _RecordingDocumentIndex([])
     verification = PublishVerification(
         job_id=job.id,
@@ -525,3 +621,219 @@ def test_cancelled_user_file_is_never_staged_or_published(
 
     assert document_index.index_calls == []
     assert document_index.update_calls == []
+
+
+def test_stage_fails_when_actual_hidden_projection_does_not_verify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
+    document_index = _RecordingDocumentIndex(
+        [],
+        verification_errors=[DocumentChunkVerificationError("missing chunk")],
+    )
+
+    with pytest.raises(DocumentChunkVerificationError, match="missing chunk"):
+        _stage(
+            job=job,
+            user_file=user_file,
+            settings=settings,
+            rows=rows,
+            items=items,
+            document_index=document_index,
+        )
+
+    assert document_index.events == ["index", "verify:true"]
+
+
+def test_stage_uses_fresh_locked_projection_instead_of_stale_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, fresh_rows, fresh_items = _fixture()
+    stale_rows = deepcopy(fresh_rows)
+    stale_items = deepcopy(fresh_items)
+    stale_rows[0].text = "STALE LEGAL TEXT"
+    stale_items[0].vector = [9.0, 9.0, 9.0]
+    _install_metadata(
+        monkeypatch,
+        job,
+        user_file,
+        settings,
+        fresh_rows,
+        fresh_items,
+    )
+    document_index = _RecordingDocumentIndex([])
+
+    _stage(
+        job=job,
+        user_file=user_file,
+        settings=settings,
+        rows=stale_rows,
+        items=stale_items,
+        document_index=document_index,
+    )
+
+    staged_chunks = document_index.index_calls[0][0]
+    assert staged_chunks[0].content == "MADDE 1 - Yürürlük hükmü."
+    assert staged_chunks[0].embeddings.full_embedding == [1.0, 0.2, 0.3]
+
+
+def test_verify_stage_reads_actual_hidden_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
+    document_index = _RecordingDocumentIndex([])
+
+    verification = verify_staged_regulatory_job(
+        job=job,
+        user_file=user_file,
+        rows=rows,
+        items=items,
+        db_session=_DB_SESSION,
+        document_index=cast(DocumentIndex, document_index),
+    )
+
+    assert verification.canonical_chunk_count == 2
+    assert document_index.events == ["verify:true"]
+
+
+def test_publish_post_update_disappearance_never_completes_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
+    document_index = _RecordingDocumentIndex(
+        [],
+        verification_errors=[
+            None,
+            DocumentChunkVerificationError("chunk disappeared after update"),
+        ],
+    )
+    completed: list[object] = []
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_user_file",
+        lambda *_args, **_kwargs: completed.append(object()) or True,
+    )
+
+    with pytest.raises(
+        DocumentChunkVerificationError, match="chunk disappeared after update"
+    ):
+        publish_regulatory_job(
+            job=job,
+            user_file=user_file,
+            rows=rows,
+            items=items,
+            verification=None,
+            db_session=_DB_SESSION,
+            document_index=cast(DocumentIndex, document_index),
+        )
+
+    assert document_index.events == [
+        "verify:true",
+        "update",
+        "verify:false",
+        "update",
+        "verify:true",
+    ]
+    assert completed == []
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["count", "missing", "hidden", "dimension", "non_finite"],
+)
+def test_elasticsearch_verification_rejects_projection_mismatch(
+    mismatch: str,
+) -> None:
+    document_id = str(uuid4())
+    tenant_state = TenantState(tenant_id="tenant-a", multitenant=False)
+    expected = DocumentChunkVerificationRequest(
+        document_id=document_id,
+        expected_chunks=(
+            DocumentChunkVerificationExpectation(
+                chunk_index=0, regulatory_chunk_id="row-0"
+            ),
+            DocumentChunkVerificationExpectation(
+                chunk_index=1, regulatory_chunk_id="row-1"
+            ),
+        ),
+        expected_hidden=True,
+        content_vector_dimension=3,
+    )
+    chunk_ids = [
+        get_elasticsearch_doc_chunk_id(
+            tenant_state=tenant_state,
+            document_id=document_id,
+            chunk_index=index,
+        )
+        for index in range(2)
+    ]
+    chunks: dict[str, DocumentChunk] = {
+        chunk_ids[index]: cast(
+            DocumentChunk,
+            SimpleNamespace(
+                document_id=document_id,
+                chunk_index=index,
+                regulatory_chunk_id=f"row-{index}",
+                hidden=True,
+                content_vector=[0.1, 0.2, 0.3],
+            ),
+        )
+        for index in range(2)
+    }
+    count = 2
+    if mismatch == "count":
+        count = 3
+    elif mismatch == "missing":
+        chunks.pop(chunk_ids[1])
+    elif mismatch == "hidden":
+        chunks[chunk_ids[1]].hidden = False
+    elif mismatch == "dimension":
+        chunks[chunk_ids[1]].content_vector = [0.1, 0.2]
+    else:
+        chunks[chunk_ids[1]].content_vector = [0.1, float("nan"), 0.3]
+
+    client = MagicMock()
+    client.count_by_query.return_value = count
+    client.get_document_chunks.return_value = chunks
+    document_index = ElasticsearchDocumentIndex.__new__(ElasticsearchDocumentIndex)
+    document_index._index_name = "regulatory-index"
+    document_index._client = client
+    document_index._tenant_state = tenant_state
+
+    with pytest.raises(DocumentChunkVerificationError):
+        document_index.verify_document_chunks(expected)
+
+
+def test_elasticsearch_verification_count_is_tenant_scoped() -> None:
+    document_id = str(uuid4())
+    request = DocumentChunkVerificationRequest(
+        document_id=document_id,
+        expected_chunks=(
+            DocumentChunkVerificationExpectation(
+                chunk_index=0,
+                regulatory_chunk_id="row-0",
+            ),
+        ),
+        expected_hidden=True,
+        content_vector_dimension=3,
+    )
+    client = MagicMock()
+    client.count_by_query.return_value = 0
+    document_index = ElasticsearchDocumentIndex.__new__(ElasticsearchDocumentIndex)
+    document_index._index_name = "regulatory-index"
+    document_index._client = client
+    document_index._tenant_state = TenantState(
+        tenant_id="tenant-a",
+        multitenant=True,
+    )
+
+    with pytest.raises(DocumentChunkVerificationError, match="count mismatch"):
+        document_index.verify_document_chunks(request)
+
+    count_query = client.count_by_query.call_args.args[0]
+    assert {"term": {"tenant_id": {"value": "tenant-a"}}} in count_query["query"][
+        "bool"
+    ]["filter"]
