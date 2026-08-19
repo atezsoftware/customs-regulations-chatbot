@@ -1023,10 +1023,99 @@ def test_prod_lite_mounts_readiness_attestation_read_only() -> None:
         "target": "/run/readiness/regulatory-capabilities.json",
         "read_only": "true",
     } in volumes
+    assert {
+        "type": "bind",
+        "source": "${REGULATORY_CAPABILITY_EVIDENCE_FILE:?set owner-1001 mode-0400 archived IAM evidence}",
+        "target": "/run/readiness/regulatory-capability-evidence.json",
+        "read_only": "true",
+    } in volumes
 
     runbook = _RUNBOOK_PATH.read_text(encoding="utf-8")
     assert "exec -T --user 1001:1001 background python" in runbook
     assert "evidence_sha256" in runbook
+    assert (
+        "--capability-evidence /run/readiness/regulatory-capability-evidence.json"
+        in runbook
+    )
+
+
+def test_supervisor_socket_allows_only_root_and_onyx_group_access(
+    tmp_path: Path,
+) -> None:
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read(_BACKEND_ROOT / "supervisord-lite.conf", encoding="utf-8")
+    socket_config = parser["unix_http_server"]
+
+    assert socket_config["file"] == "/tmp/supervisor.sock"
+    assert int(socket_config["chmod"], 8) == 0o770
+    assert socket_config["chown"] == "1001:1001"
+    assert int(socket_config["chmod"], 8) & 0o007 == 0
+    assert int(socket_config["chmod"], 8) & 0o070 == 0o070
+
+    runtime_dockerfile = (_BACKEND_ROOT / "Dockerfile.runtime-lite").read_text(
+        encoding="utf-8"
+    )
+    assert "useradd -u 1001 -g onyx" in runtime_dockerfile
+
+    socket_path = tmp_path / "supervisor.sock"
+    pid_path = tmp_path / "supervisord.pid"
+    executable_config = tmp_path / "supervisord.conf"
+    executable_config.write_text(
+        "\n".join(
+            [
+                "[supervisord]",
+                "nodaemon=true",
+                f"pidfile={pid_path}",
+                f"logfile={tmp_path / 'supervisord.log'}",
+                f"childlogdir={tmp_path}",
+                "",
+                "[unix_http_server]",
+                f"file={socket_path}",
+                f"chmod={socket_config['chmod']}",
+                f"chown={os.geteuid()}:{os.getegid()}",
+                "",
+                "[supervisorctl]",
+                f"serverurl=unix://{socket_path}",
+                "",
+                "[rpcinterface:supervisor]",
+                "supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface",
+                "",
+                "[program:permission_probe]",
+                "command=/bin/sleep 30",
+                "autorestart=false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    supervisor_bin = str(Path(sys.executable).with_name("supervisord"))
+    supervisorctl_bin = str(Path(sys.executable).with_name("supervisorctl"))
+    process = subprocess.Popen(
+        [supervisor_bin, "-c", str(executable_config)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        assert socket_path.exists()
+        result = subprocess.run(
+            [supervisorctl_bin, "-c", str(executable_config), "status"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "permission_probe" in result.stdout
+        metadata = socket_path.stat()
+        assert metadata.st_uid == os.geteuid()
+        assert metadata.st_gid == os.getegid()
+        assert metadata.st_mode & 0o777 == 0o770
+        assert metadata.st_mode & 0o007 == 0
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
 
 
 def test_codebuild_diagnostics_and_readiness_use_the_exact_worker_name() -> None:

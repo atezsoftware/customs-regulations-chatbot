@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -152,10 +153,14 @@ def test_cli_initializes_a_bounded_read_only_database_pool(
     reviewed: list[bool] = []
 
     def fake_backend(
-        *, memory_headroom_reviewed: bool, capability_attestation_path: Path | None
+        *,
+        memory_headroom_reviewed: bool,
+        capability_attestation_path: Path | None,
+        capability_evidence_path: Path | None,
     ) -> _FakeBackend:
         reviewed.append(memory_headroom_reviewed)
         assert capability_attestation_path == Path("operator-evidence.json")
+        assert capability_evidence_path == Path("archived-evidence.json")
         return backend
 
     monkeypatch.setattr(
@@ -177,6 +182,8 @@ def test_cli_initializes_a_bounded_read_only_database_pool(
                 "--memory-headroom-reviewed",
                 "--capability-attestation",
                 "operator-evidence.json",
+                "--capability-evidence",
+                "archived-evidence.json",
             ]
         )
         == EXIT_READY
@@ -193,6 +200,7 @@ def test_memory_headroom_requires_attestation_and_rejects_oom_events(
         readiness.OnyxReadinessBackend(
             memory_headroom_reviewed=False,
             capability_attestation_path=None,
+            capability_evidence_path=None,
         ).check_memory_headroom()
 
     (tmp_path / "memory.current").write_text("100\n", encoding="utf-8")
@@ -207,6 +215,7 @@ def test_memory_headroom_requires_attestation_and_rejects_oom_events(
         readiness.OnyxReadinessBackend(
             memory_headroom_reviewed=True,
             capability_attestation_path=None,
+            capability_evidence_path=None,
         ).check_memory_headroom()
 
 
@@ -288,6 +297,22 @@ def test_local_worker_pid_must_match_supervisor_status() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "status_line",
+    [
+        "celery_worker_regulatory_indexing RUNNING uptime 0:01:00",
+        "celery_worker_regulatory_indexing RUNNING pid 0, uptime 0:01:00",
+        "celery_worker_regulatory_indexing RUNNING pid nope, uptime 0:01:00",
+        "celery_worker_regulatory_indexing STOPPED pid 4242, uptime 0:01:00",
+    ],
+)
+def test_supervisor_worker_pid_fails_closed_when_not_positive_running_pid(
+    status_line: str,
+) -> None:
+    with pytest.raises(readiness.ReadinessCheckError, match="positive RUNNING PID"):
+        readiness._supervisor_worker_pid(status_line)
+
+
 def test_live_worker_inspection_targets_only_the_local_node(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -327,6 +352,7 @@ def test_observational_probe_identity_must_match_attestation(
     backend = readiness.OnyxReadinessBackend(
         memory_headroom_reviewed=True,
         capability_attestation_path=None,
+        capability_evidence_path=None,
     )
     backend._attested_identity = "expected@example.iam.gserviceaccount.com"
     gateway = SimpleNamespace(
@@ -389,6 +415,7 @@ def test_elasticsearch_mapping_rejects_wrong_dense_vector_contract(
     backend = readiness.OnyxReadinessBackend(
         memory_headroom_reviewed=True,
         capability_attestation_path=None,
+        capability_evidence_path=None,
     )
 
     with pytest.raises(
@@ -404,60 +431,153 @@ def test_capability_attestation_requires_exact_scope_permissions_and_freshness(
     tmp_path: Path,
 ) -> None:
     snapshot = _FakeBackend().load_snapshot()
-    evidence_path = tmp_path / "capability.json"
-    evidence = {
+    evidence_path = tmp_path / "archived-iam-evidence.json"
+    evidence_bytes = b'{"approved":true,"change":"TASK-8"}\n'
+    evidence_path.write_bytes(evidence_bytes)
+    os.chmod(evidence_path, 0o400)
+    digest = hashlib.sha256(evidence_bytes).hexdigest()
+    attestation_path = tmp_path / "capability-attestation.json"
+    attestation = {
         "schema_version": 1,
         "reviewed_at": "2026-08-20T08:00:00+00:00",
         "identity": "service-account@example.iam.gserviceaccount.com",
-        "evidence_reference": (
-            "gs://audit/change-record/task-8.json#sha256=" + "b" * 64
-        ),
-        "evidence_sha256": "b" * 64,
+        "evidence_reference": f"archive://TASK-8#sha256={digest}",
+        "evidence_sha256": digest,
         "gcs_uri": snapshot.gcs_uri,
         "vertex_project": snapshot.vertex_project,
         "vertex_location": snapshot.vertex_location,
         "vertex_model": snapshot.vertex_model,
         "permissions": sorted(readiness.REQUIRED_CAPABILITY_PERMISSIONS),
     }
-    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
-    os.chmod(evidence_path, 0o600)
+    attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
+    os.chmod(attestation_path, 0o600)
 
     identity = readiness._validate_capability_attestation(
+        attestation_path,
         evidence_path,
         snapshot,
         now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
         expected_owner_uid=os.geteuid(),
+        expected_owner_gid=os.getegid(),
     )
-    assert identity == evidence["identity"]
+    assert identity == attestation["identity"]
 
-    evidence["permissions"].remove("storage.objects.delete")
-    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    attestation["permissions"].remove("storage.objects.delete")
+    attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
     with pytest.raises(readiness.ReadinessCheckError, match="required permissions"):
         readiness._validate_capability_attestation(
+            attestation_path,
             evidence_path,
             snapshot,
             now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
             expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
         )
 
-    evidence["permissions"] = sorted(readiness.REQUIRED_CAPABILITY_PERMISSIONS)
-    evidence["reviewed_at"] = "2026-08-18T08:00:00+00:00"
-    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    attestation["permissions"] = sorted(readiness.REQUIRED_CAPABILITY_PERMISSIONS)
+    attestation["reviewed_at"] = "2026-08-18T08:00:00+00:00"
+    attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
     with pytest.raises(readiness.ReadinessCheckError, match="older than"):
         readiness._validate_capability_attestation(
+            attestation_path,
             evidence_path,
             snapshot,
             now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
             expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
         )
 
-    evidence["reviewed_at"] = "2026-08-20T08:00:00+00:00"
-    evidence["evidence_sha256"] = "c" * 64
-    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    attestation["reviewed_at"] = "2026-08-20T08:00:00+00:00"
+    attestation["evidence_sha256"] = "c" * 64
+    attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
     with pytest.raises(readiness.ReadinessCheckError, match="digest binding"):
         readiness._validate_capability_attestation(
+            attestation_path,
             evidence_path,
             snapshot,
             now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
             expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
+        )
+
+
+def test_capability_attestation_hashes_separate_secure_evidence_file(
+    tmp_path: Path,
+) -> None:
+    snapshot = _FakeBackend().load_snapshot()
+    evidence_path = tmp_path / "archived-iam-evidence.json"
+    evidence_bytes = b'{"approved":true,"change":"TASK-8"}\n'
+    evidence_path.write_bytes(evidence_bytes)
+    os.chmod(evidence_path, 0o400)
+    digest = hashlib.sha256(evidence_bytes).hexdigest()
+    attestation_path = tmp_path / "capability-attestation.json"
+    attestation_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "reviewed_at": "2026-08-20T08:00:00+00:00",
+                "identity": "service-account@example.iam.gserviceaccount.com",
+                "evidence_reference": f"archive://TASK-8#sha256={digest}",
+                "evidence_sha256": digest,
+                "gcs_uri": snapshot.gcs_uri,
+                "vertex_project": snapshot.vertex_project,
+                "vertex_location": snapshot.vertex_location,
+                "vertex_model": snapshot.vertex_model,
+                "permissions": sorted(readiness.REQUIRED_CAPABILITY_PERMISSIONS),
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(attestation_path, 0o600)
+
+    identity = readiness._validate_capability_attestation(
+        attestation_path,
+        evidence_path,
+        snapshot,
+        now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
+        expected_owner_uid=os.geteuid(),
+        expected_owner_gid=os.getegid(),
+    )
+    assert identity == "service-account@example.iam.gserviceaccount.com"
+
+    os.chmod(evidence_path, 0o600)
+    evidence_path.write_bytes(evidence_bytes + b"tampered")
+    os.chmod(evidence_path, 0o400)
+    with pytest.raises(readiness.ReadinessCheckError, match="actual evidence digest"):
+        readiness._validate_capability_attestation(
+            attestation_path,
+            evidence_path,
+            snapshot,
+            now=datetime.datetime(2026, 8, 20, 9, 0, tzinfo=datetime.timezone.utc),
+            expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
+        )
+
+
+def test_capability_files_reject_symlinks_and_oversize_evidence(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.write_bytes(b"12345")
+    os.chmod(target, 0o400)
+    symlink = tmp_path / "evidence-link"
+    symlink.symlink_to(target)
+
+    with pytest.raises(readiness.ReadinessCheckError, match="regular file"):
+        readiness._validated_secure_file(
+            symlink,
+            expected_mode=0o400,
+            expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
+            maximum_size=10,
+            label="capability evidence",
+        )
+    with pytest.raises(readiness.ReadinessCheckError, match="maximum size"):
+        readiness._validated_secure_file(
+            target,
+            expected_mode=0o400,
+            expected_owner_uid=os.geteuid(),
+            expected_owner_gid=os.getegid(),
+            maximum_size=4,
+            label="capability evidence",
         )

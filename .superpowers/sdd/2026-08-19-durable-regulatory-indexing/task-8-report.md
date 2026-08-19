@@ -311,3 +311,95 @@ failed, host cgroup evidence was unavailable, and attestation/provider/index
 checks were blocked by the absent snapshot. No live canary was started and no
 existing production document, index, database/provider record, GCS object, or
 Vertex job was mutated.
+
+---
+
+## Review fix round 3/5
+
+All five Important findings were implemented without a production write,
+deployment, push, or merge.
+
+### RED/GREEN evidence
+
+- PID fail-closed RED: the four missing, zero, non-numeric, and non-running PID
+  cases produced `1 failed` because the parser returned `None`. It now requires
+  a positive PID from an exact `RUNNING` Supervisor status line and always
+  compares that integer with the exact-destination Celery `stats.pid`.
+- Archived-evidence RED: the separate-file regression initially failed with
+  `TypeError: unexpected keyword argument 'expected_owner_gid'`; the Compose
+  wiring regression separately failed because the evidence volume was absent.
+  Readiness now validates two distinct regular, non-symlink files, numeric
+  owner/group `1001:1001`, modes `0600`/`0400`, non-empty bounded sizes, and a
+  streaming SHA-256 of the archived evidence's actual bytes. The attestation
+  digest and reference must bind that computed digest; evidence content is
+  never parsed or emitted.
+- Supervisor socket RED: the wiring assertion reported mode `0700`, not the
+  required app-user contract. The canonical socket is now numeric
+  `1001:1001`, mode `0770`, with no world bits. The test also starts a real
+  Supervisor 4.3.0 instance using the canonical numeric/mode shape, performs a
+  successful `supervisorctl status` through its Unix socket, and verifies the
+  resulting owner/group/mode.
+- Cleanup/provider regressions were authored against the prior unconditional
+  `finally` cleanup and global OpenRouter delete behavior. The disposable
+  services were started after the staged cleanup/advisory-lock implementation,
+  so there is no standalone pre-change pytest transcript for these two cases.
+  Their final real-infrastructure run passed: an injected Elasticsearch cleanup
+  failure is attached to, but does not replace, the original sentinel; later
+  file-store, UserFile/job, configuration, provider, and unlock stages still
+  execute. A PostgreSQL session advisory lock excludes a contender, the exact
+  pre-existing raw provider row (including encrypted API-key bytes) is restored,
+  and an absent singleton is removed only through the recorded ORM instance
+  after its entire test state is revalidated.
+
+### Deployment and safety contracts
+
+- The production-lite overlay requires distinct read-only bind mounts at
+  `/run/readiness/regulatory-capabilities.json` and
+  `/run/readiness/regulatory-capability-evidence.json`. Executable preflight
+  validates uniqueness, distinct paths, file kind, symlink rejection,
+  owner/group, modes, and size bounds. The environment template and runbook
+  define both host inputs and the exact app-UID readiness command.
+- The runbook now instructs operators to hash the archived IAM artifact's
+  actual bytes and place that digest in the separate metadata attestation. It
+  continues to state that observational GCS/Vertex probes do not prove
+  create/delete/cancel authority.
+- Cleanup attempts every stage independently and aggregates failures only when
+  no primary pipeline error exists. When a primary error exists, cleanup
+  failures are attached as exception notes and cannot replace it. The final
+  disposable-environment query returned zero Task 8 SearchSettings, LLM
+  providers, file records, UserFiles, durable jobs, and OpenRouter provider
+  rows; the Task 8 Elasticsearch index listing was empty.
+
+### Round-3 verification
+
+- Focused readiness, Vertex/GCS gateway, Supervisor/Compose wiring, and
+  executable preflight: final repeat `120 passed in 13.89s` (the executable Supervisor
+  socket test was then repeated after numeric ownership was finalized:
+  `1 passed, 24 deselected in 1.42s`).
+- Regulatory unit/runtime superset: final repeat `788 passed in 21.66s`.
+- Real PostgreSQL 15.2 repository plus PostgreSQL/Elasticsearch 9.4.2 pipeline:
+  final repeat `32 passed in 40.21s`; the pipeline file independently passed `4 passed in
+  37.12s`, including forced setup failure, forced cleanup-stage failure,
+  provider restoration/lock contention, and the full durable pipeline.
+- Fresh disposable PostgreSQL migration from empty to head succeeded. No
+  migration file or Elasticsearch production client changed in this round, so
+  a downgrade cycle and the seven-minute 70-test ES client suite were not
+  repeated.
+- Ruff and Ruff formatting on touched Python passed; `ty` on touched Python
+  passed. Host `shellcheck` was unavailable, while the repository pre-commit
+  shellcheck hook and every other applicable touched-file hook passed. The
+  final touched-file pre-commit run passed every applicable hook, including
+  lazy imports, `ty`, Ruff, Ruff formatting, YAML, shellcheck, large-file,
+  ripsecrets, and environment drift.
+
+### Live readiness recheck
+
+`getent hosts psql.dev.singlewindow.io` returned exit `2` again.
+`onyx-api_server-1` remained `unhealthy`; nginx ports `7000` and `7001` both
+returned HTTP `200`. The corrected local read-only command, with both canonical
+evidence paths, returned exit `1`, `NOT_READY`: migration/Admin snapshot failed
+with redacted `OperationalError`, Supervisor inspection failed, host cgroup
+evidence was unavailable, and all snapshot-dependent checks were blocked. No
+attestation was fabricated and no live canary was started. Existing production
+documents, indices, database/provider state, GCS objects, and Vertex jobs were
+not mutated.

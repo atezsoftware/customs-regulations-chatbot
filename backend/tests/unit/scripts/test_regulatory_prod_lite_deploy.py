@@ -34,6 +34,7 @@ _MANAGED_SERVICES = (
     "minio",
 )
 _ATTESTATION_TARGET = "/run/readiness/regulatory-capabilities.json"
+_EVIDENCE_TARGET = "/run/readiness/regulatory-capability-evidence.json"
 
 
 def _config(
@@ -144,7 +145,13 @@ def _config(
             "source": "/tmp/regulatory-capabilities.json",
             "target": _ATTESTATION_TARGET,
             "read_only": True,
-        }
+        },
+        {
+            "type": "bind",
+            "source": "/tmp/regulatory-capability-evidence.json",
+            "target": _EVIDENCE_TARGET,
+            "read_only": True,
+        },
     ]
     return json.dumps({"services": services})
 
@@ -163,6 +170,8 @@ def _fake_docker(
     model_revision: str = "d" * 40,
     attestation_owner: str = "1001",
     attestation_mode: int = 0o600,
+    evidence_owner: str = "1001",
+    evidence_mode: int = 0o400,
 ) -> tuple[dict[str, str], Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -171,11 +180,16 @@ def _fake_docker(
     attestation_path = tmp_path / "regulatory-capabilities.json"
     attestation_path.write_text("{}\n", encoding="utf-8")
     attestation_path.chmod(attestation_mode)
+    evidence_path = tmp_path / "regulatory-capability-evidence.json"
+    evidence_path.write_text('{"approved":true}\n', encoding="utf-8")
+    evidence_path.chmod(evidence_mode)
     rendered_config = json.loads(config or _config())
     background = rendered_config["services"]["background"]
     for volume in background.get("volumes", []):
         if volume.get("target") == _ATTESTATION_TARGET:
             volume["source"] = str(attestation_path)
+        if volume.get("target") == _EVIDENCE_TARGET:
+            volume["source"] = str(evidence_path)
     config_path.write_text(json.dumps(rendered_config), encoding="utf-8")
     services_path = tmp_path / "services.txt"
     services_path.write_text("\n".join(active_services) + "\n", encoding="utf-8")
@@ -241,6 +255,10 @@ if [[ "$last" == "$FAKE_ATTESTATION_PATH" && ( "${2:-}" == "%u" || "${2:-}" == "
   printf '%s\\n' "$FAKE_ATTESTATION_OWNER"
   exit 0
 fi
+if [[ "$last" == "$FAKE_EVIDENCE_PATH" && ( "${2:-}" == "%u" || "${2:-}" == "%g" ) ]]; then
+  printf '%s\\n' "$FAKE_EVIDENCE_OWNER"
+  exit 0
+fi
 exec /usr/bin/stat "$@"
 """,
         encoding="utf-8",
@@ -289,7 +307,9 @@ exec /usr/bin/stat "$@"
             "FAKE_WEB_REVISION": web_revision,
             "FAKE_MODEL_REVISION": model_revision,
             "FAKE_ATTESTATION_PATH": str(attestation_path),
+            "FAKE_EVIDENCE_PATH": str(evidence_path),
             "FAKE_ATTESTATION_OWNER": attestation_owner,
+            "FAKE_EVIDENCE_OWNER": evidence_owner,
             "_MODEL_IMAGE": _MODEL_IMAGE,
             "_WEB_IMAGE": _WEB_IMAGE,
         }
@@ -415,6 +435,91 @@ def test_preflight_rejects_untrusted_readiness_attestation_mount(
         tmp_path,
         config=json.dumps(config),
         attestation_owner=owner,
+    )
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr
+
+
+def test_preflight_rejects_missing_archived_capability_evidence_mount(
+    tmp_path: Path,
+) -> None:
+    config = json.loads(_config())
+    config["services"]["background"]["volumes"] = [
+        volume
+        for volume in config["services"]["background"]["volumes"]
+        if volume["target"] != "/run/readiness/regulatory-capability-evidence.json"
+    ]
+    env, env_file = _fake_docker(tmp_path, config=json.dumps(config))
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == 1
+    assert "archived capability evidence bind mount" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("read_only", "owner", "mode", "expected_error"),
+    [
+        (False, "1001", 0o400, "archived capability evidence bind mount"),
+        (True, "1000", 0o400, "owned by numeric UID/GID 1001:1001"),
+        (True, "1001", 0o600, "mode 0400"),
+    ],
+)
+def test_preflight_rejects_untrusted_archived_capability_evidence(
+    tmp_path: Path,
+    read_only: bool,
+    owner: str,
+    mode: int,
+    expected_error: str,
+) -> None:
+    config = json.loads(_config())
+    config["services"]["background"]["volumes"][1]["read_only"] = read_only
+    env, env_file = _fake_docker(
+        tmp_path,
+        config=json.dumps(config),
+        evidence_owner=owner,
+        evidence_mode=mode,
     )
 
     result = _run(

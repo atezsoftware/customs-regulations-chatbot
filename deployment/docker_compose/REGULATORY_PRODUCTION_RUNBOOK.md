@@ -449,10 +449,12 @@ jobs, although broker messages already emitted before the restart may still fini
 
 The shipped backend-lite image contains a read-only readiness command. Run it inside the new
 `background` container after the singleton migration and Admin configuration, while the feature flag
-is still false. First create an owner-only, non-secret attestation from the approved IAM policy review
-and mount it read-only at `/run/readiness/regulatory-capabilities.json` in `background`. It must use
-this exact schema, the active snapshot scope, the runtime credential identity observed by the IAM
-review, and a `reviewed_at` no more than 24 hours old:
+is still false. Preserve the operator-approved IAM review as a distinct archived evidence artifact;
+readiness hashes its actual bytes without parsing or printing them. Create a separate, non-secret
+attestation that binds that digest to the active scope and runtime identity. Mount both files
+read-only at `/run/readiness/regulatory-capabilities.json` and
+`/run/readiness/regulatory-capability-evidence.json` in `background`. The attestation must use this
+exact schema and a `reviewed_at` no more than 24 hours old:
 
 ```json
 {
@@ -479,23 +481,31 @@ review, and a `reviewed_at` no more than 24 hours old:
 }
 ```
 
-Replace the example digest with the lowercase SHA-256 of the archived IAM result. The evidence
+Replace the example digest with the lowercase SHA-256 of the exact archived evidence file bytes. The evidence
 reference must point to that result and end in the exact `#sha256=<evidence_sha256>` binding;
 readiness rejects a missing, malformed, or mismatched digest. This proves which archived artifact
-was reviewed, while the change-record/object-store access controls remain responsible for that
-artifact's authenticity. Do not put credentials, tokens, service-account JSON, document content,
-or vectors in this file.
+was reviewed and prevents the attestation from supplying its own unchecked digest. The approved
+archive and change-record controls remain responsible for the review's provenance. Never place
+credentials, tokens, service-account JSON, document content, or vectors in either file, and never
+print the archived evidence during readiness.
 
-Set `REGULATORY_CAPABILITY_ATTESTATION_FILE` to its absolute host path. The canonical overlay mounts
-that file read-only. Both preflight and the in-container validator require numeric owner/group
-`1001:1001` and mode `0600`, independent of which operator invokes Docker:
+Set `REGULATORY_CAPABILITY_ATTESTATION_FILE` and `REGULATORY_CAPABILITY_EVIDENCE_FILE` to distinct
+absolute host paths. The canonical overlay mounts both files read-only. Preflight and the in-container
+validator require numeric owner/group `1001:1001`, attestation mode `0600`, evidence mode `0400`,
+regular files (no symlinks), and bounded sizes, independent of which operator invokes Docker:
 
 ```bash
+evidence_digest=$(sha256sum -- "$REGULATORY_CAPABILITY_EVIDENCE_FILE" | awk '{print $1}')
+# Put exactly $evidence_digest in both attestation digest fields before continuing.
 sudo chown 1001:1001 "$REGULATORY_CAPABILITY_ATTESTATION_FILE"
+sudo chown 1001:1001 "$REGULATORY_CAPABILITY_EVIDENCE_FILE"
 sudo chmod 0600 "$REGULATORY_CAPABILITY_ATTESTATION_FILE"
+sudo chmod 0400 "$REGULATORY_CAPABILITY_EVIDENCE_FILE"
 ```
 
 The readiness process itself runs as the application UID/GID, not as the root Supervisor wrapper.
+Supervisor creates `/tmp/supervisor.sock` as numeric `1001:1001` with mode `0770`, so that app user
+can perform the read-only local status query while no world access is granted.
 For the external-infrastructure topology, the exact command is:
 
 ```bash
@@ -506,7 +516,8 @@ docker compose --project-name "$APPROVED_COMPOSE_PROJECT" --env-file .env \
   -f docker-compose.regulatory-prod-lite.yml \
   exec -T --user 1001:1001 background python /app/scripts/regulatory_indexing_readiness.py \
     --memory-headroom-reviewed \
-    --capability-attestation /run/readiness/regulatory-capabilities.json
+    --capability-attestation /run/readiness/regulatory-capabilities.json \
+    --capability-evidence /run/readiness/regulatory-capability-evidence.json
 ```
 
 Use the same command with `docker-compose.regulatory-compose-infra.yml` in Compose-managed mode.

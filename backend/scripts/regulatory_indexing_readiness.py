@@ -11,6 +11,8 @@ import argparse
 import asyncio
 import configparser
 import datetime
+import hashlib
+import hmac
 import json
 import re
 import shlex
@@ -62,6 +64,9 @@ _PROBE_TEXT = "regulatory indexing readiness probe"
 _EXPECTED_REGULATORY_QUEUES = frozenset({"user_file_processing", "regulatory_indexing"})
 _ATTESTATION_MAX_AGE = datetime.timedelta(hours=24)
 _ATTESTATION_OWNER_UID = 1001
+_ATTESTATION_OWNER_GID = 1001
+_ATTESTATION_MAX_BYTES = 64 * 1024
+_CAPABILITY_EVIDENCE_MAX_BYTES = 4 * 1024 * 1024
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REQUIRED_CAPABILITY_PERMISSIONS = frozenset(
     {
@@ -245,9 +250,11 @@ class OnyxReadinessBackend:
         *,
         memory_headroom_reviewed: bool,
         capability_attestation_path: Path | None,
+        capability_evidence_path: Path | None,
     ) -> None:
         self._memory_headroom_reviewed = memory_headroom_reviewed
         self._capability_attestation_path = capability_attestation_path
+        self._capability_evidence_path = capability_evidence_path
         self._attested_identity: str | None = None
         self._config_snapshot: RegulatoryIndexingConfigSnapshot | None = None
         self._embedding_api_key: str | None = None
@@ -389,12 +396,16 @@ class OnyxReadinessBackend:
         return self._vertex_gateway
 
     def check_capability_attestation(self, snapshot: ReadinessSnapshot) -> str:
-        if self._capability_attestation_path is None:
+        if (
+            self._capability_attestation_path is None
+            or self._capability_evidence_path is None
+        ):
             raise ReadinessCheckError(
-                "archived GCS/Vertex capability attestation is required"
+                "capability attestation and archived IAM evidence are required"
             )
         self._attested_identity = _validate_capability_attestation(
             self._capability_attestation_path,
+            self._capability_evidence_path,
             snapshot,
         )
         return (
@@ -500,13 +511,17 @@ def _configured_regulatory_worker_queues(config_text: str) -> set[str]:
     return queues
 
 
-def _supervisor_worker_pid(status_line: str) -> int | None:
-    match = re.search(r"\bpid ([1-9][0-9]*),", status_line)
-    return int(match.group(1)) if match is not None else None
+def _supervisor_worker_pid(status_line: str) -> int:
+    match = re.search(r"\sRUNNING\s+pid ([1-9][0-9]*),", status_line)
+    if match is None:
+        raise ReadinessCheckError(
+            "dedicated regulatory worker has no positive RUNNING PID"
+        )
+    return int(match.group(1))
 
 
 def _live_regulatory_worker_queues(
-    *, expected_worker_name: str, supervisor_pid: int | None
+    *, expected_worker_name: str, supervisor_pid: int
 ) -> set[str]:
     from onyx.background.celery.versioned_apps.regulatory_indexing import app
 
@@ -515,12 +530,11 @@ def _live_regulatory_worker_queues(
         inspector.active_queues(),
         expected_worker_name=expected_worker_name,
     )
-    if supervisor_pid is not None:
-        _validate_live_worker_pid(
-            inspector.stats(),
-            expected_worker_name=expected_worker_name,
-            supervisor_pid=supervisor_pid,
-        )
+    _validate_live_worker_pid(
+        inspector.stats(),
+        expected_worker_name=expected_worker_name,
+        supervisor_pid=supervisor_pid,
+    )
     return queues
 
 
@@ -609,26 +623,70 @@ def _validate_dense_vector_mapping(
                 )
 
 
-def _validate_capability_attestation(
+def _validated_secure_file(
     path: Path,
+    *,
+    expected_mode: int,
+    expected_owner_uid: int,
+    expected_owner_gid: int,
+    maximum_size: int,
+    label: str,
+) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ReadinessCheckError(f"{label} is unavailable") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ReadinessCheckError(f"{label} must be a regular file, not a symlink")
+    if (
+        stat.S_IMODE(metadata.st_mode) != expected_mode
+        or metadata.st_uid != expected_owner_uid
+        or metadata.st_gid != expected_owner_gid
+    ):
+        raise ReadinessCheckError(
+            f"{label} must be owned by runtime UID/GID "
+            f"{expected_owner_uid}:{expected_owner_gid} with mode "
+            f"{expected_mode:04o}"
+        )
+    if metadata.st_size <= 0 or metadata.st_size > maximum_size:
+        raise ReadinessCheckError(f"{label} exceeds its maximum size or is empty")
+
+
+def _streaming_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(64 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_capability_attestation(
+    attestation_path: Path,
+    evidence_path: Path,
     snapshot: ReadinessSnapshot,
     *,
     now: datetime.datetime | None = None,
     expected_owner_uid: int = _ATTESTATION_OWNER_UID,
+    expected_owner_gid: int = _ATTESTATION_OWNER_GID,
 ) -> str:
+    _validated_secure_file(
+        attestation_path,
+        expected_mode=0o600,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+        maximum_size=_ATTESTATION_MAX_BYTES,
+        label="capability attestation",
+    )
+    _validated_secure_file(
+        evidence_path,
+        expected_mode=0o400,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+        maximum_size=_CAPABILITY_EVIDENCE_MAX_BYTES,
+        label="capability evidence",
+    )
     try:
-        metadata = path.stat()
-        if (
-            stat.S_IMODE(metadata.st_mode) != 0o600
-            or metadata.st_uid != expected_owner_uid
-        ):
-            raise ReadinessCheckError(
-                "capability attestation must be owned by runtime UID "
-                f"{expected_owner_uid} with mode 0600"
-            )
-        parsed: object = json.loads(path.read_text(encoding="utf-8"))
-    except ReadinessCheckError:
-        raise
+        parsed: object = json.loads(attestation_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ReadinessCheckError(
             "capability attestation is unavailable or invalid"
@@ -653,6 +711,14 @@ def _validate_capability_attestation(
     if not reference.endswith(f"#sha256={evidence_sha256}"):
         raise ReadinessCheckError(
             "capability attestation evidence reference has invalid digest binding"
+        )
+    try:
+        actual_evidence_sha256 = _streaming_sha256(evidence_path)
+    except OSError as error:
+        raise ReadinessCheckError("capability evidence cannot be hashed") from error
+    if not hmac.compare_digest(evidence_sha256, actual_evidence_sha256):
+        raise ReadinessCheckError(
+            "capability attestation does not match the actual evidence digest"
         )
     exact_scope = {
         "gcs_uri": snapshot.gcs_uri,
@@ -752,6 +818,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "permissions, exact active scope, identity, and review time."
         ),
     )
+    parser.add_argument(
+        "--capability-evidence",
+        type=Path,
+        help=(
+            "Owner-read-only archived IAM review artifact (mode 0400). Its bytes "
+            "are hashed but never emitted."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -762,6 +836,7 @@ def main(argv: list[str] | None = None) -> int:
         OnyxReadinessBackend(
             memory_headroom_reviewed=args.memory_headroom_reviewed,
             capability_attestation_path=args.capability_attestation,
+            capability_evidence_path=args.capability_evidence,
         )
     )
     if args.json:

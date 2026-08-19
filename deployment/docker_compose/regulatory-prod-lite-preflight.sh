@@ -548,6 +548,44 @@ attestation_gid=$(stat -c '%g' -- "$attestation_path") || \
 [[ "$attestation_uid" == "1001" && "$attestation_gid" == "1001" ]] || \
   die "the readiness capability attestation must be owned by numeric UID/GID 1001:1001"
 
+evidence_mount_count=$(jq '[
+    (.services.background.volumes // [])[]
+    | select(.type == "bind")
+    | select(.target == "/run/readiness/regulatory-capability-evidence.json")
+    | select(.read_only == true)
+  ] | length' "$config_file") || die "the readiness capability evidence mount cannot be validated"
+[[ "$evidence_mount_count" == "1" ]] || \
+  die "the readiness archived capability evidence bind mount must be unique and read-only"
+evidence_path=$(jq -er '
+  .services.background.volumes[]
+  | select(.type == "bind" and .target == "/run/readiness/regulatory-capability-evidence.json" and .read_only == true)
+  | .source
+' "$config_file") || die "the readiness capability evidence source cannot be resolved"
+[[ "$evidence_path" != "$attestation_path" ]] || \
+  die "the readiness attestation and archived IAM evidence must be distinct files"
+[[ ! -L "$attestation_path" ]] || \
+  die "the readiness capability attestation must not be a symlink"
+[[ ! -L "$evidence_path" && -f "$evidence_path" ]] || \
+  die "the readiness capability evidence must be a regular host file, not a symlink"
+evidence_mode=$(stat -c '%a' -- "$evidence_path") || \
+  die "the readiness capability evidence mode cannot be read"
+[[ "$evidence_mode" == "400" ]] || \
+  die "the readiness capability evidence host file must have mode 0400"
+evidence_uid=$(stat -c '%u' -- "$evidence_path") || \
+  die "the readiness capability evidence owner cannot be read"
+evidence_gid=$(stat -c '%g' -- "$evidence_path") || \
+  die "the readiness capability evidence group cannot be read"
+[[ "$evidence_uid" == "1001" && "$evidence_gid" == "1001" ]] || \
+  die "the readiness capability evidence must be owned by numeric UID/GID 1001:1001"
+attestation_size=$(stat -c '%s' -- "$attestation_path") || \
+  die "the readiness capability attestation size cannot be read"
+evidence_size=$(stat -c '%s' -- "$evidence_path") || \
+  die "the readiness capability evidence size cannot be read"
+(( attestation_size > 0 && attestation_size <= 65536 )) || \
+  die "the readiness capability attestation must be non-empty and at most 65536 bytes"
+(( evidence_size > 0 && evidence_size <= 4194304 )) || \
+  die "the readiness capability evidence must be non-empty and at most 4194304 bytes"
+
 if [[ "$model_mode" == "local" ]]; then
   jq -e '
     .services.inference_model_server as $model

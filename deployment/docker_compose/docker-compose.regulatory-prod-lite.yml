@@ -67,6 +67,10 @@ services:
         source: ${REGULATORY_CAPABILITY_ATTESTATION_FILE:?set owner-1001 mode-0600 capability attestation}
         target: /run/readiness/regulatory-capabilities.json
         read_only: true
+      - type: bind
+        source: ${REGULATORY_CAPABILITY_EVIDENCE_FILE:?set owner-1001 mode-0400 archived IAM evidence}
+        target: /run/readiness/regulatory-capability-evidence.json
+        read_only: true
     environment:
       DOCUMENT_IMPORT_ENABLED: "false"
       MARKDOWN_IMPORT_ENABLED: ${MARKDOWN_IMPORT_ENABLED:-true}

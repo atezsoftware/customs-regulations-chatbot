@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import sys
 import threading
 from collections.abc import Generator, Iterator, Sequence
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import delete, select, text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
 from onyx.configs import app_configs
@@ -77,6 +79,7 @@ from tests.external_dependency_unit.conftest import create_test_user
 
 _TEST_REDUCED_DIMENSION = 768
 _TENANT_ID = "public"
+_OPENROUTER_PROVIDER_ADVISORY_LOCK = 5_932_460_513_101_126_737
 
 
 class _CharacterTokenizer(BaseTokenizer):
@@ -246,6 +249,10 @@ class _DisposablePipelineResources:
     database_commit_completed: bool = False
     index_mutation_started: bool = False
     embedding_provider_created: bool = False
+    embedding_provider_original_state: tuple[object, ...] | None = None
+    embedding_provider_test_state: tuple[object, ...] | None = None
+    embedding_provider: CloudEmbeddingProvider | None = None
+    embedding_provider_lock: Connection | None = None
     llm_provider_ids: list[int] = field(default_factory=list)
     model_configuration_ids: list[int] = field(default_factory=list)
     search_settings_ids: list[int] = field(default_factory=list)
@@ -289,21 +296,33 @@ def _disposable_index_names(prefix: str) -> set[str]:
 
 def _cleanup_disposable_pipeline(resources: _DisposablePipelineResources) -> None:
     db_session = resources.db_session
-    cleanup_errors: list[Exception] = []
-    db_session.rollback()
-    try:
-        if resources.document_index is not None:
-            resources.document_index._client.close()
-        if resources.index_mutation_started:
-            _delete_disposable_indices(resources.prefix)
-    except Exception as error:
-        cleanup_errors.append(error)
+    cleanup_errors: list[tuple[str, Exception]] = []
 
-    if not resources.database_commit_completed:
-        if cleanup_errors:
-            raise cleanup_errors[0]
-        return
-    try:
+    def attempt(stage: str, operation: Any) -> None:
+        try:
+            operation()
+        except Exception as error:
+            cleanup_errors.append((stage, error))
+
+    def database_stage(operation: Any) -> None:
+        db_session.rollback()
+        try:
+            operation()
+            db_session.commit()
+        except Exception:
+            db_session.rollback()
+            raise
+
+    attempt("database rollback", db_session.rollback)
+    if resources.document_index is not None:
+        attempt("Elasticsearch client close", resources.document_index._client.close)
+    if resources.index_mutation_started:
+        attempt(
+            "Elasticsearch disposable-index deletion",
+            lambda: _delete_disposable_indices(resources.prefix),
+        )
+
+    def delete_file_store_rows() -> None:
         file_records = list(
             db_session.scalars(
                 select(FileRecord).where(
@@ -315,6 +334,9 @@ def _cleanup_disposable_pipeline(resources: _DisposablePipelineResources) -> Non
             resources.file_store.delete_file(record.file_id, error_on_missing=False)
         db_session.rollback()
 
+    attempt("file-store rows and large objects", delete_file_store_rows)
+
+    def delete_user_files() -> None:
         user_files = list(
             db_session.scalars(
                 select(UserFile).where(UserFile.file_id.like(f"{resources.prefix}%"))
@@ -322,8 +344,13 @@ def _cleanup_disposable_pipeline(resources: _DisposablePipelineResources) -> Non
         )
         for user_file in user_files:
             db_session.delete(user_file)
-        db_session.commit()
 
+    attempt(
+        "UserFile/job/chunk state",
+        lambda: database_stage(delete_user_files),
+    )
+
+    def delete_disposable_configuration() -> None:
         users = list(
             db_session.execute(
                 select(User).where(User.__table__.c.email.like(f"{resources.prefix}%"))
@@ -348,18 +375,77 @@ def _cleanup_disposable_pipeline(resources: _DisposablePipelineResources) -> Non
         db_session.execute(
             delete(LLMProvider).where(LLMProvider.name.like(f"{resources.prefix}%"))
         )
-        if resources.embedding_provider_created:
+
+    attempt(
+        "disposable users and configuration",
+        lambda: database_stage(delete_disposable_configuration),
+    )
+
+    def restore_embedding_provider() -> None:
+        if resources.embedding_provider_original_state is not None:
+            (
+                provider_type,
+                api_url,
+                api_key,
+                api_version,
+                deployment_name,
+            ) = resources.embedding_provider_original_state
             db_session.execute(
-                delete(CloudEmbeddingProvider).where(
-                    CloudEmbeddingProvider.provider_type == EmbeddingProvider.OPENROUTER
-                )
+                text(
+                    "UPDATE embedding_provider SET api_url = :api_url, "
+                    "api_key = :api_key, api_version = :api_version, "
+                    "deployment_name = :deployment_name "
+                    "WHERE provider_type = :provider_type"
+                ),
+                {
+                    "provider_type": provider_type,
+                    "api_url": api_url,
+                    "api_key": api_key,
+                    "api_version": api_version,
+                    "deployment_name": deployment_name,
+                },
             )
-        db_session.commit()
-    except Exception as error:
-        db_session.rollback()
-        cleanup_errors.append(error)
+            return
+        if not resources.embedding_provider_created:
+            return
+        current_state = _raw_openrouter_provider_state(db_session)
+        if current_state != resources.embedding_provider_test_state:
+            raise RuntimeError(
+                "disposable OpenRouter provider changed while advisory lock was held"
+            )
+        if resources.embedding_provider is None:
+            raise RuntimeError(
+                "disposable OpenRouter provider identity was not recorded"
+            )
+        db_session.delete(resources.embedding_provider)
+
+    attempt(
+        "OpenRouter provider restoration",
+        lambda: database_stage(restore_embedding_provider),
+    )
+
+    def unlock_embedding_provider() -> None:
+        lock_connection = resources.embedding_provider_lock
+        if lock_connection is None:
+            return
+        try:
+            unlocked = lock_connection.scalar(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": _OPENROUTER_PROVIDER_ADVISORY_LOCK},
+            )
+            if unlocked is not True:
+                raise RuntimeError("OpenRouter provider advisory lock was not held")
+        finally:
+            lock_connection.close()
+            resources.embedding_provider_lock = None
+
+    attempt("OpenRouter provider advisory unlock", unlock_embedding_provider)
     if cleanup_errors:
-        raise cleanup_errors[0]
+        details = "; ".join(
+            f"{stage}: {type(error).__name__}: {error}"
+            for stage, error in cleanup_errors
+        )
+        raise RuntimeError(f"disposable cleanup failed: {details}")
 
 
 @contextmanager
@@ -376,6 +462,17 @@ def _disposable_pipeline_scope(
         index_name=f"{resolved_prefix}index",
     )
     try:
+        engine = cast(Engine, db_session.get_bind())
+        provider_lock = engine.connect()
+        resources.embedding_provider_lock = provider_lock
+        provider_lock.execute(
+            text("SELECT pg_advisory_lock(:lock_key)"),
+            {"lock_key": _OPENROUTER_PROVIDER_ADVISORY_LOCK},
+        )
+        resources.embedding_provider_original_state = _raw_openrouter_provider_state(
+            db_session
+        )
+
         vertex_provider = LLMProvider(
             name=f"{resolved_prefix}vertex",
             provider=LlmProviderNames.VERTEX_AI,
@@ -395,14 +492,21 @@ def _disposable_pipeline_scope(
         resources.llm_provider_ids.append(vertex_provider.id)
         resources.model_configuration_ids.append(vertex_model.id)
 
-        embedding_provider = CloudEmbeddingProvider(
-            provider_type=EmbeddingProvider.OPENROUTER,
-            api_url=embedding_url,
-            api_key="disposable-test-key",
+        embedding_provider = db_session.get(
+            CloudEmbeddingProvider, EmbeddingProvider.OPENROUTER
         )
-        db_session.add(embedding_provider)
+        if embedding_provider is None:
+            embedding_provider = CloudEmbeddingProvider(
+                provider_type=EmbeddingProvider.OPENROUTER,
+            )
+            db_session.add(embedding_provider)
+            resources.embedding_provider_created = True
+        embedding_provider.api_url = embedding_url
+        embedding_provider.api_key = "disposable-test-key"  # ty: ignore[invalid-assignment]
+        embedding_provider.api_version = None
+        embedding_provider.deployment_name = None
+        resources.embedding_provider = embedding_provider
         db_session.flush()
-        resources.embedding_provider_created = True
 
         search_settings = SearchSettings(
             model_name="openai/text-embedding-3-large",
@@ -421,6 +525,9 @@ def _disposable_pipeline_scope(
         db_session.add(search_settings)
         db_session.commit()
         resources.database_commit_completed = True
+        resources.embedding_provider_test_state = _raw_openrouter_provider_state(
+            db_session
+        )
         db_session.refresh(search_settings)
         resources.search_settings = search_settings
         resources.search_settings_ids.append(search_settings.id)
@@ -443,7 +550,13 @@ def _disposable_pipeline_scope(
             settings=DocumentSchema.get_index_settings_based_on_environment(),
         )
         yield resources
-    finally:
+    except BaseException as primary_error:
+        try:
+            _cleanup_disposable_pipeline(resources)
+        except Exception as cleanup_error:
+            primary_error.add_note(str(cleanup_error))
+        raise
+    else:
         _cleanup_disposable_pipeline(resources)
 
 
@@ -590,6 +703,135 @@ def test_forced_setup_failure_leaves_no_disposable_pipeline_state(
             )
 
     _assert_no_disposable_pipeline_state(db_session, prefix, resources)
+
+
+def test_cleanup_failure_preserves_primary_exception_and_runs_later_stages(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+    embedding_server: tuple[str, list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedding_url, _requests = embedding_server
+    prefix = f"task8_cleanup_error_{uuid4().hex}_"
+    original_delete_indices = _delete_disposable_indices
+    caught: RuntimeError | None = None
+    resources: _DisposablePipelineResources | None = None
+
+    def delete_then_fail(cleanup_prefix: str) -> None:
+        original_delete_indices(cleanup_prefix)
+        raise RuntimeError("forced cleanup stage failure")
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_delete_disposable_indices",
+        delete_then_fail,
+    )
+    try:
+        with _disposable_pipeline_scope(
+            db_session,
+            embedding_url=embedding_url,
+            prefix=prefix,
+        ) as resources:
+            monkeypatch.setattr(
+                app_configs,
+                "REGULATORY_INDEXING_GCS_URI",
+                "gs://disposable-regulatory-indexing",
+            )
+            monkeypatch.setattr(
+                orchestrator,
+                "get_default_file_store",
+                lambda: resources.file_store,
+            )
+            monkeypatch.setattr(
+                preparation,
+                "get_tokenizer",
+                lambda *_args, **_kwargs: _CharacterTokenizer(),
+            )
+            monkeypatch.setattr(
+                preparation,
+                "get_contextual_token_budget_tokenizer",
+                lambda *_args, **_kwargs: _CharacterTokenizer(),
+            )
+            _create_disposable_file(resources, marker="cleanup-error")
+            raise RuntimeError("forced primary pipeline failure")
+    except RuntimeError as error:
+        caught = error
+
+    assert caught is not None
+    assert str(caught) == "forced primary pipeline failure"
+    assert any("forced cleanup stage failure" in note for note in caught.__notes__)
+    assert resources is not None
+    _assert_no_disposable_pipeline_state(db_session, prefix, resources)
+
+
+def _raw_openrouter_provider_state(db_session: Session) -> tuple[object, ...] | None:
+    row = db_session.execute(
+        text(
+            "SELECT provider_type, api_url, api_key, api_version, deployment_name "
+            "FROM embedding_provider WHERE provider_type = 'OPENROUTER'"
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    values = list(row)
+    if isinstance(values[2], memoryview):
+        values[2] = bytes(values[2])
+    return tuple(values)
+
+
+def test_preexisting_openrouter_provider_is_locked_and_restored_exactly(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+    embedding_server: tuple[str, list[dict[str, object]]],
+) -> None:
+    embedding_url, _requests = embedding_server
+    original_provider = CloudEmbeddingProvider(
+        provider_type=EmbeddingProvider.OPENROUTER,
+        api_url="https://preexisting.example/embeddings",
+        api_key="preexisting-secret",
+        api_version="preexisting-version",
+        deployment_name="preexisting-deployment",
+    )
+    db_session.add(original_provider)
+    db_session.commit()
+    original_state = _raw_openrouter_provider_state(db_session)
+    assert original_state is not None
+
+    try:
+        with _disposable_pipeline_scope(
+            db_session,
+            embedding_url=embedding_url,
+        ):
+            db_session.expire_all()
+            current_provider = db_session.get(
+                CloudEmbeddingProvider, EmbeddingProvider.OPENROUTER
+            )
+            assert current_provider is not None
+            assert current_provider.api_url == embedding_url
+
+            engine = cast(Engine, db_session.get_bind())
+            with engine.connect() as contender:
+                assert (
+                    contender.scalar(
+                        text("SELECT pg_try_advisory_lock(:lock_key)"),
+                        {"lock_key": _OPENROUTER_PROVIDER_ADVISORY_LOCK},
+                    )
+                    is False
+                )
+
+        db_session.expire_all()
+        assert _raw_openrouter_provider_state(db_session) == original_state
+    finally:
+        db_session.rollback()
+        persisted_provider = db_session.get(
+            CloudEmbeddingProvider, EmbeddingProvider.OPENROUTER
+        )
+        if (
+            persisted_provider is not None
+            and _raw_openrouter_provider_state(db_session) == original_state
+        ):
+            db_session.delete(persisted_provider)
+        db_session.commit()
 
 
 def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
