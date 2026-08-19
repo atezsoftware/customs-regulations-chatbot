@@ -1,4 +1,5 @@
 import datetime
+import math
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
@@ -14,6 +15,35 @@ from onyx.db.enums import (
 from onyx.db.models import RegulatoryIndexingItem, RegulatoryIndexingJob
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
+_SECRET_KEY_FRAGMENTS = (
+    "apikey",
+    "accesstoken",
+    "refreshtoken",
+    "bearertoken",
+    "password",
+    "secret",
+    "credential",
+    "privatekey",
+    "accesskey",
+    "authorization",
+)
+_NEXT_STAGE = {
+    RegulatoryIndexingStage.PREPARING: RegulatoryIndexingStage.CONTEXT_SUBMIT,
+    RegulatoryIndexingStage.CONTEXT_SUBMIT: RegulatoryIndexingStage.CONTEXT_WAIT,
+    RegulatoryIndexingStage.CONTEXT_WAIT: RegulatoryIndexingStage.CONTEXT_APPLY,
+    RegulatoryIndexingStage.CONTEXT_APPLY: RegulatoryIndexingStage.EMBEDDING,
+    RegulatoryIndexingStage.EMBEDDING: RegulatoryIndexingStage.INDEX_WRITE,
+    RegulatoryIndexingStage.INDEX_WRITE: RegulatoryIndexingStage.VERIFY,
+    RegulatoryIndexingStage.VERIFY: RegulatoryIndexingStage.PUBLISH,
+}
+
+type RegulatoryIndexingJSONScalar = str | int | float | bool | None
+type RegulatoryIndexingJSONValue = (
+    RegulatoryIndexingJSONScalar
+    | list[RegulatoryIndexingJSONValue]
+    | dict[str, RegulatoryIndexingJSONValue]
+)
+type RegulatoryIndexingConfigSnapshot = dict[str, RegulatoryIndexingJSONValue]
 
 
 @dataclass(frozen=True)
@@ -23,6 +53,91 @@ class RegulatoryIndexingJobClaim:
     lease_generation: int
 
 
+def _validate_config_snapshot(
+    value: object,
+    *,
+    path: str = "config_snapshot",
+    active_container_ids: set[int] | None = None,
+) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain only finite JSON numbers")
+        return
+    if not isinstance(value, (dict, list)):
+        raise ValueError(f"{path} must contain only JSON-safe values")
+
+    container_ids = active_container_ids if active_container_ids is not None else set()
+    container_id = id(value)
+    if container_id in container_ids:
+        raise ValueError(f"{path} must not contain recursive containers")
+    container_ids.add(container_id)
+    try:
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                _validate_config_snapshot(
+                    item,
+                    path=f"{path}[{index}]",
+                    active_container_ids=container_ids,
+                )
+            return
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} must use string JSON object keys")
+            normalized_key = "".join(
+                character for character in key.lower() if character.isalnum()
+            )
+            if normalized_key == "token" or any(
+                fragment in normalized_key for fragment in _SECRET_KEY_FRAGMENTS
+            ):
+                raise ValueError(f"{path}.{key} is a secret-like key")
+            _validate_config_snapshot(
+                item,
+                path=f"{path}.{key}",
+                active_container_ids=container_ids,
+            )
+    finally:
+        container_ids.remove(container_id)
+
+
+def _legal_transition_source_status(
+    expected_stage: RegulatoryIndexingStage,
+    next_stage: RegulatoryIndexingStage,
+    next_status: RegulatoryIndexingJobStatus,
+) -> RegulatoryIndexingJobStatus | None:
+    if next_status is RegulatoryIndexingJobStatus.QUEUED:
+        if _NEXT_STAGE.get(expected_stage) is next_stage or (
+            expected_stage is RegulatoryIndexingStage.CONTEXT_WAIT
+            and next_stage is RegulatoryIndexingStage.CONTEXT_WAIT
+        ):
+            return RegulatoryIndexingJobStatus.RUNNING
+        return None
+    if next_status is RegulatoryIndexingJobStatus.SUCCEEDED:
+        if (
+            expected_stage is RegulatoryIndexingStage.PUBLISH
+            and next_stage is RegulatoryIndexingStage.PUBLISH
+        ):
+            return RegulatoryIndexingJobStatus.RUNNING
+        return None
+    if next_status in {
+        RegulatoryIndexingJobStatus.FAILED,
+        RegulatoryIndexingJobStatus.CANCELLING,
+    }:
+        return (
+            RegulatoryIndexingJobStatus.RUNNING
+            if next_stage is expected_stage
+            else None
+        )
+    if next_status is RegulatoryIndexingJobStatus.CANCELLED:
+        return (
+            RegulatoryIndexingJobStatus.CANCELLING
+            if next_stage is expected_stage
+            else None
+        )
+    return None
+
+
 def create_or_get_regulatory_indexing_job(
     db_session: Session,
     *,
@@ -30,10 +145,11 @@ def create_or_get_regulatory_indexing_job(
     content_hash: str,
     search_settings_id: int,
     prompt_hash: str,
-    config_snapshot: dict[str, object],
+    config_snapshot: RegulatoryIndexingConfigSnapshot,
     now: datetime.datetime,
 ) -> RegulatoryIndexingJob:
     """Create one durable row for an immutable file/config revision."""
+    _validate_config_snapshot(config_snapshot)
     proposed_id = uuid4()
     created_id = db_session.scalar(
         pg_insert(RegulatoryIndexingJob)
@@ -129,11 +245,16 @@ def advance_regulatory_indexing_job(
     now: datetime.datetime,
 ) -> bool:
     """Advance only the worker that owns the current stage lease."""
+    source_status = _legal_transition_source_status(
+        expected_stage, next_stage, next_status
+    )
+    if source_status is None:
+        return False
     advanced_id = db_session.scalar(
         update(RegulatoryIndexingJob)
         .where(
             RegulatoryIndexingJob.id == job_id,
-            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.status == source_status.value,
             RegulatoryIndexingJob.stage == expected_stage.value,
             RegulatoryIndexingJob.lease_generation == expected_generation,
         )
@@ -263,10 +384,18 @@ def create_or_get_regulatory_indexing_item(
     job_id: UUID,
     regulatory_chunk_id: str,
     request_hash: str,
-) -> RegulatoryIndexingItem:
+    expected_generation: int,
+) -> RegulatoryIndexingItem | None:
     """Create one result row per canonical chunk, tolerating redelivery."""
+    if not _lock_running_regulatory_indexing_job_lease(
+        db_session,
+        job_id=job_id,
+        expected_generation=expected_generation,
+    ):
+        db_session.commit()
+        return None
     proposed_id = uuid4()
-    created_id = db_session.scalar(
+    db_session.scalar(
         pg_insert(RegulatoryIndexingItem)
         .values(
             id=proposed_id,
@@ -278,19 +407,39 @@ def create_or_get_regulatory_indexing_item(
         .on_conflict_do_nothing(constraint="uq_regulatory_indexing_item_job_chunk")
         .returning(RegulatoryIndexingItem.id)
     )
-    item_id = created_id or db_session.scalar(
-        select(RegulatoryIndexingItem.id).where(
+    item = db_session.scalar(
+        select(RegulatoryIndexingItem).where(
             RegulatoryIndexingItem.job_id == job_id,
             RegulatoryIndexingItem.regulatory_chunk_id == regulatory_chunk_id,
         )
     )
-    if item_id is None:
-        raise RuntimeError("regulatory indexing item disappeared during creation")
-    db_session.commit()
-    item = db_session.get(RegulatoryIndexingItem, item_id)
     if item is None:
-        raise RuntimeError(f"regulatory indexing item {item_id} was not persisted")
+        raise RuntimeError("regulatory indexing item disappeared during creation")
+    if item.request_hash != request_hash:
+        db_session.rollback()
+        raise ValueError(
+            "regulatory indexing item request hash does not match persisted request hash"
+        )
+    db_session.commit()
     return item
+
+
+def _lock_running_regulatory_indexing_job_lease(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+) -> bool:
+    locked_id = db_session.scalar(
+        select(RegulatoryIndexingJob.id)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    return locked_id is not None
 
 
 def _persist_regulatory_indexing_item_values(
@@ -301,18 +450,27 @@ def _persist_regulatory_indexing_item_values(
     allowed_statuses: tuple[str, ...],
     values: dict[str, object],
 ) -> bool:
+    locked_job_id = db_session.scalar(
+        select(RegulatoryIndexingJob.id)
+        .join(
+            RegulatoryIndexingItem,
+            RegulatoryIndexingItem.job_id == RegulatoryIndexingJob.id,
+        )
+        .where(
+            RegulatoryIndexingItem.id == item_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update(of=RegulatoryIndexingJob)
+    )
+    if locked_job_id is None:
+        db_session.commit()
+        return False
     persisted_id = db_session.scalar(
         update(RegulatoryIndexingItem)
         .where(
             RegulatoryIndexingItem.id == item_id,
             RegulatoryIndexingItem.status.in_(allowed_statuses),
-            RegulatoryIndexingItem.job_id.in_(
-                select(RegulatoryIndexingJob.id).where(
-                    RegulatoryIndexingJob.status
-                    == RegulatoryIndexingJobStatus.RUNNING.value,
-                    RegulatoryIndexingJob.lease_generation == expected_generation,
-                )
-            ),
         )
         .values(**values)
         .returning(RegulatoryIndexingItem.id)

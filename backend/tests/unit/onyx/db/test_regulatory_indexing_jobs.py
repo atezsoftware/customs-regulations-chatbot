@@ -3,6 +3,7 @@ from typing import cast
 from unittest.mock import MagicMock
 from uuid import uuid4
 
+import pytest
 from sqlalchemy.orm import Session
 
 from onyx.db.enums import (
@@ -11,7 +12,9 @@ from onyx.db.enums import (
     RegulatoryIndexingStage,
 )
 from onyx.db.regulatory_indexing_jobs import (
+    RegulatoryIndexingConfigSnapshot,
     claim_regulatory_indexing_job,
+    create_or_get_regulatory_indexing_job,
     schedule_regulatory_indexing_retry,
 )
 
@@ -79,3 +82,36 @@ def test_retry_error_text_is_bounded_before_persistence() -> None:
     statement = db_session.scalar.call_args.args[0]
     assert scheduled is True
     assert len(statement.compile().params["error_message"]) == 4000
+
+
+@pytest.mark.parametrize(
+    ("config_snapshot", "error_pattern"),
+    [
+        (
+            {"vertex": {"client_secret": "must-not-persist"}},
+            "secret-like key",
+        ),
+        (
+            {"embedding": {"dimension": 1536, "payload": b"not-json"}},
+            "JSON-safe",
+        ),
+    ],
+)
+def test_job_creation_rejects_unsafe_snapshot_before_sql(
+    config_snapshot: dict[str, object],
+    error_pattern: str,
+) -> None:
+    db_session = MagicMock(spec=Session)
+
+    with pytest.raises(ValueError, match=error_pattern):
+        create_or_get_regulatory_indexing_job(
+            cast(Session, db_session),
+            user_file_id=uuid4(),
+            content_hash="content-v1",
+            search_settings_id=17,
+            prompt_hash="prompt-v1",
+            config_snapshot=cast(RegulatoryIndexingConfigSnapshot, config_snapshot),
+            now=datetime.datetime(2026, 8, 19, tzinfo=datetime.timezone.utc),
+        )
+
+    db_session.scalar.assert_not_called()

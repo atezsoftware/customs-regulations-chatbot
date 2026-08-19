@@ -1,6 +1,7 @@
 import datetime
 from collections.abc import Generator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from threading import Barrier
 from uuid import UUID, uuid4
 
 import pytest
@@ -20,6 +21,7 @@ from onyx.db.models import (
     UserFile,
 )
 from onyx.db.regulatory_indexing_jobs import (
+    RegulatoryIndexingConfigSnapshot,
     advance_regulatory_indexing_job,
     claim_regulatory_indexing_job,
     claim_stale_regulatory_indexing_jobs,
@@ -34,7 +36,7 @@ from onyx.db.regulatory_indexing_jobs import (
 from tests.external_dependency_unit.conftest import create_test_user
 
 _NOW = datetime.datetime(2026, 8, 19, 10, 0, tzinfo=datetime.timezone.utc)
-_SNAPSHOT: dict[str, object] = {
+_SNAPSHOT: RegulatoryIndexingConfigSnapshot = {
     "embedding_provider": "openrouter",
     "embedding_model": "openai/text-embedding-3-large",
     "effective_dimension": 1536,
@@ -149,6 +151,33 @@ def test_job_lease_can_be_claimed_only_once(
     assert job.heartbeat_at == _NOW
 
 
+def test_simultaneous_claims_have_exactly_one_winner(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    engine = db_session.get_bind()
+    barrier = Barrier(2)
+
+    def claim_in_independent_session() -> bool:
+        with Session(engine) as independent_session:
+            barrier.wait(timeout=5)
+            return claim_regulatory_indexing_job(
+                independent_session,
+                job_id=job.id,
+                expected_stage=RegulatoryIndexingStage.PREPARING,
+                expected_generation=0,
+                now=_NOW,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: claim_in_independent_session(), range(2)))
+
+    assert sorted(results) == [False, True]
+    db_session.refresh(job)
+    assert job.lease_generation == 1
+
+
 def test_older_lease_cannot_advance_job_state(
     db_session: Session,
     regulatory_user_file: UserFile,
@@ -184,7 +213,7 @@ def test_older_lease_cannot_advance_job_state(
     assert job.status == RegulatoryIndexingJobStatus.QUEUED.value
 
 
-def test_current_lease_can_persist_terminal_job_state(
+def test_illegal_stage_skip_cannot_persist_terminal_job_state(
     db_session: Session,
     regulatory_user_file: UserFile,
 ) -> None:
@@ -197,7 +226,7 @@ def test_current_lease_can_persist_terminal_job_state(
         now=_NOW,
     )
 
-    assert advance_regulatory_indexing_job(
+    assert not advance_regulatory_indexing_job(
         db_session,
         job_id=job.id,
         expected_stage=RegulatoryIndexingStage.PREPARING,
@@ -208,9 +237,68 @@ def test_current_lease_can_persist_terminal_job_state(
     )
 
     db_session.refresh(job)
-    assert job.stage == RegulatoryIndexingStage.PUBLISH.value
-    assert job.status == RegulatoryIndexingJobStatus.SUCCEEDED.value
-    assert job.completed_at == _NOW
+    assert job.stage == RegulatoryIndexingStage.PREPARING.value
+    assert job.status == RegulatoryIndexingJobStatus.RUNNING.value
+    assert job.completed_at is None
+
+
+def test_publish_stage_can_succeed_and_cancellation_can_finish(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    succeeded_job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=succeeded_job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    succeeded_job.stage = RegulatoryIndexingStage.PUBLISH.value
+    db_session.commit()
+    assert advance_regulatory_indexing_job(
+        db_session,
+        job_id=succeeded_job.id,
+        expected_stage=RegulatoryIndexingStage.PUBLISH,
+        expected_generation=1,
+        next_stage=RegulatoryIndexingStage.PUBLISH,
+        next_status=RegulatoryIndexingJobStatus.SUCCEEDED,
+        now=_NOW,
+    )
+    db_session.refresh(succeeded_job)
+    assert succeeded_job.stage == RegulatoryIndexingStage.PUBLISH.value
+    assert succeeded_job.status == RegulatoryIndexingJobStatus.SUCCEEDED.value
+    assert succeeded_job.completed_at == _NOW
+
+    cancelled_job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=cancelled_job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    assert advance_regulatory_indexing_job(
+        db_session,
+        job_id=cancelled_job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        next_stage=RegulatoryIndexingStage.PREPARING,
+        next_status=RegulatoryIndexingJobStatus.CANCELLING,
+        now=_NOW,
+    )
+    assert advance_regulatory_indexing_job(
+        db_session,
+        job_id=cancelled_job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        next_stage=RegulatoryIndexingStage.PREPARING,
+        next_status=RegulatoryIndexingJobStatus.CANCELLED,
+        now=_NOW,
+    )
+    db_session.refresh(cancelled_job)
+    assert cancelled_job.status == RegulatoryIndexingJobStatus.CANCELLED.value
+    assert cancelled_job.completed_at == _NOW
 
 
 def test_only_due_retries_are_claimable(
@@ -313,6 +401,105 @@ def test_stale_recovery_claims_due_and_abandoned_jobs_only(
     assert all(claim.lease_generation == 2 for claim in claims)
 
 
+def test_simultaneous_recovery_claims_stale_job_once(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW - datetime.timedelta(minutes=3),
+    )
+    engine = db_session.get_bind()
+    barrier = Barrier(2)
+
+    def recover_in_independent_session() -> list[UUID]:
+        with Session(engine) as independent_session:
+            barrier.wait(timeout=5)
+            return [
+                claim.job_id
+                for claim in claim_stale_regulatory_indexing_jobs(
+                    independent_session,
+                    stale_before=_NOW - datetime.timedelta(minutes=2),
+                    claimed_at=_NOW,
+                    limit=1,
+                )
+            ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(lambda _: recover_in_independent_session(), range(2))
+        )
+
+    assert [job_id for claimed_ids in results for job_id in claimed_ids] == [job.id]
+    db_session.refresh(job)
+    assert job.lease_generation == 2
+
+
+def test_item_creation_requires_current_running_lease_and_matching_request_hash(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    chunk = RegulatoryChunk(
+        id=f"regulatory-chunk-{uuid4().hex}",
+        user_file_id=regulatory_user_file.id,
+        text="MADDE 1 - Olusturma fence testi.",
+        position=0,
+        heading_path=["MADDE 1"],
+        chunk_metadata={},
+    )
+    db_session.add(chunk)
+    db_session.commit()
+
+    assert (
+        create_or_get_regulatory_indexing_item(
+            db_session,
+            job_id=job.id,
+            regulatory_chunk_id=chunk.id,
+            request_hash="request-v1",
+            expected_generation=0,
+        )
+        is None
+    )
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    assert (
+        create_or_get_regulatory_indexing_item(
+            db_session,
+            job_id=job.id,
+            regulatory_chunk_id=chunk.id,
+            request_hash="request-v1",
+            expected_generation=0,
+        )
+        is None
+    )
+    item = create_or_get_regulatory_indexing_item(
+        db_session,
+        job_id=job.id,
+        regulatory_chunk_id=chunk.id,
+        request_hash="request-v1",
+        expected_generation=1,
+    )
+    assert item is not None
+    with pytest.raises(ValueError, match="request hash"):
+        create_or_get_regulatory_indexing_item(
+            db_session,
+            job_id=job.id,
+            regulatory_chunk_id=chunk.id,
+            request_hash="request-v2",
+            expected_generation=1,
+        )
+
+
 def test_item_results_are_unique_and_fenced_by_the_job_lease(
     db_session: Session,
     regulatory_user_file: UserFile,
@@ -328,18 +515,29 @@ def test_item_results_are_unique_and_fenced_by_the_job_lease(
     )
     db_session.add(chunk)
     db_session.commit()
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
     item = create_or_get_regulatory_indexing_item(
         db_session,
         job_id=job.id,
         regulatory_chunk_id=chunk.id,
         request_hash="request-v1",
+        expected_generation=1,
     )
+    assert item is not None
     duplicate = create_or_get_regulatory_indexing_item(
         db_session,
         job_id=job.id,
         regulatory_chunk_id=chunk.id,
-        request_hash="ignored-duplicate-hash",
+        request_hash="request-v1",
+        expected_generation=1,
     )
+    assert duplicate is not None
     assert duplicate.id == item.id
     assert (
         db_session.scalar(
@@ -350,13 +548,6 @@ def test_item_results_are_unique_and_fenced_by_the_job_lease(
         == 1
     )
 
-    assert claim_regulatory_indexing_job(
-        db_session,
-        job_id=job.id,
-        expected_stage=RegulatoryIndexingStage.PREPARING,
-        expected_generation=0,
-        now=_NOW,
-    )
     assert not persist_regulatory_indexing_item_context(
         db_session,
         item_id=item.id,
@@ -396,7 +587,9 @@ def test_item_results_are_unique_and_fenced_by_the_job_lease(
         job_id=job.id,
         regulatory_chunk_id=failed_chunk.id,
         request_hash="request-v2",
+        expected_generation=1,
     )
+    assert failed_item is not None
     assert persist_regulatory_indexing_item_failure(
         db_session,
         item_id=failed_item.id,
@@ -424,7 +617,9 @@ def test_item_results_are_unique_and_fenced_by_the_job_lease(
         job_id=job.id,
         regulatory_chunk_id=skipped_chunk.id,
         request_hash="request-v3",
+        expected_generation=1,
     )
+    assert skipped_item is not None
     assert persist_regulatory_indexing_item_skipped(
         db_session,
         item_id=skipped_item.id,
@@ -440,3 +635,87 @@ def test_item_results_are_unique_and_fenced_by_the_job_lease(
     assert skipped_item.status == RegulatoryIndexingItemStatus.EMBEDDED.value
     assert skipped_item.context is None
     assert skipped_item.vector == [1.0, 0.0, 0.0]
+
+
+def test_item_write_waits_for_takeover_then_rejects_stale_generation(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    chunk = RegulatoryChunk(
+        id=f"regulatory-chunk-{uuid4().hex}",
+        user_file_id=regulatory_user_file.id,
+        text="MADDE 4 - Eski lease sonucu yazilamaz.",
+        position=0,
+        heading_path=["MADDE 4"],
+        chunk_metadata={},
+    )
+    db_session.add(chunk)
+    db_session.commit()
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW - datetime.timedelta(minutes=3),
+    )
+    item = create_or_get_regulatory_indexing_item(
+        db_session,
+        job_id=job.id,
+        regulatory_chunk_id=chunk.id,
+        request_hash="request-v4",
+        expected_generation=1,
+    )
+    assert item is not None
+    assert persist_regulatory_indexing_item_context(
+        db_session,
+        item_id=item.id,
+        expected_generation=1,
+        context={"text": "Kalici baglam"},
+    )
+    engine = db_session.get_bind()
+    takeover_session = Session(engine)
+    locked_job = takeover_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(RegulatoryIndexingJob.id == job.id)
+        .with_for_update()
+    )
+    assert locked_job is not None
+    locked_job.lease_generation = 2
+    locked_job.heartbeat_at = _NOW
+    takeover_session.flush()
+
+    def persist_stale_vector() -> bool:
+        with Session(engine) as stale_session:
+            return persist_regulatory_indexing_item_vector(
+                stale_session,
+                item_id=item.id,
+                expected_generation=1,
+                vector=[9.0, 9.0, 9.0],
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            stale_write = executor.submit(persist_stale_vector)
+            try:
+                stale_write.result(timeout=0.3)
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError(
+                    "stale item write did not wait for job-row takeover"
+                )
+            takeover_session.commit()
+            assert stale_write.result(timeout=5) is False
+    finally:
+        takeover_session.close()
+
+    assert persist_regulatory_indexing_item_vector(
+        db_session,
+        item_id=item.id,
+        expected_generation=2,
+        vector=[1.0, 2.0, 3.0],
+    )
+    db_session.refresh(item)
+    assert item.status == RegulatoryIndexingItemStatus.EMBEDDED.value
+    assert item.vector == [1.0, 2.0, 3.0]
