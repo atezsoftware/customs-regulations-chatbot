@@ -1,0 +1,173 @@
+#!/bin/bash -p
+
+set -Eeuo pipefail
+umask 077
+
+readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin"
+readonly INSTALL_ROOT="/usr/local/libexec/onyx/regulatory-prod-lite"
+readonly ENTRYPOINT_PATH="$INSTALL_ROOT/regulatory-prod-lite-preflight"
+readonly RELEASES_ROOT="$INSTALL_ROOT/releases"
+readonly MAXIMUM_BUNDLE_FILE_SIZE=1048576
+readonly -a SYSTEM_ANCESTORS=(
+  /
+  /usr
+  /usr/bin
+  /usr/sbin
+  /usr/local
+  /usr/local/libexec
+  /usr/local/libexec/onyx
+)
+readonly -a RELEASE_FILES=(
+  regulatory-prod-lite-privileged-entrypoint
+  regulatory-prod-lite-preflight.sh
+  regulatory_readiness_file_snapshot.py
+  docker-compose.regulatory-edge.yml
+  docker-compose.regulatory-compose-infra.yml
+  docker-compose.regulatory-external-infra.yml
+  docker-compose.no-local-models.yml
+  docker-compose.regulatory-prod-lite.yml
+)
+
+export PATH="$TRUSTED_SYSTEM_PATH"
+export HOME="/var/empty"
+export TMPDIR="/tmp"
+export LANG="C"
+export LC_ALL="C"
+unset BASH_ENV CDPATH ENV GLOBIGNORE LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME \
+  PYTHONPATH SUDO_ASKPASS SUDO_ASKPASS_REQUIRE
+
+die() {
+  printf 'Privileged preflight refused: %s\n' "$1" >&2
+  exit 1
+}
+
+validate_directory() {
+  local path=$1
+  local description=$2
+  local owner mode
+
+  [[ ! -L "$path" ]] || die "$description must not be a symlink"
+  [[ -d "$path" ]] || die "$description must be a directory"
+  owner=$(/usr/bin/stat -c '%u:%g' -- "$path") || \
+    die "$description ownership cannot be read"
+  mode=$(/usr/bin/stat -c '%a' -- "$path") || \
+    die "$description mode cannot be read"
+  [[ "$owner" == "0:0" ]] || die "$description must be owned by root:root"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "$description mode is invalid"
+  (( (8#$mode & 8#022) == 0 )) || \
+    die "$description must not be group/world writable"
+}
+
+validate_file() {
+  local path=$1
+  local description=$2
+  local require_executable=${3:-false}
+  local owner mode size
+
+  [[ ! -L "$path" ]] || die "$description must not be a symlink"
+  [[ -f "$path" ]] || die "$description must be a regular file"
+  owner=$(/usr/bin/stat -c '%u:%g' -- "$path") || \
+    die "$description ownership cannot be read"
+  mode=$(/usr/bin/stat -c '%a' -- "$path") || \
+    die "$description mode cannot be read"
+  size=$(/usr/bin/stat -c '%s' -- "$path") || \
+    die "$description size cannot be read"
+  [[ "$owner" == "0:0" ]] || die "$description must be owned by root:root"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "$description mode is invalid"
+  (( (8#$mode & 8#022) == 0 )) || \
+    die "$description must not be group/world writable"
+  ((size <= MAXIMUM_BUNDLE_FILE_SIZE)) || \
+    die "$description exceeds the 1 MiB limit"
+  if [[ "$require_executable" == true ]]; then
+    [[ -x "$path" ]] || die "$description must be executable"
+  fi
+}
+
+validate_manifest_shape() {
+  local manifest=$1
+  local index=0
+  local hash filename extra
+
+  while read -r hash filename extra; do
+    [[ -z "$extra" ]] || die "the privileged bundle manifest is malformed"
+    [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || \
+      die "the privileged bundle manifest contains an invalid digest"
+    ((index < ${#RELEASE_FILES[@]})) || \
+      die "the privileged bundle manifest contains unexpected files"
+    [[ "$filename" == "${RELEASE_FILES[$index]}" ]] || \
+      die "the privileged bundle manifest file set or ordering is invalid"
+    ((index += 1))
+  done <"$manifest"
+  ((index == ${#RELEASE_FILES[@]})) || \
+    die "the privileged bundle manifest is incomplete"
+}
+
+((EUID == 0)) || die "this entrypoint must run as root:root"
+[[ "$(/usr/bin/id -g)" == "0" ]] || die "this entrypoint must run as root:root"
+[[ "${1:-}" == "--bundle-digest" ]] || \
+  die "--bundle-digest must be the first argument"
+[[ "${2:-}" =~ ^[0-9a-f]{64}$ ]] || \
+  die "--bundle-digest must be a lowercase SHA-256"
+bundle_digest=$2
+shift 2
+
+entrypoint_canonical=$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}") || \
+  die "the privileged entrypoint cannot be canonicalized"
+[[ "$entrypoint_canonical" == "$ENTRYPOINT_PATH" ]] || \
+  die "the privileged entrypoint must run only from its fixed installed path"
+
+for ancestor in "${SYSTEM_ANCESTORS[@]}"; do
+  validate_directory "$ancestor" "privileged bundle ancestor $ancestor"
+done
+validate_directory "$INSTALL_ROOT" "the privileged bundle root"
+validate_directory "$RELEASES_ROOT" "the privileged bundle releases directory"
+validate_file "$ENTRYPOINT_PATH" "the privileged preflight entrypoint" true
+validate_file "$INSTALL_ROOT/current" "the privileged bundle release pointer"
+current_digest=$(<"$INSTALL_ROOT/current")
+[[ "$current_digest" == "$bundle_digest" ]] || \
+  die "the selected privileged bundle is not the active installed release"
+
+release_directory="$RELEASES_ROOT/$bundle_digest"
+manifest="$release_directory/REGULATORY_PRIVILEGED_MANIFEST.sha256"
+validate_directory "$release_directory" "the selected privileged bundle release"
+validate_file "$manifest" "the privileged bundle manifest"
+
+manifest_digest=$(/usr/bin/sha256sum -- "$manifest") || \
+  die "the privileged bundle manifest digest cannot be calculated"
+manifest_digest=${manifest_digest%% *}
+[[ "$manifest_digest" == "$bundle_digest" ]] || \
+  die "the selected privileged bundle digest does not match its manifest"
+validate_manifest_shape "$manifest"
+
+for filename in "${RELEASE_FILES[@]}"; do
+  executable=false
+  case "$filename" in
+    regulatory-prod-lite-privileged-entrypoint | regulatory-prod-lite-preflight.sh)
+      executable=true
+      ;;
+  esac
+  validate_file "$release_directory/$filename" \
+    "privileged bundle file $filename" "$executable"
+done
+
+observed_members=$(
+  /usr/bin/find "$release_directory" -mindepth 1 -maxdepth 1 -printf '%f\n' \
+    | /usr/bin/sort
+) || die "the privileged bundle members cannot be enumerated"
+expected_members=$(
+  printf '%s\n' "${RELEASE_FILES[@]}" REGULATORY_PRIVILEGED_MANIFEST.sha256 \
+    | /usr/bin/sort
+)
+[[ "$observed_members" == "$expected_members" ]] || \
+  die "the privileged bundle contains unexpected or missing members"
+
+(
+  cd -- "$release_directory"
+  /usr/bin/sha256sum --check --strict --status \
+    REGULATORY_PRIVILEGED_MANIFEST.sha256
+) || die "the privileged bundle file digest validation failed"
+/usr/bin/cmp --silent "$ENTRYPOINT_PATH" \
+  "$release_directory/regulatory-prod-lite-privileged-entrypoint" || \
+  die "the fixed privileged entrypoint does not match the selected release"
+
+exec /bin/bash -p "$release_directory/regulatory-prod-lite-preflight.sh" "$@"

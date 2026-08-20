@@ -100,8 +100,12 @@ deployment/docker_compose/env.db-admin.template
 deployment/docker_compose/env.migration.template
 deployment/docker_compose/env.web.template
 deployment/docker_compose/env.nginx.template
+deployment/docker_compose/REGULATORY_PRIVILEGED_MANIFEST.sha256
+deployment/docker_compose/install-regulatory-prod-lite-privileged-bundle.sh
+deployment/docker_compose/regulatory-prod-lite-privileged-entrypoint
 deployment/docker_compose/regulatory-prod-lite-preflight.sh
 deployment/docker_compose/regulatory-prod-lite-deploy.sh
+deployment/docker_compose/regulatory_readiness_file_snapshot.py
 deployment/docker_compose/REGULATORY_PRODUCTION_RUNBOOK.md
 deployment/data/nginx/app.conf.template
 deployment/data/nginx/app.conf.template.no-letsencrypt

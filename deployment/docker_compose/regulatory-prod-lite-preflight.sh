@@ -3,9 +3,10 @@
 set -Eeuo pipefail
 umask 077
 
-readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin"
 readonly DOCKER_BIN="/usr/bin/docker"
 readonly COMPOSE_BIN="/usr/libexec/docker/cli-plugins/docker-compose"
+readonly PYTHON_BIN="/usr/bin/python3"
 readonly DOCKER_CONFIG_DIR="/etc/onyx/regulatory-docker"
 readonly DEPLOYMENT_DOCKER_HOST="unix:///var/run/docker.sock"
 readonly DEPLOYMENT_HOME="/var/empty"
@@ -20,7 +21,6 @@ unset BASH_ENV CDPATH ENV GLOBIGNORE LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME \
 readonly MINIMUM_COMPOSE_VERSION="2.24.4"
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
-readonly DEFAULT_BASE_COMPOSE="$SCRIPT_DIR/docker-compose.prod.yml"
 readonly REGULATORY_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-prod-lite.yml"
 readonly EXTERNAL_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-external-infra.yml"
 readonly NO_LOCAL_MODELS_OVERLAY="$SCRIPT_DIR/docker-compose.no-local-models.yml"
@@ -38,8 +38,8 @@ Usage:
   regulatory-prod-lite-preflight.sh [options]
 
 Options:
-  --env-file PATH          Compose interpolation environment (default: .env beside this script)
-  --base-compose PATH      Production base Compose file (default: docker-compose.prod.yml)
+  --env-file PATH          Required Compose interpolation environment
+  --base-compose PATH      Required production base Compose file
   --project-name NAME      Required existing/intended Compose project name (normally: onyx)
   --migration-env-file PATH
                            Required dedicated migration credentials (mode 0600)
@@ -178,8 +178,8 @@ validate_root_owned_executable() {
   [[ -x "$path" ]] || die "$description must be executable"
 }
 
-env_file="$SCRIPT_DIR/.env"
-base_compose="$DEFAULT_BASE_COMPOSE"
+env_file=""
+base_compose=""
 expected_image=""
 expected_web_image=""
 infra_mode=""
@@ -256,6 +256,8 @@ done
 clear_ambient_deployment_overrides
 [[ "$project_name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || \
   die "--project-name is required and must be an explicit lowercase Compose project name"
+[[ -n "$env_file" ]] || die "--env-file is required"
+[[ -n "$base_compose" ]] || die "--base-compose is required"
 [[ -n "$migration_env_file" ]] || die "--migration-env-file is required"
 
 validate_root_owned_directory "${DOCKER_CONFIG_DIR%/*}" \
@@ -269,7 +271,7 @@ validate_root_owned_executable "$COMPOSE_BIN" "the Docker Compose CLI"
 command -v jq >/dev/null 2>&1 || die "jq is required for fail-closed Compose validation"
 command -v readlink >/dev/null 2>&1 || die "readlink is required for environment-path validation"
 command -v stat >/dev/null 2>&1 || die "stat is required for environment permission validation"
-command -v python3 >/dev/null 2>&1 || die "python3 is required for readiness snapshot validation"
+[[ -x "$PYTHON_BIN" ]] || die "the isolated Python interpreter is unavailable"
 command -v timeout >/dev/null 2>&1 || die "timeout is required for bounded readiness validation"
 [[ -r "$READINESS_SNAPSHOT_HELPER" && -f "$READINESS_SNAPSHOT_HELPER" ]] || \
   die "the readiness snapshot helper is unavailable"
@@ -576,7 +578,7 @@ trap 'exit 143' TERM
 snapshot_directory=$(mktemp -d "${TMPDIR:-/tmp}/regulatory-readiness-snapshot.XXXXXX")
 chmod 700 "$snapshot_directory"
 readiness_cidfile="$snapshot_directory/readiness.cid"
-readiness_ownership_token=$(python3 -c \
+readiness_ownership_token=$("$PYTHON_BIN" -I -S -c \
   'import secrets; print(secrets.token_hex(32))') || \
   die "a private readiness container ownership token could not be created"
 [[ "$readiness_ownership_token" =~ ^[0-9a-f]{64}$ ]] || \
@@ -961,7 +963,7 @@ fi
 
 background_image=$(jq -er '.services.background.image' "$config_file") || \
   die "the rendered background image cannot be resolved for readiness-file validation"
-python3 "$READINESS_SNAPSHOT_HELPER" \
+"$PYTHON_BIN" -I -S "$READINESS_SNAPSHOT_HELPER" \
   --attestation "$attestation_path" \
   --evidence "$evidence_path" \
   --snapshot-directory "$snapshot_directory" || \

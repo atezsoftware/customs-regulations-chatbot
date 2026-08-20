@@ -151,6 +151,16 @@ def test_production_bundle_uses_a_physical_allowlist() -> None:
     )
     assert "deployment/docker_compose/env.regulatory-prod.template" in members
     assert "deployment/docker_compose/regulatory-prod-lite-deploy.sh" in members
+    assert (
+        "deployment/docker_compose/regulatory-prod-lite-privileged-entrypoint"
+        in members
+    )
+    assert (
+        "deployment/docker_compose/install-regulatory-prod-lite-privileged-bundle.sh"
+        in members
+    )
+    assert "deployment/docker_compose/REGULATORY_PRIVILEGED_MANIFEST.sha256" in members
+    assert "deployment/docker_compose/regulatory_readiness_file_snapshot.py" in members
     assert not any("importer" in member for member in members)
     assert not any("publish-regulatory" in member for member in members)
     assert not any(member.startswith("backend/") for member in members)

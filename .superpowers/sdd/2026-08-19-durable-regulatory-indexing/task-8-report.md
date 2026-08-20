@@ -816,3 +816,91 @@ ports `7000` and `7001` returned HTTP `200`. No trusted config or attestation
 was fabricated, no live root preflight or rollout was attempted, and no
 production document, index, database/provider record, object, or job was
 mutated.
+
+---
+
+## Task 8: final privileged-bundle adjudication
+
+The remaining Critical finding was valid: despite the fixed executables and
+sanitized environment, the bounded sudo handoff still executed
+`regulatory-prod-lite-preflight.sh` from the operator-owned release directory,
+and that script selected its Python helper and trusted Compose overlays from
+the same mutable directory.
+
+### TDD and installed trust boundary
+
+- The focused RED was `2 failed in 0.23s`: the deploy wrapper had no fixed
+  privileged-bundle root and the required installed entrypoint, installer, and
+  manifest did not exist. The first contract GREEN was `2 passed in 0.04s`.
+- The only sudo target is now the fixed
+  `/usr/local/libexec/onyx/regulatory-prod-lite/regulatory-prod-lite-preflight`.
+  The wrapper invokes it directly through absolute `/usr/bin/sudo -n`, without
+  an intervening shell or `env`, and passes the exact active manifest digest.
+  The same digest-addressed installed release supplies every trusted overlay
+  to the later non-root Compose rollout; checkout preflight/helper/overlay
+  copies are never selected by root.
+- Before dispatch, the installed entrypoint validates `/`, both fixed PATH
+  directories, every fixed bundle ancestor, `current`, the selected release,
+  the exact member set, and every required file as exact `root:root`,
+  non-symlink, and non-group/world-writable. It binds the release-directory
+  name to the SHA-256 of `REGULATORY_PRIVILEGED_MANIFEST.sha256`, verifies each
+  listed digest, and proves the stable entrypoint equals the selected release
+  copy. Root then runs only the validated preflight through `/bin/bash -p`.
+  The preflight invokes the descriptor-owned snapshot helper and ownership
+  token generator through fixed `/usr/bin/python3 -I -S`, excluding cwd,
+  script-directory, `PYTHONPATH`, site, and startup-hook import paths.
+- The root-only installer is itself accepted only at
+  `/usr/local/sbin/install-regulatory-prod-lite-privileged-bundle`. It has no
+  sudo call or caller-selected destination. It accepts only a digest-named,
+  root-owned private source below
+  `/var/lib/onyx/regulatory-prod-lite-staging`, verifies the exact manifest and
+  file set, installs a versioned release through a private temporary directory,
+  fsyncs files/directories, validates the installed copy, then atomically
+  updates the fixed entrypoint and `current`. Existing corrupt releases,
+  symlinks, unsafe ownership/modes, extra members, and digest mismatches fail
+  before activation. The runbook requires organization signature/archive
+  verification, inert allowlisted staging, a verified fixed-path installer,
+  a literal no-wildcard exact-argv sudoers rule, `visudo -c`, and removal of all
+  older checkout/shell/env/wildcard grants.
+- Behavior regressions prove a mode-`0777` checkout preflight, Python helper,
+  and overlay cannot run or affect deployment; a hostile cwd `secrets.py`
+  marker is not imported; installed file/directory writable modes, final
+  symlinks, and a non-root-owned helper fail before Docker; the installer
+  atomically installs an exact reviewed bundle while rejecting symlinked or
+  writable staging and direct checkout execution. The final focused readiness,
+  deploy, runtime dependency, environment, Celery wiring/task, and Supervisor
+  unit set passed `176 passed in 27.44s`.
+
+### Privileged runtime, broad, and static evidence
+
+- A real setuid-sudo/NOPASSWD test in a disposable runtime-derived image uses
+  an exact literal rule for the fixed entrypoint and digest. UID/GID
+  `2002:2002` can run that one noninteractive `--help` handoff; sudo rejects a
+  hostile checkout shell path and rejects extra/non-exact preflight arguments,
+  and no marker executes. The complete privileged module passed `6 passed in
+  128.93s`, retaining Supervisor numeric `1001:1001`/`0770` allow/deny plus
+  normal readiness, final-component symlink, forced-timeout cleanup, and
+  pre-cidfile exact-label cleanup proofs.
+- The exact 55-file regulatory, user-file, Vertex, Supervisor, and runtime unit
+  superset passed `940 passed in 41.12s`. Durable pipeline/provider/repository
+  code did not change, so the immediately preceding unchanged PostgreSQL
+  15.2/Elasticsearch 9.4.2 proof remains `36 passed in 44.22s` with exact
+  provider restoration and zero pipeline/index residue.
+- The privileged manifest's eight SHA-256 entries passed `sha256sum --check
+  --strict`. Ruff check, Ruff formatting, `ty`, `bash -n`, and `git diff
+  --check` passed. Host shellcheck is unavailable, while the repository
+  touched-file pre-commit run passed all applicable hooks, including lazy
+  imports, `ty`, Ruff, Ruff format, shellcheck, large-file, and ripsecrets.
+  Disposable containers, ownership-label containers, test images, and probe
+  directories had zero residue.
+
+### Live-readiness limit
+
+The final read-only check remains blocked before any canary: private
+`psql.dev.singlewindow.io` DNS returned exit `2`; `onyx-api_server-1` was up
+but unhealthy; `onyx-nginx-1` was healthy; ports `7000` and `7001` returned
+HTTP `200`; and the readiness ownership label matched zero containers. The
+local host also intentionally has no approved installed privileged bundle or
+trusted capability attestation. No installer, sudoers rule, root preflight,
+rollout, live canary, production document, index, database/provider record,
+object, or job was created or mutated.

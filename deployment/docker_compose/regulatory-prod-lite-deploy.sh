@@ -3,9 +3,8 @@
 set -Eeuo pipefail
 umask 077
 
-readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin"
 readonly ENV_BIN="/usr/bin/env"
-readonly BASH_BIN="/bin/bash"
 readonly SUDO_BIN="/usr/bin/sudo"
 readonly DOCKER_BIN="/usr/bin/docker"
 readonly COMPOSE_BIN="/usr/libexec/docker/cli-plugins/docker-compose"
@@ -17,12 +16,8 @@ unset BASH_ENV CDPATH ENV GLOBIGNORE LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME \
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
-readonly PREFLIGHT="$SCRIPT_DIR/regulatory-prod-lite-preflight.sh"
-readonly REGULATORY_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-prod-lite.yml"
-readonly EXTERNAL_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-external-infra.yml"
-readonly NO_LOCAL_MODELS_OVERLAY="$SCRIPT_DIR/docker-compose.no-local-models.yml"
-readonly EDGE_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-edge.yml"
-readonly COMPOSE_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-compose-infra.yml"
+readonly PRIVILEGED_BUNDLE_ROOT="/usr/local/libexec/onyx/regulatory-prod-lite"
+readonly PRIVILEGED_PREFLIGHT="$PRIVILEGED_BUNDLE_ROOT/regulatory-prod-lite-preflight"
 readonly DEPLOYMENT_DOCKER_HOST="unix:///var/run/docker.sock"
 
 usage() {
@@ -228,6 +223,23 @@ done
 
 reject_ambient_deployment_overrides
 export HOME="$DEPLOYMENT_HOME"
+
+current_release_file="$PRIVILEGED_BUNDLE_ROOT/current"
+[[ -f "$current_release_file" && ! -L "$current_release_file" ]] || \
+  die "the fixed privileged bundle release pointer is unavailable"
+bundle_digest=$(<"$current_release_file")
+[[ "$bundle_digest" =~ ^[0-9a-f]{64}$ ]] || \
+  die "the fixed privileged bundle release pointer is invalid"
+bundle_release="$PRIVILEGED_BUNDLE_ROOT/releases/$bundle_digest"
+[[ -d "$bundle_release" && ! -L "$bundle_release" ]] || \
+  die "the selected installed privileged bundle release is unavailable"
+readonly bundle_digest bundle_release
+readonly REGULATORY_OVERLAY="$bundle_release/docker-compose.regulatory-prod-lite.yml"
+readonly EXTERNAL_INFRA_OVERLAY="$bundle_release/docker-compose.regulatory-external-infra.yml"
+readonly NO_LOCAL_MODELS_OVERLAY="$bundle_release/docker-compose.no-local-models.yml"
+readonly EDGE_OVERLAY="$bundle_release/docker-compose.regulatory-edge.yml"
+readonly COMPOSE_INFRA_OVERLAY="$bundle_release/docker-compose.regulatory-compose-infra.yml"
+
 deployment_environment=(
   "$ENV_BIN" -i
   "PATH=$TRUSTED_SYSTEM_PATH"
@@ -263,15 +275,14 @@ fi
 
 run_preflight() {
   if ((EUID == 0)); then
-    "${deployment_environment[@]}" \
-      "$BASH_BIN" -p "$PREFLIGHT" "${preflight_args[@]}"
+    "$PRIVILEGED_PREFLIGHT" --bundle-digest "$bundle_digest" \
+      "${preflight_args[@]}"
     return
   fi
   [[ -x "$SUDO_BIN" ]] || \
     die "noninteractive sudo authorization is required for the bounded readiness preflight"
-  if ! "$SUDO_BIN" -n -- \
-    "${deployment_environment[@]}" \
-    "$BASH_BIN" -p "$PREFLIGHT" "${preflight_args[@]}"; then
+  if ! "$SUDO_BIN" -n -- "$PRIVILEGED_PREFLIGHT" \
+    --bundle-digest "$bundle_digest" "${preflight_args[@]}"; then
     die "the bounded readiness preflight failed; noninteractive sudo authorization for this exact handoff is required"
   fi
 }

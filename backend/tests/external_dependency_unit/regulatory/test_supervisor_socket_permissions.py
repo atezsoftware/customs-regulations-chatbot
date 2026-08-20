@@ -76,9 +76,19 @@ def runtime_lite_supervisor_image() -> Iterator[str]:
 def preflight_operator_image(
     runtime_lite_supervisor_image: str,
 ) -> Iterator[str]:
-    fingerprint = hashlib.sha256(
-        f"{runtime_lite_supervisor_image}:trusted-cli-v1".encode()
-    ).hexdigest()[:16]
+    fingerprint_source = hashlib.sha256(
+        f"{runtime_lite_supervisor_image}:trusted-cli-v2".encode()
+    )
+    for file_name in (
+        *prod_lite_deploy._PRIVILEGED_RELEASE_FILES,
+        "REGULATORY_PRIVILEGED_MANIFEST.sha256",
+    ):
+        fingerprint_source.update(
+            (
+                _REPOSITORY_ROOT / "deployment" / "docker_compose" / file_name
+            ).read_bytes()
+        )
+    fingerprint = fingerprint_source.hexdigest()[:16]
     image = f"onyx-task8-preflight-operator:{fingerprint}"
     existing = subprocess.run(
         ["docker", "image", "inspect", image],
@@ -90,12 +100,21 @@ def preflight_operator_image(
     built_for_test = existing.returncode != 0
     if built_for_test:
         build = subprocess.run(
-            ["docker", "build", "--tag", image, "-"],
+            [
+                "docker",
+                "build",
+                "--tag",
+                image,
+                "--file",
+                "-",
+                str(_REPOSITORY_ROOT),
+            ],
             input=(
                 f"FROM {runtime_lite_supervisor_image}\n"
                 "USER 0:0\n"
-                "RUN apt-get update && apt-get install -y --no-install-recommends jq "
+                "RUN apt-get update && apt-get install -y --no-install-recommends jq sudo "
                 "&& rm -rf /var/lib/apt/lists/* "
+                "&& useradd --uid 2002 --user-group --no-create-home --shell /bin/sh preflight-operator "
                 "&& install -d -o root -g root -m 0750 /etc/onyx "
                 "/etc/onyx/regulatory-docker "
                 "&& install -d -o root -g root -m 0755 "
@@ -104,6 +123,29 @@ def preflight_operator_image(
                 "&& chmod 0640 /etc/onyx/regulatory-docker/config.json "
                 "&& if [ ! -e /usr/bin/python3 ]; then "
                 "ln -s /usr/local/bin/python3 /usr/bin/python3; fi\n"
+                "COPY deployment/docker_compose/REGULATORY_PRIVILEGED_MANIFEST.sha256 /opt/regulatory-privileged/\n"
+                "COPY deployment/docker_compose/regulatory-prod-lite-privileged-entrypoint /opt/regulatory-privileged/\n"
+                "COPY deployment/docker_compose/regulatory-prod-lite-preflight.sh /opt/regulatory-privileged/\n"
+                "COPY deployment/docker_compose/regulatory_readiness_file_snapshot.py /opt/regulatory-privileged/\n"
+                "COPY deployment/docker_compose/docker-compose.regulatory-edge.yml /opt/regulatory-privileged/\n"
+                "COPY deployment/docker_compose/docker-compose.regulatory-compose-infra.yml /opt/regulatory-privileged/\n"
+                "COPY deployment/docker_compose/docker-compose.regulatory-external-infra.yml /opt/regulatory-privileged/\n"
+                "COPY deployment/docker_compose/docker-compose.no-local-models.yml /opt/regulatory-privileged/\n"
+                "COPY deployment/docker_compose/docker-compose.regulatory-prod-lite.yml /opt/regulatory-privileged/\n"
+                "RUN cd /opt/regulatory-privileged "
+                "&& sha256sum --check --strict REGULATORY_PRIVILEGED_MANIFEST.sha256 "
+                "&& digest=$(sha256sum REGULATORY_PRIVILEGED_MANIFEST.sha256 | cut -d' ' -f1) "
+                "&& release=/usr/local/libexec/onyx/regulatory-prod-lite/releases/$digest "
+                '&& install -d -o root -g root -m 0755 "$release" '
+                '&& install -o root -g root -m 0755 regulatory-prod-lite-privileged-entrypoint regulatory-prod-lite-preflight.sh "$release/" '
+                '&& install -o root -g root -m 0644 regulatory_readiness_file_snapshot.py docker-compose.regulatory-edge.yml docker-compose.regulatory-compose-infra.yml docker-compose.regulatory-external-infra.yml docker-compose.no-local-models.yml docker-compose.regulatory-prod-lite.yml REGULATORY_PRIVILEGED_MANIFEST.sha256 "$release/" '
+                "&& install -o root -g root -m 0755 regulatory-prod-lite-privileged-entrypoint /usr/local/libexec/onyx/regulatory-prod-lite/regulatory-prod-lite-preflight "
+                "&& printf '%s\\n' \"$digest\" >/usr/local/libexec/onyx/regulatory-prod-lite/current "
+                "&& chmod 0644 /usr/local/libexec/onyx/regulatory-prod-lite/current "
+                "&& printf 'preflight-operator ALL=(root:root) NOPASSWD: /usr/local/libexec/onyx/regulatory-prod-lite/regulatory-prod-lite-preflight --bundle-digest %s --help\\n' \"$digest\" >/etc/sudoers.d/onyx-regulatory-preflight-test "
+                "&& chmod 0440 /etc/sudoers.d/onyx-regulatory-preflight-test "
+                "&& visudo -cf /etc/sudoers.d/onyx-regulatory-preflight-test "
+                "&& rm -rf /opt/regulatory-privileged\n"
             ),
             capture_output=True,
             text=True,
@@ -323,14 +365,93 @@ finally:
     assert result.returncode == 0, result.stderr
 
 
+def test_real_sudo_boundary_authorizes_only_fixed_installed_preflight(
+    preflight_operator_image: str,
+) -> None:
+    manifest = (
+        _REPOSITORY_ROOT
+        / "deployment"
+        / "docker_compose"
+        / "REGULATORY_PRIVILEGED_MANIFEST.sha256"
+    )
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    entrypoint = (
+        "/usr/local/libexec/onyx/regulatory-prod-lite/regulatory-prod-lite-preflight"
+    )
+    probe = f"""
+set -eu
+printf '#!/bin/sh\nprintf owned >/tmp/checkout-marker\n' >/tmp/checkout-preflight
+chmod 0755 /tmp/checkout-preflight
+/usr/bin/sudo -n -- {entrypoint} --bundle-digest {digest} --help >/tmp/help
+grep -q 'Validate a regulatory production-lite deployment' /tmp/help
+if /usr/bin/sudo -n -- /bin/bash /tmp/checkout-preflight 2>/dev/null; then
+  exit 91
+fi
+if /usr/bin/sudo -n -- {entrypoint} --bundle-digest {digest} --help --env-file /tmp/other 2>/dev/null; then
+  exit 92
+fi
+test ! -e /tmp/checkout-marker
+""".strip()
+
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--pull",
+            "never",
+            "--network",
+            "none",
+            "--pids-limit",
+            "64",
+            "--memory",
+            "256m",
+            "--cpus",
+            "1",
+            "--user",
+            "2002:2002",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "SETUID",
+            "--cap-add",
+            "SETGID",
+            "--cap-add",
+            "DAC_OVERRIDE",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777",
+            "--entrypoint",
+            "/bin/sh",
+            preflight_operator_image,
+            "-c",
+            probe,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=45,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def _run_preflight_as_distinct_operator_and_root(
     env_file: Path,
     env: dict[str, str],
     operator_image: str,
     probe_root: Path,
 ) -> subprocess.CompletedProcess[str]:
+    privileged_manifest = (
+        _REPOSITORY_ROOT
+        / "deployment"
+        / "docker_compose"
+        / "REGULATORY_PRIVILEGED_MANIFEST.sha256"
+    )
+    privileged_digest = hashlib.sha256(privileged_manifest.read_bytes()).hexdigest()
     command = [
-        str(prod_lite_deploy._PREFLIGHT),
+        "/usr/local/libexec/onyx/regulatory-prod-lite/regulatory-prod-lite-preflight",
+        "--bundle-digest",
+        privileged_digest,
         "--env-file",
         str(env_file),
         "--base-compose",
@@ -376,7 +497,7 @@ def run_as(uid=None, gid=None):
 
 
 non_root = run_as(2002, 2002)
-if non_root.returncode != 1 or "must be invoked as root" not in non_root.stderr:
+if non_root.returncode != 1 or "must run as root:root" not in non_root.stderr:
     raise RuntimeError("Distinct non-root operator did not fail closed before Docker")
 
 os.chown(attestation, 1001, 1001)
@@ -681,7 +802,7 @@ def test_preflight_real_runtime_enforces_source_and_cleanup_contract(
     assert result.returncode == 0, result.stderr
     observed = json.loads(result.stdout)
     assert observed["non_root_returncode"] == 1
-    assert "must be invoked as root" in observed["non_root_stderr"]
+    assert "must run as root:root" in observed["non_root_stderr"]
     assert observed["source_owners"] == [[1001, 1001], [1001, 1001]]
     combined_output = result.stdout + result.stderr
     assert "runtime-evidence-never-print" not in combined_output

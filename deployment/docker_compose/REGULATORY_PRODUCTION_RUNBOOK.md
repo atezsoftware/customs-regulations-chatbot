@@ -95,7 +95,9 @@ The builder refuses a dirty checkout or a source revision different from `HEAD`.
 a non-secret manifest containing that revision, `model_mode=cloud`, the two production image digests,
 and SHA-256 for every deployment file; the adjacent checksum covers the archive and manifest. It
 contains only the
-production base/edge/topology/lite Compose files, authoritative preflight/deploy scripts,
+production base Compose file, authoritative non-root deploy wrapper, the privileged-bundle
+installer/entrypoint/manifest, the descriptor-owned snapshot helper, trusted edge/topology/lite
+overlays,
 secret-free production/nginx/role templates, runbook, and nginx templates. It physically excludes
 the importer compose/env, importer/publish scripts, Dockerfiles, application source, and source
 documents. Production hosts receive this bundle plus approved secrets—not a full repository clone.
@@ -290,14 +292,93 @@ and the lite deployment intentionally has no Beat process to recreate generic in
 
 ## 4. Preflight the rendered deployment
 
-Run only the authoritative deployment wrapper from `deployment/docker_compose`. It rejects ambient
+Run only the authoritative non-root deployment wrapper from the verified release directory. Root
+must never execute that wrapper, a script/helper, or a Compose overlay from the extracted handoff,
+repository checkout, current working directory, or another operator-writable path. The wrapper rejects ambient
 `DOCKER_*`, `COMPOSE_*`, and image interpolation overrides, reads interpolation only from the
 selected mode-`0600` environment file, and binds both preflight and rollout to the local
 `unix:///var/run/docker.sock` daemon with one explicit environment. Remote Docker contexts are not
 supported by this production-lite procedure. The wrapper does not trust the operator's `PATH`,
 `HOME`, or Docker CLI plugin discovery: it uses the fixed system path
-`/usr/sbin:/usr/bin:/sbin:/bin`, `/usr/bin/docker`, and
+`/usr/sbin:/usr/bin`, `/usr/bin/docker`, and
 `/usr/libexec/docker/cli-plugins/docker-compose` for both phases.
+
+### Install or upgrade the privileged bundle
+
+The only root-executed application code is the fixed entrypoint
+`/usr/local/libexec/onyx/regulatory-prod-lite/regulatory-prod-lite-preflight`. It dispatches to one
+digest-named release below `releases/` only after recursively checking exact `root:root` ownership,
+rejecting symlinks and group/world-writable directories/files, checking the exact member set, and
+verifying `REGULATORY_PRIVILEGED_MANIFEST.sha256` plus every listed SHA-256. It then uses
+`/usr/bin/python3 -I -S` for the descriptor-owned snapshot helper. The non-root wrapper reads the
+same installed digest once and uses that release's trusted overlays for rollout, so preflight and
+rollout cannot select different checkout copies.
+
+First verify the production archive's organization signature/attestation and the adjacent archive
+SHA-256 through the approved release channel. Extract it as the non-root deployment operator; never
+run an installer directly from that extraction or a checkout. Record the reviewed SHA-256 of
+`REGULATORY_PRIVILEGED_MANIFEST.sha256` as `APPROVED_PRIVILEGED_MANIFEST_SHA256`. A root custodian then
+copies the exact allowlisted files as inert data into the private staging directory named by that
+digest. The following is a procedure template: substitute the verified absolute release directory
+and literal reviewed digest before the root session, and do not pipe untrusted shell text into it.
+
+```bash
+# Run in a controlled root session after release signature and archive-digest verification.
+/usr/bin/install -d -o root -g root -m 0755 /var/lib/onyx
+/usr/bin/install -d -o root -g root -m 0700 \
+  /var/lib/onyx/regulatory-prod-lite-staging
+/usr/bin/install -d -o root -g root -m 0700 \
+  "/var/lib/onyx/regulatory-prod-lite-staging/$APPROVED_PRIVILEGED_MANIFEST_SHA256"
+
+# Copy, but do not execute, only the manifest's eight files from the verified extraction.
+while IFS= read -r _ file; do
+  case "$file" in
+    regulatory-prod-lite-privileged-entrypoint|regulatory-prod-lite-preflight.sh)
+      mode=0755 ;;
+    regulatory_readiness_file_snapshot.py|docker-compose.regulatory-edge.yml|\
+    docker-compose.regulatory-compose-infra.yml|\
+    docker-compose.regulatory-external-infra.yml|\
+    docker-compose.no-local-models.yml|docker-compose.regulatory-prod-lite.yml)
+      mode=0644 ;;
+    *) exit 1 ;;
+  esac
+  /usr/bin/install -o root -g root -m "$mode" \
+    "$VERIFIED_RELEASE_DIR/$file" \
+    "/var/lib/onyx/regulatory-prod-lite-staging/$APPROVED_PRIVILEGED_MANIFEST_SHA256/$file"
+done <"$VERIFIED_RELEASE_DIR/REGULATORY_PRIVILEGED_MANIFEST.sha256"
+/usr/bin/install -o root -g root -m 0644 \
+  "$VERIFIED_RELEASE_DIR/REGULATORY_PRIVILEGED_MANIFEST.sha256" \
+  "/var/lib/onyx/regulatory-prod-lite-staging/$APPROVED_PRIVILEGED_MANIFEST_SHA256/REGULATORY_PRIVILEGED_MANIFEST.sha256"
+```
+
+Bootstrap or upgrade the installer itself only from that same identity-verified artifact. Copy it
+to a temporary root-owned file, compare its SHA-256 with the signed outer
+`REGULATORY_RELEASE_MANIFEST.txt`, and atomically rename it to the fixed path. Do not grant operators
+sudo for this provisioning step and do not invoke the extracted installer with `sudo`.
+
+```bash
+/usr/bin/install -o root -g root -m 0755 \
+  "$VERIFIED_RELEASE_DIR/install-regulatory-prod-lite-privileged-bundle.sh" \
+  /usr/local/sbin/.install-regulatory-prod-lite-privileged-bundle.new
+# APPROVED_INSTALLER_SHA256 is copied literally from the already verified outer manifest.
+printf '%s  %s\n' "$APPROVED_INSTALLER_SHA256" \
+  /usr/local/sbin/.install-regulatory-prod-lite-privileged-bundle.new \
+  | /usr/bin/sha256sum --check --strict -
+/bin/mv -f /usr/local/sbin/.install-regulatory-prod-lite-privileged-bundle.new \
+  /usr/local/sbin/install-regulatory-prod-lite-privileged-bundle
+/usr/local/sbin/install-regulatory-prod-lite-privileged-bundle \
+  --source-dir "/var/lib/onyx/regulatory-prod-lite-staging/$APPROVED_PRIVILEGED_MANIFEST_SHA256" \
+  --expected-manifest-sha256 "$APPROVED_PRIVILEGED_MANIFEST_SHA256"
+```
+
+The installer never calls sudo, accepts no destination, refuses execution outside its fixed
+root-owned path, validates the private staged source, installs a versioned release through a private
+temporary directory, fsyncs it, and atomically updates `current`. Any ownership, mode, symlink,
+member, or digest error fails closed before activation. Keep the previous versioned release for a
+reviewed rollback; never edit an installed release in place. During an upgrade, install the new
+bundle, replace the exact sudoers command below with its new literal digest/arguments using
+`visudo -c`, and only then open the change window. The wrapper fails closed while `current` and the
+authorized command differ.
 
 Before granting preflight authorization, provision the dedicated Docker CLI configuration at
 `/etc/onyx/regulatory-docker`. Both `/etc/onyx` and that directory must be root-owned, must not be
@@ -321,27 +402,33 @@ configuration through the organization's secret-safe root workflow; do not print
 from the operator's home directory.
 
 The wrapper invokes absolute `/usr/bin/sudo -n` (the noninteractive `sudo -n` form) only for the
-bounded preflight handoff. Before the change window, the
-operator must have `NOPASSWD` authorization for the exact `/usr/bin/env -i ...
-/bin/bash -p regulatory-prod-lite-preflight.sh` argv emitted by this wrapper; constrain the sudoers
-rule to that full argument sequence and deployment path, not generic `/usr/bin/env`, `docker`, a shell,
-or the deployment wrapper. A missing or interactive authorization is a release blocker: the
+fixed installed entrypoint. Before the change window, the operator must have one `NOPASSWD` sudoers
+rule for the literal full argv emitted by the wrapper: fixed entrypoint, installed bundle digest,
+absolute env/base/migration paths, project/topology modes, and approved image digests in their exact
+order. Do not use sudoers wildcards. Generate the literal line in the change record, install it with
+mode `0440`, and validate it with `/usr/sbin/visudo -c`; authorize neither `/usr/bin/env`, `docker`, a
+shell, the installer, nor the deployment wrapper. Do not add `SETENV`: the entrypoint clears ambient
+state and fixes `PATH`, `HOME`, Python isolation, Docker config, and the local Docker socket itself.
+A missing, stale, broader, or interactive authorization is a release blocker: the
 wrapper must fail immediately rather than prompt. Root is required so one descriptor-owning helper
 can validate the original numeric `1001:1001` files and hand private `1001:1001` snapshots to the
 fixed non-root validation container. Do not use `sudo -E`, print the environment, or run the
 deployment itself as root. The approved digest arguments below are non-secret values supplied by
 release automation. The exact command both verifies noninteractive privilege and runs the preflight.
-Remove any older sudoers rule that embeds an operator-derived `PATH`, `HOME`, or Docker config path;
-it does not authorize this fixed boundary and must not remain as a broader alternate route.
+Remove any older rule that authorizes a checkout path, `/usr/bin/env`, `/bin/bash`, an operator-derived
+`PATH`/`HOME`/Docker config, or wildcard arguments; it must not remain as a broader alternate route.
+Test the exact rule noninteractively before the window with the canonical wrapper command below and
+`/usr/bin/sudo -n -l`; do not run a separate root preflight by hand.
 For the recommended cloud model mode with Compose-managed data services:
 
 ```bash
+RELEASE_DIR=$(pwd -P)  # verified extracted deployment/docker_compose directory
 ./regulatory-prod-lite-deploy.sh preflight \
-  --env-file .env \
-  --base-compose docker-compose.prod.yml \
+  --env-file "$RELEASE_DIR/.env" \
+  --base-compose "$RELEASE_DIR/docker-compose.prod.yml" \
   --project-name "$APPROVED_COMPOSE_PROJECT" \
-  --migration-env-file .env.migration \
-  --db-admin-env-file .env.db-admin \
+  --migration-env-file "$RELEASE_DIR/.env.migration" \
+  --db-admin-env-file "$RELEASE_DIR/.env.db-admin" \
   --infra-mode compose-managed \
   --model-mode cloud \
   --expected-image "$APPROVED_BACKEND_DIGEST" \
@@ -352,11 +439,12 @@ For the recommended cloud model mode with approved external data services, with 
 excluding `local-infra` and `s3-filestore`:
 
 ```bash
+RELEASE_DIR=$(pwd -P)  # verified extracted deployment/docker_compose directory
 ./regulatory-prod-lite-deploy.sh preflight \
-  --env-file .env \
-  --base-compose docker-compose.prod.yml \
+  --env-file "$RELEASE_DIR/.env" \
+  --base-compose "$RELEASE_DIR/docker-compose.prod.yml" \
   --project-name "$APPROVED_COMPOSE_PROJECT" \
-  --migration-env-file .env.migration \
+  --migration-env-file "$RELEASE_DIR/.env.migration" \
   --infra-mode external \
   --model-mode cloud \
   --expected-image "$APPROVED_BACKEND_DIGEST" \

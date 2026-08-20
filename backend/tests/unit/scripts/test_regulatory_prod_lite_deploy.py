@@ -18,7 +18,22 @@ _COMPOSE_ROOT = _REPO_ROOT / "deployment" / "docker_compose"
 _PREFLIGHT = _COMPOSE_ROOT / "regulatory-prod-lite-preflight.sh"
 _DEPLOY = _COMPOSE_ROOT / "regulatory-prod-lite-deploy.sh"
 _SNAPSHOT_HELPER = _COMPOSE_ROOT / "regulatory_readiness_file_snapshot.py"
+_PRIVILEGED_ENTRYPOINT = _COMPOSE_ROOT / "regulatory-prod-lite-privileged-entrypoint"
+_PRIVILEGED_INSTALLER = (
+    _COMPOSE_ROOT / "install-regulatory-prod-lite-privileged-bundle.sh"
+)
+_PRIVILEGED_MANIFEST = _COMPOSE_ROOT / "REGULATORY_PRIVILEGED_MANIFEST.sha256"
 _RUNBOOK = _COMPOSE_ROOT / "REGULATORY_PRODUCTION_RUNBOOK.md"
+_PRIVILEGED_RELEASE_FILES = (
+    "regulatory-prod-lite-privileged-entrypoint",
+    "regulatory-prod-lite-preflight.sh",
+    "regulatory_readiness_file_snapshot.py",
+    "docker-compose.regulatory-edge.yml",
+    "docker-compose.regulatory-compose-infra.yml",
+    "docker-compose.regulatory-external-infra.yml",
+    "docker-compose.no-local-models.yml",
+    "docker-compose.regulatory-prod-lite.yml",
+)
 _IMAGE = "registry.example.com/team/regulatory-backend-lite@sha256:" + "a" * 64
 _WEB_IMAGE = "registry.example.com/team/regulatory-web@sha256:" + "b" * 64
 _MODEL_IMAGE = "registry.example.com/team/regulatory-model@sha256:" + "c" * 64
@@ -540,6 +555,11 @@ exec /usr/bin/unshare --user --map-root-user \
             """#!/usr/bin/env bash
 set -eu
 source "__FAKE_ENVIRONMENT__"
+isolated_args=()
+while [[ "${1:-}" == "-I" || "${1:-}" == "-S" ]]; do
+  isolated_args+=("$1")
+  shift
+done
 if [[ "${1:-}" == *"regulatory_readiness_file_snapshot.py" ]]; then
   shift
   attestation=""
@@ -566,7 +586,7 @@ if [[ "${1:-}" == *"regulatory_readiness_file_snapshot.py" ]]; then
     "$snapshot_directory/regulatory-capability-evidence.json"
   exit 0
 fi
-exec /usr/bin/python3 "$@"
+exec /usr/bin/python3 "${isolated_args[@]}" "$@"
 """.replace("__FAKE_ENVIRONMENT__", str(fake_environment_path)),
             encoding="utf-8",
         )
@@ -648,8 +668,9 @@ exec /usr/bin/stat "$@"
     # tests exercise an isolated copy whose constants point at fixture-owned tools.
     test_compose_root = tmp_path / "docker-compose-bundle"
     shutil.copytree(_COMPOSE_ROOT, test_compose_root)
+    installed_bundle_root = tmp_path / "installed-regulatory-bundle"
     script_replacements = {
-        'readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin:/sbin:/bin"': (
+        'readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin"': (
             "readonly TRUSTED_SYSTEM_PATH="
             + shlex.quote(f"{bin_dir}:/usr/sbin:/usr/bin:/sbin:/bin")
         ),
@@ -665,16 +686,77 @@ exec /usr/bin/stat "$@"
         'readonly DOCKER_CONFIG_DIR="/etc/onyx/regulatory-docker"': (
             f"readonly DOCKER_CONFIG_DIR={shlex.quote(str(trusted_docker_config))}"
         ),
+        'readonly PYTHON_BIN="/usr/bin/python3"': (
+            f"readonly PYTHON_BIN={shlex.quote(str(bin_dir / 'python3'))}"
+        ),
+        'readonly PRIVILEGED_BUNDLE_ROOT="/usr/local/libexec/onyx/regulatory-prod-lite"': (
+            "readonly PRIVILEGED_BUNDLE_ROOT=" + shlex.quote(str(installed_bundle_root))
+        ),
+        'readonly INSTALL_ROOT="/usr/local/libexec/onyx/regulatory-prod-lite"': (
+            f"readonly INSTALL_ROOT={shlex.quote(str(installed_bundle_root))}"
+        ),
+        "readonly -a SYSTEM_ANCESTORS=(\n"
+        "  /\n"
+        "  /usr\n"
+        "  /usr/bin\n"
+        "  /usr/sbin\n"
+        "  /usr/local\n"
+        "  /usr/local/libexec\n"
+        "  /usr/local/libexec/onyx\n"
+        ")": (
+            "readonly -a SYSTEM_ANCESTORS=("
+            + shlex.quote(str(installed_bundle_root.parent))
+            + ")"
+        ),
     }
     for script_name in (
         "regulatory-prod-lite-deploy.sh",
         "regulatory-prod-lite-preflight.sh",
+        "regulatory-prod-lite-privileged-entrypoint",
     ):
         script_path = test_compose_root / script_name
         script_text = script_path.read_text(encoding="utf-8")
         for production_value, test_value in script_replacements.items():
             script_text = script_text.replace(production_value, test_value)
         script_path.write_text(script_text, encoding="utf-8")
+
+    releases_root = installed_bundle_root / "releases"
+    releases_root.mkdir(parents=True, mode=0o755)
+    installed_bundle_root.chmod(0o755)
+    pending_release = releases_root / ".pending"
+    pending_release.mkdir(mode=0o755)
+    manifest_lines: list[str] = []
+    for file_name in _PRIVILEGED_RELEASE_FILES:
+        source = test_compose_root / file_name
+        destination = pending_release / file_name
+        shutil.copy2(source, destination)
+        destination.chmod(
+            0o755
+            if file_name
+            in {
+                "regulatory-prod-lite-privileged-entrypoint",
+                "regulatory-prod-lite-preflight.sh",
+            }
+            else 0o644
+        )
+        manifest_lines.append(
+            f"{hashlib.sha256(destination.read_bytes()).hexdigest()}  {file_name}\n"
+        )
+    manifest_path = pending_release / "REGULATORY_PRIVILEGED_MANIFEST.sha256"
+    manifest_path.write_text("".join(manifest_lines), encoding="utf-8")
+    manifest_path.chmod(0o644)
+    bundle_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    release_path = releases_root / bundle_digest
+    pending_release.rename(release_path)
+    installed_entrypoint = installed_bundle_root / "regulatory-prod-lite-preflight"
+    shutil.copy2(
+        release_path / "regulatory-prod-lite-privileged-entrypoint",
+        installed_entrypoint,
+    )
+    installed_entrypoint.chmod(0o755)
+    current_release = installed_bundle_root / "current"
+    current_release.write_text(f"{bundle_digest}\n", encoding="utf-8")
+    current_release.chmod(0o644)
     env = os.environ.copy()
     env.update(
         {
@@ -723,9 +805,9 @@ exec /usr/bin/stat "$@"
             "FAKE_DEPLOY_SCRIPT": str(
                 test_compose_root / "regulatory-prod-lite-deploy.sh"
             ),
-            "FAKE_PREFLIGHT_SCRIPT": str(
-                test_compose_root / "regulatory-prod-lite-preflight.sh"
-            ),
+            "FAKE_PREFLIGHT_SCRIPT": str(installed_entrypoint),
+            "FAKE_PRIVILEGED_BUNDLE_DIGEST": bundle_digest,
+            "FAKE_PRIVILEGED_BUNDLE_ROOT": str(installed_bundle_root),
             "FAKE_TRUSTED_COMMAND_PATH": (f"{bin_dir}:/usr/sbin:/usr/bin:/sbin:/bin"),
             "FAKE_TRUSTED_DOCKER_CONFIG": str(trusted_docker_config),
             "_IMAGE": _IMAGE,
@@ -742,13 +824,16 @@ def _run(
     env: dict[str, str],
     *,
     preflight_as_root: bool = True,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    is_preflight = script == _PREFLIGHT
     if script == _DEPLOY and "FAKE_DEPLOY_SCRIPT" in env:
         script = Path(env["FAKE_DEPLOY_SCRIPT"])
-    elif script == _PREFLIGHT and "FAKE_PREFLIGHT_SCRIPT" in env:
+    elif is_preflight and "FAKE_PREFLIGHT_SCRIPT" in env:
         script = Path(env["FAKE_PREFLIGHT_SCRIPT"])
+        args = ["--bundle-digest", env["FAKE_PRIVILEGED_BUNDLE_DIGEST"], *args]
     command = [str(script), *args]
-    if script.name == _PREFLIGHT.name:
+    if is_preflight:
         if preflight_as_root and os.geteuid() != 0:
             command = ["unshare", "--user", "--map-root-user", *command]
         elif not preflight_as_root and os.geteuid() == 0:
@@ -761,7 +846,7 @@ def _run(
             ]
     return subprocess.run(
         command,
-        cwd=script.parent,
+        cwd=cwd or script.parent,
         env=env,
         capture_output=True,
         text=True,
@@ -776,6 +861,130 @@ def _subordinate_id_start(path: Path, identity: int) -> int | None:
         if name in identity_names and int(length) > 1001:
             return int(start)
     return None
+
+
+def _prepare_privileged_installer_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, str]:
+    tmp_path.chmod(0o700)
+    fixed_sbin = tmp_path / "fixed-sbin"
+    fixed_sbin.mkdir(mode=0o755)
+    staging_root = tmp_path / "root-staging"
+    staging_root.mkdir(mode=0o755)
+    system_libexec = tmp_path / "system-libexec"
+    install_root = system_libexec / "onyx" / "regulatory-prod-lite"
+    installer_path = fixed_sbin / "install-regulatory-prod-lite-privileged-bundle"
+    lock_path = tmp_path / "install.lock"
+
+    installer_text = _PRIVILEGED_INSTALLER.read_text(encoding="utf-8")
+    replacements = {
+        'readonly INSTALLER_PATH="/usr/local/sbin/install-regulatory-prod-lite-privileged-bundle"': (
+            f"readonly INSTALLER_PATH={shlex.quote(str(installer_path))}"
+        ),
+        'readonly STAGING_ROOT="/var/lib/onyx/regulatory-prod-lite-staging"': (
+            f"readonly STAGING_ROOT={shlex.quote(str(staging_root))}"
+        ),
+        'readonly SYSTEM_LIBEXEC_ROOT="/usr/local/libexec"': (
+            f"readonly SYSTEM_LIBEXEC_ROOT={shlex.quote(str(system_libexec))}"
+        ),
+        'readonly INSTALL_ROOT="/usr/local/libexec/onyx/regulatory-prod-lite"': (
+            f"readonly INSTALL_ROOT={shlex.quote(str(install_root))}"
+        ),
+        'readonly INSTALL_LOCK="/run/lock/onyx-regulatory-prod-lite-install.lock"': (
+            f"readonly INSTALL_LOCK={shlex.quote(str(lock_path))}"
+        ),
+        "readonly -a INSTALLER_ANCESTORS=(\n"
+        "  /\n"
+        "  /usr\n"
+        "  /usr/bin\n"
+        "  /usr/sbin\n"
+        "  /usr/local\n"
+        "  /usr/local/sbin\n"
+        ")": (
+            "readonly -a INSTALLER_ANCESTORS=("
+            f"{shlex.quote(str(tmp_path))} {shlex.quote(str(fixed_sbin))})"
+        ),
+        "readonly -a STAGING_ANCESTORS=(/ /var /var/lib /var/lib/onyx)": (
+            f"readonly -a STAGING_ANCESTORS=({shlex.quote(str(tmp_path))})"
+        ),
+        "readonly -a INSTALL_ANCESTORS=(/ /usr /usr/local)": (
+            f"readonly -a INSTALL_ANCESTORS=({shlex.quote(str(tmp_path))})"
+        ),
+    }
+    for production_value, test_value in replacements.items():
+        assert production_value in installer_text
+        installer_text = installer_text.replace(production_value, test_value)
+    installer_path.write_text(installer_text, encoding="utf-8")
+    installer_path.chmod(0o755)
+
+    pending_stage = staging_root / ".pending"
+    pending_stage.mkdir(mode=0o755)
+    manifest_lines: list[str] = []
+    for file_name in _PRIVILEGED_RELEASE_FILES:
+        source_bytes = (_COMPOSE_ROOT / file_name).read_bytes()
+        if file_name == "regulatory-prod-lite-privileged-entrypoint":
+            entrypoint_text = source_bytes.decode()
+            entrypoint_text = entrypoint_text.replace(
+                'readonly INSTALL_ROOT="/usr/local/libexec/onyx/regulatory-prod-lite"',
+                f"readonly INSTALL_ROOT={shlex.quote(str(install_root))}",
+            )
+            entrypoint_text = entrypoint_text.replace(
+                "readonly -a SYSTEM_ANCESTORS=(\n"
+                "  /\n"
+                "  /usr\n"
+                "  /usr/bin\n"
+                "  /usr/sbin\n"
+                "  /usr/local\n"
+                "  /usr/local/libexec\n"
+                "  /usr/local/libexec/onyx\n"
+                ")",
+                f"readonly -a SYSTEM_ANCESTORS=({shlex.quote(str(tmp_path))})",
+            )
+            source_bytes = entrypoint_text.encode()
+        destination = pending_stage / file_name
+        destination.write_bytes(source_bytes)
+        destination.chmod(
+            0o755
+            if file_name
+            in {
+                "regulatory-prod-lite-privileged-entrypoint",
+                "regulatory-prod-lite-preflight.sh",
+            }
+            else 0o644
+        )
+        manifest_lines.append(
+            f"{hashlib.sha256(source_bytes).hexdigest()}  {file_name}\n"
+        )
+    manifest = pending_stage / "REGULATORY_PRIVILEGED_MANIFEST.sha256"
+    manifest.write_text("".join(manifest_lines), encoding="utf-8")
+    manifest.chmod(0o644)
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    stage = staging_root / digest
+    pending_stage.rename(stage)
+    return installer_path, stage, install_root, digest
+
+
+def _run_privileged_installer(
+    installer_path: Path,
+    stage: Path,
+    digest: str,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        str(installer_path),
+        "--source-dir",
+        str(stage),
+        "--expected-manifest-sha256",
+        digest,
+    ]
+    if os.geteuid() != 0:
+        command = ["/usr/bin/unshare", "--user", "--map-root-user", *command]
+    return subprocess.run(
+        command,
+        cwd=installer_path.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def _run_snapshot_helper_as_namespace_root(
@@ -999,6 +1208,31 @@ def _deploy_args(env_file: Path, env: dict[str, str]) -> list[str]:
     ]
 
 
+def _preflight_args(env_file: Path, env: dict[str, str]) -> list[str]:
+    return [
+        "--env-file",
+        str(env_file),
+        "--base-compose",
+        env["FAKE_BASE_COMPOSE"],
+        "--project-name",
+        "onyx",
+        "--migration-env-file",
+        env["FAKE_MIGRATION_ENV"],
+        "--db-admin-env-file",
+        env["FAKE_DB_ADMIN_ENV"],
+        "--infra-mode",
+        "compose-managed",
+        "--model-mode",
+        "local",
+        "--expected-image",
+        _IMAGE,
+        "--expected-web-image",
+        _WEB_IMAGE,
+        "--expected-model-image",
+        _MODEL_IMAGE,
+    ]
+
+
 def _cloud_deploy_args(env_file: Path, env: dict[str, str]) -> list[str]:
     return [
         "--env-file",
@@ -1083,7 +1317,7 @@ def test_preflight_rejects_non_root_operator_before_docker(tmp_path: Path) -> No
     )
 
     assert result.returncode == 1
-    assert "must be invoked as root" in result.stderr
+    assert "must run as root:root" in result.stderr
     docker_log = Path(env["FAKE_DOCKER_LOG"])
     assert not docker_log.exists() or docker_log.read_text(encoding="utf-8") == ""
 
@@ -2185,10 +2419,9 @@ def test_deploy_ignores_hostile_command_and_home_paths_across_root_boundary(
     assert result.returncode == 0, result.stderr
     assert not marker.exists()
     sudo_log = Path(env["FAKE_SUDO_LOG"]).read_text(encoding="utf-8")
-    assert sudo_log.startswith("-n -- /usr/bin/env -i ")
-    assert f"PATH={env['FAKE_TRUSTED_COMMAND_PATH']}" in sudo_log
-    assert "HOME=/var/empty" in sudo_log
-    assert f"DOCKER_CONFIG={env['FAKE_TRUSTED_DOCKER_CONFIG']}" in sudo_log
+    assert sudo_log.startswith(f"-n -- {env['FAKE_PREFLIGHT_SCRIPT']} --bundle-digest ")
+    assert "/usr/bin/env" not in sudo_log
+    assert "/bin/bash" not in sudo_log
     assert str(hostile_bin) not in sudo_log
     assert str(hostile_home) not in sudo_log
     assert "BASH_ENV" not in sudo_log
@@ -2235,7 +2468,7 @@ def test_deployment_scripts_pin_privileged_executable_boundaries() -> None:
 
     for source in (deploy_source, preflight_source):
         assert source.startswith("#!/bin/bash -p\n")
-        assert 'readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin:/sbin:/bin"' in source
+        assert 'readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin"' in source
         assert 'readonly DOCKER_BIN="/usr/bin/docker"' in source
         assert (
             'readonly COMPOSE_BIN="/usr/libexec/docker/cli-plugins/docker-compose"'
@@ -2246,7 +2479,269 @@ def test_deployment_scripts_pin_privileged_executable_boundaries() -> None:
         assert "docker compose" not in source
     assert 'readonly SUDO_BIN="/usr/bin/sudo"' in deploy_source
     assert '"$SUDO_BIN" -n --' in deploy_source
-    assert '"$BASH_BIN" -p "$PREFLIGHT"' in deploy_source
+    assert (
+        'readonly PRIVILEGED_BUNDLE_ROOT="/usr/local/libexec/onyx/regulatory-prod-lite"'
+        in deploy_source
+    )
+    assert '"$SUDO_BIN" -n -- "$PRIVILEGED_PREFLIGHT"' in deploy_source
+    assert '"$BASH_BIN" -p "$PREFLIGHT"' not in deploy_source
+    assert '"$SCRIPT_DIR/regulatory-prod-lite-preflight.sh"' not in deploy_source
+
+
+def test_privileged_bundle_sources_define_digest_bound_installed_boundary() -> None:
+    assert _PRIVILEGED_ENTRYPOINT.is_file()
+    assert _PRIVILEGED_INSTALLER.is_file()
+    assert _PRIVILEGED_MANIFEST.is_file()
+
+    entrypoint = _PRIVILEGED_ENTRYPOINT.read_text(encoding="utf-8")
+    installer = _PRIVILEGED_INSTALLER.read_text(encoding="utf-8")
+    preflight = _PREFLIGHT.read_text(encoding="utf-8")
+
+    assert entrypoint.startswith("#!/bin/bash -p\n")
+    assert 'readonly INSTALL_ROOT="/usr/local/libexec/onyx/regulatory-prod-lite"' in (
+        entrypoint
+    )
+    assert "--bundle-digest" in entrypoint
+    assert "sha256sum" in entrypoint
+    assert "must be owned by root:root" in entrypoint
+    assert "must not be a symlink" in entrypoint
+    assert installer.startswith("#!/bin/bash -p\n")
+    assert "must be run as root" in installer
+    assert "--expected-manifest-sha256" in installer
+    assert 'readonly PYTHON_BIN="/usr/bin/python3"' in preflight
+    assert preflight.count('"$PYTHON_BIN" -I -S') == 2
+
+    manifest_entries = []
+    for line in _PRIVILEGED_MANIFEST.read_text(encoding="utf-8").splitlines():
+        digest, file_name = line.split("  ", maxsplit=1)
+        manifest_entries.append(file_name)
+        assert (
+            digest
+            == hashlib.sha256((_COMPOSE_ROOT / file_name).read_bytes()).hexdigest()
+        )
+    assert manifest_entries == list(_PRIVILEGED_RELEASE_FILES)
+
+
+def test_privileged_installer_atomically_installs_reviewed_digest_bundle(
+    tmp_path: Path,
+) -> None:
+    installer, stage, install_root, digest = _prepare_privileged_installer_fixture(
+        tmp_path
+    )
+
+    result = _run_privileged_installer(installer, stage, digest)
+
+    assert result.returncode == 0, result.stderr
+    assert (install_root / "current").read_text(encoding="utf-8") == f"{digest}\n"
+    release = install_root / "releases" / digest
+    assert release.is_dir()
+    assert {path.name for path in release.iterdir()} == {
+        *_PRIVILEGED_RELEASE_FILES,
+        "REGULATORY_PRIVILEGED_MANIFEST.sha256",
+    }
+    assert (install_root / "regulatory-prod-lite-preflight").stat().st_mode & 0o777 == (
+        0o755
+    )
+    assert not list((install_root / "releases").glob(".install-*"))
+    assert not list(install_root.glob(".current-*"))
+    assert not list(install_root.glob(".entrypoint-*"))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "diagnostic"),
+    [
+        ("symlink", "must not be a symlink"),
+        ("writable", "must not be group/world writable"),
+        ("directory-writable", "must not be group/world writable"),
+    ],
+)
+def test_privileged_installer_rejects_unsafe_staged_files_without_activation(
+    tmp_path: Path,
+    mutation: str,
+    diagnostic: str,
+) -> None:
+    installer, stage, install_root, digest = _prepare_privileged_installer_fixture(
+        tmp_path
+    )
+    helper = stage / "regulatory_readiness_file_snapshot.py"
+    if mutation == "symlink":
+        helper.unlink()
+        helper.symlink_to(_SNAPSHOT_HELPER)
+    else:
+        helper.chmod(0o666)
+
+    result = _run_privileged_installer(installer, stage, digest)
+
+    assert result.returncode == 1
+    assert diagnostic in result.stderr
+    assert not install_root.exists()
+
+
+def test_privileged_installer_refuses_checkout_execution_before_copying(
+    tmp_path: Path,
+) -> None:
+    command = [str(_PRIVILEGED_INSTALLER), "--help"]
+    if os.geteuid() != 0:
+        command = ["/usr/bin/unshare", "--user", "--map-root-user", *command]
+
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "only from its fixed root-owned path" in result.stderr
+
+
+def test_deploy_uses_installed_bundle_when_checkout_security_files_are_hostile(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    checkout_root = Path(env["FAKE_DEPLOY_SCRIPT"]).parent
+    marker = tmp_path / "checkout-security-code-ran"
+    (checkout_root / "regulatory-prod-lite-preflight.sh").write_text(
+        f"#!/bin/bash\nprintf owned >{shlex.quote(str(marker))}\nexit 91\n",
+        encoding="utf-8",
+    )
+    (checkout_root / "regulatory_readiness_file_snapshot.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned')\n",
+        encoding="utf-8",
+    )
+    (checkout_root / "docker-compose.regulatory-prod-lite.yml").write_text(
+        "this is deliberately not a Compose document\n",
+        encoding="utf-8",
+    )
+    for path in (
+        checkout_root / "regulatory-prod-lite-preflight.sh",
+        checkout_root / "regulatory_readiness_file_snapshot.py",
+        checkout_root / "docker-compose.regulatory-prod-lite.yml",
+    ):
+        path.chmod(0o777)
+
+    result = _run(_DEPLOY, ["deploy", *_deploy_args(env_file, env)], env)
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
+    installed_root = env["FAKE_PRIVILEGED_BUNDLE_ROOT"]
+    assert f"{installed_root}/releases/" in docker_log
+    assert str(checkout_root / "docker-compose.regulatory-prod-lite.yml") not in (
+        docker_log
+    )
+
+
+def test_privileged_preflight_isolated_python_ignores_hostile_cwd(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    hostile_cwd = tmp_path / "hostile-cwd"
+    hostile_cwd.mkdir()
+    marker = tmp_path / "hostile-secrets-module-ran"
+    (hostile_cwd / "secrets.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('owned')\n"
+        "def token_hex(_: int) -> str:\n"
+        "    return '0' * 64\n",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        _PREFLIGHT,
+        _preflight_args(env_file, env),
+        env,
+        cwd=hostile_cwd,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "diagnostic"),
+    [
+        ("symlink", "must not be a symlink"),
+        ("writable", "must not be group/world writable"),
+    ],
+)
+def test_privileged_preflight_rejects_mutable_or_symlinked_installed_overlay(
+    tmp_path: Path,
+    mutation: str,
+    diagnostic: str,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    release = (
+        Path(env["FAKE_PRIVILEGED_BUNDLE_ROOT"])
+        / "releases"
+        / env["FAKE_PRIVILEGED_BUNDLE_DIGEST"]
+    )
+    overlay = release / "docker-compose.regulatory-prod-lite.yml"
+    if mutation == "directory-writable":
+        release.parent.chmod(0o777)
+    elif mutation == "symlink":
+        overlay.unlink()
+        overlay.symlink_to(
+            Path(env["FAKE_DEPLOY_SCRIPT"]).parent
+            / "docker-compose.regulatory-prod-lite.yml"
+        )
+    else:
+        overlay.chmod(0o666)
+
+    result = _run(_PREFLIGHT, _preflight_args(env_file, env), env)
+
+    assert result.returncode == 1
+    assert diagnostic in result.stderr
+    assert not Path(env["FAKE_DOCKER_LOG"]).exists()
+
+
+def test_privileged_preflight_rejects_non_root_owned_installed_helper(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("the namespace ownership probe is intended for a non-root runner")
+    subordinate_uid = _subordinate_id_start(Path("/etc/subuid"), os.geteuid())
+    subordinate_gid = _subordinate_id_start(Path("/etc/subgid"), os.getegid())
+    if subordinate_uid is None or subordinate_gid is None:
+        pytest.skip("root boundary test requires subordinate uid/gid mappings")
+    env, env_file = _fake_docker(tmp_path)
+    release = (
+        Path(env["FAKE_PRIVILEGED_BUNDLE_ROOT"])
+        / "releases"
+        / env["FAKE_PRIVILEGED_BUNDLE_DIGEST"]
+    )
+    helper = release / "regulatory_readiness_file_snapshot.py"
+    entrypoint = Path(env["FAKE_PREFLIGHT_SCRIPT"])
+    command = [
+        "/usr/bin/unshare",
+        "--user",
+        f"--map-users=0:{os.geteuid()}:1",
+        f"--map-users=1001:{subordinate_uid}:1",
+        f"--map-groups=0:{os.getegid()}:1",
+        f"--map-groups=1001:{subordinate_gid}:1",
+        "/bin/bash",
+        "-c",
+        'chown 1001:1001 "$1" && shift && exec "$@"',
+        "ownership-probe",
+        str(helper),
+        str(entrypoint),
+        "--bundle-digest",
+        env["FAKE_PRIVILEGED_BUNDLE_DIGEST"],
+        *_preflight_args(env_file, env),
+    ]
+
+    result = subprocess.run(
+        command,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert "must be owned by root:root" in result.stderr
+    assert not Path(env["FAKE_DOCKER_LOG"]).exists()
 
 
 def test_deploy_uses_noninteractive_sudo_and_controls_authorization_failure(
@@ -2260,9 +2755,9 @@ def test_deploy_uses_noninteractive_sudo_and_controls_authorization_failure(
     assert result.returncode == 1
     assert "noninteractive sudo authorization" in result.stderr
     sudo_log = Path(env["FAKE_SUDO_LOG"]).read_text(encoding="utf-8")
-    assert sudo_log.startswith("-n -- ")
-    assert "/usr/bin/env -i PATH=" in sudo_log
-    assert "DOCKER_HOST=unix:///var/run/docker.sock" in sudo_log
+    assert sudo_log.startswith(f"-n -- {env['FAKE_PREFLIGHT_SCRIPT']} --bundle-digest ")
+    assert "/usr/bin/env" not in sudo_log
+    assert "/bin/bash" not in sudo_log
     assert not Path(env["FAKE_DOCKER_LOG"]).exists()
 
 
@@ -2271,11 +2766,17 @@ def test_runbook_requires_canonical_noninteractive_least_privilege_preflight() -
 
     assert "./regulatory-prod-lite-deploy.sh preflight" in runbook
     assert "`sudo -n`" in runbook
-    assert "`NOPASSWD` authorization for the exact" in runbook
-    assert "not generic `/usr/bin/env`, `docker`, a shell" in runbook
+    assert "`NOPASSWD` sudoers" in runbook
+    assert "Do not use sudoers wildcards" in runbook
+    assert "authorize neither `/usr/bin/env`, `docker`, a" in runbook
     assert "`/usr/bin/sudo -n`" in runbook
     assert "`/etc/onyx/regulatory-docker`" in runbook
     assert "root-owned" in runbook
+    assert "/usr/local/libexec/onyx/regulatory-prod-lite" in runbook
+    assert "/usr/local/sbin/install-regulatory-prod-lite-privileged-bundle" in (runbook)
+    assert "run an installer directly from that extraction or a checkout" in runbook
+    assert "sudo for this provisioning step" in runbook
+    assert "`/usr/bin/python3 -I -S`" in runbook
     assert "$HOME/.docker" not in runbook
     assert "sudo -- ./regulatory-prod-lite-preflight.sh" not in runbook
 
