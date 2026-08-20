@@ -187,8 +187,8 @@ Before the maintenance window:
 14. Inventory all running containers on the host, including other Compose project names. Any legacy
     full-backend, importer, indexer, primary, docfetching, docprocessing, or generic
     user-file-processing container is a blocker until its work is drained and its removal is approved.
-    The only approved production-lite consumer of `user_file_processing` is
-    `celery_worker_regulatory_indexing`. In cloud mode, any
+    Production-lite owns that queue through `celery_worker_user_file_processing`; the separate
+    `celery_worker_regulatory_indexing` consumes only `regulatory_indexing`. In cloud mode, any
     inference-model or indexing-model container is also a blocker. Rendered-Compose preflight cannot
     discover an orphan owned by another project.
 
@@ -675,7 +675,7 @@ both observational probes; missing, stale, wrong-scope, wrong-identity, or incom
 readiness.
 
 Prerequisites are: the migration job completed; the new disabled API/background containers are
-running; the dedicated regulatory worker and Beat probe files are healthy; the active Admin Search
+running; both user-file and regulatory workers plus Beat probe files are healthy; the active Admin Search
 Settings select OpenRouter `openai/text-embedding-3-large` with contextual retrieval enabled; the
 selected contextual model is Vertex AI with valid batch/GCS access; and the active Elasticsearch
 index exists with both dense-vector fields matching the active effective dimension and mapping
@@ -688,6 +688,20 @@ external Helm/node capacity by itself. The readiness report's `effective_dimensi
 active SearchSettings (`reduced_dimension` when set, otherwise the model dimension), is sent to the
 OpenRouter probe, and must match the active index mapping. Never substitute a hardcoded `1024` (or
 any other dimension) in deployment configuration or acceptance evidence.
+
+After the normal read-only readiness report passes, the authorized deployment operator must run the
+same command once with `--openrouter-batch-canary`. This explicit canary creates one tiny
+`/v1/embeddings` Batch, polls its known batch ID, and cancels it if it reaches the running state. It
+mutates provider state and may incur a small charge, so it is never part of routine readiness or a
+container healthcheck. Do not run it without change-window authorization. If creation returns no
+usable batch ID or its outcome is otherwise ambiguous, stop and reconcile manually in OpenRouter;
+never rerun the canary or indexing job to guess whether the first POST succeeded.
+
+The production payload contract is `POST /api/beta/batches` with top-level endpoint
+`/v1/embeddings` and model `openai/text-embedding-3-large`; every request body repeats that exact
+`model` and contains only its bounded input group and effective `dimensions`. Poll and cancel only by
+the persisted batch ID. OpenRouter does not document collection-list recovery, request metadata
+lookup, or an idempotency header for this contract, so production must not depend on any of them.
 
 The required rollout order is therefore: keep the flag false in both processes; run the singleton
 migration; start/restart API and background on the new image with the flag still false; finish Admin
@@ -709,6 +723,12 @@ store/environment, not in source control. Defaults below match the Compose overl
 | `REGULATORY_BATCH_INDEXING_ENABLED` | API + background | `false`; coordinated enable/restart only |
 | `REGULATORY_INDEXING_GCS_URI` | background | Required non-secret `gs://...` workspace before enable |
 | `REGULATORY_INDEXING_MAX_ATTEMPTS` | background | `5` |
+| `REGULATORY_INDEXING_OPENROUTER_BATCH_URL` | background | `https://openrouter.ai/api/beta/batches` |
+| `REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_REQUESTS` | background | `1000` requests per provider Batch |
+| `REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_INPUTS` | background | `45000`, below the provider 50000-input ceiling |
+| `REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_BYTES` | background | `33554432` serialized request bytes |
+| `REGULATORY_INDEXING_OPENROUTER_BATCH_HORIZON_SECONDS` | background | `86400`; known-ID polling deadline |
+| `REGULATORY_INDEXING_ALLOW_ONLINE_EMBEDDING_FALLBACK` | background | `false`; never enable for production bulk indexing |
 | `REGULATORY_INDEXING_RETRY_BASE_SECONDS` | background | `15` |
 | `REGULATORY_INDEXING_RETRY_MAX_SECONDS` | background | `900` |
 | `REGULATORY_INDEXING_POLL_SECONDS` | background | `30` |
@@ -716,7 +736,7 @@ store/environment, not in source control. Defaults below match the Compose overl
 | `REGULATORY_INDEXING_CONTEXT_REQUEST_SIZE` | background | `64`; maximum chunks per contextual shard |
 | `REGULATORY_INDEXING_CONTEXT_JSONL_MAX_BYTES` | background | `8388608`; exact UTF-8 JSONL shard cap |
 | `REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE` | background | `64` |
-| `REGULATORY_INDEXING_SUBMISSION_RECONCILE_SECONDS` | background | `300`; fail-closed visibility horizon after an indeterminate create |
+| `REGULATORY_INDEXING_SUBMISSION_RECONCILE_SECONDS` | background | `300`; Vertex submission visibility horizon only |
 
 If the API gate fails, the wrapper leaves `background` stopped. Preserve its output, then use the
 same fixed overlay order only for read-only diagnostics; do not retry with ad hoc Compose files.
@@ -748,11 +768,12 @@ workers:
   celery_worker_regulatory_benchmark:
     - regulatory_benchmark
   celery_worker_regulatory_indexing:
-    - user_file_processing
     - regulatory_indexing
-  celery_worker_user_file_maintenance:
+  celery_worker_user_file_processing:
+    - user_file_processing
     - user_file_project_sync
     - user_file_delete
+    - user_file_port
   celery_worker_light:
     - vespa_metadata_sync
     - connector_deletion
@@ -860,7 +881,9 @@ Complete one authenticated application smoke test:
    stages and becomes searchable. Confirm non-Markdown/parser-backed upload remains rejected.
 6. Stop/restart the regulatory indexing worker after a canary reaches a non-terminal stage and verify
    the dedicated Beat recovers the stale job. Confirm queue-depth metrics include
-   `regulatory_indexing` and both exact supervisor processes remain ready.
+   `regulatory_indexing` and both exact supervisor processes remain ready. A job whose Batch-create
+   response has no usable ID must remain failed in `MANUAL_RECONCILE_REQUIRED`; confirm no second
+   provider POST is issued until an operator resolves the first submission.
 7. Start one small benchmark run only after chat/search succeeds, and confirm the dedicated worker
    completes it.
 

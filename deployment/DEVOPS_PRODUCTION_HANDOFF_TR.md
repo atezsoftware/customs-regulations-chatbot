@@ -77,8 +77,8 @@ olmak üzere yedi process'tir:
 | Process | Queue/görev |
 | --- | --- |
 | `celery_worker_regulatory_benchmark` | `regulatory_benchmark` |
-| `celery_worker_regulatory_indexing` | `user_file_processing,regulatory_indexing` |
-| `celery_worker_user_file_maintenance` | `user_file_project_sync,user_file_delete` |
+| `celery_worker_user_file_processing` | `user_file_processing,user_file_project_sync,user_file_delete,user_file_port` |
+| `celery_worker_regulatory_indexing` | `regulatory_indexing` |
 | `celery_worker_light` | Onaylı hafif bakım queue'ları |
 | `celery_worker_monitoring` | `monitoring` |
 | `celery_beat_regulatory_indexing` | Yalnız stale recovery ve queue monitoring |
@@ -88,7 +88,8 @@ Beat readiness ve liveness dosyaları sırasıyla
 `/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt` ve
 `/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt` olmalıdır. Generic Beat schedule, primary,
 docfetching, docprocessing, generic indexing ve Elasticsearch migration queue'ları bu topolojide
-yasaktır. `user_file_processing` ise yalnız özel regulatory indexing worker üzerinde zorunludur.
+yasaktır. `user_file_processing` yalnız `celery_worker_user_file_processing` üzerinde,
+`regulatory_indexing` ise yalnız özel regulatory indexing worker üzerinde zorunludur.
 
 Her background podu kendi Beat process'ini çalıştırabilir. Shelf pod-local
 `/tmp/regulatory-indexing-beat-schedule` altında kalır; replica'lar aynı dosyayı paylaşmaz. Yayın

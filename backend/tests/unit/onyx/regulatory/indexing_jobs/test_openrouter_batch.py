@@ -6,7 +6,10 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
-from onyx.regulatory.indexing_jobs.models import OpenRouterBatchConfig
+from onyx.regulatory.indexing_jobs.models import (
+    IndexingGatewayIndeterminateSubmissionError,
+    OpenRouterBatchConfig,
+)
 from onyx.regulatory.indexing_jobs.openrouter_batch import (
     HttpxOpenRouterBatchGateway,
     OpenRouterBatchContractError,
@@ -69,12 +72,12 @@ def test_gateway_submits_embedding_batch_with_provider_contract() -> None:
             {
                 "custom_id": "regulatory-0",
                 "body": {
+                    "model": "openai/text-embedding-3-large",
                     "input": ["context\nchunk one", "chunk two"],
                     "dimensions": 3,
                 },
             }
         ],
-        "metadata": {"submission_key": "submission-a"},
     }
 
 
@@ -128,30 +131,23 @@ def test_result_parser_rejects_duplicate_custom_ids() -> None:
         )
 
 
-def test_reconcile_uses_persisted_submission_identity() -> None:
-    responses = iter(
-        [
-            httpx.Response(
-                200,
-                json={
-                    "data": [
-                        {
-                            "id": "batch-found",
-                            "status": "in_progress",
-                            "metadata": {"submission_key": "submission-a"},
-                        }
-                    ]
-                },
-            )
-        ]
-    )
-    client, _requests = _client(responses)
+def test_ambiguous_submit_is_not_retried_without_a_known_batch_id() -> None:
+    sent_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent_requests.append(request)
+        raise httpx.ReadTimeout("response was lost", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
     gateway = HttpxOpenRouterBatchGateway(
         config=_config(), api_key_provider=lambda: "secret", client=client
     )
+    request = OpenRouterEmbeddingBatchRequest(
+        custom_id="regulatory-0", inputs=["context\nchunk one"]
+    )
 
-    state = gateway.reconcile_submission("submission-a")
+    with pytest.raises(IndexingGatewayIndeterminateSubmissionError):
+        gateway.submit([request], submission_key="submission-a")
 
-    assert state is not None
-    assert state.remote_batch_id == "batch-found"
-    assert state.status is OpenRouterBatchJobStatus.RUNNING
+    assert len(sent_requests) == 1
+    assert sent_requests[0].method == "POST"

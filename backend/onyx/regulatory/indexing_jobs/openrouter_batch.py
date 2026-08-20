@@ -234,7 +234,6 @@ def openrouter_embedding_payload(
     requests: Sequence[OpenRouterEmbeddingBatchRequest],
     *,
     config: OpenRouterBatchConfig,
-    submission_key: str,
 ) -> dict[str, object]:
     return {
         "endpoint": "/v1/embeddings",
@@ -243,13 +242,13 @@ def openrouter_embedding_payload(
             {
                 "custom_id": request.custom_id,
                 "body": {
+                    "model": config.model_name,
                     "input": request.inputs,
                     "dimensions": config.effective_dimension,
                 },
             }
             for request in requests
         ],
-        "metadata": {"submission_key": submission_key},
     }
 
 
@@ -257,11 +256,8 @@ def openrouter_embedding_payload_size(
     requests: Sequence[OpenRouterEmbeddingBatchRequest],
     *,
     config: OpenRouterBatchConfig,
-    submission_key: str,
 ) -> int:
-    payload = openrouter_embedding_payload(
-        requests, config=config, submission_key=submission_key
-    )
+    payload = openrouter_embedding_payload(requests, config=config)
     return len(httpx.Request("POST", config.api_url, json=payload).content)
 
 
@@ -309,7 +305,13 @@ class HttpxOpenRouterBatchGateway:
             raise IndexingGatewayTimeoutError() from None
         except httpx.TimeoutException:
             raise IndexingGatewayTimeoutError() from None
+        except httpx.ConnectError:
+            raise IndexingGatewayConnectionError() from None
         except httpx.RequestError:
+            if indeterminate_key is not None:
+                raise IndexingGatewayIndeterminateSubmissionError(
+                    indeterminate_key
+                ) from None
             raise IndexingGatewayConnectionError() from None
         if response.status_code < 200 or response.status_code >= 300:
             raise IndexingGatewayHTTPError(response.status_code)
@@ -340,14 +342,11 @@ class HttpxOpenRouterBatchGateway:
             )
         if input_count > self._config.max_inputs:
             raise OpenRouterBatchContractError("OpenRouter Batch input limit exceeded")
-        payload = openrouter_embedding_payload(
-            requests, config=self._config, submission_key=submission_key
-        )
+        payload = openrouter_embedding_payload(requests, config=self._config)
         if (
             openrouter_embedding_payload_size(
                 requests,
                 config=self._config,
-                submission_key=submission_key,
             )
             > self._config.max_bytes
         ):
@@ -367,7 +366,13 @@ class HttpxOpenRouterBatchGateway:
                 json_body=payload,
                 indeterminate_key=submission_key,
             )
-        return _batch_state(response)
+        try:
+            return _batch_state(response)
+        except OpenRouterBatchContractError:
+            # A successful POST with no usable id may already have created a
+            # billable batch. Without a documented idempotency/list contract,
+            # the caller must persist a manual-reconciliation stop.
+            raise IndexingGatewayIndeterminateSubmissionError(submission_key) from None
 
     def get(self, remote_batch_id: str) -> OpenRouterBatchState:
         if re.fullmatch(r"[A-Za-z0-9_.:-]+", remote_batch_id) is None:
@@ -376,33 +381,6 @@ class HttpxOpenRouterBatchGateway:
             "GET", f"{self._config.api_url.rstrip('/')}/{remote_batch_id}"
         )
         return _batch_state(response)
-
-    def reconcile_submission(self, submission_key: str) -> OpenRouterBatchState | None:
-        response = self._request("GET", self._config.api_url)
-        if not isinstance(response, dict):
-            raise OpenRouterBatchContractError("OpenRouter Batch list is malformed")
-        raw_batches = cast(dict[str, object], response).get("data")
-        if not isinstance(raw_batches, list):
-            raise OpenRouterBatchContractError("OpenRouter Batch list is malformed")
-        matches: list[dict[str, object]] = []
-        for raw_batch in raw_batches:
-            if not isinstance(raw_batch, dict):
-                raise OpenRouterBatchContractError("OpenRouter Batch list is malformed")
-            batch = cast(dict[str, object], raw_batch)
-            metadata = batch.get("metadata")
-            if (
-                isinstance(metadata, dict)
-                and cast(dict[str, object], metadata).get("submission_key")
-                == submission_key
-            ):
-                matches.append(batch)
-        if not matches:
-            return None
-        if len(matches) != 1:
-            raise OpenRouterBatchContractError(
-                "OpenRouter submission identity matched multiple batches"
-            )
-        return _batch_state(matches[0])
 
     def cancel(self, remote_batch_id: str) -> None:
         if re.fullmatch(r"[A-Za-z0-9_.:-]+", remote_batch_id) is None:

@@ -1672,13 +1672,12 @@ def record_openrouter_submission_intent(
     return True
 
 
-def require_openrouter_submission_reconciliation(
+def record_openrouter_submission_ambiguous(
     db_session: Session,
     *,
     job_id: UUID,
     expected_generation: int,
     submission_key: str,
-    reconcile_until: datetime.datetime,
     now: datetime.datetime,
     commit: bool = True,
 ) -> bool:
@@ -1688,12 +1687,37 @@ def require_openrouter_submission_reconciliation(
     if (
         job is None
         or job.openrouter_submission_key != submission_key
-        or job.openrouter_submission_state not in {"SUBMITTING", "RECONCILE_REQUIRED"}
+        or job.openrouter_submission_state
+        not in {
+            "SUBMITTING",
+            "RECONCILE_REQUIRED",
+            "RECONCILED_ABSENT",
+            "MANUAL_RECONCILE_REQUIRED",
+        }
     ):
         db_session.rollback()
         return False
-    job.openrouter_submission_state = "RECONCILE_REQUIRED"
-    job.openrouter_reconcile_until = reconcile_until
+    if not job.openrouter_submission_charged:
+        active_ids = [UUID(item_id) for item_id in job.openrouter_active_item_ids]
+        result = db_session.execute(
+            update(RegulatoryIndexingItem)
+            .where(
+                RegulatoryIndexingItem.job_id == job_id,
+                RegulatoryIndexingItem.id.in_(active_ids),
+            )
+            .values(
+                embedding_attempt_count=(
+                    RegulatoryIndexingItem.embedding_attempt_count + 1
+                ),
+                updated_at=func.now(),
+            )
+        )
+        if result.rowcount != len(active_ids):  # ty: ignore[unresolved-attribute]
+            db_session.rollback()
+            return False
+        job.openrouter_submission_charged = True
+    job.openrouter_submission_state = "MANUAL_RECONCILE_REQUIRED"
+    job.openrouter_reconcile_until = None
     job.heartbeat_at = now
     job.updated_at = now
     if commit:
@@ -1752,7 +1776,7 @@ def record_openrouter_submission(
     if (
         job is None
         or job.openrouter_submission_key != submission_key
-        or job.openrouter_submission_state not in {"SUBMITTING", "RECONCILE_REQUIRED"}
+        or job.openrouter_submission_state != "SUBMITTING"
         or not job.openrouter_active_item_ids
     ):
         db_session.rollback()
@@ -1784,26 +1808,6 @@ def record_openrouter_submission(
     job.updated_at = now
     if commit:
         db_session.commit()
-    return True
-
-
-def record_openrouter_reconciliation_miss(
-    db_session: Session,
-    *,
-    job_id: UUID,
-    expected_generation: int,
-    now: datetime.datetime,
-) -> bool:
-    job = _lock_openrouter_embedding_job(
-        db_session, job_id=job_id, expected_generation=expected_generation
-    )
-    if job is None or job.openrouter_submission_state != "RECONCILE_REQUIRED":
-        db_session.rollback()
-        return False
-    job.openrouter_reconcile_miss_count += 1
-    job.heartbeat_at = now
-    job.updated_at = now
-    db_session.commit()
     return True
 
 

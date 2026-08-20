@@ -753,76 +753,26 @@ def _openrouter_embedding_batch(
             now=now,
         )
 
-    if submission_state is RegulatoryIndexingSubmissionState.SUBMITTING:
-        persisted = (
-            indexing_job_repository.require_openrouter_submission_reconciliation(
-                db_session,
-                job_id=runtime.job.id,
-                expected_generation=runtime.job.lease_generation,
-                submission_key=expected_key,
-                reconcile_until=now
-                + datetime.timedelta(seconds=snapshot.submission_reconcile_seconds),
-                now=now,
-            )
-        )
-        return (
-            _advance(
-                runtime,
-                db_session,
-                next_stage=RegulatoryIndexingStage.EMBEDDING,
-                now=now,
-                countdown_seconds=snapshot.poll_seconds,
-            )
-            if persisted
-            else _skipped(runtime.job.id)
-        )
-
-    if submission_state is RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED:
-        reconcile_until = runtime.job.openrouter_reconcile_until
-        if reconcile_until is None or now >= reconcile_until:
-            raise OpenRouterBatchContractError(
-                "OpenRouter submission visibility remained indeterminate"
-            )
-        state = gateway.reconcile_submission(expected_key)
-        if state is None:
-            persisted = indexing_job_repository.record_openrouter_reconciliation_miss(
-                db_session,
-                job_id=runtime.job.id,
-                expected_generation=runtime.job.lease_generation,
-                now=now,
-            )
-            return (
-                _advance(
-                    runtime,
-                    db_session,
-                    next_stage=RegulatoryIndexingStage.EMBEDDING,
-                    now=now,
-                    countdown_seconds=snapshot.poll_seconds,
-                )
-                if persisted
-                else _skipped(runtime.job.id)
-            )
-        persisted = indexing_job_repository.record_openrouter_submission(
+    if submission_state in {
+        RegulatoryIndexingSubmissionState.SUBMITTING,
+        RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
+        RegulatoryIndexingSubmissionState.RECONCILED_ABSENT,
+    }:
+        persisted = indexing_job_repository.record_openrouter_submission_ambiguous(
             db_session,
             job_id=runtime.job.id,
             expected_generation=runtime.job.lease_generation,
             submission_key=expected_key,
-            remote_batch_id=state.remote_batch_id,
-            completion_deadline=now
-            + datetime.timedelta(seconds=config.completion_horizon_seconds),
-            charge_items=not runtime.job.openrouter_submission_charged,
             now=now,
         )
-        return (
-            _advance(
-                runtime,
-                db_session,
-                next_stage=RegulatoryIndexingStage.EMBEDDING,
-                now=now,
-                countdown_seconds=snapshot.poll_seconds,
-            )
-            if persisted
-            else _skipped(runtime.job.id)
+        if not persisted:
+            return _skipped(runtime.job.id)
+        raise OpenRouterBatchContractError(
+            "OpenRouter Batch creation outcome requires manual reconciliation"
+        )
+    if submission_state is RegulatoryIndexingSubmissionState.MANUAL_RECONCILE_REQUIRED:
+        raise OpenRouterBatchContractError(
+            "OpenRouter Batch creation outcome requires manual reconciliation"
         )
 
     if submission_state is not RegulatoryIndexingSubmissionState.NONE:
@@ -854,13 +804,11 @@ def _openrouter_embedding_batch(
                     "OpenRouter returned an unexpected submission identity"
                 ) from error
             reconciliation_persisted = (
-                indexing_job_repository.require_openrouter_submission_reconciliation(
+                indexing_job_repository.record_openrouter_submission_ambiguous(
                     db_session,
                     job_id=runtime.job.id,
                     expected_generation=runtime.job.lease_generation,
                     submission_key=expected_key,
-                    reconcile_until=now
-                    + datetime.timedelta(seconds=snapshot.submission_reconcile_seconds),
                     now=now,
                     commit=False,
                 )
@@ -868,6 +816,23 @@ def _openrouter_embedding_batch(
             if not reconciliation_persisted:
                 return _skipped(runtime.job.id)
             submission_lease.commit()
+            raise OpenRouterBatchContractError(
+                "OpenRouter Batch creation outcome requires manual reconciliation"
+            ) from error
+        except OpenRouterBatchContractError:
+            definitely_not_sent = (
+                indexing_job_repository.record_openrouter_submission_not_sent(
+                    db_session,
+                    job_id=runtime.job.id,
+                    expected_generation=runtime.job.lease_generation,
+                    submission_key=expected_key,
+                    now=now,
+                    commit=False,
+                )
+            )
+            if definitely_not_sent:
+                submission_lease.commit()
+            raise
         except IndexingGatewayError:
             definitely_not_sent = (
                 indexing_job_repository.record_openrouter_submission_not_sent(
@@ -884,13 +849,11 @@ def _openrouter_embedding_batch(
             raise
         except Exception:
             reconciliation_persisted = (
-                indexing_job_repository.require_openrouter_submission_reconciliation(
+                indexing_job_repository.record_openrouter_submission_ambiguous(
                     db_session,
                     job_id=runtime.job.id,
                     expected_generation=runtime.job.lease_generation,
                     submission_key=expected_key,
-                    reconcile_until=now
-                    + datetime.timedelta(seconds=snapshot.submission_reconcile_seconds),
                     now=now,
                     commit=False,
                 )
@@ -898,6 +861,9 @@ def _openrouter_embedding_batch(
             if not reconciliation_persisted:
                 return _skipped(runtime.job.id)
             submission_lease.commit()
+            raise OpenRouterBatchContractError(
+                "OpenRouter Batch creation outcome requires manual reconciliation"
+            )
         else:
             recorded = indexing_job_repository.record_openrouter_submission(
                 db_session,

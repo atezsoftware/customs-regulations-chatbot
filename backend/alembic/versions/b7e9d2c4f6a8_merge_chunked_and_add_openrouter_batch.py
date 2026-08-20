@@ -76,7 +76,8 @@ def upgrade() -> None:
         "regulatory_indexing_job_openrouter_submission_state_check",
         "regulatory_indexing_job",
         "openrouter_submission_state IN ('NONE', 'SUBMITTING', "
-        "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', 'SUBMITTED')",
+        "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', "
+        "'MANUAL_RECONCILE_REQUIRED', 'SUBMITTED')",
     )
     op.create_check_constraint(
         "regulatory_indexing_job_openrouter_attempts_check",

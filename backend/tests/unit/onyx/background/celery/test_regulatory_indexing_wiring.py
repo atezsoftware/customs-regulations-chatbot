@@ -59,6 +59,12 @@ _PRODUCTION_LITE_ENVIRONMENT = {
     "REGULATORY_INDEXING_GCS_URI",
     "REGULATORY_INDEXING_LEASE_SECONDS",
     "REGULATORY_INDEXING_MAX_ATTEMPTS",
+    "REGULATORY_INDEXING_OPENROUTER_BATCH_HORIZON_SECONDS",
+    "REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_BYTES",
+    "REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_INPUTS",
+    "REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_REQUESTS",
+    "REGULATORY_INDEXING_OPENROUTER_BATCH_URL",
+    "REGULATORY_INDEXING_ALLOW_ONLINE_EMBEDDING_FALLBACK",
     "REGULATORY_INDEXING_POLL_SECONDS",
     "REGULATORY_INDEXING_RETRY_BASE_SECONDS",
     "REGULATORY_INDEXING_RETRY_MAX_SECONDS",
@@ -716,9 +722,7 @@ def test_lite_supervisor_runs_exact_regulatory_indexing_queues_and_forwards_log(
         "celery -A onyx.background.celery.versioned_apps.regulatory_indexing worker"
         in command
     )
-    assert re.search(
-        r"(?:^|\s)-Q user_file_processing,regulatory_indexing(?:\s|$)", command
-    )
+    assert re.search(r"(?:^|\s)-Q regulatory_indexing(?:\s|$)", command)
     assert "--hostname=regulatory_indexing@%%n" in command
 
     log_path = parser.get(section, "stdout_logfile")
@@ -852,8 +856,8 @@ def test_production_lite_health_requires_every_worker_including_regulatory_index
     supervisorctl.chmod(0o755)
     expected_processes = [
         "celery_worker_regulatory_benchmark",
+        "celery_worker_user_file_processing",
         "celery_worker_regulatory_indexing",
-        "celery_worker_user_file_maintenance",
         "celery_worker_light",
         "celery_worker_monitoring",
         "celery_beat_regulatory_indexing",
@@ -1205,15 +1209,18 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
     assert contract["supervisor_process_count"] == 7
     assert set(workers) == {
         "celery_worker_regulatory_benchmark",
+        "celery_worker_user_file_processing",
         "celery_worker_regulatory_indexing",
-        "celery_worker_user_file_maintenance",
         "celery_worker_light",
         "celery_worker_monitoring",
     }
-    assert workers["celery_worker_regulatory_indexing"] == [
+    assert workers["celery_worker_user_file_processing"] == [
         "user_file_processing",
-        "regulatory_indexing",
+        "user_file_project_sync",
+        "user_file_delete",
+        "user_file_port",
     ]
+    assert workers["celery_worker_regulatory_indexing"] == ["regulatory_indexing"]
     assert scheduler == {
         "name": "celery_beat_regulatory_indexing",
         "tasks": ["regulatory_indexing_recover_stale", "monitor_celery_queues"],

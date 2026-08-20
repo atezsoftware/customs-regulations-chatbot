@@ -1,8 +1,8 @@
-"""Read-only production readiness checks for durable regulatory indexing.
+"""Production readiness checks for durable regulatory indexing.
 
-This command intentionally has no write-capable database, object-store, or
-Elasticsearch operations. It performs one constant-text embedding request but
-never prints or persists the returned vector.
+The default command is read-only apart from one ordinary constant-text online
+embedding request. The explicit ``--openrouter-batch-canary`` option creates a
+tiny provider Batch and may incur cost; deploy automation must opt into it.
 """
 
 from __future__ import annotations
@@ -20,10 +20,12 @@ import shlex
 import socket
 import stat
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, cast
+from uuid import uuid4
 
 import httpx
 from alembic.config import Config
@@ -48,6 +50,11 @@ from onyx.regulatory.indexing_jobs.configuration import (
     resolve_regulatory_indexing_snapshot,
 )
 from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
+from onyx.regulatory.indexing_jobs.openrouter_batch import (
+    HttpxOpenRouterBatchGateway,
+    OpenRouterBatchJobStatus,
+    OpenRouterEmbeddingBatchRequest,
+)
 from onyx.regulatory.indexing_jobs.vertex_batch import GoogleVertexBatchGateway
 from shared_configs.configs import MULTI_TENANT
 from shared_configs.enums import EmbeddingProvider
@@ -60,9 +67,24 @@ _BACKEND_ROOT = Path(__file__).resolve().parents[1]
 _SUPERVISOR_CONFIG = Path("/etc/supervisor/conf.d/supervisord.conf")
 _LOCAL_SUPERVISOR_CONFIG = _BACKEND_ROOT / "supervisord-lite.conf"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
-_WORKER_PROCESS_NAME = "celery_worker_regulatory_indexing"
+_WORKER_QUEUE_CONTRACT: dict[str, frozenset[str]] = {
+    "celery_worker_user_file_processing": frozenset(
+        {
+            "user_file_processing",
+            "user_file_project_sync",
+            "user_file_delete",
+            "user_file_port",
+        }
+    ),
+    "celery_worker_regulatory_indexing": frozenset({"regulatory_indexing"}),
+}
+_WORKER_NODE_PREFIX = {
+    "celery_worker_user_file_processing": "user_file_processing",
+    "celery_worker_regulatory_indexing": "regulatory_indexing",
+}
 _PROBE_TEXT = "regulatory indexing readiness probe"
-_EXPECTED_REGULATORY_QUEUES = frozenset({"user_file_processing", "regulatory_indexing"})
+_BATCH_CANARY_MAX_WAIT_SECONDS = 120.0
+_BATCH_CANARY_POLL_SECONDS = 2.0
 _ATTESTATION_MAX_AGE = datetime.timedelta(hours=24)
 _ATTESTATION_OWNER_UID = 1001
 _ATTESTATION_OWNER_GID = 1001
@@ -138,6 +160,8 @@ class ReadinessBackend(Protocol):
 
     def probe_embedding_dimension(self, snapshot: ReadinessSnapshot) -> int: ...
 
+    def check_openrouter_batch_canary(self, snapshot: ReadinessSnapshot) -> str: ...
+
     def check_elasticsearch_mapping(self, snapshot: ReadinessSnapshot) -> str: ...
 
 
@@ -154,7 +178,9 @@ def _run_check(name: str, check: Callable[[], str]) -> CheckResult:
         return CheckResult(name=name, status="FAIL", detail=_safe_failure(error))
 
 
-def run_readiness_checks(backend: ReadinessBackend) -> ReadinessReport:
+def run_readiness_checks(
+    backend: ReadinessBackend, *, run_openrouter_batch_canary: bool = False
+) -> ReadinessReport:
     results = [
         _run_check("migration", backend.check_migration),
         _run_check("worker_and_beat", backend.check_worker_and_beat),
@@ -170,17 +196,20 @@ def run_readiness_checks(backend: ReadinessBackend) -> ReadinessReport:
                 detail=_safe_failure(error),
             )
         )
+        blocked_checks = (
+            "capability_attestation",
+            "gcs_access",
+            "vertex_access",
+            "embedding_probe",
+            "elasticsearch_mapping",
+        )
+        if run_openrouter_batch_canary:
+            blocked_checks = (*blocked_checks, "openrouter_batch_canary")
         results.extend(
             CheckResult(
                 name=name, status="BLOCKED", detail="admin snapshot unavailable"
             )
-            for name in (
-                "capability_attestation",
-                "gcs_access",
-                "vertex_access",
-                "embedding_probe",
-                "elasticsearch_mapping",
-            )
+            for name in blocked_checks
         )
         return ReadinessReport(results=tuple(results))
 
@@ -217,6 +246,13 @@ def run_readiness_checks(backend: ReadinessBackend) -> ReadinessReport:
             ),
         )
     )
+    if run_openrouter_batch_canary:
+        results.append(
+            _run_check(
+                "openrouter_batch_canary",
+                lambda: backend.check_openrouter_batch_canary(snapshot),
+            )
+        )
     return ReadinessReport(results=tuple(results))
 
 
@@ -285,7 +321,14 @@ class OnyxReadinessBackend:
             raise ReadinessCheckError(
                 "dedicated regulatory worker or Beat supervisor config is missing"
             )
-        configured_queues = _configured_regulatory_worker_queues(config_text)
+        configured_queues = {
+            process_name: _configured_worker_queues(
+                config_text,
+                process_name=process_name,
+                expected_queues=expected_queues,
+            )
+            for process_name, expected_queues in _WORKER_QUEUE_CONTRACT.items()
+        }
 
         result = subprocess.run(
             [
@@ -293,7 +336,7 @@ class OnyxReadinessBackend:
                 "-c",
                 str(_SUPERVISOR_CONFIG),
                 "status",
-                _WORKER_PROCESS_NAME,
+                *_WORKER_QUEUE_CONTRACT,
                 BEAT_PROCESS_NAME,
             ],
             capture_output=True,
@@ -303,23 +346,33 @@ class OnyxReadinessBackend:
         if result.returncode != 0:
             raise ReadinessCheckError("supervisor status query failed")
         status_text = result.stdout
-        worker_lines = [
-            line
-            for line in status_text.splitlines()
-            if line.startswith(_WORKER_PROCESS_NAME)
-        ]
-        if len(worker_lines) != 1 or " RUNNING " not in worker_lines[0]:
-            raise ReadinessCheckError("dedicated regulatory worker is not RUNNING")
         validate_regulatory_indexing_beat(status_text)
-        expected_worker_name = f"regulatory_indexing@{socket.gethostname()}"
-        supervisor_pid = _supervisor_worker_pid(worker_lines[0])
-        live_queues = _live_regulatory_worker_queues(
-            expected_worker_name=expected_worker_name,
-            supervisor_pid=supervisor_pid,
-        )
+        verified: list[str] = []
+        for process_name, expected_queues in _WORKER_QUEUE_CONTRACT.items():
+            worker_lines = [
+                line
+                for line in status_text.splitlines()
+                if line.startswith(process_name)
+            ]
+            if len(worker_lines) != 1 or " RUNNING " not in worker_lines[0]:
+                raise ReadinessCheckError(f"{process_name} is not RUNNING")
+            expected_worker_name = (
+                f"{_WORKER_NODE_PREFIX[process_name]}@{socket.gethostname()}"
+            )
+            supervisor_pid = _supervisor_worker_pid(worker_lines[0])
+            live_queues = _live_worker_queues(
+                expected_worker_name=expected_worker_name,
+                supervisor_pid=supervisor_pid,
+                expected_queues=expected_queues,
+            )
+            if configured_queues[process_name] != live_queues:
+                raise ReadinessCheckError(
+                    f"{process_name} configured/live queue sets differ"
+                )
+            verified.append(f"{process_name}={','.join(sorted(expected_queues))}")
         return (
-            "dedicated worker RUNNING with exact configured/live queue set "
-            f"{','.join(sorted(configured_queues & live_queues))}; "
+            "required workers RUNNING with exact configured/live queue sets "
+            f"{'; '.join(verified)}; "
             "Beat readiness/liveness probes valid"
         )
 
@@ -452,6 +505,51 @@ class OnyxReadinessBackend:
             )
         )
 
+    def check_openrouter_batch_canary(self, snapshot: ReadinessSnapshot) -> str:
+        config_snapshot = self._config_snapshot
+        if config_snapshot is None or config_snapshot.openrouter_batch is None:
+            raise ReadinessCheckError("OpenRouter Batch snapshot is unavailable")
+        if (
+            config_snapshot.openrouter_batch.model_name != snapshot.embedding_model
+            or config_snapshot.openrouter_batch.effective_dimension
+            != snapshot.effective_dimension
+        ):
+            raise ReadinessCheckError(
+                "OpenRouter Batch snapshot does not match active SearchSettings"
+            )
+        if self._embedding_api_key is None:
+            raise ReadinessCheckError("OpenRouter credential is unavailable")
+        gateway = HttpxOpenRouterBatchGateway(
+            config=config_snapshot.openrouter_batch,
+            api_key_provider=lambda: cast(str, self._embedding_api_key),
+        )
+        request = OpenRouterEmbeddingBatchRequest(
+            custom_id=f"readiness-{uuid4().hex}",
+            inputs=[_PROBE_TEXT],
+        )
+        submission_key = f"readiness-{uuid4().hex}"
+        state = gateway.submit([request], submission_key=submission_key)
+        deadline = time.monotonic() + _BATCH_CANARY_MAX_WAIT_SECONDS
+        while state.status in {
+            OpenRouterBatchJobStatus.PENDING,
+            OpenRouterBatchJobStatus.CANCELLING,
+        }:
+            if time.monotonic() >= deadline:
+                gateway.cancel(state.remote_batch_id)
+                raise ReadinessCheckError(
+                    "OpenRouter Batch canary did not leave validation before timeout"
+                )
+            time.sleep(_BATCH_CANARY_POLL_SECONDS)
+            state = gateway.get(state.remote_batch_id)
+        if state.status is OpenRouterBatchJobStatus.RUNNING:
+            gateway.cancel(state.remote_batch_id)
+            return "tiny embedding Batch created, polled, and cancellation accepted"
+        if state.status is OpenRouterBatchJobStatus.SUCCEEDED:
+            return "tiny embedding Batch created, polled, and completed"
+        raise ReadinessCheckError(
+            "OpenRouter Batch canary reached an unsuccessful terminal state"
+        )
+
     def check_elasticsearch_mapping(self, snapshot: ReadinessSnapshot) -> str:
         client = ElasticsearchIndexClient(snapshot.index_name)
         try:
@@ -476,60 +574,60 @@ class OnyxReadinessBackend:
         )
 
 
-def _configured_regulatory_worker_queues(config_text: str) -> set[str]:
+def _configured_worker_queues(
+    config_text: str,
+    *,
+    process_name: str,
+    expected_queues: set[str] | frozenset[str],
+) -> set[str]:
     parser = configparser.ConfigParser(interpolation=None, strict=False)
     try:
         parser.read_string(config_text)
-        command = parser.get(f"program:{_WORKER_PROCESS_NAME}", "command")
+        command = parser.get(f"program:{process_name}", "command")
         arguments = shlex.split(" ".join(command.split()))
     except (configparser.Error, KeyError, ValueError) as error:
         raise ReadinessCheckError(
-            "dedicated regulatory worker supervisor command is invalid"
+            f"{process_name} supervisor command is invalid"
         ) from error
 
     queue_values: list[str] = []
     for index, argument in enumerate(arguments):
         if argument in {"-Q", "--queues"}:
             if index + 1 >= len(arguments):
-                raise ReadinessCheckError(
-                    "dedicated regulatory worker requires an exact queue set"
-                )
+                raise ReadinessCheckError(f"{process_name} requires an exact queue set")
             queue_values.append(arguments[index + 1])
         elif argument.startswith("--queues="):
             queue_values.append(argument.partition("=")[2])
         elif argument.startswith("-Q") and argument != "-Q":
             queue_values.append(argument[2:])
     if len(queue_values) != 1:
-        raise ReadinessCheckError(
-            "dedicated regulatory worker requires one exact queue set"
-        )
+        raise ReadinessCheckError(f"{process_name} requires one exact queue set")
     queues = {queue.strip() for queue in queue_values[0].split(",") if queue.strip()}
-    if queues != _EXPECTED_REGULATORY_QUEUES:
-        raise ReadinessCheckError(
-            "dedicated regulatory worker requires the exact queue set "
-            "regulatory_indexing,user_file_processing"
-        )
+    if queues != set(expected_queues):
+        raise ReadinessCheckError(f"{process_name} requires its exact queue set")
     return queues
 
 
 def _supervisor_worker_pid(status_line: str) -> int:
     match = re.search(r"\sRUNNING\s+pid ([1-9][0-9]*),", status_line)
     if match is None:
-        raise ReadinessCheckError(
-            "dedicated regulatory worker has no positive RUNNING PID"
-        )
+        raise ReadinessCheckError("required worker has no positive RUNNING PID")
     return int(match.group(1))
 
 
-def _live_regulatory_worker_queues(
-    *, expected_worker_name: str, supervisor_pid: int
+def _live_worker_queues(
+    *,
+    expected_worker_name: str,
+    supervisor_pid: int,
+    expected_queues: set[str] | frozenset[str],
 ) -> set[str]:
     from onyx.background.celery.versioned_apps.regulatory_indexing import app
 
     inspector = app.control.inspect(timeout=5, destination=[expected_worker_name])
-    queues = _validated_live_regulatory_worker_queues(
+    queues = _validated_live_worker_queues(
         inspector.active_queues(),
         expected_worker_name=expected_worker_name,
+        expected_queues=expected_queues,
     )
     _validate_live_worker_pid(
         inspector.stats(),
@@ -539,8 +637,11 @@ def _live_regulatory_worker_queues(
     return queues
 
 
-def _validated_live_regulatory_worker_queues(
-    responses: object, *, expected_worker_name: str
+def _validated_live_worker_queues(
+    responses: object,
+    *,
+    expected_worker_name: str,
+    expected_queues: set[str] | frozenset[str],
 ) -> set[str]:
     if not isinstance(responses, dict):
         raise ReadinessCheckError(
@@ -557,10 +658,9 @@ def _validated_live_regulatory_worker_queues(
             name = cast(dict[str, object], record).get("name")
             if isinstance(name, str):
                 queues.add(name)
-    if queues != _EXPECTED_REGULATORY_QUEUES:
+    if queues != set(expected_queues):
         raise ReadinessCheckError(
-            "live local dedicated worker must consume the exact queue set "
-            "regulatory_indexing,user_file_processing"
+            "live local required worker must consume its exact queue set"
         )
     return queues
 
@@ -873,6 +973,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--openrouter-batch-canary",
+        action="store_true",
+        help=(
+            "Explicitly create/poll/cancel one tiny OpenRouter embedding Batch. "
+            "This mutates provider state and may incur cost; omit for read-only "
+            "readiness."
+        ),
+    )
+    parser.add_argument(
         "--capability-attestation",
         type=Path,
         help=(
@@ -940,7 +1049,8 @@ def main(argv: list[str] | None = None) -> int:
             memory_headroom_reviewed=args.memory_headroom_reviewed,
             capability_attestation_path=args.capability_attestation,
             capability_evidence_path=args.capability_evidence,
-        )
+        ),
+        run_openrouter_batch_canary=args.openrouter_batch_canary,
     )
     if args.json:
         print(

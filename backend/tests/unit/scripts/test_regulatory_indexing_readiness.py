@@ -76,6 +76,12 @@ class _FakeBackend:
         self.dimensions.append(snapshot.effective_dimension)
         return snapshot.effective_dimension
 
+    def check_openrouter_batch_canary(self, snapshot: ReadinessSnapshot) -> str:
+        return self._result(
+            "openrouter_batch_canary",
+            f"tiny batch accepted for {snapshot.embedding_model}",
+        )
+
     def check_elasticsearch_mapping(self, snapshot: ReadinessSnapshot) -> str:
         self._result("elasticsearch_mapping", "")
         self.dimensions.append(snapshot.effective_dimension)
@@ -104,6 +110,15 @@ def test_readiness_uses_active_dynamic_dimension_and_reports_safe_metadata() -> 
     assert "vector" not in rendered.lower()
     assert "memory_headroom: PASS" in rendered
     assert "capability_attestation: PASS" in rendered
+    assert "openrouter_batch_canary" not in rendered
+
+
+def test_explicit_openrouter_batch_canary_is_reported_separately() -> None:
+    report = run_readiness_checks(_FakeBackend(), run_openrouter_batch_canary=True)
+
+    assert report.exit_code == EXIT_READY
+    statuses = {result.name: result.status for result in report.results}
+    assert statuses["openrouter_batch_canary"] == "PASS"
 
 
 def test_readiness_failure_is_redacted_and_blocks_dependent_checks() -> None:
@@ -301,33 +316,58 @@ def test_memory_headroom_requires_attestation_and_rejects_oom_events(
         ).check_memory_headroom()
 
 
-def test_worker_queue_parser_rejects_regulatory_substrings_outside_queue_arg() -> None:
-    false_positive = """
+def test_worker_queue_parser_requires_each_production_worker_exact_queue_set() -> None:
+    configured = """
+[program:celery_worker_user_file_processing]
+command=celery -A onyx.background.celery.versioned_apps.user_file_processing worker
+    --hostname=user_file_processing@%%n
+    -Q user_file_processing,user_file_project_sync,user_file_delete,user_file_port
+
 [program:celery_worker_regulatory_indexing]
 command=celery -A onyx.background.celery.versioned_apps.regulatory_indexing worker
     --hostname=regulatory_indexing@%%n
-    -Q user_file_processing
+    -Q regulatory_indexing
 stdout_logfile=/var/log/onyx/celery_worker_regulatory_indexing.log
 
 [program:celery_beat_regulatory_indexing]
 command=celery beat
 """
 
-    with pytest.raises(readiness.ReadinessCheckError, match="exact queue set"):
-        readiness._configured_regulatory_worker_queues(false_positive)
-
-    configured = false_positive.replace(
-        "-Q user_file_processing", "-Q user_file_processing,regulatory_indexing"
-    )
-    assert readiness._configured_regulatory_worker_queues(configured) == {
+    assert readiness._configured_worker_queues(
+        configured,
+        process_name="celery_worker_user_file_processing",
+        expected_queues={
+            "user_file_processing",
+            "user_file_project_sync",
+            "user_file_delete",
+            "user_file_port",
+        },
+    ) == {
         "user_file_processing",
-        "regulatory_indexing",
+        "user_file_project_sync",
+        "user_file_delete",
+        "user_file_port",
     }
+    assert readiness._configured_worker_queues(
+        configured,
+        process_name="celery_worker_regulatory_indexing",
+        expected_queues={"regulatory_indexing"},
+    ) == {"regulatory_indexing"}
+
+    false_positive = configured.replace(
+        "-Q regulatory_indexing", "-Q user_file_processing"
+    )
+    with pytest.raises(readiness.ReadinessCheckError, match="exact queue set"):
+        readiness._configured_worker_queues(
+            false_positive,
+            process_name="celery_worker_regulatory_indexing",
+            expected_queues={"regulatory_indexing"},
+        )
 
 
 def test_live_worker_queue_validation_requires_exact_regulatory_queue_set() -> None:
     with pytest.raises(readiness.ReadinessCheckError, match="exact queue set"):
-        readiness._validated_live_regulatory_worker_queues(
+        readiness._validated_live_worker_queues(
             {
                 "regulatory_indexing@local-node": [
                     {"name": "user_file_processing"},
@@ -338,28 +378,29 @@ def test_live_worker_queue_validation_requires_exact_regulatory_queue_set() -> N
                 ],
             },
             expected_worker_name="regulatory_indexing@local-node",
+            expected_queues={"regulatory_indexing"},
         )
 
-    assert readiness._validated_live_regulatory_worker_queues(
+    assert readiness._validated_live_worker_queues(
         {
             "regulatory_indexing@local-node": [
                 {"name": "regulatory_indexing"},
-                {"name": "user_file_processing"},
             ],
             "regulatory_indexing@remote-node": [{"name": "other"}],
         },
         expected_worker_name="regulatory_indexing@local-node",
-    ) == {"regulatory_indexing", "user_file_processing"}
+        expected_queues={"regulatory_indexing"},
+    ) == {"regulatory_indexing"}
 
     with pytest.raises(readiness.ReadinessCheckError, match="local worker response"):
-        readiness._validated_live_regulatory_worker_queues(
+        readiness._validated_live_worker_queues(
             {
                 "regulatory_indexing@remote-node": [
                     {"name": "regulatory_indexing"},
-                    {"name": "user_file_processing"},
                 ]
             },
             expected_worker_name="regulatory_indexing@local-node",
+            expected_queues={"regulatory_indexing"},
         )
 
 
@@ -401,10 +442,7 @@ def test_live_worker_inspection_targets_only_the_local_node(
     expected_worker_name = "regulatory_indexing@local-node"
     inspector = MagicMock()
     inspector.active_queues.return_value = {
-        expected_worker_name: [
-            {"name": "regulatory_indexing"},
-            {"name": "user_file_processing"},
-        ]
+        expected_worker_name: [{"name": "regulatory_indexing"}]
     }
     inspector.stats.return_value = {expected_worker_name: {"pid": 4242}}
 
@@ -413,10 +451,11 @@ def test_live_worker_inspection_targets_only_the_local_node(
     inspect_mock = MagicMock(return_value=inspector)
     monkeypatch.setattr(app.control, "inspect", inspect_mock)
 
-    assert readiness._live_regulatory_worker_queues(
+    assert readiness._live_worker_queues(
         expected_worker_name=expected_worker_name,
         supervisor_pid=4242,
-    ) == {"regulatory_indexing", "user_file_processing"}
+        expected_queues={"regulatory_indexing"},
+    ) == {"regulatory_indexing"}
     inspect_mock.assert_called_once_with(
         timeout=5,
         destination=[expected_worker_name],

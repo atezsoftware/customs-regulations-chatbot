@@ -5881,7 +5881,8 @@ class RegulatoryIndexingJob(Base):
         ),
         CheckConstraint(
             "openrouter_submission_state IN ('NONE', 'SUBMITTING', "
-            "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', 'SUBMITTED')",
+            "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', "
+            "'MANUAL_RECONCILE_REQUIRED', 'SUBMITTED')",
             name="regulatory_indexing_job_openrouter_submission_state_check",
         ),
         CheckConstraint(

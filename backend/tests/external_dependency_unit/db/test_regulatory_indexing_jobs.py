@@ -54,6 +54,8 @@ from onyx.db.regulatory_indexing_jobs import (
     persist_regulatory_indexing_item_skipped,
     persist_regulatory_indexing_item_vector,
     persist_regulatory_indexing_item_vectors,
+    record_openrouter_submission_ambiguous,
+    record_openrouter_submission_intent,
     record_reconciled_provider_cleanup_vertex_job,
     record_vertex_reconciliation_miss,
     record_vertex_submission,
@@ -1161,6 +1163,75 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
     db_session.refresh(omitted_item)
     assert submitted_item.context_attempt_count == 2
     assert omitted_item.context_attempt_count == 0
+
+
+def test_openrouter_ambiguous_submission_is_persisted_and_charged_once(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    chunk = RegulatoryChunk(
+        id=f"regulatory-chunk-{uuid4().hex}",
+        user_file_id=regulatory_user_file.id,
+        text="MADDE 1 - Embedding item.",
+        position=0,
+        heading_path=["MADDE 1"],
+        chunk_metadata={},
+    )
+    db_session.add(chunk)
+    db_session.commit()
+    item = create_or_get_regulatory_indexing_item(
+        db_session,
+        job_id=job.id,
+        regulatory_chunk_id=chunk.id,
+        request_hash="d" * 64,
+        expected_generation=1,
+    )
+    assert item is not None
+    item.status = RegulatoryIndexingItemStatus.SKIPPED.value
+    job.stage = RegulatoryIndexingStage.EMBEDDING.value
+    db_session.commit()
+    submission_key = "regulatory-embedding-" + "c" * 64
+
+    assert record_openrouter_submission_intent(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key=submission_key,
+        submission_attempt=1,
+        active_item_ids=[item.id],
+        now=_NOW,
+    )
+    assert record_openrouter_submission_ambiguous(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key=submission_key,
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    db_session.refresh(item)
+    assert job.openrouter_submission_state == "MANUAL_RECONCILE_REQUIRED"
+    assert job.remote_openrouter_batch_id is None
+    assert job.openrouter_submission_charged is True
+    assert item.embedding_attempt_count == 1
+
+    assert record_openrouter_submission_ambiguous(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key=submission_key,
+        now=_NOW,
+    )
+    db_session.refresh(item)
+    assert item.embedding_attempt_count == 1
 
 
 def test_illegal_stage_skip_cannot_persist_terminal_job_state(

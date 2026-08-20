@@ -41,6 +41,9 @@ from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayIndeterminateSubmissionError,
     RegulatoryIndexingConfigSnapshot,
 )
+from onyx.regulatory.indexing_jobs.openrouter_batch import (
+    OpenRouterEmbeddingBatchRequest,
+)
 from onyx.regulatory.indexing_jobs.orchestrator import (
     OrchestrationOutcome,
     run_preclaimed_regulatory_indexing_step,
@@ -138,6 +141,14 @@ def _runtime(
         vertex_submission_attempt_count=submission_attempt,
         vertex_submission_charged=submission_charged,
         vertex_reconcile_until=reconcile_until,
+        remote_openrouter_batch_id=None,
+        openrouter_submission_key=None,
+        openrouter_submission_state="NONE",
+        openrouter_submission_attempt_count=0,
+        openrouter_submission_charged=False,
+        openrouter_reconcile_until=None,
+        openrouter_completion_deadline=None,
+        openrouter_active_item_ids=[],
         provider_cleanup_state=provider_cleanup_state,
         provider_cleanup_phase=provider_cleanup_phase,
         provider_cleanup_generation=provider_cleanup_generation,
@@ -932,6 +943,116 @@ def test_indeterminate_submit_fails_closed_after_reconciliation_horizon() -> Non
     gateway.reconcile_submission.assert_not_called()
     gateway.submit.assert_not_called()
     request_cleanup.assert_called_once()
+
+
+def test_openrouter_ambiguous_create_persists_manual_stop_and_never_reposts() -> None:
+    runtime = _runtime(RegulatoryIndexingStage.EMBEDDING)
+    item_id = uuid4()
+    request = OpenRouterEmbeddingBatchRequest(
+        custom_id="embedding-1", inputs=["context\nchunk"]
+    )
+    plan = SimpleNamespace(
+        requests=[request],
+        item_ids_by_custom_id={request.custom_id: (item_id,)},
+        remaining_item_count=0,
+    )
+    snapshot = runtime.job.config_snapshot
+    snapshot["openrouter_batch"] = {
+        "api_url": "https://openrouter.test/api/beta/batches",
+        "model_name": "openai/text-embedding-3-large",
+        "effective_dimension": 1024,
+        "request_input_size": 2,
+        "max_requests": 1000,
+        "max_inputs": 45000,
+        "max_bytes": 33554432,
+        "completion_horizon_seconds": 86400,
+    }
+    submission_key = "regulatory-embedding-" + "f" * 64
+    gateway = MagicMock()
+    gateway.submit.side_effect = IndexingGatewayIndeterminateSubmissionError(
+        submission_key
+    )
+
+    with (
+        patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.build_openrouter_embedding_batch",
+            return_value=plan,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.openrouter_batch_submission_key",
+            return_value=submission_key,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_openrouter_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_openrouter_submission_intent",
+            return_value=True,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.regulatory_indexing_external_mutation_lease",
+            side_effect=_external_lease,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_openrouter_submission_ambiguous",
+            return_value=True,
+        ) as record_ambiguous,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.request_regulatory_indexing_terminal_failure_cleanup",
+            return_value=True,
+        ) as request_cleanup,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        first = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert first.outcome is OrchestrationOutcome.NEXT_STEP
+    gateway.submit.assert_called_once_with([request], submission_key=submission_key)
+    record_ambiguous.assert_called_once()
+    request_cleanup.assert_called_once()
+
+    runtime.job.openrouter_submission_key = submission_key
+    runtime.job.openrouter_submission_state = "MANUAL_RECONCILE_REQUIRED"
+    runtime.job.openrouter_submission_attempt_count = 1
+    runtime.job.openrouter_submission_charged = True
+    runtime.job.openrouter_active_item_ids = [str(item_id)]
+    gateway.reset_mock()
+    with (
+        patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.build_openrouter_embedding_batch",
+            return_value=plan,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.openrouter_batch_submission_key",
+            return_value=submission_key,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_openrouter_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.request_regulatory_indexing_terminal_failure_cleanup",
+            return_value=True,
+        ),
+    ):
+        second = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert second.outcome is OrchestrationOutcome.NEXT_STEP
+    gateway.submit.assert_not_called()
+    gateway.get.assert_not_called()
 
 
 def test_partial_context_output_requeues_only_still_pending_items() -> None:

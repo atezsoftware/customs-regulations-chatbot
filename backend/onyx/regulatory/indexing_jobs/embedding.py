@@ -208,11 +208,9 @@ def build_openrouter_embedding_batch(
     item_ids_by_custom_id: dict[str, tuple[UUID, ...]] = {}
     selected_count = 0
     offset = 0
-    placeholder_key = f"regulatory-embedding-{'0' * 64}"
     empty_payload_size = openrouter_embedding_payload_size(
         (),
         config=config,
-        submission_key=placeholder_key,
     )
     selected_payload_size = empty_payload_size
     while (
@@ -238,7 +236,6 @@ def build_openrouter_embedding_batch(
             candidate_payload_size = openrouter_embedding_payload_size(
                 (candidate,),
                 config=config,
-                submission_key=placeholder_key,
             )
             candidate_increment = candidate_payload_size - empty_payload_size
             if request_rows:

@@ -4,7 +4,7 @@ import json
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -19,7 +19,7 @@ from onyx.regulatory.indexing_jobs.openrouter_batch import (
 
 @pytest.fixture
 def fake_openrouter_batch_server() -> Iterator[tuple[str, dict[str, object]]]:
-    state: dict[str, object] = {"cancelled": False}
+    state: dict[str, object] = {"cancelled": False, "post_count": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status: int, payload: object) -> None:
@@ -35,7 +35,9 @@ def fake_openrouter_batch_server() -> Iterator[tuple[str, dict[str, object]]]:
                 length = int(self.headers["Content-Length"])
                 payload = json.loads(self.rfile.read(length))
                 state["payload"] = payload
-                state["metadata"] = payload["metadata"]
+                post_count = state["post_count"]
+                assert isinstance(post_count, int)
+                state["post_count"] = post_count + 1
                 self._json(202, {"id": "batch-local", "status": "validating"})
                 return
             if self.path == "/api/beta/batches/batch-local/cancel":
@@ -45,20 +47,6 @@ def fake_openrouter_batch_server() -> Iterator[tuple[str, dict[str, object]]]:
             self._json(404, {"error": "not found"})
 
         def do_GET(self) -> None:  # noqa: N802
-            if self.path == "/api/beta/batches":
-                self._json(
-                    200,
-                    {
-                        "data": [
-                            {
-                                "id": "batch-local",
-                                "status": "in_progress",
-                                "metadata": state["metadata"],
-                            }
-                        ]
-                    },
-                )
-                return
             if self.path == "/api/beta/batches/batch-local":
                 self._json(
                     200,
@@ -108,7 +96,7 @@ def fake_openrouter_batch_server() -> Iterator[tuple[str, dict[str, object]]]:
         thread.join(timeout=5)
 
 
-def test_real_http_batch_submit_poll_reconcile_and_cancel(
+def test_real_http_batch_submit_poll_and_cancel_with_official_contract(
     fake_openrouter_batch_server: tuple[str, dict[str, object]],
 ) -> None:
     url, server_state = fake_openrouter_batch_server
@@ -133,9 +121,13 @@ def test_real_http_batch_submit_poll_reconcile_and_cancel(
 
     submitted = gateway.submit(requests, submission_key="submission-local")
     assert submitted.status is OpenRouterBatchJobStatus.PENDING
-    reconciled = gateway.reconcile_submission("submission-local")
-    assert reconciled is not None
-    assert reconciled.remote_batch_id == submitted.remote_batch_id
+    payload = cast(dict[str, Any], server_state["payload"])
+    assert payload["endpoint"] == "/v1/embeddings"
+    assert payload["model"] == "openai/text-embedding-3-large"
+    batch_requests = cast(list[dict[str, Any]], payload["requests"])
+    body = cast(dict[str, Any], batch_requests[0]["body"])
+    assert body["model"] == "openai/text-embedding-3-large"
+    assert "metadata" not in payload
     completed = gateway.get(submitted.remote_batch_id)
     assert completed.status is OpenRouterBatchJobStatus.SUCCEEDED
     parsed = parse_openrouter_embedding_results(
@@ -150,3 +142,4 @@ def test_real_http_batch_submit_poll_reconcile_and_cancel(
     ]
     gateway.cancel(submitted.remote_batch_id)
     assert server_state["cancelled"] is True
+    assert server_state["post_count"] == 1
