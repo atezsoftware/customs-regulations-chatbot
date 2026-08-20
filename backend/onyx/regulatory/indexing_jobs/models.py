@@ -88,6 +88,7 @@ class RegulatoryInputHashVersion(StrEnum):
 
     LEGACY_V1 = "legacy-v1"
     CANONICAL_V2 = "canonical-v2"
+    CHUNK_ROWS_V3 = "chunk-rows-v3"
     LEGACY_OR_CANONICAL = "legacy-or-canonical"
 
 
@@ -104,6 +105,27 @@ class VertexBatchConfig(BaseModel):
     location: str = Field(min_length=1)
     authentication_mode: VertexAuthenticationMode
     gcs_uri: str = Field(pattern=r"^gs://[^/\s]+(?:/[^\s]*)?$")
+
+
+class OpenRouterBatchConfig(BaseModel):
+    """Non-secret provider contract captured with a durable embedding job."""
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    api_url: str = Field(pattern=r"^https?://[^\s]+/api/beta/batches/?$")
+    model_name: str = Field(min_length=1)
+    effective_dimension: int = Field(gt=0)
+    request_input_size: int = Field(default=64, gt=0)
+    max_requests: int = Field(default=1_000, gt=0)
+    # OpenRouter's documented provider ceiling is 50,000 total inputs. Keep a
+    # strict margin so config drift cannot submit at the hard boundary.
+    max_inputs: int = Field(default=45_000, gt=0, lt=50_000)
+    max_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
+    completion_horizon_seconds: int = Field(default=86_400, gt=0)
 
 
 class RegulatoryIndexingConfigSnapshot(BaseModel):
@@ -130,6 +152,7 @@ class RegulatoryIndexingConfigSnapshot(BaseModel):
     effective_dimension: int = Field(gt=0)
     index_name: str = Field(min_length=1)
     vertex: VertexBatchConfig
+    openrouter_batch: OpenRouterBatchConfig | None = None
     prompt_version: str = Field(min_length=1)
     prompt_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     max_attempts: int = Field(default=5, gt=0)
@@ -153,4 +176,15 @@ class RegulatoryIndexingConfigSnapshot(BaseModel):
             raise ValueError(
                 "retry_max_seconds must be greater than or equal to retry_base_seconds"
             )
+        if self.openrouter_batch is not None:
+            if self.openrouter_batch.model_name != self.embedding_model_name:
+                raise ValueError("OpenRouter Batch model must match embedding model")
+            if self.openrouter_batch.effective_dimension != self.effective_dimension:
+                raise ValueError(
+                    "OpenRouter Batch dimension must match effective dimension"
+                )
+            if self.openrouter_batch.request_input_size != self.embedding_request_size:
+                raise ValueError(
+                    "OpenRouter Batch request size must match embedding request size"
+                )
         return self

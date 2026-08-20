@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
+from onyx.configs import app_configs
 from onyx.connectors.models import Document
 from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
@@ -39,7 +40,10 @@ from onyx.regulatory.indexing_jobs.contextual import (
     build_contextual_requests,
     get_contextual_token_budget_tokenizer,
 )
-from onyx.regulatory.indexing_jobs.embedding import embed_pending_regulatory_items
+from onyx.regulatory.indexing_jobs.embedding import (
+    build_openrouter_embedding_batch,
+    embed_pending_regulatory_items,
+)
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayError,
     IndexingGatewayHTTPError,
@@ -48,8 +52,16 @@ from onyx.regulatory.indexing_jobs.models import (
     RegulatoryInputHashVersion,
     RetryReason,
 )
+from onyx.regulatory.indexing_jobs.openrouter_batch import (
+    HttpxOpenRouterBatchGateway,
+    OpenRouterBatchContractError,
+    OpenRouterBatchJobStatus,
+    openrouter_batch_submission_key,
+    parse_openrouter_embedding_results,
+)
 from onyx.regulatory.indexing_jobs.preparation import (
     prepare_claimed_regulatory_indexing_job,
+    prepare_claimed_regulatory_indexing_job_from_chunks,
 )
 from onyx.regulatory.indexing_jobs.publisher import (
     PublishOutcome,
@@ -166,6 +178,26 @@ def _build_vertex_gateway(
         config=snapshot.vertex,
         object_prefix=_vertex_object_prefix(tenant_id, runtime.job.id),
         credential_json_provider=credential_json_provider,
+    )
+
+
+def _build_openrouter_gateway(
+    runtime: indexing_job_repository.RegulatoryIndexingRuntime,
+) -> HttpxOpenRouterBatchGateway:
+    snapshot = _snapshot(runtime)
+    config = snapshot.openrouter_batch
+    if config is None:
+        raise ValueError("regulatory job has no OpenRouter Batch snapshot")
+    if runtime.search_settings is None:
+        raise ValueError("regulatory indexing SearchSettings disappeared")
+    search_settings = runtime.search_settings
+
+    def api_key_provider() -> str:
+        return search_settings.api_key or ""
+
+    return HttpxOpenRouterBatchGateway(
+        config=config,
+        api_key_provider=api_key_provider,
     )
 
 
@@ -595,6 +627,302 @@ def _context_apply(
     )
 
 
+def _openrouter_embedding_batch(
+    runtime: indexing_job_repository.RegulatoryIndexingRuntime,
+    *,
+    tenant_id: str,
+    db_session: Session,
+    now: datetime.datetime,
+) -> OrchestrationResult:
+    snapshot = _snapshot(runtime)
+    config = snapshot.openrouter_batch
+    if config is None:
+        raise ValueError("regulatory job has no OpenRouter Batch snapshot")
+    plan = build_openrouter_embedding_batch(
+        job=runtime.job,
+        rows=runtime.regulatory_chunks,
+        items=runtime.indexing_items,
+        config=config,
+        max_attempts=snapshot.max_attempts,
+    )
+    if not plan.requests:
+        return _advance(
+            runtime,
+            db_session,
+            next_stage=RegulatoryIndexingStage.INDEX_WRITE,
+            now=now,
+        )
+    submission_state = RegulatoryIndexingSubmissionState(
+        runtime.job.openrouter_submission_state
+    )
+    persisted_attempt = runtime.job.openrouter_submission_attempt_count
+    submission_attempt = (
+        persisted_attempt + 1
+        if submission_state is RegulatoryIndexingSubmissionState.NONE
+        else persisted_attempt
+    )
+    expected_key = openrouter_batch_submission_key(
+        plan.requests,
+        tenant_id=tenant_id,
+        job_id=runtime.job.id,
+        submission_attempt=submission_attempt,
+    )
+    persisted_key = runtime.job.openrouter_submission_key
+    if persisted_key is not None and persisted_key != expected_key:
+        raise ValueError(
+            "persisted OpenRouter submission key does not match pending items"
+        )
+    active_item_ids = tuple(
+        item_id
+        for request in plan.requests
+        for item_id in plan.item_ids_by_custom_id[request.custom_id]
+    )
+    if (
+        runtime.job.openrouter_active_item_ids
+        and runtime.job.openrouter_active_item_ids
+        != [str(item_id) for item_id in active_item_ids]
+    ):
+        raise ValueError("persisted OpenRouter active items do not match pending items")
+    gateway = _build_openrouter_gateway(runtime)
+
+    if submission_state is RegulatoryIndexingSubmissionState.SUBMITTED:
+        remote_batch_id = runtime.job.remote_openrouter_batch_id
+        if not remote_batch_id:
+            raise ValueError("submitted OpenRouter Batch has no remote id")
+        completion_deadline = runtime.job.openrouter_completion_deadline
+        if completion_deadline is None or now >= completion_deadline:
+            raise OpenRouterBatchContractError(
+                "OpenRouter embedding Batch exceeded its completion horizon"
+            )
+        state = gateway.get(remote_batch_id)
+        if state.status in {
+            OpenRouterBatchJobStatus.PENDING,
+            OpenRouterBatchJobStatus.RUNNING,
+            OpenRouterBatchJobStatus.CANCELLING,
+        }:
+            return _advance(
+                runtime,
+                db_session,
+                next_stage=RegulatoryIndexingStage.EMBEDDING,
+                now=now,
+                countdown_seconds=snapshot.poll_seconds,
+            )
+        if state.status is not OpenRouterBatchJobStatus.SUCCEEDED:
+            raise OpenRouterBatchContractError(
+                "OpenRouter embedding Batch terminated unsuccessfully"
+            )
+        parsed = parse_openrouter_embedding_results(
+            state.results or [],
+            expected_custom_ids={request.custom_id for request in plan.requests},
+            expected_model=config.model_name,
+            expected_dimension=config.effective_dimension,
+        )
+        item_vectors: list[tuple[UUID, list[float]]] = []
+        failed_item_ids: list[UUID] = []
+        for request in plan.requests:
+            item_ids = plan.item_ids_by_custom_id[request.custom_id]
+            result = parsed.get(request.custom_id)
+            if (
+                result is None
+                or result.error_code is not None
+                or result.vectors is None
+                or len(result.vectors) != len(item_ids)
+            ):
+                failed_item_ids.extend(item_ids)
+                continue
+            item_vectors.extend(zip(item_ids, result.vectors, strict=True))
+        persisted = indexing_job_repository.apply_openrouter_embedding_batch(
+            db_session,
+            job_id=runtime.job.id,
+            expected_generation=runtime.job.lease_generation,
+            remote_batch_id=remote_batch_id,
+            item_vectors=item_vectors,
+            failed_item_ids=failed_item_ids,
+            now=now,
+        )
+        if not persisted:
+            return _skipped(runtime.job.id)
+        return _advance(
+            runtime,
+            db_session,
+            next_stage=(
+                RegulatoryIndexingStage.EMBEDDING
+                if plan.remaining_item_count or failed_item_ids
+                else RegulatoryIndexingStage.INDEX_WRITE
+            ),
+            now=now,
+        )
+
+    if submission_state is RegulatoryIndexingSubmissionState.SUBMITTING:
+        persisted = (
+            indexing_job_repository.require_openrouter_submission_reconciliation(
+                db_session,
+                job_id=runtime.job.id,
+                expected_generation=runtime.job.lease_generation,
+                submission_key=expected_key,
+                reconcile_until=now
+                + datetime.timedelta(seconds=snapshot.submission_reconcile_seconds),
+                now=now,
+            )
+        )
+        return (
+            _advance(
+                runtime,
+                db_session,
+                next_stage=RegulatoryIndexingStage.EMBEDDING,
+                now=now,
+                countdown_seconds=snapshot.poll_seconds,
+            )
+            if persisted
+            else _skipped(runtime.job.id)
+        )
+
+    if submission_state is RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED:
+        reconcile_until = runtime.job.openrouter_reconcile_until
+        if reconcile_until is None or now >= reconcile_until:
+            raise OpenRouterBatchContractError(
+                "OpenRouter submission visibility remained indeterminate"
+            )
+        state = gateway.reconcile_submission(expected_key)
+        if state is None:
+            persisted = indexing_job_repository.record_openrouter_reconciliation_miss(
+                db_session,
+                job_id=runtime.job.id,
+                expected_generation=runtime.job.lease_generation,
+                now=now,
+            )
+            return (
+                _advance(
+                    runtime,
+                    db_session,
+                    next_stage=RegulatoryIndexingStage.EMBEDDING,
+                    now=now,
+                    countdown_seconds=snapshot.poll_seconds,
+                )
+                if persisted
+                else _skipped(runtime.job.id)
+            )
+        persisted = indexing_job_repository.record_openrouter_submission(
+            db_session,
+            job_id=runtime.job.id,
+            expected_generation=runtime.job.lease_generation,
+            submission_key=expected_key,
+            remote_batch_id=state.remote_batch_id,
+            completion_deadline=now
+            + datetime.timedelta(seconds=config.completion_horizon_seconds),
+            charge_items=not runtime.job.openrouter_submission_charged,
+            now=now,
+        )
+        return (
+            _advance(
+                runtime,
+                db_session,
+                next_stage=RegulatoryIndexingStage.EMBEDDING,
+                now=now,
+                countdown_seconds=snapshot.poll_seconds,
+            )
+            if persisted
+            else _skipped(runtime.job.id)
+        )
+
+    if submission_state is not RegulatoryIndexingSubmissionState.NONE:
+        raise ValueError("OpenRouter submission state is unsupported")
+    persisted = indexing_job_repository.record_openrouter_submission_intent(
+        db_session,
+        job_id=runtime.job.id,
+        expected_generation=runtime.job.lease_generation,
+        submission_key=expected_key,
+        submission_attempt=submission_attempt,
+        active_item_ids=active_item_ids,
+        now=now,
+    )
+    if not persisted:
+        return _skipped(runtime.job.id)
+    with indexing_job_repository.regulatory_indexing_external_mutation_lease(
+        db_session,
+        job_id=runtime.job.id,
+        expected_stage=RegulatoryIndexingStage.EMBEDDING,
+        expected_generation=runtime.job.lease_generation,
+    ) as submission_lease:
+        if submission_lease is None:
+            return _skipped(runtime.job.id)
+        try:
+            state = gateway.submit(plan.requests, submission_key=expected_key)
+        except IndexingGatewayIndeterminateSubmissionError as error:
+            if error.submission_key != expected_key:
+                raise ValueError(
+                    "OpenRouter returned an unexpected submission identity"
+                ) from error
+            reconciliation_persisted = (
+                indexing_job_repository.require_openrouter_submission_reconciliation(
+                    db_session,
+                    job_id=runtime.job.id,
+                    expected_generation=runtime.job.lease_generation,
+                    submission_key=expected_key,
+                    reconcile_until=now
+                    + datetime.timedelta(seconds=snapshot.submission_reconcile_seconds),
+                    now=now,
+                    commit=False,
+                )
+            )
+            if not reconciliation_persisted:
+                return _skipped(runtime.job.id)
+            submission_lease.commit()
+        except IndexingGatewayError:
+            definitely_not_sent = (
+                indexing_job_repository.record_openrouter_submission_not_sent(
+                    db_session,
+                    job_id=runtime.job.id,
+                    expected_generation=runtime.job.lease_generation,
+                    submission_key=expected_key,
+                    now=now,
+                    commit=False,
+                )
+            )
+            if definitely_not_sent:
+                submission_lease.commit()
+            raise
+        except Exception:
+            reconciliation_persisted = (
+                indexing_job_repository.require_openrouter_submission_reconciliation(
+                    db_session,
+                    job_id=runtime.job.id,
+                    expected_generation=runtime.job.lease_generation,
+                    submission_key=expected_key,
+                    reconcile_until=now
+                    + datetime.timedelta(seconds=snapshot.submission_reconcile_seconds),
+                    now=now,
+                    commit=False,
+                )
+            )
+            if not reconciliation_persisted:
+                return _skipped(runtime.job.id)
+            submission_lease.commit()
+        else:
+            recorded = indexing_job_repository.record_openrouter_submission(
+                db_session,
+                job_id=runtime.job.id,
+                expected_generation=runtime.job.lease_generation,
+                submission_key=expected_key,
+                remote_batch_id=state.remote_batch_id,
+                completion_deadline=now
+                + datetime.timedelta(seconds=config.completion_horizon_seconds),
+                charge_items=True,
+                now=now,
+                commit=False,
+            )
+            if not recorded:
+                return _skipped(runtime.job.id)
+            submission_lease.commit()
+    return _advance(
+        runtime,
+        db_session,
+        next_stage=RegulatoryIndexingStage.EMBEDDING,
+        now=now,
+        countdown_seconds=snapshot.poll_seconds,
+    )
+
+
 def _request_cancellation(
     runtime: indexing_job_repository.RegulatoryIndexingRuntime,
     *,
@@ -669,12 +997,22 @@ def _execute_cancellation_phase(
     phase = RegulatoryIndexingCancellationPhase(runtime.job.cancellation_phase)
     if phase is RegulatoryIndexingCancellationPhase.VERTEX_CANCEL:
         remote_job_name = runtime.job.remote_vertex_job_name
-        if not remote_job_name:
-            raise ValueError("Vertex cancellation phase has no remote job")
-        gateway = _build_vertex_gateway(
-            runtime, tenant_id=tenant_id, db_session=db_session
+        remote_openrouter_batch_id = getattr(
+            runtime.job, "remote_openrouter_batch_id", None
         )
-        gateway.cancel(remote_job_name)
+        if remote_openrouter_batch_id:
+            try:
+                _build_openrouter_gateway(runtime).cancel(remote_openrouter_batch_id)
+            except IndexingGatewayHTTPError as error:
+                if error.status_code != 404:
+                    raise
+        if remote_job_name:
+            gateway = _build_vertex_gateway(
+                runtime, tenant_id=tenant_id, db_session=db_session
+            )
+            gateway.cancel(remote_job_name)
+        if not remote_job_name and not remote_openrouter_batch_id:
+            raise ValueError("provider cancellation phase has no remote job")
         return _advance_cancellation(
             runtime,
             db_session,
@@ -772,25 +1110,43 @@ def _execute_claimed_step_impl(
                 else _skipped(runtime.job.id)
             )
     validate_snapshot_for_stage(db_session, snapshot, stage)
+    if (
+        snapshot.input_hash_version is RegulatoryInputHashVersion.CHUNK_ROWS_V3
+        and runtime.user_file.regulatory_chunk_generation_hash
+        != snapshot.chunk_generation_hash
+    ):
+        raise ValueError(
+            "CHUNKED user file generation identity is absent or mismatched"
+        )
 
     if stage is RegulatoryIndexingStage.PREPARING:
-        documents, staged_csv_ids = _load_claimed_markdown_documents(
-            runtime,
-            tenant_id,
-        )
-        try:
-            prepare_claimed_regulatory_indexing_job(
+        if snapshot.input_hash_version is RegulatoryInputHashVersion.CHUNK_ROWS_V3:
+            prepare_claimed_regulatory_indexing_job_from_chunks(
                 job_id=runtime.job.id,
                 expected_generation=runtime.job.lease_generation,
-                documents=documents,
                 tenant_id=tenant_id,
                 db_session=db_session,
             )
-        finally:
-            delete_files_best_effort(
-                staged_csv_ids,
-                context=f"durable regulatory preparation uf={runtime.user_file.id}",
+        else:
+            documents, staged_csv_ids = _load_claimed_markdown_documents(
+                runtime,
+                tenant_id,
             )
+            try:
+                prepare_claimed_regulatory_indexing_job(
+                    job_id=runtime.job.id,
+                    expected_generation=runtime.job.lease_generation,
+                    documents=documents,
+                    tenant_id=tenant_id,
+                    db_session=db_session,
+                )
+            finally:
+                delete_files_best_effort(
+                    staged_csv_ids,
+                    context=(
+                        f"durable regulatory preparation uf={runtime.user_file.id}"
+                    ),
+                )
         return _next_step(runtime.job.id, runtime.job.lease_generation)
     if stage is RegulatoryIndexingStage.CONTEXT_SUBMIT:
         return _context_submit(
@@ -816,6 +1172,17 @@ def _execute_claimed_step_impl(
     if stage is RegulatoryIndexingStage.EMBEDDING:
         if runtime.search_settings is None:
             raise ValueError("regulatory indexing SearchSettings disappeared")
+        if snapshot.openrouter_batch is not None:
+            return _openrouter_embedding_batch(
+                runtime,
+                tenant_id=tenant_id,
+                db_session=db_session,
+                now=now,
+            )
+        if not app_configs.REGULATORY_INDEXING_ALLOW_ONLINE_EMBEDDING_FALLBACK:
+            raise ValueError(
+                "online regulatory embedding fallback is disabled for this job"
+            )
         summary = embed_pending_regulatory_items(
             job=runtime.job,
             rows=runtime.regulatory_chunks,
@@ -1110,6 +1477,17 @@ def _run_claimed_regulatory_provider_cleanup(
                 )
                 return _complete(job.id) if recorded else _skipped(job.id)
         elif phase is RegulatoryIndexingProviderCleanupPhase.VERTEX_CANCEL:
+            remote_openrouter_batch_id = getattr(
+                job, "remote_openrouter_batch_id", None
+            )
+            if remote_openrouter_batch_id:
+                try:
+                    _build_openrouter_gateway(runtime).cancel(
+                        remote_openrouter_batch_id
+                    )
+                except IndexingGatewayHTTPError as error:
+                    if error.status_code != 404:
+                        raise
             if job.remote_vertex_job_name:
                 _build_vertex_gateway(
                     runtime, tenant_id=tenant_id, db_session=db_session

@@ -33,6 +33,7 @@ from onyx.regulatory.indexing import (
     REGULATORY_MAX_CHUNK_CHARS,
 )
 from onyx.regulatory.indexing_jobs.models import (
+    OpenRouterBatchConfig,
     RegulatoryIndexingConfigSnapshot,
     RegulatoryInputHashVersion,
     VertexAuthenticationMode,
@@ -70,8 +71,9 @@ class RegulatoryIndexingConfigurationError(ValueError):
 
 def compute_regulatory_chunk_generation_hash(
     *,
-    embedding_provider: EmbeddingProvider,
+    embedding_provider: EmbeddingProvider | None,
     embedding_model_name: str,
+    enable_contextual_rag: bool = True,
 ) -> str:
     """Identify every deterministic input that affects canonical chunk output."""
 
@@ -81,9 +83,11 @@ def compute_regulatory_chunk_generation_hash(
         "indexing_generation_code_version": (
             REGULATORY_INDEXING_GENERATION_CODE_VERSION
         ),
-        "embedding_provider": embedding_provider.value,
+        "embedding_provider": (
+            embedding_provider.value if embedding_provider is not None else "local"
+        ),
         "embedding_model_name": embedding_model_name,
-        "enable_contextual_rag": True,
+        "enable_contextual_rag": enable_contextual_rag,
         "regulatory_max_chunk_chars": REGULATORY_MAX_CHUNK_CHARS,
         "regulatory_contextual_initial_max_chunk_chars": (
             REGULATORY_CONTEXTUAL_INITIAL_MAX_CHUNK_CHARS
@@ -232,6 +236,30 @@ def _get_contextual_model_configuration(
     return model_configuration
 
 
+def _resolve_openrouter_batch_config(
+    search_settings: SearchSettings,
+) -> OpenRouterBatchConfig:
+    try:
+        return OpenRouterBatchConfig(
+            api_url=app_configs.REGULATORY_INDEXING_OPENROUTER_BATCH_URL,
+            model_name=search_settings.model_name,
+            effective_dimension=search_settings.final_embedding_dim,
+            request_input_size=(app_configs.REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE),
+            max_requests=(
+                app_configs.REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_REQUESTS
+            ),
+            max_inputs=app_configs.REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_INPUTS,
+            max_bytes=app_configs.REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_BYTES,
+            completion_horizon_seconds=(
+                app_configs.REGULATORY_INDEXING_OPENROUTER_BATCH_HORIZON_SECONDS
+            ),
+        )
+    except ValueError as error:
+        raise RegulatoryIndexingConfigurationError(
+            "The OpenRouter embedding Batch configuration is invalid"
+        ) from error
+
+
 def resolve_regulatory_indexing_snapshot(
     db_session: Session,
     *,
@@ -252,6 +280,7 @@ def resolve_regulatory_indexing_snapshot(
         chunk_generation_hash=compute_regulatory_chunk_generation_hash(
             embedding_provider=EmbeddingProvider.OPENROUTER,
             embedding_model_name=search_settings.model_name,
+            enable_contextual_rag=True,
         ),
         search_settings_id=search_settings.id,
         embedding_provider=EmbeddingProvider.OPENROUTER,
@@ -261,6 +290,7 @@ def resolve_regulatory_indexing_snapshot(
         effective_dimension=search_settings.final_embedding_dim,
         index_name=search_settings.index_name,
         vertex=vertex,
+        openrouter_batch=_resolve_openrouter_batch_config(search_settings),
         prompt_version=_CONTEXTUAL_PROMPT_VERSION,
         prompt_hash=_CONTEXTUAL_PROMPT_HASH,
         max_attempts=app_configs.REGULATORY_INDEXING_MAX_ATTEMPTS,
@@ -320,6 +350,7 @@ def validate_snapshot_for_stage(
     current_generation_hash = compute_regulatory_chunk_generation_hash(
         embedding_provider=snapshot.embedding_provider,
         embedding_model_name=snapshot.embedding_model_name,
+        enable_contextual_rag=True,
     )
     unresolved_preparing_snapshot = (
         stage is RegulatoryIndexingStage.PREPARING
@@ -358,3 +389,12 @@ def validate_snapshot_for_stage(
         RegulatoryIndexingStage.EMBEDDING,
     }:
         _validate_openrouter_credentials(db_session)
+    if stage is RegulatoryIndexingStage.EMBEDDING:
+        current_openrouter_batch = _resolve_openrouter_batch_config(search_settings)
+        if (
+            snapshot.openrouter_batch is not None
+            and snapshot.openrouter_batch != current_openrouter_batch
+        ):
+            raise RegulatoryIndexingConfigurationError(
+                "OpenRouter Batch configuration no longer matches the job snapshot"
+            )

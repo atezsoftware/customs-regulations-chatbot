@@ -1519,6 +1519,15 @@ configMap:
   MIN_THREADS_ML_MODELS: ""
   # Indexing Configs
   NUM_INDEXING_WORKERS: ""
+  # OpenRouter asynchronous regulatory embedding Batch contract. Keep
+  # MAX_INPUTS below the provider's 50,000-input hard ceiling.
+  REGULATORY_INDEXING_OPENROUTER_BATCH_URL: "https://openrouter.ai/api/beta/batches"
+  REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_REQUESTS: "1000"
+  REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_INPUTS: "45000"
+  REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_BYTES: "33554432"
+  REGULATORY_INDEXING_OPENROUTER_BATCH_HORIZON_SECONDS: "86400"
+  # Explicit local/test escape hatch; keep false in production.
+  REGULATORY_INDEXING_ALLOW_ONLINE_EMBEDDING_FALLBACK: "false"
   # Fail an indexing attempt when its worker exceeds this RSS (MB) instead of
   # letting the pod get OOM-killed; "" = disabled
   INDEXING_WORKER_MEMORY_LIMIT_MB: ""
@@ -1575,6 +1584,9 @@ configMap:
   HARD_DELETE_CHATS: ""
   MAX_ALLOWED_UPLOAD_SIZE_MB: ""
   DEFAULT_USER_FILE_MAX_UPLOAD_SIZE_MB: ""
+  # Persist canonical regulatory chunks on upload and require an explicit
+  # document-set indexing action.
+  DEFER_USER_FILE_INDEXING: "false"
   # Sandbox config — always "kubernetes" for Helm deployments
   SANDBOX_BACKEND: "kubernetes"
   SANDBOX_NAMESPACE: "onyx-sandboxes"

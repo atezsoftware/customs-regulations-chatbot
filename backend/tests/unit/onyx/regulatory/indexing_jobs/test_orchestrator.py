@@ -1026,6 +1026,10 @@ def test_embedding_stage_processes_one_provider_batch_per_delivery() -> None:
     with (
         patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
         patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.app_configs.REGULATORY_INDEXING_ALLOW_ONLINE_EMBEDDING_FALLBACK",
+            True,
+        ),
+        patch(
             "onyx.regulatory.indexing_jobs.orchestrator.embed_pending_regulatory_items",
             return_value=EmbeddingSummary(
                 total_count=5,

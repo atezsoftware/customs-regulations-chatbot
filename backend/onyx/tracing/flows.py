@@ -40,6 +40,7 @@ class LLMFlow(StrEnum):
     CONTEXTUAL_RAG_DOC_SUMMARY = "contextual_rag_doc_summary"
     CONTEXTUAL_RAG_CHUNK_CONTEXT = "contextual_rag_chunk_context"
     REGULATORY_CONTEXTUAL_BATCH = "regulatory_contextual_batch"
+    REGULATORY_EMBEDDING_BATCH = "regulatory_embedding_batch"
     IMAGE_SUMMARIZATION = "image_summarization"
 
     # Knowledge graph

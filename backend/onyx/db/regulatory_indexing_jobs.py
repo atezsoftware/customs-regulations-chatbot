@@ -292,6 +292,7 @@ def create_or_get_regulatory_indexing_job(
     if config_snapshot.get("input_hash_version") not in {
         "legacy-v1",
         "canonical-v2",
+        "chunk-rows-v3",
     }:
         raise ValueError("config snapshot input hash version is unsupported")
     if config_snapshot.get("chunk_generation_hash") != chunk_generation_hash:
@@ -342,6 +343,7 @@ def create_or_get_regulatory_indexing_job(
             active_job.cancellation_phase = (
                 RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
                 if active_job.remote_vertex_job_name
+                or active_job.remote_openrouter_batch_id
                 else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
             )
             active_job.lease_generation += 1
@@ -458,7 +460,7 @@ def supersede_regulatory_indexing_job_for_generation_drift(
     job.cancellation_intent = RegulatoryIndexingCancellationIntent.SUPERSEDE.value
     job.cancellation_phase = (
         RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
-        if job.remote_vertex_job_name
+        if job.remote_vertex_job_name or job.remote_openrouter_batch_id
         else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
     )
     job.lease_generation += 1
@@ -634,7 +636,7 @@ def request_user_file_deletion_cleanup(
             )
             job.cancellation_phase = (
                 RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
-                if job.remote_vertex_job_name
+                if job.remote_vertex_job_name or job.remote_openrouter_batch_id
                 else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
             )
             job.lease_generation += 1
@@ -1096,7 +1098,10 @@ def advance_regulatory_indexing_job(
     if next_status is RegulatoryIndexingJobStatus.CANCELLING:
         values["cancellation_phase"] = case(
             (
-                RegulatoryIndexingJob.remote_vertex_job_name.is_not(None),
+                or_(
+                    RegulatoryIndexingJob.remote_vertex_job_name.is_not(None),
+                    RegulatoryIndexingJob.remote_openrouter_batch_id.is_not(None),
+                ),
                 RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value,
             ),
             else_=RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value,
@@ -1333,7 +1338,11 @@ def persist_regulatory_indexing_preparation(
 ) -> bool:
     """Atomically replace chunks, create items, and finish PREPARING."""
 
-    if resolved_input_hash_version not in {"legacy-v1", "canonical-v2"}:
+    if resolved_input_hash_version not in {
+        "legacy-v1",
+        "canonical-v2",
+        "chunk-rows-v3",
+    }:
         raise ValueError("resolved input hash version is unsupported")
 
     locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
@@ -1341,6 +1350,7 @@ def persist_regulatory_indexing_preparation(
         UserFileStatus.PROCESSING,
         UserFileStatus.INDEXING,
         UserFileStatus.FAILED,
+        UserFileStatus.CHUNKED,
     }:
         db_session.rollback()
         return False
@@ -1591,6 +1601,283 @@ def persist_regulatory_indexing_item_vectors(
     return True
 
 
+def _lock_openrouter_embedding_job(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+) -> RegulatoryIndexingJob | None:
+    return db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.EMBEDDING.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+
+
+def record_openrouter_submission_intent(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    submission_attempt: int,
+    active_item_ids: Sequence[UUID],
+    now: datetime.datetime,
+) -> bool:
+    if submission_attempt < 1 or not active_item_ids:
+        raise ValueError("OpenRouter submission intent is incomplete")
+    if len(set(active_item_ids)) != len(active_item_ids):
+        raise ValueError("OpenRouter submission contains duplicate item ids")
+    job = _lock_openrouter_embedding_job(
+        db_session, job_id=job_id, expected_generation=expected_generation
+    )
+    if job is None or job.openrouter_submission_state != "NONE":
+        db_session.rollback()
+        return False
+    eligible_ids = set(
+        db_session.scalars(
+            select(RegulatoryIndexingItem.id).where(
+                RegulatoryIndexingItem.job_id == job_id,
+                RegulatoryIndexingItem.id.in_(active_item_ids),
+                RegulatoryIndexingItem.status.in_(
+                    (
+                        RegulatoryIndexingItemStatus.CONTEXT_READY.value,
+                        RegulatoryIndexingItemStatus.SKIPPED.value,
+                        RegulatoryIndexingItemStatus.EMBEDDED.value,
+                    )
+                ),
+            )
+        ).all()
+    )
+    if eligible_ids != set(active_item_ids):
+        db_session.rollback()
+        return False
+    job.openrouter_submission_key = submission_key
+    job.openrouter_submission_state = "SUBMITTING"
+    job.openrouter_submission_attempt_count = submission_attempt
+    job.openrouter_submission_charged = False
+    job.openrouter_reconcile_miss_count = 0
+    job.openrouter_reconcile_until = None
+    job.openrouter_completion_deadline = None
+    job.remote_openrouter_batch_id = None
+    job.openrouter_active_item_ids = [str(item_id) for item_id in active_item_ids]
+    job.heartbeat_at = now
+    job.updated_at = now
+    db_session.commit()
+    return True
+
+
+def require_openrouter_submission_reconciliation(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    reconcile_until: datetime.datetime,
+    now: datetime.datetime,
+    commit: bool = True,
+) -> bool:
+    job = _lock_openrouter_embedding_job(
+        db_session, job_id=job_id, expected_generation=expected_generation
+    )
+    if (
+        job is None
+        or job.openrouter_submission_key != submission_key
+        or job.openrouter_submission_state not in {"SUBMITTING", "RECONCILE_REQUIRED"}
+    ):
+        db_session.rollback()
+        return False
+    job.openrouter_submission_state = "RECONCILE_REQUIRED"
+    job.openrouter_reconcile_until = reconcile_until
+    job.heartbeat_at = now
+    job.updated_at = now
+    if commit:
+        db_session.commit()
+    return True
+
+
+def record_openrouter_submission_not_sent(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    now: datetime.datetime,
+    commit: bool = True,
+) -> bool:
+    job = _lock_openrouter_embedding_job(
+        db_session, job_id=job_id, expected_generation=expected_generation
+    )
+    if (
+        job is None
+        or job.openrouter_submission_key != submission_key
+        or job.openrouter_submission_state != "SUBMITTING"
+    ):
+        db_session.rollback()
+        return False
+    job.openrouter_submission_key = None
+    job.openrouter_submission_state = "NONE"
+    job.openrouter_submission_charged = False
+    job.openrouter_reconcile_until = None
+    job.openrouter_completion_deadline = None
+    job.remote_openrouter_batch_id = None
+    job.openrouter_active_item_ids = []
+    job.heartbeat_at = now
+    job.updated_at = now
+    if commit:
+        db_session.commit()
+    return True
+
+
+def record_openrouter_submission(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    remote_batch_id: str,
+    completion_deadline: datetime.datetime,
+    charge_items: bool,
+    now: datetime.datetime,
+    commit: bool = True,
+) -> bool:
+    job = _lock_openrouter_embedding_job(
+        db_session, job_id=job_id, expected_generation=expected_generation
+    )
+    if (
+        job is None
+        or job.openrouter_submission_key != submission_key
+        or job.openrouter_submission_state not in {"SUBMITTING", "RECONCILE_REQUIRED"}
+        or not job.openrouter_active_item_ids
+    ):
+        db_session.rollback()
+        return False
+    if charge_items and not job.openrouter_submission_charged:
+        active_ids = [UUID(item_id) for item_id in job.openrouter_active_item_ids]
+        result = db_session.execute(
+            update(RegulatoryIndexingItem)
+            .where(
+                RegulatoryIndexingItem.job_id == job_id,
+                RegulatoryIndexingItem.id.in_(active_ids),
+            )
+            .values(
+                embedding_attempt_count=(
+                    RegulatoryIndexingItem.embedding_attempt_count + 1
+                ),
+                updated_at=func.now(),
+            )
+        )
+        if result.rowcount != len(active_ids):  # ty: ignore[unresolved-attribute]
+            db_session.rollback()
+            return False
+        job.openrouter_submission_charged = True
+    job.openrouter_submission_state = "SUBMITTED"
+    job.remote_openrouter_batch_id = remote_batch_id
+    job.openrouter_completion_deadline = completion_deadline
+    job.openrouter_reconcile_until = None
+    job.heartbeat_at = now
+    job.updated_at = now
+    if commit:
+        db_session.commit()
+    return True
+
+
+def record_openrouter_reconciliation_miss(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    now: datetime.datetime,
+) -> bool:
+    job = _lock_openrouter_embedding_job(
+        db_session, job_id=job_id, expected_generation=expected_generation
+    )
+    if job is None or job.openrouter_submission_state != "RECONCILE_REQUIRED":
+        db_session.rollback()
+        return False
+    job.openrouter_reconcile_miss_count += 1
+    job.heartbeat_at = now
+    job.updated_at = now
+    db_session.commit()
+    return True
+
+
+def apply_openrouter_embedding_batch(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    remote_batch_id: str,
+    item_vectors: Sequence[tuple[UUID, list[float]]],
+    failed_item_ids: Sequence[UUID],
+    now: datetime.datetime,
+) -> bool:
+    """Atomically apply one complete provider batch and clear its remote state."""
+
+    successful_ids = [item_id for item_id, _vector in item_vectors]
+    covered_ids = [*successful_ids, *failed_item_ids]
+    if len(set(covered_ids)) != len(covered_ids):
+        raise ValueError("OpenRouter Batch results contain duplicate item ids")
+    job = _lock_openrouter_embedding_job(
+        db_session, job_id=job_id, expected_generation=expected_generation
+    )
+    if (
+        job is None
+        or job.openrouter_submission_state != "SUBMITTED"
+        or job.remote_openrouter_batch_id != remote_batch_id
+        or set(job.openrouter_active_item_ids)
+        != {str(item_id) for item_id in covered_ids}
+    ):
+        db_session.rollback()
+        return False
+    for item_id, vector in item_vectors:
+        if not vector or any(not math.isfinite(value) for value in vector):
+            db_session.rollback()
+            raise ValueError("OpenRouter Batch returned an invalid vector")
+        persisted_id = db_session.scalar(
+            update(RegulatoryIndexingItem)
+            .where(
+                RegulatoryIndexingItem.id == item_id,
+                RegulatoryIndexingItem.job_id == job_id,
+                RegulatoryIndexingItem.status.in_(
+                    (
+                        RegulatoryIndexingItemStatus.CONTEXT_READY.value,
+                        RegulatoryIndexingItemStatus.SKIPPED.value,
+                        RegulatoryIndexingItemStatus.EMBEDDED.value,
+                    )
+                ),
+            )
+            .values(
+                status=RegulatoryIndexingItemStatus.EMBEDDED.value,
+                vector=vector,
+                error_code=None,
+                error_message=None,
+                updated_at=func.now(),
+            )
+            .returning(RegulatoryIndexingItem.id)
+        )
+        if persisted_id is None:
+            db_session.rollback()
+            return False
+    job.openrouter_submission_key = None
+    job.openrouter_submission_state = "NONE"
+    job.openrouter_submission_charged = False
+    job.openrouter_reconcile_miss_count = 0
+    job.openrouter_reconcile_until = None
+    job.openrouter_completion_deadline = None
+    job.remote_openrouter_batch_id = None
+    job.openrouter_active_item_ids = []
+    job.heartbeat_at = now
+    job.updated_at = now
+    db_session.commit()
+    return True
+
+
 @contextmanager
 def regulatory_indexing_external_mutation_lease(
     db_session: Session,
@@ -1743,7 +2030,7 @@ def _schedule_provider_cleanup(
     now: datetime.datetime,
     cancel_first: bool,
 ) -> None:
-    if cancel_first and job.remote_vertex_job_name:
+    if cancel_first and (job.remote_vertex_job_name or job.remote_openrouter_batch_id):
         phase = RegulatoryIndexingProviderCleanupPhase.VERTEX_CANCEL
     elif job.remote_vertex_job_name:
         phase = RegulatoryIndexingProviderCleanupPhase.VERTEX_DELETE
@@ -2020,7 +2307,7 @@ def request_regulatory_indexing_cancellation(
     job.cancellation_intent = cancellation_intent.value
     job.cancellation_phase = (
         RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
-        if job.remote_vertex_job_name
+        if job.remote_vertex_job_name or job.remote_openrouter_batch_id
         else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
     )
     job.attempt_count = 0
@@ -2064,7 +2351,7 @@ def request_regulatory_indexing_terminal_failure_cleanup(
     )
     job.cancellation_phase = (
         RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
-        if job.remote_vertex_job_name
+        if job.remote_vertex_job_name or job.remote_openrouter_batch_id
         else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
     )
     job.attempt_count = 0

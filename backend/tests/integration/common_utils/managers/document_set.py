@@ -189,6 +189,50 @@ class DocumentSetManager:
             time.sleep(2)
 
     @staticmethod
+    def wait_for_files_chunked(
+        document_set_id: int,
+        expected_count: int,
+        user_performing_action: DATestUser,
+        timeout: float = MAX_DELAY,
+    ) -> list[UserFileSnapshot]:
+        """Poll until the production chunk phase has settled every file."""
+
+        start = time.monotonic()
+        while True:
+            files = DocumentSetManager.get_files(
+                document_set_id, user_performing_action
+            )
+            if len(files) >= expected_count and all(
+                file.status is UserFileStatus.CHUNKED for file in files
+            ):
+                return files
+            failed = [file for file in files if file.status is UserFileStatus.FAILED]
+            if failed:
+                raise RuntimeError(
+                    f"Document set {document_set_id} failed during chunking: "
+                    f"{[file.name for file in failed]}"
+                )
+            if time.monotonic() - start > timeout:
+                raise TimeoutError(
+                    f"Document set {document_set_id} files did not reach CHUNKED "
+                    f"within {timeout}s"
+                )
+            time.sleep(2)
+
+    @staticmethod
+    def index_chunked_files(
+        document_set_id: int,
+        user_performing_action: DATestUser,
+    ) -> int:
+        response = client.post(
+            f"{API_SERVER_URL}/manage/admin/document-set/"
+            f"{document_set_id}/index-chunked",
+            headers=user_performing_action.headers,
+        )
+        response.raise_for_status()
+        return int(response.json()["queued"])
+
+    @staticmethod
     def wait_for_sync(
         user_performing_action: DATestUser,
         document_sets_to_check: list[DATestDocumentSet] | None = None,

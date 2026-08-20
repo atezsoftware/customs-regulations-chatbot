@@ -1,7 +1,6 @@
 import datetime
 import threading
 import time
-from pathlib import PurePosixPath
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -99,8 +98,11 @@ from onyx.indexing.indexing_pipeline import (
 from onyx.redis.redis_pool import get_redis_client
 from onyx.redis.tenant_redis_client import TenantRedisClient
 from onyx.regulatory.indexing import RegulatoryIndexingChunker
+from onyx.regulatory.indexing_jobs.configuration import (
+    compute_regulatory_chunk_generation_hash,
+)
 from onyx.regulatory.indexing_jobs.preparation import (
-    prepare_regulatory_indexing_job,
+    prepare_regulatory_indexing_job_from_chunks,
 )
 from onyx.regulatory.projection import (
     _project_rows_to_search_settings,
@@ -518,12 +520,13 @@ def _chunk_user_file_without_indexing(
         embedding_model = DefaultIndexingEmbedder.from_db_search_settings(
             search_settings=current_search_settings,
         )
+        contextual_rag_enabled = effective_contextual_rag_enabled(
+            current_search_settings
+        )
         chunker = RegulatoryIndexingChunker(
             db_session=db_session,
             tokenizer=embedding_model.embedding_model.tokenizer,
-            enable_contextual_rag=effective_contextual_rag_enabled(
-                current_search_settings
-            ),
+            enable_contextual_rag=contextual_rag_enabled,
         )
         # The same Document -> IndexingDocument conversion the pipeline performs,
         # so the chunker sees exactly the sections it would see when indexing.
@@ -541,6 +544,13 @@ def _chunk_user_file_without_indexing(
         if user_file.status != UserFileStatus.DELETING:
             user_file.status = UserFileStatus.CHUNKED
         user_file.chunk_count = len(rows)
+        user_file.regulatory_chunk_generation_hash = (
+            compute_regulatory_chunk_generation_hash(
+                embedding_provider=current_search_settings.provider_type,
+                embedding_model_name=current_search_settings.model_name,
+                enable_contextual_rag=contextual_rag_enabled,
+            )
+        )
         db_session.add(user_file)
         # The session does not commit on exit, and the chunk rows were written
         # into this same transaction.
@@ -575,13 +585,28 @@ def index_user_file_impl(*, user_file_id: str, tenant_id: str) -> None:
                 )
                 return
 
-            chunk_count = project_user_file_to_index(
-                db_session, user_file, tenant_id, include_chunked=True
+            if app_configs.REGULATORY_BATCH_INDEXING_ENABLED:
+                job_id = prepare_regulatory_indexing_job_from_chunks(
+                    user_file.id,
+                    tenant_id,
+                    db_session,
+                )
+                chunk_count = user_file.chunk_count or 0
+            else:
+                job_id = None
+                chunk_count = project_user_file_to_index(
+                    db_session, user_file, tenant_id, include_chunked=True
+                )
+                if user_file.status != UserFileStatus.DELETING:
+                    user_file.status = UserFileStatus.COMPLETED
+                db_session.add(user_file)
+                db_session.commit()
+        if job_id is not None:
+            _enqueue_durable_regulatory_indexing(
+                job_id=job_id,
+                tenant_id=tenant_id,
+                user_file_id=user_file_id,
             )
-            if user_file.status != UserFileStatus.DELETING:
-                user_file.status = UserFileStatus.COMPLETED
-            db_session.add(user_file)
-            db_session.commit()
     except Exception:
         task_logger.exception(
             f"index_user_file_impl - Failed to index user file {user_file_id}"
@@ -701,13 +726,13 @@ def _process_user_file_with_indexing(
     _dual_write_new_file_to_secondary(user_file_id, tenant_id)
 
 
-def _process_user_file_with_durable_regulatory_indexing(
+def _enqueue_durable_regulatory_indexing(
     *,
-    user_file_id: str,
-    documents: list[Document],
+    job_id: UUID,
     tenant_id: str,
+    user_file_id: str,
 ) -> None:
-    """Persist durable Markdown preparation and emit a short-lived delivery hint."""
+    """Emit a broker hint for a DB-backed durable regulatory job."""
 
     from onyx.background.celery.apps.client import celery_app
     from onyx.background.celery.tasks.regulatory_indexing.tasks import (
@@ -715,14 +740,7 @@ def _process_user_file_with_durable_regulatory_indexing(
     )
     from onyx.regulatory.indexing_jobs.orchestrator import OrchestrationDeliveryKind
 
-    user_file_uuid = _as_uuid(user_file_id)
     with get_session_with_current_tenant() as db_session:
-        job_id = prepare_regulatory_indexing_job(
-            user_file_uuid,
-            documents,
-            tenant_id,
-            db_session,
-        )
         job = get_regulatory_indexing_job(db_session, job_id)
         if job is None:
             raise RuntimeError("prepared regulatory indexing job disappeared")
@@ -1007,10 +1025,6 @@ def process_user_file_impl(
 
             file_id = uf.file_id
             file_name = uf.name
-            if app_configs.REGULATORY_BATCH_INDEXING_ENABLED and PurePosixPath(
-                file_name or ""
-            ).suffix.lower() not in {".md", ".mdx"}:
-                raise ValueError("durable regulatory indexing accepts Markdown only")
         # DB connection returned to pool here; file I/O and indexing run without it.
 
         try:
@@ -1018,13 +1032,7 @@ def process_user_file_impl(
                 user_file_id, file_id, file_name, tenant_id
             )
             try:
-                if app_configs.REGULATORY_BATCH_INDEXING_ENABLED:
-                    _process_user_file_with_durable_regulatory_indexing(
-                        user_file_id=user_file_id,
-                        documents=documents,
-                        tenant_id=tenant_id,
-                    )
-                elif DISABLE_VECTOR_DB:
+                if DISABLE_VECTOR_DB:
                     _process_user_file_without_vector_db(
                         user_file_id=user_file_id,
                         documents=documents,

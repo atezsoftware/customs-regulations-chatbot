@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
+from hashlib import sha256
 from typing import cast
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
@@ -17,7 +20,14 @@ from onyx.db.models import (
 )
 from onyx.indexing.embedder import DefaultIndexingEmbedder
 from onyx.regulatory.indexing_jobs.contextual import contextualized_embedding_text
-from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
+from onyx.regulatory.indexing_jobs.models import (
+    OpenRouterBatchConfig,
+    RegulatoryIndexingConfigSnapshot,
+)
+from onyx.regulatory.indexing_jobs.openrouter_batch import (
+    OpenRouterEmbeddingBatchRequest,
+    openrouter_embedding_payload_size,
+)
 from shared_configs.enums import EmbedTextType
 
 
@@ -28,6 +38,19 @@ class EmbeddingSummary(BaseModel):
     embedded_count: int = Field(ge=0)
     reused_count: int = Field(ge=0)
     remaining_count: int = Field(default=0, ge=0)
+
+
+@dataclass(frozen=True)
+class OpenRouterEmbeddingBatchPlan:
+    requests: tuple[OpenRouterEmbeddingBatchRequest, ...]
+    item_ids_by_custom_id: dict[str, tuple[UUID, ...]]
+    selected_item_count: int
+    remaining_item_count: int
+
+
+def _embedding_batch_custom_id(job_id: UUID, item_ids: Sequence[UUID]) -> str:
+    identity = f"{job_id}:" + ",".join(str(item_id) for item_id in item_ids)
+    return f"regulatory-embed-{sha256(identity.encode()).hexdigest()}"
 
 
 def _is_valid_vector(vector: object, expected_dimension: int) -> bool:
@@ -138,6 +161,112 @@ def _validate_response_vectors(
         numeric_vector = cast(list[int | float], vector)
         validated.append([float(value) for value in numeric_vector])
     return validated
+
+
+def build_openrouter_embedding_batch(
+    *,
+    job: RegulatoryIndexingJob,
+    rows: Sequence[RegulatoryChunk],
+    items: Sequence[RegulatoryIndexingItem],
+    config: OpenRouterBatchConfig,
+    max_attempts: int,
+) -> OpenRouterEmbeddingBatchPlan:
+    """Build one bounded remote batch from canonical context+chunk inputs."""
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
+    ordered = _ordered_mapping(job, rows, items)
+    pending = [
+        (row, item)
+        for row, item in ordered
+        if not (
+            item.status == RegulatoryIndexingItemStatus.EMBEDDED.value
+            and _is_valid_vector(item.vector, config.effective_dimension)
+        )
+    ]
+    invalid_statuses = [
+        item.status
+        for _row, item in pending
+        if item.status
+        not in {
+            RegulatoryIndexingItemStatus.CONTEXT_READY.value,
+            RegulatoryIndexingItemStatus.SKIPPED.value,
+            RegulatoryIndexingItemStatus.EMBEDDED.value,
+        }
+    ]
+    if invalid_statuses:
+        raise ValueError("regulatory indexing item is not ready for embedding")
+    exhausted = [
+        item.id
+        for _row, item in pending
+        if getattr(item, "embedding_attempt_count", 0) >= max_attempts
+    ]
+    if exhausted:
+        raise ValueError("OpenRouter embedding attempts are exhausted")
+
+    request_rows: list[OpenRouterEmbeddingBatchRequest] = []
+    item_ids_by_custom_id: dict[str, tuple[UUID, ...]] = {}
+    selected_count = 0
+    offset = 0
+    placeholder_key = f"regulatory-embedding-{'0' * 64}"
+    empty_payload_size = openrouter_embedding_payload_size(
+        (),
+        config=config,
+        submission_key=placeholder_key,
+    )
+    selected_payload_size = empty_payload_size
+    while (
+        offset < len(pending)
+        and len(request_rows) < config.max_requests
+        and selected_count < config.max_inputs
+    ):
+        group_size = min(
+            config.request_input_size,
+            config.max_inputs - selected_count,
+            len(pending) - offset,
+        )
+        accepted_request: OpenRouterEmbeddingBatchRequest | None = None
+        accepted_item_ids: tuple[UUID, ...] = ()
+        accepted_payload_increment = 0
+        while group_size > 0:
+            group = pending[offset : offset + group_size]
+            item_ids = tuple(item.id for _row, item in group)
+            candidate = OpenRouterEmbeddingBatchRequest(
+                custom_id=_embedding_batch_custom_id(job.id, item_ids),
+                inputs=[_text_for_embedding(row, item) for row, item in group],
+            )
+            candidate_payload_size = openrouter_embedding_payload_size(
+                (candidate,),
+                config=config,
+                submission_key=placeholder_key,
+            )
+            candidate_increment = candidate_payload_size - empty_payload_size
+            if request_rows:
+                candidate_increment += 1  # comma between request objects
+            if selected_payload_size + candidate_increment <= config.max_bytes:
+                accepted_request = candidate
+                accepted_item_ids = item_ids
+                accepted_payload_increment = candidate_increment
+                break
+            group_size -= 1
+        if accepted_request is None:
+            if not request_rows:
+                raise ValueError("one embedding input exceeds the Batch byte limit")
+            break
+        request_rows.append(accepted_request)
+        item_ids_by_custom_id[accepted_request.custom_id] = accepted_item_ids
+        selected_payload_size += accepted_payload_increment
+        selected_count += len(accepted_item_ids)
+        offset += len(accepted_item_ids)
+
+    if pending and not request_rows:
+        raise ValueError("OpenRouter embedding Batch limits select no inputs")
+    return OpenRouterEmbeddingBatchPlan(
+        requests=tuple(request_rows),
+        item_ids_by_custom_id=item_ids_by_custom_id,
+        selected_item_count=selected_count,
+        remaining_item_count=len(pending) - selected_count,
+    )
 
 
 def embed_pending_regulatory_items(

@@ -28,9 +28,11 @@ from onyx.natural_language_processing.search_nlp_models import CloudEmbedding
 from onyx.regulatory.indexing_jobs import embedding
 from onyx.regulatory.indexing_jobs.embedding import (
     EmbeddingSummary,
+    build_openrouter_embedding_batch,
     embed_pending_regulatory_items,
 )
 from onyx.regulatory.indexing_jobs.models import (
+    OpenRouterBatchConfig,
     RegulatoryIndexingConfigSnapshot,
     RegulatoryInputHashVersion,
     VertexAuthenticationMode,
@@ -250,6 +252,70 @@ def test_embedding_uses_snapshot_model_dimension_context_and_bounded_order(
         embedded_count=3,
         reused_count=1,
     )
+
+
+def test_openrouter_batch_plan_groups_inputs_and_stops_below_provider_cap() -> None:
+    snapshot = _snapshot(request_size=2)
+    job = _job(snapshot)
+    rows, items = _rows_and_items(job, count=7)
+    config = OpenRouterBatchConfig(
+        api_url="https://openrouter.test/api/beta/batches",
+        model_name=snapshot.embedding_model_name,
+        effective_dimension=snapshot.effective_dimension,
+        request_input_size=2,
+        max_requests=10,
+        max_inputs=5,
+        max_bytes=1_000_000,
+        completion_horizon_seconds=86_400,
+    )
+
+    plan = build_openrouter_embedding_batch(
+        job=job,
+        rows=rows,
+        items=items,
+        config=config,
+        max_attempts=5,
+    )
+
+    assert [request.inputs for request in plan.requests] == [
+        ["Context 0.\nMADDE 1 - legal text 0.", "MADDE 2 - legal text 1."],
+        ["Context 2.\nMADDE 3 - legal text 2.", "Context 3.\nMADDE 4 - legal text 3."],
+        ["Context 4.\nMADDE 5 - legal text 4."],
+    ]
+    assert plan.selected_item_count == 5
+    assert plan.remaining_item_count == 2
+    assert len(plan.item_ids_by_custom_id) == 3
+
+
+def test_openrouter_batch_plan_scales_fifty_thousand_inputs_into_remote_shards() -> (
+    None
+):
+    snapshot = _snapshot(request_size=64)
+    job = _job(snapshot)
+    rows, items = _rows_and_items(job, count=50_000)
+    config = OpenRouterBatchConfig(
+        api_url="https://openrouter.test/api/beta/batches",
+        model_name=snapshot.embedding_model_name,
+        effective_dimension=snapshot.effective_dimension,
+        request_input_size=64,
+        max_requests=1_000,
+        max_inputs=45_000,
+        max_bytes=32 * 1024 * 1024,
+        completion_horizon_seconds=86_400,
+    )
+
+    plan = build_openrouter_embedding_batch(
+        job=job,
+        rows=rows,
+        items=items,
+        config=config,
+        max_attempts=5,
+    )
+
+    assert plan.selected_item_count == 45_000
+    assert plan.remaining_item_count == 5_000
+    assert len(plan.requests) == 704
+    assert sum(len(request.inputs) for request in plan.requests) == 45_000
 
 
 def test_embedding_delivery_limits_provider_work_to_one_batch(

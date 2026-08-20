@@ -223,17 +223,18 @@ class TestProcessUserFileWithoutVectorDb:
 
 
 class TestProcessImplBranching:
-    @patch(f"{TASKS_MODULE}._process_user_file_with_durable_regulatory_indexing")
+    @patch(f"{TASKS_MODULE}._chunk_user_file_without_indexing")
     @patch(f"{TASKS_MODULE}._process_user_file_without_vector_db")
     @patch(f"{TASKS_MODULE}._process_user_file_with_indexing")
+    @patch(f"{TASKS_MODULE}.DEFER_USER_FILE_INDEXING", True)
     @patch(f"{TASKS_MODULE}.app_configs.REGULATORY_BATCH_INDEXING_ENABLED", True)
     @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
-    def test_durable_flag_prepares_markdown_without_legacy_indexing(
+    def test_durable_flag_preserves_the_production_chunk_phase(
         self,
         mock_get_session: MagicMock,
         mock_with_indexing: MagicMock,
         mock_without_vdb: MagicMock,
-        mock_durable: MagicMock,
+        mock_chunk: MagicMock,
     ) -> None:
         uf = _make_user_file(name="regulation.md")
         session = MagicMock()
@@ -250,7 +251,7 @@ class TestProcessImplBranching:
                 redis_locking=False,
             )
 
-        mock_durable.assert_called_once_with(
+        mock_chunk.assert_called_once_with(
             user_file_id=str(uf.id),
             documents=documents,
             tenant_id="test-tenant",

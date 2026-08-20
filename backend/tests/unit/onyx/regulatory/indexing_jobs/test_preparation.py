@@ -131,6 +131,53 @@ def test_versioned_input_hash_preserves_legacy_recovery_and_v2_metadata() -> Non
     )
 
 
+def test_chunk_row_v3_hash_is_ordered_and_metadata_sensitive() -> None:
+    user_file_id = uuid4()
+    rows = [
+        cast(
+            RegulatoryChunk,
+            SimpleNamespace(
+                id="chunk-b",
+                user_file_id=user_file_id,
+                position=2,
+                text="MADDE 2",
+                chunk_type="article",
+                heading_path=["BİRİNCİ BÖLÜM", "MADDE 2"],
+                chunk_metadata={"article_no": "2"},
+                validity_start_date=datetime.date(2026, 1, 1),
+                validity_end_date=None,
+                status="active",
+                source="indexed",
+                supersedes_chunk_id=None,
+                superseded_by_chunk_id=None,
+            ),
+        ),
+        cast(
+            RegulatoryChunk,
+            SimpleNamespace(
+                id="chunk-a",
+                user_file_id=user_file_id,
+                position=1,
+                text="MADDE 1",
+                chunk_type="article",
+                heading_path=["BİRİNCİ BÖLÜM", "MADDE 1"],
+                chunk_metadata={"article_no": "1"},
+                validity_start_date=None,
+                validity_end_date=None,
+                status="active",
+                source="indexed",
+                supersedes_chunk_id=None,
+                superseded_by_chunk_id=None,
+            ),
+        ),
+    ]
+
+    first = preparation.regulatory_chunks_content_hash(rows)
+    assert preparation.regulatory_chunks_content_hash(list(reversed(rows))) == first
+    rows[0].chunk_metadata = {"article_no": "2", "version": "changed"}
+    assert preparation.regulatory_chunks_content_hash(rows) != first
+
+
 def test_unresolved_compatibility_hash_resolves_exact_legacy_algorithm() -> None:
     user_file_id = uuid4()
     document = _document(user_file_id, "MADDE 1 - Eski kimlikli hüküm.")

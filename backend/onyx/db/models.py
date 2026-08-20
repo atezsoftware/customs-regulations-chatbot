@@ -1172,7 +1172,6 @@ class Document(Base):
     # Number of chunks in the document (in Vespa)
     # Only null for documents indexed prior to this change
     chunk_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-
     # MD5 hash of title + section text at last successful index.
     # Used to skip re-indexing when content hasn't changed.
     # Null for documents indexed before this column was added.
@@ -5536,6 +5535,9 @@ class UserFile(Base):
         DateTime(timezone=True), nullable=True
     )
     chunk_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    regulatory_chunk_generation_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     last_accessed_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -5722,6 +5724,36 @@ class RegulatoryIndexingJob(Base):
     )
     vertex_input_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     vertex_output_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    remote_openrouter_batch_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    openrouter_submission_key: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    openrouter_submission_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="NONE", server_default="NONE"
+    )
+    openrouter_submission_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    openrouter_submission_charged: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    openrouter_reconcile_miss_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    openrouter_reconcile_until: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    openrouter_completion_deadline: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    openrouter_active_item_ids: Mapped[list[str]] = mapped_column(
+        PGJSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(4000), nullable=True)
 
@@ -5848,6 +5880,16 @@ class RegulatoryIndexingJob(Base):
             name="regulatory_indexing_job_vertex_attempts_check",
         ),
         CheckConstraint(
+            "openrouter_submission_state IN ('NONE', 'SUBMITTING', "
+            "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', 'SUBMITTED')",
+            name="regulatory_indexing_job_openrouter_submission_state_check",
+        ),
+        CheckConstraint(
+            "openrouter_submission_attempt_count >= 0 AND "
+            "openrouter_reconcile_miss_count >= 0",
+            name="regulatory_indexing_job_openrouter_attempts_check",
+        ),
+        CheckConstraint(
             "provider_cleanup_state IN ('NONE', 'PENDING', 'RUNNING', "
             "'RETRY_WAIT', 'SUCCEEDED', 'EXHAUSTED')",
             name="regulatory_indexing_job_provider_cleanup_state_check",
@@ -5891,6 +5933,9 @@ class RegulatoryIndexingItem(Base):
     context_attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    embedding_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     context: Mapped[dict[str, object] | None] = mapped_column(PGJSONB, nullable=True)
     vector: Mapped[list[float] | None] = mapped_column(PGJSONB, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -5928,6 +5973,10 @@ class RegulatoryIndexingItem(Base):
         CheckConstraint(
             "context_attempt_count >= 0",
             name="regulatory_indexing_item_context_attempt_count_check",
+        ),
+        CheckConstraint(
+            "embedding_attempt_count >= 0",
+            name="regulatory_indexing_item_embedding_attempt_count_check",
         ),
     )
 
