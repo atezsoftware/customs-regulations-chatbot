@@ -21,8 +21,9 @@ chart'ına yalnız `values-cloud-models.yaml` eklemek yeterli değildir: o dosya
 ama standart chart'ın primary/docfetching/docprocessing/generic user-file-processing/Beat
 release'lerini tek başına kapatmaz. Bu genel worker release'leri prod'a eklenmemelidir. Buna karşılık
 `customs-regulations-background` içinde `supervisord-lite.conf` ile çalışan özel
+`celery_worker_user_file_processing`, allowlist ile sınırlandırılmış `celery_beat`,
 `celery_worker_regulatory_indexing` ve `celery_beat_regulatory_indexing` zorunludur; bunlar ayrı bir
-Helm release değildir.
+Helm release değildir. İki Beat'in görev listeleri ayrıdır ve aynı işi çift yayınlamaz.
 
 PostgreSQL, Redis, Elasticsearch ve MinIO uygulama altyapısıdır; model-server ile birlikte
 kaldırılmayacaklardır. Redis Celery koordinasyonu/cache için, Elasticsearch arama indeksi için, MinIO
@@ -71,8 +72,8 @@ iş yükü de kontrollü olarak yeniden başlatılır. Bayrağın yalnız bir po
 migration'dan önce açılması kabul edilmez. GCS URI secret değildir; servis hesabı/Workload Identity
 credential'ı Vault/Kubernetes kimlik katmanında kalır.
 
-Background podunun supervisor sözleşmesi tam olarak beş worker, bir özel Beat ve bir log yönlendirici
-olmak üzere yedi process'tir:
+Background podunun supervisor sözleşmesi tam olarak beş worker, iki ayrık Beat ve bir log yönlendirici
+olmak üzere sekiz process'tir:
 
 | Process | Queue/görev |
 | --- | --- |
@@ -81,14 +82,16 @@ olmak üzere yedi process'tir:
 | `celery_worker_regulatory_indexing` | `regulatory_indexing` |
 | `celery_worker_light` | Onaylı hafif bakım queue'ları |
 | `celery_worker_monitoring` | `monitoring` |
+| `celery_beat` | Yalnız user-file processing/project-sync/delete recovery |
 | `celery_beat_regulatory_indexing` | Yalnız stale recovery ve queue monitoring |
-| `log-redirect-handler` | Altı Celery logunu stdout'a aktarır |
+| `log-redirect-handler` | Yedi Celery logunu stdout'a aktarır |
 
 Beat readiness ve liveness dosyaları sırasıyla
 `/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt` ve
-`/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt` olmalıdır. Generic Beat schedule, primary,
-docfetching, docprocessing, generic indexing ve Elasticsearch migration queue'ları bu topolojide
-yasaktır. `user_file_processing` yalnız `celery_worker_user_file_processing` üzerinde,
+`/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt` olmalıdır. Generic Beat'in allowlist dışındaki
+schedule görevleri ile primary, docfetching, docprocessing, generic indexing ve Elasticsearch
+migration queue'ları bu topolojide yasaktır. `user_file_processing` yalnız
+`celery_worker_user_file_processing` üzerinde,
 `regulatory_indexing` ise yalnız özel regulatory indexing worker üzerinde zorunludur.
 
 Her background podu kendi Beat process'ini çalıştırabilir. Shelf pod-local

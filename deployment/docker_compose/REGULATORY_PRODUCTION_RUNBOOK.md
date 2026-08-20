@@ -763,7 +763,7 @@ repository tests. It must change with supervisor, Compose health, workflow readi
 
 <!-- production-lite-runtime-contract:start -->
 ```yaml
-supervisor_process_count: 7
+supervisor_process_count: 8
 workers:
   celery_worker_regulatory_benchmark:
     - regulatory_benchmark
@@ -798,6 +798,13 @@ scheduler:
     monitor_celery_queues: 10
     regulatory_indexing_recover_stale: 60
   claim_ttl_semantics: stale_key_retention_not_same_slot_takeover
+user_file_recovery_scheduler:
+  name: celery_beat
+  tasks:
+    - check_for_user_file_processing
+    - check_for_user_file_project_sync
+    - check_for_user_file_delete
+  schedule_file: /app/beat-state/celerybeat-schedule
 forbidden_queues:
   - primary
   - docfetching
@@ -815,9 +822,12 @@ operations:
 ```
 <!-- production-lite-runtime-contract:end -->
 
-The background container healthcheck requires exactly five workers, the dedicated regulatory
-indexing Beat, and the log redirector—seven supervisor processes total—and requires every process to
-be `RUNNING`. Each pod keeps its Beat shelf at pod-local
+The background container healthcheck requires exactly five workers, the allowlisted user-file
+recovery Beat, the dedicated regulatory indexing Beat, and the log redirector—eight supervisor
+processes total—and requires every process to be `RUNNING`. The generic Beat is restricted to the
+three user-file recovery tasks listed above, while the dedicated Beat owns only stale regulatory
+indexing recovery and queue monitoring; their schedules do not overlap. Each pod keeps its
+regulatory Beat shelf at pod-local
 `/tmp/regulatory-indexing-beat-schedule`, regenerates every per-tenant entry from PostgreSQL before
 readiness and after a restart, and contains only stale regulatory indexing recovery (one minute) and
 queue monitoring (ten seconds). It never loads the generic/full-runtime Beat schedule. A corrupt
@@ -841,7 +851,7 @@ different instance markers, or liveness older than 150 seconds. Followers do not
 dispatch slot to remain ready. `active_queues` must
 match only the queues declared above. Primary, docfetching, docprocessing, generic indexing, and
 Elasticsearch-migration workers/queues are forbidden; `user_file_processing` is required on the
-dedicated regulatory indexing worker.
+user-file worker and `regulatory_indexing` is required on the dedicated regulatory indexing worker.
 
 CodeBuild enumerates every non-terminating Ready background pod whose container uses the new image
 tag and runs the PID/instance/freshness verifier in each matching replica. Readiness fails when no

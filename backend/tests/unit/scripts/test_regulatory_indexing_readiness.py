@@ -436,6 +436,56 @@ def test_supervisor_worker_pid_fails_closed_when_not_positive_running_pid(
         readiness._supervisor_worker_pid(status_line)
 
 
+def test_worker_readiness_requires_both_workers_and_non_overlapping_beats(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    supervisor_config = tmp_path / "supervisord.conf"
+    supervisor_config.write_text(
+        """
+[program:celery_worker_user_file_processing]
+command=celery worker --hostname=user_file_processing@%%n -Q user_file_processing,user_file_project_sync,user_file_delete,user_file_port
+[program:celery_worker_regulatory_indexing]
+command=celery worker --hostname=regulatory_indexing@%%n -Q regulatory_indexing
+[program:celery_beat]
+command=celery beat
+[program:celery_beat_regulatory_indexing]
+command=celery beat
+""",
+        encoding="utf-8",
+    )
+    status = "\n".join(
+        (
+            "celery_worker_user_file_processing RUNNING pid 111, uptime 0:01:00",
+            "celery_worker_regulatory_indexing RUNNING pid 222, uptime 0:01:00",
+            "celery_beat RUNNING pid 333, uptime 0:01:00",
+            "celery_beat_regulatory_indexing RUNNING pid 444, uptime 0:01:00",
+        )
+    )
+    run = MagicMock(return_value=SimpleNamespace(returncode=0, stdout=status))
+    validate_beat = MagicMock()
+    monkeypatch.setattr(readiness, "_SUPERVISOR_CONFIG", supervisor_config)
+    monkeypatch.setattr(readiness.subprocess, "run", run)
+    monkeypatch.setattr(readiness, "validate_regulatory_indexing_beat", validate_beat)
+    monkeypatch.setattr(
+        readiness,
+        "_live_worker_queues",
+        lambda *, expected_queues, **_kwargs: set(expected_queues),
+    )
+
+    result = readiness.OnyxReadinessBackend(
+        memory_headroom_reviewed=True,
+        capability_attestation_path=None,
+        capability_evidence_path=None,
+    ).check_worker_and_beat()
+
+    assert "user-file recovery Beat RUNNING" in result
+    command = run.call_args.args[0]
+    assert "celery_beat" in command
+    assert "celery_beat_regulatory_indexing" in command
+    validate_beat.assert_called_once_with(status)
+
+
 def test_live_worker_inspection_targets_only_the_local_node(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

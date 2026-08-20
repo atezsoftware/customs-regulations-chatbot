@@ -20,7 +20,7 @@ from celery import Celery
 from redis.exceptions import ConnectionError as RedisConnectionError
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
-from onyx.configs.constants import OnyxCeleryQueues
+from onyx.configs.constants import OnyxCeleryQueues, OnyxCeleryTask
 
 _BACKEND_ROOT = Path(__file__).resolve().parents[5]
 _REPOSITORY_ROOT = _BACKEND_ROOT.parent
@@ -169,6 +169,27 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
     assert schedules["monitor_celery_queues"] == timedelta(seconds=10)
     assert all(template["options"]["expires"] > 0 for template in templates)
     assert not any("check-for-indexing" in template["name"] for template in templates)
+
+
+def test_lite_global_and_regulatory_beat_schedules_do_not_overlap() -> None:
+    dockerfile = (_BACKEND_ROOT / "Dockerfile.runtime-lite").read_text(encoding="utf-8")
+    allowlist_match = re.search(r'ENV BEAT_TASK_ALLOWLIST="([^"]+)"', dockerfile)
+    assert allowlist_match is not None
+    global_beat_tasks = set(allowlist_match.group(1).split(","))
+    regulatory_schedule = importlib.import_module(
+        "onyx.background.celery.tasks.regulatory_indexing.beat_schedule"
+    )
+    regulatory_beat_tasks = {
+        template["task"]
+        for template in regulatory_schedule.PRODUCTION_LITE_TASK_TEMPLATES
+    }
+
+    assert global_beat_tasks == {
+        OnyxCeleryTask.CHECK_FOR_USER_FILE_PROCESSING,
+        OnyxCeleryTask.CHECK_FOR_USER_FILE_PROJECT_SYNC,
+        OnyxCeleryTask.CHECK_FOR_USER_FILE_DELETE,
+    }
+    assert global_beat_tasks.isdisjoint(regulatory_beat_tasks)
 
 
 def test_production_lite_scheduler_expands_every_task_with_each_tenant_id() -> None:
@@ -860,6 +881,7 @@ def test_production_lite_health_requires_every_worker_including_regulatory_index
         "celery_worker_regulatory_indexing",
         "celery_worker_light",
         "celery_worker_monitoring",
+        "celery_beat",
         "celery_beat_regulatory_indexing",
         "log-redirect-handler",
     ]
@@ -910,19 +932,22 @@ def test_production_lite_health_requires_every_worker_including_regulatory_index
         )
         assert wrong_process.returncode != 0
 
-        env["SUPERVISOR_ROWS"] = "\n".join(
-            f"{process} RUNNING pid 1, uptime 0:00:30"
-            for process in expected_processes
-            if process != "celery_beat_regulatory_indexing"
-        )
-        missing_worker = subprocess.run(
-            [sys.executable, *typed_health_command[2:]],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert missing_worker.returncode != 0
+        readiness_path.write_text(marker, encoding="utf-8")
+        liveness_path.write_text(marker, encoding="utf-8")
+        for missing_process in ("celery_beat", "celery_beat_regulatory_indexing"):
+            env["SUPERVISOR_ROWS"] = "\n".join(
+                f"{process} RUNNING pid 1, uptime 0:00:30"
+                for process in expected_processes
+                if process != missing_process
+            )
+            missing_scheduler = subprocess.run(
+                [sys.executable, *typed_health_command[2:]],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert missing_scheduler.returncode != 0
     finally:
         readiness_path.unlink(missing_ok=True)
         liveness_path.unlink(missing_ok=True)
@@ -1202,11 +1227,12 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
     runbook = _RUNBOOK_PATH.read_text(encoding="utf-8")
     workers = _mapping(contract["workers"])
     scheduler = _mapping(contract["scheduler"])
+    user_file_scheduler = _mapping(contract["user_file_recovery_scheduler"])
     operations = _mapping(contract["operations"])
     forbidden_queues = contract["forbidden_queues"]
     assert isinstance(forbidden_queues, list)
 
-    assert contract["supervisor_process_count"] == 7
+    assert contract["supervisor_process_count"] == 8
     assert set(workers) == {
         "celery_worker_regulatory_benchmark",
         "celery_worker_user_file_processing",
@@ -1236,6 +1262,15 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         },
         "claim_ttl_semantics": "stale_key_retention_not_same_slot_takeover",
     }
+    assert user_file_scheduler == {
+        "name": "celery_beat",
+        "tasks": [
+            "check_for_user_file_processing",
+            "check_for_user_file_project_sync",
+            "check_for_user_file_delete",
+        ],
+        "schedule_file": "/app/beat-state/celerybeat-schedule",
+    }
     assert "user_file_processing" not in forbidden_queues
     assert operations == {
         "feature_flag": "REGULATORY_BATCH_INDEXING_ENABLED",
@@ -1257,6 +1292,7 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
     assert supervisor_programs == {
         *workers,
         scheduler["name"],
+        user_file_scheduler["name"],
         "log-redirect-handler",
     }
     for worker_name, documented_queues in workers.items():
@@ -1268,7 +1304,7 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
     handoff = _HANDOFF_PATH.read_text(encoding="utf-8")
     for process_name in supervisor_programs:
         assert f"`{process_name}`" in handoff
-    assert "tam olarak beş worker, bir özel Beat ve bir log yönlendirici" in handoff
+    assert "tam olarak beş worker, iki ayrık Beat ve bir log yönlendirici" in handoff
     assert "API ve background için birlikte `true`" in handoff
     assert "Yalnız background için `REGULATORY_INDEXING_GCS_URI`" in handoff
     assert "aynı slot yeniden yayınlanmaz" in handoff

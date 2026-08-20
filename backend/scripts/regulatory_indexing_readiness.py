@@ -67,6 +67,7 @@ _BACKEND_ROOT = Path(__file__).resolve().parents[1]
 _SUPERVISOR_CONFIG = Path("/etc/supervisor/conf.d/supervisord.conf")
 _LOCAL_SUPERVISOR_CONFIG = _BACKEND_ROOT / "supervisord-lite.conf"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
+_USER_FILE_RECOVERY_BEAT_PROCESS_NAME = "celery_beat"
 _WORKER_QUEUE_CONTRACT: dict[str, frozenset[str]] = {
     "celery_worker_user_file_processing": frozenset(
         {
@@ -316,10 +317,13 @@ class OnyxReadinessBackend:
             else _LOCAL_SUPERVISOR_CONFIG
         )
         config_text = config_path.read_text(encoding="utf-8")
-        beat_section = f"[program:{BEAT_PROCESS_NAME}]"
-        if beat_section not in config_text:
+        beat_sections = {
+            f"[program:{_USER_FILE_RECOVERY_BEAT_PROCESS_NAME}]",
+            f"[program:{BEAT_PROCESS_NAME}]",
+        }
+        if not beat_sections.issubset(config_text.splitlines()):
             raise ReadinessCheckError(
-                "dedicated regulatory worker or Beat supervisor config is missing"
+                "user-file recovery or regulatory Beat supervisor config is missing"
             )
         configured_queues = {
             process_name: _configured_worker_queues(
@@ -337,6 +341,7 @@ class OnyxReadinessBackend:
                 str(_SUPERVISOR_CONFIG),
                 "status",
                 *_WORKER_QUEUE_CONTRACT,
+                _USER_FILE_RECOVERY_BEAT_PROCESS_NAME,
                 BEAT_PROCESS_NAME,
             ],
             capture_output=True,
@@ -347,6 +352,16 @@ class OnyxReadinessBackend:
             raise ReadinessCheckError("supervisor status query failed")
         status_text = result.stdout
         validate_regulatory_indexing_beat(status_text)
+        user_file_beat_lines = [
+            line
+            for line in status_text.splitlines()
+            if line.split(maxsplit=1)[0] == _USER_FILE_RECOVERY_BEAT_PROCESS_NAME
+        ]
+        if len(user_file_beat_lines) != 1:
+            raise ReadinessCheckError(
+                "celery_beat is absent or duplicated in supervisor status"
+            )
+        _supervisor_worker_pid(user_file_beat_lines[0])
         verified: list[str] = []
         for process_name, expected_queues in _WORKER_QUEUE_CONTRACT.items():
             worker_lines = [
@@ -373,7 +388,7 @@ class OnyxReadinessBackend:
         return (
             "required workers RUNNING with exact configured/live queue sets "
             f"{'; '.join(verified)}; "
-            "Beat readiness/liveness probes valid"
+            "user-file recovery Beat RUNNING; regulatory Beat probes valid"
         )
 
     def check_memory_headroom(self) -> str:
