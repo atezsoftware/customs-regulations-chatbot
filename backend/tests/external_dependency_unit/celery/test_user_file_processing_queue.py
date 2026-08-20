@@ -22,6 +22,7 @@ rows.  The Celery app is provided as a MagicMock injected via a PropertyMock
 on the task class so no real broker is needed.
 """
 
+import datetime
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
@@ -42,8 +43,14 @@ from onyx.configs.constants import (
     OnyxCeleryQueues,
     OnyxCeleryTask,
 )
-from onyx.db.enums import UserFileStatus
-from onyx.db.models import UserFile
+from onyx.db.enums import (
+    RegulatoryIndexingCancellationPhase,
+    RegulatoryIndexingJobStatus,
+    RegulatoryIndexingStage,
+    UserFileStatus,
+)
+from onyx.db.models import RegulatoryIndexingJob, UserFile
+from onyx.db.regulatory_indexing_jobs import finalize_regulatory_indexing_cancellation
 from onyx.redis.redis_pool import get_redis_client
 from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
 from tests.external_dependency_unit.conftest import create_test_user
@@ -250,6 +257,64 @@ class TestTaskExpiry:
                 ), (
                     "Task must be submitted with the correct expires value to prevent stale task accumulation"
                 )
+        finally:
+            redis_client.delete(guard_key)
+
+
+class TestSupersessionRescan:
+    def test_finalized_supersession_is_selected_by_real_processing_scanner(
+        self,
+        db_session: Session,
+        tenant_context: None,  # noqa: ARG002
+    ) -> None:
+        user = create_test_user(db_session, "supersession_rescan_user")
+        user_file = _create_processing_user_file(db_session, user.id)
+        user_file.status = UserFileStatus.INDEXING
+        job = RegulatoryIndexingJob(
+            id=uuid4(),
+            user_file_id=user_file.id,
+            content_hash="a" * 64,
+            chunk_generation_hash="1" * 64,
+            search_settings_id=17,
+            prompt_hash="prompt-v1",
+            config_snapshot={},
+            status=RegulatoryIndexingJobStatus.CANCELLING.value,
+            stage=RegulatoryIndexingStage.INDEX_WRITE.value,
+            lease_generation=4,
+            cancellation_phase=RegulatoryIndexingCancellationPhase.FINALIZE.value,
+            cancellation_intent="SUPERSEDE",
+        )
+        db_session.add(job)
+        db_session.commit()
+
+        assert finalize_regulatory_indexing_cancellation(
+            db_session,
+            job_id=job.id,
+            expected_generation=4,
+            now=datetime.datetime.now(datetime.timezone.utc),
+        )
+        db_session.refresh(user_file)
+        assert user_file.status is UserFileStatus.PROCESSING
+
+        redis_client = get_redis_client(
+            tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+        )
+        guard_key = _user_file_queued_key(user_file.id)
+        redis_client.delete(guard_key)
+        mock_app = MagicMock()
+        try:
+            with (
+                _patch_task_app(check_user_file_processing, mock_app),
+                patch(_PATCH_QUEUE_LEN, return_value=0),
+            ):
+                check_user_file_processing.run(
+                    tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+                )
+
+            assert any(
+                call.kwargs.get("kwargs", {}).get("user_file_id") == str(user_file.id)
+                for call in mock_app.send_task.call_args_list
+            )
         finally:
             redis_client.delete(guard_key)
 

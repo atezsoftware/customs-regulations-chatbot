@@ -16,7 +16,7 @@ depends_on = None
 _CURRENT_CHUNK_GENERATION_HASH = (
     "c8e1ab454f0ac79eea2db7e0c1a54979d55fa97232da08130ee8fa4b8b324e04"
 )
-_LEGACY_INPUT_HASH_VERSION = "legacy-v1"
+_UNRESOLVED_INPUT_HASH_VERSION = "legacy-or-canonical"
 
 
 def upgrade() -> None:
@@ -48,7 +48,7 @@ def upgrade() -> None:
             """
         ).bindparams(
             generation_hash=_CURRENT_CHUNK_GENERATION_HASH,
-            input_hash_version=_LEGACY_INPUT_HASH_VERSION,
+            input_hash_version=_UNRESOLVED_INPUT_HASH_VERSION,
         )
     )
     op.alter_column(

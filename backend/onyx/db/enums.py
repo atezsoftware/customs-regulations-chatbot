@@ -760,6 +760,13 @@ class RegulatoryIndexingCancellationPhase(str, PyEnum):
     FINALIZE = "FINALIZE"
 
 
+class RegulatoryIndexingCancellationIntent(str, PyEnum):
+    NONE = "NONE"
+    USER_CANCEL = "USER_CANCEL"
+    USER_DELETE = "USER_DELETE"
+    SUPERSEDE = "SUPERSEDE"
+
+
 class RegulatoryIndexingStage(str, PyEnum):
     PREPARING = "PREPARING"
     CONTEXT_SUBMIT = "CONTEXT_SUBMIT"

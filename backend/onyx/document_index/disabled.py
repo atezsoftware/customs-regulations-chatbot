@@ -50,6 +50,8 @@ class DisabledDocumentIndex(DocumentIndex):
         self,
         document_id: str,  # noqa: ARG002
         chunk_count: int | None = None,  # noqa: ARG002
+        *,
+        refresh: bool = False,  # noqa: ARG002
     ) -> int:
         raise RuntimeError(VECTOR_DB_DISABLED_ERROR)
 

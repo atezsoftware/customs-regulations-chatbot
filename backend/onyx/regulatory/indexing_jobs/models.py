@@ -88,6 +88,7 @@ class RegulatoryInputHashVersion(StrEnum):
 
     LEGACY_V1 = "legacy-v1"
     CANONICAL_V2 = "canonical-v2"
+    LEGACY_OR_CANONICAL = "legacy-or-canonical"
 
 
 class VertexBatchConfig(BaseModel):

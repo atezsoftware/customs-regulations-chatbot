@@ -228,6 +228,41 @@ GCS cleanup is best effort and separately retryable; inability to remove tempora
 objects does not change an already correct search publication result. Lifecycle
 rules on the configured bucket provide a final safety net.
 
+### Compatibility hash resolution
+
+Migration cannot infer whether an indexing job created by an earlier draft used
+the legacy semantic-identifier/title/text digest or the canonical full-Document
+digest. Such PREPARING rows carry an explicit compatibility-only
+`legacy-or-canonical` discriminator. Recovery loads the canonical Markdown once,
+computes both historical digests, and proceeds only when exactly one matches the
+persisted content hash. The resolved `legacy-v1` or `canonical-v2` discriminator is
+committed in the same transaction that replaces canonical chunks/items and advances
+PREPARING. No match and the cryptographically exceptional ambiguous match both fail
+closed without changing the immutable snapshot.
+
+Fresh jobs always use `canonical-v2`. Compatibility migration and a
+downgrade/re-upgrade may create the unresolved discriminator, but no job may leave
+PREPARING while it remains unresolved.
+
+### Chunk-generation supersession
+
+One UserFile still has at most one active durable job. If production processing
+finds that active job belongs to an older chunk-generation identity, it does not run
+or terminally fail that generation. Under the UserFile/job locks it changes the old
+job to `CANCELLING`, records typed `SUPERSEDE` intent, increments its lease fence,
+and resumes the existing Vertex, GCS, and Elasticsearch cleanup phases.
+
+Cancellation intent distinguishes `USER_CANCEL`, `USER_DELETE`, and `SUPERSEDE`.
+Deletion is a monotonic override of either other intent. Finalizing user cancellation
+keeps the UserFile cancelled; finalizing deletion keeps its deletion tombstone;
+finalizing supersession marks only the old job `CANCELLED` and sets the UserFile to
+`PROCESSING`. The existing durable UserFile scanner then invokes the ordinary
+production worker to create the current generation after the partial unique active
+job constraint has been released. A crash after finalization is safe because
+`PROCESSING` is durable. Repeated supersession delivery reuses the same cancelling
+job, and an identical already-successful current generation remains idempotent and
+completed.
+
 ## Observability
 
 Structured logs include tenant, job, user file, stage, attempt, lease generation,

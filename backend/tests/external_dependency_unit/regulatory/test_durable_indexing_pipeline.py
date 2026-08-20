@@ -17,10 +17,12 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, delete, select, text
+from sqlalchemy import create_engine, delete, func, select, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
+from onyx.background.celery.tasks.regulatory_indexing import tasks as regulatory_tasks
+from onyx.background.celery.tasks.user_file_processing import tasks as user_file_tasks
 from onyx.configs import app_configs
 from onyx.configs.constants import FileOrigin
 from onyx.connectors.file import connector as file_connector
@@ -66,7 +68,12 @@ from onyx.llm.well_known_providers.constants import (
 )
 from onyx.natural_language_processing import search_nlp_models
 from onyx.natural_language_processing.utils import BaseTokenizer
-from onyx.regulatory.indexing_jobs import orchestrator, preparation, publisher
+from onyx.regulatory.indexing_jobs import (
+    configuration,
+    orchestrator,
+    preparation,
+    publisher,
+)
 from onyx.regulatory.indexing_jobs.models import RegulatoryInputHashVersion
 from onyx.regulatory.indexing_jobs.orchestrator import (
     OrchestrationOutcome,
@@ -87,6 +94,7 @@ _TEST_REDUCED_DIMENSION = 768
 _TENANT_ID = "public"
 _OPENROUTER_PROVIDER_ADVISORY_LOCK = 5_932_460_513_101_126_737
 _LEGACY_REGULATORY_JOB_REVISION = "c8f1a6d4e2b7"
+_CHUNK_IDENTITY_REVISION = "d2a9c7e4b1f6"
 
 
 class _CharacterTokenizer(BaseTokenizer):
@@ -1129,11 +1137,21 @@ def test_preexisting_openrouter_provider_is_locked_and_restored_exactly(
     assert _raw_openrouter_provider_state(db_session) == state_before_test
 
 
-def test_pre_migration_preparing_job_with_onyx_metadata_recovers_and_publishes(
+@pytest.mark.parametrize(
+    "migration_origin,resolved_hash_version",
+    [
+        ("c8-legacy", RegulatoryInputHashVersion.LEGACY_V1),
+        ("d2-canonical", RegulatoryInputHashVersion.CANONICAL_V2),
+        ("head-c8-head-canonical", RegulatoryInputHashVersion.CANONICAL_V2),
+    ],
+)
+def test_preparing_compatibility_job_with_onyx_metadata_recovers_and_publishes(
     db_session: Session,
     tenant_context: None,  # noqa: ARG001
     embedding_server: tuple[str, list[dict[str, object]]],
     monkeypatch: pytest.MonkeyPatch,
+    migration_origin: str,
+    resolved_hash_version: RegulatoryInputHashVersion,
 ) -> None:
     source_engine = db_session.get_bind()
     assert isinstance(source_engine, Engine)
@@ -1141,6 +1159,11 @@ def test_pre_migration_preparing_job_with_onyx_metadata_recovers_and_publishes(
     gateway = _DeterministicVertexGateway()
 
     with _pre_migration_database(source_engine) as dedicated_engine:
+        migration_config = _migration_config(dedicated_engine)
+        if migration_origin == "d2-canonical":
+            command.upgrade(migration_config, _CHUNK_IDENTITY_REVISION)
+        elif migration_origin == "head-c8-head-canonical":
+            command.upgrade(migration_config, "head")
 
         @contextmanager
         def dedicated_session() -> Iterator[Session]:
@@ -1171,6 +1194,11 @@ def test_pre_migration_preparing_job_with_onyx_metadata_recovers_and_publishes(
             app_configs,
             "REGULATORY_INDEXING_GCS_URI",
             "gs://disposable-regulatory-indexing",
+        )
+        monkeypatch.setattr(
+            app_configs,
+            "REGULATORY_BATCH_INDEXING_ENABLED",
+            True,
         )
         monkeypatch.setattr(
             orchestrator,
@@ -1270,54 +1298,92 @@ def test_pre_migration_preparing_job_with_onyx_metadata_recovers_and_publishes(
                 assert staged_csv_ids == []
                 assert initial_documents[0].title == f"{marker} Kurtarma Başlığı"
                 assert initial_documents[0].metadata["regulation_number"] == "2026/7"
-                legacy_hash = preparation.regulatory_documents_content_hash(
+                input_content_hash = preparation.regulatory_documents_content_hash(
                     initial_documents,
-                    RegulatoryInputHashVersion.LEGACY_V1,
+                    resolved_hash_version,
                 )
                 snapshot = preparation.resolve_regulatory_indexing_snapshot(
                     migration_session,
-                    input_content_hash=legacy_hash,
-                    input_hash_version=RegulatoryInputHashVersion.LEGACY_V1,
+                    input_content_hash=input_content_hash,
+                    input_hash_version=resolved_hash_version,
                 )
                 pre_migration_snapshot = snapshot.model_dump(mode="json")
-                del pre_migration_snapshot["input_content_hash"]
-                del pre_migration_snapshot["input_hash_version"]
-                del pre_migration_snapshot["chunk_generation_hash"]
+                if migration_origin == "c8-legacy":
+                    del pre_migration_snapshot["input_content_hash"]
+                    del pre_migration_snapshot["input_hash_version"]
+                    del pre_migration_snapshot["chunk_generation_hash"]
+                elif migration_origin == "d2-canonical":
+                    del pre_migration_snapshot["input_hash_version"]
                 job_id = uuid4()
                 resources.job_ids.append(job_id)
-                migration_session.execute(
-                    text(
-                        """
-                        INSERT INTO regulatory_indexing_job (
-                            id, user_file_id, content_hash, search_settings_id,
-                            prompt_hash, config_snapshot, status, stage,
-                            lease_generation, attempt_count, heartbeat_at,
-                            created_at, updated_at
-                        ) VALUES (
-                            :id, :user_file_id, :content_hash,
-                            :search_settings_id, :prompt_hash,
-                            CAST(:config_snapshot AS jsonb), 'QUEUED',
-                            'PREPARING', 0, 0, now(), now(), now()
-                        )
-                        """
-                    ),
-                    {
-                        "id": job_id,
-                        "user_file_id": user_file.id,
-                        "content_hash": legacy_hash,
-                        "search_settings_id": snapshot.search_settings_id,
-                        "prompt_hash": snapshot.prompt_hash,
-                        "config_snapshot": json.dumps(pre_migration_snapshot),
-                    },
-                )
+                insert_parameters = {
+                    "id": job_id,
+                    "user_file_id": user_file.id,
+                    "content_hash": input_content_hash,
+                    "chunk_generation_hash": snapshot.chunk_generation_hash,
+                    "search_settings_id": snapshot.search_settings_id,
+                    "prompt_hash": snapshot.prompt_hash,
+                    "config_snapshot": json.dumps(pre_migration_snapshot),
+                }
+                if migration_origin == "c8-legacy":
+                    migration_session.execute(
+                        text(
+                            """
+                            INSERT INTO regulatory_indexing_job (
+                                id, user_file_id, content_hash,
+                                search_settings_id, prompt_hash,
+                                config_snapshot, status, stage,
+                                lease_generation, attempt_count, heartbeat_at,
+                                created_at, updated_at
+                            ) VALUES (
+                                :id, :user_file_id, :content_hash,
+                                :search_settings_id, :prompt_hash,
+                                CAST(:config_snapshot AS jsonb), 'QUEUED',
+                                'PREPARING', 0, 0, now(), now(), now()
+                            )
+                            """
+                        ),
+                        insert_parameters,
+                    )
+                else:
+                    migration_session.execute(
+                        text(
+                            """
+                            INSERT INTO regulatory_indexing_job (
+                                id, user_file_id, content_hash,
+                                chunk_generation_hash, search_settings_id,
+                                prompt_hash, config_snapshot, status, stage,
+                                lease_generation, attempt_count, heartbeat_at,
+                                created_at, updated_at
+                            ) VALUES (
+                                :id, :user_file_id, :content_hash,
+                                :chunk_generation_hash, :search_settings_id,
+                                :prompt_hash, CAST(:config_snapshot AS jsonb),
+                                'QUEUED', 'PREPARING', 0, 0, now(), now(), now()
+                            )
+                            """
+                        ),
+                        insert_parameters,
+                    )
                 migration_session.commit()
 
-                command.upgrade(_migration_config(dedicated_engine), "head")
+                if migration_origin == "head-c8-head-canonical":
+                    command.downgrade(
+                        migration_config,
+                        _LEGACY_REGULATORY_JOB_REVISION,
+                    )
+                command.upgrade(migration_config, "head")
                 migration_session.expire_all()
                 migrated_job = migration_session.get(RegulatoryIndexingJob, job_id)
                 assert migrated_job is not None
-                assert migrated_job.config_snapshot["input_content_hash"] == legacy_hash
-                assert migrated_job.config_snapshot["input_hash_version"] == "legacy-v1"
+                assert (
+                    migrated_job.config_snapshot["input_content_hash"]
+                    == input_content_hash
+                )
+                assert (
+                    migrated_job.config_snapshot["input_hash_version"]
+                    == "legacy-or-canonical"
+                )
 
                 first = run_regulatory_indexing_step(job_id, 0, _TENANT_ID)
                 assert first.outcome is OrchestrationOutcome.NEXT_STEP
@@ -1326,6 +1392,13 @@ def test_pre_migration_preparing_job_with_onyx_metadata_recovers_and_publishes(
                 assert (
                     _stage(migration_session, job_id)
                     is RegulatoryIndexingStage.CONTEXT_SUBMIT
+                )
+                migration_session.expire_all()
+                resolved_job = migration_session.get(RegulatoryIndexingJob, job_id)
+                assert resolved_job is not None
+                assert (
+                    resolved_job.config_snapshot["input_hash_version"]
+                    == resolved_hash_version.value
                 )
 
                 for _ in range(30):
@@ -1401,6 +1474,11 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
             app_configs,
             "REGULATORY_INDEXING_GCS_URI",
             "gs://disposable-regulatory-indexing",
+        )
+        monkeypatch.setattr(
+            app_configs,
+            "REGULATORY_BATCH_INDEXING_ENABLED",
+            True,
         )
         monkeypatch.setattr(
             orchestrator,
@@ -1577,6 +1655,169 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
         ]
         assert len(contextual_texts) >= 2
         assert all("MADDE" in text for text in embedded_texts)
+
+        enqueued_jobs: list[tuple[UUID, int]] = []
+
+        def capture_worker_delivery(
+            _celery_app: object,
+            *,
+            job_id: UUID,
+            expected_generation: int,
+            **_kwargs: object,
+        ) -> None:
+            enqueued_jobs.append((job_id, expected_generation))
+
+        monkeypatch.setattr(
+            regulatory_tasks,
+            "enqueue_regulatory_indexing_step",
+            capture_worker_delivery,
+        )
+        first_job_id = job.id
+        first_generation_hash = job.chunk_generation_hash
+        second_generation_hash = "e" * 64
+        assert second_generation_hash != first_generation_hash
+        monkeypatch.setattr(
+            configuration,
+            "compute_regulatory_chunk_generation_hash",
+            lambda *_args, **_kwargs: second_generation_hash,
+        )
+        db_session.expire_all()
+        reprocessed_file = db_session.get(UserFile, user_file.id)
+        assert reprocessed_file is not None
+        reprocessed_file.status = UserFileStatus.PROCESSING
+        db_session.commit()
+
+        user_file_tasks.process_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id=_TENANT_ID,
+            redis_locking=False,
+        )
+        db_session.expire_all()
+        second_job = db_session.scalar(
+            select(RegulatoryIndexingJob).where(
+                RegulatoryIndexingJob.user_file_id == user_file.id,
+                RegulatoryIndexingJob.id != first_job_id,
+            )
+        )
+        assert second_job is not None
+        assert second_job.chunk_generation_hash == second_generation_hash
+        assert second_job.status == RegulatoryIndexingJobStatus.QUEUED.value
+        assert second_job.stage == RegulatoryIndexingStage.CONTEXT_SUBMIT.value
+        assert enqueued_jobs[-1] == (second_job.id, second_job.lease_generation)
+
+        third_generation_hash = "f" * 64
+        monkeypatch.setattr(
+            configuration,
+            "compute_regulatory_chunk_generation_hash",
+            lambda *_args, **_kwargs: third_generation_hash,
+        )
+        user_file_tasks.process_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id=_TENANT_ID,
+            redis_locking=False,
+        )
+        db_session.expire_all()
+        superseded_job = db_session.get(RegulatoryIndexingJob, second_job.id)
+        assert superseded_job is not None
+        assert superseded_job.status == RegulatoryIndexingJobStatus.CANCELLING.value
+        assert superseded_job.cancellation_intent == "SUPERSEDE"
+        superseded_generation = superseded_job.lease_generation
+
+        supersession_outcome = OrchestrationOutcome.NEXT_STEP
+        for _ in range(4):
+            superseded_generation, supersession_outcome = _run_delivery(
+                superseded_job.id,
+                superseded_generation,
+            )
+            if supersession_outcome is OrchestrationOutcome.COMPLETE:
+                break
+        assert supersession_outcome is OrchestrationOutcome.COMPLETE
+        db_session.expire_all()
+        resumed_file = db_session.get(UserFile, user_file.id)
+        assert resumed_file is not None
+        assert resumed_file.status is UserFileStatus.PROCESSING
+
+        user_file_tasks.process_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id=_TENANT_ID,
+            redis_locking=False,
+        )
+        db_session.expire_all()
+        newest_job = db_session.scalar(
+            select(RegulatoryIndexingJob)
+            .where(
+                RegulatoryIndexingJob.user_file_id == user_file.id,
+                RegulatoryIndexingJob.status.in_(
+                    [
+                        RegulatoryIndexingJobStatus.QUEUED.value,
+                        RegulatoryIndexingJobStatus.RUNNING.value,
+                        RegulatoryIndexingJobStatus.RETRY_WAIT.value,
+                        RegulatoryIndexingJobStatus.CANCELLING.value,
+                    ]
+                ),
+            )
+            .order_by(RegulatoryIndexingJob.created_at.desc())
+        )
+        assert newest_job is not None
+        assert newest_job.id not in {first_job_id, second_job.id}
+        assert newest_job.chunk_generation_hash == third_generation_hash
+        newest_generation = newest_job.lease_generation
+        while _stage(db_session, newest_job.id) is not RegulatoryIndexingStage.VERIFY:
+            newest_generation, newest_outcome = _run_delivery(
+                newest_job.id,
+                newest_generation,
+            )
+            if newest_outcome is not OrchestrationOutcome.NEXT_STEP:
+                db_session.expire_all()
+                failed_newest_job = db_session.get(RegulatoryIndexingJob, newest_job.id)
+                pytest.fail(
+                    "successor pipeline terminated before VERIFY: "
+                    f"status={failed_newest_job.status if failed_newest_job else None} "
+                    f"stage={failed_newest_job.stage if failed_newest_job else None} "
+                    f"code={failed_newest_job.error_code if failed_newest_job else None} "
+                    f"message={failed_newest_job.error_message if failed_newest_job else None}"
+                )
+        newest_generation, newest_outcome = _run_delivery(
+            newest_job.id,
+            newest_generation,
+        )
+        assert newest_outcome is OrchestrationOutcome.NEXT_STEP
+        _newest_generation, newest_outcome = _run_delivery(
+            newest_job.id,
+            newest_generation,
+        )
+        assert newest_outcome is OrchestrationOutcome.COMPLETE
+        db_session.expire_all()
+        republished_file = db_session.get(UserFile, user_file.id)
+        assert republished_file is not None
+        assert republished_file.status is UserFileStatus.COMPLETED
+
+        terminal_job_count = db_session.scalar(
+            select(func.count(RegulatoryIndexingJob.id)).where(
+                RegulatoryIndexingJob.user_file_id == user_file.id
+            )
+        )
+        repeated_file = db_session.get(UserFile, user_file.id)
+        assert repeated_file is not None
+        repeated_file.status = UserFileStatus.PROCESSING
+        db_session.commit()
+        user_file_tasks.process_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id=_TENANT_ID,
+            redis_locking=False,
+        )
+        db_session.expire_all()
+        assert (
+            db_session.scalar(
+                select(func.count(RegulatoryIndexingJob.id)).where(
+                    RegulatoryIndexingJob.user_file_id == user_file.id
+                )
+            )
+            == terminal_job_count
+        )
+        idempotent_file = db_session.get(UserFile, user_file.id)
+        assert idempotent_file is not None
+        assert idempotent_file.status is UserFileStatus.COMPLETED
 
         cancelled_file, cancelled_job = create_file("cancel")
         cancelled_generation = cancelled_job.lease_generation

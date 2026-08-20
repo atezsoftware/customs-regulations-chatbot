@@ -18,14 +18,15 @@ _ACTIVE_JOB_PREDICATE = "status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT', 'CANCELLI
 
 def upgrade() -> None:
     # Databases upgraded through an earlier draft of d2 did not get the
-    # explicit algorithm discriminator. Those rows contain the legacy hash.
+    # explicit algorithm discriminator. The persisted digest alone cannot
+    # distinguish that draft's legacy and canonical algorithms.
     op.execute(
         """
         UPDATE regulatory_indexing_job
         SET config_snapshot = jsonb_set(
             config_snapshot,
             '{input_hash_version}',
-            '"legacy-v1"'::jsonb,
+            '"legacy-or-canonical"'::jsonb,
             true
         )
         WHERE NOT config_snapshot ? 'input_hash_version'

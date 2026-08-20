@@ -131,6 +131,71 @@ def test_versioned_input_hash_preserves_legacy_recovery_and_v2_metadata() -> Non
     )
 
 
+def test_unresolved_compatibility_hash_resolves_exact_legacy_algorithm() -> None:
+    user_file_id = uuid4()
+    document = _document(user_file_id, "MADDE 1 - Eski kimlikli hüküm.")
+    legacy_hash = preparation.regulatory_documents_content_hash(
+        [document], RegulatoryInputHashVersion.LEGACY_V1
+    )
+
+    assert (
+        preparation.resolve_regulatory_documents_input_hash_version(
+            [document],
+            persisted_content_hash=legacy_hash,
+            declared_version=RegulatoryInputHashVersion.LEGACY_OR_CANONICAL,
+        )
+        is RegulatoryInputHashVersion.LEGACY_V1
+    )
+
+
+def test_unresolved_compatibility_hash_resolves_exact_canonical_algorithm() -> None:
+    user_file_id = uuid4()
+    document = _document(user_file_id, "MADDE 1 - Metadata duyarlı hüküm.")
+    document = document.model_copy(update={"metadata": {"regulation_number": "2026/7"}})
+    canonical_hash = preparation.regulatory_documents_content_hash(
+        [document], RegulatoryInputHashVersion.CANONICAL_V2
+    )
+
+    assert (
+        preparation.resolve_regulatory_documents_input_hash_version(
+            [document],
+            persisted_content_hash=canonical_hash,
+            declared_version=RegulatoryInputHashVersion.LEGACY_OR_CANONICAL,
+        )
+        is RegulatoryInputHashVersion.CANONICAL_V2
+    )
+
+
+def test_unresolved_compatibility_hash_fails_closed_on_ambiguous_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = _document(uuid4(), "MADDE 1 - Çakışma koruması.")
+    persisted_hash = "a" * 64
+    monkeypatch.setattr(
+        preparation,
+        "regulatory_documents_content_hash",
+        lambda _documents, _version: persisted_hash,
+    )
+
+    with pytest.raises(ValueError, match="uniquely resolve"):
+        preparation.resolve_regulatory_documents_input_hash_version(
+            [document],
+            persisted_content_hash=persisted_hash,
+            declared_version=RegulatoryInputHashVersion.LEGACY_OR_CANONICAL,
+        )
+
+
+def test_unresolved_compatibility_hash_fails_closed_when_neither_matches() -> None:
+    document = _document(uuid4(), "MADDE 1 - Eşleşmeyen içerik.")
+
+    with pytest.raises(ValueError, match="uniquely resolve"):
+        preparation.resolve_regulatory_documents_input_hash_version(
+            [document],
+            persisted_content_hash="f" * 64,
+            declared_version=RegulatoryInputHashVersion.LEGACY_OR_CANONICAL,
+        )
+
+
 def test_new_preparation_snapshots_use_canonical_v2_hashing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -644,7 +709,9 @@ def test_claimed_preparation_resumes_without_claiming_again_and_advances_once(
     content_hash = preparation.regulatory_documents_content_hash(
         [document], RegulatoryInputHashVersion.CANONICAL_V2
     )
-    snapshot = _snapshot(input_content_hash=content_hash)
+    snapshot = _snapshot(input_content_hash=content_hash).model_copy(
+        update={"input_hash_version": RegulatoryInputHashVersion.LEGACY_OR_CANONICAL}
+    )
     job = cast(
         RegulatoryIndexingJob,
         SimpleNamespace(
@@ -671,7 +738,7 @@ def test_claimed_preparation_resumes_without_claiming_again_and_advances_once(
         ),
     )
     tokenizer_calls: list[tuple[str | None, object]] = []
-    atomic_calls: list[tuple[UUID, int]] = []
+    atomic_calls: list[tuple[UUID, int, str]] = []
 
     monkeypatch.setattr(
         preparation,
@@ -709,10 +776,11 @@ def test_claimed_preparation_resumes_without_claiming_again_and_advances_once(
         prepare_items: Callable[
             [], list[indexing_job_repository.RegulatoryIndexingPreparedItem]
         ],
+        resolved_input_hash_version: str,
         now: object,
     ) -> bool:
         del now
-        atomic_calls.append((job_id, expected_generation))
+        atomic_calls.append((job_id, expected_generation, resolved_input_hash_version))
         prepared_items = prepare_items()
         assert len(prepared_items) == 1
         return True
@@ -732,7 +800,7 @@ def test_claimed_preparation_resumes_without_claiming_again_and_advances_once(
     )
 
     assert result == job_id
-    assert atomic_calls == [(job_id, 3)]
+    assert atomic_calls == [(job_id, 3, RegulatoryInputHashVersion.CANONICAL_V2.value)]
     assert tokenizer_calls == [
         (snapshot.embedding_model_name, snapshot.embedding_provider),
     ]

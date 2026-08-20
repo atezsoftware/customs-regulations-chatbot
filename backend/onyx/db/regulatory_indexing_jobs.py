@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from onyx.db.enums import (
+    RegulatoryIndexingCancellationIntent,
     RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
@@ -321,6 +322,28 @@ def create_or_get_regulatory_indexing_job(
         .with_for_update()
     )
     if active_job is not None:
+        if (
+            active_job.chunk_generation_hash != chunk_generation_hash
+            and active_job.status != RegulatoryIndexingJobStatus.CANCELLING.value
+        ):
+            active_job.status = RegulatoryIndexingJobStatus.CANCELLING.value
+            active_job.cancellation_intent = (
+                RegulatoryIndexingCancellationIntent.SUPERSEDE.value
+            )
+            active_job.cancellation_phase = (
+                RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
+                if active_job.remote_vertex_job_name
+                else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
+            )
+            active_job.lease_generation += 1
+            active_job.recovery_token = None
+            active_job.attempt_count = 0
+            active_job.next_retry_at = None
+            active_job.error_code = None
+            active_job.error_message = None
+            active_job.completed_at = None
+            active_job.heartbeat_at = now
+            active_job.updated_at = now
         active_job_id = active_job.id
         db_session.commit()
         persisted_active_job = db_session.get(RegulatoryIndexingJob, active_job_id)
@@ -367,6 +390,15 @@ def create_or_get_regulatory_indexing_job(
     )
     if job_id is None:
         raise RuntimeError("regulatory indexing job disappeared during creation")
+    persisted_before_commit = db_session.get(RegulatoryIndexingJob, job_id)
+    if persisted_before_commit is None:
+        raise RuntimeError(f"regulatory indexing job {job_id} was not persisted")
+    if (
+        persisted_before_commit.status == RegulatoryIndexingJobStatus.SUCCEEDED.value
+        and locked_user_file.status
+        in {UserFileStatus.PROCESSING, UserFileStatus.INDEXING}
+    ):
+        locked_user_file.status = UserFileStatus.COMPLETED
     db_session.commit()
     job = db_session.get(RegulatoryIndexingJob, job_id)
     if job is None:
@@ -491,6 +523,9 @@ def request_user_file_deletion_cleanup(
             continue
         if job.status != RegulatoryIndexingJobStatus.CANCELLING.value:
             job.status = RegulatoryIndexingJobStatus.CANCELLING.value
+            job.cancellation_intent = (
+                RegulatoryIndexingCancellationIntent.USER_DELETE.value
+            )
             job.lease_generation += 1
             job.recovery_token = None
             job.cancellation_phase = (
@@ -503,6 +538,22 @@ def request_user_file_deletion_cleanup(
             job.error_code = None
             job.error_message = None
             job.completed_at = None
+            job.heartbeat_at = now
+            job.updated_at = now
+        elif (
+            job.cancellation_intent
+            != RegulatoryIndexingCancellationIntent.USER_DELETE.value
+        ):
+            # Deletion is authoritative over cancellation or supersession.
+            job.cancellation_intent = (
+                RegulatoryIndexingCancellationIntent.USER_DELETE.value
+            )
+            job.lease_generation += 1
+            job.recovery_token = None
+            job.attempt_count = 0
+            job.next_retry_at = None
+            job.error_code = None
+            job.error_message = None
             job.heartbeat_at = now
             job.updated_at = now
         if job.next_retry_at is None or job.next_retry_at <= now:
@@ -1064,9 +1115,13 @@ def persist_regulatory_indexing_preparation(
     job_id: UUID,
     expected_generation: int,
     prepare_items: Callable[[], Sequence[RegulatoryIndexingPreparedItem]],
+    resolved_input_hash_version: str,
     now: datetime.datetime,
 ) -> bool:
     """Atomically replace chunks, create items, and finish PREPARING."""
+
+    if resolved_input_hash_version not in {"legacy-v1", "canonical-v2"}:
+        raise ValueError("resolved input hash version is unsupported")
 
     locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
     if locked_user_file is None or locked_user_file.status not in {
@@ -1093,6 +1148,13 @@ def persist_regulatory_indexing_preparation(
     if locked_job.user_file_id != locked_user_file.id:
         db_session.rollback()
         return False
+    persisted_input_hash_version = locked_job.config_snapshot.get("input_hash_version")
+    if persisted_input_hash_version not in {
+        "legacy-or-canonical",
+        resolved_input_hash_version,
+    }:
+        db_session.rollback()
+        raise ValueError("resolved input hash version conflicts with snapshot")
 
     try:
         prepared_items = list(prepare_items())
@@ -1141,6 +1203,10 @@ def persist_regulatory_indexing_preparation(
                 )
             )
 
+        locked_job.config_snapshot = {
+            **locked_job.config_snapshot,
+            "input_hash_version": resolved_input_hash_version,
+        }
         locked_job.status = RegulatoryIndexingJobStatus.QUEUED.value
         locked_job.stage = RegulatoryIndexingStage.CONTEXT_SUBMIT.value
         locked_job.attempt_count = 0
@@ -1650,10 +1716,16 @@ def cancel_regulatory_indexing_job(
     job.error_code = None
     job.error_message = None
     job.updated_at = now
-    if locked_user_file.status in {
-        UserFileStatus.PROCESSING,
-        UserFileStatus.INDEXING,
-    }:
+    cancellation_intent = RegulatoryIndexingCancellationIntent(job.cancellation_intent)
+    if cancellation_intent is RegulatoryIndexingCancellationIntent.SUPERSEDE:
+        if locked_user_file.status not in {
+            UserFileStatus.CANCELED,
+            UserFileStatus.DELETING,
+        }:
+            locked_user_file.status = UserFileStatus.PROCESSING
+    elif cancellation_intent is RegulatoryIndexingCancellationIntent.USER_DELETE:
+        locked_user_file.status = UserFileStatus.DELETING
+    elif locked_user_file.status is not UserFileStatus.DELETING:
         locked_user_file.status = UserFileStatus.CANCELED
     db_session.commit()
     return True
@@ -1665,9 +1737,16 @@ def request_regulatory_indexing_cancellation(
     job_id: UUID,
     expected_stage: RegulatoryIndexingStage,
     expected_generation: int,
+    cancellation_intent: RegulatoryIndexingCancellationIntent,
     now: datetime.datetime,
 ) -> bool:
     """Enter the resumable cancellation state under the active stage fence."""
+
+    if cancellation_intent not in {
+        RegulatoryIndexingCancellationIntent.USER_CANCEL,
+        RegulatoryIndexingCancellationIntent.USER_DELETE,
+    }:
+        raise ValueError("explicit cancellation intent is unsupported")
 
     job = db_session.scalar(
         select(RegulatoryIndexingJob)
@@ -1683,6 +1762,7 @@ def request_regulatory_indexing_cancellation(
         db_session.rollback()
         return False
     job.status = RegulatoryIndexingJobStatus.CANCELLING.value
+    job.cancellation_intent = cancellation_intent.value
     job.cancellation_phase = (
         RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
         if job.remote_vertex_job_name
@@ -1806,10 +1886,16 @@ def finalize_regulatory_indexing_cancellation(
     job.error_message = None
     job.heartbeat_at = now
     job.updated_at = now
-    if locked_user_file.status in {
-        UserFileStatus.PROCESSING,
-        UserFileStatus.INDEXING,
-    }:
+    cancellation_intent = RegulatoryIndexingCancellationIntent(job.cancellation_intent)
+    if cancellation_intent is RegulatoryIndexingCancellationIntent.SUPERSEDE:
+        if locked_user_file.status not in {
+            UserFileStatus.CANCELED,
+            UserFileStatus.DELETING,
+        }:
+            locked_user_file.status = UserFileStatus.PROCESSING
+    elif cancellation_intent is RegulatoryIndexingCancellationIntent.USER_DELETE:
+        locked_user_file.status = UserFileStatus.DELETING
+    elif locked_user_file.status is not UserFileStatus.DELETING:
         locked_user_file.status = UserFileStatus.CANCELED
     db_session.commit()
     return True

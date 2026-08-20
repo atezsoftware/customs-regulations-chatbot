@@ -13,6 +13,7 @@ from onyx.connectors.models import Document
 from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import (
+    RegulatoryIndexingCancellationIntent,
     RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
@@ -496,6 +497,11 @@ def _request_cancellation(
         job_id=runtime.job.id,
         expected_stage=RegulatoryIndexingStage(runtime.job.stage),
         expected_generation=runtime.job.lease_generation,
+        cancellation_intent=(
+            RegulatoryIndexingCancellationIntent.USER_DELETE
+            if runtime.user_file.status is UserFileStatus.DELETING
+            else RegulatoryIndexingCancellationIntent.USER_CANCEL
+        ),
         now=now,
     )
     return (
@@ -590,6 +596,7 @@ def _execute_cancellation_phase(
             document_index.delete(
                 str(runtime.user_file.id),
                 chunk_count=runtime.user_file.chunk_count,
+                refresh=True,
             )
         return _advance_cancellation(
             runtime,

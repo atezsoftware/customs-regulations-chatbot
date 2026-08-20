@@ -69,6 +69,40 @@ def regulatory_documents_content_hash(
     return sha256(encoded.encode()).hexdigest()
 
 
+def resolve_regulatory_documents_input_hash_version(
+    documents: Sequence[Document],
+    *,
+    persisted_content_hash: str,
+    declared_version: RegulatoryInputHashVersion,
+) -> RegulatoryInputHashVersion:
+    """Resolve migration-only hash ambiguity without weakening current identity."""
+
+    if declared_version is not RegulatoryInputHashVersion.LEGACY_OR_CANONICAL:
+        if (
+            regulatory_documents_content_hash(documents, declared_version)
+            != persisted_content_hash
+        ):
+            raise ValueError(
+                "regulatory documents do not match the claimed job revision"
+            )
+        return declared_version
+
+    matching_versions = tuple(
+        version
+        for version in (
+            RegulatoryInputHashVersion.LEGACY_V1,
+            RegulatoryInputHashVersion.CANONICAL_V2,
+        )
+        if regulatory_documents_content_hash(documents, version)
+        == persisted_content_hash
+    )
+    if len(matching_versions) != 1:
+        raise ValueError(
+            "regulatory documents do not uniquely resolve the claimed job revision"
+        )
+    return matching_versions[0]
+
+
 def prepare_regulatory_indexing_job(
     user_file_id: UUID,
     documents: Sequence[Document],
@@ -145,11 +179,11 @@ def prepare_claimed_regulatory_indexing_job(
     if any(document.id != str(job.user_file_id) for document in documents):
         raise ValueError("regulatory documents must be stamped with the user file id")
     snapshot = RegulatoryIndexingConfigSnapshot.model_validate(job.config_snapshot)
-    if (
-        regulatory_documents_content_hash(documents, snapshot.input_hash_version)
-        != job.content_hash
-    ):
-        raise ValueError("regulatory documents do not match the claimed job revision")
+    resolved_input_hash_version = resolve_regulatory_documents_input_hash_version(
+        documents,
+        persisted_content_hash=job.content_hash,
+        declared_version=snapshot.input_hash_version,
+    )
     if snapshot.input_content_hash != job.content_hash:
         raise ValueError("regulatory job input hash does not match its snapshot")
     if snapshot.chunk_generation_hash != job.chunk_generation_hash:
@@ -209,6 +243,7 @@ def prepare_claimed_regulatory_indexing_job(
         job_id=job.id,
         expected_generation=expected_generation,
         prepare_items=prepare_items,
+        resolved_input_hash_version=resolved_input_hash_version.value,
         now=datetime.datetime.now(datetime.timezone.utc),
     )
     if not persisted:

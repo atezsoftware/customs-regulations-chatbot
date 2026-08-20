@@ -5688,6 +5688,9 @@ class RegulatoryIndexingJob(Base):
     cancellation_phase: Mapped[str] = mapped_column(
         String(32), nullable=False, default="NONE", server_default="NONE"
     )
+    cancellation_intent: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="NONE", server_default="NONE"
+    )
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
@@ -5758,6 +5761,11 @@ class RegulatoryIndexingJob(Base):
             "cancellation_phase IN ('NONE', 'VERTEX_CANCEL', 'GCS_CLEANUP', "
             "'INDEX_DELETE', 'FINALIZE')",
             name="regulatory_indexing_job_cancellation_phase_check",
+        ),
+        CheckConstraint(
+            "cancellation_intent IN "
+            "('NONE', 'USER_CANCEL', 'USER_DELETE', 'SUPERSEDE')",
+            name="regulatory_indexing_job_cancellation_intent_check",
         ),
         CheckConstraint(
             "status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT', 'SUCCEEDED', "

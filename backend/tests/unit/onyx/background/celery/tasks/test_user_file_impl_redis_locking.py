@@ -211,7 +211,8 @@ class TestDeleteUserFileImpl:
         )
 
         mock_get_redis.assert_not_called()
-        mock_get_session.assert_called_once()
+        # Durable cancellation fencing commits before the ordinary delete read.
+        assert mock_get_session.call_count == 2
 
 
 # ------------------------------------------------------------------

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 _LEGACY_REVISION = "c8f1a6d4e2b7"
 _CHUNK_IDENTITY_REVISION = "d2a9c7e4b1f6"
+_ACTIVE_JOB_REVISION = "e3b7d5a1c9f2"
 
 
 def _alembic_config(engine: Engine, schema_name: str) -> Config:
@@ -37,7 +38,8 @@ def legacy_regulatory_schema(
             text(
                 """
                 CREATE TABLE user_file (
-                    id uuid PRIMARY KEY
+                    id uuid PRIMARY KEY,
+                    status varchar(32) NOT NULL DEFAULT 'PROCESSING'
                 );
                 CREATE TABLE regulatory_chunk (
                     id text PRIMARY KEY
@@ -140,8 +142,30 @@ def test_two_generation_downgrade_keeps_current_job_and_cascades_old_items(
             {"id": first_job_id},
         )
         assert migrated_snapshot["input_content_hash"] == content_hash
-        assert migrated_snapshot["input_hash_version"] == "legacy-v1"
+        assert migrated_snapshot["input_hash_version"] == "legacy-or-canonical"
         first_generation_hash = migrated_snapshot["chunk_generation_hash"]
+        assert connection.scalar(
+            text(
+                """
+                SELECT count(*) = 1
+                FROM information_schema.columns
+                WHERE table_schema = :schema_name
+                  AND table_name = 'regulatory_indexing_job'
+                  AND column_name = 'cancellation_intent'
+                """
+            ),
+            {"schema_name": schema_name},
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT cancellation_intent FROM regulatory_indexing_job "
+                    "WHERE id = :id"
+                ),
+                {"id": first_job_id},
+            )
+            == "NONE"
+        )
 
         connection.execute(
             text(
@@ -212,6 +236,18 @@ def test_two_generation_downgrade_keeps_current_job_and_cascades_old_items(
             ),
             {"schema_name": schema_name},
         )
+        assert connection.scalar(
+            text(
+                """
+                SELECT count(*) = 0
+                FROM information_schema.columns
+                WHERE table_schema = :schema_name
+                  AND table_name = 'regulatory_indexing_job'
+                  AND column_name = 'cancellation_intent'
+                """
+            ),
+            {"schema_name": schema_name},
+        )
 
     command.upgrade(config, "head")
     with engine.begin() as connection:
@@ -228,7 +264,7 @@ def test_two_generation_downgrade_keeps_current_job_and_cascades_old_items(
         assert upgraded == (
             second_job_id,
             first_generation_hash,
-            "legacy-v1",
+            "legacy-or-canonical",
         )
         assert connection.scalar(
             text(
@@ -242,3 +278,92 @@ def test_two_generation_downgrade_keeps_current_job_and_cascades_old_items(
             ),
             {"schema_name": schema_name},
         )
+        assert upgraded[2] == "legacy-or-canonical"
+        assert (
+            connection.scalar(
+                text("SELECT cancellation_intent FROM regulatory_indexing_job")
+            )
+            == "NONE"
+        )
+
+
+@pytest.mark.parametrize(
+    "user_file_status,expected_intent",
+    [
+        ("DELETING", "USER_DELETE"),
+        ("CANCELED", "USER_CANCEL"),
+        ("PROCESSING", "SUPERSEDE"),
+    ],
+)
+def test_upgrade_repairs_ambiguous_hash_and_recovers_cancellation_intent(
+    legacy_regulatory_schema: tuple[Engine, str],
+    user_file_status: str,
+    expected_intent: str,
+) -> None:
+    engine, schema_name = legacy_regulatory_schema
+    config = _alembic_config(engine, schema_name)
+    user_file_id = uuid4()
+    job_id = uuid4()
+
+    with engine.begin() as connection:
+        connection.execute(text(f'SET search_path TO "{schema_name}"'))
+        connection.execute(
+            text("INSERT INTO user_file (id, status) VALUES (:id, :status)"),
+            {"id": user_file_id, "status": user_file_status},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO regulatory_indexing_job (
+                    id, user_file_id, content_hash, search_settings_id,
+                    prompt_hash, config_snapshot, status, stage,
+                    lease_generation, created_at, updated_at
+                ) VALUES (
+                    :id, :user_file_id, :content_hash, 17, 'prompt-v1',
+                    '{}'::jsonb, 'CANCELLING', 'PREPARING', 2, now(), now()
+                )
+                """
+            ),
+            {
+                "id": job_id,
+                "user_file_id": user_file_id,
+                "content_hash": "a" * 64,
+            },
+        )
+
+    command.upgrade(config, _ACTIVE_JOB_REVISION)
+    with engine.begin() as connection:
+        connection.execute(text(f'SET search_path TO "{schema_name}"'))
+        # Simulate the already-applied wave-one d2/e3 implementation, which
+        # labelled every missing discriminator as legacy-v1.
+        connection.execute(
+            text(
+                """
+                UPDATE regulatory_indexing_job
+                SET config_snapshot = jsonb_set(
+                    config_snapshot,
+                    '{input_hash_version}',
+                    '"legacy-v1"'::jsonb,
+                    true
+                )
+                WHERE id = :id
+                """
+            ),
+            {"id": job_id},
+        )
+
+    command.upgrade(config, "head")
+    with engine.begin() as connection:
+        connection.execute(text(f'SET search_path TO "{schema_name}"'))
+        upgraded = connection.execute(
+            text(
+                """
+                SELECT config_snapshot ->> 'input_hash_version',
+                       cancellation_intent
+                FROM regulatory_indexing_job
+                WHERE id = :id
+                """
+            ),
+            {"id": job_id},
+        ).one()
+        assert upgraded == ("legacy-or-canonical", expected_intent)

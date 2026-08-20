@@ -779,7 +779,13 @@ class VespaDocumentIndex(DocumentIndex):
             for cleaned_doc_id in all_cleaned_doc_ids
         ]
 
-    def delete(self, document_id: str, chunk_count: int | None = None) -> int:
+    def delete(
+        self,
+        document_id: str,
+        chunk_count: int | None = None,
+        *,
+        refresh: bool = False,  # noqa: ARG002
+    ) -> int:
         total_chunks_deleted = 0
 
         sanitized_doc_id = replace_invalid_doc_id_characters(document_id)
@@ -1292,10 +1298,16 @@ class VespaIndexPair(DocumentIndex):
         # Secondary is filled by a separate pipeline; primary only here.
         return self._primary.index(chunks, indexing_metadata)
 
-    def delete(self, document_id: str, chunk_count: int | None = None) -> int:
-        total = self._primary.delete(document_id, chunk_count)
+    def delete(
+        self,
+        document_id: str,
+        chunk_count: int | None = None,
+        *,
+        refresh: bool = False,
+    ) -> int:
+        total = self._primary.delete(document_id, chunk_count, refresh=refresh)
         if self._secondary is not None:
-            total += self._secondary.delete(document_id, chunk_count)
+            total += self._secondary.delete(document_id, chunk_count, refresh=refresh)
         return total
 
     def update(self, update_requests: list[MetadataUpdateRequest]) -> None:

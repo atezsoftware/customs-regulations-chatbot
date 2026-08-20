@@ -311,6 +311,8 @@ class Deletable(abc.ABC):
         # that takes in a list of IDs.
         document_id: str,
         chunk_count: int | None = None,
+        *,
+        refresh: bool = False,
         # TODO(andrei): Shouldn't this also have some acl filtering at minimum?
     ) -> int:
         """
@@ -327,6 +329,8 @@ class Deletable(abc.ABC):
             chunk_count: The number of chunks in the document. May be useful for
                 improving the efficiency of the delete operation. Defaults to
                 None.
+            refresh: Make the deletion visible to immediate follow-up reads and
+                writes before returning. Defaults to False.
 
         Returns:
             The number of chunks deleted.

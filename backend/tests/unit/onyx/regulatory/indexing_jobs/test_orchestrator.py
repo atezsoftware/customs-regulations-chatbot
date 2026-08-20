@@ -15,6 +15,7 @@ from onyx.configs.constants import DocumentSource
 from onyx.connectors.models import Document, TextSection
 from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.enums import (
+    RegulatoryIndexingCancellationIntent,
     RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
@@ -890,11 +891,27 @@ def test_any_publication_failure_retries_after_attempt_budget_is_exhausted() -> 
     fail_job.assert_not_called()
 
 
-def test_deleted_file_requests_durable_cancellation_without_external_work() -> None:
+@pytest.mark.parametrize(
+    "user_file_status,expected_intent",
+    [
+        (
+            UserFileStatus.DELETING,
+            RegulatoryIndexingCancellationIntent.USER_DELETE,
+        ),
+        (
+            UserFileStatus.CANCELED,
+            RegulatoryIndexingCancellationIntent.USER_CANCEL,
+        ),
+    ],
+)
+def test_terminal_file_status_requests_typed_cancellation_without_external_work(
+    user_file_status: UserFileStatus,
+    expected_intent: RegulatoryIndexingCancellationIntent,
+) -> None:
     runtime = _runtime(
         RegulatoryIndexingStage.CONTEXT_WAIT,
         remote_job_name="remote-1",
-        user_file_status=UserFileStatus.DELETING,
+        user_file_status=user_file_status,
     )
     gateway = MagicMock()
     document_index = MagicMock()
@@ -925,6 +942,9 @@ def test_deleted_file_requests_durable_cancellation_without_external_work() -> N
     gateway.cleanup.assert_not_called()
     document_index.delete.assert_not_called()
     request_cancellation.assert_called_once()
+    assert (
+        request_cancellation.call_args.kwargs["cancellation_intent"] is expected_intent
+    )
     assert result.outcome is OrchestrationOutcome.NEXT_STEP
 
 
@@ -1070,7 +1090,7 @@ def test_cancellation_index_delete_and_finalize_are_separate_deliveries() -> Non
         )
 
     document_index.delete.assert_called_once_with(
-        str(deleting.user_file.id), chunk_count=2
+        str(deleting.user_file.id), chunk_count=2, refresh=True
     )
     assert advance.call_args.kwargs["next_phase"] is (
         RegulatoryIndexingCancellationPhase.FINALIZE

@@ -627,6 +627,8 @@ class ElasticsearchDocumentIndex(DocumentIndex):
         self,
         document_id: str,
         chunk_count: int | None = None,  # noqa: ARG002
+        *,
+        refresh: bool = False,
     ) -> int:
         """Deletes all chunks for a given document.
 
@@ -641,6 +643,7 @@ class ElasticsearchDocumentIndex(DocumentIndex):
                 in Onyx, not necessarily in the document index.
             chunk_count: The number of chunks in Elasticsearch for the document.
                 Defaults to None.
+            refresh: Make the deletion visible before returning. Defaults to False.
 
         Raises:
             Exception: Failed to delete some or all of the chunks for the
@@ -659,7 +662,7 @@ class ElasticsearchDocumentIndex(DocumentIndex):
             tenant_state=self._tenant_state,
         )
 
-        return self._client.delete_by_query(query_body)
+        return self._client.delete_by_query(query_body, refresh=refresh)
 
     def _verification_chunk_ids(
         self,
@@ -1343,10 +1346,16 @@ class ElasticsearchIndexPair(DocumentIndex):
                     [request.document_id]
                 ) from error
 
-    def delete(self, document_id: str, chunk_count: int | None = None) -> int:
-        total = self._primary.delete(document_id, chunk_count)
+    def delete(
+        self,
+        document_id: str,
+        chunk_count: int | None = None,
+        *,
+        refresh: bool = False,
+    ) -> int:
+        total = self._primary.delete(document_id, chunk_count, refresh=refresh)
         if self._secondary is not None:
-            total += self._secondary.delete(document_id, chunk_count)
+            total += self._secondary.delete(document_id, chunk_count, refresh=refresh)
         return total
 
     def update(self, update_requests: list[MetadataUpdateRequest]) -> None:
