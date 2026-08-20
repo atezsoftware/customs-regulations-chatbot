@@ -172,3 +172,25 @@ def test_lite_beat_is_restricted_to_work_this_image_can_run() -> None:
         "check_for_user_file_delete",
     ):
         assert task_name in dockerfile
+
+
+def test_lite_beat_writes_its_schedule_somewhere_the_service_user_can() -> None:
+    """Beat persists its schedule to a file next to the working directory.
+
+    This image runs its programs as the unprivileged `onyx` user while /app is
+    owned by root, so beat needs an explicit writable path or it exits on boot
+    with a permission error and silently stops retrying anything.
+    """
+
+    config = _lite_supervisord()
+    dockerfile = (_backend_root() / "Dockerfile.runtime-lite").read_text(
+        encoding="utf-8"
+    )
+
+    beat_program = config.split("[program:celery_beat]", 1)[1].split("[program:", 1)[0]
+    assert "--schedule=" in beat_program, beat_program
+
+    schedule_dir = beat_program.split("--schedule=", 1)[1].split()[0].rsplit("/", 1)[0]
+    # The directory has to exist and belong to onyx before beat starts.
+    assert schedule_dir in dockerfile, schedule_dir
+    assert "chown onyx:onyx" in dockerfile

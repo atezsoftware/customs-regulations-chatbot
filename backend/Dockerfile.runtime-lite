@@ -70,9 +70,9 @@ ENV BEAT_TASK_ALLOWLIST="check_for_user_file_processing,check_for_user_file_proj
 
 RUN groupadd -g 1001 onyx && \
     useradd -u 1001 -g onyx -m -s /bin/bash onyx && \
-    mkdir -p /var/log/onyx /app/file-system && \
-    chmod 750 /var/log/onyx /app/file-system && \
-    chown onyx:onyx /var/log/onyx /app/file-system
+    mkdir -p /var/log/onyx /app/file-system /app/beat-state && \
+    chmod 750 /var/log/onyx /app/file-system /app/beat-state && \
+    chown onyx:onyx /var/log/onyx /app/file-system /app/beat-state
 
 RUN apt-get update && \
     apt-get install -y \
