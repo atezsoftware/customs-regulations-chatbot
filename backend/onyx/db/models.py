@@ -5872,7 +5872,8 @@ class RegulatoryIndexingJob(Base):
         ),
         CheckConstraint(
             "vertex_submission_state IN ('NONE', 'SUBMITTING', "
-            "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', 'SUBMITTED')",
+            "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', "
+            "'RETRY_CLEANUP_REQUIRED', 'SUBMITTED')",
             name="regulatory_indexing_job_submission_state_check",
         ),
         CheckConstraint(

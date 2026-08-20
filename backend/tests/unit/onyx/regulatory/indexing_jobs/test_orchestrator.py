@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
+from hashlib import sha256
 from types import SimpleNamespace
 from typing import Iterator, cast
 from unittest.mock import ANY, MagicMock, patch
@@ -22,6 +23,7 @@ from onyx.db.enums import (
     RegulatoryIndexingProviderCleanupPhase,
     RegulatoryIndexingProviderCleanupState,
     RegulatoryIndexingStage,
+    RegulatoryIndexingSubmissionState,
     UserFileStatus,
 )
 from onyx.db.models import (
@@ -35,6 +37,10 @@ from onyx.regulatory.indexing_jobs.configuration import (
 )
 from onyx.regulatory.indexing_jobs.contextual import ContextApplySummary
 from onyx.regulatory.indexing_jobs.embedding import EmbeddingSummary
+from onyx.regulatory.indexing_jobs.gemini_files_batch import (
+    GoogleGeminiFilesBatchGateway,
+)
+from onyx.regulatory.indexing_jobs.legacy_vertex_batch import GoogleVertexBatchGateway
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
     IndexingGatewayHTTPError,
@@ -84,7 +90,6 @@ def _snapshot() -> RegulatoryIndexingConfigSnapshot:
                 "project": "project",
                 "location": "europe-west1",
                 "authentication_mode": "workload_identity",
-                "gcs_uri": "gs://bucket/regulatory-indexing",
             },
             "prompt_version": "contextual-rag-v1",
             "prompt_hash": "a" * 64,
@@ -105,6 +110,8 @@ def _runtime(
     generation: int = 3,
     attempt_count: int = 0,
     remote_job_name: str | None = None,
+    input_uri: str | None = None,
+    output_uri: str | None = None,
     submission_key: str | None = None,
     submission_state: str = "NONE",
     submission_attempt: int = 0,
@@ -119,10 +126,14 @@ def _runtime(
         RegulatoryIndexingCancellationIntent.USER_CANCEL
     ),
     user_file_status: UserFileStatus = UserFileStatus.INDEXING,
+    legacy_gcs_uri: str | None = None,
 ) -> indexing_job_repository.RegulatoryIndexingRuntime:
     job_id = uuid4()
     user_file_id = uuid4()
     snapshot = _snapshot()
+    config_snapshot = snapshot.model_dump(mode="json")
+    if legacy_gcs_uri is not None:
+        config_snapshot["vertex"]["gcs_uri"] = legacy_gcs_uri  # type: ignore[index]
     job = SimpleNamespace(
         id=job_id,
         user_file_id=user_file_id,
@@ -132,10 +143,10 @@ def _runtime(
         attempt_count=attempt_count,
         content_hash="1" * 64,
         chunk_generation_hash=snapshot.chunk_generation_hash,
-        config_snapshot=snapshot.model_dump(mode="json"),
+        config_snapshot=config_snapshot,
         remote_vertex_job_name=remote_job_name,
-        vertex_input_uri=None,
-        vertex_output_uri=None,
+        vertex_input_uri=input_uri,
+        vertex_output_uri=output_uri,
         vertex_submission_key=submission_key,
         vertex_submission_state=submission_state,
         vertex_submission_attempt_count=submission_attempt,
@@ -188,6 +199,51 @@ def _patch_session(session: Session) -> AbstractContextManager[MagicMock]:
 @contextmanager
 def _external_lease(*_args: object, **_kwargs: object) -> Iterator[object]:
     yield SimpleNamespace(commit=lambda: None)
+
+
+def test_gateway_builder_uses_admin_service_account_for_gemini_files_batch() -> None:
+    runtime = _runtime(RegulatoryIndexingStage.CONTEXT_SUBMIT)
+    provider = SimpleNamespace(
+        custom_config={"vertex_credentials": '{"type":"service_account"}'},
+    )
+    model_configuration = SimpleNamespace(llm_provider=provider)
+    with patch(
+        "onyx.regulatory.indexing_jobs.orchestrator.fetch_model_configuration_by_id",
+        return_value=model_configuration,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _build_vertex_gateway
+
+        gateway = _build_vertex_gateway(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+        )
+
+    assert isinstance(gateway, GoogleGeminiFilesBatchGateway)
+
+
+def test_gateway_builder_routes_legacy_snapshot_to_vertex_gcs() -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.CONTEXT_WAIT,
+        legacy_gcs_uri="gs://legacy-regulatory/jobs",
+    )
+    provider = SimpleNamespace(
+        custom_config={"vertex_credentials": '{"type":"service_account"}'},
+    )
+    model_configuration = SimpleNamespace(llm_provider=provider)
+    with patch(
+        "onyx.regulatory.indexing_jobs.orchestrator.fetch_model_configuration_by_id",
+        return_value=model_configuration,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _build_vertex_gateway
+
+        gateway = _build_vertex_gateway(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+        )
+
+    assert isinstance(gateway, GoogleVertexBatchGateway)
 
 
 def test_preparing_performs_one_preparation_operation() -> None:
@@ -1059,8 +1115,9 @@ def test_partial_context_output_requeues_only_still_pending_items() -> None:
     runtime = _runtime(
         RegulatoryIndexingStage.CONTEXT_APPLY,
         remote_job_name="remote-1",
+        input_uri="files/input-1",
+        output_uri="files/output-1",
     )
-    runtime.job.vertex_output_uri = "gs://bucket/output"
     pending_request = VertexBatchRequest(prompt="pending")
     ready_request = VertexBatchRequest(prompt="ready")
     runtime = replace(
@@ -1111,9 +1168,13 @@ def test_partial_context_output_requeues_only_still_pending_items() -> None:
             ),
         ) as apply_results,
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.reset_vertex_submission_for_partial_retry",
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.mark_vertex_partial_retry_cleanup_required",
             return_value=True,
-        ) as reset_submission,
+        ) as mark_cleanup,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.complete_vertex_partial_retry_cleanup",
+            return_value=True,
+        ) as complete_cleanup,
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_job",
             return_value=True,
@@ -1129,17 +1190,70 @@ def test_partial_context_output_requeues_only_still_pending_items() -> None:
         )
 
     gateway.read_results.assert_called_once_with(runtime.job.vertex_output_uri)
+    gateway.delete.assert_called_once_with("remote-1")
+    assert [call.args for call in gateway.cleanup.call_args_list] == [
+        ("files/input-1",),
+        ("files/output-1",),
+    ]
     parse_output.assert_called_once_with(
         "jsonl",
         {pending_request.request_hash, ready_request.request_hash},
         require_complete=False,
     )
     assert apply_results.call_args.args[3] == {}
-    reset_submission.assert_called_once()
-    assert (
-        advance.call_args.kwargs["next_stage"] is RegulatoryIndexingStage.CONTEXT_SUBMIT
-    )
+    mark_cleanup.assert_called_once()
+    complete_cleanup.assert_called_once()
+    advance.assert_not_called()
     assert result.outcome is OrchestrationOutcome.NEXT_STEP
+
+
+@pytest.mark.parametrize(
+    ("delete_error", "file_cleanup_effects", "expected_file_cleanup_calls"),
+    [
+        (IndexingGatewayConnectionError(), [], 0),
+        (None, [IndexingGatewayConnectionError()], 1),
+        (None, [None, IndexingGatewayConnectionError()], 2),
+    ],
+)
+def test_partial_retry_cleanup_resumes_after_each_external_delete_boundary(
+    delete_error: IndexingGatewayConnectionError | None,
+    file_cleanup_effects: list[Exception | None],
+    expected_file_cleanup_calls: int,
+) -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.CONTEXT_APPLY,
+        remote_job_name="batches/remote-1",
+        input_uri="files/input-1",
+        output_uri="files/output-1",
+        submission_state=RegulatoryIndexingSubmissionState.RETRY_CLEANUP_REQUIRED.value,
+    )
+    gateway = MagicMock()
+    gateway.delete.side_effect = delete_error
+    gateway.cleanup.side_effect = file_cleanup_effects
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.complete_vertex_partial_retry_cleanup",
+            return_value=True,
+        ) as complete_cleanup,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _context_apply
+
+        with pytest.raises(IndexingGatewayConnectionError):
+            _context_apply(
+                runtime,
+                tenant_id="tenant-a",
+                db_session=cast(Session, MagicMock()),
+                now=_NOW,
+            )
+
+    gateway.read_results.assert_not_called()
+    gateway.delete.assert_called_once_with("batches/remote-1")
+    assert len(gateway.cleanup.call_args_list) == expected_file_cleanup_calls
+    complete_cleanup.assert_not_called()
 
 
 def test_embedding_stage_processes_one_provider_batch_per_delivery() -> None:
@@ -1431,6 +1545,7 @@ def test_terminal_provider_cleanup_exhaustion_remains_sweepable() -> None:
     runtime = _runtime(
         RegulatoryIndexingStage.CONTEXT_WAIT,
         status=RegulatoryIndexingJobStatus.FAILED,
+        input_uri="files/input-1",
         provider_cleanup_state=RegulatoryIndexingProviderCleanupState.RUNNING.value,
         provider_cleanup_phase=(
             RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP.value
@@ -1465,6 +1580,50 @@ def test_terminal_provider_cleanup_exhaustion_remains_sweepable() -> None:
     assert schedule.call_args.kwargs["exhausted"] is True
     assert schedule.call_args.kwargs["next_retry_at"] == _NOW + datetime.timedelta(
         seconds=_snapshot().retry_max_seconds
+    )
+    assert result.outcome is OrchestrationOutcome.COMPLETE
+
+
+def test_terminal_provider_cleanup_uses_legacy_job_prefix() -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.PUBLISH,
+        status=RegulatoryIndexingJobStatus.SUCCEEDED,
+        provider_cleanup_state=RegulatoryIndexingProviderCleanupState.RUNNING.value,
+        provider_cleanup_phase=(
+            RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP.value
+        ),
+        provider_cleanup_generation=8,
+        legacy_gcs_uri="gs://legacy-regulatory/jobs",
+    )
+    gateway = MagicMock()
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_provider_cleanup",
+            return_value=True,
+        ) as advance,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import (
+            _run_claimed_regulatory_provider_cleanup,
+        )
+
+        result = _run_claimed_regulatory_provider_cleanup(
+            runtime,
+            cleanup_generation=8,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    tenant_key = sha256(b"tenant-a").hexdigest()
+    gateway.cleanup.assert_called_once_with(
+        f"gs://legacy-regulatory/jobs/tenants/{tenant_key}/jobs/{runtime.job.id}"
+    )
+    assert advance.call_args.kwargs["next_phase"] is (
+        RegulatoryIndexingProviderCleanupPhase.COMPLETE
     )
     assert result.outcome is OrchestrationOutcome.COMPLETE
 
@@ -1596,6 +1755,110 @@ def test_cancellation_gcs_phase_progresses_when_gateway_config_is_missing() -> N
     build_index.assert_not_called()
     assert advance.call_args.kwargs["next_phase"] is (
         RegulatoryIndexingCancellationPhase.INDEX_DELETE
+    )
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+
+
+def test_cancellation_storage_phase_deletes_captured_gemini_files() -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.CONTEXT_WAIT,
+        status=RegulatoryIndexingJobStatus.CANCELLING,
+        input_uri="files/input-1",
+        output_uri="files/output-1",
+        cancellation_phase=RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value,
+    )
+    gateway = MagicMock()
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_cancellation",
+            return_value=True,
+        ) as advance,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert [item.args for item in gateway.cleanup.call_args_list] == [
+        ("files/input-1",),
+        ("files/output-1",),
+    ]
+    assert advance.call_args.kwargs["next_phase"] is (
+        RegulatoryIndexingCancellationPhase.INDEX_DELETE
+    )
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+
+
+def test_cancellation_storage_phase_recovers_deterministic_input_file() -> None:
+    submission_key = "regulatory-context-" + "a" * 64
+    runtime = _runtime(
+        RegulatoryIndexingStage.CONTEXT_WAIT,
+        status=RegulatoryIndexingJobStatus.CANCELLING,
+        submission_key=submission_key,
+        cancellation_phase=RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value,
+    )
+    gateway = MagicMock()
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_cancellation",
+            return_value=True,
+        ),
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    gateway.cleanup.assert_called_once_with("files/regctx-" + "a" * 32)
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+
+
+def test_cancellation_storage_phase_uses_legacy_job_prefix() -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.CONTEXT_WAIT,
+        status=RegulatoryIndexingJobStatus.CANCELLING,
+        cancellation_phase=RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value,
+        legacy_gcs_uri="gs://legacy-regulatory/jobs",
+    )
+    gateway = MagicMock()
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_cancellation",
+            return_value=True,
+        ),
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    tenant_key = sha256(b"tenant-a").hexdigest()
+    gateway.cleanup.assert_called_once_with(
+        f"gs://legacy-regulatory/jobs/tenants/{tenant_key}/jobs/{runtime.job.id}"
     )
     assert result.outcome is OrchestrationOutcome.NEXT_STEP
 

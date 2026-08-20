@@ -44,6 +44,11 @@ from onyx.regulatory.indexing_jobs.embedding import (
     build_openrouter_embedding_batch,
     embed_pending_regulatory_items,
 )
+from onyx.regulatory.indexing_jobs.gemini_files_batch import (
+    GoogleGeminiFilesBatchGateway,
+    gemini_input_file_name,
+)
+from onyx.regulatory.indexing_jobs.legacy_vertex_batch import GoogleVertexBatchGateway
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayError,
     IndexingGatewayHTTPError,
@@ -74,7 +79,6 @@ from onyx.regulatory.indexing_jobs.retry import (
     retry_delay_seconds,
 )
 from onyx.regulatory.indexing_jobs.vertex_batch import (
-    GoogleVertexBatchGateway,
     VertexBatchContractError,
     VertexBatchGateway,
     VertexBatchJobStatus,
@@ -174,9 +178,14 @@ def _build_vertex_gateway(
     def credential_json_provider() -> str | None:
         return raw_credentials
 
-    return GoogleVertexBatchGateway(
+    if snapshot.vertex.gcs_uri is not None:
+        return GoogleVertexBatchGateway(
+            config=snapshot.vertex,
+            object_prefix=_vertex_object_prefix(tenant_id, runtime.job.id),
+            credential_json_provider=credential_json_provider,
+        )
+    return GoogleGeminiFilesBatchGateway(
         config=snapshot.vertex,
-        object_prefix=_vertex_object_prefix(tenant_id, runtime.job.id),
         credential_json_provider=credential_json_provider,
     )
 
@@ -199,6 +208,66 @@ def _build_openrouter_gateway(
         config=config,
         api_key_provider=api_key_provider,
     )
+
+
+def _cleanup_gemini_files(
+    gateway: VertexBatchGateway,
+    input_file_name: str | None,
+    output_file_name: str | None,
+) -> None:
+    for file_name in dict.fromkeys((input_file_name, output_file_name)):
+        if not file_name:
+            continue
+        try:
+            gateway.cleanup(file_name)
+        except IndexingGatewayHTTPError as error:
+            if error.status_code != 404:
+                raise
+
+
+def _delete_vertex_batch(
+    gateway: VertexBatchGateway,
+    remote_job_name: str,
+) -> None:
+    try:
+        gateway.delete(remote_job_name)
+    except IndexingGatewayHTTPError as error:
+        if error.status_code != 404:
+            raise
+
+
+def _cleanup_vertex_storage(
+    runtime: indexing_job_repository.RegulatoryIndexingRuntime,
+    *,
+    tenant_id: str,
+    gateway: VertexBatchGateway,
+) -> None:
+    snapshot = _snapshot(runtime)
+    if snapshot.vertex.gcs_uri is not None:
+        gateway.cleanup(
+            f"{snapshot.vertex.gcs_uri.rstrip('/')}/"
+            f"{_vertex_object_prefix(tenant_id, runtime.job.id)}"
+        )
+        return
+    _cleanup_gemini_files(
+        gateway,
+        _input_file_name_for_cleanup(
+            runtime.job.vertex_input_uri,
+            runtime.job.vertex_submission_key,
+        ),
+        runtime.job.vertex_output_uri,
+    )
+
+
+def _input_file_name_for_cleanup(
+    captured_file_name: str | None,
+    submission_key: str | None,
+) -> str | None:
+    if captured_file_name:
+        return captured_file_name
+    if submission_key:
+        return gemini_input_file_name(submission_key)
+    return None
 
 
 def _advance(
@@ -566,11 +635,32 @@ def _context_apply(
     db_session: Session,
     now: datetime.datetime,
 ) -> OrchestrationResult:
+    remote_job_name = runtime.job.remote_vertex_job_name
+    if not remote_job_name:
+        raise ValueError("Vertex apply stage has no remote job name")
     output_uri = runtime.job.vertex_output_uri
     if not output_uri:
         raise ValueError("Vertex apply stage has no output URI")
     snapshot = _snapshot(runtime)
     gateway = _build_vertex_gateway(runtime, tenant_id=tenant_id, db_session=db_session)
+    if (
+        RegulatoryIndexingSubmissionState(runtime.job.vertex_submission_state)
+        is RegulatoryIndexingSubmissionState.RETRY_CLEANUP_REQUIRED
+    ):
+        _delete_vertex_batch(gateway, remote_job_name)
+        _cleanup_vertex_storage(runtime, tenant_id=tenant_id, gateway=gateway)
+        completed = indexing_job_repository.complete_vertex_partial_retry_cleanup(
+            db_session,
+            job_id=runtime.job.id,
+            expected_generation=runtime.job.lease_generation,
+            now=now,
+        )
+        if not completed:
+            return _skipped(runtime.job.id)
+        return _next_step(
+            runtime.job.id,
+            runtime.job.lease_generation,
+        )
     raw_output = gateway.read_results(output_uri)
     all_hashes = {item.request_hash for item in runtime.indexing_items}
     pending_hashes = {
@@ -605,18 +695,22 @@ def _context_apply(
     if summary.failed_count:
         raise ValueError("contextual batch contains terminal item failures")
     if summary.pending_count:
-        reset = indexing_job_repository.reset_vertex_submission_for_partial_retry(
+        marked = indexing_job_repository.mark_vertex_partial_retry_cleanup_required(
             db_session,
             job_id=runtime.job.id,
             expected_generation=runtime.job.lease_generation,
+            remote_job_name=remote_job_name,
             now=now,
         )
-        if not reset:
+        if not marked:
             return _skipped(runtime.job.id)
-        return _advance(
+        runtime.job.vertex_submission_state = (
+            RegulatoryIndexingSubmissionState.RETRY_CLEANUP_REQUIRED.value
+        )
+        return _context_apply(
             runtime,
-            db_session,
-            next_stage=RegulatoryIndexingStage.CONTEXT_SUBMIT,
+            tenant_id=tenant_id,
+            db_session=db_session,
             now=now,
         )
     return _advance(
@@ -988,14 +1082,17 @@ def _execute_cancellation_phase(
         )
     if phase is RegulatoryIndexingCancellationPhase.GCS_CLEANUP:
         snapshot = _snapshot(runtime)
-        cleanup_uri = (
-            f"{snapshot.vertex.gcs_uri.rstrip('/')}/"
-            f"{_vertex_object_prefix(tenant_id, runtime.job.id)}"
+        has_storage = (
+            snapshot.vertex.gcs_uri is not None
+            or runtime.job.vertex_input_uri is not None
+            or runtime.job.vertex_output_uri is not None
+            or runtime.job.vertex_submission_key is not None
         )
-        gateway = _build_vertex_gateway(
-            runtime, tenant_id=tenant_id, db_session=db_session
-        )
-        gateway.cleanup(cleanup_uri)
+        if has_storage:
+            gateway = _build_vertex_gateway(
+                runtime, tenant_id=tenant_id, db_session=db_session
+            )
+            _cleanup_vertex_storage(runtime, tenant_id=tenant_id, gateway=gateway)
         return _advance_cancellation(
             runtime,
             db_session,
@@ -1466,13 +1563,17 @@ def _run_claimed_regulatory_provider_cleanup(
                 ).delete(job.remote_vertex_job_name)
             next_phase = RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP
         elif phase is RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP:
-            cleanup_uri = (
-                f"{snapshot.vertex.gcs_uri.rstrip('/')}/"
-                f"{_vertex_object_prefix(tenant_id, job.id)}"
+            has_storage = (
+                snapshot.vertex.gcs_uri is not None
+                or job.vertex_input_uri is not None
+                or job.vertex_output_uri is not None
+                or job.vertex_submission_key is not None
             )
-            _build_vertex_gateway(
-                runtime, tenant_id=tenant_id, db_session=db_session
-            ).cleanup(cleanup_uri)
+            if has_storage:
+                gateway = _build_vertex_gateway(
+                    runtime, tenant_id=tenant_id, db_session=db_session
+                )
+                _cleanup_vertex_storage(runtime, tenant_id=tenant_id, gateway=gateway)
             next_phase = RegulatoryIndexingProviderCleanupPhase.COMPLETE
         elif phase is RegulatoryIndexingProviderCleanupPhase.COMPLETE:
             completed = indexing_job_repository.complete_regulatory_provider_cleanup(

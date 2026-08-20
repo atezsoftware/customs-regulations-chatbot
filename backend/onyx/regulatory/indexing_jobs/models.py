@@ -104,7 +104,9 @@ class VertexBatchConfig(BaseModel):
     project: str = Field(min_length=1)
     location: str = Field(min_length=1)
     authentication_mode: VertexAuthenticationMode
-    gcs_uri: str = Field(pattern=r"^gs://[^/\s]+(?:/[^\s]*)?$")
+    # Accepted only so pre-Files-API durable snapshots remain readable during
+    # an in-flight rollout. New snapshots never serialize or use this value.
+    gcs_uri: str | None = Field(default=None, exclude=True, repr=False)
 
 
 class OpenRouterBatchConfig(BaseModel):

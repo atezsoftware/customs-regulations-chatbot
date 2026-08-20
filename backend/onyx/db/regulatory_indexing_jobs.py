@@ -1202,7 +1202,7 @@ def persist_vertex_poll_state(
     return updated_id is not None
 
 
-def reset_vertex_submission_for_partial_retry(
+def complete_vertex_partial_retry_cleanup(
     db_session: Session,
     *,
     job_id: UUID,
@@ -1216,8 +1216,13 @@ def reset_vertex_submission_for_partial_retry(
             RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
             RegulatoryIndexingJob.stage == RegulatoryIndexingStage.CONTEXT_APPLY.value,
             RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.vertex_submission_state
+            == RegulatoryIndexingSubmissionState.RETRY_CLEANUP_REQUIRED.value,
         )
         .values(
+            status=RegulatoryIndexingJobStatus.QUEUED.value,
+            stage=RegulatoryIndexingStage.CONTEXT_SUBMIT.value,
+            attempt_count=0,
             vertex_submission_key=None,
             vertex_submission_state=RegulatoryIndexingSubmissionState.NONE.value,
             remote_vertex_job_name=None,
@@ -1226,6 +1231,43 @@ def reset_vertex_submission_for_partial_retry(
             vertex_submission_charged=False,
             vertex_reconcile_miss_count=0,
             vertex_reconcile_until=None,
+            heartbeat_at=now,
+            next_retry_at=None,
+            error_code=None,
+            error_message=None,
+            updated_at=now,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return updated_id is not None
+
+
+def mark_vertex_partial_retry_cleanup_required(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    remote_job_name: str,
+    now: datetime.datetime,
+) -> bool:
+    """Checkpoint provider cleanup before any retry resource is deleted."""
+
+    updated_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.CONTEXT_APPLY.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.vertex_submission_state
+            == RegulatoryIndexingSubmissionState.SUBMITTED.value,
+            RegulatoryIndexingJob.remote_vertex_job_name == remote_job_name,
+        )
+        .values(
+            vertex_submission_state=(
+                RegulatoryIndexingSubmissionState.RETRY_CLEANUP_REQUIRED.value
+            ),
             heartbeat_at=now,
             updated_at=now,
         )

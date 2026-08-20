@@ -49,13 +49,15 @@ from onyx.natural_language_processing.constants import OPENROUTER_EMBEDDINGS_URL
 from onyx.regulatory.indexing_jobs.configuration import (
     resolve_regulatory_indexing_snapshot,
 )
+from onyx.regulatory.indexing_jobs.gemini_files_batch import (
+    GoogleGeminiFilesBatchGateway,
+)
 from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
 from onyx.regulatory.indexing_jobs.openrouter_batch import (
     HttpxOpenRouterBatchGateway,
     OpenRouterBatchJobStatus,
     OpenRouterEmbeddingBatchRequest,
 )
-from onyx.regulatory.indexing_jobs.vertex_batch import GoogleVertexBatchGateway
 from shared_configs.configs import MULTI_TENANT
 from shared_configs.enums import EmbeddingProvider
 
@@ -94,15 +96,7 @@ _CAPABILITY_EVIDENCE_MAX_BYTES = 4 * 1024 * 1024
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REQUIRED_CAPABILITY_PERMISSIONS = frozenset(
     {
-        "storage.objects.create",
-        "storage.objects.get",
-        "storage.objects.delete",
-        "storage.objects.list",
-        "aiplatform.batchPredictionJobs.create",
-        "aiplatform.batchPredictionJobs.get",
-        "aiplatform.batchPredictionJobs.cancel",
-        "aiplatform.batchPredictionJobs.list",
-        "aiplatform.models.get",
+        "serviceusage.services.use",
     }
 )
 
@@ -121,7 +115,6 @@ class ReadinessSnapshot:
     vertex_model: str
     vertex_project: str
     vertex_location: str
-    gcs_uri: str
 
 
 @dataclass(frozen=True)
@@ -155,9 +148,7 @@ class ReadinessBackend(Protocol):
 
     def check_capability_attestation(self, snapshot: ReadinessSnapshot) -> str: ...
 
-    def check_gcs_access(self, snapshot: ReadinessSnapshot) -> str: ...
-
-    def check_vertex_access(self, snapshot: ReadinessSnapshot) -> str: ...
+    def check_gemini_batch_access(self, snapshot: ReadinessSnapshot) -> str: ...
 
     def probe_embedding_dimension(self, snapshot: ReadinessSnapshot) -> int: ...
 
@@ -199,8 +190,7 @@ def run_readiness_checks(
         )
         blocked_checks = (
             "capability_attestation",
-            "gcs_access",
-            "vertex_access",
+            "gemini_batch_access",
             "embedding_probe",
             "elasticsearch_mapping",
         )
@@ -235,8 +225,10 @@ def run_readiness_checks(
                 "capability_attestation",
                 lambda: backend.check_capability_attestation(snapshot),
             ),
-            _run_check("gcs_access", lambda: backend.check_gcs_access(snapshot)),
-            _run_check("vertex_access", lambda: backend.check_vertex_access(snapshot)),
+            _run_check(
+                "gemini_batch_access",
+                lambda: backend.check_gemini_batch_access(snapshot),
+            ),
             _run_check(
                 "embedding_probe",
                 lambda: _embedding_probe_detail(backend, snapshot),
@@ -296,7 +288,7 @@ class OnyxReadinessBackend:
         self._attested_identity: str | None = None
         self._config_snapshot: RegulatoryIndexingConfigSnapshot | None = None
         self._embedding_api_key: str | None = None
-        self._vertex_gateway: GoogleVertexBatchGateway | None = None
+        self._gemini_gateway: GoogleGeminiFilesBatchGateway | None = None
 
     def check_migration(self) -> str:
         config = Config(str(_BACKEND_ROOT / "alembic.ini"))
@@ -442,9 +434,8 @@ class OnyxReadinessBackend:
 
         self._config_snapshot = config_snapshot
         self._embedding_api_key = embedding_api_key
-        self._vertex_gateway = GoogleVertexBatchGateway(
+        self._gemini_gateway = GoogleGeminiFilesBatchGateway(
             config=config_snapshot.vertex,
-            object_prefix="readiness-only",
             credential_json_provider=lambda: credential_json,
         )
         return ReadinessSnapshot(
@@ -456,13 +447,12 @@ class OnyxReadinessBackend:
             vertex_model=config_snapshot.vertex.model_name,
             vertex_project=config_snapshot.vertex.project,
             vertex_location=config_snapshot.vertex.location,
-            gcs_uri=config_snapshot.vertex.gcs_uri,
         )
 
-    def _gateway(self) -> GoogleVertexBatchGateway:
-        if self._vertex_gateway is None:
+    def _gateway(self) -> GoogleGeminiFilesBatchGateway:
+        if self._gemini_gateway is None:
             raise ReadinessCheckError("admin snapshot has not been loaded")
-        return self._vertex_gateway
+        return self._gemini_gateway
 
     def check_capability_attestation(self, snapshot: ReadinessSnapshot) -> str:
         if (
@@ -478,7 +468,7 @@ class OnyxReadinessBackend:
             snapshot,
         )
         return (
-            "fresh operator evidence matches active identity and exact GCS/Vertex scope"
+            "fresh operator evidence matches active identity and Gemini project scope"
         )
 
     def _require_attested_identity(self) -> str:
@@ -488,26 +478,15 @@ class OnyxReadinessBackend:
             )
         return self._attested_identity
 
-    def check_gcs_access(self, snapshot: ReadinessSnapshot) -> str:
-        bucket_name, prefix = _parse_gcs_uri(snapshot.gcs_uri)
-        del prefix
-        attested_identity = self._require_attested_identity()
-        probe = self._gateway().probe_gcs_read_access()
-        if probe.credential_identity != attested_identity:
-            raise ReadinessCheckError(
-                "GCS probe credential identity does not match capability attestation"
-            )
-        return f"observed GCS list access for gs://{bucket_name}"
-
-    def check_vertex_access(self, snapshot: ReadinessSnapshot) -> str:
+    def check_gemini_batch_access(self, snapshot: ReadinessSnapshot) -> str:
         del snapshot
         attested_identity = self._require_attested_identity()
-        probe = self._gateway().probe_vertex_read_access()
+        probe = self._gateway().probe_gemini_read_access()
         if probe.credential_identity != attested_identity:
             raise ReadinessCheckError(
-                "Vertex probe credential identity does not match capability attestation"
+                "Gemini probe credential identity does not match capability attestation"
             )
-        return "observed Vertex model get and batch list access"
+        return "observed Gemini batch-capable model, batch list, and Files list access"
 
     def probe_embedding_dimension(self, snapshot: ReadinessSnapshot) -> int:
         if self._embedding_api_key is None:
@@ -898,7 +877,6 @@ def _validate_capability_attestation(
     if not isinstance(identity, str) or not identity.strip():
         raise ReadinessCheckError("capability attestation identity is invalid")
     exact_scope = {
-        "gcs_uri": snapshot.gcs_uri,
         "vertex_project": snapshot.vertex_project,
         "vertex_location": snapshot.vertex_location,
         "vertex_model": snapshot.vertex_model,
@@ -934,14 +912,6 @@ def _validate_capability_attestation(
     if age > _ATTESTATION_MAX_AGE:
         raise ReadinessCheckError("capability attestation is older than 24 hours")
     return identity.strip()
-
-
-def _parse_gcs_uri(uri: str) -> tuple[str, str]:
-    without_scheme = uri.removeprefix("gs://")
-    bucket, separator, prefix = without_scheme.partition("/")
-    if not uri.startswith("gs://") or not bucket:
-        raise ReadinessCheckError("configured GCS URI is invalid")
-    return bucket, prefix.rstrip("/") if separator else ""
 
 
 async def _probe_openrouter_embedding(
@@ -1000,7 +970,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--capability-attestation",
         type=Path,
         help=(
-            "Owner-only JSON evidence (mode 0600) for required GCS and Vertex "
+            "Owner-only JSON evidence (mode 0600) for required Gemini API "
             "permissions, exact active scope, identity, and review time."
         ),
     )

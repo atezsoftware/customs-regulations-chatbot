@@ -60,15 +60,12 @@ class _FakeBackend:
             vertex_model="gemini-test",
             vertex_project="project-test",
             vertex_location="europe-west4",
-            gcs_uri="gs://test-bucket/regulatory",
         )
 
-    def check_gcs_access(self, snapshot: ReadinessSnapshot) -> str:
-        return self._result("gcs_access", f"read access to {snapshot.gcs_uri}")
-
-    def check_vertex_access(self, snapshot: ReadinessSnapshot) -> str:
+    def check_gemini_batch_access(self, snapshot: ReadinessSnapshot) -> str:
         return self._result(
-            "vertex_access", f"model and batch list access for {snapshot.vertex_model}"
+            "gemini_batch_access",
+            f"model and batch list access for {snapshot.vertex_model}",
         )
 
     def probe_embedding_dimension(self, snapshot: ReadinessSnapshot) -> int:
@@ -129,9 +126,8 @@ def test_readiness_failure_is_redacted_and_blocks_dependent_checks() -> None:
     assert report.exit_code == EXIT_NOT_READY
     rendered = format_report(report)
     assert "admin_snapshot: FAIL (RuntimeError)" in rendered
-    assert "gcs_access: BLOCKED" in rendered
     assert "capability_attestation: BLOCKED" in rendered
-    assert "vertex_access: BLOCKED" in rendered
+    assert "gemini_batch_access: BLOCKED" in rendered
     assert "embedding_probe: BLOCKED" in rendered
     assert "elasticsearch_mapping: BLOCKED" in rendered
     assert "top-secret-token" not in rendered
@@ -140,15 +136,14 @@ def test_readiness_failure_is_redacted_and_blocks_dependent_checks() -> None:
 
 
 def test_independent_failure_does_not_skip_other_read_only_checks() -> None:
-    backend = _FakeBackend(fail_check="gcs_access")
+    backend = _FakeBackend(fail_check="gemini_batch_access")
 
     report = run_readiness_checks(backend)
 
     assert report.exit_code == EXIT_NOT_READY
     assert backend.dimensions == [1536, 1536]
     statuses = {result.name: result.status for result in report.results}
-    assert statuses["gcs_access"] == "FAIL"
-    assert statuses["vertex_access"] == "PASS"
+    assert statuses["gemini_batch_access"] == "FAIL"
     assert statuses["embedding_probe"] == "PASS"
     assert statuses["elasticsearch_mapping"] == "PASS"
 
@@ -513,12 +508,7 @@ def test_live_worker_inspection_targets_only_the_local_node(
     inspector.stats.assert_called_once_with()
 
 
-@pytest.mark.parametrize(
-    "probe_name", ["probe_gcs_read_access", "probe_vertex_read_access"]
-)
-def test_observational_probe_identity_must_match_attestation(
-    probe_name: str,
-) -> None:
+def test_gemini_batch_probe_identity_must_match_attestation() -> None:
     snapshot = _FakeBackend().load_snapshot()
     backend = readiness.OnyxReadinessBackend(
         memory_headroom_reviewed=True,
@@ -527,22 +517,17 @@ def test_observational_probe_identity_must_match_attestation(
     )
     backend._attested_identity = "expected@example.iam.gserviceaccount.com"
     gateway = SimpleNamespace(
-        probe_gcs_read_access=lambda: SimpleNamespace(
-            credential_identity="actual@example.iam.gserviceaccount.com"
-        ),
-        probe_vertex_read_access=lambda: SimpleNamespace(
+        probe_gemini_read_access=lambda: SimpleNamespace(
             credential_identity="actual@example.iam.gserviceaccount.com"
         ),
     )
-    backend._vertex_gateway = cast(readiness.GoogleVertexBatchGateway, gateway)
+    backend._gemini_gateway = cast(
+        readiness.GoogleGeminiFilesBatchGateway,
+        gateway,
+    )
 
-    check = (
-        backend.check_gcs_access
-        if probe_name == "probe_gcs_read_access"
-        else backend.check_vertex_access
-    )
     with pytest.raises(readiness.ReadinessCheckError, match="identity does not match"):
-        check(snapshot)
+        backend.check_gemini_batch_access(snapshot)
 
 
 @pytest.mark.parametrize(
@@ -614,7 +599,6 @@ def test_capability_attestation_requires_exact_scope_permissions_and_freshness(
         "identity": "service-account@example.iam.gserviceaccount.com",
         "evidence_reference": f"archive://TASK-8#sha256={digest}",
         "evidence_sha256": digest,
-        "gcs_uri": snapshot.gcs_uri,
         "vertex_project": snapshot.vertex_project,
         "vertex_location": snapshot.vertex_location,
         "vertex_model": snapshot.vertex_model,
@@ -633,7 +617,7 @@ def test_capability_attestation_requires_exact_scope_permissions_and_freshness(
     )
     assert identity == attestation["identity"]
 
-    attestation["permissions"].remove("storage.objects.delete")
+    attestation["permissions"].remove("serviceusage.services.use")
     attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
     with pytest.raises(readiness.ReadinessCheckError, match="required permissions"):
         readiness._validate_capability_attestation(
@@ -690,7 +674,6 @@ def test_capability_attestation_hashes_separate_secure_evidence_file(
                 "identity": "service-account@example.iam.gserviceaccount.com",
                 "evidence_reference": f"archive://TASK-8#sha256={digest}",
                 "evidence_sha256": digest,
-                "gcs_uri": snapshot.gcs_uri,
                 "vertex_project": snapshot.vertex_project,
                 "vertex_location": snapshot.vertex_location,
                 "vertex_model": snapshot.vertex_model,

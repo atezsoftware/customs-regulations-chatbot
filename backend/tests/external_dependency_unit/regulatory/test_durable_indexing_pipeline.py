@@ -754,11 +754,6 @@ def test_forced_setup_failure_leaves_no_disposable_pipeline_state(
             prefix=prefix,
         ) as resources:
             monkeypatch.setattr(
-                app_configs,
-                "REGULATORY_INDEXING_GCS_URI",
-                "gs://disposable-regulatory-indexing",
-            )
-            monkeypatch.setattr(
                 file_connector,
                 "get_default_file_store",
                 lambda: resources.file_store,
@@ -912,11 +907,6 @@ def test_cleanup_failure_preserves_primary_exception_and_runs_later_stages(
             embedding_url=embedding_url,
             prefix=prefix,
         ) as resources:
-            monkeypatch.setattr(
-                app_configs,
-                "REGULATORY_INDEXING_GCS_URI",
-                "gs://disposable-regulatory-indexing",
-            )
             monkeypatch.setattr(
                 file_connector,
                 "get_default_file_store",
@@ -1206,11 +1196,6 @@ def test_preparing_compatibility_job_with_onyx_metadata_recovers_and_publishes(
         )
         monkeypatch.setattr(
             app_configs,
-            "REGULATORY_INDEXING_GCS_URI",
-            "gs://disposable-regulatory-indexing",
-        )
-        monkeypatch.setattr(
-            app_configs,
             "REGULATORY_BATCH_INDEXING_ENABLED",
             True,
         )
@@ -1484,11 +1469,6 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
         def create_file(marker: str) -> tuple[UserFile, RegulatoryIndexingJob]:
             return _create_disposable_file(resources, marker=marker)
 
-        monkeypatch.setattr(
-            app_configs,
-            "REGULATORY_INDEXING_GCS_URI",
-            "gs://disposable-regulatory-indexing",
-        )
         monkeypatch.setattr(
             app_configs,
             "REGULATORY_BATCH_INDEXING_ENABLED",

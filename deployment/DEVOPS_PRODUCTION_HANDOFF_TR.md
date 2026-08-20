@@ -47,10 +47,10 @@ environment:
       value: "false"
 ```
 
-Yalnız background için `REGULATORY_INDEXING_GCS_URI` ve lease/retry/poll/embedding batch tuning
-değişkenleri eklenir. Arşiv limitleri yalnız API'de bulunur. Değişkenlerin tam kapsamı ve varsayılanları
-canonical `REGULATORY_PRODUCTION_RUNBOOK.md` tablosuyla birebir eşleşmelidir; secret değerler bu
-teslim notuna yazılmaz.
+Yalnız background için lease/retry/poll/embedding batch tuning değişkenleri eklenir. Arşiv limitleri
+yalnız API'de bulunur. Değişkenlerin tam kapsamı ve varsayılanları canonical
+`REGULATORY_PRODUCTION_RUNBOOK.md` tablosuyla birebir eşleşmelidir; secret değerler bu teslim notuna
+yazılmaz.
 
 İki servisten de aşağıdaki değişkenler kaldırılmalıdır:
 
@@ -66,11 +66,11 @@ Service, HPA, probe ve model-server imajı oluşturulmamalıdır. Ağ politikas�
 podlarından `openrouter.ai:443` çıkışına izin verilmelidir.
 
 `REGULATORY_BATCH_INDEXING_ENABLED` varsayılan olarak `false` kalır. Önce singleton
-`alembic upgrade head`, GCS yetki testi, Vertex contextual model testi ve aktif OpenRouter embedding
+`alembic upgrade head`, Gemini Files/Batch erişim testi, Vertex contextual model testi ve aktif OpenRouter embedding
 ayarının doğrulaması tamamlanır. Sonra bayrak API ve background için birlikte `true` yapılır ve iki
 iş yükü de kontrollü olarak yeniden başlatılır. Bayrağın yalnız bir pod türünde değiştirilmesi veya
-migration'dan önce açılması kabul edilmez. GCS URI secret değildir; servis hesabı/Workload Identity
-credential'ı Vault/Kubernetes kimlik katmanında kalır.
+migration'dan önce açılması kabul edilmez. Admin’de seçili Vertex modelinin service-account JSON’u
+şifreli Admin yapılandırmasında kalır; environment değişkenine veya teslim dokümanına yazılmaz.
 
 Background podunun supervisor sözleşmesi tam olarak beş worker, iki ayrık Beat ve bir log yönlendirici
 olmak üzere sekiz process'tir:
@@ -180,8 +180,8 @@ oluşturur; Admin'den seçilecek OpenRouter sağlayıcısıyla çelişir.
    bulunmadığını doğrulayın.
 5. Trafiği açmadan önce Admin üzerinden OpenRouter embedding modelini seçip test edin ve aktif edin.
 6. Admin üzerinden OpenRouter chat LLM'ini seçip test edin.
-7. Singleton migration'ı tamamlayın; `REGULATORY_INDEXING_GCS_URI` ve GCS/Vertex yetkilerini
-   doğruladıktan sonra durable indexing
+7. Singleton migration'ı tamamlayın; Admin’de seçili Vertex modelinin service-account JSON’u ile
+   Gemini Files/Batch erişimini doğruladıktan sonra durable indexing
    bayrağını API ve background'da birlikte açıp ikisini yeniden başlatın.
 8. Yedi supervisor process'ini, worker/Beat readiness-liveness dosyalarını, queue setini, bir küçük
    Markdown canary indeksini ve stale recovery'yi doğrulayın.
@@ -207,7 +207,7 @@ değişikliği olarak ele alınmalıdır.
 - Backend runtime-lite imajında `torch`, `triton`, NVIDIA/CUDA ve Docling paketleri yoktur.
 - Background supervisor'da tam yedi process çalışır; özel worker iki queue'yu tüketir ve özel Beat
   yalnız stale recovery ile queue monitoring yayınlar.
-- Migration ve GCS/Vertex/OpenRouter kontrollerinden önce durable indexing bayrağı kapalıdır; açıldıktan
+- Migration ve Gemini/OpenRouter kontrollerinden önce durable indexing bayrağı kapalıdır; açıldıktan
   sonra API ve background birlikte restart edilmiş ve Markdown canary tamamlanmıştır.
 - Uygulama model-server DNS'i bulunmadan sağlıklı başlar ve Admin ekranı açılır.
 - Admin OpenRouter embedding modellerini listeler; endpoint/dimension alanı göstermez.

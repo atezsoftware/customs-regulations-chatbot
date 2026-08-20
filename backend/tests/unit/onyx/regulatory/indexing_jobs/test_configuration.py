@@ -146,11 +146,6 @@ def _install_admin_configuration(
         "fetch_embedding_provider",
         lambda _db_session, _provider_type: SimpleNamespace(api_key=embedding_api_key),
     )
-    monkeypatch.setattr(
-        configuration.app_configs,
-        "REGULATORY_INDEXING_GCS_URI",
-        "gs://customs-indexing/regulatory",
-    )
 
 
 def test_regulatory_indexing_defaults() -> None:
@@ -212,8 +207,15 @@ def test_snapshot_is_frozen_json_and_excludes_credentials(
     assert dumped["effective_dimension"] == 1024
     assert dumped["vertex"]["model_configuration_id"] == 73
     assert dumped["vertex"]["authentication_mode"] == "service_account_json"
+    assert "gcs_uri" not in dumped["vertex"]
     assert "credential" not in encoded.lower()
     assert '{"type":"service_account"}' not in encoded
+
+    legacy_dump = json.loads(json.dumps(dumped))
+    legacy_dump["vertex"]["gcs_uri"] = "gs://legacy-regulatory-indexing"
+    restored = RegulatoryIndexingConfigSnapshot.model_validate(legacy_dump)
+    assert "gcs_uri" not in restored.model_dump(mode="json")["vertex"]
+
     with pytest.raises(ValidationError):
         snapshot.effective_dimension = 3072
 
@@ -304,7 +306,6 @@ def test_snapshot_rejects_an_inconsistent_effective_dimension() -> None:
                 project="customs-prod",
                 location="europe-west4",
                 authentication_mode=VertexAuthenticationMode.WORKLOAD_IDENTITY,
-                gcs_uri="gs://customs-indexing/regulatory",
             ),
         )
 
@@ -326,7 +327,6 @@ def test_snapshot_requires_prompt_identity() -> None:
                     project="customs-prod",
                     location="europe-west4",
                     authentication_mode=VertexAuthenticationMode.WORKLOAD_IDENTITY,
-                    gcs_uri="gs://customs-indexing/regulatory",
                 ),
             }
         )
@@ -351,7 +351,6 @@ def test_snapshot_rejects_nonfinite_retry_policy() -> None:
                 project="customs-prod",
                 location="europe-west4",
                 authentication_mode=VertexAuthenticationMode.WORKLOAD_IDENTITY,
-                gcs_uri="gs://customs-indexing/regulatory",
             ),
             prompt_version="contextual-rag-v1",
             prompt_hash="a" * 64,
@@ -589,7 +588,6 @@ def test_vertex_snapshot_forbids_secret_fields() -> None:
         "project": "customs-prod",
         "location": "europe-west4",
         "authentication_mode": VertexAuthenticationMode.WORKLOAD_IDENTITY,
-        "gcs_uri": "gs://customs-indexing/regulatory",
         "credentials": '{"type":"service_account"}',
     }
 

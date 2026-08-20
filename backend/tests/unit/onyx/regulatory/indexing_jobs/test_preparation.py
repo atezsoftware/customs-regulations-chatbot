@@ -76,7 +76,6 @@ def _snapshot(
             project="customs-prod",
             location="europe-west4",
             authentication_mode=VertexAuthenticationMode.WORKLOAD_IDENTITY,
-            gcs_uri="gs://customs-indexing/regulatory",
         ),
         prompt_version="contextual-rag-v1",
         prompt_hash="a" * 64,

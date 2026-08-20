@@ -56,7 +56,6 @@ _PRODUCTION_LITE_ENVIRONMENT = {
     "REGULATORY_INDEXING_CONTEXT_JSONL_MAX_BYTES",
     "REGULATORY_INDEXING_CONTEXT_REQUEST_SIZE",
     "REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE",
-    "REGULATORY_INDEXING_GCS_URI",
     "REGULATORY_INDEXING_LEASE_SECONDS",
     "REGULATORY_INDEXING_MAX_ATTEMPTS",
     "REGULATORY_INDEXING_OPENROUTER_BATCH_HORIZON_SECONDS",
@@ -979,13 +978,14 @@ def test_production_lite_wires_the_complete_regulatory_environment_contract() ->
         "MARKDOWN_IMPORT_ENABLED",
         "REGULATORY_BATCH_INDEXING_ENABLED",
         "REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE",
-        "REGULATORY_INDEXING_GCS_URI",
         "REGULATORY_INDEXING_LEASE_SECONDS",
         "REGULATORY_INDEXING_MAX_ATTEMPTS",
         "REGULATORY_INDEXING_POLL_SECONDS",
         "REGULATORY_INDEXING_RETRY_BASE_SECONDS",
         "REGULATORY_INDEXING_RETRY_MAX_SECONDS",
     } <= set(background_environment)
+    assert "REGULATORY_INDEXING_GCS_URI" not in template_variables
+    assert "REGULATORY_INDEXING_GCS_URI" not in background_environment
     assert api_environment["MARKDOWN_IMPORT_ENABLED"] == (
         "${MARKDOWN_IMPORT_ENABLED:-true}"
     )
@@ -1275,7 +1275,8 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
     assert operations == {
         "feature_flag": "REGULATORY_BATCH_INDEXING_ENABLED",
         "default_enabled": False,
-        "required_workspace": "REGULATORY_INDEXING_GCS_URI",
+        "required_workspace": "none",
+        "gemini_authentication": "admin_vertex_service_account_json_oauth",
         "migration_before_enable": "alembic upgrade head",
         "restart_after_config_change": ["api_server", "background"],
     }
@@ -1306,7 +1307,8 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         assert f"`{process_name}`" in handoff
     assert "tam olarak beş worker, iki ayrık Beat ve bir log yönlendirici" in handoff
     assert "API ve background için birlikte `true`" in handoff
-    assert "Yalnız background için `REGULATORY_INDEXING_GCS_URI`" in handoff
+    assert "Admin’de seçili Vertex modelinin service-account JSON’u" in handoff
+    assert "REGULATORY_INDEXING_GCS_URI" not in handoff
     assert "aynı slot yeniden yayınlanmaz" in handoff
     assert re.search(r"en geç sonraki\s+UTC slotunda", handoff)
     assert "tüm Ready background replica'ları" in handoff

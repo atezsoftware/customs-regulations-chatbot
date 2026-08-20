@@ -577,10 +577,11 @@ run migrations. Do not scale the API during migration. Platforms with multiple r
 the same singleton migration ownership before rolling replicas.
 
 Keep `REGULATORY_BATCH_INDEXING_ENABLED=false` through the singleton `alembic upgrade head` and
-initial readiness checks. Before enabling it, configure a non-secret `REGULATORY_INDEXING_GCS_URI`,
-archive an approved IAM policy/simulator review for the exact runtime identity and workspace (the
-read-only probe cannot prove create/delete/cancel permissions), and verify the active OpenRouter
-embedding SearchSettings contract. Then change the
+initial readiness checks. Before enabling it, select a Vertex model in Admin whose encrypted
+service-account JSON can authenticate to the Gemini Files and Batch APIs, archive an approved IAM
+policy/simulator review for that exact runtime identity (the read-only probe cannot prove
+create/delete/cancel permissions), and verify the active OpenRouter embedding SearchSettings
+contract. Then change the
 flag for both `api_server` and `background` and restart both through the owned deployment workflow;
 an API-only or worker-only flag change is forbidden. Repeat worker, Beat, queue, and Markdown-canary
 readiness checks after every indexing environment change. To disable the feature, set the flag false
@@ -603,20 +604,11 @@ exact schema and a `reviewed_at` no more than 24 hours old:
   "identity": "regulatory-runtime@example.iam.gserviceaccount.com",
   "evidence_reference": "gs://approved-audit-bucket/change/task-8.json#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "gcs_uri": "gs://approved-bucket/exact-regulatory-prefix",
   "vertex_project": "approved-project",
   "vertex_location": "approved-location",
   "vertex_model": "approved-model",
   "permissions": [
-    "storage.objects.create",
-    "storage.objects.get",
-    "storage.objects.delete",
-    "storage.objects.list",
-    "aiplatform.batchPredictionJobs.create",
-    "aiplatform.batchPredictionJobs.get",
-    "aiplatform.batchPredictionJobs.cancel",
-    "aiplatform.batchPredictionJobs.list",
-    "aiplatform.models.get"
+    "serviceusage.services.use"
   ]
 }
 ```
@@ -666,21 +658,21 @@ docker compose --project-name "$APPROVED_COMPOSE_PROJECT" --env-file .env \
 Use the same command with `docker-compose.regulatory-compose-infra.yml` in Compose-managed mode.
 Exit `0` means every check passed, exit `1` means not ready, and exit `2` is an invocation
 interruption/error. `--json` emits the same redacted result for archival. The command performs only
-database reads, exact configured/live Celery queue inspection, GCS list access, Vertex model/batch reads, one
+database reads, exact configured/live Celery queue inspection, Gemini model/batch/Files reads, one
 constant-text OpenRouter embedding call, and Elasticsearch mapping reads. It never indexes a probe,
 creates/cancels a batch, writes an object, or prints credentials, vectors, or document content.
-The GCS and Vertex calls prove only the listed observational operations. Mutation capability is
+The Gemini calls prove only the listed observational operations. Mutation capability is
 accepted only from the fresh archived IAM attestation, whose identity must equal the identity used by
-both observational probes; missing, stale, wrong-scope, wrong-identity, or incomplete evidence fails
+the observational probe; missing, stale, wrong-scope, wrong-identity, or incomplete evidence fails
 readiness.
 
 Prerequisites are: the migration job completed; the new disabled API/background containers are
 running; both user-file and regulatory workers plus Beat probe files are healthy; the active Admin Search
 Settings select OpenRouter `openai/text-embedding-3-large` with contextual retrieval enabled; the
-selected contextual model is Vertex AI with valid batch/GCS access; and the active Elasticsearch
+selected contextual model is Vertex AI with valid Gemini Files/Batch access; and the active Elasticsearch
 index exists with both dense-vector fields matching the active effective dimension and mapping
-attributes. The archived IAM evidence must enumerate GCS object create/get/delete/list and Vertex
-batch create/get/cancel/list plus model get for the exact active scope; the command deliberately does
+attributes. The archived IAM evidence must enumerate `serviceusage.services.use` for the exact active
+project and service-account identity; the command deliberately does
 not exercise create/delete/cancel. Before supplying `--memory-headroom-reviewed`, archive the cgroup and per-process RSS
 evidence required in section 6 and verify the pod limit plus node headroom; omitting the attestation
 fails closed, and any recorded OOM event still fails the check. The repository cannot validate
@@ -721,7 +713,6 @@ store/environment, not in source control. Defaults below match the Compose overl
 | `MAX_ARCHIVE_ENTRIES` | API | `500` |
 | `MAX_ARCHIVE_EXPANDED_BYTES` | API | `536870912` |
 | `REGULATORY_BATCH_INDEXING_ENABLED` | API + background | `false`; coordinated enable/restart only |
-| `REGULATORY_INDEXING_GCS_URI` | background | Required non-secret `gs://...` workspace before enable |
 | `REGULATORY_INDEXING_MAX_ATTEMPTS` | background | `5` |
 | `REGULATORY_INDEXING_OPENROUTER_BATCH_URL` | background | `https://openrouter.ai/api/beta/batches` |
 | `REGULATORY_INDEXING_OPENROUTER_BATCH_MAX_REQUESTS` | background | `1000` requests per provider Batch |
@@ -814,7 +805,8 @@ forbidden_queues:
 operations:
   feature_flag: REGULATORY_BATCH_INDEXING_ENABLED
   default_enabled: false
-  required_workspace: REGULATORY_INDEXING_GCS_URI
+  required_workspace: none
+  gemini_authentication: admin_vertex_service_account_json_oauth
   migration_before_enable: alembic upgrade head
   restart_after_config_change:
     - api_server
@@ -886,7 +878,7 @@ Complete one authenticated application smoke test:
    active/superseded chunk changes as expected.
 4. Confirm previously indexed files remain visible/searchable to the intended users.
 5. While durable indexing is disabled, keep upload controls closed to users and verify no durable job
-   was created. After the migration, provider/GCS checks, coordinated flag enable, and process
+   was created. After the migration, Gemini provider checks, coordinated flag enable, and process
    restart, upload one approved small Markdown canary; confirm it progresses through the durable job
    stages and becomes searchable. Confirm non-Markdown/parser-backed upload remains rejected.
 6. Stop/restart the regulatory indexing worker after a canary reaches a non-terminal stage and verify
@@ -908,10 +900,10 @@ frontend route. Deliver the same job message again to prove idempotency, and per
 background restart only after recording a non-terminal stage; the stale-recovery Beat must resume it.
 
 For cancellation coverage, use a second new canary and delete it through the frontend while its job
-is non-terminal. Confirm the durable job becomes cancelled and its GCS prefix and staged
+is non-terminal. Confirm the durable job becomes cancelled and its Gemini Files resources and staged
 Elasticsearch chunks are absent using credential-safe list/count diagnostics. Finally delete the
 published canary through the frontend, confirm its unique marker is no longer retrievable and no
-job-specific GCS objects or Elasticsearch chunks remain, then remove only the disposable local
+job-specific Gemini Files resources or Elasticsearch chunks remain, then remove only the disposable local
 evidence files. If any prerequisite, frontend route, or cleanup identity is ambiguous, do not start
 the canary. Never use direct backend calls, wildcard deletes, index deletion, broker purge, or cleanup
 queries that could target pre-existing documents.

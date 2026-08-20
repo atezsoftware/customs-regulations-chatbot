@@ -155,14 +155,9 @@ def _resolve_vertex_config(
         )
     custom_config = provider.custom_config or {}
     location = (custom_config.get(VERTEX_LOCATION_KWARG) or "").strip()
-    gcs_uri = (app_configs.REGULATORY_INDEXING_GCS_URI or "").strip()
     if not location:
         raise RegulatoryIndexingConfigurationError(
             "The Vertex AI location is not configured"
-        )
-    if not gcs_uri:
-        raise RegulatoryIndexingConfigurationError(
-            "REGULATORY_INDEXING_GCS_URI is not configured"
         )
 
     raw_auth_method = custom_config.get(
@@ -214,7 +209,6 @@ def _resolve_vertex_config(
             project=project,
             location=location,
             authentication_mode=authentication_mode,
-            gcs_uri=gcs_uri,
         )
     except ValueError as error:
         raise RegulatoryIndexingConfigurationError(

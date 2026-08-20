@@ -61,7 +61,6 @@ def _snapshot(*, request_size: int = 2) -> RegulatoryIndexingConfigSnapshot:
             project="customs-prod",
             location="europe-west4",
             authentication_mode=VertexAuthenticationMode.WORKLOAD_IDENTITY,
-            gcs_uri="gs://regulatory-indexing/jobs",
         ),
         prompt_version="contextual-rag-v1",
         prompt_hash="a" * 64,

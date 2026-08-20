@@ -43,12 +43,14 @@ from onyx.db.regulatory_indexing_jobs import (
     complete_regulatory_indexing_publication,
     complete_regulatory_indexing_user_file,
     complete_regulatory_provider_cleanup,
+    complete_vertex_partial_retry_cleanup,
     consume_preclaimed_regulatory_indexing_delivery,
     consume_regulatory_provider_cleanup_delivery,
     create_or_get_regulatory_indexing_item,
     create_or_get_regulatory_indexing_job,
     fail_regulatory_indexing_job,
     finalize_regulatory_indexing_cancellation,
+    mark_vertex_partial_retry_cleanup_required,
     persist_regulatory_indexing_item_context,
     persist_regulatory_indexing_item_failure,
     persist_regulatory_indexing_item_skipped,
@@ -64,7 +66,6 @@ from onyx.db.regulatory_indexing_jobs import (
     request_regulatory_indexing_cancellation,
     request_user_file_deletion_cleanup,
     require_vertex_submission_reconciliation,
-    reset_vertex_submission_for_partial_retry,
     schedule_regulatory_indexing_cancellation_retry,
     schedule_regulatory_indexing_retry,
     schedule_regulatory_provider_cleanup_retry,
@@ -1130,19 +1131,36 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
 
     job.stage = RegulatoryIndexingStage.CONTEXT_APPLY.value
     db_session.commit()
-    assert reset_vertex_submission_for_partial_retry(
+    assert mark_vertex_partial_retry_cleanup_required(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        remote_job_name="projects/p/locations/l/batchJobs/1",
+        now=_NOW + datetime.timedelta(minutes=1),
+    )
+    assert complete_vertex_partial_retry_cleanup(
         db_session,
         job_id=job.id,
         expected_generation=1,
         now=_NOW + datetime.timedelta(minutes=1),
     )
-    job.stage = RegulatoryIndexingStage.CONTEXT_SUBMIT.value
-    db_session.commit()
+    db_session.refresh(job)
+    assert job.status == RegulatoryIndexingJobStatus.QUEUED.value
+    assert job.stage == RegulatoryIndexingStage.CONTEXT_SUBMIT.value
+    assert job.remote_vertex_job_name is None
+    assert job.vertex_output_uri is None
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.CONTEXT_SUBMIT,
+        expected_generation=1,
+        now=_NOW + datetime.timedelta(minutes=1),
+    )
     repeated_key = "regulatory-context-" + "b" * 64
     assert record_vertex_submission_intent(
         db_session,
         job_id=job.id,
-        expected_generation=1,
+        expected_generation=2,
         submission_key=repeated_key,
         submission_attempt=2,
         now=_NOW + datetime.timedelta(minutes=1),
@@ -1150,7 +1168,7 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
     assert record_vertex_submission(
         db_session,
         job_id=job.id,
-        expected_generation=1,
+        expected_generation=2,
         submission_key=repeated_key,
         request_hashes=request_hashes,
         charge_items=True,
