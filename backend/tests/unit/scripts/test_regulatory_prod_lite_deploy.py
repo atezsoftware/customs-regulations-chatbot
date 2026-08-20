@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -262,6 +263,7 @@ def _fake_docker(
         "FAKE_REAL_RUNTIME_FORCE_TIMEOUT": "false",
         "FAKE_REAL_RUNTIME_PRE_CID_FAILURE": "false",
         "FAKE_REAL_DOCKER": "/usr/bin/docker",
+        "FAKE_OUTER_TMPDIR_SOURCE": "",
         "_IMAGE": _IMAGE,
         "_MODEL_IMAGE": _MODEL_IMAGE,
         "_WEB_IMAGE": _WEB_IMAGE,
@@ -280,11 +282,18 @@ def _fake_docker(
 set -eu
 source "__FAKE_ENVIRONMENT__"
 printf '%s\\n' "$*" >>"$FAKE_DOCKER_LOG"
-printf 'DOCKER_HOST=%s DOCKER_CONTEXT=%s ONYX_BACKEND_LITE_IMAGE=%s AMBIENT_MARKER=%s\\n' \
+printf 'DOCKER_HOST=%s DOCKER_CONTEXT=%s ONYX_BACKEND_LITE_IMAGE=%s AMBIENT_MARKER=%s PATH=%s HOME=%s DOCKER_CONFIG=%s BASH_ENV=%s ENV=%s PYTHONPATH=%s SUDO_ASKPASS=%s\\n' \
   "${DOCKER_HOST-<unset>}" \
   "${DOCKER_CONTEXT-<unset>}" \
   "${ONYX_BACKEND_LITE_IMAGE-<unset>}" \
   "${REGULATORY_AMBIENT_MARKER-<unset>}" \
+  "${PATH-<unset>}" \
+  "${HOME-<unset>}" \
+  "${DOCKER_CONFIG-<unset>}" \
+  "${BASH_ENV-<unset>}" \
+  "${ENV-<unset>}" \
+  "${PYTHONPATH-<unset>}" \
+  "${SUDO_ASKPASS-<unset>}" \
   >>"__FAKE_DOCKER_ENVIRONMENT_LOG__"
 if [[ "${1:-} ${2:-} ${3:-}" == "compose version --short" ]]; then
   printf '%s\\n' "$FAKE_COMPOSE_VERSION"
@@ -339,6 +348,16 @@ fi
 if [[ "${1:-}" == "run" && " $* " == *" --validate-capability-snapshots-only "* ]]; then
   if [[ -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
     arguments=("$@")
+    if [[ -n "$FAKE_OUTER_TMPDIR_SOURCE" ]]; then
+      for index in "${!arguments[@]}"; do
+        case "${arguments[$index]}" in
+          type=bind,source=/tmp/*)
+            source_and_rest=${arguments[$index]#type=bind,source=/tmp/}
+            arguments[$index]="type=bind,source=$FAKE_OUTER_TMPDIR_SOURCE/$source_and_rest"
+            ;;
+        esac
+      done
+    fi
     if [[ "$FAKE_REAL_RUNTIME_PRE_CID_FAILURE" == "true" ]]; then
       ownership_token=""
       for argument in "${arguments[@]}"; do
@@ -485,6 +504,12 @@ exit 0
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    fake_compose = bin_dir / "docker-compose"
+    fake_compose.write_text(
+        f'#!/bin/bash\nexec {shlex.quote(str(docker))} compose "$@"\n',
+        encoding="utf-8",
+    )
+    fake_compose.chmod(0o755)
     fake_sudo = bin_dir / "sudo"
     fake_sudo.write_text(
         """#!/usr/bin/env bash
@@ -560,7 +585,7 @@ while (($#)); do
     *) exit 2 ;;
   esac
 done
-if [[ -n "$FAKE_TIMEOUT_EXIT" && "${1:-} ${2:-}" == "docker run" ]]; then
+if [[ -n "$FAKE_TIMEOUT_EXIT" && "${1##*/} ${2:-}" == "docker run" ]]; then
   "$@"
   exit "$FAKE_TIMEOUT_EXIT"
 fi
@@ -613,6 +638,43 @@ exec /usr/bin/stat "$@"
         encoding="utf-8",
     )
     web_env_file.chmod(0o600)
+    trusted_docker_config = tmp_path / "trusted-docker-config"
+    trusted_docker_config.mkdir(mode=0o700)
+    trusted_docker_config_file = trusted_docker_config / "config.json"
+    trusted_docker_config_file.write_text("{}\n", encoding="utf-8")
+    trusted_docker_config_file.chmod(0o600)
+
+    # Production paths are compile-time constants, not environment overrides. Unit
+    # tests exercise an isolated copy whose constants point at fixture-owned tools.
+    test_compose_root = tmp_path / "docker-compose-bundle"
+    shutil.copytree(_COMPOSE_ROOT, test_compose_root)
+    script_replacements = {
+        'readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin:/sbin:/bin"': (
+            "readonly TRUSTED_SYSTEM_PATH="
+            + shlex.quote(f"{bin_dir}:/usr/sbin:/usr/bin:/sbin:/bin")
+        ),
+        'readonly DOCKER_BIN="/usr/bin/docker"': (
+            f"readonly DOCKER_BIN={shlex.quote(str(docker))}"
+        ),
+        'readonly COMPOSE_BIN="/usr/libexec/docker/cli-plugins/docker-compose"': (
+            f"readonly COMPOSE_BIN={shlex.quote(str(fake_compose))}"
+        ),
+        'readonly SUDO_BIN="/usr/bin/sudo"': (
+            f"readonly SUDO_BIN={shlex.quote(str(fake_sudo))}"
+        ),
+        'readonly DOCKER_CONFIG_DIR="/etc/onyx/regulatory-docker"': (
+            f"readonly DOCKER_CONFIG_DIR={shlex.quote(str(trusted_docker_config))}"
+        ),
+    }
+    for script_name in (
+        "regulatory-prod-lite-deploy.sh",
+        "regulatory-prod-lite-preflight.sh",
+    ):
+        script_path = test_compose_root / script_name
+        script_text = script_path.read_text(encoding="utf-8")
+        for production_value, test_value in script_replacements.items():
+            script_text = script_text.replace(production_value, test_value)
+        script_path.write_text(script_text, encoding="utf-8")
     env = os.environ.copy()
     env.update(
         {
@@ -657,6 +719,15 @@ exec /usr/bin/stat "$@"
             "FAKE_REAL_RUNTIME_FORCE_TIMEOUT": "false",
             "FAKE_REAL_RUNTIME_PRE_CID_FAILURE": "false",
             "FAKE_REAL_DOCKER": "/usr/bin/docker",
+            "FAKE_OUTER_TMPDIR_SOURCE": "",
+            "FAKE_DEPLOY_SCRIPT": str(
+                test_compose_root / "regulatory-prod-lite-deploy.sh"
+            ),
+            "FAKE_PREFLIGHT_SCRIPT": str(
+                test_compose_root / "regulatory-prod-lite-preflight.sh"
+            ),
+            "FAKE_TRUSTED_COMMAND_PATH": (f"{bin_dir}:/usr/sbin:/usr/bin:/sbin:/bin"),
+            "FAKE_TRUSTED_DOCKER_CONFIG": str(trusted_docker_config),
             "_IMAGE": _IMAGE,
             "_MODEL_IMAGE": _MODEL_IMAGE,
             "_WEB_IMAGE": _WEB_IMAGE,
@@ -672,8 +743,12 @@ def _run(
     *,
     preflight_as_root: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    if script == _DEPLOY and "FAKE_DEPLOY_SCRIPT" in env:
+        script = Path(env["FAKE_DEPLOY_SCRIPT"])
+    elif script == _PREFLIGHT and "FAKE_PREFLIGHT_SCRIPT" in env:
+        script = Path(env["FAKE_PREFLIGHT_SCRIPT"])
     command = [str(script), *args]
-    if script == _PREFLIGHT:
+    if script.name == _PREFLIGHT.name:
         if preflight_as_root and os.geteuid() != 0:
             command = ["unshare", "--user", "--map-root-user", *command]
         elif not preflight_as_root and os.geteuid() == 0:
@@ -686,7 +761,7 @@ def _run(
             ]
     return subprocess.run(
         command,
-        cwd=_COMPOSE_ROOT,
+        cwd=script.parent,
         env=env,
         capture_output=True,
         text=True,
@@ -1048,7 +1123,10 @@ def test_preflight_delegates_capability_files_to_no_network_secure_reader(
     assert result.returncode == 0, result.stderr
     docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
     timeout_log = Path(env["FAKE_TIMEOUT_LOG"]).read_text(encoding="utf-8")
-    assert "--foreground --kill-after=5s 30s docker run" in timeout_log
+    assert (
+        "--foreground --kill-after=5s 30s "
+        f"{Path(env['FAKE_DOCKER_LOG']).parent / 'bin' / 'docker'} run" in timeout_log
+    )
     readiness_command = next(
         command
         for command in docker_log.splitlines()
@@ -1101,7 +1179,10 @@ def test_preflight_times_out_readiness_container_and_cleans_snapshot(
     assert result.returncode == 1
     assert "timed out or failed" in result.stderr
     timeout_log = Path(env["FAKE_TIMEOUT_LOG"]).read_text(encoding="utf-8")
-    assert "--foreground --kill-after=5s 30s docker run" in timeout_log
+    assert (
+        "--foreground --kill-after=5s 30s "
+        f"{Path(env['FAKE_DOCKER_LOG']).parent / 'bin' / 'docker'} run" in timeout_log
+    )
     docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
     assert " --name " not in docker_log
     assert f"rm -f {env['FAKE_READINESS_CID']}" in docker_log
@@ -2026,8 +2107,146 @@ def test_deploy_uses_identical_sanitized_environment_before_and_after_sudo(
         "DOCKER_HOST=unix:///var/run/docker.sock "
         "DOCKER_CONTEXT=<unset> "
         "ONYX_BACKEND_LITE_IMAGE=<unset> "
-        "AMBIENT_MARKER=<unset>"
+        "AMBIENT_MARKER=<unset> "
+        f"PATH={env['FAKE_TRUSTED_COMMAND_PATH']} "
+        "HOME=/var/empty "
+        f"DOCKER_CONFIG={env['FAKE_TRUSTED_DOCKER_CONFIG']} "
+        "BASH_ENV=<unset> ENV=<unset> PYTHONPATH=<unset> SUDO_ASKPASS=<unset>"
     }
+
+
+def test_deploy_ignores_hostile_command_and_home_paths_across_root_boundary(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    trusted_bin = Path(env["FAKE_DOCKER_LOG"]).parent / "bin"
+    hostile_bin = tmp_path / "hostile-bin"
+    hostile_bin.mkdir()
+    hostile_home = tmp_path / "hostile-home"
+    hostile_plugin_dir = hostile_home / ".docker" / "cli-plugins"
+    hostile_plugin_dir.mkdir(parents=True)
+    marker = tmp_path / "hostile-executable-ran"
+
+    def write_forwarder(name: str, target: Path) -> None:
+        executable = hostile_bin / name
+        executable.write_text(
+            "#!/bin/bash\n"
+            f"printf '%s\\n' {shlex.quote(name)} >>{shlex.quote(str(marker))}\n"
+            f'exec {shlex.quote(str(target))} "$@"\n',
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+
+    write_forwarder("bash", Path("/bin/bash"))
+    write_forwarder("sudo", trusted_bin / "sudo")
+    write_forwarder("docker-compose", trusted_bin / "docker-compose")
+    write_forwarder("python3", trusted_bin / "python3")
+    write_forwarder("timeout", trusted_bin / "timeout")
+    write_forwarder("stat", trusted_bin / "stat")
+    hostile_plugin = hostile_plugin_dir / "docker-compose"
+    hostile_plugin.write_text(
+        "#!/bin/bash\n"
+        f"printf '%s\\n' docker-compose-plugin >>{shlex.quote(str(marker))}\n"
+        f'exec {shlex.quote(str(trusted_bin / "docker"))} compose "$@"\n',
+        encoding="utf-8",
+    )
+    hostile_plugin.chmod(0o755)
+    hostile_docker = hostile_bin / "docker"
+    hostile_docker.write_text(
+        "#!/bin/bash\n"
+        f"printf '%s\\n' docker >>{shlex.quote(str(marker))}\n"
+        "if [[ ${1:-} == compose ]]; then\n"
+        "  shift\n"
+        f'  exec {shlex.quote(str(hostile_plugin))} "$@"\n'
+        "fi\n"
+        f'exec {shlex.quote(str(trusted_bin / "docker"))} "$@"\n',
+        encoding="utf-8",
+    )
+    hostile_docker.chmod(0o755)
+    bash_env = tmp_path / "hostile-bash-env"
+    bash_env.write_text(
+        f"printf '%s\\n' BASH_ENV >>{shlex.quote(str(marker))}\n",
+        encoding="utf-8",
+    )
+
+    env.update(
+        {
+            "PATH": f"{hostile_bin}:{env['PATH']}",
+            "HOME": str(hostile_home),
+            "BASH_ENV": str(bash_env),
+            "ENV": str(tmp_path / "hostile-env"),
+            "PYTHONPATH": str(tmp_path / "hostile-python"),
+            "SUDO_ASKPASS": str(hostile_bin / "sudo-askpass"),
+        }
+    )
+
+    result = _run(_DEPLOY, ["deploy", *_deploy_args(env_file, env)], env)
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    sudo_log = Path(env["FAKE_SUDO_LOG"]).read_text(encoding="utf-8")
+    assert sudo_log.startswith("-n -- /usr/bin/env -i ")
+    assert f"PATH={env['FAKE_TRUSTED_COMMAND_PATH']}" in sudo_log
+    assert "HOME=/var/empty" in sudo_log
+    assert f"DOCKER_CONFIG={env['FAKE_TRUSTED_DOCKER_CONFIG']}" in sudo_log
+    assert str(hostile_bin) not in sudo_log
+    assert str(hostile_home) not in sudo_log
+    assert "BASH_ENV" not in sudo_log
+    assert "PYTHONPATH" not in sudo_log
+    assert "SUDO_ASKPASS" not in sudo_log
+
+
+def test_preflight_rejects_writable_fixed_docker_config_before_docker(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    Path(env["FAKE_TRUSTED_DOCKER_CONFIG"]).chmod(0o770)
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == 1
+    assert "Docker CLI configuration directory" in result.stderr
+    assert "must not be group writable or world accessible" in result.stderr
+    assert not Path(env["FAKE_DOCKER_LOG"]).exists()
+
+
+def test_deployment_scripts_pin_privileged_executable_boundaries() -> None:
+    deploy_source = _DEPLOY.read_text(encoding="utf-8")
+    preflight_source = _PREFLIGHT.read_text(encoding="utf-8")
+
+    for source in (deploy_source, preflight_source):
+        assert source.startswith("#!/bin/bash -p\n")
+        assert 'readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin:/sbin:/bin"' in source
+        assert 'readonly DOCKER_BIN="/usr/bin/docker"' in source
+        assert (
+            'readonly COMPOSE_BIN="/usr/libexec/docker/cli-plugins/docker-compose"'
+            in source
+        )
+        assert 'readonly DOCKER_CONFIG_DIR="/etc/onyx/regulatory-docker"' in source
+        assert "$HOME/.docker" not in source
+        assert "docker compose" not in source
+    assert 'readonly SUDO_BIN="/usr/bin/sudo"' in deploy_source
+    assert '"$SUDO_BIN" -n --' in deploy_source
+    assert '"$BASH_BIN" -p "$PREFLIGHT"' in deploy_source
 
 
 def test_deploy_uses_noninteractive_sudo_and_controls_authorization_failure(
@@ -2054,6 +2273,10 @@ def test_runbook_requires_canonical_noninteractive_least_privilege_preflight() -
     assert "`sudo -n`" in runbook
     assert "`NOPASSWD` authorization for the exact" in runbook
     assert "not generic `/usr/bin/env`, `docker`, a shell" in runbook
+    assert "`/usr/bin/sudo -n`" in runbook
+    assert "`/etc/onyx/regulatory-docker`" in runbook
+    assert "root-owned" in runbook
+    assert "$HOME/.docker" not in runbook
     assert "sudo -- ./regulatory-prod-lite-preflight.sh" not in runbook
 
 

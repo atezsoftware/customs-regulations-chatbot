@@ -1,7 +1,21 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 
 set -Eeuo pipefail
 umask 077
+
+readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+readonly DOCKER_BIN="/usr/bin/docker"
+readonly COMPOSE_BIN="/usr/libexec/docker/cli-plugins/docker-compose"
+readonly DOCKER_CONFIG_DIR="/etc/onyx/regulatory-docker"
+readonly DEPLOYMENT_DOCKER_HOST="unix:///var/run/docker.sock"
+readonly DEPLOYMENT_HOME="/var/empty"
+export PATH="$TRUSTED_SYSTEM_PATH"
+export HOME="$DEPLOYMENT_HOME"
+export TMPDIR="/tmp"
+export LANG="C"
+export LC_ALL="C"
+unset BASH_ENV CDPATH ENV GLOBIGNORE LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME \
+  PYTHONPATH SUDO_ASKPASS SUDO_ASKPASS_REQUIRE
 
 readonly MINIMUM_COMPOSE_VERSION="2.24.4"
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -87,6 +101,83 @@ version_at_least() {
   (( actual_patch >= required_patch ))
 }
 
+clear_ambient_deployment_overrides() {
+  local variable
+
+  while IFS= read -r variable; do
+    case "$variable" in
+      COMPOSE_* | DOCKER_* | ONYX_*_IMAGE | REGULATORY_*_IMAGE | \
+        BASE_IMAGE_REGISTRY | IMAGE_TAG)
+        unset -v "$variable"
+        ;;
+    esac
+  done < <(compgen -e)
+  export DOCKER_HOST="$DEPLOYMENT_DOCKER_HOST"
+  export DOCKER_CONFIG="$DOCKER_CONFIG_DIR"
+}
+
+validate_root_owned_directory() {
+  local path=$1
+  local description=$2
+  local owner mode canonical
+
+  [[ -d "$path" && ! -L "$path" ]] || \
+    die "$description must be a non-symlink directory"
+  canonical=$(/usr/bin/readlink -f -- "$path") || \
+    die "$description cannot be canonicalized"
+  [[ "$canonical" == "$path" ]] || \
+    die "$description must not traverse symlinks"
+  owner=$(/usr/bin/stat -c '%u' -- "$path") || \
+    die "$description owner cannot be read"
+  mode=$(/usr/bin/stat -c '%a' -- "$path") || \
+    die "$description mode cannot be read"
+  [[ "$owner" == "0" ]] || die "$description must be owned by root"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "$description mode is invalid"
+  (( (8#$mode & 8#027) == 0 )) || \
+    die "$description must not be group writable or world accessible"
+}
+
+validate_root_owned_file() {
+  local path=$1
+  local description=$2
+  local maximum_size=${3:-1048576}
+  local owner mode size
+
+  [[ -f "$path" && ! -L "$path" ]] || \
+    die "$description must be a non-symlink regular file"
+  owner=$(/usr/bin/stat -c '%u' -- "$path") || \
+    die "$description owner cannot be read"
+  mode=$(/usr/bin/stat -c '%a' -- "$path") || \
+    die "$description mode cannot be read"
+  size=$(/usr/bin/stat -c '%s' -- "$path") || \
+    die "$description size cannot be read"
+  [[ "$owner" == "0" ]] || die "$description must be owned by root"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "$description mode is invalid"
+  (( (8#$mode & 8#137) == 0 )) || \
+    die "$description permits unsafe group/world access or execution"
+  if ((maximum_size > 0)); then
+    ((size <= maximum_size)) || die "$description exceeds the 1 MiB limit"
+  fi
+}
+
+validate_root_owned_executable() {
+  local path=$1
+  local description=$2
+  local owner mode
+
+  [[ -f "$path" && ! -L "$path" ]] || \
+    die "$description must be a non-symlink regular file"
+  owner=$(/usr/bin/stat -c '%u' -- "$path") || \
+    die "$description owner cannot be read"
+  mode=$(/usr/bin/stat -c '%a' -- "$path") || \
+    die "$description mode cannot be read"
+  [[ "$owner" == "0" ]] || die "$description must be owned by root"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "$description mode is invalid"
+  (( (8#$mode & 8#022) == 0 )) || \
+    die "$description must not be group/world writable"
+  [[ -x "$path" ]] || die "$description must be executable"
+}
+
 env_file="$SCRIPT_DIR/.env"
 base_compose="$DEFAULT_BASE_COMPOSE"
 expected_image=""
@@ -162,11 +253,19 @@ done
 
 ((EUID == 0)) || \
   die "this bounded readiness preflight must be invoked as root; use the documented sudo command"
+clear_ambient_deployment_overrides
 [[ "$project_name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || \
   die "--project-name is required and must be an explicit lowercase Compose project name"
 [[ -n "$migration_env_file" ]] || die "--migration-env-file is required"
 
-command -v docker >/dev/null 2>&1 || die "docker is not installed"
+validate_root_owned_directory "${DOCKER_CONFIG_DIR%/*}" \
+  "the Docker CLI configuration parent directory"
+validate_root_owned_directory "$DOCKER_CONFIG_DIR" \
+  "the Docker CLI configuration directory"
+validate_root_owned_file "$DOCKER_CONFIG_DIR/config.json" \
+  "the Docker CLI configuration file"
+validate_root_owned_executable "$DOCKER_BIN" "the Docker CLI"
+validate_root_owned_executable "$COMPOSE_BIN" "the Docker Compose CLI"
 command -v jq >/dev/null 2>&1 || die "jq is required for fail-closed Compose validation"
 command -v readlink >/dev/null 2>&1 || die "readlink is required for environment-path validation"
 command -v stat >/dev/null 2>&1 || die "stat is required for environment permission validation"
@@ -332,7 +431,7 @@ if [[ -n "$expected_model_image" ]] && ! is_digest_reference "$expected_model_im
   die "--expected-model-image must be an immutable repository@sha256 reference"
 fi
 
-compose_version=$(docker compose version --short 2>/dev/null) || \
+compose_version=$("$COMPOSE_BIN" version --short 2>/dev/null) || \
   die "Docker Compose v2 is unavailable"
 version_at_least "$compose_version" "$MINIMUM_COMPOSE_VERSION" || \
   die "Docker Compose $MINIMUM_COMPOSE_VERSION or newer is required for !reset"
@@ -372,7 +471,7 @@ cleanup() {
 
   if [[ -n "$readiness_ownership_token" ]]; then
     if ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
-      docker container ls --all --quiet --no-trunc \
+      "$DOCKER_BIN" container ls --all --quiet --no-trunc \
       --filter "label=$READINESS_OWNERSHIP_LABEL=$readiness_ownership_token" 2>/dev/null); then
       printf '%s\n' \
         "Preflight cleanup failed: label-owned readiness containers could not be queried" >&2
@@ -396,7 +495,7 @@ cleanup() {
 
   if [[ "$cleanup_failed" == false && -z "$label_owned_cid" && -n "$readiness_cid" ]]; then
     if ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
-      docker container ls --all --quiet --no-trunc \
+      "$DOCKER_BIN" container ls --all --quiet --no-trunc \
       --filter "id=$readiness_cid" 2>/dev/null); then
       printf '%s\n' \
         "Preflight cleanup failed: readiness container identity could not be queried" >&2
@@ -410,7 +509,7 @@ cleanup() {
 
   if [[ "$cleanup_failed" == false && -n "$label_owned_cid" ]]; then
     if ! observed_ownership_token=$(timeout --foreground --kill-after=2s 10s \
-      docker inspect --type container \
+      "$DOCKER_BIN" inspect --type container \
       --format '{{ index .Config.Labels "io.regulatory.readiness-preflight-owner" }}' \
       "$label_owned_cid" 2>/dev/null); then
       printf '%s\n' \
@@ -421,7 +520,7 @@ cleanup() {
         "Preflight cleanup failed: readiness container ownership label does not match; refusing removal" >&2
       cleanup_failed=true
     elif ! timeout --foreground --kill-after=2s 10s \
-      docker rm -f "$label_owned_cid" >/dev/null 2>&1; then
+      "$DOCKER_BIN" rm -f "$label_owned_cid" >/dev/null 2>&1; then
       printf '%s\n' \
         "Preflight cleanup failed: could not remove the owned readiness container" >&2
       cleanup_failed=true
@@ -430,7 +529,7 @@ cleanup() {
 
   if [[ "$cleanup_failed" == false && -n "$readiness_ownership_token" ]]; then
     if ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
-      docker container ls --all --quiet --no-trunc \
+      "$DOCKER_BIN" container ls --all --quiet --no-trunc \
       --filter "label=$READINESS_OWNERSHIP_LABEL=$readiness_ownership_token" 2>/dev/null); then
       printf '%s\n' \
         "Preflight cleanup failed: label-owned readiness container removal could not be verified" >&2
@@ -483,7 +582,7 @@ readiness_ownership_token=$(python3 -c \
 [[ "$readiness_ownership_token" =~ ^[0-9a-f]{64}$ ]] || \
   die "the private readiness container ownership token is invalid"
 
-if ! docker ps \
+if ! "$DOCKER_BIN" ps \
   --format '{{.ID}}\t{{.Names}}\t{{.Label "com.docker.compose.service"}}' \
   >"$container_inventory_file" 2>"$config_error_file"; then
   die "running container inventory cannot be read"
@@ -501,8 +600,8 @@ while IFS=$'\t' read -r container_id container_name compose_service; do
       suspicious_container=true
       ;;
   esac
-  container_image_id=$(docker inspect --format '{{.Image}}' "$container_id" 2>/dev/null || true)
-  container_role=$(docker image inspect \
+  container_image_id=$("$DOCKER_BIN" inspect --format '{{.Image}}' "$container_id" 2>/dev/null || true)
+  container_role=$("$DOCKER_BIN" image inspect \
     --format '{{index .Config.Labels "io.regulatory.role"}}' \
     "$container_image_id" 2>/dev/null || true)
   if [[ "$container_role" == "importer" ]]; then
@@ -530,7 +629,7 @@ if ((${#suspicious_containers[@]})); then
 fi
 
 compose=(
-  docker compose
+  "$COMPOSE_BIN"
   --project-name "$project_name"
   --env-file "$env_file"
   -f "$base_compose"
@@ -872,7 +971,7 @@ if ! timeout \
   --foreground \
   --kill-after=5s \
   "${READINESS_VALIDATION_TIMEOUT_SECONDS}s" \
-  docker run \
+  "$DOCKER_BIN" run \
   --cidfile "$readiness_cidfile" \
   --label "$READINESS_OWNERSHIP_LABEL=$readiness_ownership_token" \
   --rm \

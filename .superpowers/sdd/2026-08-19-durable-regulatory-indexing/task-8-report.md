@@ -729,3 +729,90 @@ unhealthy; `onyx-nginx-1` was healthy; ports `7000` and `7001` returned HTTP
 trusted attestation was fabricated, no live root preflight was attempted, and
 no production document, index, database/provider record, object, or job was
 mutated.
+
+---
+
+## Task 8: privileged executable boundary closure
+
+The post-commit Critical finding was valid. The deployment wrapper placed the
+operator's `PATH`, `HOME`, and `$HOME/.docker` inside the root handoff and
+resolved `sudo`, Docker, and the Compose plugin through caller-controlled
+lookup. The internal preflight also used `/usr/bin/env bash`, so its privileged
+interpreter and later unqualified commands depended on that environment.
+
+### TDD and corrected contract
+
+- Focused RED was `4 failed, 56 deselected in 0.93s`. A deployment completed
+  while hostile Bash, sudo, Docker, Python, timeout/stat, `BASH_ENV`, and a
+  `$HOME/.docker/cli-plugins/docker-compose` marker executed; a mode-`0770`
+  Docker configuration directory was accepted and Docker was queried; the
+  scripts lacked the absolute boundary; and the runbook still selected the
+  caller's home configuration.
+- The production scripts now start with `/bin/bash -p`, immediately install the
+  fixed `/usr/sbin:/usr/bin:/sbin:/bin` path, and clear `BASH_ENV`, `ENV`,
+  `PYTHONPATH`, `PYTHONHOME`, `SUDO_ASKPASS`, loader variables, and related
+  shell controls. The only privilege transition is absolute `/usr/bin/sudo -n`
+  to `/usr/bin/env -i ... /bin/bash -p` with the same fixed environment used by
+  every later rollout command.
+- Docker is always `/usr/bin/docker`; Compose is invoked directly as
+  `/usr/libexec/docker/cli-plugins/docker-compose`, so neither caller `PATH`
+  nor home-directory CLI plugins can select an executable. Both phases use the
+  fixed local socket and fixed `/etc/onyx/regulatory-docker` configuration;
+  ambient Docker/Compose/image variables remain rejected at the wrapper.
+- Root preflight fails before Docker unless `/etc/onyx`, the dedicated config
+  directory, `config.json`, Docker, and Compose satisfy their fixed trust
+  contracts. Directories must be root-owned, non-symlink, canonical, not group
+  writable, and inaccessible to world users. `config.json` must be a
+  root-owned non-symlink regular file, at most 1 MiB, non-executable, with no
+  unsafe group/world access; executables must be root-owned regular files,
+  executable, and not group/world writable. Locked parents make the subsequent
+  use non-operator-rebindable.
+- Unit tests use a copied test-only Compose bundle whose compile-time constants
+  point to fixture-owned tools. This preserves fixed production constants and
+  adds no environment-controlled runtime escape hatch. GREEN for the new
+  boundary cases was `3 passed, 57 deselected in 0.55s`; after compatibility
+  assertions the complete deploy/preflight unit module passed `60 passed in
+  12.53s`; the final post-hook repeat was `60 passed in 12.65s`. The
+  hostile-path regression also proves the root argv contains the trusted path,
+  `/var/empty` home, fixed config, and none of the poison variables.
+
+### Runtime, broad, and static evidence
+
+- The isolated real-Docker normal case passed `1 passed, 4 deselected in
+  45.63s`. The final complete runtime module passed `5 passed in 93.56s`, retaining
+  Supervisor's root-started numeric `1001:1001`/`0770` allow/deny proof plus
+  normal, host-symlink, forced-timeout, and pre-cid cleanup scenarios. Its
+  outer image contained the canonical root-owned Docker config; root-owned
+  adapters were mounted at the exact Docker/Compose paths while the real daemon
+  handled the inner runtime container. The dedicated outer temp mount avoided
+  exposing sibling host `/tmp` data.
+- Final readiness, deployment, runtime-dependency, environment-inventory,
+  Supervisor, and Celery wiring focus passed `197 passed in 23.13s`. The broad
+  55-file regulatory, user-file, Vertex, Supervisor, and runtime unit superset
+  passed `929 passed in 31.30s`.
+- Ruff check, Ruff formatting, `ty`, `bash -n`, and `git diff --check` passed.
+  Host `shellcheck` is unavailable; the repository shellcheck pre-commit hook
+  passed. Absolute Compose `2.40.3+ds1-0ubuntu1` successfully rendered the
+  production-lite overlay directly, without Docker plugin discovery.
+- Real-Docker teardown left zero readiness-label containers, test images, or
+  probe directories. Durable pipeline/provider/repository code did not change,
+  so PostgreSQL/Elasticsearch was not rerun; the immediately preceding
+  unchanged-code evidence remains `36 passed in 44.22s` with exact provider
+  restoration and zero provider, pipeline, large-object, or index residue.
+
+### Operator and live-readiness limits
+
+The deployment host must provision root-owned
+`/etc/onyx/regulatory-docker/config.json` and update the exact `NOPASSWD` argv
+for the fixed path, config, and `/bin/bash -p` boundary before a change window;
+the current local host does not have `/etc/onyx`, so canonical preflight fails
+closed rather than falling back to an operator config. The runbook now gives
+mode-`0750`/`0640` provisioning and explicitly requires removal of any older
+caller-derived sudoers route.
+
+The read-only live check remains blocked: private PostgreSQL DNS returned exit
+`2`; `onyx-api_server-1` was up but unhealthy; `onyx-nginx-1` was healthy; and
+ports `7000` and `7001` returned HTTP `200`. No trusted config or attestation
+was fabricated, no live root preflight or rollout was attempted, and no
+production document, index, database/provider record, object, or job was
+mutated.

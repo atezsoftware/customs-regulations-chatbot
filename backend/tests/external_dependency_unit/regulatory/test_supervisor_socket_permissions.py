@@ -76,9 +76,9 @@ def runtime_lite_supervisor_image() -> Iterator[str]:
 def preflight_operator_image(
     runtime_lite_supervisor_image: str,
 ) -> Iterator[str]:
-    fingerprint = hashlib.sha256(runtime_lite_supervisor_image.encode()).hexdigest()[
-        :16
-    ]
+    fingerprint = hashlib.sha256(
+        f"{runtime_lite_supervisor_image}:trusted-cli-v1".encode()
+    ).hexdigest()[:16]
     image = f"onyx-task8-preflight-operator:{fingerprint}"
     existing = subprocess.run(
         ["docker", "image", "inspect", image],
@@ -95,7 +95,15 @@ def preflight_operator_image(
                 f"FROM {runtime_lite_supervisor_image}\n"
                 "USER 0:0\n"
                 "RUN apt-get update && apt-get install -y --no-install-recommends jq "
-                "&& rm -rf /var/lib/apt/lists/*\n"
+                "&& rm -rf /var/lib/apt/lists/* "
+                "&& install -d -o root -g root -m 0750 /etc/onyx "
+                "/etc/onyx/regulatory-docker "
+                "&& install -d -o root -g root -m 0755 "
+                "/usr/libexec/docker/cli-plugins "
+                "&& printf '{}\\n' >/etc/onyx/regulatory-docker/config.json "
+                "&& chmod 0640 /etc/onyx/regulatory-docker/config.json "
+                "&& if [ ! -e /usr/bin/python3 ]; then "
+                "ln -s /usr/local/bin/python3 /usr/bin/python3; fi\n"
             ),
             capture_output=True,
             text=True,
@@ -403,6 +411,8 @@ print(json.dumps({
         f"{Path(env['FAKE_DOCKER_LOG']).parent / 'bin'}:/usr/local/bin:/usr/bin:/bin"
     )
     selected_environment["TMPDIR"] = env["TMPDIR"]
+    selected_environment["FAKE_REAL_DOCKER"] = "/usr/libexec/regulatory-test-docker"
+    selected_environment["FAKE_OUTER_TMPDIR_SOURCE"] = str(probe_root)
     operator_environment.write_text(
         "".join(f"{key}={value}\n" for key, value in selected_environment.items()),
         encoding="utf-8",
@@ -413,8 +423,48 @@ print(json.dumps({
     assert docker_binary.is_file()
     operator_tools = probe_root / "operator-tools"
     operator_tools.mkdir(mode=0o700)
-    docker_source = operator_tools / "docker"
-    shutil.copy2(docker_binary, docker_source)
+    real_docker_source = operator_tools / "docker-real"
+    shutil.copy2(docker_binary, real_docker_source)
+    fake_docker_source = operator_tools / "docker"
+    fixture_docker = Path(env["FAKE_DOCKER_LOG"]).parent / "bin" / "docker"
+    fake_environment_source = operator_tools / "fake-environment"
+    fixture_environment = Path(env["FAKE_DOCKER_LOG"]).parent / "fake-environment"
+    shutil.copy2(fixture_environment, fake_environment_source)
+    fake_docker_source.write_text(
+        fixture_docker.read_text(encoding="utf-8").replace(
+            f'source "{fixture_environment}"',
+            'source "/usr/libexec/regulatory-test-environment"',
+        ),
+        encoding="utf-8",
+    )
+    fake_compose_source = operator_tools / "docker-compose"
+    fake_compose_source.write_text(
+        '#!/bin/bash\nexec /usr/bin/docker compose "$@"\n',
+        encoding="utf-8",
+    )
+    prepare_tools = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--pull",
+            "never",
+            "--network",
+            "none",
+            "--mount",
+            f"type=bind,source={operator_tools},target=/tools",
+            "--entrypoint",
+            "/bin/sh",
+            operator_image,
+            "-c",
+            "chown 0:0 /tools/* && chmod 0755 /tools/docker /tools/docker-compose /tools/docker-real && chmod 0600 /tools/fake-environment",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert prepare_tools.returncode == 0, prepare_tools.stderr
 
     return subprocess.run(
         [
@@ -446,8 +496,8 @@ print(json.dumps({
             "SETUID",
             "--cap-add",
             "SETGID",
-            "--tmpfs",
-            "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+            "--mount",
+            f"type=bind,source={probe_root},target=/tmp",
             "--env-file",
             str(operator_environment),
             "--env",
@@ -457,7 +507,13 @@ print(json.dumps({
             "--mount",
             f"type=bind,source={_REPOSITORY_ROOT},target={_REPOSITORY_ROOT}",
             "--mount",
-            f"type=bind,source={docker_source},target=/usr/bin/docker,readonly",
+            f"type=bind,source={fake_docker_source},target=/usr/bin/docker,readonly",
+            "--mount",
+            f"type=bind,source={fake_compose_source},target=/usr/libexec/docker/cli-plugins/docker-compose,readonly",
+            "--mount",
+            f"type=bind,source={real_docker_source},target=/usr/libexec/regulatory-test-docker,readonly",
+            "--mount",
+            f"type=bind,source={fake_environment_source},target=/usr/libexec/regulatory-test-environment,readonly",
             "--entrypoint",
             "/usr/local/bin/python",
             operator_image,

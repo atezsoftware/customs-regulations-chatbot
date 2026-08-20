@@ -1,7 +1,19 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 
 set -Eeuo pipefail
 umask 077
+
+readonly TRUSTED_SYSTEM_PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+readonly ENV_BIN="/usr/bin/env"
+readonly BASH_BIN="/bin/bash"
+readonly SUDO_BIN="/usr/bin/sudo"
+readonly DOCKER_BIN="/usr/bin/docker"
+readonly COMPOSE_BIN="/usr/libexec/docker/cli-plugins/docker-compose"
+readonly DOCKER_CONFIG_DIR="/etc/onyx/regulatory-docker"
+readonly DEPLOYMENT_HOME="/var/empty"
+export PATH="$TRUSTED_SYSTEM_PATH"
+unset BASH_ENV CDPATH ENV GLOBIGNORE LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME \
+  PYTHONPATH SUDO_ASKPASS SUDO_ASKPASS_REQUIRE
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
@@ -55,9 +67,10 @@ Deploy explicitly runs `alembic upgrade head` from the pinned image after the ba
 checks API liveness, then starts with `--no-build --wait`. Multi-tenant deployments are refused because
 they require an approved tenant-migration orchestrator. Rollback changes only the application image: it
 never downgrades, restores, or otherwise mutates the database schema.
-All commands use one sanitized environment and the fixed local Docker socket. Ambient Docker,
-Compose, and image overrides are refused. Non-root operators need noninteractive sudo authorization
-only for the exact bounded preflight handoff.
+All Docker and Compose commands use one sanitized environment, fixed root-owned Docker CLI
+configuration, and the fixed local Docker socket. Ambient Docker, Compose, executable-path, home,
+and image overrides cannot cross the boundary. Non-root operators need noninteractive sudo
+authorization only for the exact bounded preflight handoff.
 EOF
 }
 
@@ -214,24 +227,18 @@ done
 ((wait_timeout <= 3600)) || die "--wait-timeout cannot exceed 3600 seconds"
 
 reject_ambient_deployment_overrides
-[[ -n "${PATH:-}" && "$PATH" != *$'\n'* && "$PATH" != *$'\r'* ]] || \
-  die "PATH must be a non-empty single line"
-[[ -n "${HOME:-}" && "$HOME" == /* && "$HOME" != *$'\n'* && "$HOME" != *$'\r'* ]] || \
-  die "HOME must be an absolute single-line path"
-readonly deployment_command_path=$PATH
-readonly deployment_home=$HOME
-readonly deployment_docker_config="$deployment_home/.docker"
+export HOME="$DEPLOYMENT_HOME"
 deployment_environment=(
-  /usr/bin/env -i
-  "PATH=$deployment_command_path"
-  "HOME=$deployment_home"
+  "$ENV_BIN" -i
+  "PATH=$TRUSTED_SYSTEM_PATH"
+  "HOME=$DEPLOYMENT_HOME"
   "TMPDIR=/tmp"
   "LANG=C"
   "LC_ALL=C"
   "DOCKER_HOST=$DEPLOYMENT_DOCKER_HOST"
-  "DOCKER_CONFIG=$deployment_docker_config"
+  "DOCKER_CONFIG=$DOCKER_CONFIG_DIR"
 )
-readonly deployment_environment
+readonly -a deployment_environment
 
 preflight_args=(
   --env-file "$env_file"
@@ -256,13 +263,15 @@ fi
 
 run_preflight() {
   if ((EUID == 0)); then
-    "${deployment_environment[@]}" "$PREFLIGHT" "${preflight_args[@]}"
+    "${deployment_environment[@]}" \
+      "$BASH_BIN" -p "$PREFLIGHT" "${preflight_args[@]}"
     return
   fi
-  command -v sudo >/dev/null 2>&1 || \
+  [[ -x "$SUDO_BIN" ]] || \
     die "noninteractive sudo authorization is required for the bounded readiness preflight"
-  if ! sudo -n -- \
-    "${deployment_environment[@]}" "$PREFLIGHT" "${preflight_args[@]}"; then
+  if ! "$SUDO_BIN" -n -- \
+    "${deployment_environment[@]}" \
+    "$BASH_BIN" -p "$PREFLIGHT" "${preflight_args[@]}"; then
     die "the bounded readiness preflight failed; noninteractive sudo authorization for this exact handoff is required"
   fi
 }
@@ -275,7 +284,7 @@ fi
 run_preflight
 
 compose=(
-  "${deployment_environment[@]}" docker compose
+  "${deployment_environment[@]}" "$COMPOSE_BIN"
   --project-name "$project_name"
   --env-file "$env_file"
   -f "$base_compose"
@@ -337,7 +346,7 @@ inspect_image_contract() {
   local labels
 
   labels=$("${deployment_environment[@]}" \
-    docker image inspect --format '{{json .Config.Labels}}' "$image_ref") || \
+    "$DOCKER_BIN" image inspect --format '{{json .Config.Labels}}' "$image_ref") || \
     die "a pulled application image cannot be inspected"
   jq -e --arg role "$expected_role" '
     .["io.regulatory.role"] == $role
@@ -362,7 +371,7 @@ if [[ "$model_mode" == "local" ]]; then
     die "backend and model images were not built from the same source revision"
 fi
 
-if ! "${deployment_environment[@]}" docker run --rm \
+if ! "${deployment_environment[@]}" "$DOCKER_BIN" run --rm \
   --network none \
   --read-only \
   --cap-drop ALL \

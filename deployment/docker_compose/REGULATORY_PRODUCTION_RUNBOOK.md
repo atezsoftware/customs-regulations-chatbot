@@ -294,21 +294,46 @@ Run only the authoritative deployment wrapper from `deployment/docker_compose`. 
 `DOCKER_*`, `COMPOSE_*`, and image interpolation overrides, reads interpolation only from the
 selected mode-`0600` environment file, and binds both preflight and rollout to the local
 `unix:///var/run/docker.sock` daemon with one explicit environment. Remote Docker contexts are not
-supported by this production-lite procedure.
+supported by this production-lite procedure. The wrapper does not trust the operator's `PATH`,
+`HOME`, or Docker CLI plugin discovery: it uses the fixed system path
+`/usr/sbin:/usr/bin:/sbin:/bin`, `/usr/bin/docker`, and
+`/usr/libexec/docker/cli-plugins/docker-compose` for both phases.
 
-The wrapper uses `sudo -n` only for the bounded preflight handoff. Before the change window, the
+Before granting preflight authorization, provision the dedicated Docker CLI configuration at
+`/etc/onyx/regulatory-docker`. Both `/etc/onyx` and that directory must be root-owned, must not be
+group writable or world accessible, and must not be symlinks. The required `config.json` must be a
+root-owned, non-symlink, non-executable regular file, no larger than 1 MiB, with no group write/execute
+or world access. A dedicated deployment group may have read/traverse access (for example,
+directories mode `0750` and `config.json` mode `0640`) so the non-root rollout can use approved
+registry credentials without being able to alter them. For a registry that needs no client
+configuration, provision an empty root-owned object:
+
+```bash
+/usr/bin/sudo install -d -o root -g onyx-deploy -m 0750 /etc/onyx
+/usr/bin/sudo install -d -o root -g onyx-deploy -m 0750 /etc/onyx/regulatory-docker
+printf '{}\n' | /usr/bin/sudo tee /etc/onyx/regulatory-docker/config.json >/dev/null
+/usr/bin/sudo chown root:onyx-deploy /etc/onyx/regulatory-docker/config.json
+/usr/bin/sudo chmod 0640 /etc/onyx/regulatory-docker/config.json
+```
+
+Replace `onyx-deploy` with the approved read-only deployment group. Provision authenticated registry
+configuration through the organization's secret-safe root workflow; do not print it or derive it
+from the operator's home directory.
+
+The wrapper invokes absolute `/usr/bin/sudo -n` (the noninteractive `sudo -n` form) only for the
+bounded preflight handoff. Before the change window, the
 operator must have `NOPASSWD` authorization for the exact `/usr/bin/env -i ...
-regulatory-prod-lite-preflight.sh` argv emitted by this wrapper; constrain the sudoers rule to that
-full argument sequence and deployment path, not generic `/usr/bin/env`, `docker`, a shell, or the
-deployment wrapper. A missing or interactive authorization is a release blocker: the wrapper must
-fail immediately rather than prompt. Root is required so one descriptor-owning helper can validate
-the original numeric `1001:1001` files and hand private `1001:1001` snapshots to the fixed non-root
-validation container. Do not use `sudo -E`, print the environment, or run the deployment itself as
-root. Set a reviewed, stable operator `PATH` and `HOME` before invoking the wrapper; it resolves
-those values once and uses `$HOME/.docker` for registry authentication without allowing it to select
-a different daemon. The approved digest arguments below are non-secret values supplied by release
-automation. The exact command both verifies noninteractive privilege and runs the preflight. For the
-recommended cloud model mode with Compose-managed data services:
+/bin/bash -p regulatory-prod-lite-preflight.sh` argv emitted by this wrapper; constrain the sudoers
+rule to that full argument sequence and deployment path, not generic `/usr/bin/env`, `docker`, a shell,
+or the deployment wrapper. A missing or interactive authorization is a release blocker: the
+wrapper must fail immediately rather than prompt. Root is required so one descriptor-owning helper
+can validate the original numeric `1001:1001` files and hand private `1001:1001` snapshots to the
+fixed non-root validation container. Do not use `sudo -E`, print the environment, or run the
+deployment itself as root. The approved digest arguments below are non-secret values supplied by
+release automation. The exact command both verifies noninteractive privilege and runs the preflight.
+Remove any older sudoers rule that embeds an operator-derived `PATH`, `HOME`, or Docker config path;
+it does not authorize this fixed boundary and must not remain as a broader alternate route.
+For the recommended cloud model mode with Compose-managed data services:
 
 ```bash
 ./regulatory-prod-lite-deploy.sh preflight \
