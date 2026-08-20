@@ -2564,17 +2564,36 @@ def test_privileged_installer_rejects_unsafe_staged_files_without_activation(
         tmp_path
     )
     helper = stage / "regulatory_readiness_file_snapshot.py"
+    mode_target: Path | None = None
+    original_mode: int | None = None
+    unsafe_mode: int | None = None
     if mutation == "symlink":
         helper.unlink()
         helper.symlink_to(_SNAPSHOT_HELPER)
+    elif mutation == "directory-writable":
+        mode_target = stage.parent
+        original_mode = mode_target.stat().st_mode & 0o777
+        unsafe_mode = 0o777
+        mode_target.chmod(unsafe_mode)
     else:
-        helper.chmod(0o666)
+        mode_target = helper
+        original_mode = mode_target.stat().st_mode & 0o777
+        unsafe_mode = 0o666
+        mode_target.chmod(unsafe_mode)
 
-    result = _run_privileged_installer(installer, stage, digest)
+    try:
+        if mode_target is not None:
+            assert mode_target.stat().st_mode & 0o777 == unsafe_mode
+        result = _run_privileged_installer(installer, stage, digest)
+    finally:
+        if mode_target is not None and original_mode is not None:
+            mode_target.chmod(original_mode)
 
     assert result.returncode == 1
     assert diagnostic in result.stderr
     assert not install_root.exists()
+    if mode_target is not None:
+        assert mode_target.stat().st_mode & 0o777 == original_mode
 
 
 def test_privileged_installer_refuses_checkout_execution_before_copying(
@@ -2664,6 +2683,7 @@ def test_privileged_preflight_isolated_python_ignores_hostile_cwd(
     [
         ("symlink", "must not be a symlink"),
         ("writable", "must not be group/world writable"),
+        ("directory-writable", "must not be group/world writable"),
     ],
 )
 def test_privileged_preflight_rejects_mutable_or_symlinked_installed_overlay(
@@ -2678,8 +2698,14 @@ def test_privileged_preflight_rejects_mutable_or_symlinked_installed_overlay(
         / env["FAKE_PRIVILEGED_BUNDLE_DIGEST"]
     )
     overlay = release / "docker-compose.regulatory-prod-lite.yml"
+    mode_target: Path | None = None
+    original_mode: int | None = None
+    unsafe_mode: int | None = None
     if mutation == "directory-writable":
-        release.parent.chmod(0o777)
+        mode_target = release.parent
+        original_mode = mode_target.stat().st_mode & 0o777
+        unsafe_mode = 0o777
+        mode_target.chmod(unsafe_mode)
     elif mutation == "symlink":
         overlay.unlink()
         overlay.symlink_to(
@@ -2687,13 +2713,24 @@ def test_privileged_preflight_rejects_mutable_or_symlinked_installed_overlay(
             / "docker-compose.regulatory-prod-lite.yml"
         )
     else:
-        overlay.chmod(0o666)
+        mode_target = overlay
+        original_mode = mode_target.stat().st_mode & 0o777
+        unsafe_mode = 0o666
+        mode_target.chmod(unsafe_mode)
 
-    result = _run(_PREFLIGHT, _preflight_args(env_file, env), env)
+    try:
+        if mode_target is not None:
+            assert mode_target.stat().st_mode & 0o777 == unsafe_mode
+        result = _run(_PREFLIGHT, _preflight_args(env_file, env), env)
+    finally:
+        if mode_target is not None and original_mode is not None:
+            mode_target.chmod(original_mode)
 
     assert result.returncode == 1
     assert diagnostic in result.stderr
     assert not Path(env["FAKE_DOCKER_LOG"]).exists()
+    if mode_target is not None:
+        assert mode_target.stat().st_mode & 0o777 == original_mode
 
 
 def test_privileged_preflight_rejects_non_root_owned_installed_helper(

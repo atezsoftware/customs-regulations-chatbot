@@ -904,3 +904,34 @@ local host also intentionally has no approved installed privileged bundle or
 trusted capability attestation. No installer, sudoers rule, root preflight,
 rollout, live canary, production document, index, database/provider record,
 object, or job was created or mutated.
+
+---
+
+## Task 8: breaker adjudication — ancestor-mode test evidence correction
+
+The remaining Important finding was valid and test-only. The preceding report
+overstated two ancestor-mode regressions: the installer's
+`directory-writable` parameter changed the staged helper file instead of the
+staging-root ancestor, while the installed-release-ancestor mutation branch
+existed but its parameter was absent and therefore could not run.
+
+- TDD RED was the corrected staging-root assertion failing against mode `0755`
+  (`1 failed, 70 deselected in 0.21s`), proving the old parameter did not apply
+  the claimed directory mutation.
+- The installer regression now changes the actual staging-root ancestor to
+  mode `0777`, observes that mode before invocation, requires failure before
+  the install root/current activation exists, and restores the original mode
+  in `finally`. The dispatcher regression now includes the formerly
+  unreachable installed `releases`-ancestor case, observes mode `0777`,
+  requires failure before any Docker log/call exists, and likewise restores
+  the original mode in `finally`. The two corrected cases passed (`2 passed,
+  70 deselected in 0.23s`).
+- A scan of every `mutation` conditional in this module found no other
+  parameter/branch mismatch. The complete deploy/preflight test module passed
+  `72 passed in 20.62s`; the relevant deploy, secure-readiness, and runtime
+  dependency boundary set passed `110 passed in 25.26s`.
+- Ruff check, Ruff formatting, `ty`, `git diff --check`, and the touched-file
+  pre-commit suite passed. No production source or runtime artifact changed, so
+  the prior privileged runtime, broad unit, and PostgreSQL/Elasticsearch
+  evidence remains applicable without rerunning external infrastructure. No
+  production operation occurred.
