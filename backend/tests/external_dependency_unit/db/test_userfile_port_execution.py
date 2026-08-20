@@ -18,11 +18,18 @@ from onyx.background.celery.tasks.beat_schedule import BEAT_EXPIRES_DEFAULT
 from onyx.background.celery.tasks.port import tasks as port_task
 from onyx.background.celery.tasks.port.tasks import run_check_for_port, run_port_attempt
 from onyx.configs.constants import OnyxCeleryQueues, OnyxCeleryTask
-from onyx.db.enums import PortAttemptStatus, SwitchoverType, UserFileStatus
+from onyx.db.enums import (
+    PortAttemptStatus,
+    RegulatoryIndexingJobStatus,
+    RegulatoryIndexingStage,
+    SwitchoverType,
+    UserFileStatus,
+)
 from onyx.db.models import (
     ConnectorCredentialPair,
     PortAttempt,
     RegulatoryChunk,
+    RegulatoryIndexingJob,
     SearchSettings,
     User,
     UserFile,
@@ -39,6 +46,9 @@ from onyx.db.port_orphan_candidate import (
     clear_port_orphan_candidates,
     get_port_orphan_candidate_doc_ids,
     record_port_orphan_candidates_for_user_file,
+)
+from onyx.db.regulatory_indexing_jobs import (
+    has_active_regulatory_indexing_jobs_for_search_settings,
 )
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.swap_index import _port_swap_ready
@@ -408,6 +418,55 @@ def test_swap_gate_blocks_on_secondary_pending_then_releases(
     uf.secondary_reconcile_pending = False
     db_session.commit()
     # flag drained -> swap ready
+    assert _port_swap_ready(db_session, future_ss, [], [port_user.id]) is True
+
+
+def test_swap_gate_blocks_upload_started_during_port_until_publication_reconciles(
+    db_session: Session, future_ss_id: int, port_user: User
+) -> None:
+    future_ss = db_session.get(SearchSettings, future_ss_id)
+    assert future_ss is not None
+    current_ss = get_current_search_settings(db_session)
+    user_file = _make_user_file(
+        db_session,
+        port_user.id,
+        UserFileStatus.INDEXING,
+    )
+    attempt = create_port_attempt(
+        db_session, None, future_ss_id, port_user_id=port_user.id
+    )
+    mark_port_in_progress(db_session, attempt.id)
+    mark_port_succeeded(db_session, attempt.id)
+    job = RegulatoryIndexingJob(
+        user_file_id=user_file.id,
+        content_hash="a" * 64,
+        chunk_generation_hash="b" * 64,
+        search_settings_id=current_ss.id,
+        prompt_hash="c" * 64,
+        config_snapshot={
+            "input_content_hash": "a" * 64,
+            "chunk_generation_hash": "b" * 64,
+        },
+        status=RegulatoryIndexingJobStatus.RUNNING.value,
+        stage=RegulatoryIndexingStage.EMBEDDING.value,
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    assert has_active_regulatory_indexing_jobs_for_search_settings(
+        db_session,
+        current_ss.id,
+    )
+    assert _port_swap_ready(db_session, future_ss, [], [port_user.id]) is False
+
+    job.status = RegulatoryIndexingJobStatus.SUCCEEDED.value
+    user_file.status = UserFileStatus.COMPLETED
+    user_file.secondary_reconcile_pending = True
+    db_session.commit()
+    assert _port_swap_ready(db_session, future_ss, [], [port_user.id]) is False
+
+    user_file.secondary_reconcile_pending = False
+    db_session.commit()
     assert _port_swap_ready(db_session, future_ss, [], [port_user.id]) is True
 
 

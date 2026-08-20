@@ -11,6 +11,8 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
+from onyx.configs.constants import DocumentSource
+from onyx.connectors.models import Document, TextSection
 from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.enums import (
     RegulatoryIndexingCancellationPhase,
@@ -52,6 +54,8 @@ _NOW = datetime.datetime(2026, 8, 19, tzinfo=datetime.timezone.utc)
 def _snapshot() -> RegulatoryIndexingConfigSnapshot:
     return RegulatoryIndexingConfigSnapshot.model_validate(
         {
+            "input_content_hash": "1" * 64,
+            "chunk_generation_hash": "2" * 64,
             "search_settings_id": 9,
             "embedding_provider": "openrouter",
             "embedding_model_name": "openai/text-embedding-3-large",
@@ -100,6 +104,8 @@ def _runtime(
         status=status.value,
         lease_generation=generation,
         attempt_count=attempt_count,
+        content_hash="1" * 64,
+        chunk_generation_hash="2" * 64,
         config_snapshot=_snapshot().model_dump(mode="json"),
         remote_vertex_job_name=remote_job_name,
         vertex_input_uri=None,
@@ -148,7 +154,7 @@ def test_preparing_performs_one_preparation_operation() -> None:
         patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator._load_claimed_markdown_documents",
-            return_value=documents,
+            return_value=(documents, []),
         ),
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.prepare_claimed_regulatory_indexing_job"
@@ -172,6 +178,56 @@ def test_preparing_performs_one_preparation_operation() -> None:
     )
     assert result.outcome is OrchestrationOutcome.NEXT_STEP
     assert result.expected_generation == 3
+
+
+def test_preparing_uses_canonical_user_file_loader_and_reaps_staging() -> None:
+    runtime = _runtime(RegulatoryIndexingStage.PREPARING)
+    document = Document(
+        id=str(runtime.user_file.id),
+        source=DocumentSource.USER_FILE,
+        semantic_identifier="custom-display-name.md",
+        title="Embedded Regulatory Title",
+        sections=[TextSection(text="MADDE 1 - Hüküm")],
+        metadata={"regulation_number": "2026/1"},
+    )
+    documents = [document]
+    with (
+        patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.load_user_file_documents",
+            return_value=(documents, ["staged-csv"]),
+        ) as load,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.delete_files_best_effort"
+        ) as reap,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.prepare_claimed_regulatory_indexing_job"
+        ) as prepare,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    load.assert_called_once_with(
+        user_file_id=str(runtime.user_file.id),
+        file_id=runtime.user_file.file_id,
+        file_name=runtime.user_file.name,
+        tenant_id="tenant-a",
+    )
+    reap.assert_called_once_with(
+        ["staged-csv"],
+        context=f"durable regulatory preparation uf={runtime.user_file.id}",
+    )
+    recovered_document = prepare.call_args.kwargs["documents"][0]
+    assert recovered_document is document
+    assert recovered_document.semantic_identifier == "custom-display-name.md"
+    assert recovered_document.title == "Embedded Regulatory Title"
+    assert recovered_document.metadata == {"regulation_number": "2026/1"}
 
 
 def test_duplicate_normal_delivery_is_fenced_before_stage_work() -> None:

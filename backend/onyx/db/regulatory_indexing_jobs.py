@@ -105,6 +105,18 @@ class RegulatoryIndexingJobClaim:
 
 
 @dataclass(frozen=True)
+class RegulatoryIndexingCancellationDelivery:
+    job_id: UUID
+    expected_generation: int
+
+
+@dataclass(frozen=True)
+class UserFileDeletionCleanupPlan:
+    ready_to_delete: bool
+    deliveries: tuple[RegulatoryIndexingCancellationDelivery, ...]
+
+
+@dataclass(frozen=True)
 class RegulatoryIndexingPreparedItem:
     regulatory_chunk_id: str
     request_hash: str
@@ -118,6 +130,24 @@ class RegulatoryIndexingRuntime:
     search_settings: SearchSettings | None
     regulatory_chunks: tuple[RegulatoryChunk, ...]
     indexing_items: tuple[RegulatoryIndexingItem, ...]
+
+
+def _lock_user_file_for_regulatory_job(
+    db_session: Session,
+    job_id: UUID,
+) -> UserFile | None:
+    """Lock the job's parent before the job to keep lifecycle lock order stable."""
+
+    user_file_id = db_session.scalar(
+        select(RegulatoryIndexingJob.user_file_id).where(
+            RegulatoryIndexingJob.id == job_id
+        )
+    )
+    if user_file_id is None:
+        return None
+    return db_session.scalar(
+        select(UserFile).where(UserFile.id == user_file_id).with_for_update()
+    )
 
 
 def _validate_config_snapshot(
@@ -231,11 +261,41 @@ def create_or_get_regulatory_indexing_job(
     content_hash: str,
     search_settings_id: int,
     prompt_hash: str,
+    chunk_generation_hash: str,
     config_snapshot: RegulatoryIndexingConfigSnapshot,
     now: datetime.datetime,
 ) -> RegulatoryIndexingJob:
     """Create one durable row for an immutable file/config revision."""
     _validate_config_snapshot(config_snapshot)
+    if config_snapshot.get("input_content_hash") != content_hash:
+        raise ValueError("config snapshot input hash does not match content hash")
+    if config_snapshot.get("chunk_generation_hash") != chunk_generation_hash:
+        raise ValueError(
+            "config snapshot generation hash does not match chunk generation hash"
+        )
+    if len(chunk_generation_hash) != 64 or any(
+        character not in "0123456789abcdef" for character in chunk_generation_hash
+    ):
+        raise ValueError("chunk generation hash must be a lowercase SHA-256 hash")
+    db_session.scalar(
+        select(SearchSettings)
+        .where(SearchSettings.id == search_settings_id)
+        .with_for_update()
+    )
+    locked_user_file = db_session.scalar(
+        select(UserFile).where(UserFile.id == user_file_id).with_for_update()
+    )
+    if locked_user_file is None:
+        db_session.rollback()
+        raise ValueError("cannot create regulatory indexing job for missing user file")
+    if locked_user_file.status is UserFileStatus.DELETING:
+        db_session.rollback()
+        raise ValueError("cannot create regulatory indexing job for deleting user file")
+    if locked_user_file.status is UserFileStatus.CANCELED:
+        db_session.rollback()
+        raise ValueError(
+            "cannot create regulatory indexing job for cancelled user file"
+        )
     proposed_id = uuid4()
     created_id = db_session.scalar(
         pg_insert(RegulatoryIndexingJob)
@@ -243,6 +303,7 @@ def create_or_get_regulatory_indexing_job(
             id=proposed_id,
             user_file_id=user_file_id,
             content_hash=content_hash,
+            chunk_generation_hash=chunk_generation_hash,
             search_settings_id=search_settings_id,
             prompt_hash=prompt_hash,
             config_snapshot=config_snapshot,
@@ -263,6 +324,7 @@ def create_or_get_regulatory_indexing_job(
             RegulatoryIndexingJob.content_hash == content_hash,
             RegulatoryIndexingJob.search_settings_id == search_settings_id,
             RegulatoryIndexingJob.prompt_hash == prompt_hash,
+            RegulatoryIndexingJob.chunk_generation_hash == chunk_generation_hash,
         )
     )
     if job_id is None:
@@ -312,6 +374,26 @@ def get_regulatory_indexing_runtime(
     )
 
 
+def has_active_regulatory_indexing_jobs_for_search_settings(
+    db_session: Session,
+    search_settings_id: int,
+) -> bool:
+    return bool(
+        db_session.scalar(
+            select(func.count(RegulatoryIndexingJob.id) > 0).where(
+                RegulatoryIndexingJob.search_settings_id == search_settings_id,
+                RegulatoryIndexingJob.status.in_(
+                    (
+                        RegulatoryIndexingJobStatus.QUEUED.value,
+                        RegulatoryIndexingJobStatus.RUNNING.value,
+                        RegulatoryIndexingJobStatus.RETRY_WAIT.value,
+                    )
+                ),
+            )
+        )
+    )
+
+
 def mark_regulatory_indexing_user_file(
     db_session: Session,
     *,
@@ -343,6 +425,69 @@ def mark_regulatory_indexing_user_file(
     )
     db_session.commit()
     return updated_id is not None
+
+
+def request_user_file_deletion_cleanup(
+    db_session: Session,
+    *,
+    user_file_id: UUID,
+    now: datetime.datetime,
+) -> UserFileDeletionCleanupPlan:
+    """Tombstone a file and fence every durable job before external deletion."""
+
+    locked_user_file = db_session.scalar(
+        select(UserFile).where(UserFile.id == user_file_id).with_for_update()
+    )
+    if locked_user_file is None:
+        db_session.rollback()
+        return UserFileDeletionCleanupPlan(ready_to_delete=True, deliveries=())
+
+    locked_jobs = tuple(
+        db_session.scalars(
+            select(RegulatoryIndexingJob)
+            .where(RegulatoryIndexingJob.user_file_id == user_file_id)
+            .order_by(RegulatoryIndexingJob.id)
+            .with_for_update()
+        ).all()
+    )
+    locked_user_file.status = UserFileStatus.DELETING
+    deliveries: list[RegulatoryIndexingCancellationDelivery] = []
+    for job in locked_jobs:
+        if job.status == RegulatoryIndexingJobStatus.CANCELLED.value:
+            continue
+        if job.status != RegulatoryIndexingJobStatus.CANCELLING.value:
+            job.status = RegulatoryIndexingJobStatus.CANCELLING.value
+            job.lease_generation += 1
+            job.recovery_token = None
+            job.cancellation_phase = (
+                RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
+                if job.remote_vertex_job_name
+                else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
+            )
+            job.attempt_count = 0
+            job.next_retry_at = None
+            job.error_code = None
+            job.error_message = None
+            job.completed_at = None
+            job.heartbeat_at = now
+            job.updated_at = now
+        if job.next_retry_at is None or job.next_retry_at <= now:
+            deliveries.append(
+                RegulatoryIndexingCancellationDelivery(
+                    job_id=job.id,
+                    expected_generation=job.lease_generation,
+                )
+            )
+
+    db_session.commit()
+    return UserFileDeletionCleanupPlan(
+        ready_to_delete=not deliveries
+        and all(
+            job.status == RegulatoryIndexingJobStatus.CANCELLED.value
+            for job in locked_jobs
+        ),
+        deliveries=tuple(deliveries),
+    )
 
 
 def _update_vertex_submission_state(
@@ -889,6 +1034,15 @@ def persist_regulatory_indexing_preparation(
 ) -> bool:
     """Atomically replace chunks, create items, and finish PREPARING."""
 
+    locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
+    if locked_user_file is None or locked_user_file.status not in {
+        UserFileStatus.PROCESSING,
+        UserFileStatus.INDEXING,
+        UserFileStatus.FAILED,
+    }:
+        db_session.rollback()
+        return False
+
     locked_job = db_session.scalar(
         select(RegulatoryIndexingJob)
         .where(
@@ -900,6 +1054,9 @@ def persist_regulatory_indexing_preparation(
         .with_for_update()
     )
     if locked_job is None:
+        db_session.rollback()
+        return False
+    if locked_job.user_file_id != locked_user_file.id:
         db_session.rollback()
         return False
 
@@ -959,6 +1116,7 @@ def persist_regulatory_indexing_preparation(
         locked_job.error_message = None
         locked_job.completed_at = None
         locked_job.updated_at = now
+        locked_user_file.status = UserFileStatus.INDEXING
         db_session.commit()
         return True
     except Exception:
@@ -1130,6 +1288,30 @@ def regulatory_indexing_external_mutation_lease(
 ) -> Iterator[RegulatoryIndexingExternalMutationLease | None]:
     """Fence an external mutation with locked current job and file rows."""
 
+    parent_ids = db_session.execute(
+        select(
+            RegulatoryIndexingJob.user_file_id,
+            RegulatoryIndexingJob.search_settings_id,
+        ).where(RegulatoryIndexingJob.id == job_id)
+    ).one_or_none()
+    if parent_ids is None:
+        db_session.rollback()
+        yield None
+        return
+
+    locked_search_settings = db_session.scalar(
+        select(SearchSettings)
+        .where(SearchSettings.id == parent_ids.search_settings_id)
+        .with_for_update()
+    )
+    locked_user_file = db_session.scalar(
+        select(UserFile).where(UserFile.id == parent_ids.user_file_id).with_for_update()
+    )
+    if locked_user_file is None:
+        db_session.rollback()
+        yield None
+        return
+
     locked_job = db_session.scalar(
         select(RegulatoryIndexingJob)
         .where(
@@ -1144,20 +1326,13 @@ def regulatory_indexing_external_mutation_lease(
         db_session.rollback()
         yield None
         return
-
-    locked_user_file = db_session.scalar(
-        select(UserFile).where(UserFile.id == locked_job.user_file_id).with_for_update()
-    )
-    if locked_user_file is None:
+    if locked_job.user_file_id != locked_user_file.id or (
+        locked_search_settings is not None
+        and locked_job.search_settings_id != locked_search_settings.id
+    ):
         db_session.rollback()
         yield None
         return
-
-    locked_search_settings = db_session.scalar(
-        select(SearchSettings)
-        .where(SearchSettings.id == locked_job.search_settings_id)
-        .with_for_update()
-    )
     regulatory_chunks = tuple(
         db_session.scalars(
             select(RegulatoryChunk)
@@ -1212,6 +1387,14 @@ def complete_regulatory_indexing_user_file(
 
     if chunk_count <= 0:
         raise ValueError("chunk_count must be positive")
+    locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
+    if locked_user_file is None or locked_user_file.status not in {
+        UserFileStatus.INDEXING,
+        UserFileStatus.COMPLETED,
+    }:
+        if commit:
+            db_session.rollback()
+        return False
     locked_job = db_session.scalar(
         select(RegulatoryIndexingJob)
         .where(
@@ -1226,24 +1409,14 @@ def complete_regulatory_indexing_user_file(
         if commit:
             db_session.rollback()
         return False
-
-    completed_id = db_session.scalar(
-        update(UserFile)
-        .where(
-            UserFile.id == locked_job.user_file_id,
-            UserFile.status.in_((UserFileStatus.INDEXING, UserFileStatus.COMPLETED)),
-        )
-        .values(
-            status=UserFileStatus.COMPLETED,
-            chunk_count=chunk_count,
-            last_project_sync_at=now,
-        )
-        .returning(UserFile.id)
-    )
-    if completed_id is None:
+    if locked_job.user_file_id != locked_user_file.id:
         if commit:
             db_session.rollback()
         return False
+    locked_user_file.status = UserFileStatus.COMPLETED
+    locked_user_file.chunk_count = chunk_count
+    locked_user_file.last_project_sync_at = now
+    locked_user_file.secondary_reconcile_pending = True
     if commit:
         db_session.commit()
     else:
@@ -1264,6 +1437,14 @@ def complete_regulatory_indexing_publication(
 
     if chunk_count <= 0:
         raise ValueError("chunk_count must be positive")
+    locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
+    if locked_user_file is None or locked_user_file.status not in {
+        UserFileStatus.INDEXING,
+        UserFileStatus.COMPLETED,
+    }:
+        if commit:
+            db_session.rollback()
+        return False
     locked_job = db_session.scalar(
         select(RegulatoryIndexingJob)
         .where(
@@ -1278,23 +1459,14 @@ def complete_regulatory_indexing_publication(
         if commit:
             db_session.rollback()
         return False
-    completed_file_id = db_session.scalar(
-        update(UserFile)
-        .where(
-            UserFile.id == locked_job.user_file_id,
-            UserFile.status.in_((UserFileStatus.INDEXING, UserFileStatus.COMPLETED)),
-        )
-        .values(
-            status=UserFileStatus.COMPLETED,
-            chunk_count=chunk_count,
-            last_project_sync_at=now,
-        )
-        .returning(UserFile.id)
-    )
-    if completed_file_id is None:
+    if locked_job.user_file_id != locked_user_file.id:
         if commit:
             db_session.rollback()
         return False
+    locked_user_file.status = UserFileStatus.COMPLETED
+    locked_user_file.chunk_count = chunk_count
+    locked_user_file.last_project_sync_at = now
+    locked_user_file.secondary_reconcile_pending = True
     locked_job.status = RegulatoryIndexingJobStatus.SUCCEEDED.value
     locked_job.attempt_count = 0
     locked_job.next_retry_at = None
@@ -1369,6 +1541,10 @@ def fail_regulatory_indexing_job(
 ) -> bool:
     """Atomically terminally fail the fenced job and its live user file."""
 
+    locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
+    if locked_user_file is None:
+        db_session.rollback()
+        return False
     job = db_session.scalar(
         select(RegulatoryIndexingJob)
         .where(
@@ -1382,19 +1558,19 @@ def fail_regulatory_indexing_job(
     if job is None:
         db_session.rollback()
         return False
+    if job.user_file_id != locked_user_file.id:
+        db_session.rollback()
+        return False
     job.status = RegulatoryIndexingJobStatus.FAILED.value
     job.error_code = error_code[:_MAX_ERROR_CODE_LENGTH]
     job.error_message = error_message[:_MAX_ERROR_MESSAGE_LENGTH]
     job.completed_at = now
     job.updated_at = now
-    db_session.execute(
-        update(UserFile)
-        .where(
-            UserFile.id == job.user_file_id,
-            UserFile.status.in_((UserFileStatus.PROCESSING, UserFileStatus.INDEXING)),
-        )
-        .values(status=UserFileStatus.FAILED)
-    )
+    if locked_user_file.status in {
+        UserFileStatus.PROCESSING,
+        UserFileStatus.INDEXING,
+    }:
+        locked_user_file.status = UserFileStatus.FAILED
     db_session.commit()
     return True
 
@@ -1409,6 +1585,10 @@ def cancel_regulatory_indexing_job(
 ) -> bool:
     """Clear sensitive derived payloads and finish cancellation under the fence."""
 
+    locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
+    if locked_user_file is None:
+        db_session.rollback()
+        return False
     job = db_session.scalar(
         select(RegulatoryIndexingJob)
         .where(
@@ -1422,6 +1602,9 @@ def cancel_regulatory_indexing_job(
     if job is None:
         db_session.rollback()
         return False
+    if job.user_file_id != locked_user_file.id:
+        db_session.rollback()
+        return False
     db_session.execute(
         update(RegulatoryIndexingItem)
         .where(RegulatoryIndexingItem.job_id == job_id)
@@ -1433,14 +1616,11 @@ def cancel_regulatory_indexing_job(
     job.error_code = None
     job.error_message = None
     job.updated_at = now
-    db_session.execute(
-        update(UserFile)
-        .where(
-            UserFile.id == job.user_file_id,
-            UserFile.status.in_((UserFileStatus.PROCESSING, UserFileStatus.INDEXING)),
-        )
-        .values(status=UserFileStatus.CANCELED)
-    )
+    if locked_user_file.status in {
+        UserFileStatus.PROCESSING,
+        UserFileStatus.INDEXING,
+    }:
+        locked_user_file.status = UserFileStatus.CANCELED
     db_session.commit()
     return True
 
@@ -1558,6 +1738,10 @@ def finalize_regulatory_indexing_cancellation(
 ) -> bool:
     """Clear derived payloads and terminalize the final cancellation phase."""
 
+    locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
+    if locked_user_file is None:
+        db_session.rollback()
+        return False
     job = db_session.scalar(
         select(RegulatoryIndexingJob)
         .where(
@@ -1573,6 +1757,9 @@ def finalize_regulatory_indexing_cancellation(
     if job is None:
         db_session.rollback()
         return False
+    if job.user_file_id != locked_user_file.id:
+        db_session.rollback()
+        return False
     db_session.execute(
         update(RegulatoryIndexingItem)
         .where(RegulatoryIndexingItem.job_id == job_id)
@@ -1585,13 +1772,10 @@ def finalize_regulatory_indexing_cancellation(
     job.error_message = None
     job.heartbeat_at = now
     job.updated_at = now
-    db_session.execute(
-        update(UserFile)
-        .where(
-            UserFile.id == job.user_file_id,
-            UserFile.status.in_((UserFileStatus.PROCESSING, UserFileStatus.INDEXING)),
-        )
-        .values(status=UserFileStatus.CANCELED)
-    )
+    if locked_user_file.status in {
+        UserFileStatus.PROCESSING,
+        UserFileStatus.INDEXING,
+    }:
+        locked_user_file.status = UserFileStatus.CANCELED
     db_session.commit()
     return True

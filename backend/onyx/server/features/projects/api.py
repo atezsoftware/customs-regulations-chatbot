@@ -1,3 +1,4 @@
+import datetime
 import json
 from uuid import UUID
 
@@ -30,6 +31,7 @@ from onyx.db.projects import (
     get_project_token_count,
     upload_files_to_user_files_with_indexing,
 )
+from onyx.db.regulatory_indexing_jobs import request_user_file_deletion_cleanup
 from onyx.file_processing.import_capability import ensure_document_import_available
 from onyx.server.features.projects.models import (
     CategorizedFilesSnapshot,
@@ -443,9 +445,13 @@ def delete_user_file(
             document_set_names=document_set_names,
         )
 
-    # No associations found; mark as DELETING and enqueue delete task
-    user_file.status = UserFileStatus.DELETING
-    db_session.commit()
+    # The tombstone and all durable generation fences commit before any external
+    # artifact or database row can be deleted.
+    request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=user_file.id,
+        now=datetime.datetime.now(datetime.timezone.utc),
+    )
 
     tenant_id = get_current_tenant_id()
     if DISABLE_VECTOR_DB:

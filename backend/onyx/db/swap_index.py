@@ -1,6 +1,7 @@
 import time
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from onyx.configs.app_configs import DISABLE_VECTOR_DB, VESPA_NUM_ATTEMPTS_ON_STARTUP
@@ -34,6 +35,9 @@ from onyx.db.port_attempt import (
     cancel_active_port_attempts,
     get_active_port_attempt,
     get_latest_port_attempt,
+)
+from onyx.db.regulatory_indexing_jobs import (
+    has_active_regulatory_indexing_jobs_for_search_settings,
 )
 from onyx.db.reranking import transfer_reranker_configuration__no_commit
 from onyx.db.search_settings import (
@@ -237,6 +241,13 @@ def _port_swap_ready(
     copy is the whole bar — no post-port connector index attempt. The drain is scoped to
     required_cc_pairs: a global count would deadlock on un-portable INVALID/DELETING docs
     that never reach FUTURE."""
+    current_search_settings = get_current_search_settings(db_session)
+    if has_active_regulatory_indexing_jobs_for_search_settings(
+        db_session,
+        current_search_settings.id,
+    ):
+        return False
+
     ss_id = new_search_settings.id
     for cc_pair in required_cc_pairs:
         if get_active_port_attempt(db_session, cc_pair.id, ss_id) is not None:
@@ -284,16 +295,61 @@ def check_and_perform_index_swap(db_session: Session) -> SearchSettings | None:
     if not new_search_settings:
         return None
 
+    locked_settings = tuple(
+        db_session.scalars(
+            select(SearchSettings)
+            .where(
+                SearchSettings.status.in_(
+                    (IndexModelStatus.PRESENT, IndexModelStatus.FUTURE)
+                )
+            )
+            .order_by(SearchSettings.id)
+            .with_for_update()
+        ).all()
+    )
+    new_search_settings = next(
+        (
+            settings
+            for settings in locked_settings
+            if settings.id == new_search_settings.id
+            and settings.status == IndexModelStatus.FUTURE
+        ),
+        None,
+    )
+    if new_search_settings is None:
+        return None
+
     # Handle switchover based on switchover_type
     switchover_type = new_search_settings.switchover_type
 
     # Port-flow FUTURE: swap on the port-aware criterion, not the legacy
     # successful-index count (a broken connector must not block the swap).
     if new_search_settings.use_port_flow:
+        current_search_settings = next(
+            (
+                settings
+                for settings in locked_settings
+                if settings.status == IndexModelStatus.PRESENT
+            ),
+            None,
+        )
+        if current_search_settings is None:
+            return None
+        if has_active_regulatory_indexing_jobs_for_search_settings(
+            db_session,
+            current_search_settings.id,
+        ):
+            return None
         if switchover_type == SwitchoverType.INSTANT:
             # Swap now and let the port keep backfilling old data into the now-live
             # index in the background — no wait, and no wipe (the port populates it,
             # so cleanup_documents would destroy live data).
+            required_user_ids = _required_users_for_switchover(db_session)
+            if any_user_file_reconcile_pending_for_users(
+                db_session,
+                required_user_ids,
+            ):
+                return None
             return _perform_index_swap(
                 db_session=db_session,
                 new_search_settings=new_search_settings,

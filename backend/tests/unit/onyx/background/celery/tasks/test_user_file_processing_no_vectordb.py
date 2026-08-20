@@ -8,6 +8,7 @@ Verifies that when DISABLE_VECTOR_DB is True:
 - project_sync_user_file_impl skips vector DB metadata update
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -358,6 +359,69 @@ class TestDeleteImplNoVectorDb:
     @patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", True)
     @patch(f"{TASKS_MODULE}.get_default_file_store")
     @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
+    def test_waits_without_deleting_anything_until_durable_cancellation_finishes(
+        self,
+        mock_get_session: MagicMock,
+        mock_get_file_store: MagicMock,
+    ) -> None:
+        session = MagicMock()
+        mock_get_session.return_value.__enter__.return_value = session
+        plan = MagicMock(ready_to_delete=False, deliveries=())
+
+        with patch(
+            f"{TASKS_MODULE}.request_user_file_deletion_cleanup",
+            return_value=plan,
+        ):
+            delete_user_file_impl(
+                user_file_id=str(uuid4()),
+                tenant_id="test-tenant",
+                redis_locking=False,
+            )
+
+        mock_get_file_store.assert_not_called()
+        session.delete.assert_not_called()
+
+    @patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", True)
+    @patch(f"{TASKS_MODULE}.get_default_file_store")
+    @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
+    def test_pending_cancellation_is_delivered_without_hard_delete(
+        self,
+        mock_get_session: MagicMock,
+        mock_get_file_store: MagicMock,
+    ) -> None:
+        job_id = uuid4()
+        session = MagicMock()
+        mock_get_session.return_value.__enter__.return_value = session
+        plan = MagicMock(
+            ready_to_delete=False,
+            deliveries=(SimpleNamespace(job_id=job_id, expected_generation=12),),
+        )
+
+        with (
+            patch(
+                f"{TASKS_MODULE}.request_user_file_deletion_cleanup",
+                return_value=plan,
+            ),
+            patch(
+                "onyx.background.celery.tasks.regulatory_indexing.tasks."
+                "enqueue_regulatory_indexing_step"
+            ) as enqueue,
+        ):
+            delete_user_file_impl(
+                user_file_id=str(uuid4()),
+                tenant_id="test-tenant",
+                redis_locking=False,
+            )
+
+        enqueue.assert_called_once()
+        assert enqueue.call_args.kwargs["job_id"] == job_id
+        assert enqueue.call_args.kwargs["expected_generation"] == 12
+        mock_get_file_store.assert_not_called()
+        session.delete.assert_not_called()
+
+    @patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", True)
+    @patch(f"{TASKS_MODULE}.get_default_file_store")
+    @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
     def test_skips_vector_db_deletion(
         self,
         mock_get_session: MagicMock,
@@ -370,6 +434,10 @@ class TestDeleteImplNoVectorDb:
         mock_get_file_store.return_value = MagicMock()
 
         with (
+            patch(
+                f"{TASKS_MODULE}.request_user_file_deletion_cleanup",
+                return_value=MagicMock(ready_to_delete=True),
+            ),
             patch(f"{TASKS_MODULE}.get_all_document_indices") as mock_get_indices,
             patch(f"{TASKS_MODULE}.get_active_search_settings") as mock_get_ss,
             patch(f"{TASKS_MODULE}.httpx_init_vespa_pool") as mock_vespa_pool,
@@ -403,11 +471,15 @@ class TestDeleteImplNoVectorDb:
         file_store = MagicMock()
         mock_get_file_store.return_value = file_store
 
-        delete_user_file_impl(
-            user_file_id=str(uf.id),
-            tenant_id="test-tenant",
-            redis_locking=False,
-        )
+        with patch(
+            f"{TASKS_MODULE}.request_user_file_deletion_cleanup",
+            return_value=MagicMock(ready_to_delete=True),
+        ):
+            delete_user_file_impl(
+                user_file_id=str(uf.id),
+                tenant_id="test-tenant",
+                redis_locking=False,
+            )
 
         assert file_store.delete_file.call_count == 2
         session.delete.assert_called_once_with(uf)

@@ -9,8 +9,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
-from onyx.configs.constants import DocumentSource
-from onyx.connectors.models import Document, TextSection
+from onyx.connectors.models import Document
 from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import (
@@ -23,8 +22,8 @@ from onyx.db.enums import (
 )
 from onyx.db.llm import fetch_model_configuration_by_id
 from onyx.document_index.factory import build_elasticsearch_document_index
-from onyx.file_processing.extract_file_text import file_io_to_text
-from onyx.file_store.file_store import get_default_file_store
+from onyx.file_processing.user_file_loader import load_user_file_documents
+from onyx.file_store.staging import delete_files_best_effort
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.well_known_providers.constants import VERTEX_CREDENTIALS_FILE_KWARG
 from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
@@ -118,7 +117,14 @@ def _next_step(
 def _snapshot(
     runtime: indexing_job_repository.RegulatoryIndexingRuntime,
 ) -> RegulatoryIndexingConfigSnapshot:
-    return RegulatoryIndexingConfigSnapshot.model_validate(runtime.job.config_snapshot)
+    snapshot = RegulatoryIndexingConfigSnapshot.model_validate(
+        runtime.job.config_snapshot
+    )
+    if snapshot.input_content_hash != runtime.job.content_hash:
+        raise ValueError("regulatory job input hash does not match its snapshot")
+    if snapshot.chunk_generation_hash != runtime.job.chunk_generation_hash:
+        raise ValueError("regulatory job generation hash does not match its snapshot")
+    return snapshot
 
 
 def _vertex_object_prefix(tenant_id: str, job_id: UUID) -> str:
@@ -189,24 +195,17 @@ def _advance(
 
 def _load_claimed_markdown_documents(
     runtime: indexing_job_repository.RegulatoryIndexingRuntime,
-) -> list[Document]:
+    tenant_id: str,
+) -> tuple[list[Document], list[str]]:
     file_name = runtime.user_file.name or ""
     if PurePosixPath(file_name).suffix.lower() not in {".md", ".mdx"}:
         raise ValueError("durable regulatory indexing accepts Markdown only")
-    with get_default_file_store().read_file(runtime.user_file.file_id, mode="b") as raw:
-        text = file_io_to_text(raw).strip()
-    if not text:
-        raise ValueError("regulatory Markdown file is empty")
-    return [
-        Document(
-            id=str(runtime.user_file.id),
-            source=DocumentSource.USER_FILE,
-            semantic_identifier=file_name,
-            title=file_name,
-            sections=[TextSection(text=text, link=None)],
-            metadata={},
-        )
-    ]
+    return load_user_file_documents(
+        user_file_id=str(runtime.user_file.id),
+        file_id=runtime.user_file.file_id,
+        file_name=runtime.user_file.name,
+        tenant_id=tenant_id,
+    )
 
 
 def _contextual_tokenizers(
@@ -635,13 +634,23 @@ def _execute_claimed_step_impl(
     validate_snapshot_for_stage(db_session, snapshot, stage)
 
     if stage is RegulatoryIndexingStage.PREPARING:
-        prepare_claimed_regulatory_indexing_job(
-            job_id=runtime.job.id,
-            expected_generation=runtime.job.lease_generation,
-            documents=_load_claimed_markdown_documents(runtime),
-            tenant_id=tenant_id,
-            db_session=db_session,
+        documents, staged_csv_ids = _load_claimed_markdown_documents(
+            runtime,
+            tenant_id,
         )
+        try:
+            prepare_claimed_regulatory_indexing_job(
+                job_id=runtime.job.id,
+                expected_generation=runtime.job.lease_generation,
+                documents=documents,
+                tenant_id=tenant_id,
+                db_session=db_session,
+            )
+        finally:
+            delete_files_best_effort(
+                staged_csv_ids,
+                context=f"durable regulatory preparation uf={runtime.user_file.id}",
+            )
         return _next_step(runtime.job.id, runtime.job.lease_generation)
     if stage is RegulatoryIndexingStage.CONTEXT_SUBMIT:
         return _context_submit(

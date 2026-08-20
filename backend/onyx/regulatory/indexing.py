@@ -42,6 +42,8 @@ logger = setup_logger()
 REGULATORY_MAX_CHUNK_CHARS = 2400
 REGULATORY_CONTEXTUAL_INITIAL_MAX_CHUNK_CHARS = 1200
 REGULATORY_CONTEXTUAL_MIN_MAX_CHUNK_CHARS = 500
+# Bump when document aggregation, adaptive budgeting, or persisted chunk semantics change.
+REGULATORY_INDEXING_GENERATION_CODE_VERSION = "1"
 
 
 def _as_indexing_document(document: Document) -> IndexingDocument:

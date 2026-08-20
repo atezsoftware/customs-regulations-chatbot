@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from onyx.configs import app_configs
 from onyx.configs.constants import FileOrigin
+from onyx.connectors.file import connector as file_connector
 from onyx.db import regulatory_indexing_jobs as job_repository
 from onyx.db.enums import (
     EmbeddingPrecision,
@@ -582,12 +583,14 @@ def _create_disposable_file(
     )
     db_session.add(user_file)
     db_session.commit()
-    documents = orchestrator._load_claimed_markdown_documents(
+    documents, staged_csv_ids = orchestrator._load_claimed_markdown_documents(
         cast(
             job_repository.RegulatoryIndexingRuntime,
             SimpleNamespace(user_file=user_file),
-        )
+        ),
+        _TENANT_ID,
     )
+    assert staged_csv_ids == []
     job_id = preparation.prepare_regulatory_indexing_job(
         user_file.id,
         documents,
@@ -668,7 +671,7 @@ def test_forced_setup_failure_leaves_no_disposable_pipeline_state(
                 "gs://disposable-regulatory-indexing",
             )
             monkeypatch.setattr(
-                orchestrator,
+                file_connector,
                 "get_default_file_store",
                 lambda: resources.file_store,
             )
@@ -827,7 +830,7 @@ def test_cleanup_failure_preserves_primary_exception_and_runs_later_stages(
                 "gs://disposable-regulatory-indexing",
             )
             monkeypatch.setattr(
-                orchestrator,
+                file_connector,
                 "get_default_file_store",
                 lambda: resources.file_store,
             )
@@ -1090,7 +1093,7 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
             lambda *_args, **_kwargs: gateway,
         )
         monkeypatch.setattr(
-            orchestrator,
+            file_connector,
             "get_default_file_store",
             lambda: resources.file_store,
         )
@@ -1271,8 +1274,15 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
         db_session.expire_all()
         persisted_cancelled_file = db_session.get(UserFile, cancelled_file.id)
         assert persisted_cancelled_file is not None
-        persisted_cancelled_file.status = UserFileStatus.CANCELED
-        db_session.commit()
+        deletion_plan = job_repository.request_user_file_deletion_cleanup(
+            db_session,
+            user_file_id=persisted_cancelled_file.id,
+            now=datetime.datetime.now(datetime.timezone.utc),
+        )
+        assert deletion_plan.ready_to_delete is False
+        assert len(deletion_plan.deliveries) == 1
+        cancelled_generation = deletion_plan.deliveries[0].expected_generation
+        assert deletion_plan.deliveries[0].job_id == cancelled_job.id
 
         for _ in range(5):
             cancelled_generation, outcome = _run_delivery(
@@ -1285,6 +1295,9 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
         cancelled = db_session.get(RegulatoryIndexingJob, cancelled_job.id)
         assert cancelled is not None
         assert cancelled.status == RegulatoryIndexingJobStatus.CANCELLED.value
+        persisted_cancelled_file = db_session.get(UserFile, cancelled_file.id)
+        assert persisted_cancelled_file is not None
+        assert persisted_cancelled_file.status is UserFileStatus.DELETING
         cancelled_items = list(
             db_session.scalars(
                 select(RegulatoryIndexingItem).where(

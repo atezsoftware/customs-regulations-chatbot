@@ -186,12 +186,18 @@ def delete_search_settings_if_not_present(
     return True
 
 
-def get_current_search_settings(db_session: Session) -> SearchSettings:
+def get_current_search_settings(
+    db_session: Session,
+    *,
+    for_update: bool = False,
+) -> SearchSettings:
     query = (
         select(SearchSettings)
         .where(SearchSettings.status == IndexModelStatus.PRESENT)
         .order_by(SearchSettings.id.desc())
     )
+    if for_update:
+        query = query.with_for_update()
     result = db_session.execute(query)
     latest_settings = result.scalars().first()
 

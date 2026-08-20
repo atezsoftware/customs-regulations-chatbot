@@ -5,10 +5,12 @@ from typing import cast
 from sqlalchemy.orm import Session
 
 from onyx.configs import app_configs
+from onyx.configs.app_configs import BLURB_SIZE
 from onyx.db.enums import RegulatoryIndexingStage
 from onyx.db.llm import fetch_embedding_provider, fetch_model_configuration_by_id
 from onyx.db.models import LLMProvider, ModelConfiguration, SearchSettings
 from onyx.db.search_settings import get_current_search_settings
+from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.well_known_providers.constants import (
     VERTEX_AUTH_METHOD_KWARG,
@@ -22,17 +24,29 @@ from onyx.prompts.contextual_retrieval import (
     CONTEXTUAL_RAG_PROMPT1,
     CONTEXTUAL_RAG_PROMPT2,
 )
+from onyx.regulatory.chunker import REGULATORY_CHUNKER_CODE_VERSION
+from onyx.regulatory.contextual import MIN_CONTEXTUAL_RAG_RESERVED_TOKENS
+from onyx.regulatory.indexing import (
+    REGULATORY_CONTEXTUAL_INITIAL_MAX_CHUNK_CHARS,
+    REGULATORY_CONTEXTUAL_MIN_MAX_CHUNK_CHARS,
+    REGULATORY_INDEXING_GENERATION_CODE_VERSION,
+    REGULATORY_MAX_CHUNK_CHARS,
+)
 from onyx.regulatory.indexing_jobs.models import (
     RegulatoryIndexingConfigSnapshot,
     VertexAuthenticationMode,
     VertexBatchConfig,
 )
+from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 from shared_configs.enums import EmbeddingProvider
 
 _OPENROUTER_EMBEDDING_MODEL = "openai/text-embedding-3-large"
 _CONTEXTUAL_PROMPT_VERSION = "contextual-rag-v1"
 _CONTEXTUAL_PROMPT_HASH = sha256(
     f"{CONTEXTUAL_RAG_PROMPT1}\0{CONTEXTUAL_RAG_PROMPT2}".encode()
+).hexdigest()
+_READINESS_INPUT_CONTENT_HASH = sha256(
+    b"regulatory-indexing-configuration-readiness"
 ).hexdigest()
 _CONTEXT_STAGES = frozenset(
     {
@@ -51,6 +65,43 @@ _PROMPT_DEPENDENT_STAGES = frozenset(
 
 class RegulatoryIndexingConfigurationError(ValueError):
     """The active Admin configuration is unsafe for durable indexing."""
+
+
+def compute_regulatory_chunk_generation_hash(
+    *,
+    embedding_provider: EmbeddingProvider,
+    embedding_model_name: str,
+) -> str:
+    """Identify every deterministic input that affects canonical chunk output."""
+
+    payload = {
+        "identity_version": "regulatory-chunk-generation-v1",
+        "chunker_code_version": REGULATORY_CHUNKER_CODE_VERSION,
+        "indexing_generation_code_version": (
+            REGULATORY_INDEXING_GENERATION_CODE_VERSION
+        ),
+        "embedding_provider": embedding_provider.value,
+        "embedding_model_name": embedding_model_name,
+        "enable_contextual_rag": True,
+        "regulatory_max_chunk_chars": REGULATORY_MAX_CHUNK_CHARS,
+        "regulatory_contextual_initial_max_chunk_chars": (
+            REGULATORY_CONTEXTUAL_INITIAL_MAX_CHUNK_CHARS
+        ),
+        "regulatory_contextual_min_max_chunk_chars": (
+            REGULATORY_CONTEXTUAL_MIN_MAX_CHUNK_CHARS
+        ),
+        "document_embedding_context_size": DOC_EMBEDDING_CONTEXT_SIZE,
+        "blurb_size": BLURB_SIZE,
+        "default_contextual_reserved_tokens": (DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS),
+        "minimum_contextual_reserved_tokens": MIN_CONTEXTUAL_RAG_RESERVED_TOKENS,
+    }
+    return sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 def _validate_embedding_contract(search_settings: SearchSettings) -> None:
@@ -182,14 +233,21 @@ def _get_contextual_model_configuration(
 
 def resolve_regulatory_indexing_snapshot(
     db_session: Session,
+    *,
+    input_content_hash: str = _READINESS_INPUT_CONTENT_HASH,
 ) -> RegulatoryIndexingConfigSnapshot:
-    search_settings = get_current_search_settings(db_session)
+    search_settings = get_current_search_settings(db_session, for_update=True)
     _validate_embedding_contract(search_settings)
     _validate_openrouter_credentials(db_session)
     vertex = _resolve_vertex_config(
         _get_contextual_model_configuration(db_session, search_settings)
     )
     return RegulatoryIndexingConfigSnapshot(
+        input_content_hash=input_content_hash,
+        chunk_generation_hash=compute_regulatory_chunk_generation_hash(
+            embedding_provider=EmbeddingProvider.OPENROUTER,
+            embedding_model_name=search_settings.model_name,
+        ),
         search_settings_id=search_settings.id,
         embedding_provider=EmbeddingProvider.OPENROUTER,
         embedding_model_name=search_settings.model_name,
@@ -246,6 +304,15 @@ def validate_snapshot_for_stage(
     stage: RegulatoryIndexingStage,
 ) -> None:
     """Fail closed on Admin configuration drift before a stage executes."""
+
+    current_generation_hash = compute_regulatory_chunk_generation_hash(
+        embedding_provider=snapshot.embedding_provider,
+        embedding_model_name=snapshot.embedding_model_name,
+    )
+    if snapshot.chunk_generation_hash != current_generation_hash:
+        raise RegulatoryIndexingConfigurationError(
+            "Chunk-generation identity no longer matches the indexing job snapshot"
+        )
 
     if stage in _PROMPT_DEPENDENT_STAGES and (
         snapshot.prompt_version != _CONTEXTUAL_PROMPT_VERSION

@@ -7,7 +7,7 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from onyx.db import regulatory_indexing_jobs as regulatory_indexing_job_repository
@@ -50,6 +50,7 @@ from onyx.db.regulatory_indexing_jobs import (
     record_vertex_submission_intent,
     regulatory_indexing_external_mutation_lease,
     request_regulatory_indexing_cancellation,
+    request_user_file_deletion_cleanup,
     require_vertex_submission_reconciliation,
     schedule_regulatory_indexing_cancellation_retry,
     schedule_regulatory_indexing_retry,
@@ -61,6 +62,8 @@ from tests.external_dependency_unit.conftest import create_test_user
 
 _NOW = datetime.datetime(2026, 8, 19, 10, 0, tzinfo=datetime.timezone.utc)
 _SNAPSHOT: RegulatoryIndexingConfigSnapshot = {
+    "input_content_hash": "a" * 64,
+    "chunk_generation_hash": "b" * 64,
     "embedding_provider": "openrouter",
     "embedding_model": "openai/text-embedding-3-large",
     "effective_dimension": 1536,
@@ -102,14 +105,22 @@ def _create_job(
     user_file_id: UUID,
     *,
     content_hash: str | None = None,
+    chunk_generation_hash: str = "b" * 64,
 ) -> RegulatoryIndexingJob:
+    resolved_content_hash = content_hash or uuid4().hex
+    snapshot = {
+        **_SNAPSHOT,
+        "input_content_hash": resolved_content_hash,
+        "chunk_generation_hash": chunk_generation_hash,
+    }
     return create_or_get_regulatory_indexing_job(
         db_session,
         user_file_id=user_file_id,
-        content_hash=content_hash or uuid4().hex,
+        content_hash=resolved_content_hash,
         search_settings_id=17,
         prompt_hash="prompt-v1",
-        config_snapshot=_SNAPSHOT,
+        chunk_generation_hash=chunk_generation_hash,
+        config_snapshot=snapshot,
         now=_NOW,
     )
 
@@ -146,6 +157,52 @@ def test_duplicate_job_creation_is_atomic_and_idempotent(
         )
         == 1
     )
+
+
+def test_job_creation_rejects_a_tombstoned_user_file(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    deletion = request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=regulatory_user_file.id,
+        now=_NOW,
+    )
+    assert deletion.ready_to_delete is True
+
+    with pytest.raises(ValueError, match="deleting user file"):
+        _create_job(db_session, regulatory_user_file.id)
+
+    assert (
+        db_session.scalar(
+            select(func.count(RegulatoryIndexingJob.id)).where(
+                RegulatoryIndexingJob.user_file_id == regulatory_user_file.id
+            )
+        )
+        == 0
+    )
+
+
+def test_changed_chunk_generation_identity_creates_a_new_job(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    content_hash = uuid4().hex
+
+    first = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        content_hash=content_hash,
+        chunk_generation_hash="1" * 64,
+    )
+    second = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        content_hash=content_hash,
+        chunk_generation_hash="2" * 64,
+    )
+
+    assert first.id != second.id
 
 
 def test_job_lease_can_be_claimed_only_once(
@@ -965,9 +1022,14 @@ def test_item_write_waits_for_takeover_then_rejects_stale_generation(
     assert item.vector == [1.0, 2.0, 3.0]
 
 
+@pytest.mark.parametrize(
+    "preparation_file_status",
+    (UserFileStatus.PROCESSING, UserFileStatus.FAILED),
+)
 def test_atomic_preparation_repairs_partial_state_and_advances_once(
     db_session: Session,
     regulatory_user_file: UserFile,
+    preparation_file_status: UserFileStatus,
 ) -> None:
     job = _create_job(db_session, regulatory_user_file.id)
     assert claim_regulatory_indexing_job(
@@ -996,6 +1058,8 @@ def test_atomic_preparation_repairs_partial_state_and_advances_once(
     assert partial_item is not None
     partial_row_id = partial_rows[0].id
     partial_item_id = partial_item.id
+    regulatory_user_file.status = preparation_file_status
+    db_session.commit()
 
     def prepare_recovered_items() -> list[
         regulatory_indexing_job_repository.RegulatoryIndexingPreparedItem
@@ -1033,6 +1097,9 @@ def test_atomic_preparation_repairs_partial_state_and_advances_once(
     assert recovered_job is not None
     assert recovered_job.stage == RegulatoryIndexingStage.CONTEXT_SUBMIT.value
     assert recovered_job.status == RegulatoryIndexingJobStatus.QUEUED.value
+    recovered_file = db_session.get(UserFile, regulatory_user_file.id)
+    assert recovered_file is not None
+    assert recovered_file.status is UserFileStatus.INDEXING
     assert db_session.get(RegulatoryChunk, partial_row_id) is None
     assert db_session.get(RegulatoryIndexingItem, partial_item_id) is None
     recovered_items = list(
@@ -1236,10 +1303,13 @@ def test_lease_takeover_fences_stale_atomic_chunk_replacement(
         takeover_future = executor.submit(takeover_prepare)
         assert newer_prepared.wait(timeout=5)
         stale_future = executor.submit(stale_prepare)
-        assert stale_future.result(timeout=1) is False
+        with pytest.raises(TimeoutError):
+            stale_future.result(timeout=0.3)
         assert not stale_callback_started.is_set()
         allow_newer_commit.set()
         assert takeover_future.result(timeout=5) is True
+        assert stale_future.result(timeout=5) is False
+        assert not stale_callback_started.is_set()
 
     db_session.expire_all()
     chunk_texts = set(
@@ -1459,7 +1529,7 @@ def test_external_mutation_lock_blocks_cancellation_until_es_finishes(
         assert cancellation.result(timeout=5)
 
 
-def test_external_mutation_lock_blocks_user_file_deletion_status(
+def test_external_mutation_lock_blocks_durable_user_file_deletion_cleanup(
     db_session: Session,
     regulatory_user_file: UserFile,
 ) -> None:
@@ -1491,27 +1561,35 @@ def test_external_mutation_lock_blocks_user_file_deletion_status(
                 assert release.wait(timeout=5)
                 lease.commit()
 
-    def mark_deleting() -> None:
+    def request_deletion_cleanup() -> tuple[bool, tuple[tuple[UUID, int], ...]]:
         with Session(engine) as delete_session:
-            delete_session.execute(
-                update(UserFile)
-                .where(UserFile.id == regulatory_user_file.id)
-                .values(status=UserFileStatus.DELETING)
+            plan = request_user_file_deletion_cleanup(
+                delete_session,
+                user_file_id=regulatory_user_file.id,
+                now=_NOW,
             )
-            delete_session.commit()
+            return plan.ready_to_delete, tuple(
+                (delivery.job_id, delivery.expected_generation)
+                for delivery in plan.deliveries
+            )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         held = executor.submit(hold_external_mutation)
         assert entered.wait(timeout=5)
-        deletion = executor.submit(mark_deleting)
+        deletion = executor.submit(request_deletion_cleanup)
         with pytest.raises(TimeoutError):
             deletion.result(timeout=0.3)
         release.set()
         held.result(timeout=5)
-        deletion.result(timeout=5)
+        ready, deliveries = deletion.result(timeout=5)
 
     db_session.refresh(regulatory_user_file)
+    db_session.refresh(job)
     assert regulatory_user_file.status is UserFileStatus.DELETING
+    assert ready is False
+    assert deliveries == ((job.id, 2),)
+    assert job.status == RegulatoryIndexingJobStatus.CANCELLING.value
+    assert job.lease_generation == 2
 
 
 def test_user_file_completion_preserves_cancelled_and_deleting_states(
@@ -1524,6 +1602,8 @@ def test_user_file_completion_preserves_cancelled_and_deleting_states(
         (UserFileStatus.CANCELED, False),
         (UserFileStatus.DELETING, False),
     ):
+        regulatory_user_file.status = UserFileStatus.PROCESSING
+        db_session.commit()
         job = _create_job(db_session, regulatory_user_file.id)
         assert claim_regulatory_indexing_job(
             db_session,
@@ -1583,6 +1663,83 @@ def test_publication_atomically_completes_user_file_and_job(
     assert job.completed_at == _NOW
     assert regulatory_user_file.status is UserFileStatus.COMPLETED
     assert regulatory_user_file.chunk_count == 2
+    assert regulatory_user_file.secondary_reconcile_pending is True
+
+
+@pytest.mark.parametrize(
+    "stage,status",
+    [
+        (RegulatoryIndexingStage.PREPARING, RegulatoryIndexingJobStatus.QUEUED),
+        (RegulatoryIndexingStage.CONTEXT_WAIT, RegulatoryIndexingJobStatus.RUNNING),
+        (RegulatoryIndexingStage.EMBEDDING, RegulatoryIndexingJobStatus.RETRY_WAIT),
+        (RegulatoryIndexingStage.PUBLISH, RegulatoryIndexingJobStatus.SUCCEEDED),
+        (RegulatoryIndexingStage.INDEX_WRITE, RegulatoryIndexingJobStatus.FAILED),
+    ],
+)
+def test_deletion_tombstone_generation_fences_every_non_cancelled_job(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+    stage: RegulatoryIndexingStage,
+    status: RegulatoryIndexingJobStatus,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    job.stage = stage.value
+    job.status = status.value
+    job.lease_generation = 7
+    job.remote_vertex_job_name = "projects/p/locations/l/batchJobs/1"
+    regulatory_user_file.status = UserFileStatus.INDEXING
+    db_session.commit()
+
+    first = request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=regulatory_user_file.id,
+        now=_NOW,
+    )
+
+    db_session.refresh(job)
+    db_session.refresh(regulatory_user_file)
+    assert first.ready_to_delete is False
+    assert [
+        (delivery.job_id, delivery.expected_generation) for delivery in first.deliveries
+    ] == [(job.id, 8)]
+    assert regulatory_user_file.status is UserFileStatus.DELETING
+    assert job.status == RegulatoryIndexingJobStatus.CANCELLING.value
+    assert job.lease_generation == 8
+    assert (
+        job.cancellation_phase
+        == RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
+    )
+
+    repeated = request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=regulatory_user_file.id,
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    assert job.lease_generation == 8
+    assert repeated.deliveries == first.deliveries
+
+
+def test_deletion_waits_for_terminal_cancellation_without_removing_state(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    job.status = RegulatoryIndexingJobStatus.CANCELLED.value
+    job.cancellation_phase = RegulatoryIndexingCancellationPhase.FINALIZE.value
+    regulatory_user_file.status = UserFileStatus.DELETING
+    db_session.commit()
+
+    plan = request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=regulatory_user_file.id,
+        now=_NOW,
+    )
+
+    assert plan.ready_to_delete is True
+    assert plan.deliveries == ()
+    assert db_session.get(UserFile, regulatory_user_file.id) is not None
+    assert db_session.get(RegulatoryIndexingJob, job.id) is not None
 
 
 def test_cancellation_phases_are_durable_and_generation_fenced(

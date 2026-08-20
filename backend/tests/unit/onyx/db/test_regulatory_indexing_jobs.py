@@ -110,6 +110,7 @@ def test_job_creation_rejects_unsafe_snapshot_before_sql(
             content_hash="content-v1",
             search_settings_id=17,
             prompt_hash="prompt-v1",
+            chunk_generation_hash="b" * 64,
             config_snapshot=cast(RegulatoryIndexingConfigSnapshot, config_snapshot),
             now=datetime.datetime(2026, 8, 19, tzinfo=datetime.timezone.utc),
         )

@@ -20,7 +20,6 @@ from onyx.db.regulatory_indexing_jobs import (
 from onyx.llm.constants import LlmProviderNames
 from onyx.natural_language_processing.utils import get_tokenizer
 from onyx.regulatory.indexing import (
-    document_text_for_regulatory_indexing,
     documents_to_regulatory_chunks,
 )
 from onyx.regulatory.indexing_jobs.configuration import (
@@ -37,11 +36,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 
 def _regulatory_documents_content_hash(documents: Sequence[Document]) -> str:
     payload = [
-        {
-            "semantic_identifier": document.semantic_identifier,
-            "title": document.title,
-            "text": document_text_for_regulatory_indexing(document),
-        }
+        document.model_dump(mode="json", exclude={"doc_updated_at"})
         for document in documents
     ]
     encoded = json.dumps(
@@ -68,14 +63,19 @@ def prepare_regulatory_indexing_job(
     if any(document.id != str(user_file_id) for document in documents):
         raise ValueError("regulatory documents must be stamped with the user file id")
 
-    snapshot = resolve_regulatory_indexing_snapshot(db_session)
+    content_hash = _regulatory_documents_content_hash(documents)
+    snapshot = resolve_regulatory_indexing_snapshot(
+        db_session,
+        input_content_hash=content_hash,
+    )
     now = datetime.datetime.now(datetime.timezone.utc)
     job = create_or_get_regulatory_indexing_job(
         db_session,
         user_file_id=user_file_id,
-        content_hash=_regulatory_documents_content_hash(documents),
+        content_hash=content_hash,
         search_settings_id=snapshot.search_settings_id,
         prompt_hash=snapshot.prompt_hash,
+        chunk_generation_hash=snapshot.chunk_generation_hash,
         config_snapshot=snapshot.model_dump(mode="json"),
         now=now,
     )
@@ -123,6 +123,10 @@ def prepare_claimed_regulatory_indexing_job(
         raise ValueError("regulatory documents do not match the claimed job revision")
 
     snapshot = RegulatoryIndexingConfigSnapshot.model_validate(job.config_snapshot)
+    if snapshot.input_content_hash != job.content_hash:
+        raise ValueError("regulatory job input hash does not match its snapshot")
+    if snapshot.chunk_generation_hash != job.chunk_generation_hash:
+        raise ValueError("regulatory job generation hash does not match its snapshot")
     embedding_tokenizer = get_tokenizer(
         snapshot.embedding_model_name,
         snapshot.embedding_provider,

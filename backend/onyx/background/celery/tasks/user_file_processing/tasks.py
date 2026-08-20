@@ -38,14 +38,13 @@ from onyx.configs.constants import (
     USER_FILE_DELETE_MAX_QUEUE_DEPTH,
     USER_FILE_PROCESSING_MAX_QUEUE_DEPTH,
     USER_FILE_PROJECT_SYNC_MAX_QUEUE_DEPTH,
-    DocumentSource,
     OnyxCeleryPriority,
     OnyxCeleryQueues,
     OnyxCeleryTask,
     OnyxRedisLocks,
 )
 from onyx.connectors.file.connector import LocalFileConnector
-from onyx.connectors.models import Document, HierarchyNode
+from onyx.connectors.models import Document
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import UserFileStatus
 from onyx.db.models import SearchSettings, UserFile
@@ -58,7 +57,7 @@ from onyx.db.regulatory_chunks import (
 )
 from onyx.db.regulatory_indexing_jobs import (
     get_regulatory_indexing_job,
-    mark_regulatory_indexing_user_file,
+    request_user_file_deletion_cleanup,
 )
 from onyx.db.search_settings import (
     active_secondary_port_target,
@@ -79,11 +78,9 @@ from onyx.document_index.interfaces_new import (
     MetadataUpdateRequest,
     SecondaryIndexDocumentMissingError,
 )
+from onyx.file_processing.user_file_loader import load_user_file_documents
 from onyx.file_store.file_store import get_default_file_store
-from onyx.file_store.staging import (
-    build_tracking_raw_file_callback,
-    delete_files_best_effort,
-)
+from onyx.file_store.staging import delete_files_best_effort
 from onyx.file_store.utils import (
     store_user_file_plaintext,
     user_file_id_to_plaintext_file_name,
@@ -473,38 +470,13 @@ def _load_user_file_documents(
     file_name: str | None,
     tenant_id: str,
 ) -> tuple[list[Document], list[str]]:
-    """Parse a user file's blob into indexable Documents (id/source stamped), plus the ids of
-    any CSVs staged for tabular sections — the caller reaps them after indexing reads them. A
-    load failure reaps its own staged files before re-raising (the caller gets no id list)."""
-    connector = LocalFileConnector(
-        file_locations=[file_id],
-        file_names=[file_name] if file_name else None,
+    return load_user_file_documents(
+        user_file_id=str(user_file_id),
+        file_id=file_id,
+        file_name=file_name,
+        tenant_id=tenant_id,
+        connector_factory=LocalFileConnector,
     )
-    connector.load_credentials({})
-
-    # User files aren't attempt-scoped, so the docfetching staging reapers don't cover them.
-    staging_callback, staged_csv_ids = build_tracking_raw_file_callback(
-        metadata={"user_file_id": str(user_file_id), "tenant_id": tenant_id}
-    )
-    connector.set_raw_file_callback(staging_callback)
-
-    documents: list[Document] = []
-    try:
-        for batch in connector.load_from_state():
-            documents.extend(
-                [doc for doc in batch if not isinstance(doc, HierarchyNode)]
-            )
-    except Exception:
-        delete_files_best_effort(
-            staged_csv_ids,
-            context=f"user-file load-failure staging cleanup uf={user_file_id}",
-        )
-        raise
-
-    for document in documents:
-        document.id = str(user_file_id)
-        document.source = DocumentSource.USER_FILE
-    return documents, staged_csv_ids
 
 
 def _chunk_user_file_without_indexing(
@@ -751,8 +723,6 @@ def _process_user_file_with_durable_regulatory_indexing(
             tenant_id,
             db_session,
         )
-        if not mark_regulatory_indexing_user_file(db_session, job_id=job_id):
-            return
         job = get_regulatory_indexing_job(db_session, job_id)
         if job is None:
             raise RuntimeError("prepared regulatory indexing job disappeared")
@@ -1268,6 +1238,44 @@ def delete_user_file_impl(
             return
 
     try:
+        with get_session_with_current_tenant() as db_session:
+            deletion_plan = request_user_file_deletion_cleanup(
+                db_session,
+                user_file_id=_as_uuid(user_file_id),
+                now=datetime.datetime.now(datetime.timezone.utc),
+            )
+        if not deletion_plan.ready_to_delete:
+            from onyx.background.celery.apps.client import celery_app
+            from onyx.background.celery.tasks.regulatory_indexing.tasks import (
+                enqueue_regulatory_indexing_step,
+            )
+            from onyx.regulatory.indexing_jobs.orchestrator import (
+                OrchestrationDeliveryKind,
+            )
+
+            for delivery in deletion_plan.deliveries:
+                try:
+                    enqueue_regulatory_indexing_step(
+                        celery_app,
+                        job_id=delivery.job_id,
+                        expected_generation=delivery.expected_generation,
+                        tenant_id=tenant_id,
+                        delivery_kind=OrchestrationDeliveryKind.NORMAL,
+                    )
+                except Exception as error:
+                    task_logger.warning(
+                        "durable regulatory cancellation enqueue failed "
+                        "user_file_id=%s job_id=%s error_type=%s",
+                        user_file_id,
+                        delivery.job_id,
+                        error.__class__.__name__,
+                    )
+            task_logger.info(
+                "delete_user_file_impl - Waiting for durable cancellation id=%s",
+                user_file_id,
+            )
+            return
+
         skip_vespa = DISABLE_VECTOR_DB
         retry_document_indices: list[RetryDocumentIndex] = []
         chunk_count_from_db: int | None = None

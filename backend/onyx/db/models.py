@@ -5659,6 +5659,7 @@ class RegulatoryIndexingJob(Base):
         nullable=False,
     )
     content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    chunk_generation_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     search_settings_id: Mapped[int] = mapped_column(Integer, nullable=False)
     prompt_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     config_snapshot: Mapped[dict[str, object]] = mapped_column(
@@ -5736,6 +5737,7 @@ class RegulatoryIndexingJob(Base):
             "content_hash",
             "search_settings_id",
             "prompt_hash",
+            "chunk_generation_hash",
             name="uq_regulatory_indexing_job_idempotency",
         ),
         Index(

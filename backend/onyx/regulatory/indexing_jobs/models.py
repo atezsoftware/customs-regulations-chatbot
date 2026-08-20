@@ -107,6 +107,12 @@ class RegulatoryIndexingConfigSnapshot(BaseModel):
         str_strip_whitespace=True,
     )
 
+    input_content_hash: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    chunk_generation_hash: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
     search_settings_id: int = Field(gt=0)
     embedding_provider: EmbeddingProvider
     embedding_model_name: str = Field(min_length=1)

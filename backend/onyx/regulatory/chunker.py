@@ -18,6 +18,11 @@ from typing import Any
 
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
 
+# Bump whenever parser or structural chunk-boundary semantics change. Durable
+# jobs persist this identity so a process restart cannot silently reinterpret
+# an immutable input revision with different chunk-generation semantics.
+REGULATORY_CHUNKER_CODE_VERSION = "1"
+
 _DATE_DMY_RE = re.compile(r"(?<!\d)(\d{1,2})[./](\d{1,2})[./](\d{4})(?!\d)")
 _DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)")
 _HEADER_NUMBER_RE = re.compile(r"(?i)\bSayı\s*[:：]\s*([^\n]+)")

@@ -60,6 +60,8 @@ _DB_SESSION = cast(Session, SimpleNamespace())
 
 def _snapshot() -> RegulatoryIndexingConfigSnapshot:
     return RegulatoryIndexingConfigSnapshot(
+        input_content_hash="1" * 64,
+        chunk_generation_hash="2" * 64,
         search_settings_id=41,
         embedding_provider=EmbeddingProvider.OPENROUTER,
         embedding_model_name="openai/text-embedding-3-large",

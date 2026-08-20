@@ -21,6 +21,7 @@ from onyx.llm.well_known_providers.constants import (
 from onyx.regulatory.indexing_jobs import configuration
 from onyx.regulatory.indexing_jobs.configuration import (
     RegulatoryIndexingConfigurationError,
+    compute_regulatory_chunk_generation_hash,
     resolve_regulatory_indexing_snapshot,
     validate_snapshot_for_stage,
 )
@@ -130,7 +131,7 @@ def _install_admin_configuration(
     monkeypatch.setattr(
         configuration,
         "get_current_search_settings",
-        lambda _db_session: search_settings or _search_settings(),
+        lambda _db_session, **_kwargs: search_settings or _search_settings(),
     )
     monkeypatch.setattr(
         configuration,
@@ -161,6 +162,34 @@ def test_regulatory_indexing_defaults() -> None:
     assert app_configs.REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE == 64
 
 
+def test_chunk_generation_hash_is_restart_stable_and_semantics_sensitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = compute_regulatory_chunk_generation_hash(
+        embedding_provider=EmbeddingProvider.OPENROUTER,
+        embedding_model_name=_EMBEDDING_MODEL,
+    )
+    second = compute_regulatory_chunk_generation_hash(
+        embedding_provider=EmbeddingProvider.OPENROUTER,
+        embedding_model_name=_EMBEDDING_MODEL,
+    )
+
+    assert first == second
+    assert len(first) == 64
+
+    monkeypatch.setattr(
+        configuration,
+        "REGULATORY_CHUNKER_CODE_VERSION",
+        "test-next-semantics",
+    )
+    changed = compute_regulatory_chunk_generation_hash(
+        embedding_provider=EmbeddingProvider.OPENROUTER,
+        embedding_model_name=_EMBEDDING_MODEL,
+    )
+
+    assert changed != first
+
+
 def test_snapshot_is_frozen_json_and_excludes_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -171,6 +200,8 @@ def test_snapshot_is_frozen_json_and_excludes_credentials(
     encoded = json.dumps(dumped)
 
     assert dumped["search_settings_id"] == 41
+    assert dumped["input_content_hash"] == configuration._READINESS_INPUT_CONTENT_HASH
+    assert len(dumped["chunk_generation_hash"]) == 64
     assert dumped["embedding_provider"] == "openrouter"
     assert dumped["embedding_model_name"] == _EMBEDDING_MODEL
     assert dumped["effective_dimension"] == 1024
@@ -180,6 +211,28 @@ def test_snapshot_is_frozen_json_and_excludes_credentials(
     assert '{"type":"service_account"}' not in encoded
     with pytest.raises(ValidationError):
         snapshot.effective_dimension = 3072
+
+
+def test_stage_validation_rejects_changed_chunk_generation_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_admin_configuration(monkeypatch)
+    snapshot = resolve_regulatory_indexing_snapshot(_DB_SESSION)
+    monkeypatch.setattr(
+        configuration,
+        "REGULATORY_INDEXING_GENERATION_CODE_VERSION",
+        "next-generation",
+    )
+
+    with pytest.raises(
+        RegulatoryIndexingConfigurationError,
+        match="Chunk-generation identity",
+    ):
+        validate_snapshot_for_stage(
+            _DB_SESSION,
+            snapshot,
+            RegulatoryIndexingStage.PREPARING,
+        )
 
 
 def test_effective_dimension_uses_native_dimension_without_reduction(
@@ -198,6 +251,8 @@ def test_effective_dimension_uses_native_dimension_without_reduction(
 def test_snapshot_rejects_an_inconsistent_effective_dimension() -> None:
     with pytest.raises(ValidationError):
         RegulatoryIndexingConfigSnapshot(
+            input_content_hash="1" * 64,
+            chunk_generation_hash="2" * 64,
             search_settings_id=41,
             embedding_provider=EmbeddingProvider.OPENROUTER,
             embedding_model_name=_EMBEDDING_MODEL,
@@ -244,6 +299,8 @@ def test_snapshot_requires_prompt_identity() -> None:
 def test_snapshot_rejects_nonfinite_retry_policy() -> None:
     with pytest.raises(ValidationError):
         RegulatoryIndexingConfigSnapshot(
+            input_content_hash="1" * 64,
+            chunk_generation_hash="2" * 64,
             search_settings_id=41,
             embedding_provider=EmbeddingProvider.OPENROUTER,
             embedding_model_name=_EMBEDDING_MODEL,
