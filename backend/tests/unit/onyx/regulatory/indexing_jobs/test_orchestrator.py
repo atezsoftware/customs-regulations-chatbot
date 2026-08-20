@@ -28,6 +28,9 @@ from onyx.db.models import (
     SearchSettings,
     UserFile,
 )
+from onyx.regulatory.indexing_jobs.configuration import (
+    compute_regulatory_chunk_generation_hash,
+)
 from onyx.regulatory.indexing_jobs.contextual import ContextApplySummary
 from onyx.regulatory.indexing_jobs.embedding import EmbeddingSummary
 from onyx.regulatory.indexing_jobs.models import (
@@ -48,6 +51,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchResultError,
     VertexBatchState,
 )
+from shared_configs.enums import EmbeddingProvider
 
 _NOW = datetime.datetime(2026, 8, 19, tzinfo=datetime.timezone.utc)
 
@@ -57,7 +61,10 @@ def _snapshot() -> RegulatoryIndexingConfigSnapshot:
         {
             "input_content_hash": "1" * 64,
             "input_hash_version": "canonical-v2",
-            "chunk_generation_hash": "2" * 64,
+            "chunk_generation_hash": compute_regulatory_chunk_generation_hash(
+                embedding_provider=EmbeddingProvider.OPENROUTER,
+                embedding_model_name="openai/text-embedding-3-large",
+            ),
             "search_settings_id": 9,
             "embedding_provider": "openrouter",
             "embedding_model_name": "openai/text-embedding-3-large",
@@ -95,10 +102,14 @@ def _runtime(
     submission_key: str | None = None,
     submission_state: str = "NONE",
     cancellation_phase: str = "NONE",
+    cancellation_intent: RegulatoryIndexingCancellationIntent = (
+        RegulatoryIndexingCancellationIntent.USER_CANCEL
+    ),
     user_file_status: UserFileStatus = UserFileStatus.INDEXING,
 ) -> indexing_job_repository.RegulatoryIndexingRuntime:
     job_id = uuid4()
     user_file_id = uuid4()
+    snapshot = _snapshot()
     job = SimpleNamespace(
         id=job_id,
         user_file_id=user_file_id,
@@ -107,14 +118,15 @@ def _runtime(
         lease_generation=generation,
         attempt_count=attempt_count,
         content_hash="1" * 64,
-        chunk_generation_hash="2" * 64,
-        config_snapshot=_snapshot().model_dump(mode="json"),
+        chunk_generation_hash=snapshot.chunk_generation_hash,
+        config_snapshot=snapshot.model_dump(mode="json"),
         remote_vertex_job_name=remote_job_name,
         vertex_input_uri=None,
         vertex_output_uri=None,
         vertex_submission_key=submission_key,
         vertex_submission_state=submission_state,
         cancellation_phase=cancellation_phase,
+        cancellation_intent=cancellation_intent.value,
     )
     user_file = SimpleNamespace(
         id=user_file_id,
@@ -230,6 +242,77 @@ def test_preparing_uses_canonical_user_file_loader_and_reaps_staging() -> None:
     assert recovered_document.semantic_identifier == "custom-display-name.md"
     assert recovered_document.title == "Embedded Regulatory Title"
     assert recovered_document.metadata == {"regulation_number": "2026/1"}
+
+
+def test_claimed_delivery_fences_generation_drift_before_snapshot_validation() -> None:
+    runtime = _runtime(RegulatoryIndexingStage.CONTEXT_SUBMIT)
+    delivery = indexing_job_repository.RegulatoryIndexingCancellationDelivery(
+        job_id=runtime.job.id,
+        expected_generation=4,
+    )
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.compute_regulatory_chunk_generation_hash",
+            return_value="3" * 64,
+            create=True,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.supersede_regulatory_indexing_job_for_generation_drift",
+            return_value=delivery,
+            create=True,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage",
+            side_effect=AssertionError("snapshot validation ran before supersession"),
+        ),
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+    assert result.expected_generation == 4
+
+
+def test_unresolved_preparing_delivery_resolves_hash_before_generation_drift() -> None:
+    runtime = _runtime(RegulatoryIndexingStage.PREPARING)
+    runtime.job.config_snapshot["input_hash_version"] = "legacy-or-canonical"
+    documents = [MagicMock()]
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.compute_regulatory_chunk_generation_hash",
+            return_value="3" * 64,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.supersede_regulatory_indexing_job_for_generation_drift"
+        ) as supersede,
+        patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._load_claimed_markdown_documents",
+            return_value=(documents, []),
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.prepare_claimed_regulatory_indexing_job"
+        ) as prepare,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    supersede.assert_not_called()
+    prepare.assert_called_once()
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+    assert result.expected_generation == 3
 
 
 def test_duplicate_normal_delivery_is_fenced_before_stage_work() -> None:
@@ -1058,6 +1141,115 @@ def test_cancellation_external_phase_progresses_after_retry_budget() -> None:
     advance.assert_called_once()
     assert advance.call_args.kwargs["next_phase"] is (
         RegulatoryIndexingCancellationPhase.GCS_CLEANUP
+    )
+    schedule_retry.assert_not_called()
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+
+
+@pytest.mark.parametrize(
+    ("intent", "error", "attempt_count"),
+    [
+        (
+            RegulatoryIndexingCancellationIntent.USER_DELETE,
+            IndexingGatewayConnectionError(),
+            0,
+        ),
+        (
+            RegulatoryIndexingCancellationIntent.SUPERSEDE,
+            RuntimeError("unclassified deletion failure"),
+            0,
+        ),
+        (
+            RegulatoryIndexingCancellationIntent.USER_DELETE,
+            RuntimeError("exhausted deletion failure"),
+            3,
+        ),
+    ],
+)
+def test_required_index_cleanup_failure_never_advances_to_finalize(
+    intent: RegulatoryIndexingCancellationIntent,
+    error: Exception,
+    attempt_count: int,
+) -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.INDEX_WRITE,
+        status=RegulatoryIndexingJobStatus.CANCELLING,
+        attempt_count=attempt_count,
+        cancellation_phase=RegulatoryIndexingCancellationPhase.INDEX_DELETE.value,
+        cancellation_intent=intent,
+    )
+    document_index = MagicMock()
+    document_index.delete.side_effect = error
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index",
+            return_value=document_index,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_cancellation"
+        ) as advance,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.schedule_regulatory_indexing_cancellation_retry",
+            return_value=True,
+        ) as schedule_retry,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    advance.assert_not_called()
+    schedule_retry.assert_called_once()
+    assert (
+        schedule_retry.call_args.kwargs["expected_phase"]
+        is RegulatoryIndexingCancellationPhase.INDEX_DELETE
+    )
+    assert schedule_retry.call_args.kwargs["error_code"]
+    assert schedule_retry.call_args.kwargs["error_message"] == error.__class__.__name__
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+    assert result.countdown_seconds is not None
+    assert 0 <= result.countdown_seconds <= 900
+
+
+def test_user_cancel_index_cleanup_remains_bounded_best_effort() -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.INDEX_WRITE,
+        status=RegulatoryIndexingJobStatus.CANCELLING,
+        attempt_count=2,
+        cancellation_phase=RegulatoryIndexingCancellationPhase.INDEX_DELETE.value,
+        cancellation_intent=RegulatoryIndexingCancellationIntent.USER_CANCEL,
+    )
+    document_index = MagicMock()
+    document_index.delete.side_effect = RuntimeError("terminal cleanup failure")
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index",
+            return_value=document_index,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_cancellation",
+            return_value=True,
+        ) as advance,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.schedule_regulatory_indexing_cancellation_retry"
+        ) as schedule_retry,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert (
+        advance.call_args.kwargs["next_phase"]
+        is RegulatoryIndexingCancellationPhase.FINALIZE
     )
     schedule_retry.assert_not_called()
     assert result.outcome is OrchestrationOutcome.NEXT_STEP

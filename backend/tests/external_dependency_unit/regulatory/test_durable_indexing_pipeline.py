@@ -12,6 +12,7 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import MagicMock, PropertyMock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -1672,6 +1673,49 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
             "enqueue_regulatory_indexing_step",
             capture_worker_delivery,
         )
+
+        def scan_processing_deliveries(
+            target_user_file_id: UUID,
+        ) -> list[dict[str, str]]:
+            scanner_app = MagicMock()
+            scanner_task = user_file_tasks.check_user_file_processing.run.__self__
+            with (
+                patch.object(
+                    type(scanner_task),
+                    "app",
+                    new_callable=PropertyMock,
+                    return_value=scanner_app,
+                ),
+                patch(
+                    "onyx.background.celery.tasks.user_file_processing.tasks.celery_get_broker_client",
+                    return_value=MagicMock(),
+                ),
+                patch(
+                    "onyx.background.celery.tasks.user_file_processing.tasks.celery_get_queue_length",
+                    return_value=0,
+                ),
+            ):
+                user_file_tasks.check_user_file_processing.run(tenant_id=_TENANT_ID)
+
+            return [
+                call.kwargs["kwargs"]
+                for call in scanner_app.send_task.call_args_list
+                if call.kwargs["kwargs"]["user_file_id"] == str(target_user_file_id)
+            ]
+
+        def run_processing_scanner_and_worker(target_user_file_id: UUID) -> None:
+            matching_deliveries = scan_processing_deliveries(target_user_file_id)
+            assert matching_deliveries == [
+                {
+                    "user_file_id": str(target_user_file_id),
+                    "tenant_id": _TENANT_ID,
+                }
+            ]
+            user_file_tasks.process_single_user_file.run(
+                user_file_id=str(target_user_file_id),
+                tenant_id=_TENANT_ID,
+            )
+
         first_job_id = job.id
         first_generation_hash = job.chunk_generation_hash
         second_generation_hash = "e" * 64
@@ -1681,17 +1725,18 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
             "compute_regulatory_chunk_generation_hash",
             lambda *_args, **_kwargs: second_generation_hash,
         )
+        monkeypatch.setattr(
+            orchestrator,
+            "compute_regulatory_chunk_generation_hash",
+            lambda *_args, **_kwargs: second_generation_hash,
+        )
         db_session.expire_all()
         reprocessed_file = db_session.get(UserFile, user_file.id)
         assert reprocessed_file is not None
         reprocessed_file.status = UserFileStatus.PROCESSING
         db_session.commit()
 
-        user_file_tasks.process_user_file_impl(
-            user_file_id=str(user_file.id),
-            tenant_id=_TENANT_ID,
-            redis_locking=False,
-        )
+        run_processing_scanner_and_worker(user_file.id)
         db_session.expire_all()
         second_job = db_session.scalar(
             select(RegulatoryIndexingJob).where(
@@ -1711,10 +1756,15 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
             "compute_regulatory_chunk_generation_hash",
             lambda *_args, **_kwargs: third_generation_hash,
         )
-        user_file_tasks.process_user_file_impl(
-            user_file_id=str(user_file.id),
+        monkeypatch.setattr(
+            orchestrator,
+            "compute_regulatory_chunk_generation_hash",
+            lambda *_args, **_kwargs: third_generation_hash,
+        )
+        regulatory_tasks.regulatory_indexing_run_step.run(
+            job_id=str(second_job.id),
+            expected_generation=second_job.lease_generation,
             tenant_id=_TENANT_ID,
-            redis_locking=False,
         )
         db_session.expire_all()
         superseded_job = db_session.get(RegulatoryIndexingJob, second_job.id)
@@ -1723,25 +1773,69 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
         assert superseded_job.cancellation_intent == "SUPERSEDE"
         superseded_generation = superseded_job.lease_generation
 
-        supersession_outcome = OrchestrationOutcome.NEXT_STEP
-        for _ in range(4):
-            superseded_generation, supersession_outcome = _run_delivery(
-                superseded_job.id,
-                superseded_generation,
+        original_delete = document_index.delete
+        remaining_delete_failures = 1
+
+        def fail_first_index_delete(*args: object, **kwargs: object) -> int:
+            nonlocal remaining_delete_failures
+            if remaining_delete_failures:
+                remaining_delete_failures -= 1
+                raise RuntimeError("injected Elasticsearch cleanup failure")
+            return original_delete(*args, **kwargs)
+
+        monkeypatch.setattr(document_index, "delete", fail_first_index_delete)
+        superseded_generation, supersession_outcome = _run_delivery(
+            superseded_job.id,
+            superseded_generation,
+        )
+        assert supersession_outcome is OrchestrationOutcome.NEXT_STEP
+        superseded_generation, supersession_outcome = _run_delivery(
+            superseded_job.id,
+            superseded_generation,
+        )
+        assert supersession_outcome is OrchestrationOutcome.NEXT_STEP
+        db_session.expire_all()
+        blocked_cleanup = db_session.get(RegulatoryIndexingJob, superseded_job.id)
+        assert blocked_cleanup is not None
+        assert blocked_cleanup.status == RegulatoryIndexingJobStatus.CANCELLING.value
+        assert blocked_cleanup.cancellation_phase == "INDEX_DELETE"
+        assert blocked_cleanup.attempt_count == 1
+        assert blocked_cleanup.error_code == "unknown"
+        assert blocked_cleanup.error_message == "RuntimeError"
+        assert blocked_cleanup.next_retry_at is not None
+        assert scan_processing_deliveries(user_file.id) == []
+        assert (
+            db_session.scalar(
+                select(func.count(RegulatoryIndexingJob.id)).where(
+                    RegulatoryIndexingJob.user_file_id == user_file.id
+                )
             )
-            if supersession_outcome is OrchestrationOutcome.COMPLETE:
-                break
+            == 2
+        )
+        document_index._client.refresh_index()
+        still_visible = document_index._client.get_document_chunks(chunk_ids)
+        assert all(not chunk.hidden for chunk in still_visible.values())
+
+        blocked_cleanup.next_retry_at = datetime.datetime.now(
+            datetime.timezone.utc
+        ) - datetime.timedelta(seconds=1)
+        db_session.commit()
+        superseded_generation, supersession_outcome = _run_delivery(
+            superseded_job.id,
+            superseded_generation,
+        )
+        assert supersession_outcome is OrchestrationOutcome.NEXT_STEP
+        superseded_generation, supersession_outcome = _run_delivery(
+            superseded_job.id,
+            superseded_generation,
+        )
         assert supersession_outcome is OrchestrationOutcome.COMPLETE
         db_session.expire_all()
         resumed_file = db_session.get(UserFile, user_file.id)
         assert resumed_file is not None
         assert resumed_file.status is UserFileStatus.PROCESSING
 
-        user_file_tasks.process_user_file_impl(
-            user_file_id=str(user_file.id),
-            tenant_id=_TENANT_ID,
-            redis_locking=False,
-        )
+        run_processing_scanner_and_worker(user_file.id)
         db_session.expire_all()
         newest_job = db_session.scalar(
             select(RegulatoryIndexingJob)
@@ -1801,11 +1895,7 @@ def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(
         assert repeated_file is not None
         repeated_file.status = UserFileStatus.PROCESSING
         db_session.commit()
-        user_file_tasks.process_user_file_impl(
-            user_file_id=str(user_file.id),
-            tenant_id=_TENANT_ID,
-            redis_locking=False,
-        )
+        run_processing_scanner_and_worker(user_file.id)
         db_session.expire_all()
         assert (
             db_session.scalar(

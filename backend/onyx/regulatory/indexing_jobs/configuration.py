@@ -314,7 +314,15 @@ def validate_snapshot_for_stage(
         embedding_provider=snapshot.embedding_provider,
         embedding_model_name=snapshot.embedding_model_name,
     )
-    if snapshot.chunk_generation_hash != current_generation_hash:
+    unresolved_preparing_snapshot = (
+        stage is RegulatoryIndexingStage.PREPARING
+        and snapshot.input_hash_version
+        is RegulatoryInputHashVersion.LEGACY_OR_CANONICAL
+    )
+    if (
+        snapshot.chunk_generation_hash != current_generation_hash
+        and not unresolved_preparing_snapshot
+    ):
         raise RegulatoryIndexingConfigurationError(
             "Chunk-generation identity no longer matches the indexing job snapshot"
         )

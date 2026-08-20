@@ -237,6 +237,36 @@ def test_stage_validation_rejects_changed_chunk_generation_semantics(
         )
 
 
+def test_unresolved_preparing_snapshot_defers_generation_drift_until_hash_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_admin_configuration(monkeypatch)
+    snapshot = resolve_regulatory_indexing_snapshot(_DB_SESSION).model_copy(
+        update={"input_hash_version": RegulatoryInputHashVersion.LEGACY_OR_CANONICAL}
+    )
+    monkeypatch.setattr(
+        configuration,
+        "REGULATORY_INDEXING_GENERATION_CODE_VERSION",
+        "next-generation",
+    )
+
+    validate_snapshot_for_stage(
+        _DB_SESSION,
+        snapshot,
+        RegulatoryIndexingStage.PREPARING,
+    )
+
+    with pytest.raises(
+        RegulatoryIndexingConfigurationError,
+        match="Chunk-generation identity",
+    ):
+        validate_snapshot_for_stage(
+            _DB_SESSION,
+            snapshot,
+            RegulatoryIndexingStage.CONTEXT_SUBMIT,
+        )
+
+
 def test_effective_dimension_uses_native_dimension_without_reduction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

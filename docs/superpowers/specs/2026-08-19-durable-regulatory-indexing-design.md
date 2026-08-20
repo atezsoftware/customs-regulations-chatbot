@@ -224,6 +224,23 @@ documents, clears persisted embedding payloads, and marks the job `CANCELLED`.
 User-file deletion remains authoritative and must never be reversed by a late
 indexing task.
 
+Historical generations are deleted sequentially. The deletion worker locks the
+UserFile and all of its jobs, overrides the sole active cancellation with
+`USER_DELETE` or activates exactly one terminal historical generation, and leaves
+every other history row terminal. After that job reaches `CANCELLED`, the durable
+deletion scanner redelivers the tombstoned file and activates the next generation.
+The UserFile and its job history are hard-deleted only after every generation is
+`CANCELLED`; the partial unique active-job invariant therefore remains true
+throughout cleanup and broker loss.
+
+An Elasticsearch `INDEX_DELETE` failure for `USER_DELETE` or `SUPERSEDE` never
+advances to `FINALIZE`, irrespective of error classification or attempt count. It
+persists the error, incremented attempt, and a deterministic capped retry deadline
+on the same phase. This makes blocked cleanup operator-visible without a hot loop
+and prevents hard deletion or a successor while stale chunks may remain. Explicit
+`USER_CANCEL` retains bounded best-effort cleanup semantics and remains distinct
+from deletion.
+
 GCS cleanup is best effort and separately retryable; inability to remove temporary
 objects does not change an already correct search publication result. Lifecycle
 rules on the configured bucket provide a final safety net.
@@ -246,11 +263,15 @@ PREPARING while it remains unresolved.
 
 ### Chunk-generation supersession
 
-One UserFile still has at most one active durable job. If production processing
-finds that active job belongs to an older chunk-generation identity, it does not run
-or terminally fail that generation. Under the UserFile/job locks it changes the old
-job to `CANCELLING`, records typed `SUPERSEDE` intent, increments its lease fence,
-and resumes the existing Vertex, GCS, and Elasticsearch cleanup phases.
+One UserFile still has at most one active durable job. Every claimed normal or
+preclaimed delivery compares the job's generation identity with the current
+deterministic identity before ordinary terminal snapshot validation or stage work.
+On drift, it locks the UserFile and claimed job, changes that same job to
+`CANCELLING`, records typed `SUPERSEDE` intent, increments its lease fence, and
+resumes the existing Vertex, GCS, and Elasticsearch cleanup phases. An unresolved
+compatibility PREPARING snapshot is the sole exception: canonical loading and exact
+legacy/canonical input-hash resolution occur first, and the following delivery then
+performs the generation comparison.
 
 Cancellation intent distinguishes `USER_CANCEL`, `USER_DELETE`, and `SUPERSEDE`.
 Deletion is a monotonic override of either other intent. Finalizing user cancellation

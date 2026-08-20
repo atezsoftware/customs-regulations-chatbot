@@ -358,6 +358,57 @@ def test_supersession_finalization_requeues_file_and_allows_one_successor(
     )
 
 
+def test_claimed_generation_drift_is_atomically_superseded_and_fenced(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        chunk_generation_hash="1" * 64,
+    )
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    regulatory_user_file.status = UserFileStatus.INDEXING
+    db_session.commit()
+
+    delivery = regulatory_indexing_job_repository.supersede_regulatory_indexing_job_for_generation_drift(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        current_chunk_generation_hash="2" * 64,
+        now=_NOW + datetime.timedelta(minutes=1),
+    )
+
+    assert delivery is not None
+    assert delivery.job_id == job.id
+    assert delivery.expected_generation == 2
+    db_session.refresh(job)
+    assert job.status == RegulatoryIndexingJobStatus.CANCELLING.value
+    assert job.cancellation_intent == "SUPERSEDE"
+    assert (
+        job.cancellation_phase == RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
+    )
+    assert job.lease_generation == 2
+    assert (
+        regulatory_indexing_job_repository.supersede_regulatory_indexing_job_for_generation_drift(
+            db_session,
+            job_id=job.id,
+            expected_stage=RegulatoryIndexingStage.PREPARING,
+            expected_generation=1,
+            current_chunk_generation_hash="2" * 64,
+            now=_NOW + datetime.timedelta(minutes=2),
+        )
+        is None
+    )
+
+
 def test_deletion_monotonically_overrides_in_progress_supersession(
     db_session: Session,
     regulatory_user_file: UserFile,
@@ -407,6 +458,116 @@ def test_deletion_monotonically_overrides_in_progress_supersession(
         expected_generation=2,
         now=_NOW + datetime.timedelta(minutes=3),
     )
+    db_session.refresh(regulatory_user_file)
+    assert regulatory_user_file.status is UserFileStatus.DELETING
+
+
+def test_deletion_cleans_multiple_generations_sequentially(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    first = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        chunk_generation_hash="1" * 64,
+    )
+    first.status = RegulatoryIndexingJobStatus.SUCCEEDED.value
+    first.completed_at = _NOW
+    db_session.commit()
+    second = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        chunk_generation_hash="2" * 64,
+    )
+    second.status = RegulatoryIndexingJobStatus.FAILED.value
+    second.completed_at = _NOW + datetime.timedelta(seconds=1)
+    db_session.commit()
+    active = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        chunk_generation_hash="3" * 64,
+    )
+    active.status = RegulatoryIndexingJobStatus.CANCELLING.value
+    active.cancellation_intent = RegulatoryIndexingCancellationIntent.SUPERSEDE.value
+    active.cancellation_phase = RegulatoryIndexingCancellationPhase.INDEX_DELETE.value
+    active.lease_generation = 4
+    db_session.commit()
+
+    remaining_ids = {first.id, second.id, active.id}
+    expected_first_id = active.id
+    generation = 4
+    for cleanup_number in range(3):
+        plan = request_user_file_deletion_cleanup(
+            db_session,
+            user_file_id=regulatory_user_file.id,
+            now=_NOW + datetime.timedelta(minutes=cleanup_number + 1),
+        )
+        assert plan.ready_to_delete is False
+        assert len(plan.deliveries) == 1
+        delivery = plan.deliveries[0]
+        if cleanup_number == 0:
+            assert delivery.job_id == expected_first_id
+            assert delivery.expected_generation == generation + 1
+        activated = db_session.get(RegulatoryIndexingJob, delivery.job_id)
+        assert activated is not None
+        assert activated.status == RegulatoryIndexingJobStatus.CANCELLING.value
+        assert (
+            activated.cancellation_intent
+            == RegulatoryIndexingCancellationIntent.USER_DELETE.value
+        )
+        assert (
+            db_session.scalar(
+                select(func.count(RegulatoryIndexingJob.id)).where(
+                    RegulatoryIndexingJob.user_file_id == regulatory_user_file.id,
+                    RegulatoryIndexingJob.status.in_(
+                        [
+                            RegulatoryIndexingJobStatus.QUEUED.value,
+                            RegulatoryIndexingJobStatus.RUNNING.value,
+                            RegulatoryIndexingJobStatus.RETRY_WAIT.value,
+                            RegulatoryIndexingJobStatus.CANCELLING.value,
+                        ]
+                    ),
+                )
+            )
+            == 1
+        )
+        assert {
+            row.id
+            for row in db_session.scalars(
+                select(RegulatoryIndexingJob).where(
+                    RegulatoryIndexingJob.user_file_id == regulatory_user_file.id,
+                    RegulatoryIndexingJob.status
+                    == RegulatoryIndexingJobStatus.CANCELLED.value,
+                )
+            )
+        } == ({first.id, second.id, active.id} - remaining_ids)
+
+        repeated = request_user_file_deletion_cleanup(
+            db_session,
+            user_file_id=regulatory_user_file.id,
+            now=_NOW + datetime.timedelta(minutes=cleanup_number + 1),
+        )
+        assert repeated.deliveries == plan.deliveries
+
+        activated.cancellation_phase = (
+            RegulatoryIndexingCancellationPhase.FINALIZE.value
+        )
+        db_session.commit()
+        assert finalize_regulatory_indexing_cancellation(
+            db_session,
+            job_id=activated.id,
+            expected_generation=delivery.expected_generation,
+            now=_NOW + datetime.timedelta(minutes=cleanup_number + 2),
+        )
+        remaining_ids.remove(activated.id)
+
+    ready = request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=regulatory_user_file.id,
+        now=_NOW + datetime.timedelta(minutes=5),
+    )
+    assert ready.ready_to_delete is True
+    assert ready.deliveries == ()
     db_session.refresh(regulatory_user_file)
     assert regulatory_user_file.status is UserFileStatus.DELETING
 
@@ -2416,6 +2577,91 @@ def test_cancellation_retry_deadline_is_respected_by_recovery(
     )
     assert len(claims) == 1
     assert claims[0].job_id == job.id
+
+
+def test_required_index_cleanup_retry_survives_crash_and_blocks_successor(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        chunk_generation_hash="1" * 64,
+    )
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    job.status = RegulatoryIndexingJobStatus.CANCELLING.value
+    job.cancellation_intent = RegulatoryIndexingCancellationIntent.SUPERSEDE.value
+    job.cancellation_phase = RegulatoryIndexingCancellationPhase.INDEX_DELETE.value
+    job.attempt_count = 3
+    regulatory_user_file.status = UserFileStatus.INDEXING
+    db_session.commit()
+    retry_at = _NOW + datetime.timedelta(minutes=5)
+
+    assert schedule_regulatory_indexing_cancellation_retry(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        expected_phase=RegulatoryIndexingCancellationPhase.INDEX_DELETE,
+        next_retry_at=retry_at,
+        error_code="UNKNOWN",
+        error_message="RuntimeError",
+    )
+    db_session.refresh(job)
+    assert (
+        job.cancellation_phase == RegulatoryIndexingCancellationPhase.INDEX_DELETE.value
+    )
+    assert job.attempt_count == 4
+    assert job.error_code == "UNKNOWN"
+    assert job.next_retry_at == retry_at
+
+    blocked_successor = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        chunk_generation_hash="2" * 64,
+    )
+    assert blocked_successor.id == job.id
+    assert (
+        db_session.scalar(
+            select(func.count(RegulatoryIndexingJob.id)).where(
+                RegulatoryIndexingJob.user_file_id == regulatory_user_file.id
+            )
+        )
+        == 1
+    )
+    assert (
+        claim_stale_regulatory_indexing_jobs(
+            db_session,
+            stale_before=_NOW,
+            claimed_at=_NOW,
+        )
+        == []
+    )
+
+    recovered = claim_stale_regulatory_indexing_jobs(
+        db_session,
+        stale_before=retry_at,
+        claimed_at=retry_at,
+    )
+    assert len(recovered) == 1
+    assert recovered[0].job_id == job.id
+    db_session.refresh(job)
+    assert (
+        job.cancellation_phase == RegulatoryIndexingCancellationPhase.INDEX_DELETE.value
+    )
+    assert job.lease_generation == 2
+    assert not claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        now=retry_at,
+    )
 
 
 def test_stale_generation_never_calls_recording_index(

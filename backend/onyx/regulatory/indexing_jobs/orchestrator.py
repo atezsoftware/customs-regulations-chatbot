@@ -28,7 +28,10 @@ from onyx.file_store.staging import delete_files_best_effort
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.well_known_providers.constants import VERTEX_CREDENTIALS_FILE_KWARG
 from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
-from onyx.regulatory.indexing_jobs.configuration import validate_snapshot_for_stage
+from onyx.regulatory.indexing_jobs.configuration import (
+    compute_regulatory_chunk_generation_hash,
+    validate_snapshot_for_stage,
+)
 from onyx.regulatory.indexing_jobs.contextual import (
     apply_contextual_results,
     build_contextual_requests,
@@ -38,6 +41,7 @@ from onyx.regulatory.indexing_jobs.embedding import embed_pending_regulatory_ite
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayIndeterminateSubmissionError,
     RegulatoryIndexingConfigSnapshot,
+    RegulatoryInputHashVersion,
     RetryReason,
 )
 from onyx.regulatory.indexing_jobs.preparation import (
@@ -638,6 +642,30 @@ def _execute_claimed_step_impl(
         )
     stage = RegulatoryIndexingStage(runtime.job.stage)
     snapshot = _snapshot(runtime)
+    unresolved_preparing_snapshot = (
+        stage is RegulatoryIndexingStage.PREPARING
+        and snapshot.input_hash_version
+        is RegulatoryInputHashVersion.LEGACY_OR_CANONICAL
+    )
+    if not unresolved_preparing_snapshot:
+        current_chunk_generation_hash = compute_regulatory_chunk_generation_hash(
+            embedding_provider=snapshot.embedding_provider,
+            embedding_model_name=snapshot.embedding_model_name,
+        )
+        if runtime.job.chunk_generation_hash != current_chunk_generation_hash:
+            delivery = indexing_job_repository.supersede_regulatory_indexing_job_for_generation_drift(
+                db_session,
+                job_id=runtime.job.id,
+                expected_stage=stage,
+                expected_generation=runtime.job.lease_generation,
+                current_chunk_generation_hash=current_chunk_generation_hash,
+                now=now,
+            )
+            return (
+                _next_step(runtime.job.id, delivery.expected_generation)
+                if delivery is not None
+                else _skipped(runtime.job.id)
+            )
     validate_snapshot_for_stage(db_session, snapshot, stage)
 
     if stage is RegulatoryIndexingStage.PREPARING:
@@ -768,8 +796,20 @@ def _execute_claimed_step(
         next_attempt = runtime.job.attempt_count + 1
         if runtime.job.status == RegulatoryIndexingJobStatus.CANCELLING.value:
             phase = RegulatoryIndexingCancellationPhase(runtime.job.cancellation_phase)
+            cancellation_intent = RegulatoryIndexingCancellationIntent(
+                runtime.job.cancellation_intent
+            )
+            required_index_cleanup = (
+                phase is RegulatoryIndexingCancellationPhase.INDEX_DELETE
+                and cancellation_intent
+                in {
+                    RegulatoryIndexingCancellationIntent.SUPERSEDE,
+                    RegulatoryIndexingCancellationIntent.USER_DELETE,
+                }
+            )
             retry_cancellation = (
-                phase is RegulatoryIndexingCancellationPhase.FINALIZE
+                required_index_cleanup
+                or phase is RegulatoryIndexingCancellationPhase.FINALIZE
                 or decision.retryable
                 and next_attempt < snapshot.max_attempts
             )

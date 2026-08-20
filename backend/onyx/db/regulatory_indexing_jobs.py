@@ -406,6 +406,69 @@ def create_or_get_regulatory_indexing_job(
     return job
 
 
+def supersede_regulatory_indexing_job_for_generation_drift(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_stage: RegulatoryIndexingStage,
+    expected_generation: int,
+    current_chunk_generation_hash: str,
+    now: datetime.datetime,
+) -> RegulatoryIndexingCancellationDelivery | None:
+    """Fence a claimed stale generation and start its durable cleanup."""
+
+    if len(current_chunk_generation_hash) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in current_chunk_generation_hash
+    ):
+        raise ValueError("chunk generation hash must be a lowercase SHA-256 hash")
+    locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
+    if locked_user_file is None:
+        db_session.rollback()
+        return None
+    job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == expected_stage.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if (
+        job is None
+        or job.user_file_id != locked_user_file.id
+        or job.chunk_generation_hash == current_chunk_generation_hash
+        or locked_user_file.status in {UserFileStatus.CANCELED, UserFileStatus.DELETING}
+    ):
+        db_session.rollback()
+        return None
+
+    job.status = RegulatoryIndexingJobStatus.CANCELLING.value
+    job.cancellation_intent = RegulatoryIndexingCancellationIntent.SUPERSEDE.value
+    job.cancellation_phase = (
+        RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
+        if job.remote_vertex_job_name
+        else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
+    )
+    job.lease_generation += 1
+    job.recovery_token = None
+    job.attempt_count = 0
+    job.next_retry_at = None
+    job.error_code = None
+    job.error_message = None
+    job.completed_at = None
+    job.heartbeat_at = now
+    job.updated_at = now
+    next_generation = job.lease_generation
+    db_session.commit()
+    return RegulatoryIndexingCancellationDelivery(
+        job_id=job_id,
+        expected_generation=next_generation,
+    )
+
+
 def get_regulatory_indexing_job(
     db_session: Session,
     job_id: UUID,
@@ -499,7 +562,7 @@ def request_user_file_deletion_cleanup(
     user_file_id: UUID,
     now: datetime.datetime,
 ) -> UserFileDeletionCleanupPlan:
-    """Tombstone a file and fence every durable job before external deletion."""
+    """Tombstone a file and clean one durable generation at a time."""
 
     locked_user_file = db_session.scalar(
         select(UserFile).where(UserFile.id == user_file_id).with_for_update()
@@ -512,48 +575,59 @@ def request_user_file_deletion_cleanup(
         db_session.scalars(
             select(RegulatoryIndexingJob)
             .where(RegulatoryIndexingJob.user_file_id == user_file_id)
-            .order_by(RegulatoryIndexingJob.id)
+            .order_by(
+                RegulatoryIndexingJob.updated_at.desc(),
+                RegulatoryIndexingJob.created_at.desc(),
+                RegulatoryIndexingJob.id.desc(),
+            )
             .with_for_update()
         ).all()
     )
     locked_user_file.status = UserFileStatus.DELETING
     deliveries: list[RegulatoryIndexingCancellationDelivery] = []
-    for job in locked_jobs:
-        if job.status == RegulatoryIndexingJobStatus.CANCELLED.value:
-            continue
-        if job.status != RegulatoryIndexingJobStatus.CANCELLING.value:
+    active_jobs = tuple(
+        job
+        for job in locked_jobs
+        if job.status in _ACTIVE_REGULATORY_INDEXING_JOB_STATUSES
+    )
+    if len(active_jobs) > 1:
+        db_session.rollback()
+        raise RuntimeError("user file has multiple active regulatory indexing jobs")
+    job = (
+        active_jobs[0]
+        if active_jobs
+        else next(
+            (
+                candidate
+                for candidate in locked_jobs
+                if candidate.status != RegulatoryIndexingJobStatus.CANCELLED.value
+            ),
+            None,
+        )
+    )
+    if job is not None:
+        entering_delete_cancellation = (
+            job.status != RegulatoryIndexingJobStatus.CANCELLING.value
+            or job.cancellation_intent
+            != RegulatoryIndexingCancellationIntent.USER_DELETE.value
+        )
+        if entering_delete_cancellation:
             job.status = RegulatoryIndexingJobStatus.CANCELLING.value
             job.cancellation_intent = (
                 RegulatoryIndexingCancellationIntent.USER_DELETE.value
             )
-            job.lease_generation += 1
-            job.recovery_token = None
             job.cancellation_phase = (
                 RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
                 if job.remote_vertex_job_name
                 else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
             )
-            job.attempt_count = 0
-            job.next_retry_at = None
-            job.error_code = None
-            job.error_message = None
-            job.completed_at = None
-            job.heartbeat_at = now
-            job.updated_at = now
-        elif (
-            job.cancellation_intent
-            != RegulatoryIndexingCancellationIntent.USER_DELETE.value
-        ):
-            # Deletion is authoritative over cancellation or supersession.
-            job.cancellation_intent = (
-                RegulatoryIndexingCancellationIntent.USER_DELETE.value
-            )
             job.lease_generation += 1
             job.recovery_token = None
             job.attempt_count = 0
             job.next_retry_at = None
             job.error_code = None
             job.error_message = None
+            job.completed_at = None
             job.heartbeat_at = now
             job.updated_at = now
         if job.next_retry_at is None or job.next_retry_at <= now:
@@ -566,11 +640,7 @@ def request_user_file_deletion_cleanup(
 
     db_session.commit()
     return UserFileDeletionCleanupPlan(
-        ready_to_delete=not deliveries
-        and all(
-            job.status == RegulatoryIndexingJobStatus.CANCELLED.value
-            for job in locked_jobs
-        ),
+        ready_to_delete=job is None,
         deliveries=tuple(deliveries),
     )
 
