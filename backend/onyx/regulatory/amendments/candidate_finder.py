@@ -13,6 +13,7 @@ outside the directory the admin pasted the text against.
 import json
 import re
 from dataclasses import replace
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import bindparam
@@ -34,6 +35,7 @@ _TEXT_TRGM_SQL = sa_text(
            similarity(text, :query_text) AS score
     FROM regulatory_chunk
     WHERE status = 'active'
+      AND chunk_type IS DISTINCT FROM 'hierarchical_aggregate'
       AND user_file_id IN :user_file_ids
       AND text % :query_text
     ORDER BY score DESC
@@ -47,6 +49,7 @@ _HEADING_TRGM_SQL = sa_text(
            similarity(regulatory_chunk_heading_path_text(heading_path), :query_text) AS score
     FROM regulatory_chunk
     WHERE status = 'active'
+      AND chunk_type IS DISTINCT FROM 'hierarchical_aggregate'
       AND user_file_id IN :user_file_ids
       AND regulatory_chunk_heading_path_text(heading_path) % :query_text
     ORDER BY score DESC
@@ -59,6 +62,7 @@ _STRUCTURED_SQL = sa_text(
     SELECT id, user_file_id, text, chunk_metadata
     FROM regulatory_chunk
     WHERE status = 'active'
+      AND chunk_type IS DISTINCT FROM 'hierarchical_aggregate'
       AND user_file_id IN :user_file_ids
       AND chunk_metadata->>'article_no' = :article_no
     LIMIT :limit
@@ -91,17 +95,18 @@ def find_candidates(
     merged: dict[str, CandidateChunk] = {}
 
     def _get_or_create(row: object) -> CandidateChunk:
-        chunk_id = str(row.id)  # type: ignore[attr-defined]
+        typed_row = cast(Any, row)
+        chunk_id = str(typed_row.id)
         existing = merged.get(chunk_id)
         if existing is not None:
             return existing
-        metadata = row.chunk_metadata  # type: ignore[attr-defined]
+        metadata = typed_row.chunk_metadata
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
         created = CandidateChunk(
             chunk_id=chunk_id,
-            user_file_id=str(row.user_file_id),  # type: ignore[attr-defined]
-            text=str(row.text),  # type: ignore[attr-defined]
+            user_file_id=str(typed_row.user_file_id),
+            text=str(typed_row.text),
             metadata=metadata or {},
         )
         merged[chunk_id] = created

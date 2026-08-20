@@ -238,7 +238,10 @@ MADDE 92
     doc = RegulatoryChunker(min_chunk_chars=0).chunk_text(text, source_file="kanun.md")
 
     article_chunks = [
-        chunk for chunk in doc.chunks if chunk.metadata.article_no == "92"
+        chunk
+        for chunk in doc.chunks
+        if chunk.metadata.article_no == "92"
+        and chunk.metadata.chunk_variant == "atomic"
     ]
     assert [chunk.metadata.paragraph_no for chunk in article_chunks] == ["1", "2"]
     assert "tutanak düzenlenmesini" in article_chunks[0].text
@@ -826,3 +829,100 @@ def test_dotted_reference_continuation_stays_in_current_clause() -> None:
         for chunk in doc.chunks
         for heading in chunk.metadata.heading_path
     )
+
+
+def test_hierarchical_multipass_keeps_atomic_units_and_adds_article_context() -> None:
+    text = """ULUSLARARASI SÖZLEŞME
+
+MADDE 1 - Bu sözleşmede aşağıdaki veriler işlenir.
+
+a) Data 1.
+
+b) Data 2.
+"""
+
+    doc = RegulatoryChunker(min_chunk_chars=0).chunk_text(
+        text, source_file="sozlesme.md"
+    )
+
+    atomic_chunks = [
+        chunk for chunk in doc.chunks if chunk.metadata.chunk_variant == "atomic"
+    ]
+    aggregate_chunks = [
+        chunk
+        for chunk in doc.chunks
+        if chunk.metadata.chunk_variant == "hierarchical_aggregate"
+    ]
+
+    assert [chunk.text for chunk in atomic_chunks] == [
+        "MADDE 1 - Bu sözleşmede aşağıdaki veriler işlenir.",
+        "a) Data 1.",
+        "b) Data 2.",
+    ]
+    assert [chunk.metadata.chunk_order for chunk in atomic_chunks] == [0, 1, 2]
+    assert len(aggregate_chunks) == 1
+    aggregate = aggregate_chunks[0]
+    assert aggregate.metadata.chunk_order == 3
+    assert aggregate.metadata.chunk_type == "hierarchical_aggregate"
+    assert aggregate.metadata.source_chunk_orders == [0, 1, 2]
+    assert aggregate.metadata.hierarchy_root_path[-1] == "MADDE 1"
+    assert aggregate.text == (
+        "MADDE 1 - Bu sözleşmede aşağıdaki veriler işlenir.\n\na) Data 1.\n\nb) Data 2."
+    )
+    repeated = RegulatoryChunker(min_chunk_chars=0).chunk_text(
+        text, source_file="sozlesme.md"
+    )
+    assert [chunk.metadata.chunk_id for chunk in repeated.chunks] == [
+        chunk.metadata.chunk_id for chunk in doc.chunks
+    ]
+
+
+def test_hierarchical_multipass_skips_subtree_over_character_budget() -> None:
+    long_clause = "veri işleme koşulu " * 14
+    text = f"""ULUSLARARASI SÖZLEŞME
+
+MADDE 1 - Bu sözleşmede aşağıdaki veriler işlenir:
+
+a) {long_clause}
+
+b) {long_clause}
+"""
+
+    doc = RegulatoryChunker(max_chunk_chars=500, min_chunk_chars=0).chunk_text(
+        text, source_file="sozlesme.md"
+    )
+
+    assert len(doc.chunks) == 2
+    assert all(chunk.metadata.chunk_variant == "atomic" for chunk in doc.chunks)
+    assert all(len(chunk.text) <= 500 for chunk in doc.chunks)
+
+
+def test_hierarchical_multipass_never_combines_sibling_articles() -> None:
+    text = """ULUSLARARASI SÖZLEŞME
+
+MADDE 1 - Birinci grupta:
+
+a) Birinci veri.
+
+b) İkinci veri.
+
+MADDE 2 - İkinci grupta:
+
+a) Üçüncü veri.
+
+b) Dördüncü veri.
+"""
+
+    doc = RegulatoryChunker(min_chunk_chars=0).chunk_text(
+        text, source_file="sozlesme.md"
+    )
+
+    aggregates = [
+        chunk
+        for chunk in doc.chunks
+        if chunk.metadata.chunk_variant == "hierarchical_aggregate"
+    ]
+    assert len(aggregates) == 2
+    assert all(len(chunk.metadata.source_chunk_orders) == 2 for chunk in aggregates)
+    assert "MADDE 2" not in aggregates[0].text
+    assert "MADDE 1" not in aggregates[1].text

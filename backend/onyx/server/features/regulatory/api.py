@@ -30,8 +30,10 @@ from onyx.db.regulatory_amendments import (
 )
 from onyx.db.regulatory_chunks import (
     ValidityDateUpdate,
+    delete_hierarchical_aggregates_referencing_chunk,
     get_chunk_by_id,
     get_chunks_for_file,
+    is_hierarchical_aggregate_chunk,
     update_chunk,
     update_file_validity_window,
 )
@@ -103,6 +105,12 @@ def patch_chunk(
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found")
     user_file = _get_owned_user_file(db_session, chunk.user_file_id, user)
 
+    if is_hierarchical_aggregate_chunk(chunk):
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Derived aggregate chunks cannot be edited directly.",
+        )
+
     if update_request.text is not None and not update_request.text.strip():
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, "Chunk text cannot be emptied")
 
@@ -125,6 +133,11 @@ def patch_chunk(
         )
     )
 
+    delete_hierarchical_aggregates_referencing_chunk(
+        db_session,
+        user_file_id=chunk.user_file_id,
+        source_chunk_id=chunk.id,
+    )
     update_chunk(
         chunk,
         text=update_request.text,

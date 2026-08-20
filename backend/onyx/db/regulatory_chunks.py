@@ -21,6 +21,10 @@ from sqlalchemy.orm import Session
 
 from onyx.db.enums import RegulatoryChunkSource, RegulatoryChunkStatus
 from onyx.db.models import RegulatoryChunk, UserFile
+from onyx.regulatory.chunker import (
+    ATOMIC_CHUNK_VARIANT,
+    HIERARCHICAL_AGGREGATE_CHUNK_VARIANT,
+)
 from onyx.regulatory.chunker import RegulatoryChunk as ChunkerChunk
 from onyx.regulatory.heading_path import (
     RegulatoryProvisionReference,
@@ -2212,17 +2216,36 @@ def replace_indexed_chunks_for_file(
         )
     )
 
+    chunk_by_order = {chunk.metadata.chunk_order: chunk for chunk in chunker_chunks}
+    if len(chunk_by_order) != len(chunker_chunks):
+        raise ValueError("regulatory chunks contain duplicate positions")
+    chunk_id_by_order = {
+        order: make_regulatory_chunk_id(user_file_id, order, chunk.text)
+        for order, chunk in chunk_by_order.items()
+    }
+
     rows: list[RegulatoryChunk] = []
     for chunk in chunker_chunks:
         meta = chunk.metadata
+        stored_metadata = meta.to_storage_dict()
+        source_regulatory_chunk_ids: list[str] = []
+        if meta.chunk_variant == HIERARCHICAL_AGGREGATE_CHUNK_VARIANT:
+            for source_order in meta.source_chunk_orders:
+                source_chunk = chunk_by_order.get(source_order)
+                if source_chunk is None:
+                    raise ValueError("aggregate references an unknown source chunk")
+                if source_chunk.metadata.chunk_variant != ATOMIC_CHUNK_VARIANT:
+                    raise ValueError("aggregate source chunk must be atomic")
+                source_regulatory_chunk_ids.append(chunk_id_by_order[source_order])
+        stored_metadata["source_regulatory_chunk_ids"] = source_regulatory_chunk_ids
         row = RegulatoryChunk(
-            id=make_regulatory_chunk_id(user_file_id, meta.chunk_order, chunk.text),
+            id=chunk_id_by_order[meta.chunk_order],
             user_file_id=user_file_id,
             text=chunk.text,
             position=meta.chunk_order,
             chunk_type=meta.chunk_type,
             heading_path=list(meta.heading_path),
-            chunk_metadata=meta.to_storage_dict(),
+            chunk_metadata=stored_metadata,
             status=RegulatoryChunkStatus.ACTIVE.value,
             source=RegulatoryChunkSource.INDEXED.value,
             validity_start_date=(
@@ -2265,6 +2288,43 @@ def has_regulatory_chunks_for_file(db_session: Session, user_file_id: UUID) -> b
 
 def get_chunk_by_id(db_session: Session, chunk_id: str) -> RegulatoryChunk | None:
     return db_session.get(RegulatoryChunk, chunk_id)
+
+
+def is_hierarchical_aggregate_chunk(chunk: RegulatoryChunk) -> bool:
+    return (
+        chunk.chunk_type == HIERARCHICAL_AGGREGATE_CHUNK_VARIANT
+        or chunk.chunk_metadata.get("chunk_variant")
+        == HIERARCHICAL_AGGREGATE_CHUNK_VARIANT
+    )
+
+
+def delete_hierarchical_aggregates_referencing_chunk(
+    db_session: Session,
+    *,
+    user_file_id: UUID,
+    source_chunk_id: str,
+) -> int:
+    """Remove stale derived rows before an atomic source row is mutated."""
+
+    candidates = list(
+        db_session.scalars(
+            select(RegulatoryChunk)
+            .where(
+                RegulatoryChunk.user_file_id == user_file_id,
+                RegulatoryChunk.chunk_type == HIERARCHICAL_AGGREGATE_CHUNK_VARIANT,
+            )
+            .with_for_update()
+        ).all()
+    )
+    affected = [
+        candidate
+        for candidate in candidates
+        if source_chunk_id
+        in candidate.chunk_metadata.get("source_regulatory_chunk_ids", [])
+    ]
+    for candidate in affected:
+        db_session.delete(candidate)
+    return len(affected)
 
 
 def update_chunk(

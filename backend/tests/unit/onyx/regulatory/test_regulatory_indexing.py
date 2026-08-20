@@ -1,6 +1,16 @@
+from typing import cast
 from unittest.mock import MagicMock
+from uuid import UUID
 
+from sqlalchemy.orm import Session
+
+from onyx.db.regulatory_chunks import (
+    delete_hierarchical_aggregates_referencing_chunk,
+    replace_indexed_chunks_for_file,
+)
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
+from onyx.natural_language_processing.utils import BaseTokenizer
+from onyx.regulatory.chunker import RegulatoryChunker
 from onyx.regulatory.indexing import RegulatoryIndexingChunker
 
 
@@ -19,7 +29,7 @@ class _OneCharacterPerTokenTokenizer:
 def test_contextual_regulatory_chunking_reserves_embedding_space() -> None:
     chunker = RegulatoryIndexingChunker(
         db_session=MagicMock(),
-        tokenizer=_CharacterTokenizer(),  # type: ignore[arg-type]
+        tokenizer=cast(BaseTokenizer, _CharacterTokenizer()),
         enable_contextual_rag=True,
     )
     text = "Madde 1 - Genel hükümler\n\n" + "\n\n".join(
@@ -43,7 +53,7 @@ def test_contextual_regulatory_chunking_reserves_embedding_space() -> None:
 def test_unsplittable_oversized_legal_line_keeps_text_and_skips_context() -> None:
     chunker = RegulatoryIndexingChunker(
         db_session=MagicMock(),
-        tokenizer=_CharacterTokenizer(),  # type: ignore[arg-type]
+        tokenizer=cast(BaseTokenizer, _CharacterTokenizer()),
         enable_contextual_rag=True,
     )
 
@@ -61,7 +71,7 @@ def test_unsplittable_oversized_legal_line_keeps_text_and_skips_context() -> Non
 def test_minimum_structural_chunk_uses_remaining_embedding_capacity() -> None:
     chunker = RegulatoryIndexingChunker(
         db_session=MagicMock(),
-        tokenizer=_OneCharacterPerTokenTokenizer(),  # type: ignore[arg-type]
+        tokenizer=cast(BaseTokenizer, _OneCharacterPerTokenTokenizer()),
         enable_contextual_rag=True,
     )
     text = "\n\n".join(
@@ -86,7 +96,7 @@ def test_minimum_structural_chunk_uses_remaining_embedding_capacity() -> None:
 def test_single_chunk_document_does_not_spend_contextual_llm_call() -> None:
     chunker = RegulatoryIndexingChunker(
         db_session=MagicMock(),
-        tokenizer=_CharacterTokenizer(),  # type: ignore[arg-type]
+        tokenizer=cast(BaseTokenizer, _CharacterTokenizer()),
         enable_contextual_rag=True,
     )
 
@@ -103,7 +113,7 @@ def test_single_chunk_document_does_not_spend_contextual_llm_call() -> None:
 def test_non_contextual_regulatory_chunking_preserves_existing_size() -> None:
     chunker = RegulatoryIndexingChunker(
         db_session=MagicMock(),
-        tokenizer=_CharacterTokenizer(),  # type: ignore[arg-type]
+        tokenizer=cast(BaseTokenizer, _CharacterTokenizer()),
         enable_contextual_rag=False,
     )
 
@@ -120,7 +130,7 @@ def test_non_contextual_regulatory_chunking_preserves_existing_size() -> None:
 def test_one_oversized_chunk_does_not_disable_context_for_eligible_siblings() -> None:
     chunker = RegulatoryIndexingChunker(
         db_session=MagicMock(),
-        tokenizer=_OneCharacterPerTokenTokenizer(),  # type: ignore[arg-type]
+        tokenizer=cast(BaseTokenizer, _OneCharacterPerTokenTokenizer()),
         enable_contextual_rag=True,
     )
     text = (
@@ -140,3 +150,54 @@ def test_one_oversized_chunk_does_not_disable_context_for_eligible_siblings() ->
     assert len(reserved) == len(chunked.chunks)
     assert 0 in reserved
     assert any(value >= 32 for value in reserved)
+
+
+def test_persisted_aggregate_metadata_resolves_atomic_regulatory_chunk_ids() -> None:
+    chunked = RegulatoryChunker(min_chunk_chars=0).chunk_text(
+        """ULUSLARARASI SÖZLEŞME
+
+MADDE 1 - Bu sözleşmede aşağıdaki veriler işlenir:
+
+a) Data 1.
+
+b) Data 2.
+""",
+        source_file="sozlesme.md",
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.execute.return_value.all.return_value = []
+
+    rows = replace_indexed_chunks_for_file(
+        db_session,
+        UUID("00000000-0000-0000-0000-000000000123"),
+        chunked.chunks,
+    )
+
+    assert len(rows) == 3
+    assert rows[0].chunk_metadata["chunk_variant"] == "atomic"
+    assert rows[1].chunk_metadata["chunk_variant"] == "atomic"
+    assert rows[2].chunk_metadata["chunk_variant"] == "hierarchical_aggregate"
+    assert rows[2].chunk_metadata["source_regulatory_chunk_ids"] == [
+        rows[0].id,
+        rows[1].id,
+    ]
+
+
+def test_atomic_mutation_deletes_only_aggregates_that_reference_it() -> None:
+    affected = MagicMock()
+    affected.chunk_metadata = {
+        "source_regulatory_chunk_ids": ["source-chunk", "sibling-chunk"]
+    }
+    unaffected = MagicMock()
+    unaffected.chunk_metadata = {"source_regulatory_chunk_ids": ["different-chunk"]}
+    db_session = MagicMock(spec=Session)
+    db_session.scalars.return_value.all.return_value = [affected, unaffected]
+
+    deleted_count = delete_hierarchical_aggregates_referencing_chunk(
+        db_session,
+        user_file_id=UUID("00000000-0000-0000-0000-000000000123"),
+        source_chunk_id="source-chunk",
+    )
+
+    assert deleted_count == 1
+    db_session.delete.assert_called_once_with(affected)

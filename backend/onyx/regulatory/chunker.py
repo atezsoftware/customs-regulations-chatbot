@@ -14,14 +14,29 @@ import re
 import unicodedata
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
 
 # Bump whenever parser or structural chunk-boundary semantics change. Durable
 # jobs persist this identity so a process restart cannot silently reinterpret
 # an immutable input revision with different chunk-generation semantics.
-REGULATORY_CHUNKER_CODE_VERSION = "1"
+REGULATORY_CHUNKER_CODE_VERSION = "2"
+
+ATOMIC_CHUNK_VARIANT = "atomic"
+HIERARCHICAL_AGGREGATE_CHUNK_VARIANT = "hierarchical_aggregate"
+ChunkVariant = Literal["atomic", "hierarchical_aggregate"]
+
+_HIERARCHICAL_AGGREGATE_NODE_TYPES = frozenset(
+    {
+        "article",
+        "paragraph",
+        "clause",
+        "subclause",
+        "numbered_section",
+        "dotted_section",
+    }
+)
 
 _DATE_DMY_RE = re.compile(r"(?<!\d)(\d{1,2})[./](\d{1,2})[./](\d{4})(?!\d)")
 _DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)")
@@ -256,6 +271,10 @@ class ChunkMetadata:
     parent_ids: list[str]
     parent_path: list[str]
     heading_path: list[str]
+    chunk_variant: ChunkVariant = ATOMIC_CHUNK_VARIANT
+    source_chunk_orders: list[int] = field(default_factory=list)
+    hierarchy_root_id: str | None = None
+    hierarchy_root_path: list[str] = field(default_factory=list)
     article_no: str | None = None
     article_title: str | None = None
     paragraph_no: str | None = None
@@ -284,6 +303,10 @@ class ChunkMetadata:
             "document_number": self.document_number,
             "document_type": self.document_type,
             "heading_path": self.heading_path,
+            "chunk_variant": self.chunk_variant,
+            "source_chunk_orders": self.source_chunk_orders,
+            "hierarchy_root_id": self.hierarchy_root_id,
+            "hierarchy_root_path": self.hierarchy_root_path,
             "article_no": self.article_no,
             "article_title": self.article_title,
             "paragraph_no": self.paragraph_no,
@@ -428,7 +451,77 @@ class RegulatoryChunker:
             if non_empty_drafts:
                 chunks.append(self._finalize_chunk(non_empty_drafts[0], metadata, 0))
 
+        chunks.extend(
+            self._build_hierarchical_aggregate_chunks(
+                atomic_chunks=chunks,
+                structure=structure,
+                blocks=blocks,
+                metadata=metadata,
+            )
+        )
+
         return chunks, structure
+
+    def _build_hierarchical_aggregate_chunks(
+        self,
+        *,
+        atomic_chunks: list[RegulatoryChunk],
+        structure: list[StructureNode],
+        blocks: list[SourceBlock],
+        metadata: DocumentMetadata,
+    ) -> list[RegulatoryChunk]:
+        """Add bounded legal-unit subtrees without replacing atomic chunks."""
+
+        if len(atomic_chunks) < 2:
+            return []
+
+        aggregate_candidates: dict[
+            tuple[int, ...], tuple[StructureNode, list[RegulatoryChunk]]
+        ] = {}
+        for node in structure:
+            if node.node_type not in _HIERARCHICAL_AGGREGATE_NODE_TYPES:
+                continue
+            source_chunks = [
+                chunk
+                for chunk in atomic_chunks
+                if node.node_id in chunk.metadata.parent_ids
+            ]
+            if len(source_chunks) < 2:
+                continue
+            source_orders = tuple(chunk.metadata.chunk_order for chunk in source_chunks)
+            current = aggregate_candidates.get(source_orders)
+            if current is None or node.level > current[0].level:
+                aggregate_candidates[source_orders] = (node, source_chunks)
+
+        ordered_candidates = sorted(
+            aggregate_candidates.values(),
+            key=lambda candidate: (
+                candidate[1][0].metadata.chunk_order,
+                candidate[0].order,
+            ),
+        )
+        aggregates: list[RegulatoryChunk] = []
+        block_by_id = {block.block_id: block for block in blocks}
+        for node, source_chunks in ordered_candidates:
+            aggregate_text = _hierarchical_aggregate_text(node, source_chunks)
+            if len(aggregate_text) > self.max_chunk_chars:
+                continue
+            order = len(atomic_chunks) + len(aggregates)
+            aggregates.append(
+                _finalize_hierarchical_aggregate(
+                    node=node,
+                    root_source_block=(
+                        block_by_id.get(node.source_block)
+                        if node.source_block is not None
+                        else None
+                    ),
+                    source_chunks=source_chunks,
+                    text=aggregate_text,
+                    metadata=metadata,
+                    order=order,
+                )
+            )
+        return aggregates
 
     def _build_drafts(
         self, blocks: list[SourceBlock], *, metadata: DocumentMetadata
@@ -2080,6 +2173,89 @@ def _fold_text(text: str) -> str:
 
 def _draft_text(draft: _ChunkDraft) -> str:
     return _blocks_text(draft.blocks)
+
+
+def _hierarchical_aggregate_text(
+    node: StructureNode,
+    source_chunks: list[RegulatoryChunk],
+) -> str:
+    parts = [chunk.text.strip() for chunk in source_chunks if chunk.text.strip()]
+    folded_root_label = _fold_text(node.label).strip()
+    root_is_present = any(
+        folded_root_label and folded_root_label in _fold_text(part) for part in parts
+    )
+    if node.label.strip() and not root_is_present:
+        parts.insert(0, node.label.strip())
+    return "\n\n".join(parts)
+
+
+def _finalize_hierarchical_aggregate(
+    *,
+    node: StructureNode,
+    root_source_block: SourceBlock | None,
+    source_chunks: list[RegulatoryChunk],
+    text: str,
+    metadata: DocumentMetadata,
+    order: int,
+) -> RegulatoryChunk:
+    first_metadata = source_chunks[0].metadata
+    try:
+        root_index = first_metadata.parent_ids.index(node.node_id)
+    except ValueError as error:
+        raise ValueError(
+            "aggregate root is absent from source chunk hierarchy"
+        ) from error
+
+    hierarchy_root_ids = list(first_metadata.parent_ids[: root_index + 1])
+    hierarchy_root_path = list(first_metadata.parent_path[: root_index + 1])
+    source_chunk_orders = [chunk.metadata.chunk_order for chunk in source_chunks]
+    aggregate_id = _stable_id(
+        "chunk",
+        (
+            f"{metadata.source_path}:{HIERARCHICAL_AGGREGATE_CHUNK_VARIANT}:"
+            f"{node.node_id}:{','.join(str(value) for value in source_chunk_orders)}"
+        ),
+    )
+    aggregate_metadata = replace(
+        first_metadata,
+        chunk_id=aggregate_id,
+        chunk_type=HIERARCHICAL_AGGREGATE_CHUNK_VARIANT,
+        chunk_order=order,
+        parent_id=node.node_id,
+        parent_ids=hierarchy_root_ids,
+        parent_path=hierarchy_root_path,
+        heading_path=hierarchy_root_path,
+        chunk_variant=HIERARCHICAL_AGGREGATE_CHUNK_VARIANT,
+        source_chunk_orders=source_chunk_orders,
+        hierarchy_root_id=node.node_id,
+        hierarchy_root_path=hierarchy_root_path,
+        paragraph_no=(
+            first_metadata.paragraph_no
+            if node.node_type in {"paragraph", "numbered_section", "dotted_section"}
+            else None
+        ),
+        clause_label=(
+            first_metadata.clause_label if node.node_type == "clause" else None
+        ),
+        subclause_label=(
+            first_metadata.subclause_label if node.node_type == "subclause" else None
+        ),
+        table_index=None,
+        table_row_index=None,
+        source_start_char=min(
+            *[chunk.metadata.source_start_char for chunk in source_chunks],
+            *([root_source_block.start_char] if root_source_block is not None else []),
+        ),
+        source_end_char=max(chunk.metadata.source_end_char for chunk in source_chunks),
+        source_start_block=min(
+            *[chunk.metadata.source_start_block for chunk in source_chunks],
+            *([root_source_block.block_id] if root_source_block is not None else []),
+        ),
+        source_end_block=max(
+            chunk.metadata.source_end_block for chunk in source_chunks
+        ),
+    )
+    return RegulatoryChunk(text=text, metadata=aggregate_metadata)
 
 
 def _blocks_text(blocks: list[SourceBlock]) -> str:

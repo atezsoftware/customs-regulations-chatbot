@@ -18,7 +18,12 @@ from onyx.db.models import (
     AmendmentProposal,
     RegulatoryChunk,
 )
-from onyx.db.regulatory_chunks import make_regulatory_chunk_id
+from onyx.db.regulatory_chunks import (
+    delete_hierarchical_aggregates_referencing_chunk,
+    is_hierarchical_aggregate_chunk,
+    make_regulatory_chunk_id,
+)
+from onyx.regulatory.chunker import ATOMIC_CHUNK_VARIANT
 
 
 def create_batch(
@@ -168,6 +173,13 @@ def approve_amendment_proposal(
                 f"Old chunk {proposal.old_chunk_id} is already "
                 f"{old_chunk.status}; cannot approve."
             )
+        if old_chunk is not None and is_hierarchical_aggregate_chunk(old_chunk):
+            raise ValueError("Derived aggregate chunks cannot be amended directly.")
+
+    new_chunk_metadata = dict(draft.get("metadata") or {})
+    new_chunk_metadata.setdefault("chunk_variant", ATOMIC_CHUNK_VARIANT)
+    new_chunk_metadata.setdefault("source_chunk_orders", [])
+    new_chunk_metadata.setdefault("source_regulatory_chunk_ids", [])
 
     new_chunk_id = make_regulatory_chunk_id(
         user_file_id, draft["position"], draft["text"]
@@ -179,7 +191,7 @@ def approve_amendment_proposal(
         position=draft["position"],
         chunk_type=draft.get("chunk_type"),
         heading_path=draft.get("heading_path") or [],
-        chunk_metadata=draft.get("metadata") or {},
+        chunk_metadata=new_chunk_metadata,
         status=RegulatoryChunkStatus.ACTIVE.value,
         source=RegulatoryChunkSource.AMENDMENT.value,
         validity_start_date=start_date,
@@ -190,6 +202,11 @@ def approve_amendment_proposal(
     db_session.flush()
 
     if old_chunk is not None:
+        delete_hierarchical_aggregates_referencing_chunk(
+            db_session,
+            user_file_id=user_file_id,
+            source_chunk_id=old_chunk.id,
+        )
         old_chunk.status = RegulatoryChunkStatus.SUPERSEDED.value
         old_chunk.validity_end_date = start_date
         old_chunk.superseded_by_chunk_id = new_chunk.id
