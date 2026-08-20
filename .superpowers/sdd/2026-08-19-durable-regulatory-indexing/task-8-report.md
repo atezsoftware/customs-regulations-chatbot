@@ -565,3 +565,92 @@ psql.dev.singlewindow.io` returned exit `2`; `onyx-api_server-1` was running but
 unhealthy; nginx ports `7000` and `7001` returned HTTP `200`. No attestation was
 fabricated, no live canary was started, and no production document, index,
 database/provider record, GCS object, or Vertex job was mutated.
+
+---
+
+## Task 8: breaker adjudication
+
+Both load-bearing findings were implemented without a production write,
+deployment, push, or merge.
+
+### RED/GREEN evidence
+
+- Operator/ownership RED was `5 failed, 36 deselected in 0.78s`: the standalone
+  preflight accepted a non-root operator, the helper accepted caller-selected
+  owner IDs and emitted the mapped caller identity, and the validation
+  container inherited that identity instead of the canonical app identity.
+  GREEN was `5 passed, 36 deselected in 0.58s`; the complete preflight/deploy
+  unit file then passed `41 passed in 6.43s` before cleanup cases were added.
+- The canonical preflight now fails before Docker unless `EUID=0`. Its
+  stdlib-only helper also requires effective UID/GID `0:0`, opens and validates the
+  original sources against exact `1001:1001` plus `0600`/`0400`, creates each
+  snapshot exclusively in the root-owned mode-`0700` directory, then performs
+  descriptor-owned `fchown(1001, 1001)`, `fchmod(0600)`, `fsync`, and final
+  descriptor metadata/size verification. It emits neither evidence nor an
+  operator-derived identity. The runtime validator is always launched with
+  `--user 1001:1001`. The deploy wrapper grants `sudo` only to this bounded
+  preflight subprocess; rollout commands continue under the operator identity.
+  The runbook's exact preflight commands use `sudo --` and explicitly forbid
+  `sudo -E` or environment/secret printing.
+- The bounded-sudo integration exposed one topology guard that otherwise would
+  have been stripped by ordinary `sudo`: RED was `1 failed, 44 deselected in
+  0.56s` because an operator `COMPOSE_PROFILES` value reached deployment after
+  the root preflight no longer saw it. GREEN was `1 passed, 44 deselected in
+  0.05s`; the unprivileged wrapper now rejects this non-secret control before
+  sudo, while the root preflight still rejects it in its own environment and
+  in the selected `.env`.
+- Exact-cleanup RED was `5 failed, 39 deselected in 1.19s`: preflight still used
+  a guessed name, had no private cidfile or ownership label, swallowed cleanup
+  ownership/removal errors, and did not verify exact-ID absence. GREEN was
+  `5 passed, 39 deselected in 1.29s`; the final complete unit file is
+  `45 passed in 9.85s`.
+- Preflight now creates a cryptographically random 64-hex ownership token and
+  passes it as the `io.regulatory.readiness-preflight-owner` label. Docker alone
+  writes the cidfile inside the private snapshot directory. Cleanup accepts
+  only a 64-hex ID read from that private file, queries that exact full ID,
+  verifies the exact token before `docker rm -f`, and then proves the same ID is
+  absent. There is no `--name` and no name-based deletion. A label mismatch
+  leaves the unrelated container untouched and reports failure; a forced
+  removal failure changes an otherwise successful preflight to nonzero with a
+  controlled diagnostic. When validation already failed, its original message
+  remains visible alongside any cleanup failure. Normal cleanup removes the
+  cidfile, two snapshots, and private directory.
+- The real-timeout regression initially failed `1 failed, 3 deselected in
+  44.57s` because its injection did not yet keep the validation container
+  alive. GREEN was `1 passed, 3 deselected in 75.87s`: the isolated runtime
+  process ignores `TERM`, forcing the five-second kill grace and the cidfile
+  cleanup path; the exact ID appears in the removal command and a subsequent
+  Docker inspect proves it absent.
+
+### Privileged/runtime proof
+
+The disposable operator test derives a test-only image from the exact
+`runtime-lite` target, runs the canonical preflight as root with the local
+Docker socket, and uses original host-visible files whose real numeric metadata
+is `1001:1001`. A distinct UID/GID `2002:2002` direct invocation first fails
+before Docker. The root invocation succeeds, and the actual inner Docker run
+uses `--user 1001:1001`; a final-component host symlink fails before any inner
+run. The same module retains the Supervisor root startup and canonical socket
+`1001:1001`/`0770` app-user allow/unrelated-user deny proof. With the forced
+timeout cleanup case, the complete module passed `4 passed in 92.62s`. Every
+test-only container, probe directory, and image tag was removed.
+
+### Verification and live limit
+
+- Focused readiness, executable preflight/deploy, and Supervisor/Compose
+  wiring: final repeat `103 passed in 14.70s`.
+- Broad regulatory, user-file, Vertex, and runtime unit superset:
+  `871 passed in 23.62s`.
+- Ruff, Ruff formatting, `ty`, and `bash -n` passed. Host `shellcheck` remains
+  unavailable; the repository pre-commit shellcheck hook passed. The complete
+  touched-file pre-commit run passed all applicable hooks, including lazy
+  imports, `ty`, Ruff, Ruff formatting, shellcheck, large-file, and ripsecrets.
+- No durable pipeline/repository code changed in this adjudication, so the
+  immediately preceding unchanged PostgreSQL 15.2/Elasticsearch 9.4.2 evidence
+  remains `36 passed in 44.22s` with zero provider, pipeline, and index residue.
+
+The live read-only check remains blocked: private PostgreSQL DNS returned exit
+`2`, `onyx-api_server-1` was up but unhealthy, and nginx ports `7000` and `7001`
+returned HTTP `200`. No trusted live attestation was fabricated, no root
+preflight was run against unapproved evidence, and no live canary or production
+mutation was attempted.

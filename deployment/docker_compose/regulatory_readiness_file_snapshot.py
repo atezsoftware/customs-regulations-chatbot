@@ -13,6 +13,8 @@ _ATTESTATION_MAX_BYTES = 64 * 1024
 _EVIDENCE_MAX_BYTES = 4 * 1024 * 1024
 _ATTESTATION_SNAPSHOT = "regulatory-capabilities.json"
 _EVIDENCE_SNAPSHOT = "regulatory-capability-evidence.json"
+_READINESS_UID = 1001
+_READINESS_GID = 1001
 
 
 class SnapshotError(RuntimeError):
@@ -101,8 +103,8 @@ def _open_snapshot_directory(path: Path) -> int:
         if (
             not stat.S_ISDIR(metadata.st_mode)
             or stat.S_IMODE(metadata.st_mode) != 0o700
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_gid != os.getegid()
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
         ):
             raise SnapshotError("snapshot directory is not private")
     except BaseException:
@@ -133,8 +135,9 @@ def _write_snapshot(directory_descriptor: int, name: str, contents: bytes) -> No
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_gid != os.getegid()
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
         ):
             raise SnapshotError("snapshot identity is invalid")
         offset = 0
@@ -143,8 +146,19 @@ def _write_snapshot(directory_descriptor: int, name: str, contents: bytes) -> No
             if written <= 0:
                 raise SnapshotError("snapshot write failed")
             offset += written
+        os.fchown(descriptor, _READINESS_UID, _READINESS_GID)
         os.fchmod(descriptor, 0o600)
         os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != _READINESS_UID
+            or metadata.st_gid != _READINESS_GID
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_size != len(contents)
+        ):
+            raise SnapshotError("snapshot ownership handoff failed")
     except OSError as error:
         raise SnapshotError("snapshot write failed") from error
     finally:
@@ -162,22 +176,19 @@ def _snapshot_sources(
     attestation_path: Path,
     evidence_path: Path,
     snapshot_directory: Path,
-    *,
-    expected_owner_uid: int,
-    expected_owner_gid: int,
 ) -> None:
     attestation = _read_source(
         attestation_path,
         expected_mode=0o600,
-        expected_owner_uid=expected_owner_uid,
-        expected_owner_gid=expected_owner_gid,
+        expected_owner_uid=_READINESS_UID,
+        expected_owner_gid=_READINESS_GID,
         maximum_size=_ATTESTATION_MAX_BYTES,
     )
     evidence = _read_source(
         evidence_path,
         expected_mode=0o400,
-        expected_owner_uid=expected_owner_uid,
-        expected_owner_gid=expected_owner_gid,
+        expected_owner_uid=_READINESS_UID,
+        expected_owner_gid=_READINESS_GID,
         maximum_size=_EVIDENCE_MAX_BYTES,
     )
     if (attestation.device, attestation.inode) == (evidence.device, evidence.inode):
@@ -206,28 +217,6 @@ def _snapshot_sources(
         os.close(directory_descriptor)
 
 
-def _outer_namespace_id(inner_id: int, map_path: Path) -> int:
-    try:
-        mappings = map_path.read_text(encoding="ascii").splitlines()
-    except OSError as error:
-        raise SnapshotError("namespace mapping is unavailable") from error
-    for mapping in mappings:
-        fields = mapping.split()
-        if len(fields) != 3:
-            raise SnapshotError("namespace mapping is invalid")
-        inside_start, outside_start, length = (int(field) for field in fields)
-        if inside_start <= inner_id < inside_start + length:
-            return outside_start + inner_id - inside_start
-    raise SnapshotError("snapshot owner is not mapped to the Docker host")
-
-
-def _nonnegative_integer(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be non-negative")
-    return parsed
-
-
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create private descriptor-validated readiness snapshots.",
@@ -235,39 +224,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--attestation", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--snapshot-directory", type=Path, required=True)
-    parser.add_argument(
-        "--expected-owner-uid",
-        type=_nonnegative_integer,
-        required=True,
-    )
-    parser.add_argument(
-        "--expected-owner-gid",
-        type=_nonnegative_integer,
-        required=True,
-    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
+    if os.geteuid() != 0 or os.getegid() != 0:
+        print("Readiness snapshot failed: helper must run as root", file=sys.stderr)
+        return 1
     args = _parse_args(argv)
     try:
         _snapshot_sources(
             args.attestation,
             args.evidence,
             args.snapshot_directory,
-            expected_owner_uid=args.expected_owner_uid,
-            expected_owner_gid=args.expected_owner_gid,
         )
-        host_uid = _outer_namespace_id(os.geteuid(), Path("/proc/self/uid_map"))
-        host_gid = _outer_namespace_id(os.getegid(), Path("/proc/self/gid_map"))
-    except (OSError, SnapshotError, ValueError):
+    except (OSError, SnapshotError):
         print(
             "Readiness snapshot failed: secure descriptor validation failed",
             file=sys.stderr,
         )
         return 1
 
-    print(f"{host_uid}:{host_gid}")
     return 0
 
 

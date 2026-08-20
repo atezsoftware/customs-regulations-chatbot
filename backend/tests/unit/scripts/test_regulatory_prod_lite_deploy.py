@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import subprocess
 import sys
 from pathlib import Path
@@ -184,6 +185,9 @@ def _fake_docker(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log_path = tmp_path / "docker.log"
+    readiness_state_path = tmp_path / "readiness-container.state"
+    readiness_label_path = tmp_path / "readiness-container.label"
+    readiness_cid = "9" * 64
     config_path = tmp_path / "config.json"
     evidence_path = tmp_path / "regulatory-capability-evidence.json"
     evidence_bytes = b'{"approved":true}\n'
@@ -229,12 +233,42 @@ if [[ "${1:-}" == "ps" ]]; then
   command cat "$FAKE_DOCKER_INVENTORY"
   exit 0
 fi
+if [[ "${1:-} ${2:-}" == "container ls" ]]; then
+  if [[ -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
+    exec "$FAKE_REAL_DOCKER" "$@"
+  fi
+  if [[ -f "$FAKE_READINESS_STATE" ]]; then
+    printf '%s\\n' "$FAKE_READINESS_CID"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == "inspect" && " $* " == *" --type container "* ]]; then
+  if [[ -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
+    exec "$FAKE_REAL_DOCKER" "$@"
+  fi
+  [[ -f "$FAKE_READINESS_STATE" ]] || exit 1
+  if [[ -n "$FAKE_CLEANUP_LABEL_OVERRIDE" ]]; then
+    printf '%s\\n' "$FAKE_CLEANUP_LABEL_OVERRIDE"
+  else
+    command cat "$FAKE_READINESS_LABEL"
+  fi
+  exit 0
+fi
 if [[ "${1:-}" == "inspect" ]]; then
   printf '%s\\n' 'sha256:7777777777777777777777777777777777777777777777777777777777777777'
   exit 0
 fi
-if [[ "${1:-}" == "rm" && -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
-  exec "$FAKE_REAL_DOCKER" "$@"
+if [[ "${1:-}" == "rm" ]]; then
+  if [[ -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
+    exec "$FAKE_REAL_DOCKER" "$@"
+  fi
+  if [[ "$FAKE_DOCKER_RM_FAIL" == "true" ]]; then
+    exit 55
+  fi
+  if [[ "${3:-}" == "$FAKE_READINESS_CID" ]]; then
+    command rm -f -- "$FAKE_READINESS_STATE" "$FAKE_READINESS_LABEL"
+  fi
+  exit 0
 fi
 if [[ "${1:-}" == "run" && " $* " == *" --validate-capability-snapshots-only "* ]]; then
   if [[ -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
@@ -244,6 +278,42 @@ if [[ "${1:-}" == "run" && " $* " == *" --validate-capability-snapshots-only "* 
         arguments[$index]="$FAKE_REAL_RUNTIME_IMAGE"
       fi
     done
+    if [[ "$FAKE_REAL_RUNTIME_FORCE_TIMEOUT" == "true" ]]; then
+      adapted=()
+      skip_next=false
+      for index in "${!arguments[@]}"; do
+        if [[ "$skip_next" == "true" ]]; then
+          skip_next=false
+          continue
+        fi
+        if [[ "${arguments[$index]}" == "--security-opt" && \
+              "${arguments[$((index + 1))]:-}" == "no-new-privileges" && \
+              "$FAKE_REAL_RUNTIME_USE_SETPRIV_NNP" == "true" ]]; then
+          skip_next=true
+          continue
+        fi
+        if [[ "${arguments[$index]}" == "--entrypoint" ]]; then
+          adapted+=("--entrypoint")
+          if [[ "$FAKE_REAL_RUNTIME_USE_SETPRIV_NNP" == "true" ]]; then
+            adapted+=("/usr/bin/setpriv")
+          else
+            adapted+=("/bin/sh")
+          fi
+          skip_next=true
+          continue
+        fi
+        adapted+=("${arguments[$index]}")
+        if [[ "${arguments[$index]}" == "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
+          if [[ "$FAKE_REAL_RUNTIME_USE_SETPRIV_NNP" == "true" ]]; then
+            adapted+=("--no-new-privs" "/bin/sh" "-c" 'trap "" TERM; sleep 60')
+          else
+            adapted+=("-c" 'trap "" TERM; sleep 60')
+          fi
+          break
+        fi
+      done
+      exec "$FAKE_REAL_DOCKER" "${adapted[@]}"
+    fi
     if [[ "$FAKE_REAL_RUNTIME_USE_SETPRIV_NNP" == "true" ]]; then
       adapted=()
       skip_next=false
@@ -270,6 +340,24 @@ if [[ "${1:-}" == "run" && " $* " == *" --validate-capability-snapshots-only "* 
       arguments=("${adapted[@]}")
     fi
     exec "$FAKE_REAL_DOCKER" "${arguments[@]}"
+  fi
+  arguments=("$@")
+  cidfile=""
+  ownership_token=""
+  for index in "${!arguments[@]}"; do
+    case "${arguments[$index]}" in
+      --cidfile) cidfile=${arguments[$((index + 1))]:-} ;;
+      io.regulatory.readiness-preflight-owner=*)
+        ownership_token=${arguments[$index]#*=}
+        ;;
+    esac
+  done
+  [[ -n "$cidfile" && -n "$ownership_token" ]] || exit 56
+  printf '%s\\n' "$FAKE_READINESS_CID" >"$cidfile"
+  printf '%s\\n' "$ownership_token" >"$FAKE_READINESS_LABEL"
+  : >"$FAKE_READINESS_STATE"
+  if [[ -z "$FAKE_TIMEOUT_EXIT" && "$FAKE_READINESS_PERSISTS" != "true" ]]; then
+    command rm -f -- "$FAKE_READINESS_STATE" "$FAKE_READINESS_LABEL"
   fi
   exit 0
 fi
@@ -305,6 +393,22 @@ exit 0
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    fake_sudo = bin_dir / "sudo"
+    fake_sudo.write_text(
+        """#!/usr/bin/env bash
+set -eu
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+unset COMPOSE_PROFILES
+if ((EUID == 0)); then
+  exec "$@"
+fi
+exec unshare --user --map-root-user "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_sudo.chmod(0o755)
     if not use_real_snapshot_helper:
         fake_python = bin_dir / "python3"
         fake_python.write_text(
@@ -320,7 +424,6 @@ if [[ "${1:-}" == *"regulatory_readiness_file_snapshot.py" ]]; then
       --attestation) attestation=$2; shift 2 ;;
       --evidence) evidence=$2; shift 2 ;;
       --snapshot-directory) snapshot_directory=$2; shift 2 ;;
-      --expected-owner-uid | --expected-owner-gid) shift 2 ;;
       *) exit 2 ;;
     esac
   done
@@ -335,7 +438,6 @@ if [[ "${1:-}" == *"regulatory_readiness_file_snapshot.py" ]]; then
   command chmod 0600 \
     "$snapshot_directory/regulatory-capabilities.json" \
     "$snapshot_directory/regulatory-capability-evidence.json"
-  printf '%s:%s\n' "$(id -u)" "$(id -g)"
   exit 0
 fi
 exec /usr/bin/python3 "$@"
@@ -350,9 +452,6 @@ exec /usr/bin/python3 "$@"
             """#!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >>"$FAKE_TIMEOUT_LOG"
-if [[ -n "$FAKE_TIMEOUT_EXIT" && " $* " == *" docker run "* ]]; then
-  exit "$FAKE_TIMEOUT_EXIT"
-fi
 while (($#)); do
   case "$1" in
     --foreground | --kill-after=*) shift ;;
@@ -360,6 +459,10 @@ while (($#)); do
     *) exit 2 ;;
   esac
 done
+if [[ -n "$FAKE_TIMEOUT_EXIT" && "${1:-} ${2:-}" == "docker run" ]]; then
+  "$@"
+  exit "$FAKE_TIMEOUT_EXIT"
+fi
 exec "$@"
 """,
             encoding="utf-8",
@@ -433,10 +536,17 @@ exec /usr/bin/stat "$@"
             "FAKE_EVIDENCE_MODE": f"{evidence_mode:o}",
             "FAKE_TIMEOUT_EXIT": fake_timeout_exit,
             "FAKE_TIMEOUT_LOG": str(timeout_log),
+            "FAKE_READINESS_CID": readiness_cid,
+            "FAKE_READINESS_STATE": str(readiness_state_path),
+            "FAKE_READINESS_LABEL": str(readiness_label_path),
+            "FAKE_CLEANUP_LABEL_OVERRIDE": "",
+            "FAKE_DOCKER_RM_FAIL": "false",
+            "FAKE_READINESS_PERSISTS": "false",
             "FAKE_REAL_RUNTIME_IMAGE": real_runtime_image,
             "FAKE_REAL_RUNTIME_USE_SETPRIV_NNP": str(
                 real_runtime_use_setpriv_nnp
             ).lower(),
+            "FAKE_REAL_RUNTIME_FORCE_TIMEOUT": "false",
             "FAKE_REAL_DOCKER": "/usr/bin/docker",
             "_IMAGE": _IMAGE,
             "_MODEL_IMAGE": _MODEL_IMAGE,
@@ -447,10 +557,26 @@ exec /usr/bin/stat "$@"
 
 
 def _run(
-    script: Path, args: list[str], env: dict[str, str]
+    script: Path,
+    args: list[str],
+    env: dict[str, str],
+    *,
+    preflight_as_root: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    command = [str(script), *args]
+    if script == _PREFLIGHT:
+        if preflight_as_root and os.geteuid() != 0:
+            command = ["unshare", "--user", "--map-root-user", *command]
+        elif not preflight_as_root and os.geteuid() == 0:
+            command = [
+                "setpriv",
+                "--reuid=65534",
+                "--regid=65534",
+                "--clear-groups",
+                *command,
+            ]
     return subprocess.run(
-        [str(script), *args],
+        command,
         cwd=_COMPOSE_ROOT,
         env=env,
         capture_output=True,
@@ -459,25 +585,87 @@ def _run(
     )
 
 
-def _run_snapshot_helper(
+def _subordinate_id_start(path: Path, identity: int) -> int | None:
+    identity_names = {str(identity), pwd.getpwuid(identity).pw_name}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name, start, length = line.split(":")
+        if name in identity_names and int(length) > 1001:
+            return int(start)
+    return None
+
+
+def _run_snapshot_helper_as_namespace_root(
     attestation_path: Path,
     evidence_path: Path,
     snapshot_directory: Path,
 ) -> subprocess.CompletedProcess[str]:
+    probe = """
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+helper, attestation, evidence, snapshots = sys.argv[1:]
+attestation_path = Path(attestation)
+evidence_path = Path(evidence)
+snapshot_directory = Path(snapshots)
+os.chown(attestation_path, 1001, 1001)
+os.chown(evidence_path, 1001, 1001)
+result = subprocess.run(
+    [
+        sys.executable,
+        helper,
+        "--attestation",
+        attestation,
+        "--evidence",
+        evidence,
+        "--snapshot-directory",
+        snapshots,
+    ],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+observed = {}
+for path in snapshot_directory.iterdir():
+    metadata = path.stat()
+    observed[path.name] = {
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": metadata.st_mode & 0o777,
+        "matches_attestation": path.read_bytes() == attestation_path.read_bytes(),
+        "matches_evidence": path.read_bytes() == evidence_path.read_bytes(),
+    }
+print(json.dumps({
+    "returncode": result.returncode,
+    "stdout": result.stdout,
+    "stderr": result.stderr,
+    "snapshots": observed,
+}))
+"""
+    command = [sys.executable, "-c", probe]
+    if os.geteuid() != 0:
+        subordinate_uid = _subordinate_id_start(Path("/etc/subuid"), os.geteuid())
+        subordinate_gid = _subordinate_id_start(Path("/etc/subgid"), os.getegid())
+        if subordinate_uid is None or subordinate_gid is None:
+            pytest.skip("root handoff test requires subordinate uid/gid mappings")
+        command = [
+            "unshare",
+            "--user",
+            f"--map-users=0:{os.geteuid()}:1",
+            f"--map-users=1001:{subordinate_uid}:1",
+            f"--map-groups=0:{os.getegid()}:1",
+            f"--map-groups=1001:{subordinate_gid}:1",
+            *command,
+        ]
     return subprocess.run(
         [
-            sys.executable,
+            *command,
             str(_SNAPSHOT_HELPER),
-            "--attestation",
             str(attestation_path),
-            "--evidence",
             str(evidence_path),
-            "--snapshot-directory",
             str(snapshot_directory),
-            "--expected-owner-uid",
-            str(os.geteuid()),
-            "--expected-owner-gid",
-            str(os.getegid()),
         ],
         capture_output=True,
         text=True,
@@ -502,29 +690,36 @@ def test_readiness_snapshot_helper_copies_only_descriptor_validated_bytes(
     snapshot_directory = tmp_path / "snapshots"
     snapshot_directory.mkdir(mode=0o700)
 
-    result = _run_snapshot_helper(
+    result = _run_snapshot_helper_as_namespace_root(
         attestation_path,
         evidence_path,
         snapshot_directory,
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == f"{os.geteuid()}:{os.getegid()}\n"
-    assert "never-print" not in result.stdout
-    assert "never-print" not in result.stderr
-    snapshots = {path.name: path for path in snapshot_directory.iterdir()}
-    assert set(snapshots) == {
+    observed = json.loads(result.stdout)
+    assert observed["returncode"] == 0, observed["stderr"]
+    assert observed["stdout"] == ""
+    assert "never-print" not in observed["stdout"]
+    assert "never-print" not in observed["stderr"]
+    assert set(observed["snapshots"]) == {
         "regulatory-capabilities.json",
         "regulatory-capability-evidence.json",
     }
-    assert snapshots["regulatory-capabilities.json"].read_bytes() == attestation_bytes
-    assert (
-        snapshots["regulatory-capability-evidence.json"].read_bytes() == evidence_bytes
-    )
-    assert snapshots["regulatory-capabilities.json"].stat().st_mode & 0o777 == 0o600
-    assert (
-        snapshots["regulatory-capability-evidence.json"].stat().st_mode & 0o777 == 0o600
-    )
+    assert observed["snapshots"]["regulatory-capabilities.json"] == {
+        "uid": 1001,
+        "gid": 1001,
+        "mode": 0o600,
+        "matches_attestation": True,
+        "matches_evidence": False,
+    }
+    assert observed["snapshots"]["regulatory-capability-evidence.json"] == {
+        "uid": 1001,
+        "gid": 1001,
+        "mode": 0o600,
+        "matches_attestation": False,
+        "matches_evidence": True,
+    }
     assert sibling_secret.read_text(encoding="utf-8") == "must-not-be-read"
 
 
@@ -542,16 +737,53 @@ def test_readiness_snapshot_helper_rejects_final_component_symlink(
     snapshot_directory = tmp_path / "snapshots"
     snapshot_directory.mkdir(mode=0o700)
 
-    result = _run_snapshot_helper(
+    result = _run_snapshot_helper_as_namespace_root(
         attestation_path,
         evidence_path,
         snapshot_directory,
     )
 
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["returncode"] == 1
+    assert "secure descriptor validation" in observed["stderr"]
+    assert "symlink-target-never-print" not in observed["stdout"]
+    assert "symlink-target-never-print" not in observed["stderr"]
+    assert observed["snapshots"] == {}
+
+
+def test_readiness_snapshot_helper_rejects_non_root_operator(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip(
+            "non-root helper contract is covered by the privileged runtime test"
+        )
+    attestation_path = tmp_path / "capability-attestation.json"
+    attestation_path.write_bytes(b'{"schema_version":1}\n')
+    attestation_path.chmod(0o600)
+    evidence_path = tmp_path / "capability-evidence.json"
+    evidence_path.write_bytes(b'{"approved":true}\n')
+    evidence_path.chmod(0o400)
+    snapshot_directory = tmp_path / "snapshots"
+    snapshot_directory.mkdir(mode=0o700)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_SNAPSHOT_HELPER),
+            "--attestation",
+            str(attestation_path),
+            "--evidence",
+            str(evidence_path),
+            "--snapshot-directory",
+            str(snapshot_directory),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
     assert result.returncode == 1
-    assert "secure descriptor validation" in result.stderr
-    assert "symlink-target-never-print" not in result.stdout
-    assert "symlink-target-never-print" not in result.stderr
+    assert "must run as root" in result.stderr
     assert list(snapshot_directory.iterdir()) == []
 
 
@@ -641,6 +873,37 @@ def test_preflight_accepts_digest_pinned_parser_free_runtime(tmp_path: Path) -> 
     assert "No managed service or persistent Docker state was changed" in result.stdout
 
 
+def test_preflight_rejects_non_root_operator_before_docker(tmp_path: Path) -> None:
+    env, env_file = _fake_docker(tmp_path)
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+        preflight_as_root=False,
+    )
+
+    assert result.returncode == 1
+    assert "must be invoked as root" in result.stderr
+    docker_log = Path(env["FAKE_DOCKER_LOG"])
+    assert not docker_log.exists() or docker_log.read_text(encoding="utf-8") == ""
+
+
 def test_preflight_delegates_capability_files_to_no_network_secure_reader(
     tmp_path: Path,
 ) -> None:
@@ -677,22 +940,26 @@ def test_preflight_delegates_capability_files_to_no_network_secure_reader(
     docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
     timeout_log = Path(env["FAKE_TIMEOUT_LOG"]).read_text(encoding="utf-8")
     assert "--foreground --kill-after=5s 30s docker run" in timeout_log
-    assert "run --name regulatory-readiness-" in docker_log
+    readiness_command = next(
+        command
+        for command in docker_log.splitlines()
+        if "--validate-capability-snapshots-only" in command
+    )
+    assert "run --cidfile " in readiness_command
+    assert "--label io.regulatory.readiness-preflight-owner=" in readiness_command
+    ownership_token = readiness_command.split(
+        "--label io.regulatory.readiness-preflight-owner=", 1
+    )[1].split()[0]
+    assert len(ownership_token) == 64
+    assert all(character in "0123456789abcdef" for character in ownership_token)
+    assert " --name " not in readiness_command
     assert "--rm --pull never --network none --read-only" in docker_log
-    assert f"--user {os.geteuid()}:{os.getegid()}" in docker_log
+    assert "--user 1001:1001" in docker_log
     assert _IMAGE in docker_log
     assert "/app/scripts/regulatory_indexing_readiness.py" in docker_log
     assert "--validate-capability-snapshots-only" in docker_log
-    assert env["FAKE_ATTESTATION_PATH"] not in next(
-        command
-        for command in docker_log.splitlines()
-        if "--validate-capability-snapshots-only" in command
-    )
-    assert env["FAKE_EVIDENCE_PATH"] not in next(
-        command
-        for command in docker_log.splitlines()
-        if "--validate-capability-snapshots-only" in command
-    )
+    assert env["FAKE_ATTESTATION_PATH"] not in readiness_command
+    assert env["FAKE_EVIDENCE_PATH"] not in readiness_command
 
 
 def test_preflight_times_out_readiness_container_and_cleans_snapshot(
@@ -727,8 +994,118 @@ def test_preflight_times_out_readiness_container_and_cleans_snapshot(
     timeout_log = Path(env["FAKE_TIMEOUT_LOG"]).read_text(encoding="utf-8")
     assert "--foreground --kill-after=5s 30s docker run" in timeout_log
     docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
-    assert "rm -f regulatory-readiness-" in docker_log
+    assert " --name " not in docker_log
+    assert f"rm -f {env['FAKE_READINESS_CID']}" in docker_log
+    assert not Path(env["FAKE_READINESS_STATE"]).exists()
     assert not list(tmp_path.glob("regulatory-readiness-snapshot.*"))
+
+
+def test_preflight_refuses_to_remove_container_with_mismatched_ownership_label(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path, fake_timeout_exit="124")
+    env["TMPDIR"] = str(tmp_path)
+    env["FAKE_CLEANUP_LABEL_OVERRIDE"] = "unrelated-owner-token"
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == 1
+    assert "timed out or failed" in result.stderr
+    assert "ownership label does not match" in result.stderr
+    docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
+    assert f"rm -f {env['FAKE_READINESS_CID']}" not in docker_log
+    assert Path(env["FAKE_READINESS_STATE"]).exists()
+
+
+def test_preflight_surfaces_exact_container_removal_failure(tmp_path: Path) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    env["TMPDIR"] = str(tmp_path)
+    env["FAKE_DOCKER_RM_FAIL"] = "true"
+    env["FAKE_READINESS_PERSISTS"] = "true"
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == 1
+    assert "timed out or failed" not in result.stderr
+    assert "could not remove the owned readiness container" in result.stderr
+    docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
+    assert f"rm -f {env['FAKE_READINESS_CID']}" in docker_log
+    assert Path(env["FAKE_READINESS_STATE"]).exists()
+
+
+def test_preflight_normal_cleanup_leaves_no_container_or_private_files(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    env["TMPDIR"] = str(tmp_path)
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not Path(env["FAKE_READINESS_STATE"]).exists()
+    assert not list(tmp_path.glob("regulatory-readiness-snapshot.*"))
+    docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
+    assert (
+        f"container ls --all --quiet --no-trunc --filter id={env['FAKE_READINESS_CID']}"
+        in docker_log
+    )
 
 
 @pytest.mark.parametrize(
@@ -1395,6 +1772,20 @@ def test_deploy_never_builds_and_runs_migration_before_start(tmp_path: Path) -> 
         < full_up_index
     )
     assert all("docker build" not in command for command in commands)
+
+
+def test_deploy_rejects_operator_compose_profiles_before_bounded_sudo(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    env["COMPOSE_PROFILES"] = "local-infra"
+
+    result = _run(_DEPLOY, ["deploy", *_deploy_args(env_file, env)], env)
+
+    assert result.returncode == 1
+    assert "COMPOSE_PROFILES must be unset" in result.stderr
+    docker_log = Path(env["FAKE_DOCKER_LOG"])
+    assert not docker_log.exists() or docker_log.read_text(encoding="utf-8") == ""
 
 
 def test_cloud_deploy_never_pulls_or_inspects_model_image(tmp_path: Path) -> None:

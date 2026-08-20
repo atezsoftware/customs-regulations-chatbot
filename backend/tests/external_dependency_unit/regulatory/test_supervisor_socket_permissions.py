@@ -3,7 +3,7 @@ from __future__ import annotations
 import configparser
 import hashlib
 import json
-import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -56,6 +56,51 @@ def runtime_lite_supervisor_image() -> Iterator[str]:
             text=True,
             check=False,
             timeout=900,
+        )
+        assert build.returncode == 0, build.stderr
+
+    try:
+        yield image
+    finally:
+        if built_for_test:
+            subprocess.run(
+                ["docker", "image", "rm", image],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+
+
+@pytest.fixture(scope="module")
+def preflight_operator_image(
+    runtime_lite_supervisor_image: str,
+) -> Iterator[str]:
+    fingerprint = hashlib.sha256(runtime_lite_supervisor_image.encode()).hexdigest()[
+        :16
+    ]
+    image = f"onyx-task8-preflight-operator:{fingerprint}"
+    existing = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    built_for_test = existing.returncode != 0
+    if built_for_test:
+        build = subprocess.run(
+            ["docker", "build", "--tag", image, "-"],
+            input=(
+                f"FROM {runtime_lite_supervisor_image}\n"
+                "USER 0:0\n"
+                "RUN apt-get update && apt-get install -y --no-install-recommends jq "
+                "&& rm -rf /var/lib/apt/lists/*\n"
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
         )
         assert build.returncode == 0, build.stderr
 
@@ -270,9 +315,11 @@ finally:
     assert result.returncode == 0, result.stderr
 
 
-def _run_preflight_with_canonical_source_owner(
+def _run_preflight_as_distinct_operator_and_root(
     env_file: Path,
     env: dict[str, str],
+    operator_image: str,
+    probe_root: Path,
 ) -> subprocess.CompletedProcess[str]:
     command = [
         str(prod_lite_deploy._PREFLIGHT),
@@ -291,25 +338,138 @@ def _run_preflight_with_canonical_source_owner(
         "--model-mode",
         "local",
     ]
-    if (os.geteuid(), os.getegid()) != (1001, 1001) and os.geteuid() != 0:
-        unshare = shutil.which("unshare")
-        assert unshare is not None, "numeric-owner preflight proof requires unshare"
-        command = [
-            unshare,
-            "--user",
-            f"--map-users={os.geteuid()},1001,1",
-            f"--map-groups={os.getegid()},1001,1",
-            *command,
-        ]
+    driver = probe_root / "preflight-operator.py"
+    driver.write_text(
+        """
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+attestation, evidence, *command = sys.argv[1:]
+
+
+def run_as(uid=None, gid=None):
+    def drop_identity():
+        assert uid is not None and gid is not None
+        os.setgroups([])
+        os.setgid(gid)
+        os.setuid(uid)
 
     return subprocess.run(
         command,
-        cwd=prod_lite_deploy._COMPOSE_ROOT,
-        env=env,
         capture_output=True,
         text=True,
         check=False,
+        preexec_fn=drop_identity if uid is not None else None,
         timeout=90,
+    )
+
+
+non_root = run_as(2002, 2002)
+if non_root.returncode != 1 or "must be invoked as root" not in non_root.stderr:
+    raise RuntimeError("Distinct non-root operator did not fail closed before Docker")
+
+os.chown(attestation, 1001, 1001)
+os.chown(evidence, 1001, 1001)
+attestation_metadata = Path(attestation).stat()
+evidence_metadata = Path(evidence).stat()
+root = run_as()
+print(json.dumps({
+    "non_root_returncode": non_root.returncode,
+    "non_root_stderr": non_root.stderr,
+    "source_owners": [
+        [attestation_metadata.st_uid, attestation_metadata.st_gid],
+        [evidence_metadata.st_uid, evidence_metadata.st_gid],
+    ],
+    "root_returncode": root.returncode,
+    "root_stdout": root.stdout,
+    "root_stderr": root.stderr,
+}))
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    driver.chmod(0o600)
+
+    operator_environment = probe_root / "operator.env"
+    selected_environment = {
+        key: value
+        for key, value in env.items()
+        if key.startswith("FAKE_") or key in {"_IMAGE", "_MODEL_IMAGE", "_WEB_IMAGE"}
+    }
+    selected_environment["PATH"] = (
+        f"{Path(env['FAKE_DOCKER_LOG']).parent / 'bin'}:/usr/local/bin:/usr/bin:/bin"
+    )
+    selected_environment["TMPDIR"] = env["TMPDIR"]
+    operator_environment.write_text(
+        "".join(f"{key}={value}\n" for key, value in selected_environment.items()),
+        encoding="utf-8",
+    )
+    operator_environment.chmod(0o600)
+
+    docker_binary = Path(shutil.which("docker") or "")
+    assert docker_binary.is_file()
+    operator_tools = probe_root / "operator-tools"
+    operator_tools.mkdir(mode=0o700)
+    docker_source = operator_tools / "docker"
+    shutil.copy2(docker_binary, docker_source)
+
+    return subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--pull",
+            "never",
+            "--network",
+            "none",
+            "--read-only",
+            "--pids-limit",
+            "128",
+            "--memory",
+            "512m",
+            "--cpus",
+            "1",
+            "--user",
+            "0:0",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "CHOWN",
+            "--cap-add",
+            "DAC_OVERRIDE",
+            "--cap-add",
+            "FOWNER",
+            "--cap-add",
+            "SETUID",
+            "--cap-add",
+            "SETGID",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+            "--env-file",
+            str(operator_environment),
+            "--env",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "--mount",
+            "type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock",
+            "--mount",
+            f"type=bind,source={_REPOSITORY_ROOT},target={_REPOSITORY_ROOT}",
+            "--mount",
+            f"type=bind,source={docker_source},target=/usr/bin/docker,readonly",
+            "--entrypoint",
+            "/usr/local/bin/python",
+            operator_image,
+            str(driver),
+            env["FAKE_ATTESTATION_PATH"],
+            env["FAKE_EVIDENCE_PATH"],
+            *command,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=150,
     )
 
 
@@ -373,26 +533,29 @@ def real_docker_needs_setpriv_nnp(
     return True
 
 
-@pytest.mark.parametrize("attestation_symlink", [False, True])
-def test_preflight_real_runtime_validates_snapshots_and_rejects_host_symlink(
-    tmp_path: Path,
+@pytest.mark.parametrize("scenario", ["normal", "symlink", "timeout"])
+def test_preflight_real_runtime_enforces_source_and_cleanup_contract(
     runtime_lite_supervisor_image: str,
+    preflight_operator_image: str,
     real_docker_needs_setpriv_nnp: bool,
     request: pytest.FixtureRequest,
-    attestation_symlink: bool,
+    scenario: str,
 ) -> None:
     docker_visible_temp = Path(
         tempfile.mkdtemp(prefix=".task8-preflight-", dir=_REPOSITORY_ROOT)
     )
     request.addfinalizer(lambda: shutil.rmtree(docker_visible_temp, ignore_errors=True))
+    fake_root = docker_visible_temp / "fixture"
+    fake_root.mkdir()
     env, env_file = prod_lite_deploy._fake_docker(
-        tmp_path,
+        fake_root,
         use_real_snapshot_helper=True,
         use_real_timeout=True,
         real_runtime_image=runtime_lite_supervisor_image,
         real_runtime_use_setpriv_nnp=real_docker_needs_setpriv_nnp,
     )
     env["TMPDIR"] = str(docker_visible_temp)
+    env["FAKE_REAL_RUNTIME_FORCE_TIMEOUT"] = str(scenario == "timeout").lower()
     evidence_path = Path(env["FAKE_EVIDENCE_PATH"])
     evidence_bytes = b'{"approved":true,"marker":"runtime-evidence-never-print"}\n'
     evidence_path.chmod(0o600)
@@ -411,31 +574,58 @@ def test_preflight_real_runtime_validates_snapshots_and_rejects_host_symlink(
         encoding="utf-8",
     )
     attestation_path.chmod(0o600)
-    if attestation_symlink:
-        target_path = tmp_path / "attestation-target.json"
+    if scenario == "symlink":
+        target_path = fake_root / "attestation-target.json"
         attestation_path.replace(target_path)
         attestation_path.symlink_to(target_path)
 
-    if os.geteuid() == 0:
-        os.chown(attestation_path, 1001, 1001)
-        os.chown(evidence_path, 1001, 1001)
+    docker_log_path = Path(env["FAKE_DOCKER_LOG"])
+    docker_log_path.touch(mode=0o666)
+    docker_log_path.chmod(0o666)
 
-    result = _run_preflight_with_canonical_source_owner(env_file, env)
+    result = _run_preflight_as_distinct_operator_and_root(
+        env_file,
+        env,
+        preflight_operator_image,
+        docker_visible_temp,
+    )
 
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["non_root_returncode"] == 1
+    assert "must be invoked as root" in observed["non_root_stderr"]
+    assert observed["source_owners"] == [[1001, 1001], [1001, 1001]]
     combined_output = result.stdout + result.stderr
     assert "runtime-evidence-never-print" not in combined_output
-    docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
+    docker_log = docker_log_path.read_text(encoding="utf-8")
     validation_runs = [
         command
         for command in docker_log.splitlines()
         if "--validate-capability-snapshots-only" in command
     ]
-    if attestation_symlink:
-        assert result.returncode == 1
-        assert "sources failed secure descriptor validation" in result.stderr
+    if scenario == "symlink":
+        assert observed["root_returncode"] == 1
+        assert "sources failed secure descriptor validation" in observed["root_stderr"]
         assert validation_runs == []
+    elif scenario == "timeout":
+        assert observed["root_returncode"] == 1
+        assert "snapshot validation timed out or failed" in observed["root_stderr"]
+        assert len(validation_runs) == 1
+        removed_container = re.search(
+            r"^rm -f ([0-9a-f]{64})$", docker_log, re.MULTILINE
+        )
+        assert removed_container is not None
+        inspect_removed = subprocess.run(
+            ["docker", "container", "inspect", removed_container.group(1)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert inspect_removed.returncode != 0
     else:
-        assert result.returncode == 0, result.stderr
+        assert observed["root_returncode"] == 0, observed["root_stderr"]
         assert len(validation_runs) == 1
         assert "--network none --read-only" in validation_runs[0]
+        assert "--user 1001:1001" in validation_runs[0]
     assert not list(docker_visible_temp.glob("regulatory-readiness-snapshot.*"))

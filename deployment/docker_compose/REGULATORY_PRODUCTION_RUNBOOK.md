@@ -290,12 +290,15 @@ and the lite deployment intentionally has no Beat process to recreate generic in
 
 ## 4. Preflight the rendered deployment
 
-Run only the authoritative preflight wrapper from `deployment/docker_compose`. The approved digest
-variables below are non-secret values supplied by release automation. For the recommended cloud
-model mode with Compose-managed data services:
+Run only the authoritative preflight wrapper from `deployment/docker_compose`, and grant root only
+to this bounded command. Root is required so one descriptor-owning helper can validate the original
+numeric `1001:1001` files and hand private `1001:1001` snapshots to the fixed non-root validation
+container. Do not use `sudo -E`, print the environment, or run the deployment itself through this
+preflight privilege. The approved digest variables below are non-secret values supplied by release
+automation. For the recommended cloud model mode with Compose-managed data services:
 
 ```bash
-./regulatory-prod-lite-preflight.sh \
+sudo -- ./regulatory-prod-lite-preflight.sh \
   --env-file .env \
   --base-compose docker-compose.prod.yml \
   --project-name "$APPROVED_COMPOSE_PROJECT" \
@@ -311,7 +314,7 @@ For the recommended cloud model mode with approved external data services, with 
 excluding `local-infra` and `s3-filestore`:
 
 ```bash
-./regulatory-prod-lite-preflight.sh \
+sudo -- ./regulatory-prod-lite-preflight.sh \
   --env-file .env \
   --base-compose docker-compose.prod.yml \
   --project-name "$APPROVED_COMPOSE_PROJECT" \
@@ -492,7 +495,9 @@ print the archived evidence during readiness.
 Set `REGULATORY_CAPABILITY_ATTESTATION_FILE` and `REGULATORY_CAPABILITY_EVIDENCE_FILE` to distinct
 absolute host paths. The canonical overlay mounts both files read-only. Preflight and the in-container
 validator require numeric owner/group `1001:1001`, attestation mode `0600`, evidence mode `0400`,
-regular files (no symlinks), and bounded sizes, independent of which operator invokes Docker:
+regular files (no symlinks), and bounded sizes. Invoke the canonical preflight through the bounded
+`sudo -- ./regulatory-prod-lite-preflight.sh ...` command in section 4; direct non-root invocation
+fails before Docker is queried:
 
 ```bash
 evidence_digest=$(sha256sum -- "$REGULATORY_CAPABILITY_EVIDENCE_FILE" | awk '{print $1}')

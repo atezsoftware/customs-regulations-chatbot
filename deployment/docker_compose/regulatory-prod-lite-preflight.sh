@@ -14,6 +14,7 @@ readonly EDGE_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-edge.yml"
 readonly COMPOSE_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-compose-infra.yml"
 readonly READINESS_SNAPSHOT_HELPER="$SCRIPT_DIR/regulatory_readiness_file_snapshot.py"
 readonly READINESS_VALIDATION_TIMEOUT_SECONDS=30
+readonly READINESS_OWNERSHIP_LABEL="io.regulatory.readiness-preflight-owner"
 
 usage() {
   cat <<'EOF'
@@ -159,6 +160,8 @@ while (($#)); do
   esac
 done
 
+((EUID == 0)) || \
+  die "this bounded readiness preflight must be invoked as root; use the documented sudo command"
 [[ "$project_name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || \
   die "--project-name is required and must be an explicit lowercase Compose project name"
 [[ -n "$migration_env_file" ]] || die "--migration-env-file is required"
@@ -340,7 +343,8 @@ active_services_file=$(mktemp "${TMPDIR:-/tmp}/regulatory-prod-lite-services.XXX
 profiled_config_file=$(mktemp "${TMPDIR:-/tmp}/regulatory-prod-lite-profiled-config.XXXXXX")
 container_inventory_file=$(mktemp "${TMPDIR:-/tmp}/regulatory-prod-lite-containers.XXXXXX")
 snapshot_directory=""
-readiness_container_name=""
+readiness_cidfile=""
+readiness_ownership_token=""
 chmod 600 \
   "$config_file" \
   "$config_error_file" \
@@ -348,22 +352,96 @@ chmod 600 \
   "$profiled_config_file" \
   "$container_inventory_file"
 cleanup() {
-  if [[ -n "$readiness_container_name" ]]; then
-    timeout --foreground --kill-after=2s 10s \
-      docker rm -f "$readiness_container_name" >/dev/null 2>&1 || true
+  local primary_status=$?
+  local final_status=$primary_status
+  local cleanup_failed=false
+  local readiness_cid=""
+  local matching_containers=""
+  local observed_ownership_token=""
+
+  trap - EXIT HUP INT TERM
+  set +e
+
+  if [[ -n "$readiness_cidfile" && ( -e "$readiness_cidfile" || -L "$readiness_cidfile" ) ]]; then
+    if [[ ! -f "$readiness_cidfile" || -L "$readiness_cidfile" ]]; then
+      printf '%s\n' \
+        "Preflight cleanup failed: the private readiness cidfile is not a regular file" >&2
+      cleanup_failed=true
+    else
+      readiness_cid=$(<"$readiness_cidfile")
+      if [[ ! "$readiness_cid" =~ ^[0-9a-f]{64}$ ]]; then
+        printf '%s\n' \
+          "Preflight cleanup failed: the private readiness cidfile is invalid" >&2
+        cleanup_failed=true
+      elif ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
+        docker container ls --all --quiet --no-trunc \
+        --filter "id=$readiness_cid" 2>/dev/null); then
+        printf '%s\n' \
+          "Preflight cleanup failed: readiness container ownership could not be queried" >&2
+        cleanup_failed=true
+      elif [[ -n "$matching_containers" && "$matching_containers" != "$readiness_cid" ]]; then
+        printf '%s\n' \
+          "Preflight cleanup failed: readiness container identity is ambiguous" >&2
+        cleanup_failed=true
+      elif [[ "$matching_containers" == "$readiness_cid" ]]; then
+        if ! observed_ownership_token=$(timeout --foreground --kill-after=2s 10s \
+          docker inspect --type container \
+          --format '{{ index .Config.Labels "io.regulatory.readiness-preflight-owner" }}' \
+          "$readiness_cid" 2>/dev/null); then
+          printf '%s\n' \
+            "Preflight cleanup failed: readiness container ownership label could not be read" >&2
+          cleanup_failed=true
+        elif [[ -z "$readiness_ownership_token" || \
+          "$observed_ownership_token" != "$readiness_ownership_token" ]]; then
+          printf '%s\n' \
+            "Preflight cleanup failed: readiness container ownership label does not match; refusing removal" >&2
+          cleanup_failed=true
+        elif ! timeout --foreground --kill-after=2s 10s \
+          docker rm -f "$readiness_cid" >/dev/null 2>&1; then
+          printf '%s\n' \
+            "Preflight cleanup failed: could not remove the owned readiness container" >&2
+          cleanup_failed=true
+        elif ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
+          docker container ls --all --quiet --no-trunc \
+          --filter "id=$readiness_cid" 2>/dev/null); then
+          printf '%s\n' \
+            "Preflight cleanup failed: readiness container removal could not be verified" >&2
+          cleanup_failed=true
+        elif [[ -n "$matching_containers" ]]; then
+          printf '%s\n' \
+            "Preflight cleanup failed: the owned readiness container still exists" >&2
+          cleanup_failed=true
+        fi
+      fi
+    fi
   fi
   if [[ -n "$snapshot_directory" ]]; then
-    rm -f -- \
+    if ! rm -f -- \
       "$snapshot_directory/regulatory-capabilities.json" \
-      "$snapshot_directory/regulatory-capability-evidence.json"
-    rmdir -- "$snapshot_directory" 2>/dev/null || true
+      "$snapshot_directory/regulatory-capability-evidence.json" \
+      "$snapshot_directory/readiness.cid"; then
+      printf '%s\n' "Preflight cleanup failed: private readiness files could not be removed" >&2
+      cleanup_failed=true
+    fi
+    if ! rmdir -- "$snapshot_directory" 2>/dev/null; then
+      printf '%s\n' "Preflight cleanup failed: the private readiness directory could not be removed" >&2
+      cleanup_failed=true
+    fi
   fi
-  rm -f -- \
+  if ! rm -f -- \
     "$config_file" \
     "$config_error_file" \
     "$active_services_file" \
     "$profiled_config_file" \
-    "$container_inventory_file"
+    "$container_inventory_file"; then
+    printf '%s\n' "Preflight cleanup failed: temporary validation files could not be removed" >&2
+    cleanup_failed=true
+  fi
+
+  if [[ "$cleanup_failed" == true && "$primary_status" -eq 0 ]]; then
+    final_status=1
+  fi
+  exit "$final_status"
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
@@ -372,6 +450,12 @@ trap 'exit 143' TERM
 
 snapshot_directory=$(mktemp -d "${TMPDIR:-/tmp}/regulatory-readiness-snapshot.XXXXXX")
 chmod 700 "$snapshot_directory"
+readiness_cidfile="$snapshot_directory/readiness.cid"
+readiness_ownership_token=$(python3 -c \
+  'import secrets; print(secrets.token_hex(32))') || \
+  die "a private readiness container ownership token could not be created"
+[[ "$readiness_ownership_token" =~ ^[0-9a-f]{64}$ ]] || \
+  die "the private readiness container ownership token is invalid"
 
 if ! docker ps \
   --format '{{.ID}}\t{{.Names}}\t{{.Label "com.docker.compose.service"}}' \
@@ -752,23 +836,19 @@ fi
 
 background_image=$(jq -er '.services.background.image' "$config_file") || \
   die "the rendered background image cannot be resolved for readiness-file validation"
-snapshot_owner=$(python3 "$READINESS_SNAPSHOT_HELPER" \
+python3 "$READINESS_SNAPSHOT_HELPER" \
   --attestation "$attestation_path" \
   --evidence "$evidence_path" \
-  --snapshot-directory "$snapshot_directory" \
-  --expected-owner-uid 1001 \
-  --expected-owner-gid 1001) || \
+  --snapshot-directory "$snapshot_directory" || \
   die "the readiness capability sources failed secure descriptor validation"
-[[ "$snapshot_owner" =~ ^[0-9]+:[0-9]+$ ]] || \
-  die "the readiness snapshot owner could not be resolved"
 
-readiness_container_name="regulatory-readiness-${project_name}-$$-${RANDOM}"
 if ! timeout \
   --foreground \
   --kill-after=5s \
   "${READINESS_VALIDATION_TIMEOUT_SECONDS}s" \
   docker run \
-  --name "$readiness_container_name" \
+  --cidfile "$readiness_cidfile" \
+  --label "$READINESS_OWNERSHIP_LABEL=$readiness_ownership_token" \
   --rm \
   --pull never \
   --network none \
@@ -776,7 +856,7 @@ if ! timeout \
   --cap-drop ALL \
   --security-opt no-new-privileges \
   --pids-limit 64 \
-  --user "$snapshot_owner" \
+  --user 1001:1001 \
   --mount "type=bind,source=$snapshot_directory/regulatory-capabilities.json,target=/run/readiness/regulatory-capabilities.json,readonly" \
   --mount "type=bind,source=$snapshot_directory/regulatory-capability-evidence.json,target=/run/readiness/regulatory-capability-evidence.json,readonly" \
   --entrypoint /usr/local/bin/python \

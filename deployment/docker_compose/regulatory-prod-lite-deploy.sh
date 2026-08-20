@@ -214,11 +214,24 @@ if [[ -n "$expected_model_image" ]]; then
   preflight_args+=(--expected-model-image "$expected_model_image")
 fi
 
+run_preflight() {
+  [[ -z "${COMPOSE_PROFILES:-}" ]] || \
+    die "COMPOSE_PROFILES must be unset; topology is selected only by --infra-mode and --model-mode"
+  if ((EUID == 0)); then
+    "$PREFLIGHT" "${preflight_args[@]}"
+    return
+  fi
+  command -v sudo >/dev/null 2>&1 || \
+    die "sudo is required for the bounded readiness preflight"
+  sudo -- "$PREFLIGHT" "${preflight_args[@]}"
+}
+
 if [[ "$command_name" == "preflight" ]]; then
-  exec "$PREFLIGHT" "${preflight_args[@]}"
+  run_preflight
+  exit 0
 fi
 
-"$PREFLIGHT" "${preflight_args[@]}"
+run_preflight
 
 compose=(
   docker compose
