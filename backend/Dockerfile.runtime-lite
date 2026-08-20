@@ -57,6 +57,13 @@ ENV ONYX_RUNNING_IN_DOCKER="true" \
     DO_NOT_TRACK="true" \
     DOCUMENT_IMPORT_ENABLED="false"
 
+# Uploads stop after chunking so the chunks can be reviewed before anything
+# becomes searchable; indexing is then requested explicitly. Baked in while the
+# test environment is the only deployment of this image — move it to
+# per-environment configuration before a production deployment, which should
+# keep the upload-and-index flow.
+ENV DEFER_USER_FILE_INDEXING="true"
+
 RUN groupadd -g 1001 onyx && \
     useradd -u 1001 -g onyx -m -s /bin/bash onyx && \
     mkdir -p /var/log/onyx /app/file-system && \
