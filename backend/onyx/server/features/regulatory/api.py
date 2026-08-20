@@ -9,6 +9,7 @@ import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
@@ -40,8 +41,10 @@ from onyx.db.regulatory_chunks import (
 from onyx.db.user_file import lock_completed_user_file_for_projection
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
+from onyx.file_store.file_store import get_default_file_store
 from onyx.llm.factory import get_default_llm
 from onyx.regulatory.amendments.pipeline import analyze_amendment
+from onyx.regulatory.pdf import render_chunk_pdf, render_document_pdf
 from onyx.regulatory.projection import project_user_file_to_index
 from onyx.regulatory.validity_projection import (
     compensate_regulatory_validity_patch,
@@ -91,6 +94,55 @@ def list_chunks_for_file(
     _get_owned_user_file(db_session, user_file_id, user)
     chunks = get_chunks_for_file(db_session, user_file_id)
     return [RegulatoryChunkSnapshot.from_model(chunk) for chunk in chunks]
+
+
+def _pdf_response(pdf: bytes, filename: str) -> Response:
+    """Inline so the browser renders it; the same bytes are what gets saved."""
+
+    safe_name = filename.rsplit("/", 1)[-1].replace('"', "")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+    )
+
+
+@router.get("/files/{user_file_id}/pdf", tags=PUBLIC_API_TAGS)
+def get_file_pdf(
+    user_file_id: UUID,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> Response:
+    """The document as uploaded, before chunking, rendered for reading."""
+
+    user_file = _get_owned_user_file(db_session, user_file_id, user)
+    with get_default_file_store().read_file(user_file.file_id, mode="b") as handle:
+        markdown = handle.read().decode("utf-8", errors="replace")
+
+    pdf = render_document_pdf(name=user_file.name, markdown=markdown)
+    return _pdf_response(pdf, f"{user_file.name.rsplit('.', 1)[0]}.pdf")
+
+
+@router.get("/chunks/{chunk_id}/pdf", tags=PUBLIC_API_TAGS)
+def get_chunk_pdf(
+    chunk_id: str,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> Response:
+    chunk = get_chunk_by_id(db_session, chunk_id)
+    if chunk is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found")
+    # Access is granted on the file, so it is checked there.
+    _get_owned_user_file(db_session, chunk.user_file_id, user)
+
+    pdf = render_chunk_pdf(
+        text=chunk.text,
+        heading_path=list(chunk.heading_path),
+        validity_start_date=chunk.validity_start_date,
+        validity_end_date=chunk.validity_end_date,
+        position=chunk.position,
+    )
+    return _pdf_response(pdf, f"chunk-{chunk.position + 1}.pdf")
 
 
 @router.patch("/chunks/{chunk_id}", tags=PUBLIC_API_TAGS)

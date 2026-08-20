@@ -47,3 +47,15 @@ export async function renameUserFile(
   }
   return response.json();
 }
+
+/**
+ * The same bytes back both uses: the browser renders them inline and saves them
+ * unchanged, so there is no separate download route.
+ */
+export function documentPdfUrl(userFileId: string): string {
+  return `/api/regulatory/files/${encodeURIComponent(userFileId)}/pdf`;
+}
+
+export function chunkPdfUrl(chunkId: string): string {
+  return `/api/regulatory/chunks/${encodeURIComponent(chunkId)}/pdf`;
+}

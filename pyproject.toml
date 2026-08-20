@@ -98,6 +98,7 @@ backend-runtime = [
     "redis==5.0.8",
     "requests==2.33.0",
     "requests-oauthlib==2.0.0",
+    "reportlab==4.4.4",
     "simple-salesforce==1.12.6",
     "slack-sdk==3.20.2",
     "SQLAlchemy==2.0.50",

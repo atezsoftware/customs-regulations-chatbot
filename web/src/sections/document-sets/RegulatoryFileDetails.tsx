@@ -4,7 +4,9 @@ import { useCallback, useState } from "react";
 
 import { Button, InputTextArea, Modal, Tag, Text } from "@opal/components";
 import { toast } from "@opal/layouts";
-import { SvgEdit } from "@opal/icons";
+import { SvgEdit,
+  SvgFileText,
+} from "@opal/icons";
 import { cn } from "@opal/utils";
 
 import InputDatePicker from "@/refresh-components/inputs/InputDatePicker";
@@ -14,7 +16,12 @@ import type {
   RegulatoryChunk,
   RegulatoryChunkUpdate,
 } from "@/lib/regulatory/interfaces";
-import { patchChunk, renameUserFile } from "@/lib/regulatory/svc";
+import {
+  chunkPdfUrl,
+  documentPdfUrl,
+  patchChunk,
+  renameUserFile,
+} from "@/lib/regulatory/svc";
 import type { ProjectFile } from "@/lib/projects/types";
 
 function parseIsoDate(value: string | null): Date | null {
@@ -314,6 +321,16 @@ export default function RegulatoryFileDetails({
             {`${chunks.length} chunks`}
           </Text>
         )}
+        <Button
+          prominence="secondary"
+          icon={SvgFileText}
+          size="sm"
+          href={documentPdfUrl(file.id)}
+          target="_blank"
+          tooltip="The document as uploaded, before chunking"
+        >
+          Document PDF
+        </Button>
       </div>
 
       {isLoading ? (
@@ -352,6 +369,15 @@ export default function RegulatoryFileDetails({
                   onClick={() => toggleJson(chunk.id)}
                 >
                   JSON
+                </Button>
+                <Button
+                  prominence="tertiary"
+                  size="sm"
+                  href={chunkPdfUrl(chunk.id)}
+                  target="_blank"
+                  tooltip="This chunk on its own"
+                >
+                  Chunk PDF
                 </Button>
                 <Button
                   prominence="tertiary"
