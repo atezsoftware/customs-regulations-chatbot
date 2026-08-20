@@ -138,6 +138,9 @@ class RegulatoryIndexingConfigSnapshot(BaseModel):
     poll_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     lease_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
     embedding_request_size: int = Field(default=64, gt=0)
+    context_request_size: int = Field(default=64, gt=0)
+    context_jsonl_max_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
+    submission_reconcile_seconds: int = Field(default=300, gt=0)
 
     @model_validator(mode="after")
     def validate_derived_values(self) -> "RegulatoryIndexingConfigSnapshot":

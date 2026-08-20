@@ -161,6 +161,9 @@ def test_regulatory_indexing_defaults() -> None:
     assert app_configs.REGULATORY_INDEXING_POLL_SECONDS == 30
     assert app_configs.REGULATORY_INDEXING_LEASE_SECONDS == 120
     assert app_configs.REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE == 64
+    assert app_configs.REGULATORY_INDEXING_CONTEXT_REQUEST_SIZE == 64
+    assert app_configs.REGULATORY_INDEXING_CONTEXT_JSONL_MAX_BYTES == 8 * 1024 * 1024
+    assert app_configs.REGULATORY_INDEXING_SUBMISSION_RECONCILE_SECONDS == 300
 
 
 def test_chunk_generation_hash_is_restart_stable_and_semantics_sensitive(

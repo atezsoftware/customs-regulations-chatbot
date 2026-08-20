@@ -2,8 +2,10 @@ import json
 import logging
 import traceback
 from collections.abc import Callable
+from io import StringIO
 from types import SimpleNamespace
 from typing import Any, cast
+from uuid import UUID
 
 import httpx
 import pytest
@@ -235,6 +237,8 @@ class _FakeBlob:
         self.content_type: str | None = None
         self.upload_timeout: float | None = None
         self.download_timeouts: list[float | None] = []
+        self.upload_from_file_calls = 0
+        self.open_calls = 0
 
     def upload_from_string(
         self,
@@ -246,6 +250,26 @@ class _FakeBlob:
         self.uploaded = data
         self.content_type = content_type
         self.upload_timeout = timeout
+
+    def upload_from_file(
+        self,
+        file_obj: object,
+        *,
+        content_type: str,
+        rewind: bool,
+        timeout: float | None = None,
+    ) -> None:
+        self.upload_from_file_calls += 1
+        if rewind:
+            cast(Any, file_obj).seek(0)
+        raw = cast(Any, file_obj).read()
+        self.uploaded = raw.decode() if isinstance(raw, bytes) else raw
+        self.content_type = content_type
+        self.upload_timeout = timeout
+
+    def open(self, _mode: str, **_kwargs: object) -> StringIO:
+        self.open_calls += 1
+        return StringIO(self._downloads[self.name])
 
     def download_as_text(self, *, timeout: float | None = None) -> str:
         self.download_timeouts.append(timeout)
@@ -318,6 +342,7 @@ class _FakeBatches:
             error=None,
         )
         self.cancelled_name: str | None = None
+        self.deleted_name: str | None = None
         self.error: Exception | None = None
         self.create_error: Exception | None = None
         self.listed_config: object | None = None
@@ -346,6 +371,11 @@ class _FakeBatches:
         if self.error is not None:
             raise self.error
         self.cancelled_name = name
+
+    def delete(self, *, name: str) -> None:
+        if self.error is not None:
+            raise self.error
+        self.deleted_name = name
 
     def list(self, *, config: object) -> object:
         if self.error is not None:
@@ -547,7 +577,13 @@ def test_submit_resolves_service_account_fresh_and_uses_v1_clients(
         request_timeout_seconds=12.5,
     )
 
-    state = gateway.submit([VertexBatchRequest(prompt="first prompt")])
+    request = VertexBatchRequest(prompt="first prompt")
+    submission_key = "regulatory-context-" + "a" * 64
+    state = gateway.submit(
+        [request],
+        submission_key=submission_key,
+        max_jsonl_bytes=1024,
+    )
 
     assert credential_infos == [
         {"type": "service_account", "project_id": "customs-prod"}
@@ -568,10 +604,12 @@ def test_submit_resolves_service_account_fresh_and_uses_v1_clients(
     assert batches.created is not None
     assert batches.created["model"] == "gemini-3.1-flash-lite"
     assert batches.created["src"] == state.input_uri
+    assert batches.created["config"].display_name == submission_key
     assert len(created_clients) == 1
     assert created_clients[0].closed
     assert batches.created["config"].dest == state.output_uri
     uploaded = next(iter(storage_client.bucket_value.blobs.values()))
+    assert uploaded.upload_from_file_calls == 1
     assert json.loads(uploaded.uploaded or "") == {
         "request": _request_payload("first prompt")
     }
@@ -601,16 +639,17 @@ def test_submit_raises_secret_safe_indeterminate_error_after_ambiguous_create(
     batches.create_error = sdk_error
     _install_clients(monkeypatch, _FakeStorageClient(), batches)
     gateway = _gateway(lambda: '{"type":"service_account"}')
+    submission_key = "regulatory-context-" + "b" * 64
     with pytest.raises(IndexingGatewayIndeterminateSubmissionError) as raised:
-        gateway.submit([VertexBatchRequest(prompt="first prompt")])
+        gateway.submit(
+            [VertexBatchRequest(prompt="first prompt")],
+            submission_key=submission_key,
+            max_jsonl_bytes=1024,
+        )
 
     assert batches.created is not None
-    submission_key = raised.value.submission_key
+    assert raised.value.submission_key == submission_key
     assert batches.created["config"].display_name == submission_key
-    assert submission_key == (
-        "regulatory-context-"
-        "98ee8349628a7adadfdc1b029bc3e3f5b93fc917934860a3b3bc25d79147e4dd"
-    )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     rendered = "".join(traceback.format_exception(raised.value))
@@ -658,6 +697,57 @@ def test_reconcile_submission_returns_none_for_no_match(
     )
 
     assert state is None
+
+
+def test_submission_identity_is_scoped_to_tenant_job_prefix_and_attempt() -> None:
+    request = VertexBatchRequest(prompt="same canonical request")
+    job_a = UUID("00000000-0000-0000-0000-000000000001")
+    job_b = UUID("00000000-0000-0000-0000-000000000002")
+
+    identities = {
+        vertex_batch_submission_key(
+            [request],
+            tenant_id="tenant-a",
+            job_id=job_a,
+            output_prefix="tenants/a/jobs/1",
+            submission_attempt=1,
+        ),
+        vertex_batch_submission_key(
+            [request],
+            tenant_id="tenant-b",
+            job_id=job_a,
+            output_prefix="tenants/b/jobs/1",
+            submission_attempt=1,
+        ),
+        vertex_batch_submission_key(
+            [request],
+            tenant_id="tenant-a",
+            job_id=job_b,
+            output_prefix="tenants/a/jobs/2",
+            submission_attempt=1,
+        ),
+        vertex_batch_submission_key(
+            [request],
+            tenant_id="tenant-a",
+            job_id=job_a,
+            output_prefix="tenants/a/jobs/1",
+            submission_attempt=2,
+        ),
+    }
+
+    assert len(identities) == 4
+
+
+def test_build_vertex_jsonl_enforces_utf8_byte_limit() -> None:
+    requests = [
+        VertexBatchRequest(prompt="ilk çğıöşü"),
+        VertexBatchRequest(prompt="ikinci istek"),
+    ]
+    first_line_size = len(build_vertex_jsonl(requests[:1]).encode("utf-8"))
+
+    assert build_vertex_jsonl(
+        requests, max_bytes=first_line_size
+    ) == build_vertex_jsonl(requests[:1])
 
 
 def test_reconcile_submission_raises_explicit_secret_safe_conflict(
@@ -755,12 +845,12 @@ def test_read_results_combines_jsonl_blobs_in_deterministic_name_order(
     _install_clients(monkeypatch, storage_client, _FakeBatches())
     gateway = _gateway(lambda: '{"type":"service_account"}')
 
-    output = gateway.read_results("gs://customs-indexing/output")
+    output = "".join(gateway.read_results("gs://customs-indexing/output"))
 
     assert output == "first\nsecond\n"
     assert storage_client.list_timeouts == [60]
     assert all(
-        blob.download_timeouts == [60]
+        blob.open_calls == 1
         for name, blob in storage_client.bucket_value.blobs.items()
         if name.startswith("output/") and name.endswith(".jsonl")
     )
@@ -768,7 +858,7 @@ def test_read_results_combines_jsonl_blobs_in_deterministic_name_order(
     assert storage_client.closed
 
 
-def test_get_cancel_and_cleanup_are_single_bounded_operations(
+def test_get_cancel_delete_and_cleanup_are_single_bounded_operations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage_client = _FakeStorageClient(
@@ -792,18 +882,20 @@ def test_get_cancel_and_cleanup_are_single_bounded_operations(
 
     state = gateway.get("jobs/remote-1")
     gateway.cancel("jobs/remote-1")
+    gateway.delete("jobs/remote-1")
     gateway.cleanup("gs://customs-indexing/regulatory/tenant-a/job-42")
 
     assert state.status is VertexBatchJobStatus.SUCCEEDED
     assert state.output_uri == "gs://bucket/output"
     assert batches.cancelled_name == "jobs/remote-1"
+    assert batches.deleted_name == "jobs/remote-1"
     assert storage_client.bucket_value.deleted_names == [
         "regulatory/tenant-a/job-42/input.jsonl"
     ]
     assert storage_client.list_timeouts == [60]
     assert storage_client.bucket_value.delete_timeout == 60
     assert storage_client.closed
-    assert len(created_clients) == 2
+    assert len(created_clients) == 3
     assert all(client.closed for client in created_clients)
 
 

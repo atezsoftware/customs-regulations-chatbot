@@ -27,8 +27,7 @@ from onyx.regulatory.indexing_jobs.configuration import (
     resolve_regulatory_indexing_snapshot,
 )
 from onyx.regulatory.indexing_jobs.contextual import (
-    contextual_request_for_row,
-    contextual_reserve_for_row,
+    ContextualRequestFactory,
     get_contextual_token_budget_tokenizer,
 )
 from onyx.regulatory.indexing_jobs.models import (
@@ -211,19 +210,16 @@ def prepare_claimed_regulatory_indexing_job(
         prepared_items: list[
             indexing_job_repository.RegulatoryIndexingPreparedItem
         ] = []
+        request_factory = ContextualRequestFactory(
+            job=job,
+            rows=rows,
+            embedding_tokenizer=embedding_tokenizer,
+            contextual_tokenizer=contextual_tokenizer,
+        )
         for row in rows:
-            contextual_reserve = contextual_reserve_for_row(
-                rows,
-                row,
-                embedding_tokenizer=embedding_tokenizer,
-            )
+            contextual_reserve = request_factory.reserve(row)
             request = (
-                contextual_request_for_row(
-                    job,
-                    rows,
-                    row,
-                    contextual_tokenizer=contextual_tokenizer,
-                )
+                request_factory.request(row)
                 if contextual_reserve > 0
                 else VertexBatchRequest(
                     prompt=f"Context skipped for canonical chunk {row.id}"

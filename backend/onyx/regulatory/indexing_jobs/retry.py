@@ -4,8 +4,16 @@ from hashlib import sha256
 from uuid import UUID
 
 import httpx
+from elastic_transport import ConnectionError as ElasticConnectionError
+from elastic_transport import ConnectionTimeout as ElasticConnectionTimeout
+from elasticsearch import ApiError as ElasticsearchApiError
 
 from onyx.db.enums import RegulatoryIndexingStage
+from onyx.natural_language_processing.exceptions import (
+    EmbeddingProviderConnectionError,
+    EmbeddingProviderHTTPError,
+    EmbeddingProviderTimeoutError,
+)
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
     IndexingGatewayHTTPError,
@@ -37,7 +45,13 @@ def classify_indexing_error(error: Exception) -> RetryDecision:
 
     if isinstance(
         error,
-        (IndexingGatewayTimeoutError, TimeoutError, httpx.TimeoutException),
+        (
+            IndexingGatewayTimeoutError,
+            TimeoutError,
+            httpx.TimeoutException,
+            ElasticConnectionTimeout,
+            EmbeddingProviderTimeoutError,
+        ),
     ):
         return RetryDecision(
             disposition=RetryDisposition.RETRYABLE,
@@ -50,6 +64,8 @@ def classify_indexing_error(error: Exception) -> RetryDecision:
             ConnectionError,
             socket.gaierror,
             httpx.NetworkError,
+            ElasticConnectionError,
+            EmbeddingProviderConnectionError,
         ),
     ):
         return RetryDecision(
@@ -58,7 +74,11 @@ def classify_indexing_error(error: Exception) -> RetryDecision:
         )
     if isinstance(error, httpx.HTTPStatusError):
         return _http_retry_decision(error.response.status_code)
+    if isinstance(error, EmbeddingProviderHTTPError):
+        return _http_retry_decision(error.status_code)
     if isinstance(error, IndexingGatewayHTTPError):
+        return _http_retry_decision(error.status_code)
+    if isinstance(error, ElasticsearchApiError):
         return _http_retry_decision(error.status_code)
     if isinstance(error, IndexingPublicationIndeterminateError):
         return RetryDecision(

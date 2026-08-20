@@ -1,4 +1,5 @@
 import datetime
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import cast
 from uuid import uuid4
@@ -23,6 +24,7 @@ from onyx.regulatory import contextual as regulatory_contextual
 from onyx.regulatory.indexing_jobs import contextual
 from onyx.regulatory.indexing_jobs.contextual import (
     ContextApplySummary,
+    ContextAttemptBudgetExhaustedError,
     apply_contextual_results,
     build_contextual_requests,
 )
@@ -164,6 +166,199 @@ def test_contextual_requests_use_ordered_canonical_rows_and_preserve_legal_ids(
     assert requests[1].prompt.index("MADDE 12 - (1)") < requests[1].prompt.index(
         "4458 sayılı"
     )
+
+
+def test_contextual_request_selection_is_bounded_and_unselected_items_are_uncharged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job()
+    rows = [
+        _row(
+            job,
+            row_id=f"rc_{position}",
+            position=position,
+            text=f"MADDE {position + 1} - Transit hükmü.",
+            heading_path=[f"MADDE {position + 1}"],
+        )
+        for position in range(4)
+    ]
+    monkeypatch.setattr(contextual, "get_max_input_tokens", lambda *_a, **_k: 100_000)
+    requests = [
+        contextual.contextual_request_for_row(
+            job, rows, row, contextual_tokenizer=_CharacterTokenizer()
+        )
+        for row in rows
+    ]
+    items = [
+        cast(
+            RegulatoryIndexingItem,
+            SimpleNamespace(
+                id=uuid4(),
+                job_id=job.id,
+                regulatory_chunk_id=row.id,
+                request_hash=request.request_hash,
+                status=RegulatoryIndexingItemStatus.PENDING.value,
+                context_attempt_count=0,
+            ),
+        )
+        for row, request in zip(rows, requests, strict=True)
+    ]
+
+    selected = build_contextual_requests(
+        job,
+        rows,
+        items,
+        embedding_tokenizer=_CharacterTokenizer(),
+        contextual_tokenizer=_CharacterTokenizer(),
+        max_requests=2,
+        max_jsonl_bytes=1_000_000,
+        max_attempts=3,
+    )
+
+    assert selected == requests[:2]
+    assert [item.context_attempt_count for item in items] == [0, 0, 0, 0]
+
+
+def test_contextual_attempt_budget_fails_before_another_provider_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job()
+    rows = [
+        _row(
+            job,
+            row_id=f"rc_{position}",
+            position=position,
+            text=f"MADDE {position + 1} - Transit hüküm.",
+            heading_path=[f"MADDE {position + 1}"],
+        )
+        for position in range(2)
+    ]
+    monkeypatch.setattr(contextual, "get_max_input_tokens", lambda *_a, **_k: 100_000)
+    request = contextual.contextual_request_for_row(
+        job, rows, rows[0], contextual_tokenizer=_CharacterTokenizer()
+    )
+    item = cast(
+        RegulatoryIndexingItem,
+        SimpleNamespace(
+            id=uuid4(),
+            job_id=job.id,
+            regulatory_chunk_id=rows[0].id,
+            request_hash=request.request_hash,
+            status=RegulatoryIndexingItemStatus.PENDING.value,
+            context_attempt_count=3,
+        ),
+    )
+
+    with pytest.raises(ContextAttemptBudgetExhaustedError):
+        build_contextual_requests(
+            job,
+            rows,
+            [item],
+            embedding_tokenizer=_CharacterTokenizer(),
+            contextual_tokenizer=_CharacterTokenizer(),
+            max_requests=2,
+            max_jsonl_bytes=1_000_000,
+            max_attempts=3,
+        )
+
+
+def test_large_file_selection_reuses_one_document_context_and_stays_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job()
+    rows = [
+        _row(
+            job,
+            row_id=f"rc_large_{position}",
+            position=position,
+            text=f"MADDE {position + 1} - Gümrük transit hükmü {position}.",
+            heading_path=[f"MADDE {position + 1}"],
+        )
+        for position in range(120)
+    ]
+    monkeypatch.setattr(contextual, "get_max_input_tokens", lambda *_a, **_k: 100_000)
+    hash_factory = contextual.ContextualRequestFactory(
+        job=job,
+        rows=rows,
+        embedding_tokenizer=_CharacterTokenizer(),
+        contextual_tokenizer=_CharacterTokenizer(),
+    )
+    items = [
+        cast(
+            RegulatoryIndexingItem,
+            SimpleNamespace(
+                id=uuid4(),
+                job_id=job.id,
+                regulatory_chunk_id=row.id,
+                request_hash=hash_factory.request(row).request_hash,
+                status=RegulatoryIndexingItemStatus.PENDING.value,
+                context_attempt_count=0,
+            ),
+        )
+        for row in rows
+    ]
+    original_prepare = contextual._prepare_document_context
+    prepare_calls = 0
+
+    def counting_prepare(
+        ordered_rows: Sequence[RegulatoryChunk],
+        *,
+        tokenizer: BaseTokenizer,
+    ) -> object:
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return original_prepare(ordered_rows, tokenizer=tokenizer)
+
+    monkeypatch.setattr(contextual, "_prepare_document_context", counting_prepare)
+    jsonl_cap = 4 * 1024 * 1024
+
+    selected = build_contextual_requests(
+        job,
+        rows,
+        items,
+        embedding_tokenizer=_CharacterTokenizer(),
+        contextual_tokenizer=_CharacterTokenizer(),
+        max_requests=64,
+        max_jsonl_bytes=jsonl_cap,
+        max_attempts=3,
+    )
+
+    assert 1 < len(selected) <= 64
+    assert sum(contextual.vertex_jsonl_line_size(request) for request in selected) <= (
+        jsonl_cap
+    )
+    assert prepare_calls == 1
+
+
+def test_document_context_cache_is_bounded_across_many_validity_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job()
+    rows = [
+        _row(
+            job,
+            row_id=f"rc_version_{position}",
+            position=position,
+            text=f"MADDE {position + 1} - Tarihli hüküm.",
+            heading_path=[f"MADDE {position + 1}"],
+        )
+        for position in range(12)
+    ]
+    for position, row in enumerate(rows):
+        row.validity_start_date = datetime.date(2020, 1, 1) + datetime.timedelta(
+            days=position
+        )
+    monkeypatch.setattr(contextual, "get_max_input_tokens", lambda *_a, **_k: 100_000)
+    factory = contextual.ContextualRequestFactory(
+        job=job,
+        rows=rows,
+        contextual_tokenizer=_CharacterTokenizer(),
+    )
+
+    for row in rows:
+        factory.request(row)
+
+    assert len(factory._documents) == contextual._MAX_CACHED_DOCUMENT_CONTEXTS
 
 
 def test_contextual_request_fits_reconstructed_document_to_model_budget(

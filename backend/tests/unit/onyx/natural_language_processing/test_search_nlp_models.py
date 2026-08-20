@@ -10,6 +10,7 @@ from tenacity import wait_none
 
 from onyx.llm.constants import LlmProviderNames
 from onyx.natural_language_processing.constants import OPENROUTER_EMBEDDINGS_URL
+from onyx.natural_language_processing.exceptions import EmbeddingProviderResponseError
 from onyx.natural_language_processing.search_nlp_models import (
     CloudEmbedding,
     EmbeddingModel,
@@ -224,7 +225,7 @@ async def test_proxy_embedding_rejects_invalid_response_indexes(
                 "post",
                 new=AsyncMock(return_value=response),
             ),
-            pytest.raises(RuntimeError, match="EmbeddingProvider.OPENROUTER"),
+            pytest.raises(EmbeddingProviderResponseError),
         ):
             await embedding.embed(
                 texts=["test1", "test2"],
@@ -251,7 +252,7 @@ async def test_proxy_embedding_rejects_unexpected_dimension() -> None:
                 "post",
                 new=AsyncMock(return_value=response),
             ),
-            pytest.raises(RuntimeError, match="dimension"),
+            pytest.raises(EmbeddingProviderResponseError, match="dimension"),
         ):
             await embedding.embed(
                 texts=["test"],

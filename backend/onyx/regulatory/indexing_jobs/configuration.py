@@ -269,6 +269,13 @@ def resolve_regulatory_indexing_snapshot(
         poll_seconds=app_configs.REGULATORY_INDEXING_POLL_SECONDS,
         lease_seconds=app_configs.REGULATORY_INDEXING_LEASE_SECONDS,
         embedding_request_size=(app_configs.REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE),
+        context_request_size=app_configs.REGULATORY_INDEXING_CONTEXT_REQUEST_SIZE,
+        context_jsonl_max_bytes=(
+            app_configs.REGULATORY_INDEXING_CONTEXT_JSONL_MAX_BYTES
+        ),
+        submission_reconcile_seconds=(
+            app_configs.REGULATORY_INDEXING_SUBMISSION_RECONCILE_SECONDS
+        ),
     )
 
 

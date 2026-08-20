@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Sequence
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import httpx
 import pytest
 from sqlalchemy.orm import Session
 
@@ -16,6 +18,11 @@ from onyx.db.models import (
     RegulatoryIndexingItem,
     RegulatoryIndexingJob,
     SearchSettings,
+)
+from onyx.natural_language_processing.exceptions import (
+    EmbeddingProviderConnectionError,
+    EmbeddingProviderHTTPError,
+    EmbeddingProviderTimeoutError,
 )
 from onyx.natural_language_processing.search_nlp_models import CloudEmbedding
 from onyx.regulatory.indexing_jobs import embedding
@@ -420,3 +427,84 @@ def test_openrouter_boundary_restores_out_of_order_response_indexes() -> None:
         asyncio.run(cloud_embedding.aclose())
 
     assert vectors == [[0.1, 0.2], [0.3, 0.4]]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_type"),
+    [
+        (httpx.ReadTimeout("LEGAL_TIMEOUT_SENTINEL"), EmbeddingProviderTimeoutError),
+        (
+            httpx.ConnectError("LEGAL_NETWORK_SENTINEL"),
+            EmbeddingProviderConnectionError,
+        ),
+    ],
+)
+def test_openrouter_transport_failures_are_secret_safe_typed_errors(
+    failure: Exception,
+    expected_type: type[Exception],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cloud_embedding = CloudEmbedding(
+        api_key="SECRET_API_KEY_SENTINEL",
+        provider=EmbeddingProvider.OPENROUTER,
+    )
+    cloud_embedding.http_client = cast(
+        Any,
+        SimpleNamespace(
+            post=AsyncMock(side_effect=failure),
+            aclose=AsyncMock(),
+        ),
+    )
+    try:
+        with caplog.at_level(logging.DEBUG), pytest.raises(expected_type) as raised:
+            asyncio.run(
+                cloud_embedding.embed(
+                    texts=["LEGAL_TEXT_SENTINEL"],
+                    text_type=EmbedTextType.PASSAGE,
+                    model_name="openai/text-embedding-3-large",
+                )
+            )
+    finally:
+        asyncio.run(cloud_embedding.aclose())
+
+    rendered = f"{raised.value}\n{caplog.text}"
+    assert "LEGAL_TEXT_SENTINEL" not in rendered
+    assert "SECRET_API_KEY_SENTINEL" not in rendered
+    assert "LEGAL_TIMEOUT_SENTINEL" not in rendered
+    assert "LEGAL_NETWORK_SENTINEL" not in rendered
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 429, 500, 503])
+def test_openrouter_http_failure_preserves_only_status(status_code: int) -> None:
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/embeddings")
+    response = httpx.Response(
+        status_code,
+        request=request,
+        text="LEGAL_RESPONSE_SENTINEL",
+    )
+    cloud_embedding = CloudEmbedding(
+        api_key="test-key",
+        provider=EmbeddingProvider.OPENROUTER,
+    )
+    cloud_embedding.http_client = cast(
+        Any,
+        SimpleNamespace(
+            post=AsyncMock(return_value=response),
+            aclose=AsyncMock(),
+        ),
+    )
+    try:
+        with pytest.raises(EmbeddingProviderHTTPError) as raised:
+            asyncio.run(
+                cloud_embedding.embed(
+                    texts=["LEGAL_REQUEST_SENTINEL"],
+                    text_type=EmbedTextType.PASSAGE,
+                    model_name="openai/text-embedding-3-large",
+                )
+            )
+    finally:
+        asyncio.run(cloud_embedding.aclose())
+
+    assert raised.value.status_code == status_code
+    assert "LEGAL_RESPONSE_SENTINEL" not in str(raised.value)
+    assert "LEGAL_REQUEST_SENTINEL" not in str(raised.value)

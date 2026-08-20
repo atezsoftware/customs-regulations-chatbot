@@ -2,8 +2,17 @@ from uuid import UUID
 
 import httpx
 import pytest
+from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
+from elastic_transport import ConnectionError as ElasticConnectionError
+from elastic_transport import ConnectionTimeout as ElasticConnectionTimeout
+from elasticsearch import ApiError
 
 from onyx.db.enums import RegulatoryIndexingStage
+from onyx.natural_language_processing.exceptions import (
+    EmbeddingProviderConnectionError,
+    EmbeddingProviderHTTPError,
+    EmbeddingProviderTimeoutError,
+)
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
     IndexingGatewayHTTPError,
@@ -53,6 +62,8 @@ def test_terminal_http_boundaries(status_code: int) -> None:
         (httpx.ReadTimeout("timed out"), RetryReason.TIMEOUT),
         (ConnectionResetError("connection reset"), RetryReason.NETWORK),
         (httpx.ConnectError("connection failed"), RetryReason.NETWORK),
+        (EmbeddingProviderTimeoutError(), RetryReason.TIMEOUT),
+        (EmbeddingProviderConnectionError(), RetryReason.NETWORK),
     ],
 )
 def test_transient_transport_errors_are_retryable(
@@ -70,6 +81,66 @@ def test_unknown_errors_fail_closed() -> None:
 
     assert decision.disposition is RetryDisposition.TERMINAL
     assert decision.reason is RetryReason.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ElasticConnectionTimeout("timed out"),
+        ElasticConnectionError("connection reset"),
+    ],
+)
+def test_elastic_transport_connection_failures_are_retryable(error: Exception) -> None:
+    decision = classify_indexing_error(error)
+
+    assert decision.disposition is RetryDisposition.RETRYABLE
+    assert decision.reason in {RetryReason.TIMEOUT, RetryReason.NETWORK}
+
+
+@pytest.mark.parametrize(
+    ("status_code", "disposition"),
+    [
+        (429, RetryDisposition.RETRYABLE),
+        (503, RetryDisposition.RETRYABLE),
+        (400, RetryDisposition.TERMINAL),
+        (401, RetryDisposition.TERMINAL),
+    ],
+)
+def test_elasticsearch_api_status_is_classified(
+    status_code: int, disposition: RetryDisposition
+) -> None:
+    error = ApiError(
+        "provider status",
+        meta=ApiResponseMeta(
+            status=status_code,
+            http_version="1.1",
+            headers=HttpHeaders(),
+            duration=0.0,
+            node=NodeConfig("http", "localhost", 9200),
+        ),
+        body=None,
+    )
+
+    assert classify_indexing_error(error).disposition is disposition
+
+
+@pytest.mark.parametrize(
+    ("status_code", "disposition"),
+    [
+        (429, RetryDisposition.RETRYABLE),
+        (500, RetryDisposition.RETRYABLE),
+        (503, RetryDisposition.RETRYABLE),
+        (400, RetryDisposition.TERMINAL),
+        (401, RetryDisposition.TERMINAL),
+    ],
+)
+def test_openrouter_embedding_http_status_is_classified(
+    status_code: int, disposition: RetryDisposition
+) -> None:
+    decision = classify_indexing_error(EmbeddingProviderHTTPError(status_code))
+
+    assert decision.disposition is disposition
+    assert decision.status_code == status_code
 
 
 def test_indeterminate_publication_is_retryable() -> None:

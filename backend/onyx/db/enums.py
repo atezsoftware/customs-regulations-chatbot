@@ -765,6 +765,25 @@ class RegulatoryIndexingCancellationIntent(str, PyEnum):
     USER_CANCEL = "USER_CANCEL"
     USER_DELETE = "USER_DELETE"
     SUPERSEDE = "SUPERSEDE"
+    TERMINAL_FAILURE = "TERMINAL_FAILURE"
+
+
+class RegulatoryIndexingProviderCleanupState(str, PyEnum):
+    NONE = "NONE"
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    RETRY_WAIT = "RETRY_WAIT"
+    SUCCEEDED = "SUCCEEDED"
+    EXHAUSTED = "EXHAUSTED"
+
+
+class RegulatoryIndexingProviderCleanupPhase(str, PyEnum):
+    NONE = "NONE"
+    VERTEX_CANCEL = "VERTEX_CANCEL"
+    VERTEX_RECONCILE = "VERTEX_RECONCILE"
+    VERTEX_DELETE = "VERTEX_DELETE"
+    GCS_CLEANUP = "GCS_CLEANUP"
+    COMPLETE = "COMPLETE"
 
 
 class RegulatoryIndexingStage(str, PyEnum):

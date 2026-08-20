@@ -17,6 +17,8 @@ from onyx.db.enums import (
     RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
+    RegulatoryIndexingProviderCleanupPhase,
+    RegulatoryIndexingProviderCleanupState,
     RegulatoryIndexingStage,
     RegulatoryIndexingSubmissionState,
     UserFileStatus,
@@ -34,11 +36,13 @@ from onyx.db.regulatory_indexing_jobs import (
     RegulatoryIndexingConfigSnapshot,
     advance_regulatory_indexing_cancellation,
     advance_regulatory_indexing_job,
+    claim_due_regulatory_provider_cleanups,
     claim_regulatory_indexing_job,
     claim_stale_regulatory_indexing_jobs,
     complete_regulatory_indexing_publication,
     complete_regulatory_indexing_user_file,
     consume_preclaimed_regulatory_indexing_delivery,
+    consume_regulatory_provider_cleanup_delivery,
     create_or_get_regulatory_indexing_item,
     create_or_get_regulatory_indexing_job,
     fail_regulatory_indexing_job,
@@ -48,15 +52,18 @@ from onyx.db.regulatory_indexing_jobs import (
     persist_regulatory_indexing_item_skipped,
     persist_regulatory_indexing_item_vector,
     persist_regulatory_indexing_item_vectors,
+    record_reconciled_provider_cleanup_vertex_job,
+    record_vertex_reconciliation_miss,
     record_vertex_submission,
-    record_vertex_submission_absent,
     record_vertex_submission_intent,
     regulatory_indexing_external_mutation_lease,
     request_regulatory_indexing_cancellation,
     request_user_file_deletion_cleanup,
     require_vertex_submission_reconciliation,
+    reset_vertex_submission_for_partial_retry,
     schedule_regulatory_indexing_cancellation_retry,
     schedule_regulatory_indexing_retry,
+    schedule_regulatory_provider_cleanup_retry,
 )
 from onyx.document_index.interfaces_new import DocumentIndex
 from onyx.regulatory.chunker import RegulatoryChunker
@@ -735,6 +742,11 @@ def test_stale_failure_from_terminal_generation_cannot_overwrite_new_reindex(
         error_message="terminal before reindex",
         now=_NOW,
     )
+    db_session.refresh(old_job)
+    assert (
+        old_job.provider_cleanup_state
+        == RegulatoryIndexingProviderCleanupState.PENDING.value
+    )
 
     new_job = _create_job(
         db_session,
@@ -941,15 +953,50 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
         expected_generation=0,
         now=_NOW,
     )
+    submitted_chunk = RegulatoryChunk(
+        id=f"regulatory-chunk-{uuid4().hex}",
+        user_file_id=regulatory_user_file.id,
+        text="MADDE 1 - Submitted item.",
+        position=0,
+        heading_path=["MADDE 1"],
+        chunk_metadata={},
+    )
+    omitted_chunk = RegulatoryChunk(
+        id=f"regulatory-chunk-{uuid4().hex}",
+        user_file_id=regulatory_user_file.id,
+        text="MADDE 2 - Omitted item.",
+        position=1,
+        heading_path=["MADDE 2"],
+        chunk_metadata={},
+    )
+    db_session.add_all((submitted_chunk, omitted_chunk))
+    db_session.commit()
+    submitted_item = create_or_get_regulatory_indexing_item(
+        db_session,
+        job_id=job.id,
+        regulatory_chunk_id=submitted_chunk.id,
+        request_hash="f" * 64,
+        expected_generation=1,
+    )
+    omitted_item = create_or_get_regulatory_indexing_item(
+        db_session,
+        job_id=job.id,
+        regulatory_chunk_id=omitted_chunk.id,
+        request_hash="e" * 64,
+        expected_generation=1,
+    )
+    assert submitted_item is not None and omitted_item is not None
     job.stage = RegulatoryIndexingStage.CONTEXT_SUBMIT.value
     db_session.commit()
     submission_key = "regulatory-context-" + "a" * 64
+    request_hashes = ("f" * 64,)
 
     assert not record_vertex_submission_intent(
         db_session,
         job_id=job.id,
         expected_generation=0,
         submission_key=submission_key,
+        submission_attempt=1,
         now=_NOW,
     )
     assert record_vertex_submission_intent(
@@ -957,6 +1004,7 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
         job_id=job.id,
         expected_generation=1,
         submission_key=submission_key,
+        submission_attempt=1,
         now=_NOW,
     )
     db_session.refresh(job)
@@ -971,6 +1019,8 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
         job_id=job.id,
         expected_generation=1,
         submission_key=submission_key,
+        request_hashes=request_hashes,
+        reconcile_until=_NOW + datetime.timedelta(minutes=5),
         now=_NOW,
     )
     db_session.refresh(job)
@@ -978,25 +1028,31 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
         job.vertex_submission_state
         == RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED.value
     )
+    db_session.refresh(submitted_item)
+    db_session.refresh(omitted_item)
+    assert submitted_item.context_attempt_count == 1
+    assert omitted_item.context_attempt_count == 0
 
-    assert record_vertex_submission_absent(
+    assert record_vertex_reconciliation_miss(
         db_session,
         job_id=job.id,
         expected_generation=1,
-        submission_key=submission_key,
         now=_NOW,
     )
     db_session.refresh(job)
     assert (
         job.vertex_submission_state
-        == RegulatoryIndexingSubmissionState.RECONCILED_ABSENT.value
+        == RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED.value
     )
+    assert job.vertex_reconcile_miss_count == 1
 
     assert record_vertex_submission(
         db_session,
         job_id=job.id,
         expected_generation=1,
         submission_key=submission_key,
+        request_hashes=request_hashes,
+        charge_items=False,
         remote_job_name="projects/p/locations/l/batchJobs/1",
         input_uri="gs://bucket/input.jsonl",
         output_uri="gs://bucket/output",
@@ -1007,6 +1063,44 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
         job.vertex_submission_state == RegulatoryIndexingSubmissionState.SUBMITTED.value
     )
     assert job.remote_vertex_job_name == "projects/p/locations/l/batchJobs/1"
+    db_session.refresh(submitted_item)
+    assert submitted_item.context_attempt_count == 1
+
+    job.stage = RegulatoryIndexingStage.CONTEXT_APPLY.value
+    db_session.commit()
+    assert reset_vertex_submission_for_partial_retry(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        now=_NOW + datetime.timedelta(minutes=1),
+    )
+    job.stage = RegulatoryIndexingStage.CONTEXT_SUBMIT.value
+    db_session.commit()
+    repeated_key = "regulatory-context-" + "b" * 64
+    assert record_vertex_submission_intent(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key=repeated_key,
+        submission_attempt=2,
+        now=_NOW + datetime.timedelta(minutes=1),
+    )
+    assert record_vertex_submission(
+        db_session,
+        job_id=job.id,
+        expected_generation=1,
+        submission_key=repeated_key,
+        request_hashes=request_hashes,
+        charge_items=True,
+        remote_job_name="projects/p/locations/l/batchJobs/2",
+        input_uri="gs://bucket/input-2.jsonl",
+        output_uri="gs://bucket/output-2",
+        now=_NOW + datetime.timedelta(minutes=1),
+    )
+    db_session.refresh(submitted_item)
+    db_session.refresh(omitted_item)
+    assert submitted_item.context_attempt_count == 2
+    assert omitted_item.context_attempt_count == 0
 
 
 def test_illegal_stage_skip_cannot_persist_terminal_job_state(
@@ -1332,6 +1426,7 @@ def test_submission_external_lease_prevents_stale_recovery_during_create(
         job_id=job.id,
         expected_generation=1,
         submission_key="regulatory-context-" + "c" * 64,
+        submission_attempt=1,
         now=_NOW,
     )
     engine = db_session.get_bind()
@@ -2322,6 +2417,136 @@ def test_publication_atomically_completes_user_file_and_job(
     assert regulatory_user_file.status is UserFileStatus.COMPLETED
     assert regulatory_user_file.chunk_count == 2
     assert regulatory_user_file.secondary_reconcile_pending is True
+    assert (
+        job.provider_cleanup_state
+        == RegulatoryIndexingProviderCleanupState.PENDING.value
+    )
+    assert (
+        job.provider_cleanup_phase
+        == RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP.value
+    )
+
+    claims = claim_due_regulatory_provider_cleanups(
+        db_session,
+        stale_before=_NOW - datetime.timedelta(minutes=1),
+        claimed_at=_NOW,
+        limit=1,
+    )
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim.job_id == job.id
+    assert consume_regulatory_provider_cleanup_delivery(
+        db_session,
+        job_id=job.id,
+        cleanup_generation=claim.cleanup_generation,
+        cleanup_token=claim.cleanup_token,
+        consumed_at=_NOW,
+    )
+    assert not consume_regulatory_provider_cleanup_delivery(
+        db_session,
+        job_id=job.id,
+        cleanup_generation=claim.cleanup_generation,
+        cleanup_token=claim.cleanup_token,
+        consumed_at=_NOW,
+    )
+    sweep_at = _NOW + datetime.timedelta(minutes=15)
+    assert schedule_regulatory_provider_cleanup_retry(
+        db_session,
+        job_id=job.id,
+        cleanup_generation=claim.cleanup_generation,
+        next_retry_at=sweep_at,
+        error_code="provider_unavailable",
+        error_message="IndexingGatewayConnectionError",
+        exhausted=True,
+    )
+    db_session.refresh(job)
+    assert (
+        job.provider_cleanup_state
+        == RegulatoryIndexingProviderCleanupState.EXHAUSTED.value
+    )
+    assert (
+        claim_due_regulatory_provider_cleanups(
+            db_session,
+            stale_before=_NOW,
+            claimed_at=sweep_at - datetime.timedelta(seconds=1),
+            limit=1,
+        )
+        == []
+    )
+    swept = claim_due_regulatory_provider_cleanups(
+        db_session,
+        stale_before=_NOW,
+        claimed_at=sweep_at,
+        limit=1,
+    )
+    assert len(swept) == 1
+    db_session.refresh(job)
+    assert job.provider_cleanup_attempt_count == 0
+
+
+def test_terminal_cleanup_persists_a_late_visible_vertex_job(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    submission_key = "regulatory-context-" + "f" * 64
+    job.stage = RegulatoryIndexingStage.CONTEXT_SUBMIT.value
+    job.vertex_submission_key = submission_key
+    job.vertex_submission_state = (
+        RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED.value
+    )
+    db_session.commit()
+    assert fail_regulatory_indexing_job(
+        db_session,
+        job_id=job.id,
+        expected_stage=RegulatoryIndexingStage.CONTEXT_SUBMIT,
+        expected_generation=1,
+        error_code="visibility_horizon",
+        error_message="VertexBatchContractError",
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    assert (
+        job.provider_cleanup_phase
+        == RegulatoryIndexingProviderCleanupPhase.VERTEX_RECONCILE.value
+    )
+    claim = claim_due_regulatory_provider_cleanups(
+        db_session,
+        stale_before=_NOW - datetime.timedelta(minutes=1),
+        claimed_at=_NOW,
+        limit=1,
+    )[0]
+    assert consume_regulatory_provider_cleanup_delivery(
+        db_session,
+        job_id=job.id,
+        cleanup_generation=claim.cleanup_generation,
+        cleanup_token=claim.cleanup_token,
+        consumed_at=_NOW,
+    )
+    assert record_reconciled_provider_cleanup_vertex_job(
+        db_session,
+        job_id=job.id,
+        cleanup_generation=claim.cleanup_generation,
+        submission_key=submission_key,
+        remote_job_name="projects/p/locations/l/batchJobs/late",
+        input_uri="gs://bucket/input.jsonl",
+        output_uri="gs://bucket/output",
+        now=_NOW,
+    )
+    db_session.refresh(job)
+    assert job.remote_vertex_job_name is not None
+    assert job.remote_vertex_job_name.endswith("/late")
+    assert (
+        job.provider_cleanup_phase
+        == RegulatoryIndexingProviderCleanupPhase.VERTEX_DELETE.value
+    )
 
 
 @pytest.mark.parametrize(

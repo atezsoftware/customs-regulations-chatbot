@@ -243,7 +243,7 @@ class _RecordingDocumentIndex:
 class _StatefulVisibilityIndex(_RecordingDocumentIndex):
     def __init__(self, events: list[str]) -> None:
         super().__init__(events)
-        self.hidden = True
+        self.hidden: bool | None = True
 
     def update_document_visibility(
         self, request: DocumentChunkVerificationRequest
@@ -265,6 +265,35 @@ class _StatefulVisibilityIndex(_RecordingDocumentIndex):
             ),
             hidden=self.hidden,
         )
+
+
+def test_publish_converges_a_process_death_mixed_visibility_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
+    events: list[str] = []
+    document_index = _StatefulVisibilityIndex(events)
+    document_index.hidden = None
+    monkeypatch.setattr(
+        publisher.indexing_job_repository,
+        "complete_regulatory_indexing_publication",
+        MagicMock(return_value=True),
+    )
+
+    outcome = publish_regulatory_job(
+        job=job,
+        user_file=user_file,
+        rows=rows,
+        items=items,
+        db_session=_DB_SESSION,
+        document_index=cast(DocumentIndex, document_index),
+        search_settings=settings,
+    )
+
+    assert outcome is publisher.PublishOutcome.COMPLETED
+    assert document_index.hidden is False
+    assert events == ["update", "verify:true", "update", "verify:false"]
 
 
 class _SimulatedProcessDeath(BaseException):
@@ -435,6 +464,7 @@ def test_stage_indexes_every_chunk_hidden_then_publish_completes_file(
     assert events == [
         "index",
         "verify:true",
+        "update",
         "verify:true",
         "update",
         "verify:false",
@@ -445,9 +475,16 @@ def test_stage_indexes_every_chunk_hidden_then_publish_completes_file(
             MetadataUpdateRequest(
                 document_ids=[str(user_file.id)],
                 doc_id_to_chunk_cnt={str(user_file.id): 2},
+                hidden=True,
+            )
+        ],
+        [
+            MetadataUpdateRequest(
+                document_ids=[str(user_file.id)],
+                doc_id_to_chunk_cnt={str(user_file.id): 2},
                 hidden=False,
             )
-        ]
+        ],
     ]
     assert completed == [(job.id, 11, 2)]
     assert user_file.status is UserFileStatus.INDEXING
@@ -501,11 +538,14 @@ def test_publish_recovers_visible_projection_after_process_death(
     assert outcome is publisher.PublishOutcome.COMPLETED
     assert document_index.hidden is False
     assert events == [
+        "update",
         "verify:true",
         "update",
         "verify:false",
         "complete-publication",
+        "update",
         "verify:true",
+        "update",
         "verify:false",
         "complete-publication",
     ]
@@ -524,7 +564,7 @@ def test_already_visible_projection_db_failure_requires_reconciliation(
         MagicMock(side_effect=RuntimeError("database unavailable")),
     )
 
-    with pytest.raises(IndexingPublicationIndeterminateError):
+    with pytest.raises(RuntimeError, match="database unavailable"):
         publish_regulatory_job(
             job=job,
             user_file=user_file,
@@ -535,7 +575,7 @@ def test_already_visible_projection_db_failure_requires_reconciliation(
             search_settings=settings,
         )
 
-    assert document_index.hidden is False
+    assert document_index.hidden is True
 
 
 def test_stage_retry_preserves_document_and_chunk_ids(
@@ -863,6 +903,7 @@ def test_publish_post_update_disappearance_never_completes_file(
         )
 
     assert document_index.events == [
+        "update",
         "verify:true",
         "update",
         "verify:false",
@@ -911,6 +952,7 @@ def test_publish_completion_failure_restores_hidden_projection(
         )
 
     assert document_index.events == [
+        "update",
         "verify:true",
         "update",
         "verify:false",
@@ -954,6 +996,7 @@ def test_publish_commit_failure_preserves_visible_projection_for_reconciliation(
 
     assert len(commit_calls) == 1
     assert document_index.events == [
+        "update",
         "verify:true",
         "update",
         "verify:false",

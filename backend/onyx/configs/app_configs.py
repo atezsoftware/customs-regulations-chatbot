@@ -1504,6 +1504,19 @@ REGULATORY_INDEXING_LEASE_SECONDS = max(
 REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE = max(
     1, int(os.environ.get("REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE") or 64)
 )
+REGULATORY_INDEXING_CONTEXT_REQUEST_SIZE = max(
+    1, int(os.environ.get("REGULATORY_INDEXING_CONTEXT_REQUEST_SIZE") or 64)
+)
+REGULATORY_INDEXING_CONTEXT_JSONL_MAX_BYTES = max(
+    1,
+    int(
+        os.environ.get("REGULATORY_INDEXING_CONTEXT_JSONL_MAX_BYTES") or 8 * 1024 * 1024
+    ),
+)
+REGULATORY_INDEXING_SUBMISSION_RECONCILE_SECONDS = max(
+    1,
+    int(os.environ.get("REGULATORY_INDEXING_SUBMISSION_RECONCILE_SECONDS") or 300),
+)
 # When swapping to a new embedding model, a secondary index is created in the background, to conserve
 # resources, we pause updates on the primary index by default while the secondary index is created
 DISABLE_INDEX_UPDATE_ON_SWAP = (

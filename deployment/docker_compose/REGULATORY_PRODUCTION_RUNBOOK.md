@@ -253,12 +253,23 @@ docker compose --project-name "$APPROVED_COMPOSE_PROJECT" --env-file .env \
     "https://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=10s"'
 ```
 
+The regulatory publication client is compatibility-tested against Elasticsearch `8.6.2` (the
+repository Compose/ECK/client baseline) and Elasticsearch `9.4.2`. Before enabling the worker,
+archive the authenticated root response and require `.version.number` to equal one of those exact
+versions. An unidentified distribution or any other version blocks rollout until its bulk
+visibility, refresh/readback, vector `_source`, mapping, and transport-error behavior passes the
+durable pipeline suite.
+
 For external basic-auth Elasticsearch, use a mode-`0600` netrc/secret file and the approved CA; do not put
 the password in an argument or shell history. The first call must report green/yellow and the second
 must prove the approved live index/alias is readable and non-empty:
 
 ```bash
 test "$(stat -c '%a' "$ELASTICSEARCH_NETRC")" = 600
+curl --fail --silent --show-error --netrc-file "$ELASTICSEARCH_NETRC" \
+  --cacert "$ELASTICSEARCH_CA_FILE" "$ELASTICSEARCH_URL/" \
+  | tee elasticsearch-version.json \
+  | jq -e '.version.number == "8.6.2" or .version.number == "9.4.2"'
 curl --fail --silent --show-error --netrc-file "$ELASTICSEARCH_NETRC" \
   --cacert "$ELASTICSEARCH_CA_FILE" \
   "$ELASTICSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=10s" \
@@ -702,7 +713,10 @@ store/environment, not in source control. Defaults below match the Compose overl
 | `REGULATORY_INDEXING_RETRY_MAX_SECONDS` | background | `900` |
 | `REGULATORY_INDEXING_POLL_SECONDS` | background | `30` |
 | `REGULATORY_INDEXING_LEASE_SECONDS` | background | `120` |
+| `REGULATORY_INDEXING_CONTEXT_REQUEST_SIZE` | background | `64`; maximum chunks per contextual shard |
+| `REGULATORY_INDEXING_CONTEXT_JSONL_MAX_BYTES` | background | `8388608`; exact UTF-8 JSONL shard cap |
 | `REGULATORY_INDEXING_EMBEDDING_REQUEST_SIZE` | background | `64` |
+| `REGULATORY_INDEXING_SUBMISSION_RECONCILE_SECONDS` | background | `300`; fail-closed visibility horizon after an indeterminate create |
 
 If the API gate fails, the wrapper leaves `background` stopped. Preserve its output, then use the
 same fixed overlay order only for read-only diagnostics; do not retry with ad hoc Compose files.

@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import math
 import re
+import tempfile
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from hashlib import sha256
 from typing import TYPE_CHECKING, NoReturn, Protocol, cast
+from uuid import UUID
 
 import google.auth
 import httpx
@@ -148,15 +150,23 @@ class VertexReadOnlyAccessProbe(BaseModel):
 
 
 class VertexBatchGateway(Protocol):
-    def submit(self, requests: Sequence[VertexBatchRequest]) -> VertexBatchState: ...
+    def submit(
+        self,
+        requests: Sequence[VertexBatchRequest],
+        *,
+        submission_key: str,
+        max_jsonl_bytes: int,
+    ) -> VertexBatchState: ...
 
     def get(self, remote_job_name: str) -> VertexBatchState: ...
 
     def reconcile_submission(self, submission_key: str) -> VertexBatchState | None: ...
 
-    def read_results(self, output_uri: str) -> str: ...
+    def read_results(self, output_uri: str) -> Iterator[str]: ...
 
     def cancel(self, remote_job_name: str) -> None: ...
+
+    def delete(self, remote_job_name: str) -> None: ...
 
     def cleanup(self, prefix: str) -> None: ...
 
@@ -173,31 +183,89 @@ def _credential_identity(credentials: Credentials) -> str:
 
 def vertex_batch_submission_key(
     requests: Sequence[VertexBatchRequest],
+    *,
+    tenant_id: str | None = None,
+    job_id: UUID | None = None,
+    output_prefix: str | None = None,
+    submission_attempt: int | None = None,
 ) -> str:
     if not requests:
         raise VertexBatchContractError("Vertex batch requires at least one request")
     request_hashes = [request.request_hash for request in requests]
     if len(set(request_hashes)) != len(request_hashes):
         raise VertexBatchContractError("Vertex batch contains a duplicate request hash")
-    request_set_hash = sha256("\n".join(sorted(request_hashes)).encode()).hexdigest()
-    return f"regulatory-context-{request_set_hash}"
+    identity_fields = (tenant_id, job_id, output_prefix, submission_attempt)
+    if all(field is None for field in identity_fields):
+        request_set_hash = sha256(
+            "\n".join(sorted(request_hashes)).encode()
+        ).hexdigest()
+        return f"regulatory-context-{request_set_hash}"
+    if (
+        not isinstance(tenant_id, str)
+        or not tenant_id.strip()
+        or job_id is None
+        or not isinstance(output_prefix, str)
+        or not output_prefix.strip()
+        or submission_attempt is None
+        or submission_attempt < 1
+    ):
+        raise VertexBatchContractError(
+            "Vertex submission identity requires tenant, job, prefix, and attempt"
+        )
+    identity = json.dumps(
+        {
+            "job_id": str(job_id),
+            "output_prefix": output_prefix,
+            "request_hashes": sorted(request_hashes),
+            "submission_attempt": submission_attempt,
+            "tenant_id": tenant_id,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"regulatory-context-{sha256(identity.encode()).hexdigest()}"
 
 
-def build_vertex_jsonl(requests: Sequence[VertexBatchRequest]) -> str:
-    if not requests:
-        raise VertexBatchContractError("Vertex batch requires at least one request")
-    request_hashes = [request.request_hash for request in requests]
-    if len(set(request_hashes)) != len(request_hashes):
-        raise VertexBatchContractError("Vertex batch contains a duplicate request hash")
-    lines = [
+def _vertex_jsonl_line(request: VertexBatchRequest) -> str:
+    return (
         json.dumps(
             {"request": _request_payload(request.prompt)},
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        for request in requests
-    ]
-    return "\n".join(lines) + "\n"
+        + "\n"
+    )
+
+
+def vertex_jsonl_line_size(request: VertexBatchRequest) -> int:
+    return len(_vertex_jsonl_line(request).encode("utf-8"))
+
+
+def build_vertex_jsonl(
+    requests: Sequence[VertexBatchRequest], *, max_bytes: int | None = None
+) -> str:
+    if not requests:
+        raise VertexBatchContractError("Vertex batch requires at least one request")
+    request_hashes = [request.request_hash for request in requests]
+    if len(set(request_hashes)) != len(request_hashes):
+        raise VertexBatchContractError("Vertex batch contains a duplicate request hash")
+    if max_bytes is not None and max_bytes < 1:
+        raise VertexBatchContractError("Vertex JSONL byte limit must be positive")
+    parts: list[str] = []
+    used_bytes = 0
+    for request in requests:
+        line = _vertex_jsonl_line(request)
+        line_bytes = len(line.encode("utf-8"))
+        if max_bytes is not None and used_bytes + line_bytes > max_bytes:
+            if not parts:
+                raise VertexBatchContractError(
+                    "Vertex request exceeds the configured JSONL byte limit"
+                )
+            break
+        parts.append(line)
+        used_bytes += line_bytes
+    return "".join(parts)
 
 
 def _output_request_hash(value: object) -> str:
@@ -284,14 +352,15 @@ def _parse_output_result(
 
 
 def parse_vertex_jsonl_output(
-    output: str,
+    output: str | Iterator[str],
     expected_request_hashes: Collection[str],
     *,
     require_complete: bool = True,
 ) -> dict[str, VertexBatchResult]:
     expected = set(expected_request_hashes)
     results: dict[str, VertexBatchResult] = {}
-    for line in output.splitlines():
+    lines = output.splitlines() if isinstance(output, str) else output
+    for line in lines:
         if not line.strip():
             continue
         try:
@@ -588,11 +657,26 @@ class GoogleVertexBatchGateway:
             identity = _credential_identity(credentials)
         return VertexReadOnlyAccessProbe(credential_identity=identity)
 
-    def submit(self, requests: Sequence[VertexBatchRequest]) -> VertexBatchState:
+    def submit(
+        self,
+        requests: Sequence[VertexBatchRequest],
+        *,
+        submission_key: str,
+        max_jsonl_bytes: int,
+    ) -> VertexBatchState:
         from google.genai import types as genai_types
 
-        payload = build_vertex_jsonl(requests)
-        submission_key = vertex_batch_submission_key(requests)
+        if re.fullmatch(r"regulatory-context-[0-9a-f]{64}", submission_key) is None:
+            raise VertexBatchContractError("Vertex submission key is invalid")
+        if max_jsonl_bytes < 1:
+            raise VertexBatchContractError("Vertex JSONL byte limit must be positive")
+        if not requests:
+            raise VertexBatchContractError("Vertex batch requires at least one request")
+        request_hashes = [request.request_hash for request in requests]
+        if len(set(request_hashes)) != len(request_hashes):
+            raise VertexBatchContractError(
+                "Vertex batch contains a duplicate request hash"
+            )
         request_set_hash = submission_key.removeprefix("regulatory-context-")
         base_uri = self._config.gcs_uri.rstrip("/")
         batch_prefix = f"{base_uri}/{self._object_prefix}/{request_set_hash}"
@@ -603,11 +687,24 @@ class GoogleVertexBatchGateway:
         with _translate_gateway_errors():
             credentials = self._credentials()
             with self._managed_storage_client(credentials) as storage_client:
-                storage_client.bucket(bucket_name).blob(input_name).upload_from_string(
-                    payload,
-                    content_type="application/jsonl",
-                    timeout=self._request_timeout_seconds,
-                )
+                with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as payload:
+                    used_bytes = 0
+                    for request in requests:
+                        line = _vertex_jsonl_line(request).encode("utf-8")
+                        if used_bytes + len(line) > max_jsonl_bytes:
+                            raise VertexBatchContractError(
+                                "Vertex batch exceeds the configured JSONL byte limit"
+                            )
+                        payload.write(line)
+                        used_bytes += len(line)
+                    storage_client.bucket(bucket_name).blob(
+                        input_name
+                    ).upload_from_file(
+                        payload,
+                        content_type="application/jsonl",
+                        rewind=True,
+                        timeout=self._request_timeout_seconds,
+                    )
             with self._managed_genai_client(credentials) as client:
                 with _translate_create_errors(submission_key):
                     with traced_llm_call(
@@ -658,40 +755,50 @@ class GoogleVertexBatchGateway:
             raise VertexBatchSubmissionConflictError(submission_key, len(matches))
         return _batch_state(matches[0])
 
-    def read_results(self, output_uri: str) -> str:
+    def read_results(self, output_uri: str) -> Iterator[str]:
         bucket_name, output_prefix = _parse_gcs_uri(output_uri)
-        with _translate_gateway_errors():
-            credentials = self._credentials()
-            with self._managed_storage_client(credentials) as storage_client:
-                blobs = sorted(
-                    (
-                        blob
-                        for blob in storage_client.list_blobs(
-                            bucket_name,
-                            prefix=f"{output_prefix}/",
-                            timeout=self._request_timeout_seconds,
+
+        def iter_lines() -> Iterator[str]:
+            with _translate_gateway_errors():
+                credentials = self._credentials()
+                with self._managed_storage_client(credentials) as storage_client:
+                    blobs = sorted(
+                        (
+                            blob
+                            for blob in storage_client.list_blobs(
+                                bucket_name,
+                                prefix=f"{output_prefix}/",
+                                timeout=self._request_timeout_seconds,
+                            )
+                            if blob.name.endswith(".jsonl")
+                        ),
+                        key=lambda blob: blob.name,
+                    )
+                    if not blobs:
+                        raise VertexBatchContractError(
+                            "Vertex output contains no JSONL files"
                         )
-                        if blob.name.endswith(".jsonl")
-                    ),
-                    key=lambda blob: blob.name,
-                )
-                if not blobs:
-                    raise VertexBatchContractError(
-                        "Vertex output contains no JSONL files"
-                    )
-                parts = [
-                    blob.download_as_text(timeout=self._request_timeout_seconds).rstrip(
-                        "\n"
-                    )
-                    for blob in blobs
-                ]
-        return "\n".join(parts) + "\n"
+                    for blob in blobs:
+                        with blob.open(
+                            "rt",
+                            encoding="utf-8",
+                            timeout=self._request_timeout_seconds,
+                        ) as stream:
+                            yield from stream
+
+        return iter_lines()
 
     def cancel(self, remote_job_name: str) -> None:
         with _translate_gateway_errors():
             credentials = self._credentials()
             with self._managed_genai_client(credentials) as client:
                 client.batches.cancel(name=remote_job_name)
+
+    def delete(self, remote_job_name: str) -> None:
+        with _translate_gateway_errors():
+            credentials = self._credentials()
+            with self._managed_genai_client(credentials) as client:
+                client.batches.delete(name=remote_job_name)
 
     def cleanup(self, prefix: str) -> None:
         bucket_name, object_prefix = _parse_gcs_uri(prefix)
@@ -708,15 +815,22 @@ class GoogleVertexBatchGateway:
         with _translate_gateway_errors():
             credentials = self._credentials()
             with self._managed_storage_client(credentials) as storage_client:
-                blobs = list(
-                    storage_client.list_blobs(
-                        bucket_name,
-                        prefix=f"{object_prefix}/",
-                        timeout=self._request_timeout_seconds,
-                    )
-                )
-                if blobs:
-                    storage_client.bucket(bucket_name).delete_blobs(
-                        blobs,
+                bucket = storage_client.bucket(bucket_name)
+                batch: list[object] = []
+                for blob in storage_client.list_blobs(
+                    bucket_name,
+                    prefix=f"{object_prefix}/",
+                    timeout=self._request_timeout_seconds,
+                ):
+                    batch.append(blob)
+                    if len(batch) == 100:
+                        bucket.delete_blobs(
+                            batch,
+                            timeout=self._request_timeout_seconds,
+                        )
+                        batch.clear()
+                if batch:
+                    bucket.delete_blobs(
+                        batch,
                         timeout=self._request_timeout_seconds,
                     )

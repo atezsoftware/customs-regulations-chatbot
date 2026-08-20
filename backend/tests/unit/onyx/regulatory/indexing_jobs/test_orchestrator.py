@@ -19,6 +19,8 @@ from onyx.db.enums import (
     RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
+    RegulatoryIndexingProviderCleanupPhase,
+    RegulatoryIndexingProviderCleanupState,
     RegulatoryIndexingStage,
     UserFileStatus,
 )
@@ -35,6 +37,7 @@ from onyx.regulatory.indexing_jobs.contextual import ContextApplySummary
 from onyx.regulatory.indexing_jobs.embedding import EmbeddingSummary
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
+    IndexingGatewayHTTPError,
     IndexingGatewayIndeterminateSubmissionError,
     RegulatoryIndexingConfigSnapshot,
 )
@@ -101,6 +104,13 @@ def _runtime(
     remote_job_name: str | None = None,
     submission_key: str | None = None,
     submission_state: str = "NONE",
+    submission_attempt: int = 0,
+    submission_charged: bool = False,
+    reconcile_until: datetime.datetime | None = None,
+    provider_cleanup_state: str = "NONE",
+    provider_cleanup_phase: str = "NONE",
+    provider_cleanup_generation: int = 0,
+    provider_cleanup_attempt_count: int = 0,
     cancellation_phase: str = "NONE",
     cancellation_intent: RegulatoryIndexingCancellationIntent = (
         RegulatoryIndexingCancellationIntent.USER_CANCEL
@@ -125,6 +135,14 @@ def _runtime(
         vertex_output_uri=None,
         vertex_submission_key=submission_key,
         vertex_submission_state=submission_state,
+        vertex_submission_attempt_count=submission_attempt,
+        vertex_submission_charged=submission_charged,
+        vertex_reconcile_until=reconcile_until,
+        provider_cleanup_state=provider_cleanup_state,
+        provider_cleanup_phase=provider_cleanup_phase,
+        provider_cleanup_generation=provider_cleanup_generation,
+        provider_cleanup_attempt_count=provider_cleanup_attempt_count,
+        provider_cleanup_token=None,
         cancellation_phase=cancellation_phase,
         cancellation_intent=cancellation_intent.value,
     )
@@ -540,7 +558,7 @@ def test_submission_intent_is_committed_before_provider_create() -> None:
     runtime = _runtime(RegulatoryIndexingStage.CONTEXT_SUBMIT)
     events: list[str] = []
     gateway = MagicMock()
-    gateway.submit.side_effect = lambda _requests: (
+    gateway.submit.side_effect = lambda _requests, **_kwargs: (
         events.append("provider-create"),
         VertexBatchState(
             remote_job_name="remote-1",
@@ -609,7 +627,7 @@ def test_submission_intent_is_committed_before_provider_create() -> None:
     assert result.outcome is OrchestrationOutcome.NEXT_STEP
 
 
-def test_indeterminate_submit_is_reconciled_before_any_recreate() -> None:
+def test_indeterminate_submit_survives_list_miss_then_later_visibility() -> None:
     request = VertexBatchRequest(prompt="context request")
     runtime = _runtime(RegulatoryIndexingStage.CONTEXT_SUBMIT)
     gateway = MagicMock()
@@ -626,7 +644,7 @@ def test_indeterminate_submit_is_reconciled_before_any_recreate() -> None:
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.build_contextual_requests",
             return_value=[request],
-        ),
+        ) as build_requests,
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.vertex_batch_submission_key",
             return_value="regulatory-context-" + "b" * 64,
@@ -658,15 +676,23 @@ def test_indeterminate_submit_is_reconciled_before_any_recreate() -> None:
         )
 
     assert first.outcome is OrchestrationOutcome.NEXT_STEP
-    gateway.submit.assert_called_once_with([request])
+    gateway.submit.assert_called_once_with(
+        [request],
+        submission_key="regulatory-context-" + "b" * 64,
+        max_jsonl_bytes=8 * 1024 * 1024,
+    )
     gateway.reconcile_submission.assert_not_called()
     require_reconciliation.assert_called_once()
+    assert build_requests.call_args.kwargs["max_attempts"] == 3
 
     recovery_runtime = _runtime(
         RegulatoryIndexingStage.CONTEXT_SUBMIT,
         generation=4,
         submission_key="regulatory-context-" + "b" * 64,
         submission_state="RECONCILE_REQUIRED",
+        submission_attempt=1,
+        submission_charged=True,
+        reconcile_until=_NOW + datetime.timedelta(minutes=5),
     )
     gateway.reset_mock()
     gateway.reconcile_submission.return_value = None
@@ -679,13 +705,13 @@ def test_indeterminate_submit_is_reconciled_before_any_recreate() -> None:
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.build_contextual_requests",
             return_value=[request],
-        ),
+        ) as build_recovery_requests,
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.vertex_batch_submission_key",
             return_value="regulatory-context-" + "b" * 64,
         ),
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_vertex_submission_absent",
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_vertex_reconciliation_miss",
             return_value=True,
         ),
         patch(
@@ -707,22 +733,68 @@ def test_indeterminate_submit_is_reconciled_before_any_recreate() -> None:
         recovery_runtime.job.vertex_submission_key
     )
     gateway.submit.assert_not_called()
+    assert build_recovery_requests.call_args.kwargs["max_attempts"] is None
 
-    recreated_runtime = _runtime(
+    visible_runtime = _runtime(
         RegulatoryIndexingStage.CONTEXT_SUBMIT,
         generation=5,
         submission_key="regulatory-context-" + "b" * 64,
-        submission_state="RECONCILED_ABSENT",
+        submission_state="RECONCILE_REQUIRED",
+        submission_attempt=1,
+        submission_charged=True,
+        reconcile_until=_NOW + datetime.timedelta(minutes=5),
     )
-    events: list[str] = []
     gateway.reset_mock()
-    gateway.submit.side_effect = lambda _requests: (
-        events.append("recreate"),
-        VertexBatchState(
-            remote_job_name="remote-2",
-            status=VertexBatchJobStatus.PENDING,
+    gateway.reconcile_submission.return_value = VertexBatchState(
+        remote_job_name="remote-2",
+        status=VertexBatchJobStatus.PENDING,
+    )
+    with (
+        patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
         ),
-    )[1]
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.build_contextual_requests",
+            return_value=[request],
+        ) as build_visible_requests,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.vertex_batch_submission_key",
+            return_value="regulatory-context-" + "b" * 64,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_vertex_submission",
+            return_value=True,
+        ) as record_submission,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_job",
+            return_value=True,
+        ),
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        third = _execute_claimed_step(
+            visible_runtime,
+            tenant_id="tenant-a",
+            db_session=session,
+            now=_NOW,
+        )
+
+    gateway.reconcile_submission.assert_called_once_with(
+        visible_runtime.job.vertex_submission_key
+    )
+    gateway.submit.assert_not_called()
+    assert build_visible_requests.call_args.kwargs["max_attempts"] is None
+    assert record_submission.call_args.kwargs["charge_items"] is False
+    assert third.outcome is OrchestrationOutcome.NEXT_STEP
+
+
+def test_definitely_rejected_create_resets_intent_before_bounded_retry() -> None:
+    request = VertexBatchRequest(prompt="context request")
+    runtime = _runtime(RegulatoryIndexingStage.CONTEXT_SUBMIT)
+    gateway = MagicMock()
+    gateway.submit.side_effect = IndexingGatewayHTTPError(429)
     with (
         patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
         patch(
@@ -735,39 +807,131 @@ def test_indeterminate_submit_is_reconciled_before_any_recreate() -> None:
         ),
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.vertex_batch_submission_key",
-            return_value="regulatory-context-" + "b" * 64,
+            return_value="regulatory-context-" + "d" * 64,
         ),
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_vertex_submission_intent",
-            side_effect=lambda *_args, **_kwargs: (
-                events.append("recreate-intent") or True
-            ),
+            return_value=True,
         ),
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.regulatory_indexing_external_mutation_lease",
             side_effect=_external_lease,
         ),
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_vertex_submission",
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_vertex_submission_not_sent",
             return_value=True,
-        ),
+        ) as record_not_sent,
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_job",
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.schedule_regulatory_indexing_retry",
             return_value=True,
-        ),
+        ) as schedule_retry,
     ):
         from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
 
-        third = _execute_claimed_step(
-            recreated_runtime,
+        result = _execute_claimed_step(
+            runtime,
             tenant_id="tenant-a",
-            db_session=session,
+            db_session=cast(Session, MagicMock()),
             now=_NOW,
         )
 
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+    record_not_sent.assert_called_once()
+    schedule_retry.assert_called_once()
+
+
+def test_unknown_create_failure_is_reconciled_instead_of_recreated() -> None:
+    request = VertexBatchRequest(prompt="context request")
+    runtime = _runtime(RegulatoryIndexingStage.CONTEXT_SUBMIT)
+    gateway = MagicMock()
+    gateway.submit.side_effect = RuntimeError("unrecognized provider failure")
+    with (
+        patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.build_contextual_requests",
+            return_value=[request],
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.vertex_batch_submission_key",
+            return_value="regulatory-context-" + "e" * 64,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_vertex_submission_intent",
+            return_value=True,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.regulatory_indexing_external_mutation_lease",
+            side_effect=_external_lease,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.require_vertex_submission_reconciliation",
+            return_value=True,
+        ) as require_reconciliation,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_vertex_submission_not_sent"
+        ) as record_not_sent,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+    require_reconciliation.assert_called_once()
+    record_not_sent.assert_not_called()
+
+
+def test_indeterminate_submit_fails_closed_after_reconciliation_horizon() -> None:
+    request = VertexBatchRequest(prompt="context request")
+    runtime = _runtime(
+        RegulatoryIndexingStage.CONTEXT_SUBMIT,
+        submission_key="regulatory-context-" + "c" * 64,
+        submission_state="RECONCILE_REQUIRED",
+        submission_attempt=1,
+        submission_charged=True,
+        reconcile_until=_NOW,
+    )
+    gateway = MagicMock()
+    with (
+        patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.build_contextual_requests",
+            return_value=[request],
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.vertex_batch_submission_key",
+            return_value=runtime.job.vertex_submission_key,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.request_regulatory_indexing_terminal_failure_cleanup",
+            return_value=True,
+        ) as request_cleanup,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
     gateway.reconcile_submission.assert_not_called()
-    assert events == ["recreate-intent", "recreate"]
-    assert third.outcome is OrchestrationOutcome.NEXT_STEP
+    gateway.submit.assert_not_called()
+    request_cleanup.assert_called_once()
 
 
 def test_partial_context_output_requeues_only_still_pending_items() -> None:
@@ -929,9 +1093,9 @@ def test_retryable_failure_persists_backoff_and_terminal_failure_stops() -> None
             return_value=gateway,
         ),
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.fail_regulatory_indexing_job",
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.request_regulatory_indexing_terminal_failure_cleanup",
             return_value=True,
-        ) as fail_job,
+        ) as request_cleanup,
     ):
         terminal_result = _execute_claimed_step(
             terminal_runtime,
@@ -940,11 +1104,11 @@ def test_retryable_failure_persists_backoff_and_terminal_failure_stops() -> None
             now=_NOW,
         )
 
-    assert terminal_result.outcome is OrchestrationOutcome.COMPLETE
-    fail_job.assert_called_once()
+    assert terminal_result.outcome is OrchestrationOutcome.NEXT_STEP
+    request_cleanup.assert_called_once()
 
 
-def test_any_publication_failure_retries_after_attempt_budget_is_exhausted() -> None:
+def test_terminal_publication_failure_obeys_attempt_budget() -> None:
     runtime = _runtime(RegulatoryIndexingStage.PUBLISH, attempt_count=2)
     with (
         patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
@@ -957,8 +1121,9 @@ def test_any_publication_failure_retries_after_attempt_budget_is_exhausted() -> 
             return_value=True,
         ) as schedule_retry,
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.fail_regulatory_indexing_job"
-        ) as fail_job,
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.request_regulatory_indexing_terminal_failure_cleanup",
+            return_value=True,
+        ) as request_cleanup,
     ):
         from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
 
@@ -970,8 +1135,213 @@ def test_any_publication_failure_retries_after_attempt_budget_is_exhausted() -> 
         )
 
     assert result.outcome is OrchestrationOutcome.NEXT_STEP
-    schedule_retry.assert_called_once()
-    fail_job.assert_not_called()
+    schedule_retry.assert_not_called()
+    request_cleanup.assert_called_once()
+
+
+def test_publish_snapshot_drift_requests_cleanup_before_terminal_failure() -> None:
+    runtime = _runtime(RegulatoryIndexingStage.PUBLISH)
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage",
+            side_effect=ValueError("settings drift"),
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.publish_regulatory_job"
+        ) as publish,
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.request_regulatory_indexing_terminal_failure_cleanup",
+            return_value=True,
+        ) as request_cleanup,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
+
+        result = _execute_claimed_step(
+            runtime,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert result.outcome is OrchestrationOutcome.NEXT_STEP
+    publish.assert_not_called()
+    request_cleanup.assert_called_once()
+
+
+def test_terminal_provider_cleanup_deletes_remote_before_gcs() -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.PUBLISH,
+        status=RegulatoryIndexingJobStatus.SUCCEEDED,
+        remote_job_name="remote-1",
+        provider_cleanup_state=RegulatoryIndexingProviderCleanupState.RUNNING.value,
+        provider_cleanup_phase=(
+            RegulatoryIndexingProviderCleanupPhase.VERTEX_DELETE.value
+        ),
+        provider_cleanup_generation=4,
+    )
+    gateway = MagicMock()
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_provider_cleanup",
+            return_value=True,
+        ) as advance,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import (
+            _run_claimed_regulatory_provider_cleanup,
+        )
+
+        result = _run_claimed_regulatory_provider_cleanup(
+            runtime,
+            cleanup_generation=4,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    gateway.delete.assert_called_once_with("remote-1")
+    gateway.cleanup.assert_not_called()
+    assert advance.call_args.kwargs["next_phase"] is (
+        RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP
+    )
+    assert result.outcome is OrchestrationOutcome.COMPLETE
+
+
+def test_terminal_cleanup_persists_late_visible_indeterminate_job_before_delete() -> (
+    None
+):
+    submission_key = "regulatory-context-" + "f" * 64
+    runtime = _runtime(
+        RegulatoryIndexingStage.CONTEXT_SUBMIT,
+        status=RegulatoryIndexingJobStatus.FAILED,
+        submission_key=submission_key,
+        submission_state="RECONCILE_REQUIRED",
+        provider_cleanup_state=RegulatoryIndexingProviderCleanupState.RUNNING.value,
+        provider_cleanup_phase=(
+            RegulatoryIndexingProviderCleanupPhase.VERTEX_RECONCILE.value
+        ),
+        provider_cleanup_generation=5,
+    )
+    gateway = MagicMock()
+    gateway.reconcile_submission.return_value = VertexBatchState(
+        remote_job_name="remote-late",
+        status=VertexBatchJobStatus.SUCCEEDED,
+        input_uri="gs://bucket/input.jsonl",
+        output_uri="gs://bucket/output",
+    )
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.record_reconciled_provider_cleanup_vertex_job",
+            return_value=True,
+        ) as record_remote,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import (
+            _run_claimed_regulatory_provider_cleanup,
+        )
+
+        result = _run_claimed_regulatory_provider_cleanup(
+            runtime,
+            cleanup_generation=5,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    gateway.reconcile_submission.assert_called_once_with(submission_key)
+    gateway.delete.assert_not_called()
+    assert record_remote.call_args.kwargs["remote_job_name"] == "remote-late"
+    assert result.outcome is OrchestrationOutcome.COMPLETE
+
+
+def test_terminal_cleanup_retries_late_visibility_after_list_miss() -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.CONTEXT_SUBMIT,
+        status=RegulatoryIndexingJobStatus.FAILED,
+        submission_key="regulatory-context-" + "a" * 64,
+        submission_state="RECONCILE_REQUIRED",
+        provider_cleanup_state=RegulatoryIndexingProviderCleanupState.RUNNING.value,
+        provider_cleanup_phase=(
+            RegulatoryIndexingProviderCleanupPhase.VERTEX_RECONCILE.value
+        ),
+        provider_cleanup_generation=6,
+        provider_cleanup_attempt_count=2,
+    )
+    gateway = MagicMock()
+    gateway.reconcile_submission.return_value = None
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.schedule_regulatory_provider_cleanup_retry",
+            return_value=True,
+        ) as schedule,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import (
+            _run_claimed_regulatory_provider_cleanup,
+        )
+
+        result = _run_claimed_regulatory_provider_cleanup(
+            runtime,
+            cleanup_generation=6,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert schedule.call_args.kwargs["exhausted"] is True
+    assert schedule.call_args.kwargs["error_code"] == "VERTEX_VISIBILITY_PENDING"
+    assert result.outcome is OrchestrationOutcome.COMPLETE
+
+
+def test_terminal_provider_cleanup_exhaustion_remains_sweepable() -> None:
+    runtime = _runtime(
+        RegulatoryIndexingStage.CONTEXT_WAIT,
+        status=RegulatoryIndexingJobStatus.FAILED,
+        provider_cleanup_state=RegulatoryIndexingProviderCleanupState.RUNNING.value,
+        provider_cleanup_phase=(
+            RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP.value
+        ),
+        provider_cleanup_generation=7,
+        provider_cleanup_attempt_count=2,
+    )
+    gateway = MagicMock()
+    gateway.cleanup.side_effect = IndexingGatewayConnectionError()
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
+            return_value=gateway,
+        ),
+        patch(
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.schedule_regulatory_provider_cleanup_retry",
+            return_value=True,
+        ) as schedule,
+    ):
+        from onyx.regulatory.indexing_jobs.orchestrator import (
+            _run_claimed_regulatory_provider_cleanup,
+        )
+
+        result = _run_claimed_regulatory_provider_cleanup(
+            runtime,
+            cleanup_generation=7,
+            tenant_id="tenant-a",
+            db_session=cast(Session, MagicMock()),
+            now=_NOW,
+        )
+
+    assert schedule.call_args.kwargs["exhausted"] is True
+    assert schedule.call_args.kwargs["next_retry_at"] == _NOW + datetime.timedelta(
+        seconds=_snapshot().retry_max_seconds
+    )
+    assert result.outcome is OrchestrationOutcome.COMPLETE
 
 
 @pytest.mark.parametrize(

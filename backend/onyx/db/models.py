@@ -5708,10 +5708,56 @@ class RegulatoryIndexingJob(Base):
     vertex_submission_state: Mapped[str] = mapped_column(
         String(32), nullable=False, default="NONE", server_default="NONE"
     )
+    vertex_submission_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    vertex_submission_charged: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    vertex_reconcile_miss_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    vertex_reconcile_until: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     vertex_input_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     vertex_output_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+
+    provider_cleanup_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="NONE", server_default="NONE"
+    )
+    provider_cleanup_phase: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="NONE", server_default="NONE"
+    )
+    provider_cleanup_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    provider_cleanup_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    provider_cleanup_token: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True
+    )
+    provider_cleanup_next_retry_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    provider_cleanup_heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    provider_cleanup_had_failure: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    provider_cleanup_error_code: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    provider_cleanup_error_message: Mapped[str | None] = mapped_column(
+        String(4000), nullable=True
+    )
+    provider_cleanup_completed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -5750,6 +5796,12 @@ class RegulatoryIndexingJob(Base):
             "heartbeat_at",
         ),
         Index(
+            "ix_regulatory_indexing_job_provider_cleanup",
+            "provider_cleanup_state",
+            "provider_cleanup_next_retry_at",
+            "provider_cleanup_heartbeat_at",
+        ),
+        Index(
             "uq_regulatory_indexing_job_active_user_file",
             "user_file_id",
             unique=True,
@@ -5764,7 +5816,8 @@ class RegulatoryIndexingJob(Base):
         ),
         CheckConstraint(
             "cancellation_intent IN "
-            "('NONE', 'USER_CANCEL', 'USER_DELETE', 'SUPERSEDE')",
+            "('NONE', 'USER_CANCEL', 'USER_DELETE', 'SUPERSEDE', "
+            "'TERMINAL_FAILURE')",
             name="regulatory_indexing_job_cancellation_intent_check",
         ),
         CheckConstraint(
@@ -5789,6 +5842,24 @@ class RegulatoryIndexingJob(Base):
             "vertex_submission_state IN ('NONE', 'SUBMITTING', "
             "'RECONCILE_REQUIRED', 'RECONCILED_ABSENT', 'SUBMITTED')",
             name="regulatory_indexing_job_submission_state_check",
+        ),
+        CheckConstraint(
+            "vertex_submission_attempt_count >= 0 AND vertex_reconcile_miss_count >= 0",
+            name="regulatory_indexing_job_vertex_attempts_check",
+        ),
+        CheckConstraint(
+            "provider_cleanup_state IN ('NONE', 'PENDING', 'RUNNING', "
+            "'RETRY_WAIT', 'SUCCEEDED', 'EXHAUSTED')",
+            name="regulatory_indexing_job_provider_cleanup_state_check",
+        ),
+        CheckConstraint(
+            "provider_cleanup_phase IN ('NONE', 'VERTEX_CANCEL', "
+            "'VERTEX_RECONCILE', 'VERTEX_DELETE', 'GCS_CLEANUP', 'COMPLETE')",
+            name="regulatory_indexing_job_provider_cleanup_phase_check",
+        ),
+        CheckConstraint(
+            "provider_cleanup_attempt_count >= 0 AND provider_cleanup_generation >= 0",
+            name="regulatory_indexing_job_provider_cleanup_attempts_check",
         ),
     )
 
@@ -5817,6 +5888,9 @@ class RegulatoryIndexingItem(Base):
         default=RegulatoryIndexingItemStatus.PENDING.value,
     )
     request_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    context_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     context: Mapped[dict[str, object] | None] = mapped_column(PGJSONB, nullable=True)
     vector: Mapped[list[float] | None] = mapped_column(PGJSONB, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -5850,6 +5924,10 @@ class RegulatoryIndexingItem(Base):
         CheckConstraint(
             "status IN ('PENDING', 'CONTEXT_READY', 'EMBEDDED', 'FAILED', 'SKIPPED')",
             name="regulatory_indexing_item_status_check",
+        ),
+        CheckConstraint(
+            "context_attempt_count >= 0",
+            name="regulatory_indexing_item_context_attempt_count_check",
         ),
     )
 

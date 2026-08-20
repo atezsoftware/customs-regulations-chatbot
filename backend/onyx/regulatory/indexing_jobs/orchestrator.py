@@ -17,6 +17,8 @@ from onyx.db.enums import (
     RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
+    RegulatoryIndexingProviderCleanupPhase,
+    RegulatoryIndexingProviderCleanupState,
     RegulatoryIndexingStage,
     RegulatoryIndexingSubmissionState,
     UserFileStatus,
@@ -39,6 +41,8 @@ from onyx.regulatory.indexing_jobs.contextual import (
 )
 from onyx.regulatory.indexing_jobs.embedding import embed_pending_regulatory_items
 from onyx.regulatory.indexing_jobs.models import (
+    IndexingGatewayError,
+    IndexingGatewayHTTPError,
     IndexingGatewayIndeterminateSubmissionError,
     RegulatoryIndexingConfigSnapshot,
     RegulatoryInputHashVersion,
@@ -77,6 +81,7 @@ class OrchestrationOutcome(StrEnum):
 class OrchestrationDeliveryKind(StrEnum):
     NORMAL = "NORMAL"
     PRECLAIMED = "PRECLAIMED"
+    PROVIDER_CLEANUP = "PROVIDER_CLEANUP"
 
 
 class OrchestrationResult(BaseModel):
@@ -233,6 +238,9 @@ def _context_submit(
     now: datetime.datetime,
 ) -> OrchestrationResult:
     snapshot = _snapshot(runtime)
+    submission_state = RegulatoryIndexingSubmissionState(
+        runtime.job.vertex_submission_state
+    )
     embedding_tokenizer, contextual_tokenizer = _contextual_tokenizers(snapshot)
     requests = build_contextual_requests(
         runtime.job,
@@ -240,6 +248,15 @@ def _context_submit(
         runtime.indexing_items,
         embedding_tokenizer=embedding_tokenizer,
         contextual_tokenizer=contextual_tokenizer,
+        max_requests=snapshot.context_request_size,
+        max_jsonl_bytes=snapshot.context_jsonl_max_bytes,
+        # A charged, indeterminate submission must remain reconcilable even when
+        # it consumed the final new-submission attempt.
+        max_attempts=(
+            snapshot.max_attempts
+            if submission_state is RegulatoryIndexingSubmissionState.NONE
+            else None
+        ),
     )
     if not requests:
         return _advance(
@@ -251,10 +268,20 @@ def _context_submit(
 
     gateway = _build_vertex_gateway(runtime, tenant_id=tenant_id, db_session=db_session)
     persisted_key = runtime.job.vertex_submission_key
-    submission_state = RegulatoryIndexingSubmissionState(
-        runtime.job.vertex_submission_state
+    persisted_attempt = getattr(runtime.job, "vertex_submission_attempt_count", 0)
+    submission_attempt = (
+        persisted_attempt + 1
+        if submission_state is RegulatoryIndexingSubmissionState.NONE
+        else persisted_attempt
     )
-    expected_key = vertex_batch_submission_key(requests)
+    expected_key = vertex_batch_submission_key(
+        requests,
+        tenant_id=tenant_id,
+        job_id=runtime.job.id,
+        output_prefix=_vertex_object_prefix(tenant_id, runtime.job.id),
+        submission_attempt=submission_attempt,
+    )
+    request_hashes = tuple(request.request_hash for request in requests)
     if persisted_key is not None and persisted_key != expected_key:
         raise ValueError("persisted Vertex submission key does not match pending items")
 
@@ -268,17 +295,41 @@ def _context_submit(
             now=now,
         )
 
-    if submission_state in {
-        RegulatoryIndexingSubmissionState.SUBMITTING,
-        RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
-    }:
+    if submission_state is RegulatoryIndexingSubmissionState.SUBMITTING:
+        persisted = indexing_job_repository.require_vertex_submission_reconciliation(
+            db_session,
+            job_id=runtime.job.id,
+            expected_generation=runtime.job.lease_generation,
+            submission_key=expected_key,
+            request_hashes=request_hashes,
+            reconcile_until=now
+            + datetime.timedelta(seconds=snapshot.submission_reconcile_seconds),
+            now=now,
+        )
+        return (
+            _advance(
+                runtime,
+                db_session,
+                next_stage=RegulatoryIndexingStage.CONTEXT_SUBMIT,
+                now=now,
+                countdown_seconds=snapshot.poll_seconds,
+            )
+            if persisted
+            else _skipped(runtime.job.id)
+        )
+
+    if submission_state is RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED:
+        reconcile_until = getattr(runtime.job, "vertex_reconcile_until", None)
+        if reconcile_until is None or now >= reconcile_until:
+            raise VertexBatchContractError(
+                "Vertex submission visibility remained indeterminate"
+            )
         state = gateway.reconcile_submission(expected_key)
         if state is None:
-            persisted = indexing_job_repository.record_vertex_submission_absent(
+            persisted = indexing_job_repository.record_vertex_reconciliation_miss(
                 db_session,
                 job_id=runtime.job.id,
                 expected_generation=runtime.job.lease_generation,
-                submission_key=expected_key,
                 now=now,
             )
             if not persisted:
@@ -295,6 +346,8 @@ def _context_submit(
             job_id=runtime.job.id,
             expected_generation=runtime.job.lease_generation,
             submission_key=expected_key,
+            request_hashes=request_hashes,
+            charge_items=not getattr(runtime.job, "vertex_submission_charged", True),
             remote_job_name=state.remote_job_name,
             input_uri=state.input_uri,
             output_uri=state.output_uri,
@@ -314,6 +367,7 @@ def _context_submit(
         job_id=runtime.job.id,
         expected_generation=runtime.job.lease_generation,
         submission_key=expected_key,
+        submission_attempt=submission_attempt,
         now=now,
     )
     if not persisted:
@@ -327,7 +381,11 @@ def _context_submit(
         if submission_lease is None:
             return _skipped(runtime.job.id)
         try:
-            state = gateway.submit(requests)
+            state = gateway.submit(
+                requests,
+                submission_key=expected_key,
+                max_jsonl_bytes=snapshot.context_jsonl_max_bytes,
+            )
         except IndexingGatewayIndeterminateSubmissionError as error:
             if error.submission_key != expected_key:
                 raise ValueError(
@@ -339,6 +397,51 @@ def _context_submit(
                     job_id=runtime.job.id,
                     expected_generation=runtime.job.lease_generation,
                     submission_key=expected_key,
+                    request_hashes=request_hashes,
+                    reconcile_until=now
+                    + datetime.timedelta(seconds=snapshot.submission_reconcile_seconds),
+                    now=now,
+                    commit=False,
+                )
+            )
+            if not reconciliation_persisted:
+                return _skipped(runtime.job.id)
+            submission_lease.commit()
+            return _advance(
+                runtime,
+                db_session,
+                next_stage=RegulatoryIndexingStage.CONTEXT_SUBMIT,
+                now=now,
+                countdown_seconds=snapshot.poll_seconds,
+            )
+        except IndexingGatewayError:
+            definitely_not_sent = (
+                indexing_job_repository.record_vertex_submission_not_sent(
+                    db_session,
+                    job_id=runtime.job.id,
+                    expected_generation=runtime.job.lease_generation,
+                    submission_key=expected_key,
+                    now=now,
+                    commit=False,
+                )
+            )
+            if definitely_not_sent:
+                submission_lease.commit()
+            raise
+        except Exception:
+            # Once control entered the provider submission boundary, an
+            # unrecognized failure cannot prove that create was rejected. Keep
+            # the persisted identity and reconcile instead of risking a second
+            # billable create.
+            reconciliation_persisted = (
+                indexing_job_repository.require_vertex_submission_reconciliation(
+                    db_session,
+                    job_id=runtime.job.id,
+                    expected_generation=runtime.job.lease_generation,
+                    submission_key=expected_key,
+                    request_hashes=request_hashes,
+                    reconcile_until=now
+                    + datetime.timedelta(seconds=snapshot.submission_reconcile_seconds),
                     now=now,
                     commit=False,
                 )
@@ -358,6 +461,8 @@ def _context_submit(
             job_id=runtime.job.id,
             expected_generation=runtime.job.lease_generation,
             submission_key=expected_key,
+            request_hashes=request_hashes,
+            charge_items=True,
             remote_job_name=state.remote_job_name,
             input_uri=state.input_uri,
             output_uri=state.output_uri,
@@ -853,9 +958,7 @@ def _execute_claimed_step(
                 else _skipped(runtime.job.id)
             )
         must_reconcile_publication = (
-            RegulatoryIndexingStage(runtime.job.stage)
-            is RegulatoryIndexingStage.PUBLISH
-            or decision.reason is RetryReason.PUBLICATION_INDETERMINATE
+            decision.reason is RetryReason.PUBLICATION_INDETERMINATE
         )
         if must_reconcile_publication or (
             decision.retryable and next_attempt < snapshot.max_attempts
@@ -885,7 +988,7 @@ def _execute_claimed_step(
                 if scheduled
                 else _skipped(runtime.job.id)
             )
-        failed = indexing_job_repository.fail_regulatory_indexing_job(
+        cleanup_requested = indexing_job_repository.request_regulatory_indexing_terminal_failure_cleanup(
             db_session,
             job_id=runtime.job.id,
             expected_stage=RegulatoryIndexingStage(runtime.job.stage),
@@ -894,7 +997,11 @@ def _execute_claimed_step(
             error_message=error.__class__.__name__,
             now=now,
         )
-        return _complete(runtime.job.id) if failed else _skipped(runtime.job.id)
+        return (
+            _next_step(runtime.job.id, runtime.job.lease_generation)
+            if cleanup_requested
+            else _skipped(runtime.job.id)
+        )
 
 
 def run_regulatory_indexing_step(
@@ -927,6 +1034,187 @@ def run_regulatory_indexing_step(
             return _skipped(job_id)
         return _execute_claimed_step(
             claimed_runtime,
+            tenant_id=tenant_id,
+            db_session=db_session,
+            now=now,
+        )
+
+
+def _run_claimed_regulatory_provider_cleanup(
+    runtime: indexing_job_repository.RegulatoryIndexingRuntime,
+    *,
+    cleanup_generation: int,
+    tenant_id: str,
+    db_session: Session,
+    now: datetime.datetime,
+) -> OrchestrationResult:
+    job = runtime.job
+    if (
+        job.status
+        not in {
+            RegulatoryIndexingJobStatus.SUCCEEDED.value,
+            RegulatoryIndexingJobStatus.FAILED.value,
+            RegulatoryIndexingJobStatus.CANCELLED.value,
+        }
+        or job.provider_cleanup_state
+        != RegulatoryIndexingProviderCleanupState.RUNNING.value
+        or job.provider_cleanup_generation != cleanup_generation
+        or job.provider_cleanup_token is not None
+    ):
+        return _skipped(job.id)
+    snapshot = _snapshot(runtime)
+    phase = RegulatoryIndexingProviderCleanupPhase(job.provider_cleanup_phase)
+    next_phase: RegulatoryIndexingProviderCleanupPhase | None = None
+    try:
+        if phase is RegulatoryIndexingProviderCleanupPhase.VERTEX_RECONCILE:
+            submission_key = job.vertex_submission_key
+            if not submission_key:
+                next_phase = RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP
+            else:
+                state = _build_vertex_gateway(
+                    runtime, tenant_id=tenant_id, db_session=db_session
+                ).reconcile_submission(submission_key)
+                if state is None:
+                    next_attempt = job.provider_cleanup_attempt_count + 1
+                    exhausted = next_attempt >= snapshot.max_attempts
+                    delay = (
+                        snapshot.retry_max_seconds
+                        if exhausted
+                        else retry_delay_seconds(
+                            job.id,
+                            RegulatoryIndexingStage(job.stage),
+                            next_attempt,
+                            snapshot.retry_base_seconds,
+                            snapshot.retry_max_seconds,
+                        )
+                    )
+                    scheduled = indexing_job_repository.schedule_regulatory_provider_cleanup_retry(
+                        db_session,
+                        job_id=job.id,
+                        cleanup_generation=cleanup_generation,
+                        next_retry_at=now + datetime.timedelta(seconds=delay),
+                        error_code="VERTEX_VISIBILITY_PENDING",
+                        error_message="VertexSubmissionNotVisible",
+                        exhausted=exhausted,
+                    )
+                    return _complete(job.id) if scheduled else _skipped(job.id)
+                recorded = indexing_job_repository.record_reconciled_provider_cleanup_vertex_job(
+                    db_session,
+                    job_id=job.id,
+                    cleanup_generation=cleanup_generation,
+                    submission_key=submission_key,
+                    remote_job_name=state.remote_job_name,
+                    input_uri=state.input_uri,
+                    output_uri=state.output_uri,
+                    now=now,
+                )
+                return _complete(job.id) if recorded else _skipped(job.id)
+        elif phase is RegulatoryIndexingProviderCleanupPhase.VERTEX_CANCEL:
+            if job.remote_vertex_job_name:
+                _build_vertex_gateway(
+                    runtime, tenant_id=tenant_id, db_session=db_session
+                ).cancel(job.remote_vertex_job_name)
+            next_phase = RegulatoryIndexingProviderCleanupPhase.VERTEX_DELETE
+        elif phase is RegulatoryIndexingProviderCleanupPhase.VERTEX_DELETE:
+            if job.remote_vertex_job_name:
+                _build_vertex_gateway(
+                    runtime, tenant_id=tenant_id, db_session=db_session
+                ).delete(job.remote_vertex_job_name)
+            next_phase = RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP
+        elif phase is RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP:
+            cleanup_uri = (
+                f"{snapshot.vertex.gcs_uri.rstrip('/')}/"
+                f"{_vertex_object_prefix(tenant_id, job.id)}"
+            )
+            _build_vertex_gateway(
+                runtime, tenant_id=tenant_id, db_session=db_session
+            ).cleanup(cleanup_uri)
+            next_phase = RegulatoryIndexingProviderCleanupPhase.COMPLETE
+        elif phase is RegulatoryIndexingProviderCleanupPhase.COMPLETE:
+            completed = indexing_job_repository.complete_regulatory_provider_cleanup(
+                db_session,
+                job_id=job.id,
+                cleanup_generation=cleanup_generation,
+                now=now,
+            )
+            return _complete(job.id) if completed else _skipped(job.id)
+        else:
+            raise ValueError("terminal regulatory job has no provider cleanup phase")
+    except Exception as error:
+        if isinstance(error, IndexingGatewayHTTPError) and error.status_code == 404:
+            if phase is RegulatoryIndexingProviderCleanupPhase.VERTEX_CANCEL:
+                next_phase = RegulatoryIndexingProviderCleanupPhase.VERTEX_DELETE
+            elif phase is RegulatoryIndexingProviderCleanupPhase.VERTEX_DELETE:
+                next_phase = RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP
+            else:
+                raise
+        else:
+            decision = classify_indexing_error(error)
+            next_attempt = job.provider_cleanup_attempt_count + 1
+            exhausted = not decision.retryable or next_attempt >= snapshot.max_attempts
+            delay = (
+                snapshot.retry_max_seconds
+                if exhausted
+                else retry_delay_seconds(
+                    job.id,
+                    RegulatoryIndexingStage(job.stage),
+                    next_attempt,
+                    snapshot.retry_base_seconds,
+                    snapshot.retry_max_seconds,
+                )
+            )
+            scheduled = (
+                indexing_job_repository.schedule_regulatory_provider_cleanup_retry(
+                    db_session,
+                    job_id=job.id,
+                    cleanup_generation=cleanup_generation,
+                    next_retry_at=now + datetime.timedelta(seconds=delay),
+                    error_code=decision.error_code,
+                    error_message=error.__class__.__name__,
+                    exhausted=exhausted,
+                )
+            )
+            return _complete(job.id) if scheduled else _skipped(job.id)
+
+    if next_phase is None:
+        raise RuntimeError("provider cleanup did not select a next phase")
+    advanced = indexing_job_repository.advance_regulatory_provider_cleanup(
+        db_session,
+        job_id=job.id,
+        cleanup_generation=cleanup_generation,
+        expected_phase=phase,
+        next_phase=next_phase,
+        now=now,
+    )
+    return _complete(job.id) if advanced else _skipped(job.id)
+
+
+def run_preclaimed_regulatory_provider_cleanup(
+    job_id: UUID,
+    cleanup_generation: int,
+    cleanup_token: UUID,
+    tenant_id: str,
+) -> OrchestrationResult:
+    if not tenant_id.strip():
+        raise ValueError("tenant_id must not be empty")
+    with get_session_with_current_tenant() as db_session:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if not indexing_job_repository.consume_regulatory_provider_cleanup_delivery(
+            db_session,
+            job_id=job_id,
+            cleanup_generation=cleanup_generation,
+            cleanup_token=cleanup_token,
+            consumed_at=now,
+        ):
+            return _skipped(job_id)
+        runtime = indexing_job_repository.get_regulatory_indexing_runtime(
+            db_session, job_id
+        )
+        if runtime is None:
+            return _skipped(job_id)
+        return _run_claimed_regulatory_provider_cleanup(
+            runtime,
+            cleanup_generation=cleanup_generation,
             tenant_id=tenant_id,
             db_session=db_session,
             now=now,

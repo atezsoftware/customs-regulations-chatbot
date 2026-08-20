@@ -20,6 +20,7 @@ from onyx.regulatory.indexing_jobs.orchestrator import (
     OrchestrationDeliveryKind,
     OrchestrationOutcome,
     run_preclaimed_regulatory_indexing_step,
+    run_preclaimed_regulatory_provider_cleanup,
     run_regulatory_indexing_step,
 )
 
@@ -55,7 +56,10 @@ def enqueue_regulatory_indexing_step(
         "tenant_id": tenant_id,
         "delivery_kind": delivery_kind.value,
     }
-    if delivery_kind is OrchestrationDeliveryKind.PRECLAIMED:
+    if delivery_kind in {
+        OrchestrationDeliveryKind.PRECLAIMED,
+        OrchestrationDeliveryKind.PROVIDER_CLEANUP,
+    }:
         if recovery_token is None:
             raise ValueError("preclaimed delivery requires a recovery token")
         kwargs["recovery_token"] = str(recovery_token)
@@ -105,6 +109,15 @@ def regulatory_indexing_run_step(
             UUID(recovery_token),
             tenant_id,
         )
+    elif kind is OrchestrationDeliveryKind.PROVIDER_CLEANUP:
+        if recovery_token is None:
+            raise ValueError("provider cleanup delivery requires a recovery token")
+        result = run_preclaimed_regulatory_provider_cleanup(
+            parsed_job_id,
+            expected_generation,
+            UUID(recovery_token),
+            tenant_id,
+        )
     else:
         if recovery_token is not None:
             raise ValueError("normal delivery must not include a recovery token")
@@ -144,6 +157,23 @@ def _claim_stale_jobs(
         )
 
 
+def _claim_due_provider_cleanups(
+    tenant_id: str,
+) -> list[indexing_job_repository.RegulatoryIndexingProviderCleanupClaim]:
+    if not tenant_id.strip():
+        raise ValueError("tenant_id must not be empty")
+    claimed_at = datetime.datetime.now(datetime.timezone.utc)
+    stale_before = claimed_at - datetime.timedelta(
+        seconds=app_configs.REGULATORY_INDEXING_LEASE_SECONDS
+    )
+    with get_session_with_current_tenant() as db_session:
+        return indexing_job_repository.claim_due_regulatory_provider_cleanups(
+            db_session,
+            stale_before=stale_before,
+            claimed_at=claimed_at,
+        )
+
+
 @shared_task(
     name=OnyxCeleryTask.REGULATORY_INDEXING_RECOVER_STALE,
     bind=True,
@@ -160,4 +190,13 @@ def regulatory_indexing_recover_stale(self: Task, *, tenant_id: str) -> None:
             tenant_id=tenant_id,
             delivery_kind=OrchestrationDeliveryKind.PRECLAIMED,
             recovery_token=claim.recovery_token,
+        )
+    for cleanup_claim in _claim_due_provider_cleanups(tenant_id):
+        enqueue_regulatory_indexing_step(
+            self.app,
+            job_id=cleanup_claim.job_id,
+            expected_generation=cleanup_claim.cleanup_generation,
+            tenant_id=tenant_id,
+            delivery_kind=OrchestrationDeliveryKind.PROVIDER_CLEANUP,
+            recovery_token=cleanup_claim.cleanup_token,
         )

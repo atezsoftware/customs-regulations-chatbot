@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import datetime
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import cast
 
@@ -28,6 +30,7 @@ from onyx.prompts.contextual_retrieval import (
     CONTEXTUAL_RAG_PROMPT2,
 )
 from onyx.regulatory.contextual import (
+    context_reference_date,
     contextual_reserve_for_embedding_text,
     fit_context_fields_to_embedding_budget,
     visible_regulatory_snapshot_for_target,
@@ -35,8 +38,11 @@ from onyx.regulatory.contextual import (
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchRequest,
     VertexBatchResult,
+    vertex_jsonl_line_size,
 )
 from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
+
+_MAX_CACHED_DOCUMENT_CONTEXTS = 4
 
 _VERTEX_BATCH_MAX_OUTPUT_TOKENS = 256
 
@@ -98,6 +104,10 @@ class ContextualMappingError(ValueError):
     """Canonical chunks, persisted items, and Vertex results do not agree."""
 
 
+class ContextAttemptBudgetExhaustedError(RuntimeError):
+    """A pending chunk already consumed its durable contextual attempt budget."""
+
+
 class ContextApplySummary(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -124,17 +134,21 @@ def _row_block(row: RegulatoryChunk) -> str:
     )
 
 
-def _fit_document_context(
+@dataclass(frozen=True, slots=True)
+class _PreparedDocumentContext:
+    rows: tuple[RegulatoryChunk, ...]
+    text: str
+    tokens: tuple[int, ...]
+    boundary_anchors: str
+    boundary_anchor_tokens: tuple[int, ...]
+
+
+def _prepare_document_context(
     ordered_rows: Sequence[RegulatoryChunk],
     *,
-    token_budget: int,
     tokenizer: BaseTokenizer,
-) -> str:
+) -> _PreparedDocumentContext:
     document = "\n\n".join(_row_block(candidate) for candidate in ordered_rows)
-    document_tokens = tokenizer.encode(document)
-    if len(document_tokens) <= token_budget:
-        return document
-
     first_heading = (
         ordered_rows[0].heading_path[-1] if ordered_rows[0].heading_path else ""
     )
@@ -144,15 +158,31 @@ def _fit_document_context(
     boundary_anchors = (
         f"[Document boundary headings: {first_heading} | {last_heading}]\n"
     )
-    anchor_tokens = tokenizer.encode(boundary_anchors)
-    remaining_budget = token_budget - len(anchor_tokens)
+    return _PreparedDocumentContext(
+        rows=tuple(ordered_rows),
+        text=document,
+        tokens=tuple(tokenizer.encode(document)),
+        boundary_anchors=boundary_anchors,
+        boundary_anchor_tokens=tuple(tokenizer.encode(boundary_anchors)),
+    )
+
+
+def _fit_document_context(
+    prepared: _PreparedDocumentContext,
+    *,
+    token_budget: int,
+    tokenizer: BaseTokenizer,
+) -> str:
+    if len(prepared.tokens) <= token_budget:
+        return prepared.text
+    remaining_budget = token_budget - len(prepared.boundary_anchor_tokens)
     if remaining_budget <= 0:
         raise ContextualMappingError(
             "contextual model input window cannot preserve document boundaries"
         )
     try:
         representative_document = tokenizer_trim_middle(
-            document_tokens,
+            list(prepared.tokens),
             remaining_budget,
             tokenizer,
         )
@@ -160,7 +190,7 @@ def _fit_document_context(
         raise ContextualMappingError(
             "contextual model input window is too small for document context"
         ) from error
-    return f"{boundary_anchors}{representative_document}"
+    return f"{prepared.boundary_anchors}{representative_document}"
 
 
 def _contextual_model_name(job: RegulatoryIndexingJob) -> str:
@@ -172,6 +202,92 @@ def _contextual_model_name(job: RegulatoryIndexingJob) -> str:
     if not isinstance(model_name, str) or not model_name.strip():
         raise ContextualMappingError("indexing job has no contextual model name")
     return model_name
+
+
+@dataclass(slots=True)
+class ContextualRequestFactory:
+    """Reuse sorted rows and tokenized document snapshots across chunk prompts."""
+
+    job: RegulatoryIndexingJob
+    rows: Sequence[RegulatoryChunk]
+    contextual_tokenizer: BaseTokenizer
+    embedding_tokenizer: BaseTokenizer | None = None
+    _ordered_rows: tuple[RegulatoryChunk, ...] = field(init=False)
+    _row_by_id: dict[str, RegulatoryChunk] = field(init=False)
+    _documents: OrderedDict[
+        datetime.date, tuple[tuple[RegulatoryChunk, ...], _PreparedDocumentContext]
+    ] = field(init=False, default_factory=OrderedDict)
+
+    def __post_init__(self) -> None:
+        self._ordered_rows = tuple(_ordered_rows(self.rows))
+        self._row_by_id = {row.id: row for row in self._ordered_rows}
+        if any(row.user_file_id != self.job.user_file_id for row in self._ordered_rows):
+            raise ContextualMappingError(
+                "canonical rows do not belong to the indexing job"
+            )
+
+    def _canonical_row(self, row: RegulatoryChunk) -> RegulatoryChunk:
+        canonical_row = self._row_by_id.get(row.id)
+        if canonical_row is None:
+            raise ContextualMappingError(
+                "contextual row is not part of the canonical file"
+            )
+        return canonical_row
+
+    def _document(
+        self, row: RegulatoryChunk
+    ) -> tuple[tuple[RegulatoryChunk, ...], _PreparedDocumentContext]:
+        canonical_row = self._canonical_row(row)
+        reference_date = context_reference_date(
+            canonical_row.validity_start_date,
+            canonical_row.validity_end_date,
+        )
+        cached = self._documents.get(reference_date)
+        if cached is not None:
+            self._documents.move_to_end(reference_date)
+            return cached
+        visible_rows = tuple(
+            _ordered_rows(
+                visible_regulatory_snapshot_for_target(
+                    self._ordered_rows, canonical_row
+                )
+            )
+        )
+        prepared = _prepare_document_context(
+            visible_rows,
+            tokenizer=self.contextual_tokenizer,
+        )
+        cached = (visible_rows, prepared)
+        self._documents[reference_date] = cached
+        if len(self._documents) > _MAX_CACHED_DOCUMENT_CONTEXTS:
+            self._documents.popitem(last=False)
+        return cached
+
+    def reserve(self, row: RegulatoryChunk) -> int:
+        if self.embedding_tokenizer is None:
+            raise ContextualMappingError(
+                "contextual reserve requires an embedding tokenizer"
+            )
+        canonical_row = self._canonical_row(row)
+        visible_rows, _prepared = self._document(canonical_row)
+        if len(visible_rows) <= 1:
+            return 0
+        return contextual_reserve_for_embedding_text(
+            canonical_row.text,
+            tokenizer=self.embedding_tokenizer,
+            embedding_token_limit=DOC_EMBEDDING_CONTEXT_SIZE,
+            requested_reserve=DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS,
+        )
+
+    def request(self, row: RegulatoryChunk) -> VertexBatchRequest:
+        canonical_row = self._canonical_row(row)
+        _visible_rows, prepared = self._document(canonical_row)
+        return _contextual_request_for_prepared_document(
+            self.job,
+            canonical_row,
+            prepared_document=prepared,
+            contextual_tokenizer=self.contextual_tokenizer,
+        )
 
 
 def contextual_reserve_for_row(
@@ -208,19 +324,20 @@ def contextual_request_for_row(
     *,
     contextual_tokenizer: BaseTokenizer,
 ) -> VertexBatchRequest:
-    canonical_rows = _ordered_rows(rows)
-    row_by_id = {candidate.id: candidate for candidate in canonical_rows}
-    canonical_row = row_by_id.get(row.id)
-    if canonical_row is None:
-        raise ContextualMappingError("contextual row is not part of the canonical file")
-    if canonical_row.user_file_id != job.user_file_id or any(
-        candidate.user_file_id != job.user_file_id for candidate in canonical_rows
-    ):
-        raise ContextualMappingError("canonical rows do not belong to the indexing job")
-    ordered_rows = _ordered_rows(
-        visible_regulatory_snapshot_for_target(canonical_rows, canonical_row)
-    )
+    return ContextualRequestFactory(
+        job=job,
+        rows=rows,
+        contextual_tokenizer=contextual_tokenizer,
+    ).request(row)
 
+
+def _contextual_request_for_prepared_document(
+    job: RegulatoryIndexingJob,
+    canonical_row: RegulatoryChunk,
+    *,
+    prepared_document: _PreparedDocumentContext,
+    contextual_tokenizer: BaseTokenizer,
+) -> VertexBatchRequest:
     chunk_block = _row_block(canonical_row)
     prompt_without_document = CONTEXTUAL_RAG_PROMPT1.format(
         document=""
@@ -242,7 +359,7 @@ def contextual_request_for_row(
         )
 
     document = _fit_document_context(
-        ordered_rows,
+        prepared_document,
         token_budget=document_token_budget,
         tokenizer=contextual_tokenizer,
     )
@@ -262,7 +379,16 @@ def build_contextual_requests(
     *,
     embedding_tokenizer: BaseTokenizer,
     contextual_tokenizer: BaseTokenizer,
+    max_requests: int | None = None,
+    max_jsonl_bytes: int | None = None,
+    max_attempts: int | None = None,
 ) -> list[VertexBatchRequest]:
+    if max_requests is not None and max_requests < 1:
+        raise ValueError("max_requests must be positive")
+    if max_jsonl_bytes is not None and max_jsonl_bytes < 1:
+        raise ValueError("max_jsonl_bytes must be positive")
+    if max_attempts is not None and max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
     ordered_rows = _ordered_rows(rows)
     row_by_id = {row.id: row for row in ordered_rows}
     requests: list[VertexBatchRequest] = []
@@ -276,34 +402,47 @@ def build_contextual_requests(
             raise ContextualMappingError("contextual item has no canonical chunk")
         item_by_row_id[item.regulatory_chunk_id] = item
 
+    request_factory = ContextualRequestFactory(
+        job=job,
+        rows=ordered_rows,
+        embedding_tokenizer=embedding_tokenizer,
+        contextual_tokenizer=contextual_tokenizer,
+    )
+    used_jsonl_bytes = 0
     for row in ordered_rows:
         item = item_by_row_id.get(row.id)
         if item is None:
             continue
         if item.status != RegulatoryIndexingItemStatus.PENDING.value:
             continue
-        if (
-            contextual_reserve_for_row(
-                ordered_rows,
-                row,
-                embedding_tokenizer=embedding_tokenizer,
+        context_attempt_count = getattr(item, "context_attempt_count", 0)
+        if max_attempts is not None and context_attempt_count >= max_attempts:
+            raise ContextAttemptBudgetExhaustedError(
+                "contextual item attempt budget is exhausted"
             )
-            == 0
-        ):
+        if max_requests is not None and len(requests) >= max_requests:
+            break
+        if request_factory.reserve(row) == 0:
             raise ContextualMappingError(
                 "context-ineligible item was not persisted as skipped"
             )
-        request = contextual_request_for_row(
-            job,
-            ordered_rows,
-            row,
-            contextual_tokenizer=contextual_tokenizer,
-        )
+        request = request_factory.request(row)
         if request.request_hash != item.request_hash:
             raise ContextualMappingError(
                 "contextual request hash does not match the persisted item"
             )
+        request_bytes = vertex_jsonl_line_size(request)
+        if (
+            max_jsonl_bytes is not None
+            and used_jsonl_bytes + request_bytes > max_jsonl_bytes
+        ):
+            if not requests:
+                raise ContextualMappingError(
+                    "contextual request exceeds the JSONL byte limit"
+                )
+            break
         requests.append(request)
+        used_jsonl_bytes += request_bytes
     if len({request.request_hash for request in requests}) != len(requests):
         raise ContextualMappingError("contextual requests contain a duplicate hash")
     return requests

@@ -33,7 +33,6 @@ from onyx.db.user_file import (
 )
 from onyx.document_index.factory import build_elasticsearch_document_index
 from onyx.document_index.interfaces_new import (
-    DocumentChunkVerificationError,
     DocumentChunkVerificationExpectation,
     DocumentChunkVerificationRequest,
     DocumentChunkVerificationResult,
@@ -567,22 +566,21 @@ def publish_regulatory_job(
             hidden=True,
         )
         visible_request = hidden_request.model_copy(update={"expected_hidden": False})
-        already_visible = False
+        # Elasticsearch bulk visibility is not transactional. A killed process can
+        # therefore leave a mixed generation that verifies as neither hidden nor
+        # visible. Re-establish the safe all-hidden baseline before every publish;
+        # the two idempotent bulk updates then converge hidden, visible, or mixed
+        # projections through the same path.
         try:
+            target_index.update_document_visibility(hidden_request)
             hidden_result = target_index.verify_document_chunks(hidden_request)
             _validate_index_verification(hidden_result, expected, hidden=True)
-        except DocumentChunkVerificationError as hidden_error:
-            try:
-                visible_result = target_index.verify_document_chunks(visible_request)
-                _validate_index_verification(visible_result, expected, hidden=False)
-                already_visible = True
-            except DocumentChunkVerificationError:
-                raise hidden_error
+        except Exception as baseline_error:
+            raise IndexingPublicationIndeterminateError() from baseline_error
         try:
-            if not already_visible:
-                target_index.update_document_visibility(visible_request)
-                visible_result = target_index.verify_document_chunks(visible_request)
-                _validate_index_verification(visible_result, expected, hidden=False)
+            target_index.update_document_visibility(visible_request)
+            visible_result = target_index.verify_document_chunks(visible_request)
+            _validate_index_verification(visible_result, expected, hidden=False)
             completed = (
                 indexing_job_repository.complete_regulatory_indexing_publication(
                     db_session,
@@ -605,8 +603,6 @@ def publish_regulatory_job(
         except Exception as publish_error:
             if isinstance(publish_error, IndexingPublicationIndeterminateError):
                 raise
-            if already_visible:
-                raise IndexingPublicationIndeterminateError() from publish_error
             try:
                 target_index.update_document_visibility(hidden_request)
                 restored_result = target_index.verify_document_chunks(hidden_request)

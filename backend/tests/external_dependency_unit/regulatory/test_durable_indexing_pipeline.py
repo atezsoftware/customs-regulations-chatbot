@@ -112,12 +112,22 @@ class _CharacterTokenizer(BaseTokenizer):
 class _DeterministicVertexGateway(VertexBatchGateway):
     def __init__(self) -> None:
         self.submissions: list[list[VertexBatchRequest]] = []
+        self.submission_keys: list[str] = []
         self.cancelled: list[str] = []
+        self.deleted: list[str] = []
         self.cleaned: list[str] = []
 
-    def submit(self, requests: Sequence[VertexBatchRequest]) -> VertexBatchState:
+    def submit(
+        self,
+        requests: Sequence[VertexBatchRequest],
+        *,
+        submission_key: str,
+        max_jsonl_bytes: int,
+    ) -> VertexBatchState:
         submission = list(requests)
+        assert len(build_vertex_jsonl(submission).encode()) <= max_jsonl_bytes
         self.submissions.append(submission)
+        self.submission_keys.append(submission_key)
         suffix = len(self.submissions)
         return VertexBatchState(
             remote_job_name=f"jobs/deterministic-{suffix}",
@@ -137,7 +147,7 @@ class _DeterministicVertexGateway(VertexBatchGateway):
         del submission_key
         return None
 
-    def read_results(self, output_uri: str) -> str:
+    def read_results(self, output_uri: str) -> Iterator[str]:
         del output_uri
         current = self.submissions[-1]
         returned = current[:-1] if len(current) > 1 else current
@@ -170,10 +180,13 @@ class _DeterministicVertexGateway(VertexBatchGateway):
                     }
                 )
             )
-        return "\n".join(lines) + "\n"
+        return iter(f"{line}\n" for line in lines)
 
     def cancel(self, remote_job_name: str) -> None:
         self.cancelled.append(remote_job_name)
+
+    def delete(self, remote_job_name: str) -> None:
+        self.deleted.append(remote_job_name)
 
     def cleanup(self, prefix: str) -> None:
         self.cleaned.append(prefix)

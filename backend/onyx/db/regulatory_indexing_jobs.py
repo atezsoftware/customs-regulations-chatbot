@@ -16,6 +16,8 @@ from onyx.db.enums import (
     RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingJobStatus,
+    RegulatoryIndexingProviderCleanupPhase,
+    RegulatoryIndexingProviderCleanupState,
     RegulatoryIndexingStage,
     RegulatoryIndexingSubmissionState,
     UserFileStatus,
@@ -115,6 +117,13 @@ class RegulatoryIndexingJobClaim:
 class RegulatoryIndexingCancellationDelivery:
     job_id: UUID
     expected_generation: int
+
+
+@dataclass(frozen=True)
+class RegulatoryIndexingProviderCleanupClaim:
+    job_id: UUID
+    cleanup_generation: int
+    cleanup_token: UUID
 
 
 @dataclass(frozen=True)
@@ -696,25 +705,139 @@ def record_vertex_submission_intent(
     job_id: UUID,
     expected_generation: int,
     submission_key: str,
+    submission_attempt: int,
     now: datetime.datetime,
 ) -> bool:
     """Commit deterministic create intent before the provider create call."""
 
-    return _update_vertex_submission_state(
-        db_session,
-        job_id=job_id,
-        expected_generation=expected_generation,
-        submission_key=submission_key,
-        allowed_states=(
-            RegulatoryIndexingSubmissionState.NONE,
-            RegulatoryIndexingSubmissionState.RECONCILED_ABSENT,
-        ),
-        next_state=RegulatoryIndexingSubmissionState.SUBMITTING,
-        now=now,
+    if submission_attempt < 1:
+        raise ValueError("Vertex submission attempt must be positive")
+    updated_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.CONTEXT_SUBMIT.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.vertex_submission_state
+            == RegulatoryIndexingSubmissionState.NONE.value,
+            RegulatoryIndexingJob.vertex_submission_key.is_(None),
+            RegulatoryIndexingJob.vertex_submission_attempt_count
+            == submission_attempt - 1,
+        )
+        .values(
+            vertex_submission_key=submission_key,
+            vertex_submission_state=RegulatoryIndexingSubmissionState.SUBMITTING.value,
+            vertex_submission_attempt_count=submission_attempt,
+            vertex_submission_charged=False,
+            vertex_reconcile_miss_count=0,
+            vertex_reconcile_until=None,
+            heartbeat_at=now,
+            updated_at=now,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return updated_id is not None
+
+
+def _charge_vertex_submission_items(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    request_hashes: Sequence[str],
+    now: datetime.datetime,
+) -> None:
+    hashes = tuple(request_hashes)
+    if not hashes or len(set(hashes)) != len(hashes):
+        raise ValueError("charged Vertex request hashes must be unique and non-empty")
+    db_session.execute(
+        update(RegulatoryIndexingItem)
+        .where(
+            RegulatoryIndexingItem.job_id == job_id,
+            RegulatoryIndexingItem.status == RegulatoryIndexingItemStatus.PENDING.value,
+            RegulatoryIndexingItem.request_hash.in_(hashes),
+        )
+        .values(
+            context_attempt_count=RegulatoryIndexingItem.context_attempt_count + 1,
+            updated_at=now,
+        )
     )
 
 
 def require_vertex_submission_reconciliation(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    submission_key: str,
+    request_hashes: Sequence[str],
+    reconcile_until: datetime.datetime,
+    now: datetime.datetime,
+    commit: bool = True,
+) -> bool:
+    persisted = _update_vertex_submission_state(
+        db_session,
+        job_id=job_id,
+        expected_generation=expected_generation,
+        submission_key=submission_key,
+        allowed_states=(RegulatoryIndexingSubmissionState.SUBMITTING,),
+        next_state=RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
+        now=now,
+        extra_values={
+            "vertex_submission_charged": True,
+            "vertex_reconcile_miss_count": 0,
+            "vertex_reconcile_until": reconcile_until,
+        },
+        commit=False,
+    )
+    if persisted:
+        _charge_vertex_submission_items(
+            db_session,
+            job_id=job_id,
+            request_hashes=request_hashes,
+            now=now,
+        )
+        if commit:
+            db_session.commit()
+        else:
+            db_session.flush()
+    return persisted
+
+
+def record_vertex_reconciliation_miss(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    now: datetime.datetime,
+) -> bool:
+    updated_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == RegulatoryIndexingStage.CONTEXT_SUBMIT.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+            RegulatoryIndexingJob.vertex_submission_state
+            == RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED.value,
+            RegulatoryIndexingJob.vertex_reconcile_until.is_not(None),
+            RegulatoryIndexingJob.vertex_reconcile_until > now,
+        )
+        .values(
+            vertex_reconcile_miss_count=(
+                RegulatoryIndexingJob.vertex_reconcile_miss_count + 1
+            ),
+            heartbeat_at=now,
+            updated_at=now,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return updated_id is not None
+
+
+def record_vertex_submission_not_sent(
     db_session: Session,
     *,
     job_id: UUID,
@@ -729,31 +852,15 @@ def require_vertex_submission_reconciliation(
         expected_generation=expected_generation,
         submission_key=submission_key,
         allowed_states=(RegulatoryIndexingSubmissionState.SUBMITTING,),
-        next_state=RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
+        next_state=RegulatoryIndexingSubmissionState.NONE,
         now=now,
+        extra_values={
+            "vertex_submission_key": None,
+            "vertex_submission_charged": False,
+            "vertex_reconcile_miss_count": 0,
+            "vertex_reconcile_until": None,
+        },
         commit=commit,
-    )
-
-
-def record_vertex_submission_absent(
-    db_session: Session,
-    *,
-    job_id: UUID,
-    expected_generation: int,
-    submission_key: str,
-    now: datetime.datetime,
-) -> bool:
-    return _update_vertex_submission_state(
-        db_session,
-        job_id=job_id,
-        expected_generation=expected_generation,
-        submission_key=submission_key,
-        allowed_states=(
-            RegulatoryIndexingSubmissionState.SUBMITTING,
-            RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
-        ),
-        next_state=RegulatoryIndexingSubmissionState.RECONCILED_ABSENT,
-        now=now,
     )
 
 
@@ -763,13 +870,15 @@ def record_vertex_submission(
     job_id: UUID,
     expected_generation: int,
     submission_key: str,
+    request_hashes: Sequence[str],
+    charge_items: bool,
     remote_job_name: str,
     input_uri: str | None,
     output_uri: str | None,
     now: datetime.datetime,
     commit: bool = True,
 ) -> bool:
-    return _update_vertex_submission_state(
+    persisted = _update_vertex_submission_state(
         db_session,
         job_id=job_id,
         expected_generation=expected_generation,
@@ -777,7 +886,6 @@ def record_vertex_submission(
         allowed_states=(
             RegulatoryIndexingSubmissionState.SUBMITTING,
             RegulatoryIndexingSubmissionState.RECONCILE_REQUIRED,
-            RegulatoryIndexingSubmissionState.RECONCILED_ABSENT,
         ),
         next_state=RegulatoryIndexingSubmissionState.SUBMITTED,
         now=now,
@@ -785,9 +893,24 @@ def record_vertex_submission(
             "remote_vertex_job_name": remote_job_name,
             "vertex_input_uri": input_uri,
             "vertex_output_uri": output_uri,
+            "vertex_submission_charged": True,
+            "vertex_reconcile_until": None,
         },
-        commit=commit,
+        commit=False,
     )
+    if persisted and charge_items:
+        _charge_vertex_submission_items(
+            db_session,
+            job_id=job_id,
+            request_hashes=request_hashes,
+            now=now,
+        )
+    if persisted:
+        if commit:
+            db_session.commit()
+        else:
+            db_session.flush()
+    return persisted
 
 
 def persist_vertex_poll_state(
@@ -836,6 +959,9 @@ def reset_vertex_submission_for_partial_retry(
             remote_vertex_job_name=None,
             vertex_input_uri=None,
             vertex_output_uri=None,
+            vertex_submission_charged=False,
+            vertex_reconcile_miss_count=0,
+            vertex_reconcile_until=None,
             heartbeat_at=now,
             updated_at=now,
         )
@@ -1594,6 +1720,31 @@ def complete_regulatory_indexing_user_file(
     return True
 
 
+def _schedule_provider_cleanup(
+    job: RegulatoryIndexingJob,
+    *,
+    now: datetime.datetime,
+    cancel_first: bool,
+) -> None:
+    if cancel_first and job.remote_vertex_job_name:
+        phase = RegulatoryIndexingProviderCleanupPhase.VERTEX_CANCEL
+    elif job.remote_vertex_job_name:
+        phase = RegulatoryIndexingProviderCleanupPhase.VERTEX_DELETE
+    elif job.vertex_submission_key:
+        phase = RegulatoryIndexingProviderCleanupPhase.VERTEX_RECONCILE
+    else:
+        phase = RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP
+    job.provider_cleanup_state = RegulatoryIndexingProviderCleanupState.PENDING.value
+    job.provider_cleanup_phase = phase.value
+    job.provider_cleanup_attempt_count = 0
+    job.provider_cleanup_token = None
+    job.provider_cleanup_next_retry_at = None
+    job.provider_cleanup_heartbeat_at = now
+    job.provider_cleanup_error_code = None
+    job.provider_cleanup_error_message = None
+    job.provider_cleanup_completed_at = None
+
+
 def complete_regulatory_indexing_publication(
     db_session: Session,
     *,
@@ -1645,6 +1796,7 @@ def complete_regulatory_indexing_publication(
     locked_job.heartbeat_at = now
     locked_job.updated_at = now
     locked_job.completed_at = now
+    _schedule_provider_cleanup(locked_job, now=now, cancel_first=False)
     if commit:
         db_session.commit()
     else:
@@ -1736,6 +1888,7 @@ def fail_regulatory_indexing_job(
     job.error_message = error_message[:_MAX_ERROR_MESSAGE_LENGTH]
     job.completed_at = now
     job.updated_at = now
+    _schedule_provider_cleanup(job, now=now, cancel_first=True)
     if locked_user_file.status in {
         UserFileStatus.PROCESSING,
         UserFileStatus.INDEXING,
@@ -1780,14 +1933,29 @@ def cancel_regulatory_indexing_job(
         .where(RegulatoryIndexingItem.job_id == job_id)
         .values(vector=None, updated_at=now)
     )
-    job.status = RegulatoryIndexingJobStatus.CANCELLED.value
+    cancellation_intent = RegulatoryIndexingCancellationIntent(job.cancellation_intent)
+    terminal_failure = (
+        cancellation_intent is RegulatoryIndexingCancellationIntent.TERMINAL_FAILURE
+    )
+    job.status = (
+        RegulatoryIndexingJobStatus.FAILED.value
+        if terminal_failure
+        else RegulatoryIndexingJobStatus.CANCELLED.value
+    )
     job.completed_at = now
     job.next_retry_at = None
-    job.error_code = None
-    job.error_message = None
+    if not terminal_failure:
+        job.error_code = None
+        job.error_message = None
     job.updated_at = now
-    cancellation_intent = RegulatoryIndexingCancellationIntent(job.cancellation_intent)
-    if cancellation_intent is RegulatoryIndexingCancellationIntent.SUPERSEDE:
+    _schedule_provider_cleanup(job, now=now, cancel_first=False)
+    if terminal_failure:
+        if locked_user_file.status in {
+            UserFileStatus.PROCESSING,
+            UserFileStatus.INDEXING,
+        }:
+            locked_user_file.status = UserFileStatus.FAILED
+    elif cancellation_intent is RegulatoryIndexingCancellationIntent.SUPERSEDE:
         if locked_user_file.status not in {
             UserFileStatus.CANCELED,
             UserFileStatus.DELETING,
@@ -1848,6 +2016,50 @@ def request_regulatory_indexing_cancellation(
     return True
 
 
+def request_regulatory_indexing_terminal_failure_cleanup(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_stage: RegulatoryIndexingStage,
+    expected_generation: int,
+    error_code: str,
+    error_message: str,
+    now: datetime.datetime,
+) -> bool:
+    """Fail closed through the durable external and index cleanup phases."""
+
+    job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.status == RegulatoryIndexingJobStatus.RUNNING.value,
+            RegulatoryIndexingJob.stage == expected_stage.value,
+            RegulatoryIndexingJob.lease_generation == expected_generation,
+        )
+        .with_for_update()
+    )
+    if job is None:
+        db_session.rollback()
+        return False
+    job.status = RegulatoryIndexingJobStatus.CANCELLING.value
+    job.cancellation_intent = (
+        RegulatoryIndexingCancellationIntent.TERMINAL_FAILURE.value
+    )
+    job.cancellation_phase = (
+        RegulatoryIndexingCancellationPhase.VERTEX_CANCEL.value
+        if job.remote_vertex_job_name
+        else RegulatoryIndexingCancellationPhase.GCS_CLEANUP.value
+    )
+    job.attempt_count = 0
+    job.next_retry_at = None
+    job.error_code = error_code[:_MAX_ERROR_CODE_LENGTH]
+    job.error_message = error_message[:_MAX_ERROR_MESSAGE_LENGTH]
+    job.heartbeat_at = now
+    job.updated_at = now
+    db_session.commit()
+    return True
+
+
 def advance_regulatory_indexing_cancellation(
     db_session: Session,
     *,
@@ -1870,8 +2082,22 @@ def advance_regulatory_indexing_cancellation(
             cancellation_phase=next_phase.value,
             attempt_count=0,
             next_retry_at=None,
-            error_code=None,
-            error_message=None,
+            error_code=case(
+                (
+                    RegulatoryIndexingJob.cancellation_intent
+                    == RegulatoryIndexingCancellationIntent.TERMINAL_FAILURE.value,
+                    RegulatoryIndexingJob.error_code,
+                ),
+                else_=None,
+            ),
+            error_message=case(
+                (
+                    RegulatoryIndexingJob.cancellation_intent
+                    == RegulatoryIndexingCancellationIntent.TERMINAL_FAILURE.value,
+                    RegulatoryIndexingJob.error_message,
+                ),
+                else_=None,
+            ),
             heartbeat_at=now,
             updated_at=now,
         )
@@ -1903,8 +2129,22 @@ def schedule_regulatory_indexing_cancellation_retry(
         .values(
             attempt_count=RegulatoryIndexingJob.attempt_count + 1,
             next_retry_at=next_retry_at,
-            error_code=error_code[:_MAX_ERROR_CODE_LENGTH],
-            error_message=error_message[:_MAX_ERROR_MESSAGE_LENGTH],
+            error_code=case(
+                (
+                    RegulatoryIndexingJob.cancellation_intent
+                    == RegulatoryIndexingCancellationIntent.TERMINAL_FAILURE.value,
+                    RegulatoryIndexingJob.error_code,
+                ),
+                else_=error_code[:_MAX_ERROR_CODE_LENGTH],
+            ),
+            error_message=case(
+                (
+                    RegulatoryIndexingJob.cancellation_intent
+                    == RegulatoryIndexingCancellationIntent.TERMINAL_FAILURE.value,
+                    RegulatoryIndexingJob.error_message,
+                ),
+                else_=error_message[:_MAX_ERROR_MESSAGE_LENGTH],
+            ),
             updated_at=func.now(),
         )
         .returning(RegulatoryIndexingJob.id)
@@ -1949,15 +2189,30 @@ def finalize_regulatory_indexing_cancellation(
         .where(RegulatoryIndexingItem.job_id == job_id)
         .values(vector=None, updated_at=now)
     )
-    job.status = RegulatoryIndexingJobStatus.CANCELLED.value
+    cancellation_intent = RegulatoryIndexingCancellationIntent(job.cancellation_intent)
+    terminal_failure = (
+        cancellation_intent is RegulatoryIndexingCancellationIntent.TERMINAL_FAILURE
+    )
+    job.status = (
+        RegulatoryIndexingJobStatus.FAILED.value
+        if terminal_failure
+        else RegulatoryIndexingJobStatus.CANCELLED.value
+    )
     job.completed_at = now
     job.next_retry_at = None
-    job.error_code = None
-    job.error_message = None
+    if not terminal_failure:
+        job.error_code = None
+        job.error_message = None
     job.heartbeat_at = now
     job.updated_at = now
-    cancellation_intent = RegulatoryIndexingCancellationIntent(job.cancellation_intent)
-    if cancellation_intent is RegulatoryIndexingCancellationIntent.SUPERSEDE:
+    _schedule_provider_cleanup(job, now=now, cancel_first=False)
+    if terminal_failure:
+        if locked_user_file.status in {
+            UserFileStatus.PROCESSING,
+            UserFileStatus.INDEXING,
+        }:
+            locked_user_file.status = UserFileStatus.FAILED
+    elif cancellation_intent is RegulatoryIndexingCancellationIntent.SUPERSEDE:
         if locked_user_file.status not in {
             UserFileStatus.CANCELED,
             UserFileStatus.DELETING,
@@ -1969,3 +2224,262 @@ def finalize_regulatory_indexing_cancellation(
         locked_user_file.status = UserFileStatus.CANCELED
     db_session.commit()
     return True
+
+
+def claim_due_regulatory_provider_cleanups(
+    db_session: Session,
+    *,
+    stale_before: datetime.datetime,
+    claimed_at: datetime.datetime,
+    limit: int = 20,
+) -> list[RegulatoryIndexingProviderCleanupClaim]:
+    """Claim terminal provider cleanup with a one-use delivery token."""
+
+    due = or_(
+        RegulatoryIndexingJob.provider_cleanup_state
+        == RegulatoryIndexingProviderCleanupState.PENDING.value,
+        and_(
+            RegulatoryIndexingJob.provider_cleanup_state.in_(
+                (
+                    RegulatoryIndexingProviderCleanupState.RETRY_WAIT.value,
+                    RegulatoryIndexingProviderCleanupState.EXHAUSTED.value,
+                )
+            ),
+            RegulatoryIndexingJob.provider_cleanup_next_retry_at.is_not(None),
+            RegulatoryIndexingJob.provider_cleanup_next_retry_at <= claimed_at,
+        ),
+        and_(
+            RegulatoryIndexingJob.provider_cleanup_state
+            == RegulatoryIndexingProviderCleanupState.RUNNING.value,
+            RegulatoryIndexingJob.provider_cleanup_heartbeat_at.is_not(None),
+            RegulatoryIndexingJob.provider_cleanup_heartbeat_at <= stale_before,
+        ),
+    )
+    jobs = list(
+        db_session.scalars(
+            select(RegulatoryIndexingJob)
+            .where(
+                RegulatoryIndexingJob.status.in_(
+                    (
+                        RegulatoryIndexingJobStatus.SUCCEEDED.value,
+                        RegulatoryIndexingJobStatus.FAILED.value,
+                        RegulatoryIndexingJobStatus.CANCELLED.value,
+                    )
+                ),
+                due,
+            )
+            .order_by(
+                func.coalesce(
+                    RegulatoryIndexingJob.provider_cleanup_next_retry_at,
+                    RegulatoryIndexingJob.provider_cleanup_heartbeat_at,
+                    RegulatoryIndexingJob.completed_at,
+                ),
+                RegulatoryIndexingJob.id,
+            )
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).all()
+    )
+    claims: list[RegulatoryIndexingProviderCleanupClaim] = []
+    for job in jobs:
+        token = uuid4()
+        if (
+            job.provider_cleanup_state
+            == RegulatoryIndexingProviderCleanupState.EXHAUSTED.value
+        ):
+            job.provider_cleanup_attempt_count = 0
+        job.provider_cleanup_state = (
+            RegulatoryIndexingProviderCleanupState.RUNNING.value
+        )
+        job.provider_cleanup_generation += 1
+        job.provider_cleanup_token = token
+        job.provider_cleanup_next_retry_at = None
+        job.provider_cleanup_heartbeat_at = claimed_at
+        claims.append(
+            RegulatoryIndexingProviderCleanupClaim(
+                job_id=job.id,
+                cleanup_generation=job.provider_cleanup_generation,
+                cleanup_token=token,
+            )
+        )
+    db_session.commit()
+    return claims
+
+
+def consume_regulatory_provider_cleanup_delivery(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    cleanup_generation: int,
+    cleanup_token: UUID,
+    consumed_at: datetime.datetime,
+) -> bool:
+    consumed_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.provider_cleanup_state
+            == RegulatoryIndexingProviderCleanupState.RUNNING.value,
+            RegulatoryIndexingJob.provider_cleanup_generation == cleanup_generation,
+            RegulatoryIndexingJob.provider_cleanup_token == cleanup_token,
+        )
+        .values(
+            provider_cleanup_token=None,
+            provider_cleanup_heartbeat_at=consumed_at,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return consumed_id is not None
+
+
+def advance_regulatory_provider_cleanup(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    cleanup_generation: int,
+    expected_phase: RegulatoryIndexingProviderCleanupPhase,
+    next_phase: RegulatoryIndexingProviderCleanupPhase,
+    now: datetime.datetime,
+) -> bool:
+    advanced_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.provider_cleanup_state
+            == RegulatoryIndexingProviderCleanupState.RUNNING.value,
+            RegulatoryIndexingJob.provider_cleanup_generation == cleanup_generation,
+            RegulatoryIndexingJob.provider_cleanup_token.is_(None),
+            RegulatoryIndexingJob.provider_cleanup_phase == expected_phase.value,
+        )
+        .values(
+            provider_cleanup_state=RegulatoryIndexingProviderCleanupState.PENDING.value,
+            provider_cleanup_phase=next_phase.value,
+            provider_cleanup_attempt_count=0,
+            provider_cleanup_next_retry_at=None,
+            provider_cleanup_heartbeat_at=now,
+            provider_cleanup_error_code=None,
+            provider_cleanup_error_message=None,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return advanced_id is not None
+
+
+def record_reconciled_provider_cleanup_vertex_job(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    cleanup_generation: int,
+    submission_key: str,
+    remote_job_name: str,
+    input_uri: str | None,
+    output_uri: str | None,
+    now: datetime.datetime,
+) -> bool:
+    """Persist a late-visible indeterminate job before deleting it."""
+
+    recorded_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.provider_cleanup_state
+            == RegulatoryIndexingProviderCleanupState.RUNNING.value,
+            RegulatoryIndexingJob.provider_cleanup_generation == cleanup_generation,
+            RegulatoryIndexingJob.provider_cleanup_token.is_(None),
+            RegulatoryIndexingJob.provider_cleanup_phase
+            == RegulatoryIndexingProviderCleanupPhase.VERTEX_RECONCILE.value,
+            RegulatoryIndexingJob.vertex_submission_key == submission_key,
+        )
+        .values(
+            remote_vertex_job_name=remote_job_name,
+            vertex_input_uri=input_uri,
+            vertex_output_uri=output_uri,
+            provider_cleanup_state=RegulatoryIndexingProviderCleanupState.PENDING.value,
+            provider_cleanup_phase=(
+                RegulatoryIndexingProviderCleanupPhase.VERTEX_DELETE.value
+            ),
+            provider_cleanup_attempt_count=0,
+            provider_cleanup_next_retry_at=None,
+            provider_cleanup_heartbeat_at=now,
+            provider_cleanup_error_code=None,
+            provider_cleanup_error_message=None,
+            updated_at=now,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return recorded_id is not None
+
+
+def schedule_regulatory_provider_cleanup_retry(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    cleanup_generation: int,
+    next_retry_at: datetime.datetime,
+    error_code: str,
+    error_message: str,
+    exhausted: bool,
+) -> bool:
+    scheduled_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.provider_cleanup_state
+            == RegulatoryIndexingProviderCleanupState.RUNNING.value,
+            RegulatoryIndexingJob.provider_cleanup_generation == cleanup_generation,
+            RegulatoryIndexingJob.provider_cleanup_token.is_(None),
+        )
+        .values(
+            provider_cleanup_state=(
+                RegulatoryIndexingProviderCleanupState.EXHAUSTED.value
+                if exhausted
+                else RegulatoryIndexingProviderCleanupState.RETRY_WAIT.value
+            ),
+            provider_cleanup_attempt_count=(
+                RegulatoryIndexingJob.provider_cleanup_attempt_count + 1
+            ),
+            provider_cleanup_next_retry_at=next_retry_at,
+            provider_cleanup_had_failure=True,
+            provider_cleanup_error_code=error_code[:_MAX_ERROR_CODE_LENGTH],
+            provider_cleanup_error_message=error_message[:_MAX_ERROR_MESSAGE_LENGTH],
+            provider_cleanup_heartbeat_at=func.now(),
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return scheduled_id is not None
+
+
+def complete_regulatory_provider_cleanup(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    cleanup_generation: int,
+    now: datetime.datetime,
+) -> bool:
+    completed_id = db_session.scalar(
+        update(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.id == job_id,
+            RegulatoryIndexingJob.provider_cleanup_state
+            == RegulatoryIndexingProviderCleanupState.RUNNING.value,
+            RegulatoryIndexingJob.provider_cleanup_generation == cleanup_generation,
+            RegulatoryIndexingJob.provider_cleanup_token.is_(None),
+            RegulatoryIndexingJob.provider_cleanup_phase
+            == RegulatoryIndexingProviderCleanupPhase.COMPLETE.value,
+        )
+        .values(
+            provider_cleanup_state=RegulatoryIndexingProviderCleanupState.SUCCEEDED.value,
+            provider_cleanup_next_retry_at=None,
+            provider_cleanup_heartbeat_at=now,
+            provider_cleanup_error_code=None,
+            provider_cleanup_error_message=None,
+            provider_cleanup_completed_at=now,
+        )
+        .returning(RegulatoryIndexingJob.id)
+    )
+    db_session.commit()
+    return completed_id is not None

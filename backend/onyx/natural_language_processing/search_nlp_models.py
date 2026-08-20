@@ -49,6 +49,10 @@ from onyx.natural_language_processing.constants import (
 )
 from onyx.natural_language_processing.exceptions import (
     CohereBillingLimitError,
+    EmbeddingProviderConnectionError,
+    EmbeddingProviderHTTPError,
+    EmbeddingProviderResponseError,
+    EmbeddingProviderTimeoutError,
     ModelServerRateLimitError,
 )
 from onyx.natural_language_processing.utils import (
@@ -294,12 +298,10 @@ def format_embedding_error(
     """
     detail = f"Status {status_code}" if status_code else f"{type(error)}"
 
+    del error, sanitized_api_key
     return (
-        f"{'HTTP error' if status_code else 'Exception'} embedding text with {service_name} - {detail}: "
-        f"Model: {model} "
-        f"Provider: {provider} "
-        f"API Key: {sanitized_api_key} "
-        f"Exception: {error}"
+        f"{'HTTP error' if status_code else 'Exception'} embedding request with "
+        f"{service_name} - {detail}: Model: {model} Provider: {provider}"
     )
 
 
@@ -586,26 +588,41 @@ class CloudEmbedding:
         if reduced_dimension is not None:
             request_body["dimensions"] = reduced_dimension
 
-        response = await self.http_client.post(
-            api_url,
-            json=request_body,
-            headers=headers,
-        )
-        response.raise_for_status()
-        result = response.json()
+        try:
+            response = await self.http_client.post(
+                api_url,
+                json=request_body,
+                headers=headers,
+            )
+            response.raise_for_status()
+            result = response.json()
+        except httpx.TimeoutException:
+            raise EmbeddingProviderTimeoutError() from None
+        except httpx.NetworkError:
+            raise EmbeddingProviderConnectionError() from None
+        except httpx.HTTPStatusError as error:
+            raise EmbeddingProviderHTTPError(error.response.status_code) from None
+        except ValueError:
+            raise EmbeddingProviderResponseError(
+                "embedding provider returned invalid JSON"
+            ) from None
         if not isinstance(result, dict) or not isinstance(result.get("data"), list):
-            raise ValueError("Embedding provider returned an invalid response.")
+            raise EmbeddingProviderResponseError(
+                "embedding provider returned an invalid response"
+            )
 
         response_data = result["data"]
         if len(response_data) != len(texts):
-            raise ValueError(
+            raise EmbeddingProviderResponseError(
                 "Embedding provider returned a different number of vectors than inputs."
             )
 
         ordered_embeddings: list[Embedding | None] = [None] * len(texts)
         for item in response_data:
             if not isinstance(item, dict):
-                raise ValueError("Embedding provider returned an invalid vector entry.")
+                raise EmbeddingProviderResponseError(
+                    "Embedding provider returned an invalid vector entry."
+                )
             index = item.get("index")
             vector = item.get("embedding")
             if (
@@ -615,20 +632,24 @@ class CloudEmbedding:
                 or index >= len(texts)
                 or ordered_embeddings[index] is not None
             ):
-                raise ValueError("Embedding provider returned invalid vector indexes.")
+                raise EmbeddingProviderResponseError(
+                    "Embedding provider returned invalid vector indexes."
+                )
             if not isinstance(vector, list) or not vector:
-                raise ValueError(
+                raise EmbeddingProviderResponseError(
                     "Embedding provider returned an invalid embedding vector."
                 )
             if reduced_dimension is not None and len(vector) != reduced_dimension:
-                raise ValueError(
+                raise EmbeddingProviderResponseError(
                     "Embedding provider returned vector dimension "
                     f"{len(vector)}; expected {reduced_dimension}."
                 )
             ordered_embeddings[index] = vector
 
         if any(embedding is None for embedding in ordered_embeddings):
-            raise ValueError("Embedding provider omitted an embedding vector.")
+            raise EmbeddingProviderResponseError(
+                "Embedding provider omitted an embedding vector."
+            )
         return cast(list[Embedding], ordered_embeddings)
 
     @retry(
@@ -674,6 +695,13 @@ class CloudEmbedding:
                 raise ValueError(f"Unsupported provider: {self.provider}")
         except openai.AuthenticationError:
             raise AuthenticationError(provider="OpenAI")
+        except (
+            EmbeddingProviderConnectionError,
+            EmbeddingProviderHTTPError,
+            EmbeddingProviderResponseError,
+            EmbeddingProviderTimeoutError,
+        ):
+            raise
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
                 raise AuthenticationError(provider=str(self.provider))
@@ -692,8 +720,6 @@ class CloudEmbedding:
             # transient provider outages). The final failure surfaces via
             # the RuntimeError below and is logged by the caller.
             logger.warning(error_string)
-            logger.debug("Exception texts: %s", texts)
-
             raise RuntimeError(error_string)
         except Exception as e:
             if is_authentication_error(e):
@@ -707,8 +733,6 @@ class CloudEmbedding:
                 sanitized_api_key=self.sanitized_api_key,
             )
             logger.warning(error_string)
-            logger.debug("Exception texts: %s", texts)
-
             raise RuntimeError(error_string)
 
     @staticmethod

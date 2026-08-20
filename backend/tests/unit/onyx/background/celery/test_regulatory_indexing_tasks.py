@@ -20,7 +20,10 @@ from onyx.configs.constants import (
     OnyxCeleryTask,
 )
 from onyx.db.enums import RegulatoryIndexingStage
-from onyx.db.regulatory_indexing_jobs import RegulatoryIndexingJobClaim
+from onyx.db.regulatory_indexing_jobs import (
+    RegulatoryIndexingJobClaim,
+    RegulatoryIndexingProviderCleanupClaim,
+)
 from onyx.regulatory.indexing_jobs.orchestrator import (
     OrchestrationDeliveryKind,
     OrchestrationOutcome,
@@ -111,6 +114,10 @@ def test_recovery_sends_preclaimed_generation_without_double_claim() -> None:
             "onyx.background.celery.tasks.regulatory_indexing.tasks._claim_stale_jobs",
             return_value=claims,
         ) as claim_stale,
+        patch(
+            "onyx.background.celery.tasks.regulatory_indexing.tasks._claim_due_provider_cleanups",
+            return_value=[],
+        ),
         patch.object(regulatory_indexing_recover_stale, "app", task_app),
         patch(
             "onyx.background.celery.tasks.regulatory_indexing.tasks.app_configs.REGULATORY_BATCH_INDEXING_ENABLED",
@@ -173,6 +180,10 @@ def test_periodic_recovery_republishes_stale_job_after_initial_broker_failure() 
             "onyx.background.celery.tasks.regulatory_indexing.tasks._claim_stale_jobs",
             return_value=[claim],
         ),
+        patch(
+            "onyx.background.celery.tasks.regulatory_indexing.tasks._claim_due_provider_cleanups",
+            return_value=[],
+        ),
         patch.object(regulatory_indexing_recover_stale, "app", recovery_app),
         patch(
             "onyx.background.celery.tasks.regulatory_indexing.tasks.app_configs.REGULATORY_BATCH_INDEXING_ENABLED",
@@ -189,6 +200,45 @@ def test_periodic_recovery_republishes_stale_job_after_initial_broker_failure() 
             "recovery_token": str(claim.recovery_token),
             "tenant_id": "tenant-a",
             "delivery_kind": OrchestrationDeliveryKind.PRECLAIMED.value,
+        },
+        queue=OnyxCeleryQueues.REGULATORY_INDEXING,
+        priority=OnyxCeleryPriority.MEDIUM,
+        expires=CELERY_REGULATORY_INDEXING_TASK_EXPIRES,
+    )
+
+
+def test_recovery_enqueues_preclaimed_terminal_provider_cleanup() -> None:
+    cleanup_claim = RegulatoryIndexingProviderCleanupClaim(
+        job_id=uuid4(),
+        cleanup_generation=6,
+        cleanup_token=uuid4(),
+    )
+    task_app = MagicMock()
+    with (
+        patch(
+            "onyx.background.celery.tasks.regulatory_indexing.tasks._claim_stale_jobs",
+            return_value=[],
+        ),
+        patch(
+            "onyx.background.celery.tasks.regulatory_indexing.tasks._claim_due_provider_cleanups",
+            return_value=[cleanup_claim],
+        ),
+        patch.object(regulatory_indexing_recover_stale, "app", task_app),
+        patch(
+            "onyx.background.celery.tasks.regulatory_indexing.tasks.app_configs.REGULATORY_BATCH_INDEXING_ENABLED",
+            True,
+        ),
+    ):
+        regulatory_indexing_recover_stale.run(tenant_id="tenant-a")
+
+    task_app.send_task.assert_called_once_with(
+        OnyxCeleryTask.REGULATORY_INDEXING_RUN_STEP,
+        kwargs={
+            "job_id": str(cleanup_claim.job_id),
+            "expected_generation": cleanup_claim.cleanup_generation,
+            "recovery_token": str(cleanup_claim.cleanup_token),
+            "tenant_id": "tenant-a",
+            "delivery_kind": OrchestrationDeliveryKind.PROVIDER_CLEANUP.value,
         },
         queue=OnyxCeleryQueues.REGULATORY_INDEXING,
         priority=OnyxCeleryPriority.MEDIUM,
