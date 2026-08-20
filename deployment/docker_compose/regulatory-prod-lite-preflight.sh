@@ -356,63 +356,89 @@ cleanup() {
   local final_status=$primary_status
   local cleanup_failed=false
   local readiness_cid=""
+  local label_owned_cid=""
   local matching_containers=""
   local observed_ownership_token=""
 
   trap - EXIT HUP INT TERM
   set +e
 
-  if [[ -n "$readiness_cidfile" && ( -e "$readiness_cidfile" || -L "$readiness_cidfile" ) ]]; then
-    if [[ ! -f "$readiness_cidfile" || -L "$readiness_cidfile" ]]; then
+  if [[ -n "$readiness_cidfile" && -f "$readiness_cidfile" && ! -L "$readiness_cidfile" ]]; then
+    readiness_cid=$(<"$readiness_cidfile")
+    if [[ ! "$readiness_cid" =~ ^[0-9a-f]{64}$ ]]; then
+      readiness_cid=""
+    fi
+  fi
+
+  if [[ -n "$readiness_ownership_token" ]]; then
+    if ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
+      docker container ls --all --quiet --no-trunc \
+      --filter "label=$READINESS_OWNERSHIP_LABEL=$readiness_ownership_token" 2>/dev/null); then
       printf '%s\n' \
-        "Preflight cleanup failed: the private readiness cidfile is not a regular file" >&2
+        "Preflight cleanup failed: label-owned readiness containers could not be queried" >&2
+      cleanup_failed=true
+    elif [[ -n "$matching_containers" && \
+      ! "$matching_containers" =~ ^[0-9a-f]{64}$ ]]; then
+      printf '%s\n' \
+        "Preflight cleanup failed: label-owned readiness container identity is ambiguous" >&2
       cleanup_failed=true
     else
-      readiness_cid=$(<"$readiness_cidfile")
-      if [[ ! "$readiness_cid" =~ ^[0-9a-f]{64}$ ]]; then
-        printf '%s\n' \
-          "Preflight cleanup failed: the private readiness cidfile is invalid" >&2
-        cleanup_failed=true
-      elif ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
-        docker container ls --all --quiet --no-trunc \
-        --filter "id=$readiness_cid" 2>/dev/null); then
-        printf '%s\n' \
-          "Preflight cleanup failed: readiness container ownership could not be queried" >&2
-        cleanup_failed=true
-      elif [[ -n "$matching_containers" && "$matching_containers" != "$readiness_cid" ]]; then
-        printf '%s\n' \
-          "Preflight cleanup failed: readiness container identity is ambiguous" >&2
-        cleanup_failed=true
-      elif [[ "$matching_containers" == "$readiness_cid" ]]; then
-        if ! observed_ownership_token=$(timeout --foreground --kill-after=2s 10s \
-          docker inspect --type container \
-          --format '{{ index .Config.Labels "io.regulatory.readiness-preflight-owner" }}' \
-          "$readiness_cid" 2>/dev/null); then
-          printf '%s\n' \
-            "Preflight cleanup failed: readiness container ownership label could not be read" >&2
-          cleanup_failed=true
-        elif [[ -z "$readiness_ownership_token" || \
-          "$observed_ownership_token" != "$readiness_ownership_token" ]]; then
-          printf '%s\n' \
-            "Preflight cleanup failed: readiness container ownership label does not match; refusing removal" >&2
-          cleanup_failed=true
-        elif ! timeout --foreground --kill-after=2s 10s \
-          docker rm -f "$readiness_cid" >/dev/null 2>&1; then
-          printf '%s\n' \
-            "Preflight cleanup failed: could not remove the owned readiness container" >&2
-          cleanup_failed=true
-        elif ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
-          docker container ls --all --quiet --no-trunc \
-          --filter "id=$readiness_cid" 2>/dev/null); then
-          printf '%s\n' \
-            "Preflight cleanup failed: readiness container removal could not be verified" >&2
-          cleanup_failed=true
-        elif [[ -n "$matching_containers" ]]; then
-          printf '%s\n' \
-            "Preflight cleanup failed: the owned readiness container still exists" >&2
-          cleanup_failed=true
-        fi
-      fi
+      label_owned_cid=$matching_containers
+    fi
+  fi
+
+  if [[ "$cleanup_failed" == false && -n "$readiness_cid" && \
+    -n "$label_owned_cid" && "$readiness_cid" != "$label_owned_cid" ]]; then
+    printf '%s\n' \
+      "Preflight cleanup failed: cidfile and ownership label identify different containers" >&2
+    cleanup_failed=true
+  fi
+
+  if [[ "$cleanup_failed" == false && -z "$label_owned_cid" && -n "$readiness_cid" ]]; then
+    if ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
+      docker container ls --all --quiet --no-trunc \
+      --filter "id=$readiness_cid" 2>/dev/null); then
+      printf '%s\n' \
+        "Preflight cleanup failed: readiness container identity could not be queried" >&2
+      cleanup_failed=true
+    elif [[ -n "$matching_containers" ]]; then
+      printf '%s\n' \
+        "Preflight cleanup failed: cidfile container is not bound to the private ownership label; refusing removal" >&2
+      cleanup_failed=true
+    fi
+  fi
+
+  if [[ "$cleanup_failed" == false && -n "$label_owned_cid" ]]; then
+    if ! observed_ownership_token=$(timeout --foreground --kill-after=2s 10s \
+      docker inspect --type container \
+      --format '{{ index .Config.Labels "io.regulatory.readiness-preflight-owner" }}' \
+      "$label_owned_cid" 2>/dev/null); then
+      printf '%s\n' \
+        "Preflight cleanup failed: readiness container ownership label could not be read" >&2
+      cleanup_failed=true
+    elif [[ "$observed_ownership_token" != "$readiness_ownership_token" ]]; then
+      printf '%s\n' \
+        "Preflight cleanup failed: readiness container ownership label does not match; refusing removal" >&2
+      cleanup_failed=true
+    elif ! timeout --foreground --kill-after=2s 10s \
+      docker rm -f "$label_owned_cid" >/dev/null 2>&1; then
+      printf '%s\n' \
+        "Preflight cleanup failed: could not remove the owned readiness container" >&2
+      cleanup_failed=true
+    fi
+  fi
+
+  if [[ "$cleanup_failed" == false && -n "$readiness_ownership_token" ]]; then
+    if ! matching_containers=$(timeout --foreground --kill-after=2s 10s \
+      docker container ls --all --quiet --no-trunc \
+      --filter "label=$READINESS_OWNERSHIP_LABEL=$readiness_ownership_token" 2>/dev/null); then
+      printf '%s\n' \
+        "Preflight cleanup failed: label-owned readiness container removal could not be verified" >&2
+      cleanup_failed=true
+    elif [[ -n "$matching_containers" ]]; then
+      printf '%s\n' \
+        "Preflight cleanup failed: a label-owned readiness container still exists" >&2
+      cleanup_failed=true
     fi
   fi
   if [[ -n "$snapshot_directory" ]]; then

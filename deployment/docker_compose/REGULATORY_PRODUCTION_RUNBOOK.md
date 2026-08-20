@@ -290,15 +290,28 @@ and the lite deployment intentionally has no Beat process to recreate generic in
 
 ## 4. Preflight the rendered deployment
 
-Run only the authoritative preflight wrapper from `deployment/docker_compose`, and grant root only
-to this bounded command. Root is required so one descriptor-owning helper can validate the original
-numeric `1001:1001` files and hand private `1001:1001` snapshots to the fixed non-root validation
-container. Do not use `sudo -E`, print the environment, or run the deployment itself through this
-preflight privilege. The approved digest variables below are non-secret values supplied by release
-automation. For the recommended cloud model mode with Compose-managed data services:
+Run only the authoritative deployment wrapper from `deployment/docker_compose`. It rejects ambient
+`DOCKER_*`, `COMPOSE_*`, and image interpolation overrides, reads interpolation only from the
+selected mode-`0600` environment file, and binds both preflight and rollout to the local
+`unix:///var/run/docker.sock` daemon with one explicit environment. Remote Docker contexts are not
+supported by this production-lite procedure.
+
+The wrapper uses `sudo -n` only for the bounded preflight handoff. Before the change window, the
+operator must have `NOPASSWD` authorization for the exact `/usr/bin/env -i ...
+regulatory-prod-lite-preflight.sh` argv emitted by this wrapper; constrain the sudoers rule to that
+full argument sequence and deployment path, not generic `/usr/bin/env`, `docker`, a shell, or the
+deployment wrapper. A missing or interactive authorization is a release blocker: the wrapper must
+fail immediately rather than prompt. Root is required so one descriptor-owning helper can validate
+the original numeric `1001:1001` files and hand private `1001:1001` snapshots to the fixed non-root
+validation container. Do not use `sudo -E`, print the environment, or run the deployment itself as
+root. Set a reviewed, stable operator `PATH` and `HOME` before invoking the wrapper; it resolves
+those values once and uses `$HOME/.docker` for registry authentication without allowing it to select
+a different daemon. The approved digest arguments below are non-secret values supplied by release
+automation. The exact command both verifies noninteractive privilege and runs the preflight. For the
+recommended cloud model mode with Compose-managed data services:
 
 ```bash
-sudo -- ./regulatory-prod-lite-preflight.sh \
+./regulatory-prod-lite-deploy.sh preflight \
   --env-file .env \
   --base-compose docker-compose.prod.yml \
   --project-name "$APPROVED_COMPOSE_PROJECT" \
@@ -314,7 +327,7 @@ For the recommended cloud model mode with approved external data services, with 
 excluding `local-infra` and `s3-filestore`:
 
 ```bash
-sudo -- ./regulatory-prod-lite-preflight.sh \
+./regulatory-prod-lite-deploy.sh preflight \
   --env-file .env \
   --base-compose docker-compose.prod.yml \
   --project-name "$APPROVED_COMPOSE_PROJECT" \
@@ -496,7 +509,8 @@ Set `REGULATORY_CAPABILITY_ATTESTATION_FILE` and `REGULATORY_CAPABILITY_EVIDENCE
 absolute host paths. The canonical overlay mounts both files read-only. Preflight and the in-container
 validator require numeric owner/group `1001:1001`, attestation mode `0600`, evidence mode `0400`,
 regular files (no symlinks), and bounded sizes. Invoke the canonical preflight through the bounded
-`sudo -- ./regulatory-prod-lite-preflight.sh ...` command in section 4; direct non-root invocation
+`./regulatory-prod-lite-deploy.sh preflight ...` command in section 4; the wrapper uses
+noninteractive least-privilege sudo, and direct non-root invocation of the internal preflight stage
 fails before Docker is queried:
 
 ```bash

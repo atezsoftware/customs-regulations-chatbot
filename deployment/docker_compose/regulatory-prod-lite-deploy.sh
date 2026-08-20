@@ -11,6 +11,7 @@ readonly EXTERNAL_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-external-
 readonly NO_LOCAL_MODELS_OVERLAY="$SCRIPT_DIR/docker-compose.no-local-models.yml"
 readonly EDGE_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-edge.yml"
 readonly COMPOSE_INFRA_OVERLAY="$SCRIPT_DIR/docker-compose.regulatory-compose-infra.yml"
+readonly DEPLOYMENT_DOCKER_HOST="unix:///var/run/docker.sock"
 
 usage() {
   cat <<'EOF'
@@ -54,6 +55,9 @@ Deploy explicitly runs `alembic upgrade head` from the pinned image after the ba
 checks API liveness, then starts with `--no-build --wait`. Multi-tenant deployments are refused because
 they require an approved tenant-migration orchestrator. Rollback changes only the application image: it
 never downgrades, restores, or otherwise mutates the database schema.
+All commands use one sanitized environment and the fixed local Docker socket. Ambient Docker,
+Compose, and image overrides are refused. Non-root operators need noninteractive sudo authorization
+only for the exact bounded preflight handoff.
 EOF
 }
 
@@ -74,6 +78,22 @@ validate_acknowledgement() {
   ((${#value} <= 256)) || die "--backup-reference is too long"
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || \
     die "--backup-reference must be a single line"
+}
+
+reject_ambient_deployment_overrides() {
+  local variable
+
+  while IFS= read -r variable; do
+    case "$variable" in
+      COMPOSE_PROFILES)
+        die "COMPOSE_PROFILES must be unset; topology is selected only by --infra-mode and --model-mode"
+        ;;
+      COMPOSE_* | DOCKER_* | ONYX_*_IMAGE | REGULATORY_*_IMAGE | \
+        BASE_IMAGE_REGISTRY | IMAGE_TAG)
+        die "$variable must be unset; deployment inputs come only from the selected environment file and fixed local Docker target"
+        ;;
+    esac
+  done < <(compgen -e)
 }
 
 if (($# == 0)); then
@@ -193,6 +213,26 @@ done
 [[ "$wait_timeout" =~ ^[1-9][0-9]*$ ]] || die "--wait-timeout must be a positive integer"
 ((wait_timeout <= 3600)) || die "--wait-timeout cannot exceed 3600 seconds"
 
+reject_ambient_deployment_overrides
+[[ -n "${PATH:-}" && "$PATH" != *$'\n'* && "$PATH" != *$'\r'* ]] || \
+  die "PATH must be a non-empty single line"
+[[ -n "${HOME:-}" && "$HOME" == /* && "$HOME" != *$'\n'* && "$HOME" != *$'\r'* ]] || \
+  die "HOME must be an absolute single-line path"
+readonly deployment_command_path=$PATH
+readonly deployment_home=$HOME
+readonly deployment_docker_config="$deployment_home/.docker"
+deployment_environment=(
+  /usr/bin/env -i
+  "PATH=$deployment_command_path"
+  "HOME=$deployment_home"
+  "TMPDIR=/tmp"
+  "LANG=C"
+  "LC_ALL=C"
+  "DOCKER_HOST=$DEPLOYMENT_DOCKER_HOST"
+  "DOCKER_CONFIG=$deployment_docker_config"
+)
+readonly deployment_environment
+
 preflight_args=(
   --env-file "$env_file"
   --base-compose "$base_compose"
@@ -215,15 +255,16 @@ if [[ -n "$expected_model_image" ]]; then
 fi
 
 run_preflight() {
-  [[ -z "${COMPOSE_PROFILES:-}" ]] || \
-    die "COMPOSE_PROFILES must be unset; topology is selected only by --infra-mode and --model-mode"
   if ((EUID == 0)); then
-    "$PREFLIGHT" "${preflight_args[@]}"
+    "${deployment_environment[@]}" "$PREFLIGHT" "${preflight_args[@]}"
     return
   fi
   command -v sudo >/dev/null 2>&1 || \
-    die "sudo is required for the bounded readiness preflight"
-  sudo -- "$PREFLIGHT" "${preflight_args[@]}"
+    die "noninteractive sudo authorization is required for the bounded readiness preflight"
+  if ! sudo -n -- \
+    "${deployment_environment[@]}" "$PREFLIGHT" "${preflight_args[@]}"; then
+    die "the bounded readiness preflight failed; noninteractive sudo authorization for this exact handoff is required"
+  fi
 }
 
 if [[ "$command_name" == "preflight" ]]; then
@@ -234,7 +275,7 @@ fi
 run_preflight
 
 compose=(
-  docker compose
+  "${deployment_environment[@]}" docker compose
   --project-name "$project_name"
   --env-file "$env_file"
   -f "$base_compose"
@@ -295,7 +336,8 @@ inspect_image_contract() {
   local expected_role=$2
   local labels
 
-  labels=$(docker image inspect --format '{{json .Config.Labels}}' "$image_ref") || \
+  labels=$("${deployment_environment[@]}" \
+    docker image inspect --format '{{json .Config.Labels}}' "$image_ref") || \
     die "a pulled application image cannot be inspected"
   jq -e --arg role "$expected_role" '
     .["io.regulatory.role"] == $role
@@ -320,7 +362,7 @@ if [[ "$model_mode" == "local" ]]; then
     die "backend and model images were not built from the same source revision"
 fi
 
-if ! docker run --rm \
+if ! "${deployment_environment[@]}" docker run --rm \
   --network none \
   --read-only \
   --cap-drop ALL \

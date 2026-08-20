@@ -131,7 +131,8 @@ def test_deployments_use_published_images_without_host_builds() -> None:
     assert '.["io.regulatory.document-import"] == "true"' in importer_runner
     assert '.["org.opencontainers.image.revision"] == $revision' in importer_runner
     assert "compatibility alias" in production_validator
-    assert "regulatory-prod-lite-preflight.sh" in production_validator
+    assert "regulatory-prod-lite-deploy.sh" in production_validator
+    assert " preflight" in production_validator
     for forbidden_runtime_module in ("docling", "nvidia", "torch", "triton"):
         assert f'"{forbidden_runtime_module}"' in production_deployer
 

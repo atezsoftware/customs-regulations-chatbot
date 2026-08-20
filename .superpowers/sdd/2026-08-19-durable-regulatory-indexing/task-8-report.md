@@ -654,3 +654,78 @@ The live read-only check remains blocked: private PostgreSQL DNS returned exit
 returned HTTP `200`. No trusted live attestation was fabricated, no root
 preflight was run against unapproved evidence, and no live canary or production
 mutation was attempted.
+
+---
+
+## Task 8: post-adjudication deployment-target binding
+
+The three reviewed trust-boundary findings were reproduced and fixed without a
+production write, deployment, push, merge, or security-contract downgrade.
+
+### RED/GREEN and security contract
+
+- The focused RED selector was `10 failed, 45 deselected in 0.84s`. It proved
+  that Docker/Compose/image ambient overrides reached different sides of the
+  sudo boundary, sudo was interactive-capable, and a container created before
+  Docker wrote the private cidfile was not recovered. The same selector passed
+  GREEN as `10 passed, 45 deselected in 1.10s`; the completed deploy/preflight
+  unit module passed `56 passed in 10.14s` before the final ambiguity and
+  runbook assertions were added.
+- The deploy wrapper now rejects ambient `DOCKER_*`, `COMPOSE_*`, application,
+  edge, and infrastructure image interpolation overrides before sudo or
+  Docker. It resolves `PATH`, `HOME`, `$HOME/.docker`, and the fixed local
+  `unix:///var/run/docker.sock` target once, then prefixes the root preflight
+  and every Compose/direct-Docker rollout operation with the same explicit
+  `env -i` allowlist. Compose interpolation therefore comes from the selected
+  mode-`0600` environment file, not the operator shell. The regression's fake
+  sudo performs a realistic environment reset; every observed preflight and
+  rollout Docker invocation had the same fixed host, no context, no ambient
+  image override, and no unrelated marker.
+- Non-root handoff now uses `sudo -n` and emits a controlled non-secret refusal
+  when exact noninteractive authorization is unavailable. The runbook's exact
+  commands go through `regulatory-prod-lite-deploy.sh preflight`, require an
+  exact-argv `NOPASSWD` rule only for the bounded preflight handoff, and forbid
+  generic `env`, Docker, shell, or whole-deployer privilege. The compatibility
+  alias also routes through that canonical wrapper.
+- Cleanup no longer depends on Docker successfully writing the cidfile. On a
+  missing, non-regular, or invalid private cidfile it queries the exact
+  cryptographically random ownership label, accepts only zero or one full
+  64-hex container ID, independently inspects the exact label value, removes
+  only that full ID, and proves no container with the token remains. A cidfile
+  and label disagreement, multi-ID/invalid output, label mismatch, query
+  failure, removal failure, or residual container fails closed without
+  removing an unrelated container or hiding the primary validation failure.
+
+### Real Docker, broad, and static verification
+
+- The new real-Docker pre-cid regression passed `1 passed, 4 deselected in
+  38.15s`. The fake CLI used the real daemon to create the labeled validation
+  container and deliberately omitted the cidfile. Cleanup recovered and
+  removed the exact owned ID, an exact-token daemon query returned zero
+  residue, and a deliberately pre-existing container with the same label key
+  but a different token remained inspectable until fixture teardown. The full
+  privileged runtime module passed `5 passed in 95.62s`, retaining the
+  Supervisor numeric `1001:1001`/`0770` allow/deny proof and normal, symlink,
+  timeout, and pre-cid validation cases.
+- Final focused readiness, executable preflight/deploy, compatibility alias,
+  and Supervisor/Compose wiring passed `120 passed in 15.21s`. The broad
+  regulatory, user-file, Vertex, and runtime unit superset passed `888 passed
+  in 30.71s`.
+- Ruff check, Ruff formatting, `ty`, and `bash -n` passed. Host `shellcheck`
+  remained unavailable; the repository shellcheck pre-commit hook and the
+  complete touched-file pre-commit run passed all applicable hooks.
+- Durable pipeline/provider/repository code did not change, so disposable
+  PostgreSQL 15.2 and Elasticsearch 9.4.2 were not rerun. The immediately
+  preceding unchanged-code evidence remains `36 passed in 44.22s` with exact
+  provider restoration and zero provider, pipeline, large-object, or index
+  residue.
+
+### Live-readiness limit
+
+The final read-only check remained blocked before any canary: private
+`psql.dev.singlewindow.io` DNS returned exit `2`; `onyx-api_server-1` was up but
+unhealthy; `onyx-nginx-1` was healthy; ports `7000` and `7001` returned HTTP
+`200`. The test ownership label had zero remaining Docker containers. No
+trusted attestation was fabricated, no live root preflight was attempted, and
+no production document, index, database/provider record, object, or job was
+mutated.

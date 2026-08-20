@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import pwd
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ _COMPOSE_ROOT = _REPO_ROOT / "deployment" / "docker_compose"
 _PREFLIGHT = _COMPOSE_ROOT / "regulatory-prod-lite-preflight.sh"
 _DEPLOY = _COMPOSE_ROOT / "regulatory-prod-lite-deploy.sh"
 _SNAPSHOT_HELPER = _COMPOSE_ROOT / "regulatory_readiness_file_snapshot.py"
+_RUNBOOK = _COMPOSE_ROOT / "REGULATORY_PRODUCTION_RUNBOOK.md"
 _IMAGE = "registry.example.com/team/regulatory-backend-lite@sha256:" + "a" * 64
 _WEB_IMAGE = "registry.example.com/team/regulatory-web@sha256:" + "b" * 64
 _MODEL_IMAGE = "registry.example.com/team/regulatory-model@sha256:" + "c" * 64
@@ -185,6 +187,9 @@ def _fake_docker(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log_path = tmp_path / "docker.log"
+    environment_log_path = tmp_path / "docker-environment.log"
+    sudo_log_path = tmp_path / "sudo.log"
+    timeout_log = tmp_path / "timeout.log"
     readiness_state_path = tmp_path / "readiness-container.state"
     readiness_label_path = tmp_path / "readiness-container.label"
     readiness_cid = "9" * 64
@@ -220,11 +225,67 @@ def _fake_docker(
     inventory_path.write_text(running_inventory, encoding="utf-8")
     base_path = tmp_path / "docker-compose.prod.yml"
     base_path.write_text("services: {}\n", encoding="utf-8")
+    fake_environment_path = tmp_path / "fake-environment"
+    fake_environment_defaults = {
+        "FAKE_COMPOSE_CONFIG": str(config_path),
+        "FAKE_COMPOSE_SERVICES": str(services_path),
+        "FAKE_COMPOSE_VERSION": version,
+        "FAKE_BACKEND_ROLE": backend_role,
+        "FAKE_BASE_COMPOSE": str(base_path),
+        "FAKE_MIGRATION_ENV": str(tmp_path / ".env.migration"),
+        "FAKE_DB_ADMIN_ENV": str(tmp_path / ".env.db-admin"),
+        "FAKE_DOCKER_FAIL_MATCH": fail_match,
+        "FAKE_DOCKER_INVENTORY": str(inventory_path),
+        "FAKE_DOCKER_LOG": str(log_path),
+        "FAKE_BACKEND_REVISION": backend_revision,
+        "FAKE_WEB_REVISION": web_revision,
+        "FAKE_MODEL_REVISION": model_revision,
+        "FAKE_ATTESTATION_PATH": str(attestation_path),
+        "FAKE_EVIDENCE_PATH": str(evidence_path),
+        "FAKE_ATTESTATION_OWNER": attestation_owner,
+        "FAKE_ATTESTATION_MODE": f"{attestation_mode:o}",
+        "FAKE_EVIDENCE_OWNER": evidence_owner,
+        "FAKE_EVIDENCE_MODE": f"{evidence_mode:o}",
+        "FAKE_TIMEOUT_EXIT": fake_timeout_exit,
+        "FAKE_TIMEOUT_LOG": str(timeout_log),
+        "FAKE_READINESS_CID": readiness_cid,
+        "FAKE_READINESS_STATE": str(readiness_state_path),
+        "FAKE_READINESS_LABEL": str(readiness_label_path),
+        "FAKE_CLEANUP_LABEL_OVERRIDE": "",
+        "FAKE_DOCKER_RM_FAIL": "false",
+        "FAKE_READINESS_PERSISTS": "false",
+        "FAKE_PRE_CID_FAILURE": "false",
+        "FAKE_INVALID_CIDFILE": "false",
+        "FAKE_LABEL_QUERY_RESULT": "",
+        "FAKE_REAL_RUNTIME_IMAGE": real_runtime_image,
+        "FAKE_REAL_RUNTIME_USE_SETPRIV_NNP": str(real_runtime_use_setpriv_nnp).lower(),
+        "FAKE_REAL_RUNTIME_FORCE_TIMEOUT": "false",
+        "FAKE_REAL_RUNTIME_PRE_CID_FAILURE": "false",
+        "FAKE_REAL_DOCKER": "/usr/bin/docker",
+        "_IMAGE": _IMAGE,
+        "_MODEL_IMAGE": _MODEL_IMAGE,
+        "_WEB_IMAGE": _WEB_IMAGE,
+    }
+    fake_environment_path.write_text(
+        "".join(
+            f"if [[ -z ${{{key}+x}} ]]; then export {key}={shlex.quote(value)}; fi\n"
+            for key, value in fake_environment_defaults.items()
+        ),
+        encoding="utf-8",
+    )
+    fake_environment_path.chmod(0o600)
     docker = bin_dir / "docker"
     docker.write_text(
         """#!/usr/bin/env bash
 set -eu
+source "__FAKE_ENVIRONMENT__"
 printf '%s\\n' "$*" >>"$FAKE_DOCKER_LOG"
+printf 'DOCKER_HOST=%s DOCKER_CONTEXT=%s ONYX_BACKEND_LITE_IMAGE=%s AMBIENT_MARKER=%s\\n' \
+  "${DOCKER_HOST-<unset>}" \
+  "${DOCKER_CONTEXT-<unset>}" \
+  "${ONYX_BACKEND_LITE_IMAGE-<unset>}" \
+  "${REGULATORY_AMBIENT_MARKER-<unset>}" \
+  >>"__FAKE_DOCKER_ENVIRONMENT_LOG__"
 if [[ "${1:-} ${2:-} ${3:-}" == "compose version --short" ]]; then
   printf '%s\\n' "$FAKE_COMPOSE_VERSION"
   exit 0
@@ -236,6 +297,11 @@ fi
 if [[ "${1:-} ${2:-}" == "container ls" ]]; then
   if [[ -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
     exec "$FAKE_REAL_DOCKER" "$@"
+  fi
+  if [[ " $* " == *" --filter label=io.regulatory.readiness-preflight-owner="* && \
+        -n "$FAKE_LABEL_QUERY_RESULT" ]]; then
+    printf '%s\\n' "$FAKE_LABEL_QUERY_RESULT"
+    exit 0
   fi
   if [[ -f "$FAKE_READINESS_STATE" ]]; then
     printf '%s\\n' "$FAKE_READINESS_CID"
@@ -273,6 +339,23 @@ fi
 if [[ "${1:-}" == "run" && " $* " == *" --validate-capability-snapshots-only "* ]]; then
   if [[ -n "$FAKE_REAL_RUNTIME_IMAGE" ]]; then
     arguments=("$@")
+    if [[ "$FAKE_REAL_RUNTIME_PRE_CID_FAILURE" == "true" ]]; then
+      ownership_token=""
+      for argument in "${arguments[@]}"; do
+        case "$argument" in
+          io.regulatory.readiness-preflight-owner=*)
+            ownership_token=${argument#*=}
+            ;;
+        esac
+      done
+      [[ "$ownership_token" =~ ^[0-9a-f]{64}$ ]] || exit 57
+      "$FAKE_REAL_DOCKER" create \
+        --label "io.regulatory.readiness-preflight-owner=$ownership_token" \
+        --user 1001:1001 \
+        --entrypoint /bin/sleep \
+        "$FAKE_REAL_RUNTIME_IMAGE" 60 >/dev/null
+      exit 42
+    fi
     for index in "${!arguments[@]}"; do
       if [[ "${arguments[$index]}" == "$_IMAGE" ]]; then
         arguments[$index]="$FAKE_REAL_RUNTIME_IMAGE"
@@ -353,9 +436,16 @@ if [[ "${1:-}" == "run" && " $* " == *" --validate-capability-snapshots-only "* 
     esac
   done
   [[ -n "$cidfile" && -n "$ownership_token" ]] || exit 56
-  printf '%s\\n' "$FAKE_READINESS_CID" >"$cidfile"
   printf '%s\\n' "$ownership_token" >"$FAKE_READINESS_LABEL"
   : >"$FAKE_READINESS_STATE"
+  if [[ "$FAKE_PRE_CID_FAILURE" == "true" ]]; then
+    exit 42
+  fi
+  if [[ "$FAKE_INVALID_CIDFILE" == "true" ]]; then
+    printf '%s\\n' 'invalid-private-cid' >"$cidfile"
+  else
+    printf '%s\\n' "$FAKE_READINESS_CID" >"$cidfile"
+  fi
   if [[ -z "$FAKE_TIMEOUT_EXIT" && "$FAKE_READINESS_PERSISTS" != "true" ]]; then
     command rm -f -- "$FAKE_READINESS_STATE" "$FAKE_READINESS_LABEL"
   fi
@@ -389,7 +479,9 @@ if [[ -n "$FAKE_DOCKER_FAIL_MATCH" && " $* " == *"$FAKE_DOCKER_FAIL_MATCH"* ]]; 
   exit 42
 fi
 exit 0
-""",
+""".replace("__FAKE_ENVIRONMENT__", str(fake_environment_path)).replace(
+            "__FAKE_DOCKER_ENVIRONMENT_LOG__", str(environment_log_path)
+        ),
         encoding="utf-8",
     )
     docker.chmod(0o755)
@@ -397,15 +489,23 @@ exit 0
     fake_sudo.write_text(
         """#!/usr/bin/env bash
 set -eu
+printf '%s\\n' "$*" >>"__FAKE_SUDO_LOG__"
+if [[ "${1:-}" != "-n" ]]; then
+  exit 88
+fi
+shift
 if [[ "${1:-}" == "--" ]]; then
   shift
 fi
-unset COMPOSE_PROFILES
-if ((EUID == 0)); then
-  exec "$@"
+if [[ "${FAKE_SUDO_AUTHORIZATION_FAIL:-false}" == "true" ]]; then
+  exit 89
 fi
-exec unshare --user --map-root-user "$@"
-""",
+if ((EUID == 0)); then
+  exec /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root LANG=C LC_ALL=C "$@"
+fi
+exec /usr/bin/unshare --user --map-root-user \
+  /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root LANG=C LC_ALL=C "$@"
+""".replace("__FAKE_SUDO_LOG__", str(sudo_log_path)),
         encoding="utf-8",
     )
     fake_sudo.chmod(0o755)
@@ -414,6 +514,7 @@ exec unshare --user --map-root-user "$@"
         fake_python.write_text(
             """#!/usr/bin/env bash
 set -eu
+source "__FAKE_ENVIRONMENT__"
 if [[ "${1:-}" == *"regulatory_readiness_file_snapshot.py" ]]; then
   shift
   attestation=""
@@ -441,16 +542,16 @@ if [[ "${1:-}" == *"regulatory_readiness_file_snapshot.py" ]]; then
   exit 0
 fi
 exec /usr/bin/python3 "$@"
-""",
+""".replace("__FAKE_ENVIRONMENT__", str(fake_environment_path)),
             encoding="utf-8",
         )
         fake_python.chmod(0o755)
-    timeout_log = tmp_path / "timeout.log"
     if not use_real_timeout:
         fake_timeout = bin_dir / "timeout"
         fake_timeout.write_text(
             """#!/usr/bin/env bash
 set -eu
+source "__FAKE_ENVIRONMENT__"
 printf '%s\n' "$*" >>"$FAKE_TIMEOUT_LOG"
 while (($#)); do
   case "$1" in
@@ -464,7 +565,7 @@ if [[ -n "$FAKE_TIMEOUT_EXIT" && "${1:-} ${2:-}" == "docker run" ]]; then
   exit "$FAKE_TIMEOUT_EXIT"
 fi
 exec "$@"
-""",
+""".replace("__FAKE_ENVIRONMENT__", str(fake_environment_path)),
             encoding="utf-8",
         )
         fake_timeout.chmod(0o755)
@@ -472,6 +573,7 @@ exec "$@"
     fake_stat.write_text(
         """#!/usr/bin/env bash
 set -eu
+source "__FAKE_ENVIRONMENT__"
 last=${!#}
 if [[ "$last" == "$FAKE_ATTESTATION_PATH" && ( "${2:-}" == "%u" || "${2:-}" == "%g" ) ]]; then
   printf '%s\\n' "$FAKE_ATTESTATION_OWNER"
@@ -482,7 +584,7 @@ if [[ "$last" == "$FAKE_EVIDENCE_PATH" && ( "${2:-}" == "%u" || "${2:-}" == "%g"
   exit 0
 fi
 exec /usr/bin/stat "$@"
-""",
+""".replace("__FAKE_ENVIRONMENT__", str(fake_environment_path)),
         encoding="utf-8",
     )
     fake_stat.chmod(0o755)
@@ -542,11 +644,18 @@ exec /usr/bin/stat "$@"
             "FAKE_CLEANUP_LABEL_OVERRIDE": "",
             "FAKE_DOCKER_RM_FAIL": "false",
             "FAKE_READINESS_PERSISTS": "false",
+            "FAKE_PRE_CID_FAILURE": "false",
+            "FAKE_INVALID_CIDFILE": "false",
+            "FAKE_LABEL_QUERY_RESULT": "",
+            "FAKE_SUDO_AUTHORIZATION_FAIL": "false",
+            "FAKE_DOCKER_ENVIRONMENT_LOG": str(environment_log_path),
+            "FAKE_SUDO_LOG": str(sudo_log_path),
             "FAKE_REAL_RUNTIME_IMAGE": real_runtime_image,
             "FAKE_REAL_RUNTIME_USE_SETPRIV_NNP": str(
                 real_runtime_use_setpriv_nnp
             ).lower(),
             "FAKE_REAL_RUNTIME_FORCE_TIMEOUT": "false",
+            "FAKE_REAL_RUNTIME_PRE_CID_FAILURE": "false",
             "FAKE_REAL_DOCKER": "/usr/bin/docker",
             "_IMAGE": _IMAGE,
             "_MODEL_IMAGE": _MODEL_IMAGE,
@@ -998,6 +1107,89 @@ def test_preflight_times_out_readiness_container_and_cleans_snapshot(
     assert f"rm -f {env['FAKE_READINESS_CID']}" in docker_log
     assert not Path(env["FAKE_READINESS_STATE"]).exists()
     assert not list(tmp_path.glob("regulatory-readiness-snapshot.*"))
+
+
+@pytest.mark.parametrize("invalid_cidfile", [False, True])
+def test_preflight_recovers_owned_container_when_cidfile_is_unavailable(
+    tmp_path: Path,
+    invalid_cidfile: bool,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    env["TMPDIR"] = str(tmp_path)
+    env["FAKE_PRE_CID_FAILURE"] = str(not invalid_cidfile).lower()
+    env["FAKE_INVALID_CIDFILE"] = str(invalid_cidfile).lower()
+    if invalid_cidfile:
+        env["FAKE_READINESS_PERSISTS"] = "true"
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == (0 if invalid_cidfile else 1)
+    if not invalid_cidfile:
+        assert "timed out or failed" in result.stderr
+    docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
+    assert (
+        "container ls --all --quiet --no-trunc --filter "
+        "label=io.regulatory.readiness-preflight-owner="
+    ) in docker_log
+    assert f"rm -f {env['FAKE_READINESS_CID']}" in docker_log
+    assert not Path(env["FAKE_READINESS_STATE"]).exists()
+    assert not list(tmp_path.glob("regulatory-readiness-snapshot.*"))
+
+
+def test_preflight_refuses_ambiguous_label_fallback_without_removing_anything(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    env["TMPDIR"] = str(tmp_path)
+    env["FAKE_PRE_CID_FAILURE"] = "true"
+    env["FAKE_LABEL_QUERY_RESULT"] = f"{'8' * 64}\n{'9' * 64}"
+
+    result = _run(
+        _PREFLIGHT,
+        [
+            "--env-file",
+            str(env_file),
+            "--base-compose",
+            env["FAKE_BASE_COMPOSE"],
+            "--project-name",
+            "onyx",
+            "--migration-env-file",
+            env["FAKE_MIGRATION_ENV"],
+            "--db-admin-env-file",
+            env["FAKE_DB_ADMIN_ENV"],
+            "--infra-mode",
+            "compose-managed",
+            "--model-mode",
+            "local",
+        ],
+        env,
+    )
+
+    assert result.returncode == 1
+    assert "timed out or failed" in result.stderr
+    assert "identity is ambiguous" in result.stderr
+    docker_log = Path(env["FAKE_DOCKER_LOG"]).read_text(encoding="utf-8")
+    assert "rm -f" not in docker_log
+    assert Path(env["FAKE_READINESS_STATE"]).exists()
 
 
 def test_preflight_refuses_to_remove_container_with_mismatched_ownership_label(
@@ -1786,6 +1978,83 @@ def test_deploy_rejects_operator_compose_profiles_before_bounded_sudo(
     assert "COMPOSE_PROFILES must be unset" in result.stderr
     docker_log = Path(env["FAKE_DOCKER_LOG"])
     assert not docker_log.exists() or docker_log.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_CONFIG",
+        "ONYX_BACKEND_LITE_IMAGE",
+        "ONYX_WEB_SERVER_IMAGE",
+        "REGULATORY_POSTGRES_IMAGE",
+    ],
+)
+def test_deploy_rejects_dangerous_ambient_target_overrides_before_sudo(
+    tmp_path: Path,
+    variable: str,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    env[variable] = "operator-ambient-override"
+
+    result = _run(_DEPLOY, ["deploy", *_deploy_args(env_file, env)], env)
+
+    assert result.returncode == 1
+    assert variable in result.stderr
+    assert "must be unset" in result.stderr
+    assert not Path(env["FAKE_SUDO_LOG"]).exists()
+    assert not Path(env["FAKE_DOCKER_LOG"]).exists()
+
+
+def test_deploy_uses_identical_sanitized_environment_before_and_after_sudo(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    env["REGULATORY_AMBIENT_MARKER"] = "must-not-cross-boundary"
+
+    result = _run(_DEPLOY, ["deploy", *_deploy_args(env_file, env)], env)
+
+    assert result.returncode == 0, result.stderr
+    observed_environments = (
+        Path(env["FAKE_DOCKER_ENVIRONMENT_LOG"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert len(observed_environments) > 10
+    assert set(observed_environments) == {
+        "DOCKER_HOST=unix:///var/run/docker.sock "
+        "DOCKER_CONTEXT=<unset> "
+        "ONYX_BACKEND_LITE_IMAGE=<unset> "
+        "AMBIENT_MARKER=<unset>"
+    }
+
+
+def test_deploy_uses_noninteractive_sudo_and_controls_authorization_failure(
+    tmp_path: Path,
+) -> None:
+    env, env_file = _fake_docker(tmp_path)
+    env["FAKE_SUDO_AUTHORIZATION_FAIL"] = "true"
+
+    result = _run(_DEPLOY, ["deploy", *_deploy_args(env_file, env)], env)
+
+    assert result.returncode == 1
+    assert "noninteractive sudo authorization" in result.stderr
+    sudo_log = Path(env["FAKE_SUDO_LOG"]).read_text(encoding="utf-8")
+    assert sudo_log.startswith("-n -- ")
+    assert "/usr/bin/env -i PATH=" in sudo_log
+    assert "DOCKER_HOST=unix:///var/run/docker.sock" in sudo_log
+    assert not Path(env["FAKE_DOCKER_LOG"]).exists()
+
+
+def test_runbook_requires_canonical_noninteractive_least_privilege_preflight() -> None:
+    runbook = _RUNBOOK.read_text(encoding="utf-8")
+
+    assert "./regulatory-prod-lite-deploy.sh preflight" in runbook
+    assert "`sudo -n`" in runbook
+    assert "`NOPASSWD` authorization for the exact" in runbook
+    assert "not generic `/usr/bin/env`, `docker`, a shell" in runbook
+    assert "sudo -- ./regulatory-prod-lite-preflight.sh" not in runbook
 
 
 def test_cloud_deploy_never_pulls_or_inspects_model_image(tmp_path: Path) -> None:

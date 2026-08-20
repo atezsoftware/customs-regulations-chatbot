@@ -533,7 +533,7 @@ def real_docker_needs_setpriv_nnp(
     return True
 
 
-@pytest.mark.parametrize("scenario", ["normal", "symlink", "timeout"])
+@pytest.mark.parametrize("scenario", ["normal", "symlink", "timeout", "pre-cid"])
 def test_preflight_real_runtime_enforces_source_and_cleanup_contract(
     runtime_lite_supervisor_image: str,
     preflight_operator_image: str,
@@ -556,6 +556,38 @@ def test_preflight_real_runtime_enforces_source_and_cleanup_contract(
     )
     env["TMPDIR"] = str(docker_visible_temp)
     env["FAKE_REAL_RUNTIME_FORCE_TIMEOUT"] = str(scenario == "timeout").lower()
+    env["FAKE_REAL_RUNTIME_PRE_CID_FAILURE"] = str(scenario == "pre-cid").lower()
+    unrelated_container = ""
+    if scenario == "pre-cid":
+        unrelated = subprocess.run(
+            [
+                "docker",
+                "create",
+                "--label",
+                f"io.regulatory.readiness-preflight-owner={'0' * 64}",
+                "--user",
+                "1001:1001",
+                "--entrypoint",
+                "/bin/true",
+                runtime_lite_supervisor_image,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert unrelated.returncode == 0, unrelated.stderr
+        unrelated_container = unrelated.stdout.strip()
+        assert re.fullmatch(r"[0-9a-f]{64}", unrelated_container)
+        request.addfinalizer(
+            lambda: subprocess.run(
+                ["docker", "rm", "-f", unrelated_container],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        )
     evidence_path = Path(env["FAKE_EVIDENCE_PATH"])
     evidence_bytes = b'{"approved":true,"marker":"runtime-evidence-never-print"}\n'
     evidence_path.chmod(0o600)
@@ -607,10 +639,46 @@ def test_preflight_real_runtime_enforces_source_and_cleanup_contract(
         assert observed["root_returncode"] == 1
         assert "sources failed secure descriptor validation" in observed["root_stderr"]
         assert validation_runs == []
-    elif scenario == "timeout":
+    elif scenario in {"timeout", "pre-cid"}:
         assert observed["root_returncode"] == 1
         assert "snapshot validation timed out or failed" in observed["root_stderr"]
         assert len(validation_runs) == 1
+        if scenario == "pre-cid":
+            assert (
+                "--filter label=io.regulatory.readiness-preflight-owner=" in docker_log
+            )
+            ownership_token = re.search(
+                r"--label io\.regulatory\.readiness-preflight-owner=([0-9a-f]{64})",
+                validation_runs[0],
+            )
+            assert ownership_token is not None
+            owned_residue = subprocess.run(
+                [
+                    "docker",
+                    "container",
+                    "ls",
+                    "--all",
+                    "--quiet",
+                    "--no-trunc",
+                    "--filter",
+                    "label=io.regulatory.readiness-preflight-owner="
+                    f"{ownership_token.group(1)}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            assert owned_residue.returncode == 0, owned_residue.stderr
+            assert owned_residue.stdout == ""
+            unrelated_still_exists = subprocess.run(
+                ["docker", "container", "inspect", unrelated_container],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            assert unrelated_still_exists.returncode == 0
         removed_container = re.search(
             r"^rm -f ([0-9a-f]{64})$", docker_log, re.MULTILINE
         )
