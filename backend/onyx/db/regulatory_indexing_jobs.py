@@ -29,6 +29,12 @@ from onyx.db.models import (
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
 _MAX_ERROR_CODE_LENGTH = 128
+_ACTIVE_REGULATORY_INDEXING_JOB_STATUSES = (
+    RegulatoryIndexingJobStatus.QUEUED.value,
+    RegulatoryIndexingJobStatus.RUNNING.value,
+    RegulatoryIndexingJobStatus.RETRY_WAIT.value,
+    RegulatoryIndexingJobStatus.CANCELLING.value,
+)
 _SECRET_KEY_FRAGMENTS = (
     "apikey",
     "accesstoken",
@@ -265,10 +271,19 @@ def create_or_get_regulatory_indexing_job(
     config_snapshot: RegulatoryIndexingConfigSnapshot,
     now: datetime.datetime,
 ) -> RegulatoryIndexingJob:
-    """Create one durable row for an immutable file/config revision."""
+    """Create one active job, or reuse the file's existing active generation.
+
+    Once every earlier generation is terminal, a different immutable identity may
+    create a new reindex job. An identical terminal identity remains idempotent.
+    """
     _validate_config_snapshot(config_snapshot)
     if config_snapshot.get("input_content_hash") != content_hash:
         raise ValueError("config snapshot input hash does not match content hash")
+    if config_snapshot.get("input_hash_version") not in {
+        "legacy-v1",
+        "canonical-v2",
+    }:
+        raise ValueError("config snapshot input hash version is unsupported")
     if config_snapshot.get("chunk_generation_hash") != chunk_generation_hash:
         raise ValueError(
             "config snapshot generation hash does not match chunk generation hash"
@@ -277,11 +292,6 @@ def create_or_get_regulatory_indexing_job(
         character not in "0123456789abcdef" for character in chunk_generation_hash
     ):
         raise ValueError("chunk generation hash must be a lowercase SHA-256 hash")
-    db_session.scalar(
-        select(SearchSettings)
-        .where(SearchSettings.id == search_settings_id)
-        .with_for_update()
-    )
     locked_user_file = db_session.scalar(
         select(UserFile).where(UserFile.id == user_file_id).with_for_update()
     )
@@ -296,6 +306,34 @@ def create_or_get_regulatory_indexing_job(
         raise ValueError(
             "cannot create regulatory indexing job for cancelled user file"
         )
+    active_job = db_session.scalar(
+        select(RegulatoryIndexingJob)
+        .where(
+            RegulatoryIndexingJob.user_file_id == user_file_id,
+            RegulatoryIndexingJob.status.in_(_ACTIVE_REGULATORY_INDEXING_JOB_STATUSES),
+        )
+        .order_by(
+            RegulatoryIndexingJob.updated_at.desc(),
+            RegulatoryIndexingJob.created_at.desc(),
+            RegulatoryIndexingJob.id.desc(),
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    if active_job is not None:
+        active_job_id = active_job.id
+        db_session.commit()
+        persisted_active_job = db_session.get(RegulatoryIndexingJob, active_job_id)
+        if persisted_active_job is None:
+            raise RuntimeError(
+                f"active regulatory indexing job {active_job_id} disappeared"
+            )
+        return persisted_active_job
+    db_session.scalar(
+        select(SearchSettings)
+        .where(SearchSettings.id == search_settings_id)
+        .with_for_update()
+    )
     proposed_id = uuid4()
     created_id = db_session.scalar(
         pg_insert(RegulatoryIndexingJob)
@@ -383,11 +421,7 @@ def has_active_regulatory_indexing_jobs_for_search_settings(
             select(func.count(RegulatoryIndexingJob.id) > 0).where(
                 RegulatoryIndexingJob.search_settings_id == search_settings_id,
                 RegulatoryIndexingJob.status.in_(
-                    (
-                        RegulatoryIndexingJobStatus.QUEUED.value,
-                        RegulatoryIndexingJobStatus.RUNNING.value,
-                        RegulatoryIndexingJobStatus.RETRY_WAIT.value,
-                    )
+                    _ACTIVE_REGULATORY_INDEXING_JOB_STATUSES
                 ),
             )
         )

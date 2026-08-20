@@ -83,6 +83,13 @@ class VertexAuthenticationMode(StrEnum):
     WORKLOAD_IDENTITY = "workload_identity"
 
 
+class RegulatoryInputHashVersion(StrEnum):
+    """Stable algorithms used to identify one immutable loader result."""
+
+    LEGACY_V1 = "legacy-v1"
+    CANONICAL_V2 = "canonical-v2"
+
+
 class VertexBatchConfig(BaseModel):
     model_config = ConfigDict(
         frozen=True,
@@ -110,6 +117,7 @@ class RegulatoryIndexingConfigSnapshot(BaseModel):
     input_content_hash: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
+    input_hash_version: RegulatoryInputHashVersion
     chunk_generation_hash: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )

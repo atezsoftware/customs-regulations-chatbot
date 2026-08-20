@@ -9,12 +9,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import delete, select, text
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
@@ -52,6 +55,7 @@ from onyx.document_index.elasticsearch.schema import (
     get_elasticsearch_doc_chunk_id,
 )
 from onyx.document_index.interfaces_new import TenantState
+from onyx.file_store import postgres_file_store
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.well_known_providers.constants import (
@@ -63,6 +67,7 @@ from onyx.llm.well_known_providers.constants import (
 from onyx.natural_language_processing import search_nlp_models
 from onyx.natural_language_processing.utils import BaseTokenizer
 from onyx.regulatory.indexing_jobs import orchestrator, preparation, publisher
+from onyx.regulatory.indexing_jobs.models import RegulatoryInputHashVersion
 from onyx.regulatory.indexing_jobs.orchestrator import (
     OrchestrationOutcome,
     run_preclaimed_regulatory_indexing_step,
@@ -81,6 +86,7 @@ from tests.external_dependency_unit.conftest import create_test_user
 _TEST_REDUCED_DIMENSION = 768
 _TENANT_ID = "public"
 _OPENROUTER_PROVIDER_ADVISORY_LOCK = 5_932_460_513_101_126_737
+_LEGACY_REGULATORY_JOB_REVISION = "c8f1a6d4e2b7"
 
 
 class _CharacterTokenizer(BaseTokenizer):
@@ -219,6 +225,66 @@ def _markdown_bytes(marker: str) -> bytes:
         f"# {marker}\n\n## MADDE 1\nBirinci hüküm.{repeated}\n\n"
         f"## MADDE 2\nİkinci hüküm.{repeated}"
     ).encode()
+
+
+def _metadata_markdown_bytes(marker: str) -> bytes:
+    metadata = json.dumps(
+        {
+            "title": f"{marker} Kurtarma Başlığı",
+            "regulation_number": "2026/7",
+        },
+        ensure_ascii=False,
+    )
+    return (
+        f"<!-- ONYX_METADATA={metadata} -->\n"
+        f"# {marker}\n\n## MADDE 1\nMetadata ile kurtarılan hüküm.\n\n"
+        "## MADDE 2\nİkinci metadata hükmü."
+    ).encode()
+
+
+def _migration_config(engine: Engine) -> Config:
+    backend_root = Path(__file__).resolve().parents[3]
+    config = Config(str(backend_root / "alembic.ini"))
+    config.set_main_option("script_location", str(backend_root / "alembic"))
+    config.attributes["connection"] = engine
+    config.attributes["schema_name"] = "public"
+    config.attributes["configure_logger"] = False
+    return config
+
+
+@contextmanager
+def _pre_migration_database(source_engine: Engine) -> Iterator[Engine]:
+    database_name = f"regulatory_recovery_{uuid4().hex}"
+    admin_engine = create_engine(
+        source_engine.url.set(database="postgres"),
+        isolation_level="AUTOCOMMIT",
+    )
+    dedicated_engine: Engine | None = None
+    try:
+        with admin_engine.connect() as connection:
+            connection.exec_driver_sql(
+                f'CREATE DATABASE "{database_name}" TEMPLATE template0'
+            )
+        dedicated_engine = create_engine(source_engine.url.set(database=database_name))
+        command.upgrade(
+            _migration_config(dedicated_engine),
+            _LEGACY_REGULATORY_JOB_REVISION,
+        )
+        yield dedicated_engine
+    finally:
+        if dedicated_engine is not None:
+            dedicated_engine.dispose()
+        with admin_engine.connect() as connection:
+            connection.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) "
+                    "FROM pg_stat_activity "
+                    "WHERE datname = :database_name AND pid <> pg_backend_pid()"
+                ),
+                {"database_name": database_name},
+            )
+            connection.exec_driver_sql(f'DROP DATABASE IF EXISTS "{database_name}"')
+        admin_engine.dispose()
 
 
 def _run_delivery(
@@ -1061,6 +1127,255 @@ def test_preexisting_openrouter_provider_is_locked_and_restored_exactly(
         db_session.expire_all()
         assert _raw_openrouter_provider_state(db_session) == original_state
     assert _raw_openrouter_provider_state(db_session) == state_before_test
+
+
+def test_pre_migration_preparing_job_with_onyx_metadata_recovers_and_publishes(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+    embedding_server: tuple[str, list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_engine = db_session.get_bind()
+    assert isinstance(source_engine, Engine)
+    embedding_url, _embedding_requests = embedding_server
+    gateway = _DeterministicVertexGateway()
+
+    with _pre_migration_database(source_engine) as dedicated_engine:
+
+        @contextmanager
+        def dedicated_session() -> Iterator[Session]:
+            with Session(dedicated_engine) as session:
+                yield session
+
+        @contextmanager
+        def dedicated_session_if_none(
+            existing_session: Session | None = None,
+        ) -> Iterator[Session]:
+            if existing_session is not None:
+                yield existing_session
+                return
+            with Session(dedicated_engine) as session:
+                yield session
+
+        monkeypatch.setattr(
+            orchestrator,
+            "get_session_with_current_tenant",
+            dedicated_session,
+        )
+        monkeypatch.setattr(
+            postgres_file_store,
+            "get_session_with_current_tenant_if_none",
+            dedicated_session_if_none,
+        )
+        monkeypatch.setattr(
+            app_configs,
+            "REGULATORY_INDEXING_GCS_URI",
+            "gs://disposable-regulatory-indexing",
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "_build_vertex_gateway",
+            lambda *_args, **_kwargs: gateway,
+        )
+        monkeypatch.setattr(
+            preparation,
+            "get_tokenizer",
+            lambda *_args, **_kwargs: _CharacterTokenizer(),
+        )
+        monkeypatch.setattr(
+            preparation,
+            "get_contextual_token_budget_tokenizer",
+            lambda *_args, **_kwargs: _CharacterTokenizer(),
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "_contextual_tokenizers",
+            lambda _snapshot_value: (_CharacterTokenizer(), _CharacterTokenizer()),
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "get_tokenizer",
+            lambda *_args, **_kwargs: _CharacterTokenizer(),
+        )
+        monkeypatch.setattr(
+            search_nlp_models,
+            "OPENROUTER_EMBEDDINGS_URL",
+            embedding_url,
+        )
+
+        with Session(dedicated_engine) as migration_session:
+            with _disposable_pipeline_scope(
+                migration_session,
+                embedding_url=embedding_url,
+                prefix=f"legacy_recovery_{uuid4().hex}_",
+            ) as resources:
+                document_index = resources.document_index
+                assert document_index is not None
+                monkeypatch.setattr(
+                    file_connector,
+                    "get_default_file_store",
+                    lambda: resources.file_store,
+                )
+                monkeypatch.setattr(
+                    publisher,
+                    "build_elasticsearch_document_index",
+                    lambda _settings: document_index,
+                )
+                monkeypatch.setattr(
+                    orchestrator,
+                    "build_elasticsearch_document_index",
+                    lambda _settings: document_index,
+                )
+
+                marker = "Gözetim"
+                user = create_test_user(
+                    migration_session,
+                    f"{resources.prefix}metadata",
+                )
+                resources.user_ids.append(user.id)
+                store_file_id = f"{resources.prefix}file_{uuid4().hex}"
+                resources.store_file_ids.append(store_file_id)
+                resources.file_store.save_file(
+                    content=BytesIO(_metadata_markdown_bytes(marker)),
+                    display_name=f"{resources.prefix}metadata.md",
+                    file_origin=FileOrigin.USER_FILE,
+                    file_type="text/markdown",
+                    file_id=store_file_id,
+                    db_session=migration_session,
+                )
+                file_content = migration_session.get(FileContent, store_file_id)
+                assert file_content is not None
+                resources.large_object_oids.append(file_content.lobj_oid)
+                user_file = UserFile(
+                    id=uuid4(),
+                    user_id=user.id,
+                    file_id=store_file_id,
+                    name=f"{resources.prefix}metadata.md",
+                    file_type="text/markdown",
+                    status=UserFileStatus.INDEXING,
+                )
+                resources.user_file_ids.append(user_file.id)
+                migration_session.add(user_file)
+                migration_session.commit()
+
+                initial_documents, staged_csv_ids = (
+                    orchestrator._load_claimed_markdown_documents(
+                        cast(
+                            job_repository.RegulatoryIndexingRuntime,
+                            SimpleNamespace(user_file=user_file),
+                        ),
+                        _TENANT_ID,
+                    )
+                )
+                assert staged_csv_ids == []
+                assert initial_documents[0].title == f"{marker} Kurtarma Başlığı"
+                assert initial_documents[0].metadata["regulation_number"] == "2026/7"
+                legacy_hash = preparation.regulatory_documents_content_hash(
+                    initial_documents,
+                    RegulatoryInputHashVersion.LEGACY_V1,
+                )
+                snapshot = preparation.resolve_regulatory_indexing_snapshot(
+                    migration_session,
+                    input_content_hash=legacy_hash,
+                    input_hash_version=RegulatoryInputHashVersion.LEGACY_V1,
+                )
+                pre_migration_snapshot = snapshot.model_dump(mode="json")
+                del pre_migration_snapshot["input_content_hash"]
+                del pre_migration_snapshot["input_hash_version"]
+                del pre_migration_snapshot["chunk_generation_hash"]
+                job_id = uuid4()
+                resources.job_ids.append(job_id)
+                migration_session.execute(
+                    text(
+                        """
+                        INSERT INTO regulatory_indexing_job (
+                            id, user_file_id, content_hash, search_settings_id,
+                            prompt_hash, config_snapshot, status, stage,
+                            lease_generation, attempt_count, heartbeat_at,
+                            created_at, updated_at
+                        ) VALUES (
+                            :id, :user_file_id, :content_hash,
+                            :search_settings_id, :prompt_hash,
+                            CAST(:config_snapshot AS jsonb), 'QUEUED',
+                            'PREPARING', 0, 0, now(), now(), now()
+                        )
+                        """
+                    ),
+                    {
+                        "id": job_id,
+                        "user_file_id": user_file.id,
+                        "content_hash": legacy_hash,
+                        "search_settings_id": snapshot.search_settings_id,
+                        "prompt_hash": snapshot.prompt_hash,
+                        "config_snapshot": json.dumps(pre_migration_snapshot),
+                    },
+                )
+                migration_session.commit()
+
+                command.upgrade(_migration_config(dedicated_engine), "head")
+                migration_session.expire_all()
+                migrated_job = migration_session.get(RegulatoryIndexingJob, job_id)
+                assert migrated_job is not None
+                assert migrated_job.config_snapshot["input_content_hash"] == legacy_hash
+                assert migrated_job.config_snapshot["input_hash_version"] == "legacy-v1"
+
+                first = run_regulatory_indexing_step(job_id, 0, _TENANT_ID)
+                assert first.outcome is OrchestrationOutcome.NEXT_STEP
+                generation = first.expected_generation
+                assert generation is not None
+                assert (
+                    _stage(migration_session, job_id)
+                    is RegulatoryIndexingStage.CONTEXT_SUBMIT
+                )
+
+                for _ in range(30):
+                    if (
+                        _stage(migration_session, job_id)
+                        is RegulatoryIndexingStage.VERIFY
+                    ):
+                        break
+                    generation, outcome = _run_delivery(job_id, generation)
+                    assert outcome is OrchestrationOutcome.NEXT_STEP
+                else:
+                    pytest.fail("legacy PREPARING recovery did not reach VERIFY")
+
+                migration_session.expire_all()
+                rows = list(
+                    migration_session.scalars(
+                        select(RegulatoryChunk)
+                        .where(RegulatoryChunk.user_file_id == user_file.id)
+                        .order_by(RegulatoryChunk.position)
+                    ).all()
+                )
+                assert rows
+                generation, outcome = _run_delivery(job_id, generation)
+                assert outcome is OrchestrationOutcome.NEXT_STEP
+                assert (
+                    _stage(migration_session, job_id) is RegulatoryIndexingStage.PUBLISH
+                )
+                _generation, outcome = _run_delivery(job_id, generation)
+                assert outcome is OrchestrationOutcome.COMPLETE
+
+                migration_session.expire_all()
+                completed_job = migration_session.get(RegulatoryIndexingJob, job_id)
+                completed_file = migration_session.get(UserFile, user_file.id)
+                assert completed_job is not None
+                assert (
+                    completed_job.status == RegulatoryIndexingJobStatus.SUCCEEDED.value
+                )
+                assert completed_file is not None
+                assert completed_file.status is UserFileStatus.COMPLETED
+                document_index._client.refresh_index()
+                chunk_ids = [
+                    get_elasticsearch_doc_chunk_id(
+                        TenantState(tenant_id=_TENANT_ID, multitenant=False),
+                        str(user_file.id),
+                        row.position,
+                    )
+                    for row in rows
+                ]
+                visible_chunks = document_index._client.get_document_chunks(chunk_ids)
+                assert all(not chunk.hidden for chunk in visible_chunks.values())
 
 
 def test_durable_pipeline_uses_real_postgres_elasticsearch_and_http_embedding(

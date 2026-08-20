@@ -34,6 +34,7 @@ from onyx.regulatory.indexing import (
 )
 from onyx.regulatory.indexing_jobs.models import (
     RegulatoryIndexingConfigSnapshot,
+    RegulatoryInputHashVersion,
     VertexAuthenticationMode,
     VertexBatchConfig,
 )
@@ -235,6 +236,9 @@ def resolve_regulatory_indexing_snapshot(
     db_session: Session,
     *,
     input_content_hash: str = _READINESS_INPUT_CONTENT_HASH,
+    input_hash_version: RegulatoryInputHashVersion = (
+        RegulatoryInputHashVersion.CANONICAL_V2
+    ),
 ) -> RegulatoryIndexingConfigSnapshot:
     search_settings = get_current_search_settings(db_session, for_update=True)
     _validate_embedding_contract(search_settings)
@@ -244,6 +248,7 @@ def resolve_regulatory_indexing_snapshot(
     )
     return RegulatoryIndexingConfigSnapshot(
         input_content_hash=input_content_hash,
+        input_hash_version=input_hash_version,
         chunk_generation_hash=compute_regulatory_chunk_generation_hash(
             embedding_provider=EmbeddingProvider.OPENROUTER,
             embedding_model_name=search_settings.model_name,

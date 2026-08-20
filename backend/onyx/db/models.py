@@ -5746,6 +5746,14 @@ class RegulatoryIndexingJob(Base):
             "next_retry_at",
             "heartbeat_at",
         ),
+        Index(
+            "uq_regulatory_indexing_job_active_user_file",
+            "user_file_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('QUEUED', 'RUNNING', 'RETRY_WAIT', 'CANCELLING')"
+            ),
+        ),
         CheckConstraint(
             "cancellation_phase IN ('NONE', 'VERTEX_CANCEL', 'GCS_CLEANUP', "
             "'INDEX_DELETE', 'FINALIZE')",

@@ -55,6 +55,7 @@ def _snapshot() -> RegulatoryIndexingConfigSnapshot:
     return RegulatoryIndexingConfigSnapshot.model_validate(
         {
             "input_content_hash": "1" * 64,
+            "input_hash_version": "canonical-v2",
             "chunk_generation_hash": "2" * 64,
             "search_settings_id": 9,
             "embedding_provider": "openrouter",

@@ -28,6 +28,7 @@ from onyx.regulatory.indexing_jobs import preparation
 from onyx.regulatory.indexing_jobs.contextual import contextualized_embedding_text
 from onyx.regulatory.indexing_jobs.models import (
     RegulatoryIndexingConfigSnapshot,
+    RegulatoryInputHashVersion,
     VertexAuthenticationMode,
     VertexBatchConfig,
 )
@@ -60,6 +61,7 @@ def _snapshot(
 ) -> RegulatoryIndexingConfigSnapshot:
     return RegulatoryIndexingConfigSnapshot(
         input_content_hash=input_content_hash,
+        input_hash_version=RegulatoryInputHashVersion.CANONICAL_V2,
         chunk_generation_hash="2" * 64,
         search_settings_id=41,
         embedding_provider=EmbeddingProvider.OPENROUTER,
@@ -81,7 +83,7 @@ def _snapshot(
     )
 
 
-def test_input_hash_ignores_loader_clock_but_tracks_canonical_metadata() -> None:
+def test_versioned_input_hash_preserves_legacy_recovery_and_v2_metadata() -> None:
     user_file_id = uuid4()
     document = _document(user_file_id, "MADDE 1 - Değişmeyen hüküm.")
     first_load = document.model_copy(
@@ -102,12 +104,145 @@ def test_input_hash_ignores_loader_clock_but_tracks_canonical_metadata() -> None
         update={"metadata": {"regulation_number": "2026/1"}}
     )
 
-    original_hash = preparation._regulatory_documents_content_hash([first_load])
-    assert preparation._regulatory_documents_content_hash([recovered_load]) == (
-        original_hash
+    canonical_hash = preparation.regulatory_documents_content_hash(
+        [first_load], RegulatoryInputHashVersion.CANONICAL_V2
     )
-    assert preparation._regulatory_documents_content_hash([metadata_changed]) != (
-        original_hash
+    assert (
+        preparation.regulatory_documents_content_hash(
+            [recovered_load], RegulatoryInputHashVersion.CANONICAL_V2
+        )
+        == canonical_hash
+    )
+    assert (
+        preparation.regulatory_documents_content_hash(
+            [metadata_changed], RegulatoryInputHashVersion.CANONICAL_V2
+        )
+        != canonical_hash
+    )
+
+    legacy_hash = preparation.regulatory_documents_content_hash(
+        [first_load], RegulatoryInputHashVersion.LEGACY_V1
+    )
+    assert (
+        preparation.regulatory_documents_content_hash(
+            [metadata_changed], RegulatoryInputHashVersion.LEGACY_V1
+        )
+        == legacy_hash
+    )
+
+
+def test_new_preparation_snapshots_use_canonical_v2_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_file_id = uuid4()
+    document = _document(user_file_id, "MADDE 1 - Metadata-sensitive hüküm.")
+    expected_hash = preparation.regulatory_documents_content_hash(
+        [document], RegulatoryInputHashVersion.CANONICAL_V2
+    )
+    captured_snapshot_kwargs: list[dict[str, object]] = []
+    snapshot = _snapshot(input_content_hash=expected_hash)
+    job = cast(
+        RegulatoryIndexingJob,
+        SimpleNamespace(
+            id=uuid4(),
+            user_file_id=user_file_id,
+            content_hash=expected_hash,
+            chunk_generation_hash=snapshot.chunk_generation_hash,
+            lease_generation=0,
+            config_snapshot=snapshot.model_dump(mode="json"),
+        ),
+    )
+
+    def resolve_snapshot(_session: Session, **kwargs: object) -> object:
+        captured_snapshot_kwargs.append(kwargs)
+        return snapshot
+
+    monkeypatch.setattr(
+        preparation, "resolve_regulatory_indexing_snapshot", resolve_snapshot
+    )
+    monkeypatch.setattr(
+        preparation,
+        "create_or_get_regulatory_indexing_job",
+        lambda *_args, **_kwargs: job,
+    )
+    monkeypatch.setattr(
+        preparation,
+        "claim_regulatory_indexing_job",
+        lambda *_args, **_kwargs: False,
+    )
+
+    assert (
+        preparation.prepare_regulatory_indexing_job(
+            user_file_id,
+            [document],
+            "tenant-a",
+            cast(Session, SimpleNamespace()),
+        )
+        == job.id
+    )
+    assert captured_snapshot_kwargs == [
+        {
+            "input_content_hash": expected_hash,
+            "input_hash_version": RegulatoryInputHashVersion.CANONICAL_V2,
+        }
+    ]
+
+
+def test_duplicate_delivery_does_not_prepare_an_active_older_chunk_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_file_id = uuid4()
+    document = _document(user_file_id, "MADDE 1 - Sürüm geçişi hükmü.")
+    content_hash = preparation.regulatory_documents_content_hash(
+        [document], RegulatoryInputHashVersion.CANONICAL_V2
+    )
+    current_snapshot = _snapshot(input_content_hash=content_hash)
+    older_snapshot = current_snapshot.model_copy(
+        update={"chunk_generation_hash": "3" * 64}
+    )
+    active_job = cast(
+        RegulatoryIndexingJob,
+        SimpleNamespace(
+            id=uuid4(),
+            user_file_id=user_file_id,
+            content_hash=content_hash,
+            chunk_generation_hash=older_snapshot.chunk_generation_hash,
+            lease_generation=4,
+            config_snapshot=older_snapshot.model_dump(mode="json"),
+        ),
+    )
+
+    monkeypatch.setattr(
+        preparation,
+        "resolve_regulatory_indexing_snapshot",
+        lambda *_args, **_kwargs: current_snapshot,
+    )
+    monkeypatch.setattr(
+        preparation,
+        "create_or_get_regulatory_indexing_job",
+        lambda *_args, **_kwargs: active_job,
+    )
+    monkeypatch.setattr(
+        preparation,
+        "claim_regulatory_indexing_job",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an older active generation must be recovered, not re-prepared"
+        ),
+    )
+    monkeypatch.setattr(
+        preparation,
+        "documents_to_regulatory_chunks",
+        lambda **_kwargs: pytest.fail("canonical chunks must remain untouched"),
+    )
+
+    assert (
+        preparation.prepare_regulatory_indexing_job(
+            user_file_id,
+            [document],
+            "tenant-a",
+            cast(Session, SimpleNamespace()),
+        )
+        == active_job.id
     )
 
 
@@ -283,8 +418,9 @@ def test_context_ineligible_item_is_skipped_but_keeps_original_embedding_text(
 ) -> None:
     user_file_id = uuid4()
     job_id = uuid4()
-    content_hash = preparation._regulatory_documents_content_hash(
-        [_document(user_file_id, row_text)]
+    content_hash = preparation.regulatory_documents_content_hash(
+        [_document(user_file_id, row_text)],
+        RegulatoryInputHashVersion.CANONICAL_V2,
     )
     snapshot = _snapshot(input_content_hash=content_hash)
     job = cast(
@@ -399,7 +535,9 @@ def test_duplicate_preparation_does_not_replace_successful_item_state(
     user_file_id = uuid4()
     job_id = uuid4()
     document = _document(user_file_id, "MADDE 1 - Transit hükmü.")
-    content_hash = preparation._regulatory_documents_content_hash([document])
+    content_hash = preparation.regulatory_documents_content_hash(
+        [document], RegulatoryInputHashVersion.CANONICAL_V2
+    )
     snapshot = _snapshot(input_content_hash=content_hash)
     job = cast(
         RegulatoryIndexingJob,
@@ -503,7 +641,9 @@ def test_claimed_preparation_resumes_without_claiming_again_and_advances_once(
     user_file_id = uuid4()
     job_id = uuid4()
     document = _document(user_file_id, "MADDE 1 - Kurtarılan hazırlık.")
-    content_hash = preparation._regulatory_documents_content_hash([document])
+    content_hash = preparation.regulatory_documents_content_hash(
+        [document], RegulatoryInputHashVersion.CANONICAL_V2
+    )
     snapshot = _snapshot(input_content_hash=content_hash)
     job = cast(
         RegulatoryIndexingJob,

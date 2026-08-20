@@ -20,6 +20,7 @@ from onyx.db.regulatory_indexing_jobs import (
 from onyx.llm.constants import LlmProviderNames
 from onyx.natural_language_processing.utils import get_tokenizer
 from onyx.regulatory.indexing import (
+    document_text_for_regulatory_indexing,
     documents_to_regulatory_chunks,
 )
 from onyx.regulatory.indexing_jobs.configuration import (
@@ -30,15 +31,35 @@ from onyx.regulatory.indexing_jobs.contextual import (
     contextual_reserve_for_row,
     get_contextual_token_budget_tokenizer,
 )
-from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
+from onyx.regulatory.indexing_jobs.models import (
+    RegulatoryIndexingConfigSnapshot,
+    RegulatoryInputHashVersion,
+)
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 
 
-def _regulatory_documents_content_hash(documents: Sequence[Document]) -> str:
-    payload = [
-        document.model_dump(mode="json", exclude={"doc_updated_at"})
-        for document in documents
-    ]
+def regulatory_documents_content_hash(
+    documents: Sequence[Document],
+    input_hash_version: RegulatoryInputHashVersion,
+) -> str:
+    if input_hash_version is RegulatoryInputHashVersion.LEGACY_V1:
+        payload = [
+            {
+                "semantic_identifier": document.semantic_identifier,
+                "title": document.title,
+                "text": document_text_for_regulatory_indexing(document),
+            }
+            for document in documents
+        ]
+    elif input_hash_version is RegulatoryInputHashVersion.CANONICAL_V2:
+        payload = [
+            document.model_dump(mode="json", exclude={"doc_updated_at"})
+            for document in documents
+        ]
+    else:
+        raise ValueError(
+            f"unsupported regulatory input hash version: {input_hash_version}"
+        )
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -63,10 +84,12 @@ def prepare_regulatory_indexing_job(
     if any(document.id != str(user_file_id) for document in documents):
         raise ValueError("regulatory documents must be stamped with the user file id")
 
-    content_hash = _regulatory_documents_content_hash(documents)
+    input_hash_version = RegulatoryInputHashVersion.CANONICAL_V2
+    content_hash = regulatory_documents_content_hash(documents, input_hash_version)
     snapshot = resolve_regulatory_indexing_snapshot(
         db_session,
         input_content_hash=content_hash,
+        input_hash_version=input_hash_version,
     )
     now = datetime.datetime.now(datetime.timezone.utc)
     job = create_or_get_regulatory_indexing_job(
@@ -79,6 +102,8 @@ def prepare_regulatory_indexing_job(
         config_snapshot=snapshot.model_dump(mode="json"),
         now=now,
     )
+    if job.chunk_generation_hash != snapshot.chunk_generation_hash:
+        return job.id
     unclaimed_generation = job.lease_generation
     claimed = claim_regulatory_indexing_job(
         db_session,
@@ -119,10 +144,12 @@ def prepare_claimed_regulatory_indexing_job(
         raise ValueError(f"regulatory indexing job {job_id} does not exist")
     if any(document.id != str(job.user_file_id) for document in documents):
         raise ValueError("regulatory documents must be stamped with the user file id")
-    if _regulatory_documents_content_hash(documents) != job.content_hash:
-        raise ValueError("regulatory documents do not match the claimed job revision")
-
     snapshot = RegulatoryIndexingConfigSnapshot.model_validate(job.config_snapshot)
+    if (
+        regulatory_documents_content_hash(documents, snapshot.input_hash_version)
+        != job.content_hash
+    ):
+        raise ValueError("regulatory documents do not match the claimed job revision")
     if snapshot.input_content_hash != job.content_hash:
         raise ValueError("regulatory job input hash does not match its snapshot")
     if snapshot.chunk_generation_hash != job.chunk_generation_hash:

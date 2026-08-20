@@ -16,6 +16,7 @@ depends_on = None
 _CURRENT_CHUNK_GENERATION_HASH = (
     "c8e1ab454f0ac79eea2db7e0c1a54979d55fa97232da08130ee8fa4b8b324e04"
 )
+_LEGACY_INPUT_HASH_VERSION = "legacy-v1"
 
 
 def upgrade() -> None:
@@ -30,9 +31,14 @@ def upgrade() -> None:
             SET chunk_generation_hash = :generation_hash,
                 config_snapshot = jsonb_set(
                     jsonb_set(
-                        config_snapshot,
-                        '{input_content_hash}',
-                        to_jsonb(content_hash),
+                        jsonb_set(
+                            config_snapshot,
+                            '{input_content_hash}',
+                            to_jsonb(content_hash),
+                            true
+                        ),
+                        '{input_hash_version}',
+                        to_jsonb(CAST(:input_hash_version AS text)),
                         true
                     ),
                     '{chunk_generation_hash}',
@@ -40,7 +46,10 @@ def upgrade() -> None:
                     true
                 )
             """
-        ).bindparams(generation_hash=_CURRENT_CHUNK_GENERATION_HASH)
+        ).bindparams(
+            generation_hash=_CURRENT_CHUNK_GENERATION_HASH,
+            input_hash_version=_LEGACY_INPUT_HASH_VERSION,
+        )
     )
     op.alter_column(
         "regulatory_indexing_job",
@@ -72,6 +81,42 @@ def downgrade() -> None:
         "regulatory_indexing_job",
         type_="unique",
     )
+    # Downgrading removes chunk-generation identity from the legacy unique key.
+    # Preserve the current/best row deterministically and let the existing
+    # ON DELETE CASCADE foreign key remove only its superseded job items.
+    op.execute(
+        """
+        WITH ranked_jobs AS (
+            SELECT
+                id,
+                row_number() OVER (
+                    PARTITION BY
+                        user_file_id,
+                        content_hash,
+                        search_settings_id,
+                        prompt_hash
+                    ORDER BY
+                        CASE
+                            WHEN status IN (
+                                'QUEUED', 'RUNNING', 'RETRY_WAIT', 'CANCELLING'
+                            ) THEN 0
+                            WHEN status = 'SUCCEEDED' THEN 1
+                            WHEN status = 'FAILED' THEN 2
+                            ELSE 3
+                        END,
+                        updated_at DESC,
+                        created_at DESC,
+                        lease_generation DESC,
+                        id DESC
+                ) AS row_rank
+            FROM regulatory_indexing_job
+        )
+        DELETE FROM regulatory_indexing_job AS discarded
+        USING ranked_jobs
+        WHERE discarded.id = ranked_jobs.id
+          AND ranked_jobs.row_rank > 1
+        """
+    )
     op.create_unique_constraint(
         "uq_regulatory_indexing_job_idempotency",
         "regulatory_indexing_job",
@@ -82,6 +127,7 @@ def downgrade() -> None:
         UPDATE regulatory_indexing_job
         SET config_snapshot = config_snapshot
             - 'input_content_hash'
+            - 'input_hash_version'
             - 'chunk_generation_hash'
         """
     )

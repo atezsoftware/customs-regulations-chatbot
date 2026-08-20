@@ -445,6 +445,7 @@ def test_swap_gate_blocks_upload_started_during_port_until_publication_reconcile
         prompt_hash="c" * 64,
         config_snapshot={
             "input_content_hash": "a" * 64,
+            "input_hash_version": "canonical-v2",
             "chunk_generation_hash": "b" * 64,
         },
         status=RegulatoryIndexingJobStatus.RUNNING.value,

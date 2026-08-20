@@ -116,3 +116,25 @@ def test_job_creation_rejects_unsafe_snapshot_before_sql(
         )
 
     db_session.scalar.assert_not_called()
+
+
+def test_job_creation_rejects_unknown_input_hash_version_before_sql() -> None:
+    db_session = MagicMock(spec=Session)
+
+    with pytest.raises(ValueError, match="input hash version"):
+        create_or_get_regulatory_indexing_job(
+            cast(Session, db_session),
+            user_file_id=uuid4(),
+            content_hash="a" * 64,
+            search_settings_id=17,
+            prompt_hash="prompt-v1",
+            chunk_generation_hash="b" * 64,
+            config_snapshot={
+                "input_content_hash": "a" * 64,
+                "input_hash_version": "future-v3",
+                "chunk_generation_hash": "b" * 64,
+            },
+            now=datetime.datetime(2026, 8, 19, tzinfo=datetime.timezone.utc),
+        )
+
+    db_session.scalar.assert_not_called()

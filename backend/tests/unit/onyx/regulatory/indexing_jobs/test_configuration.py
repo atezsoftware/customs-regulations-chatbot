@@ -27,6 +27,7 @@ from onyx.regulatory.indexing_jobs.configuration import (
 )
 from onyx.regulatory.indexing_jobs.models import (
     RegulatoryIndexingConfigSnapshot,
+    RegulatoryInputHashVersion,
     VertexAuthenticationMode,
     VertexBatchConfig,
 )
@@ -201,6 +202,7 @@ def test_snapshot_is_frozen_json_and_excludes_credentials(
 
     assert dumped["search_settings_id"] == 41
     assert dumped["input_content_hash"] == configuration._READINESS_INPUT_CONTENT_HASH
+    assert dumped["input_hash_version"] == "canonical-v2"
     assert len(dumped["chunk_generation_hash"]) == 64
     assert dumped["embedding_provider"] == "openrouter"
     assert dumped["embedding_model_name"] == _EMBEDDING_MODEL
@@ -252,6 +254,7 @@ def test_snapshot_rejects_an_inconsistent_effective_dimension() -> None:
     with pytest.raises(ValidationError):
         RegulatoryIndexingConfigSnapshot(
             input_content_hash="1" * 64,
+            input_hash_version=RegulatoryInputHashVersion.CANONICAL_V2,
             chunk_generation_hash="2" * 64,
             search_settings_id=41,
             embedding_provider=EmbeddingProvider.OPENROUTER,
@@ -300,6 +303,7 @@ def test_snapshot_rejects_nonfinite_retry_policy() -> None:
     with pytest.raises(ValidationError):
         RegulatoryIndexingConfigSnapshot(
             input_content_hash="1" * 64,
+            input_hash_version=RegulatoryInputHashVersion.CANONICAL_V2,
             chunk_generation_hash="2" * 64,
             search_settings_id=41,
             embedding_provider=EmbeddingProvider.OPENROUTER,

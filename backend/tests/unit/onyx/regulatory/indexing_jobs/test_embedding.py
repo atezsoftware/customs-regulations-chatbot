@@ -25,6 +25,7 @@ from onyx.regulatory.indexing_jobs.embedding import (
 )
 from onyx.regulatory.indexing_jobs.models import (
     RegulatoryIndexingConfigSnapshot,
+    RegulatoryInputHashVersion,
     VertexAuthenticationMode,
     VertexBatchConfig,
 )
@@ -36,6 +37,7 @@ _DB_SESSION = cast(Session, SimpleNamespace())
 def _snapshot(*, request_size: int = 2) -> RegulatoryIndexingConfigSnapshot:
     return RegulatoryIndexingConfigSnapshot(
         input_content_hash="1" * 64,
+        input_hash_version=RegulatoryInputHashVersion.CANONICAL_V2,
         chunk_generation_hash="2" * 64,
         search_settings_id=41,
         embedding_provider=EmbeddingProvider.OPENROUTER,

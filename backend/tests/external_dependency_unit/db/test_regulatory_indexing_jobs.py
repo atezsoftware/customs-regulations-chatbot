@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from onyx.db import regulatory_indexing_jobs as regulatory_indexing_job_repository
@@ -39,6 +40,7 @@ from onyx.db.regulatory_indexing_jobs import (
     consume_preclaimed_regulatory_indexing_delivery,
     create_or_get_regulatory_indexing_item,
     create_or_get_regulatory_indexing_job,
+    fail_regulatory_indexing_job,
     finalize_regulatory_indexing_cancellation,
     persist_regulatory_indexing_item_context,
     persist_regulatory_indexing_item_failure,
@@ -63,6 +65,7 @@ from tests.external_dependency_unit.conftest import create_test_user
 _NOW = datetime.datetime(2026, 8, 19, 10, 0, tzinfo=datetime.timezone.utc)
 _SNAPSHOT: RegulatoryIndexingConfigSnapshot = {
     "input_content_hash": "a" * 64,
+    "input_hash_version": "canonical-v2",
     "chunk_generation_hash": "b" * 64,
     "embedding_provider": "openrouter",
     "embedding_model": "openai/text-embedding-3-large",
@@ -90,10 +93,12 @@ def regulatory_user_file(
         yield user_file
     finally:
         db_session.rollback()
-        persisted_file = db_session.get(UserFile, user_file.id)
-        if persisted_file is not None:
+        persisted_files = db_session.scalars(
+            select(UserFile).where(UserFile.user_id == user.id)
+        ).all()
+        for persisted_file in persisted_files:
             db_session.delete(persisted_file)
-            db_session.commit()
+        db_session.commit()
         persisted_user = db_session.get(User, user.id)
         if persisted_user is not None:
             db_session.delete(persisted_user)
@@ -123,6 +128,22 @@ def _create_job(
         config_snapshot=snapshot,
         now=_NOW,
     )
+
+
+def _create_sibling_user_file(
+    db_session: Session,
+    user_file: UserFile,
+) -> UserFile:
+    sibling = UserFile(
+        id=uuid4(),
+        user_id=user_file.user_id,
+        file_id=f"regulatory-indexing-{uuid4().hex}",
+        name="mevzuat-sibling.md",
+        file_type="text/markdown",
+    )
+    db_session.add(sibling)
+    db_session.commit()
+    return sibling
 
 
 def test_duplicate_job_creation_is_atomic_and_idempotent(
@@ -183,7 +204,7 @@ def test_job_creation_rejects_a_tombstoned_user_file(
     )
 
 
-def test_changed_chunk_generation_identity_creates_a_new_job(
+def test_changed_chunk_generation_identity_reuses_the_active_job(
     db_session: Session,
     regulatory_user_file: UserFile,
 ) -> None:
@@ -202,7 +223,175 @@ def test_changed_chunk_generation_identity_creates_a_new_job(
         chunk_generation_hash="2" * 64,
     )
 
-    assert first.id != second.id
+    assert second.id == first.id
+    assert second.chunk_generation_hash == "1" * 64
+    assert (
+        db_session.scalar(
+            select(func.count(RegulatoryIndexingJob.id)).where(
+                RegulatoryIndexingJob.user_file_id == regulatory_user_file.id
+            )
+        )
+        == 1
+    )
+
+
+def test_terminal_job_allows_a_new_chunk_generation_reindex(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    content_hash = uuid4().hex
+    first = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        content_hash=content_hash,
+        chunk_generation_hash="1" * 64,
+    )
+    first.status = RegulatoryIndexingJobStatus.SUCCEEDED.value
+    first.completed_at = _NOW
+    db_session.commit()
+
+    second = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        content_hash=content_hash,
+        chunk_generation_hash="2" * 64,
+    )
+
+    assert second.id != first.id
+    assert second.chunk_generation_hash == "2" * 64
+
+
+def test_concurrent_different_generations_create_only_one_active_job(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    engine = db_session.get_bind()
+    barrier = Barrier(2)
+
+    def create_in_independent_session(generation: str) -> UUID:
+        with Session(engine) as independent_session:
+            barrier.wait(timeout=5)
+            return _create_job(
+                independent_session,
+                regulatory_user_file.id,
+                content_hash=uuid4().hex,
+                chunk_generation_hash=generation * 64,
+            ).id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(create_in_independent_session, "1")
+        second = executor.submit(create_in_independent_session, "2")
+        created_ids = [first.result(timeout=10), second.result(timeout=10)]
+
+    assert created_ids[0] == created_ids[1]
+    assert (
+        db_session.scalar(
+            select(func.count(RegulatoryIndexingJob.id)).where(
+                RegulatoryIndexingJob.user_file_id == regulatory_user_file.id,
+                RegulatoryIndexingJob.status.in_(
+                    [
+                        RegulatoryIndexingJobStatus.QUEUED.value,
+                        RegulatoryIndexingJobStatus.RUNNING.value,
+                        RegulatoryIndexingJobStatus.RETRY_WAIT.value,
+                        RegulatoryIndexingJobStatus.CANCELLING.value,
+                    ]
+                ),
+            )
+        )
+        == 1
+    )
+
+
+def test_partial_unique_index_defends_against_a_second_active_job(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    first = _create_job(db_session, regulatory_user_file.id)
+    second = RegulatoryIndexingJob(
+        id=uuid4(),
+        user_file_id=regulatory_user_file.id,
+        content_hash=uuid4().hex,
+        chunk_generation_hash="9" * 64,
+        search_settings_id=17,
+        prompt_hash="prompt-v2",
+        config_snapshot={
+            **_SNAPSHOT,
+            "input_content_hash": "f" * 64,
+            "chunk_generation_hash": "9" * 64,
+        },
+        status=RegulatoryIndexingJobStatus.RUNNING.value,
+        stage=RegulatoryIndexingStage.PREPARING.value,
+        heartbeat_at=_NOW,
+        created_at=_NOW,
+        updated_at=_NOW,
+    )
+    db_session.add(second)
+
+    with pytest.raises(
+        IntegrityError,
+        match="uq_regulatory_indexing_job_active_user_file",
+    ):
+        db_session.commit()
+    db_session.rollback()
+
+    assert db_session.get(RegulatoryIndexingJob, first.id) is not None
+
+
+def test_stale_failure_from_terminal_generation_cannot_overwrite_new_reindex(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    old_job = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        chunk_generation_hash="1" * 64,
+    )
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=old_job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    assert fail_regulatory_indexing_job(
+        db_session,
+        job_id=old_job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        error_code="old_generation",
+        error_message="terminal before reindex",
+        now=_NOW,
+    )
+
+    new_job = _create_job(
+        db_session,
+        regulatory_user_file.id,
+        chunk_generation_hash="2" * 64,
+    )
+    assert new_job.id != old_job.id
+    assert claim_regulatory_indexing_job(
+        db_session,
+        job_id=new_job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=0,
+        now=_NOW,
+    )
+    regulatory_user_file.status = UserFileStatus.INDEXING
+    db_session.commit()
+
+    assert not fail_regulatory_indexing_job(
+        db_session,
+        job_id=old_job.id,
+        expected_stage=RegulatoryIndexingStage.PREPARING,
+        expected_generation=1,
+        error_code="stale_delivery",
+        error_message="must not affect the new generation",
+        now=_NOW + datetime.timedelta(minutes=1),
+    )
+    db_session.refresh(new_job)
+    db_session.refresh(regulatory_user_file)
+    assert new_job.status == RegulatoryIndexingJobStatus.RUNNING.value
+    assert regulatory_user_file.status is UserFileStatus.INDEXING
 
 
 def test_job_lease_can_be_claimed_only_once(
@@ -474,7 +663,8 @@ def test_only_due_retries_are_claimable(
     regulatory_user_file: UserFile,
 ) -> None:
     due_job = _create_job(db_session, regulatory_user_file.id)
-    future_job = _create_job(db_session, regulatory_user_file.id)
+    future_file = _create_sibling_user_file(db_session, regulatory_user_file)
+    future_job = _create_job(db_session, future_file.id)
     for job in (due_job, future_job):
         assert claim_regulatory_indexing_job(
             db_session,
@@ -551,9 +741,12 @@ def test_stale_recovery_claims_due_and_abandoned_jobs_only(
     regulatory_user_file: UserFile,
 ) -> None:
     stale_running = _create_job(db_session, regulatory_user_file.id)
-    fresh_running = _create_job(db_session, regulatory_user_file.id)
-    due_retry = _create_job(db_session, regulatory_user_file.id)
-    future_retry = _create_job(db_session, regulatory_user_file.id)
+    fresh_file = _create_sibling_user_file(db_session, regulatory_user_file)
+    due_file = _create_sibling_user_file(db_session, regulatory_user_file)
+    future_file = _create_sibling_user_file(db_session, regulatory_user_file)
+    fresh_running = _create_job(db_session, fresh_file.id)
+    due_retry = _create_job(db_session, due_file.id)
+    future_retry = _create_job(db_session, future_file.id)
 
     for job in (stale_running, fresh_running, due_retry, future_retry):
         assert claim_regulatory_indexing_job(
@@ -1596,15 +1789,21 @@ def test_user_file_completion_preserves_cancelled_and_deleting_states(
     db_session: Session,
     regulatory_user_file: UserFile,
 ) -> None:
-    for initial_status, should_complete in (
+    cases = (
         (UserFileStatus.INDEXING, True),
         (UserFileStatus.COMPLETED, True),
         (UserFileStatus.CANCELED, False),
         (UserFileStatus.DELETING, False),
-    ):
-        regulatory_user_file.status = UserFileStatus.PROCESSING
+    )
+    for index, (initial_status, should_complete) in enumerate(cases):
+        case_user_file = (
+            regulatory_user_file
+            if index == 0
+            else _create_sibling_user_file(db_session, regulatory_user_file)
+        )
+        case_user_file.status = UserFileStatus.PROCESSING
         db_session.commit()
-        job = _create_job(db_session, regulatory_user_file.id)
+        job = _create_job(db_session, case_user_file.id)
         assert claim_regulatory_indexing_job(
             db_session,
             job_id=job.id,
@@ -1613,7 +1812,7 @@ def test_user_file_completion_preserves_cancelled_and_deleting_states(
             now=_NOW,
         )
         job.stage = RegulatoryIndexingStage.PUBLISH.value
-        regulatory_user_file.status = initial_status
+        case_user_file.status = initial_status
         db_session.commit()
 
         assert (
@@ -1626,8 +1825,8 @@ def test_user_file_completion_preserves_cancelled_and_deleting_states(
             )
             is should_complete
         )
-        db_session.refresh(regulatory_user_file)
-        assert regulatory_user_file.status is (
+        db_session.refresh(case_user_file)
+        assert case_user_file.status is (
             UserFileStatus.COMPLETED if should_complete else initial_status
         )
 
