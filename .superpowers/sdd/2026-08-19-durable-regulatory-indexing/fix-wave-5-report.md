@@ -114,3 +114,31 @@ resources were disposable local containers.
 - The expanded relevant unit suite passed `623 passed in 13.94s`. Final
   touched-file pre-commit passed `ty`, Ruff, formatting, secret scanning, and
   every other applicable hook.
+
+## Exact Vertex JSONL cap closure
+
+- Contextual request construction now measures the final serialized Vertex
+  JSONL line, including the prompt template, canonical chunk, request fields,
+  UTF-8 encoding, JSON escaping, and trailing newline. If the bounded document
+  candidate is too large, it selects a smaller prepared-context window by exact
+  line measurements before the request hash is persisted. The canonical chunk
+  is unchanged, so the contract is identical for direct Markdown and
+  ZIP-extracted Markdown inputs.
+- A request is rejected with a precise terminal mapping error only when the
+  template and canonical chunk cannot fit even with an empty document context.
+  The regression test uses a logically greater-than-100 MB snapshot with
+  escape-heavy text, fails if more than 16 chunk texts are read, passes through
+  `build_contextual_requests`, and proves its nonempty request line is no larger
+  than 65,536 bytes.
+- TDD evidence: the large-snapshot regression first failed with
+  `contextual request exceeds the JSONL byte limit`; the minimal-headroom
+  regression also failed before the bounded fallback was added. After the fix,
+  all three cap regressions passed `3 passed in 1.08s`. The full contextual
+  suite passed `16 passed in 2.96s`, and the broad regulatory plus indexing-job
+  repository unit suite passed in final verification: `552 passed in 12.60s`.
+- Final touched-file pre-commit passed `ty`, Ruff, Ruff formatting, secret
+  scanning, environment drift, and every other applicable hook.
+- The controller-provided privileged manifest update was preserved verbatim;
+  its `4ed23f...eb1f` entry matches the current regulatory prod-lite Compose
+  file. No ZIP ingestion integration, deployment, provider call, production
+  mutation, push, or secret/content logging was performed.

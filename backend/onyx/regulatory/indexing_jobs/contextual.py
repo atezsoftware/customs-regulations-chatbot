@@ -461,12 +461,25 @@ def _contextual_request_for_prepared_document(
     contextual_tokenizer: BaseTokenizer,
 ) -> VertexBatchRequest:
     chunk_block = _row_block(canonical_row)
-    prompt_without_document = CONTEXTUAL_RAG_PROMPT1.format(
-        document=""
-    ) + CONTEXTUAL_RAG_PROMPT2.format(chunk=chunk_block)
+
+    def request_for_document(document: str) -> VertexBatchRequest:
+        return VertexBatchRequest(
+            prompt=(
+                CONTEXTUAL_RAG_PROMPT1.format(document=document)
+                + CONTEXTUAL_RAG_PROMPT2.format(chunk=chunk_block)
+            )
+        )
+
+    jsonl_byte_limit = _document_context_utf8_byte_limit(job)
+    minimum_request = request_for_document("")
+    if vertex_jsonl_line_size(minimum_request) > jsonl_byte_limit:
+        raise ContextualMappingError(
+            "contextual request template and canonical chunk exceed the JSONL byte limit"
+        )
+
     safe_input_limit = _contextual_safe_input_limit(job)
     document_token_budget = safe_input_limit - len(
-        contextual_tokenizer.encode(prompt_without_document)
+        contextual_tokenizer.encode(minimum_request.prompt)
     )
     if document_token_budget <= 0:
         raise ContextualMappingError(
@@ -478,13 +491,34 @@ def _contextual_request_for_prepared_document(
         token_budget=document_token_budget,
         tokenizer=contextual_tokenizer,
     )
+    request = request_for_document(document)
+    if vertex_jsonl_line_size(request) <= jsonl_byte_limit:
+        return request
 
-    return VertexBatchRequest(
-        prompt=(
-            CONTEXTUAL_RAG_PROMPT1.format(document=document)
-            + CONTEXTUAL_RAG_PROMPT2.format(chunk=chunk_block)
-        )
+    best_request = minimum_request
+    minimum_context_budget = len(prepared_document.boundary_anchor_tokens) + 1
+    maximum_context_budget = min(
+        document_token_budget,
+        len(prepared_document.tokens) + len(prepared_document.boundary_anchor_tokens),
     )
+    while minimum_context_budget <= maximum_context_budget:
+        candidate_budget = (minimum_context_budget + maximum_context_budget) // 2
+        try:
+            candidate_document = _fit_document_context(
+                prepared_document,
+                token_budget=candidate_budget,
+                tokenizer=contextual_tokenizer,
+            )
+        except ContextualMappingError:
+            minimum_context_budget = candidate_budget + 1
+            continue
+        candidate_request = request_for_document(candidate_document)
+        if vertex_jsonl_line_size(candidate_request) <= jsonl_byte_limit:
+            best_request = candidate_request
+            minimum_context_budget = candidate_budget + 1
+        else:
+            maximum_context_budget = candidate_budget - 1
+    return best_request
 
 
 def build_contextual_requests(

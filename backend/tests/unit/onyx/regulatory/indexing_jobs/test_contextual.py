@@ -337,58 +337,167 @@ def test_large_file_selection_reuses_one_document_context_and_stays_bounded(
     assert prepare_calls == 1
 
 
-def test_document_context_preparation_stops_before_consuming_a_100mb_snapshot() -> None:
+def test_contextual_build_stops_before_consuming_a_100mb_snapshot_and_fits_jsonl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     job = _job()
-    chunk_text = "x" * 10_000
+    context_cap = 64 * 1024
+    job.config_snapshot["context_jsonl_max_bytes"] = context_cap
+    chunk_text = ('\\"Gümrük hükmü\\n' * 625)[:10_000]
+    text_reads = 0
 
-    class _LogicalLargeRows:
-        access_count = 0
+    class _LogicalLargeRow:
+        def __init__(self, index: int) -> None:
+            self._index = index
+            self.id = f"rc_logical_{index}"
+            self.user_file_id = job.user_file_id
+            self.position = index
+            self.heading_path = [f"MADDE {index + 1}"]
+            self.validity_start_date = None
+            self.validity_end_date = None
 
-        def __len__(self) -> int:
-            return 10_000
-
-        def __getitem__(self, index: int) -> RegulatoryChunk:
-            if index < 0:
-                index += len(self)
-            if index < 0 or index >= len(self):
-                raise IndexError(index)
-            self.access_count += 1
-            if self.access_count > 16:
+        @property
+        def text(self) -> str:
+            nonlocal text_reads
+            text_reads += 1
+            if text_reads > 16:
                 raise AssertionError("document context consumed past its byte ceiling")
-            return _row(
-                job,
-                row_id=f"rc_logical_{index}",
-                position=index,
-                text=chunk_text,
-                heading_path=[f"MADDE {index + 1}"],
-            )
+            if self._index == 0:
+                return "MADDE 1 - Transit işlemleri gümrük gözetiminde yürütülür."
+            return chunk_text
 
-    source = _LogicalLargeRows()
+    rows = cast(
+        list[RegulatoryChunk],
+        [_LogicalLargeRow(index) for index in range(10_000)],
+    )
     tokenizer = contextual.get_contextual_token_budget_tokenizer(
         model_provider=LlmProviderNames.VERTEX_AI,
         model_name="gemini-3.1-flash-lite",
     )
-    context_cap = 64 * 1024
+    monkeypatch.setattr(
+        contextual,
+        "get_max_input_tokens",
+        lambda *_args, **_kwargs: 1_000_000,
+    )
+    request = contextual.ContextualRequestFactory(
+        job=job,
+        rows=rows,
+        contextual_tokenizer=tokenizer,
+    ).request(rows[0])
+    item = cast(
+        RegulatoryIndexingItem,
+        SimpleNamespace(
+            id=uuid4(),
+            job_id=job.id,
+            regulatory_chunk_id=rows[0].id,
+            request_hash=request.request_hash,
+            status=RegulatoryIndexingItemStatus.PENDING.value,
+            context_attempt_count=0,
+        ),
+    )
+    text_reads = 0
 
-    prepared = contextual._prepare_document_context(
-        cast(Sequence[RegulatoryChunk], source),
-        tokenizer=tokenizer,
-        max_utf8_bytes=context_cap,
-        max_tokens=context_cap,
+    selected = build_contextual_requests(
+        job,
+        rows,
+        [item],
+        embedding_tokenizer=_CharacterTokenizer(),
+        contextual_tokenizer=tokenizer,
+        max_requests=1,
+        max_jsonl_bytes=context_cap,
+        max_attempts=3,
     )
 
-    assert source.access_count < 16
-    assert len(prepared.text.encode("utf-8")) <= context_cap
-    assert isinstance(prepared.tokens, bytes)
-    assert "MADDE 1" in prepared.text
-    assert "MADDE 10000" not in prepared.text
-    assert "MADDE 10000" in prepared.boundary_anchors
-    fitted = contextual._fit_document_context(
-        prepared,
-        token_budget=context_cap,
-        tokenizer=tokenizer,
+    assert text_reads < 16
+    assert len(selected) == 1
+    assert selected[0].prompt
+    assert contextual.vertex_jsonl_line_size(selected[0]) <= context_cap
+    assert "MADDE 1" in selected[0].prompt
+    assert "MADDE 10000" in selected[0].prompt
+
+
+def test_contextual_request_rejects_chunk_that_cannot_fit_jsonl_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job()
+    job.config_snapshot["context_jsonl_max_bytes"] = 512
+    target = _row(
+        job,
+        row_id="rc_oversized",
+        position=0,
+        text="MADDE 1 - " + "uzun hüküm " * 100,
+        heading_path=["MADDE 1"],
     )
-    assert len(fitted.encode("utf-8")) <= context_cap
+    sibling = _row(
+        job,
+        row_id="rc_sibling",
+        position=1,
+        text="MADDE 2 - Kısa hüküm.",
+        heading_path=["MADDE 2"],
+    )
+    monkeypatch.setattr(
+        contextual,
+        "get_max_input_tokens",
+        lambda *_args, **_kwargs: 100_000,
+    )
+
+    with pytest.raises(
+        contextual.ContextualMappingError,
+        match="template and canonical chunk exceed the JSONL byte limit",
+    ):
+        contextual.contextual_request_for_row(
+            job,
+            [target, sibling],
+            target,
+            contextual_tokenizer=_CharacterTokenizer(),
+        )
+
+
+def test_contextual_request_uses_empty_document_when_only_wrapper_fits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job()
+    target = _row(
+        job,
+        row_id="rc_target",
+        position=0,
+        text="MADDE 1 - Transit hükmü.",
+        heading_path=["MADDE 1"],
+    )
+    sibling = _row(
+        job,
+        row_id="rc_sibling",
+        position=1,
+        text="MADDE 2 - " + "Bağlam hükmü. " * 100,
+        heading_path=["MADDE 2"],
+    )
+    minimum_request = VertexBatchRequest(
+        prompt=(
+            CONTEXTUAL_RAG_PROMPT1.format(document="")
+            + CONTEXTUAL_RAG_PROMPT2.format(chunk=_chunk_block(target))
+        )
+    )
+    job.config_snapshot["context_jsonl_max_bytes"] = (
+        contextual.vertex_jsonl_line_size(minimum_request) + 1
+    )
+    monkeypatch.setattr(
+        contextual,
+        "get_max_input_tokens",
+        lambda *_args, **_kwargs: 100_000,
+    )
+
+    request = contextual.contextual_request_for_row(
+        job,
+        [target, sibling],
+        target,
+        contextual_tokenizer=_CharacterTokenizer(),
+    )
+
+    assert request == minimum_request
+    assert (
+        contextual.vertex_jsonl_line_size(request)
+        <= job.config_snapshot["context_jsonl_max_bytes"]
+    )
 
 
 def test_document_context_cache_is_bounded_across_many_validity_snapshots(
