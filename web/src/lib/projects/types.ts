@@ -15,6 +15,36 @@ export interface CategorizedFiles {
   rejected_files: RejectedFile[];
 }
 
+export interface RegulatoryIndexingProgress {
+  job_id: string;
+  status:
+    | "QUEUED"
+    | "RUNNING"
+    | "RETRY_WAIT"
+    | "SUCCEEDED"
+    | "FAILED"
+    | "CANCELLING"
+    | "CANCELLED";
+  stage:
+    | "PREPARING"
+    | "CONTEXT_SUBMIT"
+    | "CONTEXT_WAIT"
+    | "CONTEXT_APPLY"
+    | "EMBEDDING"
+    | "INDEX_WRITE"
+    | "VERIFY"
+    | "PUBLISH";
+  total_items: number;
+  completed_items: number;
+  context_ready_items: number;
+  embedded_items: number;
+  failed_items: number;
+  attempt_count: number;
+  next_retry_at: string | null;
+  error_summary: string | null;
+  provider_batch_state: string | null;
+}
+
 export interface ProjectFile {
   id: string;
   name: string;
@@ -29,6 +59,7 @@ export interface ProjectFile {
   token_count: number | null;
   chunk_count: number | null;
   temp_id?: string | null;
+  regulatory_indexing_progress?: RegulatoryIndexingProgress | null;
 }
 
 export interface RejectedFile {

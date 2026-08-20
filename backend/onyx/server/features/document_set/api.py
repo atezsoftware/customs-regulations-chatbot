@@ -34,10 +34,14 @@ from onyx.db.enums import Permission, UserFileStatus
 from onyx.db.models import DocumentSet as DocumentSetDBModel
 from onyx.db.models import User
 from onyx.db.projects import upload_files_to_user_files_with_indexing
+from onyx.db.regulatory_indexing_jobs import (
+    fetch_latest_regulatory_indexing_progress_for_user_files,
+)
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_processing.archive_expansion import expand_archive_uploads
 from onyx.file_processing.import_capability import ensure_markdown_import_available
+from onyx.server.features.document_set.file_models import DocumentSetUserFileSnapshot
 from onyx.server.features.document_set.models import (
     CheckDocSetPublicRequest,
     CheckDocSetPublicResponse,
@@ -209,10 +213,20 @@ def list_document_set_files(
     document_set_id: int,
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
-) -> list[UserFileSnapshot]:
+) -> list[DocumentSetUserFileSnapshot]:
     _get_editable_document_set_or_raise(document_set_id, user, db_session)
     user_files = fetch_user_files_for_document_set(db_session, document_set_id)
-    return [UserFileSnapshot.from_model(user_file) for user_file in user_files]
+    progress_by_file_id = fetch_latest_regulatory_indexing_progress_for_user_files(
+        db_session,
+        user_file_ids=[user_file.id for user_file in user_files],
+    )
+    return [
+        DocumentSetUserFileSnapshot.from_user_file(
+            user_file,
+            progress=progress_by_file_id.get(user_file.id),
+        )
+        for user_file in user_files
+    ]
 
 
 @router.post("/admin/document-set/{document_set_id}/file/upload")

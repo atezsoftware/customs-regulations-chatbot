@@ -15,7 +15,10 @@ import {
   SvgSearchMenu,
 } from "@opal/icons";
 
-import type { ProjectFile } from "@/lib/projects/types";
+import type {
+  ProjectFile,
+  RegulatoryIndexingProgress,
+} from "@/lib/projects/types";
 import { UserFileStatus } from "@/lib/projects/types";
 import { useSettings } from "@/lib/settings/hooks";
 import {
@@ -34,15 +37,95 @@ const ACTIVE_FILE_STATUSES = new Set<UserFileStatus>([
   UserFileStatus.INDEXING,
 ]);
 
+const INDEXING_STAGE_LABELS: Record<
+  RegulatoryIndexingProgress["stage"],
+  string
+> = {
+  PREPARING: "Dizinleme hazırlanıyor",
+  CONTEXT_SUBMIT: "Bağlam işi gönderiliyor",
+  CONTEXT_WAIT: "Bağlam işi bekleniyor",
+  CONTEXT_APPLY: "Bağlam sonuçları işleniyor",
+  EMBEDDING: "Vektörler oluşturuluyor",
+  INDEX_WRITE: "Arama dizinine yazılıyor",
+  VERIFY: "Dizin doğrulanıyor",
+  PUBLISH: "Dizin yayımlanıyor",
+};
+
+const PROVIDER_BATCH_STATE_LABELS: Record<string, string> = {
+  SUBMITTING: "gönderiliyor",
+  RECONCILE_REQUIRED: "sağlayıcı kontrolü bekliyor",
+  RECONCILED_ABSENT: "sağlayıcıda bulunamadı",
+  MANUAL_RECONCILE_REQUIRED: "operatör kontrolü gerekiyor",
+  SUBMITTED: "gönderildi",
+};
+
+function getProviderBatchDescription(value: string | null): string | null {
+  if (!value) return null;
+  const [provider, state] = value.split(":", 2);
+  if (!provider || !state) return null;
+  const stateLabel = PROVIDER_BATCH_STATE_LABELS[state];
+  if (!stateLabel) return null;
+  const providerLabel =
+    provider === "openrouter"
+      ? "OpenRouter"
+      : provider === "vertex"
+        ? "Vertex"
+        : null;
+  return providerLabel ? `${providerLabel} toplu işi ${stateLabel}` : null;
+}
+
+function getIndexingProgressDescription(
+  progress: RegulatoryIndexingProgress
+): string {
+  const details = [INDEXING_STAGE_LABELS[progress.stage]];
+  const hasReliableCounts =
+    Number.isInteger(progress.total_items) &&
+    Number.isInteger(progress.completed_items) &&
+    progress.total_items > 0 &&
+    progress.completed_items >= 0 &&
+    progress.completed_items <= progress.total_items;
+  if (hasReliableCounts) {
+    const percentage = Math.floor(
+      (progress.completed_items / progress.total_items) * 100
+    );
+    details.push(
+      `${progress.completed_items}/${progress.total_items} (${percentage}%)`
+    );
+  }
+  if (progress.attempt_count > 0) {
+    details.push(`Deneme ${progress.attempt_count}`);
+  }
+  if (progress.next_retry_at) {
+    details.push("Yeniden deneme planlandı");
+  }
+  const providerBatchDescription = getProviderBatchDescription(
+    progress.provider_batch_state
+  );
+  if (providerBatchDescription) {
+    details.push(providerBatchDescription);
+  }
+  if (progress.error_summary) {
+    details.push(progress.error_summary);
+  }
+  return details.join(" · ");
+}
+
 function getFileStatusDescription(file: ProjectFile): string {
   const normalizedStatus = file.status.toLowerCase().replaceAll("_", " ");
   const status =
     normalizedStatus.length > 0
       ? normalizedStatus[0]!.toUpperCase() + normalizedStatus.slice(1)
       : "Unknown";
-  return file.chunk_count == null
-    ? status
-    : `${status} · ${file.chunk_count} chunks`;
+  const details = [status];
+  if (file.chunk_count != null) {
+    details.push(`${file.chunk_count} chunks`);
+  }
+  if (file.regulatory_indexing_progress) {
+    details.push(
+      getIndexingProgressDescription(file.regulatory_indexing_progress)
+    );
+  }
+  return details.join(" · ");
 }
 
 // Extensions a markdown-only deployment accepts. Mirrors
@@ -244,7 +327,9 @@ export default function DocumentSetFiles({
       await refreshFiles();
     } catch (requestError) {
       toast.error(
-        requestError instanceof Error ? requestError.message : "Indexing failed."
+        requestError instanceof Error
+          ? requestError.message
+          : "Indexing failed."
       );
     } finally {
       setIndexingAll(false);

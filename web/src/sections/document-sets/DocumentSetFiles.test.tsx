@@ -15,7 +15,8 @@ jest.mock("@/app/admin/documents/sets/lib", () => ({
   unlinkFileFromDocumentSet: jest.fn().mockResolvedValue(undefined),
   uploadDocumentSetFiles: (...args: unknown[]) =>
     mockUploadDocumentSetFiles(...args),
-  indexDocumentSetFile: (...args: unknown[]) => mockIndexDocumentSetFile(...args),
+  indexDocumentSetFile: (...args: unknown[]) =>
+    mockIndexDocumentSetFile(...args),
   indexDocumentSetChunkedFiles: (...args: unknown[]) =>
     mockIndexDocumentSetChunkedFiles(...args),
 }));
@@ -193,4 +194,39 @@ describe("indexing reviewed chunks", () => {
       screen.queryByRole("button", { name: /index all chunked/i })
     ).not.toBeInTheDocument();
   });
+});
+
+test("shows durable indexing stage and trustworthy item progress without an ETA", async () => {
+  mockGetDocumentSetFiles.mockResolvedValue([
+    {
+      id: "file-2",
+      name: "mevzuat/gumruk-kanunu.md",
+      status: UserFileStatus.INDEXING,
+      chunk_count: 40,
+      regulatory_indexing_progress: {
+        job_id: "job-2",
+        status: "RETRY_WAIT",
+        stage: "CONTEXT_WAIT",
+        total_items: 40,
+        completed_items: 12,
+        context_ready_items: 12,
+        embedded_items: 0,
+        failed_items: 0,
+        attempt_count: 2,
+        next_retry_at: "2026-08-20T12:00:00Z",
+        error_summary: "Dizinleme otomatik yeniden denemeyi bekliyor.",
+        provider_batch_state: "vertex:SUBMITTED",
+      },
+    },
+  ]);
+
+  renderFiles();
+
+  expect(
+    await screen.findByText(/Bağlam işi bekleniyor · 12\/40 \(30%\)/i)
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/Deneme 2 · Yeniden deneme planlandı/i)
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/ETA/i)).not.toBeInTheDocument();
 });

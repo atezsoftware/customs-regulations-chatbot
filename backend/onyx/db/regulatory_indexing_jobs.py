@@ -148,6 +148,127 @@ class RegulatoryIndexingRuntime:
     indexing_items: tuple[RegulatoryIndexingItem, ...]
 
 
+@dataclass(frozen=True)
+class RegulatoryIndexingProgress:
+    """Safe, item-backed progress for the admin document-set file list."""
+
+    job_id: UUID
+    status: RegulatoryIndexingJobStatus
+    stage: RegulatoryIndexingStage
+    total_items: int
+    completed_items: int
+    context_ready_items: int
+    embedded_items: int
+    failed_items: int
+    attempt_count: int
+    next_retry_at: datetime.datetime | None
+    error_summary: str | None
+    provider_batch_state: str | None
+
+
+def _provider_batch_state(job: RegulatoryIndexingJob) -> str | None:
+    openrouter_state = RegulatoryIndexingSubmissionState(
+        job.openrouter_submission_state
+    )
+    vertex_state = RegulatoryIndexingSubmissionState(job.vertex_submission_state)
+    if (
+        openrouter_state is not RegulatoryIndexingSubmissionState.NONE
+        or job.remote_openrouter_batch_id
+    ):
+        effective_state = (
+            RegulatoryIndexingSubmissionState.SUBMITTED
+            if openrouter_state is RegulatoryIndexingSubmissionState.NONE
+            else openrouter_state
+        )
+        return f"openrouter:{effective_state.value}"
+    if (
+        vertex_state is not RegulatoryIndexingSubmissionState.NONE
+        or job.remote_vertex_job_name
+    ):
+        effective_state = (
+            RegulatoryIndexingSubmissionState.SUBMITTED
+            if vertex_state is RegulatoryIndexingSubmissionState.NONE
+            else vertex_state
+        )
+        return f"vertex:{effective_state.value}"
+    return None
+
+
+def _safe_progress_error_summary(
+    job: RegulatoryIndexingJob,
+    *,
+    failed_items: int,
+) -> str | None:
+    if (
+        job.openrouter_submission_state
+        == RegulatoryIndexingSubmissionState.MANUAL_RECONCILE_REQUIRED.value
+    ):
+        return "Embedding toplu işi için operatör kontrolü gerekiyor."
+    status = RegulatoryIndexingJobStatus(job.status)
+    if status is RegulatoryIndexingJobStatus.RETRY_WAIT:
+        return "Dizinleme otomatik yeniden denemeyi bekliyor."
+    if status is RegulatoryIndexingJobStatus.FAILED:
+        return "Dizinleme başarısız oldu; ayrıntılar sunucu günlüklerinde."
+    if status is RegulatoryIndexingJobStatus.CANCELLING:
+        return "Dizinleme iptal ediliyor."
+    if status is RegulatoryIndexingJobStatus.CANCELLED:
+        return "Dizinleme iptal edildi."
+    if failed_items:
+        return f"{failed_items} öğe işlenemedi."
+    return None
+
+
+def _build_regulatory_indexing_progress(
+    job: RegulatoryIndexingJob,
+    *,
+    total_items: int,
+    context_ready_items: int,
+    embedded_items: int,
+    failed_items: int,
+    skipped_items: int,
+) -> RegulatoryIndexingProgress:
+    status = RegulatoryIndexingJobStatus(job.status)
+    stage = RegulatoryIndexingStage(job.stage)
+    if status is RegulatoryIndexingJobStatus.SUCCEEDED:
+        completed_items = total_items
+    elif stage in {
+        RegulatoryIndexingStage.CONTEXT_SUBMIT,
+        RegulatoryIndexingStage.CONTEXT_WAIT,
+        RegulatoryIndexingStage.CONTEXT_APPLY,
+    }:
+        completed_items = context_ready_items + skipped_items
+    elif stage in {
+        RegulatoryIndexingStage.EMBEDDING,
+        RegulatoryIndexingStage.INDEX_WRITE,
+    }:
+        completed_items = embedded_items
+    elif stage in {
+        RegulatoryIndexingStage.VERIFY,
+        RegulatoryIndexingStage.PUBLISH,
+    }:
+        completed_items = total_items
+    else:
+        completed_items = 0
+
+    return RegulatoryIndexingProgress(
+        job_id=job.id,
+        status=status,
+        stage=stage,
+        total_items=total_items,
+        completed_items=min(total_items, max(0, completed_items)),
+        context_ready_items=context_ready_items,
+        embedded_items=embedded_items,
+        failed_items=failed_items,
+        attempt_count=job.attempt_count,
+        next_retry_at=job.next_retry_at,
+        error_summary=_safe_progress_error_summary(
+            job,
+            failed_items=failed_items,
+        ),
+        provider_batch_state=_provider_batch_state(job),
+    )
+
+
 def _lock_user_file_for_regulatory_job(
     db_session: Session,
     job_id: UUID,
@@ -485,6 +606,130 @@ def get_regulatory_indexing_job(
     job_id: UUID,
 ) -> RegulatoryIndexingJob | None:
     return db_session.get(RegulatoryIndexingJob, job_id)
+
+
+def fetch_latest_regulatory_indexing_progress_for_user_files(
+    db_session: Session,
+    *,
+    user_file_ids: Sequence[UUID],
+) -> dict[UUID, RegulatoryIndexingProgress]:
+    """Fetch one deterministic current-job snapshot for every requested file."""
+
+    unique_file_ids = tuple(dict.fromkeys(user_file_ids))
+    if not unique_file_ids:
+        return {}
+
+    active_job_priority = case(
+        (RegulatoryIndexingJob.status.in_(_ACTIVE_REGULATORY_INDEXING_JOB_STATUSES), 0),
+        else_=1,
+    )
+    ranked_jobs = (
+        select(
+            RegulatoryIndexingJob.id.label("job_id"),
+            RegulatoryIndexingJob.user_file_id.label("user_file_id"),
+            func.row_number()
+            .over(
+                partition_by=RegulatoryIndexingJob.user_file_id,
+                order_by=(
+                    active_job_priority.asc(),
+                    RegulatoryIndexingJob.created_at.desc(),
+                    RegulatoryIndexingJob.id.desc(),
+                ),
+            )
+            .label("job_rank"),
+        )
+        .where(RegulatoryIndexingJob.user_file_id.in_(unique_file_ids))
+        .cte("ranked_regulatory_indexing_jobs")
+    )
+    latest_jobs = (
+        select(ranked_jobs.c.job_id, ranked_jobs.c.user_file_id)
+        .where(ranked_jobs.c.job_rank == 1)
+        .cte("latest_regulatory_indexing_jobs")
+    )
+    item_counts = (
+        select(
+            RegulatoryIndexingItem.job_id.label("job_id"),
+            func.count(RegulatoryIndexingItem.id).label("total_items"),
+            func.sum(
+                case(
+                    (
+                        RegulatoryIndexingItem.status.in_(
+                            (
+                                RegulatoryIndexingItemStatus.CONTEXT_READY.value,
+                                RegulatoryIndexingItemStatus.EMBEDDED.value,
+                            )
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("context_ready_items"),
+            func.sum(
+                case(
+                    (
+                        RegulatoryIndexingItem.status
+                        == RegulatoryIndexingItemStatus.EMBEDDED.value,
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("embedded_items"),
+            func.sum(
+                case(
+                    (
+                        RegulatoryIndexingItem.status
+                        == RegulatoryIndexingItemStatus.FAILED.value,
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("failed_items"),
+            func.sum(
+                case(
+                    (
+                        RegulatoryIndexingItem.status
+                        == RegulatoryIndexingItemStatus.SKIPPED.value,
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("skipped_items"),
+        )
+        .where(RegulatoryIndexingItem.job_id.in_(select(latest_jobs.c.job_id)))
+        .group_by(RegulatoryIndexingItem.job_id)
+        .subquery("regulatory_indexing_item_counts")
+    )
+    statement = (
+        select(
+            RegulatoryIndexingJob,
+            func.coalesce(item_counts.c.total_items, 0),
+            func.coalesce(item_counts.c.context_ready_items, 0),
+            func.coalesce(item_counts.c.embedded_items, 0),
+            func.coalesce(item_counts.c.failed_items, 0),
+            func.coalesce(item_counts.c.skipped_items, 0),
+        )
+        .join(latest_jobs, latest_jobs.c.job_id == RegulatoryIndexingJob.id)
+        .outerjoin(item_counts, item_counts.c.job_id == RegulatoryIndexingJob.id)
+    )
+
+    progress_by_file_id: dict[UUID, RegulatoryIndexingProgress] = {}
+    for (
+        job,
+        total_items,
+        context_ready_items,
+        embedded_items,
+        failed_items,
+        skipped_items,
+    ) in db_session.execute(statement).all():
+        progress_by_file_id[job.user_file_id] = _build_regulatory_indexing_progress(
+            job,
+            total_items=total_items,
+            context_ready_items=context_ready_items,
+            embedded_items=embedded_items,
+            failed_items=failed_items,
+            skipped_items=skipped_items,
+        )
+    return progress_by_file_id
 
 
 def get_regulatory_indexing_runtime(
