@@ -99,6 +99,15 @@ DEFER_USER_FILE_INDEXING = (
     os.environ.get("DEFER_USER_FILE_INDEXING", "false").lower() == "true"
 )
 
+# Restricts Celery Beat to the named tasks. Deployments that run a subset of the
+# workers use this so beat does not fire recurring work onto queues nothing
+# consumes. Empty (the default) schedules everything, as a full deployment wants.
+BEAT_TASK_ALLOWLIST: list[str] = [
+    name.strip()
+    for name in os.environ.get("BEAT_TASK_ALLOWLIST", "").split(",")
+    if name.strip()
+]
+
 # Disables vector DB (Vespa/Elasticsearch) entirely. When True, connectors and RAG search
 # are disabled but core chat, tools, user file uploads, and Projects still work.
 DISABLE_VECTOR_DB = os.environ.get("DISABLE_VECTOR_DB", "").lower() == "true"

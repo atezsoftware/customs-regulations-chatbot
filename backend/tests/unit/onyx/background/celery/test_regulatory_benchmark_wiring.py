@@ -912,8 +912,9 @@ def test_full_and_lite_supervisors_consume_regulatory_benchmark_queue() -> None:
 
     lite_config = (backend_root / "supervisord-lite.conf").read_text(encoding="utf-8")
     assert "celery_worker_scheduled_tasks" not in lite_config
-    assert "celery_beat" not in lite_config
     assert "elasticsearch_migration" not in lite_config
+    # Beat does run here, restricted by BEAT_TASK_ALLOWLIST to the user-file
+    # retry loop (see test_user_file_processing_lite_wiring).
     # Connector ingestion stays out; user-file indexing does not, because
     # markdown uploads are served here (see test_user_file_processing_lite_wiring).
     assert "celery_worker_docfetching" not in lite_config

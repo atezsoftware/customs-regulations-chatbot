@@ -64,6 +64,10 @@ ENV ONYX_RUNNING_IN_DOCKER="true" \
 # keep the upload-and-index flow.
 ENV DEFER_USER_FILE_INDEXING="true"
 
+# Beat here exists only to retry user-file work whose task expired; the rest of
+# the schedule targets queues this image runs no worker for.
+ENV BEAT_TASK_ALLOWLIST="check_for_user_file_processing,check_for_user_file_project_sync,check_for_user_file_delete"
+
 RUN groupadd -g 1001 onyx && \
     useradd -u 1001 -g onyx -m -s /bin/bash onyx && \
     mkdir -p /var/log/onyx /app/file-system && \

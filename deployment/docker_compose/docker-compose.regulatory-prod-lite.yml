@@ -77,7 +77,7 @@ services:
           import subprocess
           result = subprocess.run(["supervisorctl", "status"], capture_output=True, text=True)
           rows = [line.split() for line in result.stdout.splitlines() if line.split()]
-          expected = {"celery_worker_regulatory_benchmark", "celery_worker_user_file_processing", "celery_worker_light", "celery_worker_monitoring", "log-redirect-handler"}
+          expected = {"celery_worker_regulatory_benchmark", "celery_beat", "celery_worker_user_file_processing", "celery_worker_light", "celery_worker_monitoring", "log-redirect-handler"}
           assert result.returncode == 0 and {row[0] for row in rows} == expected and all(len(row) > 1 and row[1] == "RUNNING" for row in rows)
       interval: 30s
       timeout: 10s

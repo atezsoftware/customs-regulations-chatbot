@@ -7,6 +7,7 @@ from celery.schedules import crontab
 from onyx.configs.app_configs import (
     AUTO_LLM_CONFIG_URL,
     AUTO_LLM_UPDATE_INTERVAL_SECONDS,
+    BEAT_TASK_ALLOWLIST,
     DISABLE_ELASTICSEARCH_MIGRATION_TASK,
     DISABLE_VECTOR_DB,
     ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX,
@@ -485,4 +486,18 @@ def get_cloud_tasks_to_schedule(beat_multiplier: float) -> list[dict[str, Any]]:
 
 
 def get_tasks_to_schedule() -> list[dict[str, Any]]:
-    return tasks_to_schedule
+    if not BEAT_TASK_ALLOWLIST:
+        return tasks_to_schedule
+
+    scheduled = [
+        task for task in tasks_to_schedule if task["task"] in BEAT_TASK_ALLOWLIST
+    ]
+    # A misspelled entry would silently drop the task it was meant to keep, and
+    # the loss only shows up as work that quietly stops happening.
+    unknown = set(BEAT_TASK_ALLOWLIST) - {task["task"] for task in scheduled}
+    if unknown:
+        raise ValueError(
+            "BEAT_TASK_ALLOWLIST names tasks that are not scheduled: "
+            + ", ".join(sorted(unknown))
+        )
+    return scheduled

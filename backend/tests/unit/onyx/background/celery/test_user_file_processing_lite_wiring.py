@@ -141,3 +141,34 @@ def test_lite_user_file_queues_have_exactly_one_consumer_each() -> None:
 
     assert sorted(consumed) == sorted(set(consumed)), queues_by_program
     assert "user_file_processing" in consumed
+
+
+def test_lite_image_runs_beat_so_expired_processing_tasks_are_retried() -> None:
+    """A bulk upload enqueues more tasks than fit inside their expiry window.
+
+    The tasks that expire are discarded silently, and the files they belonged to
+    stay in PROCESSING forever unless something re-queues them. That something is
+    beat, which the image previously did not run.
+    """
+
+    config = _lite_supervisord()
+
+    assert "[program:celery_beat]" in config
+    assert "versioned_apps.beat beat" in config
+
+
+def test_lite_beat_is_restricted_to_work_this_image_can_run() -> None:
+    """An unrestricted beat would fire connector and pruning work at queues no
+    worker here consumes."""
+
+    dockerfile = (_backend_root() / "Dockerfile.runtime-lite").read_text(
+        encoding="utf-8"
+    )
+
+    assert "BEAT_TASK_ALLOWLIST=" in dockerfile
+    for task_name in (
+        "check_for_user_file_processing",
+        "check_for_user_file_project_sync",
+        "check_for_user_file_delete",
+    ):
+        assert task_name in dockerfile
