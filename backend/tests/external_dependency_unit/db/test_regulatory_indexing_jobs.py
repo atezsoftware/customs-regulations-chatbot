@@ -36,11 +36,13 @@ from onyx.db.regulatory_indexing_jobs import (
     RegulatoryIndexingConfigSnapshot,
     advance_regulatory_indexing_cancellation,
     advance_regulatory_indexing_job,
+    advance_regulatory_provider_cleanup,
     claim_due_regulatory_provider_cleanups,
     claim_regulatory_indexing_job,
     claim_stale_regulatory_indexing_jobs,
     complete_regulatory_indexing_publication,
     complete_regulatory_indexing_user_file,
+    complete_regulatory_provider_cleanup,
     consume_preclaimed_regulatory_indexing_delivery,
     consume_regulatory_provider_cleanup_delivery,
     create_or_get_regulatory_indexing_item,
@@ -568,10 +570,68 @@ def test_deletion_cleans_multiple_generations_sequentially(
         )
         remaining_ids.remove(activated.id)
 
-    ready = request_user_file_deletion_cleanup(
+    blocked = request_user_file_deletion_cleanup(
         db_session,
         user_file_id=regulatory_user_file.id,
         now=_NOW + datetime.timedelta(minutes=5),
+    )
+    assert blocked.ready_to_delete is False
+    assert blocked.deliveries == ()
+
+    cleanup_claims = claim_due_regulatory_provider_cleanups(
+        db_session,
+        stale_before=_NOW,
+        claimed_at=_NOW + datetime.timedelta(minutes=5),
+        limit=10,
+    )
+    assert {claim.job_id for claim in cleanup_claims} == {
+        first.id,
+        second.id,
+        active.id,
+    }
+    for claim in cleanup_claims:
+        assert consume_regulatory_provider_cleanup_delivery(
+            db_session,
+            job_id=claim.job_id,
+            cleanup_generation=claim.cleanup_generation,
+            cleanup_token=claim.cleanup_token,
+            consumed_at=_NOW + datetime.timedelta(minutes=5),
+        )
+        assert advance_regulatory_provider_cleanup(
+            db_session,
+            job_id=claim.job_id,
+            cleanup_generation=claim.cleanup_generation,
+            expected_phase=RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP,
+            next_phase=RegulatoryIndexingProviderCleanupPhase.COMPLETE,
+            now=_NOW + datetime.timedelta(minutes=5),
+        )
+
+    completion_claims = claim_due_regulatory_provider_cleanups(
+        db_session,
+        stale_before=_NOW,
+        claimed_at=_NOW + datetime.timedelta(minutes=6),
+        limit=10,
+    )
+    assert len(completion_claims) == 3
+    for claim in completion_claims:
+        assert consume_regulatory_provider_cleanup_delivery(
+            db_session,
+            job_id=claim.job_id,
+            cleanup_generation=claim.cleanup_generation,
+            cleanup_token=claim.cleanup_token,
+            consumed_at=_NOW + datetime.timedelta(minutes=6),
+        )
+        assert complete_regulatory_provider_cleanup(
+            db_session,
+            job_id=claim.job_id,
+            cleanup_generation=claim.cleanup_generation,
+            now=_NOW + datetime.timedelta(minutes=6),
+        )
+
+    ready = request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=regulatory_user_file.id,
+        now=_NOW + datetime.timedelta(minutes=7),
     )
     assert ready.ready_to_delete is True
     assert ready.deliveries == ()
@@ -2605,13 +2665,43 @@ def test_deletion_tombstone_generation_fences_every_non_cancelled_job(
     assert repeated.deliveries == first.deliveries
 
 
-def test_deletion_waits_for_terminal_cancellation_without_removing_state(
+@pytest.mark.parametrize(
+    "cleanup_state,cleanup_phase",
+    [
+        (
+            RegulatoryIndexingProviderCleanupState.PENDING,
+            RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP,
+        ),
+        (
+            RegulatoryIndexingProviderCleanupState.RETRY_WAIT,
+            RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP,
+        ),
+        (
+            RegulatoryIndexingProviderCleanupState.EXHAUSTED,
+            RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP,
+        ),
+        (
+            RegulatoryIndexingProviderCleanupState.PENDING,
+            RegulatoryIndexingProviderCleanupPhase.VERTEX_RECONCILE,
+        ),
+    ],
+)
+def test_deletion_blocks_every_incomplete_provider_cleanup_state(
     db_session: Session,
     regulatory_user_file: UserFile,
+    cleanup_state: RegulatoryIndexingProviderCleanupState,
+    cleanup_phase: RegulatoryIndexingProviderCleanupPhase,
 ) -> None:
     job = _create_job(db_session, regulatory_user_file.id)
     job.status = RegulatoryIndexingJobStatus.CANCELLED.value
     job.cancellation_phase = RegulatoryIndexingCancellationPhase.FINALIZE.value
+    job.provider_cleanup_state = cleanup_state.value
+    job.provider_cleanup_phase = cleanup_phase.value
+    if cleanup_state in {
+        RegulatoryIndexingProviderCleanupState.RETRY_WAIT,
+        RegulatoryIndexingProviderCleanupState.EXHAUSTED,
+    }:
+        job.provider_cleanup_next_retry_at = _NOW + datetime.timedelta(minutes=5)
     regulatory_user_file.status = UserFileStatus.DELETING
     db_session.commit()
 
@@ -2621,10 +2711,93 @@ def test_deletion_waits_for_terminal_cancellation_without_removing_state(
         now=_NOW,
     )
 
-    assert plan.ready_to_delete is True
+    assert plan.ready_to_delete is False
     assert plan.deliveries == ()
     assert db_session.get(UserFile, regulatory_user_file.id) is not None
     assert db_session.get(RegulatoryIndexingJob, job.id) is not None
+
+
+def test_deletion_becomes_ready_only_after_cancelled_job_cleanup_completes(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    job.status = RegulatoryIndexingJobStatus.CANCELLED.value
+    job.cancellation_phase = RegulatoryIndexingCancellationPhase.FINALIZE.value
+    job.provider_cleanup_state = RegulatoryIndexingProviderCleanupState.PENDING.value
+    job.provider_cleanup_phase = RegulatoryIndexingProviderCleanupPhase.COMPLETE.value
+    job.completed_at = _NOW
+    regulatory_user_file.status = UserFileStatus.DELETING
+    db_session.commit()
+
+    blocked = request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=regulatory_user_file.id,
+        now=_NOW,
+    )
+    assert blocked.ready_to_delete is False
+    assert blocked.deliveries == ()
+
+    claim = claim_due_regulatory_provider_cleanups(
+        db_session,
+        stale_before=_NOW - datetime.timedelta(minutes=1),
+        claimed_at=_NOW,
+        limit=1,
+    )[0]
+    assert consume_regulatory_provider_cleanup_delivery(
+        db_session,
+        job_id=job.id,
+        cleanup_generation=claim.cleanup_generation,
+        cleanup_token=claim.cleanup_token,
+        consumed_at=_NOW,
+    )
+    assert complete_regulatory_provider_cleanup(
+        db_session,
+        job_id=job.id,
+        cleanup_generation=claim.cleanup_generation,
+        now=_NOW + datetime.timedelta(seconds=1),
+    )
+
+    db_session.expire_all()
+    ready = request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=regulatory_user_file.id,
+        now=_NOW + datetime.timedelta(seconds=2),
+    )
+    assert ready.ready_to_delete is True
+    assert ready.deliveries == ()
+
+
+def test_deletion_schedules_cleanup_for_a_legacy_cancelled_job(
+    db_session: Session,
+    regulatory_user_file: UserFile,
+) -> None:
+    job = _create_job(db_session, regulatory_user_file.id)
+    job.status = RegulatoryIndexingJobStatus.CANCELLED.value
+    job.cancellation_phase = RegulatoryIndexingCancellationPhase.FINALIZE.value
+    job.provider_cleanup_state = RegulatoryIndexingProviderCleanupState.NONE.value
+    job.provider_cleanup_phase = RegulatoryIndexingProviderCleanupPhase.NONE.value
+    job.completed_at = _NOW
+    regulatory_user_file.status = UserFileStatus.DELETING
+    db_session.commit()
+
+    blocked = request_user_file_deletion_cleanup(
+        db_session,
+        user_file_id=regulatory_user_file.id,
+        now=_NOW,
+    )
+
+    db_session.refresh(job)
+    assert blocked.ready_to_delete is False
+    assert blocked.deliveries == ()
+    assert (
+        job.provider_cleanup_state
+        == RegulatoryIndexingProviderCleanupState.PENDING.value
+    )
+    assert (
+        job.provider_cleanup_phase
+        == RegulatoryIndexingProviderCleanupPhase.GCS_CLEANUP.value
+    )
 
 
 def test_user_cancel_intent_remains_distinct_from_supersession_and_deletion(

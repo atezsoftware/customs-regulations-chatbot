@@ -304,10 +304,17 @@ def test_large_file_selection_reuses_one_document_context_and_stays_bounded(
         ordered_rows: Sequence[RegulatoryChunk],
         *,
         tokenizer: BaseTokenizer,
+        max_utf8_bytes: int,
+        max_tokens: int,
     ) -> object:
         nonlocal prepare_calls
         prepare_calls += 1
-        return original_prepare(ordered_rows, tokenizer=tokenizer)
+        return original_prepare(
+            ordered_rows,
+            tokenizer=tokenizer,
+            max_utf8_bytes=max_utf8_bytes,
+            max_tokens=max_tokens,
+        )
 
     monkeypatch.setattr(contextual, "_prepare_document_context", counting_prepare)
     jsonl_cap = 4 * 1024 * 1024
@@ -328,6 +335,60 @@ def test_large_file_selection_reuses_one_document_context_and_stays_bounded(
         jsonl_cap
     )
     assert prepare_calls == 1
+
+
+def test_document_context_preparation_stops_before_consuming_a_100mb_snapshot() -> None:
+    job = _job()
+    chunk_text = "x" * 10_000
+
+    class _LogicalLargeRows:
+        access_count = 0
+
+        def __len__(self) -> int:
+            return 10_000
+
+        def __getitem__(self, index: int) -> RegulatoryChunk:
+            if index < 0:
+                index += len(self)
+            if index < 0 or index >= len(self):
+                raise IndexError(index)
+            self.access_count += 1
+            if self.access_count > 16:
+                raise AssertionError("document context consumed past its byte ceiling")
+            return _row(
+                job,
+                row_id=f"rc_logical_{index}",
+                position=index,
+                text=chunk_text,
+                heading_path=[f"MADDE {index + 1}"],
+            )
+
+    source = _LogicalLargeRows()
+    tokenizer = contextual.get_contextual_token_budget_tokenizer(
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name="gemini-3.1-flash-lite",
+    )
+    context_cap = 64 * 1024
+
+    prepared = contextual._prepare_document_context(
+        cast(Sequence[RegulatoryChunk], source),
+        tokenizer=tokenizer,
+        max_utf8_bytes=context_cap,
+        max_tokens=context_cap,
+    )
+
+    assert source.access_count < 16
+    assert len(prepared.text.encode("utf-8")) <= context_cap
+    assert isinstance(prepared.tokens, bytes)
+    assert "MADDE 1" in prepared.text
+    assert "MADDE 10000" not in prepared.text
+    assert "MADDE 10000" in prepared.boundary_anchors
+    fitted = contextual._fit_document_context(
+        prepared,
+        token_budget=context_cap,
+        tokenizer=tokenizer,
+    )
+    assert len(fitted.encode("utf-8")) <= context_cap
 
 
 def test_document_context_cache_is_bounded_across_many_validity_snapshots(

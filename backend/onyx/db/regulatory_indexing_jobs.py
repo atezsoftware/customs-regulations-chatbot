@@ -602,6 +602,13 @@ def request_user_file_deletion_cleanup(
     if len(active_jobs) > 1:
         db_session.rollback()
         raise RuntimeError("user file has multiple active regulatory indexing jobs")
+    for terminal_job in locked_jobs:
+        if (
+            terminal_job.status == RegulatoryIndexingJobStatus.CANCELLED.value
+            and terminal_job.provider_cleanup_state
+            == RegulatoryIndexingProviderCleanupState.NONE.value
+        ):
+            _schedule_provider_cleanup(terminal_job, now=now, cancel_first=True)
     job = (
         active_jobs[0]
         if active_jobs
@@ -649,7 +656,17 @@ def request_user_file_deletion_cleanup(
 
     db_session.commit()
     return UserFileDeletionCleanupPlan(
-        ready_to_delete=job is None,
+        ready_to_delete=(
+            job is None
+            and all(
+                candidate.status == RegulatoryIndexingJobStatus.CANCELLED.value
+                and candidate.provider_cleanup_state
+                == RegulatoryIndexingProviderCleanupState.SUCCEEDED.value
+                and candidate.provider_cleanup_phase
+                == RegulatoryIndexingProviderCleanupPhase.COMPLETE.value
+                for candidate in locked_jobs
+            )
+        ),
         deliveries=tuple(deliveries),
     )
 

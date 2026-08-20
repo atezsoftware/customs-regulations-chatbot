@@ -4,8 +4,8 @@ Date: 2026-08-20
 
 This bounded wave resolves final-review findings 2, 3, 6, 7, 8, and 9 without
 changing canonical Markdown chunking, feature flags, tenant fencing, dynamic
-SearchSettings dimensions, deletion/supersession behavior, or the lite runtime
-boundary.
+SearchSettings dimensions, sequential deletion/supersession, or the lite
+runtime boundary.
 
 ## Implemented contracts
 
@@ -21,8 +21,11 @@ boundary.
   caps; omitted, never-submitted items are not charged. Partial/remote-error
   subsets retain their charge and eventually fail closed at the configured
   budget. JSONL upload, result reads, and GCS deletion are streamed/batched.
-- Context preparation reuses sorted rows and tokenized legal snapshots, with a
-  bounded LRU across distinct validity dates. Existing Markdown chunks remain
+- Context preparation walks canonical chunk strings incrementally and stops at
+  the smaller of the frozen JSONL UTF-8 byte cap and the contextual model's safe
+  token ceiling. It never joins or tokenizes the whole document, retains only a
+  capped prepared snapshot in the bounded validity-date LRU, and keeps boundary
+  headings when truncation is required. Existing Markdown chunks remain
   canonical. Gemini receives each chunk's contextual prompt, and OpenRouter
   embeds only generated context plus that original chunk at the persisted
   SearchSettings dimension; no whole-document embedding was added.
@@ -36,7 +39,10 @@ boundary.
   keys, and exception details are absent from added diagnostics.
 - Success, failure, cancellation, and settings-drift termination schedule durable
   Vertex cancel/reconcile/delete and GCS cleanup. One-use generation-fenced
-  cleanup deliveries survive restarts; exhausted cleanup remains sweepable.
+  cleanup deliveries survive restarts; exhausted cleanup remains sweepable. A
+  file deletion cannot cascade until every historical job is `CANCELLED` and
+  provider cleanup is `SUCCEEDED` at phase `COMPLETE`; legacy cancelled rows in
+  state `NONE` are first made cleanup-scanner eligible.
 - Added and documented `REGULATORY_INDEXING_CONTEXT_REQUEST_SIZE`,
   `REGULATORY_INDEXING_CONTEXT_JSONL_MAX_BYTES`, and
   `REGULATORY_INDEXING_SUBMISSION_RECONCILE_SECONDS` in the lite environment and
@@ -88,3 +94,23 @@ resources were disposable local containers.
   secret scanning, large-file, and environment-drift checks.
 - `git diff --check` and the final single-head/current checks passed before
   commit.
+
+## Review closure for bounded context and deletion readiness
+
+- A logical 100 MB canonical `Sequence` fails the test immediately if context
+  preparation consumes more than the capped prefix. The regression proves the
+  source is not fully consumed and the final UTF-8 contextual input remains
+  within 64 KiB; the focused contextual suite passed `14 passed in 3.93s`.
+- Real PostgreSQL tests cover `CANCELLED` jobs in `PENDING`, `RETRY_WAIT`,
+  `EXHAUSTED`, and `VERTEX_RECONCILE`, cleanup completion before deletion, and
+  restart-safe scheduling of legacy `NONE` rows. The full repository suite
+  passed `62 passed in 8.81s`.
+- The cleanup orchestration suite passed `35 passed in 2.61s`, including
+  late-visible reconciliation followed by remote deletion, and the user-file
+  delete worker suite passed `18 passed in 2.69s`.
+- The real PostgreSQL + local HTTP embedder + Elasticsearch 8.6.2 production
+  path passed `1 passed in 14.49s` after the bounded-context and deletion-gate
+  changes.
+- The expanded relevant unit suite passed `623 passed in 13.94s`. Final
+  touched-file pre-commit passed `ty`, Ruff, formatting, secret scanning, and
+  every other applicable hook.

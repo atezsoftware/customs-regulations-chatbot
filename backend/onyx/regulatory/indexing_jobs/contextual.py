@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import cast
@@ -136,19 +136,68 @@ def _row_block(row: RegulatoryChunk) -> str:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedDocumentContext:
-    rows: tuple[RegulatoryChunk, ...]
+    row_count: int
     text: str
-    tokens: tuple[int, ...]
+    tokens: tuple[int, ...] | bytes
     boundary_anchors: str
-    boundary_anchor_tokens: tuple[int, ...]
+    boundary_anchor_tokens: tuple[int, ...] | bytes
+    truncated: bool
+
+
+def _utf8_prefix(value: str, max_bytes: int) -> tuple[str, int, bool]:
+    """Take a UTF-8-safe prefix without encoding more than the bounded prefix."""
+
+    if max_bytes <= 0:
+        return "", 0, not value
+    if len(value) <= max_bytes:
+        encoded = value.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return value, len(encoded), True
+    encoded_prefix = value[:max_bytes].encode("utf-8")
+    prefix = encoded_prefix[:max_bytes].decode("utf-8", errors="ignore")
+    return prefix, len(prefix.encode("utf-8")), len(prefix) == len(value)
+
+
+def _append_bounded_row_block(
+    parts: list[str],
+    row: RegulatoryChunk,
+    *,
+    remaining_bytes: int,
+) -> tuple[int, bool]:
+    used_bytes = 0
+
+    def pieces() -> Iterator[str]:
+        yield f"[Canonical position: {row.position}]\nHeading path: "
+        for index, heading in enumerate(row.heading_path):
+            if index:
+                yield " > "
+            yield heading
+        yield "\n"
+        yield row.text
+
+    for piece in pieces():
+        prefix, prefix_bytes, complete = _utf8_prefix(
+            piece, remaining_bytes - used_bytes
+        )
+        if prefix:
+            parts.append(prefix)
+            used_bytes += prefix_bytes
+        if not complete:
+            return used_bytes, False
+    return used_bytes, True
 
 
 def _prepare_document_context(
     ordered_rows: Sequence[RegulatoryChunk],
     *,
     tokenizer: BaseTokenizer,
+    max_utf8_bytes: int,
+    max_tokens: int,
 ) -> _PreparedDocumentContext:
-    document = "\n\n".join(_row_block(candidate) for candidate in ordered_rows)
+    if not ordered_rows:
+        raise ContextualMappingError("canonical regulatory document is empty")
+    if max_utf8_bytes <= 0 or max_tokens <= 0:
+        raise ContextualMappingError("document context limits must be positive")
     first_heading = (
         ordered_rows[0].heading_path[-1] if ordered_rows[0].heading_path else ""
     )
@@ -158,12 +207,59 @@ def _prepare_document_context(
     boundary_anchors = (
         f"[Document boundary headings: {first_heading} | {last_heading}]\n"
     )
+    if isinstance(tokenizer, VertexUTF8ContextualBudgetTokenizer):
+        boundary_anchor_tokens: tuple[int, ...] | bytes = boundary_anchors.encode(
+            "utf-8"
+        )
+    else:
+        boundary_anchor_tokens = tuple(tokenizer.encode(boundary_anchors))
+    context_ceiling = min(max_utf8_bytes, max_tokens)
+    document_ceiling = context_ceiling - len(boundary_anchor_tokens)
+    if document_ceiling <= 0:
+        raise ContextualMappingError(
+            "contextual model input window cannot preserve document boundaries"
+        )
+
+    parts: list[str] = []
+    used_bytes = 0
+    truncated = False
+    for index, row in enumerate(ordered_rows):
+        if index:
+            separator, separator_bytes, complete = _utf8_prefix(
+                "\n\n", document_ceiling - used_bytes
+            )
+            if separator:
+                parts.append(separator)
+                used_bytes += separator_bytes
+            if not complete:
+                truncated = True
+                break
+        row_bytes, complete = _append_bounded_row_block(
+            parts,
+            row,
+            remaining_bytes=document_ceiling - used_bytes,
+        )
+        used_bytes += row_bytes
+        if not complete:
+            truncated = True
+            break
+    document = "".join(parts)
+    if isinstance(tokenizer, VertexUTF8ContextualBudgetTokenizer):
+        tokens: tuple[int, ...] | bytes = document.encode("utf-8")
+    else:
+        encoded_tokens = tokenizer.encode(document)
+        if len(encoded_tokens) > document_ceiling:
+            encoded_tokens = encoded_tokens[:document_ceiling]
+            document = tokenizer.decode(encoded_tokens)
+            truncated = True
+        tokens = tuple(encoded_tokens)
     return _PreparedDocumentContext(
-        rows=tuple(ordered_rows),
+        row_count=len(ordered_rows),
         text=document,
-        tokens=tuple(tokenizer.encode(document)),
+        tokens=tokens,
         boundary_anchors=boundary_anchors,
-        boundary_anchor_tokens=tuple(tokenizer.encode(boundary_anchors)),
+        boundary_anchor_tokens=boundary_anchor_tokens,
+        truncated=truncated,
     )
 
 
@@ -173,23 +269,32 @@ def _fit_document_context(
     token_budget: int,
     tokenizer: BaseTokenizer,
 ) -> str:
-    if len(prepared.tokens) <= token_budget:
+    if len(prepared.tokens) <= token_budget and not prepared.truncated:
         return prepared.text
     remaining_budget = token_budget - len(prepared.boundary_anchor_tokens)
     if remaining_budget <= 0:
         raise ContextualMappingError(
             "contextual model input window cannot preserve document boundaries"
         )
-    try:
-        representative_document = tokenizer_trim_middle(
-            list(prepared.tokens),
-            remaining_budget,
-            tokenizer,
-        )
-    except AssertionError as error:
-        raise ContextualMappingError(
-            "contextual model input window is too small for document context"
-        ) from error
+    if len(prepared.tokens) <= remaining_budget:
+        representative_document = prepared.text
+    elif isinstance(prepared.tokens, bytes):
+        first_size = remaining_budget // 2
+        last_size = remaining_budget - first_size
+        representative_document = prepared.tokens[:first_size].decode(
+            "utf-8", errors="ignore"
+        ) + prepared.tokens[-last_size:].decode("utf-8", errors="ignore")
+    else:
+        try:
+            representative_document = tokenizer_trim_middle(
+                list(prepared.tokens),
+                remaining_budget,
+                tokenizer,
+            )
+        except AssertionError as error:
+            raise ContextualMappingError(
+                "contextual model input window is too small for document context"
+            ) from error
     return f"{prepared.boundary_anchors}{representative_document}"
 
 
@@ -204,6 +309,28 @@ def _contextual_model_name(job: RegulatoryIndexingJob) -> str:
     return model_name
 
 
+def _contextual_safe_input_limit(job: RegulatoryIndexingJob) -> int:
+    return int(
+        get_max_input_tokens(
+            model_name=_contextual_model_name(job),
+            model_provider=LlmProviderNames.VERTEX_AI,
+            output_tokens=_VERTEX_BATCH_MAX_OUTPUT_TOKENS,
+        )
+        * (1 - GEN_AI_INPUT_TOKEN_SAFETY_MARGIN)
+    )
+
+
+def _document_context_utf8_byte_limit(job: RegulatoryIndexingJob) -> int:
+    configured = job.config_snapshot.get("context_jsonl_max_bytes", 8 * 1024 * 1024)
+    if (
+        not isinstance(configured, int)
+        or isinstance(configured, bool)
+        or configured <= 0
+    ):
+        raise ContextualMappingError("indexing job has no valid context byte limit")
+    return configured
+
+
 @dataclass(slots=True)
 class ContextualRequestFactory:
     """Reuse sorted rows and tokenized document snapshots across chunk prompts."""
@@ -214,9 +341,9 @@ class ContextualRequestFactory:
     embedding_tokenizer: BaseTokenizer | None = None
     _ordered_rows: tuple[RegulatoryChunk, ...] = field(init=False)
     _row_by_id: dict[str, RegulatoryChunk] = field(init=False)
-    _documents: OrderedDict[
-        datetime.date, tuple[tuple[RegulatoryChunk, ...], _PreparedDocumentContext]
-    ] = field(init=False, default_factory=OrderedDict)
+    _documents: OrderedDict[datetime.date, _PreparedDocumentContext] = field(
+        init=False, default_factory=OrderedDict
+    )
 
     def __post_init__(self) -> None:
         self._ordered_rows = tuple(_ordered_rows(self.rows))
@@ -234,9 +361,7 @@ class ContextualRequestFactory:
             )
         return canonical_row
 
-    def _document(
-        self, row: RegulatoryChunk
-    ) -> tuple[tuple[RegulatoryChunk, ...], _PreparedDocumentContext]:
+    def _document(self, row: RegulatoryChunk) -> _PreparedDocumentContext:
         canonical_row = self._canonical_row(row)
         reference_date = context_reference_date(
             canonical_row.validity_start_date,
@@ -246,22 +371,19 @@ class ContextualRequestFactory:
         if cached is not None:
             self._documents.move_to_end(reference_date)
             return cached
-        visible_rows = tuple(
-            _ordered_rows(
-                visible_regulatory_snapshot_for_target(
-                    self._ordered_rows, canonical_row
-                )
-            )
+        visible_rows = _ordered_rows(
+            visible_regulatory_snapshot_for_target(self._ordered_rows, canonical_row)
         )
         prepared = _prepare_document_context(
             visible_rows,
             tokenizer=self.contextual_tokenizer,
+            max_utf8_bytes=_document_context_utf8_byte_limit(self.job),
+            max_tokens=_contextual_safe_input_limit(self.job),
         )
-        cached = (visible_rows, prepared)
-        self._documents[reference_date] = cached
+        self._documents[reference_date] = prepared
         if len(self._documents) > _MAX_CACHED_DOCUMENT_CONTEXTS:
             self._documents.popitem(last=False)
-        return cached
+        return prepared
 
     def reserve(self, row: RegulatoryChunk) -> int:
         if self.embedding_tokenizer is None:
@@ -269,8 +391,8 @@ class ContextualRequestFactory:
                 "contextual reserve requires an embedding tokenizer"
             )
         canonical_row = self._canonical_row(row)
-        visible_rows, _prepared = self._document(canonical_row)
-        if len(visible_rows) <= 1:
+        prepared = self._document(canonical_row)
+        if prepared.row_count <= 1:
             return 0
         return contextual_reserve_for_embedding_text(
             canonical_row.text,
@@ -281,7 +403,7 @@ class ContextualRequestFactory:
 
     def request(self, row: RegulatoryChunk) -> VertexBatchRequest:
         canonical_row = self._canonical_row(row)
-        _visible_rows, prepared = self._document(canonical_row)
+        prepared = self._document(canonical_row)
         return _contextual_request_for_prepared_document(
             self.job,
             canonical_row,
@@ -342,14 +464,7 @@ def _contextual_request_for_prepared_document(
     prompt_without_document = CONTEXTUAL_RAG_PROMPT1.format(
         document=""
     ) + CONTEXTUAL_RAG_PROMPT2.format(chunk=chunk_block)
-    contextual_model_input_limit = get_max_input_tokens(
-        model_name=_contextual_model_name(job),
-        model_provider=LlmProviderNames.VERTEX_AI,
-        output_tokens=_VERTEX_BATCH_MAX_OUTPUT_TOKENS,
-    )
-    safe_input_limit = int(
-        contextual_model_input_limit * (1 - GEN_AI_INPUT_TOKEN_SAFETY_MARGIN)
-    )
+    safe_input_limit = _contextual_safe_input_limit(job)
     document_token_budget = safe_input_limit - len(
         contextual_tokenizer.encode(prompt_without_document)
     )
