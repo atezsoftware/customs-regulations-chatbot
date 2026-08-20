@@ -48,6 +48,10 @@ beat_task_templates: list[dict] = [
         "options": {
             "priority": OnyxCeleryPriority.MEDIUM,
             "expires": BEAT_EXPIRES_DEFAULT,
+            # Its own worker already serves this queue. Left unset these land on
+            # the default `celery` queue, which only the primary worker reads —
+            # so deployments without a primary would never run the recovery.
+            "queue": OnyxCeleryQueues.USER_FILE_PROCESSING,
         },
     },
     {
@@ -57,6 +61,10 @@ beat_task_templates: list[dict] = [
         "options": {
             "priority": OnyxCeleryPriority.MEDIUM,
             "expires": BEAT_EXPIRES_DEFAULT,
+            # Its own worker already serves this queue. Left unset these land on
+            # the default `celery` queue, which only the primary worker reads —
+            # so deployments without a primary would never run the recovery.
+            "queue": OnyxCeleryQueues.USER_FILE_PROCESSING,
         },
     },
     {
@@ -66,6 +74,10 @@ beat_task_templates: list[dict] = [
         "options": {
             "priority": OnyxCeleryPriority.MEDIUM,
             "expires": BEAT_EXPIRES_DEFAULT,
+            # Its own worker already serves this queue. Left unset these land on
+            # the default `celery` queue, which only the primary worker reads —
+            # so deployments without a primary would never run the recovery.
+            "queue": OnyxCeleryQueues.USER_FILE_PROCESSING,
         },
     },
     {

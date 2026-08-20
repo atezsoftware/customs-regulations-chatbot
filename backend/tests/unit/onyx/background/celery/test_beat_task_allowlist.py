@@ -51,3 +51,25 @@ def test_every_allowlisted_task_still_exists_in_the_schedule(
 
     with pytest.raises(ValueError, match="not_a_real_task_name"):
         beat_schedule.get_tasks_to_schedule()
+
+
+def test_user_file_recovery_tasks_name_the_queue_a_worker_consumes() -> None:
+    """Without an explicit queue these land on the default `celery` queue.
+
+    Only the primary worker consumes that queue, and deployments that run a
+    subset of the workers have no primary — so the recovery tasks would sit
+    unconsumed until they expired, and the files they were meant to retry would
+    stay stuck. They belong on the queue their own worker already serves.
+    """
+
+    from onyx.configs.constants import OnyxCeleryQueues
+
+    scheduled_by_task = {
+        entry["task"]: entry for entry in beat_schedule.tasks_to_schedule
+    }
+
+    for task_name in USER_FILE_RECOVERY_TASKS:
+        options = scheduled_by_task[task_name]["options"]
+        assert (
+            options.get("queue") == OnyxCeleryQueues.USER_FILE_PROCESSING
+        ), f"{task_name} -> {options.get('queue')}"
