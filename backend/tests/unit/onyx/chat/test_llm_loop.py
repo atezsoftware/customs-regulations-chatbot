@@ -21,6 +21,7 @@ from onyx.chat.llm_loop import (
     _REGULATORY_MAX_PARALLEL_SEARCH_CALLS,
     SearchEvidenceLedgerEntry,
     _build_candidate_answer_evidence_chunks,
+    _build_fast_regulatory_absence_recovery_tool_calls,
     _build_regulatory_coverage_tool_calls,
     _build_regulatory_matrix_citation_issues,
     _build_regulatory_navigation_recovery_tool_calls,
@@ -29,6 +30,7 @@ from onyx.chat.llm_loop import (
     _compact_regulatory_search_history_for_reconsideration,
     _compact_repeated_search_results_for_history,
     _constrain_regulatory_tool_calls,
+    _draft_claims_regulatory_source_gap,
     _effective_regulatory_search_call_budget,
     _extract_llm_visible_search_results,
     _extract_regulatory_navigation_leads,
@@ -40,6 +42,7 @@ from onyx.chat.llm_loop import (
     _merge_gathered_search_docs,
     _prime_fast_regulatory_query_embeddings,
     _project_regulatory_history_for_tool_decision,
+    _qualify_fast_regulatory_source_gap_answer,
     _regulatory_llm_step_max_tokens,
     _regulatory_outline_result_matches_requested_lead,
     _regulatory_search_call_budget,
@@ -1851,7 +1854,9 @@ def test_matrix_closure_review_uses_only_matrix_named_exact_chunks() -> None:
     assert [chunk.retrieval_number for chunk in selected] == [2]
 
 
-def test_closure_evidence_keeps_protected_sources_and_target_diversity() -> None:
+def test_closure_evidence_prioritizes_protected_sources_without_dropping_others() -> (
+    None
+):
     evidence_chunks = [
         build_candidate_answer_evidence_chunk(
             document_id=f"document-{number}",
@@ -1883,10 +1888,10 @@ def test_closure_evidence_keeps_protected_sources_and_target_diversity() -> None
         priority_citation_numbers={3},
     )
 
-    assert [chunk.retrieval_number for chunk in selected] == [3, 4, 6, 5]
+    assert [chunk.retrieval_number for chunk in selected] == [3, 4, 6, 1, 2, 5]
 
 
-def test_closure_evidence_never_drops_protected_sources_above_soft_limit() -> None:
+def test_closure_evidence_has_no_fixed_total_evidence_limit() -> None:
     evidence_chunks = [
         build_candidate_answer_evidence_chunk(
             document_id=f"document-{number}",
@@ -1908,10 +1913,10 @@ def test_closure_evidence_never_drops_protected_sources_above_soft_limit() -> No
         priority_citation_numbers=set(range(1, 100)),
     )
 
-    assert [chunk.retrieval_number for chunk in selected] == list(range(1, 100))
+    assert [chunk.retrieval_number for chunk in selected] == list(range(1, 110))
 
 
-def test_closure_evidence_groups_search_probes_by_answer_coverage() -> None:
+def test_closure_evidence_does_not_cap_one_answer_obligation() -> None:
     evidence_chunks = [
         build_candidate_answer_evidence_chunk(
             document_id=f"document-{number}",
@@ -1933,7 +1938,50 @@ def test_closure_evidence_groups_search_probes_by_answer_coverage() -> None:
         evidence_matrix=None,
     )
 
-    assert [chunk.retrieval_number for chunk in selected] == list(range(1, 9))
+    assert [chunk.retrieval_number for chunk in selected] == list(range(1, 11))
+
+
+def test_closure_evidence_preserves_every_distinct_probe_for_one_obligation() -> None:
+    evidence_chunks = [
+        build_candidate_answer_evidence_chunk(
+            document_id="transit-convention",
+            chunk_id=number,
+            citation_number=None,
+            retrieval_number=number,
+            chunk_identifier=f"chunk-{number}",
+            heading=f"Annex IV > Article 7 > {number}",
+            research_target=(
+                "Broad collection assistance rules"
+                if number <= 9
+                else "Article 7(2)(a) and (b) exact conditions"
+            ),
+            coverage_item="How may Turkey request collection assistance?",
+            content=(
+                "Exact Article 7(2)(a) condition"
+                if number == 12
+                else (
+                    "Exact Article 7(2)(b) condition"
+                    if number == 13
+                    else f"Exact source text {number}"
+                )
+            ),
+        )
+        for number in range(1, 19)
+    ]
+
+    selected = _select_regulatory_closure_evidence(
+        evidence_chunks,
+        candidate_answer="",
+        evidence_matrix=None,
+    )
+    selected_numbers = [chunk.retrieval_number for chunk in selected]
+
+    assert len(selected_numbers) == 18
+    assert selected_numbers == list(range(1, 19))
+    assert {chunk.content for chunk in selected} >= {
+        "Exact Article 7(2)(a) condition",
+        "Exact Article 7(2)(b) condition",
+    }
 
 
 def test_matrix_input_keeps_bounded_ranked_evidence_for_each_probe() -> None:
@@ -2078,6 +2126,122 @@ def test_regulatory_synthesis_history_orders_review_priority_without_dropping_ev
     assert len(documents) == 219
     assert documents[:2] == [218, 219]
     assert set(documents) == set(range(1, 220))
+
+
+def test_regulatory_synthesis_history_fits_physical_token_budget_without_dropping_docs() -> (
+    None
+):
+    history = _build_regulatory_synthesis_history(
+        current_request="Resolve every legal issue.",
+        earlier_user_context=(),
+        visible_results_by_citation={
+            citation: (f"Title {citation}", f"Evidence {citation} " + "x" * 1_800)
+            for citation in range(1, 110)
+        },
+        token_counter=len,
+        max_history_tokens=80_000,
+    )
+
+    evidence_payload = json.loads(history[-1].message)
+    assert [result["document"] for result in evidence_payload["results"]] == list(
+        range(1, 110)
+    )
+    assert history[-1].token_count <= 80_000
+    assert any(
+        "physical-context compaction" in result["content"]
+        for result in evidence_payload["results"]
+    )
+    constructed = construct_message_history(
+        system_prompt=None,
+        custom_agent_prompt=None,
+        simple_chat_history=history,
+        reminder_message=None,
+        context_files=create_context_files(),
+        available_tokens=100_000,
+        token_counter=len,
+    )
+    assert constructed
+
+
+def test_regulatory_synthesis_history_reserves_request_and_correction_tokens() -> None:
+    history = _build_regulatory_synthesis_history(
+        current_request="R" * 3_000,
+        earlier_user_context=(),
+        visible_results_by_citation={
+            citation: (f"Title {citation}", "Evidence " + "x" * 1_800)
+            for citation in range(1, 40)
+        },
+        token_counter=len,
+        prior_candidate_answer="C" * 36_000,
+        max_history_tokens=70_000,
+    )
+
+    assert sum(message.token_count for message in history) <= 70_000
+
+
+def test_regulatory_synthesis_compaction_preserves_priority_evidence_verbatim() -> None:
+    critical = "start " + "operative Article 7(2)(a) and (b)" + " end"
+    history = _build_regulatory_synthesis_history(
+        current_request="Request",
+        earlier_user_context=(),
+        visible_results_by_citation={
+            1: ("Critical", critical),
+            **{
+                citation: (f"Title {citation}", "x" * 1_800)
+                for citation in range(2, 80)
+            },
+        },
+        priority_citation_numbers={1},
+        token_counter=len,
+        max_history_tokens=55_000,
+    )
+
+    evidence_payload = json.loads(history[-1].message)
+    critical_result = next(
+        result for result in evidence_payload["results"] if result["document"] == 1
+    )
+    assert critical_result["content"] == critical
+    assert any(
+        "physical-context compaction" in result["content"]
+        for result in evidence_payload["results"]
+        if result["document"] != 1
+    )
+
+
+def test_regulatory_synthesis_hierarchically_compacts_large_priority_inventory() -> (
+    None
+):
+    operative_text = "Article 7(2)(a) and (b) exact operative conditions"
+    history = _build_regulatory_synthesis_history(
+        current_request="Request",
+        earlier_user_context=(),
+        visible_results_by_citation={
+            citation: (
+                f"Title {citation}",
+                "prefix " + "x" * 800 + operative_text + "y" * 800 + " suffix",
+            )
+            for citation in range(1, 101)
+        },
+        research_targets_by_citation={
+            citation: ["Article 7(2)(a) and (b) exact conditions"]
+            for citation in range(1, 101)
+        },
+        priority_citation_numbers=set(range(1, 101)),
+        token_counter=len,
+        max_history_tokens=80_000,
+    )
+
+    assert sum(message.token_count for message in history) <= 80_000
+    evidence_payload = json.loads(history[-1].message)
+    assert len(evidence_payload["results"]) == 100
+    assert all(
+        "Article 7(2)(a) and (b)" in result["content"]
+        for result in evidence_payload["results"]
+    )
+    assert all(
+        "target-aligned physical-context extract" in result["content"]
+        for result in evidence_payload["results"]
+    )
 
 
 def test_candidate_answer_evidence_uses_exact_visible_content_and_citation_order() -> (
@@ -2356,6 +2520,278 @@ def test_fast_coverage_profile_uses_plan_derived_search_count() -> None:
 
     assert len(calls) == 40
     assert all(call.tool_args["search_mode"] == "hybrid" for call in calls)
+
+
+def test_source_gap_detector_catches_the_observed_false_negative_draft() -> None:
+    draft = (
+        "Kaynak boşluğu: Madde 7(2)(a) ve (b)'deki şartların tam metni "
+        "getirilemedi: ____. Bu nedenle metne dayalı olarak teyit edemiyorum."
+    )
+
+    assert _draft_claims_regulatory_source_gap(draft)
+    assert not _draft_claims_regulatory_source_gap(
+        "Madde 7(2)(a) ve (b) şartları kaynak metne göre birlikte uygulanır."
+    )
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "İlgili hükme erişemedim.",
+        "Arama sonuçlarında ilgili metne erişilemedi.",
+        "Veri tabanında bu konuda kayıt yok.",
+    ],
+)
+def test_source_gap_detector_catches_contextual_retrieval_misses(draft: str) -> None:
+    assert _draft_claims_regulatory_source_gap(draft)
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "Kaynakta ilgili hüküm bulunamadı.",
+        "İlgili hükme erişemedim.",
+        "Arama sonuçlarında ilgili metne erişilemedi.",
+        "Veri tabanında bu konuda kayıt yok.",
+    ],
+)
+def test_source_gap_qualifier_never_publishes_unqualified_absence(draft: str) -> None:
+    qualified = _qualify_fast_regulatory_source_gap_answer(draft)
+
+    assert "uygulanan aramalarda" in qualified.casefold()
+    assert "veri tabanında" not in qualified.casefold()
+    assert "kaynakta" not in qualified.casefold()
+    assert "arama sonuçlarında" not in qualified.casefold()
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "Could not retrieve the controlling provision.",
+        "The requested text was not found in the database.",
+    ],
+)
+def test_source_gap_qualifier_handles_english_absence_claims(draft: str) -> None:
+    qualified = _qualify_fast_regulatory_source_gap_answer(draft)
+
+    assert "searches performed" in qualified.casefold()
+    assert "database" not in qualified.casefold()
+
+
+def test_source_gap_detector_ignores_unrelated_calculation_uncertainty() -> None:
+    assert not _draft_claims_regulatory_source_gap(
+        "Bu hesaplamayı mevcut rakamlarla teyit edemiyorum."
+    )
+
+
+def test_fast_source_gap_recovery_uses_only_unattempted_deferred_plan_queries() -> None:
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="How may Turkey request collection assistance?",
+                evidence_dimensions=["Article 7(2)(a) and (b) exact conditions"],
+                retrieval_queries=["Ek IV Madde 7 2 a b"],
+                material_factual_branches=["Domestic collection remedies exhausted"],
+                request_anchor_groups=[["Madde 7", "2(a)", "2(b)"]],
+                source_anchors=["Common Transit Convention Annex IV"],
+                completion_test="Resolve every condition for collection assistance.",
+            )
+        ],
+        request_context_atoms=["Turkey could not collect from the Italian firm"],
+    )
+    attempted = {("article 7(2)(a) and (b) exact conditions", "hybrid")}
+
+    calls = _build_fast_regulatory_absence_recovery_tool_calls(
+        plan,
+        turn_index=3,
+        attempted_query_modes=attempted,
+    )
+    query_modes = {
+        (call.tool_args["queries"][0], call.tool_args["search_mode"]) for call in calls
+    }
+
+    assert ("Article 7(2)(a) and (b) exact conditions", "hybrid") not in query_modes
+    assert ("Ek IV Madde 7 2 a b", "keyword") in query_modes
+    assert ("Domestic collection remedies exhausted", "hybrid") in query_modes
+    assert ("Madde 7; 2(a); 2(b)", "hybrid") in query_modes
+    assert all(
+        call.tool_call_id.startswith("regulatory-absence-recovery-3-") for call in calls
+    )
+
+
+@pytest.mark.parametrize("recovery_batch_fails", [False, True])
+def test_fast_source_gap_draft_is_withheld_retrieved_once_and_resynthesized(
+    recovery_batch_fails: bool,
+) -> None:
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question="Resolve collection assistance conditions.",
+                evidence_dimensions=["Article 7(2) exact conditions"],
+                retrieval_queries=["Madde 7 2 a b"],
+                material_factual_branches=["Domestic remedies exhausted"],
+                completion_test="Establish the complete conditions.",
+            )
+        ]
+    )
+    synthesis_steps = iter(
+        [
+            "Kaynak boşluğu: Madde 7(2)(a) ve (b) getirilemedi: ____.",
+            "Veri tabanında kayıt yok: ____. [1]",
+        ]
+    )
+    llm_step_histories: list[list[ChatMessageSimple]] = []
+    llm_step_tool_choices: list[ToolChoiceOptions] = []
+    dispatched_batches: list[list[ToolCallKickoff]] = []
+
+    def fake_run_llm_step(**kwargs: Any) -> tuple[LlmStepResult, bool]:
+        llm_step_histories.append(kwargs["history"])
+        llm_step_tool_choices.append(kwargs["tool_choice"])
+        raw_answer = next(synthesis_steps)
+        answer = raw_answer.replace("[1]", "[[1]](https://example.test/source)")
+        cast(ChatStateContainer, kwargs["state_container"]).set_answer_tokens(answer)
+        placement = kwargs["placement"]
+        cast(Emitter, kwargs["emitter"]).emit(
+            Packet(placement=placement, obj=AgentResponseStart())
+        )
+        cast(Emitter, kwargs["emitter"]).emit(
+            Packet(placement=placement, obj=AgentResponseDelta(content=answer))
+        )
+        return (
+            LlmStepResult(
+                reasoning=None,
+                answer=answer,
+                tool_calls=None,
+                raw_answer=raw_answer,
+                finish_reason="stop",
+            ),
+            False,
+        )
+
+    def fake_run_tool_calls(**kwargs: Any) -> ParallelToolCallResponse:
+        calls = list(kwargs["tool_calls"])
+        dispatched_batches.append(calls)
+        if recovery_batch_fails and any(
+            call.tool_call_id.startswith("regulatory-absence-recovery-")
+            for call in calls
+        ):
+            return ParallelToolCallResponse(
+                tool_responses=[],
+                updated_citation_mapping={},
+            )
+        return ParallelToolCallResponse(
+            tool_responses=[
+                ToolResponse(
+                    rich_response=SearchDocsResponse(
+                        search_docs=[],
+                        citation_mapping={},
+                    ),
+                    llm_facing_response=json.dumps(
+                        {
+                            "receipt": {
+                                "coverage_item": call.tool_args.get(
+                                    "coverage_item", ""
+                                ),
+                                "evidence_target": call.tool_args.get(
+                                    "evidence_target", ""
+                                ),
+                            },
+                            "results": [],
+                        }
+                    ),
+                    tool_call=call,
+                )
+                for call in calls
+            ],
+            updated_citation_mapping={},
+        )
+
+    search_tool = Mock(spec=SearchTool)
+    search_tool.id = 1
+    search_tool.name = SearchTool.NAME
+    search_tool.user_selected_filters = BaseFilters(
+        regulatory_chunks_only=True,
+        regulatory_workflow_mode="fast",
+    )
+    search_tool.tool_definition.return_value = {
+        "type": "function",
+        "function": {
+            "name": SearchTool.NAME,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    persona = Mock(
+        id=1,
+        datetime_aware=False,
+        replace_base_system_prompt=False,
+        system_prompt=None,
+        task_prompt=None,
+    )
+    llm = Mock()
+    llm.config = LLMConfig(
+        model_provider="openai",
+        model_name="test-model",
+        temperature=0.0,
+        max_input_tokens=100_000,
+    )
+    state = ChatStateContainer()
+    output_queue: queue.Queue[tuple[int, Packet | Exception | object]] = queue.Queue()
+
+    with (
+        patch("onyx.chat.llm_loop.run_llm_step", side_effect=fake_run_llm_step),
+        patch("onyx.chat.llm_loop.run_tool_calls", side_effect=fake_run_tool_calls),
+        patch("onyx.chat.llm_loop._prime_fast_regulatory_query_embeddings"),
+        patch("onyx.chat.llm_loop.build_regulatory_coverage_plan", return_value=plan),
+        patch("onyx.chat.llm_loop.get_default_base_system_prompt", return_value=""),
+        patch("onyx.chat.llm_loop.get_session_with_current_tenant"),
+        patch("onyx.llm.litellm_singleton.config.initialize_litellm"),
+    ):
+        run_llm_loop(
+            emitter=Emitter(merged_queue=output_queue),
+            state_container=state,
+            simple_chat_history=[
+                create_message("Tahsil şartlarını incele.", MessageType.USER)
+            ],
+            tools=[search_tool],
+            custom_agent_prompt=None,
+            context_files=create_context_files(),
+            persona=persona,
+            user_memory_context=None,
+            llm=llm,
+            token_counter=len,
+        )
+
+    assert len(dispatched_batches) == 2
+    assert [
+        (call.tool_args["queries"][0], call.tool_args["search_mode"])
+        for call in dispatched_batches[0]
+    ] == [("Article 7(2) exact conditions", "hybrid")]
+    recovery_query_modes = {
+        (call.tool_args["queries"][0], call.tool_args["search_mode"])
+        for call in dispatched_batches[1]
+    }
+    assert recovery_query_modes == {
+        ("Domestic remedies exhausted", "hybrid"),
+        ("Madde 7 2 a b", "keyword"),
+    }
+    assert len(llm_step_histories) == 2
+    assert llm_step_tool_choices == [
+        ToolChoiceOptions.NONE,
+        ToolChoiceOptions.NONE,
+    ]
+    assert "uygulanan aramalarda ulaşılamadı" in "\n".join(
+        message.message for message in llm_step_histories[1]
+    )
+    assert state.get_answer_tokens() == (
+        "Uygulanan aramalarda ilgili metne ulaşılamadı: "
+        "uygulanan aramalarda ulaşılamadı. [[1]](https://example.test/source)"
+    )
+    streamed_answer = "".join(
+        packet.obj.content
+        for _model_index, packet in list(output_queue.queue)
+        if isinstance(packet, Packet) and isinstance(packet.obj, AgentResponseDelta)
+    )
+    assert streamed_answer == state.get_answer_tokens()
 
 
 def test_fast_coverage_embeddings_are_primed_in_one_batch() -> None:
