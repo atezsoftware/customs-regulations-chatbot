@@ -29,7 +29,9 @@ jest.mock("@/lib/settings/hooks", () => ({
 
 jest.mock("@/sections/document-sets/RegulatoryFileDetails", () => ({
   __esModule: true,
-  default: () => null,
+  default: ({ file }: { file: { name: string } }) => (
+    <div>{`File details for ${file.name}`}</div>
+  ),
 }));
 
 function renderFiles() {
@@ -158,6 +160,62 @@ describe("indexing reviewed chunks", () => {
 
     expect(
       await screen.findByRole("button", { name: /^index$/i })
+    ).toBeInTheDocument();
+  });
+
+  test("offers distinguishable PDF links for files in every status", async () => {
+    mockGetDocumentSetFiles.mockResolvedValue([
+      chunkedFile,
+      {
+        id: "file-2",
+        name: "mevzuat/gumruk-kanunu.md",
+        status: UserFileStatus.COMPLETED,
+        chunk_count: 40,
+      },
+    ]);
+    renderFiles();
+
+    const chunkedPdfLink = await screen.findByRole("link", {
+      name: "Open mevzuat/1975_tir_sozlesmesi.md as PDF in a new tab",
+    });
+    const completedPdfLink = screen.getByRole("link", {
+      name: "Open mevzuat/gumruk-kanunu.md as PDF in a new tab",
+    });
+
+    expect(chunkedPdfLink).toHaveAttribute(
+      "href",
+      "/api/regulatory/files/file-1/pdf"
+    );
+    expect(chunkedPdfLink).toHaveAttribute("target", "_blank");
+    expect(completedPdfLink).toHaveAttribute(
+      "href",
+      "/api/regulatory/files/file-2/pdf"
+    );
+  });
+
+  test("keeps the PDF action separate from chunk-detail navigation", async () => {
+    const user = setupUser();
+    renderFiles();
+
+    const pdfLink = await screen.findByRole("link", {
+      name: "Open mevzuat/1975_tir_sozlesmesi.md as PDF in a new tab",
+    });
+    pdfLink.addEventListener("click", (event) => event.preventDefault(), {
+      once: true,
+    });
+
+    await user.click(pdfLink);
+    expect(
+      screen.queryByText("File details for mevzuat/1975_tir_sozlesmesi.md")
+    ).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /mevzuat\/1975_tir_sozlesmesi\.md/i,
+      })
+    );
+    expect(
+      await screen.findByText("File details for mevzuat/1975_tir_sozlesmesi.md")
     ).toBeInTheDocument();
   });
 

@@ -21,6 +21,7 @@ import type {
 } from "@/lib/projects/types";
 import { UserFileStatus } from "@/lib/projects/types";
 import { useSettings } from "@/lib/settings/hooks";
+import { documentPdfUrl } from "@/lib/regulatory/svc";
 import {
   getDocumentSetFiles,
   getDocumentSetFilesKey,
@@ -460,6 +461,17 @@ export default function DocumentSetFiles({
                   {ACTIVE_FILE_STATUSES.has(file.status) && (
                     <Tag title="Processing" />
                   )}
+                  <Button
+                    prominence="tertiary"
+                    icon={SvgFileText}
+                    size="sm"
+                    href={documentPdfUrl(file.id)}
+                    target="_blank"
+                    aria-label={`Open ${file.name} as PDF in a new tab`}
+                    tooltip="Open the complete document as PDF"
+                  >
+                    PDF
+                  </Button>
                   {file.status === UserFileStatus.CHUNKED && (
                     <Button
                       prominence="secondary"
