@@ -1,1 +1,1 @@
-"""Administrative OpenRouter reranking configuration."""
+"""Administrative external reranking configuration."""

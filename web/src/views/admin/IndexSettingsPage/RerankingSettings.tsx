@@ -22,13 +22,14 @@ import InputSelect from "@/refresh-components/inputs/InputSelect";
 import { useRerankingConfig } from "@/lib/indexing/hooks";
 import {
   deleteRerankingConfig,
-  fetchOpenRouterRerankingModels,
+  fetchSiliconFlowRerankingModels,
   saveRerankingConfig,
   testRerankingConfig,
 } from "@/lib/indexing/svc";
 import type { OpenRouterRerankingModel } from "@/lib/indexing/types";
 
 const EMPTY_KEY = "";
+const DEFAULT_MODEL = "Qwen/Qwen3-Reranker-8B";
 
 function errorDetail(error: unknown): string {
   return error instanceof Error
@@ -40,7 +41,11 @@ export default function RerankingSettings() {
   const { data: persistedConfig, isLoading, mutate } = useRerankingConfig();
   const deleteModal = useCreateModal();
   const [enabled, setEnabled] = useState(persistedConfig?.enabled ?? false);
-  const [modelId, setModelId] = useState(persistedConfig?.model_id ?? "");
+  const [modelId, setModelId] = useState(
+    persistedConfig?.provider_type === "siliconflow"
+      ? (persistedConfig.model_id ?? DEFAULT_MODEL)
+      : DEFAULT_MODEL
+  );
   const [apiKey, setApiKey] = useState(EMPTY_KEY);
   const [catalog, setCatalog] = useState<OpenRouterRerankingModel[]>([]);
   const [attestation, setAttestation] = useState<string | null>(null);
@@ -51,7 +56,11 @@ export default function RerankingSettings() {
   useEffect(() => {
     if (!persistedConfig) return;
     setEnabled(persistedConfig.enabled);
-    setModelId(persistedConfig.model_id ?? "");
+    setModelId(
+      persistedConfig.provider_type === "siliconflow"
+        ? (persistedConfig.model_id ?? DEFAULT_MODEL)
+        : DEFAULT_MODEL
+    );
     setApiKey(EMPTY_KEY);
     setAttestation(null);
   }, [persistedConfig]);
@@ -92,14 +101,12 @@ export default function RerankingSettings() {
 
   const handleLoadModels = useCallback(() => {
     void runOperation(async () => {
-      const models = await fetchOpenRouterRerankingModels(
-        apiKey.trim() || undefined
-      );
+      const models = await fetchSiliconFlowRerankingModels();
       setCatalog(models);
       setSuccessMessage(
         models.length > 0
-          ? "OpenRouter model catalog loaded"
-          : "OpenRouter returned no reranking models"
+          ? "SiliconFlow model catalog loaded"
+          : "SiliconFlow returned no reranking models"
       );
     });
   }, [apiKey, runOperation]);
@@ -107,12 +114,12 @@ export default function RerankingSettings() {
   const handleTest = useCallback(() => {
     void runOperation(async () => {
       const response = await testRerankingConfig({
-        provider_type: "openrouter",
+        provider_type: "siliconflow",
         model_id: modelId.trim(),
         ...(apiKey.trim() && { api_key: apiKey.trim() }),
       });
       if (!response.success) {
-        throw new Error("OpenRouter did not confirm the reranking test.");
+        throw new Error("SiliconFlow did not confirm the reranking test.");
       }
       setAttestation(response.test_attestation);
       setSuccessMessage("Configuration test passed");
@@ -123,7 +130,7 @@ export default function RerankingSettings() {
     void runOperation(async () => {
       const saved = await saveRerankingConfig({
         enabled,
-        provider_type: "openrouter",
+        provider_type: "siliconflow",
         model_id: modelId.trim(),
         ...(apiKey.trim() && { api_key: apiKey.trim() }),
         ...(enabled && attestation && { test_attestation: attestation }),
@@ -178,7 +185,7 @@ export default function RerankingSettings() {
           }
         >
           <Text font="main-ui-body" color="text-03" as="p">
-            This permanently removes the encrypted OpenRouter API key, model,
+            This permanently removes the encrypted SiliconFlow API key, model,
             and enabled state.
           </Text>
         </ConfirmationModalLayout>
@@ -194,7 +201,7 @@ export default function RerankingSettings() {
       <MessageCard
         variant="warning"
         title="External data processing"
-        description="The query and authorized candidate text leave this deployment and are sent to OpenRouter. Only use a provider/model route that contractually enforces zero data retention (ZDR) and data-use denial."
+        description="The query and authorized candidate text leave this deployment and are sent to SiliconFlow for reranking."
         titleMaxLines={undefined}
       />
 
@@ -214,11 +221,11 @@ export default function RerankingSettings() {
           </InputHorizontal>
 
           <InputHorizontal
-            title="OpenRouter API key"
+            title="SiliconFlow API key"
             description={
               persistedConfig?.api_key_configured
                 ? "A stored encrypted key is configured. Leave this blank to retain it."
-                : "Used only for OpenRouter model discovery, testing, and reranking."
+                : "Used only for SiliconFlow testing and reranking."
             }
             withLabel="reranking-api-key"
             responsive
@@ -226,10 +233,10 @@ export default function RerankingSettings() {
           >
             <PasswordInputTypeIn
               id="reranking-api-key"
-              aria-label="OpenRouter API key"
+              aria-label="SiliconFlow API key"
               value={apiKey}
               placeholder={
-                persistedConfig?.masked_api_key ?? "Enter an OpenRouter API key"
+                persistedConfig?.masked_api_key ?? "Enter a SiliconFlow API key"
               }
               disabled={isBusy || isLoading}
               onChange={handleApiKeyChange}
@@ -252,7 +259,7 @@ export default function RerankingSettings() {
 
           {catalog.length > 0 && (
             <InputHorizontal
-              title="OpenRouter model catalog"
+              title="SiliconFlow model catalog"
               description="Selecting a catalog entry copies its exact ID into the manual field below."
               withLabel
               responsive
@@ -265,7 +272,7 @@ export default function RerankingSettings() {
                 onValueChange={handleModelChange}
               >
                 <InputSelect.Trigger
-                  aria-label="OpenRouter reranking model catalog"
+                  aria-label="SiliconFlow reranking model catalog"
                   placeholder="Select a discovered model"
                 />
                 <InputSelect.Content>
@@ -280,17 +287,17 @@ export default function RerankingSettings() {
           )}
 
           <InputHorizontal
-            title="Manual model ID"
-            description="Always available for valid OpenRouter rerank models that are not present in the catalog."
+            title="SiliconFlow model ID"
+            description="Only SiliconFlow's supported Qwen3 reranker IDs are accepted."
             withLabel="reranking-model-id"
             responsive
             fillInput
           >
             <InputTypeIn
               id="reranking-model-id"
-              aria-label="Manual model ID"
+              aria-label="SiliconFlow model ID"
               value={modelId}
-              placeholder="provider/model-id"
+              placeholder={DEFAULT_MODEL}
               variant={isBusy || isLoading ? "disabled" : undefined}
               onChange={(event) => handleModelChange(event.target.value)}
             />

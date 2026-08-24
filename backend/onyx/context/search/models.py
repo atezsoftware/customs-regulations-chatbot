@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -113,6 +113,11 @@ class BaseFilters(BaseModel):
     # prevents legacy whole-file/user-file chunks from contaminating results,
     # including for administrators whose ACL would otherwise expose them.
     regulatory_chunks_only: bool = False
+    # Internal orchestration selector. Excluded from index filter payloads; the
+    # SearchTool and research loops consume it to choose bounded workflow limits.
+    regulatory_workflow_mode: Literal["standard", "fast"] = Field(
+        default="standard", exclude=True
+    )
 
     # Deprecated wire-compat alias for updated_at_range.start. Folded into
     # updated_at_range on validation and cleared; internal code must never read

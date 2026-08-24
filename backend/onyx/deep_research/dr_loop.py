@@ -92,6 +92,7 @@ from onyx.regulatory.gap_recovery import (
     run_single_gap_recovery,
     select_priority_recovery_issue,
 )
+from onyx.regulatory.workflow_profile import get_regulatory_workflow_profile
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
     AgentResponseDelta,
@@ -399,10 +400,16 @@ def _run_regulatory_coverage_searches(
     )
     if search_tool is None:
         return {}, []
+    workflow_profile = get_regulatory_workflow_profile(
+        search_tool.user_selected_filters.regulatory_workflow_mode
+    )
 
     coverage_calls = _build_regulatory_coverage_tool_calls(
         coverage_plan,
         turn_index=turn_index,
+        max_calls=workflow_profile.max_parallel_search_calls,
+        include_auxiliary_searches=workflow_profile.include_auxiliary_searches,
+        include_lexical_fallbacks=workflow_profile.include_lexical_fallbacks,
     )
     if not coverage_calls:
         return {}, []
@@ -414,10 +421,10 @@ def _run_regulatory_coverage_searches(
     for batch_start in range(
         0,
         len(coverage_calls),
-        _REGULATORY_COVERAGE_SEARCH_BATCH_SIZE,
+        workflow_profile.max_concurrent_search_tools,
     ):
         batch = coverage_calls[
-            batch_start : batch_start + _REGULATORY_COVERAGE_SEARCH_BATCH_SIZE
+            batch_start : batch_start + workflow_profile.max_concurrent_search_tools
         ]
         next_citation_number = max(lightweight_citation_mapping, default=0) + 1
         batch_result = run_tool_calls(
@@ -431,7 +438,10 @@ def _run_regulatory_coverage_searches(
             skip_search_query_expansion=True,
             inject_memories_in_prompt=False,
             search_llm_chunks_per_call_cap=(
-                _REGULATORY_COVERAGE_SEARCH_CHUNKS_PER_CALL
+                min(
+                    _REGULATORY_COVERAGE_SEARCH_CHUNKS_PER_CALL,
+                    workflow_profile.search_chunks_per_call,
+                )
             ),
         )
         lightweight_citation_mapping = batch_result.updated_citation_mapping
@@ -1439,12 +1449,17 @@ def run_deep_research_llm_loop(
         # future registry change cannot silently grant web access to research.
         allowed_tools = _deep_research_search_tools(tools)
         include_internal_search_tunings = bool(allowed_tools)
-        is_regulatory_deep_research = any(
-            isinstance(tool, SearchTool)
-            and tool.user_selected_filters is not None
-            and tool.user_selected_filters.regulatory_chunks_only
-            for tool in allowed_tools
+        regulatory_deep_search_tool = next(
+            (
+                tool
+                for tool in allowed_tools
+                if isinstance(tool, SearchTool)
+                and tool.user_selected_filters is not None
+                and tool.user_selected_filters.regulatory_chunks_only
+            ),
+            None,
         )
+        is_regulatory_deep_research = regulatory_deep_search_tool is not None
         regulatory_coverage_plan: RegulatoryCoveragePlan | None = None
         regulatory_coverage_contract: str | None = None
         if is_regulatory_deep_research:

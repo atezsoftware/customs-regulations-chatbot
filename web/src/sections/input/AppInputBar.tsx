@@ -87,9 +87,11 @@ export interface AppInputBarProps {
   filterManager: FilterManager;
   deepResearchEnabled: boolean;
   atezSearchEnabled?: boolean;
+  atezSearchV2Enabled?: boolean;
   setPresentingDocument?: (document: MinimalOnyxDocument) => void;
   toggleDeepResearch: () => void;
   toggleAtezSearch?: () => void;
+  toggleAtezSearchV2?: () => void;
   isMultiModelActive?: boolean;
   disabled: boolean;
   awaitingPreferredSelection?: boolean;
@@ -115,8 +117,10 @@ const AppInputBar = React.memo(
     llmManager,
     deepResearchEnabled,
     atezSearchEnabled = false,
+    atezSearchV2Enabled = false,
     toggleDeepResearch,
     toggleAtezSearch,
+    toggleAtezSearchV2,
     isMultiModelActive,
     setPresentingDocument,
     disabled,
@@ -710,6 +714,23 @@ const AppInputBar = React.memo(
                     }
                   >
                     Atez Search
+                  </SelectButton>
+                )}
+                {showAtezSearch && toggleAtezSearchV2 && (
+                  <SelectButton
+                    disabled={disabled || isMultiModelActive}
+                    variant="select-light"
+                    icon={SvgSearch}
+                    onClick={toggleAtezSearchV2}
+                    state={atezSearchV2Enabled ? "selected" : "empty"}
+                    foldable={false}
+                    tooltip={
+                      isMultiModelActive
+                        ? "Atez Search V2 is disabled in multi-model mode"
+                        : "Faster structure-aware regulatory research"
+                    }
+                  >
+                    Atez Search V2
                   </SelectButton>
                 )}
                 {showDeepResearch && (

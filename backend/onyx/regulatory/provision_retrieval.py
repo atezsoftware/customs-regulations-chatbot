@@ -1,6 +1,7 @@
 """Bounded same-provision expansion for selected regulatory search hits."""
 
 import datetime
+import logging
 import re
 import unicodedata
 from collections import deque
@@ -57,6 +58,7 @@ _NAVIGATION_GENERIC_TERMS = {
 _NAVIGATION_LEAD_MAX_SECTIONS = 2
 _SOURCE_LEXICAL_MAX_MATCHES = 2
 _SOURCE_LEXICAL_MAX_SECTIONS = 4
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +89,14 @@ class RegulatoryProvisionNavigationPayload(TypedDict):
     document_title: str
     usage_note: str
     headings: list[RegulatoryProvisionNavigationPayloadEntry]
+
+
+@dataclass(frozen=True, slots=True)
+class RegulatoryRerankPacket:
+    """One reranker document backed by independently citable atomic chunks."""
+
+    candidate: InferenceChunk
+    members: tuple[InferenceChunk, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,6 +670,211 @@ def _chunk_identity(chunk: InferenceChunk) -> tuple[str, str | int]:
     if chunk.regulatory_chunk_id is not None:
         return (chunk.document_id, chunk.regulatory_chunk_id)
     return (chunk.document_id, chunk.chunk_id)
+
+
+def _projection_provision_identity(
+    projection: RegulatoryChunkProjection,
+) -> tuple[str, ...]:
+    last_article_index: int | None = None
+    for index, heading in enumerate(projection.heading_path):
+        if parse_regulatory_article_heading(heading) is not None:
+            last_article_index = index
+    structural_path = (
+        projection.heading_path[: last_article_index + 1]
+        if last_article_index is not None
+        else projection.heading_path[:-1]
+    )
+    return (
+        str(projection.user_file_id),
+        *(_fold_heading(heading) for heading in structural_path),
+    )
+
+
+def _packet_document(members: Sequence[InferenceChunk]) -> str:
+    passages: list[str] = []
+    for member in members:
+        heading = (
+            " > ".join(member.heading_path)
+            if isinstance(member.heading_path, list)
+            else member.semantic_identifier
+        )
+        passages.append(f"[{heading}]\n{member.content}" if heading else member.content)
+    return "\n\n".join(passages)
+
+
+def _singleton_rerank_packets(
+    chunks: Sequence[InferenceChunk],
+) -> list[RegulatoryRerankPacket]:
+    return [
+        RegulatoryRerankPacket(candidate=chunk, members=(chunk,)) for chunk in chunks
+    ]
+
+
+def build_regulatory_rerank_packets(
+    db_session: Session,
+    chunks: Sequence[InferenceChunk],
+    *,
+    query: str,
+    as_of_date: datetime.date | None,
+    max_chunks_per_provision: int = 12,
+    max_chars_per_provision: int = 6_000,
+) -> list[RegulatoryRerankPacket]:
+    """Build bounded structural reranker documents in one metadata lookup.
+
+    The synthetic candidate is used only for scoring. Every packet retains the
+    exact atomic chunks that downstream citation and authorization code consumes.
+    Any metadata failure fails closed to the original singleton candidates.
+    """
+
+    deduplicated: list[InferenceChunk] = []
+    seen_chunk_identities: set[tuple[str, str | int]] = set()
+    for chunk in chunks:
+        identity = _chunk_identity(chunk)
+        if identity not in seen_chunk_identities:
+            seen_chunk_identities.add(identity)
+            deduplicated.append(chunk)
+    seed_ids = [
+        chunk_id
+        for chunk in deduplicated
+        if (chunk_id := chunk.regulatory_chunk_id) is not None
+    ]
+    if not seed_ids:
+        return _singleton_rerank_packets(deduplicated)
+
+    try:
+        projections = get_bounded_same_provision_siblings(
+            db_session,
+            seed_ids,
+            query=query,
+            as_of_date=as_of_date,
+            max_chunks_per_provision=max_chunks_per_provision,
+            max_chars_per_provision=max_chars_per_provision,
+        )
+    except Exception:
+        logger.exception(
+            "Regulatory rerank packet metadata lookup failed; using singletons"
+        )
+        return _singleton_rerank_packets(deduplicated)
+
+    template_by_document = {
+        chunk.document_id: chunk
+        for chunk in deduplicated
+        if chunk.regulatory_chunk_id is not None
+    }
+    members_by_family: dict[tuple[str, ...], list[InferenceChunk]] = {}
+    member_ids_by_family: dict[tuple[str, ...], set[str]] = {}
+    family_by_seed_id: dict[str, tuple[str, ...]] = {}
+    for projection in projections:
+        template = template_by_document.get(str(projection.user_file_id))
+        if template is None:
+            continue
+        family = _projection_provision_identity(projection)
+        family_member_ids = member_ids_by_family.setdefault(family, set())
+        if projection.regulatory_chunk_id in family_member_ids:
+            if projection.regulatory_chunk_id in seed_ids:
+                family_by_seed_id[projection.regulatory_chunk_id] = family
+            continue
+        family_member_ids.add(projection.regulatory_chunk_id)
+        member = _chunk_from_projection(
+            projection,
+            template,
+            relevance_explanation="Atomic member of structural rerank packet",
+        )
+        members_by_family.setdefault(family, []).append(member)
+        if projection.regulatory_chunk_id in seed_ids:
+            family_by_seed_id[projection.regulatory_chunk_id] = family
+
+    packets: list[RegulatoryRerankPacket] = []
+    emitted_families: set[tuple[str, ...]] = set()
+    for seed in deduplicated:
+        seed_id = seed.regulatory_chunk_id
+        family = family_by_seed_id.get(seed_id) if seed_id is not None else None
+        if family is None:
+            packets.append(RegulatoryRerankPacket(candidate=seed, members=(seed,)))
+            continue
+        if family in emitted_families:
+            continue
+        emitted_families.add(family)
+        all_members = sorted(
+            members_by_family[family],
+            key=lambda member: (member.chunk_id, member.regulatory_chunk_id or ""),
+        )
+        prioritized_members = [
+            member for member in all_members if member.regulatory_chunk_id in seed_ids
+        ]
+        prioritized_members.extend(
+            member
+            for member in all_members
+            if member.regulatory_chunk_id not in seed_ids
+        )
+        bounded_members: list[InferenceChunk] = []
+        rendered_chars = 0
+        for member in prioritized_members:
+            if len(bounded_members) >= max_chunks_per_provision:
+                break
+            rendered_member = _packet_document((member,))
+            separator_chars = 2 if bounded_members else 0
+            if (
+                bounded_members
+                and rendered_chars + separator_chars + len(rendered_member)
+                > max_chars_per_provision
+            ):
+                continue
+            bounded_members.append(member)
+            rendered_chars += separator_chars + len(rendered_member)
+        members = tuple(
+            sorted(
+                bounded_members,
+                key=lambda member: (member.chunk_id, member.regulatory_chunk_id or ""),
+            )
+        )
+        if len(members) == 1:
+            packets.append(
+                RegulatoryRerankPacket(candidate=members[0], members=members)
+            )
+            continue
+        first = members[0]
+        candidate_document = _packet_document(members)[:max_chars_per_provision]
+        candidate = first.model_copy(
+            deep=True,
+            update={
+                "content": candidate_document,
+                "blurb": candidate_document[:_SIBLING_BLURB_CHARS],
+                "match_highlights": [],
+                "relevance_explanation": "Structural provision packet for reranking",
+            },
+        )
+        packets.append(RegulatoryRerankPacket(candidate=candidate, members=members))
+    return packets
+
+
+def expand_ranked_regulatory_rerank_packets(
+    ranked_candidates: Sequence[InferenceChunk],
+    packets: Sequence[RegulatoryRerankPacket],
+    packet_scores: dict[tuple[str, int], float],
+) -> tuple[list[InferenceChunk], dict[tuple[str, int], float]]:
+    """Project packet ordering/scores back onto exact, deduplicated atomics."""
+
+    packet_by_candidate = {
+        _chunk_identity(packet.candidate): packet for packet in packets
+    }
+    expanded: list[InferenceChunk] = []
+    expanded_scores: dict[tuple[str, int], float] = {}
+    seen: set[tuple[str, str | int]] = set()
+    for candidate in ranked_candidates:
+        packet = packet_by_candidate.get(_chunk_identity(candidate))
+        if packet is None:
+            packet = RegulatoryRerankPacket(candidate=candidate, members=(candidate,))
+        packet_score = packet_scores.get((candidate.document_id, candidate.chunk_id))
+        for member in packet.members:
+            identity = _chunk_identity(member)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            expanded.append(member)
+            if packet_score is not None:
+                expanded_scores[(member.document_id, member.chunk_id)] = packet_score
+    return expanded, expanded_scores
 
 
 def _structural_provision_family_identity(

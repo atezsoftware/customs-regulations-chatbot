@@ -373,6 +373,45 @@ async def test_vertex_embed_uses_instruction_prefix_for_gemini_embedding_2(
             assert config.task_type is None
             assert contents[0].parts[0].text == expected_text
 
+            client_kwargs = mock_genai_client.call_args.kwargs
+            assert client_kwargs["enterprise"] is True
+            assert "vertexai" not in client_kwargs
+
+
+@pytest.mark.asyncio
+async def test_vertex_embed_gemini_embedding_2_rejects_legacy_client() -> None:
+    """A stale SDK must not silently select an incompatible vector endpoint."""
+    with patch(
+        "google.oauth2.service_account.Credentials.from_service_account_info"
+    ) as mock_credentials:
+        mock_credentials.return_value = MagicMock()
+
+        with patch(
+            "google.genai.Client",
+            side_effect=TypeError(
+                "Client.__init__() got an unexpected keyword argument 'enterprise'"
+            ),
+        ) as mock_genai_client:
+            embedding = CloudEmbedding(
+                '{"project_id":"test-project"}',
+                EmbeddingProvider.GOOGLE,
+            )
+            try:
+                with pytest.raises(
+                    RuntimeError,
+                    match="google-genai runtime is incompatible",
+                ):
+                    await embedding._embed_vertex(
+                        ["hello world"],
+                        "gemini-embedding-2",
+                        "RETRIEVAL_QUERY",
+                        1024,
+                    )
+            finally:
+                await embedding.aclose()
+
+    mock_genai_client.assert_called_once()
+
 
 @pytest.mark.asyncio
 async def test_cohere_embed_supports_v3_response_format(

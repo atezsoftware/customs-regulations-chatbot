@@ -21,6 +21,7 @@ from onyx.db.reranking import RerankerRuntimeConfig
 from onyx.error_handling.exceptions import OnyxError
 from onyx.reranking.models import RerankScore
 from onyx.reranking.openrouter import OpenRouterRerankClient
+from onyx.reranking.siliconflow import SiliconFlowRerankClient
 from onyx.utils.sensitive import SensitiveValue
 from shared_configs.enums import RerankerProvider
 from tests.unit.fakes import FakeCache
@@ -149,6 +150,8 @@ class _DirectClient:
                     user,
                     db_session,
                 )
+            elif method == "GET" and path == f"{RERANKING_URL}/siliconflow-models":
+                result = reranking_api.siliconflow_models(user)
             else:
                 return httpx.Response(404)
         except OnyxError as error:
@@ -369,6 +372,61 @@ def test_get_masks_api_key_and_never_returns_plaintext(
     }
     assert TEST_KEY not in response.text
     assert "api_key" not in response.json()
+
+
+def test_siliconflow_catalog_is_fixed_and_requires_no_credential(
+    admin_client: _DirectClient,
+) -> None:
+    response = admin_client.get(f"{RERANKING_URL}/siliconflow-models")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "models": [
+            {"id": "Qwen/Qwen3-Reranker-8B", "name": "Qwen3 Reranker 8B"},
+            {"id": "Qwen/Qwen3-Reranker-4B", "name": "Qwen3 Reranker 4B"},
+            {"id": "Qwen/Qwen3-Reranker-0.6B", "name": "Qwen3 Reranker 0.6B"},
+        ]
+    }
+
+
+def test_siliconflow_test_then_enable_normalizes_model_and_provider(
+    admin_client: _DirectClient,
+    repository: _Repository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def successful_rerank(
+        self: SiliconFlowRerankClient,  # noqa: ARG001
+        **kwargs: Any,
+    ) -> list[RerankScore]:
+        assert kwargs["model"] == "Qwen/Qwen3-Reranker-8B"
+        return [RerankScore(index=0, relevance_score=0.8)]
+
+    monkeypatch.setattr(SiliconFlowRerankClient, "rerank", successful_rerank)
+    test_response = admin_client.post(
+        f"{RERANKING_URL}/test",
+        json={
+            "provider_type": "siliconflow",
+            "model_id": "qwen/qwen3-reranker-8b",
+            "api_key": TEST_KEY,
+        },
+    )
+
+    assert test_response.status_code == 200
+    enabled = admin_client.put(
+        f"{RERANKING_URL}/config",
+        json={
+            "enabled": True,
+            "provider_type": "siliconflow",
+            "model_id": "qwen/qwen3-reranker-8b",
+            "api_key": TEST_KEY,
+            "test_attestation": test_response.json()["test_attestation"],
+        },
+    )
+
+    assert enabled.status_code == 200
+    assert enabled.json()["provider_type"] == "siliconflow"
+    assert enabled.json()["model_id"] == "Qwen/Qwen3-Reranker-8B"
+    assert repository.provider_type is RerankerProvider.SILICONFLOW
 
 
 def test_put_disabled_with_omitted_key_retains_exact_ciphertext(

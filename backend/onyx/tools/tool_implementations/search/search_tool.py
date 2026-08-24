@@ -107,6 +107,8 @@ from onyx.regulatory.heading_path import (
 from onyx.regulatory.provision_retrieval import (
     RegulatoryProvisionNavigation,
     build_regulatory_provision_navigation,
+    build_regulatory_rerank_packets,
+    expand_ranked_regulatory_rerank_packets,
     expand_selected_regulatory_adjacent_provisions,
     expand_selected_regulatory_navigation_leads,
     expand_selected_regulatory_references,
@@ -2168,9 +2170,22 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         rerank_query = (
             evidence_target if regulatory_chunks_only else canonical_original_query
         )
+        rerank_packets = None
+        rerank_input_chunks = fused_candidates
+        if regulatory_chunks_only and effective_reranker_config.enabled:
+            with get_session_with_current_tenant() as rerank_packet_session:
+                rerank_packets = build_regulatory_rerank_packets(
+                    rerank_packet_session,
+                    fused_candidates,
+                    query=rerank_query,
+                    as_of_date=(
+                        effective_filters.as_of_date if effective_filters else None
+                    ),
+                )
+            rerank_input_chunks = [packet.candidate for packet in rerank_packets]
         rerank_result = rerank_chunks(
             query=rerank_query,
-            chunks=fused_candidates,
+            chunks=rerank_input_chunks,
             config=effective_reranker_config,
         )
         diverse_candidate_chunks = apply_soft_diversity(
@@ -2178,6 +2193,25 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             scores=rerank_result.scores_by_chunk,
             limit=override_kwargs.rerank_candidate_limit,
         )
+        if rerank_result.used_external and rerank_packets is not None:
+            diverse_candidate_chunks, atomic_scores = (
+                expand_ranked_regulatory_rerank_packets(
+                    diverse_candidate_chunks,
+                    rerank_packets,
+                    rerank_result.scores_by_chunk,
+                )
+            )
+            atomic_ranked_chunks, _ = expand_ranked_regulatory_rerank_packets(
+                rerank_result.ordered_chunks,
+                rerank_packets,
+                rerank_result.scores_by_chunk,
+            )
+            rerank_result = rerank_result.model_copy(
+                update={
+                    "ordered_chunks": atomic_ranked_chunks,
+                    "scores_by_chunk": atomic_scores,
+                }
+            )
         chunks_for_selection = (
             diverse_candidate_chunks
             if rerank_result.used_external

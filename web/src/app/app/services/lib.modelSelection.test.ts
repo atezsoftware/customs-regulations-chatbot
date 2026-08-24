@@ -63,6 +63,30 @@ it("serializes Atez Search independently from Deep Research", async () => {
   expect(payload.deep_research).toBe(false);
 });
 
+it("serializes Atez Search V2 independently from the original workflow", async () => {
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: false,
+    status: 400,
+    json: async () => ({ detail: "stop after payload capture" }),
+  });
+
+  await expect(
+    sendMessage({
+      message: "Antrepo nedir?",
+      parentMessageId: null,
+      chatSessionId: "session-1",
+      filters: null,
+      atezSearch: false,
+      atezSearchV2: true,
+    }).next()
+  ).rejects.toThrow("stop after payload capture");
+
+  const request = jest.mocked(global.fetch).mock.calls[0]![1];
+  const payload = JSON.parse(String(request?.body));
+  expect(payload.atez_search).toBe(false);
+  expect(payload.atez_search_v2).toBe(true);
+});
+
 it("waits for the selected session model to be persisted", async () => {
   let releaseRequest: ((value: { ok: true }) => void) | undefined;
   global.fetch = jest.fn().mockReturnValue(

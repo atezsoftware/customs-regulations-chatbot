@@ -204,6 +204,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         currentMessageFiles,
         deepResearch: deepResearchEnabledForCurrentWorkflow,
         atezSearch: atezSearchEnabledForCurrentWorkflow,
+        atezSearchV2: atezSearchV2EnabledForCurrentWorkflow,
       });
     }
   }
@@ -226,6 +227,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     toggleDeepResearch,
     atezSearchEnabled,
     toggleAtezSearch,
+    atezSearchV2Enabled,
+    toggleAtezSearchV2,
   } = useDeepResearchToggle({
     chatSessionId: currentChatSessionId,
     agentId: selectedAgent?.id,
@@ -236,6 +239,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentProjectId === null &&
     (selectedAgent ?? liveAgent)?.id === 0 &&
     atezSearchEnabled;
+  const atezSearchV2EnabledForCurrentWorkflow =
+    currentProjectId === null &&
+    (selectedAgent ?? liveAgent)?.id === 0 &&
+    atezSearchV2Enabled;
 
   const [presentingDocument, setPresentingDocument] =
     useState<MinimalOnyxDocument | null>(null);
@@ -548,6 +555,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
         deepResearchEnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
       atezSearch:
         atezSearchEnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
+      atezSearchV2:
+        atezSearchV2EnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
       messageIdToResend: lastUserMsg.messageId,
     });
   }, [
@@ -556,6 +565,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     currentMessageFiles,
     deepResearchEnabledForCurrentWorkflow,
     atezSearchEnabledForCurrentWorkflow,
+    atezSearchV2EnabledForCurrentWorkflow,
     multiModel.isMultiModelActive,
   ]);
 
@@ -577,6 +587,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           !multiModel.isMultiModelActive,
         atezSearch:
           atezSearchEnabledForCurrentWorkflow && !multiModel.isMultiModelActive,
+        atezSearchV2:
+          atezSearchV2EnabledForCurrentWorkflow &&
+          !multiModel.isMultiModelActive,
         selectedModels: multiModel.isMultiModelActive
           ? multiModel.selectedModels
           : undefined,
@@ -591,6 +604,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       currentMessageFiles,
       deepResearchEnabledForCurrentWorkflow,
       atezSearchEnabledForCurrentWorkflow,
+      atezSearchV2EnabledForCurrentWorkflow,
       multiModel.isMultiModelActive,
       multiModel.selectedModels,
       foldSidebarForMultiModel,
@@ -637,6 +651,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
           atezSearch:
             atezSearchEnabledForCurrentWorkflow &&
             !multiModel.isMultiModelActive,
+          atezSearchV2:
+            atezSearchV2EnabledForCurrentWorkflow &&
+            !multiModel.isMultiModelActive,
           selectedModels: multiModel.isMultiModelActive
             ? multiModel.selectedModels
             : undefined,
@@ -662,6 +679,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       currentMessageFiles,
       deepResearchEnabledForCurrentWorkflow,
       atezSearchEnabledForCurrentWorkflow,
+      atezSearchV2EnabledForCurrentWorkflow,
       showOnboarding,
       onboardingDismissed,
       finishOnboarding,
@@ -851,6 +869,9 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                           deepResearchEnabledForCurrentWorkflow
                         }
                         atezSearchEnabled={atezSearchEnabledForCurrentWorkflow}
+                        atezSearchV2Enabled={
+                          atezSearchV2EnabledForCurrentWorkflow
+                        }
                         currentMessageFiles={currentMessageFiles}
                         setPresentingDocument={setPresentingDocument}
                         onSubmit={onSubmit}
@@ -1035,6 +1056,10 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         toggleDeepResearch={toggleDeepResearch}
                         atezSearchEnabled={atezSearchEnabledForCurrentWorkflow}
                         toggleAtezSearch={toggleAtezSearch}
+                        atezSearchV2Enabled={
+                          atezSearchV2EnabledForCurrentWorkflow
+                        }
+                        toggleAtezSearchV2={toggleAtezSearchV2}
                         isMultiModelActive={multiModel.isMultiModelActive}
                         filterManager={filterManager}
                         llmManager={llmManager}

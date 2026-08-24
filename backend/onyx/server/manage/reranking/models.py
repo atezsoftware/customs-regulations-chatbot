@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 class RerankerConfigUpdate(BaseModel):
     enabled: bool
-    provider_type: Literal["openrouter"]
+    provider_type: Literal["openrouter", "siliconflow"]
     model_id: str
     api_key: str | None = None
     test_attestation: str | None = None
@@ -13,14 +13,14 @@ class RerankerConfigUpdate(BaseModel):
 
 class RerankerConfigView(BaseModel):
     enabled: bool
-    provider_type: Literal["openrouter"] | None
+    provider_type: Literal["openrouter", "siliconflow"] | None
     model_id: str | None
     api_key_configured: bool
     masked_api_key: str | None
 
 
 class RerankerTestRequest(BaseModel):
-    provider_type: Literal["openrouter"]
+    provider_type: Literal["openrouter", "siliconflow"]
     model_id: str | None = None
     api_key: str | None = None
 

@@ -47,11 +47,15 @@ from onyx.chat.prompt_utils import (
     process_prompt_template,
 )
 from onyx.chat.staged_generation import commit_staged_llm_step
-from onyx.configs.app_configs import INTEGRATION_TESTS_MODE
+from onyx.configs.app_configs import (
+    INTEGRATION_TESTS_MODE,
+    QUERY_EMBEDDING_CACHE_ENABLED,
+)
 from onyx.configs.chat_configs import MAX_LLM_CYCLES
 from onyx.configs.constants import DocumentSource, MessageType
 from onyx.configs.model_configs import GEN_AI_INPUT_TOKEN_SAFETY_MARGIN
 from onyx.context.search.models import SearchDoc, SearchDocsResponse
+from onyx.context.search.utils import prime_query_embedding_cache
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.memory import UserMemoryContext, add_memory, update_memory_at_index
 from onyx.db.models import Persona
@@ -98,6 +102,10 @@ from onyx.regulatory.gap_recovery import (
 from onyx.regulatory.navigation_recovery import (
     select_regulatory_navigation_recovery_leads,
 )
+from onyx.regulatory.workflow_profile import (
+    STANDARD_REGULATORY_WORKFLOW,
+    get_regulatory_workflow_profile,
+)
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import (
     OverallStop,
@@ -121,7 +129,10 @@ from onyx.tools.tool_implementations.images.models import FinalImageGenerationRe
 from onyx.tools.tool_implementations.memory.models import MemoryToolResponse
 from onyx.tools.tool_implementations.open_url.open_url_tool import OpenURLTool
 from onyx.tools.tool_implementations.python.python_tool import PythonTool
-from onyx.tools.tool_implementations.search.search_tool import SearchTool
+from onyx.tools.tool_implementations.search.search_tool import (
+    SearchTool,
+    _prepare_search_query,
+)
 from onyx.tools.tool_implementations.web_search.utils import extract_url_snippet_map
 from onyx.tools.tool_implementations.web_search.web_search_tool import WebSearchTool
 from onyx.tools.tool_runner import run_tool_calls
@@ -137,6 +148,52 @@ _REGULATORY_SEARCH_LLM_CHUNKS_PER_CALL = 10
 _REGULATORY_BOOTSTRAP_COVERAGE_CYCLES = 1
 _REGULATORY_AUTONOMOUS_RESEARCH_CYCLES = 1
 _MAX_EMPTY_FINAL_RESPONSE_RETRIES = 1
+
+
+def _prime_fast_regulatory_query_embeddings(
+    tool_calls: Sequence[ToolCallKickoff],
+) -> None:
+    """Batch/cache validated V2 plan queries without changing their semantics."""
+
+    if not QUERY_EMBEDDING_CACHE_ENABLED:
+        return
+    queries: list[str] = []
+    seen_queries: set[str] = set()
+    for call in tool_calls:
+        if (
+            not call.tool_call_id.startswith("regulatory-coverage-0-")
+            or call.tool_args.get("search_mode") != "hybrid"
+        ):
+            continue
+        raw_queries = call.tool_args.get("queries")
+        if (
+            not isinstance(raw_queries, list)
+            or len(raw_queries) != 1
+            or not isinstance(raw_queries[0], str)
+            or not raw_queries[0].strip()
+        ):
+            continue
+        query = _prepare_search_query(raw_queries[0], "hybrid")
+        if query and query not in seen_queries:
+            seen_queries.add(query)
+            queries.append(query)
+    if not queries:
+        return
+    try:
+        with get_session_with_current_tenant() as db_session:
+            prime_query_embedding_cache(
+                queries,
+                db_session=db_session,
+                max_workers=_REGULATORY_MAX_CONCURRENT_SEARCH_TOOLS,
+            )
+    except Exception:
+        # SearchTool retains its established per-query embedding and lexical
+        # fail-soft paths; cache priming must never block retrieval.
+        logger.exception(
+            "Fast regulatory embedding batch prime failed; continuing per query"
+        )
+
+
 _REGULATORY_POST_REVIEW_MAIN_CYCLES = 3
 # One full independent audit followed by one issue-resolution audit. Further
 # audits of the same fixed evidence create a rewrite loop rather than new proof.
@@ -180,11 +237,17 @@ def _build_regulatory_coverage_tool_calls(
     plan: RegulatoryCoveragePlan | None,
     *,
     turn_index: int,
+    max_calls: int | None = _REGULATORY_MAX_PARALLEL_SEARCH_CALLS,
+    include_auxiliary_searches: bool = True,
+    include_lexical_fallbacks: bool = True,
 ) -> list[ToolCallKickoff]:
     """Allocate retrieval fairly from a request-derived, source-neutral plan."""
 
     if plan is None:
         return []
+
+    def has_capacity(current_count: int) -> bool:
+        return max_calls is None or current_count < max_calls
 
     def bounded(value: str, max_chars: int) -> str:
         normalized = " ".join(value.split())
@@ -243,7 +306,7 @@ def _build_regulatory_coverage_tool_calls(
     # Allocate the first attempt for every independent row before spending
     # budget on a complementary lexical interpretation of an earlier row.
     dimension_index = 0
-    while len(atomic_rows) < _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+    while has_capacity(len(atomic_rows)):
         added = False
         for item in plan.coverage_items:
             dimensions = atomic_dimensions(item)
@@ -265,7 +328,7 @@ def _build_regulatory_coverage_tool_calls(
                     )
                 )
                 added = True
-            if len(atomic_rows) >= _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+            if not has_capacity(len(atomic_rows)):
                 break
         if not added:
             break
@@ -274,7 +337,7 @@ def _build_regulatory_coverage_tool_calls(
     obligation_rows: list[tuple[str, str, str, list[str]]] = []
     obligation_identities: set[str] = set()
     obligation_index = 0
-    while len(obligation_rows) < _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+    while has_capacity(len(obligation_rows)):
         added = False
         for item in plan.coverage_items:
             if obligation_index >= len(item.request_anchor_groups):
@@ -293,7 +356,7 @@ def _build_regulatory_coverage_tool_calls(
                     )
                 )
                 added = True
-            if len(obligation_rows) >= _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+            if not has_capacity(len(obligation_rows)):
                 break
         if not added:
             break
@@ -302,7 +365,7 @@ def _build_regulatory_coverage_tool_calls(
     branch_rows: list[tuple[str, str, str, list[str]]] = []
     branch_identities: set[str] = set()
     branch_index = 0
-    while len(branch_rows) < _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+    while has_capacity(len(branch_rows)):
         added = False
         for item in plan.coverage_items:
             if branch_index >= len(item.material_factual_branches):
@@ -325,7 +388,7 @@ def _build_regulatory_coverage_tool_calls(
                     )
                 )
                 added = True
-            if len(branch_rows) >= _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+            if not has_capacity(len(branch_rows)):
                 break
         if not added:
             break
@@ -380,7 +443,7 @@ def _build_regulatory_coverage_tool_calls(
         evidence_target: str,
         source_anchors: list[str],
     ) -> None:
-        if len(calls) >= _REGULATORY_MAX_PARALLEL_SEARCH_CALLS:
+        if not has_capacity(len(calls)):
             return
         identity = (" ".join(query.casefold().split()), mode)
         if not query.strip() or identity in identities:
@@ -408,60 +471,32 @@ def _build_regulatory_coverage_tool_calls(
             evidence_target=evidence_target,
             source_anchors=source_anchors,
         )
-    for (
-        query,
-        coverage_item,
-        evidence_target,
-        source_anchors,
-    ) in branch_rows:
-        append(
-            query,
-            "hybrid",
-            coverage_item=coverage_item,
-            evidence_target=evidence_target,
-            source_anchors=source_anchors,
-        )
-    for (
-        query,
-        coverage_item,
-        evidence_target,
-        source_anchors,
-    ) in context_atom_rows:
-        append(
-            query,
-            "hybrid",
-            coverage_item=coverage_item,
-            evidence_target=evidence_target,
-            source_anchors=source_anchors,
-        )
-    for (
-        query,
-        coverage_item,
-        evidence_target,
-        source_anchors,
-    ) in obligation_rows:
-        append(
-            query,
-            "hybrid",
-            coverage_item=coverage_item,
-            evidence_target=evidence_target,
-            source_anchors=source_anchors,
-        )
+    if include_auxiliary_searches:
+        for rows in (branch_rows, context_atom_rows, obligation_rows):
+            for query, coverage_item, evidence_target, source_anchors in rows:
+                append(
+                    query,
+                    "hybrid",
+                    coverage_item=coverage_item,
+                    evidence_target=evidence_target,
+                    source_anchors=source_anchors,
+                )
     # Allocate remaining recall-first keyword fallbacks fairly across planner rows.
-    for (
-        _hybrid_query,
-        keyword_query,
-        coverage_item,
-        evidence_target,
-        source_anchors,
-    ) in atomic_rows:
-        append(
+    if include_lexical_fallbacks:
+        for (
+            _hybrid_query,
             keyword_query,
-            "keyword",
-            coverage_item=coverage_item,
-            evidence_target=evidence_target,
-            source_anchors=source_anchors,
-        )
+            coverage_item,
+            evidence_target,
+            source_anchors,
+        ) in atomic_rows:
+            append(
+                keyword_query,
+                "keyword",
+                coverage_item=coverage_item,
+                evidence_target=evidence_target,
+                source_anchors=source_anchors,
+            )
     return [
         ToolCallKickoff(
             tool_call_id=f"regulatory-coverage-{turn_index}-{query_index}",
@@ -561,13 +596,12 @@ def _regulatory_llm_step_max_tokens(
 def _should_schedule_regulatory_candidate_correction(
     review_count: int,
     review: CandidateAnswerReviewResult,
+    *,
+    max_reviews: int = _REGULATORY_MAX_CANDIDATE_REVIEWS,
 ) -> bool:
     """Never replace the last reviewed draft with an unreviewed full rewrite."""
 
-    return (
-        review.needs_reconsideration
-        and review_count < _REGULATORY_MAX_CANDIDATE_REVIEWS
-    )
+    return review.needs_reconsideration and review_count < max_reviews
 
 
 def _commit_canonical_tool_decision_step(
@@ -1942,10 +1976,14 @@ def _compact_repeated_search_results_for_history(
     return json.dumps(payload, indent=2, ensure_ascii=False), repeated_result_count
 
 
-def _regulatory_search_chunk_cap(enabled: bool) -> int | None:
+def _regulatory_search_chunk_cap(
+    enabled: bool,
+    *,
+    chunks_per_call: int = _REGULATORY_SEARCH_LLM_CHUNKS_PER_CALL,
+) -> int | None:
     """Use a modestly wider window for structure-fragmented regulatory text."""
 
-    return _REGULATORY_SEARCH_LLM_CHUNKS_PER_CALL if enabled else None
+    return chunks_per_call if enabled else None
 
 
 def _regulatory_search_call_budget(
@@ -2651,12 +2689,22 @@ def run_llm_loop(
         regulatory_attempted_navigation_lead_identities: set[tuple[str, str]] = set()
         pending_regulatory_coverage_tool_calls: list[ToolCallKickoff] = []
 
-        is_regulatory_search_chat = any(
-            isinstance(tool, SearchTool)
-            and tool.user_selected_filters is not None
-            and tool.user_selected_filters.regulatory_chunks_only
-            for tool in tools
+        regulatory_search_tool = next(
+            (
+                tool
+                for tool in tools
+                if isinstance(tool, SearchTool)
+                and tool.user_selected_filters is not None
+                and tool.user_selected_filters.regulatory_chunks_only
+            ),
+            None,
         )
+        is_regulatory_search_chat = regulatory_search_tool is not None
+        regulatory_workflow_profile = STANDARD_REGULATORY_WORKFLOW
+        if regulatory_search_tool is not None:
+            regulatory_workflow_profile = get_regulatory_workflow_profile(
+                regulatory_search_tool.user_selected_filters.regulatory_workflow_mode
+            )
         if is_regulatory_search_chat:
             regulatory_review_user_context = build_regulatory_review_user_context(
                 simple_chat_history
@@ -2681,7 +2729,20 @@ def run_llm_loop(
                 _build_regulatory_coverage_tool_calls(
                     regulatory_coverage_plan,
                     turn_index=0,
+                    max_calls=regulatory_workflow_profile.max_parallel_search_calls,
+                    include_auxiliary_searches=(
+                        regulatory_workflow_profile.include_auxiliary_searches
+                    ),
+                    include_lexical_fallbacks=(
+                        regulatory_workflow_profile.include_lexical_fallbacks
+                    ),
                 )
+            )
+            regulatory_navigation_recovery_ready = (
+                not regulatory_workflow_profile.use_navigation_recovery
+            )
+            regulatory_evidence_matrix_ready = (
+                not regulatory_workflow_profile.use_evidence_matrix
             )
         regulatory_bootstrap_searches_completed = not bool(
             pending_regulatory_coverage_tool_calls
@@ -2708,7 +2769,8 @@ def run_llm_loop(
             )
 
         regulatory_search_chunk_cap = _regulatory_search_chunk_cap(
-            complex_regulatory_request
+            complex_regulatory_request,
+            chunks_per_call=regulatory_workflow_profile.search_chunks_per_call,
         )
         regulatory_search_call_budget = _regulatory_search_call_budget(
             complex_regulatory_request=complex_regulatory_request,
@@ -2752,7 +2814,7 @@ def run_llm_loop(
         reasoning_cycles = 0
         maximum_cycle_count = MAX_LLM_CYCLES + (
             (
-                _REGULATORY_POST_REVIEW_MAIN_CYCLES
+                regulatory_workflow_profile.post_review_cycles
                 + _REGULATORY_PROJECTED_STOP_SYNTHESIS_CYCLES
                 + _REGULATORY_BOOTSTRAP_COVERAGE_CYCLES
                 + _REGULATORY_AUTONOMOUS_RESEARCH_CYCLES
@@ -2770,7 +2832,7 @@ def run_llm_loop(
                 if candidate_review_rejected_at_cycle is None
                 else llm_cycle_count
                 >= candidate_review_rejected_at_cycle
-                + _REGULATORY_POST_REVIEW_MAIN_CYCLES
+                + regulatory_workflow_profile.post_review_cycles
             )
             effective_regulatory_search_call_budget = (
                 _effective_regulatory_search_call_budget(
@@ -2902,7 +2964,7 @@ def run_llm_loop(
                 recovery_queries = (
                     evidence_matrix_recovery_queries(
                         regulatory_evidence_matrix,
-                        limit=_REGULATORY_MAX_PARALLEL_SEARCH_CALLS,
+                        limit=regulatory_workflow_profile.max_parallel_search_calls,
                     )
                     if not regulatory_evidence_matrix_recovery_started
                     else []
@@ -3370,7 +3432,7 @@ def run_llm_loop(
                 continue
             search_slots = (
                 min(
-                    _REGULATORY_MAX_PARALLEL_SEARCH_CALLS,
+                    regulatory_workflow_profile.max_parallel_search_calls,
                     max(
                         0,
                         effective_regulatory_search_call_budget
@@ -3378,7 +3440,7 @@ def run_llm_loop(
                     ),
                 )
                 if effective_regulatory_search_call_budget is not None
-                else _REGULATORY_MAX_PARALLEL_SEARCH_CALLS
+                else regulatory_workflow_profile.max_parallel_search_calls
             )
             tool_calls = _constrain_regulatory_tool_calls(
                 raw_tool_calls,
@@ -3434,7 +3496,8 @@ def run_llm_loop(
                 )
                 direct_recovery_messages: list[ChatMessageSimple] = []
                 if (
-                    candidate_answer_review_count < _REGULATORY_MAX_CANDIDATE_REVIEWS
+                    candidate_answer_review_count
+                    < regulatory_workflow_profile.max_candidate_reviews
                     and has_called_search_tool
                     and candidate_answer_for_review.strip()
                 ):
@@ -3782,6 +3845,9 @@ def run_llm_loop(
                         _should_schedule_regulatory_candidate_correction(
                             candidate_answer_review_count,
                             candidate_review,
+                            max_reviews=(
+                                regulatory_workflow_profile.max_candidate_reviews
+                            ),
                         )
                     ):
                         if candidate_review_rejected_at_cycle is None:
@@ -3859,6 +3925,8 @@ def run_llm_loop(
             # in-flight citations
             # It can be cleaned up but not super trivial or worthwhile right now
             just_ran_web_search = False
+            if regulatory_workflow_profile.mode == "fast":
+                _prime_fast_regulatory_query_embeddings(tool_calls)
             parallel_tool_call_results = run_tool_calls(
                 tool_calls=tool_calls,
                 tools=final_tools,
@@ -3869,7 +3937,7 @@ def run_llm_loop(
                 next_citation_num=citation_processor.get_next_citation_number(),
                 max_concurrent_tools=None,
                 max_parallel_workers=(
-                    _REGULATORY_MAX_CONCURRENT_SEARCH_TOOLS
+                    regulatory_workflow_profile.max_concurrent_search_tools
                     if complex_regulatory_request
                     else None
                 ),
@@ -3895,6 +3963,9 @@ def run_llm_loop(
                 for tool_call in tool_calls
             ):
                 regulatory_bootstrap_searches_completed = True
+                if regulatory_workflow_profile.direct_synthesis_after_plan_search:
+                    regulatory_autonomous_research_completed = True
+                    regulatory_research_complete_pending = True
 
             for tool_response in tool_responses:
                 # Extract tool_call from the response (set by run_tool_calls)

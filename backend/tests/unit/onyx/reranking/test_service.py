@@ -22,6 +22,7 @@ from onyx.reranking.models import (
 )
 from onyx.reranking.openrouter import OpenRouterRerankClient
 from onyx.reranking.service import RerankingService
+from onyx.reranking.siliconflow import SiliconFlowRerankClient
 from onyx.tracing.flows import LLMFlow
 from onyx.utils.sensitive import make_mock_sensitive_value
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
@@ -56,10 +57,11 @@ def _config(
     enabled: bool = True,
     generation: str = "generation-a",
     model_name: str = "cohere/rerank-v3.5",
+    provider: RerankerProvider = RerankerProvider.OPENROUTER,
 ) -> RerankerRuntimeConfig:
     return RerankerRuntimeConfig(
         enabled=enabled,
-        provider_type=RerankerProvider.OPENROUTER if enabled else None,
+        provider_type=provider if enabled else None,
         model_name=model_name if enabled else None,
         api_key=make_mock_sensitive_value("top-secret") if enabled else None,
         configuration_generation=generation,
@@ -279,6 +281,35 @@ def test_trace_uses_rerank_flow_without_recording_request_content(
         "model": "cohere/rerank-v3.5",
         "provider": "openrouter",
     }
+
+
+def test_siliconflow_configuration_routes_to_siliconflow_client() -> None:
+    openrouter = MagicMock(spec=OpenRouterRerankClient)
+    siliconflow = MagicMock(spec=SiliconFlowRerankClient)
+    siliconflow.rerank.return_value = [RerankScore(index=0, relevance_score=0.8)]
+    trace_call = MagicMock(side_effect=_span)
+    service = RerankingService(
+        clients={
+            RerankerProvider.OPENROUTER: openrouter,
+            RerankerProvider.SILICONFLOW: siliconflow,
+        },
+        circuit_breaker=RerankCircuitBreaker(),
+        trace_call=trace_call,
+    )
+
+    result = service.rerank_chunks(
+        query="soru",
+        chunks=[_chunk("d1")],
+        config=_config(
+            provider=RerankerProvider.SILICONFLOW,
+            model_name="Qwen/Qwen3-Reranker-8B",
+        ),
+    )
+
+    assert result.outcome is RerankOutcome.SUCCESS
+    siliconflow.rerank.assert_called_once()
+    openrouter.rerank.assert_not_called()
+    assert trace_call.call_args.kwargs["provider"] == "siliconflow"
 
 
 def test_logs_are_secret_free(

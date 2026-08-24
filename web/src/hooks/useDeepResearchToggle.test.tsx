@@ -34,4 +34,19 @@ describe("useDeepResearchToggle", () => {
     expect(result.current.atezSearchEnabled).toBe(false);
     expect(result.current.deepResearchEnabled).toBe(false);
   });
+
+  it("keeps Atez Search versions mutually exclusive", () => {
+    const { result } = renderHook(() =>
+      useDeepResearchToggle({ chatSessionId: null, agentId: 0 })
+    );
+
+    act(() => result.current.toggleAtezSearch());
+    act(() => result.current.toggleAtezSearchV2());
+    expect(result.current.atezSearchEnabled).toBe(false);
+    expect(result.current.atezSearchV2Enabled).toBe(true);
+
+    act(() => result.current.toggleAtezSearch());
+    expect(result.current.atezSearchEnabled).toBe(true);
+    expect(result.current.atezSearchV2Enabled).toBe(false);
+  });
 });

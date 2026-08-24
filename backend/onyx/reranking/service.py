@@ -1,6 +1,6 @@
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from typing import Any
 
@@ -32,6 +32,7 @@ from onyx.reranking.models import (
 )
 from onyx.reranking.openrouter import OpenRouterRerankClient
 from onyx.reranking.payload import serialize_rerank_candidates
+from onyx.reranking.siliconflow import SiliconFlowRerankClient
 from onyx.server.metrics.reranking import observe_rerank
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import traced_llm_call
@@ -42,6 +43,7 @@ from shared_configs.enums import RerankerProvider
 logger = setup_logger()
 
 TraceCall = Callable[..., AbstractContextManager[Any]]
+RerankClient = OpenRouterRerankClient | SiliconFlowRerankClient
 _IMMEDIATE_PROVIDER_FAILURES = frozenset({400, 401, 402, 403, 404, 413, 422})
 
 
@@ -49,11 +51,18 @@ class RerankingService:
     def __init__(
         self,
         *,
-        client: OpenRouterRerankClient,
+        client: RerankClient | None = None,
+        clients: Mapping[RerankerProvider, RerankClient] | None = None,
         circuit_breaker: RerankCircuitBreaker,
         trace_call: TraceCall = traced_llm_call,
     ) -> None:
-        self._client = client
+        if client is not None and clients is not None:
+            raise ValueError("Provide either client or clients, not both")
+        self._clients = dict(
+            clients
+            if clients is not None
+            else ({RerankerProvider.OPENROUTER: client} if client else {})
+        )
         self._circuit_breaker = circuit_breaker
         self._trace_call = trace_call
 
@@ -119,7 +128,8 @@ class RerankingService:
                 fallback_used=True,
             )
         if (
-            config.provider_type is not RerankerProvider.OPENROUTER
+            config.provider_type is None
+            or config.provider_type not in self._clients
             or config.model_name is None
             or config.api_key is None
         ):
@@ -140,6 +150,8 @@ class RerankingService:
             )
 
         api_key = config.api_key.get_value(apply_mask=False)
+        provider = config.provider_type
+        client = self._clients[provider]
         circuit_key = RerankCircuitKey(
             tenant_id=get_current_tenant_id(),
             config_fingerprint=reranker_configuration_fingerprint(
@@ -181,9 +193,9 @@ class RerankingService:
             with self._trace_call(
                 flow=LLMFlow.RERANK,
                 model=config.model_name,
-                provider=RerankerProvider.OPENROUTER.value,
+                provider=provider.value,
             ):
-                scores = self._client.rerank(
+                scores = client.rerank(
                     api_key=api_key,
                     model=config.model_name,
                     query=query,
@@ -267,7 +279,10 @@ def _get_default_service() -> RerankingService:
         with _DEFAULT_SERVICE_LOCK:
             if _DEFAULT_SERVICE is None:
                 _DEFAULT_SERVICE = RerankingService(
-                    client=OpenRouterRerankClient(),
+                    clients={
+                        RerankerProvider.OPENROUTER: OpenRouterRerankClient(),
+                        RerankerProvider.SILICONFLOW: SiliconFlowRerankClient(),
+                    },
                     circuit_breaker=RerankCircuitBreaker(),
                 )
     return _DEFAULT_SERVICE

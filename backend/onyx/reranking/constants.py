@@ -1,4 +1,5 @@
 OPENROUTER_RERANK_URL = "https://openrouter.ai/api/v1/rerank"
+SILICONFLOW_RERANK_URL = "https://api.siliconflow.com/v1/rerank"
 OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_LUNA_RERANK_MODEL = "openai/gpt-5.6-luna"
 OPENROUTER_CHAT_RERANK_MODELS = frozenset({OPENROUTER_LUNA_RERANK_MODEL})

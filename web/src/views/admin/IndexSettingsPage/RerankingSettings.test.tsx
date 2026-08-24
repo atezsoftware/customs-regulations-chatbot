@@ -13,8 +13,8 @@ const EMPTY_CONFIG: RerankingConfigView = {
 
 const STORED_CONFIG: RerankingConfigView = {
   enabled: false,
-  provider_type: "openrouter",
-  model_id: "voyageai/rerank-2.5",
+  provider_type: "siliconflow",
+  model_id: "Qwen/Qwen3-Reranker-8B",
   api_key_configured: true,
   masked_api_key: "********last4",
 };
@@ -55,7 +55,7 @@ describe("RerankingSettings", () => {
 
     renderSettings(STORED_CONFIG);
 
-    expect(screen.getByLabelText("OpenRouter API key")).toHaveAttribute(
+    expect(screen.getByLabelText("SiliconFlow API key")).toHaveAttribute(
       "placeholder",
       "********last4"
     );
@@ -66,8 +66,8 @@ describe("RerankingSettings", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(requestBody(fetchMock)).toEqual({
       enabled: false,
-      provider_type: "openrouter",
-      model_id: "voyageai/rerank-2.5",
+      provider_type: "siliconflow",
+      model_id: "Qwen/Qwen3-Reranker-8B",
     });
   });
 
@@ -75,25 +75,24 @@ describe("RerankingSettings", () => {
     const user = setupUser();
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
-        models: [{ id: "cohere/rerank-v3.5", name: "Cohere Rerank 3.5" }],
+        models: [{ id: "Qwen/Qwen3-Reranker-4B", name: "Qwen3 Reranker 4B" }],
       })
     );
 
     renderSettings();
 
-    await user.type(screen.getByLabelText("OpenRouter API key"), "sk-unsaved");
-    await user.type(screen.getByLabelText("Manual model ID"), "manual/model");
+    await user.type(screen.getByLabelText("SiliconFlow API key"), "sk-unsaved");
     await user.click(screen.getByRole("button", { name: "Load models" }));
 
     expect(
       await screen.findByRole("combobox", {
-        name: "OpenRouter reranking model catalog",
+        name: "SiliconFlow reranking model catalog",
       })
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("Manual model ID")).toHaveValue(
-      "manual/model"
+    expect(screen.getByLabelText("SiliconFlow model ID")).toHaveValue(
+      "Qwen/Qwen3-Reranker-8B"
     );
-    expect(requestBody(fetchMock)).toEqual({ api_key: "sk-unsaved" });
+    expect(fetchMock).toHaveBeenCalledWith(SWR_KEYS.siliconFlowRerankingModels);
   });
 
   it("invalidates a successful exact-configuration test when the model changes", async () => {
@@ -104,11 +103,7 @@ describe("RerankingSettings", () => {
 
     renderSettings();
 
-    await user.type(screen.getByLabelText("OpenRouter API key"), "sk-test");
-    await user.type(
-      screen.getByLabelText("Manual model ID"),
-      "voyageai/rerank-2.5"
-    );
+    await user.type(screen.getByLabelText("SiliconFlow API key"), "sk-test");
     await user.click(screen.getByRole("switch", { name: "Enable reranking" }));
     expect(
       screen.getByRole("button", { name: "Enable and save" })
@@ -124,7 +119,7 @@ describe("RerankingSettings", () => {
       screen.getByRole("button", { name: "Enable and save" })
     ).toBeEnabled();
 
-    await user.type(screen.getByLabelText("Manual model ID"), "-new");
+    await user.type(screen.getByLabelText("SiliconFlow model ID"), "-new");
 
     expect(
       screen.getByRole("button", { name: "Enable and save" })
@@ -143,8 +138,8 @@ describe("RerankingSettings", () => {
       .mockResolvedValueOnce(
         jsonResponse({
           enabled: true,
-          provider_type: "openrouter",
-          model_id: "voyageai/rerank-2.5",
+          provider_type: "siliconflow",
+          model_id: "Qwen/Qwen3-Reranker-8B",
           api_key_configured: true,
           masked_api_key: "********",
         })
@@ -152,11 +147,7 @@ describe("RerankingSettings", () => {
 
     renderSettings();
 
-    await user.type(screen.getByLabelText("OpenRouter API key"), "sk-test");
-    await user.type(
-      screen.getByLabelText("Manual model ID"),
-      "voyageai/rerank-2.5"
-    );
+    await user.type(screen.getByLabelText("SiliconFlow API key"), "sk-test");
     await user.click(screen.getByRole("switch", { name: "Enable reranking" }));
     await user.click(
       screen.getByRole("button", { name: "Test configuration" })
@@ -167,19 +158,19 @@ describe("RerankingSettings", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect(requestBody(fetchMock, 1)).toEqual({
       enabled: true,
-      provider_type: "openrouter",
-      model_id: "voyageai/rerank-2.5",
+      provider_type: "siliconflow",
+      model_id: "Qwen/Qwen3-Reranker-8B",
       api_key: "sk-test",
       test_attestation: "exact-token",
     });
   });
 
-  it("shows backend detail when OpenRouter rejects a test", async () => {
+  it("shows backend detail when SiliconFlow rejects a test", async () => {
     const user = setupUser();
     fetchMock.mockResolvedValueOnce(
       jsonResponse(
         {
-          detail: "OpenRouter rejected this key under the required ZDR policy.",
+          detail: "SiliconFlow rejected this key.",
         },
         502
       )
@@ -192,9 +183,7 @@ describe("RerankingSettings", () => {
     );
 
     expect(
-      await screen.findByText(
-        "OpenRouter rejected this key under the required ZDR policy."
-      )
+      await screen.findByText("SiliconFlow rejected this key.")
     ).toBeInTheDocument();
   });
 
@@ -203,8 +192,8 @@ describe("RerankingSettings", () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
         enabled: false,
-        provider_type: "openrouter",
-        model_id: "custom/reranker",
+        provider_type: "siliconflow",
+        model_id: "Qwen/Qwen3-Reranker-8B",
         api_key_configured: true,
         masked_api_key: "********",
       })
@@ -212,11 +201,7 @@ describe("RerankingSettings", () => {
 
     renderSettings();
 
-    await user.type(screen.getByLabelText("OpenRouter API key"), "sk-new");
-    await user.type(
-      screen.getByLabelText("Manual model ID"),
-      "custom/reranker"
-    );
+    await user.type(screen.getByLabelText("SiliconFlow API key"), "sk-new");
     const saveButton = screen.getByRole("button", {
       name: "Save disabled configuration",
     });
@@ -226,8 +211,8 @@ describe("RerankingSettings", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(requestBody(fetchMock)).toEqual({
       enabled: false,
-      provider_type: "openrouter",
-      model_id: "custom/reranker",
+      provider_type: "siliconflow",
+      model_id: "Qwen/Qwen3-Reranker-8B",
       api_key: "sk-new",
     });
   });
@@ -257,7 +242,7 @@ describe("RerankingSettings", () => {
     ).toBeInTheDocument();
   });
 
-  it("discloses external query processing and the required provider controls", () => {
+  it("discloses external query processing and the selected provider", () => {
     renderSettings();
 
     expect(
@@ -266,8 +251,7 @@ describe("RerankingSettings", () => {
       )
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/zero data retention \(ZDR\)/i)
+      screen.getByText(/sent to SiliconFlow for reranking/i)
     ).toBeInTheDocument();
-    expect(screen.getByText(/data-use denial/i)).toBeInTheDocument();
   });
 });

@@ -40,6 +40,7 @@ export interface ChatUIProps {
     currentMessageFiles: any[];
     deepResearch: boolean;
     atezSearch?: boolean;
+    atezSearchV2?: boolean;
     modelOverride?: LlmDescriptor;
     regenerationRequest?: {
       messageId: number;
@@ -51,6 +52,7 @@ export interface ChatUIProps {
   }) => Promise<void>;
   deepResearchEnabled: boolean;
   atezSearchEnabled?: boolean;
+  atezSearchV2Enabled?: boolean;
   currentMessageFiles: any[];
 
   onResubmit: () => void;
@@ -78,6 +80,7 @@ const ChatUI = React.memo(
     onSubmit,
     deepResearchEnabled,
     atezSearchEnabled = false,
+    atezSearchV2Enabled = false,
     currentMessageFiles,
     onResubmit,
     anchorNodeId,
@@ -106,11 +109,13 @@ const ChatUI = React.memo(
     const onSubmitRef = useRef(onSubmit);
     const deepResearchEnabledRef = useRef(deepResearchEnabled);
     const atezSearchEnabledRef = useRef(atezSearchEnabled);
+    const atezSearchV2EnabledRef = useRef(atezSearchV2Enabled);
     const currentMessageFilesRef = useRef(currentMessageFiles);
     const selectedModelsRef = useRef(selectedModels);
     onSubmitRef.current = onSubmit;
     deepResearchEnabledRef.current = deepResearchEnabled;
     atezSearchEnabledRef.current = atezSearchEnabled;
+    atezSearchV2EnabledRef.current = atezSearchV2Enabled;
     currentMessageFilesRef.current = currentMessageFiles;
     selectedModelsRef.current = selectedModels;
 
@@ -126,6 +131,7 @@ const ChatUI = React.memo(
             currentMessageFiles: currentMessageFilesRef.current,
             deepResearch: deepResearchEnabledRef.current,
             atezSearch: atezSearchEnabledRef.current,
+            atezSearchV2: atezSearchV2EnabledRef.current,
             modelOverride,
             messageIdToResend: regenerationRequest.parentMessage.messageId,
             regenerationRequest,
@@ -145,6 +151,7 @@ const ChatUI = React.memo(
           currentMessageFiles: [],
           deepResearch: deepResearchEnabledRef.current,
           atezSearch: atezSearchEnabledRef.current,
+          atezSearchV2: atezSearchV2EnabledRef.current,
           selectedModels: models && models.length >= 2 ? models : undefined,
         });
       },

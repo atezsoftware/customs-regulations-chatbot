@@ -63,6 +63,27 @@ def test_atez_search_forces_regulatory_scope_without_discarding_user_filters() -
     assert effective_filters.source_type == [DocumentSource.USER_FILE]
     assert effective_filters.document_set == ["Dar kapsam"]
     assert effective_filters.as_of_date == requested_date
+    assert effective_filters.regulatory_workflow_mode == "standard"
+
+
+def test_atez_search_v2_uses_fast_regulatory_profile() -> None:
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SimpleNamespace(
+            internal_search_filters=None,
+            message="Antrepo rejiminin şartları nelerdir?",
+            atez_search=False,
+            atez_search_v2=True,
+        ),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(
+        cast(ChatTurnSetup, setup)
+    )
+
+    assert effective_filters is not None
+    assert effective_filters.regulatory_chunks_only is True
+    assert effective_filters.regulatory_workflow_mode == "fast"
 
 
 @pytest.mark.parametrize(
@@ -156,6 +177,16 @@ def test_send_message_request_defaults_atez_search_to_false() -> None:
     request = SendMessageRequest(message="Merhaba")
 
     assert request.atez_search is False
+    assert request.atez_search_v2 is False
+
+
+def test_send_message_request_rejects_both_atez_versions() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SendMessageRequest(
+            message="Merhaba",
+            atez_search=True,
+            atez_search_v2=True,
+        )
 
 
 def test_gather_stream_returns_empty_answer_when_streaming_error_only() -> None:

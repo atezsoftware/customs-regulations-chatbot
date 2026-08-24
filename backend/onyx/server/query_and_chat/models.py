@@ -118,6 +118,9 @@ class SendMessageRequest(BaseModel):
     # Opts the default assistant into the structure-aware Atez regulatory
     # workflow. Normal chat remains on the standard Onyx agent loop.
     atez_search: bool = False
+    # Independent, lower-latency profile. It shares the same indexed corpus,
+    # authorization, citations, coverage plan, and validation contracts.
+    atez_search_v2: bool = False
 
     # Headers to forward to MCP tool calls (e.g., user JWT token, user ID)
     # Example: {"Authorization": "Bearer <user_jwt>", "X-User-ID": "user123"}
@@ -153,6 +156,8 @@ class SendMessageRequest(BaseModel):
 
     @model_validator(mode="after")
     def check_chat_session_id_or_info(self) -> "SendMessageRequest":
+        if self.atez_search and self.atez_search_v2:
+            raise ValueError("atez_search and atez_search_v2 are mutually exclusive")
         # If neither is provided, default to creating a new chat session using the
         # default ChatSessionCreationRequest values.
         if self.chat_session_id is None and self.chat_session_info is None:

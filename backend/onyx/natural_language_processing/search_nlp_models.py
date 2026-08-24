@@ -461,12 +461,29 @@ class CloudEmbedding:
             or "global"
         )
 
-        client = genai.Client(
-            vertexai=True,
-            project=project_id,
-            location=location,
-            credentials=credentials,
-        )
+        client_kwargs = {
+            "project": project_id,
+            "location": location,
+            "credentials": credentials,
+        }
+        if _is_gemini_embedding_2_model(resolved_model):
+            # Gemini Embedding 2 is served through the Enterprise v1 transport.
+            # Keep query embeddings on the same endpoint as provider-batch
+            # document embeddings or hybrid retrieval silently falls back to
+            # lexical search after Vertex returns a misleading model-not-found.
+            client_kwargs["http_options"] = genai_types.HttpOptions(api_version="v1")
+            try:
+                client = genai.Client(enterprise=True, **client_kwargs)
+            except TypeError as error:
+                if "enterprise" not in str(error):
+                    raise
+                raise RuntimeError(
+                    "The google-genai runtime is incompatible with "
+                    "Gemini Embedding 2 Enterprise queries. Rebuild the service "
+                    "from the lockfile before enabling semantic search."
+                ) from error
+        else:
+            client = genai.Client(vertexai=True, **client_kwargs)
 
         # gemini-embedding-2 rejects task_type; embedding intent is conveyed
         # via the instruction-formatted text instead. Older models continue
@@ -871,6 +888,7 @@ class EmbeddingModel:
         api_version: str | None = None,
         deployment_name: str | None = None,
         reduced_dimension: int | None = None,
+        search_settings_id: int | None = None,
     ) -> None:
         self.api_key = api_key
         self.provider_type = provider_type
@@ -883,6 +901,7 @@ class EmbeddingModel:
         self.api_version = api_version
         self.deployment_name = deployment_name
         self.reduced_dimension = reduced_dimension
+        self.search_settings_id = search_settings_id
         self.tokenizer = (
             DisabledLocalTokenizer()
             if provider_type is None and DISABLE_MODEL_SERVER
@@ -1308,6 +1327,7 @@ class EmbeddingModel:
             api_version=search_settings.api_version,
             deployment_name=search_settings.deployment_name,
             reduced_dimension=requested_dimension,
+            search_settings_id=search_settings.id,
         )
 
 

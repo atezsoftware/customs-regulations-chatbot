@@ -151,7 +151,7 @@ export interface LLMContextualCost {
   cost: number;
 }
 
-export type RerankingProviderType = "openrouter";
+export type RerankingProviderType = "openrouter" | "siliconflow";
 
 /** Safe persisted view; the backend never returns the plaintext credential. */
 export interface RerankingConfigView {

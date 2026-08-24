@@ -26,6 +26,7 @@ export default function useDeepResearchToggle({
 }: UseDeepResearchToggleProps) {
   const [deepResearchEnabled, setDeepResearchEnabled] = useState(false);
   const [atezSearchEnabled, setAtezSearchEnabled] = useState(false);
+  const [atezSearchV2Enabled, setAtezSearchV2Enabled] = useState(false);
   const previousChatSessionId = useRef<string | null>(chatSessionId);
 
   // Reset when switching chat sessions, but preserve when going from null to a new session
@@ -37,6 +38,7 @@ export default function useDeepResearchToggle({
     if (previousId !== null && previousId !== chatSessionId) {
       setDeepResearchEnabled(false);
       setAtezSearchEnabled(false);
+      setAtezSearchV2Enabled(false);
     }
   }, [chatSessionId]);
 
@@ -44,6 +46,7 @@ export default function useDeepResearchToggle({
   useEffect(() => {
     setDeepResearchEnabled(false);
     setAtezSearchEnabled(false);
+    setAtezSearchV2Enabled(false);
   }, [agentId]);
 
   const toggleDeepResearch = useCallback(() => {
@@ -51,7 +54,19 @@ export default function useDeepResearchToggle({
   }, []);
 
   const toggleAtezSearch = useCallback(() => {
-    setAtezSearchEnabled((enabled) => !enabled);
+    setAtezSearchEnabled((enabled) => {
+      const next = !enabled;
+      if (next) setAtezSearchV2Enabled(false);
+      return next;
+    });
+  }, []);
+
+  const toggleAtezSearchV2 = useCallback(() => {
+    setAtezSearchV2Enabled((enabled) => {
+      const next = !enabled;
+      if (next) setAtezSearchEnabled(false);
+      return next;
+    });
   }, []);
 
   return {
@@ -59,5 +74,7 @@ export default function useDeepResearchToggle({
     toggleDeepResearch,
     atezSearchEnabled,
     toggleAtezSearch,
+    atezSearchV2Enabled,
+    toggleAtezSearchV2,
   };
 }

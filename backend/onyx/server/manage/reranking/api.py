@@ -35,6 +35,11 @@ from onyx.reranking.distributed_state import distributed_reranker_attestations
 from onyx.reranking.models import RerankError, RerankScore
 from onyx.reranking.openrouter import OpenRouterRerankClient
 from onyx.reranking.service import invalidate_reranker_circuit
+from onyx.reranking.siliconflow import (
+    SILICONFLOW_RERANK_MODELS,
+    SiliconFlowRerankClient,
+    normalize_siliconflow_model,
+)
 from onyx.server.manage.reranking.models import (
     OpenRouterModelsRequest,
     OpenRouterModelsResponse,
@@ -67,8 +72,9 @@ def _view(config: RerankerRuntimeConfig) -> RerankerConfigView:
     return RerankerConfigView(
         enabled=config.enabled,
         provider_type=(
-            "openrouter"
-            if config.provider_type is RerankerProvider.OPENROUTER
+            config.provider_type.value
+            if config.provider_type
+            in {RerankerProvider.OPENROUTER, RerankerProvider.SILICONFLOW}
             else None
         ),
         model_id=config.model_name,
@@ -90,12 +96,24 @@ def _provided_api_key(api_key: str | None) -> str | None:
     return api_key
 
 
-def _model_id(model_id: str | None) -> str | None:
+def _provider_type(provider_type: str) -> RerankerProvider:
+    return RerankerProvider(provider_type)
+
+
+def _model_id(model_id: str | None, *, provider: RerankerProvider) -> str | None:
     if model_id is None:
         return None
     model_id = model_id.strip()
     if not model_id:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, "Model ID cannot be blank.")
+    if provider is RerankerProvider.SILICONFLOW:
+        try:
+            return normalize_siliconflow_model(model_id)
+        except ValueError as error:
+            raise OnyxError(
+                OnyxErrorCode.INVALID_INPUT,
+                "Select a supported SiliconFlow reranking model.",
+            ) from error
     return model_id
 
 
@@ -108,11 +126,11 @@ def _effective_key(*, api_key: str | None, stored: RerankerRuntimeConfig) -> str
     return stored.api_key.get_value(apply_mask=False)
 
 
-def _require_key(api_key: str | None) -> str:
+def _require_key(api_key: str | None, *, provider: RerankerProvider) -> str:
     if api_key is None:
         raise OnyxError(
             OnyxErrorCode.MISSING_REQUIRED_FIELD,
-            "Configure an OpenRouter API key first.",
+            f"Configure a {provider.value} API key first.",
         )
     return api_key
 
@@ -136,14 +154,15 @@ def put_config(
     db_session: Session = Depends(get_session),
 ) -> RerankerConfigView:
     stored = get_reranker_configuration_for_update(db_session)
+    provider = _provider_type(request.provider_type)
     provided_key = _provided_api_key(request.api_key)
     effective_key = _effective_key(api_key=provided_key, stored=stored)
-    model_id = _model_id(request.model_id)
+    model_id = _model_id(request.model_id, provider=provider)
     if model_id is None:
         raise OnyxError(OnyxErrorCode.MISSING_REQUIRED_FIELD, "Model ID is required.")
     tenant_id = get_current_tenant_id()
     if request.enabled:
-        required_key = _require_key(effective_key)
+        required_key = _require_key(effective_key, provider=provider)
         fingerprint = reranker_configuration_fingerprint(
             model=model_id,
             api_key=required_key,
@@ -169,7 +188,7 @@ def put_config(
     config = upsert_reranker_configuration(
         db_session,
         enabled=request.enabled,
-        provider_type=RerankerProvider.OPENROUTER,
+        provider_type=provider,
         model_name=model_id,
         api_key=provided_key,
         updated_by_user_id=user.id,
@@ -202,15 +221,31 @@ def test_config(
     db_session: Session = Depends(get_session),
 ) -> RerankerTestResponse:
     stored = get_reranker_configuration(db_session)
-    api_key = _require_key(_effective_key(api_key=request.api_key, stored=stored))
-    model_id = _model_id(request.model_id) or stored.model_name
+    provider = _provider_type(request.provider_type)
+    api_key = _require_key(
+        _effective_key(api_key=request.api_key, stored=stored), provider=provider
+    )
+    model_id = (
+        _model_id(request.model_id, provider=provider)
+        if request.model_id is not None
+        else (
+            _model_id(stored.model_name, provider=provider)
+            if stored.model_name is not None
+            else None
+        )
+    )
     if model_id is None:
         raise OnyxError(
             OnyxErrorCode.MISSING_REQUIRED_FIELD,
-            "Select or enter an OpenRouter reranking model first.",
+            f"Select a {provider.value} reranking model first.",
         )
+    client = (
+        SiliconFlowRerankClient()
+        if provider is RerankerProvider.SILICONFLOW
+        else OpenRouterRerankClient()
+    )
     try:
-        scores = OpenRouterRerankClient().rerank(
+        scores = client.rerank(
             api_key=api_key,
             model=model_id,
             query=_TEST_QUERY,
@@ -219,15 +254,16 @@ def test_config(
         )
     except RerankError as error:
         logger.warning(
-            "OpenRouter reranker test failed error_type=%s status_code=%s "
+            "Reranker test failed provider=%s error_type=%s status_code=%s "
             "retry_after_seconds=%s",
+            provider.value,
             type(error).__name__,
             getattr(error, "status_code", None),
             getattr(error, "retry_after_seconds", None),
         )
         raise OnyxError(
             OnyxErrorCode.BAD_GATEWAY,
-            "OpenRouter could not complete a private reranking test.",
+            f"{provider.value} could not complete the reranking test.",
         ) from error
     if (
         not isinstance(scores, list)
@@ -238,7 +274,7 @@ def test_config(
     ):
         raise OnyxError(
             OnyxErrorCode.BAD_GATEWAY,
-            "OpenRouter could not complete a private reranking test.",
+            f"{provider.value} could not complete the reranking test.",
         )
 
     fingerprint = reranker_configuration_fingerprint(
@@ -278,7 +314,10 @@ def openrouter_models(
     db_session: Session = Depends(get_session),
 ) -> OpenRouterModelsResponse:
     stored = get_reranker_configuration(db_session)
-    api_key = _require_key(_effective_key(api_key=request.api_key, stored=stored))
+    api_key = _require_key(
+        _effective_key(api_key=request.api_key, stored=stored),
+        provider=RerankerProvider.OPENROUTER,
+    )
     try:
         with _catalog_http_client() as http:
             response = http.get(
@@ -309,3 +348,20 @@ def openrouter_models(
         and (item.get("name") is None or isinstance(item.get("name"), str))
     ]
     return OpenRouterModelsResponse(models=models)
+
+
+@admin_router.get("/siliconflow-models")
+def siliconflow_models(
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+) -> OpenRouterModelsResponse:
+    labels = {
+        "Qwen/Qwen3-Reranker-8B": "Qwen3 Reranker 8B",
+        "Qwen/Qwen3-Reranker-4B": "Qwen3 Reranker 4B",
+        "Qwen/Qwen3-Reranker-0.6B": "Qwen3 Reranker 0.6B",
+    }
+    return OpenRouterModelsResponse(
+        models=[
+            OpenRouterModelView(id=model, name=labels[model])
+            for model in SILICONFLOW_RERANK_MODELS
+        ]
+    )

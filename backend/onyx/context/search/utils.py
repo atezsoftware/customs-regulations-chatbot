@@ -25,9 +25,10 @@ from onyx.natural_language_processing.query_embedding_cache import (
 )
 from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
 from onyx.utils.logger import setup_logger
+from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 from onyx.utils.timing import log_function_time
 from shared_configs.configs import MODEL_SERVER_HOST, MODEL_SERVER_PORT
-from shared_configs.enums import EmbedTextType
+from shared_configs.enums import EmbeddingProvider, EmbedTextType
 from shared_configs.model_server_models import Embedding
 
 logger = setup_logger()
@@ -87,6 +88,7 @@ def get_query_embeddings(
     embedding_model: EmbeddingModel | None = None,
 ) -> list[Embedding]:
     search_settings: SearchSettings | None = None
+    search_settings_id: int | None = None
     if embedding_model is None:
         if db_session is None:
             raise ValueError("Either db_session or embedding_model must be provided")
@@ -96,14 +98,20 @@ def get_query_embeddings(
             server_host=MODEL_SERVER_HOST,
             server_port=MODEL_SERVER_PORT,
         )
+        search_settings_id = search_settings.id
     elif db_session is not None:
         # Cache key needs search_settings.id even when the caller already
         # supplied an embedding_model.
         search_settings = get_current_search_settings(db_session)
+        search_settings_id = search_settings.id
+    else:
+        search_settings_id = embedding_model.search_settings_id
 
     result: list[Embedding] = []
     cache_usable: bool = (
-        QUERY_EMBEDDING_CACHE_ENABLED and bool(queries) and search_settings is not None
+        QUERY_EMBEDDING_CACHE_ENABLED
+        and bool(queries)
+        and search_settings_id is not None
     )
     if not cache_usable:
         if queries:
@@ -113,11 +121,11 @@ def get_query_embeddings(
             "Bug: The length of embeddings does not match the length of queries."
         )
         return result
-    assert search_settings is not None, "Bug: search_settings is None."
+    assert search_settings_id is not None, "Bug: search_settings_id is None."
 
     cached = get_cached_query_embeddings(
         queries=queries,
-        search_settings_id=search_settings.id,
+        search_settings_id=search_settings_id,
         provider_type=embedding_model.provider_type,
         ttl_seconds=QUERY_EMBEDDING_CACHE_TTL_S,
     )
@@ -138,7 +146,7 @@ def get_query_embeddings(
     cache_query_embeddings(
         queries=miss_queries,
         embeddings=fresh_embeddings,
-        search_settings_id=search_settings.id,
+        search_settings_id=search_settings_id,
         provider_type=embedding_model.provider_type,
         ttl_seconds=QUERY_EMBEDDING_CACHE_TTL_S,
     )
@@ -164,6 +172,44 @@ def get_query_embedding(
     return get_query_embeddings(
         [query], db_session=db_session, embedding_model=embedding_model
     )[0]
+
+
+def prime_query_embedding_cache(
+    queries: list[str],
+    *,
+    db_session: Session,
+    max_workers: int,
+) -> None:
+    """Populate query cache efficiently for the active provider contract."""
+
+    if not queries:
+        return
+    search_settings = get_current_search_settings(db_session)
+    embedding_model = EmbeddingModel.from_db_model(
+        search_settings=search_settings,
+        server_host=MODEL_SERVER_HOST,
+        server_port=MODEL_SERVER_PORT,
+    )
+    if (
+        embedding_model.provider_type == EmbeddingProvider.GOOGLE
+        and embedding_model.model_name == "gemini-embedding-2"
+    ):
+        # This model's embedContent endpoint accepts one content per request.
+        # Parallel single-item calls retain exact vectors while avoiding a
+        # guaranteed batch failure/retry before the normal search fan-out.
+        run_functions_tuples_in_parallel(
+            [
+                (get_query_embedding, (query, None, embedding_model))
+                for query in queries
+            ],
+            max_workers=max_workers,
+        )
+        return
+    get_query_embeddings(
+        queries,
+        db_session=db_session,
+        embedding_model=embedding_model,
+    )
 
 
 def convert_inference_sections_to_search_docs(

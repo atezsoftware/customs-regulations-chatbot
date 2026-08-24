@@ -38,6 +38,7 @@ from onyx.chat.llm_loop import (
     _join_search_work_reminders,
     _merge_candidate_review_verdicts,
     _merge_gathered_search_docs,
+    _prime_fast_regulatory_query_embeddings,
     _project_regulatory_history_for_tool_decision,
     _regulatory_llm_step_max_tokens,
     _regulatory_outline_result_matches_requested_lead,
@@ -2322,6 +2323,69 @@ def test_coverage_queries_use_planner_dimensions_without_domain_inference() -> N
     assert "collection assistance" not in joined
     assert "technical compliance" not in joined
     assert "temporary import" not in joined
+
+
+def test_fast_coverage_profile_uses_plan_derived_search_count() -> None:
+    plan = RegulatoryCoveragePlan(
+        coverage_items=[
+            RegulatoryCoverageItem(
+                research_question=f"Question {index}",
+                evidence_dimensions=[
+                    f"Primary dimension {index}",
+                    f"Secondary dimension {index}",
+                ],
+                retrieval_queries=[
+                    f"Primary lexical {index}",
+                    f"Secondary lexical {index}",
+                ],
+                material_factual_branches=[f"Branch {index}"],
+                request_anchor_groups=[[f"Anchor {index}"]],
+                completion_test=f"Complete {index}",
+            )
+            for index in range(20)
+        ]
+    )
+
+    calls = _build_regulatory_coverage_tool_calls(
+        plan,
+        turn_index=0,
+        max_calls=None,
+        include_auxiliary_searches=False,
+        include_lexical_fallbacks=False,
+    )
+
+    assert len(calls) == 40
+    assert all(call.tool_args["search_mode"] == "hybrid" for call in calls)
+
+
+def test_fast_coverage_embeddings_are_primed_in_one_batch() -> None:
+    calls = [
+        _search_tool_call(
+            f"regulatory-coverage-0-{index}",
+            query=f"Focused query {index}",
+        )
+        for index in range(3)
+    ]
+    for call in calls:
+        call.tool_args.update(
+            {
+                "search_mode": "hybrid",
+                "coverage_item": "Requested issue",
+                "evidence_target": "Operative test",
+            }
+        )
+
+    with (
+        patch("onyx.chat.llm_loop.get_session_with_current_tenant") as session,
+        patch("onyx.chat.llm_loop.prime_query_embedding_cache") as embed,
+    ):
+        _prime_fast_regulatory_query_embeddings(calls)
+
+    embed.assert_called_once_with(
+        ["Focused query 0", "Focused query 1", "Focused query 2"],
+        db_session=session.return_value.__enter__.return_value,
+        max_workers=8,
+    )
 
 
 def test_coverage_hybrid_uses_semantic_dimension_and_keyword_uses_lexical_query() -> (

@@ -237,6 +237,23 @@ export async function fetchOpenRouterRerankingModels(
   return result.models;
 }
 
+/** Loads the server-pinned SiliconFlow reranking catalog without exposing a key. */
+export async function fetchSiliconFlowRerankingModels(): Promise<
+  OpenRouterRerankingModel[]
+> {
+  const response = await fetch(SWR_KEYS.siliconFlowRerankingModels);
+  if (!response.ok) {
+    throw new Error(
+      await responseErrorMessage(
+        response,
+        "Failed to fetch SiliconFlow reranking models"
+      )
+    );
+  }
+  const result = (await response.json()) as OpenRouterRerankingModelsResponse;
+  return result.models;
+}
+
 /**
  * Tests and persists the fixed OpenRouter embedding connection.
  * The test response is authoritative for model dimension, so the UI never

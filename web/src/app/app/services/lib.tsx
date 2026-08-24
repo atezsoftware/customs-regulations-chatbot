@@ -163,6 +163,7 @@ export interface SendMessageParams {
   signal?: AbortSignal;
   deepResearch?: boolean;
   atezSearch?: boolean;
+  atezSearchV2?: boolean;
   enabledToolIds?: number[];
   // Single forced tool ID (new API uses singular, not array)
   forcedToolId?: number | null;
@@ -189,6 +190,7 @@ export async function* sendMessage({
   signal,
   deepResearch,
   atezSearch,
+  atezSearchV2,
   enabledToolIds,
   forcedToolId,
   modelProvider,
@@ -208,6 +210,7 @@ export async function* sendMessage({
     internal_search_filters: filters,
     deep_research: deepResearch ?? false,
     atez_search: atezSearch ?? false,
+    atez_search_v2: atezSearchV2 ?? false,
     allowed_tool_ids: enabledToolIds,
     forced_tool_id: forcedToolId ?? null,
     llm_override:

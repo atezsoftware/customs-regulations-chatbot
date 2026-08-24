@@ -81,6 +81,7 @@ export const SWR_KEYS = {
   rerankingConfig: "/api/admin/reranking/config",
   rerankingTest: "/api/admin/reranking/test",
   openRouterRerankingModels: "/api/admin/reranking/openrouter-models",
+  siliconFlowRerankingModels: "/api/admin/reranking/siliconflow-models",
 
   // ── Chat Sessions ─────────────────────────────────────────────────────────
   chatSessions: "/api/chat/get-user-chat-sessions",

@@ -16,6 +16,7 @@ class RerankerProvider(StrEnum):
     LITELLM = "litellm"
     BEDROCK = "bedrock"
     OPENROUTER = "openrouter"
+    SILICONFLOW = "siliconflow"
 
 
 class EmbedTextType(str, Enum):

@@ -644,10 +644,13 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
     if setup.persona.id != DEFAULT_PERSONA_ID:
         return filters
 
+    atez_search_v2 = getattr(setup.new_msg_req, "atez_search_v2", False) is True
+    regulatory_search_enabled = setup.new_msg_req.atez_search or atez_search_v2
     updates: dict[str, object] = {
         "source_type": [DocumentSource.USER_FILE],
-        "regulatory_chunks_only": setup.new_msg_req.atez_search
+        "regulatory_chunks_only": regulatory_search_enabled
         and not _is_social_only_message(setup.new_msg_req.message),
+        "regulatory_workflow_mode": "fast" if atez_search_v2 else "standard",
     }
     if filters is None or filters.as_of_date is None:
         updates["as_of_date"] = datetime.date.today()
@@ -773,6 +776,7 @@ def build_chat_turn(
             "has_persona": persona is not None and persona.id != DEFAULT_PERSONA_ID,
             "deep_research": new_msg_req.deep_research,
             "atez_search": new_msg_req.atez_search,
+            "atez_search_v2": new_msg_req.atez_search_v2,
         },
     )
 

@@ -116,6 +116,110 @@ def test_selected_provision_siblings_become_exact_citable_sections(
     lookup.assert_called_once()
 
 
+def test_regulatory_rerank_packet_combines_parent_and_clauses_but_keeps_atomics(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    parent = _projection("parent", 22, text='10. "İhracat vergileri" deyimi,')
+    clause_a = _projection(
+        "clause-a",
+        23,
+        text="a) Eşyanın ihracatında ödenecek gümrük vergileri;",
+    )
+    clause_b = _projection(
+        "clause-b",
+        24,
+        text="b) Tarım politikası çerçevesindeki ihracat vergileri;",
+    )
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        MagicMock(return_value=[parent, clause_a, clause_b]),
+    )
+    seed = _chunk(23, "clause-a", content=clause_a.text)
+
+    packets = provision_retrieval.build_regulatory_rerank_packets(
+        MagicMock(),
+        [seed],
+        query="ihracat vergileri",
+        as_of_date=date(2026, 8, 24),
+    )
+
+    assert len(packets) == 1
+    assert [member.regulatory_chunk_id for member in packets[0].members] == [
+        "parent",
+        "clause-a",
+        "clause-b",
+    ]
+    assert '10. "İhracat vergileri" deyimi,' in packets[0].candidate.content
+    assert "a) Eşyanın ihracatında" in packets[0].candidate.content
+    assert "b) Tarım politikası" in packets[0].candidate.content
+
+    chunks, scores = provision_retrieval.expand_ranked_regulatory_rerank_packets(
+        [packets[0].candidate, packets[0].candidate],
+        packets,
+        {(packets[0].candidate.document_id, packets[0].candidate.chunk_id): 0.91},
+    )
+
+    assert [chunk.regulatory_chunk_id for chunk in chunks] == [
+        "parent",
+        "clause-a",
+        "clause-b",
+    ]
+    assert all(chunk.content != packets[0].candidate.content for chunk in chunks)
+    assert set(scores.values()) == {0.91}
+
+
+def test_regulatory_rerank_packet_falls_back_to_singletons_without_metadata(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        MagicMock(side_effect=RuntimeError("db unavailable")),
+    )
+    chunks = [_chunk(1, "one"), _chunk(2, "two")]
+
+    packets = provision_retrieval.build_regulatory_rerank_packets(
+        MagicMock(),
+        chunks,
+        query="query",
+        as_of_date=None,
+    )
+
+    assert [packet.candidate for packet in packets] == chunks
+    assert [packet.members for packet in packets] == [(chunks[0],), (chunks[1],)]
+
+
+def test_regulatory_rerank_packet_enforces_family_bounds_after_seed_union(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    projections = [
+        _projection(f"member-{index}", index, text=f"Operative clause {index}")
+        for index in range(1, 9)
+    ]
+    # The DB selector can return the same family once for each matching seed.
+    # Packet construction must still deduplicate and enforce its own hard bound.
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        MagicMock(return_value=[*projections, *projections]),
+    )
+
+    packets = provision_retrieval.build_regulatory_rerank_packets(
+        MagicMock(),
+        [_chunk(2, "member-2"), _chunk(6, "member-6")],
+        query="operative clause",
+        as_of_date=None,
+        max_chunks_per_provision=5,
+        max_chars_per_provision=10_000,
+    )
+
+    assert len(packets) == 1
+    member_ids = [member.regulatory_chunk_id for member in packets[0].members]
+    assert len(member_ids) == 5
+    assert len(member_ids) == len(set(member_ids))
+
+
 def test_source_lexical_fallback_replaces_only_weak_tail(
     monkeypatch: MonkeyPatch,
 ) -> None:
