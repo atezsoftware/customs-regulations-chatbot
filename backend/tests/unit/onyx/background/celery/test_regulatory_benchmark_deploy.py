@@ -12,9 +12,13 @@ def test_backend_deploy_verifies_the_benchmark_worker_is_running() -> None:
 
     assert (
         'deploy_app "customs-regulations-background" '
-        '"customs-regulations/customs-regulations-background-values.yaml" "true"'
+        '"customs-regulations/customs-regulations-background-values.yaml" "true" "3Gi"'
         in workflow
     )
+    assert 'local memory_limit="$4"' in workflow
+    assert 'memory_override+=(--set "app.mem_limits=$memory_limit")' in workflow
+    assert 'kubectl rollout status deployment "$deployment" \\' in workflow
+    assert '--namespace "${namespace}" --timeout=600s' in workflow
     assert "verify_benchmark_worker" in workflow
     assert (
         "supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status "

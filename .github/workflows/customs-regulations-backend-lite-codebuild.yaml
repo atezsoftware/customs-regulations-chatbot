@@ -211,9 +211,15 @@ jobs:
             local app_name="$1"
             local values_file="$2"
             local wait_for_ready="$3"
+            local memory_limit="$4"
             local release="${app_name}-${env_x}"
             local deployment="${env_x}-${app_name}-deployment"
             local selector="app=${env_x}-${app_name}"
+            local -a memory_override=()
+
+            if [[ -n "$memory_limit" ]]; then
+              memory_override+=(--set "app.mem_limits=$memory_limit")
+            fi
 
             if ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
               echo "Namespace ${namespace} does not exist yet; skipping terminating pod cleanup for ${app_name}."
@@ -251,8 +257,12 @@ jobs:
               --create-namespace \
               --server-side=false \
               --set image.tag="${IMAGE_TAG}" \
+              "${memory_override[@]}" \
               ./devops \
               --timeout 600s
+
+            kubectl rollout status deployment "$deployment" \
+              --namespace "${namespace}" --timeout=600s
 
             echo "Waiting for deployment $deployment to use image tag ${IMAGE_TAG}"
             for attempt in {1..60}; do
@@ -448,8 +458,8 @@ jobs:
               sh -c 'ps -eo pid,ppid,rss,vsz,comm,args | grep -E "[c]elery|[s]upervisord|[t]ail -qF"' || true
           }
 
-          deploy_app "customs-regulations-api" "customs-regulations/customs-regulations-api-values.yaml" "true"
-          deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "true"
+          deploy_app "customs-regulations-api" "customs-regulations/customs-regulations-api-values.yaml" "true" ""
+          deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "true" "3Gi"
           verify_benchmark_worker
           verify_regulatory_indexing_worker
           verify_regulatory_indexing_beat
