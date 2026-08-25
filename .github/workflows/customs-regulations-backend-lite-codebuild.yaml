@@ -236,6 +236,70 @@ jobs:
             | grep -E -i 'benchmark|regulatory.?index|oom|out of memory|memoryerror|sigkill|killed|worker lost|terminated by' \
             | tail -n 800 || true
 
+      - name: Rebind legacy benchmark questions to PC Kulliyati
+        if: github.ref == 'refs/heads/diag/test-api-outage' && inputs.action == 'redeploy' && inputs.image_tag == 'benchmark-scope-pc'
+        run: |
+          set -euo pipefail
+          selector="app=${env_x}-customs-regulations-api"
+          pod=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json \
+            | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | select(.status.phase == "Running") | .metadata.name' \
+            | head -n 1)
+          test -n "$pod"
+          container=$(kubectl get pod "$pod" --namespace "${namespace}" -o json \
+            | jq -r '.spec.containers[] | select(.name | contains("api-container")) | .name' \
+            | head -n 1)
+          test -n "$container"
+
+          kubectl exec -i "$pod" --namespace "${namespace}" -c "$container" -- python - <<'PY'
+          from sqlalchemy import text
+
+          from onyx.db.engine.sql_engine import get_session_with_current_tenant
+
+
+          with get_session_with_current_tenant() as session:
+              questions = session.execute(
+                  text(
+                      """
+                      SELECT id, document_set_id
+                      FROM benchmark_question
+                      WHERE id BETWEEN 1 AND 5
+                      ORDER BY id
+                      FOR UPDATE
+                      """
+                  )
+              ).mappings().all()
+              assert [row["id"] for row in questions] == [1, 2, 3, 4, 5]
+              current_scopes = {row["document_set_id"] for row in questions}
+              assert current_scopes <= {5, 15}, current_scopes
+              updated = session.execute(
+                  text(
+                      """
+                      UPDATE benchmark_question
+                      SET document_set_id = 15,
+                          updated_at = now()
+                      WHERE id BETWEEN 1 AND 5
+                        AND document_set_id = 5
+                      RETURNING id
+                      """
+                  )
+              ).scalars().all()
+              session.commit()
+              verified = session.execute(
+                  text(
+                      """
+                      SELECT id, document_set_id
+                      FROM benchmark_question
+                      WHERE id BETWEEN 1 AND 5
+                      ORDER BY id
+                      """
+                  )
+              ).mappings().all()
+              assert [row["document_set_id"] for row in verified] == [15] * 5
+
+          print("rebound_question_ids", updated)
+          print("verified_question_scope", [dict(row) for row in verified])
+          PY
+
       - name: Set up Helm
         uses: azure/setup-helm@v5.0.0
         with:
