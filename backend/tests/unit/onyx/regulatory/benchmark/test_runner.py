@@ -900,7 +900,10 @@ def test_document_set_scope_tool_failure_cannot_be_judged_as_an_answer() -> None
     ):
         _generate_item_answer(
             db_session,
-            run=cast(BenchmarkRun, SimpleNamespace(id=7, deep_research=False)),
+            run=cast(
+                BenchmarkRun,
+                SimpleNamespace(id=7, deep_research=False, search_mode="v2"),
+            ),
             item=cast(BenchmarkRunItem, item),
             user=cast(User, SimpleNamespace(id=uuid4())),
             persona=MagicMock(id=DEFAULT_PERSONA_ID),
