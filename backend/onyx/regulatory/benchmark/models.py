@@ -17,13 +17,15 @@ class BenchmarkExpectedCitation(BenchmarkExpectedCitationInput):
 
 class BenchmarkFactAssessment(BaseModel):
     fact: str
-    verdict: Literal["met", "partial", "missing", "contradicted"]
+    verdict: Literal["met", "partial", "missing", "contradicted", "unverifiable"]
     explanation: str
 
 
 class BenchmarkCitationAssessment(BaseModel):
     expected_chunk_id: str
-    verdict: Literal["cited", "supported_elsewhere", "missing", "incorrect"]
+    verdict: Literal[
+        "cited", "supported_elsewhere", "missing", "incorrect", "unverifiable"
+    ]
     explanation: str
 
 

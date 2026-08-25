@@ -152,6 +152,48 @@ def test_judge_normalizes_models_that_return_overall_on_five_point_scale() -> No
     assert result.overall_score == 40
 
 
+def test_judge_accepts_unverifiable_evidence_assessments_required_by_prompt() -> None:
+    result = BenchmarkJudgeResult.model_validate(
+        {
+            "correctness_score": 3,
+            "groundedness_score": 3,
+            "completeness_score": 3,
+            "clarity_score": 4,
+            "overall_score": 65,
+            "rationale": "Supplied evidence cannot resolve one expectation.",
+            "summary": "Partially verifiable.",
+            "criteria": {
+                name: {"score": score, "rationale": "rationale"}
+                for name, score in {
+                    "correctness": 3,
+                    "groundedness": 3,
+                    "completeness": 3,
+                    "clarity": 4,
+                }.items()
+            },
+            "strengths": [],
+            "weaknesses": [],
+            "fact_assessments": [
+                {
+                    "fact": "fact",
+                    "verdict": "unverifiable",
+                    "explanation": "The supplied excerpts do not resolve it.",
+                }
+            ],
+            "citation_assessments": [
+                {
+                    "expected_chunk_id": "chunk-1",
+                    "verdict": "unverifiable",
+                    "explanation": "The supplied excerpt is incomplete.",
+                }
+            ],
+        }
+    )
+
+    assert result.fact_assessments[0].verdict == "unverifiable"
+    assert result.citation_assessments[0].verdict == "unverifiable"
+
+
 def test_usage_cost_sums_each_actual_llm_call() -> None:
     usage_calls = [
         LLMCallUsage("candidate", "provider-a", 100, 20, 0),
