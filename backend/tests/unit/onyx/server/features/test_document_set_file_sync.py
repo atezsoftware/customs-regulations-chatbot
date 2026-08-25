@@ -1,11 +1,14 @@
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 
-from onyx.db.enums import UserFileStatus
+from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
 from onyx.error_handling.exceptions import OnyxError
 from onyx.server.features.document_set.api import (
+    get_completed_document_set_file_reprojection,
     link_document_set_file,
     list_document_set_files,
     reproject_completed_document_set_file,
@@ -128,7 +131,14 @@ def test_completed_regulatory_file_reprojection_is_queued() -> None:
     file_id = uuid4()
     attempt_id = uuid4()
     user_file = MagicMock(id=file_id, status=UserFileStatus.COMPLETED)
-    snapshot = MagicMock()
+    updated_at = datetime.now(timezone.utc)
+    repair = SimpleNamespace(
+        user_file_id=file_id,
+        attempt_id=attempt_id,
+        status=UserFileProjectionRepairStatus.PENDING,
+        updated_at=updated_at,
+    )
+    db_session = MagicMock()
 
     with (
         patch(
@@ -151,19 +161,21 @@ def test_completed_regulatory_file_reprojection_is_queued() -> None:
             "onyx.server.features.document_set.api._enqueue_user_file_indexing"
         ) as enqueue,
         patch(
-            "onyx.server.features.document_set.api.UserFileSnapshot.from_model",
-            return_value=snapshot,
+            "onyx.server.features.document_set.api.get_user_file_projection_repair",
+            return_value=repair,
         ),
     ):
         result = reproject_completed_document_set_file(
             document_set_id=7,
             file_id=file_id,
             user=MagicMock(),
-            db_session=MagicMock(),
+            db_session=db_session,
             tenant_id="tenant",
         )
 
-    assert result is snapshot
+    assert result.attempt_id == attempt_id
+    assert result.status is UserFileProjectionRepairStatus.PENDING
+    assert result.updated_at == updated_at
     claim.assert_called_once()
     enqueue.assert_called_once_with(
         file_id,
@@ -171,6 +183,43 @@ def test_completed_regulatory_file_reprojection_is_queued() -> None:
         reproject_completed=True,
         projection_repair_attempt_id=attempt_id,
     )
+
+
+def test_projection_repair_status_is_returned() -> None:
+    file_id = uuid4()
+    attempt_id = uuid4()
+    updated_at = datetime.now(timezone.utc)
+    user_file = MagicMock(id=file_id)
+    repair = SimpleNamespace(
+        user_file_id=file_id,
+        attempt_id=attempt_id,
+        status=UserFileProjectionRepairStatus.FAILED,
+        updated_at=updated_at,
+    )
+
+    with (
+        patch(
+            "onyx.server.features.document_set.api._get_editable_document_set_or_raise"
+        ),
+        patch(
+            "onyx.server.features.document_set.api."
+            "get_user_file_for_document_set_management",
+            return_value=user_file,
+        ),
+        patch(
+            "onyx.server.features.document_set.api.get_user_file_projection_repair",
+            return_value=repair,
+        ),
+    ):
+        result = get_completed_document_set_file_reprojection(
+            document_set_id=7,
+            file_id=file_id,
+            user=MagicMock(),
+            db_session=MagicMock(),
+        )
+
+    assert result.attempt_id == attempt_id
+    assert result.status is UserFileProjectionRepairStatus.FAILED
 
 
 def test_pending_regulatory_file_reprojection_is_not_queued_twice() -> None:

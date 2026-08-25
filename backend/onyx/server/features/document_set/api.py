@@ -41,6 +41,7 @@ from onyx.db.regulatory_indexing_jobs import (
 from onyx.db.user_file import (
     claim_user_file_projection_repair,
     finish_user_file_projection_repair,
+    get_user_file_projection_repair,
 )
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
@@ -54,6 +55,7 @@ from onyx.server.features.document_set.models import (
     DocumentSetSummary,
     DocumentSetUpdateRequest,
     IndexChunkedFilesResponse,
+    ProjectionRepairSnapshot,
 )
 from onyx.server.features.projects.models import (
     CategorizedFilesSnapshot,
@@ -330,7 +332,7 @@ def reproject_completed_document_set_file(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
     tenant_id: str = Depends(get_current_tenant_id),
-) -> UserFileSnapshot:
+) -> ProjectionRepairSnapshot:
     """Queue index repair for an already-completed regulatory user file."""
 
     _get_editable_document_set_or_raise(document_set_id, user, db_session)
@@ -371,7 +373,42 @@ def reproject_completed_document_set_file(
         )
         db_session.commit()
         raise
-    return UserFileSnapshot.from_model(user_file)
+    repair = get_user_file_projection_repair(db_session, user_file.id)
+    if repair is None:
+        raise OnyxError(
+            OnyxErrorCode.INTERNAL_ERROR,
+            "Projection repair state was not persisted",
+        )
+    return ProjectionRepairSnapshot(
+        user_file_id=repair.user_file_id,
+        attempt_id=repair.attempt_id,
+        status=repair.status,
+        updated_at=repair.updated_at,
+    )
+
+
+@router.get("/admin/document-set/{document_set_id}/files/{file_id}/reproject")
+def get_completed_document_set_file_reprojection(
+    document_set_id: int,
+    file_id: UUID,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> ProjectionRepairSnapshot:
+    """Return the durable state of the latest projection repair attempt."""
+
+    _get_editable_document_set_or_raise(document_set_id, user, db_session)
+    user_file = get_user_file_for_document_set_management(db_session, file_id, user)
+    if user_file is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "File not found")
+    repair = get_user_file_projection_repair(db_session, user_file.id)
+    if repair is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Projection repair not found")
+    return ProjectionRepairSnapshot(
+        user_file_id=repair.user_file_id,
+        attempt_id=repair.attempt_id,
+        status=repair.status,
+        updated_at=repair.updated_at,
+    )
 
 
 @router.post("/admin/document-set/{document_set_id}/index-chunked")

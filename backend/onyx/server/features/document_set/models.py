@@ -1,8 +1,10 @@
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from onyx.db.enums import UserFileProjectionRepairStatus
 from onyx.db.models import DocumentSet as DocumentSetDBModel
 from onyx.db.models import FederatedConnector__DocumentSet
 from onyx.server.documents.models import (
@@ -205,3 +207,10 @@ class IndexChunkedFilesResponse(BaseModel):
     """How many reviewed files were handed to the indexing worker."""
 
     queued: int
+
+
+class ProjectionRepairSnapshot(BaseModel):
+    user_file_id: UUID
+    attempt_id: UUID
+    status: UserFileProjectionRepairStatus
+    updated_at: datetime

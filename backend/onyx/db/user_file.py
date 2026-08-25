@@ -133,6 +133,12 @@ def fetch_user_file_projection_repair_statuses(
     return {user_file_id: status for user_file_id, status in rows}
 
 
+def get_user_file_projection_repair(
+    db_session: Session, user_file_id: UUID
+) -> UserFileProjectionRepair | None:
+    return db_session.get(UserFileProjectionRepair, user_file_id)
+
+
 def fetch_chunk_counts_for_user_files(
     user_file_ids: list[str],
     db_session: Session,
