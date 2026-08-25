@@ -123,7 +123,7 @@ def test_judge_scores_remain_application_validated() -> None:
         )
 
 
-def test_judge_normalizes_models_that_return_overall_on_five_point_scale() -> None:
+def test_judge_ignores_provider_overall_on_five_point_scale() -> None:
     result = BenchmarkJudgeResult.model_validate(
         {
             "correctness_score": 4,
@@ -149,7 +149,7 @@ def test_judge_normalizes_models_that_return_overall_on_five_point_scale() -> No
         }
     )
 
-    assert result.overall_score == 40
+    assert result.overall_score == 56
 
 
 def test_judge_accepts_unverifiable_evidence_assessments_required_by_prompt() -> None:
@@ -216,7 +216,33 @@ def test_judge_derives_duplicate_top_level_scores_from_criteria() -> None:
     assert result.groundedness_score == 3
     assert result.completeness_score == 2
     assert result.clarity_score == 5
-    assert result.overall_score == 70
+    assert result.overall_score == 63
+
+
+def test_judge_replaces_inconsistent_provider_overall_score() -> None:
+    result = BenchmarkJudgeResult.model_validate(
+        {
+            "correctness_score": 1,
+            "groundedness_score": 1,
+            "completeness_score": 1,
+            "clarity_score": 3,
+            "overall_score": 100,
+            "rationale": "The answer is unusable.",
+            "summary": "Materially incomplete.",
+            "criteria": {
+                "correctness": {"score": 1, "rationale": "No answer."},
+                "groundedness": {"score": 1, "rationale": "No sources."},
+                "completeness": {"score": 1, "rationale": "Missing."},
+                "clarity": {"score": 3, "rationale": "Readable."},
+            },
+            "strengths": [],
+            "weaknesses": [],
+            "fact_assessments": [],
+            "citation_assessments": [],
+        }
+    )
+
+    assert result.overall_score == 13
 
 
 def test_judge_decodes_provider_stringified_criteria_report() -> None:

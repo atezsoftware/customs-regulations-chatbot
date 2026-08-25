@@ -537,6 +537,7 @@ def create_run(
 @router.post("/runs/{run_id}/start", tags=PUBLIC_API_TAGS)
 def start_run(
     run_id: int,
+    rerun_completed: bool = False,
     user: User = Depends(  # noqa: ARG001
         require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)
     ),
@@ -548,10 +549,14 @@ def start_run(
     if run.status not in {
         BenchmarkRunStatus.PENDING.value,
         BenchmarkRunStatus.ERROR.value,
+        BenchmarkRunStatus.CANCELLED.value,
     }:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, "Run is not pending or retryable")
-    if run.status == BenchmarkRunStatus.ERROR.value:
-        reset_benchmark_run_for_retry(run)
+    if run.status in {
+        BenchmarkRunStatus.ERROR.value,
+        BenchmarkRunStatus.CANCELLED.value,
+    }:
+        reset_benchmark_run_for_retry(run, rerun_completed=rerun_completed)
     run.status = BenchmarkRunStatus.QUEUED.value
     run.queued_at = datetime.datetime.now(datetime.timezone.utc)
     run.started_at = None

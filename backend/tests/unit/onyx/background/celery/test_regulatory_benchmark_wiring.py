@@ -227,6 +227,37 @@ def test_error_run_retry_preserves_judge_failed_answers_and_completed_items() ->
     assert completed_item.final_result == "completed answer"
 
 
+def test_cancelled_run_can_restart_and_explicitly_rejudge_completed_items() -> None:
+    run = SimpleNamespace(
+        id=42,
+        status=BenchmarkRunStatus.CANCELLED.value,
+        queued_at=None,
+        started_at=MagicMock(),
+        heartbeat_at=MagicMock(),
+        completed_at=MagicMock(),
+        failure_code=None,
+        failure_message=None,
+        items=[],
+    )
+    db_session = MagicMock()
+
+    with (
+        patch.object(benchmark_api, "get_benchmark_run_for_update", return_value=run),
+        patch.object(benchmark_api, "reset_benchmark_run_for_retry") as reset,
+        patch.object(benchmark_api, "_enqueue_benchmark_run"),
+        patch.object(benchmark_api, "benchmark_run_snapshot", return_value=MagicMock()),
+    ):
+        benchmark_api.start_run(
+            42,
+            rerun_completed=True,
+            user=MagicMock(),
+            db_session=db_session,
+        )
+
+    reset.assert_called_once_with(run, rerun_completed=True)
+    assert run.status == BenchmarkRunStatus.QUEUED.value
+
+
 def test_start_publish_failure_leaves_committed_queue_state_for_recovery() -> None:
     run = SimpleNamespace(
         id=42,

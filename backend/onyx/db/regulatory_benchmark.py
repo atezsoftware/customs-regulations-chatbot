@@ -350,12 +350,26 @@ def refresh_benchmark_run_counts(db_session: Session, run: BenchmarkRun) -> None
     run.failed_items = counts.get(BenchmarkRunItemStatus.ERROR.value, 0)
 
 
-def reset_benchmark_run_for_retry(run: BenchmarkRun) -> None:
+def reset_benchmark_run_for_retry(
+    run: BenchmarkRun, *, rerun_completed: bool = False
+) -> None:
     for item in run.items:
-        if item.status != BenchmarkRunItemStatus.ERROR.value:
+        original_status = item.status
+        retryable_statuses = {
+            BenchmarkRunItemStatus.ERROR.value,
+            BenchmarkRunItemStatus.CANCELLED.value,
+        }
+        if rerun_completed:
+            retryable_statuses.add(BenchmarkRunItemStatus.COMPLETED.value)
+        if original_status not in retryable_statuses:
             continue
-        retry_judging_only = (
-            item.judge_error is not None and item.final_result is not None
+        retry_judging_only = item.final_result is not None and (
+            item.judge_error is not None
+            or original_status
+            in {
+                BenchmarkRunItemStatus.CANCELLED.value,
+                BenchmarkRunItemStatus.COMPLETED.value,
+            }
         )
         item.status = BenchmarkRunItemStatus.PENDING.value
         item.error_message = None

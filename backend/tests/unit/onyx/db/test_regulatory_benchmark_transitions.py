@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import MagicMock
 
 from sqlalchemy.orm import Session
 
@@ -197,3 +198,44 @@ def test_retry_preserves_completed_answer_when_only_judging_failed() -> None:
     assert answer_item.final_result is None
     assert answer_item.input_tokens is None
     assert answer_item.llm_calls == []
+
+
+def test_cancelled_retry_can_rejudge_completed_and_preserve_available_answers() -> None:
+    completed_item = BenchmarkRunItem(
+        status=BenchmarkRunItemStatus.COMPLETED.value,
+        final_result="Completed answer",
+        input_tokens=100,
+        judgment=MagicMock(),
+    )
+    cancelled_with_answer = BenchmarkRunItem(
+        status=BenchmarkRunItemStatus.CANCELLED.value,
+        final_result="Interrupted after answering",
+        input_tokens=80,
+        judgment=None,
+    )
+    cancelled_without_answer = BenchmarkRunItem(
+        status=BenchmarkRunItemStatus.CANCELLED.value,
+        final_result=None,
+        input_tokens=20,
+        judgment=None,
+    )
+    run = BenchmarkRun(
+        status=BenchmarkRunStatus.CANCELLED.value,
+        completed_items=1,
+        failed_items=0,
+        items=[completed_item, cancelled_with_answer, cancelled_without_answer],
+    )
+
+    reset_benchmark_run_for_retry(run, rerun_completed=True)
+
+    assert completed_item.status == BenchmarkRunItemStatus.PENDING.value
+    assert completed_item.final_result == "Completed answer"
+    assert completed_item.input_tokens == 100
+    assert completed_item.judgment is None
+    assert cancelled_with_answer.status == BenchmarkRunItemStatus.PENDING.value
+    assert cancelled_with_answer.final_result == "Interrupted after answering"
+    assert cancelled_with_answer.input_tokens == 80
+    assert cancelled_without_answer.status == BenchmarkRunItemStatus.PENDING.value
+    assert cancelled_without_answer.final_result is None
+    assert cancelled_without_answer.input_tokens is None
+    assert run.completed_items == 0

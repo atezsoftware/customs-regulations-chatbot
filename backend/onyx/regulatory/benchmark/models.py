@@ -98,11 +98,13 @@ class BenchmarkJudgeResult(BaseModel):
                 if criterion_score is not None:
                     normalized[score_field] = criterion_score
 
-        if "overall_score" not in normalized:
-            criterion_scores = [normalized.get(field) for field in score_fields]
-            if all(isinstance(score, int) for score in criterion_scores):
-                # Four 1-5 criteria map linearly to the benchmark's 0-100 scale.
-                normalized["overall_score"] = sum(criterion_scores) * 5
+        criterion_scores = [normalized.get(field) for field in score_fields]
+        if all(isinstance(score, int) for score in criterion_scores):
+            # The detailed criteria are the judge's auditable measurements. Derive
+            # the aggregate deterministically so a contradictory provider-supplied
+            # overall score cannot corrupt model rankings. Map 1 -> 0 and 5 -> 100.
+            adjusted_score_total = sum(criterion_scores) - len(criterion_scores)
+            normalized["overall_score"] = (adjusted_score_total * 100 + 8) // 16
         return normalized
 
     @field_validator(
