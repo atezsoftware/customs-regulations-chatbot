@@ -58,11 +58,13 @@ def claim_user_file_projection_repair(
             attempt_id=attempt_id,
             status=UserFileProjectionRepairStatus.PENDING,
             updated_at=now,
+            failure_code=None,
         )
     else:
         repair.attempt_id = attempt_id
         repair.status = UserFileProjectionRepairStatus.PENDING
         repair.updated_at = now
+        repair.failure_code = None
     db_session.add(repair)
     return attempt_id
 
@@ -95,6 +97,7 @@ def finish_user_file_projection_repair(
     attempt_id: UUID,
     *,
     succeeded: bool,
+    failure_code: str | None = None,
 ) -> bool:
     repair = db_session.scalar(
         select(UserFileProjectionRepair)
@@ -116,6 +119,7 @@ def finish_user_file_projection_repair(
         else UserFileProjectionRepairStatus.FAILED
     )
     repair.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    repair.failure_code = None if succeeded else (failure_code or "UNKNOWN")[:128]
     db_session.add(repair)
     return True
 

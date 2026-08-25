@@ -137,6 +137,7 @@ def test_completed_regulatory_file_reprojection_is_queued() -> None:
         attempt_id=attempt_id,
         status=UserFileProjectionRepairStatus.PENDING,
         updated_at=updated_at,
+        failure_code=None,
     )
     db_session = MagicMock()
 
@@ -195,6 +196,7 @@ def test_projection_repair_status_is_returned() -> None:
         attempt_id=attempt_id,
         status=UserFileProjectionRepairStatus.FAILED,
         updated_at=updated_at,
+        failure_code="projection:RuntimeError",
     )
 
     with (
@@ -220,6 +222,7 @@ def test_projection_repair_status_is_returned() -> None:
 
     assert result.attempt_id == attempt_id
     assert result.status is UserFileProjectionRepairStatus.FAILED
+    assert result.failure_code == "projection:RuntimeError"
 
 
 def test_pending_regulatory_file_reprojection_is_not_queued_twice() -> None:
@@ -300,7 +303,13 @@ def test_reprojection_publish_failure_is_recorded() -> None:
             tenant_id="tenant",
         )
 
-    finish.assert_called_once_with(db_session, file_id, attempt_id, succeeded=False)
+    finish.assert_called_once_with(
+        db_session,
+        file_id,
+        attempt_id,
+        succeeded=False,
+        failure_code="publish:task_submission_failed",
+    )
     assert db_session.commit.call_count == 2
 
 

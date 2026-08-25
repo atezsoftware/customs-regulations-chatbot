@@ -5595,6 +5595,7 @@ class UserFileProjectionRepair(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class RegulatoryChunk(Base):

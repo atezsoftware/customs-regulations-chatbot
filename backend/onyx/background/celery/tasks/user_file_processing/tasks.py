@@ -583,6 +583,7 @@ def index_user_file_impl(
 ) -> None:
     """Phase two: project already-written chunk rows into the search index."""
 
+    repair_phase = "validation"
     try:
         with get_session_with_current_tenant() as db_session:
             user_file = db_session.get(UserFile, _as_uuid(user_file_id))
@@ -611,6 +612,7 @@ def index_user_file_impl(
                     return
                 db_session.commit()
                 job_id = None
+                repair_phase = "projection"
                 chunk_count = project_user_file_to_index(
                     db_session, user_file, tenant_id
                 )
@@ -619,6 +621,7 @@ def index_user_file_impl(
                 user_file.last_project_sync_at = datetime.datetime.now(
                     datetime.timezone.utc
                 )
+                repair_phase = "finalization"
                 db_session.commit()
             elif app_configs.REGULATORY_BATCH_INDEXING_ENABLED:
                 job_id = prepare_regulatory_indexing_job_from_chunks(
@@ -642,7 +645,7 @@ def index_user_file_impl(
                 tenant_id=tenant_id,
                 user_file_id=user_file_id,
             )
-    except Exception:
+    except Exception as exc:
         task_logger.exception(
             f"index_user_file_impl - Failed to index user file {user_file_id}"
         )
@@ -654,6 +657,7 @@ def index_user_file_impl(
                         _as_uuid(user_file_id),
                         _as_uuid(projection_repair_attempt_id),
                         succeeded=False,
+                        failure_code=f"{repair_phase}:{type(exc).__name__}",
                     )
                     db_session.commit()
         else:

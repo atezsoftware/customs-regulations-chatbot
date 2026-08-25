@@ -370,6 +370,7 @@ def reproject_completed_document_set_file(
             user_file.id,
             attempt_id,
             succeeded=False,
+            failure_code="publish:task_submission_failed",
         )
         db_session.commit()
         raise
@@ -384,6 +385,7 @@ def reproject_completed_document_set_file(
         attempt_id=repair.attempt_id,
         status=repair.status,
         updated_at=repair.updated_at,
+        failure_code=repair.failure_code,
     )
 
 
@@ -408,6 +410,7 @@ def get_completed_document_set_file_reprojection(
         attempt_id=repair.attempt_id,
         status=repair.status,
         updated_at=repair.updated_at,
+        failure_code=repair.failure_code,
     )
 
 

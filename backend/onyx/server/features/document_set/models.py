@@ -214,3 +214,4 @@ class ProjectionRepairSnapshot(BaseModel):
     attempt_id: UUID
     status: UserFileProjectionRepairStatus
     updated_at: datetime
+    failure_code: str | None

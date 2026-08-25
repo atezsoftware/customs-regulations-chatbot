@@ -257,6 +257,7 @@ def test_failed_reprojection_records_terminal_failure() -> None:
 
     assert user_file.status == UserFileStatus.COMPLETED
     assert finish_repair.call_args.kwargs["succeeded"] is False
+    assert finish_repair.call_args.kwargs["failure_code"] == "projection:RuntimeError"
     assert session_context.db_session.commit.call_count == 2
 
 
@@ -310,6 +311,7 @@ def test_empty_projection_repair_is_recorded_as_failed() -> None:
         )
 
     assert finish.call_args.kwargs["succeeded"] is False
+    assert finish.call_args.kwargs["failure_code"] == "projection:RuntimeError"
 
 
 def test_malformed_projection_repair_does_not_demote_completed_file() -> None:
