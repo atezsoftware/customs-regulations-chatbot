@@ -6159,6 +6159,9 @@ class BenchmarkRun(Base):
     deep_research: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    search_mode: Mapped[str] = mapped_column(
+        Text, nullable=False, default="v2", server_default=text("'v2'")
+    )
     report: Mapped[dict[str, Any] | None] = mapped_column(PGJSONB, nullable=True)
     report_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -6197,6 +6200,10 @@ class BenchmarkRun(Base):
         CheckConstraint(
             "status IN ('pending', 'queued', 'running', 'completed', 'error', 'cancelled')",
             name="benchmark_run_status_check",
+        ),
+        CheckConstraint(
+            "search_mode IN ('v1', 'v2')",
+            name="benchmark_run_search_mode_check",
         ),
     )
 

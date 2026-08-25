@@ -99,6 +99,7 @@ function buildRun(
     judge_provider_id: 3,
     judge_model: "openai/gpt-5",
     deep_research: false,
+    search_mode: "v2",
     total_items: 4,
     completed_items: status === "completed" ? 4 : 1,
     failed_items: status === "error" ? 1 : 0,
@@ -291,7 +292,40 @@ test("sends the selected provider row for candidates and the judge", async () =>
         model_id: model.model_id,
       },
       deep_research: false,
+      search_mode: "v2",
     })
+  );
+});
+
+test("sends the search mode selected for a benchmark run", async () => {
+  const createdRun = buildRun(46, "pending", "V1 comparison");
+  mockedCreateRun.mockResolvedValue(createdRun);
+  mockedStartRun.mockResolvedValue({
+    ...createdRun,
+    status: "queued",
+    queued_at: "2026-08-10T09:00:30Z",
+  });
+
+  render(<BenchmarkPage />);
+  const user = await configureRun();
+  act(() => {
+    screen.getByRole("combobox", { name: "Search mode" }).focus();
+  });
+  await user.keyboard("{ArrowDown}");
+  await waitFor(() =>
+    expect(screen.getByRole("option", { name: "Atez Search V2" })).toHaveFocus()
+  );
+  await user.keyboard("{End}");
+  await waitFor(() =>
+    expect(screen.getByRole("option", { name: "Atez Search V1" })).toHaveFocus()
+  );
+  await user.keyboard("{Enter}");
+  await user.click(screen.getByRole("button", { name: "Create and start" }));
+
+  await waitFor(() =>
+    expect(mockedCreateRun).toHaveBeenCalledWith(
+      expect.objectContaining({ search_mode: "v1" })
+    )
   );
 });
 

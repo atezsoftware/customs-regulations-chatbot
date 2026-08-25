@@ -769,7 +769,9 @@ def test_run_creation_persists_candidate_and_judge_provider_ids() -> None:
     judge = BenchmarkModelSelection(
         provider="Judge", provider_id=8, model_id="judge/model"
     )
-    request = BenchmarkRunCreate(candidates=[candidate], judge=judge)
+    request = BenchmarkRunCreate(
+        candidates=[candidate], judge=judge, search_mode="v1"
+    )
     question = SimpleNamespace(id=11, document_set_id=3)
     created_run = MagicMock()
 
@@ -794,6 +796,7 @@ def test_run_creation_persists_candidate_and_judge_provider_ids() -> None:
     assert create_run.call_args.kwargs["candidates"] == [
         ("openrouter", 7, "candidate/model")
     ]
+    assert create_run.call_args.kwargs["search_mode"] == "v1"
 
 
 def test_run_snapshot_keeps_same_named_models_separate_by_provider_id() -> None:
@@ -820,6 +823,7 @@ def test_run_snapshot_keeps_same_named_models_separate_by_provider_id() -> None:
         judge_provider_id=10,
         judge_model="judge/model",
         deep_research=False,
+        search_mode="v2",
         total_items=2,
         completed_items=2,
         failed_items=0,
@@ -889,6 +893,8 @@ def test_every_benchmark_route_requires_full_admin_panel_access() -> None:
 
 def test_run_request_has_bounded_candidate_and_question_lists() -> None:
     selection = BenchmarkModelSelection(provider="openrouter", model_id="model")
+    assert BenchmarkRunCreate(candidates=[selection], judge=selection).search_mode == "v2"
+
     with pytest.raises(ValueError):
         BenchmarkRunCreate(
             question_ids=list(range(1, 10_000)),

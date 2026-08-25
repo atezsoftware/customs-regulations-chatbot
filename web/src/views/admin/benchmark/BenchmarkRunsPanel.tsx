@@ -19,6 +19,7 @@ import {
   type BenchmarkAvailableModel,
   type BenchmarkQuestion,
   type BenchmarkRun,
+  type BenchmarkSearchMode,
   cancelBenchmarkRun,
   createBenchmarkRun,
   listBenchmarkModels,
@@ -128,6 +129,7 @@ export default function BenchmarkRunsPanel() {
   const [questionSearch, setQuestionSearch] = useState("");
   const [label, setLabel] = useState("");
   const [deepResearch, setDeepResearch] = useState(false);
+  const [searchMode, setSearchMode] = useState<BenchmarkSearchMode>("v2");
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
   const [launching, setLaunching] = useState(false);
   const [startingRunIds, setStartingRunIds] = useState<Set<number>>(new Set());
@@ -266,6 +268,7 @@ export default function BenchmarkRunsPanel() {
           model_id: judge.model_id,
         },
         deep_research: deepResearch,
+        search_mode: searchMode,
       });
       runRequestSequence.current += 1;
       protectedRunUpdates.current.set(run.id, {
@@ -309,6 +312,7 @@ export default function BenchmarkRunsPanel() {
     modelMap,
     selectedModels,
     selectedQuestionIds,
+    searchMode,
     setRunStarting,
   ]);
 
@@ -557,6 +561,33 @@ export default function BenchmarkRunsPanel() {
                 </InputSelect.Content>
               </InputSelect>
             </Field>
+            <Field
+              label="Search mode"
+              hint="Choose the production regulatory search workflow for every run item."
+            >
+              <InputSelect
+                value={searchMode}
+                onValueChange={(value) =>
+                  setSearchMode(value as BenchmarkSearchMode)
+                }
+              >
+                <InputSelect.Trigger aria-label="Search mode" />
+                <InputSelect.Content>
+                  <InputSelect.Item
+                    value="v2"
+                    description="Current regulatory search workflow"
+                  >
+                    Atez Search V2
+                  </InputSelect.Item>
+                  <InputSelect.Item
+                    value="v1"
+                    description="Legacy regulatory search workflow"
+                  >
+                    Atez Search V1
+                  </InputSelect.Item>
+                </InputSelect.Content>
+              </InputSelect>
+            </Field>
             <Card border="solid" padding="sm">
               <label className="flex cursor-pointer items-start gap-3">
                 <Checkbox
@@ -655,7 +686,7 @@ export default function BenchmarkRunsPanel() {
                         selectedRun.deep_research
                           ? "Deep research"
                           : "Internal search"
-                      }`}
+                      } · Atez Search ${selectedRun.search_mode.toUpperCase()}`}
                     </Text>
                   </div>
                   <div className="flex items-center gap-2">

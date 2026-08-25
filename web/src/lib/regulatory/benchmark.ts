@@ -21,6 +21,8 @@ export interface BenchmarkModelSelection {
   model_id: string;
 }
 
+export type BenchmarkSearchMode = "v1" | "v2";
+
 export interface BenchmarkAvailableModel extends BenchmarkModelSelection {
   provider_id: number;
   display_name: string;
@@ -167,6 +169,7 @@ export interface BenchmarkRun {
   judge_provider_id: number | null;
   judge_model: string;
   deep_research: boolean;
+  search_mode: BenchmarkSearchMode;
   total_items: number;
   completed_items: number;
   failed_items: number;
@@ -256,6 +259,7 @@ export const createBenchmarkRun = (input: {
   candidates: BenchmarkModelSelection[];
   judge: BenchmarkModelSelection;
   deep_research: boolean;
+  search_mode: BenchmarkSearchMode;
 }) =>
   requestJson<BenchmarkRun>(
     "/api/regulatory/benchmark/runs",

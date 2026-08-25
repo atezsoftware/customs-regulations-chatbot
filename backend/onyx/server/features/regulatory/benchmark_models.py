@@ -121,6 +121,7 @@ class BenchmarkRunCreate(BaseModel):
     )
     judge: BenchmarkModelSelection
     deep_research: bool = False
+    search_mode: Literal["v1", "v2"] = "v2"
 
 
 class BenchmarkJudgmentSnapshot(BaseModel):
@@ -244,6 +245,7 @@ class BenchmarkRunSnapshot(BaseModel):
     judge_provider_id: int | None
     judge_model: str
     deep_research: bool
+    search_mode: Literal["v1", "v2"]
     total_items: int
     completed_items: int
     failed_items: int
@@ -323,6 +325,7 @@ def benchmark_run_snapshot(run: BenchmarkRun) -> BenchmarkRunSnapshot:
         judge_provider_id=run.judge_provider_id,
         judge_model=run.judge_model,
         deep_research=run.deep_research,
+        search_mode=run.search_mode,
         total_items=run.total_items,
         completed_items=run.completed_items,
         failed_items=run.failed_items,

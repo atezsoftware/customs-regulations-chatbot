@@ -217,6 +217,7 @@ def create_benchmark_run(
     judge_provider_id: int,
     judge_model: str,
     deep_research: bool,
+    search_mode: str,
     created_by: UUID,
     questions: Sequence[BenchmarkQuestion],
     candidates: Sequence[tuple[str, int, str]],
@@ -227,6 +228,7 @@ def create_benchmark_run(
         judge_provider_id=judge_provider_id,
         judge_model=judge_model,
         deep_research=deep_research,
+        search_mode=search_mode,
         created_by=created_by,
         total_items=len(questions) * len(candidates),
     )

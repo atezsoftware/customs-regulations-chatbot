@@ -532,7 +532,15 @@ def test_usage_snapshots_keep_every_production_chat_llm_cycle() -> None:
     ]
 
 
-def test_answer_generation_scopes_search_to_document_set_without_project() -> None:
+@pytest.mark.parametrize(
+    ("search_mode", "expected_atez_search", "expected_atez_search_v2"),
+    [("v1", True, False), ("v2", False, True)],
+)
+def test_answer_generation_uses_the_selected_search_mode(
+    search_mode: str,
+    expected_atez_search: bool,
+    expected_atez_search_v2: bool,
+) -> None:
     chat_session_id = uuid4()
     response = SimpleNamespace(
         error_msg=None,
@@ -554,7 +562,7 @@ def test_answer_generation_scopes_search_to_document_set_without_project() -> No
             "expected_citations": [],
         },
     )
-    run = SimpleNamespace(id=7, deep_research=False)
+    run = SimpleNamespace(id=7, deep_research=False, search_mode=search_mode)
     user = SimpleNamespace(id=uuid4())
     db_session = MagicMock()
 
@@ -610,8 +618,8 @@ def test_answer_generation_scopes_search_to_document_set_without_project() -> No
     assert request.internal_search_filters is not None
     assert request.internal_search_filters.document_set == ["Current Regulations"]
     assert request.internal_search_filters.as_of_date == datetime.date(2026, 8, 6)
-    assert request.atez_search is False
-    assert request.atez_search_v2 is True
+    assert request.atez_search is expected_atez_search
+    assert request.atez_search_v2 is expected_atez_search_v2
     assert request.origin == MessageOrigin.BENCHMARK
     assert item.chat_session_id == chat_session_id
     assert item.execution_phase == "answering"
@@ -641,7 +649,7 @@ def test_nameless_openrouter_selector_becomes_a_typed_provider_override() -> Non
         ),
         question_snapshot={"prompt": "prompt", "expected_citations": []},
     )
-    run = SimpleNamespace(id=7, deep_research=False)
+    run = SimpleNamespace(id=7, deep_research=False, search_mode="v2")
     user = SimpleNamespace(id=uuid4())
 
     with (
@@ -728,7 +736,10 @@ def test_named_provider_uses_persisted_provider_id_without_assumed_type() -> Non
     ):
         _generate_item_answer(
             MagicMock(),
-            run=cast(BenchmarkRun, SimpleNamespace(id=7, deep_research=False)),
+            run=cast(
+                BenchmarkRun,
+                SimpleNamespace(id=7, deep_research=False, search_mode="v2"),
+            ),
             item=cast(BenchmarkRunItem, item),
             user=cast(User, SimpleNamespace(id=uuid4())),
             persona=MagicMock(),
@@ -800,7 +811,10 @@ def test_failed_answer_persists_usage_cost_and_execution_diagnostics() -> None:
     ):
         _generate_item_answer(
             db_session,
-            run=cast(BenchmarkRun, SimpleNamespace(id=7, deep_research=True)),
+            run=cast(
+                BenchmarkRun,
+                SimpleNamespace(id=7, deep_research=True, search_mode="v2"),
+            ),
             item=cast(BenchmarkRunItem, item),
             user=cast(User, SimpleNamespace(id=uuid4())),
             persona=MagicMock(id=DEFAULT_PERSONA_ID),

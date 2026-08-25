@@ -527,6 +527,7 @@ def create_run(
         judge_provider_id=judge_provider.id,
         judge_model=request.judge.model_id,
         deep_research=request.deep_research,
+        search_mode=request.search_mode,
         created_by=user.id,
         questions=questions,
         candidates=unique_candidates,
