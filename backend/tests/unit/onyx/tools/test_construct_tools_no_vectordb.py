@@ -14,7 +14,7 @@ import pytest
 
 from onyx.configs.constants import DEFAULT_PERSONA_ID
 from onyx.context.search.models import BaseFilters
-from onyx.db.enums import UserFileStatus
+from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
 from onyx.error_handling.exceptions import OnyxError
 from onyx.tools.models import SearchToolUsage
 from onyx.tools.tool_constructor import (
@@ -183,7 +183,13 @@ class TestEffectivePersonaTools:
                     document_set_names=["Benchmark Set"],
                 )
 
-    def test_document_set_file_scope_rejects_mixed_file_statuses(self) -> None:
+    @pytest.mark.parametrize(
+        "unready_status",
+        [UserFileStatus.CHUNKED, UserFileStatus.INDEXING, UserFileStatus.FAILED],
+    )
+    def test_document_set_file_scope_rejects_mixed_file_statuses(
+        self, unready_status: UserFileStatus
+    ) -> None:
         with (
             patch(
                 "onyx.tools.tool_constructor.filter_document_set_names_by_user_access",
@@ -205,7 +211,7 @@ class TestEffectivePersonaTools:
                     SimpleNamespace(
                         id="completed-file", status=UserFileStatus.COMPLETED
                     ),
-                    SimpleNamespace(id="chunked-file", status=UserFileStatus.CHUNKED),
+                    SimpleNamespace(id="unready-file", status=unready_status),
                 ],
             ),
         ):
@@ -215,6 +221,54 @@ class TestEffectivePersonaTools:
                     user=MagicMock(),
                     document_set_names=["Benchmark Set"],
                 )
+
+    @pytest.mark.parametrize(
+        "repair_status",
+        [
+            UserFileProjectionRepairStatus.PENDING,
+            UserFileProjectionRepairStatus.RUNNING,
+            UserFileProjectionRepairStatus.FAILED,
+        ],
+    )
+    def test_document_set_file_scope_rejects_unready_projection_repair(
+        self, repair_status: UserFileProjectionRepairStatus
+    ) -> None:
+        user_file = SimpleNamespace(id="repair-file", status=UserFileStatus.COMPLETED)
+        with (
+            patch(
+                "onyx.tools.tool_constructor.filter_document_set_names_by_user_access",
+                return_value={"Benchmark Set"},
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_document_sets_by_name",
+                return_value=[
+                    SimpleNamespace(
+                        id=99,
+                        connector_credential_pairs=[],
+                        federated_connectors=[],
+                    )
+                ],
+            ),
+            patch(
+                "onyx.tools.tool_constructor.fetch_user_files_for_document_set",
+                return_value=[user_file],
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_chunk_counts_for_files",
+                return_value={user_file.id: 1},
+            ),
+            patch(
+                "onyx.tools.tool_constructor."
+                "fetch_user_file_projection_repair_statuses",
+                return_value={user_file.id: repair_status},
+            ),
+            pytest.raises(OnyxError, match="repair is not ready"),
+        ):
+            _resolve_document_set_file_ids(
+                db_session=MagicMock(),
+                user=MagicMock(),
+                document_set_names=["Benchmark Set"],
+            )
 
     @pytest.mark.parametrize(
         ("user_files", "chunk_counts"),
@@ -513,6 +567,7 @@ class TestEffectivePersonaTools:
         assert search_tool.persona_search_info.hierarchy_node_ids == []
         assert search_tool.persona_search_info.search_start_date is None
         assert search_tool.user_selected_filters is not None
+
         assert search_tool.user_selected_filters.document_set is None
         assert search_tool.project_id_filter is None
         assert search_tool.persona_id_filter is None

@@ -191,6 +191,147 @@ def test_feature_enabled_indexing_creates_a_durable_job_without_legacy_projectio
     assert user_file.status == UserFileStatus.CHUNKED
 
 
+def test_completed_regulatory_file_can_be_reprojected_for_index_repair() -> None:
+    user_file = _user_file(UserFileStatus.COMPLETED)
+    attempt_id = uuid4()
+    session_context = _session_returning(user_file)
+
+    with (
+        patch(
+            f"{TASKS_MODULE}.get_session_with_current_tenant",
+            return_value=session_context,
+        ),
+        patch(f"{TASKS_MODULE}.app_configs.REGULATORY_BATCH_INDEXING_ENABLED", True),
+        patch(f"{TASKS_MODULE}.project_user_file_to_index", return_value=85) as project,
+        patch(f"{TASKS_MODULE}.prepare_regulatory_indexing_job_from_chunks") as prepare,
+        patch(
+            f"{TASKS_MODULE}.start_user_file_projection_repair", return_value=True
+        ) as start_repair,
+        patch(
+            f"{TASKS_MODULE}.finish_user_file_projection_repair", return_value=True
+        ) as finish_repair,
+    ):
+        index_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id="tenant-a",
+            reproject_completed=True,
+            projection_repair_attempt_id=str(attempt_id),
+        )
+
+    project.assert_called_once_with(session_context.db_session, user_file, "tenant-a")
+    prepare.assert_not_called()
+    start_repair.assert_called_once_with(
+        session_context.db_session, user_file.id, attempt_id
+    )
+    assert finish_repair.call_args.kwargs["succeeded"] is True
+    assert user_file.status == UserFileStatus.COMPLETED
+    assert session_context.db_session.commit.call_count == 3
+
+
+def test_failed_reprojection_records_terminal_failure() -> None:
+    user_file = _user_file(UserFileStatus.COMPLETED)
+    attempt_id = uuid4()
+    session_context = _session_returning(user_file)
+
+    with (
+        patch(
+            f"{TASKS_MODULE}.get_session_with_current_tenant",
+            return_value=session_context,
+        ),
+        patch(
+            f"{TASKS_MODULE}.project_user_file_to_index",
+            side_effect=RuntimeError("elasticsearch is down"),
+        ),
+        patch(f"{TASKS_MODULE}.start_user_file_projection_repair", return_value=True),
+        patch(
+            f"{TASKS_MODULE}.finish_user_file_projection_repair", return_value=True
+        ) as finish_repair,
+        pytest.raises(RuntimeError),
+    ):
+        index_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id="tenant-a",
+            reproject_completed=True,
+            projection_repair_attempt_id=str(attempt_id),
+        )
+
+    assert user_file.status == UserFileStatus.COMPLETED
+    assert finish_repair.call_args.kwargs["succeeded"] is False
+    assert session_context.db_session.commit.call_count == 2
+
+
+def test_duplicate_projection_repair_task_is_skipped_before_projection() -> None:
+    user_file = _user_file(UserFileStatus.COMPLETED)
+    attempt_id = uuid4()
+    session_context = _session_returning(user_file)
+
+    with (
+        patch(
+            f"{TASKS_MODULE}.get_session_with_current_tenant",
+            return_value=session_context,
+        ),
+        patch(f"{TASKS_MODULE}.start_user_file_projection_repair", return_value=False),
+        patch(f"{TASKS_MODULE}.project_user_file_to_index") as project,
+        patch(f"{TASKS_MODULE}.finish_user_file_projection_repair") as finish,
+    ):
+        index_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id="tenant-a",
+            reproject_completed=True,
+            projection_repair_attempt_id=str(attempt_id),
+        )
+
+    project.assert_not_called()
+    finish.assert_not_called()
+
+
+def test_empty_projection_repair_is_recorded_as_failed() -> None:
+    user_file = _user_file(UserFileStatus.COMPLETED)
+    attempt_id = uuid4()
+    session_context = _session_returning(user_file)
+
+    with (
+        patch(
+            f"{TASKS_MODULE}.get_session_with_current_tenant",
+            return_value=session_context,
+        ),
+        patch(f"{TASKS_MODULE}.start_user_file_projection_repair", return_value=True),
+        patch(f"{TASKS_MODULE}.project_user_file_to_index", return_value=0),
+        patch(
+            f"{TASKS_MODULE}.finish_user_file_projection_repair", return_value=True
+        ) as finish,
+        pytest.raises(RuntimeError, match="wrote no regulatory chunks"),
+    ):
+        index_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id="tenant-a",
+            reproject_completed=True,
+            projection_repair_attempt_id=str(attempt_id),
+        )
+
+    assert finish.call_args.kwargs["succeeded"] is False
+
+
+def test_malformed_projection_repair_does_not_demote_completed_file() -> None:
+    user_file = _user_file(UserFileStatus.COMPLETED)
+    session_context = _session_returning(user_file)
+
+    with (
+        patch(
+            f"{TASKS_MODULE}.get_session_with_current_tenant",
+            return_value=session_context,
+        ),
+        pytest.raises(ValueError, match="attempt id is required"),
+    ):
+        index_user_file_impl(
+            user_file_id=str(user_file.id),
+            tenant_id="tenant-a",
+            reproject_completed=True,
+        )
+
+    assert user_file.status == UserFileStatus.COMPLETED
+
+
 def test_indexing_marks_the_file_failed_when_projection_raises() -> None:
     user_file = _user_file(UserFileStatus.CHUNKED)
 

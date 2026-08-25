@@ -125,6 +125,7 @@ from onyx.db.enums import (
     SyncType,
     TaskStatus,
     ThemePreference,
+    UserFileProjectionRepairStatus,
     UserFileStatus,
 )
 from onyx.db.index_attempt_metrics_models import IndexAttemptStage
@@ -5571,6 +5572,28 @@ class UserFile(Base):
             "user_id",
             postgresql_where=text("status = 'COMPLETED'"),
         ),
+    )
+
+
+class UserFileProjectionRepair(Base):
+    __tablename__ = "user_file_projection_repair"
+
+    user_file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_file.id", ondelete="CASCADE"), primary_key=True
+    )
+    attempt_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), nullable=False, unique=True
+    )
+    status: Mapped[UserFileProjectionRepairStatus] = mapped_column(
+        Enum(
+            UserFileProjectionRepairStatus,
+            native_enum=False,
+            name="userfileprojectionrepairstatus",
+        ),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
     )
 
 

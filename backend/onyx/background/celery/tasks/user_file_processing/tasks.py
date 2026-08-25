@@ -68,8 +68,10 @@ from onyx.db.user_file import (
     fetch_persona_ids_for_user_files,
     fetch_user_files_with_access_relationships,
     fetch_user_project_ids_for_user_files,
+    finish_user_file_projection_repair,
     lock_completed_user_file_for_projection,
     mark_user_file_reconcile_pending,
+    start_user_file_projection_repair,
 )
 from onyx.document_index.factory import get_all_document_indices
 from onyx.document_index.interfaces_new import (
@@ -572,7 +574,13 @@ def _chunk_user_file_without_indexing(
     )
 
 
-def index_user_file_impl(*, user_file_id: str, tenant_id: str) -> None:
+def index_user_file_impl(
+    *,
+    user_file_id: str,
+    tenant_id: str,
+    reproject_completed: bool = False,
+    projection_repair_attempt_id: str | None = None,
+) -> None:
     """Phase two: project already-written chunk rows into the search index."""
 
     try:
@@ -585,7 +593,34 @@ def index_user_file_impl(*, user_file_id: str, tenant_id: str) -> None:
                 )
                 return
 
-            if app_configs.REGULATORY_BATCH_INDEXING_ENABLED:
+            if reproject_completed:
+                if projection_repair_attempt_id is None:
+                    raise ValueError("projection repair attempt id is required")
+                if user_file.status != UserFileStatus.COMPLETED:
+                    raise ValueError(
+                        "regulatory index repair requires a COMPLETED user file"
+                    )
+                attempt_id = _as_uuid(projection_repair_attempt_id)
+                if not start_user_file_projection_repair(
+                    db_session, user_file.id, attempt_id
+                ):
+                    task_logger.info(
+                        "index_user_file_impl - projection repair attempt is stale or "
+                        f"already claimed for user file {user_file_id}; skipping"
+                    )
+                    return
+                db_session.commit()
+                job_id = None
+                chunk_count = project_user_file_to_index(
+                    db_session, user_file, tenant_id
+                )
+                if chunk_count == 0:
+                    raise RuntimeError("projection repair wrote no regulatory chunks")
+                user_file.last_project_sync_at = datetime.datetime.now(
+                    datetime.timezone.utc
+                )
+                db_session.commit()
+            elif app_configs.REGULATORY_BATCH_INDEXING_ENABLED:
                 job_id = prepare_regulatory_indexing_job_from_chunks(
                     user_file.id,
                     tenant_id,
@@ -611,13 +646,37 @@ def index_user_file_impl(*, user_file_id: str, tenant_id: str) -> None:
         task_logger.exception(
             f"index_user_file_impl - Failed to index user file {user_file_id}"
         )
-        with get_session_with_current_tenant() as db_session:
-            user_file = db_session.get(UserFile, _as_uuid(user_file_id))
-            if user_file is not None and user_file.status != UserFileStatus.DELETING:
-                user_file.status = UserFileStatus.FAILED
-                db_session.add(user_file)
-                db_session.commit()
+        if reproject_completed:
+            if projection_repair_attempt_id is not None:
+                with get_session_with_current_tenant() as db_session:
+                    finish_user_file_projection_repair(
+                        db_session,
+                        _as_uuid(user_file_id),
+                        _as_uuid(projection_repair_attempt_id),
+                        succeeded=False,
+                    )
+                    db_session.commit()
+        else:
+            with get_session_with_current_tenant() as db_session:
+                user_file = db_session.get(UserFile, _as_uuid(user_file_id))
+                if (
+                    user_file is not None
+                    and user_file.status != UserFileStatus.DELETING
+                ):
+                    user_file.status = UserFileStatus.FAILED
+                    db_session.add(user_file)
+                    db_session.commit()
         raise
+
+    if reproject_completed and projection_repair_attempt_id is not None:
+        with get_session_with_current_tenant() as db_session:
+            finish_user_file_projection_repair(
+                db_session,
+                _as_uuid(user_file_id),
+                _as_uuid(projection_repair_attempt_id),
+                succeeded=True,
+            )
+            db_session.commit()
 
     task_logger.info(
         f"index_user_file_impl - Indexed id={user_file_id} chunks={chunk_count}"
@@ -1117,8 +1176,15 @@ def index_single_user_file(
     *,
     user_file_id: str,
     tenant_id: str,
+    reproject_completed: bool = False,
+    projection_repair_attempt_id: str | None = None,
 ) -> None:
-    index_user_file_impl(user_file_id=user_file_id, tenant_id=tenant_id)
+    index_user_file_impl(
+        user_file_id=user_file_id,
+        tenant_id=tenant_id,
+        reproject_completed=reproject_completed,
+        projection_repair_attempt_id=projection_repair_attempt_id,
+    )
 
 
 @shared_task(

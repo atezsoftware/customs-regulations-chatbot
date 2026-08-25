@@ -292,6 +292,13 @@ class UserFileStatus(str, PyEnum):
     DELETING = "DELETING"
 
 
+class UserFileProjectionRepairStatus(str, PyEnum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
 class ThemePreference(str, PyEnum):
     LIGHT = "light"
     DARK = "dark"

@@ -1,10 +1,10 @@
 import datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import exists, func, select, update
 from sqlalchemy.orm import Session, joinedload, selectinload
 
-from onyx.db.enums import UserFileStatus
+from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
 from onyx.db.models import (
     DocumentSet,
     DocumentSet__UserFile,
@@ -13,7 +13,124 @@ from onyx.db.models import (
     RegulatoryChunk,
     User,
     UserFile,
+    UserFileProjectionRepair,
 )
+
+_PROJECTION_REPAIR_PENDING_STALE_AFTER = datetime.timedelta(minutes=2)
+_PROJECTION_REPAIR_RUNNING_STALE_AFTER = datetime.timedelta(hours=2)
+
+
+def claim_user_file_projection_repair(
+    db_session: Session,
+    user_file_id: UUID,
+    *,
+    now: datetime.datetime | None = None,
+) -> UUID | None:
+    """Create one durable repair attempt, replacing only a stale/terminal one."""
+
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    user_file = db_session.scalar(
+        select(UserFile).where(UserFile.id == user_file_id).with_for_update()
+    )
+    if user_file is None or user_file.status is not UserFileStatus.COMPLETED:
+        return None
+
+    repair = db_session.get(UserFileProjectionRepair, user_file_id)
+    if repair is not None:
+        stale_after = (
+            _PROJECTION_REPAIR_PENDING_STALE_AFTER
+            if repair.status is UserFileProjectionRepairStatus.PENDING
+            else _PROJECTION_REPAIR_RUNNING_STALE_AFTER
+        )
+        if (
+            repair.status
+            in {
+                UserFileProjectionRepairStatus.PENDING,
+                UserFileProjectionRepairStatus.RUNNING,
+            }
+            and repair.updated_at > now - stale_after
+        ):
+            return None
+    attempt_id = uuid4()
+    if repair is None:
+        repair = UserFileProjectionRepair(
+            user_file_id=user_file_id,
+            attempt_id=attempt_id,
+            status=UserFileProjectionRepairStatus.PENDING,
+            updated_at=now,
+        )
+    else:
+        repair.attempt_id = attempt_id
+        repair.status = UserFileProjectionRepairStatus.PENDING
+        repair.updated_at = now
+    db_session.add(repair)
+    return attempt_id
+
+
+def start_user_file_projection_repair(
+    db_session: Session,
+    user_file_id: UUID,
+    attempt_id: UUID,
+) -> bool:
+    repair = db_session.scalar(
+        select(UserFileProjectionRepair)
+        .where(UserFileProjectionRepair.user_file_id == user_file_id)
+        .with_for_update()
+    )
+    if (
+        repair is None
+        or repair.attempt_id != attempt_id
+        or repair.status is not UserFileProjectionRepairStatus.PENDING
+    ):
+        return False
+    repair.status = UserFileProjectionRepairStatus.RUNNING
+    repair.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    db_session.add(repair)
+    return True
+
+
+def finish_user_file_projection_repair(
+    db_session: Session,
+    user_file_id: UUID,
+    attempt_id: UUID,
+    *,
+    succeeded: bool,
+) -> bool:
+    repair = db_session.scalar(
+        select(UserFileProjectionRepair)
+        .where(UserFileProjectionRepair.user_file_id == user_file_id)
+        .with_for_update()
+    )
+    allowed_statuses = {UserFileProjectionRepairStatus.RUNNING}
+    if not succeeded:
+        allowed_statuses.add(UserFileProjectionRepairStatus.PENDING)
+    if (
+        repair is None
+        or repair.attempt_id != attempt_id
+        or repair.status not in allowed_statuses
+    ):
+        return False
+    repair.status = (
+        UserFileProjectionRepairStatus.SUCCEEDED
+        if succeeded
+        else UserFileProjectionRepairStatus.FAILED
+    )
+    repair.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    db_session.add(repair)
+    return True
+
+
+def fetch_user_file_projection_repair_statuses(
+    db_session: Session, user_file_ids: list[UUID]
+) -> dict[UUID, UserFileProjectionRepairStatus]:
+    if not user_file_ids:
+        return {}
+    rows = db_session.execute(
+        select(
+            UserFileProjectionRepair.user_file_id, UserFileProjectionRepair.status
+        ).where(UserFileProjectionRepair.user_file_id.in_(user_file_ids))
+    ).all()
+    return {user_file_id: status for user_file_id, status in rows}
 
 
 def fetch_chunk_counts_for_user_files(

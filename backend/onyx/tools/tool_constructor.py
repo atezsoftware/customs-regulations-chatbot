@@ -17,7 +17,7 @@ from onyx.db.document_set import (
     get_document_sets_by_name,
 )
 from onyx.db.engine.sql_engine import get_session_with_current_tenant_if_none
-from onyx.db.enums import UserFileStatus
+from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
 from onyx.db.mcp import (
     MCPCredentialsError,
     get_all_mcp_tools_for_server,
@@ -31,6 +31,7 @@ from onyx.db.persona import get_effective_persona_tools
 from onyx.db.regulatory_chunks import get_chunk_counts_for_files
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.tools import get_builtin_tool
+from onyx.db.user_file import fetch_user_file_projection_repair_statuses
 from onyx.document_index.factory import get_default_document_index
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
@@ -126,6 +127,17 @@ def _resolve_document_set_file_ids(
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
             "Every Benchmark Document Set file must have regulatory chunks",
+        )
+    repair_statuses = fetch_user_file_projection_repair_statuses(
+        db_session, user_file_ids
+    )
+    if any(
+        status is not UserFileProjectionRepairStatus.SUCCEEDED
+        for status in repair_statuses.values()
+    ):
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Benchmark Document Set projection repair is not ready",
         )
     return [str(user_file_id) for user_file_id in user_file_ids]
 

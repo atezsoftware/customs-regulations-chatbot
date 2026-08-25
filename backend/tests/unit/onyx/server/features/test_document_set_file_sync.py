@@ -3,9 +3,12 @@ from uuid import uuid4
 
 import pytest
 
+from onyx.db.enums import UserFileStatus
+from onyx.error_handling.exceptions import OnyxError
 from onyx.server.features.document_set.api import (
     link_document_set_file,
     list_document_set_files,
+    reproject_completed_document_set_file,
     unlink_document_set_file,
 )
 
@@ -119,3 +122,158 @@ def test_list_files_includes_latest_durable_indexing_progress() -> None:
     fetch_progress.assert_called_once()
     assert fetch_progress.call_args.kwargs["user_file_ids"] == [file_id]
     from_model.assert_called_once_with(user_file, progress=progress)
+
+
+def test_completed_regulatory_file_reprojection_is_queued() -> None:
+    file_id = uuid4()
+    attempt_id = uuid4()
+    user_file = MagicMock(id=file_id, status=UserFileStatus.COMPLETED)
+    snapshot = MagicMock()
+
+    with (
+        patch(
+            "onyx.server.features.document_set.api._get_editable_document_set_or_raise"
+        ),
+        patch(
+            "onyx.server.features.document_set.api."
+            "get_user_file_for_document_set_management",
+            return_value=user_file,
+        ),
+        patch(
+            "onyx.server.features.document_set.api.get_chunk_counts_for_files",
+            return_value={file_id: 1},
+        ),
+        patch(
+            "onyx.server.features.document_set.api.claim_user_file_projection_repair",
+            return_value=attempt_id,
+        ) as claim,
+        patch(
+            "onyx.server.features.document_set.api._enqueue_user_file_indexing"
+        ) as enqueue,
+        patch(
+            "onyx.server.features.document_set.api.UserFileSnapshot.from_model",
+            return_value=snapshot,
+        ),
+    ):
+        result = reproject_completed_document_set_file(
+            document_set_id=7,
+            file_id=file_id,
+            user=MagicMock(),
+            db_session=MagicMock(),
+            tenant_id="tenant",
+        )
+
+    assert result is snapshot
+    claim.assert_called_once()
+    enqueue.assert_called_once_with(
+        file_id,
+        "tenant",
+        reproject_completed=True,
+        projection_repair_attempt_id=attempt_id,
+    )
+
+
+def test_pending_regulatory_file_reprojection_is_not_queued_twice() -> None:
+    file_id = uuid4()
+    user_file = MagicMock(id=file_id, status=UserFileStatus.COMPLETED)
+
+    with (
+        patch(
+            "onyx.server.features.document_set.api._get_editable_document_set_or_raise"
+        ),
+        patch(
+            "onyx.server.features.document_set.api."
+            "get_user_file_for_document_set_management",
+            return_value=user_file,
+        ),
+        patch(
+            "onyx.server.features.document_set.api.get_chunk_counts_for_files",
+            return_value={file_id: 1},
+        ),
+        patch(
+            "onyx.server.features.document_set.api.claim_user_file_projection_repair",
+            return_value=None,
+        ),
+        patch(
+            "onyx.server.features.document_set.api._enqueue_user_file_indexing"
+        ) as enqueue,
+        pytest.raises(OnyxError, match="already in progress"),
+    ):
+        reproject_completed_document_set_file(
+            document_set_id=7,
+            file_id=file_id,
+            user=MagicMock(),
+            db_session=MagicMock(),
+            tenant_id="tenant",
+        )
+
+    enqueue.assert_not_called()
+
+
+def test_reprojection_publish_failure_is_recorded() -> None:
+    file_id = uuid4()
+    attempt_id = uuid4()
+    user_file = MagicMock(id=file_id, status=UserFileStatus.COMPLETED)
+    db_session = MagicMock()
+
+    with (
+        patch(
+            "onyx.server.features.document_set.api._get_editable_document_set_or_raise"
+        ),
+        patch(
+            "onyx.server.features.document_set.api."
+            "get_user_file_for_document_set_management",
+            return_value=user_file,
+        ),
+        patch(
+            "onyx.server.features.document_set.api.get_chunk_counts_for_files",
+            return_value={file_id: 1},
+        ),
+        patch(
+            "onyx.server.features.document_set.api.claim_user_file_projection_repair",
+            return_value=attempt_id,
+        ),
+        patch(
+            "onyx.server.features.document_set.api._enqueue_user_file_indexing",
+            side_effect=RuntimeError("broker unavailable"),
+        ),
+        patch(
+            "onyx.server.features.document_set.api.finish_user_file_projection_repair",
+            return_value=True,
+        ) as finish,
+        pytest.raises(RuntimeError, match="broker unavailable"),
+    ):
+        reproject_completed_document_set_file(
+            document_set_id=7,
+            file_id=file_id,
+            user=MagicMock(),
+            db_session=db_session,
+            tenant_id="tenant",
+        )
+
+    finish.assert_called_once_with(db_session, file_id, attempt_id, succeeded=False)
+    assert db_session.commit.call_count == 2
+
+
+def test_chunked_file_cannot_use_reprojection_repair() -> None:
+    file_id = uuid4()
+    user_file = MagicMock(id=file_id, status=UserFileStatus.CHUNKED)
+
+    with (
+        patch(
+            "onyx.server.features.document_set.api._get_editable_document_set_or_raise"
+        ),
+        patch(
+            "onyx.server.features.document_set.api."
+            "get_user_file_for_document_set_management",
+            return_value=user_file,
+        ),
+        pytest.raises(OnyxError, match="Only completed files"),
+    ):
+        reproject_completed_document_set_file(
+            document_set_id=7,
+            file_id=file_id,
+            user=MagicMock(),
+            db_session=MagicMock(),
+            tenant_id="tenant",
+        )

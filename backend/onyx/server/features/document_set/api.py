@@ -34,8 +34,13 @@ from onyx.db.enums import Permission, UserFileStatus
 from onyx.db.models import DocumentSet as DocumentSetDBModel
 from onyx.db.models import User
 from onyx.db.projects import upload_files_to_user_files_with_indexing
+from onyx.db.regulatory_chunks import get_chunk_counts_for_files
 from onyx.db.regulatory_indexing_jobs import (
     fetch_latest_regulatory_indexing_progress_for_user_files,
+)
+from onyx.db.user_file import (
+    claim_user_file_projection_repair,
+    finish_user_file_projection_repair,
 )
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
@@ -267,10 +272,24 @@ def upload_document_set_files(
     return CategorizedFilesSnapshot.from_result(categorized_files_result)
 
 
-def _enqueue_user_file_indexing(user_file_id: UUID, tenant_id: str) -> None:
+def _enqueue_user_file_indexing(
+    user_file_id: UUID,
+    tenant_id: str,
+    *,
+    reproject_completed: bool = False,
+    projection_repair_attempt_id: UUID | None = None,
+) -> None:
+    kwargs: dict[str, str | bool] = {
+        "user_file_id": str(user_file_id),
+        "tenant_id": tenant_id,
+    }
+    if reproject_completed:
+        kwargs["reproject_completed"] = True
+    if projection_repair_attempt_id is not None:
+        kwargs["projection_repair_attempt_id"] = str(projection_repair_attempt_id)
     client_app.send_task(
         OnyxCeleryTask.INDEX_SINGLE_USER_FILE,
-        kwargs={"user_file_id": str(user_file_id), "tenant_id": tenant_id},
+        kwargs=kwargs,
         queue=OnyxCeleryQueues.USER_FILE_PROCESSING,
         priority=OnyxCeleryPriority.HIGH,
         expires=CELERY_USER_FILE_PROCESSING_TASK_EXPIRES,
@@ -298,6 +317,60 @@ def index_document_set_file(
         )
 
     _enqueue_user_file_indexing(user_file.id, tenant_id)
+    return UserFileSnapshot.from_model(user_file)
+
+
+@router.post(
+    "/admin/document-set/{document_set_id}/files/{file_id}/reproject",
+    status_code=202,
+)
+def reproject_completed_document_set_file(
+    document_set_id: int,
+    file_id: UUID,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> UserFileSnapshot:
+    """Queue index repair for an already-completed regulatory user file."""
+
+    _get_editable_document_set_or_raise(document_set_id, user, db_session)
+    user_file = get_user_file_for_document_set_management(db_session, file_id, user)
+    if user_file is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "File not found")
+    if user_file.status != UserFileStatus.COMPLETED:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Only completed files can be reprojected",
+        )
+    if get_chunk_counts_for_files(db_session, [user_file.id]).get(user_file.id, 0) == 0:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Only files with regulatory chunks can be reprojected",
+        )
+
+    attempt_id = claim_user_file_projection_repair(db_session, user_file.id)
+    if attempt_id is None:
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT,
+            "A projection repair is already in progress",
+        )
+    db_session.commit()
+    try:
+        _enqueue_user_file_indexing(
+            user_file.id,
+            tenant_id,
+            reproject_completed=True,
+            projection_repair_attempt_id=attempt_id,
+        )
+    except Exception:
+        finish_user_file_projection_repair(
+            db_session,
+            user_file.id,
+            attempt_id,
+            succeeded=False,
+        )
+        db_session.commit()
+        raise
     return UserFileSnapshot.from_model(user_file)
 
 
