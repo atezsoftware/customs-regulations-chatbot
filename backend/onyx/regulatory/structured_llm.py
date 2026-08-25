@@ -150,6 +150,19 @@ def _response_hit_output_limit(finish_reason: str | None) -> bool:
     return finish_reason.casefold() in {"length", "max_tokens", "max_output_tokens"}
 
 
+def _validation_error_summary(error: ValidationError, limit: int = 5) -> str:
+    """Return actionable schema errors without echoing model-supplied content."""
+
+    summaries: list[str] = []
+    for issue in error.errors(include_url=False, include_input=False)[:limit]:
+        location = ".".join(str(part) for part in issue.get("loc", ())) or "<root>"
+        summaries.append(
+            f"{location} [{issue.get('type', 'validation_error')}]: "
+            f"{issue.get('msg', 'invalid value')}"
+        )
+    return "; ".join(summaries)
+
+
 def generate_structured(
     llm: LLM,
     *,
@@ -222,7 +235,7 @@ def generate_structured(
     if reasoning_effort is not None:
         invoke_options["reasoning_effort"] = reasoning_effort
 
-    last_error: Exception | None = None
+    last_error: ValidationError | None = None
     for attempt in range(max_attempts):
         response: ModelResponse | None = None
         for provider_attempt in range(provider_max_attempts):
@@ -303,5 +316,5 @@ def generate_structured(
     assert last_error is not None
     raise ValueError(
         f"LLM failed to produce valid {response_model.__name__} after "
-        f"{max_attempts} attempts"
+        f"{max_attempts} attempts: {_validation_error_summary(last_error)}"
     ) from last_error

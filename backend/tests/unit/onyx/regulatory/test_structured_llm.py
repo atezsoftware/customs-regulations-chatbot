@@ -123,6 +123,18 @@ def test_generate_structured_extracts_schema_matching_json_from_prose() -> None:
     llm.invoke.assert_called_once()
 
 
+def test_generate_structured_terminal_error_identifies_invalid_fields() -> None:
+    llm = MagicMock()
+    llm.invoke.return_value = _response('{"wrong":"shape"}')
+
+    with pytest.raises(ValueError) as raised:
+        _generate(llm, max_attempts=1)
+
+    message = str(raised.value)
+    assert "value [missing]: Field required" in message
+    assert '"wrong":"shape"' not in message
+
+
 def test_generate_structured_retries_transient_provider_error_separately() -> None:
     llm = MagicMock()
     llm.invoke.side_effect = [
