@@ -219,6 +219,35 @@ def test_judge_derives_duplicate_top_level_scores_from_criteria() -> None:
     assert result.overall_score == 70
 
 
+def test_judge_decodes_provider_stringified_criteria_report() -> None:
+    result = BenchmarkJudgeResult.model_validate(
+        {
+            "correctness_score": 4,
+            "groundedness_score": 3,
+            "completeness_score": 2,
+            "clarity_score": 5,
+            "overall_score": 70,
+            "rationale": "Criterion reports contain the detailed evaluation.",
+            "summary": "Usable with gaps.",
+            "criteria": (
+                '{"correctness":{"score":4,"rationale":"Mostly correct."},'
+                '"groundedness":{"score":3,"rationale":"Some support gaps."},'
+                '"completeness":{"score":2,"rationale":"Material omissions."},'
+                '"clarity":{"score":5,"rationale":"Clear."}}'
+            ),
+            "strengths": [],
+            "weaknesses": [],
+            "fact_assessments": [],
+            "citation_assessments": [],
+        }
+    )
+
+    assert result.criteria.correctness.score == 4
+    assert result.criteria.groundedness.score == 3
+    assert result.criteria.completeness.score == 2
+    assert result.criteria.clarity.score == 5
+
+
 def test_usage_cost_sums_each_actual_llm_call() -> None:
     usage_calls = [
         LLMCallUsage("candidate", "provider-a", 100, 20, 0),

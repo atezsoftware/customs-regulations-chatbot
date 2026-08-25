@@ -117,7 +117,8 @@ def _validate_json_object(
     try:
         return response_model.model_validate_json(normalized)
     except ValidationError as primary_error:
-        last_candidate_error: ValidationError | None = None
+        best_candidate_error = primary_error
+        best_candidate_error_count = len(primary_error.errors())
         decoder = json.JSONDecoder()
         for start, character in enumerate(content):
             if character != "{":
@@ -131,9 +132,12 @@ def _validate_json_object(
             try:
                 return response_model.model_validate(candidate)
             except ValidationError as candidate_error:
-                last_candidate_error = candidate_error
+                candidate_error_count = len(candidate_error.errors())
+                if candidate_error_count < best_candidate_error_count:
+                    best_candidate_error = candidate_error
+                    best_candidate_error_count = candidate_error_count
 
-        raise last_candidate_error or primary_error
+        raise best_candidate_error
 
 
 def _is_truncated_json_error(error: ValidationError) -> bool:

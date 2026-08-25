@@ -20,6 +20,11 @@ class _ConstrainedResult(BaseModel):
     index: int = Field(ge=0, lt=10)
 
 
+class _TwoFieldResult(BaseModel):
+    first: str
+    second: str
+
+
 def _response(content: str, *, finish_reason: str | None = None) -> ModelResponse:
     return ModelResponse(
         id="test-response",
@@ -133,6 +138,36 @@ def test_generate_structured_terminal_error_identifies_invalid_fields() -> None:
     message = str(raised.value)
     assert "value [missing]: Field required" in message
     assert '"wrong":"shape"' not in message
+
+
+def test_generate_structured_keeps_best_validation_error_from_embedded_objects() -> (
+    None
+):
+    llm = MagicMock()
+    llm.invoke.return_value = _response(
+        '{"first":"present","nested":{"unrelated":"value"}}'
+    )
+
+    with (
+        patch(
+            "onyx.regulatory.structured_llm.llm_generation_span",
+            return_value=nullcontext(MagicMock()),
+        ),
+        patch("onyx.regulatory.structured_llm.record_llm_response"),
+        pytest.raises(ValueError) as raised,
+    ):
+        generate_structured(
+            llm,
+            flow=LLMFlow.REGULATORY_ANSWER_AUDIT,
+            system_prompt="Return the requested data.",
+            user_prompt="payload",
+            response_model=_TwoFieldResult,
+            max_attempts=1,
+        )
+
+    message = str(raised.value)
+    assert "second [missing]: Field required" in message
+    assert "first [missing]: Field required" not in message
 
 
 def test_generate_structured_retries_transient_provider_error_separately() -> None:

@@ -1,3 +1,4 @@
+import json
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -73,6 +74,14 @@ class BenchmarkJudgeResult(BaseModel):
             return value
         normalized = dict(value)
         criteria = normalized.get("criteria")
+        if isinstance(criteria, str):
+            try:
+                decoded_criteria = json.loads(criteria)
+            except json.JSONDecodeError:
+                decoded_criteria = None
+            if isinstance(decoded_criteria, dict):
+                normalized["criteria"] = decoded_criteria
+                criteria = decoded_criteria
         if not isinstance(criteria, dict):
             return normalized
 
