@@ -38,6 +38,7 @@ from onyx.natural_language_processing.utils import get_tokenizer
 from onyx.server.manage.llm.models import LLMProviderView
 from onyx.utils.headers import build_llm_extra_headers
 from onyx.utils.logger import setup_logger
+from shared_configs.enums import EmbeddingProvider
 
 logger = setup_logger()
 
@@ -534,9 +535,19 @@ def get_llm_tokenizer_encode_func(llm: LLM) -> Callable[[str], list[int]]:
     llm_provider = llm.config.model_provider
     llm_model_name = llm.config.model_name
 
+    # Anthropic and Vertex model names are not embedding-provider enum values.
+    # Passing those raw strings into get_tokenizer falls back to the heavyweight
+    # local Hugging Face document tokenizer. That is both a poor fit for cloud
+    # chat models and can exhaust a clean spawned worker before its first LLM
+    # call. Route them through the offline-safe tiktoken approximation used by
+    # generic cloud models instead.
+    tokenizer_provider: EmbeddingProvider | str = llm_provider
+    if llm_provider in {LlmProviderNames.ANTHROPIC, LlmProviderNames.VERTEX_AI}:
+        tokenizer_provider = EmbeddingProvider.LITELLM
+
     llm_tokenizer = get_tokenizer(
         model_name=llm_model_name,
-        provider_type=llm_provider,
+        provider_type=tokenizer_provider,
     )
     return llm_tokenizer.encode
 

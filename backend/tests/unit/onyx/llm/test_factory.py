@@ -18,11 +18,13 @@ from onyx.llm.factory import (
     _resolve_provider_and_model,
     get_llm,
     get_llm_for_persona,
+    get_llm_tokenizer_encode_func,
     llm_from_provider,
 )
 from onyx.llm.override_models import LLMOverride
 from onyx.llm.well_known_providers.constants import LM_STUDIO_API_KEY_CONFIG_KEY
 from onyx.server.manage.llm.models import LLMProviderView, ModelConfigurationView
+from shared_configs.enums import EmbeddingProvider
 
 
 def test_build_provider_extra_headers_adds_bearer_for_lm_studio_api_key() -> None:
@@ -61,6 +63,32 @@ def test_build_provider_extra_headers_ignores_legacy_ollama_custom_config() -> N
     )
 
     assert headers == {}
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_tokenizer_provider"),
+    [
+        (LlmProviderNames.OPENAI, EmbeddingProvider.OPENAI),
+        (LlmProviderNames.ANTHROPIC, EmbeddingProvider.LITELLM),
+        (LlmProviderNames.VERTEX_AI, EmbeddingProvider.LITELLM),
+    ],
+)
+def test_llm_tokenizer_uses_lightweight_cloud_fallback(
+    provider: str, expected_tokenizer_provider: EmbeddingProvider
+) -> None:
+    llm = MagicMock()
+    llm.config.model_provider = provider
+    llm.config.model_name = "new-cloud-model"
+    tokenizer = MagicMock()
+
+    with patch("onyx.llm.factory.get_tokenizer", return_value=tokenizer) as get:
+        encode = get_llm_tokenizer_encode_func(llm)
+
+    assert encode is tokenizer.encode
+    get.assert_called_once_with(
+        model_name="new-cloud-model",
+        provider_type=expected_tokenizer_provider,
+    )
 
 
 def test_resolve_provider_uses_type_for_nameless_provider() -> None:
