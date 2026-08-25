@@ -18,7 +18,12 @@ from onyx.configs.constants import (
     OnyxCeleryQueues,
     OnyxCeleryTask,
 )
-from onyx.db.enums import BenchmarkRunItemStatus, BenchmarkRunStatus, Permission
+from onyx.db.enums import (
+    BenchmarkRunItemStatus,
+    BenchmarkRunStatus,
+    LLMModelFlowType,
+    Permission,
+)
 from onyx.db.models import BenchmarkRun, LLMProvider
 from onyx.error_handling.exceptions import OnyxError
 from onyx.server.features.regulatory import benchmark_api
@@ -264,6 +269,7 @@ def test_benchmark_models_exclude_hidden_openrouter_configurations() -> None:
         display_name="Visible",
         max_input_tokens=100,
         is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
     )
     hidden = SimpleNamespace(
         name="hidden/model",
@@ -271,6 +277,7 @@ def test_benchmark_models_exclude_hidden_openrouter_configurations() -> None:
         display_name="Hidden",
         max_input_tokens=100,
         is_visible=False,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
     )
     provider = SimpleNamespace(
         provider="openrouter",
@@ -296,6 +303,7 @@ def test_benchmark_models_include_nameless_openrouter_provider() -> None:
         display_name="GPT-5 mini",
         max_input_tokens=100,
         is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
     )
     provider = SimpleNamespace(
         provider="openrouter",
@@ -314,6 +322,68 @@ def test_benchmark_models_include_nameless_openrouter_provider() -> None:
     ] == [("openrouter", 8, "openai/gpt-5-mini")]
 
 
+def test_benchmark_models_include_visible_configurations_from_all_providers() -> None:
+    visible = SimpleNamespace(
+        name="claude-fable-5",
+        custom_display_name=None,
+        display_name="Claude Fable 5",
+        max_input_tokens=998_976,
+        is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
+    )
+    provider = SimpleNamespace(
+        provider="anthropic",
+        name=None,
+        id=4,
+        model_configurations=[visible],
+    )
+
+    with patch.object(
+        benchmark_api, "fetch_existing_llm_providers", return_value=[provider]
+    ):
+        models = benchmark_api.list_models(user=MagicMock(), db_session=MagicMock())
+
+    assert [
+        (model.provider, model.provider_id, model.model_id) for model in models
+    ] == [("anthropic", 4, "claude-fable-5")]
+
+
+def test_benchmark_models_exclude_visible_non_chat_configurations() -> None:
+    chat = SimpleNamespace(
+        name="claude-fable-5",
+        custom_display_name=None,
+        display_name="Claude Fable 5",
+        max_input_tokens=998_976,
+        is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
+    )
+    contextual_only = SimpleNamespace(
+        name="contextual-only",
+        custom_display_name=None,
+        display_name="Contextual only",
+        max_input_tokens=998_976,
+        is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CONTEXTUAL_RAG],
+    )
+    provider = SimpleNamespace(
+        provider="anthropic",
+        name=None,
+        id=4,
+        model_configurations=[chat, contextual_only],
+    )
+
+    db_session = MagicMock()
+    with patch.object(
+        benchmark_api, "fetch_existing_llm_providers", return_value=[provider]
+    ) as fetch_providers:
+        models = benchmark_api.list_models(user=MagicMock(), db_session=db_session)
+
+    fetch_providers.assert_called_once_with(
+        db_session, flow_type_filter=[LLMModelFlowType.CHAT]
+    )
+    assert [model.model_id for model in models] == ["claude-fable-5"]
+
+
 def test_benchmark_models_exclude_account_policy_incompatible_models() -> None:
     compatible = SimpleNamespace(
         name="anthropic/claude-sonnet-5",
@@ -321,6 +391,7 @@ def test_benchmark_models_exclude_account_policy_incompatible_models() -> None:
         display_name="Claude Sonnet 5",
         max_input_tokens=1_000_000,
         is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
     )
     incompatible = SimpleNamespace(
         name="anthropic/claude-fable-5",
@@ -328,6 +399,7 @@ def test_benchmark_models_exclude_account_policy_incompatible_models() -> None:
         display_name="Claude Fable 5",
         max_input_tokens=1_000_000,
         is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
     )
     provider = SimpleNamespace(
         provider="openrouter",
@@ -391,6 +463,7 @@ def test_benchmark_models_give_each_nameless_provider_a_stable_selector() -> Non
         display_name="Visible",
         max_input_tokens=100,
         is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
     )
     named_collision = SimpleNamespace(
         provider="openrouter",
@@ -432,6 +505,7 @@ def test_nameless_openrouter_selector_cannot_be_captured_by_named_collision() ->
         display_name="Visible",
         max_input_tokens=100,
         is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
     )
     named_collision = SimpleNamespace(
         provider="openrouter",
@@ -460,7 +534,11 @@ def test_nameless_openrouter_selector_cannot_be_captured_by_named_collision() ->
 
 
 def test_benchmark_model_validation_rejects_hidden_configuration() -> None:
-    hidden = SimpleNamespace(name="hidden/model", is_visible=False)
+    hidden = SimpleNamespace(
+        name="hidden/model",
+        is_visible=False,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
+    )
     provider = SimpleNamespace(
         provider="openrouter",
         name="OpenRouter Prod",
@@ -474,7 +552,7 @@ def test_benchmark_model_validation_rejects_hidden_configuration() -> None:
     with (
         patch.object(
             benchmark_api,
-            "fetch_existing_llm_provider_by_name_and_type",
+            "fetch_llm_provider_for_legacy_selection",
             return_value=provider,
         ),
         pytest.raises(OnyxError, match="not available through OpenRouter"),
@@ -483,7 +561,11 @@ def test_benchmark_model_validation_rejects_hidden_configuration() -> None:
 
 
 def test_benchmark_model_validation_rejects_account_policy_incompatible_model() -> None:
-    visible = SimpleNamespace(name="anthropic/claude-fable-5", is_visible=True)
+    visible = SimpleNamespace(
+        name="anthropic/claude-fable-5",
+        is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
+    )
     provider = SimpleNamespace(
         provider="openrouter",
         name="OpenRouter Prod",
@@ -497,7 +579,7 @@ def test_benchmark_model_validation_rejects_account_policy_incompatible_model() 
     with (
         patch.object(
             benchmark_api,
-            "fetch_existing_llm_provider_by_name_and_type",
+            "fetch_llm_provider_for_legacy_selection",
             return_value=provider,
         ),
         patch.object(
@@ -511,7 +593,11 @@ def test_benchmark_model_validation_rejects_account_policy_incompatible_model() 
 
 
 def test_benchmark_model_validation_resolves_nameless_selector_by_provider_id() -> None:
-    visible = SimpleNamespace(name="visible/model", is_visible=True)
+    visible = SimpleNamespace(
+        name="visible/model",
+        is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
+    )
     provider = SimpleNamespace(
         provider="openrouter",
         name=None,
@@ -536,6 +622,84 @@ def test_benchmark_model_validation_resolves_nameless_selector_by_provider_id() 
     resolve_provider.assert_called_once_with(8, db_session)
 
 
+def test_benchmark_model_validation_accepts_non_openrouter_provider_by_id() -> None:
+    visible = SimpleNamespace(
+        name="gemini-3.7-flash",
+        is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
+    )
+    provider = SimpleNamespace(
+        provider="vertex_ai",
+        name=None,
+        id=1,
+        model_configurations=[visible],
+    )
+    selection = BenchmarkModelSelection(
+        provider="vertex_ai", provider_id=1, model_id="gemini-3.7-flash"
+    )
+
+    with patch.object(
+        benchmark_api,
+        "fetch_existing_llm_provider_by_id",
+        return_value=provider,
+    ):
+        resolved = benchmark_api._validate_model(MagicMock(), selection)
+
+    assert resolved is provider
+
+
+def test_benchmark_model_validation_resolves_unique_non_openrouter_legacy_selector() -> (
+    None
+):
+    visible = SimpleNamespace(
+        name="claude-fable-5",
+        is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
+    )
+    provider = SimpleNamespace(
+        provider="anthropic",
+        name=None,
+        id=4,
+        model_configurations=[visible],
+    )
+    selection = BenchmarkModelSelection(provider="anthropic", model_id="claude-fable-5")
+
+    with patch.object(
+        benchmark_api,
+        "fetch_llm_provider_for_legacy_selection",
+        return_value=provider,
+    ):
+        resolved = benchmark_api._validate_model(MagicMock(), selection)
+
+    assert resolved is provider
+
+
+def test_benchmark_legacy_selector_prefers_exact_name_over_nameless_type() -> None:
+    visible = SimpleNamespace(
+        name="visible/model",
+        is_visible=True,
+        llm_model_flow_types=[LLMModelFlowType.CHAT],
+    )
+    named = SimpleNamespace(
+        provider="openrouter",
+        name="openrouter",
+        id=7,
+        model_configurations=[visible],
+    )
+    selection = BenchmarkModelSelection(provider="openrouter", model_id="visible/model")
+
+    db_session = MagicMock()
+    with patch.object(
+        benchmark_api,
+        "fetch_llm_provider_for_legacy_selection",
+        return_value=named,
+    ) as resolve_provider:
+        resolved = benchmark_api._validate_model(db_session, selection)
+
+    assert resolved is named
+    resolve_provider.assert_called_once_with("openrouter", db_session)
+
+
 def test_provider_id_allows_a_named_provider_that_looks_like_old_reserved_syntax() -> (
     None
 ):
@@ -543,7 +707,13 @@ def test_provider_id_allows_a_named_provider_that_looks_like_old_reserved_syntax
         provider="openrouter",
         name="openrouter::8",
         id=8,
-        model_configurations=[SimpleNamespace(name="visible/model", is_visible=True)],
+        model_configurations=[
+            SimpleNamespace(
+                name="visible/model",
+                is_visible=True,
+                llm_model_flow_types=[LLMModelFlowType.CHAT],
+            )
+        ],
     )
     selection = BenchmarkModelSelection(
         provider="openrouter::8", provider_id=8, model_id="visible/model"

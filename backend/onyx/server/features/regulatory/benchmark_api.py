@@ -24,11 +24,16 @@ from onyx.configs.constants import (
 )
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
-from onyx.db.enums import BenchmarkRunFailureCode, BenchmarkRunStatus, Permission
+from onyx.db.enums import (
+    BenchmarkRunFailureCode,
+    BenchmarkRunStatus,
+    LLMModelFlowType,
+    Permission,
+)
 from onyx.db.llm import (
     fetch_existing_llm_provider_by_id,
-    fetch_existing_llm_provider_by_name_and_type,
     fetch_existing_llm_providers,
+    fetch_llm_provider_for_legacy_selection,
 )
 from onyx.db.models import (
     BenchmarkQuestion,
@@ -207,32 +212,30 @@ def _validate_model(
         if expected_provider != selection.provider:
             provider = None
     else:
-        provider = fetch_existing_llm_provider_by_name_and_type(
-            selection.provider,
-            "openrouter",
-            db_session,
+        provider = fetch_llm_provider_for_legacy_selection(
+            selection.provider, db_session
         )
     if provider is None:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
             f"LLM provider '{selection.provider}' is not configured",
         )
-    if provider.provider != "openrouter":
-        raise OnyxError(
-            OnyxErrorCode.INVALID_INPUT,
-            "Benchmark models must use a configured OpenRouter provider",
-        )
-    available_models = {
-        configuration.name
-        for configuration in provider.model_configurations
-        if configuration.is_visible
-    }
+    available_models = _visible_chat_model_names(provider)
     if selection.model_id not in available_models:
+        provider_label = (
+            "OpenRouter"
+            if provider.provider == "openrouter"
+            else provider.name or provider.provider
+        )
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
-            f"Model '{selection.model_id}' is not available through OpenRouter",
+            f"Model '{selection.model_id}' is not available through {provider_label}",
         )
-    account_models = _account_available_openrouter_model_ids(provider)
+    account_models = (
+        _account_available_openrouter_model_ids(provider)
+        if provider.provider == "openrouter"
+        else None
+    )
     if account_models is not None and selection.model_id not in account_models:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
@@ -240,6 +243,15 @@ def _validate_model(
             "privacy or guardrail policy",
         )
     return provider
+
+
+def _visible_chat_model_names(provider: LLMProvider) -> set[str]:
+    return {
+        configuration.name
+        for configuration in provider.model_configurations
+        if configuration.is_visible
+        and LLMModelFlowType.CHAT in configuration.llm_model_flow_types
+    }
 
 
 def _expected_citation_snapshots(
@@ -291,15 +303,21 @@ def list_models(
     db_session: Session = Depends(get_session),
 ) -> list[BenchmarkAvailableModel]:
     models: list[BenchmarkAvailableModel] = []
-    providers = fetch_existing_llm_providers(db_session, flow_type_filter=[])
-    openrouter_providers = [
-        provider for provider in providers if provider.provider == "openrouter"
-    ]
-    for provider in openrouter_providers:
+    providers = fetch_existing_llm_providers(
+        db_session, flow_type_filter=[LLMModelFlowType.CHAT]
+    )
+    for provider in providers:
         provider_selector = provider.name or provider.provider
-        account_models = _account_available_openrouter_model_ids(provider)
+        account_models = (
+            _account_available_openrouter_model_ids(provider)
+            if provider.provider == "openrouter"
+            else None
+        )
         for configuration in provider.model_configurations:
-            if not configuration.is_visible:
+            if (
+                not configuration.is_visible
+                or LLMModelFlowType.CHAT not in configuration.llm_model_flow_types
+            ):
                 continue
             if account_models is not None and configuration.name not in account_models:
                 continue

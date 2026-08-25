@@ -89,10 +89,14 @@ def _override_provider_name(
 def _override_provider_type(
     provider_selector: str, provider_id: int | None
 ) -> str | None:
+    if provider_id is not None:
+        # The exact row ID is authoritative across all configured provider
+        # implementations; adding an assumed type can only make it conflict.
+        return None
     # A named provider whose name equals its type needs exact-name resolution.
     return (
         None
-        if provider_id is None and provider_selector == LlmProviderNames.OPENROUTER
+        if provider_selector == LlmProviderNames.OPENROUTER
         else LlmProviderNames.OPENROUTER
     )
 
@@ -424,7 +428,7 @@ def _generate_item_answer(
             as_of_date=as_of_date,
         ),
         deep_research=run.deep_research,
-        atez_search=True,
+        atez_search_v2=True,
         stream=True,
         include_citations=True,
         origin=MessageOrigin.BENCHMARK,

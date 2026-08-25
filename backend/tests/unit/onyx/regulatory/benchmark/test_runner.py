@@ -484,7 +484,8 @@ def test_answer_generation_scopes_search_to_document_set_without_project() -> No
     assert request.internal_search_filters is not None
     assert request.internal_search_filters.document_set == ["Current Regulations"]
     assert request.internal_search_filters.as_of_date == datetime.date(2026, 8, 6)
-    assert request.atez_search is True
+    assert request.atez_search is False
+    assert request.atez_search_v2 is True
     assert request.origin == MessageOrigin.BENCHMARK
     assert item.chat_session_id == chat_session_id
     assert item.execution_phase == "answering"
@@ -550,11 +551,11 @@ def test_nameless_openrouter_selector_becomes_a_typed_provider_override() -> Non
 
     override = create_chat_session.call_args.kwargs["llm_override"]
     assert override.model_provider is None
-    assert override.model_provider_type == "openrouter"
+    assert override.model_provider_type is None
     assert override.model_provider_id == 8
 
 
-def test_named_openrouter_provider_uses_persisted_provider_id() -> None:
+def test_named_provider_uses_persisted_provider_id_without_assumed_type() -> None:
     chat_session_id = uuid4()
     response = SimpleNamespace(
         error_msg=None,
@@ -610,7 +611,7 @@ def test_named_openrouter_provider_uses_persisted_provider_id() -> None:
 
     override = create_chat_session.call_args.kwargs["llm_override"]
     assert override.model_provider is None
-    assert override.model_provider_type == "openrouter"
+    assert override.model_provider_type is None
     assert override.model_provider_id == 7
 
 
