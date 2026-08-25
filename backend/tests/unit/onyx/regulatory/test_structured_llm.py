@@ -110,6 +110,19 @@ def test_generate_structured_retries_validation_failure() -> None:
     assert "previous response was not valid JSON" in retry_messages[-1].content
 
 
+def test_generate_structured_extracts_schema_matching_json_from_prose() -> None:
+    llm = MagicMock()
+    llm.invoke.return_value = _response(
+        'Evaluation notes {"wrong":"shape"}.\n'
+        'Final result:\n```json\n{"value":"recovered"}\n```\nDone.'
+    )
+
+    result = _generate(llm, max_attempts=1)
+
+    assert result.value == "recovered"
+    llm.invoke.assert_called_once()
+
+
 def test_generate_structured_retries_transient_provider_error_separately() -> None:
     llm = MagicMock()
     llm.invoke.side_effect = [

@@ -8,6 +8,7 @@ with the validation error fed back closes the gap without depending on any
 single provider's structured-output guarantees.
 """
 
+import json
 import random
 import time
 from typing import Any, NotRequired, TypedDict, TypeVar
@@ -97,6 +98,42 @@ def _extract_json_object(content: str) -> str:
         if text.endswith("```"):
             text = text.rsplit("```", 1)[0]
     return text.strip()
+
+
+def _validate_json_object(
+    content: str, response_model: type[ResponseModel]
+) -> ResponseModel:
+    """Validate a structured response, tolerating provider-added prose.
+
+    Some provider/model routes ignore JSON-only response formatting and wrap
+    the object in analysis or a closing note. Try the normal strict path first,
+    then examine each complete JSON object embedded in the response and accept
+    only one that validates against the requested schema. Schema validation is
+    what prevents an incidental object in the prose from being mistaken for the
+    actual answer.
+    """
+
+    normalized = _extract_json_object(content)
+    try:
+        return response_model.model_validate_json(normalized)
+    except ValidationError as primary_error:
+        last_candidate_error: ValidationError | None = None
+        decoder = json.JSONDecoder()
+        for start, character in enumerate(content):
+            if character != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(content, start)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                return response_model.model_validate(candidate)
+            except ValidationError as candidate_error:
+                last_candidate_error = candidate_error
+
+        raise last_candidate_error or primary_error
 
 
 def _is_truncated_json_error(error: ValidationError) -> bool:
@@ -223,7 +260,7 @@ def generate_structured(
             raise RuntimeError("structured LLM invocation produced no response")
         content = llm_response_to_string(response)
         try:
-            return response_model.model_validate_json(_extract_json_object(content))
+            return _validate_json_object(content, response_model)
         except ValidationError as e:
             last_error = e
             finish_reason = response.choice.finish_reason
