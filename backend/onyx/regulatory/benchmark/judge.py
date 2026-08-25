@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 from onyx.llm.interfaces import LLM
+from onyx.llm.models import ReasoningEffort
 from onyx.regulatory.benchmark.models import BenchmarkJudgeResult, BenchmarkRunReport
 from onyx.regulatory.structured_llm import generate_structured
 from onyx.tracing.flows import LLMFlow
@@ -107,6 +108,14 @@ def judge_benchmark_answer(
         system_prompt=_SYSTEM_PROMPT,
         user_prompt=json.dumps(payload, ensure_ascii=False, indent=2),
         response_model=BenchmarkJudgeResult,
+        # A complete review contains one assessment for every expected fact and
+        # citation.  Provider defaults can leave too little room once adaptive
+        # thinking is included, producing an otherwise valid but truncated JSON
+        # document.  Keep reasoning economical and reserve enough output for the
+        # full schema instead of repeatedly retrying with the same small budget.
+        max_tokens=12_000,
+        reasoning_effort=ReasoningEffort.LOW,
+        max_attempts=3,
     )
 
 

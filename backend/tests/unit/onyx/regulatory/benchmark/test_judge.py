@@ -1,7 +1,13 @@
 import json
 from typing import cast
+from unittest.mock import MagicMock, patch
 
-from onyx.regulatory.benchmark.judge import _SYSTEM_PROMPT, _build_judge_payload
+from onyx.llm.models import ReasoningEffort
+from onyx.regulatory.benchmark.judge import (
+    _SYSTEM_PROMPT,
+    _build_judge_payload,
+    judge_benchmark_answer,
+)
 
 
 def test_judge_payload_preserves_complete_long_candidate_answer() -> None:
@@ -65,3 +71,26 @@ def test_judge_treats_reference_expectations_as_non_authoritative() -> None:
         normalized_prompt
     )
     assert "that is consistent with the controlling evidence" in normalized_prompt
+
+
+def test_judge_has_enough_output_budget_for_complete_structured_review() -> None:
+    llm = MagicMock()
+    expected_result = MagicMock()
+
+    with patch(
+        "onyx.regulatory.benchmark.judge.generate_structured",
+        return_value=expected_result,
+    ) as generate:
+        result = judge_benchmark_answer(
+            llm,
+            question_snapshot={"prompt": "Question"},
+            candidate_answer="Answer",
+            cited_sources=[],
+            citation_recall=None,
+            citation_precision=None,
+        )
+
+    assert result is expected_result
+    assert generate.call_args.kwargs["max_tokens"] == 12_000
+    assert generate.call_args.kwargs["reasoning_effort"] is ReasoningEffort.LOW
+    assert generate.call_args.kwargs["max_attempts"] == 3
