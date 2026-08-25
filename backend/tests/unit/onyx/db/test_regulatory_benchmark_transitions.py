@@ -8,6 +8,7 @@ from onyx.db.enums import BenchmarkRunItemStatus, BenchmarkRunStatus
 from onyx.db.models import BenchmarkRun, BenchmarkRunItem
 from onyx.db.regulatory_benchmark import (
     cancel_benchmark_run,
+    list_benchmark_runs,
     mark_benchmark_run_failed,
     reset_benchmark_run_for_retry,
 )
@@ -35,6 +36,20 @@ class _LockAwareSession:
 
     def commit(self) -> None:
         self.commits += 1
+
+
+def test_run_history_query_does_not_select_large_report_columns() -> None:
+    db_session = MagicMock(spec=Session)
+    db_session.scalars.return_value.all.return_value = []
+
+    list_benchmark_runs(db_session)
+
+    statement = db_session.scalars.call_args.args[0]
+    selected_columns = str(statement).partition(" FROM ")[0]
+    assert "benchmark_run.report" not in selected_columns
+    assert "benchmark_run.report_error" not in selected_columns
+    assert "benchmark_run.report_input_tokens" not in selected_columns
+    assert "benchmark_run.report_output_tokens" not in selected_columns
 
 
 def test_competing_terminal_transitions_lock_and_preserve_first_winner() -> None:

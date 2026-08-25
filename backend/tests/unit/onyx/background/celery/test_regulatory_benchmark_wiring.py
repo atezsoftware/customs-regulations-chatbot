@@ -12,7 +12,11 @@ import pytest
 from fastapi.routing import APIRoute
 
 from onyx.background.celery.tasks.regulatory_benchmark import tasks as benchmark_tasks
-from onyx.configs.app_configs import REGULATORY_BENCHMARK_MAX_QUESTIONS
+from onyx.configs.app_configs import (
+    REGULATORY_BENCHMARK_MAX_CANDIDATES,
+    REGULATORY_BENCHMARK_MAX_QUESTIONS,
+    REGULATORY_BENCHMARK_MAX_RUN_ITEMS,
+)
 from onyx.configs.constants import (
     OnyxCeleryPriority,
     OnyxCeleryQueues,
@@ -769,9 +773,7 @@ def test_run_creation_persists_candidate_and_judge_provider_ids() -> None:
     judge = BenchmarkModelSelection(
         provider="Judge", provider_id=8, model_id="judge/model"
     )
-    request = BenchmarkRunCreate(
-        candidates=[candidate], judge=judge, search_mode="v1"
-    )
+    request = BenchmarkRunCreate(candidates=[candidate], judge=judge, search_mode="v1")
     question = SimpleNamespace(id=11, document_set_id=3)
     created_run = MagicMock()
 
@@ -859,6 +861,98 @@ def test_run_snapshot_keeps_same_named_models_separate_by_provider_id() -> None:
     ]
 
 
+def test_run_history_does_not_access_or_serialize_item_details() -> None:
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    class SummaryOnlyRun(SimpleNamespace):
+        @property
+        def items(self) -> list[object]:
+            raise AssertionError("run history must not access item relationships")
+
+    run = SummaryOnlyRun(
+        id=1,
+        label="bounded history",
+        status="running",
+        judge_provider="openrouter",
+        judge_provider_id=10,
+        judge_model="judge/model",
+        deep_research=False,
+        search_mode="v2",
+        total_items=300,
+        completed_items=12,
+        failed_items=1,
+        queued_at=now,
+        started_at=now,
+        heartbeat_at=now,
+        completed_at=None,
+        created_at=now,
+        failure_code=None,
+        failure_message=None,
+    )
+
+    with (
+        patch.object(benchmark_api, "_recover_stale_runs"),
+        patch.object(benchmark_api, "list_benchmark_runs", return_value=[run]),
+    ):
+        snapshots = benchmark_api.list_runs(user=MagicMock(), db_session=MagicMock())
+
+    assert len(snapshots) == 1
+    assert snapshots[0].id == 1
+    assert snapshots[0].total_items == 300
+    assert not hasattr(snapshots[0], "items")
+    assert not hasattr(snapshots[0], "report")
+
+
+def test_run_item_results_are_returned_as_a_stable_bounded_page() -> None:
+    route = next(
+        (
+            route
+            for route in benchmark_api.router.routes
+            if isinstance(route, APIRoute)
+            and route.path == "/regulatory/benchmark/runs/{run_id}/items"
+        ),
+        None,
+    )
+
+    assert route is not None
+    item = MagicMock()
+    item.id = 41
+    item_snapshot = BenchmarkRunItemSnapshot.model_construct(id=41)
+    with (
+        patch.object(
+            benchmark_api,
+            "get_benchmark_run_status",
+            return_value=BenchmarkRunStatus.RUNNING.value,
+            create=True,
+        ),
+        patch.object(
+            benchmark_api,
+            "list_benchmark_run_items",
+            return_value=([item], 300),
+            create=True,
+        ) as list_items,
+        patch.object(
+            BenchmarkRunItemSnapshot, "from_model", return_value=item_snapshot
+        ),
+    ):
+        page = route.endpoint(
+            run_id=7,
+            offset=20,
+            limit=10,
+            user=MagicMock(),
+            db_session=MagicMock(),
+        )
+
+    assert page.total == 300
+    assert page.offset == 20
+    assert page.limit == 10
+    assert [snapshot.id for snapshot in page.items] == [41]
+    list_items.assert_called_once()
+    assert list_items.call_args.kwargs["run_id"] == 7
+    assert list_items.call_args.kwargs["offset"] == 20
+    assert list_items.call_args.kwargs["limit"] == 10
+
+
 def test_polling_requeues_only_runs_claimed_by_the_recovery_lease() -> None:
     with (
         patch.object(
@@ -893,7 +987,9 @@ def test_every_benchmark_route_requires_full_admin_panel_access() -> None:
 
 def test_run_request_has_bounded_candidate_and_question_lists() -> None:
     selection = BenchmarkModelSelection(provider="openrouter", model_id="model")
-    assert BenchmarkRunCreate(candidates=[selection], judge=selection).search_mode == "v2"
+    assert (
+        BenchmarkRunCreate(candidates=[selection], judge=selection).search_mode == "v2"
+    )
 
     with pytest.raises(ValueError):
         BenchmarkRunCreate(
@@ -907,6 +1003,105 @@ def test_run_request_has_bounded_candidate_and_question_lists() -> None:
             candidates=[selection] * 10_000,
             judge=selection,
         )
+
+
+def test_benchmark_limits_are_exposed_as_runtime_contract() -> None:
+    route = next(
+        (
+            route
+            for route in benchmark_api.router.routes
+            if isinstance(route, APIRoute)
+            and route.path == "/regulatory/benchmark/limits"
+        ),
+        None,
+    )
+
+    assert route is not None
+    limits = route.endpoint(user=MagicMock())
+    assert limits.max_questions == REGULATORY_BENCHMARK_MAX_QUESTIONS
+    assert limits.max_candidates == REGULATORY_BENCHMARK_MAX_CANDIDATES
+    assert limits.max_run_items == REGULATORY_BENCHMARK_MAX_RUN_ITEMS
+    assert limits.default_item_page_size == 20
+    assert limits.max_item_page_size == 50
+
+
+def test_run_accepts_three_hundred_items_from_hundred_questions_and_three_models() -> (
+    None
+):
+    question_ids = list(range(1, 101))
+    candidates = [
+        BenchmarkModelSelection(
+            provider="openrouter", provider_id=index, model_id=f"model-{index}"
+        )
+        for index in range(1, 4)
+    ]
+    judge = BenchmarkModelSelection(
+        provider="openrouter", provider_id=4, model_id="judge"
+    )
+    request = BenchmarkRunCreate(
+        question_ids=question_ids,
+        candidates=candidates,
+        judge=judge,
+    )
+    providers = [
+        SimpleNamespace(id=index, name=None, provider="openrouter")
+        for index in range(1, 5)
+    ]
+    questions = [
+        SimpleNamespace(id=question_id, document_set_id=15)
+        for question_id in question_ids
+    ]
+
+    with (
+        patch.object(benchmark_api, "_validate_model", side_effect=providers),
+        patch.object(benchmark_api, "list_benchmark_questions", return_value=questions),
+        patch.object(benchmark_api, "_get_editable_document_set"),
+        patch.object(
+            benchmark_api, "create_benchmark_run", return_value=MagicMock()
+        ) as create_run,
+        patch.object(benchmark_api, "benchmark_run_snapshot", return_value=MagicMock()),
+    ):
+        benchmark_api.create_run(request, user=MagicMock(), db_session=MagicMock())
+
+    assert len(create_run.call_args.kwargs["questions"]) == 100
+    assert len(create_run.call_args.kwargs["candidates"]) == 3
+
+
+def test_run_rejects_more_than_three_hundred_unique_items() -> None:
+    question_ids = list(range(1, 101))
+    candidates = [
+        BenchmarkModelSelection(
+            provider="openrouter", provider_id=index, model_id=f"model-{index}"
+        )
+        for index in range(1, 5)
+    ]
+    judge = BenchmarkModelSelection(
+        provider="openrouter", provider_id=5, model_id="judge"
+    )
+    request = BenchmarkRunCreate(
+        question_ids=question_ids,
+        candidates=candidates,
+        judge=judge,
+    )
+    providers = [
+        SimpleNamespace(id=index, name=None, provider="openrouter")
+        for index in range(1, 6)
+    ]
+    questions = [
+        SimpleNamespace(id=question_id, document_set_id=15)
+        for question_id in question_ids
+    ]
+
+    with (
+        patch.object(benchmark_api, "_validate_model", side_effect=providers),
+        patch.object(benchmark_api, "list_benchmark_questions", return_value=questions),
+        patch.object(benchmark_api, "_get_editable_document_set"),
+        patch.object(benchmark_api, "create_benchmark_run") as create_run,
+        pytest.raises(OnyxError, match="400 items exceeds the configured limit of 300"),
+    ):
+        benchmark_api.create_run(request, user=MagicMock(), db_session=MagicMock())
+
+    create_run.assert_not_called()
 
 
 def test_implicit_all_questions_is_still_bounded() -> None:

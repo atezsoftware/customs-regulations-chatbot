@@ -155,16 +155,18 @@ export interface BenchmarkRunReport {
   recommendation: string;
 }
 
-export interface BenchmarkRun {
+export type BenchmarkRunStatus =
+  | "pending"
+  | "queued"
+  | "running"
+  | "completed"
+  | "error"
+  | "cancelled";
+
+export interface BenchmarkRunSummary {
   id: number;
   label: string | null;
-  status:
-    | "pending"
-    | "queued"
-    | "running"
-    | "completed"
-    | "error"
-    | "cancelled";
+  status: BenchmarkRunStatus;
   judge_provider: string;
   judge_provider_id: number | null;
   judge_model: string;
@@ -186,13 +188,30 @@ export interface BenchmarkRun {
     | "execution_failed"
     | null;
   failure_message: string | null;
+}
+
+export interface BenchmarkRun extends BenchmarkRunSummary {
   report: BenchmarkRunReport | null;
   report_error: string | null;
   report_input_tokens: number | null;
   report_output_tokens: number | null;
   report_cost_cents: number | null;
-  items: BenchmarkRunItem[];
   aggregates: BenchmarkModelAggregate[];
+}
+
+export interface BenchmarkRunItemPage {
+  items: BenchmarkRunItem[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export interface BenchmarkLimits {
+  max_questions: number;
+  max_candidates: number;
+  max_run_items: number;
+  default_item_page_size: number;
+  max_item_page_size: number;
 }
 
 export interface BenchmarkQuestionInput {
@@ -251,7 +270,10 @@ export async function deleteBenchmarkQuestion(id: number): Promise<void> {
 }
 
 export const listBenchmarkRuns = () =>
-  requestJson<BenchmarkRun[]>("/api/regulatory/benchmark/runs");
+  requestJson<BenchmarkRunSummary[]>("/api/regulatory/benchmark/runs");
+
+export const getBenchmarkLimits = () =>
+  requestJson<BenchmarkLimits>("/api/regulatory/benchmark/limits");
 
 export const createBenchmarkRun = (input: {
   label: string | null;
@@ -278,6 +300,15 @@ export const cancelBenchmarkRun = (id: number) =>
 
 export const getBenchmarkRun = (id: number) =>
   requestJson<BenchmarkRun>(`/api/regulatory/benchmark/runs/${id}`);
+
+export const listBenchmarkRunItems = (
+  id: number,
+  offset: number,
+  limit: number
+) =>
+  requestJson<BenchmarkRunItemPage>(
+    `/api/regulatory/benchmark/runs/${id}/items?offset=${offset}&limit=${limit}`
+  );
 
 export const listBenchmarkModels = () =>
   requestJson<BenchmarkAvailableModel[]>("/api/regulatory/benchmark/models");

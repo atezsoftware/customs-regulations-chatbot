@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from sqlalchemy import func, or_, select, update
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, load_only, selectinload
 
 from onyx.db.enums import (
     BenchmarkCostSource,
@@ -262,6 +262,62 @@ def get_benchmark_run(db_session: Session, run_id: int) -> BenchmarkRun | None:
     return db_session.scalars(stmt).one_or_none()
 
 
+def get_benchmark_run_metadata(db_session: Session, run_id: int) -> BenchmarkRun | None:
+    return db_session.get(BenchmarkRun, run_id)
+
+
+def list_benchmark_run_aggregate_items(
+    db_session: Session, run_id: int
+) -> Sequence[BenchmarkRunItem]:
+    stmt = (
+        select(BenchmarkRunItem)
+        .where(BenchmarkRunItem.run_id == run_id)
+        .options(
+            load_only(
+                BenchmarkRunItem.provider,
+                BenchmarkRunItem.provider_id,
+                BenchmarkRunItem.model_id,
+                BenchmarkRunItem.status,
+                BenchmarkRunItem.total_tokens,
+                BenchmarkRunItem.duration_ms,
+                BenchmarkRunItem.cost_cents,
+                BenchmarkRunItem.citation_recall,
+                BenchmarkRunItem.citation_precision,
+            ),
+            selectinload(BenchmarkRunItem.judgment).load_only(
+                BenchmarkRunJudgment.overall_score,
+                BenchmarkRunJudgment.cost_cents,
+            ),
+        )
+        .order_by(BenchmarkRunItem.id)
+    )
+    return db_session.scalars(stmt).all()
+
+
+def list_benchmark_run_items(
+    db_session: Session,
+    *,
+    run_id: int,
+    offset: int,
+    limit: int,
+) -> tuple[Sequence[BenchmarkRunItem], int]:
+    total = db_session.scalar(
+        select(func.count(BenchmarkRunItem.id)).where(BenchmarkRunItem.run_id == run_id)
+    )
+    stmt = (
+        select(BenchmarkRunItem)
+        .where(BenchmarkRunItem.run_id == run_id)
+        .options(
+            selectinload(BenchmarkRunItem.question),
+            selectinload(BenchmarkRunItem.judgment),
+        )
+        .order_by(BenchmarkRunItem.id)
+        .offset(offset)
+        .limit(limit)
+    )
+    return db_session.scalars(stmt).all(), int(total or 0)
+
+
 def get_benchmark_run_for_update(
     db_session: Session, run_id: int
 ) -> BenchmarkRun | None:
@@ -333,8 +389,26 @@ def list_benchmark_runs(db_session: Session) -> Sequence[BenchmarkRun]:
     stmt = (
         select(BenchmarkRun)
         .options(
-            selectinload(BenchmarkRun.items).selectinload(BenchmarkRunItem.question),
-            selectinload(BenchmarkRun.items).selectinload(BenchmarkRunItem.judgment),
+            load_only(
+                BenchmarkRun.id,
+                BenchmarkRun.label,
+                BenchmarkRun.status,
+                BenchmarkRun.judge_provider,
+                BenchmarkRun.judge_provider_id,
+                BenchmarkRun.judge_model,
+                BenchmarkRun.deep_research,
+                BenchmarkRun.search_mode,
+                BenchmarkRun.total_items,
+                BenchmarkRun.completed_items,
+                BenchmarkRun.failed_items,
+                BenchmarkRun.started_at,
+                BenchmarkRun.queued_at,
+                BenchmarkRun.heartbeat_at,
+                BenchmarkRun.failure_code,
+                BenchmarkRun.failure_message,
+                BenchmarkRun.completed_at,
+                BenchmarkRun.created_at,
+            )
         )
         .order_by(BenchmarkRun.created_at.desc())
     )

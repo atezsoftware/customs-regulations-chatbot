@@ -230,7 +230,7 @@ class TestEffectivePersonaTools:
             UserFileProjectionRepairStatus.FAILED,
         ],
     )
-    def test_document_set_file_scope_rejects_unready_projection_repair(
+    def test_document_id_scope_does_not_depend_on_projection_repair_state(
         self, repair_status: UserFileProjectionRepairStatus
     ) -> None:
         user_file = SimpleNamespace(id="repair-file", status=UserFileStatus.COMPLETED)
@@ -261,14 +261,16 @@ class TestEffectivePersonaTools:
                 "onyx.tools.tool_constructor."
                 "fetch_user_file_projection_repair_statuses",
                 return_value={user_file.id: repair_status},
+                create=True,
             ),
-            pytest.raises(OnyxError, match="repair is not ready"),
         ):
-            _resolve_document_set_file_ids(
+            file_ids = _resolve_document_set_file_ids(
                 db_session=MagicMock(),
                 user=MagicMock(),
                 document_set_names=["Benchmark Set"],
             )
+
+        assert file_ids == ["repair-file"]
 
     @pytest.mark.parametrize(
         ("user_files", "chunk_counts"),

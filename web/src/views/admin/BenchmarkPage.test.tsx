@@ -14,9 +14,12 @@ import {
   BenchmarkRunItem,
   createBenchmarkQuestion,
   createBenchmarkRun,
+  getBenchmarkLimits,
+  getBenchmarkRun,
   listBenchmarkCitationOptions,
   listBenchmarkModels,
   listBenchmarkQuestions,
+  listBenchmarkRunItems,
   listBenchmarkRuns,
   startBenchmarkRun,
 } from "@/lib/regulatory/benchmark";
@@ -32,9 +35,8 @@ test("tiny non-zero benchmark costs are not rendered as zero", () => {
 
 test("cancelled benchmark items count as processed progress", () => {
   const run = buildRun(8, "cancelled");
-  run.items = [{ status: "cancelled" } as BenchmarkRun["items"][number]];
 
-  expect(processedItemCount(run)).toBe(2);
+  expect(processedItemCount(run)).toBe(run.total_items);
 });
 
 let mockDocumentSets: Array<{ id: number; name: string }> = [];
@@ -52,9 +54,12 @@ jest.mock("@/lib/regulatory/benchmark", () => ({
   createBenchmarkQuestion: jest.fn(),
   createBenchmarkRun: jest.fn(),
   deleteBenchmarkQuestion: jest.fn(),
+  getBenchmarkLimits: jest.fn(),
+  getBenchmarkRun: jest.fn(),
   listBenchmarkCitationOptions: jest.fn(),
   listBenchmarkModels: jest.fn(),
   listBenchmarkQuestions: jest.fn(),
+  listBenchmarkRunItems: jest.fn(),
   listBenchmarkRuns: jest.fn(),
   startBenchmarkRun: jest.fn(),
   updateBenchmarkQuestion: jest.fn(),
@@ -86,12 +91,14 @@ const model: BenchmarkAvailableModel = {
   is_visible: true,
 };
 
+const mockRunDetails = new Map<number, BenchmarkRun>();
+
 function buildRun(
   id: number,
   status: BenchmarkRun["status"],
   label = `Run ${id}`
 ): BenchmarkRun {
-  return {
+  const run: BenchmarkRun = {
     id,
     label,
     status,
@@ -122,9 +129,10 @@ function buildRun(
     report_input_tokens: null,
     report_output_tokens: null,
     report_cost_cents: null,
-    items: [],
     aggregates: [],
   };
+  mockRunDetails.set(id, run);
+  return run;
 }
 
 function buildRunningItem(): BenchmarkRunItem {
@@ -166,9 +174,12 @@ function buildRunningItem(): BenchmarkRunItem {
 
 const mockedCreateRun = jest.mocked(createBenchmarkRun);
 const mockedCreateQuestion = jest.mocked(createBenchmarkQuestion);
+const mockedGetLimits = jest.mocked(getBenchmarkLimits);
+const mockedGetRun = jest.mocked(getBenchmarkRun);
 const mockedListCitationOptions = jest.mocked(listBenchmarkCitationOptions);
 const mockedListModels = jest.mocked(listBenchmarkModels);
 const mockedListQuestions = jest.mocked(listBenchmarkQuestions);
+const mockedListRunItems = jest.mocked(listBenchmarkRunItems);
 const mockedListRuns = jest.mocked(listBenchmarkRuns);
 const mockedStartRun = jest.mocked(startBenchmarkRun);
 
@@ -201,10 +212,29 @@ async function configureRun() {
 
 beforeEach(() => {
   mockDocumentSets = [];
+  mockRunDetails.clear();
   mockedListQuestions.mockResolvedValue([question]);
   mockedListRuns.mockResolvedValue([]);
   mockedListModels.mockResolvedValue([model]);
   mockedListCitationOptions.mockResolvedValue([]);
+  mockedGetLimits.mockResolvedValue({
+    max_questions: 100,
+    max_candidates: 6,
+    max_run_items: 300,
+    default_item_page_size: 20,
+    max_item_page_size: 50,
+  });
+  mockedGetRun.mockImplementation(async (runId) => {
+    const run = mockRunDetails.get(runId);
+    if (!run) throw new Error(`Missing run detail fixture ${runId}`);
+    return run;
+  });
+  mockedListRunItems.mockResolvedValue({
+    items: [],
+    total: 0,
+    offset: 0,
+    limit: 20,
+  });
 });
 
 afterEach(() => {
@@ -327,6 +357,48 @@ test("sends the search mode selected for a benchmark run", async () => {
       expect.objectContaining({ search_mode: "v1" })
     )
   );
+});
+
+test("blocks a question and model combination above the run item capacity", async () => {
+  const questions = Array.from({ length: 100 }, (_, index) => ({
+    ...question,
+    id: index + 1,
+    title: `Question ${index + 1}`,
+    prompt: `Prompt ${index + 1}`,
+  }));
+  const models = Array.from({ length: 4 }, (_, index) => ({
+    ...model,
+    provider_id: index + 1,
+    model_id: `candidate/model-${index + 1}`,
+    display_name: `Candidate ${index + 1}`,
+  }));
+  mockedListQuestions.mockResolvedValue(questions);
+  mockedListModels.mockResolvedValue(models);
+
+  render(<BenchmarkPage />);
+  const user = setupUser();
+  await screen.findByText("Question 1");
+  await user.click(screen.getByRole("tab", { name: "Runs" }));
+  await screen.findByRole("heading", { name: "Create a run" });
+  await user.click(screen.getByRole("button", { name: "Select visible" }));
+  for (const candidate of models) {
+    await user.click(
+      screen.getByRole("checkbox", {
+        name: `${candidate.display_name}: ${candidate.model_id}`,
+      })
+    );
+  }
+  act(() => {
+    screen.getByRole("combobox", { name: "Judge model" }).focus();
+  });
+  await user.keyboard("{ArrowDown}");
+  await user.click(await screen.findByRole("option", { name: "Candidate 1" }));
+
+  expect(screen.getByText("400 total run items")).toBeInTheDocument();
+  expect(screen.getByText(/configured maximum is 300/i)).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Create and start" })
+  ).toBeDisabled();
 });
 
 test("retains a newly created run when starting it fails", async () => {
@@ -746,6 +818,7 @@ test("distinguishes provider rows in report and aggregate cards without reorderi
     ],
   };
   mockedListRuns.mockResolvedValue([completedRun]);
+  mockedGetRun.mockResolvedValue(completedRun);
   const originalReportOrder = completedRun.report!.model_reports.map(
     (report) => report.provider_id
   );
@@ -946,8 +1019,13 @@ test("names the deep-research control and exposes run selection to keyboards", a
 
 test("shows the active phase and heartbeat for a running item", async () => {
   const run = buildRun(73, "running", "Live progress");
-  run.items = [buildRunningItem()];
   mockedListRuns.mockResolvedValue([run]);
+  mockedListRunItems.mockResolvedValue({
+    items: [buildRunningItem()],
+    total: 1,
+    offset: 0,
+    limit: 20,
+  });
 
   render(<BenchmarkPage />);
   await openRuns();
@@ -955,4 +1033,113 @@ test("shows the active phase and heartbeat for a running item", async () => {
   expect(
     screen.getByText("Deep research · heartbeat 09:01:30 UTC")
   ).toBeInTheDocument();
+});
+
+test("loads only the selected benchmark item page", async () => {
+  const run = buildRun(74, "completed", "Paged results");
+  run.total_items = 45;
+  run.completed_items = 45;
+  mockedListRuns.mockResolvedValue([run]);
+  mockedListRunItems.mockResolvedValue({
+    items: [buildRunningItem()],
+    total: 45,
+    offset: 0,
+    limit: 20,
+  });
+
+  render(<BenchmarkPage />);
+  const user = await openRuns();
+  await waitFor(() =>
+    expect(mockedListRunItems).toHaveBeenCalledWith(run.id, 0, 20)
+  );
+  await user.click(screen.getByRole("button", { name: "Next items" }));
+
+  await waitFor(() =>
+    expect(mockedListRunItems).toHaveBeenCalledWith(run.id, 20, 20)
+  );
+});
+
+test("never renders item results from the previously selected run", async () => {
+  const firstRun = buildRun(75, "completed", "First run");
+  const secondRun = buildRun(76, "completed", "Second run");
+  const firstItem = {
+    ...buildRunningItem(),
+    question_title: "Only belongs to first run",
+  };
+  mockedListRuns.mockResolvedValue([firstRun, secondRun]);
+  mockedListRunItems.mockImplementation(async (runId) => {
+    if (runId === firstRun.id) {
+      return { items: [firstItem], total: 1, offset: 0, limit: 20 };
+    }
+    throw new Error("Second run page failed");
+  });
+
+  render(<BenchmarkPage />);
+  const user = await openRuns();
+  expect(await screen.findByText(firstItem.question_title)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /Second run/ }));
+
+  expect(screen.queryByText(firstItem.question_title)).not.toBeInTheDocument();
+});
+
+test("refreshes terminal detail after observing the terminal summary", async () => {
+  jest.useFakeTimers();
+  const runningRun = buildRun(77, "running", "Finishing run");
+  const completedRun = {
+    ...runningRun,
+    status: "completed" as const,
+    completed_items: runningRun.total_items,
+    report_error: "final report marker",
+  };
+  let terminalCommitObserved = false;
+  mockedListRuns.mockResolvedValueOnce([runningRun]).mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        window.setTimeout(() => {
+          terminalCommitObserved = true;
+          resolve([completedRun]);
+        }, 10);
+      })
+  );
+  mockedGetRun.mockImplementation(async () =>
+    terminalCommitObserved ? completedRun : runningRun
+  );
+
+  render(<BenchmarkPage />);
+  await openRuns();
+  await act(async () => {
+    await jest.advanceTimersByTimeAsync(3010);
+  });
+
+  expect(
+    await screen.findByText("Run report failed: final report marker")
+  ).toBeInTheDocument();
+});
+
+test("does not let a cancelled poll refresh the previously selected run", async () => {
+  jest.useFakeTimers();
+  const firstRun = buildRun(78, "running", "First running run");
+  const secondRun = buildRun(79, "running", "Second running run");
+  const obsoletePoll = deferred<BenchmarkRun[]>();
+  mockedListRuns
+    .mockResolvedValueOnce([firstRun, secondRun])
+    .mockReturnValueOnce(obsoletePoll.promise)
+    .mockResolvedValue([firstRun, secondRun]);
+
+  render(<BenchmarkPage />);
+  const user = await openRuns();
+  await act(async () => {
+    jest.advanceTimersByTime(3000);
+  });
+  await user.click(screen.getByRole("button", { name: /Second running run/ }));
+  await waitFor(() =>
+    expect(mockedListRunItems).toHaveBeenCalledWith(secondRun.id, 0, 20)
+  );
+  mockedListRunItems.mockClear();
+
+  await act(async () => {
+    obsoletePoll.resolve([firstRun, secondRun]);
+  });
+
+  expect(mockedListRunItems).not.toHaveBeenCalledWith(firstRun.id, 0, 20);
 });

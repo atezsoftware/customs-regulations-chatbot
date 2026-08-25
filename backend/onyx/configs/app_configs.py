@@ -1151,11 +1151,13 @@ REGULATORY_BENCHMARK_MAX_CANDIDATES = max(
     1, int(os.environ.get("REGULATORY_BENCHMARK_MAX_CANDIDATES") or 6)
 )
 REGULATORY_BENCHMARK_MAX_QUESTIONS = max(
-    1, int(os.environ.get("REGULATORY_BENCHMARK_MAX_QUESTIONS") or 50)
+    1, int(os.environ.get("REGULATORY_BENCHMARK_MAX_QUESTIONS") or 100)
 )
 REGULATORY_BENCHMARK_MAX_RUN_ITEMS = max(
-    1, int(os.environ.get("REGULATORY_BENCHMARK_MAX_RUN_ITEMS") or 100)
+    1, int(os.environ.get("REGULATORY_BENCHMARK_MAX_RUN_ITEMS") or 300)
 )
+REGULATORY_BENCHMARK_DEFAULT_ITEM_PAGE_SIZE = 20
+REGULATORY_BENCHMARK_MAX_ITEM_PAGE_SIZE = 50
 # A Deep Research item runs the complete chat stack in a child process. The
 # lite background runtime cannot safely hold more than one such process.
 REGULATORY_BENCHMARK_PARALLEL_ITEMS = 1

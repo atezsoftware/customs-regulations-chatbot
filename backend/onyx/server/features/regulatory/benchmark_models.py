@@ -1,11 +1,15 @@
 import datetime
-from typing import Annotated, Literal
+from collections.abc import Sequence
+from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, Field
 
 from onyx.configs.app_configs import (
+    REGULATORY_BENCHMARK_DEFAULT_ITEM_PAGE_SIZE,
     REGULATORY_BENCHMARK_MAX_CANDIDATES,
+    REGULATORY_BENCHMARK_MAX_ITEM_PAGE_SIZE,
     REGULATORY_BENCHMARK_MAX_QUESTIONS,
+    REGULATORY_BENCHMARK_MAX_RUN_ITEMS,
 )
 from onyx.db.enums import BenchmarkRunFailureCode
 from onyx.db.models import (
@@ -98,6 +102,14 @@ class BenchmarkAvailableModel(BaseModel):
     display_name: str
     max_input_tokens: int | None
     is_visible: bool
+
+
+class BenchmarkLimitsSnapshot(BaseModel):
+    max_questions: int = REGULATORY_BENCHMARK_MAX_QUESTIONS
+    max_candidates: int = REGULATORY_BENCHMARK_MAX_CANDIDATES
+    max_run_items: int = REGULATORY_BENCHMARK_MAX_RUN_ITEMS
+    default_item_page_size: int = REGULATORY_BENCHMARK_DEFAULT_ITEM_PAGE_SIZE
+    max_item_page_size: int = REGULATORY_BENCHMARK_MAX_ITEM_PAGE_SIZE
 
 
 class BenchmarkCitationOption(BaseModel):
@@ -237,7 +249,7 @@ class BenchmarkModelAggregate(BaseModel):
     average_citation_precision: float | None
 
 
-class BenchmarkRunSnapshot(BaseModel):
+class BenchmarkRunSummary(BaseModel):
     id: int
     label: str | None
     status: str
@@ -256,18 +268,58 @@ class BenchmarkRunSnapshot(BaseModel):
     created_at: datetime.datetime
     failure_code: BenchmarkRunFailureCode | None
     failure_message: str | None
+
+    @classmethod
+    def from_model(cls, run: BenchmarkRun) -> "BenchmarkRunSummary":
+        return cls(
+            id=run.id,
+            label=run.label,
+            status=run.status,
+            judge_provider=run.judge_provider,
+            judge_provider_id=run.judge_provider_id,
+            judge_model=run.judge_model,
+            deep_research=run.deep_research,
+            search_mode=cast(Literal["v1", "v2"], run.search_mode),
+            total_items=run.total_items,
+            completed_items=run.completed_items,
+            failed_items=run.failed_items,
+            queued_at=run.queued_at,
+            started_at=run.started_at,
+            heartbeat_at=run.heartbeat_at,
+            completed_at=run.completed_at,
+            created_at=run.created_at,
+            failure_code=(
+                BenchmarkRunFailureCode(run.failure_code)
+                if run.failure_code is not None
+                else None
+            ),
+            failure_message=run.failure_message,
+        )
+
+
+class BenchmarkRunSnapshot(BenchmarkRunSummary):
     report: dict[str, object] | None
     report_error: str | None
     report_input_tokens: int | None
     report_output_tokens: int | None
     report_cost_cents: float | None
-    items: list[BenchmarkRunItemSnapshot]
     aggregates: list[BenchmarkModelAggregate]
 
 
-def benchmark_run_snapshot(run: BenchmarkRun) -> BenchmarkRunSnapshot:
+class BenchmarkRunItemPage(BaseModel):
+    items: list[BenchmarkRunItemSnapshot]
+    total: int
+    offset: int
+    limit: int
+
+
+def benchmark_run_snapshot(
+    run: BenchmarkRun,
+    aggregate_items: Sequence[BenchmarkRunItem] | None = None,
+) -> BenchmarkRunSnapshot:
+    items_for_aggregates = aggregate_items if aggregate_items is not None else run.items
     grouped: dict[tuple[str, int | None, str], list[BenchmarkRunItem]] = {}
-    for item in run.items:
+    for item in items_for_aggregates:
         grouped.setdefault((item.provider, item.provider_id, item.model_id), []).append(
             item
         )
@@ -318,33 +370,11 @@ def benchmark_run_snapshot(run: BenchmarkRun) -> BenchmarkRunSnapshot:
             )
         )
     return BenchmarkRunSnapshot(
-        id=run.id,
-        label=run.label,
-        status=run.status,
-        judge_provider=run.judge_provider,
-        judge_provider_id=run.judge_provider_id,
-        judge_model=run.judge_model,
-        deep_research=run.deep_research,
-        search_mode=run.search_mode,
-        total_items=run.total_items,
-        completed_items=run.completed_items,
-        failed_items=run.failed_items,
-        queued_at=run.queued_at,
-        started_at=run.started_at,
-        heartbeat_at=run.heartbeat_at,
-        completed_at=run.completed_at,
-        created_at=run.created_at,
-        failure_code=(
-            BenchmarkRunFailureCode(run.failure_code)
-            if run.failure_code is not None
-            else None
-        ),
-        failure_message=run.failure_message,
+        **BenchmarkRunSummary.from_model(run).model_dump(),
         report=run.report,
         report_error=run.report_error,
         report_input_tokens=run.report_input_tokens,
         report_output_tokens=run.report_output_tokens,
         report_cost_cents=run.report_cost_cents,
-        items=[BenchmarkRunItemSnapshot.from_model(item) for item in run.items],
         aggregates=aggregates,
     )

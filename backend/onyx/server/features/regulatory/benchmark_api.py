@@ -1,17 +1,20 @@
 import datetime
 import hashlib
 import threading
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlparse
 
 import httpx
 from cachetools import TTLCache
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
 from onyx.background.celery.versioned_apps.client import app as celery_app
 from onyx.configs.app_configs import (
+    REGULATORY_BENCHMARK_DEFAULT_ITEM_PAGE_SIZE,
+    REGULATORY_BENCHMARK_MAX_CANDIDATES,
+    REGULATORY_BENCHMARK_MAX_ITEM_PAGE_SIZE,
     REGULATORY_BENCHMARK_MAX_QUESTIONS,
     REGULATORY_BENCHMARK_MAX_RUN_ITEMS,
     REGULATORY_BENCHMARK_RECOVERY_LEASE_SECONDS,
@@ -47,9 +50,12 @@ from onyx.db.regulatory_benchmark import (
     claim_stale_benchmark_runs_for_recovery,
     create_benchmark_run,
     get_benchmark_question,
-    get_benchmark_run,
     get_benchmark_run_for_update,
+    get_benchmark_run_metadata,
+    get_benchmark_run_status,
     list_benchmark_questions,
+    list_benchmark_run_aggregate_items,
+    list_benchmark_run_items,
     list_benchmark_runs,
     question_has_run_items,
     reset_benchmark_run_for_retry,
@@ -61,12 +67,16 @@ from onyx.regulatory.benchmark.models import BenchmarkExpectedCitationInput
 from onyx.server.features.regulatory.benchmark_models import (
     BenchmarkAvailableModel,
     BenchmarkCitationOption,
+    BenchmarkLimitsSnapshot,
     BenchmarkModelSelection,
     BenchmarkQuestionCreate,
     BenchmarkQuestionSnapshot,
     BenchmarkQuestionUpdate,
     BenchmarkRunCreate,
+    BenchmarkRunItemPage,
+    BenchmarkRunItemSnapshot,
     BenchmarkRunSnapshot,
+    BenchmarkRunSummary,
     benchmark_run_snapshot,
 )
 from onyx.utils.logger import setup_logger
@@ -78,6 +88,21 @@ logger = setup_logger()
 _OPENROUTER_ACCOUNT_MODELS_CACHE: TTLCache[tuple[int, str, str], frozenset[str]] = (
     TTLCache(maxsize=32, ttl=5 * 60)
 )
+
+
+@router.get("/limits", tags=PUBLIC_API_TAGS)
+def get_limits(
+    user: User = Depends(  # noqa: ARG001
+        require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)
+    ),
+) -> BenchmarkLimitsSnapshot:
+    return BenchmarkLimitsSnapshot(
+        max_questions=REGULATORY_BENCHMARK_MAX_QUESTIONS,
+        max_candidates=REGULATORY_BENCHMARK_MAX_CANDIDATES,
+        max_run_items=REGULATORY_BENCHMARK_MAX_RUN_ITEMS,
+    )
+
+
 _OPENROUTER_ACCOUNT_MODELS_CACHE_LOCK = threading.Lock()
 
 
@@ -603,9 +628,39 @@ def list_runs(
         require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)
     ),
     db_session: Session = Depends(get_session),
-) -> list[BenchmarkRunSnapshot]:
+) -> list[BenchmarkRunSummary]:
     _recover_stale_runs(db_session)
-    return [benchmark_run_snapshot(run) for run in list_benchmark_runs(db_session)]
+    return [
+        BenchmarkRunSummary.from_model(run) for run in list_benchmark_runs(db_session)
+    ]
+
+
+@router.get("/runs/{run_id}/items", tags=PUBLIC_API_TAGS)
+def list_run_items(
+    run_id: int,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[
+        int, Query(ge=1, le=REGULATORY_BENCHMARK_MAX_ITEM_PAGE_SIZE)
+    ] = REGULATORY_BENCHMARK_DEFAULT_ITEM_PAGE_SIZE,
+    user: User = Depends(  # noqa: ARG001
+        require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)
+    ),
+    db_session: Session = Depends(get_session),
+) -> BenchmarkRunItemPage:
+    if get_benchmark_run_status(db_session, run_id) is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Benchmark run not found")
+    items, total = list_benchmark_run_items(
+        db_session,
+        run_id=run_id,
+        offset=offset,
+        limit=limit,
+    )
+    return BenchmarkRunItemPage(
+        items=[BenchmarkRunItemSnapshot.from_model(item) for item in items],
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
 
 
 @router.get("/runs/{run_id}", tags=PUBLIC_API_TAGS)
@@ -617,7 +672,8 @@ def get_run(
     db_session: Session = Depends(get_session),
 ) -> BenchmarkRunSnapshot:
     _recover_stale_runs(db_session)
-    run = get_benchmark_run(db_session, run_id)
+    run = get_benchmark_run_metadata(db_session, run_id)
     if run is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Benchmark run not found")
-    return benchmark_run_snapshot(run)
+    aggregate_items = list_benchmark_run_aggregate_items(db_session, run_id)
+    return benchmark_run_snapshot(run, aggregate_items)

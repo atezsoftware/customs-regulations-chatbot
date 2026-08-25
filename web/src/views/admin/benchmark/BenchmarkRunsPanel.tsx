@@ -17,11 +17,17 @@ import { toast } from "@opal/layouts";
 
 import {
   type BenchmarkAvailableModel,
+  type BenchmarkLimits,
   type BenchmarkQuestion,
   type BenchmarkRun,
+  type BenchmarkRunItemPage,
+  type BenchmarkRunSummary,
   type BenchmarkSearchMode,
   cancelBenchmarkRun,
   createBenchmarkRun,
+  getBenchmarkLimits,
+  getBenchmarkRun,
+  listBenchmarkRunItems,
   listBenchmarkModels,
   listBenchmarkQuestions,
   listBenchmarkRuns,
@@ -41,24 +47,40 @@ import BenchmarkRunItemDetails from "@/views/admin/benchmark/BenchmarkRunItemDet
 
 const panelClass = "rounded-xl border border-border-02 bg-background p-5";
 const Field = FormField;
+const defaultLimits: BenchmarkLimits = {
+  max_questions: 100,
+  max_candidates: 6,
+  max_run_items: 300,
+  default_item_page_size: 20,
+  max_item_page_size: 50,
+};
+const emptyItemPage: BenchmarkRunItemPage = {
+  items: [],
+  total: 0,
+  offset: 0,
+  limit: defaultLimits.default_item_page_size,
+};
 
-const withUpdatedRun = (runs: BenchmarkRun[], updatedRun: BenchmarkRun) => [
-  updatedRun,
-  ...runs.filter((run) => run.id !== updatedRun.id),
-];
+interface SelectedItemPage {
+  runId: number;
+  page: BenchmarkRunItemPage;
+}
 
-export function processedItemCount(run: BenchmarkRun): number {
-  const cancelledItems = run.items.filter(
-    (item) => item.status === "cancelled"
-  ).length;
-  return run.completed_items + run.failed_items + cancelledItems;
+const withUpdatedRun = (
+  runs: BenchmarkRunSummary[],
+  updatedRun: BenchmarkRunSummary
+) => [updatedRun, ...runs.filter((run) => run.id !== updatedRun.id)];
+
+export function processedItemCount(run: BenchmarkRunSummary): number {
+  if (run.status === "cancelled") return run.total_items;
+  return run.completed_items + run.failed_items;
 }
 
 function mergeRunSnapshots(
-  currentRuns: BenchmarkRun[],
-  incomingRuns: BenchmarkRun[],
+  currentRuns: BenchmarkRunSummary[],
+  incomingRuns: BenchmarkRunSummary[],
   protectedRunIds: ReadonlySet<number>
-): BenchmarkRun[] {
+): BenchmarkRunSummary[] {
   const currentById = new Map(currentRuns.map((run) => [run.id, run]));
   const mergedRuns = incomingRuns.map((incomingRun) => {
     const currentRun = currentById.get(incomingRun.id);
@@ -75,8 +97,8 @@ function mergeRunSnapshots(
 }
 
 interface ProtectedRunUpdate {
-  expected: BenchmarkRun["status"];
-  previous: BenchmarkRun["status"] | null;
+  expected: BenchmarkRunSummary["status"];
+  previous: BenchmarkRunSummary["status"] | null;
   attemptQueuedAt: string | null;
 }
 
@@ -96,7 +118,7 @@ function isSameOrNewerAttempt(
 
 function hasObservedRunUpdate(
   update: ProtectedRunUpdate,
-  incomingRun: BenchmarkRun
+  incomingRun: BenchmarkRunSummary
 ) {
   const incomingStatus = incomingRun.status;
   if (incomingStatus === update.expected) return true;
@@ -117,10 +139,29 @@ function hasObservedRunUpdate(
   );
 }
 
+export function benchmarkCapacityError(
+  questionCount: number,
+  candidateCount: number,
+  limits: BenchmarkLimits
+): string | null {
+  if (questionCount > limits.max_questions) {
+    return `${questionCount} questions selected; the configured maximum is ${limits.max_questions}.`;
+  }
+  if (candidateCount > limits.max_candidates) {
+    return `${candidateCount} models selected; the configured maximum is ${limits.max_candidates}.`;
+  }
+  const runItemCount = questionCount * candidateCount;
+  if (runItemCount > limits.max_run_items) {
+    return `${runItemCount} run items selected; the configured maximum is ${limits.max_run_items}.`;
+  }
+  return null;
+}
+
 export default function BenchmarkRunsPanel() {
   const [questions, setQuestions] = useState<BenchmarkQuestion[]>([]);
   const [models, setModels] = useState<BenchmarkAvailableModel[]>([]);
-  const [runs, setRuns] = useState<BenchmarkRun[]>([]);
+  const [limits, setLimits] = useState<BenchmarkLimits>(defaultLimits);
+  const [runs, setRuns] = useState<BenchmarkRunSummary[]>([]);
   const [selectedQuestionIds, setSelectedQuestionIds] = useState<number[]>([]);
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [judgeKey, setJudgeKey] = useState<string>("");
@@ -131,9 +172,15 @@ export default function BenchmarkRunsPanel() {
   const [deepResearch, setDeepResearch] = useState(false);
   const [searchMode, setSearchMode] = useState<BenchmarkSearchMode>("v2");
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
+  const [selectedRunDetail, setSelectedRunDetail] =
+    useState<BenchmarkRun | null>(null);
+  const [selectedItemPage, setSelectedItemPage] =
+    useState<SelectedItemPage | null>(null);
+  const [itemOffset, setItemOffset] = useState(0);
   const [launching, setLaunching] = useState(false);
   const [startingRunIds, setStartingRunIds] = useState<Set<number>>(new Set());
   const runRequestSequence = useRef(0);
+  const selectedRunRequestSequence = useRef(0);
   const protectedRunUpdates = useRef(new Map<number, ProtectedRunUpdate>());
 
   const setRunStarting = useCallback((runId: number, starting: boolean) => {
@@ -160,7 +207,34 @@ export default function BenchmarkRunsPanel() {
       .catch((error: unknown) =>
         toast.error(error instanceof Error ? error.message : "Models failed.")
       );
+    void getBenchmarkLimits()
+      .then(setLimits)
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : "Limits failed.")
+      );
   }, []);
+
+  const refreshSelectedRun = useCallback(
+    async (runId: number, offset: number) => {
+      const requestSequence = ++selectedRunRequestSequence.current;
+      try {
+        const [run, page] = await Promise.all([
+          getBenchmarkRun(runId),
+          listBenchmarkRunItems(runId, offset, limits.default_item_page_size),
+        ]);
+        if (requestSequence !== selectedRunRequestSequence.current) return;
+        setSelectedRunDetail(run);
+        setSelectedItemPage({ runId, page });
+      } catch (error) {
+        if (requestSequence !== selectedRunRequestSequence.current) return;
+        setSelectedItemPage(null);
+        toast.error(
+          error instanceof Error ? error.message : "Run details failed."
+        );
+      }
+    },
+    [limits.default_item_page_size]
+  );
 
   const refreshRuns = useCallback(async () => {
     const requestSequence = ++runRequestSequence.current;
@@ -192,6 +266,17 @@ export default function BenchmarkRunsPanel() {
     void refreshRuns();
   }, [refreshConfiguration, refreshRuns]);
   useEffect(() => {
+    if (selectedRunId === null) {
+      setSelectedRunDetail(null);
+      setSelectedItemPage(null);
+      return;
+    }
+    void refreshSelectedRun(selectedRunId, itemOffset);
+  }, [itemOffset, refreshSelectedRun, selectedRunId]);
+  useEffect(() => {
+    setItemOffset(0);
+  }, [selectedRunId]);
+  useEffect(() => {
     if (
       !runs.some((run) => run.status === "queued" || run.status === "running")
     )
@@ -200,6 +285,9 @@ export default function BenchmarkRunsPanel() {
     let timer: number | undefined;
     const poll = async () => {
       await refreshRuns();
+      if (!cancelled && selectedRunId !== null) {
+        await refreshSelectedRun(selectedRunId, itemOffset);
+      }
       if (!cancelled) timer = window.setTimeout(() => void poll(), 3000);
     };
     timer = window.setTimeout(() => void poll(), 3000);
@@ -207,9 +295,29 @@ export default function BenchmarkRunsPanel() {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [refreshRuns, runs]);
+  }, [itemOffset, refreshRuns, refreshSelectedRun, runs, selectedRunId]);
 
-  const selectedRun = runs.find((run) => run.id === selectedRunId) ?? null;
+  const selectedRunSummary =
+    runs.find((run) => run.id === selectedRunId) ?? null;
+  const itemPage =
+    selectedItemPage?.runId === selectedRunId &&
+    selectedItemPage.page.offset === itemOffset
+      ? selectedItemPage.page
+      : emptyItemPage;
+  const selectedDetailForRun =
+    selectedRunDetail?.id === selectedRunId ? selectedRunDetail : null;
+  const selectedRun: BenchmarkRun | null = selectedRunSummary
+    ? {
+        ...selectedRunSummary,
+        report: selectedDetailForRun?.report ?? null,
+        report_error: selectedDetailForRun?.report_error ?? null,
+        report_input_tokens: selectedDetailForRun?.report_input_tokens ?? null,
+        report_output_tokens:
+          selectedDetailForRun?.report_output_tokens ?? null,
+        report_cost_cents: selectedDetailForRun?.report_cost_cents ?? null,
+        aggregates: selectedDetailForRun?.aggregates ?? [],
+      }
+    : selectedDetailForRun;
   const modelMap = useMemo(
     () => new Map(models.map((model) => [modelKey(model), model])),
     [models]
@@ -244,13 +352,24 @@ export default function BenchmarkRunsPanel() {
           .includes(query)
     );
   }, [questionSearch, questions]);
+  const runItemCount = selectedQuestionIds.length * selectedModels.length;
+  const capacityError = benchmarkCapacityError(
+    selectedQuestionIds.length,
+    selectedModels.length,
+    limits
+  );
 
   const launch = useCallback(async () => {
     const judge = modelMap.get(judgeKey);
     const candidates = selectedModels
       .map((key) => modelMap.get(key))
       .filter((model): model is BenchmarkAvailableModel => Boolean(model));
-    if (!judge || candidates.length === 0 || selectedQuestionIds.length === 0)
+    if (
+      !judge ||
+      candidates.length === 0 ||
+      selectedQuestionIds.length === 0 ||
+      capacityError
+    )
       return;
     setLaunching(true);
     try {
@@ -270,6 +389,8 @@ export default function BenchmarkRunsPanel() {
         deep_research: deepResearch,
         search_mode: searchMode,
       });
+      setSelectedRunDetail(run);
+      setSelectedItemPage(null);
       runRequestSequence.current += 1;
       protectedRunUpdates.current.set(run.id, {
         expected: run.status,
@@ -287,6 +408,7 @@ export default function BenchmarkRunsPanel() {
           previous: run.status,
           attemptQueuedAt: startedRun.queued_at,
         });
+        setSelectedRunDetail(startedRun);
         setRuns((current) => withUpdatedRun(current, startedRun));
         toast.success("Benchmark run queued through the production chat flow.");
       } catch (error) {
@@ -306,6 +428,7 @@ export default function BenchmarkRunsPanel() {
       setLaunching(false);
     }
   }, [
+    capacityError,
     deepResearch,
     judgeKey,
     label,
@@ -317,7 +440,7 @@ export default function BenchmarkRunsPanel() {
   ]);
 
   const startRun = useCallback(
-    async (run: BenchmarkRun) => {
+    async (run: BenchmarkRunSummary) => {
       setSelectedRunId(run.id);
       setRunStarting(run.id, true);
       try {
@@ -328,6 +451,7 @@ export default function BenchmarkRunsPanel() {
           previous: run.status,
           attemptQueuedAt: startedRun.queued_at,
         });
+        setSelectedRunDetail(startedRun);
         setRuns((current) => withUpdatedRun(current, startedRun));
         toast.success(
           run.status === "error"
@@ -345,7 +469,7 @@ export default function BenchmarkRunsPanel() {
     [setRunStarting]
   );
 
-  const cancelRun = useCallback(async (run: BenchmarkRun) => {
+  const cancelRun = useCallback(async (run: BenchmarkRunSummary) => {
     try {
       const cancelledRun = await cancelBenchmarkRun(run.id);
       runRequestSequence.current += 1;
@@ -354,6 +478,7 @@ export default function BenchmarkRunsPanel() {
         previous: run.status,
         attemptQueuedAt: cancelledRun.queued_at,
       });
+      setSelectedRunDetail(cancelledRun);
       setRuns((current) => withUpdatedRun(current, cancelledRun));
     } catch (error) {
       toast.error(
@@ -613,7 +738,14 @@ export default function BenchmarkRunsPanel() {
                   {`${selectedQuestionIds.length} questions × ${selectedModels.length} models`}
                 </Text>
                 <Text font="main-ui-action" color="text-05">
-                  {`${selectedQuestionIds.length * selectedModels.length} total run items`}
+                  {`${runItemCount} total run items`}
+                </Text>
+                <Text
+                  font="secondary-body"
+                  color={capacityError ? "status-error-05" : "text-02"}
+                >
+                  {capacityError ??
+                    `Configured maximum is ${limits.max_run_items} run items.`}
                 </Text>
               </div>
             </Card>
@@ -622,7 +754,8 @@ export default function BenchmarkRunsPanel() {
                 launching ||
                 selectedQuestionIds.length === 0 ||
                 selectedModels.length === 0 ||
-                !judgeKey
+                !judgeKey ||
+                capacityError !== null
               }
               onClick={() => void launch()}
             >
@@ -860,12 +993,51 @@ export default function BenchmarkRunsPanel() {
                 ))}
               </section>
               <section className="flex flex-col gap-3">
-                <Text as="h3" font="heading-h3" color="text-05">
-                  Item results
-                </Text>
-                {selectedRun.items.map((item) => (
+                <div className="flex items-center justify-between gap-3">
+                  <Text as="h3" font="heading-h3" color="text-05">
+                    Item results
+                  </Text>
+                  <Text font="secondary-body" color="text-02">
+                    {itemPage.total === 0
+                      ? "No item results"
+                      : `${itemPage.offset + 1}-${Math.min(
+                          itemPage.offset + itemPage.items.length,
+                          itemPage.total
+                        )} of ${itemPage.total}`}
+                  </Text>
+                </div>
+                {itemPage.items.map((item) => (
                   <BenchmarkRunItemDetails key={item.id} item={item} />
                 ))}
+                {itemPage.total > itemPage.limit && (
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      size="sm"
+                      prominence="tertiary"
+                      disabled={itemPage.offset === 0}
+                      onClick={() =>
+                        setItemOffset((current) =>
+                          Math.max(0, current - itemPage.limit)
+                        )
+                      }
+                    >
+                      Previous items
+                    </Button>
+                    <Button
+                      size="sm"
+                      prominence="tertiary"
+                      disabled={
+                        itemPage.offset + itemPage.items.length >=
+                        itemPage.total
+                      }
+                      onClick={() =>
+                        setItemOffset((current) => current + itemPage.limit)
+                      }
+                    >
+                      Next items
+                    </Button>
+                  </div>
+                )}
               </section>
             </div>
           )}
