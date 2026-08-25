@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import CheckConstraint, Table
 
 from onyx.configs.constants import DEFAULT_PERSONA_ID
 from onyx.db.enums import (
@@ -50,10 +51,13 @@ def test_judge_schema_is_openrouter_provider_compatible() -> None:
 
 
 def test_item_phase_constraint_accepts_every_persisted_phase() -> None:
-    phase_constraint = next(
-        constraint
-        for constraint in BenchmarkRunItem.__table__.constraints
-        if constraint.name == "benchmark_run_item_execution_phase_check"
+    phase_constraint = cast(
+        CheckConstraint,
+        next(
+            constraint
+            for constraint in cast(Table, BenchmarkRunItem.__table__).constraints
+            if constraint.name == "benchmark_run_item_execution_phase_check"
+        ),
     )
     constraint_sql = str(phase_constraint.sqltext)
 
@@ -815,6 +819,101 @@ def test_failed_answer_persists_usage_cost_and_execution_diagnostics() -> None:
     assert db_session.commit.call_count == 3
 
 
+def test_document_set_scope_tool_failure_cannot_be_judged_as_an_answer() -> None:
+    scope_failure = (
+        "Tool failed with error: Selected Document Sets are outside this "
+        "agent's knowledge scope."
+    )
+    response = SimpleNamespace(
+        error_msg=None,
+        answer="The searches did not reach the requested sources.",
+        pre_answer_reasoning=None,
+        message_id=295,
+        citation_info=[],
+        top_documents=[],
+        tool_calls=[
+            SimpleNamespace(
+                tool_name="internal_search",
+                tool_arguments={"queries": ["controlling provision"]},
+                pre_reasoning=None,
+                tool_result=scope_failure,
+                search_docs=[],
+            )
+        ],
+    )
+    item = SimpleNamespace(
+        id=46,
+        status=BenchmarkRunItemStatus.RUNNING.value,
+        provider="openrouter",
+        provider_id=3,
+        model_id="anthropic/claude-sonnet-5",
+        question=SimpleNamespace(
+            prompt="prompt",
+            document_set=SimpleNamespace(name="Benchmark Set"),
+        ),
+        question_snapshot={"prompt": "prompt", "expected_citations": []},
+        final_result=None,
+        judgment=None,
+        error_message=None,
+        execution_phase=BenchmarkRunItemPhase.ANSWERING.value,
+        heartbeat_at=None,
+        completed_at=None,
+    )
+    db_session = MagicMock()
+
+    with (
+        patch(
+            "onyx.regulatory.benchmark.runner.create_chat_session",
+            return_value=SimpleNamespace(id=uuid4()),
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.benchmark_usage_capture",
+            return_value=nullcontext([]),
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.handle_stream_message_objects",
+            return_value=iter(()),
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner.gather_stream_full",
+            return_value=response,
+        ),
+        patch(
+            "onyx.regulatory.benchmark.runner._usage_cost",
+            return_value=(0, 0, None, "unavailable"),
+        ),
+        pytest.raises(RuntimeError, match="selected document set scope"),
+    ):
+        _generate_item_answer(
+            db_session,
+            run=cast(BenchmarkRun, SimpleNamespace(id=7, deep_research=False)),
+            item=cast(BenchmarkRunItem, item),
+            user=cast(User, SimpleNamespace(id=uuid4())),
+            persona=MagicMock(id=DEFAULT_PERSONA_ID),
+            started=time.monotonic(),
+        )
+
+    assert item.execution_steps[0]["result"] == scope_failure
+    assert item.final_result is None
+    assert (
+        item.error_message
+        == "Benchmark search could not access the selected document set scope"
+    )
+    assert db_session.commit.call_count == 3
+
+    recovered_at = datetime.datetime.now(datetime.timezone.utc)
+    recovered = _recover_interrupted_items(
+        cast(BenchmarkRun, SimpleNamespace(items=[item])),
+        recovered_at=recovered_at,
+    )
+
+    assert recovered == 1
+    assert item.status == BenchmarkRunItemStatus.ERROR.value
+    assert item.execution_phase is None
+    assert item.completed_at == recovered_at
+    assert item.heartbeat_at == recovered_at
+
+
 def test_benchmark_items_use_the_default_new_session_persona() -> None:
     db_session = MagicMock()
     default_persona = MagicMock(id=DEFAULT_PERSONA_ID)
@@ -840,6 +939,7 @@ def test_redelivery_recovers_running_items_without_discarding_saved_answer() -> 
         status=BenchmarkRunItemStatus.RUNNING.value,
         judgment=None,
         final_result="persisted canonical-chat answer",
+        error_message=None,
         completed_at=recovered_at,
     )
     judgment_saved = SimpleNamespace(
@@ -1276,6 +1376,8 @@ def test_parallel_run_preparation_recovers_only_resumable_items() -> None:
         id=34,
         status=BenchmarkRunItemStatus.RUNNING.value,
         judgment=None,
+        final_result=None,
+        error_message=None,
         completed_at=None,
     )
     completed = SimpleNamespace(

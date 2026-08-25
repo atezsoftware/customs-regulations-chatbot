@@ -59,6 +59,7 @@ def _disambiguate_mcp_tool_names(tools: list[Tool]) -> None:
 
 class SearchToolConfig(BaseModel):
     user_selected_filters: BaseFilters | None = None
+    document_set_names_override: list[str] | None = None
     # Vespa metadata filters for overflowing user files.  These are NOT the
     # IDs of the current project/persona — they are only set when the
     # project's/persona's user files didn't fit in the LLM context window and
@@ -194,11 +195,27 @@ def _construct_tools_impl(
     document_index = get_default_document_index(search_settings, None, db_session)
 
     def _build_search_tool(tool_id: int, config: SearchToolConfig) -> SearchTool:
+        document_set_names_override = config.document_set_names_override
+        has_document_set_override = document_set_names_override is not None
         persona_search_info = PersonaSearchInfo(
-            document_set_names=[ds.name for ds in persona.document_sets],
-            search_start_date=persona.search_start_date,
-            attached_document_ids=[doc.id for doc in persona.attached_documents],
-            hierarchy_node_ids=[node.id for node in persona.hierarchy_nodes],
+            document_set_names=(
+                document_set_names_override
+                if document_set_names_override is not None
+                else [ds.name for ds in persona.document_sets]
+            ),
+            search_start_date=(
+                None if has_document_set_override else persona.search_start_date
+            ),
+            attached_document_ids=(
+                []
+                if has_document_set_override
+                else [doc.id for doc in persona.attached_documents]
+            ),
+            hierarchy_node_ids=(
+                []
+                if has_document_set_override
+                else [node.id for node in persona.hierarchy_nodes]
+            ),
         )
         return SearchTool(
             tool_id=tool_id,
@@ -208,8 +225,12 @@ def _construct_tools_impl(
             llm=llm,
             document_index=document_index,
             user_selected_filters=config.user_selected_filters,
-            project_id_filter=config.project_id_filter,
-            persona_id_filter=config.persona_id_filter,
+            project_id_filter=(
+                None if has_document_set_override else config.project_id_filter
+            ),
+            persona_id_filter=(
+                None if has_document_set_override else config.persona_id_filter
+            ),
             bypass_acl=config.bypass_acl,
             slack_context=config.slack_context,
             enable_slack_search=config.enable_slack_search,

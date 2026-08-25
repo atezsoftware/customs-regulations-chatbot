@@ -52,6 +52,12 @@ logger = setup_logger()
 _MAX_TOOL_RESULT_CHARS = 20_000
 _MAX_REASONING_CHARS = 30_000
 _PROGRESS_HEARTBEAT_INTERVAL_SECONDS = 15
+_DOCUMENT_SET_SCOPE_TOOL_ERROR = (
+    "Selected Document Sets are outside this agent's knowledge scope."
+)
+_BENCHMARK_DOCUMENT_SET_SCOPE_ERROR = (
+    "Benchmark search could not access the selected document set scope"
+)
 
 
 def _utcnow() -> datetime.datetime:
@@ -314,6 +320,14 @@ def _execution_steps(response: object) -> list[dict[str, object]]:
     return steps
 
 
+def _has_document_set_scope_tool_failure(response: object) -> bool:
+    return any(
+        getattr(tool_call, "tool_name", None) == "internal_search"
+        and _DOCUMENT_SET_SCOPE_TOOL_ERROR in str(getattr(tool_call, "tool_result", ""))
+        for tool_call in getattr(response, "tool_calls", [])
+    )
+
+
 def _judge_completed_item(
     db_session: Session,
     *,
@@ -469,6 +483,10 @@ def _generate_item_answer(
     )
     item.execution_steps = _execution_steps(response)
     item.llm_calls = _usage_snapshots(answer_usage, phase="answer")
+    if _has_document_set_scope_tool_failure(response):
+        item.error_message = _BENCHMARK_DOCUMENT_SET_SCOPE_ERROR
+        db_session.commit()
+        raise RuntimeError(_BENCHMARK_DOCUMENT_SET_SCOPE_ERROR)
     if response.error_msg:
         # Preserve provider usage and partial execution evidence even though the
         # canonical answer boundary was not reached.
@@ -686,8 +704,8 @@ def _recover_interrupted_items(
     """Return abandoned in-flight items to a resumable state.
 
     The task-level distributed lease guarantees that no live worker owns the run
-    when this executes. A persisted answer is intentionally retained so
-    ``_run_item`` can continue at the judge boundary.
+    when this executes. Persisted answers resume at the judge boundary, while a
+    persisted pre-answer failure marker becomes terminal without another paid call.
     """
     recovered = 0
     for item in run.items:
@@ -696,6 +714,11 @@ def _recover_interrupted_items(
         recovered += 1
         if item.judgment is not None:
             item.status = BenchmarkRunItemStatus.COMPLETED.value
+            item.heartbeat_at = recovered_at
+            item.completed_at = recovered_at
+        elif item.error_message is not None and item.final_result is None:
+            item.status = BenchmarkRunItemStatus.ERROR.value
+            item.execution_phase = None
             item.heartbeat_at = recovered_at
             item.completed_at = recovered_at
         else:

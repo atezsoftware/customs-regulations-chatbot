@@ -1,13 +1,43 @@
+from types import SimpleNamespace
+
 import pytest
 
+import onyx.chat.process_message as process_message
 from onyx.chat.process_message import (
     _resolve_query_processing_hook_result,
     remove_answer_citations,
 )
+from onyx.context.search.models import BaseFilters
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.hooks.executor import HookSkipped, HookSoftFailed
 from onyx.hooks.points.query_processing import QueryProcessingResponse
+
+
+def test_benchmark_session_uses_requested_document_sets_as_effective_scope() -> None:
+    helper = getattr(process_message, "_benchmark_document_set_names_override", None)
+    assert helper is not None
+    setup = SimpleNamespace(
+        chat_session=SimpleNamespace(benchmark_flow=True),
+        new_msg_req=SimpleNamespace(
+            internal_search_filters=BaseFilters(document_set=["Benchmark Set"])
+        ),
+    )
+
+    assert helper(setup) == ["Benchmark Set"]
+
+
+def test_normal_session_preserves_persona_document_set_scope() -> None:
+    helper = getattr(process_message, "_benchmark_document_set_names_override", None)
+    assert helper is not None
+    setup = SimpleNamespace(
+        chat_session=SimpleNamespace(benchmark_flow=False),
+        new_msg_req=SimpleNamespace(
+            internal_search_filters=BaseFilters(document_set=["User Selected Set"])
+        ),
+    )
+
+    assert helper(setup) is None
 
 
 def test_remove_answer_citations_strips_http_markdown_citation() -> None:

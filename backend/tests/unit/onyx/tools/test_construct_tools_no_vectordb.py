@@ -271,6 +271,62 @@ class TestEffectivePersonaTools:
             "Agent Knowledge"
         ]
 
+    def test_explicit_search_scope_overrides_persona_document_sets(self) -> None:
+        configured_search_tool = MagicMock(
+            id=1,
+            name="internal_search",
+            in_code_tool_id=SearchTool.__name__,
+        )
+        persona = MagicMock(
+            id=DEFAULT_PERSONA_ID,
+            name="default",
+            tools=[configured_search_tool],
+        )
+        persona.document_sets = [SimpleNamespace(name="Unrelated Persona Set")]
+        persona.attached_documents = [SimpleNamespace(id="attached-document")]
+        persona.hierarchy_nodes = [SimpleNamespace(id=41)]
+        persona.search_start_date = MagicMock()
+        user = MagicMock(oauth_accounts=[], enable_memory_tool=False)
+
+        with (
+            patch(
+                "onyx.tools.tool_constructor.get_current_search_settings",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_default_document_index",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_built_in_tool_by_id",
+                return_value=SearchTool,
+            ),
+            patch.object(SearchTool, "is_available", return_value=True),
+        ):
+            result = _construct_tools_impl(
+                persona=persona,
+                db_session=MagicMock(),
+                emitter=MagicMock(),
+                user=user,
+                llm=MagicMock(),
+                search_tool_config=SearchToolConfig(
+                    user_selected_filters=BaseFilters(document_set=["Benchmark Set"]),
+                    document_set_names_override=["Benchmark Set"],
+                    project_id_filter=12,
+                    persona_id_filter=13,
+                ),
+                search_usage_forcing_setting=SearchToolUsage.ENABLED,
+            )
+
+        search_tool = result[1][0]
+        assert isinstance(search_tool, SearchTool)
+        assert search_tool.persona_search_info.document_set_names == ["Benchmark Set"]
+        assert search_tool.persona_search_info.attached_document_ids == []
+        assert search_tool.persona_search_info.hierarchy_node_ids == []
+        assert search_tool.persona_search_info.search_start_date is None
+        assert search_tool.project_id_filter is None
+        assert search_tool.persona_id_filter is None
+
     def test_legacy_document_set_persona_respects_empty_allowlist(self) -> None:
         persona = MagicMock(id=7, name="legacy", tools=[])
         persona.document_sets = [SimpleNamespace(name="Agent Knowledge")]

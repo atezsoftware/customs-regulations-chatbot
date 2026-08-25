@@ -657,6 +657,17 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
     return (filters or BaseFilters()).model_copy(update=updates)
 
 
+def _benchmark_document_set_names_override(
+    setup: ChatTurnSetup,
+) -> list[str] | None:
+    if not setup.chat_session.benchmark_flow:
+        return None
+    filters = setup.new_msg_req.internal_search_filters
+    if filters is None or filters.document_set is None:
+        return None
+    return list(filters.document_set)
+
+
 def _should_auto_detect_search_filters(
     *, persona_id: int, workspace_setting_enabled: bool
 ) -> bool:
@@ -1388,6 +1399,9 @@ def _run_models(
                 llm=model_llm,
                 search_tool_config=SearchToolConfig(
                     user_selected_filters=_global_regulatory_search_filters(setup),
+                    document_set_names_override=(
+                        _benchmark_document_set_names_override(setup)
+                    ),
                     project_id_filter=setup.search_params.project_id_filter,
                     persona_id_filter=setup.search_params.persona_id_filter,
                     bypass_acl=setup.bypass_acl,
