@@ -194,6 +194,31 @@ def test_judge_accepts_unverifiable_evidence_assessments_required_by_prompt() ->
     assert result.citation_assessments[0].verdict == "unverifiable"
 
 
+def test_judge_derives_duplicate_top_level_scores_from_criteria() -> None:
+    result = BenchmarkJudgeResult.model_validate(
+        {
+            "rationale": "Criterion reports contain the detailed evaluation.",
+            "summary": "Usable with gaps.",
+            "criteria": {
+                "correctness": {"score": 4, "rationale": "Mostly correct."},
+                "groundedness": {"score": 3, "rationale": "Some support gaps."},
+                "completeness": {"score": 2, "rationale": "Material omissions."},
+                "clarity": {"score": 5, "rationale": "Clear."},
+            },
+            "strengths": [],
+            "weaknesses": [],
+            "fact_assessments": [],
+            "citation_assessments": [],
+        }
+    )
+
+    assert result.correctness_score == 4
+    assert result.groundedness_score == 3
+    assert result.completeness_score == 2
+    assert result.clarity_score == 5
+    assert result.overall_score == 70
+
+
 def test_usage_cost_sums_each_actual_llm_call() -> None:
     usage_calls = [
         LLMCallUsage("candidate", "provider-a", 100, 20, 0),

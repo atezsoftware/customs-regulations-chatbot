@@ -459,7 +459,7 @@ jobs:
           }
 
           deploy_app "customs-regulations-api" "customs-regulations/customs-regulations-api-values.yaml" "true" ""
-          deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "true" "3Gi"
+          deploy_app "customs-regulations-background" "customs-regulations/customs-regulations-background-values.yaml" "true" "4Gi"
           verify_benchmark_worker
           verify_regulatory_indexing_worker
           verify_regulatory_indexing_beat

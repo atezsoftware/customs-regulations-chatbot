@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class BenchmarkExpectedCitationInput(BaseModel):
@@ -65,6 +65,36 @@ class BenchmarkJudgeResult(BaseModel):
     citation_assessments: list[BenchmarkCitationAssessment] = Field(
         default_factory=list
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_duplicate_scores_from_criteria(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        criteria = normalized.get("criteria")
+        if not isinstance(criteria, dict):
+            return normalized
+
+        score_fields = {
+            "correctness_score": "correctness",
+            "groundedness_score": "groundedness",
+            "completeness_score": "completeness",
+            "clarity_score": "clarity",
+        }
+        for score_field, criterion_name in score_fields.items():
+            criterion = criteria.get(criterion_name)
+            if score_field not in normalized and isinstance(criterion, dict):
+                criterion_score = criterion.get("score")
+                if criterion_score is not None:
+                    normalized[score_field] = criterion_score
+
+        if "overall_score" not in normalized:
+            criterion_scores = [normalized.get(field) for field in score_fields]
+            if all(isinstance(score, int) for score in criterion_scores):
+                # Four 1-5 criteria map linearly to the benchmark's 0-100 scale.
+                normalized["overall_score"] = sum(criterion_scores) * 5
+        return normalized
 
     @field_validator(
         "correctness_score",

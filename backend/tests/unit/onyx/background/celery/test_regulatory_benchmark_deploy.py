@@ -12,7 +12,7 @@ def test_backend_deploy_verifies_the_benchmark_worker_is_running() -> None:
 
     assert (
         'deploy_app "customs-regulations-background" '
-        '"customs-regulations/customs-regulations-background-values.yaml" "true" "3Gi"'
+        '"customs-regulations/customs-regulations-background-values.yaml" "true" "4Gi"'
         in workflow
     )
     assert 'local memory_limit="$4"' in workflow

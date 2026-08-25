@@ -354,24 +354,28 @@ def reset_benchmark_run_for_retry(run: BenchmarkRun) -> None:
     for item in run.items:
         if item.status != BenchmarkRunItemStatus.ERROR.value:
             continue
+        retry_judging_only = (
+            item.judge_error is not None and item.final_result is not None
+        )
         item.status = BenchmarkRunItemStatus.PENDING.value
-        item.final_result = None
         item.error_message = None
-        item.input_tokens = None
-        item.output_tokens = None
-        item.total_tokens = None
-        item.duration_ms = None
-        item.cost_cents = None
-        item.cost_source = BenchmarkCostSource.UNAVAILABLE.value
-        item.cited_chunk_ids = []
-        item.cited_sources = []
-        item.execution_steps = []
-        item.llm_calls = []
-        item.answer_reasoning = None
-        item.chat_session_id = None
-        item.assistant_message_id = None
-        item.citation_recall = None
-        item.citation_precision = None
+        if not retry_judging_only:
+            item.final_result = None
+            item.input_tokens = None
+            item.output_tokens = None
+            item.total_tokens = None
+            item.duration_ms = None
+            item.cost_cents = None
+            item.cost_source = BenchmarkCostSource.UNAVAILABLE.value
+            item.cited_chunk_ids = []
+            item.cited_sources = []
+            item.execution_steps = []
+            item.llm_calls = []
+            item.answer_reasoning = None
+            item.chat_session_id = None
+            item.assistant_message_id = None
+            item.citation_recall = None
+            item.citation_precision = None
         item.judge_error = None
         item.execution_phase = None
         item.heartbeat_at = None

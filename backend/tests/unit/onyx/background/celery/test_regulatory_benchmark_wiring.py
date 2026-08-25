@@ -135,7 +135,7 @@ def test_concurrent_start_observes_locked_queued_state_and_does_not_republish(
     assert mock_send_task.call_count == 2
 
 
-def test_error_run_retry_resets_failed_items_and_preserves_completed_items() -> None:
+def test_error_run_retry_preserves_judge_failed_answers_and_completed_items() -> None:
     failed_item = SimpleNamespace(
         status=BenchmarkRunItemStatus.ERROR.value,
         final_result="failed answer",
@@ -202,23 +202,23 @@ def test_error_run_retry_resets_failed_items_and_preserves_completed_items() -> 
     assert run.report_output_tokens is None
     assert run.report_cost_cents is None
     assert failed_item.status == BenchmarkRunItemStatus.PENDING.value
-    assert failed_item.final_result is None
+    assert failed_item.final_result == "failed answer"
     assert failed_item.error_message is None
-    assert failed_item.input_tokens is None
-    assert failed_item.output_tokens is None
-    assert failed_item.total_tokens is None
-    assert failed_item.duration_ms is None
-    assert failed_item.cost_cents is None
-    assert failed_item.cost_source == "unavailable"
-    assert failed_item.cited_chunk_ids == []
-    assert failed_item.cited_sources == []
-    assert failed_item.execution_steps == []
-    assert failed_item.llm_calls == []
-    assert failed_item.answer_reasoning is None
-    assert failed_item.chat_session_id is None
-    assert failed_item.assistant_message_id is None
-    assert failed_item.citation_recall is None
-    assert failed_item.citation_precision is None
+    assert failed_item.input_tokens == 10
+    assert failed_item.output_tokens == 20
+    assert failed_item.total_tokens == 30
+    assert failed_item.duration_ms == 40
+    assert failed_item.cost_cents == 0.5
+    assert failed_item.cost_source == "measured"
+    assert failed_item.cited_chunk_ids == ["chunk-1"]
+    assert failed_item.cited_sources == [{"document_id": "doc-1"}]
+    assert failed_item.execution_steps == [{"kind": "answer"}]
+    assert failed_item.llm_calls == [{"model": "candidate"}]
+    assert failed_item.answer_reasoning == "reasoning"
+    assert failed_item.chat_session_id == "chat-id"
+    assert failed_item.assistant_message_id == 99
+    assert failed_item.citation_recall == 0.5
+    assert failed_item.citation_precision == 0.25
     assert failed_item.judge_error is None
     assert failed_item.started_at is None
     assert failed_item.completed_at is None
