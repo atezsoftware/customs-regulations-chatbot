@@ -140,6 +140,43 @@ jobs:
         run: |
           aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
+      - name: Capture API outage diagnostics
+        run: |
+          set -euo pipefail
+
+          selector="app=${env_x}-customs-regulations-api"
+          deployment="${env_x}-customs-regulations-api-deployment"
+          echo "API deployment and endpoints"
+          kubectl get deployment "$deployment" --namespace "${namespace}" -o wide || true
+          kubectl get endpoints --namespace "${namespace}" -l "$selector" -o wide || true
+          echo "API pod runtime state"
+          kubectl get pods --namespace "${namespace}" -l "$selector" -o json \
+            | jq '{items: [.items[] | {
+                name: .metadata.name,
+                phase: .status.phase,
+                deletion_timestamp: .metadata.deletionTimestamp,
+                conditions: .status.conditions,
+                containers: [.status.containerStatuses[]? | {
+                  name,
+                  ready,
+                  restart_count: .restartCount,
+                  state,
+                  last_state: .lastState
+                }]
+              }]}' || true
+          for pod in $(kubectl get pods --namespace "${namespace}" -l "$selector" -o name 2>/dev/null); do
+            echo "Describe $pod"
+            kubectl describe --namespace "${namespace}" "$pod" || true
+            echo "Current logs $pod"
+            kubectl logs --namespace "${namespace}" "$pod" --tail=500 || true
+            echo "Previous logs $pod"
+            kubectl logs --namespace "${namespace}" "$pod" --previous --tail=500 || true
+          done
+          echo "Recent namespace warnings"
+          kubectl get events --namespace "${namespace}" --sort-by='.metadata.creationTimestamp' \
+            | grep -E -i 'warning|unhealthy|failed|kill|evict|memory|api' \
+            | tail -n 300 || true
+
       - name: Capture pre-deploy worker diagnostics
         run: |
           set -euo pipefail
@@ -206,6 +243,7 @@ jobs:
 
       - name: Deploy api and background with Helm
         id: helm_deploy
+        if: github.ref != 'refs/heads/diag/test-api-outage'
         run: |
           deploy_app() {
             local app_name="$1"
