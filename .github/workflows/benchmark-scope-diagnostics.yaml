@@ -1,0 +1,107 @@
+name: Benchmark Scope Diagnostics
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+
+      - name: Inspect benchmark Document Set scope
+        run: |
+          set -euo pipefail
+          namespace="customs-regulations-test"
+          selector="app=test-v1-customs-regulations-api"
+          pod=$(kubectl get pods --namespace "$namespace" -l "$selector" -o json \
+            | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | select(.status.phase == "Running") | .metadata.name' \
+            | head -n 1)
+          test -n "$pod"
+          container=$(kubectl get pod "$pod" --namespace "$namespace" -o json \
+            | jq -r '.spec.containers[] | select(.name | contains("api-container")) | .name' \
+            | head -n 1)
+          test -n "$container"
+
+          kubectl exec -i "$pod" --namespace "$namespace" -c "$container" -- python - <<'PY'
+          from sqlalchemy import text
+
+          from onyx.db.engine.sql_engine import get_session_with_current_tenant
+
+
+          with get_session_with_current_tenant() as session:
+              sets = session.execute(
+                  text(
+                      """
+                      SELECT id, name
+                      FROM document_set
+                      WHERE id IN (5, 15)
+                      ORDER BY id
+                      """
+                  )
+              ).mappings().all()
+              scope = session.execute(
+                  text(
+                      """
+                      SELECT q.document_set_id, d.name, count(*) AS active_questions
+                      FROM benchmark_question q
+                      JOIN document_set d ON d.id = q.document_set_id
+                      WHERE q.is_active
+                      GROUP BY q.document_set_id, d.name
+                      ORDER BY q.document_set_id
+                      """
+                  )
+              ).mappings().all()
+              overlap = session.execute(
+                  text(
+                      """
+                      SELECT
+                        count(*) AS tir_files,
+                        count(*) FILTER (
+                          WHERE EXISTS (
+                            SELECT 1
+                            FROM document_set__user_file pc_link
+                            WHERE pc_link.document_set_id = 15
+                              AND pc_link.user_file_id = tir_link.user_file_id
+                          )
+                        ) AS overlap_by_id,
+                        count(*) FILTER (
+                          WHERE EXISTS (
+                            SELECT 1
+                            FROM document_set__user_file pc_link
+                            JOIN user_file pc_file ON pc_file.id = pc_link.user_file_id
+                            WHERE pc_link.document_set_id = 15
+                              AND lower(pc_file.name) = lower(tir_file.name)
+                          )
+                        ) AS overlap_by_name
+                      FROM document_set__user_file tir_link
+                      JOIN user_file tir_file ON tir_file.id = tir_link.user_file_id
+                      WHERE tir_link.document_set_id = 5
+                      """
+                  )
+              ).mappings().one()
+              repairs = session.execute(
+                  text(
+                      """
+                      SELECT dsuf.document_set_id,
+                             coalesce(repair.status, 'missing') AS repair_status,
+                             count(*) AS files
+                      FROM document_set__user_file dsuf
+                      LEFT JOIN user_file_projection_repair repair
+                        ON repair.user_file_id = dsuf.user_file_id
+                      WHERE dsuf.document_set_id IN (5, 15)
+                      GROUP BY dsuf.document_set_id, coalesce(repair.status, 'missing')
+                      ORDER BY dsuf.document_set_id, repair_status
+                      """
+                  )
+              ).mappings().all()
+
+          print("document_sets", [dict(row) for row in sets])
+          print("active_question_scope", [dict(row) for row in scope])
+          print("tir_pc_overlap", dict(overlap))
+          print("projection_repair", [dict(row) for row in repairs])
+          PY
