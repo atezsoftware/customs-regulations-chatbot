@@ -10,12 +10,17 @@ Verifies that:
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from onyx.configs.constants import DEFAULT_PERSONA_ID
 from onyx.context.search.models import BaseFilters
+from onyx.db.enums import UserFileStatus
+from onyx.error_handling.exceptions import OnyxError
 from onyx.tools.models import SearchToolUsage
 from onyx.tools.tool_constructor import (
     SearchToolConfig,
     _construct_tools_impl,
+    _resolve_document_set_file_ids,
     construct_tools,
 )
 from onyx.tools.tool_implementations.file_reader.file_reader_tool import FileReaderTool
@@ -114,6 +119,157 @@ class TestForceAddSearchToolGuard:
 
 
 class TestEffectivePersonaTools:
+    def test_document_set_file_scope_fails_closed_without_access(self) -> None:
+        with patch(
+            "onyx.tools.tool_constructor.filter_document_set_names_by_user_access",
+            return_value=set(),
+        ):
+            with pytest.raises(OnyxError, match="scope is unavailable"):
+                _resolve_document_set_file_ids(
+                    db_session=MagicMock(),
+                    user=MagicMock(),
+                    document_set_names=["Benchmark Set"],
+                )
+
+    def test_document_set_file_scope_fails_closed_when_set_is_empty(self) -> None:
+        with (
+            patch(
+                "onyx.tools.tool_constructor.filter_document_set_names_by_user_access",
+                return_value={"Benchmark Set"},
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_document_sets_by_name",
+                return_value=[
+                    SimpleNamespace(
+                        id=99,
+                        connector_credential_pairs=[],
+                        federated_connectors=[],
+                    )
+                ],
+            ),
+            patch(
+                "onyx.tools.tool_constructor.fetch_user_files_for_document_set",
+                return_value=[],
+            ),
+        ):
+            with pytest.raises(OnyxError, match="no searchable files"):
+                _resolve_document_set_file_ids(
+                    db_session=MagicMock(),
+                    user=MagicMock(),
+                    document_set_names=["Benchmark Set"],
+                )
+
+    def test_document_set_file_scope_rejects_connector_content(self) -> None:
+        with (
+            patch(
+                "onyx.tools.tool_constructor.filter_document_set_names_by_user_access",
+                return_value={"Benchmark Set"},
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_document_sets_by_name",
+                return_value=[
+                    SimpleNamespace(
+                        id=99,
+                        connector_credential_pairs=[SimpleNamespace(id=7)],
+                        federated_connectors=[],
+                    )
+                ],
+            ),
+        ):
+            with pytest.raises(OnyxError, match="only uploaded files"):
+                _resolve_document_set_file_ids(
+                    db_session=MagicMock(),
+                    user=MagicMock(),
+                    document_set_names=["Benchmark Set"],
+                )
+
+    def test_document_set_file_scope_rejects_mixed_file_statuses(self) -> None:
+        with (
+            patch(
+                "onyx.tools.tool_constructor.filter_document_set_names_by_user_access",
+                return_value={"Benchmark Set"},
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_document_sets_by_name",
+                return_value=[
+                    SimpleNamespace(
+                        id=99,
+                        connector_credential_pairs=[],
+                        federated_connectors=[],
+                    )
+                ],
+            ),
+            patch(
+                "onyx.tools.tool_constructor.fetch_user_files_for_document_set",
+                return_value=[
+                    SimpleNamespace(
+                        id="completed-file", status=UserFileStatus.COMPLETED
+                    ),
+                    SimpleNamespace(id="chunked-file", status=UserFileStatus.CHUNKED),
+                ],
+            ),
+        ):
+            with pytest.raises(OnyxError, match="must be completed"):
+                _resolve_document_set_file_ids(
+                    db_session=MagicMock(),
+                    user=MagicMock(),
+                    document_set_names=["Benchmark Set"],
+                )
+
+    @pytest.mark.parametrize(
+        ("user_files", "chunk_counts"),
+        [
+            (
+                [SimpleNamespace(id="generic-file", status=UserFileStatus.COMPLETED)],
+                {},
+            ),
+            (
+                [
+                    SimpleNamespace(
+                        id="regulatory-file", status=UserFileStatus.COMPLETED
+                    ),
+                    SimpleNamespace(id="generic-file", status=UserFileStatus.COMPLETED),
+                ],
+                {"regulatory-file": 3},
+            ),
+        ],
+    )
+    def test_document_set_file_scope_rejects_missing_regulatory_projection(
+        self,
+        user_files: list[SimpleNamespace],
+        chunk_counts: dict[str, int],
+    ) -> None:
+        with (
+            patch(
+                "onyx.tools.tool_constructor.filter_document_set_names_by_user_access",
+                return_value={"Benchmark Set"},
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_document_sets_by_name",
+                return_value=[
+                    SimpleNamespace(
+                        id=99,
+                        connector_credential_pairs=[],
+                        federated_connectors=[],
+                    )
+                ],
+            ),
+            patch(
+                "onyx.tools.tool_constructor.fetch_user_files_for_document_set",
+                return_value=user_files,
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_chunk_counts_for_files",
+                return_value=chunk_counts,
+            ),
+        ):
+            with pytest.raises(OnyxError, match="must have regulatory chunks"):
+                _resolve_document_set_file_ids(
+                    db_session=MagicMock(),
+                    user=MagicMock(),
+                    document_set_names=["Benchmark Set"],
+                )
+
     def test_default_persona_preserves_explicit_standard_search_mode(self) -> None:
         configured_search_tool = MagicMock(
             id=1,
@@ -302,6 +458,35 @@ class TestEffectivePersonaTools:
                 return_value=SearchTool,
             ),
             patch.object(SearchTool, "is_available", return_value=True),
+            patch(
+                "onyx.tools.tool_constructor.filter_document_set_names_by_user_access",
+                return_value={"Benchmark Set"},
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_document_sets_by_name",
+                return_value=[
+                    SimpleNamespace(
+                        id=99,
+                        connector_credential_pairs=[],
+                        federated_connectors=[],
+                    )
+                ],
+            ),
+            patch(
+                "onyx.tools.tool_constructor.fetch_user_files_for_document_set",
+                return_value=[
+                    SimpleNamespace(
+                        id="benchmark-file-a", status=UserFileStatus.COMPLETED
+                    ),
+                    SimpleNamespace(
+                        id="benchmark-file-b", status=UserFileStatus.COMPLETED
+                    ),
+                ],
+            ),
+            patch(
+                "onyx.tools.tool_constructor.get_chunk_counts_for_files",
+                return_value={"benchmark-file-a": 4, "benchmark-file-b": 7},
+            ),
         ):
             result = _construct_tools_impl(
                 persona=persona,
@@ -320,10 +505,15 @@ class TestEffectivePersonaTools:
 
         search_tool = result[1][0]
         assert isinstance(search_tool, SearchTool)
-        assert search_tool.persona_search_info.document_set_names == ["Benchmark Set"]
-        assert search_tool.persona_search_info.attached_document_ids == []
+        assert search_tool.persona_search_info.document_set_names == []
+        assert search_tool.persona_search_info.attached_document_ids == [
+            "benchmark-file-a",
+            "benchmark-file-b",
+        ]
         assert search_tool.persona_search_info.hierarchy_node_ids == []
         assert search_tool.persona_search_info.search_start_date is None
+        assert search_tool.user_selected_filters is not None
+        assert search_tool.user_selected_filters.document_set is None
         assert search_tool.project_id_filter is None
         assert search_tool.persona_id_filter is None
 

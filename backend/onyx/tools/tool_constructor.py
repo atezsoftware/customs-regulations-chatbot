@@ -11,7 +11,13 @@ from onyx.chat.emitter import Emitter
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
 from onyx.configs.model_configs import GEN_AI_TEMPERATURE
 from onyx.context.search.models import BaseFilters, PersonaSearchInfo
+from onyx.db.document_set import (
+    fetch_user_files_for_document_set,
+    filter_document_set_names_by_user_access,
+    get_document_sets_by_name,
+)
 from onyx.db.engine.sql_engine import get_session_with_current_tenant_if_none
+from onyx.db.enums import UserFileStatus
 from onyx.db.mcp import (
     MCPCredentialsError,
     get_all_mcp_tools_for_server,
@@ -22,9 +28,12 @@ from onyx.db.models import Persona, User
 from onyx.db.models import Tool as DbTool
 from onyx.db.oauth_config import get_oauth_config
 from onyx.db.persona import get_effective_persona_tools
+from onyx.db.regulatory_chunks import get_chunk_counts_for_files
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.tools import get_builtin_tool
 from onyx.document_index.factory import get_default_document_index
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.image_gen.interfaces import ImageGenerationProviderCredentials
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.onyxbot.slack.models import SlackContext
@@ -71,6 +80,54 @@ class SearchToolConfig(BaseModel):
     slack_context: SlackContext | None = None
     enable_slack_search: bool = True
     auto_detect_filters: bool = True
+
+
+def _resolve_document_set_file_ids(
+    *, db_session: Session, user: User, document_set_names: list[str]
+) -> list[str]:
+    requested_names = set(document_set_names)
+    accessible_names = filter_document_set_names_by_user_access(
+        db_session=db_session,
+        document_set_names=document_set_names,
+        user=user,
+    )
+    if not requested_names or accessible_names != requested_names:
+        raise OnyxError(
+            OnyxErrorCode.INSUFFICIENT_PERMISSIONS,
+            "Benchmark Document Set scope is unavailable",
+        )
+    document_sets = get_document_sets_by_name(db_session, document_set_names)
+    if any(
+        document_set.connector_credential_pairs or document_set.federated_connectors
+        for document_set in document_sets
+    ):
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Benchmark Document Sets must contain only uploaded files",
+        )
+    user_files = [
+        user_file
+        for document_set in document_sets
+        for user_file in fetch_user_files_for_document_set(db_session, document_set.id)
+    ]
+    if any(user_file.status != UserFileStatus.COMPLETED for user_file in user_files):
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Every Benchmark Document Set file must be completed before testing",
+        )
+    user_file_ids = sorted({user_file.id for user_file in user_files})
+    if not user_file_ids:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Benchmark Document Set has no searchable files",
+        )
+    chunk_counts = get_chunk_counts_for_files(db_session, user_file_ids)
+    if any(chunk_counts.get(user_file_id, 0) == 0 for user_file_id in user_file_ids):
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Every Benchmark Document Set file must have regulatory chunks",
+        )
+    return [str(user_file_id) for user_file_id in user_file_ids]
 
 
 class FileReaderToolConfig(BaseModel):
@@ -197,17 +254,31 @@ def _construct_tools_impl(
     def _build_search_tool(tool_id: int, config: SearchToolConfig) -> SearchTool:
         document_set_names_override = config.document_set_names_override
         has_document_set_override = document_set_names_override is not None
+        document_ids_override: list[str] = []
+        effective_user_selected_filters = config.user_selected_filters
+        if document_set_names_override is not None:
+            document_ids_override = _resolve_document_set_file_ids(
+                db_session=db_session,
+                document_set_names=document_set_names_override,
+                user=user,
+            )
+            if effective_user_selected_filters is not None:
+                effective_user_selected_filters = (
+                    effective_user_selected_filters.model_copy(
+                        update={"document_set": None}
+                    )
+                )
         persona_search_info = PersonaSearchInfo(
             document_set_names=(
-                document_set_names_override
-                if document_set_names_override is not None
+                []
+                if has_document_set_override
                 else [ds.name for ds in persona.document_sets]
             ),
             search_start_date=(
                 None if has_document_set_override else persona.search_start_date
             ),
             attached_document_ids=(
-                []
+                document_ids_override
                 if has_document_set_override
                 else [doc.id for doc in persona.attached_documents]
             ),
@@ -224,7 +295,7 @@ def _construct_tools_impl(
             persona_search_info=persona_search_info,
             llm=llm,
             document_index=document_index,
-            user_selected_filters=config.user_selected_filters,
+            user_selected_filters=effective_user_selected_filters,
             project_id_filter=(
                 None if has_document_set_override else config.project_id_filter
             ),
