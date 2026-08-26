@@ -67,6 +67,15 @@ def analyze_amendment(
 
         match = confirm_match(llm, instruction=instruction, candidates=candidates)
 
+        candidate_ids = {candidate.chunk_id for candidate in candidates}
+        if match.old_chunk_id is not None and match.old_chunk_id not in candidate_ids:
+            logger.warning(
+                "Amendment matcher returned candidate id outside the supplied set: %s",
+                match.old_chunk_id,
+            )
+            unmatched.append(instruction)
+            continue
+
         old_chunk: RegulatoryChunk | None = None
         if match.old_chunk_id:
             old_chunk = get_chunk_by_id(db_session, match.old_chunk_id)

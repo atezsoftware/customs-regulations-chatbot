@@ -1,5 +1,7 @@
 import {
   analyzeAmendment,
+  extractAmendmentPdf,
+  extractAmendmentUrl,
   listAmendmentBatches,
 } from "@/lib/regulatory/amendments";
 import { listBenchmarkCitationOptions } from "@/lib/regulatory/benchmark";
@@ -55,6 +57,50 @@ describe("regulatory document set API contracts", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/regulatory/benchmark/document-sets/17/citation-options",
       undefined
+    );
+  });
+
+  it("extracts an amendment URL before analysis", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        text: "MADDE 1- Yeni metin.",
+        source_type: "html",
+        display_name: "20260826-2.htm",
+      })
+    );
+
+    await extractAmendmentUrl("https://example.gov/20260826-2.htm");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/regulatory/amendments/sources/url",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: "https://example.gov/20260826-2.htm" }),
+      }
+    );
+  });
+
+  it("uploads an amendment PDF as multipart data", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        text: "MADDE 1- Yeni metin.",
+        source_type: "pdf",
+        display_name: "update.pdf",
+      })
+    );
+    const file = new File(["%PDF-1.7"], "update.pdf", {
+      type: "application/pdf",
+    });
+
+    await extractAmendmentPdf(file);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/regulatory/amendments/sources/pdf",
+      {
+        method: "POST",
+        body: expect.any(FormData),
+      }
     );
   });
 });

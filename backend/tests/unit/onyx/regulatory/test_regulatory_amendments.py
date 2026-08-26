@@ -5,7 +5,16 @@ import pytest
 from sqlalchemy.orm import Session
 
 from onyx.db.regulatory_amendments import approve_amendment_proposal
-from onyx.regulatory.amendments import candidate_finder
+from onyx.regulatory.amendments import candidate_finder, pipeline
+from onyx.regulatory.amendments.drafter import DraftResult
+from onyx.regulatory.amendments.models import (
+    AmendmentInstruction,
+    ChunkFieldsDraft,
+    DateResolution,
+    MatchResult,
+    SegmentationResult,
+)
+from onyx.regulatory.amendments.ranker import CandidateChunk
 
 
 def test_amendment_candidate_queries_exclude_hierarchical_aggregates() -> None:
@@ -44,3 +53,58 @@ def test_amendment_approval_rejects_derived_aggregate_target() -> None:
         )
 
     db_session.add.assert_not_called()
+
+
+def test_analyze_amendment_marks_match_id_outside_candidates_unmatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = AmendmentInstruction(instruction_text="MADDE 3 değiştirilmiştir.")
+    monkeypatch.setattr(
+        pipeline,
+        "segment_amendment_text",
+        lambda *_args: SegmentationResult(
+            reference_date=None, instructions=[instruction]
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "find_candidates",
+        lambda *_args, **_kwargs: [
+            CandidateChunk(
+                chunk_id="allowed",
+                user_file_id="00000000-0000-0000-0000-000000000123",
+                text="MADDE 3 eski metin.",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "confirm_match",
+        lambda *_args, **_kwargs: MatchResult(
+            old_chunk_id="foreign", confidence=0.9, rationale="wrong chunk"
+        ),
+    )
+    monkeypatch.setattr(pipeline, "get_chunk_by_id", lambda *_args: None)
+    monkeypatch.setattr(pipeline, "get_chunks_for_file", lambda *_args: [])
+    monkeypatch.setattr(
+        pipeline,
+        "draft_new_chunk",
+        lambda *_args, **_kwargs: DraftResult(
+            new_chunk=ChunkFieldsDraft(text="MADDE 3 yeni metin."),
+            dates=DateResolution(
+                effective_start_date=None,
+                effective_end_date=None,
+                rationale="no date",
+            ),
+        ),
+    )
+
+    result = pipeline.analyze_amendment(
+        MagicMock(spec=Session),
+        llm=MagicMock(),
+        user_file_ids=[UUID("00000000-0000-0000-0000-000000000123")],
+        raw_text="MADDE 3 değiştirilmiştir.",
+    )
+
+    assert result.proposals == []
+    assert result.unmatched_instructions == [instruction]

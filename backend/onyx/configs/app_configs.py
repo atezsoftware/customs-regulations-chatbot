@@ -1652,6 +1652,17 @@ MAX_FILE_SIZE_BYTES = int(
     os.environ.get("MAX_FILE_SIZE_BYTES") or 2 * 1024 * 1024 * 1024
 )  # 2GB in bytes
 
+# One-off amendment sources are synchronously extracted and then sent to the
+# default LLM. Keep their network and prompt footprint bounded independently
+# from normal user-file ingestion.
+MAX_AMENDMENT_SOURCE_BYTES = _non_negative_int_env(
+    "MAX_AMENDMENT_SOURCE_BYTES", 25 * 1024 * 1024
+)
+MAX_AMENDMENT_SOURCE_TEXT_CHARS = _non_negative_int_env(
+    "MAX_AMENDMENT_SOURCE_TEXT_CHARS", 200_000
+)
+MIN_AMENDMENT_PDF_TEXT_CHARS = _non_negative_int_env("MIN_AMENDMENT_PDF_TEXT_CHARS", 40)
+
 # Maximum embedded images allowed in a single file. PDFs (and other formats)
 # with thousands of embedded images can OOM the user-file-processing worker
 # because every image is decoded with PIL and then sent to the vision LLM.

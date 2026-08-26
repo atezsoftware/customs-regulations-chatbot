@@ -1,11 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   Button,
   InputSelect,
   InputTextArea,
+  InputTypeIn,
   Tag,
   Text,
 } from "@opal/components";
@@ -17,10 +18,26 @@ import {
   AmendmentProposal,
   analyzeAmendment,
   approveProposal,
+  extractAmendmentPdf,
+  extractAmendmentUrl,
   listAmendmentBatches,
   listAmendmentProposals,
   rejectProposal,
 } from "@/lib/regulatory/amendments";
+
+type AmendmentSourceMode = "text" | "url" | "pdf";
+
+function sourceIdentity(
+  mode: AmendmentSourceMode,
+  url: string,
+  file: File | null
+) {
+  if (mode === "url") return url.trim() ? `url:${url.trim()}` : null;
+  if (mode === "pdf" && file) {
+    return `pdf:${file.name}:${file.size}:${file.lastModified}`;
+  }
+  return null;
+}
 
 function ChunkPreview({
   title,
@@ -174,6 +191,14 @@ export default function AmendmentsPage() {
     string | null
   >(null);
   const [rawText, setRawText] = useState("");
+  const [sourceMode, setSourceMode] = useState<AmendmentSourceMode>("text");
+  const [sourceUrl, setSourceUrl] = useState("");
+  const [sourceFile, setSourceFile] = useState<File | null>(null);
+  const [extractedSourceIdentity, setExtractedSourceIdentity] = useState<
+    string | null
+  >(null);
+  const [extracting, setExtracting] = useState(false);
+  const pdfInputRef = useRef<HTMLInputElement>(null);
   const [analyzing, setAnalyzing] = useState(false);
 
   const [batches, setBatches] = useState<AmendmentBatch[]>([]);
@@ -205,8 +230,54 @@ export default function AmendmentsPage() {
     void refreshProposals(selectedBatchId);
   }, [selectedBatchId, refreshProposals]);
 
+  const currentSourceIdentity = sourceIdentity(
+    sourceMode,
+    sourceUrl,
+    sourceFile
+  );
+  const hasCurrentSourceExtraction =
+    sourceMode === "text" ||
+    (currentSourceIdentity !== null &&
+      currentSourceIdentity === extractedSourceIdentity);
+  const canAnalyze = Boolean(rawText.trim()) && hasCurrentSourceExtraction;
+
+  const handleSourceModeChange = useCallback((mode: AmendmentSourceMode) => {
+    setSourceMode(mode);
+    setRawText("");
+    setExtractedSourceIdentity(null);
+  }, []);
+
+  const handleExtract = useCallback(async () => {
+    const identity = sourceIdentity(sourceMode, sourceUrl, sourceFile);
+    if (!identity) {
+      toast.error(
+        sourceMode === "url"
+          ? "Enter an amendment source URL."
+          : "Choose a PDF file."
+      );
+      return;
+    }
+
+    setExtracting(true);
+    try {
+      const result =
+        sourceMode === "url"
+          ? await extractAmendmentUrl(sourceUrl.trim())
+          : await extractAmendmentPdf(sourceFile as File);
+      setRawText(result.text);
+      setExtractedSourceIdentity(identity);
+      toast.success(
+        `Extracted text from ${result.display_name}. Review it before analysis.`
+      );
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Source extraction failed.");
+    } finally {
+      setExtracting(false);
+    }
+  }, [sourceFile, sourceMode, sourceUrl]);
+
   const handleAnalyze = useCallback(async () => {
-    if (!selectedDocumentSetId || !rawText.trim()) return;
+    if (!selectedDocumentSetId || !canAnalyze) return;
     setAnalyzing(true);
     try {
       const result = await analyzeAmendment(
@@ -226,7 +297,7 @@ export default function AmendmentsPage() {
     } finally {
       setAnalyzing(false);
     }
-  }, [selectedDocumentSetId, rawText, refreshBatches]);
+  }, [selectedDocumentSetId, rawText, canAnalyze, refreshBatches]);
 
   const selectedBatch = useMemo(
     () => batches.find((b) => b.id === selectedBatchId) ?? null,
@@ -247,7 +318,7 @@ export default function AmendmentsPage() {
               Document Set
             </Text>
             <InputSelect
-              value={selectedDocumentSetId ?? undefined}
+              value={selectedDocumentSetId ?? ""}
               onValueChange={(value) => {
                 setSelectedDocumentSetId(value);
                 setSelectedBatchId(null);
@@ -271,7 +342,100 @@ export default function AmendmentsPage() {
             <>
               <div className="flex flex-col gap-2">
                 <Text font="main-ui-action" color="text-04">
-                  Paste amendment text
+                  Amendment source
+                </Text>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    prominence={sourceMode === "text" ? "primary" : "secondary"}
+                    onClick={() => handleSourceModeChange("text")}
+                  >
+                    Text
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    prominence={sourceMode === "url" ? "primary" : "secondary"}
+                    onClick={() => handleSourceModeChange("url")}
+                  >
+                    URL
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    prominence={sourceMode === "pdf" ? "primary" : "secondary"}
+                    onClick={() => handleSourceModeChange("pdf")}
+                  >
+                    PDF
+                  </Button>
+                </div>
+
+                {sourceMode === "url" && (
+                  <div className="flex gap-2">
+                    <InputTypeIn
+                      aria-label="Amendment source URL"
+                      value={sourceUrl}
+                      onChange={(event) => {
+                        setSourceUrl(event.target.value);
+                        setRawText("");
+                        setExtractedSourceIdentity(null);
+                      }}
+                      placeholder="https://www.resmigazete.gov.tr/..."
+                    />
+                    <Button
+                      type="button"
+                      onClick={() => void handleExtract()}
+                      disabled={extracting || !sourceUrl.trim()}
+                    >
+                      {extracting ? "Extracting…" : "Extract"}
+                    </Button>
+                  </div>
+                )}
+
+                {sourceMode === "pdf" && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      ref={pdfInputRef}
+                      aria-label="Amendment source PDF"
+                      className="hidden"
+                      type="file"
+                      accept="application/pdf,.pdf"
+                      onChange={(event) => {
+                        setSourceFile(event.target.files?.[0] ?? null);
+                        setRawText("");
+                        setExtractedSourceIdentity(null);
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      prominence="secondary"
+                      onClick={() => pdfInputRef.current?.click()}
+                    >
+                      {sourceFile ? "Choose another PDF" : "Choose PDF"}
+                    </Button>
+                    {sourceFile && (
+                      <Text font="main-ui-body" color="text-03">
+                        {sourceFile.name}
+                      </Text>
+                    )}
+                    <Button
+                      type="button"
+                      onClick={() => void handleExtract()}
+                      disabled={extracting || !sourceFile}
+                    >
+                      {extracting ? "Extracting…" : "Extract"}
+                    </Button>
+                  </div>
+                )}
+
+                <Text font="secondary-body" color="text-03">
+                  {sourceMode === "text"
+                    ? "Paste the official amendment/update text below."
+                    : "Extracted text remains editable. Change the source and extract again before analysis."}
+                </Text>
+                <Text font="main-ui-action" color="text-04">
+                  Amendment text
                 </Text>
                 <InputTextArea
                   value={rawText}
@@ -284,7 +448,7 @@ export default function AmendmentsPage() {
                 <div className="flex justify-end">
                   <Button
                     onClick={() => void handleAnalyze()}
-                    disabled={analyzing || !rawText.trim()}
+                    disabled={analyzing || !canAnalyze}
                   >
                     {analyzing ? "Analyzing…" : "Analyze"}
                   </Button>

@@ -36,6 +36,12 @@ export interface AnalyzeAmendmentResponse {
   unmatched_instructions: string[];
 }
 
+export interface AmendmentSourceExtraction {
+  text: string;
+  source_type: "html" | "pdf";
+  display_name: string;
+}
+
 const handleRequestError = (action: string, response: Response): never => {
   throw new Error(`${action} failed (Status: ${response.status})`);
 };
@@ -56,6 +62,41 @@ export async function analyzeAmendment(
     const body = await response.json().catch(() => null);
     throw new Error(
       body?.detail || `Amendment analysis failed (Status: ${response.status})`
+    );
+  }
+  return response.json();
+}
+
+export async function extractAmendmentUrl(
+  url: string
+): Promise<AmendmentSourceExtraction> {
+  const response = await fetch("/api/regulatory/amendments/sources/url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(
+      body?.detail || `URL extraction failed (Status: ${response.status})`
+    );
+  }
+  return response.json();
+}
+
+export async function extractAmendmentPdf(
+  file: File
+): Promise<AmendmentSourceExtraction> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch("/api/regulatory/amendments/sources/pdf", {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(
+      body?.detail || `PDF extraction failed (Status: ${response.status})`
     );
   }
   return response.json();

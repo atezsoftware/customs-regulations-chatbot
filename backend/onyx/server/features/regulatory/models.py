@@ -1,8 +1,9 @@
 import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_TEXT_CHARS
 from onyx.db.models import RegulatoryChunk
 
 
@@ -84,7 +85,17 @@ class UserFileRenameRequest(BaseModel):
 
 class AnalyzeAmendmentRequest(BaseModel):
     document_set_id: int
-    raw_text: str = Field(min_length=1)
+    raw_text: str = Field(min_length=1, max_length=MAX_AMENDMENT_SOURCE_TEXT_CHARS)
+
+
+class AmendmentSourceUrlRequest(BaseModel):
+    url: str = Field(min_length=1)
+
+
+class AmendmentSourceExtractionSnapshot(BaseModel):
+    text: str
+    source_type: Literal["html", "pdf"]
+    display_name: str
 
 
 class AmendmentProposalSnapshot(BaseModel):

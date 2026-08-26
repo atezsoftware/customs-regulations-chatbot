@@ -6,14 +6,16 @@ Elasticsearch patch and rejects unsafe projections.
 """
 
 import datetime
+from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, UploadFile
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
 from onyx.auth.schemas import UserRole
+from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_BYTES
 from onyx.configs.constants import PUBLIC_API_TAGS
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
@@ -44,6 +46,13 @@ from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
 from onyx.llm.factory import get_default_llm
 from onyx.regulatory.amendments.pipeline import analyze_amendment
+from onyx.regulatory.amendments.source_extraction import (
+    AmendmentSourceExtractionError,
+    fetch_and_extract_amendment_url,
+)
+from onyx.regulatory.amendments.source_extraction import (
+    extract_amendment_pdf as extract_amendment_pdf_text,
+)
 from onyx.regulatory.pdf import render_chunk_pdf, render_document_pdf
 from onyx.regulatory.projection import project_user_file_to_index
 from onyx.regulatory.validity_projection import (
@@ -54,6 +63,8 @@ from onyx.server.features.projects.models import UserFileSnapshot
 from onyx.server.features.regulatory.models import (
     AmendmentBatchSnapshot,
     AmendmentProposalSnapshot,
+    AmendmentSourceExtractionSnapshot,
+    AmendmentSourceUrlRequest,
     AnalyzeAmendmentRequest,
     AnalyzeAmendmentResponse,
     RegulatoryChunkSnapshot,
@@ -360,6 +371,46 @@ def rename_user_file(
 # and drafted into proposals — nothing writes to regulatory_chunk until a
 # proposal is approved (approve_amendment_proposal owns that transaction).
 # =============================================================================
+
+
+def _source_extraction_snapshot(
+    text: str, source_type: Literal["html", "pdf"], display_name: str
+) -> AmendmentSourceExtractionSnapshot:
+    return AmendmentSourceExtractionSnapshot(
+        text=text,
+        source_type=source_type,
+        display_name=display_name,
+    )
+
+
+@router.post("/amendments/sources/url", tags=PUBLIC_API_TAGS)
+def extract_amendment_url(
+    source_request: AmendmentSourceUrlRequest,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+) -> AmendmentSourceExtractionSnapshot:
+    del user
+    try:
+        extraction = fetch_and_extract_amendment_url(source_request.url)
+    except AmendmentSourceExtractionError as exc:
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    return _source_extraction_snapshot(
+        extraction.text, extraction.source_type, extraction.display_name
+    )
+
+
+@router.post("/amendments/sources/pdf", tags=PUBLIC_API_TAGS)
+def extract_amendment_pdf(
+    file: UploadFile = File(...),
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+) -> AmendmentSourceExtractionSnapshot:
+    del user
+    file_name = file.filename or "amendment.pdf"
+    content = file.file.read(MAX_AMENDMENT_SOURCE_BYTES + 1)
+    try:
+        text = extract_amendment_pdf_text(content, file_name)
+    except AmendmentSourceExtractionError as exc:
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    return _source_extraction_snapshot(text, "pdf", file_name)
 
 
 def _get_editable_document_set(
