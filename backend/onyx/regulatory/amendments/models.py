@@ -43,6 +43,14 @@ class AmendmentInstruction(BaseModel):
         default=None,
         description="The article/provision this instruction refers to (e.g. 'Madde 3'), if stated",
     )
+    target_source: str | None = Field(
+        default=None,
+        description=(
+            "The full name/identity of the existing regulation being changed. "
+            "Resolve references such as 'Aynı Tebliğ' to the concrete source "
+            "named earlier in the pasted amendment text."
+        ),
+    )
     raw_date_phrase: str | None = Field(
         default=None,
         description="The natural-language effective-date phrase for this instruction, if any",

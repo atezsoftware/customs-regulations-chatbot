@@ -16,7 +16,11 @@ from onyx.regulatory.amendments.models import (
     MatchResult,
     SegmentationResult,
 )
+from onyx.regulatory.amendments.new_provision_policy import (
+    explicitly_adds_top_level_provision,
+)
 from onyx.regulatory.amendments.ranker import CandidateChunk
+from onyx.regulatory.amendments.segmenter import propagate_target_sources
 
 
 def test_amendment_candidate_queries_exclude_hierarchical_aggregates() -> None:
@@ -177,3 +181,184 @@ def test_analyze_amendment_marks_match_id_outside_candidates_unmatched(
 
     assert result.proposals == []
     assert result.unmatched_instructions == [instruction]
+
+
+@pytest.mark.parametrize(
+    "instruction_text",
+    [
+        "Aynı Tebliğin 34 üncü maddesine aşağıdaki fıkra eklenmiştir.",
+        "Aynı Yönetmeliğin 8 inci maddesine aşağıdaki bent eklenmiştir.",
+        "MADDE 7 aşağıdaki şekilde değiştirilmiştir.",
+        "MADDE 9 yürürlükten kaldırılmıştır.",
+        "Bu Tebliğ 17/11/2024 tarihinde yürürlüğe girer.",
+        "Bu Tebliğ hükümlerini Ticaret Bakanı yürütür.",
+    ],
+)
+def test_only_explicit_top_level_addition_can_be_new(
+    instruction_text: str,
+) -> None:
+    assert explicitly_adds_top_level_provision(instruction_text) is False
+
+
+@pytest.mark.parametrize(
+    "instruction_text",
+    [
+        "Aynı Tebliğe aşağıdaki MADDE 46 eklenmiştir.",
+        "Yönetmeliğe aşağıdaki geçici madde eklenmiştir: GEÇİCİ MADDE 3- ...",
+        "MADDE 12- Aşağıdaki yeni madde Tebliğe eklenmiştir.",
+    ],
+)
+def test_explicit_top_level_addition_is_allowed(instruction_text: str) -> None:
+    assert explicitly_adds_top_level_provision(instruction_text) is True
+
+
+def test_matcher_null_for_existing_update_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "Aynı Tebliğin 19 uncu maddesindeki DEC_REJ ibaresi "
+            "DEP_REJ olarak değiştirilmiştir."
+        ),
+        article_reference="Madde 19",
+        target_source="Gümrük Genel Tebliği (Transit Rejimi) (Seri No: 4)",
+    )
+    candidates = [
+        CandidateChunk(
+            chunk_id="candidate",
+            user_file_id="00000000-0000-0000-0000-000000000123",
+            text="MADDE 19 eski metin",
+        )
+    ]
+    monkeypatch.setattr(
+        pipeline,
+        "confirm_match",
+        lambda *_args, **_kwargs: MatchResult(
+            old_chunk_id=None,
+            confidence=0.2,
+            rationale="No sufficiently related candidate",
+        ),
+    )
+
+    assert (
+        pipeline.confirm_instruction_match(
+            MagicMock(), instruction=instruction, candidates=candidates
+        )
+        is None
+    )
+
+
+def test_matcher_null_for_explicit_new_article_is_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="Aynı Tebliğe aşağıdaki MADDE 46 eklenmiştir.",
+        article_reference="Madde 46",
+    )
+    expected = MatchResult(
+        old_chunk_id=None,
+        confidence=0.95,
+        rationale="Explicit top-level article addition",
+    )
+    monkeypatch.setattr(pipeline, "confirm_match", lambda *_args, **_kwargs: expected)
+
+    actual = pipeline.confirm_instruction_match(
+        MagicMock(),
+        instruction=instruction,
+        candidates=[
+            CandidateChunk(
+                chunk_id="sibling",
+                user_file_id="00000000-0000-0000-0000-000000000123",
+                text="MADDE 45 mevcut metin",
+            )
+        ],
+    )
+
+    assert actual == expected
+
+
+def test_disappeared_matched_chunk_is_not_converted_to_new_provision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pipeline, "get_chunk_by_id", lambda *_args: None)
+    get_next_position = MagicMock()
+    monkeypatch.setattr(pipeline, "get_next_chunk_position", get_next_position)
+
+    context = pipeline.load_instruction_draft_context(
+        MagicMock(spec=Session),
+        candidates=[
+            CandidateChunk(
+                chunk_id="old",
+                user_file_id="00000000-0000-0000-0000-000000000123",
+                text="MADDE 19 eski metin",
+            )
+        ],
+        match=MatchResult(
+            old_chunk_id="old",
+            confidence=0.9,
+            rationale="matched",
+        ),
+    )
+
+    assert context is None
+    get_next_position.assert_not_called()
+
+
+def test_source_and_structured_lanes_beat_unrelated_same_number_candidate() -> None:
+    related = CandidateChunk(
+        chunk_id="related",
+        user_file_id="00000000-0000-0000-0000-000000000123",
+        text="MADDE 19 transit beyanı",
+        source_name="gumruk_genel_tebligi_transit_rejimi_seri_no_4.md",
+    )
+    unrelated = CandidateChunk(
+        chunk_id="unrelated",
+        user_file_id="00000000-0000-0000-0000-000000000124",
+        text="MADDE 19 etil alkol düzenlemesi",
+        source_name="etil_alkol_yonetmeligi.md",
+    )
+
+    fused = candidate_finder.fuse_candidate_lanes(
+        [
+            ([unrelated, related], 0.7),
+            ([related, unrelated], 1.5),
+            ([related], 1.2),
+        ],
+        limit=2,
+    )
+
+    assert [candidate.chunk_id for candidate in fused] == ["related", "unrelated"]
+
+
+def test_structured_lane_prioritizes_normalized_source_name() -> None:
+    statement = str(candidate_finder._STRUCTURED_SQL)
+
+    assert "JOIN user_file" in statement
+    assert "source_score" in statement
+    assert "ORDER BY source_score DESC" in statement
+    assert ">= :minimum_source_score" in str(candidate_finder._SOURCE_FILES_SQL)
+
+
+def test_concrete_source_is_extracted_and_propagated_to_same_regulation() -> None:
+    instructions = propagate_target_sources(
+        [
+            AmendmentInstruction(
+                instruction_text=(
+                    "Resmî Gazete’de yayımlanan Gümrük Genel Tebliği "
+                    "(Transit Rejimi) (Seri No: 4)’nin 17 nci maddesi "
+                    "değiştirilmiştir."
+                ),
+                article_reference="Madde 17",
+            ),
+            AmendmentInstruction(
+                instruction_text="Aynı Tebliğin 19 uncu maddesi değiştirilmiştir.",
+                article_reference="Madde 19",
+                target_source="Aynı Tebliğ",
+            ),
+        ]
+    )
+
+    assert [item.target_source for item in instructions] == [
+        "Gümrük Genel Tebliği (Transit Rejimi) (Seri No: 4)",
+        "Gümrük Genel Tebliği (Transit Rejimi) (Seri No: 4)",
+    ]

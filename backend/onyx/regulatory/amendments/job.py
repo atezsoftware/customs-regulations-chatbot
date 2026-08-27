@@ -22,7 +22,10 @@ from onyx.regulatory.amendments.pipeline import (
     draft_instruction_proposal,
     load_instruction_draft_context,
 )
-from onyx.regulatory.amendments.segmenter import segment_amendment_text
+from onyx.regulatory.amendments.segmenter import (
+    propagate_target_sources,
+    segment_amendment_text,
+)
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -74,15 +77,21 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
         reference_date = segmentation.reference_date
 
+    instructions = propagate_target_sources(
+        [
+            AmendmentInstruction.model_validate(payload)
+            for payload in instruction_payloads
+        ]
+    )
+    source_scope_cache: dict[str, list[UUID]] = {}
     for instruction_index in range(start_index, len(instruction_payloads)):
-        instruction = AmendmentInstruction.model_validate(
-            instruction_payloads[instruction_index]
-        )
+        instruction = instructions[instruction_index]
         with _session() as db_session:
             candidates = find_candidates(
                 db_session,
                 user_file_ids=user_file_ids,
                 instruction=instruction,
+                source_scope_cache=source_scope_cache,
             )
 
         if not candidates:
@@ -118,20 +127,30 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                         candidates=candidates,
                         match=match,
                     )
-                proposal = draft_instruction_proposal(
-                    llm,
-                    instruction_index=instruction_index,
-                    instruction=instruction,
-                    reference_date=reference_date,
-                    context=context,
-                )
-                with _session() as db_session:
-                    persisted = persist_proposal_checkpoint(
-                        db_session,
-                        batch_id=batch_id,
-                        lease_generation=lease_generation,
-                        proposal=proposal,
+                if context is None:
+                    with _session() as db_session:
+                        persisted = persist_unmatched_checkpoint(
+                            db_session,
+                            batch_id=batch_id,
+                            lease_generation=lease_generation,
+                            instruction_index=instruction_index,
+                            instruction_text=instruction.instruction_text,
+                        )
+                else:
+                    proposal = draft_instruction_proposal(
+                        llm,
+                        instruction_index=instruction_index,
+                        instruction=instruction,
+                        reference_date=reference_date,
+                        context=context,
                     )
+                    with _session() as db_session:
+                        persisted = persist_proposal_checkpoint(
+                            db_session,
+                            batch_id=batch_id,
+                            lease_generation=lease_generation,
+                            proposal=proposal,
+                        )
 
         if not persisted:
             raise RuntimeError(f"Amendment batch {batch_id} lost its lease")

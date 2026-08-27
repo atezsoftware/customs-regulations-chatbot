@@ -31,6 +31,7 @@ def _format_candidates(candidates: list[CandidateChunk]) -> str:
             json.dumps(
                 {
                     "id": candidate.chunk_id,
+                    "source_name": candidate.source_name,
                     "text": candidate.text,
                     "metadata": candidate.metadata,
                     "scores": {
@@ -54,6 +55,7 @@ def confirm_match(
     prompt = (
         f"Amendment instruction:\n{instruction.instruction_text}\n\n"
         f"Article reference: {instruction.article_reference or '(not stated)'}\n\n"
+        f"Target source: {instruction.target_source or '(not stated)'}\n\n"
         f"Candidate chunks:\n{_format_candidates(candidates)}"
     )
     return generate_structured(

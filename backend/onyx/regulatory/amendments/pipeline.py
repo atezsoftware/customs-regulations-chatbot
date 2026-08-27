@@ -25,6 +25,9 @@ from onyx.regulatory.amendments.models import (
     MatchResult,
     ProposalDraft,
 )
+from onyx.regulatory.amendments.new_provision_policy import (
+    explicitly_adds_top_level_provision,
+)
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.segmenter import segment_amendment_text
 from onyx.utils.logger import setup_logger
@@ -69,6 +72,14 @@ def confirm_instruction_match(
             match.old_chunk_id,
         )
         return None
+    if match.old_chunk_id is None and not explicitly_adds_top_level_provision(
+        instruction.instruction_text
+    ):
+        logger.warning(
+            "Amendment matcher declined all candidates for an instruction that "
+            "does not explicitly add a top-level provision; marking unmatched"
+        )
+        return None
     return match
 
 
@@ -77,19 +88,16 @@ def load_instruction_draft_context(
     *,
     candidates: list[CandidateChunk],
     match: MatchResult,
-) -> InstructionDraftContext:
+) -> InstructionDraftContext | None:
     old_chunk: RegulatoryChunk | None = None
     if match.old_chunk_id:
         old_chunk = get_chunk_by_id(db_session, match.old_chunk_id)
         if old_chunk is None:
-            match = MatchResult(
-                old_chunk_id=None,
-                confidence=match.confidence,
-                rationale=(
-                    f"{match.rationale} "
-                    "(named chunk id no longer exists, treated as a new provision)"
-                ),
+            logger.warning(
+                "Matched amendment chunk %s no longer exists; marking instruction unmatched",
+                match.old_chunk_id,
             )
+            return None
 
     sibling_reference: dict[str, Any] | None = None
     if old_chunk is not None:
@@ -166,9 +174,13 @@ def analyze_instruction(
     instruction_index: int,
     instruction: AmendmentInstruction,
     reference_date: str | None,
+    source_scope_cache: dict[str, list[UUID]] | None = None,
 ) -> ProposalDraft | None:
     candidates = find_candidates(
-        db_session, user_file_ids=user_file_ids, instruction=instruction
+        db_session,
+        user_file_ids=user_file_ids,
+        instruction=instruction,
+        source_scope_cache=source_scope_cache,
     )
     if not candidates:
         return None
@@ -181,6 +193,8 @@ def analyze_instruction(
     context = load_instruction_draft_context(
         db_session, candidates=candidates, match=match
     )
+    if context is None:
+        return None
     return draft_instruction_proposal(
         llm,
         instruction_index=instruction_index,
@@ -201,6 +215,7 @@ def analyze_amendment(
 
     proposals: list[ProposalDraft] = []
     unmatched: list[AmendmentInstruction] = []
+    source_scope_cache: dict[str, list[UUID]] = {}
 
     for index, instruction in enumerate(segmentation.instructions):
         proposal = analyze_instruction(
@@ -210,6 +225,7 @@ def analyze_amendment(
             instruction_index=index,
             instruction=instruction,
             reference_date=segmentation.reference_date,
+            source_scope_cache=source_scope_cache,
         )
         if proposal is None:
             unmatched.append(instruction)
