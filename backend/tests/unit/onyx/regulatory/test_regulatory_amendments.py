@@ -148,7 +148,9 @@ def test_amendment_approval_rejects_derived_aggregate_target() -> None:
     db_session.add.assert_not_called()
 
 
-def test_amendment_approval_locks_fresh_proposal_and_old_chunk_rows() -> None:
+def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_rows() -> (
+    None
+):
     submitted_proposal = cast(
         AmendmentProposal,
         SimpleNamespace(
@@ -192,6 +194,10 @@ def test_amendment_approval_locks_fresh_proposal_and_old_chunk_rows() -> None:
     lock_queries = [str(call.args[0]) for call in db_session.scalar.call_args_list]
     assert len(lock_queries) == 2
     assert all("FOR UPDATE" in query for query in lock_queries)
+    assert all(
+        call.args[0].get_execution_options()["populate_existing"] is True
+        for call in db_session.scalar.call_args_list
+    )
 
 
 def test_analyze_amendment_marks_match_id_outside_candidates_unmatched(

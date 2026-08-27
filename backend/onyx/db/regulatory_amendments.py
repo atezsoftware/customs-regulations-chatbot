@@ -259,6 +259,15 @@ def persist_unmatched_checkpoint(
         return False
     covered_indices = _processed_instruction_indices(batch)
     if instruction_index in covered_indices:
+        proposal_owns_index = db_session.scalar(
+            select(AmendmentProposal.id).where(
+                AmendmentProposal.batch_id == batch_id,
+                AmendmentProposal.instruction_indices.contains([instruction_index]),
+            )
+        )
+        if proposal_owns_index is not None:
+            db_session.rollback()
+            return False
         batch.heartbeat_at = datetime.datetime.now(datetime.timezone.utc)
         db_session.commit()
         return True
@@ -542,6 +551,7 @@ def approve_amendment_proposal(
         select(AmendmentProposal)
         .where(AmendmentProposal.id == proposal.id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if locked_proposal is None:
         raise ValueError(f"Amendment proposal {proposal.id} no longer exists.")
@@ -567,6 +577,7 @@ def approve_amendment_proposal(
             select(RegulatoryChunk)
             .where(RegulatoryChunk.id == proposal.old_chunk_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if old_chunk is not None and old_chunk.status != "active":
             raise ValueError(

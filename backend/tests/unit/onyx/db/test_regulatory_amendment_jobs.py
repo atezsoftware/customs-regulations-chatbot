@@ -284,6 +284,63 @@ def test_unmatched_checkpoint_records_non_contiguous_exact_coverage_once() -> No
     assert batch.unmatched_instructions == ["MADDE 4"]
 
 
+def test_unmatched_checkpoint_replays_only_an_unmatched_covered_index() -> None:
+    batch = SimpleNamespace(
+        id=24,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=5,
+        processed_instruction_count=2,
+        processed_instruction_indices=[0, 3],
+        unmatched_instructions=["MADDE 4"],
+        heartbeat_at=NOW,
+    )
+    db_session = MagicMock()
+    db_session.scalar.side_effect = [batch, None]
+
+    persisted = persist_unmatched_checkpoint(
+        db_session,
+        batch_id=24,
+        lease_generation=4,
+        instruction_index=3,
+        instruction_text="MADDE 4",
+    )
+
+    assert persisted is True
+    assert batch.unmatched_instructions == ["MADDE 4"]
+    db_session.commit.assert_called_once_with()
+
+
+def test_unmatched_checkpoint_rejects_an_index_owned_by_a_proposal() -> None:
+    batch = SimpleNamespace(
+        id=25,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=5,
+        processed_instruction_count=2,
+        processed_instruction_indices=[0, 3],
+        unmatched_instructions=[],
+        heartbeat_at=NOW,
+    )
+    proposal = SimpleNamespace(id=99, instruction_indices=[3])
+    db_session = MagicMock()
+    db_session.scalar.side_effect = [batch, proposal]
+
+    persisted = persist_unmatched_checkpoint(
+        db_session,
+        batch_id=25,
+        lease_generation=4,
+        instruction_index=3,
+        instruction_text="MADDE 4",
+    )
+
+    assert persisted is False
+    assert batch.unmatched_instructions == []
+    db_session.rollback.assert_called_once_with()
+    proposal_lookup = str(db_session.scalar.call_args_list[1].args[0])
+    assert "instruction_indices" in proposal_lookup
+
+
 def test_finalization_requires_exact_index_coverage_and_group_member_total() -> None:
     batch = SimpleNamespace(
         id=22,
