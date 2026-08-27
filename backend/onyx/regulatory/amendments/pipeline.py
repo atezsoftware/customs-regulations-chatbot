@@ -69,6 +69,11 @@ def confirm_instruction_match(
             match.old_chunk_id,
         )
         return None
+    if match.old_chunk_id is None and not instruction.is_new_provision:
+        logger.warning(
+            "Amendment matcher found no existing candidate for a non-new provision"
+        )
+        return None
     return match
 
 

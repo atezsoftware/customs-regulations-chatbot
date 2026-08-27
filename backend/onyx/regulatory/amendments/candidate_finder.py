@@ -31,13 +31,16 @@ _ARTICLE_NUMBER_RE = re.compile(r"(\d+)")
 
 _TEXT_TRGM_SQL = sa_text(
     """
-    SELECT id, user_file_id, text, chunk_metadata,
-           similarity(text, :query_text) AS score
-    FROM regulatory_chunk
-    WHERE status = 'active'
-      AND chunk_type IS DISTINCT FROM 'hierarchical_aggregate'
-      AND user_file_id IN :user_file_ids
-      AND text % :query_text
+    SELECT rc.id, rc.user_file_id, rc.text, rc.chunk_metadata,
+           uf.name AS document_name,
+           word_similarity(uf.name, :query_text) AS document_name_score,
+           similarity(rc.text, :query_text) AS score
+    FROM regulatory_chunk AS rc
+    JOIN user_file AS uf ON uf.id = rc.user_file_id
+    WHERE rc.status = 'active'
+      AND rc.chunk_type IS DISTINCT FROM 'hierarchical_aggregate'
+      AND rc.user_file_id IN :user_file_ids
+      AND rc.text % :query_text
     ORDER BY score DESC
     LIMIT :limit
     """
@@ -45,13 +48,16 @@ _TEXT_TRGM_SQL = sa_text(
 
 _HEADING_TRGM_SQL = sa_text(
     """
-    SELECT id, user_file_id, text, chunk_metadata,
-           similarity(regulatory_chunk_heading_path_text(heading_path), :query_text) AS score
-    FROM regulatory_chunk
-    WHERE status = 'active'
-      AND chunk_type IS DISTINCT FROM 'hierarchical_aggregate'
-      AND user_file_id IN :user_file_ids
-      AND regulatory_chunk_heading_path_text(heading_path) % :query_text
+    SELECT rc.id, rc.user_file_id, rc.text, rc.chunk_metadata,
+           uf.name AS document_name,
+           word_similarity(uf.name, :document_query_text) AS document_name_score,
+           similarity(regulatory_chunk_heading_path_text(rc.heading_path), :query_text) AS score
+    FROM regulatory_chunk AS rc
+    JOIN user_file AS uf ON uf.id = rc.user_file_id
+    WHERE rc.status = 'active'
+      AND rc.chunk_type IS DISTINCT FROM 'hierarchical_aggregate'
+      AND rc.user_file_id IN :user_file_ids
+      AND regulatory_chunk_heading_path_text(rc.heading_path) % :query_text
     ORDER BY score DESC
     LIMIT :limit
     """
@@ -59,12 +65,17 @@ _HEADING_TRGM_SQL = sa_text(
 
 _STRUCTURED_SQL = sa_text(
     """
-    SELECT id, user_file_id, text, chunk_metadata
-    FROM regulatory_chunk
-    WHERE status = 'active'
-      AND chunk_type IS DISTINCT FROM 'hierarchical_aggregate'
-      AND user_file_id IN :user_file_ids
-      AND chunk_metadata->>'article_no' = :article_no
+    SELECT rc.id, rc.user_file_id, rc.text, rc.chunk_metadata,
+           uf.name AS document_name,
+           word_similarity(uf.name, :query_text) AS document_name_score,
+           similarity(rc.text, :query_text) AS text_score
+    FROM regulatory_chunk AS rc
+    JOIN user_file AS uf ON uf.id = rc.user_file_id
+    WHERE rc.status = 'active'
+      AND rc.chunk_type IS DISTINCT FROM 'hierarchical_aggregate'
+      AND rc.user_file_id IN :user_file_ids
+      AND rc.chunk_metadata->>'article_no' = :article_no
+    ORDER BY document_name_score DESC, text_score DESC, rc.id
     LIMIT :limit
     """
 ).bindparams(bindparam("user_file_ids", expanding=True))
@@ -108,6 +119,14 @@ def find_candidates(
             user_file_id=str(typed_row.user_file_id),
             text=str(typed_row.text),
             metadata=metadata or {},
+            document_name=(
+                str(typed_row.document_name)
+                if getattr(typed_row, "document_name", None)
+                else None
+            ),
+            document_name_score=float(
+                getattr(typed_row, "document_name_score", 0.0) or 0.0
+            ),
         )
         merged[chunk_id] = created
         return created
@@ -132,6 +151,7 @@ def find_candidates(
             _HEADING_TRGM_SQL,
             {
                 "query_text": instruction.article_reference,
+                "document_query_text": query_text,
                 "user_file_ids": user_file_ids,
                 "limit": fetch_limit,
             },
@@ -147,11 +167,22 @@ def find_candidates(
                 _STRUCTURED_SQL,
                 {
                     "article_no": article_no,
+                    "query_text": query_text,
                     "user_file_ids": user_file_ids,
                     "limit": fetch_limit,
                 },
             ).all():
                 candidate = _get_or_create(row)
+                candidate = with_score(
+                    candidate,
+                    "document_name_score",
+                    float(getattr(row, "document_name_score", 0.0) or 0.0),
+                )
+                candidate = with_score(
+                    candidate,
+                    "text_trgm_score",
+                    float(getattr(row, "text_score", 0.0) or 0.0),
+                )
                 merged[candidate.chunk_id] = replace(candidate, structured_match=True)
 
     return rank_candidates(list(merged.values()), limit=limit)

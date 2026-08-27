@@ -31,10 +31,14 @@ def _format_candidates(candidates: list[CandidateChunk]) -> str:
             json.dumps(
                 {
                     "id": candidate.chunk_id,
+                    "document_name": candidate.document_name,
                     "text": candidate.text,
                     "metadata": candidate.metadata,
                     "scores": {
                         "text_similarity": round(candidate.text_trgm_score, 3),
+                        "document_name_similarity": round(
+                            candidate.document_name_score, 3
+                        ),
                         "heading_similarity": round(candidate.heading_trgm_score, 3),
                         "structured_match": candidate.structured_match,
                     },

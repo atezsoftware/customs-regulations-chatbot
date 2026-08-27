@@ -17,7 +17,7 @@ You will be given a pasted amendment/update text. Your job:
    - "... yürürlükten kaldırılmıştır." (repealed)
    Put the exact text needed to fully understand each change (the instruction sentence plus any new article text) into `instruction_text`.
 
-2. CRITICAL — only treat an instruction as adding a brand-new article/provision if the text EXPLICITLY says so (e.g. "... eklenmiştir", "yeni bir madde olarak", "MADDE N eklenmiştir"). If the text is merely amending, replacing, or clarifying an existing article, it is NOT a new article — leave `article_reference` pointing at the existing article being changed. Never infer a new-article addition from ambiguous or silent phrasing.
+2. Set `is_new_provision` to true ONLY when the text EXPLICITLY adds an entirely new article/provision (e.g. "yeni bir madde olarak", "MADDE N eklenmiştir"). Keep it false when amending, replacing, repealing, or adding a paragraph/clause inside an existing article. Never infer a new-article addition from ambiguous or silent phrasing.
 
 3. For each instruction, fill `article_reference` with the relevant article/paragraph reference (e.g. "Madde 3", "Madde 5 fıkra 2") if stated; otherwise null.
 

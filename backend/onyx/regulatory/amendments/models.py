@@ -47,6 +47,14 @@ class AmendmentInstruction(BaseModel):
         default=None,
         description="The natural-language effective-date phrase for this instruction, if any",
     )
+    is_new_provision: bool = Field(
+        default=False,
+        description=(
+            "True only when the instruction explicitly adds an entirely new "
+            "article/provision; false for amendments, repeals, and additions "
+            "inside an existing provision"
+        ),
+    )
 
 
 class SegmentationResult(BaseModel):

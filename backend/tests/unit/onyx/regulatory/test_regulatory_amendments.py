@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from onyx.db.regulatory_amendments import approve_amendment_proposal
 from onyx.db.regulatory_chunks import get_next_chunk_position
-from onyx.regulatory.amendments import candidate_finder, pipeline
+from onyx.regulatory.amendments import candidate_finder, matcher, pipeline
 from onyx.regulatory.amendments.drafter import DraftResult
 from onyx.regulatory.amendments.models import (
     AmendmentInstruction,
@@ -16,7 +16,7 @@ from onyx.regulatory.amendments.models import (
     MatchResult,
     SegmentationResult,
 )
-from onyx.regulatory.amendments.ranker import CandidateChunk
+from onyx.regulatory.amendments.ranker import CandidateChunk, rank_candidates
 
 
 def test_amendment_candidate_queries_exclude_hierarchical_aggregates() -> None:
@@ -59,6 +59,81 @@ def test_candidate_lookup_keeps_large_dataset_out_of_llm_context() -> None:
     assert query_parameters["user_file_ids"] == [user_file_id]
 
 
+def test_candidate_lookup_carries_document_identity_into_matching() -> None:
+    user_file_id = UUID("00000000-0000-0000-0000-000000000123")
+    row = SimpleNamespace(
+        id="target-chunk",
+        user_file_id=user_file_id,
+        text="MADDE 15 hedef metin",
+        chunk_metadata={"article_no": "15"},
+        document_name="Türkiye Limanları Tebliği.pdf",
+        document_name_score=0.94,
+        score=0.81,
+    )
+    result = MagicMock()
+    result.all.return_value = [row]
+    db_session = MagicMock(spec=Session)
+    db_session.execute.side_effect = [MagicMock(), result]
+
+    candidates = candidate_finder.find_candidates(
+        db_session,
+        user_file_ids=[user_file_id],
+        instruction=AmendmentInstruction(
+            instruction_text="Türkiye Limanları Tebliği yürürlükten kaldırılmıştır."
+        ),
+    )
+
+    assert candidates[0].document_name == "Türkiye Limanları Tebliği.pdf"
+    assert candidates[0].document_name_score == 0.94
+    assert "Türkiye Limanları Tebliği.pdf" in matcher._format_candidates(candidates)
+
+
+def test_article_number_collisions_do_not_hide_the_best_text_match() -> None:
+    correct = CandidateChunk(
+        chunk_id="correct-existing-chunk",
+        user_file_id="00000000-0000-0000-0000-000000000123",
+        text="MADDE 15 - Türkiye Limanları Tebliği yürürlükten kaldırılmıştır.",
+        text_trgm_score=0.98,
+    )
+    unrelated = [
+        CandidateChunk(
+            chunk_id=f"unrelated-article-15-{index}",
+            user_file_id=f"00000000-0000-0000-0000-{index:012d}",
+            text="Etil alkol ve metanol hakkında yönetmelik.",
+            structured_match=True,
+        )
+        for index in range(5)
+    ]
+
+    ranked = rank_candidates([*unrelated, correct], limit=5)
+
+    assert correct in ranked
+
+
+def test_article_number_collisions_do_not_hide_the_best_document_match() -> None:
+    correct = CandidateChunk(
+        chunk_id="correct-document-chunk",
+        user_file_id="00000000-0000-0000-0000-000000000123",
+        document_name="Türkiye Limanları Tebliği.pdf",
+        document_name_score=0.96,
+        text="Eski hükmün mevcut metni.",
+    )
+    unrelated = [
+        CandidateChunk(
+            chunk_id=f"unrelated-document-{index}",
+            user_file_id=f"00000000-0000-0000-0000-{index:012d}",
+            document_name="Etil Alkol Yönetmeliği.pdf",
+            text="Etil alkol ve metanol hakkında yönetmelik.",
+            structured_match=True,
+        )
+        for index in range(5)
+    ]
+
+    ranked = rank_candidates([*unrelated, correct], limit=5)
+
+    assert correct in ranked
+
+
 def test_new_provision_position_uses_database_max_without_loading_chunks() -> None:
     db_session = MagicMock(spec=Session)
     db_session.scalar.return_value = 14_999
@@ -92,6 +167,58 @@ def test_analyze_instruction_without_candidates_skips_llm_calls(
 
     assert proposal is None
     confirm_match.assert_not_called()
+    draft_new_chunk.assert_not_called()
+
+
+def test_unmatched_existing_provision_is_not_drafted_as_new(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 15 yürürlükten kaldırılmıştır.",
+        article_reference="Madde 15",
+        is_new_provision=False,
+    )
+    candidate = CandidateChunk(
+        chunk_id="unrelated",
+        user_file_id="00000000-0000-0000-0000-000000000123",
+        text="Etil alkol hakkında MADDE 15.",
+        structured_match=True,
+    )
+    monkeypatch.setattr(
+        pipeline, "find_candidates", lambda *_args, **_kwargs: [candidate]
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "confirm_match",
+        lambda *_args, **_kwargs: MatchResult(
+            old_chunk_id=None,
+            confidence=1.0,
+            rationale="The candidate belongs to a different regulation.",
+        ),
+    )
+    monkeypatch.setattr(pipeline, "get_next_chunk_position", lambda *_args: 0)
+    draft_new_chunk = MagicMock(
+        return_value=DraftResult(
+            new_chunk=ChunkFieldsDraft(text="Yanlış yeni taslak"),
+            dates=DateResolution(
+                effective_start_date=None,
+                effective_end_date=None,
+                rationale="no date",
+            ),
+        )
+    )
+    monkeypatch.setattr(pipeline, "draft_new_chunk", draft_new_chunk)
+
+    proposal = pipeline.analyze_instruction(
+        MagicMock(spec=Session),
+        llm=MagicMock(),
+        user_file_ids=[UUID("00000000-0000-0000-0000-000000000123")],
+        instruction_index=0,
+        instruction=instruction,
+        reference_date=None,
+    )
+
+    assert proposal is None
     draft_new_chunk.assert_not_called()
 
 
