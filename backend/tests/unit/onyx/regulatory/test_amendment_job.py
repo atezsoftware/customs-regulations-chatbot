@@ -608,6 +608,23 @@ def test_resume_uses_exact_processed_indices_instead_of_a_count_prefix(
     ] == [[0], [2]]
 
 
+def test_resume_uses_legacy_count_when_exact_indices_are_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=26,
+        targets=["already-done", "target-b"],
+        processed_instruction_count=1,
+        processed_instruction_indices=[],
+    )
+
+    assert [event for event in result.events if event[0] == "match"] == [("match", 1)]
+    assert [
+        call.kwargs["instruction_indices"] for call in result.draft.call_args_list
+    ] == [[1]]
+
+
 def test_lost_heartbeat_lease_stops_before_drafting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

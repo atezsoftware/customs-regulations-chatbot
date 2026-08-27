@@ -6108,8 +6108,9 @@ class AmendmentProposal(Base):
 
     `old_chunk_snapshot`/`new_chunk_draft` are frozen JSONB copies, not live
     joins, so what an admin reviewed and approved can't drift if
-    `regulatory_chunk` changes between analysis and approval, and stays
-    inspectable after `old_chunk_id` itself is later marked superseded.
+    `regulatory_chunk` changes between analysis and approval. The snapshot's
+    `id` also preserves the reviewed target identity if `old_chunk_id` is
+    cleared by its ON DELETE behavior.
     """
 
     __tablename__ = "amendment_proposal"

@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from onyx.db.models import AmendmentProposal
-from onyx.db.regulatory_amendments import approve_amendment_proposal
+from onyx.db.regulatory_amendments import approve_amendment_proposal, reject_proposal
 from onyx.db.regulatory_chunks import get_active_chunks_by_ids, get_next_chunk_position
 from onyx.regulatory.amendments import candidate_finder, pipeline
 from onyx.regulatory.amendments.drafter import DraftResult
@@ -198,6 +198,82 @@ def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_row
         call.args[0].get_execution_options()["populate_existing"] is True
         for call in db_session.scalar.call_args_list
     )
+
+
+def test_amendment_approval_rejects_target_deleted_after_analysis() -> None:
+    proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(
+            id=43,
+            status="pending",
+            old_chunk_id=None,
+            old_chunk_snapshot={"id": "deleted-old-chunk", "text": "Eski metin"},
+            new_chunk_draft={
+                "user_file_id": "00000000-0000-0000-0000-000000000123",
+                "position": 3,
+                "text": "Yeni metin",
+            },
+        ),
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.return_value = proposal
+
+    with pytest.raises(ValueError, match="deleted-old-chunk.*no longer exists"):
+        approve_amendment_proposal(db_session, proposal, decided_by=None)
+
+    db_session.add.assert_not_called()
+    db_session.flush.assert_not_called()
+
+
+def test_amendment_approval_keeps_true_new_provision_unlinked() -> None:
+    proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(
+            id=44,
+            status="pending",
+            old_chunk_id=None,
+            old_chunk_snapshot={},
+            new_chunk_draft={
+                "user_file_id": "00000000-0000-0000-0000-000000000123",
+                "position": 3,
+                "text": "Yeni ek madde",
+            },
+        ),
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.return_value = proposal
+
+    result = approve_amendment_proposal(db_session, proposal, decided_by=None)
+
+    assert result.old_chunk is None
+    assert result.new_chunk.supersedes_chunk_id is None
+    assert result.proposal.status == "approved"
+
+
+def test_rejection_locks_and_refreshes_before_checking_pending_status() -> None:
+    submitted_proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(id=45, status="pending"),
+    )
+    approved_while_waiting = cast(
+        AmendmentProposal,
+        SimpleNamespace(id=45, status="approved"),
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.return_value = approved_while_waiting
+
+    with pytest.raises(ValueError, match="already approved"):
+        reject_proposal(
+            db_session,
+            submitted_proposal,
+            decided_by=None,
+        )
+
+    assert submitted_proposal.status == "pending"
+    assert approved_while_waiting.status == "approved"
+    lock_query = db_session.scalar.call_args.args[0]
+    assert "FOR UPDATE" in str(lock_query)
+    assert lock_query.get_execution_options()["populate_existing"] is True
 
 
 def test_analyze_amendment_marks_match_id_outside_candidates_unmatched(

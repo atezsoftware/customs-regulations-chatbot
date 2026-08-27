@@ -109,7 +109,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         exact_processed_indices = getattr(batch, "processed_instruction_indices", None)
         processed_instruction_indices = (
             set(range(batch.processed_instruction_count))
-            if exact_processed_indices is None
+            if not exact_processed_indices
             else set(exact_processed_indices)
         )
         if batch.segmented_instructions:

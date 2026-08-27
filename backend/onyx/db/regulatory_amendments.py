@@ -10,7 +10,7 @@ import datetime
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db.enums import (
@@ -81,7 +81,7 @@ def _get_batch_for_update(db_session: Session, batch_id: int) -> AmendmentBatch 
 
 def _processed_instruction_indices(batch: AmendmentBatch) -> set[int]:
     indices = getattr(batch, "processed_instruction_indices", None)
-    if indices is None:
+    if not indices:
         return set(range(batch.processed_instruction_count))
     return set(indices)
 
@@ -90,7 +90,7 @@ def _proposal_instruction_indices(
     proposal: AmendmentProposal | ProposalDraft,
 ) -> list[int]:
     indices = getattr(proposal, "instruction_indices", None)
-    if indices is None:
+    if not indices:
         return [proposal.instruction_index]
     return list(indices)
 
@@ -262,7 +262,14 @@ def persist_unmatched_checkpoint(
         proposal_owns_index = db_session.scalar(
             select(AmendmentProposal.id).where(
                 AmendmentProposal.batch_id == batch_id,
-                AmendmentProposal.instruction_indices.contains([instruction_index]),
+                or_(
+                    AmendmentProposal.instruction_indices.contains([instruction_index]),
+                    and_(
+                        func.jsonb_array_length(AmendmentProposal.instruction_indices)
+                        == 0,
+                        AmendmentProposal.instruction_index == instruction_index,
+                    ),
+                ),
             )
         )
         if proposal_owns_index is not None:
@@ -305,11 +312,17 @@ def mark_batch_analyzed(
     ):
         db_session.rollback()
         return False
+    grouped_instruction_count = func.jsonb_array_length(
+        AmendmentProposal.instruction_indices
+    )
     proposal_coverage = db_session.scalar(
         select(
             func.coalesce(
                 func.sum(
-                    func.jsonb_array_length(AmendmentProposal.instruction_indices)
+                    case(
+                        (grouped_instruction_count > 0, grouped_instruction_count),
+                        else_=1,
+                    )
                 ),
                 0,
             )
@@ -489,9 +502,27 @@ def compute_duplicate_targets(
     }
 
 
-def reject_proposal(
-    proposal: AmendmentProposal, *, decided_by: UUID | None
+def _lock_proposal_for_transition(
+    db_session: Session, proposal_id: int
 ) -> AmendmentProposal:
+    proposal = db_session.scalar(
+        select(AmendmentProposal)
+        .where(AmendmentProposal.id == proposal_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if proposal is None:
+        raise ValueError(f"Amendment proposal {proposal_id} no longer exists.")
+    return proposal
+
+
+def reject_proposal(
+    db_session: Session,
+    proposal: AmendmentProposal,
+    *,
+    decided_by: UUID | None,
+) -> AmendmentProposal:
+    proposal = _lock_proposal_for_transition(db_session, proposal.id)
     if proposal.status != "pending":
         raise ValueError(
             f"Amendment proposal {proposal.id} is already {proposal.status}."
@@ -547,18 +578,20 @@ def approve_amendment_proposal(
     it after a successful approval, same as chunk edits from the Files
     panel.
     """
-    locked_proposal = db_session.scalar(
-        select(AmendmentProposal)
-        .where(AmendmentProposal.id == proposal.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if locked_proposal is None:
-        raise ValueError(f"Amendment proposal {proposal.id} no longer exists.")
-    proposal = locked_proposal
+    proposal = _lock_proposal_for_transition(db_session, proposal.id)
     if proposal.status != "pending":
         raise ValueError(
             f"Amendment proposal {proposal.id} is already {proposal.status}."
+        )
+
+    snapshot_target_id = (getattr(proposal, "old_chunk_snapshot", None) or {}).get("id")
+    if (
+        isinstance(snapshot_target_id, str)
+        and snapshot_target_id
+        and proposal.old_chunk_id != snapshot_target_id
+    ):
+        raise ValueError(
+            f"Old chunk {snapshot_target_id} no longer exists; cannot approve."
         )
 
     draft = proposal.new_chunk_draft
@@ -579,12 +612,16 @@ def approve_amendment_proposal(
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        if old_chunk is not None and old_chunk.status != "active":
+        if old_chunk is None:
+            raise ValueError(
+                f"Old chunk {proposal.old_chunk_id} no longer exists; cannot approve."
+            )
+        if old_chunk.status != "active":
             raise ValueError(
                 f"Old chunk {proposal.old_chunk_id} is already "
                 f"{old_chunk.status}; cannot approve."
             )
-        if old_chunk is not None and is_hierarchical_aggregate_chunk(old_chunk):
+        if is_hierarchical_aggregate_chunk(old_chunk):
             raise ValueError("Derived aggregate chunks cannot be amended directly.")
 
     new_chunk_metadata = dict(draft.get("metadata") or {})

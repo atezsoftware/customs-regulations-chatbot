@@ -608,7 +608,7 @@ def reject_proposal_endpoint(
         )
 
     try:
-        reject_proposal(proposal, decided_by=user.id)
+        proposal = reject_proposal(db_session, proposal, decided_by=user.id)
     except ValueError as e:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e)) from e
     db_session.commit()

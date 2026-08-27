@@ -256,6 +256,48 @@ def test_grouped_proposal_replay_requires_the_exact_existing_group() -> None:
     db_session.rollback.assert_called_once_with()
 
 
+def test_legacy_singleton_proposal_replay_uses_scalar_checkpoint_fields() -> None:
+    batch = SimpleNamespace(
+        id=26,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=2,
+        processed_instruction_count=1,
+        processed_instruction_indices=[],
+        heartbeat_at=NOW,
+    )
+    existing = SimpleNamespace(
+        instruction_index=0,
+        instruction_indices=[],
+        instruction_text="MADDE 1",
+        instruction_texts=[],
+    )
+    db_session = MagicMock()
+    db_session.scalar.side_effect = [batch, existing]
+    proposal = ProposalDraft(
+        instruction_index=0,
+        instruction_text="MADDE 1",
+        instruction_indices=[0],
+        instruction_texts=["MADDE 1"],
+        old_chunk_id="old-chunk",
+        old_chunk_snapshot={"id": "old-chunk"},
+        new_chunk_draft={},
+    )
+
+    persisted = persist_proposal_checkpoint(
+        db_session,
+        batch_id=26,
+        lease_generation=4,
+        proposal=proposal,
+    )
+
+    assert persisted is True
+    assert batch.processed_instruction_indices == []
+    assert batch.processed_instruction_count == 1
+    db_session.add.assert_not_called()
+    db_session.commit.assert_called_once_with()
+
+
 def test_unmatched_checkpoint_records_non_contiguous_exact_coverage_once() -> None:
     batch = SimpleNamespace(
         id=21,
@@ -341,6 +383,38 @@ def test_unmatched_checkpoint_rejects_an_index_owned_by_a_proposal() -> None:
     assert "instruction_indices" in proposal_lookup
 
 
+def test_legacy_singleton_proposal_owns_its_scalar_index_during_unmatched_replay() -> (
+    None
+):
+    batch = SimpleNamespace(
+        id=27,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=2,
+        processed_instruction_count=1,
+        processed_instruction_indices=[],
+        unmatched_instructions=[],
+        heartbeat_at=NOW,
+    )
+    db_session = MagicMock()
+    db_session.scalar.side_effect = [batch, 99]
+
+    persisted = persist_unmatched_checkpoint(
+        db_session,
+        batch_id=27,
+        lease_generation=4,
+        instruction_index=0,
+        instruction_text="MADDE 1",
+    )
+
+    assert persisted is False
+    assert batch.unmatched_instructions == []
+    proposal_lookup = str(db_session.scalar.call_args_list[1].args[0])
+    assert "instruction_index" in proposal_lookup
+    assert "jsonb_array_length" in proposal_lookup
+    db_session.rollback.assert_called_once_with()
+
+
 def test_finalization_requires_exact_index_coverage_and_group_member_total() -> None:
     batch = SimpleNamespace(
         id=22,
@@ -390,6 +464,33 @@ def test_finalization_sums_group_members_not_proposal_rows() -> None:
     assert finalized is True
     proposal_coverage_query = str(db_session.scalar.call_args_list[1].args[0])
     assert "jsonb_array_length" in proposal_coverage_query
+
+
+def test_finalization_uses_legacy_scalar_coverage_for_empty_group_arrays() -> None:
+    batch = SimpleNamespace(
+        id=28,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=2,
+        processed_instruction_count=2,
+        processed_instruction_indices=[],
+        unmatched_instructions=["MADDE 2"],
+    )
+    db_session = MagicMock()
+    db_session.scalar.side_effect = [batch, 1]
+
+    finalized = mark_batch_analyzed(
+        db_session,
+        batch_id=28,
+        lease_generation=4,
+        now=NOW,
+    )
+
+    assert finalized is True
+    proposal_coverage_query = str(db_session.scalar.call_args_list[1].args[0])
+    assert "CASE" in proposal_coverage_query
+    assert "jsonb_array_length" in proposal_coverage_query
+    db_session.commit.assert_called_once_with()
 
 
 def test_proposal_draft_rejects_unsorted_or_duplicate_group_indices() -> None:

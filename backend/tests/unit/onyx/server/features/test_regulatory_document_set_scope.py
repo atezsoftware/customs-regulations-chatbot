@@ -182,6 +182,20 @@ def test_amendment_proposal_snapshot_serializes_grouped_instructions_with_fallba
     historical = AmendmentProposalSnapshot.from_model(
         SimpleNamespace(**proposal_fields)
     )
+    empty_group = AmendmentProposalSnapshot.from_model(
+        SimpleNamespace(
+            **proposal_fields,
+            instruction_indices=[],
+            instruction_texts=[],
+        )
+    )
+    null_group = AmendmentProposalSnapshot.from_model(
+        SimpleNamespace(
+            **proposal_fields,
+            instruction_indices=None,
+            instruction_texts=None,
+        )
+    )
 
     assert grouped.instruction_indices == [2, 5]
     assert grouped.instruction_texts == [
@@ -190,6 +204,10 @@ def test_amendment_proposal_snapshot_serializes_grouped_instructions_with_fallba
     ]
     assert historical.instruction_indices == [2]
     assert historical.instruction_texts == ["Replace Article 2."]
+    assert empty_group.instruction_indices == [2]
+    assert empty_group.instruction_texts == ["Replace Article 2."]
+    assert null_group.instruction_indices == [2]
+    assert null_group.instruction_texts == ["Replace Article 2."]
 
 
 def test_benchmark_citation_route_is_document_set_canonical() -> None:
