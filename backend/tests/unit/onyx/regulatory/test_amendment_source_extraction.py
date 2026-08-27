@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 
 from onyx.regulatory.amendments import source_extraction
@@ -23,6 +26,34 @@ class _Response:
 
     def raise_for_status(self) -> None:
         return None
+
+
+def test_source_extraction_imports_without_playwright() -> None:
+    script = """
+import builtins
+import sys
+
+sys.path.insert(0, "backend")
+
+original_import = builtins.__import__
+
+def block_playwright(name, *args, **kwargs):
+    if name == \"playwright\" or name.startswith(\"playwright.\"):
+        raise ModuleNotFoundError(\"No module named 'playwright'\")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = block_playwright
+import onyx.regulatory.amendments.source_extraction
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_extract_amendment_html_removes_page_chrome() -> None:

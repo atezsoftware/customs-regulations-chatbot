@@ -14,7 +14,6 @@ from onyx.configs.app_configs import (
     MIN_AMENDMENT_PDF_TEXT_CHARS,
 )
 from onyx.file_processing.extract_file_text import extract_file_text
-from onyx.utils.playwright_fetch import DEFAULT_HEADERS
 from onyx.utils.url import ssrf_safe_get
 from onyx.utils.web_content import (
     decode_html_bytes,
@@ -26,6 +25,15 @@ from onyx.utils.web_content import (
 _DOWNLOAD_CHUNK_SIZE = 64 * 1024
 _URL_TIMEOUT_SECONDS = (5, 20)
 _NON_CONTENT_TAGS = ("script", "style", "template", "noscript", "nav", "footer")
+_AMENDMENT_SOURCE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8",
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate",
+}
 
 
 class AmendmentSourceExtractionError(ValueError):
@@ -103,7 +111,7 @@ def fetch_and_extract_amendment_url(url: str) -> AmendmentSourceExtraction:
     try:
         response = ssrf_safe_get(
             url,
-            headers=DEFAULT_HEADERS,
+            headers=_AMENDMENT_SOURCE_HEADERS,
             timeout=_URL_TIMEOUT_SECONDS,
             stream=True,
         )
