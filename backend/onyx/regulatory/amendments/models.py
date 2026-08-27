@@ -8,7 +8,7 @@ parsing.
 from datetime import date
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _require_iso_date_or_none(value: str | None) -> str | None:
@@ -171,12 +171,41 @@ class ProposalDraft(BaseModel):
 
     instruction_index: int
     instruction_text: str
+    instruction_indices: list[int]
+    instruction_texts: list[str]
     old_chunk_id: str | None
     old_chunk_snapshot: dict[str, Any]
     new_chunk_draft: dict[str, Any]
     match_confidence: float | None = None
     match_rationale: str | None = None
     date_rationale: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_instruction_group(self) -> "ProposalDraft":
+        if not self.instruction_indices:
+            raise ValueError("instruction_indices must be non-empty")
+        if any(
+            current <= previous
+            for previous, current in zip(
+                self.instruction_indices, self.instruction_indices[1:]
+            )
+        ):
+            raise ValueError(
+                "instruction_indices must be strictly increasing and duplicate-free"
+            )
+        if self.instruction_indices[0] != self.instruction_index:
+            raise ValueError(
+                "instruction_index must be the first instruction_indices value"
+            )
+        if len(self.instruction_texts) != len(self.instruction_indices):
+            raise ValueError(
+                "instruction_texts must have one entry per instruction index"
+            )
+        if self.instruction_texts[0] != self.instruction_text:
+            raise ValueError(
+                "instruction_text must be the first instruction_texts value"
+            )
+        return self
 
 
 class AnalysisResult(BaseModel):

@@ -59,6 +59,7 @@ def create_batch(
         stage=AmendmentBatchStage.QUEUED.value,
         instruction_count=0,
         processed_instruction_count=0,
+        processed_instruction_indices=[],
         lease_generation=0,
         segmented_instructions=[],
         unmatched_instructions=[],
@@ -76,6 +77,22 @@ def _get_batch_for_update(db_session: Session, batch_id: int) -> AmendmentBatch 
     return db_session.scalar(
         select(AmendmentBatch).where(AmendmentBatch.id == batch_id).with_for_update()
     )
+
+
+def _processed_instruction_indices(batch: AmendmentBatch) -> set[int]:
+    indices = getattr(batch, "processed_instruction_indices", None)
+    if indices is None:
+        return set(range(batch.processed_instruction_count))
+    return set(indices)
+
+
+def _proposal_instruction_indices(
+    proposal: AmendmentProposal | ProposalDraft,
+) -> list[int]:
+    indices = getattr(proposal, "instruction_indices", None)
+    if indices is None:
+        return [proposal.instruction_index]
+    return list(indices)
 
 
 def claim_batch_for_analysis(
@@ -170,30 +187,52 @@ def persist_proposal_checkpoint(
     ):
         db_session.rollback()
         return False
+    instruction_indices = _proposal_instruction_indices(proposal)
+    covered_indices = _processed_instruction_indices(batch)
+    if not instruction_indices or any(
+        index < 0 or index >= batch.instruction_count for index in instruction_indices
+    ):
+        db_session.rollback()
+        return False
     existing = db_session.scalar(
         select(AmendmentProposal).where(
             AmendmentProposal.batch_id == batch_id,
             AmendmentProposal.instruction_index == proposal.instruction_index,
         )
     )
-    if existing is None:
-        if proposal.instruction_index != batch.processed_instruction_count:
+    if existing is not None:
+        if _proposal_instruction_indices(existing) != instruction_indices or not set(
+            instruction_indices
+        ).issubset(covered_indices):
             db_session.rollback()
             return False
-        db_session.add(
-            AmendmentProposal(
-                batch_id=batch_id,
-                instruction_index=proposal.instruction_index,
-                instruction_text=proposal.instruction_text,
-                old_chunk_id=proposal.old_chunk_id,
-                old_chunk_snapshot=proposal.old_chunk_snapshot,
-                new_chunk_draft=proposal.new_chunk_draft,
-                match_confidence=proposal.match_confidence,
-                match_rationale=proposal.match_rationale,
-                date_rationale=proposal.date_rationale,
-            )
+        batch.heartbeat_at = datetime.datetime.now(datetime.timezone.utc)
+        db_session.commit()
+        return True
+    if covered_indices.intersection(instruction_indices):
+        db_session.rollback()
+        return False
+    instruction_texts = list(getattr(proposal, "instruction_texts", None) or [])
+    if not instruction_texts:
+        instruction_texts = [proposal.instruction_text]
+    db_session.add(
+        AmendmentProposal(
+            batch_id=batch_id,
+            instruction_index=proposal.instruction_index,
+            instruction_text=proposal.instruction_text,
+            instruction_indices=instruction_indices,
+            instruction_texts=instruction_texts,
+            old_chunk_id=proposal.old_chunk_id,
+            old_chunk_snapshot=proposal.old_chunk_snapshot,
+            new_chunk_draft=proposal.new_chunk_draft,
+            match_confidence=proposal.match_confidence,
+            match_rationale=proposal.match_rationale,
+            date_rationale=proposal.date_rationale,
         )
-        batch.processed_instruction_count += 1
+    )
+    covered_indices.update(instruction_indices)
+    batch.processed_instruction_indices = sorted(covered_indices)
+    batch.processed_instruction_count = len(covered_indices)
     batch.heartbeat_at = datetime.datetime.now(datetime.timezone.utc)
     db_session.commit()
     return True
@@ -215,17 +254,21 @@ def persist_unmatched_checkpoint(
     ):
         db_session.rollback()
         return False
-    if instruction_index < batch.processed_instruction_count:
-        db_session.rollback()
-        return True
-    if instruction_index != batch.processed_instruction_count:
+    if instruction_index < 0 or instruction_index >= batch.instruction_count:
         db_session.rollback()
         return False
+    covered_indices = _processed_instruction_indices(batch)
+    if instruction_index in covered_indices:
+        batch.heartbeat_at = datetime.datetime.now(datetime.timezone.utc)
+        db_session.commit()
+        return True
     batch.unmatched_instructions = [
         *batch.unmatched_instructions,
         instruction_text,
     ]
-    batch.processed_instruction_count += 1
+    covered_indices.add(instruction_index)
+    batch.processed_instruction_indices = sorted(covered_indices)
+    batch.processed_instruction_count = len(covered_indices)
     batch.heartbeat_at = datetime.datetime.now(datetime.timezone.utc)
     db_session.commit()
     return True
@@ -243,16 +286,27 @@ def mark_batch_analyzed(
         batch is None
         or batch.status != AmendmentBatchStatus.ANALYZING.value
         or batch.lease_generation != lease_generation
-        or batch.processed_instruction_count != batch.instruction_count
     ):
         db_session.rollback()
         return False
-    proposal_count = db_session.scalar(
-        select(func.count(AmendmentProposal.id)).where(
-            AmendmentProposal.batch_id == batch_id
-        )
+    covered_indices = _processed_instruction_indices(batch)
+    expected_indices = set(range(batch.instruction_count))
+    if covered_indices != expected_indices or batch.processed_instruction_count != len(
+        covered_indices
+    ):
+        db_session.rollback()
+        return False
+    proposal_coverage = db_session.scalar(
+        select(
+            func.coalesce(
+                func.sum(
+                    func.jsonb_array_length(AmendmentProposal.instruction_indices)
+                ),
+                0,
+            )
+        ).where(AmendmentProposal.batch_id == batch_id)
     )
-    if (proposal_count or 0) + len(
+    if (proposal_coverage or 0) + len(
         batch.unmatched_instructions
     ) != batch.instruction_count:
         db_session.rollback()
@@ -484,6 +538,14 @@ def approve_amendment_proposal(
     it after a successful approval, same as chunk edits from the Files
     panel.
     """
+    locked_proposal = db_session.scalar(
+        select(AmendmentProposal)
+        .where(AmendmentProposal.id == proposal.id)
+        .with_for_update()
+    )
+    if locked_proposal is None:
+        raise ValueError(f"Amendment proposal {proposal.id} no longer exists.")
+    proposal = locked_proposal
     if proposal.status != "pending":
         raise ValueError(
             f"Amendment proposal {proposal.id} is already {proposal.status}."
@@ -501,7 +563,11 @@ def approve_amendment_proposal(
 
     old_chunk: RegulatoryChunk | None = None
     if proposal.old_chunk_id:
-        old_chunk = db_session.get(RegulatoryChunk, proposal.old_chunk_id)
+        old_chunk = db_session.scalar(
+            select(RegulatoryChunk)
+            .where(RegulatoryChunk.id == proposal.old_chunk_id)
+            .with_for_update()
+        )
         if old_chunk is not None and old_chunk.status != "active":
             raise ValueError(
                 f"Old chunk {proposal.old_chunk_id} is already "

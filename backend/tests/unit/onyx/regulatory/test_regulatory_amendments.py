@@ -1,10 +1,12 @@
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
 from sqlalchemy.orm import Session
 
+from onyx.db.models import AmendmentProposal
 from onyx.db.regulatory_amendments import approve_amendment_proposal
 from onyx.db.regulatory_chunks import get_active_chunks_by_ids, get_next_chunk_position
 from onyx.regulatory.amendments import candidate_finder, pipeline
@@ -132,7 +134,7 @@ def test_amendment_approval_rejects_derived_aggregate_target() -> None:
     aggregate.chunk_type = "hierarchical_aggregate"
     aggregate.chunk_metadata = {"chunk_variant": "hierarchical_aggregate"}
     db_session = MagicMock(spec=Session)
-    db_session.get.return_value = aggregate
+    db_session.scalar.side_effect = [proposal, aggregate]
 
     with pytest.raises(
         ValueError, match="Derived aggregate chunks cannot be amended directly"
@@ -144,6 +146,52 @@ def test_amendment_approval_rejects_derived_aggregate_target() -> None:
         )
 
     db_session.add.assert_not_called()
+
+
+def test_amendment_approval_locks_fresh_proposal_and_old_chunk_rows() -> None:
+    submitted_proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(
+            id=42,
+            status="pending",
+            old_chunk_id="old-chunk",
+            new_chunk_draft={
+                "user_file_id": "00000000-0000-0000-0000-000000000123",
+                "position": 3,
+                "text": "Yeni metin",
+            },
+        ),
+    )
+    locked_proposal = SimpleNamespace(
+        id=42,
+        status="pending",
+        old_chunk_id="old-chunk",
+        new_chunk_draft={
+            "user_file_id": "00000000-0000-0000-0000-000000000123",
+            "position": 3,
+            "text": "Yeni metin",
+        },
+    )
+    old_chunk = SimpleNamespace(
+        id="old-chunk",
+        status="active",
+        chunk_type=None,
+        chunk_metadata={},
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.side_effect = [locked_proposal, old_chunk]
+
+    result = approve_amendment_proposal(
+        db_session,
+        submitted_proposal,
+        decided_by=None,
+    )
+
+    assert result.proposal is locked_proposal
+    assert old_chunk.status == "superseded"
+    lock_queries = [str(call.args[0]) for call in db_session.scalar.call_args_list]
+    assert len(lock_queries) == 2
+    assert all("FOR UPDATE" in query for query in lock_queries)
 
 
 def test_analyze_amendment_marks_match_id_outside_candidates_unmatched(

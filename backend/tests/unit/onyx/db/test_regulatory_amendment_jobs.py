@@ -1,7 +1,11 @@
 import datetime
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 from uuid import uuid4
+
+import pytest
+from pydantic import ValidationError
 
 from onyx.db.enums import AmendmentBatchStage, AmendmentBatchStatus
 from onyx.db.regulatory_amendments import (
@@ -14,6 +18,7 @@ from onyx.db.regulatory_amendments import (
     persist_unmatched_checkpoint,
     reset_failed_batch_for_retry,
 )
+from onyx.regulatory.amendments.models import ProposalDraft
 
 NOW = datetime.datetime(2026, 8, 27, 12, 0, tzinfo=datetime.timezone.utc)
 
@@ -35,6 +40,7 @@ def test_create_batch_snapshots_scope_and_starts_queued() -> None:
     assert batch.stage == AmendmentBatchStage.QUEUED.value
     assert batch.user_file_ids == [str(first_file_id), str(second_file_id)]
     assert batch.processed_instruction_count == 0
+    assert batch.processed_instruction_indices == []
     assert batch.instruction_count == 0
     db_session.add.assert_called_once_with(batch)
     db_session.flush.assert_called_once_with()
@@ -151,13 +157,14 @@ def test_duplicate_delivery_does_not_create_second_proposal() -> None:
         id=15,
         status=AmendmentBatchStatus.ANALYZING.value,
         lease_generation=4,
+        instruction_count=1,
         processed_instruction_count=1,
         heartbeat_at=NOW,
     )
-    existing = SimpleNamespace(id=99)
+    existing = SimpleNamespace(id=99, instruction_index=0)
     db_session = MagicMock()
     db_session.scalar.side_effect = [batch, existing]
-    proposal = SimpleNamespace(instruction_index=0)
+    proposal = cast(ProposalDraft, SimpleNamespace(instruction_index=0))
 
     persisted = persist_proposal_checkpoint(
         db_session,
@@ -170,6 +177,175 @@ def test_duplicate_delivery_does_not_create_second_proposal() -> None:
     assert batch.processed_instruction_count == 1
     db_session.add.assert_not_called()
     db_session.commit.assert_called_once_with()
+
+
+def test_grouped_proposal_checkpoint_tracks_exact_non_contiguous_indices() -> None:
+    batch = SimpleNamespace(
+        id=19,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=5,
+        processed_instruction_count=1,
+        processed_instruction_indices=[0],
+        heartbeat_at=NOW,
+    )
+    db_session = MagicMock()
+    db_session.scalar.side_effect = [batch, None]
+    proposal = ProposalDraft(
+        instruction_index=2,
+        instruction_text="MADDE 3",
+        instruction_indices=[2, 4],
+        instruction_texts=["MADDE 3", "MADDE 5"],
+        old_chunk_id="old-chunk",
+        old_chunk_snapshot={},
+        new_chunk_draft={},
+    )
+
+    persisted = persist_proposal_checkpoint(
+        db_session,
+        batch_id=19,
+        lease_generation=4,
+        proposal=proposal,
+    )
+
+    assert persisted is True
+    assert batch.processed_instruction_indices == [0, 2, 4]
+    assert batch.processed_instruction_count == 3
+    inserted = db_session.add.call_args.args[0]
+    assert inserted.instruction_indices == [2, 4]
+    assert inserted.instruction_texts == ["MADDE 3", "MADDE 5"]
+
+
+def test_grouped_proposal_replay_requires_the_exact_existing_group() -> None:
+    batch = SimpleNamespace(
+        id=20,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=5,
+        processed_instruction_count=3,
+        processed_instruction_indices=[0, 2, 3],
+        heartbeat_at=NOW,
+    )
+    existing = SimpleNamespace(
+        instruction_index=2,
+        instruction_indices=[2, 3],
+        instruction_texts=["MADDE 3", "MADDE 4"],
+    )
+    db_session = MagicMock()
+    db_session.scalar.side_effect = [batch, existing]
+    proposal = ProposalDraft(
+        instruction_index=2,
+        instruction_text="MADDE 3",
+        instruction_indices=[2, 4],
+        instruction_texts=["MADDE 3", "MADDE 5"],
+        old_chunk_id="old-chunk",
+        old_chunk_snapshot={},
+        new_chunk_draft={},
+    )
+
+    persisted = persist_proposal_checkpoint(
+        db_session,
+        batch_id=20,
+        lease_generation=4,
+        proposal=proposal,
+    )
+
+    assert persisted is False
+    assert batch.processed_instruction_indices == [0, 2, 3]
+    db_session.add.assert_not_called()
+    db_session.rollback.assert_called_once_with()
+
+
+def test_unmatched_checkpoint_records_non_contiguous_exact_coverage_once() -> None:
+    batch = SimpleNamespace(
+        id=21,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=5,
+        processed_instruction_count=1,
+        processed_instruction_indices=[0],
+        unmatched_instructions=[],
+        heartbeat_at=NOW,
+    )
+    db_session = MagicMock()
+    db_session.scalar.return_value = batch
+
+    persisted = persist_unmatched_checkpoint(
+        db_session,
+        batch_id=21,
+        lease_generation=4,
+        instruction_index=3,
+        instruction_text="MADDE 4",
+    )
+
+    assert persisted is True
+    assert batch.processed_instruction_indices == [0, 3]
+    assert batch.processed_instruction_count == 2
+    assert batch.unmatched_instructions == ["MADDE 4"]
+
+
+def test_finalization_requires_exact_index_coverage_and_group_member_total() -> None:
+    batch = SimpleNamespace(
+        id=22,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=3,
+        processed_instruction_count=3,
+        processed_instruction_indices=[0, 2, 3],
+        unmatched_instructions=[],
+    )
+    db_session = MagicMock()
+    db_session.scalar.side_effect = [batch, 3]
+
+    finalized = mark_batch_analyzed(
+        db_session,
+        batch_id=22,
+        lease_generation=4,
+        now=NOW,
+    )
+
+    assert finalized is False
+    db_session.rollback.assert_called_once_with()
+    statement = str(db_session.scalar.call_args_list[0].args[0])
+    assert "amendment_batch" in statement
+
+
+def test_finalization_sums_group_members_not_proposal_rows() -> None:
+    batch = SimpleNamespace(
+        id=23,
+        status=AmendmentBatchStatus.ANALYZING.value,
+        lease_generation=4,
+        instruction_count=3,
+        processed_instruction_count=3,
+        processed_instruction_indices=[0, 1, 2],
+        unmatched_instructions=["MADDE 3"],
+    )
+    db_session = MagicMock()
+    db_session.scalar.side_effect = [batch, 2]
+
+    finalized = mark_batch_analyzed(
+        db_session,
+        batch_id=23,
+        lease_generation=4,
+        now=NOW,
+    )
+
+    assert finalized is True
+    proposal_coverage_query = str(db_session.scalar.call_args_list[1].args[0])
+    assert "jsonb_array_length" in proposal_coverage_query
+
+
+def test_proposal_draft_rejects_unsorted_or_duplicate_group_indices() -> None:
+    with pytest.raises(ValidationError, match="strictly increasing"):
+        ProposalDraft(
+            instruction_index=1,
+            instruction_text="MADDE 2",
+            instruction_indices=[1, 1],
+            instruction_texts=["MADDE 2", "MADDE 2 tekrar"],
+            old_chunk_id=None,
+            old_chunk_snapshot={},
+            new_chunk_draft={},
+        )
 
 
 def test_terminal_batch_cannot_be_overwritten_as_failed() -> None:

@@ -6043,6 +6043,9 @@ class AmendmentBatch(Base):
     processed_instruction_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
+    processed_instruction_indices: Mapped[list[int]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[UUID | None] = mapped_column(
@@ -6117,6 +6120,12 @@ class AmendmentProposal(Base):
     )
     instruction_index: Mapped[int] = mapped_column(Integer, nullable=False)
     instruction_text: Mapped[str] = mapped_column(Text, nullable=False)
+    instruction_indices: Mapped[list[int]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    instruction_texts: Mapped[list[str]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     old_chunk_id: Mapped[str | None] = mapped_column(
         ForeignKey("regulatory_chunk.id", ondelete="SET NULL"), nullable=True
     )

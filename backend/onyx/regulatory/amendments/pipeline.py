@@ -157,6 +157,8 @@ def draft_instruction_proposal(
     return ProposalDraft(
         instruction_index=instruction_index,
         instruction_text=instruction.instruction_text,
+        instruction_indices=[instruction_index],
+        instruction_texts=[instruction.instruction_text],
         old_chunk_id=context.match.old_chunk_id,
         old_chunk_snapshot=context.old_chunk_snapshot,
         new_chunk_draft=new_chunk_draft,
