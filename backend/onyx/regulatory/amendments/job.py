@@ -2,6 +2,7 @@
 
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -13,13 +14,14 @@ from onyx.db.regulatory_amendments import (
     persist_proposal_checkpoint,
     persist_segmentation_checkpoint,
     persist_unmatched_checkpoint,
+    touch_batch_heartbeat,
 )
 from onyx.llm.factory import get_default_llm
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
 from onyx.regulatory.amendments.pipeline import (
     confirm_instruction_match,
-    draft_instruction_proposal,
+    draft_instruction_group_proposal,
     load_instruction_draft_context,
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
@@ -34,6 +36,14 @@ from onyx.regulatory.amendments.segmenter import (
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
+
+
+@dataclass(frozen=True)
+class _MatchedInstruction:
+    instruction_index: int
+    instruction: AmendmentInstruction
+    candidates: list[CandidateChunk]
+    match: MatchResult
 
 
 @contextmanager
@@ -96,7 +106,12 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         document_set_id = batch.document_set_id
         created_by = batch.created_by
         raw_text = batch.raw_text
-        start_index = batch.processed_instruction_count
+        exact_processed_indices = getattr(batch, "processed_instruction_indices", None)
+        processed_instruction_indices = (
+            set(range(batch.processed_instruction_count))
+            if exact_processed_indices is None
+            else set(exact_processed_indices)
+        )
         if batch.segmented_instructions:
             instruction_payloads = list(batch.segmented_instructions)
             reference_date = (
@@ -141,8 +156,10 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             for payload in instruction_payloads
         ]
     )
-    for instruction_index in range(start_index, len(instruction_payloads)):
-        instruction = instructions[instruction_index]
+    matched_instructions: list[_MatchedInstruction] = []
+    for instruction_index, instruction in enumerate(instructions):
+        if instruction_index in processed_instruction_indices:
+            continue
         candidates, match = retrieve_and_confirm_instruction(
             retriever=retriever,
             llm=llm,
@@ -158,47 +175,99 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     instruction_index=instruction_index,
                     instruction_text=instruction.instruction_text,
                 )
+            if not persisted:
+                raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
         else:
             with _session() as db_session:
-                context = load_instruction_draft_context(
+                heartbeat_refreshed = touch_batch_heartbeat(
                     db_session,
+                    batch_id=batch_id,
+                    lease_generation=lease_generation,
+                )
+            if not heartbeat_refreshed:
+                raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
+            matched_instructions.append(
+                _MatchedInstruction(
+                    instruction_index=instruction_index,
+                    instruction=instruction,
                     candidates=candidates,
                     match=match,
                 )
-            if context is None:
-                with _session() as db_session:
-                    persisted = persist_unmatched_checkpoint(
-                        db_session,
-                        batch_id=batch_id,
-                        lease_generation=lease_generation,
-                        instruction_index=instruction_index,
-                        instruction_text=instruction.instruction_text,
-                    )
-            else:
-                proposal = draft_instruction_proposal(
-                    llm,
-                    instruction_index=instruction_index,
-                    instruction=instruction,
-                    reference_date=reference_date,
-                    context=context,
-                )
-                with _session() as db_session:
-                    persisted = persist_proposal_checkpoint(
-                        db_session,
-                        batch_id=batch_id,
-                        lease_generation=lease_generation,
-                        proposal=proposal,
-                    )
+            )
 
-        if not persisted:
-            raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
         logger.info(
-            "Amendment batch=%s processed instruction=%s/%s lease=%s candidates=%s",
+            "Amendment batch=%s collected instruction=%s/%s lease=%s candidates=%s",
             batch_id,
             instruction_index + 1,
             len(instruction_payloads),
             lease_generation,
             len(candidates),
+        )
+
+    groups: dict[tuple[str, str | int], list[_MatchedInstruction]] = {}
+    for matched_instruction in matched_instructions:
+        old_chunk_id = matched_instruction.match.old_chunk_id
+        group_key: tuple[str, str | int] = (
+            ("existing", old_chunk_id)
+            if old_chunk_id is not None
+            else ("new", matched_instruction.instruction_index)
+        )
+        groups.setdefault(group_key, []).append(matched_instruction)
+
+    ordered_groups = sorted(
+        groups.values(),
+        key=lambda group: min(item.instruction_index for item in group),
+    )
+    for group in ordered_groups:
+        ordered_group = sorted(group, key=lambda item: item.instruction_index)
+        instruction_indices = [item.instruction_index for item in ordered_group]
+        group_candidates: list[CandidateChunk] = []
+        for item in ordered_group:
+            group_candidates = _merge_candidates(group_candidates, item.candidates)
+
+        with _session() as db_session:
+            context = load_instruction_draft_context(
+                db_session,
+                candidates=group_candidates,
+                match=ordered_group[0].match,
+            )
+        if context is None:
+            for item in ordered_group:
+                with _session() as db_session:
+                    persisted = persist_unmatched_checkpoint(
+                        db_session,
+                        batch_id=batch_id,
+                        lease_generation=lease_generation,
+                        instruction_index=item.instruction_index,
+                        instruction_text=item.instruction.instruction_text,
+                    )
+                if not persisted:
+                    raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
+            continue
+
+        proposal = draft_instruction_group_proposal(
+            llm,
+            instruction_indices=instruction_indices,
+            instructions=[item.instruction for item in ordered_group],
+            matches=[item.match for item in ordered_group],
+            reference_date=reference_date,
+            context=context,
+        )
+        with _session() as db_session:
+            persisted = persist_proposal_checkpoint(
+                db_session,
+                batch_id=batch_id,
+                lease_generation=lease_generation,
+                proposal=proposal,
+            )
+        if not persisted:
+            raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
+        logger.info(
+            "Amendment batch=%s processed instruction group=%s lease=%s candidates=%s",
+            batch_id,
+            instruction_indices,
+            lease_generation,
+            len(group_candidates),
         )
 
     with _session() as db_session:

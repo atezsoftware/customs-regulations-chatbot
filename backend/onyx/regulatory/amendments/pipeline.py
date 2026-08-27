@@ -17,11 +17,12 @@ from onyx.db.models import RegulatoryChunk
 from onyx.db.regulatory_chunks import get_chunk_by_id, get_next_chunk_position
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.candidate_finder import find_candidates
-from onyx.regulatory.amendments.drafter import draft_new_chunk
+from onyx.regulatory.amendments.drafter import draft_combined_chunk, draft_new_chunk
 from onyx.regulatory.amendments.matcher import confirm_match
 from onyx.regulatory.amendments.models import (
     AmendmentInstruction,
     AnalysisResult,
+    DraftResult,
     MatchResult,
     ProposalDraft,
 )
@@ -139,6 +140,23 @@ def draft_instruction_proposal(
         sibling_reference=context.sibling_reference,
         reference_date=reference_date,
     )
+    return _build_proposal_draft(
+        instruction_indices=[instruction_index],
+        instructions=[instruction],
+        matches=[context.match],
+        context=context,
+        draft=draft,
+    )
+
+
+def _build_proposal_draft(
+    *,
+    instruction_indices: list[int],
+    instructions: list[AmendmentInstruction],
+    matches: list[MatchResult],
+    context: InstructionDraftContext,
+    draft: DraftResult,
+) -> ProposalDraft:
     merged_metadata = {
         **context.base_metadata,
         **draft.new_chunk.metadata_changes,
@@ -154,17 +172,64 @@ def draft_instruction_proposal(
         "effective_start_date": draft.dates.effective_start_date,
         "effective_end_date": draft.dates.effective_end_date,
     }
+    combined_match_rationale = (
+        matches[0].rationale
+        if len(matches) == 1
+        else "\n".join(
+            f"Instruction {instruction_index}: {match.rationale}"
+            for instruction_index, match in zip(instruction_indices, matches)
+        )
+    )
     return ProposalDraft(
-        instruction_index=instruction_index,
-        instruction_text=instruction.instruction_text,
-        instruction_indices=[instruction_index],
-        instruction_texts=[instruction.instruction_text],
-        old_chunk_id=context.match.old_chunk_id,
+        instruction_index=instruction_indices[0],
+        instruction_text=instructions[0].instruction_text,
+        instruction_indices=instruction_indices,
+        instruction_texts=[
+            instruction.instruction_text for instruction in instructions
+        ],
+        old_chunk_id=matches[0].old_chunk_id,
         old_chunk_snapshot=context.old_chunk_snapshot,
         new_chunk_draft=new_chunk_draft,
-        match_confidence=context.match.confidence,
-        match_rationale=context.match.rationale,
+        match_confidence=min(match.confidence for match in matches),
+        match_rationale=combined_match_rationale,
         date_rationale=draft.dates.rationale,
+    )
+
+
+def draft_instruction_group_proposal(
+    llm: LLM,
+    *,
+    instruction_indices: list[int],
+    instructions: list[AmendmentInstruction],
+    matches: list[MatchResult],
+    reference_date: str | None,
+    context: InstructionDraftContext,
+) -> ProposalDraft:
+    if not instructions or len(instruction_indices) != len(instructions):
+        raise ValueError(
+            "Grouped amendment drafting requires one index per instruction"
+        )
+    if len(matches) != len(instructions):
+        raise ValueError(
+            "Grouped amendment drafting requires one match per instruction"
+        )
+    old_chunk_ids = {match.old_chunk_id for match in matches}
+    if len(old_chunk_ids) != 1:
+        raise ValueError("Grouped amendment instructions must share one target chunk")
+
+    draft = draft_combined_chunk(
+        llm,
+        instructions=instructions,
+        old_chunk=context.old_chunk_snapshot or None,
+        sibling_reference=context.sibling_reference,
+        reference_date=reference_date,
+    )
+    return _build_proposal_draft(
+        instruction_indices=instruction_indices,
+        instructions=instructions,
+        matches=matches,
+        context=context,
+        draft=draft,
     )
 
 

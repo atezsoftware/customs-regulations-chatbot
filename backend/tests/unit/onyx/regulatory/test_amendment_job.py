@@ -6,8 +6,11 @@ from uuid import UUID
 
 import pytest
 
-from onyx.regulatory.amendments import job
-from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
+from onyx.regulatory.amendments import drafter, job, pipeline
+from onyx.regulatory.amendments.models import (
+    AmendmentInstruction,
+    MatchResult,
+)
 from onyx.regulatory.amendments.ranker import CandidateChunk
 
 _CREATOR_ID = UUID("00000000-0000-0000-0000-000000000321")
@@ -24,6 +27,150 @@ def _patch_empty_retriever(
         MagicMock(return_value=retriever),
     )
     return retriever
+
+
+def _candidate(chunk_id: str) -> CandidateChunk:
+    return CandidateChunk(
+        chunk_id=chunk_id,
+        user_file_id="00000000-0000-0000-0000-000000000123",
+        text=f"Existing text for {chunk_id}",
+    )
+
+
+def _run_grouping_job(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    batch_id: int,
+    targets: list[str | None],
+    raw_date_phrases: list[str | None] | None = None,
+    candidate_ids: list[list[str]] | None = None,
+    processed_instruction_count: int = 0,
+    processed_instruction_indices: list[int] | None = None,
+    heartbeat_result: bool = True,
+) -> SimpleNamespace:
+    instructions = [
+        AmendmentInstruction(
+            instruction_text=f"Instruction {index}",
+            raw_date_phrase=(raw_date_phrases or [None] * len(targets))[index],
+        )
+        for index in range(len(targets))
+    ]
+    matches = [
+        MatchResult(
+            old_chunk_id=target,
+            confidence=0.9 - index / 10,
+            rationale=f"rationale {index}",
+        )
+        for index, target in enumerate(targets)
+    ]
+    batch_values: dict[str, object] = {
+        "id": batch_id,
+        "document_set_id": 7,
+        "created_by": _CREATOR_ID,
+        "raw_text": "original",
+        "user_file_ids": ["00000000-0000-0000-0000-000000000123"],
+        "reference_date": None,
+        "segmented_instructions": [item.model_dump() for item in instructions],
+        "processed_instruction_count": processed_instruction_count,
+    }
+    if processed_instruction_indices is not None:
+        batch_values["processed_instruction_indices"] = processed_instruction_indices
+    batch = SimpleNamespace(**batch_values)
+    session_depth = 0
+
+    @contextmanager
+    def _session():
+        nonlocal session_depth
+        session_depth += 1
+        try:
+            yield MagicMock()
+        finally:
+            session_depth -= 1
+
+    events: list[tuple[str, object]] = []
+    candidate_lists = [
+        [_candidate(chunk_id) for chunk_id in ids]
+        for ids in (
+            candidate_ids
+            or [
+                [target or f"new-reference-{index}"]
+                for index, target in enumerate(targets)
+            ]
+        )
+    ]
+    index_by_text = {
+        instruction.instruction_text: index
+        for index, instruction in enumerate(instructions)
+    }
+
+    def retrieve(
+        *,
+        retriever: object,
+        llm: object,
+        instruction: AmendmentInstruction,
+    ) -> tuple[list[CandidateChunk], MatchResult]:
+        del retriever, llm
+        assert session_depth == 0
+        instruction_index = index_by_text[instruction.instruction_text]
+        events.append(("match", instruction_index))
+        return candidate_lists[instruction_index], matches[instruction_index]
+
+    def load_context(
+        *_args: object,
+        candidates: list[CandidateChunk],
+        match: MatchResult,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        assert session_depth == 1
+        events.append(
+            (
+                "load",
+                (match.old_chunk_id, [candidate.chunk_id for candidate in candidates]),
+            )
+        )
+        return SimpleNamespace(match=match, candidates=candidates)
+
+    def draft_group(*_args: object, **kwargs: Any) -> SimpleNamespace:
+        assert session_depth == 0
+        events.append(("draft", list(kwargs["instruction_indices"])))
+        return SimpleNamespace(
+            instruction_indices=list(kwargs["instruction_indices"]),
+            instruction_texts=[
+                instruction.instruction_text for instruction in kwargs["instructions"]
+            ],
+            match_confidence=min(match.confidence for match in kwargs["matches"]),
+        )
+
+    persisted = MagicMock(return_value=True)
+    heartbeat = MagicMock(return_value=heartbeat_result)
+    draft_group_mock = MagicMock(side_effect=draft_group)
+    monkeypatch.setattr(job, "_session", _session)
+    monkeypatch.setattr(job, "get_batch", lambda *_args: batch)
+    monkeypatch.setattr(
+        job,
+        "build_amendment_search_retriever",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(job, "retrieve_and_confirm_instruction", retrieve)
+    monkeypatch.setattr(job, "load_instruction_draft_context", load_context)
+    monkeypatch.setattr(
+        job, "draft_instruction_group_proposal", draft_group_mock, raising=False
+    )
+    monkeypatch.setattr(job, "touch_batch_heartbeat", heartbeat, raising=False)
+    monkeypatch.setattr(job, "persist_proposal_checkpoint", persisted)
+    monkeypatch.setattr(
+        job, "persist_unmatched_checkpoint", MagicMock(return_value=True)
+    )
+    monkeypatch.setattr(job, "mark_batch_analyzed", MagicMock(return_value=True))
+    monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=MagicMock()))
+    job.run_amendment_batch(batch_id=batch_id, lease_generation=2)
+    return SimpleNamespace(
+        draft=draft_group_mock,
+        persist=persisted,
+        heartbeat=heartbeat,
+        events=events,
+        instructions=instructions,
+    )
 
 
 def test_unmatched_initial_search_gets_one_recovery_before_giving_up(
@@ -289,6 +436,10 @@ def test_empty_segmentation_fails_instead_of_checkpointing_ambiguous_empty_list(
 def test_match_and_draft_llm_calls_run_outside_database_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    instructions = [
+        {"instruction_text": "MADDE 1"},
+        {"instruction_text": "MADDE 1 ikinci değişiklik"},
+    ]
     batch = SimpleNamespace(
         id=13,
         document_set_id=7,
@@ -296,8 +447,9 @@ def test_match_and_draft_llm_calls_run_outside_database_sessions(
         raw_text="MADDE 1",
         user_file_ids=["00000000-0000-0000-0000-000000000123"],
         reference_date=None,
-        segmented_instructions=[{"instruction_text": "MADDE 1"}],
+        segmented_instructions=instructions,
         processed_instruction_count=0,
+        processed_instruction_indices=[],
     )
     session_depth = 0
 
@@ -311,12 +463,19 @@ def test_match_and_draft_llm_calls_run_outside_database_sessions(
             session_depth -= 1
 
     candidate = SimpleNamespace(chunk_id="chunk-1")
-    match = SimpleNamespace(old_chunk_id="chunk-1")
+    match = MatchResult(old_chunk_id="chunk-1", confidence=0.9, rationale="match")
     context = SimpleNamespace()
     proposal = SimpleNamespace(instruction_index=0)
+    matcher_calls = 0
 
-    def confirm(*_args: object, **_kwargs: object) -> SimpleNamespace:
+    def search(**_kwargs: object) -> list[SimpleNamespace]:
         assert session_depth == 0
+        return [candidate]
+
+    def confirm(*_args: object, **_kwargs: object) -> MatchResult:
+        nonlocal matcher_calls
+        assert session_depth == 0
+        matcher_calls += 1
         return match
 
     def load_context(*_args: object, **_kwargs: object) -> SimpleNamespace:
@@ -327,10 +486,12 @@ def test_match_and_draft_llm_calls_run_outside_database_sessions(
         assert session_depth == 0
         return proposal
 
+    draft_mock = MagicMock(side_effect=draft)
+
     monkeypatch.setattr(job, "_session", _session)
     monkeypatch.setattr(job, "get_batch", lambda *_args: batch)
     retriever = MagicMock()
-    retriever.search.return_value = [candidate]
+    retriever.search.side_effect = search
     monkeypatch.setattr(
         job,
         "build_amendment_search_retriever",
@@ -338,7 +499,12 @@ def test_match_and_draft_llm_calls_run_outside_database_sessions(
     )
     monkeypatch.setattr(job, "confirm_instruction_match", confirm)
     monkeypatch.setattr(job, "load_instruction_draft_context", load_context)
-    monkeypatch.setattr(job, "draft_instruction_proposal", draft)
+    monkeypatch.setattr(
+        job, "draft_instruction_group_proposal", draft_mock, raising=False
+    )
+    monkeypatch.setattr(
+        job, "touch_batch_heartbeat", MagicMock(return_value=True), raising=False
+    )
     monkeypatch.setattr(
         job, "persist_proposal_checkpoint", MagicMock(return_value=True)
     )
@@ -346,3 +512,152 @@ def test_match_and_draft_llm_calls_run_outside_database_sessions(
     monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=MagicMock()))
 
     job.run_amendment_batch(batch_id=13, lease_generation=1)
+
+    assert matcher_calls == 2
+    draft_mock.assert_called_once()
+
+
+def test_same_target_instructions_create_one_combined_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=20,
+        targets=["shared", "shared"],
+        candidate_ids=[["shared", "first-only"], ["shared", "second-only"]],
+        processed_instruction_indices=[],
+    )
+
+    result.draft.assert_called_once()
+    assert result.draft.call_args.kwargs["instruction_indices"] == [0, 1]
+    proposal = result.persist.call_args.kwargs["proposal"]
+    assert proposal.instruction_indices == [0, 1]
+    assert proposal.instruction_texts == ["Instruction 0", "Instruction 1"]
+    assert proposal.match_confidence == 0.8
+    assert result.heartbeat.call_count == 2
+    assert result.events == [
+        ("match", 0),
+        ("match", 1),
+        ("load", ("shared", ["shared", "first-only", "second-only"])),
+        ("draft", [0, 1]),
+    ]
+
+
+def test_noncontiguous_same_target_instructions_still_consolidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=21,
+        targets=["target-a", "target-b", "target-a"],
+        processed_instruction_indices=[],
+    )
+
+    assert [
+        call.kwargs["instruction_indices"] for call in result.draft.call_args_list
+    ] == [[0, 2], [1]]
+    assert [
+        call.kwargs["proposal"].instruction_indices
+        for call in result.persist.call_args_list
+    ] == [[0, 2], [1]]
+    assert result.events[:3] == [("match", 0), ("match", 1), ("match", 2)]
+
+
+@pytest.mark.parametrize(
+    ("targets", "batch_id"),
+    [
+        pytest.param(["target-a", "target-b"], 22, id="different-target-ids"),
+        pytest.param([None, None], 23, id="separate-new-provisions"),
+    ],
+)
+def test_distinct_targets_create_separate_proposals(
+    monkeypatch: pytest.MonkeyPatch,
+    targets: list[str | None],
+    batch_id: int,
+) -> None:
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=batch_id,
+        targets=targets,
+        processed_instruction_indices=[],
+    )
+
+    assert [
+        call.kwargs["instruction_indices"] for call in result.draft.call_args_list
+    ] == [[0], [1]]
+    assert result.persist.call_count == 2
+
+
+def test_resume_uses_exact_processed_indices_instead_of_a_count_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=24,
+        targets=["target-a", "already-done", "target-c"],
+        processed_instruction_count=1,
+        processed_instruction_indices=[1],
+    )
+
+    assert [event for event in result.events if event[0] == "match"] == [
+        ("match", 0),
+        ("match", 2),
+    ]
+    assert [
+        call.kwargs["instruction_indices"] for call in result.draft.call_args_list
+    ] == [[0], [2]]
+
+
+def test_lost_heartbeat_lease_stops_before_drafting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(RuntimeError, match="lost its lease"):
+        _run_grouping_job(
+            monkeypatch,
+            batch_id=25,
+            targets=["target-a"],
+            processed_instruction_indices=[],
+            heartbeat_result=False,
+        )
+
+
+def test_same_target_conflicting_explicit_date_phrases_fail_before_drafting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instructions = [
+        AmendmentInstruction(
+            instruction_text="Change the amount.",
+            raw_date_phrase="Yayımı tarihinden itibaren",
+        ),
+        AmendmentInstruction(
+            instruction_text="Change the deadline.",
+            raw_date_phrase="1 Ocak 2027 tarihinde",
+        ),
+    ]
+    matches = [
+        MatchResult(old_chunk_id="shared", confidence=0.9, rationale="amount"),
+        MatchResult(old_chunk_id="shared", confidence=0.8, rationale="deadline"),
+    ]
+    context = pipeline.InstructionDraftContext(
+        match=matches[0],
+        old_chunk_snapshot={"id": "shared", "text": "old"},
+        target_user_file_id=UUID("00000000-0000-0000-0000-000000000123"),
+        target_position=4,
+        sibling_reference=None,
+        base_metadata={},
+        base_heading_path=[],
+    )
+    generate_structured = MagicMock()
+    monkeypatch.setattr(drafter, "generate_structured", generate_structured)
+
+    with pytest.raises(RuntimeError, match="effective-date phrases"):
+        pipeline.draft_instruction_group_proposal(
+            MagicMock(),
+            instruction_indices=[0, 1],
+            instructions=instructions,
+            matches=matches,
+            reference_date="2026-08-27",
+            context=context,
+        )
+
+    generate_structured.assert_not_called()

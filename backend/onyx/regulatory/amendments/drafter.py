@@ -1,6 +1,7 @@
 """LLM drafting of the amended chunk content and its effective dates."""
 
 import json
+import unicodedata
 from typing import Any
 
 from onyx.llm.interfaces import LLM
@@ -14,10 +15,10 @@ from onyx.tracing.flows import LLMFlow
 # ruff: noqa: E501 start
 _SYSTEM_PROMPT = """You are an expert at drafting amended Turkish regulatory text.
 
-You will be given an amendment instruction, (if any) the existing chunk it amends, and the amendment's reference/publication date. Your task is to produce the new chunk content and its effective dates.
+You will be given one or more amendment instructions, (if any) the existing chunk they amend, and the amendment's reference/publication date. Your task is to apply every listed instruction and produce ONE full replacement chunk containing all listed changes, plus its single effective-date window. Never return separate or partial chunk texts.
 
 For `new_chunk`:
-- `text`: the FULL amended chunk text per the instruction (not just the changed part — the whole chunk, with the amendment applied).
+- `text`: the FULL amended chunk text after applying EVERY listed instruction (not just the changed parts — one complete replacement chunk containing all changes).
 - `chunk_type`: usually stays the same as the old chunk; only change it if the nature of the amendment requires it.
 - `heading_path`: leave null to carry over the old chunk's heading_path unchanged. ONLY set this if there is NO old chunk (a brand-new article) — in that case you will be given a `sibling_reference` (an example chunk from the same document); base heading_path on sibling_reference's heading_path (same BÖLÜM/KISIM/top-level heading), updating only the MADDE number/title for the new article.
 - `metadata_changes`: ONLY the metadata fields that actually change (e.g. article_no if the article was renumbered). Do NOT repeat fields that stay the same — they carry over automatically from the old chunk. Leave empty ({}) if nothing in metadata changes.
@@ -43,14 +44,48 @@ def _chunk_to_review_dict(chunk: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def draft_new_chunk(
+def _normalized_date_phrase(phrase: str) -> str:
+    normalized_case = (
+        unicodedata.normalize("NFKC", phrase)
+        .translate(str.maketrans({"İ": "i", "I": "ı"}))
+        .casefold()
+    )
+    return " ".join(normalized_case.split())
+
+
+def _group_date_phrase(instructions: list[AmendmentInstruction]) -> str | None:
+    phrases_by_normalized_value: dict[str, str] = {}
+    for instruction in instructions:
+        if instruction.raw_date_phrase is None:
+            continue
+        display_phrase = " ".join(instruction.raw_date_phrase.split())
+        phrases_by_normalized_value.setdefault(
+            _normalized_date_phrase(display_phrase), display_phrase
+        )
+    if len(phrases_by_normalized_value) > 1:
+        phrases = ", ".join(
+            repr(value) for value in phrases_by_normalized_value.values()
+        )
+        raise RuntimeError(
+            "Same-target amendment instructions contain incompatible explicit "
+            f"effective-date phrases: {phrases}"
+        )
+    return next(iter(phrases_by_normalized_value.values()), None)
+
+
+def draft_combined_chunk(
     llm: LLM,
     *,
-    instruction: AmendmentInstruction,
+    instructions: list[AmendmentInstruction],
     old_chunk: dict[str, Any] | None,
     sibling_reference: dict[str, Any] | None,
     reference_date: str | None,
 ) -> DraftResult:
+    if not instructions:
+        raise ValueError(
+            "Combined amendment drafting requires at least one instruction"
+        )
+    group_date_phrase = _group_date_phrase(instructions)
     old_chunk_json = (
         json.dumps(_chunk_to_review_dict(old_chunk), ensure_ascii=False, indent=2)
         if old_chunk is not None
@@ -63,13 +98,32 @@ def draft_new_chunk(
         if sibling_reference is not None
         else "(none)"
     )
+    instruction_sections = []
+    for display_index, instruction in enumerate(instructions, start=1):
+        own_date_phrase = (
+            instruction.raw_date_phrase.strip()
+            if instruction.raw_date_phrase is not None
+            else (
+                f"(none; inherits group phrase: {group_date_phrase})"
+                if group_date_phrase is not None
+                else "(none)"
+            )
+        )
+        instruction_sections.append(
+            f"[Instruction {display_index}]\n"
+            f"Text: {instruction.instruction_text}\n"
+            f"Natural-language date phrase: {own_date_phrase}"
+        )
     prompt = (
-        f"Amendment instruction:\n{instruction.instruction_text}\n\n"
+        "Amendment instructions, in application order:\n\n"
+        f"{'\n\n'.join(instruction_sections)}\n\n"
         f"Reference/publication date: {reference_date or '(not stated)'}\n\n"
-        f"Natural-language date phrase: {instruction.raw_date_phrase or '(none)'}\n\n"
+        f"Shared effective-date phrase for this chunk version: "
+        f"{group_date_phrase or '(none)'}\n\n"
         f"Old chunk:\n{old_chunk_json}\n\n"
         f"Sibling chunk from the same document (only used when there is no old "
-        f"chunk, for heading_path/metadata convention):\n{sibling_json}"
+        f"chunk, for heading_path/metadata convention):\n{sibling_json}\n\n"
+        "Return one full replacement chunk containing every listed change."
     )
     return generate_structured(
         llm,
@@ -77,4 +131,21 @@ def draft_new_chunk(
         system_prompt=_SYSTEM_PROMPT,
         user_prompt=prompt,
         response_model=DraftResult,
+    )
+
+
+def draft_new_chunk(
+    llm: LLM,
+    *,
+    instruction: AmendmentInstruction,
+    old_chunk: dict[str, Any] | None,
+    sibling_reference: dict[str, Any] | None,
+    reference_date: str | None,
+) -> DraftResult:
+    return draft_combined_chunk(
+        llm,
+        instructions=[instruction],
+        old_chunk=old_chunk,
+        sibling_reference=sibling_reference,
+        reference_date=reference_date,
     )
