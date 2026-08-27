@@ -41,7 +41,9 @@ def decode_html_bytes(
         override_encodings.append(fallback_encoding)
 
     unicode_dammit = UnicodeDammit(
-        content, override_encodings=override_encodings or None
+        content,
+        override_encodings=override_encodings or None,
+        is_html=True,
     )
     if unicode_dammit.unicode_markup is not None:
         return unicode_dammit.unicode_markup

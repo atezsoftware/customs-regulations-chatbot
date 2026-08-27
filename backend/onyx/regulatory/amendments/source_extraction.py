@@ -1,9 +1,15 @@
 """Normalize one amendment HTML or PDF source into reviewable text."""
 
+import atexit
 import io
+import os
 import re
+import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -34,6 +40,10 @@ _AMENDMENT_SOURCE_HEADERS = {
     "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept-Encoding": "gzip, deflate",
 }
+_RESMI_GAZETE_HOST = "resmigazete.gov.tr"
+_RESMI_GAZETE_INTERMEDIATE_CA = (
+    Path(__file__).with_name("certs") / "geotrust_tls_rsa_ca_g1.pem"
+)
 
 
 class AmendmentSourceExtractionError(ValueError):
@@ -45,6 +55,40 @@ class AmendmentSourceExtraction:
     text: str
     source_type: Literal["html", "pdf"]
     display_name: str
+
+
+def _is_resmi_gazete_url(url: str) -> bool:
+    hostname = (urlsplit(url).hostname or "").lower().rstrip(".")
+    return hostname == _RESMI_GAZETE_HOST or hostname.endswith(f".{_RESMI_GAZETE_HOST}")
+
+
+def _remove_temporary_ca_bundle(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+@lru_cache(maxsize=1)
+def _resmi_gazete_ca_bundle_path() -> str:
+    """Combine Requests' trust store with the intermediate omitted by the site."""
+    default_bundle = Path(requests.certs.where()).read_bytes()
+    intermediate = _RESMI_GAZETE_INTERMEDIATE_CA.read_bytes()
+
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix="onyx-resmigazete-ca-",
+        suffix=".pem",
+        delete=False,
+    ) as bundle:
+        bundle.write(default_bundle)
+        if not default_bundle.endswith(b"\n"):
+            bundle.write(b"\n")
+        bundle.write(intermediate)
+        bundle_path = bundle.name
+
+    atexit.register(_remove_temporary_ca_bundle, bundle_path)
+    return bundle_path
 
 
 def _normalize_text(text: str) -> str:
@@ -108,16 +152,25 @@ def _read_response_content(response: requests.Response) -> bytes:
 
 def fetch_and_extract_amendment_url(url: str) -> AmendmentSourceExtraction:
     """Fetch one public URL through the shared SSRF-safe HTTP helper."""
+    request_kwargs: dict[str, object] = {}
+    if _is_resmi_gazete_url(url):
+        request_kwargs["verify"] = _resmi_gazete_ca_bundle_path()
+
     try:
         response = ssrf_safe_get(
             url,
             headers=_AMENDMENT_SOURCE_HEADERS,
             timeout=_URL_TIMEOUT_SECONDS,
             stream=True,
+            **request_kwargs,
         )
         content = _read_response_content(response)
     except AmendmentSourceExtractionError:
         raise
+    except requests.exceptions.SSLError as exc:
+        raise AmendmentSourceExtractionError(
+            "The URL's TLS certificate chain could not be verified."
+        ) from exc
     except Exception as exc:
         raise AmendmentSourceExtractionError(
             "The URL could not be downloaded. Check that it is publicly accessible."

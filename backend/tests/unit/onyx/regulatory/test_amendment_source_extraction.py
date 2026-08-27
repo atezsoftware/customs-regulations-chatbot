@@ -1,5 +1,7 @@
+import ssl
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -65,6 +67,17 @@ def test_extract_amendment_html_removes_page_chrome() -> None:
     assert result == "TEBLIG\n\nMADDE 1- Yeni metin."
 
 
+def test_extract_amendment_html_honors_declared_turkish_charset() -> None:
+    content = (
+        b'<html><head><meta http-equiv=Content-Type content="text/html; '
+        b'charset=Windows-1254"></head><main>16 Kas\xfdm TEBL\xdd\xd0</main></html>'
+    )
+
+    result = extract_amendment_html(content, "text/html")
+
+    assert result == "16 Kasım TEBLİĞ"
+
+
 def test_extract_amendment_pdf_rejects_empty_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -93,6 +106,44 @@ def test_fetch_url_detects_pdf_by_signature(monkeypatch: pytest.MonkeyPatch) -> 
     assert result.text == "MADDE 1- Yeni metin."
     assert result.source_type == "pdf"
     assert result.display_name == "update"
+
+
+def test_fetch_resmi_gazete_url_uses_augmented_ca_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_kwargs: dict[str, object] = {}
+
+    def fake_get(*_args: object, **kwargs: object) -> _Response:
+        request_kwargs.update(kwargs)
+        return _Response(b"<main>Resmi Gazete metni</main>", "text/html")
+
+    monkeypatch.setattr(source_extraction, "ssrf_safe_get", fake_get)
+
+    fetch_and_extract_amendment_url(
+        "https://www.resmigazete.gov.tr/eskiler/2024/11/20241116-2.htm"
+    )
+
+    assert "verify" in request_kwargs
+    ca_bundle_path = Path(str(request_kwargs["verify"]))
+    assert ca_bundle_path.is_file()
+    ssl.create_default_context(cafile=ca_bundle_path)
+
+
+def test_fetch_url_reports_tls_verification_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_tls(*_args: object, **_kwargs: object) -> _Response:
+        raise source_extraction.requests.exceptions.SSLError(
+            "certificate verify failed"
+        )
+
+    monkeypatch.setattr(source_extraction, "ssrf_safe_get", fail_tls)
+
+    with pytest.raises(
+        AmendmentSourceExtractionError,
+        match="TLS certificate chain could not be verified",
+    ):
+        fetch_and_extract_amendment_url("https://example.gov/update.htm")
 
 
 def test_fetch_url_rejects_oversized_stream(monkeypatch: pytest.MonkeyPatch) -> None:
