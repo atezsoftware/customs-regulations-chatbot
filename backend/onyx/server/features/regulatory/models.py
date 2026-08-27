@@ -103,6 +103,8 @@ class AmendmentProposalSnapshot(BaseModel):
     batch_id: int
     instruction_index: int
     instruction_text: str
+    instruction_indices: list[int]
+    instruction_texts: list[str]
     old_chunk_id: str | None
     old_chunk_snapshot: dict[str, Any]
     new_chunk_draft: dict[str, Any]
@@ -121,11 +123,20 @@ class AmendmentProposalSnapshot(BaseModel):
     def from_model(
         cls, proposal: Any, *, duplicate_target: bool = False
     ) -> "AmendmentProposalSnapshot":
+        instruction_indices = list(
+            getattr(proposal, "instruction_indices", None)
+            or [proposal.instruction_index]
+        )
+        instruction_texts = list(
+            getattr(proposal, "instruction_texts", None) or [proposal.instruction_text]
+        )
         return cls(
             id=proposal.id,
             batch_id=proposal.batch_id,
             instruction_index=proposal.instruction_index,
             instruction_text=proposal.instruction_text,
+            instruction_indices=instruction_indices,
+            instruction_texts=instruction_texts,
             old_chunk_id=proposal.old_chunk_id,
             old_chunk_snapshot=dict(proposal.old_chunk_snapshot),
             new_chunk_draft=dict(proposal.new_chunk_draft),

@@ -192,6 +192,65 @@ test("queues PDF-extracted text through the same durable analysis", async () => 
   expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(7, "MADDE 2- PDF metni.");
 });
 
+test("renders all grouped instructions on one proposal card", async () => {
+  const analyzedBatch = {
+    ...queuedBatch,
+    status: "analyzed" as const,
+    stage: "finalizing" as const,
+    instruction_count: 2,
+    processed_instruction_count: 2,
+  };
+  mockedListAmendmentBatches.mockResolvedValue([analyzedBatch]);
+  mockedGetAmendmentAnalysis.mockResolvedValue({
+    batch: analyzedBatch,
+    proposals: [
+      {
+        id: 19,
+        batch_id: 42,
+        instruction_index: 0,
+        instruction_text: "Replace Article 1.",
+        instruction_indices: [0, 1],
+        instruction_texts: [
+          "Replace Article 1.",
+          "Add the Article 1 exception.",
+        ],
+        old_chunk_id: "chunk-1",
+        old_chunk_snapshot: { text: "Current Article 1." },
+        new_chunk_draft: { text: "Updated Article 1." },
+        match_confidence: 0.9,
+        match_rationale: "Same target",
+        date_rationale: null,
+        status: "pending" as const,
+        applied_new_chunk_id: null,
+        decided_by: null,
+        decided_at: null,
+        created_at: "2026-08-27T12:00:00Z",
+        updated_at: "2026-08-27T12:00:00Z",
+        duplicate_target: false,
+      },
+    ],
+    unmatched_instructions: [],
+  });
+
+  const user = setupUser();
+  render(<AmendmentsPage />);
+  act(() => {
+    screen.getByRole("combobox").focus();
+  });
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
+  );
+
+  expect(await screen.findByText("Replace Article 1.")).toBeVisible();
+  expect(screen.getByText("Add the Article 1 exception.")).toBeVisible();
+  expect(
+    screen.getAllByRole("article", { name: "Amendment proposal" })
+  ).toHaveLength(1);
+});
+
 test("retries a failed batch from its checkpoint", async () => {
   const failedBatch = {
     ...queuedBatch,

@@ -19,7 +19,10 @@ from onyx.server.features.regulatory.benchmark_api import (
 from onyx.server.features.regulatory.benchmark_models import (
     BenchmarkQuestionSnapshot,
 )
-from onyx.server.features.regulatory.models import AmendmentBatchSnapshot
+from onyx.server.features.regulatory.models import (
+    AmendmentBatchSnapshot,
+    AmendmentProposalSnapshot,
+)
 
 
 def test_benchmark_citation_must_belong_to_selected_document_set() -> None:
@@ -144,6 +147,49 @@ def test_amendment_batch_snapshot_uses_document_set_id() -> None:
 
     assert snapshot.document_set_id == 34
     assert "project_id" not in snapshot.model_dump()
+
+
+def test_amendment_proposal_snapshot_serializes_grouped_instructions_with_fallback() -> (
+    None
+):
+    created_at = datetime.datetime.now(datetime.timezone.utc)
+    proposal_fields = {
+        "id": 9,
+        "batch_id": 8,
+        "instruction_index": 2,
+        "instruction_text": "Replace Article 2.",
+        "old_chunk_id": "chunk-2",
+        "old_chunk_snapshot": {},
+        "new_chunk_draft": {"text": "Updated Article 2."},
+        "match_confidence": 0.92,
+        "match_rationale": "Exact article reference",
+        "date_rationale": None,
+        "status": "pending",
+        "applied_new_chunk_id": None,
+        "decided_by": None,
+        "decided_at": None,
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+
+    grouped = AmendmentProposalSnapshot.from_model(
+        SimpleNamespace(
+            **proposal_fields,
+            instruction_indices=[2, 5],
+            instruction_texts=["Replace Article 2.", "Add the new exception."],
+        )
+    )
+    historical = AmendmentProposalSnapshot.from_model(
+        SimpleNamespace(**proposal_fields)
+    )
+
+    assert grouped.instruction_indices == [2, 5]
+    assert grouped.instruction_texts == [
+        "Replace Article 2.",
+        "Add the new exception.",
+    ]
+    assert historical.instruction_indices == [2]
+    assert historical.instruction_texts == ["Replace Article 2."]
 
 
 def test_benchmark_citation_route_is_document_set_canonical() -> None:

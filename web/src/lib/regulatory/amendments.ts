@@ -21,6 +21,8 @@ export interface AmendmentProposal {
   batch_id: number;
   instruction_index: number;
   instruction_text: string;
+  instruction_indices: number[];
+  instruction_texts: string[];
   old_chunk_id: string | null;
   old_chunk_snapshot: Record<string, unknown>;
   new_chunk_draft: Record<string, unknown>;

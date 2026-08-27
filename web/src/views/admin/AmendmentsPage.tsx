@@ -137,13 +137,38 @@ function ProposalCard({
 
   const isNewChunk = Object.keys(proposal.old_chunk_snapshot).length === 0;
   const newDraft = proposal.new_chunk_draft;
+  const isConsolidated = proposal.instruction_texts.length > 1;
 
   return (
-    <div className="rounded-lg border border-border-02 p-4 flex flex-col gap-3">
+    <div
+      className="rounded-lg border border-border-02 p-4 flex flex-col gap-3"
+      role="article"
+      aria-label="Amendment proposal"
+    >
       <div className="flex items-start justify-between gap-2">
-        <Text font="main-ui-body" color="text-05" as="p">
-          {proposal.instruction_text}
-        </Text>
+        {isConsolidated ? (
+          <div className="flex flex-col gap-2">
+            <Tag
+              title={`${proposal.instruction_texts.length} consolidated changes`}
+            />
+            <ol className="list-decimal list-inside flex flex-col gap-1">
+              {proposal.instruction_texts.map((instruction, index) => (
+                <Text
+                  key={`${proposal.id}-${index}`}
+                  font="main-ui-body"
+                  color="text-05"
+                  as="li"
+                >
+                  {instruction}
+                </Text>
+              ))}
+            </ol>
+          </div>
+        ) : (
+          <Text font="main-ui-body" color="text-05" as="p">
+            {proposal.instruction_text}
+          </Text>
+        )}
         <div className="flex items-center gap-2 shrink-0">
           {isNewChunk && <Tag title="New article" />}
           {proposal.duplicate_target && <Tag title="Duplicate target" />}
