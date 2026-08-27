@@ -1237,7 +1237,7 @@ def test_benchmark_task_persists_startup_crash_and_terminalizes_items() -> None:
     assert completed_item.status == BenchmarkRunItemStatus.COMPLETED.value
 
 
-def test_regulatory_benchmark_worker_only_registers_benchmark_task() -> None:
+def test_regulatory_worker_only_registers_benchmark_and_amendment_tasks() -> None:
     backend_root = _backend_root()
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(
@@ -1281,9 +1281,11 @@ known_onyx_tasks = {
     if name.isupper() and isinstance(value, str)
 }
 registered_onyx_tasks = known_onyx_tasks.intersection(app.tasks)
-assert registered_onyx_tasks == {OnyxCeleryTask.REGULATORY_BENCHMARK_RUN}, (
-    registered_onyx_tasks
-)
+assert registered_onyx_tasks == {
+    OnyxCeleryTask.REGULATORY_BENCHMARK_RUN,
+    OnyxCeleryTask.REGULATORY_AMENDMENT_RUN,
+    OnyxCeleryTask.REGULATORY_AMENDMENT_RECOVER_STALE,
+}, registered_onyx_tasks
 assert "onyx.background.celery.tasks.scheduled_tasks.tasks" not in sys.modules
 assert "onyx.regulatory.benchmark.runner" not in sys.modules
 """
@@ -1312,7 +1314,7 @@ def test_full_and_lite_supervisors_consume_regulatory_benchmark_queue() -> None:
         config = (backend_root / config_name).read_text(encoding="utf-8")
         assert expected_program in config
         assert expected_app in config
-        assert "-Q regulatory_benchmark" in config
+        assert "-Q regulatory_benchmark,regulatory_amendment" in config
 
     lite_config = (backend_root / "supervisord-lite.conf").read_text(encoding="utf-8")
     assert "celery_worker_scheduled_tasks" not in lite_config

@@ -148,10 +148,16 @@ class AmendmentBatchSnapshot(BaseModel):
     raw_text: str
     reference_date: datetime.date | None
     status: str
+    stage: str = "queued"
+    instruction_count: int = 0
+    processed_instruction_count: int = 0
     error_message: str | None
     created_by: str | None
     created_at: datetime.datetime
     updated_at: datetime.datetime
+    started_at: datetime.datetime | None = None
+    heartbeat_at: datetime.datetime | None = None
+    completed_at: datetime.datetime | None = None
 
     @classmethod
     def from_model(cls, batch: Any) -> "AmendmentBatchSnapshot":
@@ -161,10 +167,18 @@ class AmendmentBatchSnapshot(BaseModel):
             raw_text=batch.raw_text,
             reference_date=batch.reference_date,
             status=batch.status,
+            stage=getattr(batch, "stage", "queued"),
+            instruction_count=getattr(batch, "instruction_count", 0),
+            processed_instruction_count=getattr(
+                batch, "processed_instruction_count", 0
+            ),
             error_message=batch.error_message,
             created_by=str(batch.created_by) if batch.created_by else None,
             created_at=batch.created_at,
             updated_at=batch.updated_at,
+            started_at=getattr(batch, "started_at", None),
+            heartbeat_at=getattr(batch, "heartbeat_at", None),
+            completed_at=getattr(batch, "completed_at", None),
         )
 
 

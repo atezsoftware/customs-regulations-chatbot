@@ -1138,10 +1138,10 @@ CELERY_WORKER_SCHEDULED_TASKS_CONCURRENCY = int(
     os.environ.get("CELERY_WORKER_SCHEDULED_TASKS_CONCURRENCY") or 4
 )
 
-# A benchmark task drains an entire run through the production chat pipeline.
-# Default to one concurrent run to bound provider load while remaining tunable.
+# Benchmark and amendment tasks share this isolated regulatory LLM worker.
+# Two threads allow one of each to progress while keeping provider load bounded.
 CELERY_WORKER_REGULATORY_BENCHMARK_CONCURRENCY = int(
-    os.environ.get("CELERY_WORKER_REGULATORY_BENCHMARK_CONCURRENCY") or 1
+    os.environ.get("CELERY_WORKER_REGULATORY_BENCHMARK_CONCURRENCY") or 2
 )
 
 # Hard safety rails for admin-triggered benchmark runs. They are configurable

@@ -42,6 +42,16 @@ CLOUD_DOC_PERMISSION_SYNC_MULTIPLIER_DEFAULT = 1.0
 # tasks that run in either self-hosted on cloud
 beat_task_templates: list[dict] = [
     {
+        "name": "recover-stale-regulatory-amendments",
+        "task": OnyxCeleryTask.REGULATORY_AMENDMENT_RECOVER_STALE,
+        "schedule": timedelta(minutes=1),
+        "options": {
+            "priority": OnyxCeleryPriority.LOW,
+            "expires": 5 * 60,
+            "queue": OnyxCeleryQueues.REGULATORY_AMENDMENT,
+        },
+    },
+    {
         "name": "recover-stale-regulatory-indexing",
         "task": OnyxCeleryTask.REGULATORY_INDEXING_RECOVER_STALE,
         "schedule": timedelta(minutes=1),

@@ -817,9 +817,19 @@ class RegulatoryIndexingItemStatus(str, PyEnum):
 class AmendmentBatchStatus(str, PyEnum):
     """Lifecycle of one pasted-amendment-text analysis run."""
 
+    QUEUED = "queued"
     ANALYZING = "analyzing"
     ANALYZED = "analyzed"
     FAILED = "failed"
+
+
+class AmendmentBatchStage(str, PyEnum):
+    """Checkpointed stage of an amendment analysis run."""
+
+    QUEUED = "queued"
+    SEGMENTING = "segmenting"
+    PROCESSING = "processing"
+    FINALIZING = "finalizing"
 
 
 class AmendmentProposalStatus(str, PyEnum):

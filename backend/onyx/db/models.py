@@ -69,6 +69,7 @@ from onyx.connectors.models import InputType
 from onyx.db.enums import (
     AccessType,
     AccountType,
+    AmendmentBatchStage,
     AmendmentBatchStatus,
     AmendmentProposalStatus,
     ApprovalDecidedVia,
@@ -6022,16 +6023,42 @@ class AmendmentBatch(Base):
         ForeignKey("document_set.id", ondelete="CASCADE"), nullable=False
     )
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    user_file_ids: Mapped[list[str]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    segmented_instructions: Mapped[list[dict[str, Any]]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    unmatched_instructions: Mapped[list[str]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     reference_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(
-        Text, nullable=False, default=AmendmentBatchStatus.ANALYZING.value
+        Text, nullable=False, default=AmendmentBatchStatus.QUEUED.value
     )
+    stage: Mapped[str] = mapped_column(
+        Text, nullable=False, default=AmendmentBatchStage.QUEUED.value
+    )
+    instruction_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    processed_instruction_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("user.id"), nullable=True
     )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    started_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
@@ -6047,9 +6074,28 @@ class AmendmentBatch(Base):
 
     __table_args__ = (
         Index("ix_amendment_batch_document_set_id", "document_set_id"),
+        Index(
+            "ix_amendment_batch_recovery",
+            "status",
+            "heartbeat_at",
+            "created_at",
+        ),
         CheckConstraint(
-            "status IN ('analyzing', 'analyzed', 'failed')",
+            "status IN ('queued', 'analyzing', 'analyzed', 'failed')",
             name="amendment_batch_status_check",
+        ),
+        CheckConstraint(
+            "stage IN ('queued', 'segmenting', 'processing', 'finalizing')",
+            name="amendment_batch_stage_check",
+        ),
+        CheckConstraint(
+            "instruction_count >= 0 AND processed_instruction_count >= 0 "
+            "AND processed_instruction_count <= instruction_count",
+            name="amendment_batch_progress_check",
+        ),
+        CheckConstraint(
+            "lease_generation >= 0",
+            name="amendment_batch_lease_generation_check",
         ),
     )
 
@@ -6111,6 +6157,11 @@ class AmendmentProposal(Base):
 
     __table_args__ = (
         Index("ix_amendment_proposal_batch_id", "batch_id"),
+        UniqueConstraint(
+            "batch_id",
+            "instruction_index",
+            name="uq_amendment_proposal_batch_instruction",
+        ),
         Index("ix_amendment_proposal_status", "status"),
         Index("ix_amendment_proposal_old_chunk_id", "old_chunk_id"),
         CheckConstraint(

@@ -12,6 +12,16 @@ from onyx.configs.constants import (
 # must not dispatch connector ingestion or generic document-indexing work.
 PRODUCTION_LITE_TASK_TEMPLATES: tuple[dict[str, Any], ...] = (
     {
+        "name": "recover-stale-regulatory-amendments",
+        "task": OnyxCeleryTask.REGULATORY_AMENDMENT_RECOVER_STALE,
+        "schedule": timedelta(minutes=1),
+        "options": {
+            "priority": OnyxCeleryPriority.LOW,
+            "expires": 5 * 60,
+            "queue": OnyxCeleryQueues.REGULATORY_AMENDMENT,
+        },
+    },
+    {
         "name": "recover-stale-regulatory-indexing",
         "task": OnyxCeleryTask.REGULATORY_INDEXING_RECOVER_STALE,
         "schedule": timedelta(minutes=1),

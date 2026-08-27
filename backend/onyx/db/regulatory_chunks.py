@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from sqlalchemy import delete, exists, or_, select
+from sqlalchemy import delete, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db.enums import RegulatoryChunkSource, RegulatoryChunkStatus
@@ -2274,6 +2274,17 @@ def get_chunks_for_file(
     if not include_superseded:
         stmt = stmt.where(RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value)
     return list(db_session.scalars(stmt).all())
+
+
+def get_next_chunk_position(db_session: Session, user_file_id: UUID) -> int:
+    """Return the next position without materializing a file's chunks."""
+
+    max_position = db_session.scalar(
+        select(func.max(RegulatoryChunk.position)).where(
+            RegulatoryChunk.user_file_id == user_file_id
+        )
+    )
+    return 0 if max_position is None else max_position + 1
 
 
 def has_regulatory_chunks_for_file(db_session: Session, user_file_id: UUID) -> bool:

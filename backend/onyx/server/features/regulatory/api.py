@@ -5,7 +5,6 @@ re-project the whole file; file-level validity uses an exact metadata-only
 Elasticsearch patch and rejects unsafe projections.
 """
 
-import datetime
 from typing import Literal
 from uuid import UUID
 
@@ -15,12 +14,15 @@ from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
 from onyx.auth.schemas import UserRole
+from onyx.background.celery.tasks.regulatory_amendments.tasks import (
+    enqueue_amendment_batch,
+)
 from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_BYTES
 from onyx.configs.constants import PUBLIC_API_TAGS
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
-from onyx.db.enums import Permission
-from onyx.db.models import AmendmentProposal, DocumentSet, User, UserFile
+from onyx.db.enums import AmendmentBatchStatus, Permission
+from onyx.db.models import DocumentSet, User, UserFile
 from onyx.db.regulatory_amendments import (
     approve_amendment_proposal,
     compute_duplicate_targets,
@@ -30,6 +32,7 @@ from onyx.db.regulatory_amendments import (
     list_batches_for_document_set,
     list_proposals_for_batch,
     reject_proposal,
+    reset_failed_batch_for_retry,
 )
 from onyx.db.regulatory_chunks import (
     ValidityDateUpdate,
@@ -44,8 +47,6 @@ from onyx.db.user_file import lock_completed_user_file_for_projection
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
-from onyx.llm.factory import get_default_llm
-from onyx.regulatory.amendments.pipeline import analyze_amendment
 from onyx.regulatory.amendments.source_extraction import (
     AmendmentSourceExtractionError,
     fetch_and_extract_amendment_url,
@@ -427,12 +428,13 @@ def _get_editable_document_set(
     return document_set
 
 
-@router.post("/amendments/analyze", tags=PUBLIC_API_TAGS)
+@router.post("/amendments/analyze", tags=PUBLIC_API_TAGS, status_code=202)
 def analyze_amendment_text(
     analyze_request: AnalyzeAmendmentRequest,
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
-) -> AnalyzeAmendmentResponse:
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> AmendmentBatchSnapshot:
     document_set = _get_editable_document_set(
         db_session, analyze_request.document_set_id, user
     )
@@ -443,80 +445,26 @@ def analyze_amendment_text(
             "This document set has no files to amend yet.",
         )
 
-    # Committed on its own so the batch row survives (with status='failed')
-    # even if analysis below raises mid-transaction.
+    # Commit before dispatch so every broker delivery points at a durable row.
     batch = create_batch(
         db_session,
         document_set_id=document_set.id,
+        user_file_ids=user_file_ids,
         raw_text=analyze_request.raw_text,
         created_by=user.id,
     )
     db_session.commit()
-
     try:
-        llm = get_default_llm()
-        result = analyze_amendment(
-            db_session,
-            llm=llm,
-            user_file_ids=user_file_ids,
-            raw_text=analyze_request.raw_text,
-        )
-    except Exception as e:
-        logger.exception("Amendment analysis failed for batch=%s", batch.id)
-        # analyze_amendment only reads; rollback discards nothing durable and
-        # clears the aborted-transaction state so the status update below can
-        # commit.
-        db_session.rollback()
-        batch = get_batch(db_session, batch.id)
-        assert batch is not None
-        batch.status = "failed"
-        batch.error_message = str(e)
-        db_session.commit()
-        raise OnyxError(
-            OnyxErrorCode.INTERNAL_ERROR,
-            f"Amendment analysis failed: {e}",
-        ) from e
-
-    batch.status = "analyzed"
-    batch.reference_date = (
-        datetime.date.fromisoformat(result.reference_date)
-        if result.reference_date
-        else None
-    )
-
-    proposal_models: list[AmendmentProposal] = []
-    for draft in result.proposals:
-        proposal = AmendmentProposal(
+        enqueue_amendment_batch(
             batch_id=batch.id,
-            instruction_index=draft.instruction_index,
-            instruction_text=draft.instruction_text,
-            old_chunk_id=draft.old_chunk_id,
-            old_chunk_snapshot=draft.old_chunk_snapshot,
-            new_chunk_draft=draft.new_chunk_draft,
-            match_confidence=draft.match_confidence,
-            match_rationale=draft.match_rationale,
-            date_rationale=draft.date_rationale,
+            tenant_id=tenant_id,
         )
-        db_session.add(proposal)
-        proposal_models.append(proposal)
-
-    db_session.commit()
-    for proposal in proposal_models:
-        db_session.refresh(proposal)
-
-    duplicates = compute_duplicate_targets(proposal_models)
-    return AnalyzeAmendmentResponse(
-        batch=AmendmentBatchSnapshot.from_model(batch),
-        proposals=[
-            AmendmentProposalSnapshot.from_model(
-                p, duplicate_target=duplicates.get(p.id, False)
-            )
-            for p in proposal_models
-        ],
-        unmatched_instructions=[
-            instr.instruction_text for instr in result.unmatched_instructions
-        ],
-    )
+    except Exception:
+        logger.exception(
+            "Initial dispatch failed for amendment batch=%s; recovery will retry",
+            batch.id,
+        )
+    return AmendmentBatchSnapshot.from_model(batch)
 
 
 @router.get("/amendments/batches", tags=PUBLIC_API_TAGS)
@@ -551,6 +499,65 @@ def list_amendment_proposals(
     ]
 
 
+@router.get(
+    "/amendments/batches/{batch_id}/analysis",
+    tags=PUBLIC_API_TAGS,
+)
+def get_amendment_analysis(
+    batch_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> AnalyzeAmendmentResponse:
+    batch = get_batch(db_session, batch_id)
+    if batch is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Amendment batch not found")
+    _get_editable_document_set(db_session, batch.document_set_id, user)
+    proposals = list_proposals_for_batch(db_session, batch_id)
+    duplicates = compute_duplicate_targets(proposals)
+    return AnalyzeAmendmentResponse(
+        batch=AmendmentBatchSnapshot.from_model(batch),
+        proposals=[
+            AmendmentProposalSnapshot.from_model(
+                proposal,
+                duplicate_target=duplicates.get(proposal.id, False),
+            )
+            for proposal in proposals
+        ],
+        unmatched_instructions=list(batch.unmatched_instructions),
+    )
+
+
+@router.post(
+    "/amendments/batches/{batch_id}/retry",
+    tags=PUBLIC_API_TAGS,
+    status_code=202,
+)
+def retry_amendment_analysis(
+    batch_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> AmendmentBatchSnapshot:
+    batch = get_batch(db_session, batch_id)
+    if batch is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Amendment batch not found")
+    _get_editable_document_set(db_session, batch.document_set_id, user)
+    retried = reset_failed_batch_for_retry(db_session, batch_id=batch_id)
+    if retried is None:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Only failed amendment batches can be retried.",
+        )
+    try:
+        enqueue_amendment_batch(batch_id=batch_id, tenant_id=tenant_id)
+    except Exception:
+        logger.exception(
+            "Retry dispatch failed for amendment batch=%s; recovery will retry",
+            batch_id,
+        )
+    return AmendmentBatchSnapshot.from_model(retried)
+
+
 @router.post("/amendments/proposals/{proposal_id}/approve", tags=PUBLIC_API_TAGS)
 def approve_proposal(
     proposal_id: int,
@@ -563,6 +570,11 @@ def approve_proposal(
     batch = get_batch(db_session, proposal.batch_id)
     assert batch is not None
     _get_editable_document_set(db_session, batch.document_set_id, user)
+    if batch.status != AmendmentBatchStatus.ANALYZED.value:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Proposals can only be reviewed after analysis is complete.",
+        )
 
     try:
         result = approve_amendment_proposal(db_session, proposal, decided_by=user.id)
@@ -589,6 +601,11 @@ def reject_proposal_endpoint(
     batch = get_batch(db_session, proposal.batch_id)
     assert batch is not None
     _get_editable_document_set(db_session, batch.document_set_id, user)
+    if batch.status != AmendmentBatchStatus.ANALYZED.value:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Proposals can only be reviewed after analysis is complete.",
+        )
 
     try:
         reject_proposal(proposal, decided_by=user.id)

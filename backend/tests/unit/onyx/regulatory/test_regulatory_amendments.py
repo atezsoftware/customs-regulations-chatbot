@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -5,6 +6,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from onyx.db.regulatory_amendments import approve_amendment_proposal
+from onyx.db.regulatory_chunks import get_next_chunk_position
 from onyx.regulatory.amendments import candidate_finder, pipeline
 from onyx.regulatory.amendments.drafter import DraftResult
 from onyx.regulatory.amendments.models import (
@@ -24,6 +26,73 @@ def test_amendment_candidate_queries_exclude_hierarchical_aggregates() -> None:
         candidate_finder._STRUCTURED_SQL,
     ):
         assert "chunk_type IS DISTINCT FROM 'hierarchical_aggregate'" in str(statement)
+
+
+def test_candidate_lookup_keeps_large_dataset_out_of_llm_context() -> None:
+    user_file_id = UUID("00000000-0000-0000-0000-000000000123")
+    rows = [
+        SimpleNamespace(
+            id=f"chunk-{index}",
+            user_file_id=user_file_id,
+            text=f"MADDE {index} düzenlemesi",
+            chunk_metadata={},
+            score=1 - index / 100,
+        )
+        for index in range(15)
+    ]
+    result = MagicMock()
+    result.all.return_value = rows
+    db_session = MagicMock(spec=Session)
+    db_session.execute.side_effect = [MagicMock(), result]
+
+    candidates = candidate_finder.find_candidates(
+        db_session,
+        user_file_ids=[user_file_id],
+        instruction=AmendmentInstruction(
+            instruction_text="MADDE 1 düzenlemesi değiştirilmiştir."
+        ),
+    )
+
+    assert len(candidates) == 5
+    query_parameters = db_session.execute.call_args_list[1].args[1]
+    assert query_parameters["limit"] == 15
+    assert query_parameters["user_file_ids"] == [user_file_id]
+
+
+def test_new_provision_position_uses_database_max_without_loading_chunks() -> None:
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.return_value = 14_999
+
+    position = get_next_chunk_position(
+        db_session, UUID("00000000-0000-0000-0000-000000000123")
+    )
+
+    assert position == 15_000
+    db_session.scalar.assert_called_once()
+
+
+def test_analyze_instruction_without_candidates_skips_llm_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = AmendmentInstruction(instruction_text="MADDE 7 değiştirilmiştir.")
+    monkeypatch.setattr(pipeline, "find_candidates", lambda *_args, **_kwargs: [])
+    confirm_match = MagicMock()
+    draft_new_chunk = MagicMock()
+    monkeypatch.setattr(pipeline, "confirm_match", confirm_match)
+    monkeypatch.setattr(pipeline, "draft_new_chunk", draft_new_chunk)
+
+    proposal = pipeline.analyze_instruction(
+        MagicMock(spec=Session),
+        llm=MagicMock(),
+        user_file_ids=[UUID("00000000-0000-0000-0000-000000000123")],
+        instruction_index=0,
+        instruction=instruction,
+        reference_date=None,
+    )
+
+    assert proposal is None
+    confirm_match.assert_not_called()
+    draft_new_chunk.assert_not_called()
 
 
 def test_amendment_approval_rejects_derived_aggregate_target() -> None:
@@ -85,7 +154,7 @@ def test_analyze_amendment_marks_match_id_outside_candidates_unmatched(
         ),
     )
     monkeypatch.setattr(pipeline, "get_chunk_by_id", lambda *_args: None)
-    monkeypatch.setattr(pipeline, "get_chunks_for_file", lambda *_args: [])
+    monkeypatch.setattr(pipeline, "get_next_chunk_position", lambda *_args: 0)
     monkeypatch.setattr(
         pipeline,
         "draft_new_chunk",

@@ -3,11 +3,17 @@ export interface AmendmentBatch {
   document_set_id: number;
   raw_text: string;
   reference_date: string | null;
-  status: "analyzing" | "analyzed" | "failed";
+  status: "queued" | "analyzing" | "analyzed" | "failed";
+  stage: "queued" | "segmenting" | "processing" | "finalizing";
+  instruction_count: number;
+  processed_instruction_count: number;
   error_message: string | null;
   created_by: string | null;
   created_at: string;
   updated_at: string;
+  started_at: string | null;
+  heartbeat_at: string | null;
+  completed_at: string | null;
 }
 
 export interface AmendmentProposal {
@@ -42,14 +48,27 @@ export interface AmendmentSourceExtraction {
   display_name: string;
 }
 
+export class RegulatoryRequestError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number
+  ) {
+    super(message);
+    this.name = "RegulatoryRequestError";
+  }
+}
+
 const handleRequestError = (action: string, response: Response): never => {
-  throw new Error(`${action} failed (Status: ${response.status})`);
+  throw new RegulatoryRequestError(
+    `${action} failed (Status: ${response.status})`,
+    response.status
+  );
 };
 
 export async function analyzeAmendment(
   documentSetId: number,
   rawText: string
-): Promise<AnalyzeAmendmentResponse> {
+): Promise<AmendmentBatch> {
   const response = await fetch("/api/regulatory/amendments/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -62,6 +81,34 @@ export async function analyzeAmendment(
     const body = await response.json().catch(() => null);
     throw new Error(
       body?.detail || `Amendment analysis failed (Status: ${response.status})`
+    );
+  }
+  return response.json();
+}
+
+export async function getAmendmentAnalysis(
+  batchId: number
+): Promise<AnalyzeAmendmentResponse> {
+  const response = await fetch(
+    `/api/regulatory/amendments/batches/${batchId}/analysis`
+  );
+  if (!response.ok) {
+    handleRequestError("Get amendment analysis", response);
+  }
+  return response.json();
+}
+
+export async function retryAmendmentBatch(
+  batchId: number
+): Promise<AmendmentBatch> {
+  const response = await fetch(
+    `/api/regulatory/amendments/batches/${batchId}/retry`,
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(
+      body?.detail || `Retry analysis failed (Status: ${response.status})`
     );
   }
   return response.json();

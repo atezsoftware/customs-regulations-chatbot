@@ -7,13 +7,14 @@ rows, and nothing lands in `regulatory_chunk` until an admin approves a
 specific proposal (see onyx/db/regulatory_amendments.py).
 """
 
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
 from onyx.db.models import RegulatoryChunk
-from onyx.db.regulatory_chunks import get_chunk_by_id, get_chunks_for_file
+from onyx.db.regulatory_chunks import get_chunk_by_id, get_next_chunk_position
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.candidate_finder import find_candidates
 from onyx.regulatory.amendments.drafter import draft_new_chunk
@@ -24,6 +25,7 @@ from onyx.regulatory.amendments.models import (
     MatchResult,
     ProposalDraft,
 )
+from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.segmenter import segment_amendment_text
 from onyx.utils.logger import setup_logger
 
@@ -42,6 +44,152 @@ def _chunk_to_review_dict(chunk: RegulatoryChunk) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class InstructionDraftContext:
+    match: MatchResult
+    old_chunk_snapshot: dict[str, Any]
+    target_user_file_id: UUID
+    target_position: int
+    sibling_reference: dict[str, Any] | None
+    base_metadata: dict[str, Any]
+    base_heading_path: list[str]
+
+
+def confirm_instruction_match(
+    llm: LLM,
+    *,
+    instruction: AmendmentInstruction,
+    candidates: list[CandidateChunk],
+) -> MatchResult | None:
+    match = confirm_match(llm, instruction=instruction, candidates=candidates)
+    candidate_ids = {candidate.chunk_id for candidate in candidates}
+    if match.old_chunk_id is not None and match.old_chunk_id not in candidate_ids:
+        logger.warning(
+            "Amendment matcher returned candidate id outside the supplied set: %s",
+            match.old_chunk_id,
+        )
+        return None
+    return match
+
+
+def load_instruction_draft_context(
+    db_session: Session,
+    *,
+    candidates: list[CandidateChunk],
+    match: MatchResult,
+) -> InstructionDraftContext:
+    old_chunk: RegulatoryChunk | None = None
+    if match.old_chunk_id:
+        old_chunk = get_chunk_by_id(db_session, match.old_chunk_id)
+        if old_chunk is None:
+            match = MatchResult(
+                old_chunk_id=None,
+                confidence=match.confidence,
+                rationale=(
+                    f"{match.rationale} "
+                    "(named chunk id no longer exists, treated as a new provision)"
+                ),
+            )
+
+    sibling_reference: dict[str, Any] | None = None
+    if old_chunk is not None:
+        target_user_file_id = old_chunk.user_file_id
+        target_position = old_chunk.position
+    else:
+        best_candidate = candidates[0]
+        target_user_file_id = UUID(best_candidate.user_file_id)
+        sibling_reference = {
+            "text": best_candidate.text,
+            "metadata": best_candidate.metadata,
+            "heading_path": best_candidate.metadata.get("heading_path"),
+        }
+        target_position = get_next_chunk_position(db_session, target_user_file_id)
+
+    return InstructionDraftContext(
+        match=match,
+        old_chunk_snapshot=_chunk_to_review_dict(old_chunk) if old_chunk else {},
+        target_user_file_id=target_user_file_id,
+        target_position=target_position,
+        sibling_reference=sibling_reference,
+        base_metadata=dict(old_chunk.chunk_metadata) if old_chunk else {},
+        base_heading_path=list(old_chunk.heading_path) if old_chunk else [],
+    )
+
+
+def draft_instruction_proposal(
+    llm: LLM,
+    *,
+    instruction_index: int,
+    instruction: AmendmentInstruction,
+    reference_date: str | None,
+    context: InstructionDraftContext,
+) -> ProposalDraft:
+    draft = draft_new_chunk(
+        llm,
+        instruction=instruction,
+        old_chunk=context.old_chunk_snapshot or None,
+        sibling_reference=context.sibling_reference,
+        reference_date=reference_date,
+    )
+    merged_metadata = {
+        **context.base_metadata,
+        **draft.new_chunk.metadata_changes,
+    }
+    heading_path = draft.new_chunk.heading_path or context.base_heading_path
+    new_chunk_draft: dict[str, Any] = {
+        "user_file_id": str(context.target_user_file_id),
+        "position": context.target_position,
+        "text": draft.new_chunk.text,
+        "chunk_type": draft.new_chunk.chunk_type,
+        "heading_path": heading_path,
+        "metadata": merged_metadata,
+        "effective_start_date": draft.dates.effective_start_date,
+        "effective_end_date": draft.dates.effective_end_date,
+    }
+    return ProposalDraft(
+        instruction_index=instruction_index,
+        instruction_text=instruction.instruction_text,
+        old_chunk_id=context.match.old_chunk_id,
+        old_chunk_snapshot=context.old_chunk_snapshot,
+        new_chunk_draft=new_chunk_draft,
+        match_confidence=context.match.confidence,
+        match_rationale=context.match.rationale,
+        date_rationale=draft.dates.rationale,
+    )
+
+
+def analyze_instruction(
+    db_session: Session,
+    *,
+    llm: LLM,
+    user_file_ids: list[UUID],
+    instruction_index: int,
+    instruction: AmendmentInstruction,
+    reference_date: str | None,
+) -> ProposalDraft | None:
+    candidates = find_candidates(
+        db_session, user_file_ids=user_file_ids, instruction=instruction
+    )
+    if not candidates:
+        return None
+
+    match = confirm_instruction_match(
+        llm, instruction=instruction, candidates=candidates
+    )
+    if match is None:
+        return None
+    context = load_instruction_draft_context(
+        db_session, candidates=candidates, match=match
+    )
+    return draft_instruction_proposal(
+        llm,
+        instruction_index=instruction_index,
+        instruction=instruction,
+        reference_date=reference_date,
+        context=context,
+    )
+
+
 def analyze_amendment(
     db_session: Session,
     *,
@@ -55,108 +203,18 @@ def analyze_amendment(
     unmatched: list[AmendmentInstruction] = []
 
     for index, instruction in enumerate(segmentation.instructions):
-        candidates = find_candidates(
-            db_session, user_file_ids=user_file_ids, instruction=instruction
-        )
-        if not candidates:
-            # Nothing in the directory resembles this instruction at all — no
-            # chunk to attach a new one to, so surface it as unmatched rather
-            # than guessing.
-            unmatched.append(instruction)
-            continue
-
-        match = confirm_match(llm, instruction=instruction, candidates=candidates)
-
-        candidate_ids = {candidate.chunk_id for candidate in candidates}
-        if match.old_chunk_id is not None and match.old_chunk_id not in candidate_ids:
-            logger.warning(
-                "Amendment matcher returned candidate id outside the supplied set: %s",
-                match.old_chunk_id,
-            )
-            unmatched.append(instruction)
-            continue
-
-        old_chunk: RegulatoryChunk | None = None
-        if match.old_chunk_id:
-            old_chunk = get_chunk_by_id(db_session, match.old_chunk_id)
-            if old_chunk is None:
-                # The LLM named a chunk id outside the candidate set — don't
-                # trust it blindly, fall back to "no match".
-                match = MatchResult(
-                    old_chunk_id=None,
-                    confidence=match.confidence,
-                    rationale=(
-                        f"{match.rationale} "
-                        "(named chunk id not found among candidates, treated as unmatched)"
-                    ),
-                )
-
-        sibling_reference: dict[str, Any] | None = None
-        if old_chunk is not None:
-            target_user_file_id = old_chunk.user_file_id
-            target_position = old_chunk.position
-        else:
-            # New provision, no existing chunk to replace — attach it to the
-            # same file as the strongest candidate (virtually always the one
-            # this amendment is targeting) and append it after that file's
-            # existing chunks. Give the LLM that candidate's own metadata as
-            # a reference so it can build a heading_path/article_no
-            # consistent with the rest of the file instead of leaving them
-            # empty — citations and search both depend on these being
-            # populated, for amendment-created chunks same as indexed ones.
-            best_candidate = candidates[0]
-            target_user_file_id = UUID(best_candidate.user_file_id)
-            sibling_reference = {
-                "text": best_candidate.text,
-                "metadata": best_candidate.metadata,
-                "heading_path": best_candidate.metadata.get("heading_path"),
-            }
-            siblings = get_chunks_for_file(db_session, target_user_file_id)
-            target_position = max((s.position for s in siblings), default=-1) + 1
-
-        draft = draft_new_chunk(
-            llm,
+        proposal = analyze_instruction(
+            db_session,
+            llm=llm,
+            user_file_ids=user_file_ids,
+            instruction_index=index,
             instruction=instruction,
-            old_chunk=_chunk_to_review_dict(old_chunk) if old_chunk else None,
-            sibling_reference=sibling_reference,
             reference_date=segmentation.reference_date,
         )
-
-        # Merge, don't replace: the LLM only returns the metadata fields it
-        # actually changed (`metadata_changes`), so fields it wasn't asked to
-        # touch survive by construction instead of depending on the model
-        # faithfully reproducing every unrelated key.
-        base_metadata = dict(old_chunk.chunk_metadata) if old_chunk else {}
-        merged_metadata = {**base_metadata, **draft.new_chunk.metadata_changes}
-
-        base_heading_path = list(old_chunk.heading_path) if old_chunk else []
-        heading_path = draft.new_chunk.heading_path or base_heading_path
-
-        new_chunk_draft: dict[str, Any] = {
-            "user_file_id": str(target_user_file_id),
-            "position": target_position,
-            "text": draft.new_chunk.text,
-            "chunk_type": draft.new_chunk.chunk_type,
-            "heading_path": heading_path,
-            "metadata": merged_metadata,
-            "effective_start_date": draft.dates.effective_start_date,
-            "effective_end_date": draft.dates.effective_end_date,
-        }
-
-        proposals.append(
-            ProposalDraft(
-                instruction_index=index,
-                instruction_text=instruction.instruction_text,
-                old_chunk_id=match.old_chunk_id,
-                old_chunk_snapshot=(
-                    _chunk_to_review_dict(old_chunk) if old_chunk else {}
-                ),
-                new_chunk_draft=new_chunk_draft,
-                match_confidence=match.confidence,
-                match_rationale=match.rationale,
-                date_rationale=draft.dates.rationale,
-            )
-        )
+        if proposal is None:
+            unmatched.append(instruction)
+        else:
+            proposals.append(proposal)
 
     return AnalysisResult(
         reference_date=segmentation.reference_date,

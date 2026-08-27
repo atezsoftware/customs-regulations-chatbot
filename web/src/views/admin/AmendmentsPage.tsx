@@ -16,13 +16,16 @@ import { useDocumentSets } from "@/lib/hooks/useDocumentSets";
 import {
   AmendmentBatch,
   AmendmentProposal,
+  RegulatoryRequestError,
   analyzeAmendment,
   approveProposal,
   extractAmendmentPdf,
   extractAmendmentUrl,
+  getAmendmentAnalysis,
   listAmendmentBatches,
   listAmendmentProposals,
   rejectProposal,
+  retryAmendmentBatch,
 } from "@/lib/regulatory/amendments";
 
 type AmendmentSourceMode = "text" | "url" | "pdf";
@@ -37,6 +40,15 @@ function sourceIdentity(
     return `pdf:${file.name}:${file.size}:${file.lastModified}`;
   }
   return null;
+}
+
+function analysisProgressLabel(batch: AmendmentBatch) {
+  if (batch.stage === "segmenting") return "Segmenting amendment…";
+  if (batch.stage === "finalizing") return "Finalizing analysis…";
+  if (batch.instruction_count > 0) {
+    return `Analyzing ${batch.processed_instruction_count} / ${batch.instruction_count}`;
+  }
+  return "Analysis queued…";
 }
 
 function ChunkPreview({
@@ -89,9 +101,11 @@ function ChunkPreview({
 function ProposalCard({
   proposal,
   onDecided,
+  reviewEnabled,
 }: {
   proposal: AmendmentProposal;
   onDecided: () => void;
+  reviewEnabled: boolean;
 }) {
   const [deciding, setDeciding] = useState(false);
 
@@ -172,11 +186,14 @@ function ProposalCard({
             variant="danger"
             prominence="secondary"
             onClick={() => void handleReject()}
-            disabled={deciding}
+            disabled={deciding || !reviewEnabled}
           >
             Reject
           </Button>
-          <Button onClick={() => void handleApprove()} disabled={deciding}>
+          <Button
+            onClick={() => void handleApprove()}
+            disabled={deciding || !reviewEnabled}
+          >
             Approve
           </Button>
         </div>
@@ -200,6 +217,8 @@ export default function AmendmentsPage() {
   const [extracting, setExtracting] = useState(false);
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [pollRevision, setPollRevision] = useState(0);
 
   const [batches, setBatches] = useState<AmendmentBatch[]>([]);
   const [selectedBatchId, setSelectedBatchId] = useState<number | null>(null);
@@ -225,10 +244,65 @@ export default function AmendmentsPage() {
   useEffect(() => {
     if (selectedBatchId === null) {
       setProposals([]);
+      setUnmatched([]);
       return;
     }
-    void refreshProposals(selectedBatchId);
-  }, [selectedBatchId, refreshProposals]);
+
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let pollErrorReported = false;
+    let pollDelayMs = 2000;
+
+    const poll = async () => {
+      try {
+        const result = await getAmendmentAnalysis(selectedBatchId);
+        if (cancelled) return;
+        pollErrorReported = false;
+        pollDelayMs = 2000;
+
+        setBatches((current) => {
+          const exists = current.some((batch) => batch.id === result.batch.id);
+          return exists
+            ? current.map((batch) =>
+                batch.id === result.batch.id ? result.batch : batch
+              )
+            : [result.batch, ...current];
+        });
+        setProposals(result.proposals);
+        setUnmatched(result.unmatched_instructions);
+
+        if (
+          result.batch.status === "queued" ||
+          result.batch.status === "analyzing"
+        ) {
+          timeoutId = setTimeout(() => void poll(), pollDelayMs);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          if (!pollErrorReported) {
+            toast.error(
+              e instanceof Error ? e.message : "Could not refresh analysis."
+            );
+            pollErrorReported = true;
+          }
+          if (
+            e instanceof RegulatoryRequestError &&
+            [401, 403, 404].includes(e.status)
+          ) {
+            return;
+          }
+          pollDelayMs = Math.min(pollDelayMs * 2, 30_000);
+          timeoutId = setTimeout(() => void poll(), pollDelayMs);
+        }
+      }
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    };
+  }, [selectedBatchId, pollRevision]);
 
   const currentSourceIdentity = sourceIdentity(
     sourceMode,
@@ -284,20 +358,40 @@ export default function AmendmentsPage() {
         Number(selectedDocumentSetId),
         rawText
       );
-      toast.success(
-        `Analyzed: ${result.proposals.length} proposal(s), ${result.unmatched_instructions.length} unmatched.`
-      );
+      toast.success("Analysis queued. Progress will update automatically.");
       setRawText("");
-      await refreshBatches(Number(selectedDocumentSetId));
-      setSelectedBatchId(result.batch.id);
-      setProposals(result.proposals);
-      setUnmatched(result.unmatched_instructions);
+      setBatches((current) => [
+        result,
+        ...current.filter((batch) => batch.id !== result.id),
+      ]);
+      setSelectedBatchId(result.id);
+      setProposals([]);
+      setUnmatched([]);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Analysis failed.");
     } finally {
       setAnalyzing(false);
     }
-  }, [selectedDocumentSetId, rawText, canAnalyze, refreshBatches]);
+  }, [selectedDocumentSetId, rawText, canAnalyze]);
+
+  const handleRetry = useCallback(async () => {
+    if (selectedBatchId === null) return;
+    setRetrying(true);
+    try {
+      const batch = await retryAmendmentBatch(selectedBatchId);
+      setBatches((current) =>
+        current.map((item) => (item.id === batch.id ? batch : item))
+      );
+      setProposals([]);
+      setUnmatched([]);
+      setPollRevision((revision) => revision + 1);
+      toast.success("Analysis queued again from its last checkpoint.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Retry failed.");
+    } finally {
+      setRetrying(false);
+    }
+  }, [selectedBatchId]);
 
   const selectedBatch = useMemo(
     () => batches.find((b) => b.id === selectedBatchId) ?? null,
@@ -438,6 +532,7 @@ export default function AmendmentsPage() {
                   Amendment text
                 </Text>
                 <InputTextArea
+                  aria-label="Amendment text"
                   value={rawText}
                   onChange={(e) => setRawText(e.target.value)}
                   rows={8}
@@ -479,10 +574,25 @@ export default function AmendmentsPage() {
 
               {selectedBatch && (
                 <div className="flex flex-col gap-3">
-                  {selectedBatch.status === "failed" && (
+                  {(selectedBatch.status === "queued" ||
+                    selectedBatch.status === "analyzing") && (
                     <Text font="main-ui-body" color="text-05" as="p">
-                      {`Analysis failed: ${selectedBatch.error_message ?? "unknown error"}`}
+                      {analysisProgressLabel(selectedBatch)}
                     </Text>
+                  )}
+                  {selectedBatch.status === "failed" && (
+                    <div className="flex items-center justify-between gap-3">
+                      <Text font="main-ui-body" color="text-05" as="p">
+                        {`Analysis failed: ${selectedBatch.error_message ?? "unknown error"}`}
+                      </Text>
+                      <Button
+                        size="sm"
+                        onClick={() => void handleRetry()}
+                        disabled={retrying}
+                      >
+                        {retrying ? "Retrying…" : "Retry"}
+                      </Button>
+                    </div>
                   )}
 
                   {unmatched.length > 0 && (
@@ -508,6 +618,7 @@ export default function AmendmentsPage() {
                       key={proposal.id}
                       proposal={proposal}
                       onDecided={() => void refreshProposals(selectedBatch.id)}
+                      reviewEnabled={selectedBatch.status === "analyzed"}
                     />
                   ))}
                 </div>

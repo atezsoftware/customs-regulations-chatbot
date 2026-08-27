@@ -156,15 +156,18 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
     templates = schedule_module.PRODUCTION_LITE_TASK_TEMPLATES
 
     assert {template["task"] for template in templates} == {
+        "regulatory_amendment_recover_stale",
         "regulatory_indexing_recover_stale",
         "monitor_celery_queues",
     }
     assert {template["options"]["queue"] for template in templates} == {
+        OnyxCeleryQueues.REGULATORY_AMENDMENT,
         OnyxCeleryQueues.REGULATORY_INDEXING,
         OnyxCeleryQueues.MONITORING,
     }
     schedules = {template["task"]: template["schedule"] for template in templates}
     assert schedules["regulatory_indexing_recover_stale"] == timedelta(minutes=1)
+    assert schedules["regulatory_amendment_recover_stale"] == timedelta(minutes=1)
     assert schedules["monitor_celery_queues"] == timedelta(seconds=10)
     assert all(template["options"]["expires"] > 0 for template in templates)
     assert not any("check-for-indexing" in template["name"] for template in templates)
@@ -200,7 +203,7 @@ def test_production_lite_scheduler_expands_every_task_with_each_tenant_id() -> N
         ["public", "tenant-a"]
     )
 
-    assert len(schedule) == 4
+    assert len(schedule) == 6
     assert {entry["kwargs"]["tenant_id"] for entry in schedule.values()} == {
         "public",
         "tenant-a",
@@ -226,6 +229,7 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
     with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
         scheduler.update_schedule()
     expected_names = {
+        "recover-stale-regulatory-amendments-public",
         "recover-stale-regulatory-indexing-public",
         "monitor-celery-queues-public",
     }
@@ -283,12 +287,14 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
     tenants = ("public", "tenant-a")
     tasks = {
         "monitor_celery_queues": 10,
+        "regulatory_amendment_recover_stale": 60,
         "regulatory_indexing_recover_stale": 60,
     }
     entry_names = {
         f"{entry_prefix}-{tenant}"
         for entry_prefix in (
             "monitor-celery-queues",
+            "recover-stale-regulatory-amendments",
             "recover-stale-regulatory-indexing",
         )
         for tenant in tenants
@@ -360,7 +366,7 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
         assert Counter(publications) == Counter(
             {publication: 1 for publication in expected_publications}
         )
-        assert len(claim_store.claims) == 4
+        assert len(claim_store.claims) == 6
         assert {claim[0] for claim in claim_store.claims} == set(tenants)
         for tenant_id, claim_key, ttl in claim_store.claims:
             tenant_entry_names = {
@@ -524,6 +530,7 @@ def test_scheduler_recovers_a_corrupt_pod_local_schedule(tmp_path: Path) -> None
         with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
             scheduler.update_schedule()
         assert set(scheduler.schedule) == {
+            "recover-stale-regulatory-amendments-public",
             "recover-stale-regulatory-indexing-public",
             "monitor-celery-queues-public",
         }
@@ -1247,9 +1254,17 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         "user_file_port",
     ]
     assert workers["celery_worker_regulatory_indexing"] == ["regulatory_indexing"]
+    assert workers["celery_worker_regulatory_benchmark"] == [
+        "regulatory_benchmark",
+        "regulatory_amendment",
+    ]
     assert scheduler == {
         "name": "celery_beat_regulatory_indexing",
-        "tasks": ["regulatory_indexing_recover_stale", "monitor_celery_queues"],
+        "tasks": [
+            "regulatory_amendment_recover_stale",
+            "regulatory_indexing_recover_stale",
+            "monitor_celery_queues",
+        ],
         "readiness_file": "/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt",
         "liveness_file": "/tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt",
         "liveness_max_age_seconds": 150,
@@ -1258,6 +1273,7 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         "claimant_failure_delivery": "next_utc_slot",
         "max_failover_gap_seconds": {
             "monitor_celery_queues": 10,
+            "regulatory_amendment_recover_stale": 60,
             "regulatory_indexing_recover_stale": 60,
         },
         "claim_ttl_semantics": "stale_key_retention_not_same_slot_takeover",

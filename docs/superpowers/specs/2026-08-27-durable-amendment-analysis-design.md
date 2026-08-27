@@ -151,6 +151,11 @@ proposal uniqueness are authoritative.
    deleting checkpoints. An admin retry changes it back to `queued`; processing
    resumes from the first incomplete instruction.
 
+Database sessions are deliberately short-lived in this flow. Batch/candidate
+state is copied into typed plain values before each provider call; segmentation,
+match confirmation, and drafting never wait on an LLM with an open PostgreSQL
+transaction. Checkpoints then use fresh fenced transactions.
+
 If the initial broker send fails after the batch commit, periodic recovery picks
 up the queued row. If the worker dies, late acknowledgement and stale recovery
 redeliver it. If a user retries while an old delivery exists, lease fencing
@@ -263,8 +268,14 @@ The Alembic migration runs before the updated API and worker become ready. The
 background release continues using the runtime-lite image and its 4 GiB memory
 limit. No PDF parser or new model dependency is added to the worker.
 
+For rolling deployments, recovery gives legacy synchronous `analyzing` rows a
+stale grace period. A legacy row with no heartbeat and no file-scope snapshot is
+recovered only after that grace period; its document-set scope is reconstructed
+and persisted before it is queued. Deployments should still drain old API pods
+before enabling the new worker whenever the platform supports an ordered
+rollout.
+
 Deployment readiness verifies that the regulatory LLM worker consumes the new
-queue and has registered both run and recovery tasks. Monitoring adds amendment
-queue depth and batches by status/stage. The old synchronous behavior is removed
-rather than retained behind a second endpoint, so all input modes receive the
-same durable behavior.
+queue and has registered both run and recovery tasks. The old synchronous
+behavior is removed rather than retained behind a second endpoint, so all input
+modes receive the same durable behavior.

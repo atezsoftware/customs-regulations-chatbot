@@ -758,6 +758,7 @@ supervisor_process_count: 8
 workers:
   celery_worker_regulatory_benchmark:
     - regulatory_benchmark
+    - regulatory_amendment
   celery_worker_regulatory_indexing:
     - regulatory_indexing
   celery_worker_user_file_processing:
@@ -777,6 +778,7 @@ workers:
 scheduler:
   name: celery_beat_regulatory_indexing
   tasks:
+    - regulatory_amendment_recover_stale
     - regulatory_indexing_recover_stale
     - monitor_celery_queues
   readiness_file: /tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt
@@ -787,6 +789,7 @@ scheduler:
   claimant_failure_delivery: next_utc_slot
   max_failover_gap_seconds:
     monitor_celery_queues: 10
+    regulatory_amendment_recover_stale: 60
     regulatory_indexing_recover_stale: 60
   claim_ttl_semantics: stale_key_retention_not_same_slot_takeover
 user_file_recovery_scheduler:
@@ -817,12 +820,12 @@ operations:
 The background container healthcheck requires exactly five workers, the allowlisted user-file
 recovery Beat, the dedicated regulatory indexing Beat, and the log redirector—eight supervisor
 processes total—and requires every process to be `RUNNING`. The generic Beat is restricted to the
-three user-file recovery tasks listed above, while the dedicated Beat owns only stale regulatory
-indexing recovery and queue monitoring; their schedules do not overlap. Each pod keeps its
+three user-file recovery tasks listed above, while the dedicated Beat owns stale regulatory
+indexing/amendment recovery and queue monitoring; their schedules do not overlap. Each pod keeps its
 regulatory Beat shelf at pod-local
 `/tmp/regulatory-indexing-beat-schedule`, regenerates every per-tenant entry from PostgreSQL before
-readiness and after a restart, and contains only stale regulatory indexing recovery (one minute) and
-queue monitoring (ten seconds). It never loads the generic/full-runtime Beat schedule. A corrupt
+readiness and after a restart, and contains only stale regulatory indexing/amendment recovery (one
+minute) and queue monitoring (ten seconds). It never loads the generic/full-runtime Beat schedule. A corrupt
 pod-local shelf is discarded and rebuilt; no shelf is shared between replicas.
 
 Multiple background replicas are safe without a Helm singleton setting. Before dispatch, every Beat
@@ -830,7 +833,7 @@ claims a tenant-prefixed Redis key containing the schedule entry and UTC interva
 `SET NX EX`. Only the claimant publishes that tenant/slot; followers remain healthy and try later
 slots. If a claimant stops after `SET NX EX` but before broker publication, that UTC slot is not
 replayed. Deterministic recovery is the next UTC slot: within ten seconds for queue monitoring and
-within sixty seconds for stale indexing recovery. The two-interval TTL only bounds stale-key
+within sixty seconds for stale indexing/amendment recovery. The two-interval TTL only bounds stale-key
 retention and clock-anomaly impact; it is not a same-slot takeover guarantee. Redis failure prevents
 an uncoordinated publish. The PostgreSQL job table—not the Beat shelf or Redis claim—is the durable
 indexing scheduler/source of truth.

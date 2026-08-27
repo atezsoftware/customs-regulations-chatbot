@@ -486,6 +486,7 @@ class OnyxCeleryQueues:
     # Regulatory benchmark runs use the normal chat pipeline but execute on an
     # isolated worker so they cannot consume Craft scheduled-task capacity.
     REGULATORY_BENCHMARK = "regulatory_benchmark"
+    REGULATORY_AMENDMENT = "regulatory_amendment"
     REGULATORY_INDEXING = "regulatory_indexing"
 
     ELASTICSEARCH_MIGRATION = "elasticsearch_migration"
@@ -704,6 +705,8 @@ class OnyxCeleryTask:
     SCHEDULED_TASKS_CLEANUP_STUCK = "scheduled_tasks_cleanup_stuck"
 
     REGULATORY_BENCHMARK_RUN = "regulatory_benchmark_run"
+    REGULATORY_AMENDMENT_RUN = "regulatory_amendment_run"
+    REGULATORY_AMENDMENT_RECOVER_STALE = "regulatory_amendment_recover_stale"
     REGULATORY_INDEXING_RUN_STEP = "regulatory_indexing_run_step"
     REGULATORY_INDEXING_RECOVER_STALE = "regulatory_indexing_recover_stale"
 

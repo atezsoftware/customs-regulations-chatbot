@@ -2,7 +2,9 @@ import {
   analyzeAmendment,
   extractAmendmentPdf,
   extractAmendmentUrl,
+  getAmendmentAnalysis,
   listAmendmentBatches,
+  retryAmendmentBatch,
 } from "@/lib/regulatory/amendments";
 import { listBenchmarkCitationOptions } from "@/lib/regulatory/benchmark";
 
@@ -57,6 +59,27 @@ describe("regulatory document set API contracts", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/regulatory/benchmark/document-sets/17/citation-options",
       undefined
+    );
+  });
+
+  it("polls and retries durable amendment batches", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ batch: {}, proposals: [], unmatched_instructions: [] })
+      )
+      .mockResolvedValueOnce(jsonResponse({ id: 42, status: "queued" }));
+
+    await getAmendmentAnalysis(42);
+    await retryAmendmentBatch(42);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/regulatory/amendments/batches/42/analysis"
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/regulatory/amendments/batches/42/retry",
+      { method: "POST" }
     );
   });
 
