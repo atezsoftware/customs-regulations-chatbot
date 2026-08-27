@@ -309,7 +309,11 @@ def read_pdf_file(
     """
     from pypdf import PdfReader
     from pypdf.errors import PdfStreamError
-    from pypdfium2 import PdfiumError
+
+    try:
+        from pypdfium2 import PdfiumError
+    except ModuleNotFoundError:
+        PdfiumError = None
 
     metadata: dict[str, Any] = {}
     extracted_images: list[tuple[bytes, str]] = []
@@ -352,23 +356,30 @@ def read_pdf_file(
                 ):
                     metadata[clean_key] = ", ".join(value)
 
-        # PDFium can hard-abort or hang on a malformed PDF (uncatchable in-process),
-        # so run it isolated; a crash, timeout, or PdfiumError falls back to pypdf.
-        try:
-            text = run_in_isolated_process(
-                _extract_pdf_text_pdfium,
-                file_bytes,
-                decrypt_password,
-                timeout=PDF_TEXT_EXTRACTION_TIMEOUT_SECONDS,
-            )
-        except (PdfiumError, IsolatedProcessError) as pdfium_err:
-            logger.warning(
-                "PDFium text extraction failed (%s); falling back to pypdf",
-                pdfium_err,
-            )
+        if PdfiumError is None:
+            logger.info("PDFium is unavailable; extracting PDF text with pypdf")
             text = TEXT_SECTION_SEPARATOR.join(
                 page.extract_text() for page in pdf_reader.pages
             )
+        else:
+            # PDFium can hard-abort or hang on a malformed PDF (uncatchable
+            # in-process), so run it isolated; a crash, timeout, or PdfiumError
+            # falls back to pypdf.
+            try:
+                text = run_in_isolated_process(
+                    _extract_pdf_text_pdfium,
+                    file_bytes,
+                    decrypt_password,
+                    timeout=PDF_TEXT_EXTRACTION_TIMEOUT_SECONDS,
+                )
+            except (PdfiumError, IsolatedProcessError) as pdfium_err:
+                logger.warning(
+                    "PDFium text extraction failed (%s); falling back to pypdf",
+                    pdfium_err,
+                )
+                text = TEXT_SECTION_SEPARATOR.join(
+                    page.extract_text() for page in pdf_reader.pages
+                )
 
         if extract_images:
             image_cap = MAX_EMBEDDED_IMAGES_PER_FILE

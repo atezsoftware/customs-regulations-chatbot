@@ -9,6 +9,7 @@ Fixture PDFs live in ./fixtures/ and are pre-built so the test layer has no
 dependency on pypdf internals (pypdf.generic).
 """
 
+import builtins
 from io import BytesIO
 from pathlib import Path
 
@@ -76,6 +77,30 @@ class TestReadPdfFile:
 
         monkeypatch.setattr(extract_file_text, "run_in_isolated_process", _fail)
         text, _, _ = read_pdf_file(_load("multipage.pdf"))
+        assert "Page one content" in text
+        assert "Page two content" in text
+
+    def test_text_extraction_falls_back_to_pypdf_when_pdfium_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lite runtime omits pypdfium2 but must still accept text PDFs."""
+        original_import = builtins.__import__
+
+        def _block_pdfium(
+            name: str,
+            globals: object = None,
+            locals: object = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> object:
+            if name == "pypdfium2":
+                raise ModuleNotFoundError("No module named 'pypdfium2'")
+            return original_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", _block_pdfium)
+
+        text, _, _ = read_pdf_file(_load("multipage.pdf"))
+
         assert "Page one content" in text
         assert "Page two content" in text
 
