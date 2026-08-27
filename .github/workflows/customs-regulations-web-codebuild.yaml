@@ -7,10 +7,12 @@ on:
       environment:
         description: 'Select the environment'
         required: false
-        default: test
+        default: dev
         type: choice
         options:
+          - dev
           - test
+          - production
       action:
         description: 'Select the action'
         required: false
@@ -25,7 +27,9 @@ on:
         default: ''
   push:
     branches:
+      - develop
       - test/v1
+      - release/v1
     paths:
       - "web/**"
       - ".dockerignore"
@@ -58,7 +62,9 @@ jobs:
             deployment_target="$DISPATCH_ENVIRONMENT"
           elif [[ "$WORKFLOW_EVENT_NAME" == "push" ]]; then
             case "$WORKFLOW_GIT_REF" in
+              refs/heads/develop) deployment_target="dev" ;;
               refs/heads/test/v1) deployment_target="test" ;;
+              refs/heads/release/v1) deployment_target="production" ;;
               *)
                 echo "Unsupported deployment ref: $WORKFLOW_GIT_REF" >&2
                 exit 1
@@ -70,6 +76,14 @@ jobs:
           fi
 
           case "$deployment_target" in
+          dev)
+            echo "SERVICE_NAME=customs-regulations-web-dev" >> $GITHUB_ENV
+            echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-web-dev" >> $GITHUB_ENV
+            echo "env_x=dev" >> $GITHUB_ENV
+            echo "space_x=dev" >> $GITHUB_ENV
+            echo "namespace=customs-regulations-dev" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=atez-dev-cluster" >> $GITHUB_ENV
+            ;;
           test)
             echo "SERVICE_NAME=customs-regulations-web-test-v1" >> $GITHUB_ENV
             echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-web-test-v1" >> $GITHUB_ENV
@@ -77,6 +91,14 @@ jobs:
             echo "space_x=test-v1" >> $GITHUB_ENV
             echo "namespace=customs-regulations-test" >> $GITHUB_ENV
             echo "CLUSTER_NAME=atez-dev-cluster" >> $GITHUB_ENV
+            ;;
+          production)
+            echo "SERVICE_NAME=customs-regulations-web-v1" >> $GITHUB_ENV
+            echo "DOCKER_IMAGE_REPO=255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-web-v1" >> $GITHUB_ENV
+            echo "env_x=v1" >> $GITHUB_ENV
+            echo "space_x=prod" >> $GITHUB_ENV
+            echo "namespace=customs-regulations-prod" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=atez-prod-cluster" >> $GITHUB_ENV
             ;;
           *)
             echo "Unsupported deployment target: $deployment_target" >&2
