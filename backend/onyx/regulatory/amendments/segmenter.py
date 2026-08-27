@@ -2,6 +2,8 @@
 
 import re
 
+from pydantic import Field
+
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction, SegmentationResult
 from onyx.regulatory.structured_llm import generate_structured
@@ -12,12 +14,14 @@ _SYSTEM_PROMPT = """You are an expert at analyzing Turkish regulatory amendment 
 
 You will be given a pasted amendment/update text. Your job:
 
-1. Split the text into atomic amendment instructions, each affecting exactly ONE article/provision.
+1. Split the text into atomic amendment instructions, each affecting exactly ONE independently retrievable legal rule or provision.
    Common patterns in Turkish regulatory amendments:
    - "MADDE N ... aşağıdaki şekilde değiştirilmiştir." (article N is changed to read as follows)
    - "... aşağıdaki fıkra/bent eklenmiştir." (the following paragraph/clause is added)
    - "... yürürlükten kaldırılmıştır." (repealed)
    Put the exact text needed to fully understand each change (the instruction sentence plus any new article text) into `instruction_text`.
+   The input may instead be a concise natural-language summary in any language. Such a summary is still an amendment request. Split coordinated changes into separate instructions whenever they concern different operative rules, even when no article number is given. Do not leave multiple independently searchable changes in one instruction.
+   CRITICAL: Never keep a changed numerical threshold/cap and a distinct exception, fallback, or alternative procedure that applies beyond that threshold in the same instruction. Emit one instruction for the threshold and another for the beyond-threshold procedure. Each instruction must be answerable by one focused search question and target one existing chunk.
 
 2. CRITICAL — only treat an instruction as adding a brand-new article/provision if the text EXPLICITLY says so (e.g. "... eklenmiştir", "yeni bir madde olarak", "MADDE N eklenmiştir"). If the text is merely amending, replacing, or clarifying an existing article, it is NOT a new article — leave `article_reference` pointing at the existing article being changed. Never infer a new-article addition from ambiguous or silent phrasing.
 
@@ -27,7 +31,11 @@ You will be given a pasted amendment/update text. Your job:
 
 5. For each instruction, fill `raw_date_phrase` with the natural-language effective-date phrase verbatim (e.g. "yayımı tarihinden itibaren yürürlüğe girer", "1 Ocak 2027 tarihinde yürürlüğe girer") if any; otherwise null.
 
-6. Fill `reference_date` with the text's own official publication/signing date (YYYY-MM-DD), if stated — this will be used as the anchor for resolving relative date phrases (e.g. "yayımı tarihinden itibaren"). Leave null if not stated.
+6. For each instruction, write `search_query` as ONE concise question that asks for the currently indexed rule being changed. Use the likely language of the existing source (Turkish for Turkish regulations), retain the legal mechanism and subject nouns, and do not combine independent issues. The query should search for the old rule, not merely repeat phrases such as "updated" or "amended".
+
+7. For each instruction, write `recovery_query` as ONE short alternate lexical query using the source/mechanism anchors and the most discriminative nouns. It must target the same rule as `search_query`, not broaden to another issue.
+
+8. Fill `reference_date` with the text's own official publication/signing date (YYYY-MM-DD), if stated — this will be used as the anchor for resolving relative date phrases (e.g. "yayımı tarihinden itibaren"). Leave null if not stated.
 
 Use ONLY information explicitly present in the given text. Never invent or assume anything not stated."""
 # ruff: noqa: E501 end
@@ -44,6 +52,17 @@ _SAME_SOURCE_RE = re.compile(
     r"\b(?:aynı|ayni)\s+(?:tebliğ|teblig|yönetmelik|yonetmelik|kanun|karar)",
     re.IGNORECASE,
 )
+
+
+class _RetrievalPlannedInstruction(AmendmentInstruction):
+    """Require retrieval lanes for newly generated segmentation checkpoints."""
+
+    search_query: str = Field(min_length=1, max_length=500)
+    recovery_query: str = Field(min_length=1, max_length=500)
+
+
+class _RetrievalPlannedSegmentationResult(SegmentationResult):
+    instructions: list[_RetrievalPlannedInstruction]
 
 
 def propagate_target_sources(
@@ -78,8 +97,14 @@ def segment_amendment_text(llm: LLM, raw_text: str) -> SegmentationResult:
         flow=LLMFlow.AMENDMENT_SEGMENTATION,
         system_prompt=_SYSTEM_PROMPT,
         user_prompt=raw_text,
-        response_model=SegmentationResult,
+        response_model=_RetrievalPlannedSegmentationResult,
     )
-    return result.model_copy(
-        update={"instructions": propagate_target_sources(result.instructions)}
+    return SegmentationResult(
+        reference_date=result.reference_date,
+        instructions=propagate_target_sources(
+            [
+                AmendmentInstruction.model_validate(item.model_dump())
+                for item in result.instructions
+            ]
+        ),
     )

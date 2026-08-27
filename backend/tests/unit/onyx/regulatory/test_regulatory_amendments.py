@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from onyx.db.regulatory_amendments import approve_amendment_proposal
-from onyx.db.regulatory_chunks import get_next_chunk_position
+from onyx.db.regulatory_chunks import get_active_chunks_by_ids, get_next_chunk_position
 from onyx.regulatory.amendments import candidate_finder, pipeline
 from onyx.regulatory.amendments.drafter import DraftResult
 from onyx.regulatory.amendments.models import (
@@ -30,6 +30,24 @@ def test_amendment_candidate_queries_exclude_hierarchical_aggregates() -> None:
         candidate_finder._STRUCTURED_SQL,
     ):
         assert "chunk_type IS DISTINCT FROM 'hierarchical_aggregate'" in str(statement)
+
+
+def test_exact_search_projection_ids_load_canonical_active_chunks() -> None:
+    row = SimpleNamespace(id="chunk-1")
+    scalars = MagicMock()
+    scalars.all.return_value = [row]
+    db_session = MagicMock(spec=Session)
+    db_session.scalars.return_value = scalars
+
+    chunks = get_active_chunks_by_ids(
+        db_session,
+        ["chunk-1", "chunk-1"],
+    )
+
+    assert chunks == {"chunk-1": row}
+    statement = str(db_session.scalars.call_args.args[0])
+    assert "regulatory_chunk.status" in statement
+    assert "IS DISTINCT FROM" in statement
 
 
 def test_candidate_lookup_keeps_large_dataset_out_of_llm_context() -> None:

@@ -2301,6 +2301,26 @@ def get_chunk_by_id(db_session: Session, chunk_id: str) -> RegulatoryChunk | Non
     return db_session.get(RegulatoryChunk, chunk_id)
 
 
+def get_active_chunks_by_ids(
+    db_session: Session, chunk_ids: Sequence[str]
+) -> dict[str, RegulatoryChunk]:
+    """Load canonical active source chunks for exact search projection ids."""
+
+    unique_chunk_ids = list(dict.fromkeys(chunk_ids))
+    if not unique_chunk_ids:
+        return {}
+    rows = db_session.scalars(
+        select(RegulatoryChunk).where(
+            RegulatoryChunk.id.in_(unique_chunk_ids),
+            RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value,
+            RegulatoryChunk.chunk_type.is_distinct_from(
+                HIERARCHICAL_AGGREGATE_CHUNK_VARIANT
+            ),
+        )
+    ).all()
+    return {row.id: row for row in rows}
+
+
 def is_hierarchical_aggregate_chunk(chunk: RegulatoryChunk) -> bool:
     return (
         chunk.chunk_type == HIERARCHICAL_AGGREGATE_CHUNK_VARIANT

@@ -15,12 +15,17 @@ from onyx.db.regulatory_amendments import (
     persist_unmatched_checkpoint,
 )
 from onyx.llm.factory import get_default_llm
-from onyx.regulatory.amendments.candidate_finder import find_candidates
-from onyx.regulatory.amendments.models import AmendmentInstruction
+from onyx.llm.interfaces import LLM
+from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
 from onyx.regulatory.amendments.pipeline import (
     confirm_instruction_match,
     draft_instruction_proposal,
     load_instruction_draft_context,
+)
+from onyx.regulatory.amendments.ranker import CandidateChunk
+from onyx.regulatory.amendments.search_retriever import (
+    AmendmentSearchRetriever,
+    build_amendment_search_retriever,
 )
 from onyx.regulatory.amendments.segmenter import (
     propagate_target_sources,
@@ -37,6 +42,49 @@ def _session() -> Generator[Session, None, None]:
         yield db_session
 
 
+def _merge_candidates(
+    initial: list[CandidateChunk], recovered: list[CandidateChunk]
+) -> list[CandidateChunk]:
+    merged: list[CandidateChunk] = []
+    seen_ids: set[str] = set()
+    for candidate in [*initial, *recovered]:
+        if candidate.chunk_id in seen_ids:
+            continue
+        seen_ids.add(candidate.chunk_id)
+        merged.append(candidate)
+    return merged
+
+
+def retrieve_and_confirm_instruction(
+    *,
+    retriever: AmendmentSearchRetriever,
+    llm: LLM,
+    instruction: AmendmentInstruction,
+) -> tuple[list[CandidateChunk], MatchResult | None]:
+    """Search, confirm, then make at most one focused recovery attempt."""
+
+    candidates = retriever.search(instruction=instruction, recovery=False)
+    if candidates:
+        match = confirm_instruction_match(
+            llm,
+            instruction=instruction,
+            candidates=candidates,
+        )
+        if match is not None:
+            return candidates, match
+
+    recovered = retriever.search(instruction=instruction, recovery=True)
+    if not recovered:
+        return candidates, None
+    candidates = _merge_candidates(candidates, recovered)
+    match = confirm_instruction_match(
+        llm,
+        instruction=instruction,
+        candidates=candidates,
+    )
+    return candidates, match
+
+
 def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
     llm = get_default_llm()
 
@@ -45,6 +93,8 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         if batch is None:
             raise RuntimeError(f"Amendment batch {batch_id} no longer exists")
         user_file_ids = [UUID(value) for value in batch.user_file_ids]
+        document_set_id = batch.document_set_id
+        created_by = batch.created_by
         raw_text = batch.raw_text
         start_index = batch.processed_instruction_count
         if batch.segmented_instructions:
@@ -57,6 +107,14 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         else:
             instruction_payloads = []
             reference_date = None
+
+        retriever = build_amendment_search_retriever(
+            db_session,
+            document_set_id=document_set_id,
+            created_by=created_by,
+            user_file_ids=user_file_ids,
+            llm=llm,
+        )
 
     if not instruction_payloads:
         # No database session is held while the provider performs segmentation.
@@ -83,18 +141,15 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             for payload in instruction_payloads
         ]
     )
-    source_scope_cache: dict[str, list[UUID]] = {}
     for instruction_index in range(start_index, len(instruction_payloads)):
         instruction = instructions[instruction_index]
-        with _session() as db_session:
-            candidates = find_candidates(
-                db_session,
-                user_file_ids=user_file_ids,
-                instruction=instruction,
-                source_scope_cache=source_scope_cache,
-            )
+        candidates, match = retrieve_and_confirm_instruction(
+            retriever=retriever,
+            llm=llm,
+            instruction=instruction,
+        )
 
-        if not candidates:
+        if match is None:
             with _session() as db_session:
                 persisted = persist_unmatched_checkpoint(
                     db_session,
@@ -104,14 +159,13 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     instruction_text=instruction.instruction_text,
                 )
         else:
-            # Match and drafting are provider calls; keep them outside database
-            # sessions so slow LLM responses cannot leave idle transactions.
-            match = confirm_instruction_match(
-                llm,
-                instruction=instruction,
-                candidates=candidates,
-            )
-            if match is None:
+            with _session() as db_session:
+                context = load_instruction_draft_context(
+                    db_session,
+                    candidates=candidates,
+                    match=match,
+                )
+            if context is None:
                 with _session() as db_session:
                     persisted = persist_unmatched_checkpoint(
                         db_session,
@@ -121,36 +175,20 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                         instruction_text=instruction.instruction_text,
                     )
             else:
+                proposal = draft_instruction_proposal(
+                    llm,
+                    instruction_index=instruction_index,
+                    instruction=instruction,
+                    reference_date=reference_date,
+                    context=context,
+                )
                 with _session() as db_session:
-                    context = load_instruction_draft_context(
+                    persisted = persist_proposal_checkpoint(
                         db_session,
-                        candidates=candidates,
-                        match=match,
+                        batch_id=batch_id,
+                        lease_generation=lease_generation,
+                        proposal=proposal,
                     )
-                if context is None:
-                    with _session() as db_session:
-                        persisted = persist_unmatched_checkpoint(
-                            db_session,
-                            batch_id=batch_id,
-                            lease_generation=lease_generation,
-                            instruction_index=instruction_index,
-                            instruction_text=instruction.instruction_text,
-                        )
-                else:
-                    proposal = draft_instruction_proposal(
-                        llm,
-                        instruction_index=instruction_index,
-                        instruction=instruction,
-                        reference_date=reference_date,
-                        context=context,
-                    )
-                    with _session() as db_session:
-                        persisted = persist_proposal_checkpoint(
-                            db_session,
-                            batch_id=batch_id,
-                            lease_generation=lease_generation,
-                            proposal=proposal,
-                        )
 
         if not persisted:
             raise RuntimeError(f"Amendment batch {batch_id} lost its lease")

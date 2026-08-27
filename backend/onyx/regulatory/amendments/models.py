@@ -55,6 +55,22 @@ class AmendmentInstruction(BaseModel):
         default=None,
         description="The natural-language effective-date phrase for this instruction, if any",
     )
+    search_query: str | None = Field(
+        default=None,
+        max_length=500,
+        description=(
+            "One focused question in the likely language of the indexed source "
+            "that retrieves the existing rule affected by this instruction"
+        ),
+    )
+    recovery_query: str | None = Field(
+        default=None,
+        max_length=500,
+        description=(
+            "One alternate, concise lexical query for a single bounded recovery "
+            "attempt if the first retrieval cannot be confirmed"
+        ),
+    )
 
 
 class SegmentationResult(BaseModel):
