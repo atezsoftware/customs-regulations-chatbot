@@ -14,6 +14,10 @@ from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
+from docx import Document
+from docx.opc.exceptions import OpcError
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from requests.utils import DEFAULT_CA_BUNDLE_PATH
 
 from onyx.configs.app_configs import (
@@ -24,11 +28,7 @@ from onyx.configs.app_configs import (
     MIN_AMENDMENT_PDF_TEXT_CHARS,
 )
 from onyx.file_processing.archive_expansion import COMPRESSION_RATIO_CHECK_MIN_BYTES
-from onyx.file_processing.extract_file_text import (
-    DocxExtractionError,
-    extract_file_text,
-    read_docx_file,
-)
+from onyx.file_processing.extract_file_text import extract_file_text
 from onyx.utils.url import ssrf_safe_get
 from onyx.utils.web_content import (
     decode_html_bytes,
@@ -41,6 +41,7 @@ _DOWNLOAD_CHUNK_SIZE = 64 * 1024
 _URL_TIMEOUT_SECONDS = (5, 20)
 _MAX_AMENDMENT_DOCX_EXPANDED_BYTES = 50 * 1024 * 1024
 _MAX_AMENDMENT_DOCX_XML_BYTES = 10 * 1024 * 1024
+_DOCX_HEADING_STYLE_PATTERN = re.compile(r"Heading ([1-9])")
 _NON_CONTENT_TAGS = ("script", "style", "template", "noscript", "nav", "footer")
 _AMENDMENT_SOURCE_HEADERS = {
     "User-Agent": (
@@ -145,6 +146,47 @@ def extract_amendment_pdf(content: bytes, file_name: str) -> str:
     return _normalize_text(extracted_text)
 
 
+def _docx_paragraph_text(paragraph: Paragraph) -> str:
+    text = paragraph.text.strip()
+    if not text:
+        return ""
+
+    style_name = paragraph.style.name if paragraph.style is not None else ""
+    heading_match = _DOCX_HEADING_STYLE_PATTERN.fullmatch(style_name)
+    if heading_match is None:
+        return text
+
+    heading_level = int(heading_match.group(1))
+    return f"{'#' * heading_level} {text}"
+
+
+def _docx_table_rows(table: Table) -> list[str]:
+    rows: list[str] = []
+    for row in table.rows:
+        cells = [re.sub(r"\s*\n\s*", " ", cell.text).strip() for cell in row.cells]
+        if any(cells):
+            rows.append(" | ".join(cells))
+    return rows
+
+
+def _extract_docx_text(content: bytes) -> str:
+    try:
+        document = Document(io.BytesIO(content))
+    except (KeyError, OpcError, SyntaxError, ValueError, zipfile.BadZipFile) as exc:
+        raise AmendmentSourceExtractionError(
+            "The uploaded Word .docx document could not be read."
+        ) from exc
+
+    sections: list[str] = []
+    for block in document.iter_inner_content():
+        if isinstance(block, Paragraph):
+            if paragraph_text := _docx_paragraph_text(block):
+                sections.append(paragraph_text)
+        elif isinstance(block, Table):
+            sections.extend(_docx_table_rows(block))
+    return "\n\n".join(sections)
+
+
 def extract_amendment_docx(content: bytes, file_name: str) -> str:
     """Extract normalized text from a Word Open XML document."""
     if len(content) > MAX_AMENDMENT_SOURCE_BYTES:
@@ -197,15 +239,7 @@ def extract_amendment_docx(content: bytes, file_name: str) -> str:
             "The uploaded file is not a valid Word .docx document."
         )
 
-    try:
-        extracted_text = read_docx_file(
-            io.BytesIO(content), file_name, allow_text_fallback=False
-        )[0]
-    except DocxExtractionError as exc:
-        raise AmendmentSourceExtractionError(
-            "The uploaded Word .docx document could not be read."
-        ) from exc
-    return _normalize_text(extracted_text)
+    return _normalize_text(_extract_docx_text(content))
 
 
 def _read_response_content(response: requests.Response) -> bytes:

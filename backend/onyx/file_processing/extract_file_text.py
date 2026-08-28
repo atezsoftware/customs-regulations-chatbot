@@ -57,10 +57,6 @@ KNOWN_OPENPYXL_BUGS = [
 ]
 
 
-class DocxExtractionError(ValueError):
-    """A file declared as DOCX could not be parsed as a Word document."""
-
-
 def get_markitdown_converter() -> "MarkItDown":
     global _MARKITDOWN_CONVERTER
 
@@ -494,7 +490,6 @@ def read_docx_file(
     file_name: str = "",
     extract_images: bool = False,
     image_callback: Callable[[bytes, str], None] | None = None,
-    allow_text_fallback: bool = True,
 ) -> tuple[str, Sequence[tuple[bytes, str]]]:
     """
     Extract text from a docx.
@@ -521,10 +516,6 @@ def read_docx_file(
         FileConversionException,
         UnsupportedFormatException,
     ) as e:
-        if not allow_text_fallback:
-            raise DocxExtractionError(
-                f"Failed to parse {file_name or 'docx file'} as a Word document."
-            ) from e
         logger.warning(
             "Failed to extract docx %s: %s. Attempting to read as text file.",
             file_name or "docx file",

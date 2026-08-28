@@ -61,6 +61,46 @@ import onyx.regulatory.amendments.source_extraction
     assert result.returncode == 0, result.stderr
 
 
+def test_extract_amendment_docx_does_not_require_markitdown() -> None:
+    script = """
+import builtins
+import io
+import sys
+
+sys.path.insert(0, "backend")
+
+from docx import Document
+
+document_bytes = io.BytesIO()
+document = Document()
+document.add_paragraph("MADDE 1- Runtime metni.")
+document.save(document_bytes)
+
+original_import = builtins.__import__
+
+def block_markitdown(name, *args, **kwargs):
+    if name == "markitdown" or name.startswith("markitdown."):
+        raise ModuleNotFoundError("No module named 'markitdown'")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = block_markitdown
+
+from onyx.regulatory.amendments.source_extraction import extract_amendment_docx
+
+result = extract_amendment_docx(document_bytes.getvalue(), "runtime.docx")
+assert result == "MADDE 1- Runtime metni.", result
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_extract_amendment_html_removes_page_chrome() -> None:
     result = extract_amendment_html(
         b"<html><nav>Menu</nav><main><h1>TEBLIG</h1><p>MADDE 1- Yeni metin.</p></main><script>bad()</script></html>",
@@ -106,6 +146,24 @@ def test_extract_amendment_docx_returns_normalized_text() -> None:
     assert result == (
         "# ÜCRETLİ KARAYOLLARI\n\nMADDE 1- Geçiş ücretleri tahsil edilir."
     )
+
+
+def test_extract_amendment_docx_includes_table_text() -> None:
+    document_bytes = BytesIO()
+    document = Document()
+    document.add_paragraph("Ücret tarifesi")
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Araç sınıfı"
+    table.cell(0, 1).text = "Ücret"
+    table.cell(1, 0).text = "1. sınıf"
+    table.cell(1, 1).text = "100 TL"
+    document.save(document_bytes)
+
+    result = source_extraction.extract_amendment_docx(
+        document_bytes.getvalue(), "tarife.docx"
+    )
+
+    assert result == ("Ücret tarifesi\n\nAraç sınıfı | Ücret\n\n1. sınıf | 100 TL")
 
 
 def test_extract_amendment_docx_rejects_non_docx_filename() -> None:
