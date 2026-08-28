@@ -1031,6 +1031,19 @@ def _build_scope_note(
     )
 
 
+def _resolve_regulatory_as_of_date(
+    filters: BaseFilters | None,
+) -> BaseFilters | None:
+    """Bound undated regulatory searches to the versions effective today."""
+    if (
+        filters is None
+        or not filters.regulatory_chunks_only
+        or filters.as_of_date is not None
+    ):
+        return filters
+    return filters.model_copy(update={"as_of_date": date.today()})
+
+
 def deduplicate_queries(
     queries_with_weights: list[tuple[str, float]],
 ) -> list[tuple[str, float]]:
@@ -2021,6 +2034,8 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 time_filter.start.isoformat() if time_filter.start else "any",
                 time_filter.end.isoformat() if time_filter.end else "any",
             )
+
+        effective_filters = _resolve_regulatory_as_of_date(effective_filters)
 
         focused_regulatory_search = bool(
             effective_filters

@@ -1,3 +1,4 @@
+from datetime import date
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
@@ -161,6 +162,7 @@ def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_row
                 "user_file_id": "00000000-0000-0000-0000-000000000123",
                 "position": 3,
                 "text": "Yeni metin",
+                "effective_start_date": "2026-08-15",
             },
         ),
     )
@@ -172,6 +174,7 @@ def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_row
             "user_file_id": "00000000-0000-0000-0000-000000000123",
             "position": 3,
             "text": "Yeni metin",
+            "effective_start_date": "2026-08-15",
         },
     )
     old_chunk = SimpleNamespace(
@@ -191,6 +194,10 @@ def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_row
 
     assert result.proposal is locked_proposal
     assert old_chunk.status == "superseded"
+    assert old_chunk.validity_end_date == date(2026, 8, 15)
+    assert result.new_chunk.validity_start_date == date(2026, 8, 15)
+    assert result.new_chunk.supersedes_chunk_id == "old-chunk"
+    assert old_chunk.superseded_by_chunk_id == result.new_chunk.id
     lock_queries = [str(call.args[0]) for call in db_session.scalar.call_args_list]
     assert len(lock_queries) == 2
     assert all("FOR UPDATE" in query for query in lock_queries)

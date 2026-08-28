@@ -1,10 +1,12 @@
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 
 from onyx.db.enums import AmendmentBatchStatus
+from onyx.db.models import User
 from onyx.error_handling.exceptions import OnyxError
 from onyx.server.features.regulatory import api
 from onyx.server.features.regulatory.models import AnalyzeAmendmentRequest
@@ -16,7 +18,7 @@ def test_analyze_queues_batch_without_invoking_llm() -> None:
         id=7,
         user_files=[SimpleNamespace(id=user_file_id)],
     )
-    user = SimpleNamespace(id=uuid4())
+    user = cast(User, SimpleNamespace(id=uuid4()))
     batch = SimpleNamespace(
         id=42,
         document_set_id=7,
@@ -72,7 +74,7 @@ def test_proposal_cannot_be_approved_before_batch_finishes() -> None:
         document_set_id=7,
         status=AmendmentBatchStatus.ANALYZING.value,
     )
-    user = SimpleNamespace(id=uuid4())
+    user = cast(User, SimpleNamespace(id=uuid4()))
 
     with (
         patch.object(api, "get_proposal", return_value=proposal),
@@ -84,3 +86,43 @@ def test_proposal_cannot_be_approved_before_batch_finishes() -> None:
         api.approve_proposal(9, user=user, db_session=MagicMock())
 
     approve.assert_not_called()
+
+
+def test_approval_projects_only_the_affected_user_file_before_commit() -> None:
+    user_file_id = uuid4()
+    proposal = SimpleNamespace(batch_id=42)
+    batch = SimpleNamespace(
+        id=42,
+        document_set_id=7,
+        status=AmendmentBatchStatus.ANALYZED.value,
+    )
+    user = cast(User, SimpleNamespace(id=uuid4()))
+    affected_user_file = SimpleNamespace(id=user_file_id)
+    approval_result = SimpleNamespace(
+        new_chunk=SimpleNamespace(user_file_id=user_file_id)
+    )
+    snapshot = MagicMock()
+    db_session = MagicMock()
+    db_session.get.return_value = affected_user_file
+    events: list[str] = []
+    db_session.commit.side_effect = lambda: events.append("commit")
+
+    with (
+        patch.object(api, "get_proposal", return_value=proposal),
+        patch.object(api, "get_batch", return_value=batch),
+        patch.object(api, "_get_editable_document_set"),
+        patch.object(api, "approve_amendment_proposal", return_value=approval_result),
+        patch.object(api, "project_user_file_to_index") as project_file,
+        patch.object(api, "get_current_tenant_id", return_value="tenant-a"),
+        patch.object(
+            api.AmendmentProposalSnapshot, "from_model", return_value=snapshot
+        ),
+    ):
+        project_file.side_effect = lambda *_args: events.append("project")
+        result = api.approve_proposal(9, user=user, db_session=db_session)
+
+    assert result is snapshot
+    db_session.get.assert_called_once_with(api.UserFile, user_file_id)
+    project_file.assert_called_once_with(db_session, affected_user_file, "tenant-a")
+    db_session.commit.assert_called_once_with()
+    assert events == ["project", "commit"]

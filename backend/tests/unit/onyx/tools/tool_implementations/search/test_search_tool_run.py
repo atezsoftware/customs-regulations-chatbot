@@ -1793,7 +1793,7 @@ def test_filter_decision_uses_full_history_and_all_parallel_queries() -> None:
 def test_parallel_fork_preserves_explicit_regulatory_as_of_date() -> None:
     as_of_date = date(2024, 7, 1)
     tool = _make_tool(
-        BaseFilters(as_of_date=as_of_date),
+        BaseFilters(regulatory_chunks_only=True, as_of_date=as_of_date),
         auto_detect_filters=False,
     ).fork_for_parallel_calls(2)[0]
 
@@ -1806,6 +1806,37 @@ def test_parallel_fork_preserves_explicit_regulatory_as_of_date() -> None:
     assert filters
     assert all(applied is not None for applied in filters)
     assert all(applied.as_of_date == as_of_date for applied in filters if applied)
+
+
+def test_regulatory_search_without_date_uses_today_for_candidate_filters() -> None:
+    tool = _make_tool(
+        BaseFilters(regulatory_chunks_only=True),
+        auto_detect_filters=False,
+    )
+
+    mock_search_pipeline = _run(
+        tool,
+        connected_sources=[DocumentSource.USER_FILE],
+    )
+
+    filters = _filters_passed_to_search(mock_search_pipeline)
+    assert filters
+    assert all(applied is not None for applied in filters)
+    assert all(applied.as_of_date == date.today() for applied in filters if applied)
+
+
+def test_non_regulatory_search_without_date_stays_temporally_unbounded() -> None:
+    tool = _make_tool(BaseFilters(), auto_detect_filters=False)
+
+    mock_search_pipeline = _run(
+        tool,
+        connected_sources=[DocumentSource.USER_FILE],
+    )
+
+    filters = _filters_passed_to_search(mock_search_pipeline)
+    assert filters
+    assert all(applied is not None for applied in filters)
+    assert all(applied.as_of_date is None for applied in filters if applied)
 
 
 def test_filter_delta_emitted_for_a_subset_scope() -> None:
