@@ -52,23 +52,31 @@ function analysisProgressLabel(batch: AmendmentBatch) {
   return "Analysis queued…";
 }
 
-function ChunkPreview({
+const emptyCurrentChunkSnapshot: Record<string, unknown> = {
+  id: null,
+  user_file_id: null,
+  position: null,
+  text: null,
+  chunk_type: null,
+  heading_path: [],
+  metadata: {},
+  validity_start_date: null,
+  validity_end_date: null,
+  status: null,
+  source: null,
+  supersedes_chunk_id: null,
+  superseded_by_chunk_id: null,
+  created_at: null,
+  updated_at: null,
+};
+
+function CurrentChunkJson({
   title,
   chunk,
-  validityStart,
-  validityEnd,
 }: {
   title: string;
   chunk: Record<string, unknown> | null;
-  validityStart?: string | null;
-  validityEnd?: string | null;
 }) {
-  const text = chunk ? String(chunk.text ?? "") : null;
-  const headingPath = chunk?.heading_path;
-  const headingPathText = Array.isArray(headingPath)
-    ? headingPath.join(" > ")
-    : "";
-
   return (
     <div className="flex-1 rounded-lg border border-border-02 p-3 flex flex-col gap-2 min-w-0">
       <Text font="main-ui-action" color="text-04">
@@ -79,24 +87,31 @@ function ChunkPreview({
           (new — no existing chunk)
         </Text>
       ) : (
-        <>
-          {headingPathText && (
-            <Text font="secondary-body" color="text-03">
-              {headingPathText}
-            </Text>
-          )}
-          <Text font="main-ui-body" color="text-05" as="p">
-            {text ?? ""}
-          </Text>
-          {(validityStart || validityEnd) && (
-            <Text font="secondary-body" color="text-03">
-              {`Validity: ${validityStart ?? "—"} → ${validityEnd ?? "open"}`}
-            </Text>
-          )}
-        </>
+        <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words font-mono text-sm text-text-05">
+          {JSON.stringify(chunk, null, 2)}
+        </pre>
       )}
     </div>
   );
+}
+
+function parseDraftJson(value: string): {
+  draft: Record<string, unknown> | null;
+  error: string | null;
+} {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      parsed === null ||
+      Array.isArray(parsed) ||
+      typeof parsed !== "object"
+    ) {
+      return { draft: null, error: "Proposed chunk must be a JSON object." };
+    }
+    return { draft: parsed as Record<string, unknown>, error: null };
+  } catch {
+    return { draft: null, error: "Proposed chunk JSON is invalid." };
+  }
 }
 
 function ProposalCard({
@@ -109,11 +124,22 @@ function ProposalCard({
   reviewEnabled: boolean;
 }) {
   const [deciding, setDeciding] = useState(false);
+  const [draftJson, setDraftJson] = useState(() =>
+    JSON.stringify(proposal.new_chunk_draft, null, 2)
+  );
+  const parsedDraft = useMemo(() => parseDraftJson(draftJson), [draftJson]);
+
+  useEffect(() => {
+    if (proposal.status !== "pending") {
+      setDraftJson(JSON.stringify(proposal.new_chunk_draft, null, 2));
+    }
+  }, [proposal.status, proposal.updated_at, proposal.new_chunk_draft]);
 
   const handleApprove = useCallback(async () => {
+    if (parsedDraft.draft === null) return;
     setDeciding(true);
     try {
-      await approveProposal(proposal.id);
+      await approveProposal(proposal.id, parsedDraft.draft);
       toast.success("Proposal approved and indexed.");
       onDecided();
     } catch (e) {
@@ -121,7 +147,7 @@ function ProposalCard({
     } finally {
       setDeciding(false);
     }
-  }, [proposal.id, onDecided]);
+  }, [proposal.id, parsedDraft.draft, onDecided]);
 
   const handleReject = useCallback(async () => {
     setDeciding(true);
@@ -137,8 +163,11 @@ function ProposalCard({
   }, [proposal.id, onDecided]);
 
   const isNewChunk = Object.keys(proposal.old_chunk_snapshot).length === 0;
-  const newDraft = proposal.new_chunk_draft;
   const isConsolidated = proposal.instruction_texts.length > 1;
+  const effectiveStart = parsedDraft.draft?.effective_start_date;
+  const currentChunk = isNewChunk
+    ? null
+    : { ...emptyCurrentChunkSnapshot, ...proposal.old_chunk_snapshot };
 
   return (
     <div
@@ -187,22 +216,45 @@ function ProposalCard({
         </Text>
       )}
 
-      <div className="flex gap-3">
-        <ChunkPreview
-          title="Current"
-          chunk={isNewChunk ? null : proposal.old_chunk_snapshot}
-        />
-        <ChunkPreview
-          title="Proposed"
-          chunk={newDraft}
-          validityStart={newDraft.effective_start_date as string | undefined}
-          validityEnd={newDraft.effective_end_date as string | undefined}
-        />
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+        <CurrentChunkJson title="Current" chunk={currentChunk} />
+        <div className="flex min-w-0 flex-1 flex-col gap-2 rounded-lg border border-border-02 p-3">
+          <Text font="main-ui-action" color="text-04">
+            Proposed
+          </Text>
+          <InputTextArea
+            aria-label="Proposed chunk JSON"
+            value={draftJson}
+            onChange={(event) => setDraftJson(event.target.value)}
+            variant={proposal.status === "pending" ? "primary" : "readOnly"}
+            rows={18}
+            maxRows={28}
+            autoResize
+          />
+          <Text font="secondary-body" color="text-03">
+            user_file_id and position identify the target and cannot be changed.
+          </Text>
+          {parsedDraft.error && (
+            <Text font="secondary-body" color="text-05">
+              {parsedDraft.error}
+            </Text>
+          )}
+        </div>
       </div>
+
+      {!isNewChunk && (
+        <Text font="secondary-body" color="text-03">
+          {`On approval, the current chunk closes at ${
+            typeof effectiveStart === "string" && effectiveStart
+              ? effectiveStart
+              : "the approval date (effective_start_date is null)"
+          }. A null effective_end_date means the proposed replacement — including a (Mülga) marker — remains effective indefinitely.`}
+        </Text>
+      )}
 
       {proposal.date_rationale && (
         <Text font="secondary-body" color="text-03">
-          {`Dates: ${proposal.date_rationale}`}
+          {`Original date analysis: ${proposal.date_rationale}`}
         </Text>
       )}
 
@@ -218,7 +270,7 @@ function ProposalCard({
           </Button>
           <Button
             onClick={() => void handleApprove()}
-            disabled={deciding || !reviewEnabled}
+            disabled={deciding || !reviewEnabled || parsedDraft.draft === null}
           >
             Approve
           </Button>

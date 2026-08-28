@@ -7,8 +7,9 @@ parsing.
 
 from datetime import date
 from typing import Any
+from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _require_iso_date_or_none(value: str | None) -> str | None:
@@ -159,6 +160,43 @@ class DateResolution(BaseModel):
     _validate_dates = field_validator("effective_start_date", "effective_end_date")(
         _require_iso_date_or_none
     )
+
+
+class ReviewedAmendmentChunkDraft(BaseModel):
+    """Admin-reviewed replacement chunk accepted by the approval boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_file_id: UUID
+    position: int = Field(ge=0, strict=True)
+    text: str = Field(min_length=1)
+    chunk_type: str | None = None
+    heading_path: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    effective_start_date: str | None = None
+    effective_end_date: str | None = None
+
+    _validate_dates = field_validator("effective_start_date", "effective_end_date")(
+        _require_iso_date_or_none
+    )
+
+    @field_validator("text")
+    @classmethod
+    def _require_non_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Replacement chunk text cannot be blank")
+        return value
+
+    @model_validator(mode="after")
+    def _require_non_empty_validity_window(self) -> "ReviewedAmendmentChunkDraft":
+        if (
+            self.effective_start_date is not None
+            and self.effective_end_date is not None
+            and date.fromisoformat(self.effective_end_date)
+            <= date.fromisoformat(self.effective_start_date)
+        ):
+            raise ValueError("effective_end_date must be after effective_start_date")
+        return self
 
 
 class DraftResult(BaseModel):

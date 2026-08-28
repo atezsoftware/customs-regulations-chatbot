@@ -194,11 +194,16 @@ export async function listAmendmentProposals(
 }
 
 export async function approveProposal(
-  proposalId: number
+  proposalId: number,
+  newChunkDraft: Record<string, unknown>
 ): Promise<AmendmentProposal> {
   const response = await fetch(
     `/api/regulatory/amendments/proposals/${proposalId}/approve`,
-    { method: "POST" }
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_chunk_draft: newChunkDraft }),
+    }
   );
   if (!response.ok) {
     const body = await response.json().catch(() => null);

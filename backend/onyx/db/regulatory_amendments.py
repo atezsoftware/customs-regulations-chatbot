@@ -8,6 +8,7 @@ amendment-sourced row into `regulatory_chunk` — everything upstream
 
 import datetime
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import and_, case, func, or_, select
@@ -30,7 +31,7 @@ from onyx.db.regulatory_chunks import (
     is_hierarchical_aggregate_chunk,
     make_regulatory_chunk_id,
 )
-from onyx.regulatory.amendments.models import ProposalDraft
+from onyx.regulatory.amendments.models import ProposalDraft, ReviewedAmendmentChunkDraft
 from onyx.regulatory.chunker import ATOMIC_CHUNK_VARIANT
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
@@ -546,11 +547,74 @@ class ApprovalResult:
         self.old_chunk = old_chunk
 
 
+def _validated_reviewed_chunk_draft(
+    stored_draft: dict[str, Any],
+    reviewed_draft: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        stored = ReviewedAmendmentChunkDraft.model_validate(stored_draft)
+        reviewed = ReviewedAmendmentChunkDraft.model_validate(reviewed_draft)
+    except ValueError as error:
+        raise ValueError(f"Invalid reviewed chunk draft: {error}") from error
+
+    if reviewed.user_file_id != stored.user_file_id:
+        raise ValueError("Reviewed chunk draft cannot change user_file_id")
+    if reviewed.position != stored.position:
+        raise ValueError("Reviewed chunk draft cannot change position")
+    return reviewed.model_dump(mode="json")
+
+
+def _review_snapshot_value(chunk: RegulatoryChunk, key: str) -> Any:
+    """Return the live value for one field persisted in a review snapshot."""
+    if key == "user_file_id":
+        return str(chunk.user_file_id)
+    if key == "metadata":
+        return dict(chunk.chunk_metadata)
+    if key == "heading_path":
+        return list(chunk.heading_path)
+    if key in {"validity_start_date", "validity_end_date"}:
+        value = getattr(chunk, key)
+        return value.isoformat() if value is not None else None
+    if key in {"created_at", "updated_at"}:
+        return getattr(chunk, key).isoformat()
+    return getattr(chunk, key)
+
+
+def _ensure_old_chunk_matches_review_snapshot(
+    chunk: RegulatoryChunk,
+    snapshot: dict[str, Any],
+) -> None:
+    supported_keys = {
+        "id",
+        "user_file_id",
+        "position",
+        "text",
+        "chunk_type",
+        "heading_path",
+        "metadata",
+        "validity_start_date",
+        "validity_end_date",
+        "status",
+        "source",
+        "supersedes_chunk_id",
+        "superseded_by_chunk_id",
+        "created_at",
+        "updated_at",
+    }
+    for key in snapshot.keys() & supported_keys:
+        if snapshot[key] != _review_snapshot_value(chunk, key):
+            raise ValueError(
+                f"Old chunk {chunk.id} changed after analysis; "
+                "refresh or reanalyze before approval."
+            )
+
+
 def approve_amendment_proposal(
     db_session: Session,
     proposal: AmendmentProposal,
     *,
     decided_by: UUID | None,
+    reviewed_new_chunk_draft: dict[str, Any] | None = None,
 ) -> ApprovalResult:
     """Apply one pending proposal:
 
@@ -595,6 +659,11 @@ def approve_amendment_proposal(
         )
 
     draft = proposal.new_chunk_draft
+    if reviewed_new_chunk_draft is not None:
+        draft = _validated_reviewed_chunk_draft(
+            proposal.new_chunk_draft,
+            reviewed_new_chunk_draft,
+        )
     user_file_id = UUID(draft["user_file_id"])
     today = datetime.date.today()
     start_date_str = draft.get("effective_start_date")
@@ -603,6 +672,8 @@ def approve_amendment_proposal(
         datetime.date.fromisoformat(start_date_str) if start_date_str else today
     )
     end_date = datetime.date.fromisoformat(end_date_str) if end_date_str else None
+    if end_date is not None and end_date <= start_date:
+        raise ValueError("effective_end_date must be after effective_start_date")
 
     old_chunk: RegulatoryChunk | None = None
     if proposal.old_chunk_id:
@@ -623,6 +694,10 @@ def approve_amendment_proposal(
             )
         if is_hierarchical_aggregate_chunk(old_chunk):
             raise ValueError("Derived aggregate chunks cannot be amended directly.")
+        _ensure_old_chunk_matches_review_snapshot(
+            old_chunk,
+            getattr(proposal, "old_chunk_snapshot", None) or {},
+        )
 
     new_chunk_metadata = dict(draft.get("metadata") or {})
     new_chunk_metadata.setdefault("chunk_variant", ATOMIC_CHUNK_VARIANT)
@@ -660,6 +735,7 @@ def approve_amendment_proposal(
         old_chunk.superseded_by_chunk_id = new_chunk.id
         db_session.add(old_chunk)
 
+    proposal.new_chunk_draft = draft
     proposal.status = "approved"
     proposal.applied_new_chunk_id = new_chunk.id
     proposal.decided_by = decided_by

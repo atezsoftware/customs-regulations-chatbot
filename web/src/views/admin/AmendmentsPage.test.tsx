@@ -1,12 +1,20 @@
-import { act, render, screen, setupUser } from "@tests/setup/test-utils";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  setupUser,
+} from "@tests/setup/test-utils";
 
 import {
   analyzeAmendment,
+  approveProposal,
   extractAmendmentDocx,
   extractAmendmentPdf,
   extractAmendmentUrl,
   getAmendmentAnalysis,
   listAmendmentBatches,
+  listAmendmentProposals,
   retryAmendmentBatch,
 } from "@/lib/regulatory/amendments";
 import AmendmentsPage from "@/views/admin/AmendmentsPage";
@@ -55,6 +63,9 @@ const queuedBatch = {
 const mockedAnalyzeAmendment = analyzeAmendment as jest.MockedFunction<
   typeof analyzeAmendment
 >;
+const mockedApproveProposal = approveProposal as jest.MockedFunction<
+  typeof approveProposal
+>;
 const mockedGetAmendmentAnalysis = getAmendmentAnalysis as jest.MockedFunction<
   typeof getAmendmentAnalysis
 >;
@@ -71,6 +82,8 @@ const mockedExtractAmendmentPdf = extractAmendmentPdf as jest.MockedFunction<
 const mockedListAmendmentBatches = listAmendmentBatches as jest.MockedFunction<
   typeof listAmendmentBatches
 >;
+const mockedListAmendmentProposals =
+  listAmendmentProposals as jest.MockedFunction<typeof listAmendmentProposals>;
 const mockedRetryAmendmentBatch = retryAmendmentBatch as jest.MockedFunction<
   typeof retryAmendmentBatch
 >;
@@ -83,6 +96,8 @@ beforeEach(() => {
   mockDocumentSets = [{ id: 7, name: "Transit rules" }];
   mockedListAmendmentBatches.mockReset();
   mockedListAmendmentBatches.mockResolvedValue([]);
+  mockedListAmendmentProposals.mockReset();
+  mockedListAmendmentProposals.mockResolvedValue([]);
   mockedExtractAmendmentUrl.mockReset();
   mockedExtractAmendmentUrl.mockResolvedValue({
     text: "MADDE 1- Yeni metin.",
@@ -103,6 +118,8 @@ beforeEach(() => {
   });
   mockedAnalyzeAmendment.mockReset();
   mockedAnalyzeAmendment.mockResolvedValue(queuedBatch);
+  mockedApproveProposal.mockReset();
+  mockedApproveProposal.mockResolvedValue({} as never);
   mockedGetAmendmentAnalysis.mockReset();
   mockedGetAmendmentAnalysis.mockResolvedValue({
     batch: {
@@ -312,6 +329,96 @@ test("renders all grouped instructions on one proposal card", async () => {
   expect(
     screen.getAllByRole("article", { name: "Amendment proposal" })
   ).toHaveLength(1);
+});
+
+test("shows the complete current chunk and approves the edited proposed JSON", async () => {
+  const analyzedBatch = {
+    ...queuedBatch,
+    status: "analyzed" as const,
+    stage: "finalizing" as const,
+    instruction_count: 1,
+    processed_instruction_count: 1,
+  };
+  const proposedDraft = {
+    user_file_id: "00000000-0000-0000-0000-000000000123",
+    position: 15,
+    text: "MADDE 15 - (2) a)",
+    chunk_type: "article",
+    heading_path: ["TIR İşlemleri", "MADDE 15"],
+    metadata: { article_no: "15" },
+    effective_start_date: null,
+    effective_end_date: null,
+  };
+  mockedListAmendmentBatches.mockResolvedValue([analyzedBatch]);
+  mockedGetAmendmentAnalysis.mockResolvedValue({
+    batch: analyzedBatch,
+    proposals: [
+      {
+        id: 19,
+        batch_id: 42,
+        instruction_index: 0,
+        instruction_text: "(a) bendi yürürlükten kaldırılmıştır.",
+        instruction_indices: [0],
+        instruction_texts: ["(a) bendi yürürlükten kaldırılmıştır."],
+        old_chunk_id: "old-chunk",
+        old_chunk_snapshot: {
+          id: "old-chunk",
+          user_file_id: proposedDraft.user_file_id,
+          position: 15,
+          text: "MADDE 15 - (2) a)",
+          chunk_type: "article",
+          heading_path: proposedDraft.heading_path,
+          metadata: proposedDraft.metadata,
+          validity_start_date: "2010-12-31",
+          validity_end_date: null,
+          status: "active",
+          source: "indexed",
+          supersedes_chunk_id: null,
+          superseded_by_chunk_id: null,
+        },
+        new_chunk_draft: proposedDraft,
+        match_confidence: 0.99,
+        match_rationale: "Exact provision",
+        date_rationale: "Publication date was not provided.",
+        status: "pending" as const,
+        applied_new_chunk_id: null,
+        decided_by: null,
+        decided_at: null,
+        created_at: "2026-08-27T12:00:00Z",
+        updated_at: "2026-08-27T12:00:00Z",
+        duplicate_target: false,
+      },
+    ],
+    unmatched_instructions: [],
+  });
+
+  const user = setupUser();
+  render(<AmendmentsPage />);
+  act(() => {
+    screen.getByRole("combobox").focus();
+  });
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
+  );
+
+  expect(
+    await screen.findByText(/"validity_start_date": "2010-12-31"/)
+  ).toBeVisible();
+  const editor = screen.getByRole("textbox", { name: "Proposed chunk JSON" });
+  const reviewedDraft = {
+    ...proposedDraft,
+    text: "MADDE 15 - (2) a) (Mülga)",
+    effective_start_date: "2026-08-28",
+  };
+  fireEvent.change(editor, {
+    target: { value: JSON.stringify(reviewedDraft, null, 2) },
+  });
+  await user.click(screen.getByRole("button", { name: "Approve" }));
+
+  expect(mockedApproveProposal).toHaveBeenCalledWith(19, reviewedDraft);
 });
 
 test("retries a failed batch from its checkpoint", async () => {

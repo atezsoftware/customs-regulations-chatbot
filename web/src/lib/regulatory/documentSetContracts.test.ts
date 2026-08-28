@@ -1,5 +1,6 @@
 import {
   analyzeAmendment,
+  approveProposal,
   extractAmendmentPdf,
   extractAmendmentUrl,
   getAmendmentAnalysis,
@@ -80,6 +81,27 @@ describe("regulatory document set API contracts", () => {
       2,
       "/api/regulatory/amendments/batches/42/retry",
       { method: "POST" }
+    );
+  });
+
+  it("sends the reviewed chunk draft with approval", async () => {
+    const reviewedDraft = {
+      user_file_id: "00000000-0000-0000-0000-000000000123",
+      position: 15,
+      text: "MADDE 15 - (2) a) (Mülga)",
+      effective_start_date: "2026-08-28",
+      effective_end_date: null,
+    };
+
+    await approveProposal(19, reviewedDraft);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/regulatory/amendments/proposals/19/approve",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_chunk_draft: reviewedDraft }),
+      }
     );
   });
 

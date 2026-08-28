@@ -45,6 +45,22 @@ def _chunk_to_review_dict(chunk: RegulatoryChunk) -> dict[str, Any]:
         "chunk_type": chunk.chunk_type,
         "heading_path": list(chunk.heading_path),
         "metadata": dict(chunk.chunk_metadata),
+        "validity_start_date": (
+            chunk.validity_start_date.isoformat()
+            if chunk.validity_start_date is not None
+            else None
+        ),
+        "validity_end_date": (
+            chunk.validity_end_date.isoformat()
+            if chunk.validity_end_date is not None
+            else None
+        ),
+        "status": chunk.status,
+        "source": chunk.source,
+        "supersedes_chunk_id": chunk.supersedes_chunk_id,
+        "superseded_by_chunk_id": chunk.superseded_by_chunk_id,
+        "created_at": chunk.created_at.isoformat(),
+        "updated_at": chunk.updated_at.isoformat(),
     }
 
 

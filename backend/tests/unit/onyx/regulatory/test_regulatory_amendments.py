@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
@@ -7,7 +7,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy.orm import Session
 
-from onyx.db.models import AmendmentProposal
+from onyx.db.models import AmendmentProposal, RegulatoryChunk
 from onyx.db.regulatory_amendments import approve_amendment_proposal, reject_proposal
 from onyx.db.regulatory_chunks import get_active_chunks_by_ids, get_next_chunk_position
 from onyx.regulatory.amendments import candidate_finder, pipeline
@@ -17,6 +17,7 @@ from onyx.regulatory.amendments.models import (
     ChunkFieldsDraft,
     DateResolution,
     MatchResult,
+    ReviewedAmendmentChunkDraft,
     SegmentationResult,
 )
 from onyx.regulatory.amendments.new_provision_policy import (
@@ -33,6 +34,47 @@ def test_amendment_candidate_queries_exclude_hierarchical_aggregates() -> None:
         candidate_finder._STRUCTURED_SQL,
     ):
         assert "chunk_type IS DISTINCT FROM 'hierarchical_aggregate'" in str(statement)
+
+
+def test_review_snapshot_contains_the_complete_existing_chunk_state() -> None:
+    chunk = cast(
+        RegulatoryChunk,
+        SimpleNamespace(
+            id="old-chunk",
+            user_file_id=UUID("00000000-0000-0000-0000-000000000123"),
+            position=15,
+            text="MADDE 15 eski metin",
+            chunk_type="article",
+            heading_path=["TIR İşlemleri", "MADDE 15"],
+            chunk_metadata={"article_no": "15"},
+            validity_start_date=date(2010, 12, 31),
+            validity_end_date=None,
+            status="active",
+            source="indexed",
+            supersedes_chunk_id=None,
+            superseded_by_chunk_id=None,
+            created_at=datetime(2010, 12, 31, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 8, 28, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert pipeline._chunk_to_review_dict(chunk) == {
+        "id": "old-chunk",
+        "user_file_id": "00000000-0000-0000-0000-000000000123",
+        "position": 15,
+        "text": "MADDE 15 eski metin",
+        "chunk_type": "article",
+        "heading_path": ["TIR İşlemleri", "MADDE 15"],
+        "metadata": {"article_no": "15"},
+        "validity_start_date": "2010-12-31",
+        "validity_end_date": None,
+        "status": "active",
+        "source": "indexed",
+        "supersedes_chunk_id": None,
+        "superseded_by_chunk_id": None,
+        "created_at": "2010-12-31T00:00:00+00:00",
+        "updated_at": "2026-08-28T00:00:00+00:00",
+    }
 
 
 def test_exact_search_projection_ids_load_canonical_active_chunks() -> None:
@@ -205,6 +247,195 @@ def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_row
         call.args[0].get_execution_options()["populate_existing"] is True
         for call in db_session.scalar.call_args_list
     )
+
+
+def test_amendment_approval_applies_reviewed_draft_atomically() -> None:
+    stored_draft = {
+        "user_file_id": "00000000-0000-0000-0000-000000000123",
+        "position": 15,
+        "text": "MADDE 15 eski öneri",
+        "chunk_type": "article",
+        "heading_path": ["TIR İşlemleri", "MADDE 15"],
+        "metadata": {"article_no": "15"},
+        "effective_start_date": None,
+        "effective_end_date": None,
+    }
+    reviewed_draft = {
+        **stored_draft,
+        "text": "MADDE 15 - (2) a) (Mülga)",
+        "effective_start_date": "2026-08-28",
+    }
+    submitted_proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(id=46, status="pending", old_chunk_id="old-chunk"),
+    )
+    locked_proposal = SimpleNamespace(
+        id=46,
+        status="pending",
+        old_chunk_id="old-chunk",
+        old_chunk_snapshot={"id": "old-chunk"},
+        new_chunk_draft=stored_draft,
+    )
+    old_chunk = SimpleNamespace(
+        id="old-chunk",
+        status="active",
+        chunk_type="article",
+        chunk_metadata={"chunk_variant": "atomic"},
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.side_effect = [locked_proposal, old_chunk]
+
+    result = approve_amendment_proposal(
+        db_session,
+        submitted_proposal,
+        decided_by=None,
+        reviewed_new_chunk_draft=reviewed_draft,
+    )
+
+    assert locked_proposal.new_chunk_draft == reviewed_draft
+    assert result.new_chunk.text == "MADDE 15 - (2) a) (Mülga)"
+    assert result.new_chunk.validity_start_date == date(2026, 8, 28)
+    assert old_chunk.validity_end_date == date(2026, 8, 28)
+
+
+def test_amendment_approval_rejects_reviewed_draft_identity_changes() -> None:
+    stored_draft = {
+        "user_file_id": "00000000-0000-0000-0000-000000000123",
+        "position": 15,
+        "text": "MADDE 15 eski öneri",
+    }
+    reviewed_draft = {
+        **stored_draft,
+        "user_file_id": "00000000-0000-0000-0000-000000000999",
+    }
+    submitted_proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(id=47, status="pending", old_chunk_id="old-chunk"),
+    )
+    locked_proposal = SimpleNamespace(
+        id=47,
+        status="pending",
+        old_chunk_id="old-chunk",
+        old_chunk_snapshot={"id": "old-chunk"},
+        new_chunk_draft=stored_draft,
+    )
+    old_chunk = SimpleNamespace(
+        id="old-chunk",
+        status="active",
+        chunk_type="article",
+        chunk_metadata={"chunk_variant": "atomic"},
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.side_effect = [locked_proposal, old_chunk]
+
+    with pytest.raises(ValueError, match="cannot change user_file_id"):
+        approve_amendment_proposal(
+            db_session,
+            submitted_proposal,
+            decided_by=None,
+            reviewed_new_chunk_draft=reviewed_draft,
+        )
+
+    db_session.add.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "effective_end_date",
+    [
+        date.today().isoformat(),
+        (date.today() - timedelta(days=1)).isoformat(),
+    ],
+)
+def test_amendment_approval_rejects_end_on_or_before_approval_date_fallback(
+    effective_end_date: str,
+) -> None:
+    stored_draft = {
+        "user_file_id": "00000000-0000-0000-0000-000000000123",
+        "position": 15,
+        "text": "MADDE 15 eski öneri",
+    }
+    submitted_proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(id=48, status="pending", old_chunk_id="old-chunk"),
+    )
+    locked_proposal = SimpleNamespace(
+        id=48,
+        status="pending",
+        old_chunk_id="old-chunk",
+        old_chunk_snapshot={"id": "old-chunk", "text": "Eski metin"},
+        new_chunk_draft=stored_draft,
+    )
+    old_chunk = SimpleNamespace(
+        id="old-chunk",
+        text="Eski metin",
+        status="active",
+        chunk_type="article",
+        chunk_metadata={"chunk_variant": "atomic"},
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.side_effect = [locked_proposal, old_chunk]
+
+    with pytest.raises(ValueError, match="effective_end_date must be after"):
+        approve_amendment_proposal(
+            db_session,
+            submitted_proposal,
+            decided_by=None,
+            reviewed_new_chunk_draft={
+                **stored_draft,
+                "effective_start_date": None,
+                "effective_end_date": effective_end_date,
+            },
+        )
+
+    db_session.add.assert_not_called()
+
+
+def test_amendment_approval_rejects_old_chunk_changed_after_analysis() -> None:
+    stored_draft = {
+        "user_file_id": "00000000-0000-0000-0000-000000000123",
+        "position": 15,
+        "text": "Yeni metin",
+    }
+    submitted_proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(id=49, status="pending", old_chunk_id="old-chunk"),
+    )
+    locked_proposal = SimpleNamespace(
+        id=49,
+        status="pending",
+        old_chunk_id="old-chunk",
+        old_chunk_snapshot={"id": "old-chunk", "text": "İncelenen eski metin"},
+        new_chunk_draft=stored_draft,
+    )
+    changed_old_chunk = SimpleNamespace(
+        id="old-chunk",
+        text="Analizden sonra elle değiştirilmiş metin",
+        status="active",
+        chunk_type="article",
+        chunk_metadata={"chunk_variant": "atomic"},
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.side_effect = [locked_proposal, changed_old_chunk]
+
+    with pytest.raises(ValueError, match="changed after analysis"):
+        approve_amendment_proposal(
+            db_session,
+            submitted_proposal,
+            decided_by=None,
+        )
+
+    db_session.add.assert_not_called()
+
+
+def test_reviewed_draft_rejects_string_position() -> None:
+    with pytest.raises(ValueError):
+        ReviewedAmendmentChunkDraft.model_validate(
+            {
+                "user_file_id": "00000000-0000-0000-0000-000000000123",
+                "position": "15",
+                "text": "MADDE 15 yeni metin",
+            }
+        )
 
 
 def test_amendment_approval_rejects_target_deleted_after_analysis() -> None:

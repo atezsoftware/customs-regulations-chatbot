@@ -71,6 +71,7 @@ from onyx.server.features.regulatory.models import (
     AmendmentSourceUrlRequest,
     AnalyzeAmendmentRequest,
     AnalyzeAmendmentResponse,
+    ApproveAmendmentProposalRequest,
     RegulatoryChunkSnapshot,
     RegulatoryChunkUpdateRequest,
     RegulatoryFileValidityUpdateRequest,
@@ -579,6 +580,7 @@ def retry_amendment_analysis(
 @router.post("/amendments/proposals/{proposal_id}/approve", tags=PUBLIC_API_TAGS)
 def approve_proposal(
     proposal_id: int,
+    approval_request: ApproveAmendmentProposalRequest | None = None,
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> AmendmentProposalSnapshot:
@@ -595,7 +597,14 @@ def approve_proposal(
         )
 
     try:
-        result = approve_amendment_proposal(db_session, proposal, decided_by=user.id)
+        result = approve_amendment_proposal(
+            db_session,
+            proposal,
+            decided_by=user.id,
+            reviewed_new_chunk_draft=(
+                approval_request.new_chunk_draft if approval_request else None
+            ),
+        )
     except ValueError as e:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e)) from e
 

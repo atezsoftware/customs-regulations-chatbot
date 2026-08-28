@@ -9,7 +9,10 @@ from onyx.db.enums import AmendmentBatchStatus
 from onyx.db.models import User
 from onyx.error_handling.exceptions import OnyxError
 from onyx.server.features.regulatory import api
-from onyx.server.features.regulatory.models import AnalyzeAmendmentRequest
+from onyx.server.features.regulatory.models import (
+    AnalyzeAmendmentRequest,
+    ApproveAmendmentProposalRequest,
+)
 
 
 def test_analyze_queues_batch_without_invoking_llm() -> None:
@@ -106,12 +109,20 @@ def test_approval_projects_only_the_affected_user_file_before_commit() -> None:
     db_session.get.return_value = affected_user_file
     events: list[str] = []
     db_session.commit.side_effect = lambda: events.append("commit")
+    reviewed_draft = {
+        "user_file_id": str(user_file_id),
+        "position": 15,
+        "text": "MADDE 15 - (2) a) (Mülga)",
+    }
+    approval_request = ApproveAmendmentProposalRequest(new_chunk_draft=reviewed_draft)
 
     with (
         patch.object(api, "get_proposal", return_value=proposal),
         patch.object(api, "get_batch", return_value=batch),
         patch.object(api, "_get_editable_document_set"),
-        patch.object(api, "approve_amendment_proposal", return_value=approval_result),
+        patch.object(
+            api, "approve_amendment_proposal", return_value=approval_result
+        ) as approve_amendment,
         patch.object(api, "project_user_file_to_index") as project_file,
         patch.object(api, "get_current_tenant_id", return_value="tenant-a"),
         patch.object(
@@ -119,9 +130,20 @@ def test_approval_projects_only_the_affected_user_file_before_commit() -> None:
         ),
     ):
         project_file.side_effect = lambda *_args: events.append("project")
-        result = api.approve_proposal(9, user=user, db_session=db_session)
+        result = api.approve_proposal(
+            9,
+            approval_request=approval_request,
+            user=user,
+            db_session=db_session,
+        )
 
     assert result is snapshot
+    approve_amendment.assert_called_once_with(
+        db_session,
+        proposal,
+        decided_by=user.id,
+        reviewed_new_chunk_draft=reviewed_draft,
+    )
     db_session.get.assert_called_once_with(api.UserFile, user_file_id)
     project_file.assert_called_once_with(db_session, affected_user_file, "tenant-a")
     db_session.commit.assert_called_once_with()

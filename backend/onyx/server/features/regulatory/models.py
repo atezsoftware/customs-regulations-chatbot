@@ -88,6 +88,10 @@ class AnalyzeAmendmentRequest(BaseModel):
     raw_text: str = Field(min_length=1, max_length=MAX_AMENDMENT_SOURCE_TEXT_CHARS)
 
 
+class ApproveAmendmentProposalRequest(BaseModel):
+    new_chunk_draft: dict[str, Any]
+
+
 class AmendmentSourceUrlRequest(BaseModel):
     url: str = Field(min_length=1)
 
