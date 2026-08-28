@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
+from difflib import SequenceMatcher
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -16,7 +17,10 @@ from onyx.context.search.models import (
 )
 from onyx.db.document_set import get_document_set_by_id
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.regulatory_chunks import get_active_chunks_by_ids
+from onyx.db.regulatory_chunks import (
+    get_active_chunks_by_ids,
+    get_active_chunks_by_structural_reference,
+)
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.tools import get_tools
 from onyx.db.users import fetch_user_by_id
@@ -24,6 +28,11 @@ from onyx.document_index.factory import get_default_document_index
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.ranker import CandidateChunk
+from onyx.regulatory.amendments.structural_target import (
+    parse_amendment_structural_target,
+    source_identity_distinguishing_tokens,
+    source_identity_matches,
+)
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS, SEARCH_TOOL_ID
 from onyx.tools.models import ChatMinimalTextMessage, SearchToolOverrideKwargs
@@ -35,6 +44,7 @@ logger = setup_logger()
 _MAX_AMENDMENT_CANDIDATES = 8
 SearchToolFactory = Callable[[], SearchTool]
 CanonicalCandidateLoader = Callable[[Sequence[str]], Mapping[str, CandidateChunk]]
+StructuralCandidateLoader = Callable[[AmendmentInstruction], Sequence[CandidateChunk]]
 
 
 class AmendmentSearchRetriever:
@@ -45,10 +55,12 @@ class AmendmentSearchRetriever:
         *,
         search_tool_factory: SearchToolFactory,
         canonical_candidate_loader: CanonicalCandidateLoader,
+        structural_candidate_loader: StructuralCandidateLoader | None = None,
         allowed_user_file_ids: Sequence[UUID],
     ) -> None:
         self._search_tool_factory = search_tool_factory
         self._canonical_candidate_loader = canonical_candidate_loader
+        self._structural_candidate_loader = structural_candidate_loader
         self._allowed_user_file_ids = {
             str(user_file_id) for user_file_id in allowed_user_file_ids
         }
@@ -103,9 +115,9 @@ class AmendmentSearchRetriever:
                 "Amendment SearchTool retrieval returned no document response phase=%s",
                 "recovery" if recovery else "initial",
             )
-            return []
-
-        ranked_docs = rich_response.displayed_docs or rich_response.search_docs
+            ranked_docs: Sequence[SearchDoc] = []
+        else:
+            ranked_docs = rich_response.displayed_docs or rich_response.search_docs
         docs_by_chunk_id: dict[str, SearchDoc] = {}
         for search_doc in ranked_docs:
             raw_chunk_id = search_doc.metadata.get("regulatory_chunk_id")
@@ -120,6 +132,7 @@ class AmendmentSearchRetriever:
 
         canonical_candidates = self._canonical_candidate_loader(list(docs_by_chunk_id))
         candidates: list[CandidateChunk] = []
+        seen_candidate_ids: set[str] = set()
         for chunk_id, search_doc in docs_by_chunk_id.items():
             candidate = canonical_candidates.get(chunk_id)
             if (
@@ -130,8 +143,22 @@ class AmendmentSearchRetriever:
             candidates.append(
                 replace(candidate, source_name=search_doc.semantic_identifier)
             )
+            seen_candidate_ids.add(candidate.chunk_id)
             if len(candidates) == _MAX_AMENDMENT_CANDIDATES:
                 break
+
+        structural_source_tokens = source_identity_distinguishing_tokens(
+            instruction.target_source
+        )
+        if self._structural_candidate_loader is not None and structural_source_tokens:
+            for candidate in self._structural_candidate_loader(instruction):
+                if (
+                    candidate.chunk_id in seen_candidate_ids
+                    or candidate.user_file_id not in self._allowed_user_file_ids
+                ):
+                    continue
+                candidates.append(candidate)
+                seen_candidate_ids.add(candidate.chunk_id)
 
         logger.info(
             "Amendment SearchTool retrieval phase=%s returned=%s in_scope=%s",
@@ -221,8 +248,60 @@ def build_amendment_search_retriever(
                 for chunk_id, row in rows.items()
             }
 
+    def structural_candidate_loader(
+        instruction: AmendmentInstruction,
+    ) -> Sequence[CandidateChunk]:
+        target = parse_amendment_structural_target(instruction)
+        if target is None:
+            return []
+        with get_session_with_current_tenant() as structural_session:
+            matches = get_active_chunks_by_structural_reference(
+                structural_session,
+                user_file_ids=user_file_ids,
+                article_no=target.article_no,
+                clause_label=target.clause_label,
+                appendix_label=target.appendix_label,
+                source_name_hint=instruction.target_source,
+                source_name_tokens=source_identity_distinguishing_tokens(
+                    instruction.target_source
+                ),
+                limit=32 if target.appendix_label is not None else 8,
+            )
+            normalized_source = " ".join(
+                (instruction.target_source or "").casefold().split()
+            )
+            candidates = [
+                CandidateChunk(
+                    chunk_id=match.chunk.id,
+                    user_file_id=str(match.chunk.user_file_id),
+                    text=match.chunk.text,
+                    source_name=match.source_name,
+                    metadata={
+                        **match.chunk.chunk_metadata,
+                        "heading_path": list(match.chunk.heading_path),
+                    },
+                    structured_match=True,
+                    source_score=(
+                        SequenceMatcher(
+                            None,
+                            normalized_source,
+                            " ".join(match.source_name.casefold().split()),
+                        ).ratio()
+                        if normalized_source
+                        else 0.0
+                    ),
+                )
+                for match in matches
+                if source_identity_matches(instruction.target_source, match.source_name)
+            ]
+        return sorted(
+            candidates,
+            key=lambda candidate: (-candidate.source_score, candidate.chunk_id),
+        )
+
     return AmendmentSearchRetriever(
         search_tool_factory=search_tool_factory,
         canonical_candidate_loader=canonical_candidate_loader,
+        structural_candidate_loader=structural_candidate_loader,
         allowed_user_file_ids=user_file_ids,
     )

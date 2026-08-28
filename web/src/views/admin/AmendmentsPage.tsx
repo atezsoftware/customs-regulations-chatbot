@@ -654,17 +654,14 @@ export default function AmendmentsPage() {
                   {unmatched.length > 0 && (
                     <div className="rounded-lg border border-border-02 p-3">
                       <Text font="main-ui-action" color="text-04">
-                        Unmatched instructions
+                        Instructions requiring attention
                       </Text>
                       {unmatched.map((instr, i) => (
-                        <Text
-                          key={i}
-                          font="main-ui-body"
-                          color="text-03"
-                          as="p"
-                        >
-                          {instr}
-                        </Text>
+                        <div key={i} className="whitespace-pre-wrap">
+                          <Text font="main-ui-body" color="text-03" as="p">
+                            {instr}
+                          </Text>
+                        </div>
                       ))}
                     </div>
                   )}

@@ -143,3 +143,92 @@ def test_legacy_checkpoint_instruction_fallback_respects_search_query_limit() ->
     query = search_tool.run.call_args.kwargs["queries"][0]
     assert query == instruction.instruction_text[:REGULATORY_MAX_SEARCH_QUERY_CHARS]
     assert len(query) == REGULATORY_MAX_SEARCH_QUERY_CHARS
+
+
+def test_explicit_clause_candidate_is_kept_when_search_tool_omits_it() -> None:
+    search_result = _search_doc(file_id=None, chunk_id="article-3-intro")
+    search_tool = MagicMock()
+    search_tool.run.return_value = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[search_result],
+            displayed_docs=[search_result],
+            citation_mapping={},
+        ),
+        llm_facing_response="",
+    )
+    exact_clause = CandidateChunk(
+        chunk_id="article-3-clause-u",
+        user_file_id=str(_FILE_ID),
+        text="u) Son üç yıl içinde ...",
+        source_name="Gümrük Genel Tebliği (TIR İşlemleri) (Seri No: 1)",
+        metadata={"article_no": "3", "clause_label": "u"},
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: search_tool,
+        canonical_candidate_loader=lambda _chunk_ids: {
+            "article-3-intro": CandidateChunk(
+                chunk_id="article-3-intro",
+                user_file_id=str(_FILE_ID),
+                text="MADDE 3 – Bu Tebliğde geçen ...",
+            )
+        },
+        structural_candidate_loader=lambda _instruction: [exact_clause],
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "Gümrük Genel Tebliği (TIR İşlemleri) (Seri No: 1)’nin "
+            "3 üncü maddesinin birinci fıkrasının (u) bendinde yer alan "
+            "“iki” ibaresi “dört” şeklinde değiştirilmiştir."
+        ),
+        article_reference="Madde 3",
+        target_source="Gümrük Genel Tebliği (TIR İşlemleri) (Seri No: 1)",
+        search_query="TIR İşlemleri Tebliği Madde 3 birinci fıkra u bendi nedir?",
+        recovery_query="TIR İşlemleri Madde 3 bent u",
+    )
+
+    candidates = retriever.search(instruction)
+
+    assert [candidate.chunk_id for candidate in candidates] == [
+        "article-3-intro",
+        "article-3-clause-u",
+    ]
+
+
+def test_structural_expansion_is_disabled_without_distinguishing_source_identity() -> (
+    None
+):
+    search_tool = MagicMock()
+    search_tool.run.return_value = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[], citation_mapping={}, displayed_docs=None
+        ),
+        llm_facing_response="",
+    )
+    structural_loader = MagicMock(return_value=[_candidate_for_wrong_source()])
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: search_tool,
+        canonical_candidate_loader=lambda _chunk_ids: {},
+        structural_candidate_loader=structural_loader,
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    for target_source in (None, "Gümrük Genel Tebliği"):
+        instruction = AmendmentInstruction(
+            instruction_text="3 üncü maddesinin (u) bendi değiştirilmiştir.",
+            article_reference="Madde 3",
+            target_source=target_source,
+        )
+
+        assert retriever.search(instruction) == []
+    structural_loader.assert_not_called()
+
+
+def _candidate_for_wrong_source() -> CandidateChunk:
+    return CandidateChunk(
+        chunk_id="wrong-instrument-article-3-u",
+        user_file_id=str(_FILE_ID),
+        text="Another instrument's article 3 clause u.",
+        source_name="Unrelated instrument",
+        metadata={"article_no": "3", "clause_label": "u"},
+        structured_match=True,
+    )

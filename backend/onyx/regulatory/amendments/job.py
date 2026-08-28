@@ -33,6 +33,9 @@ from onyx.regulatory.amendments.segmenter import (
     propagate_target_sources,
     segment_amendment_text,
 )
+from onyx.regulatory.amendments.structural_target import (
+    appendix_replacement_attention_message,
+)
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -74,6 +77,8 @@ def retrieve_and_confirm_instruction(
     """Search, confirm, then make at most one focused recovery attempt."""
 
     candidates = retriever.search(instruction=instruction, recovery=False)
+    if appendix_replacement_attention_message(instruction, candidates) is not None:
+        return candidates, None
     if candidates:
         match = confirm_instruction_match(
             llm,
@@ -87,6 +92,8 @@ def retrieve_and_confirm_instruction(
     if not recovered:
         return candidates, None
     candidates = _merge_candidates(candidates, recovered)
+    if appendix_replacement_attention_message(instruction, candidates) is not None:
+        return candidates, None
     match = confirm_instruction_match(
         llm,
         instruction=instruction,
@@ -167,13 +174,17 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         )
 
         if match is None:
+            unresolved_text = (
+                appendix_replacement_attention_message(instruction, candidates)
+                or instruction.instruction_text
+            )
             with _session() as db_session:
                 persisted = persist_unmatched_checkpoint(
                     db_session,
                     batch_id=batch_id,
                     lease_generation=lease_generation,
                     instruction_index=instruction_index,
-                    instruction_text=instruction.instruction_text,
+                    instruction_text=unresolved_text,
                 )
             if not persisted:
                 raise RuntimeError(f"Amendment batch {batch_id} lost its lease")

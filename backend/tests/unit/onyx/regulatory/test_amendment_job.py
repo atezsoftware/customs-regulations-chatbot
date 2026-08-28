@@ -255,6 +255,79 @@ def test_match_rejection_gets_only_one_recovery_and_rechecks_merged_candidates(
     assert confirm.call_count == 2
 
 
+def test_appendix_without_replacement_body_never_reaches_matcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "Gümrük Genel Tebliği (TIR İşlemleri) (Seri No: 1)'nin "
+            "EK-4’ü ekteki şekilde değiştirilmiştir."
+        ),
+        recovery_query="TIR İşlemleri EK-4",
+    )
+    candidates = [
+        CandidateChunk(
+            chunk_id="ek-4-part-1",
+            user_file_id="00000000-0000-0000-0000-000000000123",
+            text="EK-4 first part",
+            metadata={"appendix_label": "EK-4"},
+        ),
+        CandidateChunk(
+            chunk_id="ek-4-part-2",
+            user_file_id="00000000-0000-0000-0000-000000000123",
+            text="EK-4 second part",
+            metadata={"appendix_label": "EK-4"},
+        ),
+    ]
+    retriever = MagicMock()
+    retriever.search.return_value = candidates
+    confirm = MagicMock()
+    monkeypatch.setattr(job, "confirm_instruction_match", confirm)
+
+    returned_candidates, match = job.retrieve_and_confirm_instruction(
+        retriever=retriever,
+        llm=MagicMock(),
+        instruction=instruction,
+    )
+
+    assert returned_candidates == candidates
+    assert match is None
+    assert retriever.search.call_count == 1
+    confirm.assert_not_called()
+
+
+def test_recovery_only_appendix_without_body_never_reaches_matcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="TIR İşlemleri Tebliği'nin EK-10’u ekteki şekilde değiştirilmiştir.",
+        target_source="Gümrük Genel Tebliği (TIR İşlemleri) (Seri No: 1)",
+        search_query="TIR İşlemleri EK-10",
+        recovery_query="TIR İşlemleri eki 10",
+    )
+    recovered = CandidateChunk(
+        chunk_id="ek-10-part-1",
+        user_file_id="00000000-0000-0000-0000-000000000123",
+        text="EK-10 content",
+        metadata={"appendix_label": "EK-10"},
+    )
+    retriever = MagicMock()
+    retriever.search.side_effect = [[], [recovered]]
+    confirm = MagicMock()
+    monkeypatch.setattr(job, "confirm_instruction_match", confirm)
+
+    candidates, match = job.retrieve_and_confirm_instruction(
+        retriever=retriever,
+        llm=MagicMock(),
+        instruction=instruction,
+    )
+
+    assert candidates == [recovered]
+    assert match is None
+    assert retriever.search.call_count == 2
+    confirm.assert_not_called()
+
+
 def test_resume_reuses_segmentation_and_skips_completed_instructions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

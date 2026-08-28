@@ -180,6 +180,14 @@ class RegulatoryFileValidityWindow:
 
 
 @dataclass(frozen=True, slots=True)
+class RegulatoryChunkStructuralMatch:
+    """One active atomic chunk selected by explicit legal structure."""
+
+    chunk: RegulatoryChunk
+    source_name: str
+
+
+@dataclass(frozen=True, slots=True)
 class RegulatoryFileValidityUpdateResult:
     """Counts and uniform windows from a file-level temporal update."""
 
@@ -2319,6 +2327,101 @@ def get_active_chunks_by_ids(
         )
     ).all()
     return {row.id: row for row in rows}
+
+
+def get_active_chunks_by_structural_reference(
+    db_session: Session,
+    *,
+    user_file_ids: Sequence[UUID],
+    article_no: str | None,
+    clause_label: str | None,
+    appendix_label: str | None,
+    source_name_hint: str | None,
+    source_name_tokens: Sequence[str] = (),
+    limit: int = 32,
+) -> list[RegulatoryChunkStructuralMatch]:
+    """Load bounded exact structural targets inside a captured batch scope."""
+
+    unique_user_file_ids = list(dict.fromkeys(user_file_ids))
+    if not unique_user_file_ids or limit <= 0:
+        return []
+    if article_no is None and appendix_label is None:
+        return []
+
+    conditions = [
+        RegulatoryChunk.user_file_id.in_(unique_user_file_ids),
+        RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value,
+        RegulatoryChunk.chunk_type.is_distinct_from(
+            HIERARCHICAL_AGGREGATE_CHUNK_VARIANT
+        ),
+    ]
+    if article_no is not None:
+        conditions.append(
+            func.upper(func.trim(RegulatoryChunk.chunk_metadata["article_no"].astext))
+            == article_no.upper()
+        )
+    if clause_label is not None:
+        conditions.append(
+            func.lower(func.trim(RegulatoryChunk.chunk_metadata["clause_label"].astext))
+            == clause_label.casefold()
+        )
+    if appendix_label is not None:
+        normalized_appendix_label = "".join(
+            character for character in appendix_label.casefold() if character.isalnum()
+        )
+        conditions.append(
+            func.lower(
+                func.regexp_replace(
+                    RegulatoryChunk.chunk_metadata["appendix_label"].astext,
+                    "[^[:alnum:]]",
+                    "",
+                    "g",
+                )
+            )
+            == normalized_appendix_label
+        )
+
+    normalized_source_name = func.lower(
+        func.regexp_replace(
+            func.replace(func.replace(UserFile.name, "_x1", " "), "x2", " "),
+            "[^[:alnum:]]",
+            " ",
+            "g",
+        )
+    )
+    for source_name_token in source_name_tokens:
+        conditions.append(
+            normalized_source_name.op("~")(
+                rf"(^|[^[:alnum:]]){re.escape(source_name_token.casefold())}"
+                r"([^[:alnum:]]|$)"
+            )
+        )
+
+    source_score = (
+        func.similarity(normalized_source_name, source_name_hint.casefold())
+        if source_name_hint
+        else None
+    )
+    statement = (
+        select(RegulatoryChunk, UserFile.name)
+        .join(UserFile, UserFile.id == RegulatoryChunk.user_file_id)
+        .where(*conditions)
+    )
+    if source_score is not None:
+        statement = statement.order_by(
+            source_score.desc(),
+            RegulatoryChunk.user_file_id,
+            RegulatoryChunk.position,
+        )
+    else:
+        statement = statement.order_by(
+            RegulatoryChunk.user_file_id, RegulatoryChunk.position
+        )
+    rows = db_session.execute(statement.limit(limit)).all()
+    return [
+        RegulatoryChunkStructuralMatch(chunk=row[0], source_name=str(row[1]))
+        for row in rows
+    ]
 
 
 def is_hierarchical_aggregate_chunk(chunk: RegulatoryChunk) -> bool:
