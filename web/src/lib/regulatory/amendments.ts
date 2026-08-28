@@ -46,7 +46,7 @@ export interface AnalyzeAmendmentResponse {
 
 export interface AmendmentSourceExtraction {
   text: string;
-  source_type: "html" | "pdf";
+  source_type: "html" | "pdf" | "docx";
   display_name: string;
 }
 
@@ -146,6 +146,24 @@ export async function extractAmendmentPdf(
     const body = await response.json().catch(() => null);
     throw new Error(
       body?.detail || `PDF extraction failed (Status: ${response.status})`
+    );
+  }
+  return response.json();
+}
+
+export async function extractAmendmentDocx(
+  file: File
+): Promise<AmendmentSourceExtraction> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch("/api/regulatory/amendments/sources/docx", {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(
+      body?.detail || `Word extraction failed (Status: ${response.status})`
     );
   }
   return response.json();

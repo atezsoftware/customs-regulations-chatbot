@@ -1,10 +1,11 @@
-"""Normalize one amendment HTML or PDF source into reviewable text."""
+"""Normalize one amendment HTML, PDF, or DOCX source into reviewable text."""
 
 import atexit
 import io
 import os
 import re
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -13,13 +14,21 @@ from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
+from requests.utils import DEFAULT_CA_BUNDLE_PATH
 
 from onyx.configs.app_configs import (
     MAX_AMENDMENT_SOURCE_BYTES,
     MAX_AMENDMENT_SOURCE_TEXT_CHARS,
+    MAX_ARCHIVE_COMPRESSION_RATIO,
+    MAX_ARCHIVE_ENTRIES,
     MIN_AMENDMENT_PDF_TEXT_CHARS,
 )
-from onyx.file_processing.extract_file_text import extract_file_text
+from onyx.file_processing.archive_expansion import COMPRESSION_RATIO_CHECK_MIN_BYTES
+from onyx.file_processing.extract_file_text import (
+    DocxExtractionError,
+    extract_file_text,
+    read_docx_file,
+)
 from onyx.utils.url import ssrf_safe_get
 from onyx.utils.web_content import (
     decode_html_bytes,
@@ -30,6 +39,8 @@ from onyx.utils.web_content import (
 
 _DOWNLOAD_CHUNK_SIZE = 64 * 1024
 _URL_TIMEOUT_SECONDS = (5, 20)
+_MAX_AMENDMENT_DOCX_EXPANDED_BYTES = 50 * 1024 * 1024
+_MAX_AMENDMENT_DOCX_XML_BYTES = 10 * 1024 * 1024
 _NON_CONTENT_TAGS = ("script", "style", "template", "noscript", "nav", "footer")
 _AMENDMENT_SOURCE_HEADERS = {
     "User-Agent": (
@@ -53,7 +64,7 @@ class AmendmentSourceExtractionError(ValueError):
 @dataclass(frozen=True)
 class AmendmentSourceExtraction:
     text: str
-    source_type: Literal["html", "pdf"]
+    source_type: Literal["html", "pdf", "docx"]
     display_name: str
 
 
@@ -72,7 +83,7 @@ def _remove_temporary_ca_bundle(path: str) -> None:
 @lru_cache(maxsize=1)
 def _resmi_gazete_ca_bundle_path() -> str:
     """Combine Requests' trust store with the intermediate omitted by the site."""
-    default_bundle = Path(requests.certs.where()).read_bytes()
+    default_bundle = Path(DEFAULT_CA_BUNDLE_PATH).read_bytes()
     intermediate = _RESMI_GAZETE_INTERMEDIATE_CA.read_bytes()
 
     with tempfile.NamedTemporaryFile(
@@ -134,6 +145,69 @@ def extract_amendment_pdf(content: bytes, file_name: str) -> str:
     return _normalize_text(extracted_text)
 
 
+def extract_amendment_docx(content: bytes, file_name: str) -> str:
+    """Extract normalized text from a Word Open XML document."""
+    if len(content) > MAX_AMENDMENT_SOURCE_BYTES:
+        raise AmendmentSourceExtractionError(
+            "The Word document is too large to upload for analysis."
+        )
+    if Path(file_name).suffix.lower() != ".docx":
+        raise AmendmentSourceExtractionError(
+            "The uploaded Word file must use the .docx format; only .docx files are supported."
+        )
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            archive_entries = archive.infolist()
+            archive_names = {entry.filename for entry in archive_entries}
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise AmendmentSourceExtractionError(
+            "The uploaded file is not a valid Word .docx document."
+        ) from exc
+    if len(archive_entries) > MAX_ARCHIVE_ENTRIES:
+        raise AmendmentSourceExtractionError(
+            "The Word document contains too many entries to extract safely."
+        )
+    for entry in archive_entries:
+        if (
+            Path(entry.filename).suffix.lower() == ".xml"
+            and entry.file_size > _MAX_AMENDMENT_DOCX_XML_BYTES
+        ):
+            raise AmendmentSourceExtractionError(
+                "The Word document contains an XML part that is too large to extract safely."
+            )
+        if entry.file_size < COMPRESSION_RATIO_CHECK_MIN_BYTES:
+            continue
+        if (
+            entry.compress_size == 0
+            or entry.file_size / entry.compress_size > MAX_ARCHIVE_COMPRESSION_RATIO
+        ):
+            raise AmendmentSourceExtractionError(
+                "The Word document contains an unsafe compression ratio."
+            )
+    expanded_size = sum(entry.file_size for entry in archive_entries)
+    if expanded_size > _MAX_AMENDMENT_DOCX_EXPANDED_BYTES:
+        raise AmendmentSourceExtractionError(
+            "The Word document expands beyond the safe extraction limit."
+        )
+    if (
+        "[Content_Types].xml" not in archive_names
+        or "word/document.xml" not in archive_names
+    ):
+        raise AmendmentSourceExtractionError(
+            "The uploaded file is not a valid Word .docx document."
+        )
+
+    try:
+        extracted_text = read_docx_file(
+            io.BytesIO(content), file_name, allow_text_fallback=False
+        )[0]
+    except DocxExtractionError as exc:
+        raise AmendmentSourceExtractionError(
+            "The uploaded Word .docx document could not be read."
+        ) from exc
+    return _normalize_text(extracted_text)
+
+
 def _read_response_content(response: requests.Response) -> bytes:
     response.raise_for_status()
     payload = bytearray()
@@ -152,9 +226,9 @@ def _read_response_content(response: requests.Response) -> bytes:
 
 def fetch_and_extract_amendment_url(url: str) -> AmendmentSourceExtraction:
     """Fetch one public URL through the shared SSRF-safe HTTP helper."""
-    request_kwargs: dict[str, object] = {}
-    if _is_resmi_gazete_url(url):
-        request_kwargs["verify"] = _resmi_gazete_ca_bundle_path()
+    verify: bool | str = (
+        _resmi_gazete_ca_bundle_path() if _is_resmi_gazete_url(url) else True
+    )
 
     try:
         response = ssrf_safe_get(
@@ -162,7 +236,7 @@ def fetch_and_extract_amendment_url(url: str) -> AmendmentSourceExtraction:
             headers=_AMENDMENT_SOURCE_HEADERS,
             timeout=_URL_TIMEOUT_SECONDS,
             stream=True,
-            **request_kwargs,
+            verify=verify,
         )
         content = _read_response_content(response)
     except AmendmentSourceExtractionError:

@@ -52,6 +52,9 @@ from onyx.regulatory.amendments.source_extraction import (
     fetch_and_extract_amendment_url,
 )
 from onyx.regulatory.amendments.source_extraction import (
+    extract_amendment_docx as extract_amendment_docx_text,
+)
+from onyx.regulatory.amendments.source_extraction import (
     extract_amendment_pdf as extract_amendment_pdf_text,
 )
 from onyx.regulatory.pdf import render_chunk_pdf, render_document_pdf
@@ -375,7 +378,7 @@ def rename_user_file(
 
 
 def _source_extraction_snapshot(
-    text: str, source_type: Literal["html", "pdf"], display_name: str
+    text: str, source_type: Literal["html", "pdf", "docx"], display_name: str
 ) -> AmendmentSourceExtractionSnapshot:
     return AmendmentSourceExtractionSnapshot(
         text=text,
@@ -412,6 +415,21 @@ def extract_amendment_pdf(
     except AmendmentSourceExtractionError as exc:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
     return _source_extraction_snapshot(text, "pdf", file_name)
+
+
+@router.post("/amendments/sources/docx", tags=PUBLIC_API_TAGS)
+def extract_amendment_docx(
+    file: UploadFile = File(...),
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+) -> AmendmentSourceExtractionSnapshot:
+    del user
+    file_name = file.filename or "amendment.docx"
+    content = file.file.read(MAX_AMENDMENT_SOURCE_BYTES + 1)
+    try:
+        text = extract_amendment_docx_text(content, file_name)
+    except AmendmentSourceExtractionError as exc:
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    return _source_extraction_snapshot(text, "docx", file_name)
 
 
 def _get_editable_document_set(

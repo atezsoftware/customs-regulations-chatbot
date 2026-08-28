@@ -57,6 +57,10 @@ KNOWN_OPENPYXL_BUGS = [
 ]
 
 
+class DocxExtractionError(ValueError):
+    """A file declared as DOCX could not be parsed as a Word document."""
+
+
 def get_markitdown_converter() -> "MarkItDown":
     global _MARKITDOWN_CONVERTER
 
@@ -310,10 +314,13 @@ def read_pdf_file(
     from pypdf import PdfReader
     from pypdf.errors import PdfStreamError
 
+    pdfium_error_type: type[Exception] | None
     try:
         from pypdfium2 import PdfiumError
+
+        pdfium_error_type = PdfiumError
     except ModuleNotFoundError:
-        PdfiumError = None
+        pdfium_error_type = None
 
     metadata: dict[str, Any] = {}
     extracted_images: list[tuple[bytes, str]] = []
@@ -356,7 +363,7 @@ def read_pdf_file(
                 ):
                     metadata[clean_key] = ", ".join(value)
 
-        if PdfiumError is None:
+        if pdfium_error_type is None:
             logger.info("PDFium is unavailable; extracting PDF text with pypdf")
             text = TEXT_SECTION_SEPARATOR.join(
                 page.extract_text() for page in pdf_reader.pages
@@ -372,7 +379,7 @@ def read_pdf_file(
                     decrypt_password,
                     timeout=PDF_TEXT_EXTRACTION_TIMEOUT_SECONDS,
                 )
-            except (PdfiumError, IsolatedProcessError) as pdfium_err:
+            except (pdfium_error_type, IsolatedProcessError) as pdfium_err:
                 logger.warning(
                     "PDFium text extraction failed (%s); falling back to pypdf",
                     pdfium_err,
@@ -487,6 +494,7 @@ def read_docx_file(
     file_name: str = "",
     extract_images: bool = False,
     image_callback: Callable[[bytes, str], None] | None = None,
+    allow_text_fallback: bool = True,
 ) -> tuple[str, Sequence[tuple[bytes, str]]]:
     """
     Extract text from a docx.
@@ -513,6 +521,10 @@ def read_docx_file(
         FileConversionException,
         UnsupportedFormatException,
     ) as e:
+        if not allow_text_fallback:
+            raise DocxExtractionError(
+                f"Failed to parse {file_name or 'docx file'} as a Word document."
+            ) from e
         logger.warning(
             "Failed to extract docx %s: %s. Attempting to read as text file.",
             file_name or "docx file",

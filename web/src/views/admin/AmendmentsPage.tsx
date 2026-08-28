@@ -19,6 +19,7 @@ import {
   RegulatoryRequestError,
   analyzeAmendment,
   approveProposal,
+  extractAmendmentDocx,
   extractAmendmentPdf,
   extractAmendmentUrl,
   getAmendmentAnalysis,
@@ -28,7 +29,7 @@ import {
   retryAmendmentBatch,
 } from "@/lib/regulatory/amendments";
 
-type AmendmentSourceMode = "text" | "url" | "pdf";
+type AmendmentSourceMode = "text" | "url" | "pdf" | "docx";
 
 function sourceIdentity(
   mode: AmendmentSourceMode,
@@ -36,8 +37,8 @@ function sourceIdentity(
   file: File | null
 ) {
   if (mode === "url") return url.trim() ? `url:${url.trim()}` : null;
-  if (mode === "pdf" && file) {
-    return `pdf:${file.name}:${file.size}:${file.lastModified}`;
+  if ((mode === "pdf" || mode === "docx") && file) {
+    return `${mode}:${file.name}:${file.size}:${file.lastModified}`;
   }
   return null;
 }
@@ -240,7 +241,7 @@ export default function AmendmentsPage() {
     string | null
   >(null);
   const [extracting, setExtracting] = useState(false);
-  const pdfInputRef = useRef<HTMLInputElement>(null);
+  const sourceFileInputRef = useRef<HTMLInputElement>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [pollRevision, setPollRevision] = useState(0);
@@ -342,6 +343,10 @@ export default function AmendmentsPage() {
 
   const handleSourceModeChange = useCallback((mode: AmendmentSourceMode) => {
     setSourceMode(mode);
+    setSourceFile(null);
+    if (sourceFileInputRef.current) {
+      sourceFileInputRef.current.value = "";
+    }
     setRawText("");
     setExtractedSourceIdentity(null);
   }, []);
@@ -352,7 +357,9 @@ export default function AmendmentsPage() {
       toast.error(
         sourceMode === "url"
           ? "Enter an amendment source URL."
-          : "Choose a PDF file."
+          : sourceMode === "pdf"
+            ? "Choose a PDF file."
+            : "Choose a Word .docx file."
       );
       return;
     }
@@ -362,7 +369,9 @@ export default function AmendmentsPage() {
       const result =
         sourceMode === "url"
           ? await extractAmendmentUrl(sourceUrl.trim())
-          : await extractAmendmentPdf(sourceFile as File);
+          : sourceMode === "pdf"
+            ? await extractAmendmentPdf(sourceFile as File)
+            : await extractAmendmentDocx(sourceFile as File);
       setRawText(result.text);
       setExtractedSourceIdentity(identity);
       toast.success(
@@ -488,6 +497,14 @@ export default function AmendmentsPage() {
                   >
                     PDF
                   </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    prominence={sourceMode === "docx" ? "primary" : "secondary"}
+                    onClick={() => handleSourceModeChange("docx")}
+                  >
+                    Word (.docx)
+                  </Button>
                 </div>
 
                 {sourceMode === "url" && (
@@ -512,14 +529,22 @@ export default function AmendmentsPage() {
                   </div>
                 )}
 
-                {sourceMode === "pdf" && (
+                {(sourceMode === "pdf" || sourceMode === "docx") && (
                   <div className="flex flex-wrap items-center gap-2">
                     <input
-                      ref={pdfInputRef}
-                      aria-label="Amendment source PDF"
+                      ref={sourceFileInputRef}
+                      aria-label={
+                        sourceMode === "pdf"
+                          ? "Amendment source PDF"
+                          : "Amendment source Word document"
+                      }
                       className="hidden"
                       type="file"
-                      accept="application/pdf,.pdf"
+                      accept={
+                        sourceMode === "pdf"
+                          ? "application/pdf,.pdf"
+                          : "application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx"
+                      }
                       onChange={(event) => {
                         setSourceFile(event.target.files?.[0] ?? null);
                         setRawText("");
@@ -529,9 +554,15 @@ export default function AmendmentsPage() {
                     <Button
                       type="button"
                       prominence="secondary"
-                      onClick={() => pdfInputRef.current?.click()}
+                      onClick={() => sourceFileInputRef.current?.click()}
                     >
-                      {sourceFile ? "Choose another PDF" : "Choose PDF"}
+                      {sourceMode === "pdf"
+                        ? sourceFile
+                          ? "Choose another PDF"
+                          : "Choose PDF"
+                        : sourceFile
+                          ? "Choose another Word document"
+                          : "Choose Word document"}
                     </Button>
                     {sourceFile && (
                       <Text font="main-ui-body" color="text-03">

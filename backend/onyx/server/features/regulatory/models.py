@@ -94,7 +94,7 @@ class AmendmentSourceUrlRequest(BaseModel):
 
 class AmendmentSourceExtractionSnapshot(BaseModel):
     text: str
-    source_type: Literal["html", "pdf"]
+    source_type: Literal["html", "pdf", "docx"]
     display_name: str
 
 

@@ -2,6 +2,7 @@ import { act, render, screen, setupUser } from "@tests/setup/test-utils";
 
 import {
   analyzeAmendment,
+  extractAmendmentDocx,
   extractAmendmentPdf,
   extractAmendmentUrl,
   getAmendmentAnalysis,
@@ -22,6 +23,7 @@ jest.mock("@/lib/hooks/useDocumentSets", () => ({
 
 jest.mock("@/lib/regulatory/amendments", () => ({
   analyzeAmendment: jest.fn(),
+  extractAmendmentDocx: jest.fn(),
   approveProposal: jest.fn(),
   extractAmendmentPdf: jest.fn(),
   extractAmendmentUrl: jest.fn(),
@@ -60,6 +62,9 @@ const mockedGetAmendmentAnalysis = getAmendmentAnalysis as jest.MockedFunction<
 const mockedExtractAmendmentUrl = extractAmendmentUrl as jest.MockedFunction<
   typeof extractAmendmentUrl
 >;
+const mockedExtractAmendmentDocx = extractAmendmentDocx as jest.MockedFunction<
+  typeof extractAmendmentDocx
+>;
 const mockedExtractAmendmentPdf = extractAmendmentPdf as jest.MockedFunction<
   typeof extractAmendmentPdf
 >;
@@ -83,6 +88,12 @@ beforeEach(() => {
     text: "MADDE 1- Yeni metin.",
     source_type: "html",
     display_name: "20260826-2.htm",
+  });
+  mockedExtractAmendmentDocx.mockReset();
+  mockedExtractAmendmentDocx.mockResolvedValue({
+    text: "MADDE 3- Word metni.",
+    source_type: "docx",
+    display_name: "değişiklik.docx",
   });
   mockedExtractAmendmentPdf.mockReset();
   mockedExtractAmendmentPdf.mockResolvedValue({
@@ -190,6 +201,58 @@ test("queues PDF-extracted text through the same durable analysis", async () => 
   await user.click(screen.getByRole("button", { name: "Analyze" }));
 
   expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(7, "MADDE 2- PDF metni.");
+});
+
+test("queues DOCX-extracted text through the same durable analysis", async () => {
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  act(() => {
+    screen.getByRole("combobox").focus();
+  });
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(screen.getByRole("button", { name: "Word (.docx)" }));
+  await user.upload(
+    screen.getByLabelText("Amendment source Word document"),
+    new File(["docx"], "değişiklik.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    })
+  );
+  await user.click(screen.getByRole("button", { name: "Extract" }));
+
+  expect(await screen.findByDisplayValue("MADDE 3- Word metni.")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Analyze" }));
+  expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(
+    7,
+    "MADDE 3- Word metni."
+  );
+});
+
+test("clears the selected file when switching between DOCX and PDF", async () => {
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  act(() => {
+    screen.getByRole("combobox").focus();
+  });
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(screen.getByRole("button", { name: "Word (.docx)" }));
+  await user.upload(
+    screen.getByLabelText("Amendment source Word document"),
+    new File(["docx"], "değişiklik.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    })
+  );
+  expect(screen.getByText("değişiklik.docx")).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: "PDF" }));
+
+  expect(screen.queryByText("değişiklik.docx")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Extract" })).toBeDisabled();
 });
 
 test("renders all grouped instructions on one proposal card", async () => {
