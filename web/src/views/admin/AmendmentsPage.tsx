@@ -70,48 +70,240 @@ const emptyCurrentChunkSnapshot: Record<string, unknown> = {
   updated_at: null,
 };
 
-function CurrentChunkJson({
+const chunkFieldOrder = [
+  "id",
+  "user_file_id",
+  "position",
+  "text",
+  "chunk_type",
+  "heading_path",
+  "metadata",
+  "validity_start_date",
+  "validity_end_date",
+  "status",
+  "source",
+  "supersedes_chunk_id",
+  "superseded_by_chunk_id",
+  "created_at",
+  "updated_at",
+] as const;
+
+const alwaysVisibleFields = new Set([
+  "validity_start_date",
+  "validity_end_date",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && !Array.isArray(value) && typeof value === "object";
+}
+
+function cloneEditableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(cloneEditableValue);
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [
+        key,
+        cloneEditableValue(child),
+      ])
+    );
+  }
+  return value;
+}
+
+function cloneDraft(draft: Record<string, unknown>): Record<string, unknown> {
+  return cloneEditableValue(draft) as Record<string, unknown>;
+}
+
+function ReadOnlyFieldValue({ value }: { value: unknown }) {
+  if (value === null || value === undefined || value === "") {
+    return <span className="text-text-03">—</span>;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return <span className="text-text-03">Empty</span>;
+    }
+    return (
+      <div className="flex flex-col gap-1">
+        {value.map((item, index) => (
+          <div key={index} className="break-words text-sm text-text-05">
+            {String(item)}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (isRecord(value)) {
+    const visibleEntries = Object.entries(value).filter(
+      ([, child]) => child !== null && child !== undefined
+    );
+    if (visibleEntries.length === 0) {
+      return <span className="text-text-03">Empty</span>;
+    }
+    return (
+      <div className="flex flex-col gap-1.5">
+        {visibleEntries.map(([key, child]) => (
+          <div
+            key={key}
+            className="grid grid-cols-[minmax(6rem,0.35fr)_minmax(0,1fr)] gap-2"
+          >
+            <span className="break-words font-mono text-xs text-text-03">
+              {key}
+            </span>
+            <ReadOnlyFieldValue value={child} />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <span className="whitespace-pre-wrap break-words text-sm text-text-05">
+      {String(value)}
+    </span>
+  );
+}
+
+function FieldTable({
   title,
-  chunk,
+  fields,
+  renderValue,
 }: {
   title: string;
-  chunk: Record<string, unknown> | null;
+  fields: Record<string, unknown> | null;
+  renderValue?: (key: string, value: unknown) => React.ReactNode;
 }) {
+  const visibleKeys = fields
+    ? chunkFieldOrder.filter(
+        (key) =>
+          alwaysVisibleFields.has(key) ||
+          (fields[key] !== null && fields[key] !== undefined)
+      )
+    : [];
+
   return (
-    <div className="flex-1 rounded-lg border border-border-02 p-3 flex flex-col gap-2 min-w-0">
-      <Text font="main-ui-action" color="text-04">
-        {title}
-      </Text>
-      {chunk === null ? (
-        <Text font="main-ui-body" color="text-03">
-          (new — no existing chunk)
+    <div className="min-w-0 flex-1 overflow-hidden rounded-12 border border-border-02 bg-background-neutral-00">
+      <div className="border-b border-border-02 bg-background-tint-01 px-3 py-2.5">
+        <Text font="main-ui-action" color="text-04">
+          {title}
         </Text>
+      </div>
+      {fields === null ? (
+        <div className="p-3">
+          <Text font="main-ui-body" color="text-03">
+            (new — no existing chunk)
+          </Text>
+        </div>
       ) : (
-        <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words font-mono text-sm text-text-05">
-          {JSON.stringify(chunk, null, 2)}
-        </pre>
+        <div role="table" aria-label={`${title} chunk fields`}>
+          {visibleKeys.map((key) => (
+            <div
+              key={key}
+              role="row"
+              className="grid grid-cols-1 gap-2 border-b border-border-01 px-3 py-2.5 last:border-b-0 sm:grid-cols-[minmax(9rem,0.35fr)_minmax(0,1fr)]"
+            >
+              <div role="rowheader">
+                <span className="break-words font-mono text-xs text-text-03">
+                  {key}
+                </span>
+              </div>
+              <div role="cell" className="min-w-0">
+                {renderValue ? (
+                  renderValue(key, fields[key])
+                ) : (
+                  <ReadOnlyFieldValue value={fields[key]} />
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
 }
 
-function parseDraftJson(value: string): {
-  draft: Record<string, unknown> | null;
-  error: string | null;
-} {
-  try {
-    const parsed: unknown = JSON.parse(value);
-    if (
-      parsed === null ||
-      Array.isArray(parsed) ||
-      typeof parsed !== "object"
-    ) {
-      return { draft: null, error: "Proposed chunk must be a JSON object." };
-    }
-    return { draft: parsed as Record<string, unknown>, error: null };
-  } catch {
-    return { draft: null, error: "Proposed chunk JSON is invalid." };
+function isIsoDate(value: unknown): boolean {
+  if (value === null || value === "") return true;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false;
   }
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month - 1 &&
+    parsed.getUTCDate() === day
+  );
+}
+
+function draftValidationError(draft: Record<string, unknown>): string | null {
+  if (typeof draft.text !== "string" || !draft.text.trim()) {
+    return "Replacement text cannot be empty.";
+  }
+  if (
+    !isIsoDate(draft.effective_start_date) ||
+    !isIsoDate(draft.effective_end_date)
+  ) {
+    return "Use a YYYY-MM-DD date.";
+  }
+  return null;
+}
+
+interface MetadataLeaf {
+  path: string[];
+  value: unknown;
+}
+
+function metadataLeaves(
+  value: Record<string, unknown>,
+  prefix: string[] = []
+): MetadataLeaf[] {
+  return Object.entries(value).flatMap(([key, child]) => {
+    const path = [...prefix, key];
+    if (child === null || child === undefined) return [];
+    if (isRecord(child) && Object.keys(child).length > 0) {
+      return metadataLeaves(child, path);
+    }
+    return [{ path, value: child }];
+  });
+}
+
+function updateNestedValue(
+  root: Record<string, unknown>,
+  path: string[],
+  value: unknown
+): Record<string, unknown> {
+  const [head, ...tail] = path;
+  if (head === undefined) return root;
+  if (tail.length === 0) return { ...root, [head]: value };
+  const child = isRecord(root[head]) ? root[head] : {};
+  return { ...root, [head]: updateNestedValue(child, tail, value) };
+}
+
+function metadataInputValue(value: unknown): string {
+  if (Array.isArray(value)) return value.map(String).join("\n");
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+function metadataValueFromInput(original: unknown, value: string): unknown {
+  if (Array.isArray(original)) {
+    const lines = value
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (original.every((item) => typeof item === "number")) {
+      const numbers = lines.map(Number);
+      return numbers.every(Number.isFinite) ? numbers : lines;
+    }
+    return lines;
+  }
+  if (typeof original === "number") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : value;
+  }
+  if (typeof original === "boolean") return value.toLowerCase() === "true";
+  return value;
 }
 
 function ProposalCard({
@@ -124,22 +316,22 @@ function ProposalCard({
   reviewEnabled: boolean;
 }) {
   const [deciding, setDeciding] = useState(false);
-  const [draftJson, setDraftJson] = useState(() =>
-    JSON.stringify(proposal.new_chunk_draft, null, 2)
+  const [draft, setDraft] = useState<Record<string, unknown>>(() =>
+    cloneDraft(proposal.new_chunk_draft)
   );
-  const parsedDraft = useMemo(() => parseDraftJson(draftJson), [draftJson]);
+  const validationError = useMemo(() => draftValidationError(draft), [draft]);
 
   useEffect(() => {
     if (proposal.status !== "pending") {
-      setDraftJson(JSON.stringify(proposal.new_chunk_draft, null, 2));
+      setDraft(cloneDraft(proposal.new_chunk_draft));
     }
   }, [proposal.status, proposal.updated_at, proposal.new_chunk_draft]);
 
   const handleApprove = useCallback(async () => {
-    if (parsedDraft.draft === null) return;
+    if (validationError !== null) return;
     setDeciding(true);
     try {
-      await approveProposal(proposal.id, parsedDraft.draft);
+      await approveProposal(proposal.id, draft);
       toast.success("Proposal approved and indexed.");
       onDecided();
     } catch (e) {
@@ -147,7 +339,7 @@ function ProposalCard({
     } finally {
       setDeciding(false);
     }
-  }, [proposal.id, parsedDraft.draft, onDecided]);
+  }, [proposal.id, draft, validationError, onDecided]);
 
   const handleReject = useCallback(async () => {
     setDeciding(true);
@@ -164,10 +356,166 @@ function ProposalCard({
 
   const isNewChunk = Object.keys(proposal.old_chunk_snapshot).length === 0;
   const isConsolidated = proposal.instruction_texts.length > 1;
-  const effectiveStart = parsedDraft.draft?.effective_start_date;
+  const effectiveStart = draft.effective_start_date;
   const currentChunk = isNewChunk
     ? null
     : { ...emptyCurrentChunkSnapshot, ...proposal.old_chunk_snapshot };
+  const afterChunk: Record<string, unknown> = {
+    id: "Generated on approval",
+    user_file_id: draft.user_file_id,
+    position: draft.position,
+    text: draft.text,
+    chunk_type: draft.chunk_type,
+    heading_path: draft.heading_path,
+    metadata: draft.metadata,
+    validity_start_date: draft.effective_start_date,
+    validity_end_date: draft.effective_end_date,
+    status: "active",
+    source: "amendment",
+    supersedes_chunk_id: proposal.old_chunk_id,
+    superseded_by_chunk_id: null,
+    created_at: "Generated on approval",
+    updated_at: "Generated on approval",
+  };
+  const readOnly = proposal.status !== "pending";
+
+  const updateDraftField = (key: string, value: unknown) => {
+    setDraft((current) => ({ ...current, [key]: value }));
+  };
+
+  const renderAfterValue = (key: string, value: unknown) => {
+    if (key === "user_file_id" || key === "position") {
+      return (
+        <InputTypeIn
+          aria-label={`After ${key}`}
+          value={value === null || value === undefined ? "" : String(value)}
+          variant="readOnly"
+        />
+      );
+    }
+    if (key === "text") {
+      return (
+        <InputTextArea
+          aria-label="After text"
+          value={typeof draft.text === "string" ? draft.text : ""}
+          onChange={(event) => updateDraftField("text", event.target.value)}
+          variant={readOnly ? "readOnly" : "primary"}
+          rows={5}
+          maxRows={14}
+          autoResize
+        />
+      );
+    }
+    if (key === "chunk_type") {
+      return (
+        <InputTypeIn
+          aria-label="After chunk_type"
+          value={typeof draft.chunk_type === "string" ? draft.chunk_type : ""}
+          onChange={(event) =>
+            updateDraftField("chunk_type", event.target.value || null)
+          }
+          variant={readOnly ? "readOnly" : "primary"}
+        />
+      );
+    }
+    if (key === "heading_path") {
+      const headingPath = Array.isArray(draft.heading_path)
+        ? draft.heading_path.map(String)
+        : [];
+      return (
+        <div className="flex flex-col gap-1.5">
+          <InputTextArea
+            aria-label="After heading_path"
+            value={headingPath.join("\n")}
+            onChange={(event) =>
+              updateDraftField(
+                "heading_path",
+                event.target.value
+                  .split("\n")
+                  .map((heading) => heading.trim())
+                  .filter(Boolean)
+              )
+            }
+            variant={readOnly ? "readOnly" : "primary"}
+            rows={Math.max(2, Math.min(headingPath.length, 6))}
+            maxRows={8}
+            autoResize
+          />
+          <Text font="secondary-body" color="text-03">
+            One heading per line.
+          </Text>
+        </div>
+      );
+    }
+    if (key === "metadata") {
+      const metadata = isRecord(draft.metadata) ? draft.metadata : {};
+      const leaves = metadataLeaves(metadata);
+      if (leaves.length === 0) {
+        return <span className="text-sm text-text-03">Empty</span>;
+      }
+      return (
+        <div className="flex flex-col gap-2">
+          {leaves.map((leaf) => {
+            const metadataKey = leaf.path.join(".");
+            const multiline = Array.isArray(leaf.value);
+            const sharedProps = {
+              "aria-label": `After metadata ${metadataKey}`,
+              value: metadataInputValue(leaf.value),
+              onChange: (
+                event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>
+              ) => {
+                const nextMetadata = updateNestedValue(
+                  metadata,
+                  leaf.path,
+                  metadataValueFromInput(leaf.value, event.target.value)
+                );
+                updateDraftField("metadata", nextMetadata);
+              },
+              variant: readOnly ? ("readOnly" as const) : ("primary" as const),
+            };
+            return (
+              <div key={metadataKey} className="flex flex-col gap-1">
+                <span className="break-words font-mono text-xs text-text-03">
+                  {metadataKey}
+                </span>
+                {multiline ? (
+                  <InputTextArea
+                    {...sharedProps}
+                    rows={2}
+                    maxRows={6}
+                    autoResize
+                  />
+                ) : (
+                  <InputTypeIn {...sharedProps} />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+    if (key === "validity_start_date" || key === "validity_end_date") {
+      const draftKey =
+        key === "validity_start_date"
+          ? "effective_start_date"
+          : "effective_end_date";
+      const dateValue = draft[draftKey];
+      return (
+        <InputTypeIn
+          aria-label={`After ${key}`}
+          value={typeof dateValue === "string" ? dateValue : ""}
+          placeholder="YYYY-MM-DD"
+          onChange={(event) =>
+            updateDraftField(draftKey, event.target.value || null)
+          }
+          variant={
+            readOnly ? "readOnly" : isIsoDate(dateValue) ? "primary" : "error"
+          }
+        />
+      );
+    }
+    return <ReadOnlyFieldValue value={value} />;
+  };
 
   return (
     <div
@@ -217,30 +565,22 @@ function ProposalCard({
       )}
 
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-        <CurrentChunkJson title="Current" chunk={currentChunk} />
-        <div className="flex min-w-0 flex-1 flex-col gap-2 rounded-lg border border-border-02 p-3">
-          <Text font="main-ui-action" color="text-04">
-            Proposed
-          </Text>
-          <InputTextArea
-            aria-label="Proposed chunk JSON"
-            value={draftJson}
-            onChange={(event) => setDraftJson(event.target.value)}
-            variant={proposal.status === "pending" ? "primary" : "readOnly"}
-            rows={18}
-            maxRows={28}
-            autoResize
-          />
-          <Text font="secondary-body" color="text-03">
-            user_file_id and position identify the target and cannot be changed.
-          </Text>
-          {parsedDraft.error && (
-            <Text font="secondary-body" color="text-05">
-              {parsedDraft.error}
-            </Text>
-          )}
-        </div>
+        <FieldTable title="Before" fields={currentChunk} />
+        <FieldTable
+          title="After"
+          fields={afterChunk}
+          renderValue={renderAfterValue}
+        />
       </div>
+
+      <Text font="secondary-body" color="text-03">
+        user_file_id and position identify the target and cannot be changed.
+      </Text>
+      {validationError && (
+        <Text font="secondary-body" color="text-05">
+          {validationError}
+        </Text>
+      )}
 
       {!isNewChunk && (
         <Text font="secondary-body" color="text-03">
@@ -270,7 +610,7 @@ function ProposalCard({
           </Button>
           <Button
             onClick={() => void handleApprove()}
-            disabled={deciding || !reviewEnabled || parsedDraft.draft === null}
+            disabled={deciding || !reviewEnabled || validationError !== null}
           >
             Approve
           </Button>

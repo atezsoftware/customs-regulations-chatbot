@@ -331,7 +331,7 @@ test("renders all grouped instructions on one proposal card", async () => {
   ).toHaveLength(1);
 });
 
-test("shows the complete current chunk and approves the edited proposed JSON", async () => {
+test("shows before and after field tables and approves edits without exposing JSON", async () => {
   const analyzedBatch = {
     ...queuedBatch,
     status: "analyzed" as const,
@@ -404,21 +404,113 @@ test("shows the complete current chunk and approves the edited proposed JSON", a
     await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
   );
 
+  expect(await screen.findByText("Before")).toBeVisible();
+  expect(screen.getByText("After")).toBeVisible();
+  expect(screen.getByText("2010-12-31")).toBeVisible();
+  expect(screen.getAllByText("validity_end_date")).toHaveLength(2);
+  expect(screen.queryByText("superseded_by_chunk_id")).not.toBeInTheDocument();
   expect(
-    await screen.findByText(/"validity_start_date": "2010-12-31"/)
-  ).toBeVisible();
-  const editor = screen.getByRole("textbox", { name: "Proposed chunk JSON" });
+    screen.queryByRole("textbox", { name: "Proposed chunk JSON" })
+  ).not.toBeInTheDocument();
+
   const reviewedDraft = {
     ...proposedDraft,
     text: "MADDE 15 - (2) a) (Mülga)",
     effective_start_date: "2026-08-28",
+    metadata: { article_no: "15/a" },
   };
-  fireEvent.change(editor, {
-    target: { value: JSON.stringify(reviewedDraft, null, 2) },
+  fireEvent.change(screen.getByRole("textbox", { name: "After text" }), {
+    target: { value: reviewedDraft.text },
   });
+  fireEvent.change(
+    screen.getByRole("textbox", { name: "After validity_start_date" }),
+    {
+      target: { value: reviewedDraft.effective_start_date },
+    }
+  );
+  fireEvent.change(
+    screen.getByRole("textbox", { name: "After metadata article_no" }),
+    {
+      target: { value: "15/a" },
+    }
+  );
+  expect(
+    screen.getByRole("textbox", { name: "After user_file_id" })
+  ).toHaveAttribute("readonly");
+  expect(
+    screen.getByRole("textbox", { name: "After position" })
+  ).toHaveAttribute("readonly");
+  expect(screen.getAllByText("Generated on approval")).not.toHaveLength(0);
+  expect(screen.getByText("amendment")).toBeVisible();
+
   await user.click(screen.getByRole("button", { name: "Approve" }));
 
   expect(mockedApproveProposal).toHaveBeenCalledWith(19, reviewedDraft);
+});
+
+test("keeps an invalid date edit from being approved", async () => {
+  const analyzedBatch = {
+    ...queuedBatch,
+    status: "analyzed" as const,
+    stage: "finalizing" as const,
+  };
+  mockedListAmendmentBatches.mockResolvedValue([analyzedBatch]);
+  mockedGetAmendmentAnalysis.mockResolvedValue({
+    batch: analyzedBatch,
+    proposals: [
+      {
+        id: 20,
+        batch_id: 42,
+        instruction_index: 0,
+        instruction_text: "Geçici değişiklik.",
+        instruction_indices: [0],
+        instruction_texts: ["Geçici değişiklik."],
+        old_chunk_id: "old-chunk",
+        old_chunk_snapshot: { id: "old-chunk", text: "Eski metin" },
+        new_chunk_draft: {
+          user_file_id: "00000000-0000-0000-0000-000000000123",
+          position: 15,
+          text: "Yeni metin",
+          chunk_type: "article",
+          heading_path: [],
+          metadata: {},
+          effective_start_date: null,
+          effective_end_date: null,
+        },
+        match_confidence: 0.9,
+        match_rationale: "Exact provision",
+        date_rationale: null,
+        status: "pending" as const,
+        applied_new_chunk_id: null,
+        decided_by: null,
+        decided_at: null,
+        created_at: "2026-08-27T12:00:00Z",
+        updated_at: "2026-08-27T12:00:00Z",
+        duplicate_target: false,
+      },
+    ],
+    unmatched_instructions: [],
+  });
+
+  const user = setupUser();
+  render(<AmendmentsPage />);
+  act(() => {
+    screen.getByRole("combobox").focus();
+  });
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
+  );
+
+  fireEvent.change(
+    await screen.findByRole("textbox", { name: "After validity_start_date" }),
+    { target: { value: "not-a-date" } }
+  );
+
+  expect(screen.getByText("Use a YYYY-MM-DD date.")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
 });
 
 test("retries a failed batch from its checkpoint", async () => {
