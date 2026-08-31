@@ -7,29 +7,29 @@ from typing import Any
 from uuid import UUID
 
 from celery import Celery, shared_task
+from sqlalchemy.orm import Session
 
-from onyx.background.celery.tasks.regulatory_indexing.tasks import (
-    enqueue_prepared_regulatory_indexing_job,
-)
 from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryQueues, OnyxCeleryTask
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import AmendmentProposalStatus
+from onyx.db.models import UserFile
 from onyx.db.regulatory_amendments import (
     approve_amendment_proposal,
     claim_batch_for_analysis,
     claim_stale_batches_for_recovery,
+    finalize_amendment_proposal_projection,
     get_proposal,
-    link_amendment_proposal_indexing_job,
     mark_batch_failed,
     recover_stale_amendment_proposal_approvals,
     reset_amendment_proposal_approval,
+    touch_amendment_proposal_approval,
     touch_batch_heartbeat,
 )
+from onyx.db.search_settings import get_current_search_settings
 from onyx.regulatory.amendments.job import run_amendment_batch
-from onyx.regulatory.indexing_jobs.preparation import (
-    prepare_regulatory_indexing_job_from_chunks,
-)
+from onyx.regulatory.projection import project_user_file_to_index
 from onyx.utils.logger import setup_logger
+from shared_configs.enums import EmbeddingProvider
 
 logger = setup_logger()
 
@@ -39,6 +39,35 @@ _HEARTBEAT_INTERVAL_SECONDS = 60
 _SAFE_FAILURE_MESSAGE = (
     "Analysis failed. Retry to resume from the last completed instruction."
 )
+_SAFE_APPROVAL_FAILURE_MESSAGE = "Indexing failed. The approval was not published."
+_AMENDMENT_EMBEDDING_MODEL = "gemini-embedding-2"
+_AMENDMENT_EMBEDDING_DIMENSION = 1024
+
+
+def validate_amendment_projection_search_settings(
+    db_session: Session,
+    *,
+    expected_id: int | None = None,
+    for_update: bool = False,
+) -> int:
+    search_settings = (
+        get_current_search_settings(db_session, for_update=True)
+        if for_update
+        else get_current_search_settings(db_session)
+    )
+    if expected_id is not None and search_settings.id != expected_id:
+        raise RuntimeError("Search settings changed during amendment projection")
+    if search_settings.provider_type is not EmbeddingProvider.GOOGLE:
+        raise RuntimeError(
+            "Amendment indexing requires the active Google Gemini provider"
+        )
+    if search_settings.model_name != _AMENDMENT_EMBEDDING_MODEL:
+        raise RuntimeError(f"Amendment indexing requires {_AMENDMENT_EMBEDDING_MODEL}")
+    if search_settings.final_embedding_dim != _AMENDMENT_EMBEDDING_DIMENSION:
+        raise RuntimeError(
+            "Amendment indexing requires 1024-dimensional Elasticsearch vectors"
+        )
+    return search_settings.id
 
 
 @contextmanager
@@ -71,6 +100,41 @@ def _renew_batch_lease(*, batch_id: int, lease_generation: int) -> Generator[Non
 
     # TenantAwareTask stores tenant scope in contextvars. Threads do not inherit
     # that context automatically, so run the watchdog in an explicit copy.
+    context = copy_context()
+    thread = Thread(target=lambda: context.run(renew), daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+
+
+@contextmanager
+def _renew_amendment_approval(*, proposal_id: int) -> Generator[None]:
+    """Keep recovery from redelivering a live full-file Gemini projection."""
+
+    stop = Event()
+
+    def renew() -> None:
+        while not stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                with get_session_with_current_tenant() as db_session:
+                    if not touch_amendment_proposal_approval(
+                        db_session,
+                        proposal_id=proposal_id,
+                    ):
+                        logger.warning(
+                            "Stopped approval heartbeat for proposal=%s",
+                            proposal_id,
+                        )
+                        return
+            except Exception:
+                logger.exception(
+                    "Approval heartbeat failed for proposal=%s",
+                    proposal_id,
+                )
+
     context = copy_context()
     thread = Thread(target=lambda: context.run(renew), daemon=True)
     thread.start()
@@ -207,35 +271,52 @@ def regulatory_amendment_approve(
                 user_file_id,
             )
 
-        with get_session_with_current_tenant() as db_session:
-            job_id = prepare_regulatory_indexing_job_from_chunks(
-                user_file_id,
-                tenant_id,
-                db_session,
-            )
-
-        with get_session_with_current_tenant() as db_session:
-            if not link_amendment_proposal_indexing_job(
-                db_session,
-                proposal_id=proposal_id,
-                job_id=job_id,
-            ):
-                raise RuntimeError("amendment proposal could not be linked to indexing")
-            db_session.commit()
-
-        enqueue_prepared_regulatory_indexing_job(
-            job_id=job_id,
-            tenant_id=tenant_id,
-        )
+        with _renew_amendment_approval(proposal_id=proposal_id):
+            with get_session_with_current_tenant() as db_session:
+                user_file = db_session.get(UserFile, user_file_id)
+                if user_file is None:
+                    raise RuntimeError(f"User file {user_file_id} no longer exists")
+                current_search_settings_id = (
+                    validate_amendment_projection_search_settings(db_session)
+                )
+                projected_chunk_count = project_user_file_to_index(
+                    db_session,
+                    user_file,
+                    tenant_id,
+                    include_failed=True,
+                    current_search_settings_id=current_search_settings_id,
+                )
+                if projected_chunk_count <= 0:
+                    raise RuntimeError("Amendment projection did not write any chunks")
+                validate_amendment_projection_search_settings(
+                    db_session,
+                    expected_id=current_search_settings_id,
+                    for_update=True,
+                )
+                if not finalize_amendment_proposal_projection(
+                    db_session,
+                    proposal_id=proposal_id,
+                    succeeded=True,
+                ):
+                    raise RuntimeError("amendment proposal could not be finalized")
+                db_session.commit()
         logger.info(
-            "Amendment approval indexing dispatched proposal=%s user_file=%s job=%s",
+            "Amendment approval projected proposal=%s user_file=%s",
             proposal_id,
             user_file_id,
-            job_id,
         )
     except Exception:
         logger.exception("Amendment proposal %s approval failed", proposal_id)
-        if not version_applied:
+        if version_applied:
+            with get_session_with_current_tenant() as db_session:
+                finalize_amendment_proposal_projection(
+                    db_session,
+                    proposal_id=proposal_id,
+                    succeeded=False,
+                    error_message=_SAFE_APPROVAL_FAILURE_MESSAGE,
+                )
+                db_session.commit()
+        else:
             with get_session_with_current_tenant() as db_session:
                 reset_amendment_proposal_approval(
                     db_session,

@@ -16,6 +16,7 @@ import {
   listAmendmentBatches,
   listAmendmentProposals,
   retryAmendmentBatch,
+  retryProposalIndexing,
 } from "@/lib/regulatory/amendments";
 import AmendmentsPage from "@/views/admin/AmendmentsPage";
 
@@ -40,6 +41,7 @@ jest.mock("@/lib/regulatory/amendments", () => ({
   listAmendmentProposals: jest.fn(),
   rejectProposal: jest.fn(),
   retryAmendmentBatch: jest.fn(),
+  retryProposalIndexing: jest.fn(),
 }));
 
 const queuedBatch = {
@@ -87,6 +89,8 @@ const mockedListAmendmentProposals =
 const mockedRetryAmendmentBatch = retryAmendmentBatch as jest.MockedFunction<
   typeof retryAmendmentBatch
 >;
+const mockedRetryProposalIndexing =
+  retryProposalIndexing as jest.MockedFunction<typeof retryProposalIndexing>;
 
 beforeAll(() => {
   window.HTMLElement.prototype.scrollIntoView = jest.fn();
@@ -134,6 +138,8 @@ beforeEach(() => {
   });
   mockedRetryAmendmentBatch.mockReset();
   mockedRetryAmendmentBatch.mockResolvedValue(queuedBatch);
+  mockedRetryProposalIndexing.mockReset();
+  mockedRetryProposalIndexing.mockResolvedValue({} as never);
 });
 
 test("places extracted URL text in the editable amendment text area", async () => {
@@ -581,6 +587,10 @@ test("shows a terminal indexing error instead of an endless running state", asyn
   expect(
     screen.queryByText(/Approval is running.*indexed in the background/)
   ).not.toBeInTheDocument();
+  const retryButton = screen.getByRole("button", { name: "Retry indexing" });
+  expect(retryButton).toBeEnabled();
+  await user.click(retryButton);
+  expect(mockedRetryProposalIndexing).toHaveBeenCalledWith(22);
 });
 
 test("keeps an invalid date edit from being approved", async () => {

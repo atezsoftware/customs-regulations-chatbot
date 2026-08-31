@@ -27,6 +27,7 @@ import {
   listAmendmentProposals,
   rejectProposal,
   retryAmendmentBatch,
+  retryProposalIndexing,
 } from "@/lib/regulatory/amendments";
 
 type AmendmentSourceMode = "text" | "url" | "pdf" | "docx";
@@ -354,6 +355,19 @@ function ProposalCard({
     }
   }, [proposal.id, onUpdated]);
 
+  const handleRetryIndexing = useCallback(async () => {
+    setDeciding(true);
+    try {
+      const queuedProposal = await retryProposalIndexing(proposal.id);
+      onUpdated(queuedProposal);
+      toast.info("Indexing retry queued.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Retry indexing failed.");
+    } finally {
+      setDeciding(false);
+    }
+  }, [proposal.id, onUpdated]);
+
   const isNewChunk = Object.keys(proposal.old_chunk_snapshot).length === 0;
   const isConsolidated = proposal.instruction_texts.length > 1;
   const effectiveStart = draft.effective_start_date;
@@ -622,14 +636,24 @@ function ProposalCard({
       )}
 
       {proposal.status === "approval_failed" && (
-        <div
-          role="alert"
-          className="rounded-08 border border-status-error-02 bg-status-error-01 p-3"
-        >
-          <Text font="main-ui-action" color="status-error-05">
-            {proposal.approval_error ||
-              "Indexing failed. The approval was not published."}
-          </Text>
+        <div className="flex flex-col gap-2">
+          <div
+            role="alert"
+            className="rounded-08 border border-status-error-02 bg-status-error-01 p-3"
+          >
+            <Text font="main-ui-action" color="status-error-05">
+              {proposal.approval_error ||
+                "Indexing failed. The approval was not published."}
+            </Text>
+          </div>
+          <div className="flex justify-end">
+            <Button
+              onClick={() => void handleRetryIndexing()}
+              disabled={deciding || !reviewEnabled}
+            >
+              Retry indexing
+            </Button>
+          </div>
         </div>
       )}
 

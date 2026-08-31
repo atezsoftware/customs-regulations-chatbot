@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from onyx.db import regulatory_amendments
 from onyx.db.enums import (
     AmendmentBatchStage,
     AmendmentBatchStatus,
@@ -63,6 +64,54 @@ def test_stale_approval_recovery_resets_legacy_and_resumes_applied() -> None:
     assert legacy.updated_at == NOW
     assert applied.updated_at == NOW
     db_session.commit.assert_called_once_with()
+
+
+def test_failed_projection_retry_reuses_applied_chunk() -> None:
+    legacy_job_id = uuid4()
+    proposal = SimpleNamespace(
+        id=72,
+        status=AmendmentProposalStatus.APPROVAL_FAILED.value,
+        applied_new_chunk_id="new-chunk",
+        approval_error="Indexing failed",
+        decided_at=None,
+        updated_at=NOW,
+        approval_indexing_job_id=legacy_job_id,
+    )
+    db_session = MagicMock()
+    db_session.scalar.return_value = proposal
+
+    retried, should_enqueue = regulatory_amendments.retry_amendment_proposal_projection(
+        db_session,
+        proposal_id=72,
+    )
+
+    assert retried is proposal
+    assert should_enqueue is True
+    assert proposal.status == AmendmentProposalStatus.APPROVING.value
+    assert proposal.applied_new_chunk_id == "new-chunk"
+    assert proposal.approval_error is None
+    assert proposal.approval_indexing_job_id is None
+    db_session.flush.assert_called_once_with()
+
+
+def test_duplicate_projection_retry_is_idempotent() -> None:
+    proposal = SimpleNamespace(
+        id=72,
+        status=AmendmentProposalStatus.APPROVING.value,
+        applied_new_chunk_id="new-chunk",
+        approval_indexing_job_id=None,
+    )
+    db_session = MagicMock()
+    db_session.scalar.return_value = proposal
+
+    retried, should_enqueue = regulatory_amendments.retry_amendment_proposal_projection(
+        db_session,
+        proposal_id=72,
+    )
+
+    assert retried is proposal
+    assert should_enqueue is False
+    db_session.flush.assert_not_called()
 
 
 def test_create_batch_snapshots_scope_and_starts_queued() -> None:

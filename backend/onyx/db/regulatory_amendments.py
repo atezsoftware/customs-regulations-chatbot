@@ -580,6 +580,38 @@ def reset_amendment_proposal_approval(
     return True
 
 
+def retry_amendment_proposal_projection(
+    db_session: Session,
+    *,
+    proposal_id: int,
+) -> tuple[AmendmentProposal, bool]:
+    """Retry search projection without creating another legal chunk version."""
+
+    proposal = _lock_proposal_for_transition(db_session, proposal_id)
+    if (
+        proposal.status == AmendmentProposalStatus.APPROVING.value
+        and proposal.applied_new_chunk_id
+        and proposal.approval_indexing_job_id is None
+    ):
+        return proposal, False
+    if proposal.status != AmendmentProposalStatus.APPROVAL_FAILED.value:
+        raise ValueError(
+            f"Amendment proposal {proposal.id} is not awaiting an indexing retry."
+        )
+    if not proposal.applied_new_chunk_id:
+        raise ValueError(
+            f"Amendment proposal {proposal.id} has no applied chunk to reindex."
+        )
+    proposal.status = AmendmentProposalStatus.APPROVING.value
+    proposal.approval_error = None
+    proposal.approval_indexing_job_id = None
+    proposal.decided_at = None
+    proposal.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    db_session.add(proposal)
+    db_session.flush()
+    return proposal, True
+
+
 def link_amendment_proposal_indexing_job(
     db_session: Session,
     *,
@@ -639,6 +671,65 @@ def finalize_amendment_proposals_for_indexing_job(
         .values(**values)
     )
     return int(result.rowcount or 0)  # ty: ignore[unresolved-attribute]
+
+
+def finalize_amendment_proposal_projection(
+    db_session: Session,
+    *,
+    proposal_id: int,
+    succeeded: bool,
+    error_message: str | None = None,
+) -> bool:
+    """Persist the terminal state of an active-index amendment projection."""
+
+    values: dict[str, Any]
+    if succeeded:
+        values = {
+            "status": AmendmentProposalStatus.APPROVED.value,
+            "approval_error": None,
+            "decided_at": datetime.datetime.now(datetime.timezone.utc),
+            "updated_at": func.now(),
+        }
+    else:
+        values = {
+            "status": AmendmentProposalStatus.APPROVAL_FAILED.value,
+            "approval_error": (
+                error_message or "Indexing failed. The approval was not published."
+            )[:_MAX_ERROR_MESSAGE_LENGTH],
+            "decided_at": None,
+            "updated_at": func.now(),
+        }
+    result = db_session.execute(
+        update(AmendmentProposal)
+        .where(
+            AmendmentProposal.id == proposal_id,
+            AmendmentProposal.status == AmendmentProposalStatus.APPROVING.value,
+            AmendmentProposal.applied_new_chunk_id.is_not(None),
+        )
+        .values(**values)
+    )
+    return bool(result.rowcount)  # ty: ignore[unresolved-attribute]
+
+
+def touch_amendment_proposal_approval(
+    db_session: Session,
+    *,
+    proposal_id: int,
+) -> bool:
+    """Keep an applied active-index projection out of stale recovery."""
+
+    result = db_session.execute(
+        update(AmendmentProposal)
+        .where(
+            AmendmentProposal.id == proposal_id,
+            AmendmentProposal.status == AmendmentProposalStatus.APPROVING.value,
+            AmendmentProposal.applied_new_chunk_id.is_not(None),
+            AmendmentProposal.approval_indexing_job_id.is_(None),
+        )
+        .values(updated_at=func.now())
+    )
+    db_session.commit()
+    return bool(result.rowcount)  # ty: ignore[unresolved-attribute]
 
 
 def recover_stale_amendment_proposal_approvals(

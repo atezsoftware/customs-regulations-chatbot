@@ -143,3 +143,83 @@ def test_approval_returns_after_durable_queueing_without_projecting() -> None:
     enqueue_approval.assert_called_once_with(proposal_id=9, tenant_id="tenant-a")
     db_session.commit.assert_called_once_with()
     assert events == ["commit"]
+
+
+def test_failed_projection_retry_returns_after_requeueing() -> None:
+    proposal = SimpleNamespace(id=9, batch_id=42, status="approval_failed")
+    batch = SimpleNamespace(
+        id=42,
+        document_set_id=7,
+        status=AmendmentBatchStatus.ANALYZED.value,
+    )
+    user = cast(User, SimpleNamespace(id=uuid4()))
+    queued_proposal = SimpleNamespace(id=9, batch_id=42, status="approving")
+    snapshot = MagicMock()
+    db_session = MagicMock()
+
+    with (
+        patch.object(api, "get_proposal", return_value=proposal),
+        patch.object(api, "get_batch", return_value=batch),
+        patch.object(api, "_get_editable_document_set"),
+        patch.object(
+            api,
+            "retry_amendment_proposal_projection",
+            return_value=(queued_proposal, True),
+            create=True,
+        ) as retry_projection,
+        patch.object(api, "enqueue_amendment_proposal_approval") as enqueue,
+        patch.object(
+            api.AmendmentProposalSnapshot,
+            "from_model",
+            return_value=snapshot,
+        ),
+    ):
+        result = api.retry_proposal_indexing(
+            9,
+            user=user,
+            db_session=db_session,
+            tenant_id="tenant-a",
+        )
+
+    assert result is snapshot
+    retry_projection.assert_called_once_with(db_session, proposal_id=9)
+    db_session.commit.assert_called_once_with()
+    enqueue.assert_called_once_with(proposal_id=9, tenant_id="tenant-a")
+
+
+def test_duplicate_failed_projection_retry_does_not_dispatch_twice() -> None:
+    proposal = SimpleNamespace(id=9, batch_id=42, status="approving")
+    batch = SimpleNamespace(
+        id=42,
+        document_set_id=7,
+        status=AmendmentBatchStatus.ANALYZED.value,
+    )
+    user = cast(User, SimpleNamespace(id=uuid4()))
+    snapshot = MagicMock()
+    db_session = MagicMock()
+
+    with (
+        patch.object(api, "get_proposal", return_value=proposal),
+        patch.object(api, "get_batch", return_value=batch),
+        patch.object(api, "_get_editable_document_set"),
+        patch.object(
+            api,
+            "retry_amendment_proposal_projection",
+            return_value=(proposal, False),
+        ),
+        patch.object(api, "enqueue_amendment_proposal_approval") as enqueue,
+        patch.object(
+            api.AmendmentProposalSnapshot,
+            "from_model",
+            return_value=snapshot,
+        ),
+    ):
+        result = api.retry_proposal_indexing(
+            9,
+            user=user,
+            db_session=db_session,
+            tenant_id="tenant-a",
+        )
+
+    assert result is snapshot
+    enqueue.assert_not_called()

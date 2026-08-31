@@ -1,113 +1,87 @@
-# Durable Amendment Approval Indexing Design
+# Gemini Amendment Approval Projection Design
 
 ## Problem
 
-The amendment approval endpoint correctly returns before indexing, but the
-background approval task still performs a full `project_user_file_to_index`
-call inside the same database transaction that applies the legal version
-change. For large regulatory files this can run for more than an hour while
-holding proposal and chunk locks. The proposal has no approval heartbeat or
-durable indexing-job identity, so the UI can remain in `approving` forever if
-the worker is lost or the projection stalls.
+The approval endpoint returns before indexing, but the background task was
+changed to prepare the OpenRouter-only durable regulatory indexing pipeline.
+The active DEV search settings instead use Google `gemini-embedding-2` with a
+1024-dimensional Elasticsearch index. Durable preparation therefore failed
+before creating a job, while stale recovery kept re-enqueueing the same
+impossible operation and left the UI in `approving` indefinitely.
 
-The fix must preserve the existing legal-versioning contract: the historical
-chunk remains stored and receives an end date, while the replacement is a new
-active chunk. Search must expose the new version only after its index
-projection has been published successfully.
+The fix must preserve the legal-versioning contract: the historical chunk
+remains stored and receives an end date, while the replacement is a new active
+chunk. A proposal is successful only after the active search projection has
+been written.
 
 ## Chosen Design
 
-Approval becomes a short, durable state transition followed by the existing
-regulatory indexing job workflow.
+Approval remains asynchronous and uses the active regulatory projection path.
 
 1. The approval worker locks the proposal, creates the replacement chunk,
    closes the old chunk, records the replacement on the proposal, and commits.
-   It does not call an embedding provider or Elasticsearch while this
-   transaction is open.
-2. The worker creates a durable regulatory indexing job from the canonical
-   chunk rows for that user file and stores the job ID on the proposal.
-3. The regulatory indexing worker performs contextualization, embedding,
-   hidden index staging, verification, and atomic publication using its
-   existing heartbeat, retry, fencing, and stale-recovery behavior.
-4. Successful publication marks every linked proposal `approved` in the same
-   database transaction that marks the indexing job successful. This prevents
-   the UI from claiming success before the new search projection is visible.
-5. Terminal indexing failure marks linked proposals with a visible approval
-   error state. A retry reuses the already-created legal version and restarts
-   only its failed indexing job; it never creates another replacement chunk.
+2. In a new transaction, the worker validates that the current search settings
+   are Google `gemini-embedding-2` with final embedding dimension 1024.
+3. The worker reprojects the canonical chunk rows for the affected user file
+   through `project_user_file_to_index` and the exact validated PRESENT index.
+   It never invokes a FUTURE embedding provider; instead, an existing FUTURE
+   copy is marked for normal reconciliation. A separate approval heartbeat
+   keeps stale recovery from dispatching a duplicate while this full-file
+   operation is running.
+4. Successful projection marks the proposal `approved`. A projection failure
+   marks it `approval_failed` with a bounded safe message; provider details are
+   retained only in server logs.
+5. Retry reuses `applied_new_chunk_id`, repeats only the search projection, and
+   never creates another replacement chunk.
 
-## State and Schema
+The general-purpose durable regulatory indexing pipeline remains available for
+its existing workflows. Amendment approval does not use it because that path
+has a different OpenRouter embedding contract.
 
-`amendment_proposal` gains:
+## State and Recovery
 
-- `approval_indexing_job_id`: nullable foreign key to
-  `regulatory_indexing_job.id`.
-- `approval_error`: nullable safe user-facing failure message.
-
-The proposal status constraint gains `approval_failed`. The existing
 `applied_new_chunk_id` distinguishes a proposal whose legal DB transition has
-already been applied from a legacy queued proposal that never started.
+already been applied from a queued proposal that never started. The existing
+`approval_failed` and `approval_error` fields provide a terminal, visible
+failure state.
 
-The durable chunk-row preparation path is extended to accept a completed user
-file during an amendment reprojection. Preparation moves that file to
-`INDEXING`; successful publication returns it to `COMPLETED`. Existing active
-job fencing remains the single authority for concurrent file projections.
+Recovery behaves as follows:
 
-## Recovery and Compatibility
+- a live projection renews the proposal timestamp;
+- an applied, stale `approving` proposal is re-enqueued and resumes from the
+  existing replacement chunk;
+- a stale proposal with no applied chunk returns to `pending`;
+- a terminal projection failure remains `approval_failed` until an admin
+  explicitly retries it.
 
-The periodic amendment recovery task also reconciles approval state:
-
-- A linked succeeded job finalizes the proposal as `approved`.
-- A linked terminal failed or cancelled job marks it `approval_failed` with a
-  safe message.
-- A stale legacy `approving` proposal with neither an applied chunk nor an
-  indexing job is returned to `pending`; this repairs approvals created by the
-  previous deployment.
-- A proposal with an applied chunk but no job is re-enqueued so indexing can be
-  prepared idempotently.
-
-The approval task is safe to redeliver. If `applied_new_chunk_id` exists, it
-skips the legal mutation and resumes from durable indexing preparation.
+A retry may reclaim a file left `FAILED` by a terminal legacy job. It does not
+claim an `INDEXING` file, because an active durable job may still own that file.
+The worker verifies and locks the same PRESENT settings row again after the
+long projection before it marks the proposal approved, so a concurrent index
+promotion becomes a safe terminal retry instead of a false success.
 
 ## API and UI
 
-The existing approve endpoint remains asynchronous and returns HTTP 202.
-Pending proposals accept reviewed field edits. `approval_failed` proposals
-offer retry without accepting further legal-content edits, because their new
-chunk version already exists in PostgreSQL.
+The approve endpoint remains asynchronous and returns HTTP 202. Pending
+proposals accept reviewed field edits. `approval_failed` proposals expose a
+retry endpoint and a `Retry indexing` action without allowing further legal
+content edits, because the replacement chunk already exists in PostgreSQL.
 
-The admin UI continues polling while a proposal is `approving`. It shows:
-
-- informational progress while the durable job is active;
-- success only after index publication;
-- a clear error and retry action for `approval_failed`;
-- no infinite generic running state for terminal failures.
-
-## Error Handling and Observability
-
-Logs include proposal ID, user-file ID, indexing job ID, and lifecycle event at
-dispatch, DB application, job linkage, publication completion, failure, and
-recovery. Provider exception details stay in server logs; the proposal stores
-only a bounded safe message.
-
-Dispatch failure after the DB transition does not roll back or duplicate the
-legal version. The recovery task detects the applied proposal without a job
-and resumes it.
+The admin UI polls while a proposal is `approving`, shows success only after
+projection, and replaces the endless running message with a clear terminal
+error and retry action when projection fails.
 
 ## Tests
 
 Backend tests verify that:
 
-- the approval task never calls `project_user_file_to_index`;
-- legal mutation commits before durable job preparation and no duplicate chunk
-  is created on redelivery;
-- proposal and indexing-job linkage is persisted;
-- publication success atomically finalizes linked proposals;
-- terminal failure becomes `approval_failed`;
-- stale legacy proposals and applied-but-unlinked proposals recover correctly;
-- retry does not reapply the legal amendment;
-- worker registration, queue expiry, and deployment queue wiring remain valid.
+- legal mutation commits before active-index projection;
+- only Google `gemini-embedding-2` with 1024-dimensional vectors is accepted;
+- long projection renews its approval heartbeat;
+- success and failure become explicit terminal proposal states;
+- retry reuses the existing applied chunk;
+- worker registration, queue expiry, and stale recovery remain valid.
 
-Frontend tests verify polling success, visible terminal failure, and retry.
-After deployment, a browser test approves a real DEV proposal, observes the
-transition out of `approving`, and verifies the amended text is retrievable.
+Frontend tests verify the visible terminal failure and retry action. Live DEV
+verification checks the proposal transition, Elasticsearch mapping/vector
+dimension, and retrieval of the amended content after the `develop` deploy.

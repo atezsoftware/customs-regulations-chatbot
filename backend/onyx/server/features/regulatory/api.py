@@ -27,6 +27,7 @@ from onyx.db.models import DocumentSet, User, UserFile
 from onyx.db.regulatory_amendments import (
     compute_duplicate_targets,
     create_batch,
+    finalize_amendment_proposal_projection,
     get_batch,
     get_proposal,
     list_batches_for_document_set,
@@ -35,6 +36,7 @@ from onyx.db.regulatory_amendments import (
     reject_proposal,
     reset_amendment_proposal_approval,
     reset_failed_batch_for_retry,
+    retry_amendment_proposal_projection,
 )
 from onyx.db.regulatory_chunks import (
     ValidityDateUpdate,
@@ -631,6 +633,62 @@ def approve_proposal(
             OnyxErrorCode.SERVICE_UNAVAILABLE,
             "Approval could not be queued. Please try again.",
         ) from error
+
+    return AmendmentProposalSnapshot.from_model(proposal)
+
+
+@router.post(
+    "/amendments/proposals/{proposal_id}/retry",
+    tags=PUBLIC_API_TAGS,
+    status_code=202,
+)
+def retry_proposal_indexing(
+    proposal_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> AmendmentProposalSnapshot:
+    proposal = get_proposal(db_session, proposal_id)
+    if proposal is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Proposal not found")
+    batch = get_batch(db_session, proposal.batch_id)
+    assert batch is not None
+    _get_editable_document_set(db_session, batch.document_set_id, user)
+    if batch.status != AmendmentBatchStatus.ANALYZED.value:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Proposals can only be retried after analysis is complete.",
+        )
+    try:
+        proposal, should_enqueue = retry_amendment_proposal_projection(
+            db_session,
+            proposal_id=proposal_id,
+        )
+    except ValueError as error:
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(error)) from error
+    db_session.commit()
+
+    if should_enqueue:
+        try:
+            enqueue_amendment_proposal_approval(
+                proposal_id=proposal.id,
+                tenant_id=tenant_id,
+            )
+        except Exception as error:
+            logger.exception(
+                "Approval retry dispatch failed for proposal=%s", proposal.id
+            )
+            finalize_amendment_proposal_projection(
+                db_session,
+                proposal_id=proposal.id,
+                succeeded=False,
+                error_message="Indexing could not be queued. Please try again.",
+            )
+            db_session.commit()
+            raise OnyxError(
+                OnyxErrorCode.SERVICE_UNAVAILABLE,
+                "Indexing could not be queued. Please try again.",
+            ) from error
 
     return AmendmentProposalSnapshot.from_model(proposal)
 

@@ -21,7 +21,7 @@ from onyx.configs.app_configs import (
 )
 from onyx.configs.constants import DEFAULT_BOOST, DocumentSource
 from onyx.connectors.models import Document, TextSection
-from onyx.db.models import RegulatoryChunk, SearchSettings, UserFile
+from onyx.db.models import RegulatoryChunk, SearchSettings, UserFile, UserFileStatus
 from onyx.db.regulatory_chunks import get_chunks_for_file
 from onyx.db.search_settings import get_active_search_settings_list
 from onyx.db.user_file import (
@@ -392,17 +392,36 @@ def project_user_file_to_index(
     tenant_id: str,
     *,
     include_chunked: bool = False,
+    include_failed: bool = False,
+    current_search_settings_id: int | None = None,
 ) -> int:
-    """Embed and replace one file from its rows in PRESENT and FUTURE indices.
+    """Embed and replace one file from its canonical regulatory rows.
 
     `include_chunked` admits files that have chunks but were never indexed, which
     is what an explicit index request needs.
+
+    `current_search_settings_id` selects only the exact validated PRESENT row.
+    This strict mode rejects a concurrent promotion and marks an existing FUTURE
+    copy for reconciliation instead of invoking its embedding provider.
+
+    `include_failed` admits a file left FAILED by a terminal legacy indexing job.
+    INDEXING remains excluded because another durable job may still own it.
     """
 
     user_file_id = str(user_file.id)
-    locked_user_file = lock_completed_user_file_for_projection(
-        db_session, UUID(user_file_id), include_chunked=include_chunked
-    )
+    if include_failed:
+        locked_user_file = lock_completed_user_file_for_projection(
+            db_session,
+            UUID(user_file_id),
+            include_chunked=include_chunked,
+            include_failed=True,
+        )
+    else:
+        locked_user_file = lock_completed_user_file_for_projection(
+            db_session,
+            UUID(user_file_id),
+            include_chunked=include_chunked,
+        )
     if locked_user_file is None:
         logger.info(
             "project_user_file_to_index: user file is gone or not completed; "
@@ -421,6 +440,20 @@ def project_user_file_to_index(
     search_settings_list = get_active_search_settings_list(db_session)
     if not any(settings.status.is_current() for settings in search_settings_list):
         raise RuntimeError("No current search settings found")
+    if current_search_settings_id is not None:
+        current_settings = [
+            settings
+            for settings in search_settings_list
+            if settings.status.is_current()
+        ]
+        if (
+            len(current_settings) != 1
+            or current_settings[0].id != current_search_settings_id
+        ):
+            raise RuntimeError("Current search settings changed after validation")
+        if any(settings.status.is_future() for settings in search_settings_list):
+            user_file.secondary_reconcile_pending = True
+        search_settings_list = current_settings
 
     project_ids = fetch_user_project_ids_for_user_files([user_file_id], db_session)
     persona_ids = fetch_persona_ids_for_user_files([user_file_id], db_session)
@@ -468,5 +501,7 @@ def project_user_file_to_index(
             user_file.secondary_reconcile_pending = False
 
     user_file.chunk_count = len(rows)
+    if include_failed and user_file.status is UserFileStatus.FAILED:
+        user_file.status = UserFileStatus.COMPLETED
     db_session.add(user_file)
     return len(rows)

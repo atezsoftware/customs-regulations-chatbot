@@ -419,17 +419,20 @@ def lock_completed_user_file_for_projection(
     user_file_id: UUID,
     *,
     include_chunked: bool = False,
+    include_failed: bool = False,
 ) -> UserFile | None:
     """Serialize canonical projection with file deletion and other projectors.
 
     Only COMPLETED files project by default, so edits to a file still awaiting an
-    explicit index request stay in Postgres. The explicit index request itself
-    opts in with `include_chunked`.
+    explicit index request stay in Postgres. Explicit indexing may opt into
+    CHUNKED files, while a terminal amendment retry may opt into FAILED files.
     """
 
     statuses = [UserFileStatus.COMPLETED]
     if include_chunked:
         statuses.append(UserFileStatus.CHUNKED)
+    if include_failed:
+        statuses.append(UserFileStatus.FAILED)
 
     return db_session.scalar(
         select(UserFile)

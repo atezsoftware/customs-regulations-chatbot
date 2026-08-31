@@ -216,6 +216,22 @@ export async function approveProposal(
   return response.json();
 }
 
+export async function retryProposalIndexing(
+  proposalId: number
+): Promise<AmendmentProposal> {
+  const response = await fetch(
+    `/api/regulatory/amendments/proposals/${proposalId}/retry`,
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(
+      body?.detail || `Retry indexing failed (Status: ${response.status})`
+    );
+  }
+  return response.json();
+}
+
 export async function rejectProposal(
   proposalId: number
 ): Promise<AmendmentProposal> {

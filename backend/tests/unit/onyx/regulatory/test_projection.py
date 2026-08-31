@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from onyx.db.models import RegulatoryChunk
+from onyx.db.models import RegulatoryChunk, UserFileStatus
 from onyx.document_index.interfaces_new import IndexingMetadata
 from onyx.indexing.models import DocAwareChunk
 from onyx.regulatory.projection import (
@@ -145,6 +145,82 @@ def test_present_projection_failure_prevents_future_write() -> None:
     project_one.assert_called_once()
 
 
+def test_projection_targets_the_exact_validated_current_setting() -> None:
+    user_file = MagicMock()
+    user_file.id = uuid4()
+    user_file.chunk_count = 1
+    rows = [MagicMock()]
+    present = _settings(current=True)
+    present.id = 11
+    future = _settings(current=False, future=True)
+
+    with (
+        patch(
+            "onyx.regulatory.projection.lock_completed_user_file_for_projection",
+            return_value=user_file,
+        ),
+        patch("onyx.regulatory.projection.get_chunks_for_file", return_value=rows),
+        patch(
+            "onyx.regulatory.projection.get_active_search_settings_list",
+            return_value=[present, future],
+        ),
+        patch(
+            "onyx.regulatory.projection.fetch_user_project_ids_for_user_files",
+            return_value={},
+        ),
+        patch(
+            "onyx.regulatory.projection.fetch_persona_ids_for_user_files",
+            return_value={},
+        ),
+        patch(
+            "onyx.regulatory.projection._project_rows_to_search_settings",
+            return_value=1,
+        ) as project_one,
+    ):
+        count = project_user_file_to_index(
+            MagicMock(),
+            user_file,
+            "tenant",
+            current_search_settings_id=11,
+        )
+
+    assert count == 1
+    project_one.assert_called_once()
+    assert project_one.call_args.kwargs["search_settings"] is present
+
+
+def test_projection_rejects_a_promoted_unvalidated_current_setting() -> None:
+    user_file = MagicMock()
+    user_file.id = uuid4()
+    rows = [MagicMock()]
+    promoted = _settings(current=True)
+    promoted.id = 12
+
+    with (
+        patch(
+            "onyx.regulatory.projection.lock_completed_user_file_for_projection",
+            return_value=user_file,
+        ),
+        patch("onyx.regulatory.projection.get_chunks_for_file", return_value=rows),
+        patch(
+            "onyx.regulatory.projection.get_active_search_settings_list",
+            return_value=[promoted],
+        ),
+        patch(
+            "onyx.regulatory.projection._project_rows_to_search_settings"
+        ) as project_one,
+        pytest.raises(RuntimeError, match="changed after validation"),
+    ):
+        project_user_file_to_index(
+            MagicMock(),
+            user_file,
+            "tenant",
+            current_search_settings_id=11,
+        )
+
+    project_one.assert_not_called()
+
+
 def test_projection_skips_file_that_cannot_be_locked_as_completed() -> None:
     user_file = MagicMock()
     user_file.id = uuid4()
@@ -165,6 +241,57 @@ def test_projection_skips_file_that_cannot_be_locked_as_completed() -> None:
     lock_user_file.assert_called_once_with(ANY, user_file.id, include_chunked=False)
     get_rows.assert_not_called()
     project_rows.assert_not_called()
+
+
+def test_strict_current_projection_recovers_a_legacy_failed_file() -> None:
+    user_file = MagicMock()
+    user_file.id = uuid4()
+    user_file.status = UserFileStatus.FAILED
+    user_file.chunk_count = 1
+    rows = [MagicMock()]
+    present = _settings(current=True)
+    present.id = 11
+    db_session = MagicMock()
+
+    with (
+        patch(
+            "onyx.regulatory.projection.lock_completed_user_file_for_projection",
+            return_value=user_file,
+        ) as lock_user_file,
+        patch("onyx.regulatory.projection.get_chunks_for_file", return_value=rows),
+        patch(
+            "onyx.regulatory.projection.get_active_search_settings_list",
+            return_value=[present],
+        ),
+        patch(
+            "onyx.regulatory.projection.fetch_user_project_ids_for_user_files",
+            return_value={},
+        ),
+        patch(
+            "onyx.regulatory.projection.fetch_persona_ids_for_user_files",
+            return_value={},
+        ),
+        patch(
+            "onyx.regulatory.projection._project_rows_to_search_settings",
+            return_value=1,
+        ),
+    ):
+        count = project_user_file_to_index(
+            db_session,
+            user_file,
+            "tenant",
+            current_search_settings_id=11,
+            include_failed=True,
+        )
+
+    assert count == 1
+    lock_user_file.assert_called_once_with(
+        db_session,
+        user_file.id,
+        include_chunked=False,
+        include_failed=True,
+    )
+    assert user_file.status is UserFileStatus.COMPLETED
 
 
 def test_target_projection_builds_setting_specific_index_and_embedder() -> None:
