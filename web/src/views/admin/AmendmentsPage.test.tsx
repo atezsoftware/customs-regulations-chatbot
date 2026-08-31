@@ -520,6 +520,69 @@ test("shows a green success message after approval and indexing complete", async
   expect(success).toHaveClass("bg-status-success-01");
 });
 
+test("shows a terminal indexing error instead of an endless running state", async () => {
+  const analyzedBatch = {
+    ...queuedBatch,
+    status: "analyzed" as const,
+    stage: "finalizing" as const,
+    instruction_count: 1,
+    processed_instruction_count: 1,
+  };
+  mockedListAmendmentBatches.mockResolvedValue([analyzedBatch]);
+  mockedGetAmendmentAnalysis.mockResolvedValue({
+    batch: analyzedBatch,
+    proposals: [
+      {
+        id: 22,
+        batch_id: 42,
+        instruction_index: 0,
+        instruction_text: "MADDE 15 değiştirilmiştir.",
+        instruction_indices: [0],
+        instruction_texts: ["MADDE 15 değiştirilmiştir."],
+        old_chunk_id: "old-chunk",
+        old_chunk_snapshot: { id: "old-chunk", text: "Eski metin" },
+        new_chunk_draft: {
+          user_file_id: "00000000-0000-0000-0000-000000000123",
+          position: 15,
+          text: "Yeni metin",
+        },
+        match_confidence: 0.99,
+        match_rationale: "Exact provision",
+        date_rationale: null,
+        status: "approval_failed" as const,
+        applied_new_chunk_id: "new-chunk",
+        approval_indexing_job_id: "job-id",
+        approval_error: "Indexing failed. The approval was not published.",
+        decided_by: "admin-id",
+        decided_at: null,
+        created_at: "2026-08-31T11:00:00Z",
+        updated_at: "2026-08-31T12:00:00Z",
+        duplicate_target: false,
+      },
+    ],
+    unmatched_instructions: [],
+  });
+
+  const user = setupUser();
+  render(<AmendmentsPage />);
+  act(() => {
+    screen.getByRole("combobox").focus();
+  });
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
+  );
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Indexing failed. The approval was not published."
+  );
+  expect(
+    screen.queryByText(/Approval is running.*indexed in the background/)
+  ).not.toBeInTheDocument();
+});
+
 test("keeps an invalid date edit from being approved", async () => {
   const analyzedBatch = {
     ...queuedBatch,

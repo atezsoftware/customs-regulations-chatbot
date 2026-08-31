@@ -494,7 +494,33 @@ def test_amendment_approval_keeps_true_new_provision_unlinked() -> None:
 
     assert result.old_chunk is None
     assert result.new_chunk.supersedes_chunk_id is None
-    assert result.proposal.status == "approved"
+    assert result.proposal.status == "approving"
+
+
+def test_amendment_approval_redelivery_reuses_applied_chunk() -> None:
+    proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(
+            id=50,
+            status="approving",
+            applied_new_chunk_id="new-chunk",
+        ),
+    )
+    new_chunk = SimpleNamespace(
+        id="new-chunk",
+        supersedes_chunk_id="old-chunk",
+    )
+    old_chunk = SimpleNamespace(id="old-chunk")
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.return_value = proposal
+    db_session.get.side_effect = [new_chunk, old_chunk]
+
+    result = approve_amendment_proposal(db_session, proposal, decided_by=None)
+
+    assert result.new_chunk is new_chunk
+    assert result.old_chunk is old_chunk
+    db_session.add.assert_not_called()
+    db_session.flush.assert_not_called()
 
 
 def test_rejection_locks_and_refreshes_before_checking_pending_status() -> None:

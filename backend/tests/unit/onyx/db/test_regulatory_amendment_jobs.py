@@ -7,7 +7,11 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from onyx.db.enums import AmendmentBatchStage, AmendmentBatchStatus
+from onyx.db.enums import (
+    AmendmentBatchStage,
+    AmendmentBatchStatus,
+    AmendmentProposalStatus,
+)
 from onyx.db.regulatory_amendments import (
     claim_batch_for_analysis,
     claim_stale_batches_for_recovery,
@@ -16,11 +20,49 @@ from onyx.db.regulatory_amendments import (
     mark_batch_failed,
     persist_proposal_checkpoint,
     persist_unmatched_checkpoint,
+    recover_stale_amendment_proposal_approvals,
     reset_failed_batch_for_retry,
 )
 from onyx.regulatory.amendments.models import ProposalDraft
 
 NOW = datetime.datetime(2026, 8, 27, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+def test_stale_approval_recovery_resets_legacy_and_resumes_applied() -> None:
+    legacy = SimpleNamespace(
+        id=70,
+        status=AmendmentProposalStatus.APPROVING.value,
+        applied_new_chunk_id=None,
+        decided_by=uuid4(),
+        decided_at=None,
+        approval_error=None,
+        updated_at=NOW - datetime.timedelta(hours=2),
+    )
+    applied = SimpleNamespace(
+        id=71,
+        status=AmendmentProposalStatus.APPROVING.value,
+        applied_new_chunk_id="new-chunk",
+        decided_by=uuid4(),
+        decided_at=None,
+        approval_error=None,
+        updated_at=NOW - datetime.timedelta(hours=2),
+    )
+    db_session = MagicMock()
+    db_session.scalars.return_value.all.return_value = [legacy, applied]
+
+    resume_ids = recover_stale_amendment_proposal_approvals(
+        db_session,
+        stale_before=NOW - datetime.timedelta(minutes=10),
+        recovered_at=NOW,
+    )
+
+    assert resume_ids == [71]
+    assert legacy.status == AmendmentProposalStatus.PENDING.value
+    assert legacy.decided_by is None
+    assert applied.status == AmendmentProposalStatus.APPROVING.value
+    assert legacy.updated_at == NOW
+    assert applied.updated_at == NOW
+    db_session.commit.assert_called_once_with()
 
 
 def test_create_batch_snapshots_scope_and_starts_queued() -> None:

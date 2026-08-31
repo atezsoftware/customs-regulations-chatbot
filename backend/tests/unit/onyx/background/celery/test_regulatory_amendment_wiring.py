@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
+from uuid import UUID
 
 from onyx.background.celery.tasks.regulatory_amendments import tasks
 from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryQueues, OnyxCeleryTask
@@ -63,12 +64,27 @@ def test_run_task_claims_and_executes_batch() -> None:
     run_batch.assert_called_once_with(batch_id=42, lease_generation=7)
 
 
-def test_approval_task_projects_affected_file_before_committing() -> None:
-    proposal = SimpleNamespace(id=9, status="approving")
-    result = SimpleNamespace(new_chunk=SimpleNamespace(user_file_id="file-id"))
-    user_file = SimpleNamespace(id="file-id")
-    db_session = MagicMock()
-    db_session.get.return_value = user_file
+def test_approval_task_commits_version_before_durable_indexing() -> None:
+    proposal = SimpleNamespace(
+        id=9,
+        status="approving",
+        applied_new_chunk_id=None,
+    )
+    user_file_id = UUID("00000000-0000-0000-0000-000000000111")
+    result = SimpleNamespace(new_chunk=SimpleNamespace(user_file_id=user_file_id))
+    job_id = UUID("00000000-0000-0000-0000-000000000909")
+    apply_session = MagicMock()
+    prepare_session = MagicMock()
+    link_session = MagicMock()
+    events: list[str] = []
+    apply_session.commit.side_effect = lambda: events.append("version-commit")
+    link_session.commit.side_effect = lambda: events.append("link-commit")
+
+    session_contexts = []
+    for session in (apply_session, prepare_session, link_session):
+        context = MagicMock()
+        context.__enter__.return_value = session
+        session_contexts.append(context)
 
     with (
         patch.object(tasks, "get_session_with_current_tenant") as session_factory,
@@ -76,18 +92,35 @@ def test_approval_task_projects_affected_file_before_committing() -> None:
         patch.object(
             tasks, "approve_amendment_proposal", return_value=result
         ) as approve,
-        patch.object(tasks, "project_user_file_to_index") as project,
-        patch.object(tasks, "get_current_tenant_id", return_value="tenant-a"),
+        patch.object(
+            tasks,
+            "prepare_regulatory_indexing_job_from_chunks",
+            return_value=job_id,
+        ) as prepare,
+        patch.object(
+            tasks, "link_amendment_proposal_indexing_job", return_value=True
+        ) as link,
+        patch.object(tasks, "enqueue_prepared_regulatory_indexing_job") as enqueue,
     ):
-        session_factory.return_value.__enter__.return_value = db_session
+        session_factory.side_effect = session_contexts
         tasks.regulatory_amendment_approve.run(
             proposal_id=9,
             tenant_id="tenant-a",
         )
 
-    approve.assert_called_once_with(db_session, proposal)
-    project.assert_called_once_with(db_session, user_file, "tenant-a")
-    db_session.commit.assert_called_once_with()
+    approve.assert_called_once_with(apply_session, proposal)
+    prepare.assert_called_once_with(user_file_id, "tenant-a", prepare_session)
+    link.assert_called_once_with(
+        link_session,
+        proposal_id=9,
+        job_id=job_id,
+    )
+    enqueue.assert_called_once_with(job_id=job_id, tenant_id="tenant-a")
+    assert events == ["version-commit", "link-commit"]
+
+
+def test_approval_task_does_not_use_locked_full_file_projection() -> None:
+    assert not hasattr(tasks, "project_user_file_to_index")
 
 
 def test_lease_watchdog_renews_heartbeat_with_tenant_context() -> None:
@@ -117,6 +150,41 @@ def test_lease_watchdog_renews_heartbeat_with_tenant_context() -> None:
     )
     stop.set.assert_called_once_with()
     thread.join.assert_called_once_with(timeout=2)
+
+
+def test_recovery_redelivers_applied_unlinked_approvals() -> None:
+    batch_context = MagicMock()
+    batch_context.__enter__.return_value = MagicMock()
+    proposal_context = MagicMock()
+    proposal_context.__enter__.return_value = MagicMock()
+
+    with (
+        patch.object(
+            tasks,
+            "get_session_with_current_tenant",
+            side_effect=[batch_context, proposal_context],
+        ),
+        patch.object(tasks, "claim_stale_batches_for_recovery", return_value=[42]),
+        patch.object(
+            tasks,
+            "recover_stale_amendment_proposal_approvals",
+            return_value=[9],
+        ),
+        patch.object(tasks, "enqueue_amendment_batch") as enqueue_batch,
+        patch.object(tasks, "enqueue_amendment_proposal_approval") as enqueue_approval,
+    ):
+        tasks.regulatory_amendment_recover_stale.run(tenant_id="tenant-a")
+
+    enqueue_batch.assert_called_once()
+    enqueue_approval.assert_called_once()
+    assert enqueue_batch.call_args.kwargs == {
+        "batch_id": 42,
+        "tenant_id": "tenant-a",
+    }
+    assert enqueue_approval.call_args.kwargs == {
+        "proposal_id": 9,
+        "tenant_id": "tenant-a",
+    }
 
 
 def test_runtime_lite_worker_consumes_amendment_queue() -> None:

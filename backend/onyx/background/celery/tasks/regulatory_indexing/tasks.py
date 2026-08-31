@@ -84,6 +84,31 @@ def enqueue_regulatory_indexing_step(
         )
 
 
+def enqueue_prepared_regulatory_indexing_job(
+    *,
+    job_id: UUID,
+    tenant_id: str,
+    celery_app: Celery | None = None,
+) -> None:
+    """Emit a broker hint for a committed DB-backed indexing job."""
+
+    if celery_app is None:
+        from onyx.background.celery.versioned_apps.client import app as celery_app
+
+    with get_session_with_current_tenant() as db_session:
+        job = indexing_job_repository.get_regulatory_indexing_job(db_session, job_id)
+        if job is None:
+            raise RuntimeError("prepared regulatory indexing job disappeared")
+        expected_generation = job.lease_generation
+    enqueue_regulatory_indexing_step(
+        celery_app,
+        job_id=job_id,
+        expected_generation=expected_generation,
+        tenant_id=tenant_id,
+        delivery_kind=OrchestrationDeliveryKind.NORMAL,
+    )
+
+
 @shared_task(
     name=OnyxCeleryTask.REGULATORY_INDEXING_RUN_STEP,
     bind=True,

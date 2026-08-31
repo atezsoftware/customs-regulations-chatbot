@@ -213,8 +213,15 @@ def prepare_regulatory_indexing_job_from_chunks(
     user_file = db_session.get(UserFile, user_file_id)
     if user_file is None:
         raise ValueError("regulatory indexing user file does not exist")
-    if user_file.status not in {UserFileStatus.CHUNKED, UserFileStatus.INDEXING}:
-        raise ValueError("durable regulatory indexing requires a CHUNKED user file")
+    if user_file.status not in {
+        UserFileStatus.CHUNKED,
+        UserFileStatus.INDEXING,
+        UserFileStatus.COMPLETED,
+    }:
+        raise ValueError(
+            "durable regulatory indexing requires a CHUNKED, INDEXING, or "
+            "COMPLETED user file"
+        )
     rows = get_chunks_for_file(db_session, user_file_id)
     content_hash = regulatory_chunks_content_hash(rows)
     snapshot = resolve_regulatory_indexing_snapshot(
@@ -238,6 +245,10 @@ def prepare_regulatory_indexing_job_from_chunks(
         config_snapshot=snapshot.model_dump(mode="json"),
         now=now,
     )
+    if job.content_hash != content_hash:
+        raise RuntimeError(
+            "another regulatory indexing revision is still active for this file"
+        )
     if job.chunk_generation_hash != snapshot.chunk_generation_hash:
         return job.id
     unclaimed_generation = job.lease_generation

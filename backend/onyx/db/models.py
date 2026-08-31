@@ -6145,6 +6145,12 @@ class AmendmentProposal(Base):
     applied_new_chunk_id: Mapped[str | None] = mapped_column(
         ForeignKey("regulatory_chunk.id", ondelete="SET NULL"), nullable=True
     )
+    approval_indexing_job_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_indexing_job.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    approval_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     decided_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("user.id"), nullable=True
     )
@@ -6174,8 +6180,13 @@ class AmendmentProposal(Base):
         ),
         Index("ix_amendment_proposal_status", "status"),
         Index("ix_amendment_proposal_old_chunk_id", "old_chunk_id"),
+        Index(
+            "ix_amendment_proposal_approval_indexing_job_id",
+            "approval_indexing_job_id",
+        ),
         CheckConstraint(
-            "status IN ('pending', 'approving', 'approved', 'rejected')",
+            "status IN ('pending', 'approving', 'approval_failed', "
+            "'approved', 'rejected')",
             name="amendment_proposal_status_check",
         ),
     )

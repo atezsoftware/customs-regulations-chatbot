@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from onyx.db.enums import (
@@ -580,6 +580,104 @@ def reset_amendment_proposal_approval(
     return True
 
 
+def link_amendment_proposal_indexing_job(
+    db_session: Session,
+    *,
+    proposal_id: int,
+    job_id: UUID,
+) -> bool:
+    """Link an applied proposal to the durable projection that will publish it."""
+
+    result = db_session.execute(
+        update(AmendmentProposal)
+        .where(
+            AmendmentProposal.id == proposal_id,
+            AmendmentProposal.status == AmendmentProposalStatus.APPROVING.value,
+            AmendmentProposal.applied_new_chunk_id.is_not(None),
+        )
+        .values(
+            approval_indexing_job_id=job_id,
+            approval_error=None,
+            updated_at=func.now(),
+        )
+    )
+    return bool(result.rowcount)  # ty: ignore[unresolved-attribute]
+
+
+def finalize_amendment_proposals_for_indexing_job(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    succeeded: bool,
+    error_message: str | None = None,
+) -> int:
+    """Reflect one terminal projection outcome on every linked proposal."""
+
+    values: dict[str, Any]
+    if succeeded:
+        values = {
+            "status": AmendmentProposalStatus.APPROVED.value,
+            "approval_error": None,
+            "decided_at": datetime.datetime.now(datetime.timezone.utc),
+            "updated_at": func.now(),
+        }
+    else:
+        values = {
+            "status": AmendmentProposalStatus.APPROVAL_FAILED.value,
+            "approval_error": (
+                error_message or "Indexing failed. The approval was not published."
+            )[:_MAX_ERROR_MESSAGE_LENGTH],
+            "decided_at": None,
+            "updated_at": func.now(),
+        }
+    result = db_session.execute(
+        update(AmendmentProposal)
+        .where(
+            AmendmentProposal.approval_indexing_job_id == job_id,
+            AmendmentProposal.status == AmendmentProposalStatus.APPROVING.value,
+        )
+        .values(**values)
+    )
+    return int(result.rowcount or 0)  # ty: ignore[unresolved-attribute]
+
+
+def recover_stale_amendment_proposal_approvals(
+    db_session: Session,
+    *,
+    stale_before: datetime.datetime,
+    recovered_at: datetime.datetime,
+    limit: int = 100,
+) -> list[int]:
+    """Repair pre-job approvals and claim applied-but-unlinked approvals."""
+
+    proposals = list(
+        db_session.scalars(
+            select(AmendmentProposal)
+            .where(
+                AmendmentProposal.status == AmendmentProposalStatus.APPROVING.value,
+                AmendmentProposal.approval_indexing_job_id.is_(None),
+                AmendmentProposal.updated_at < stale_before,
+            )
+            .order_by(AmendmentProposal.updated_at, AmendmentProposal.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).all()
+    )
+    resume_ids: list[int] = []
+    for proposal in proposals:
+        if proposal.applied_new_chunk_id:
+            proposal.updated_at = recovered_at
+            resume_ids.append(proposal.id)
+            continue
+        proposal.status = AmendmentProposalStatus.PENDING.value
+        proposal.decided_by = None
+        proposal.decided_at = None
+        proposal.approval_error = None
+        proposal.updated_at = recovered_at
+    db_session.commit()
+    return resume_ids
+
+
 class ApprovalResult:
     def __init__(
         self,
@@ -671,7 +769,8 @@ def approve_amendment_proposal(
        `validity_start_date` doubles as the old chunk's supersession
        boundary (when the new text starts applying is when the old text
        stops).
-    4. Mark the proposal approved and record which chunk it produced.
+    4. Record which chunk it produced while leaving the proposal `approving`.
+       Durable index publication is the only operation that marks it approved.
 
     Date fallback: if the drafted `effective_start_date` is null (no
     explicit date in the amendment text, and no reference/publication date
@@ -692,6 +791,25 @@ def approve_amendment_proposal(
         raise ValueError(
             f"Amendment proposal {proposal.id} is not queued for approval "
             f"(status: {proposal.status})."
+        )
+
+    applied_new_chunk_id = getattr(proposal, "applied_new_chunk_id", None)
+    if isinstance(applied_new_chunk_id, str) and applied_new_chunk_id:
+        new_chunk = db_session.get(RegulatoryChunk, applied_new_chunk_id)
+        if new_chunk is None:
+            raise ValueError(
+                f"Applied chunk {applied_new_chunk_id} no longer exists; "
+                "cannot resume approval."
+            )
+        old_chunk = (
+            db_session.get(RegulatoryChunk, new_chunk.supersedes_chunk_id)
+            if new_chunk.supersedes_chunk_id
+            else None
+        )
+        return ApprovalResult(
+            proposal=proposal,
+            new_chunk=new_chunk,
+            old_chunk=old_chunk,
         )
 
     snapshot_target_id = (getattr(proposal, "old_chunk_snapshot", None) or {}).get("id")
@@ -777,11 +895,12 @@ def approve_amendment_proposal(
         db_session.add(old_chunk)
 
     proposal.new_chunk_draft = draft
-    proposal.status = AmendmentProposalStatus.APPROVED.value
+    proposal.status = AmendmentProposalStatus.APPROVING.value
     proposal.applied_new_chunk_id = new_chunk.id
+    proposal.approval_error = None
     if decided_by is not None:
         proposal.decided_by = decided_by
-    proposal.decided_at = datetime.datetime.now(datetime.timezone.utc)
+    proposal.decided_at = None
     db_session.add(proposal)
     db_session.flush()
 

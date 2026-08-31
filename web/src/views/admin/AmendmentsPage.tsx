@@ -621,6 +621,18 @@ function ProposalCard({
         </div>
       )}
 
+      {proposal.status === "approval_failed" && (
+        <div
+          role="alert"
+          className="rounded-08 border border-status-error-02 bg-status-error-01 p-3"
+        >
+          <Text font="main-ui-action" color="status-error-05">
+            {proposal.approval_error ||
+              "Indexing failed. The approval was not published."}
+          </Text>
+        </div>
+      )}
+
       {proposal.status === "pending" && (
         <div className="flex gap-2 justify-end">
           <Button
@@ -779,7 +791,8 @@ export default function AmendmentsPage() {
         ).length;
         const failedCount = refreshed.filter(
           (proposal) =>
-            trackedIds.has(proposal.id) && proposal.status === "pending"
+            trackedIds.has(proposal.id) &&
+            ["pending", "approval_failed"].includes(proposal.status)
         ).length;
         setProposals(refreshed);
 

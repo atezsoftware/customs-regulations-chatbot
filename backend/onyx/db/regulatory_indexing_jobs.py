@@ -29,6 +29,9 @@ from onyx.db.models import (
     SearchSettings,
     UserFile,
 )
+from onyx.db.regulatory_amendments import (
+    finalize_amendment_proposals_for_indexing_job,
+)
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
 _MAX_ERROR_CODE_LENGTH = 128
@@ -1638,6 +1641,7 @@ def persist_regulatory_indexing_preparation(
         UserFileStatus.INDEXING,
         UserFileStatus.FAILED,
         UserFileStatus.CHUNKED,
+        UserFileStatus.COMPLETED,
     }:
         db_session.rollback()
         return False
@@ -2391,6 +2395,11 @@ def complete_regulatory_indexing_publication(
     locked_job.heartbeat_at = now
     locked_job.updated_at = now
     locked_job.completed_at = now
+    finalize_amendment_proposals_for_indexing_job(
+        db_session,
+        job_id=locked_job.id,
+        succeeded=True,
+    )
     _schedule_provider_cleanup(locked_job, now=now, cancel_first=False)
     if commit:
         db_session.commit()
@@ -2483,6 +2492,12 @@ def fail_regulatory_indexing_job(
     job.error_message = error_message[:_MAX_ERROR_MESSAGE_LENGTH]
     job.completed_at = now
     job.updated_at = now
+    finalize_amendment_proposals_for_indexing_job(
+        db_session,
+        job_id=job.id,
+        succeeded=False,
+        error_message="Indexing failed. The approval was not published.",
+    )
     _schedule_provider_cleanup(job, now=now, cancel_first=True)
     if locked_user_file.status in {
         UserFileStatus.PROCESSING,
@@ -2545,6 +2560,12 @@ def cancel_regulatory_indexing_job(
     job.updated_at = now
     _schedule_provider_cleanup(job, now=now, cancel_first=False)
     if terminal_failure:
+        finalize_amendment_proposals_for_indexing_job(
+            db_session,
+            job_id=job.id,
+            succeeded=False,
+            error_message="Indexing failed. The approval was not published.",
+        )
         if locked_user_file.status in {
             UserFileStatus.PROCESSING,
             UserFileStatus.INDEXING,
@@ -2802,6 +2823,12 @@ def finalize_regulatory_indexing_cancellation(
     job.updated_at = now
     _schedule_provider_cleanup(job, now=now, cancel_first=False)
     if terminal_failure:
+        finalize_amendment_proposals_for_indexing_job(
+            db_session,
+            job_id=job.id,
+            succeeded=False,
+            error_message="Indexing failed. The approval was not published.",
+        )
         if locked_user_file.status in {
             UserFileStatus.PROCESSING,
             UserFileStatus.INDEXING,

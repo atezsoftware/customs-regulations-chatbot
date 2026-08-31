@@ -837,6 +837,7 @@ class AmendmentProposalStatus(str, PyEnum):
 
     PENDING = "pending"
     APPROVING = "approving"
+    APPROVAL_FAILED = "approval_failed"
     APPROVED = "approved"
     REJECTED = "rejected"
 

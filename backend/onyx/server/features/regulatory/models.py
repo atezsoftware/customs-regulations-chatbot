@@ -117,6 +117,8 @@ class AmendmentProposalSnapshot(BaseModel):
     date_rationale: str | None
     status: str
     applied_new_chunk_id: str | None
+    approval_indexing_job_id: str | None
+    approval_error: str | None
     decided_by: str | None
     decided_at: datetime.datetime | None
     created_at: datetime.datetime
@@ -149,6 +151,12 @@ class AmendmentProposalSnapshot(BaseModel):
             date_rationale=proposal.date_rationale,
             status=proposal.status,
             applied_new_chunk_id=proposal.applied_new_chunk_id,
+            approval_indexing_job_id=(
+                str(proposal.approval_indexing_job_id)
+                if getattr(proposal, "approval_indexing_job_id", None)
+                else None
+            ),
+            approval_error=getattr(proposal, "approval_error", None),
             decided_by=str(proposal.decided_by) if proposal.decided_by else None,
             decided_at=proposal.decided_at,
             created_at=proposal.created_at,

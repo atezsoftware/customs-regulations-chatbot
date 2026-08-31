@@ -4,26 +4,32 @@ from contextlib import contextmanager
 from contextvars import copy_context
 from threading import Event, Thread
 from typing import Any
+from uuid import UUID
 
 from celery import Celery, shared_task
 
+from onyx.background.celery.tasks.regulatory_indexing.tasks import (
+    enqueue_prepared_regulatory_indexing_job,
+)
 from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryQueues, OnyxCeleryTask
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import AmendmentProposalStatus
-from onyx.db.models import UserFile
 from onyx.db.regulatory_amendments import (
     approve_amendment_proposal,
     claim_batch_for_analysis,
     claim_stale_batches_for_recovery,
     get_proposal,
+    link_amendment_proposal_indexing_job,
     mark_batch_failed,
+    recover_stale_amendment_proposal_approvals,
     reset_amendment_proposal_approval,
     touch_batch_heartbeat,
 )
 from onyx.regulatory.amendments.job import run_amendment_batch
-from onyx.regulatory.projection import project_user_file_to_index
+from onyx.regulatory.indexing_jobs.preparation import (
+    prepare_regulatory_indexing_job_from_chunks,
+)
 from onyx.utils.logger import setup_logger
-from shared_configs.contextvars import get_current_tenant_id
 
 logger = setup_logger()
 
@@ -176,6 +182,7 @@ def regulatory_amendment_approve(
 ) -> None:
     """Apply and project one approval outside the Cloudflare request window."""
 
+    version_applied = False
     try:
         with get_session_with_current_tenant() as db_session:
             proposal = get_proposal(db_session, proposal_id)
@@ -191,24 +198,49 @@ def regulatory_amendment_approve(
                 return
 
             result = approve_amendment_proposal(db_session, proposal)
-            user_file = db_session.get(UserFile, result.new_chunk.user_file_id)
-            if user_file is None:
-                raise RuntimeError(
-                    f"User file {result.new_chunk.user_file_id} no longer exists"
-                )
-            project_user_file_to_index(
-                db_session,
-                user_file,
-                get_current_tenant_id(),
-            )
+            user_file_id = UUID(str(result.new_chunk.user_file_id))
             db_session.commit()
-    except Exception:
-        logger.exception("Amendment proposal %s approval failed", proposal_id)
+            version_applied = True
+            logger.info(
+                "Amendment approval version committed proposal=%s user_file=%s",
+                proposal_id,
+                user_file_id,
+            )
+
         with get_session_with_current_tenant() as db_session:
-            reset_amendment_proposal_approval(
+            job_id = prepare_regulatory_indexing_job_from_chunks(
+                user_file_id,
+                tenant_id,
+                db_session,
+            )
+
+        with get_session_with_current_tenant() as db_session:
+            if not link_amendment_proposal_indexing_job(
                 db_session,
                 proposal_id=proposal_id,
-            )
+                job_id=job_id,
+            ):
+                raise RuntimeError("amendment proposal could not be linked to indexing")
+            db_session.commit()
+
+        enqueue_prepared_regulatory_indexing_job(
+            job_id=job_id,
+            tenant_id=tenant_id,
+        )
+        logger.info(
+            "Amendment approval indexing dispatched proposal=%s user_file=%s job=%s",
+            proposal_id,
+            user_file_id,
+            job_id,
+        )
+    except Exception:
+        logger.exception("Amendment proposal %s approval failed", proposal_id)
+        if not version_applied:
+            with get_session_with_current_tenant() as db_session:
+                reset_amendment_proposal_approval(
+                    db_session,
+                    proposal_id=proposal_id,
+                )
         raise
 
 
@@ -228,8 +260,12 @@ def regulatory_amendment_recover_stale(
             stale_before=now - datetime.timedelta(seconds=_STALE_HEARTBEAT_SECONDS),
             claimed_at=now,
         )
-    if not batch_ids:
-        return
+    with get_session_with_current_tenant() as db_session:
+        proposal_ids = recover_stale_amendment_proposal_approvals(
+            db_session,
+            stale_before=now - datetime.timedelta(seconds=_STALE_HEARTBEAT_SECONDS),
+            recovered_at=now,
+        )
 
     from onyx.background.celery.versioned_apps.client import app as celery_app
 
@@ -242,3 +278,15 @@ def regulatory_amendment_recover_stale(
             )
         except Exception:
             logger.exception("Failed to recover amendment batch %s", batch_id)
+    for proposal_id in proposal_ids:
+        try:
+            enqueue_amendment_proposal_approval(
+                celery_app,
+                proposal_id=proposal_id,
+                tenant_id=tenant_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to recover amendment approval proposal=%s",
+                proposal_id,
+            )
