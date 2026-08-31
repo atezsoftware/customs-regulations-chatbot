@@ -77,7 +77,7 @@ def test_custom_agent_tools_keep_file_reader() -> None:
     ) == [file_reader_tool]
 
 
-def test_global_regulatory_filters_limit_search_to_current_user_files() -> None:
+def test_global_regulatory_filters_do_not_invent_an_as_of_date() -> None:
     setup = MagicMock()
     setup.persona.id = DEFAULT_PERSONA_ID
     setup.new_msg_req.internal_search_filters = None
@@ -88,7 +88,7 @@ def test_global_regulatory_filters_limit_search_to_current_user_files() -> None:
 
     assert filters is not None
     assert filters.source_type == [DocumentSource.USER_FILE]
-    assert filters.as_of_date is not None
+    assert filters.as_of_date is None
     assert filters.regulatory_chunks_only is False
 
 

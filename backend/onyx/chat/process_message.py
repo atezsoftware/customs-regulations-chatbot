@@ -4,7 +4,6 @@ An overview can be found in the README.md file in this directory.
 """
 
 import contextvars
-import datetime
 import io
 import os
 import queue
@@ -115,6 +114,7 @@ from onyx.llm.utils import (
 )
 from onyx.onyxbot.slack.models import SlackContext
 from onyx.prompts.prompt_utils import substitute_user_placeholders
+from onyx.regulatory.temporal_query import extract_regulatory_as_of_date
 from onyx.server.query_and_chat.chat_utils import mime_type_to_chat_file_type
 from onyx.server.query_and_chat.models import (
     AUTO_PLACE_AFTER_LATEST_MESSAGE,
@@ -652,8 +652,11 @@ def _global_regulatory_search_filters(setup: ChatTurnSetup) -> BaseFilters | Non
         and not _is_social_only_message(setup.new_msg_req.message),
         "regulatory_workflow_mode": "fast" if atez_search_v2 else "standard",
     }
-    if filters is None or filters.as_of_date is None:
-        updates["as_of_date"] = datetime.date.today()
+    query_as_of_date = None
+    if regulatory_search_enabled and (filters is None or filters.as_of_date is None):
+        query_as_of_date = extract_regulatory_as_of_date(setup.new_msg_req.message)
+    if query_as_of_date is not None:
+        updates["as_of_date"] = query_as_of_date
     return (filters or BaseFilters()).model_copy(update=updates)
 
 

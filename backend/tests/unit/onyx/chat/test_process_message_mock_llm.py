@@ -1,3 +1,4 @@
+from datetime import date
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, Mock
@@ -14,7 +15,7 @@ from onyx.server.query_and_chat.models import MessageResponseIDInfo, SendMessage
 
 
 def test_default_persona_uses_original_search_scope_without_atez_search() -> None:
-    requested_date = process_message.datetime.date(2026, 7, 1)
+    requested_date = date(2026, 7, 1)
     requested_filters = BaseFilters(
         document_set=["Dar kapsam"],
         as_of_date=requested_date,
@@ -40,7 +41,7 @@ def test_default_persona_uses_original_search_scope_without_atez_search() -> Non
 
 
 def test_atez_search_forces_regulatory_scope_without_discarding_user_filters() -> None:
-    requested_date = process_message.datetime.date(2026, 7, 1)
+    requested_date = date(2026, 7, 1)
     requested_filters = BaseFilters(
         document_set=["Dar kapsam"],
         as_of_date=requested_date,
@@ -49,7 +50,7 @@ def test_atez_search_forces_regulatory_scope_without_discarding_user_filters() -
         persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
         new_msg_req=SimpleNamespace(
             internal_search_filters=requested_filters,
-            message="Antrepo rejiminin şartları nelerdir?",
+            message="26 Haziran 2026 tarihinde antrepo rejiminin şartları nelerdir?",
             atez_search=True,
         ),
     )
@@ -84,6 +85,63 @@ def test_atez_search_v2_uses_fast_regulatory_profile() -> None:
     assert effective_filters is not None
     assert effective_filters.regulatory_chunks_only is True
     assert effective_filters.regulatory_workflow_mode == "fast"
+
+
+@pytest.mark.parametrize(
+    "date_expression",
+    [
+        "26 HAZİRAN 2026 TARİHİNDE",
+        "26 Haziran 2026 tarihi itibarıyla",
+        "26.06.2026 tarihinde",
+        "26/06/2026 itibarıyla",
+        "2026-06-26 tarihinde",
+    ],
+)
+def test_atez_search_v2_uses_explicit_historical_date_from_user_query(
+    date_expression: str,
+) -> None:
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SimpleNamespace(
+            internal_search_filters=None,
+            message=(
+                f"{date_expression} GÜMRÜK GENEL TEBLİĞİ "
+                "(TIR İŞLEMLERİ) (SERİ NO: 1)'de taşıt onay belgesi kaç "
+                "yıl geçerlidir?"
+            ),
+            atez_search=False,
+            atez_search_v2=True,
+        ),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(
+        cast(ChatTurnSetup, setup)
+    )
+
+    assert effective_filters is not None
+    assert effective_filters.as_of_date == date(2026, 6, 26)
+
+
+def test_atez_search_v2_does_not_guess_between_multiple_query_dates() -> None:
+    setup = SimpleNamespace(
+        persona=SimpleNamespace(id=process_message.DEFAULT_PERSONA_ID),
+        new_msg_req=SimpleNamespace(
+            internal_search_filters=None,
+            message=(
+                "26 Haziran 2026 ile 4 Temmuz 2026 arasında taşıt onay "
+                "belgesinin süresi nasıl değişti?"
+            ),
+            atez_search=False,
+            atez_search_v2=True,
+        ),
+    )
+
+    effective_filters = process_message._global_regulatory_search_filters(
+        cast(ChatTurnSetup, setup)
+    )
+
+    assert effective_filters is not None
+    assert effective_filters.as_of_date is None
 
 
 @pytest.mark.parametrize(
