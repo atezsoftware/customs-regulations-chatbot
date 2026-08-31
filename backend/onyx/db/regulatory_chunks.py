@@ -2256,6 +2256,7 @@ def replace_indexed_chunks_for_file(
             chunk_metadata=stored_metadata,
             status=RegulatoryChunkStatus.ACTIVE.value,
             source=RegulatoryChunkSource.INDEXED.value,
+            projection_ordinal=meta.chunk_order,
             validity_start_date=(
                 inherited_window.start if inherited_window is not None else None
             ),
@@ -2459,6 +2460,46 @@ def delete_hierarchical_aggregates_referencing_chunk(
     for candidate in affected:
         db_session.delete(candidate)
     return len(affected)
+
+
+def supersede_hierarchical_aggregates_referencing_chunk(
+    db_session: Session,
+    *,
+    user_file_id: UUID,
+    source_chunk_id: str,
+    superseded_at: datetime.date,
+) -> list[RegulatoryChunk]:
+    """Close active derived rows without changing stable projection positions."""
+
+    candidates = list(
+        db_session.scalars(
+            select(RegulatoryChunk)
+            .where(
+                RegulatoryChunk.user_file_id == user_file_id,
+                RegulatoryChunk.chunk_type == HIERARCHICAL_AGGREGATE_CHUNK_VARIANT,
+                RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value,
+            )
+            .with_for_update()
+        ).all()
+    )
+    affected = [
+        candidate
+        for candidate in candidates
+        if source_chunk_id
+        in candidate.chunk_metadata.get("source_regulatory_chunk_ids", [])
+    ]
+    for candidate in affected:
+        if (
+            candidate.validity_start_date is not None
+            and superseded_at <= candidate.validity_start_date
+        ):
+            raise ValueError(
+                "Aggregate validity end must be after its validity start date"
+            )
+        candidate.status = RegulatoryChunkStatus.SUPERSEDED.value
+        candidate.validity_end_date = superseded_at
+        db_session.add(candidate)
+    return affected
 
 
 def update_chunk(

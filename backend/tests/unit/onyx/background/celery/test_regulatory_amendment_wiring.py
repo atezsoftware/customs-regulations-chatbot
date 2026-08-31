@@ -74,7 +74,10 @@ def test_approval_task_commits_version_before_active_index_projection() -> None:
         applied_new_chunk_id=None,
     )
     user_file_id = UUID("00000000-0000-0000-0000-000000000111")
-    result = SimpleNamespace(new_chunk=SimpleNamespace(user_file_id=user_file_id))
+    result = SimpleNamespace(
+        new_chunk=SimpleNamespace(id="new-chunk", user_file_id=user_file_id),
+        old_chunk=SimpleNamespace(id="old-chunk"),
+    )
     user_file = SimpleNamespace(id=user_file_id)
     apply_session = MagicMock()
     projection_session = MagicMock()
@@ -96,7 +99,7 @@ def test_approval_task_commits_version_before_active_index_projection() -> None:
             tasks, "approve_amendment_proposal", return_value=result
         ) as approve,
         patch.object(
-            tasks, "project_user_file_to_index", create=True
+            tasks, "project_amendment_to_index", create=True
         ) as project_to_active_index,
         patch.object(
             tasks,
@@ -127,8 +130,9 @@ def test_approval_task_commits_version_before_active_index_projection() -> None:
         projection_session,
         user_file,
         "tenant-a",
+        old_chunk_id="old-chunk",
+        new_chunk_id="new-chunk",
         current_search_settings_id=11,
-        include_failed=True,
     )
     finalize.assert_called_once_with(
         projection_session,
@@ -217,7 +221,10 @@ def test_amendment_projection_lock_rejects_a_different_current_setting() -> None
 def test_approval_task_marks_projection_failure_terminal_after_version_commit() -> None:
     proposal = SimpleNamespace(id=9, status="approving", applied_new_chunk_id=None)
     user_file_id = UUID("00000000-0000-0000-0000-000000000111")
-    result = SimpleNamespace(new_chunk=SimpleNamespace(user_file_id=user_file_id))
+    result = SimpleNamespace(
+        new_chunk=SimpleNamespace(id="new-chunk", user_file_id=user_file_id),
+        old_chunk=None,
+    )
     apply_session = MagicMock()
     projection_session = MagicMock()
     projection_session.get.return_value = SimpleNamespace(id=user_file_id)
@@ -239,7 +246,7 @@ def test_approval_task_marks_projection_failure_terminal_after_version_commit() 
         patch.object(tasks, "validate_amendment_projection_search_settings"),
         patch.object(
             tasks,
-            "project_user_file_to_index",
+            "project_amendment_to_index",
             side_effect=RuntimeError("provider secret detail"),
         ),
         patch.object(
@@ -266,7 +273,10 @@ def test_approval_task_marks_projection_failure_terminal_after_version_commit() 
 def test_approval_task_rejects_an_empty_projection() -> None:
     proposal = SimpleNamespace(id=9, status="approving", applied_new_chunk_id=None)
     user_file_id = UUID("00000000-0000-0000-0000-000000000111")
-    result = SimpleNamespace(new_chunk=SimpleNamespace(user_file_id=user_file_id))
+    result = SimpleNamespace(
+        new_chunk=SimpleNamespace(id="new-chunk", user_file_id=user_file_id),
+        old_chunk=None,
+    )
     apply_session = MagicMock()
     projection_session = MagicMock()
     projection_session.get.return_value = SimpleNamespace(id=user_file_id)
@@ -290,7 +300,7 @@ def test_approval_task_rejects_an_empty_projection() -> None:
             "validate_amendment_projection_search_settings",
             return_value=11,
         ),
-        patch.object(tasks, "project_user_file_to_index", return_value=0),
+        patch.object(tasks, "project_amendment_to_index", return_value=0),
         patch.object(
             tasks,
             "finalize_amendment_proposal_projection",
@@ -314,7 +324,10 @@ def test_approval_task_rejects_an_empty_projection() -> None:
 def test_approval_task_rejects_promotion_during_projection() -> None:
     proposal = SimpleNamespace(id=9, status="approving", applied_new_chunk_id=None)
     user_file_id = UUID("00000000-0000-0000-0000-000000000111")
-    result = SimpleNamespace(new_chunk=SimpleNamespace(user_file_id=user_file_id))
+    result = SimpleNamespace(
+        new_chunk=SimpleNamespace(id="new-chunk", user_file_id=user_file_id),
+        old_chunk=None,
+    )
     apply_session = MagicMock()
     projection_session = MagicMock()
     projection_session.get.return_value = SimpleNamespace(id=user_file_id)
@@ -338,7 +351,7 @@ def test_approval_task_rejects_promotion_during_projection() -> None:
             "validate_amendment_projection_search_settings",
             side_effect=[11, RuntimeError("changed after projection")],
         ) as validate_settings,
-        patch.object(tasks, "project_user_file_to_index", return_value=461),
+        patch.object(tasks, "project_amendment_to_index", return_value=4),
         patch.object(
             tasks,
             "finalize_amendment_proposal_projection",

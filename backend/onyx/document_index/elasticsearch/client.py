@@ -1567,6 +1567,59 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 f"{len(set(mismatches))} chunk(s): {preview}"
             )
 
+    def get_document_chunk_identities(
+        self,
+        document_id: str,
+    ) -> dict[str, tuple[int, str]]:
+        """Fetch every stored identity for one document without vector payloads."""
+
+        raw_response = self._client.search(
+            index=self._index_name,
+            size=DEFAULT_ELASTICSEARCH_MAX_RESULT_WINDOW,
+            query={
+                "term": {
+                    DOCUMENT_ID_FIELD_NAME: {"value": document_id},
+                }
+            },
+            source_includes=[CHUNK_INDEX_FIELD_NAME, REGULATORY_CHUNK_ID_FIELD_NAME],
+        )
+        response = (
+            raw_response if isinstance(raw_response, dict) else dict(raw_response.body)
+        )
+        hits_container = response.get("hits")
+        hits = hits_container.get("hits") if isinstance(hits_container, dict) else None
+        if not isinstance(hits, list):
+            raise ElasticsearchUpdateError(
+                "Elasticsearch returned malformed regulatory chunk identities."
+            )
+        if len(hits) >= DEFAULT_ELASTICSEARCH_MAX_RESULT_WINDOW:
+            raise ElasticsearchUpdateError(
+                "Regulatory identity preflight exceeded the safe result window."
+            )
+
+        identities: dict[str, tuple[int, str]] = {}
+        for hit in hits:
+            if not isinstance(hit, dict):
+                raise ElasticsearchUpdateError(
+                    "Elasticsearch returned a malformed regulatory identity."
+                )
+            chunk_id = hit.get("_id")
+            source = hit.get("_source")
+            if not isinstance(chunk_id, str) or not isinstance(source, dict):
+                raise ElasticsearchUpdateError(
+                    "Elasticsearch returned an incomplete regulatory identity."
+                )
+            chunk_index = source.get(CHUNK_INDEX_FIELD_NAME)
+            regulatory_chunk_id = source.get(REGULATORY_CHUNK_ID_FIELD_NAME)
+            if not isinstance(chunk_index, int) or not isinstance(
+                regulatory_chunk_id, str
+            ):
+                raise ElasticsearchUpdateError(
+                    "Elasticsearch returned an invalid regulatory identity."
+                )
+            identities[chunk_id] = (chunk_index, regulatory_chunk_id)
+        return identities
+
     def get_document_chunks(
         self,
         document_chunk_ids: list[str],

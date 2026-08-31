@@ -242,6 +242,7 @@ def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_row
     assert old_chunk.status == "superseded"
     assert old_chunk.validity_end_date == date(2026, 8, 15)
     assert result.new_chunk.validity_start_date == date(2026, 8, 15)
+    assert result.new_chunk.projection_ordinal == 1_000_000_042
     assert result.new_chunk.supersedes_chunk_id == "old-chunk"
     assert old_chunk.superseded_by_chunk_id == result.new_chunk.id
     lock_queries = [str(call.args[0]) for call in db_session.scalar.call_args_list]

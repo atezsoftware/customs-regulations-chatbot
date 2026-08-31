@@ -1,12 +1,19 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from onyx.access.models import DocumentAccess
 from onyx.configs.constants import DocumentSource
 from onyx.connectors.models import Document, TextSection
 from onyx.document_index.elasticsearch.elasticsearch_document_index import (
     ElasticsearchDocumentIndex,
 )
-from onyx.document_index.interfaces_new import IndexingMetadata, TenantState
+from onyx.document_index.elasticsearch.schema import get_elasticsearch_doc_chunk_id
+from onyx.document_index.interfaces_new import (
+    DocumentChunkVerificationError,
+    IndexingMetadata,
+    TenantState,
+)
 from onyx.indexing.models import ChunkEmbedding, DocMetadataAwareIndexChunk
 
 
@@ -128,6 +135,66 @@ def test_bulk_payload_contains_legal_exact_fields_from_text_and_metadata() -> No
     assert indexed_document.provision_identifiers == ["geçici madde 2"]
     assert indexed_document.decision_numbers == ["2024/17"]
     assert indexed_document.legal_dates == ["2026-08-06"]
+
+
+def test_partial_upsert_preserves_sibling_chunks() -> None:
+    index, mock_bulk = _make_index()
+    chunks = [_make_chunk("legal-doc", 90), _make_chunk("legal-doc", 461)]
+
+    with patch.object(index, "delete") as delete:
+        index.upsert_chunks(chunks)
+
+    delete.assert_not_called()
+    assert len(mock_bulk.call_args.kwargs["documents"]) == 2
+    assert mock_bulk.call_args.kwargs["update_if_exists"] is True
+
+
+def test_partial_identity_preflight_rejects_shifted_chunk() -> None:
+    index, _ = _make_index()
+    chunk_id = get_elasticsearch_doc_chunk_id(
+        tenant_state=index._tenant_state,  # noqa: SLF001
+        document_id="legal-doc",
+        chunk_index=90,
+    )
+    with (
+        patch.object(
+            index._client,  # noqa: SLF001
+            "get_document_chunk_identities",
+            return_value={chunk_id: (90, "wrong-row")},
+        ),
+        pytest.raises(
+            DocumentChunkVerificationError,
+            match="canonical regulatory chunk identity mismatch",
+        ),
+    ):
+        index.verify_chunk_identities(
+            document_id="legal-doc",
+            expected_by_ordinal={90: "expected-row"},
+            required_ordinals={90},
+        )
+
+
+def test_partial_identity_preflight_allows_missing_unpublished_amendment() -> None:
+    index, _ = _make_index()
+    imported_id = get_elasticsearch_doc_chunk_id(
+        tenant_state=index._tenant_state,  # noqa: SLF001
+        document_id="legal-doc",
+        chunk_index=0,
+    )
+
+    with patch.object(
+        index._client,  # noqa: SLF001
+        "get_document_chunk_identities",
+        return_value={imported_id: (0, "imported-row")},
+    ):
+        index.verify_chunk_identities(
+            document_id="legal-doc",
+            expected_by_ordinal={
+                0: "imported-row",
+                1_000_000_066: "amendment-row",
+            },
+            required_ordinals={0},
+        )
 
 
 @patch(

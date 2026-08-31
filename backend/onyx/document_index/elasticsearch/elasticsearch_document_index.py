@@ -623,6 +623,62 @@ class ElasticsearchDocumentIndex(DocumentIndex):
 
         return document_indexing_results
 
+    def upsert_chunks(
+        self,
+        chunks: Iterable[DocMetadataAwareIndexChunk],
+    ) -> None:
+        """Upsert selected chunks while preserving every sibling chunk."""
+
+        chunk_batch = [
+            _convert_onyx_chunk_to_elasticsearch_document(chunk) for chunk in chunks
+        ]
+        if not chunk_batch:
+            return
+        self._client.bulk_index_documents(
+            documents=chunk_batch,
+            tenant_state=self._tenant_state,
+            update_if_exists=True,
+        )
+
+    def verify_chunk_identities(
+        self,
+        *,
+        document_id: str,
+        expected_by_ordinal: dict[int, str],
+        required_ordinals: set[int],
+    ) -> None:
+        """Reject missing required rows and every stale or shifted identity."""
+
+        try:
+            stored_identities = self._client.get_document_chunk_identities(document_id)
+        except ElasticsearchUpdateError as error:
+            raise DocumentChunkVerificationError(str(error)) from error
+        present_ordinals: set[int] = set()
+        for chunk_id, (ordinal, regulatory_chunk_id) in stored_identities.items():
+            expected_regulatory_id = expected_by_ordinal.get(ordinal)
+            expected_chunk_id = get_elasticsearch_doc_chunk_id(
+                tenant_state=self._tenant_state,
+                document_id=document_id,
+                chunk_index=ordinal,
+            )
+            if (
+                chunk_id != expected_chunk_id
+                or expected_regulatory_id != regulatory_chunk_id
+            ):
+                raise DocumentChunkVerificationError(
+                    "canonical regulatory chunk identity mismatch"
+                )
+            if ordinal in present_ordinals:
+                raise DocumentChunkVerificationError(
+                    "duplicate canonical regulatory chunk identity"
+                )
+            present_ordinals.add(ordinal)
+        missing_required = required_ordinals - present_ordinals
+        if missing_required:
+            raise DocumentChunkVerificationError(
+                "canonical regulatory chunk identities are incomplete"
+            )
+
     def delete(
         self,
         document_id: str,
@@ -1324,6 +1380,27 @@ class ElasticsearchIndexPair(DocumentIndex):
         indexing_metadata: IndexingMetadata,
     ) -> list[DocumentInsertionRecord]:
         return self._primary.index(chunks, indexing_metadata)
+
+    def upsert_chunks(
+        self,
+        chunks: Iterable[DocMetadataAwareIndexChunk],
+    ) -> None:
+        # Forward writes target PRESENT. FUTURE remains the port/reconciliation
+        # pipeline's responsibility, matching ``index`` above.
+        self._primary.upsert_chunks(chunks)
+
+    def verify_chunk_identities(
+        self,
+        *,
+        document_id: str,
+        expected_by_ordinal: dict[int, str],
+        required_ordinals: set[int],
+    ) -> None:
+        self._primary.verify_chunk_identities(
+            document_id=document_id,
+            expected_by_ordinal=expected_by_ordinal,
+            required_ordinals=required_ordinals,
+        )
 
     def verify_document_chunks(
         self,

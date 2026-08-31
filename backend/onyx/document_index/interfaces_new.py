@@ -297,6 +297,32 @@ class Indexable(abc.ABC):
         """
         raise NotImplementedError
 
+    def upsert_chunks(
+        self,
+        chunks: Iterable[DocMetadataAwareIndexChunk],
+    ) -> None:
+        """Insert or replace only the supplied chunks without deleting siblings.
+
+        Backends that cannot provide deterministic partial writes should keep
+        the default failure instead of silently falling back to whole-document
+        replacement.
+        """
+
+        del chunks
+        raise NotImplementedError("Partial chunk upserts are not supported")
+
+    def verify_chunk_identities(
+        self,
+        *,
+        document_id: str,
+        expected_by_ordinal: dict[int, str],
+        required_ordinals: set[int],
+    ) -> None:
+        """Reject partial writes when existing deterministic identities drifted."""
+
+        del document_id, expected_by_ordinal, required_ordinals
+        raise NotImplementedError("Chunk identity verification is not supported")
+
 
 class Deletable(abc.ABC):
     """

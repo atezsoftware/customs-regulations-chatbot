@@ -77,6 +77,7 @@ def _make_regulatory_chunk(db_session: Session, user_file: UserFile) -> Regulato
         user_file_id=user_file.id,
         text="canonical regulatory text",
         position=0,
+        projection_ordinal=0,
         heading_path=["Madde 1"],
         chunk_metadata={"article_no": "1"},
     )

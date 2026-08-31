@@ -21,8 +21,13 @@ from onyx.configs.app_configs import (
 )
 from onyx.configs.constants import DEFAULT_BOOST, DocumentSource
 from onyx.connectors.models import Document, TextSection
+from onyx.db.enums import RegulatoryChunkSource
 from onyx.db.models import RegulatoryChunk, SearchSettings, UserFile, UserFileStatus
-from onyx.db.regulatory_chunks import get_chunks_for_file
+from onyx.db.regulatory_chunks import (
+    get_bounded_adjacent_provisions,
+    get_bounded_same_provision_siblings,
+    get_chunks_for_file,
+)
 from onyx.db.search_settings import get_active_search_settings_list
 from onyx.db.user_file import (
     fetch_document_set_names_for_user_files,
@@ -77,13 +82,10 @@ def _rows_to_doc_aware_chunks(
     rows: list[RegulatoryChunk],
     blurb_splitter: SentenceChunker,
 ) -> list[DocAwareChunk]:
-    # ``position`` is a logical slot shared by an original and its amendment.
-    # Enumerating the complete, stable row order prevents those versions from
-    # overwriting one another in Elasticsearch.
     return [
         DocAwareChunk(
             source_document=document,
-            chunk_id=chunk_id,
+            chunk_id=row.projection_ordinal,
             blurb=extract_blurb(row.text, blurb_splitter),
             content=row.text,
             source_links={0: ""},
@@ -120,8 +122,14 @@ def _rows_to_doc_aware_chunks(
             validity_start_date=row.validity_start_date,
             validity_end_date=row.validity_end_date,
         )
-        for chunk_id, row in enumerate(rows)
+        for row in rows
     ]
+
+
+def _rows_in_structural_order(rows: list[RegulatoryChunk]) -> list[RegulatoryChunk]:
+    """Order legal structure independently from immutable index identity."""
+
+    return sorted(rows, key=lambda row: (row.position, row.id))
 
 
 def _row_context_text(row: RegulatoryChunk) -> str:
@@ -155,6 +163,7 @@ def _contextualize_chunks(
     user_file: UserFile,
     embedder: DefaultIndexingEmbedder,
     search_settings: SearchSettings,
+    context_rows: list[RegulatoryChunk] | None = None,
 ) -> None:
     """Add temporally isolated context without crowding out legal text."""
 
@@ -167,14 +176,15 @@ def _contextualize_chunks(
     contextual_chunks: list[DocAwareChunk] = []
     skipped_for_budget = 0
 
-    for chunk, row in zip(chunks, rows):
+    snapshot_rows = context_rows if context_rows is not None else rows
+    for chunk, row in zip(chunks, rows, strict=True):
         reference_date = context_reference_date(
             row.validity_start_date,
             row.validity_end_date,
             today=today,
         )
         visible_rows = visible_regulatory_snapshot_for_target(
-            rows,
+            snapshot_rows,
             row,
             today=today,
         )
@@ -329,6 +339,7 @@ def _project_rows_to_search_settings(
 
     user_file_id = str(user_file.id)
     canonical_document = _build_document_shell(user_file)
+    ordered_rows = _rows_in_structural_order(rows)
     embedder = DefaultIndexingEmbedder.from_db_search_settings(
         search_settings=search_settings
     )
@@ -344,13 +355,13 @@ def _project_rows_to_search_settings(
     )
     doc_chunks = _rows_to_doc_aware_chunks(
         canonical_document,
-        rows,
+        ordered_rows,
         blurb_splitter,
     )
     if effective_contextual_rag_enabled(search_settings):
         _contextualize_chunks(
             chunks=doc_chunks,
-            rows=rows,
+            rows=ordered_rows,
             user_file=user_file,
             embedder=embedder,
             search_settings=search_settings,
@@ -384,6 +395,212 @@ def _project_rows_to_search_settings(
         search_settings.id,
     )
     return len(enriched_chunks)
+
+
+def _affected_amendment_row_ids(
+    db_session: Session,
+    *,
+    all_rows: list[RegulatoryChunk],
+    old_chunk: RegulatoryChunk | None,
+    new_chunk: RegulatoryChunk,
+) -> set[str]:
+    """Select a bounded structural/contextual neighborhood for one amendment."""
+
+    mandatory_ids = {new_chunk.id}
+    affected_positions = {new_chunk.position}
+    if old_chunk is not None:
+        mandatory_ids.add(old_chunk.id)
+        affected_positions.add(old_chunk.position)
+
+    affected_ids = {
+        row.id
+        for row in all_rows
+        if row.id in mandatory_ids or row.position in affected_positions
+    }
+    for row in all_rows:
+        source_ids = row.chunk_metadata.get("source_regulatory_chunk_ids", [])
+        if any(source_id in mandatory_ids for source_id in source_ids):
+            affected_ids.add(row.id)
+
+    for seed in (old_chunk, new_chunk):
+        if seed is None:
+            continue
+        as_of_date = context_reference_date(
+            seed.validity_start_date,
+            seed.validity_end_date,
+            today=datetime.date.today(),
+        )
+        for projection in get_bounded_same_provision_siblings(
+            db_session,
+            [seed.id],
+            query=new_chunk.text,
+            as_of_date=as_of_date,
+        ):
+            affected_ids.add(projection.regulatory_chunk_id)
+        for projection in get_bounded_adjacent_provisions(
+            db_session,
+            [seed.id],
+            query=new_chunk.text,
+            as_of_date=as_of_date,
+        ):
+            affected_ids.add(projection.regulatory_chunk_id)
+    return affected_ids
+
+
+def _project_amendment_rows_to_search_settings(
+    *,
+    user_file: UserFile,
+    all_rows: list[RegulatoryChunk],
+    projection_rows: list[RegulatoryChunk],
+    search_settings: SearchSettings,
+    tenant_id: str,
+    project_ids: dict[str, list[int]],
+    persona_ids: dict[str, list[int]],
+    document_set_names: dict[str, list[str]],
+    user_file_access: dict[str, DocumentAccess],
+) -> int:
+    """Embed and upsert only the bounded rows affected by an amendment."""
+
+    if not projection_rows:
+        return 0
+    user_file_id = str(user_file.id)
+    canonical_document = _build_document_shell(user_file)
+    document_indices = get_all_document_indices(
+        search_settings,
+        None,
+        httpx_client=HttpxPool.get("vespa"),
+    )
+    expected_identities = {row.projection_ordinal: row.id for row in all_rows}
+    required_ordinals = {
+        row.projection_ordinal
+        for row in all_rows
+        if row.source == RegulatoryChunkSource.INDEXED.value
+    }
+    if expected_identities:
+        for document_index in document_indices:
+            document_index.verify_chunk_identities(
+                document_id=user_file_id,
+                expected_by_ordinal=expected_identities,
+                required_ordinals=required_ordinals,
+            )
+    embedder = DefaultIndexingEmbedder.from_db_search_settings(
+        search_settings=search_settings
+    )
+
+    def token_counter(text: str) -> int:
+        return len(embedder.embedding_model.tokenizer.encode(text))
+
+    blurb_splitter = SentenceChunker(
+        tokenizer_or_token_counter=token_counter,
+        chunk_size=BLURB_SIZE,
+        chunk_overlap=0,
+        return_type="texts",
+    )
+    rows = projection_rows
+    doc_chunks = _rows_to_doc_aware_chunks(canonical_document, rows, blurb_splitter)
+    if effective_contextual_rag_enabled(search_settings):
+        _contextualize_chunks(
+            chunks=doc_chunks,
+            rows=rows,
+            context_rows=all_rows,
+            user_file=user_file,
+            embedder=embedder,
+            search_settings=search_settings,
+        )
+
+    index_chunks = embedder.embed_chunks(doc_chunks, tenant_id=tenant_id)
+    enriched_chunks = _enrich_index_chunks(
+        index_chunks=index_chunks,
+        user_file_id=user_file_id,
+        project_ids=project_ids,
+        persona_ids=persona_ids,
+        document_set_names=document_set_names,
+        user_file_access=user_file_access,
+        tenant_id=tenant_id,
+    )
+    for document_index in document_indices:
+        document_index.upsert_chunks(enriched_chunks)
+    logger.info(
+        "project_amendment_to_index: upserted %d/%d chunks for user_file=%s "
+        "search_settings=%s",
+        len(enriched_chunks),
+        len(all_rows),
+        user_file_id,
+        search_settings.id,
+    )
+    return len(enriched_chunks)
+
+
+def project_amendment_to_index(
+    db_session: Session,
+    user_file: UserFile,
+    tenant_id: str,
+    *,
+    old_chunk_id: str | None,
+    new_chunk_id: str,
+    current_search_settings_id: int,
+) -> int:
+    """Project only the rows structurally affected by one approved amendment."""
+
+    user_file_id = UUID(str(user_file.id))
+    locked_user_file = lock_completed_user_file_for_projection(
+        db_session,
+        user_file_id,
+        include_chunked=False,
+        include_failed=True,
+    )
+    if locked_user_file is None:
+        return 0
+
+    all_rows = get_chunks_for_file(db_session, user_file_id)
+    rows_by_id = {row.id: row for row in all_rows}
+    new_chunk = rows_by_id.get(new_chunk_id)
+    if new_chunk is None:
+        raise RuntimeError(f"Amendment chunk {new_chunk_id} no longer exists")
+    old_chunk = rows_by_id.get(old_chunk_id) if old_chunk_id is not None else None
+    if old_chunk_id is not None and old_chunk is None:
+        raise RuntimeError(f"Source chunk {old_chunk_id} no longer exists")
+
+    search_settings = get_active_search_settings_list(db_session)
+    current_settings = [item for item in search_settings if item.status.is_current()]
+    if (
+        len(current_settings) != 1
+        or current_settings[0].id != current_search_settings_id
+    ):
+        raise RuntimeError("Current search settings changed after validation")
+    if any(item.status.is_future() for item in search_settings):
+        locked_user_file.secondary_reconcile_pending = True
+
+    affected_ids = _affected_amendment_row_ids(
+        db_session,
+        all_rows=all_rows,
+        old_chunk=old_chunk,
+        new_chunk=new_chunk,
+    )
+    ordered_rows = _rows_in_structural_order(all_rows)
+    projection_rows = [row for row in ordered_rows if row.id in affected_ids]
+
+    file_id = str(user_file_id)
+    project_ids = fetch_user_project_ids_for_user_files([file_id], db_session)
+    persona_ids = fetch_persona_ids_for_user_files([file_id], db_session)
+    document_set_names = fetch_document_set_names_for_user_files([file_id], db_session)
+    user_file_access = get_access_for_user_files([file_id], db_session)
+    projected_count = _project_amendment_rows_to_search_settings(
+        user_file=locked_user_file,
+        all_rows=ordered_rows,
+        projection_rows=projection_rows,
+        search_settings=current_settings[0],
+        tenant_id=tenant_id,
+        project_ids=project_ids,
+        persona_ids=persona_ids,
+        document_set_names=document_set_names,
+        user_file_access=user_file_access,
+    )
+    locked_user_file.chunk_count = len(all_rows)
+    if locked_user_file.status is UserFileStatus.FAILED:
+        locked_user_file.status = UserFileStatus.COMPLETED
+    db_session.add(locked_user_file)
+    return projected_count
 
 
 def project_user_file_to_index(

@@ -5641,6 +5641,7 @@ class RegulatoryChunk(Base):
     source: Mapped[str] = mapped_column(
         Text, nullable=False, default=RegulatoryChunkSource.INDEXED.value
     )
+    projection_ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     supersedes_chunk_id: Mapped[str | None] = mapped_column(
         ForeignKey("regulatory_chunk.id", ondelete="SET NULL"), nullable=True
     )
@@ -5661,6 +5662,11 @@ class RegulatoryChunk(Base):
 
     __table_args__ = (
         Index("ix_regulatory_chunk_user_file_status", "user_file_id", "status"),
+        UniqueConstraint(
+            "user_file_id",
+            "projection_ordinal",
+            name="uq_regulatory_chunk_file_projection_ordinal",
+        ),
         CheckConstraint(
             "status IN ('active', 'superseded')",
             name="regulatory_chunk_status_check",

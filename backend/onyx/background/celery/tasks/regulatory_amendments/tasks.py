@@ -27,7 +27,7 @@ from onyx.db.regulatory_amendments import (
 )
 from onyx.db.search_settings import get_current_search_settings
 from onyx.regulatory.amendments.job import run_amendment_batch
-from onyx.regulatory.projection import project_user_file_to_index
+from onyx.regulatory.projection import project_amendment_to_index
 from onyx.utils.logger import setup_logger
 from shared_configs.enums import EmbeddingProvider
 
@@ -263,6 +263,10 @@ def regulatory_amendment_approve(
 
             result = approve_amendment_proposal(db_session, proposal)
             user_file_id = UUID(str(result.new_chunk.user_file_id))
+            new_chunk_id = str(result.new_chunk.id)
+            old_chunk_id = (
+                str(result.old_chunk.id) if result.old_chunk is not None else None
+            )
             db_session.commit()
             version_applied = True
             logger.info(
@@ -279,11 +283,12 @@ def regulatory_amendment_approve(
                 current_search_settings_id = (
                     validate_amendment_projection_search_settings(db_session)
                 )
-                projected_chunk_count = project_user_file_to_index(
+                projected_chunk_count = project_amendment_to_index(
                     db_session,
                     user_file,
                     tenant_id,
-                    include_failed=True,
+                    old_chunk_id=old_chunk_id,
+                    new_chunk_id=new_chunk_id,
                     current_search_settings_id=current_search_settings_id,
                 )
                 if projected_chunk_count <= 0:

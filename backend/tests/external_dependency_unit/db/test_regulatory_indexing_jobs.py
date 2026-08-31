@@ -1021,6 +1021,7 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
         user_file_id=regulatory_user_file.id,
         text="MADDE 1 - Submitted item.",
         position=0,
+        projection_ordinal=0,
         heading_path=["MADDE 1"],
         chunk_metadata={},
     )
@@ -1029,6 +1030,7 @@ def test_vertex_submission_identity_and_reconciliation_state_are_generation_fenc
         user_file_id=regulatory_user_file.id,
         text="MADDE 2 - Omitted item.",
         position=1,
+        projection_ordinal=1,
         heading_path=["MADDE 2"],
         chunk_metadata={},
     )
@@ -1200,6 +1202,7 @@ def test_openrouter_ambiguous_submission_is_persisted_and_charged_once(
         user_file_id=regulatory_user_file.id,
         text="MADDE 1 - Embedding item.",
         position=0,
+        projection_ordinal=0,
         heading_path=["MADDE 1"],
         chunk_metadata={},
     )
@@ -1631,6 +1634,7 @@ def test_item_creation_requires_current_running_lease_and_matching_request_hash(
         user_file_id=regulatory_user_file.id,
         text="MADDE 1 - Olusturma fence testi.",
         position=0,
+        projection_ordinal=0,
         heading_path=["MADDE 1"],
         chunk_metadata={},
     )
@@ -1692,6 +1696,7 @@ def test_item_results_are_unique_and_fenced_by_the_job_lease(
         user_file_id=regulatory_user_file.id,
         text="MADDE 1 - Kalici test metni.",
         position=0,
+        projection_ordinal=0,
         heading_path=["MADDE 1"],
         chunk_metadata={"article_no": "1"},
     )
@@ -1759,6 +1764,7 @@ def test_item_results_are_unique_and_fenced_by_the_job_lease(
         user_file_id=regulatory_user_file.id,
         text="MADDE 2 - Hata sonucu test metni.",
         position=1,
+        projection_ordinal=1,
         heading_path=["MADDE 2"],
         chunk_metadata={"article_no": "2"},
     )
@@ -1789,6 +1795,7 @@ def test_item_results_are_unique_and_fenced_by_the_job_lease(
         user_file_id=regulatory_user_file.id,
         text="MADDE 3 - Baglamsiz gomulecek test metni.",
         position=2,
+        projection_ordinal=2,
         heading_path=["MADDE 3"],
         chunk_metadata={"article_no": "3"},
     )
@@ -1829,6 +1836,7 @@ def test_item_write_waits_for_takeover_then_rejects_stale_generation(
         user_file_id=regulatory_user_file.id,
         text="MADDE 4 - Eski lease sonucu yazilamaz.",
         position=0,
+        projection_ordinal=0,
         heading_path=["MADDE 4"],
         chunk_metadata={},
     )
@@ -2237,6 +2245,7 @@ def _create_vector_items(
             user_file_id=user_file.id,
             text=f"MADDE {position + 1} - Vektor testi.",
             position=position,
+            projection_ordinal=position,
             heading_path=[f"MADDE {position + 1}"],
             chunk_metadata={},
         )

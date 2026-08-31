@@ -1599,6 +1599,45 @@ def test_adjacent_provisions_select_immediate_same_scope_neighbors() -> None:
     assert _ids(selected) == ["article-112", "article-114"]
 
 
+def test_active_amendment_keeps_logical_adjacent_provisions() -> None:
+    rows = [
+        _candidate(
+            "article-89",
+            89,
+            article_no="89",
+            heading_path=("Belge", "MADDE 89"),
+        ),
+        _candidate(
+            "article-90-old",
+            90,
+            article_no="90",
+            heading_path=("Belge", "MADDE 90"),
+            status=RegulatoryChunkStatus.SUPERSEDED.value,
+        ),
+        _candidate(
+            "article-90-amendment",
+            90,
+            article_no="90",
+            heading_path=("Belge", "MADDE 90"),
+        ),
+        _candidate(
+            "article-91",
+            91,
+            article_no="91",
+            heading_path=("Belge", "MADDE 91"),
+        ),
+    ]
+
+    selected = select_bounded_adjacent_provisions(
+        rows,
+        ["article-90-amendment"],
+        query="",
+        as_of_date=None,
+    )
+
+    assert _ids(selected) == ["article-89", "article-91"]
+
+
 def test_adjacent_provisions_do_not_cross_structural_scope() -> None:
     rows = [
         _candidate(

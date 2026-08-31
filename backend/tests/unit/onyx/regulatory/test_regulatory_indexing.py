@@ -1,3 +1,4 @@
+from datetime import date
 from typing import cast
 from unittest.mock import MagicMock
 from uuid import UUID
@@ -7,6 +8,7 @@ from sqlalchemy.orm import Session
 from onyx.db.regulatory_chunks import (
     delete_hierarchical_aggregates_referencing_chunk,
     replace_indexed_chunks_for_file,
+    supersede_hierarchical_aggregates_referencing_chunk,
 )
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.natural_language_processing.utils import BaseTokenizer
@@ -174,6 +176,7 @@ b) Data 2.
     )
 
     assert len(rows) == 3
+    assert [row.projection_ordinal for row in rows] == [0, 1, 2]
     assert rows[0].chunk_metadata["chunk_variant"] == "atomic"
     assert rows[1].chunk_metadata["chunk_variant"] == "atomic"
     assert rows[2].chunk_metadata["chunk_variant"] == "hierarchical_aggregate"
@@ -201,3 +204,29 @@ def test_atomic_mutation_deletes_only_aggregates_that_reference_it() -> None:
 
     assert deleted_count == 1
     db_session.delete.assert_called_once_with(affected)
+
+
+def test_amendment_supersedes_only_aggregates_that_reference_old_chunk() -> None:
+    affected = MagicMock()
+    affected.chunk_metadata = {
+        "source_regulatory_chunk_ids": ["source-chunk", "sibling-chunk"]
+    }
+    affected.status = "active"
+    affected.validity_start_date = date(2020, 1, 1)
+    unaffected = MagicMock()
+    unaffected.chunk_metadata = {"source_regulatory_chunk_ids": ["different-chunk"]}
+    db_session = MagicMock(spec=Session)
+    db_session.scalars.return_value.all.return_value = [affected, unaffected]
+
+    superseded = supersede_hierarchical_aggregates_referencing_chunk(
+        db_session,
+        user_file_id=UUID("00000000-0000-0000-0000-000000000123"),
+        source_chunk_id="source-chunk",
+        superseded_at=date(2026, 8, 15),
+    )
+
+    assert superseded == [affected]
+    assert affected.status == "superseded"
+    assert affected.validity_end_date == date(2026, 8, 15)
+    db_session.add.assert_called_once_with(affected)
+    db_session.delete.assert_not_called()

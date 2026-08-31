@@ -100,6 +100,7 @@ def _create_regulatory_chunk(
         user_file_id=user_file.id,
         text="Madde 1 - Test hukuki hükmü.",
         position=0,
+        projection_ordinal=0,
         chunk_type="article",
         heading_path=["Madde 1"],
         chunk_metadata={},

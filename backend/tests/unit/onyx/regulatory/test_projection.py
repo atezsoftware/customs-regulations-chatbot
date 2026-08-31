@@ -1,3 +1,5 @@
+import datetime
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import ANY, MagicMock, patch
 from uuid import uuid4
@@ -8,10 +10,13 @@ from onyx.db.models import RegulatoryChunk, UserFileStatus
 from onyx.document_index.interfaces_new import IndexingMetadata
 from onyx.indexing.models import DocAwareChunk
 from onyx.regulatory.projection import (
+    _affected_amendment_row_ids,
     _build_document_shell,
     _contextualize_chunks,
+    _project_amendment_rows_to_search_settings,
     _project_rows_to_search_settings,
     _row_context_text,
+    _rows_in_structural_order,
     _rows_to_doc_aware_chunks,
     project_user_file_to_index,
 )
@@ -353,6 +358,193 @@ def test_target_projection_builds_setting_specific_index_and_embedder() -> None:
     )
 
 
+def test_structural_order_does_not_reassign_immutable_projection_ordinals() -> None:
+    imported_later = SimpleNamespace(
+        id="imported-20",
+        source="indexed",
+        position=20,
+        projection_ordinal=20,
+        created_at=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+    )
+    imported_earlier = SimpleNamespace(
+        id="imported-10",
+        source="indexed",
+        position=10,
+        projection_ordinal=10,
+        created_at=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+    )
+    first_amendment = SimpleNamespace(
+        id="amendment-a",
+        source="amendment",
+        position=10,
+        projection_ordinal=1_000_000_064,
+        created_at=datetime.datetime(2026, 2, 1, tzinfo=datetime.timezone.utc),
+    )
+    second_amendment = SimpleNamespace(
+        id="amendment-b",
+        source="amendment",
+        position=20,
+        projection_ordinal=1_000_000_066,
+        created_at=datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+    )
+
+    ordered = _rows_in_structural_order(
+        cast(
+            list[RegulatoryChunk],
+            [second_amendment, imported_later, first_amendment, imported_earlier],
+        )
+    )
+
+    assert [row.id for row in ordered] == [
+        "amendment-a",
+        "imported-10",
+        "amendment-b",
+        "imported-20",
+    ]
+    assert [row.projection_ordinal for row in ordered] == [
+        1_000_000_064,
+        10,
+        1_000_000_066,
+        20,
+    ]
+
+
+def test_affected_amendment_rows_are_bounded_to_structural_neighbors() -> None:
+    old_chunk = MagicMock()
+    old_chunk.id = "old"
+    old_chunk.position = 90
+    old_chunk.validity_start_date = None
+    old_chunk.validity_end_date = datetime.date(2026, 7, 4)
+    old_chunk.chunk_metadata = {}
+    new_chunk = MagicMock()
+    new_chunk.id = "new"
+    new_chunk.position = 90
+    new_chunk.text = "updated provision"
+    new_chunk.validity_start_date = datetime.date(2026, 7, 4)
+    new_chunk.validity_end_date = None
+    new_chunk.chunk_metadata = {}
+    same_position = MagicMock()
+    same_position.id = "same-position-version"
+    same_position.position = 90
+    same_position.chunk_metadata = {}
+    aggregate = MagicMock()
+    aggregate.id = "aggregate"
+    aggregate.position = 89
+    aggregate.chunk_metadata = {"source_regulatory_chunk_ids": ["old"]}
+    unrelated = MagicMock()
+    unrelated.id = "unrelated"
+    unrelated.position = 400
+    unrelated.chunk_metadata = {}
+
+    with (
+        patch(
+            "onyx.regulatory.projection.get_bounded_same_provision_siblings",
+            side_effect=[
+                [SimpleNamespace(regulatory_chunk_id="old-neighbor")],
+                [SimpleNamespace(regulatory_chunk_id="new-neighbor")],
+            ],
+        ),
+        patch(
+            "onyx.regulatory.projection.get_bounded_adjacent_provisions",
+            side_effect=[
+                [SimpleNamespace(regulatory_chunk_id="old-adjacent")],
+                [SimpleNamespace(regulatory_chunk_id="new-adjacent")],
+            ],
+        ),
+    ):
+        affected = _affected_amendment_row_ids(
+            MagicMock(),
+            all_rows=[old_chunk, new_chunk, same_position, aggregate, unrelated],
+            old_chunk=old_chunk,
+            new_chunk=new_chunk,
+        )
+
+    assert affected == {
+        "old",
+        "new",
+        "same-position-version",
+        "aggregate",
+        "old-neighbor",
+        "new-neighbor",
+        "old-adjacent",
+        "new-adjacent",
+    }
+
+
+def test_amendment_projection_embeds_only_selected_rows_and_partial_upserts() -> None:
+    user_file = MagicMock()
+    user_file.id = uuid4()
+    user_file.name = "Mevzuat"
+    settings = _settings(current=True)
+    all_rows = cast(list[RegulatoryChunk], [MagicMock() for _ in range(462)])
+    for ordinal, row in enumerate(all_rows):
+        row.id = f"row-{ordinal}"
+        row.source = "indexed"
+        row.projection_ordinal = ordinal
+    all_rows[461].source = "amendment"
+    all_rows[90].projection_ordinal = 90
+    all_rows[461].projection_ordinal = 1_000_000_066
+    selected_rows = [all_rows[90], all_rows[461]]
+    doc_chunks = [MagicMock(), MagicMock()]
+    index_chunks = [MagicMock(), MagicMock()]
+    enriched_chunks = [MagicMock(), MagicMock()]
+    embedder = MagicMock()
+    embedder.embedding_model.tokenizer.encode.return_value = [1]
+    embedder.embed_chunks.return_value = index_chunks
+    document_index = MagicMock()
+
+    with (
+        patch(
+            "onyx.regulatory.projection.DefaultIndexingEmbedder.from_db_search_settings",
+            return_value=embedder,
+        ),
+        patch(
+            "onyx.regulatory.projection._rows_to_doc_aware_chunks",
+            return_value=doc_chunks,
+        ) as build_chunks,
+        patch("onyx.regulatory.projection._contextualize_chunks") as contextualize,
+        patch(
+            "onyx.regulatory.projection._enrich_index_chunks",
+            return_value=enriched_chunks,
+        ),
+        patch(
+            "onyx.regulatory.projection.get_all_document_indices",
+            return_value=[document_index],
+        ),
+        patch(
+            "onyx.regulatory.projection.effective_contextual_rag_enabled",
+            return_value=True,
+        ),
+    ):
+        count = _project_amendment_rows_to_search_settings(
+            user_file=user_file,
+            all_rows=all_rows,
+            projection_rows=selected_rows,
+            search_settings=settings,
+            tenant_id="tenant",
+            project_ids={},
+            persona_ids={},
+            document_set_names={},
+            user_file_access={},
+        )
+
+    assert count == 2
+    assert build_chunks.call_args.args[1] == selected_rows
+    assert contextualize.call_args.kwargs["rows"] == [all_rows[90], all_rows[461]]
+    assert contextualize.call_args.kwargs["context_rows"] is all_rows
+    embedder.embed_chunks.assert_called_once_with(doc_chunks, tenant_id="tenant")
+    document_index.verify_chunk_identities.assert_called_once_with(
+        document_id=str(user_file.id),
+        expected_by_ordinal={
+            **{ordinal: f"row-{ordinal}" for ordinal in range(461)},
+            1_000_000_066: "row-461",
+        },
+        required_ordinals=set(range(461)),
+    )
+    document_index.upsert_chunks.assert_called_once_with(enriched_chunks)
+    document_index.index.assert_not_called()
+
+
 def test_contextual_projection_rejects_incomplete_eligible_chunks() -> None:
     canonical_document = MagicMock()
     chunks = [cast(DocAwareChunk, MagicMock()), cast(DocAwareChunk, MagicMock())]
@@ -423,10 +615,12 @@ def test_projection_and_context_use_reverse_article_anchor() -> None:
     row.chunk_metadata = {"article_no": "4"}
     row.validity_start_date = None
     row.validity_end_date = None
+    row.projection_ordinal = 1_000_000_064
 
     with patch("onyx.regulatory.projection.extract_blurb", return_value=row.text):
         chunks = _rows_to_doc_aware_chunks(document, [row], MagicMock())
 
+    assert chunks[0].chunk_id == 1_000_000_064
     assert chunks[0].heading_path == ["Belge", "4A Maddesi:", "(1)"]
     assert _row_context_text(row) == "Belge > 4A Maddesi: > (1)\nEklenen hüküm."
 
@@ -448,6 +642,7 @@ def test_projection_and_context_repair_legacy_article_metadata_lineage() -> None
     row.chunk_type = "numbered_section"
     row.validity_start_date = None
     row.validity_end_date = None
+    row.projection_ordinal = 75
 
     with patch("onyx.regulatory.projection.extract_blurb", return_value=row.text):
         chunks = _rows_to_doc_aware_chunks(document, [row], MagicMock())

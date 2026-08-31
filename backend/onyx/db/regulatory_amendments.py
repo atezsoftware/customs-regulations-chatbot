@@ -28,14 +28,16 @@ from onyx.db.models import (
     RegulatoryChunk,
 )
 from onyx.db.regulatory_chunks import (
-    delete_hierarchical_aggregates_referencing_chunk,
     is_hierarchical_aggregate_chunk,
     make_regulatory_chunk_id,
+    supersede_hierarchical_aggregates_referencing_chunk,
 )
 from onyx.regulatory.amendments.models import ProposalDraft, ReviewedAmendmentChunkDraft
 from onyx.regulatory.chunker import ATOMIC_CHUNK_VARIANT
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
+_AMENDMENT_PROJECTION_ORDINAL_BASE = 1_000_000_000
+_MAX_AMENDMENT_PROPOSAL_ID = 999_999_999
 
 
 @dataclass(frozen=True)
@@ -957,6 +959,9 @@ def approve_amendment_proposal(
     new_chunk_id = make_regulatory_chunk_id(
         user_file_id, draft["position"], draft["text"]
     )
+    projection_ordinal = _AMENDMENT_PROJECTION_ORDINAL_BASE + proposal.id
+    if proposal.id > _MAX_AMENDMENT_PROPOSAL_ID:
+        raise ValueError("Amendment projection ordinal range is exhausted")
     new_chunk = RegulatoryChunk(
         id=new_chunk_id,
         user_file_id=user_file_id,
@@ -967,6 +972,7 @@ def approve_amendment_proposal(
         chunk_metadata=new_chunk_metadata,
         status=RegulatoryChunkStatus.ACTIVE.value,
         source=RegulatoryChunkSource.AMENDMENT.value,
+        projection_ordinal=projection_ordinal,
         validity_start_date=start_date,
         validity_end_date=end_date,
         supersedes_chunk_id=old_chunk.id if old_chunk else None,
@@ -975,10 +981,11 @@ def approve_amendment_proposal(
     db_session.flush()
 
     if old_chunk is not None:
-        delete_hierarchical_aggregates_referencing_chunk(
+        supersede_hierarchical_aggregates_referencing_chunk(
             db_session,
             user_file_id=user_file_id,
             source_chunk_id=old_chunk.id,
+            superseded_at=start_date,
         )
         old_chunk.status = RegulatoryChunkStatus.SUPERSEDED.value
         old_chunk.validity_end_date = start_date
