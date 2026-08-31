@@ -1014,6 +1014,7 @@ def _run(
     filter_queries: list[str] | None = None,
     response_sink: list[ToolResponse] | None = None,
     query: str = "ticket",
+    original_query: str | None = None,
     queries: list[str] | None = None,
     search_mode: str | None = "hybrid",
     expanded_keyword_queries: list[str] | None = None,
@@ -1109,7 +1110,7 @@ def _run(
             override_kwargs=SearchToolOverrideKwargs(
                 starting_citation_num=1,
                 original_query=(
-                    query
+                    original_query or query
                     if queries is None or len(queries) == 1
                     else "resolve the ticket"
                 ),
@@ -1395,12 +1396,12 @@ def test_regulatory_luna_rerank_is_deferred_until_after_bootstrap() -> None:
     )
 
     call = rerank_mocks[0].call_args.kwargs
-    assert call["query"] == "whether the ticket can be resolved"
+    assert call["query"] == "ticket"
     assert call["config"].enabled is False
     assert configured.enabled is True
 
 
-def test_regulatory_luna_rerank_is_enabled_for_followup_evidence_target() -> None:
+def test_regulatory_luna_rerank_is_enabled_for_followup_query() -> None:
     rerank_mocks: list[MagicMock] = []
     configured = RerankerRuntimeConfig(
         enabled=True,
@@ -1427,8 +1428,29 @@ def test_regulatory_luna_rerank_is_enabled_for_followup_evidence_target() -> Non
     )
 
     call = rerank_mocks[0].call_args.kwargs
-    assert call["query"] == "whether the ticket can be resolved"
+    assert call["query"] == "ticket"
     assert call["config"].enabled is True
+
+
+def test_regulatory_rerank_preserves_original_and_model_rewritten_queries() -> None:
+    rerank_mocks: list[MagicMock] = []
+
+    _run(
+        _make_tool(
+            BaseFilters(regulatory_chunks_only=True),
+            auto_detect_filters=False,
+        ),
+        connected_sources=[DocumentSource.USER_FILE],
+        query="taşıt onay belgesinin geçerlilik süresi",
+        original_query="taşıt onay belgesi kaç yıl geçerlidir?",
+        rerank_sink=rerank_mocks,
+        placement_turn_index=1,
+    )
+
+    assert rerank_mocks[0].call_args.kwargs["query"] == (
+        "taşıt onay belgesi kaç yıl geçerlidir?\n\n"
+        "taşıt onay belgesinin geçerlilik süresi"
+    )
 
 
 def test_regulatory_bootstrap_keeps_ranked_selection_without_semantic_call() -> None:

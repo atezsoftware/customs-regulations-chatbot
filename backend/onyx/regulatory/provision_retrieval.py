@@ -96,6 +96,7 @@ class RegulatoryRerankPacket:
     """One reranker document backed by independently citable atomic chunks."""
 
     candidate: InferenceChunk
+    primary_member: InferenceChunk
     members: tuple[InferenceChunk, ...]
 
 
@@ -706,7 +707,12 @@ def _singleton_rerank_packets(
     chunks: Sequence[InferenceChunk],
 ) -> list[RegulatoryRerankPacket]:
     return [
-        RegulatoryRerankPacket(candidate=chunk, members=(chunk,)) for chunk in chunks
+        RegulatoryRerankPacket(
+            candidate=chunk,
+            members=(chunk,),
+            primary_member=chunk,
+        )
+        for chunk in chunks
     ]
 
 
@@ -738,6 +744,7 @@ def build_regulatory_rerank_packets(
         for chunk in deduplicated
         if (chunk_id := chunk.regulatory_chunk_id) is not None
     ]
+    seed_rank_by_id = {chunk_id: rank for rank, chunk_id in enumerate(seed_ids)}
     if not seed_ids:
         return _singleton_rerank_packets(deduplicated)
 
@@ -790,7 +797,13 @@ def build_regulatory_rerank_packets(
         seed_id = seed.regulatory_chunk_id
         family = family_by_seed_id.get(seed_id) if seed_id is not None else None
         if family is None:
-            packets.append(RegulatoryRerankPacket(candidate=seed, members=(seed,)))
+            packets.append(
+                RegulatoryRerankPacket(
+                    candidate=seed,
+                    members=(seed,),
+                    primary_member=seed,
+                )
+            )
             continue
         if family in emitted_families:
             continue
@@ -828,9 +841,20 @@ def build_regulatory_rerank_packets(
                 key=lambda member: (member.chunk_id, member.regulatory_chunk_id or ""),
             )
         )
+        primary_member = min(
+            members,
+            key=lambda member: seed_rank_by_id.get(
+                member.regulatory_chunk_id or "",
+                len(seed_rank_by_id),
+            ),
+        )
         if len(members) == 1:
             packets.append(
-                RegulatoryRerankPacket(candidate=members[0], members=members)
+                RegulatoryRerankPacket(
+                    candidate=members[0],
+                    members=members,
+                    primary_member=primary_member,
+                )
             )
             continue
         first = members[0]
@@ -844,7 +868,13 @@ def build_regulatory_rerank_packets(
                 "relevance_explanation": "Structural provision packet for reranking",
             },
         )
-        packets.append(RegulatoryRerankPacket(candidate=candidate, members=members))
+        packets.append(
+            RegulatoryRerankPacket(
+                candidate=candidate,
+                members=members,
+                primary_member=primary_member,
+            )
+        )
     return packets
 
 
@@ -853,27 +883,49 @@ def expand_ranked_regulatory_rerank_packets(
     packets: Sequence[RegulatoryRerankPacket],
     packet_scores: dict[tuple[str, int], float],
 ) -> tuple[list[InferenceChunk], dict[tuple[str, int], float]]:
-    """Project packet ordering/scores back onto exact, deduplicated atomics."""
+    """Project packet ranks onto diverse exact atomics before adding context."""
 
     packet_by_candidate = {
         _chunk_identity(packet.candidate): packet for packet in packets
     }
-    expanded: list[InferenceChunk] = []
-    expanded_scores: dict[tuple[str, int], float] = {}
-    seen: set[tuple[str, str | int]] = set()
+    ranked_packets: list[
+        tuple[RegulatoryRerankPacket, InferenceChunk, float | None]
+    ] = []
     for candidate in ranked_candidates:
         packet = packet_by_candidate.get(_chunk_identity(candidate))
         if packet is None:
-            packet = RegulatoryRerankPacket(candidate=candidate, members=(candidate,))
-        packet_score = packet_scores.get((candidate.document_id, candidate.chunk_id))
+            packet = RegulatoryRerankPacket(
+                candidate=candidate,
+                members=(candidate,),
+                primary_member=candidate,
+            )
+        ranked_packets.append(
+            (
+                packet,
+                packet.primary_member,
+                packet_scores.get((candidate.document_id, candidate.chunk_id)),
+            )
+        )
+
+    expanded: list[InferenceChunk] = []
+    expanded_scores: dict[tuple[str, int], float] = {}
+    seen: set[tuple[str, str | int]] = set()
+
+    def append_member(member: InferenceChunk, packet_score: float | None) -> None:
+        identity = _chunk_identity(member)
+        if identity in seen:
+            return
+        seen.add(identity)
+        expanded.append(member)
+        if packet_score is not None:
+            expanded_scores[(member.document_id, member.chunk_id)] = packet_score
+
+    for _, primary_member, packet_score in ranked_packets:
+        append_member(primary_member, packet_score)
+
+    for packet, _, packet_score in ranked_packets:
         for member in packet.members:
-            identity = _chunk_identity(member)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            expanded.append(member)
-            if packet_score is not None:
-                expanded_scores[(member.document_id, member.chunk_id)] = packet_score
+            append_member(member, packet_score)
     return expanded, expanded_scores
 
 

@@ -161,12 +161,90 @@ def test_regulatory_rerank_packet_combines_parent_and_clauses_but_keeps_atomics(
     )
 
     assert [chunk.regulatory_chunk_id for chunk in chunks] == [
-        "parent",
         "clause-a",
+        "parent",
         "clause-b",
     ]
     assert all(chunk.content != packets[0].candidate.content for chunk in chunks)
     assert set(scores.values()) == {0.91}
+
+
+def test_regulatory_rerank_packet_expansion_reserves_ranked_candidates_before_siblings() -> (
+    None
+):
+    first_primary = _chunk(10, "first-primary")
+    first_sibling_one = _chunk(11, "first-sibling-one")
+    first_sibling_two = _chunk(12, "first-sibling-two")
+    second_primary = _chunk(20, "second-primary")
+    second_sibling = _chunk(21, "second-sibling")
+    first_packet = provision_retrieval.RegulatoryRerankPacket(
+        candidate=first_primary,
+        primary_member=first_primary,
+        members=(first_primary, first_sibling_one, first_sibling_two),
+    )
+    second_packet = provision_retrieval.RegulatoryRerankPacket(
+        candidate=second_primary,
+        primary_member=second_primary,
+        members=(second_primary, second_sibling),
+    )
+
+    chunks, _ = provision_retrieval.expand_ranked_regulatory_rerank_packets(
+        [first_packet.candidate, second_packet.candidate],
+        [first_packet, second_packet],
+        {},
+    )
+
+    assert [chunk.regulatory_chunk_id for chunk in chunks] == [
+        "first-primary",
+        "second-primary",
+        "first-sibling-one",
+        "first-sibling-two",
+        "second-sibling",
+    ]
+
+
+def test_regulatory_rerank_packet_expansion_prioritizes_the_query_matched_amendment(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    parent = _projection("parent", 85, text="MADDE 15 - Düzenleme usulü")
+    amendment = _projection(
+        "amendment",
+        1_000_000_066,
+        text="Taşıt onay belgesi beş yıl süreyle geçerlidir.",
+    )
+    monkeypatch.setattr(
+        provision_retrieval,
+        "get_bounded_same_provision_siblings",
+        MagicMock(return_value=[parent, amendment]),
+    )
+    amendment_seed = _chunk(
+        1_000_000_066,
+        "amendment",
+        content=amendment.text,
+    )
+    amendment_packet = provision_retrieval.build_regulatory_rerank_packets(
+        MagicMock(),
+        [amendment_seed],
+        query="taşıt onay belgesi kaç yıl geçerlidir",
+        as_of_date=date(2026, 8, 31),
+    )[0]
+    other_primary = _chunk(200, "other-primary")
+    other_packet = provision_retrieval.RegulatoryRerankPacket(
+        candidate=other_primary,
+        primary_member=other_primary,
+        members=(other_primary,),
+    )
+
+    chunks, _ = provision_retrieval.expand_ranked_regulatory_rerank_packets(
+        [amendment_packet.candidate, other_packet.candidate],
+        [amendment_packet, other_packet],
+        {},
+    )
+
+    assert [chunk.regulatory_chunk_id for chunk in chunks[:2]] == [
+        "amendment",
+        "other-primary",
+    ]
 
 
 def test_regulatory_rerank_packet_falls_back_to_singletons_without_metadata(

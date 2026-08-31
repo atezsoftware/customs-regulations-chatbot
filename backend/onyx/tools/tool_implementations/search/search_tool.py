@@ -916,6 +916,24 @@ def _query_deduplication_key(query: str) -> str:
     return " ".join("".join(searchable_characters).split())
 
 
+def _regulatory_rerank_query(
+    original_query: str,
+    model_rewritten_query: str,
+) -> str:
+    """Preserve answer intent while retaining the model's focused rewrite."""
+
+    queries = [original_query.strip(), model_rewritten_query.strip()]
+    unique_queries: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        deduplication_key = _query_deduplication_key(query)
+        if not deduplication_key or deduplication_key in seen:
+            continue
+        seen.add(deduplication_key)
+        unique_queries.append(query)
+    return "\n\n".join(unique_queries)
+
+
 def build_query_lanes(
     *,
     original_query: str | None,
@@ -2183,7 +2201,9 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 update={"enabled": False}
             )
         rerank_query = (
-            evidence_target if regulatory_chunks_only else canonical_original_query
+            _regulatory_rerank_query(canonical_original_query, llm_queries[0])
+            if regulatory_chunks_only
+            else canonical_original_query
         )
         rerank_packets = None
         rerank_input_chunks = fused_candidates
