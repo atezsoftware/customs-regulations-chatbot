@@ -50,6 +50,8 @@ def test_grounding_guidance_resolves_source_supported_priority_before_conflict()
     prompt = append_grounding_guidance("Custom prompt")
 
     assert "source roles, scope, specificity, cross-references, or validity" in prompt
+    assert "dedicated operative provision" in prompt
+    assert "general definition's incidental description" in prompt
     assert "lead with the controlling passage" in prompt
     assert "If the supplied material does not establish priority" in prompt
 
