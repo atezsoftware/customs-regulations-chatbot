@@ -29,7 +29,7 @@ export interface AmendmentProposal {
   match_confidence: number | null;
   match_rationale: string | null;
   date_rationale: string | null;
-  status: "pending" | "approved" | "rejected";
+  status: "pending" | "approving" | "approved" | "rejected";
   applied_new_chunk_id: string | null;
   decided_by: string | null;
   decided_at: string | null;

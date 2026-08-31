@@ -349,47 +349,51 @@ test("shows before and after field tables and approves edits without exposing JS
     effective_start_date: null,
     effective_end_date: null,
   };
+  const pendingProposal = {
+    id: 19,
+    batch_id: 42,
+    instruction_index: 0,
+    instruction_text: "(a) bendi yürürlükten kaldırılmıştır.",
+    instruction_indices: [0],
+    instruction_texts: ["(a) bendi yürürlükten kaldırılmıştır."],
+    old_chunk_id: "old-chunk",
+    old_chunk_snapshot: {
+      id: "old-chunk",
+      user_file_id: proposedDraft.user_file_id,
+      position: 15,
+      text: "MADDE 15 - (2) a)",
+      chunk_type: "article",
+      heading_path: proposedDraft.heading_path,
+      metadata: proposedDraft.metadata,
+      validity_start_date: "2010-12-31",
+      validity_end_date: null,
+      status: "active",
+      source: "indexed",
+      supersedes_chunk_id: null,
+      superseded_by_chunk_id: null,
+    },
+    new_chunk_draft: proposedDraft,
+    match_confidence: 0.99,
+    match_rationale: "Exact provision",
+    date_rationale: "Publication date was not provided.",
+    status: "pending" as const,
+    applied_new_chunk_id: null,
+    decided_by: null,
+    decided_at: null,
+    created_at: "2026-08-27T12:00:00Z",
+    updated_at: "2026-08-27T12:00:00Z",
+    duplicate_target: false,
+  };
   mockedListAmendmentBatches.mockResolvedValue([analyzedBatch]);
   mockedGetAmendmentAnalysis.mockResolvedValue({
     batch: analyzedBatch,
-    proposals: [
-      {
-        id: 19,
-        batch_id: 42,
-        instruction_index: 0,
-        instruction_text: "(a) bendi yürürlükten kaldırılmıştır.",
-        instruction_indices: [0],
-        instruction_texts: ["(a) bendi yürürlükten kaldırılmıştır."],
-        old_chunk_id: "old-chunk",
-        old_chunk_snapshot: {
-          id: "old-chunk",
-          user_file_id: proposedDraft.user_file_id,
-          position: 15,
-          text: "MADDE 15 - (2) a)",
-          chunk_type: "article",
-          heading_path: proposedDraft.heading_path,
-          metadata: proposedDraft.metadata,
-          validity_start_date: "2010-12-31",
-          validity_end_date: null,
-          status: "active",
-          source: "indexed",
-          supersedes_chunk_id: null,
-          superseded_by_chunk_id: null,
-        },
-        new_chunk_draft: proposedDraft,
-        match_confidence: 0.99,
-        match_rationale: "Exact provision",
-        date_rationale: "Publication date was not provided.",
-        status: "pending" as const,
-        applied_new_chunk_id: null,
-        decided_by: null,
-        decided_at: null,
-        created_at: "2026-08-27T12:00:00Z",
-        updated_at: "2026-08-27T12:00:00Z",
-        duplicate_target: false,
-      },
-    ],
+    proposals: [pendingProposal],
     unmatched_instructions: [],
+  });
+  mockedApproveProposal.mockResolvedValue({
+    ...pendingProposal,
+    status: "approving",
+    new_chunk_draft: proposedDraft,
   });
 
   const user = setupUser();
@@ -446,6 +450,74 @@ test("shows before and after field tables and approves edits without exposing JS
   await user.click(screen.getByRole("button", { name: "Approve" }));
 
   expect(mockedApproveProposal).toHaveBeenCalledWith(19, reviewedDraft);
+  expect(
+    await screen.findByText(/Approval is running.*indexed in the background/)
+  ).toBeVisible();
+});
+
+test("shows a green success message after approval and indexing complete", async () => {
+  const analyzedBatch = {
+    ...queuedBatch,
+    status: "analyzed" as const,
+    stage: "finalizing" as const,
+    instruction_count: 1,
+    processed_instruction_count: 1,
+  };
+  mockedListAmendmentBatches.mockResolvedValue([analyzedBatch]);
+  mockedGetAmendmentAnalysis.mockResolvedValue({
+    batch: analyzedBatch,
+    proposals: [
+      {
+        id: 21,
+        batch_id: 42,
+        instruction_index: 0,
+        instruction_text: "MADDE 15 değiştirilmiştir.",
+        instruction_indices: [0],
+        instruction_texts: ["MADDE 15 değiştirilmiştir."],
+        old_chunk_id: "old-chunk",
+        old_chunk_snapshot: { id: "old-chunk", text: "Eski metin" },
+        new_chunk_draft: {
+          user_file_id: "00000000-0000-0000-0000-000000000123",
+          position: 15,
+          text: "Yeni metin",
+          chunk_type: "article",
+          heading_path: [],
+          metadata: {},
+          effective_start_date: "2026-08-31",
+          effective_end_date: null,
+        },
+        match_confidence: 0.99,
+        match_rationale: "Exact provision",
+        date_rationale: null,
+        status: "approved" as const,
+        applied_new_chunk_id: "new-chunk",
+        decided_by: "admin-id",
+        decided_at: "2026-08-31T12:00:00Z",
+        created_at: "2026-08-31T11:00:00Z",
+        updated_at: "2026-08-31T12:00:00Z",
+        duplicate_target: false,
+      },
+    ],
+    unmatched_instructions: [],
+  });
+
+  const user = setupUser();
+  render(<AmendmentsPage />);
+  act(() => {
+    screen.getByRole("combobox").focus();
+  });
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
+  );
+
+  const success = await screen.findByRole("status");
+  expect(success).toHaveTextContent(
+    "Success — this proposal was approved and indexed."
+  );
+  expect(success).toHaveClass("bg-status-success-01");
 });
 
 test("keeps an invalid date edit from being approved", async () => {

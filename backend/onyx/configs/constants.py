@@ -706,6 +706,7 @@ class OnyxCeleryTask:
 
     REGULATORY_BENCHMARK_RUN = "regulatory_benchmark_run"
     REGULATORY_AMENDMENT_RUN = "regulatory_amendment_run"
+    REGULATORY_AMENDMENT_APPROVE = "regulatory_amendment_approve"
     REGULATORY_AMENDMENT_RECOVER_STALE = "regulatory_amendment_recover_stale"
     REGULATORY_INDEXING_RUN_STEP = "regulatory_indexing_run_step"
     REGULATORY_INDEXING_RECOVER_STALE = "regulatory_indexing_recover_stale"

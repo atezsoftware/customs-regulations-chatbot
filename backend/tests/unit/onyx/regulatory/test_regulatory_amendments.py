@@ -8,7 +8,11 @@ import pytest
 from sqlalchemy.orm import Session
 
 from onyx.db.models import AmendmentProposal, RegulatoryChunk
-from onyx.db.regulatory_amendments import approve_amendment_proposal, reject_proposal
+from onyx.db.regulatory_amendments import (
+    approve_amendment_proposal,
+    queue_amendment_proposal_approval,
+    reject_proposal,
+)
 from onyx.db.regulatory_chunks import get_active_chunks_by_ids, get_next_chunk_position
 from onyx.regulatory.amendments import candidate_finder, pipeline
 from onyx.regulatory.amendments.drafter import DraftResult
@@ -165,7 +169,7 @@ def test_analyze_instruction_without_candidates_skips_llm_calls(
 def test_amendment_approval_rejects_derived_aggregate_target() -> None:
     proposal = MagicMock()
     proposal.id = 41
-    proposal.status = "pending"
+    proposal.status = "approving"
     proposal.old_chunk_id = "aggregate-id"
     proposal.new_chunk_draft = {
         "user_file_id": str(UUID("00000000-0000-0000-0000-000000000123")),
@@ -198,7 +202,7 @@ def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_row
         AmendmentProposal,
         SimpleNamespace(
             id=42,
-            status="pending",
+            status="approving",
             old_chunk_id="old-chunk",
             new_chunk_draft={
                 "user_file_id": "00000000-0000-0000-0000-000000000123",
@@ -210,7 +214,7 @@ def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_row
     )
     locked_proposal = SimpleNamespace(
         id=42,
-        status="pending",
+        status="approving",
         old_chunk_id="old-chunk",
         new_chunk_draft={
             "user_file_id": "00000000-0000-0000-0000-000000000123",
@@ -283,13 +287,18 @@ def test_amendment_approval_applies_reviewed_draft_atomically() -> None:
         chunk_metadata={"chunk_variant": "atomic"},
     )
     db_session = MagicMock(spec=Session)
-    db_session.scalar.side_effect = [locked_proposal, old_chunk]
+    db_session.scalar.side_effect = [locked_proposal, locked_proposal, old_chunk]
 
-    result = approve_amendment_proposal(
+    queue_amendment_proposal_approval(
         db_session,
         submitted_proposal,
         decided_by=None,
         reviewed_new_chunk_draft=reviewed_draft,
+    )
+    result = approve_amendment_proposal(
+        db_session,
+        submitted_proposal,
+        decided_by=None,
     )
 
     assert locked_proposal.new_chunk_draft == reviewed_draft
@@ -319,17 +328,11 @@ def test_amendment_approval_rejects_reviewed_draft_identity_changes() -> None:
         old_chunk_snapshot={"id": "old-chunk"},
         new_chunk_draft=stored_draft,
     )
-    old_chunk = SimpleNamespace(
-        id="old-chunk",
-        status="active",
-        chunk_type="article",
-        chunk_metadata={"chunk_variant": "atomic"},
-    )
     db_session = MagicMock(spec=Session)
-    db_session.scalar.side_effect = [locked_proposal, old_chunk]
+    db_session.scalar.return_value = locked_proposal
 
     with pytest.raises(ValueError, match="cannot change user_file_id"):
-        approve_amendment_proposal(
+        queue_amendment_proposal_approval(
             db_session,
             submitted_proposal,
             decided_by=None,
@@ -373,18 +376,24 @@ def test_amendment_approval_rejects_end_on_or_before_approval_date_fallback(
         chunk_metadata={"chunk_variant": "atomic"},
     )
     db_session = MagicMock(spec=Session)
-    db_session.scalar.side_effect = [locked_proposal, old_chunk]
+    db_session.scalar.side_effect = [locked_proposal, locked_proposal, old_chunk]
 
+    queue_amendment_proposal_approval(
+        db_session,
+        submitted_proposal,
+        decided_by=None,
+        reviewed_new_chunk_draft={
+            **stored_draft,
+            "effective_start_date": None,
+            "effective_end_date": effective_end_date,
+        },
+    )
+    db_session.add.reset_mock()
     with pytest.raises(ValueError, match="effective_end_date must be after"):
         approve_amendment_proposal(
             db_session,
             submitted_proposal,
             decided_by=None,
-            reviewed_new_chunk_draft={
-                **stored_draft,
-                "effective_start_date": None,
-                "effective_end_date": effective_end_date,
-            },
         )
 
     db_session.add.assert_not_called()
@@ -398,11 +407,11 @@ def test_amendment_approval_rejects_old_chunk_changed_after_analysis() -> None:
     }
     submitted_proposal = cast(
         AmendmentProposal,
-        SimpleNamespace(id=49, status="pending", old_chunk_id="old-chunk"),
+        SimpleNamespace(id=49, status="approving", old_chunk_id="old-chunk"),
     )
     locked_proposal = SimpleNamespace(
         id=49,
-        status="pending",
+        status="approving",
         old_chunk_id="old-chunk",
         old_chunk_snapshot={"id": "old-chunk", "text": "İncelenen eski metin"},
         new_chunk_draft=stored_draft,
@@ -443,7 +452,7 @@ def test_amendment_approval_rejects_target_deleted_after_analysis() -> None:
         AmendmentProposal,
         SimpleNamespace(
             id=43,
-            status="pending",
+            status="approving",
             old_chunk_id=None,
             old_chunk_snapshot={"id": "deleted-old-chunk", "text": "Eski metin"},
             new_chunk_draft={
@@ -468,7 +477,7 @@ def test_amendment_approval_keeps_true_new_provision_unlinked() -> None:
         AmendmentProposal,
         SimpleNamespace(
             id=44,
-            status="pending",
+            status="approving",
             old_chunk_id=None,
             old_chunk_snapshot={},
             new_chunk_draft={

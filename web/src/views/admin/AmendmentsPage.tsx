@@ -308,11 +308,11 @@ function metadataValueFromInput(original: unknown, value: string): unknown {
 
 function ProposalCard({
   proposal,
-  onDecided,
+  onUpdated,
   reviewEnabled,
 }: {
   proposal: AmendmentProposal;
-  onDecided: () => void;
+  onUpdated: (proposal: AmendmentProposal) => void;
   reviewEnabled: boolean;
 }) {
   const [deciding, setDeciding] = useState(false);
@@ -331,28 +331,28 @@ function ProposalCard({
     if (validationError !== null) return;
     setDeciding(true);
     try {
-      await approveProposal(proposal.id, draft);
-      toast.success("Proposal approved and indexed.");
-      onDecided();
+      const queuedProposal = await approveProposal(proposal.id, draft);
+      onUpdated(queuedProposal);
+      toast.info("Approval queued. Indexing will continue in the background.");
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Approve failed.");
     } finally {
       setDeciding(false);
     }
-  }, [proposal.id, draft, validationError, onDecided]);
+  }, [proposal.id, draft, validationError, onUpdated]);
 
   const handleReject = useCallback(async () => {
     setDeciding(true);
     try {
-      await rejectProposal(proposal.id);
+      const rejectedProposal = await rejectProposal(proposal.id);
       toast.success("Proposal rejected.");
-      onDecided();
+      onUpdated(rejectedProposal);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Reject failed.");
     } finally {
       setDeciding(false);
     }
-  }, [proposal.id, onDecided]);
+  }, [proposal.id, onUpdated]);
 
   const isNewChunk = Object.keys(proposal.old_chunk_snapshot).length === 0;
   const isConsolidated = proposal.instruction_texts.length > 1;
@@ -598,6 +598,29 @@ function ProposalCard({
         </Text>
       )}
 
+      {proposal.status === "approving" && (
+        <div
+          role="status"
+          className="rounded-08 border border-border-02 bg-status-info-01 p-3"
+        >
+          <Text font="main-ui-action" color="text-05">
+            Approval is running. The updated chunk is being indexed in the
+            background.
+          </Text>
+        </div>
+      )}
+
+      {proposal.status === "approved" && (
+        <div
+          role="status"
+          className="rounded-08 border border-status-success-02 bg-status-success-01 p-3"
+        >
+          <Text font="main-ui-action" color="status-success-05">
+            Success — this proposal was approved and indexed.
+          </Text>
+        </div>
+      )}
+
       {proposal.status === "pending" && (
         <div className="flex gap-2 justify-end">
           <Button
@@ -649,9 +672,12 @@ export default function AmendmentsPage() {
     return result;
   }, []);
 
-  const refreshProposals = useCallback(async (batchId: number) => {
-    const result = await listAmendmentProposals(batchId);
-    setProposals(result);
+  const updateProposal = useCallback((updatedProposal: AmendmentProposal) => {
+    setProposals((current) =>
+      current.map((proposal) =>
+        proposal.id === updatedProposal.id ? updatedProposal : proposal
+      )
+    );
   }, []);
 
   useEffect(() => {
@@ -721,6 +747,79 @@ export default function AmendmentsPage() {
       if (timeoutId !== null) clearTimeout(timeoutId);
     };
   }, [selectedBatchId, pollRevision]);
+
+  const approvingProposalIdsKey = useMemo(
+    () =>
+      proposals
+        .filter((proposal) => proposal.status === "approving")
+        .map((proposal) => proposal.id)
+        .sort((left, right) => left - right)
+        .join(","),
+    [proposals]
+  );
+
+  useEffect(() => {
+    if (selectedBatchId === null || !approvingProposalIdsKey) return;
+
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let pollDelayMs = 1500;
+    const trackedIds = new Set(
+      approvingProposalIdsKey.split(",").map((value) => Number(value))
+    );
+
+    const pollApprovals = async () => {
+      try {
+        const refreshed = await listAmendmentProposals(selectedBatchId);
+        if (cancelled) return;
+
+        const completedCount = refreshed.filter(
+          (proposal) =>
+            trackedIds.has(proposal.id) && proposal.status === "approved"
+        ).length;
+        const failedCount = refreshed.filter(
+          (proposal) =>
+            trackedIds.has(proposal.id) && proposal.status === "pending"
+        ).length;
+        setProposals(refreshed);
+
+        if (completedCount > 0) {
+          toast.success(
+            completedCount === 1
+              ? "Proposal approved and indexed."
+              : `${completedCount} proposals approved and indexed.`
+          );
+        }
+        if (failedCount > 0) {
+          toast.error(
+            failedCount === 1
+              ? "Approval failed during indexing. Review the proposal and try again."
+              : `${failedCount} approvals failed during indexing. Review them and try again.`
+          );
+        }
+
+        if (
+          refreshed.some(
+            (proposal) =>
+              trackedIds.has(proposal.id) && proposal.status === "approving"
+          )
+        ) {
+          pollDelayMs = 1500;
+          timeoutId = setTimeout(() => void pollApprovals(), pollDelayMs);
+        }
+      } catch {
+        if (cancelled) return;
+        pollDelayMs = Math.min(pollDelayMs * 2, 30_000);
+        timeoutId = setTimeout(() => void pollApprovals(), pollDelayMs);
+      }
+    };
+
+    timeoutId = setTimeout(() => void pollApprovals(), pollDelayMs);
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    };
+  }, [selectedBatchId, approvingProposalIdsKey]);
 
   const currentSourceIdentity = sourceIdentity(
     sourceMode,
@@ -1062,7 +1161,7 @@ export default function AmendmentsPage() {
                     <ProposalCard
                       key={proposal.id}
                       proposal={proposal}
-                      onDecided={() => void refreshProposals(selectedBatch.id)}
+                      onUpdated={updateProposal}
                       reviewEnabled={selectedBatch.status === "analyzed"}
                     />
                   ))}

@@ -16,6 +16,7 @@ from onyx.auth.permissions import require_permission
 from onyx.auth.schemas import UserRole
 from onyx.background.celery.tasks.regulatory_amendments.tasks import (
     enqueue_amendment_batch,
+    enqueue_amendment_proposal_approval,
 )
 from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_BYTES
 from onyx.configs.constants import PUBLIC_API_TAGS
@@ -24,14 +25,15 @@ from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import AmendmentBatchStatus, Permission
 from onyx.db.models import DocumentSet, User, UserFile
 from onyx.db.regulatory_amendments import (
-    approve_amendment_proposal,
     compute_duplicate_targets,
     create_batch,
     get_batch,
     get_proposal,
     list_batches_for_document_set,
     list_proposals_for_batch,
+    queue_amendment_proposal_approval,
     reject_proposal,
+    reset_amendment_proposal_approval,
     reset_failed_batch_for_retry,
 )
 from onyx.db.regulatory_chunks import (
@@ -577,12 +579,17 @@ def retry_amendment_analysis(
     return AmendmentBatchSnapshot.from_model(retried)
 
 
-@router.post("/amendments/proposals/{proposal_id}/approve", tags=PUBLIC_API_TAGS)
+@router.post(
+    "/amendments/proposals/{proposal_id}/approve",
+    tags=PUBLIC_API_TAGS,
+    status_code=202,
+)
 def approve_proposal(
     proposal_id: int,
     approval_request: ApproveAmendmentProposalRequest | None = None,
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
 ) -> AmendmentProposalSnapshot:
     proposal = get_proposal(db_session, proposal_id)
     if proposal is None:
@@ -597,7 +604,7 @@ def approve_proposal(
         )
 
     try:
-        result = approve_amendment_proposal(
+        proposal = queue_amendment_proposal_approval(
             db_session,
             proposal,
             decided_by=user.id,
@@ -607,11 +614,23 @@ def approve_proposal(
         )
     except ValueError as e:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e)) from e
-
-    user_file = db_session.get(UserFile, result.new_chunk.user_file_id)
-    assert user_file is not None
-    project_user_file_to_index(db_session, user_file, get_current_tenant_id())
     db_session.commit()
+
+    try:
+        enqueue_amendment_proposal_approval(
+            proposal_id=proposal.id,
+            tenant_id=tenant_id,
+        )
+    except Exception as error:
+        logger.exception("Approval dispatch failed for proposal=%s", proposal.id)
+        reset_amendment_proposal_approval(
+            db_session,
+            proposal_id=proposal.id,
+        )
+        raise OnyxError(
+            OnyxErrorCode.SERVICE_UNAVAILABLE,
+            "Approval could not be queued. Please try again.",
+        ) from error
 
     return AmendmentProposalSnapshot.from_model(proposal)
 

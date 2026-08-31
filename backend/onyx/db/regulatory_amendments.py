@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from onyx.db.enums import (
     AmendmentBatchStage,
     AmendmentBatchStatus,
+    AmendmentProposalStatus,
     RegulatoryChunkSource,
     RegulatoryChunkStatus,
 )
@@ -524,14 +525,59 @@ def reject_proposal(
     decided_by: UUID | None,
 ) -> AmendmentProposal:
     proposal = _lock_proposal_for_transition(db_session, proposal.id)
-    if proposal.status != "pending":
+    if proposal.status != AmendmentProposalStatus.PENDING.value:
         raise ValueError(
             f"Amendment proposal {proposal.id} is already {proposal.status}."
         )
-    proposal.status = "rejected"
+    proposal.status = AmendmentProposalStatus.REJECTED.value
     proposal.decided_by = decided_by
     proposal.decided_at = datetime.datetime.now(datetime.timezone.utc)
     return proposal
+
+
+def queue_amendment_proposal_approval(
+    db_session: Session,
+    proposal: AmendmentProposal,
+    *,
+    decided_by: UUID | None,
+    reviewed_new_chunk_draft: dict[str, Any] | None = None,
+) -> AmendmentProposal:
+    """Validate and durably claim a proposal before dispatching its projection."""
+
+    proposal = _lock_proposal_for_transition(db_session, proposal.id)
+    if proposal.status != AmendmentProposalStatus.PENDING.value:
+        raise ValueError(
+            f"Amendment proposal {proposal.id} is already {proposal.status}."
+        )
+    if reviewed_new_chunk_draft is not None:
+        proposal.new_chunk_draft = _validated_reviewed_chunk_draft(
+            proposal.new_chunk_draft,
+            reviewed_new_chunk_draft,
+        )
+    proposal.status = AmendmentProposalStatus.APPROVING.value
+    proposal.decided_by = decided_by
+    proposal.decided_at = None
+    db_session.add(proposal)
+    db_session.flush()
+    return proposal
+
+
+def reset_amendment_proposal_approval(
+    db_session: Session,
+    *,
+    proposal_id: int,
+) -> bool:
+    """Return a failed queued approval to review without undoing later decisions."""
+
+    proposal = _lock_proposal_for_transition(db_session, proposal_id)
+    if proposal.status != AmendmentProposalStatus.APPROVING.value:
+        db_session.rollback()
+        return False
+    proposal.status = AmendmentProposalStatus.PENDING.value
+    proposal.decided_by = None
+    proposal.decided_at = None
+    db_session.commit()
+    return True
 
 
 class ApprovalResult:
@@ -613,12 +659,11 @@ def approve_amendment_proposal(
     db_session: Session,
     proposal: AmendmentProposal,
     *,
-    decided_by: UUID | None,
-    reviewed_new_chunk_draft: dict[str, Any] | None = None,
+    decided_by: UUID | None = None,
 ) -> ApprovalResult:
-    """Apply one pending proposal:
+    """Apply one durably queued proposal:
 
-    1. Verify the proposal is still 'pending'.
+    1. Verify the proposal is still 'approving'.
     2. Insert the new chunk (source='amendment').
     3. If old_chunk_id is set, mark it superseded — guarded by
        `status == 'active'` so two proposals racing to supersede the same
@@ -643,9 +688,10 @@ def approve_amendment_proposal(
     panel.
     """
     proposal = _lock_proposal_for_transition(db_session, proposal.id)
-    if proposal.status != "pending":
+    if proposal.status != AmendmentProposalStatus.APPROVING.value:
         raise ValueError(
-            f"Amendment proposal {proposal.id} is already {proposal.status}."
+            f"Amendment proposal {proposal.id} is not queued for approval "
+            f"(status: {proposal.status})."
         )
 
     snapshot_target_id = (getattr(proposal, "old_chunk_snapshot", None) or {}).get("id")
@@ -659,11 +705,6 @@ def approve_amendment_proposal(
         )
 
     draft = proposal.new_chunk_draft
-    if reviewed_new_chunk_draft is not None:
-        draft = _validated_reviewed_chunk_draft(
-            proposal.new_chunk_draft,
-            reviewed_new_chunk_draft,
-        )
     user_file_id = UUID(draft["user_file_id"])
     today = datetime.date.today()
     start_date_str = draft.get("effective_start_date")
@@ -736,9 +777,10 @@ def approve_amendment_proposal(
         db_session.add(old_chunk)
 
     proposal.new_chunk_draft = draft
-    proposal.status = "approved"
+    proposal.status = AmendmentProposalStatus.APPROVED.value
     proposal.applied_new_chunk_id = new_chunk.id
-    proposal.decided_by = decided_by
+    if decided_by is not None:
+        proposal.decided_by = decided_by
     proposal.decided_at = datetime.datetime.now(datetime.timezone.utc)
     db_session.add(proposal)
     db_session.flush()

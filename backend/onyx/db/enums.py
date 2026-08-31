@@ -836,6 +836,7 @@ class AmendmentProposalStatus(str, PyEnum):
     """Review state of one atomic amendment proposal within a batch."""
 
     PENDING = "pending"
+    APPROVING = "approving"
     APPROVED = "approved"
     REJECTED = "rejected"
 

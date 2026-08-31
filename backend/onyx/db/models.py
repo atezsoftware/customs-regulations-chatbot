@@ -6175,7 +6175,7 @@ class AmendmentProposal(Base):
         Index("ix_amendment_proposal_status", "status"),
         Index("ix_amendment_proposal_old_chunk_id", "old_chunk_id"),
         CheckConstraint(
-            "status IN ('pending', 'approved', 'rejected')",
+            "status IN ('pending', 'approving', 'approved', 'rejected')",
             name="amendment_proposal_status_check",
         ),
     )
