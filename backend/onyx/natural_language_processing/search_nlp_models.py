@@ -461,19 +461,19 @@ class CloudEmbedding:
             or "global"
         )
 
-        client_kwargs = {
-            "project": project_id,
-            "location": location,
-            "credentials": credentials,
-        }
         if _is_gemini_embedding_2_model(resolved_model):
             # Gemini Embedding 2 is served through the Enterprise v1 transport.
             # Keep query embeddings on the same endpoint as provider-batch
             # document embeddings or hybrid retrieval silently falls back to
             # lexical search after Vertex returns a misleading model-not-found.
-            client_kwargs["http_options"] = genai_types.HttpOptions(api_version="v1")
             try:
-                client = genai.Client(enterprise=True, **client_kwargs)
+                client = genai.Client(
+                    enterprise=True,
+                    project=project_id,
+                    location=location,
+                    credentials=credentials,
+                    http_options=genai_types.HttpOptions(api_version="v1"),
+                )
             except TypeError as error:
                 if "enterprise" not in str(error):
                     raise
@@ -483,7 +483,12 @@ class CloudEmbedding:
                     "from the lockfile before enabling semantic search."
                 ) from error
         else:
-            client = genai.Client(vertexai=True, **client_kwargs)
+            client = genai.Client(
+                vertexai=True,
+                project=project_id,
+                location=location,
+                credentials=credentials,
+            )
 
         # gemini-embedding-2 rejects task_type; embedding intent is conveyed
         # via the instruction-formatted text instead. Older models continue
@@ -536,9 +541,17 @@ class CloudEmbedding:
         # Process VertexAI batches sequentially to avoid additional intra-task fanout.
         # The higher-level thread pool already provides concurrency; running these
         # requests in parallel here was causing excessive memory usage.
+        # The Gemini Embedding 2 Enterprise ``embedContent`` endpoint rejects
+        # multiple contents in one request. Keep the shared Vertex path batched
+        # for older models, but submit Gemini Embedding 2 inputs individually.
+        local_batch_size = (
+            1
+            if _is_gemini_embedding_2_model(resolved_model)
+            else VERTEXAI_EMBEDDING_LOCAL_BATCH_SIZE
+        )
         batches = [
-            texts[i : i + VERTEXAI_EMBEDDING_LOCAL_BATCH_SIZE]
-            for i in range(0, len(texts), VERTEXAI_EMBEDDING_LOCAL_BATCH_SIZE)
+            texts[i : i + local_batch_size]
+            for i in range(0, len(texts), local_batch_size)
         ]
         all_embeddings: list[Embedding] = []
 
@@ -546,7 +559,7 @@ class CloudEmbedding:
             "VertexAI embedding: processing %s texts in %s batches (batch_size=%s)",
             len(texts),
             len(batches),
-            VERTEXAI_EMBEDDING_LOCAL_BATCH_SIZE,
+            local_batch_size,
         )
 
         try:

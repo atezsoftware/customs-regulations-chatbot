@@ -379,6 +379,51 @@ async def test_vertex_embed_uses_instruction_prefix_for_gemini_embedding_2(
 
 
 @pytest.mark.asyncio
+async def test_vertex_embed_sends_gemini_embedding_2_contents_individually(
+    sample_embeddings: list[list[float]],
+) -> None:
+    """Gemini Embedding 2's Enterprise endpoint accepts one content per call."""
+    with patch(
+        "google.oauth2.service_account.Credentials.from_service_account_info"
+    ) as mock_credentials:
+        mock_credentials.return_value = MagicMock()
+
+        with patch("google.genai.Client") as mock_genai_client:
+            mock_client = MagicMock()
+            mock_client.aio.models.embed_content = AsyncMock(
+                side_effect=[
+                    _build_google_embed_response(sample_embeddings[:1]),
+                    _build_google_embed_response(sample_embeddings[1:2]),
+                ]
+            )
+            mock_client.aio.aclose = AsyncMock()
+            mock_genai_client.return_value = mock_client
+
+            embedding = CloudEmbedding(
+                '{"project_id":"test-project"}',
+                EmbeddingProvider.GOOGLE,
+            )
+            try:
+                result = await embedding._embed_vertex(
+                    ["first passage", "second passage"],
+                    "gemini-embedding-2",
+                    "RETRIEVAL_DOCUMENT",
+                    1024,
+                )
+            finally:
+                await embedding.aclose()
+
+            assert result == sample_embeddings[:2]
+            calls = mock_client.aio.models.embed_content.await_args_list
+            assert len(calls) == 2
+            assert [call.kwargs["contents"][0].parts[0].text for call in calls] == [
+                "title: none | text: first passage",
+                "title: none | text: second passage",
+            ]
+            assert all(len(call.kwargs["contents"]) == 1 for call in calls)
+
+
+@pytest.mark.asyncio
 async def test_vertex_embed_gemini_embedding_2_rejects_legacy_client() -> None:
     """A stale SDK must not silently select an incompatible vector endpoint."""
     with patch(
