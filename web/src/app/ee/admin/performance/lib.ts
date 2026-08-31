@@ -1,6 +1,11 @@
 import { errorHandlingFetcher } from "@/lib/fetcher";
 import useSWR, { mutate } from "swr";
-import { OnyxBotAnalytics, QueryAnalytics, UserAnalytics } from "./usage/types";
+import {
+  OnyxBotAnalytics,
+  QueryAnalytics,
+  UsageSummary,
+  UserAnalytics,
+} from "./usage/types";
 import { useState } from "react";
 import { buildApiPath } from "@/lib/urlBuilder";
 
@@ -44,6 +49,15 @@ export const useUserAnalytics = (timeRange: DateRangePickerValue) => {
     ...swrResponse,
     refreshUserAnalytics: () => mutate(url),
   };
+};
+
+export const useUsageSummary = (timeRange: DateRangePickerValue) => {
+  const url = buildApiPath("/api/admin/usage-report/summary", {
+    period_from: convertDateToStartOfDay(timeRange.from)?.toISOString(),
+    period_to: convertDateToEndOfDay(timeRange.to)?.toISOString(),
+  });
+
+  return useSWR<UsageSummary>(url, errorHandlingFetcher);
 };
 
 export const useOnyxBotAnalytics = (timeRange: DateRangePickerValue) => {

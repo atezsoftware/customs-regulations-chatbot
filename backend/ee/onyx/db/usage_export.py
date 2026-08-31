@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import IO, Optional
 
 from fastapi_users_db_sqlalchemy import UUID_ID
-from sqlalchemy import cast
+from sqlalchemy import cast, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Session
 
@@ -13,9 +13,10 @@ from ee.onyx.server.reporting.usage_export_models import (
     ChatMessageSkeleton,
     FlowType,
     UsageReportMetadata,
+    UsageSummary,
 )
 from onyx.configs.constants import MessageType
-from onyx.db.models import ChatMessage, UsageReport, User
+from onyx.db.models import ChatMessage, ChatSession, UsageReport, User
 from onyx.file_store.file_store import get_default_file_store
 
 
@@ -43,6 +44,9 @@ def get_empty_chat_messages_entries__paginated(
 
     message_skeletons: list[ChatMessageSkeleton] = []
     for chat_session in chat_sessions:
+        if chat_session.benchmark_flow:
+            continue
+
         flow_type = FlowType.SLACK if chat_session.onyxbot_flow else FlowType.CHAT
 
         # Group assistant messages by their parent (user) message id. A user
@@ -109,12 +113,48 @@ def get_empty_chat_messages_entries__paginated(
     return chat_sessions[-1].time_created, message_skeletons
 
 
+def get_usage_summary(
+    db_session: Session,
+    period: tuple[datetime, datetime],
+) -> UsageSummary:
+    total_queries, total_sessions, total_tokens = (
+        db_session.query(
+            func.count(ChatMessage.id),
+            func.count(func.distinct(ChatSession.id)),
+            func.coalesce(func.sum(ChatMessage.token_count), 0),
+        )
+        .join(ChatSession, ChatSession.id == ChatMessage.chat_session_id)
+        .filter(
+            ChatSession.time_created.between(period[0], period[1]),
+            ChatSession.benchmark_flow.is_(False),
+            ChatMessage.message_type == MessageType.USER,
+        )
+        .one()
+    )
+    query_count = int(total_queries or 0)
+    session_count = int(total_sessions or 0)
+    token_count = int(total_tokens or 0)
+
+    return UsageSummary(
+        total_user_queries=query_count,
+        total_user_sessions=session_count,
+        total_query_tokens=token_count,
+        average_tokens_per_query=(token_count / query_count if query_count else 0.0),
+        average_tokens_per_session=(
+            token_count / session_count if session_count else 0.0
+        ),
+        average_queries_per_session=(
+            query_count / session_count if session_count else 0.0
+        ),
+    )
+
+
 def get_all_empty_chat_message_entries(
     db_session: Session,
     period: tuple[datetime, datetime],
 ) -> Generator[list[ChatMessageSkeleton], None, None]:
     """period is the range of time over which to fetch messages."""
-    initial_time: Optional[datetime] = period[0]
+    initial_time: Optional[datetime] = None
     while True:
         # iterate from oldest to newest
         time_created, message_skeletons = get_empty_chat_messages_entries__paginated(
@@ -123,10 +163,11 @@ def get_all_empty_chat_message_entries(
             initial_time=initial_time,
         )
 
-        if not message_skeletons:
+        if time_created is None:
             return
 
-        yield message_skeletons
+        if message_skeletons:
+            yield message_skeletons
 
         # Update initial_time for the next iteration
         initial_time = time_created

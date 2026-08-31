@@ -33,6 +33,10 @@ import Calendar from "@/refresh-components/Calendar";
 import { cn } from "@opal/utils";
 import { Spinner } from "@/components/Spinner";
 import { SvgCalendar, SvgDownloadCloud } from "@opal/icons";
+import {
+  convertDateToEndOfDay,
+  convertDateToStartOfDay,
+} from "@/components/dateRangeSelectors/dateUtils";
 
 function GenerateReportInput({
   onReportGenerated,
@@ -56,8 +60,11 @@ function GenerateReportInput({
       let period_to: string | null = null;
 
       if (dateRange?.selectValue != "allTime" && dateRange?.from) {
-        period_from = dateRange?.from?.toISOString();
-        period_to = dateRange?.to?.toISOString() ?? new Date().toISOString();
+        period_from =
+          convertDateToStartOfDay(dateRange.from)?.toISOString() ?? null;
+        period_to =
+          convertDateToEndOfDay(dateRange.to ?? new Date())?.toISOString() ??
+          null;
       }
 
       const res = await fetch("/api/admin/usage-report", {

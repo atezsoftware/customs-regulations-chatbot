@@ -1,9 +1,13 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from ee.onyx.db.usage_export import get_empty_chat_messages_entries__paginated
+from ee.onyx.db.usage_export import (
+    get_all_empty_chat_message_entries,
+    get_empty_chat_messages_entries__paginated,
+    get_usage_summary,
+)
 from onyx.configs.constants import MessageType
 from onyx.db.chat import (
     create_chat_session,
@@ -133,3 +137,77 @@ def test_orphan_user_message_emits_row_with_null_model(db_session: Session) -> N
     matching = [s for s in skeletons if s.message_id == user_msg.id]
     assert len(matching) == 1
     assert matching[0].llm_model is None
+
+
+def test_usage_summary_counts_unique_queries_sessions_and_token_rates(
+    db_session: Session,
+) -> None:
+    user = create_test_user(db_session, "usage-summary")
+    summary_time = datetime(2200, 1, 1, tzinfo=timezone.utc) + timedelta(
+        seconds=user.id.int % 1_000_000_000
+    )
+    first_session = create_chat_session(
+        db_session=db_session,
+        description="first session",
+        user_id=user.id,
+        persona_id=None,
+    )
+    second_session = create_chat_session(
+        db_session=db_session,
+        description="second session",
+        user_id=user.id,
+        persona_id=None,
+    )
+    first_session.time_created = summary_time
+    second_session.time_created = summary_time
+    first_root = get_or_create_root_message(first_session.id, db_session)
+    second_root = get_or_create_root_message(second_session.id, db_session)
+
+    first_query = _make_user_message(db_session, first_session.id, first_root)
+    second_query = _make_user_message(db_session, first_session.id, first_query)
+    third_query = _make_user_message(db_session, second_session.id, second_root)
+    first_query.token_count = 10
+    second_query.token_count = 20
+    third_query.token_count = 60
+    db_session.commit()
+
+    summary = get_usage_summary(
+        db_session,
+        (
+            summary_time - timedelta(seconds=1),
+            summary_time + timedelta(seconds=1),
+        ),
+    )
+
+    assert summary.total_user_queries == 3
+    assert summary.total_user_sessions == 2
+    assert summary.total_query_tokens == 90
+    assert summary.average_tokens_per_query == 30.0
+    assert summary.average_tokens_per_session == 45.0
+    assert summary.average_queries_per_session == 1.5
+
+
+def test_usage_export_includes_session_at_period_start(db_session: Session) -> None:
+    user = create_test_user(db_session, "usage-period-start")
+    period_start = datetime(2250, 1, 1, tzinfo=timezone.utc) + timedelta(
+        seconds=user.id.int % 1_000_000_000
+    )
+    chat_session = create_chat_session(
+        db_session=db_session,
+        description="period boundary",
+        user_id=user.id,
+        persona_id=None,
+    )
+    chat_session.time_created = period_start
+    root = get_or_create_root_message(chat_session.id, db_session)
+    user_message = _make_user_message(db_session, chat_session.id, root)
+    db_session.commit()
+
+    batches = list(
+        get_all_empty_chat_message_entries(
+            db_session,
+            (period_start, period_start + timedelta(seconds=1)),
+        )
+    )
+
+    assert [row.message_id for batch in batches for row in batch] == [user_message.id]

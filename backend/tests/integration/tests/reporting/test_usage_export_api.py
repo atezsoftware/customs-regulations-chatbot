@@ -292,6 +292,20 @@ class TestUsageExportAPI:
             file_names = zip_file.namelist()
             assert "chat_messages.csv" in file_names
             assert "users.csv" in file_names
+            assert "usage_summary.csv" in file_names
+
+            with zip_file.open("usage_summary.csv") as summary_file:
+                summary_rows = list(
+                    csv.DictReader(StringIO(summary_file.read().decode("utf-8")))
+                )
+                assert len(summary_rows) == 1
+                summary = summary_rows[0]
+                assert int(summary["total_user_queries"]) > 0
+                assert int(summary["total_user_sessions"]) > 0
+                assert int(summary["total_query_tokens"]) >= 0
+                assert float(summary["average_tokens_per_query"]) >= 0
+                assert float(summary["average_tokens_per_session"]) >= 0
+                assert float(summary["average_queries_per_session"]) > 0
 
             # Verify chat_messages.csv has the expected columns
             with zip_file.open("chat_messages.csv") as csv_file:

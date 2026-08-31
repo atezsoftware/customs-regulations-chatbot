@@ -37,3 +37,12 @@ class UsageReportMetadata(BaseModel):
     time_created: datetime
     period_from: datetime | None  # None = All time
     period_to: datetime | None
+
+
+class UsageSummary(BaseModel):
+    total_user_queries: int
+    total_user_sessions: int
+    total_query_tokens: int
+    average_tokens_per_query: float
+    average_tokens_per_session: float
+    average_queries_per_session: float

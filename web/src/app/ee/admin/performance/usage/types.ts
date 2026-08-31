@@ -68,3 +68,12 @@ export interface UsageReport {
   period_from: string | null;
   period_to: string | null;
 }
+
+export interface UsageSummary {
+  total_user_queries: number;
+  total_user_sessions: number;
+  total_query_tokens: number;
+  average_tokens_per_query: number;
+  average_tokens_per_session: number;
+  average_queries_per_session: number;
+}

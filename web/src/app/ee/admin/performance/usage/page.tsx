@@ -12,6 +12,7 @@ import { Divider } from "@opal/components";
 import { useAdminAgents } from "@/lib/agents/hooks";
 import { ADMIN_ROUTES } from "@/lib/admin-routes";
 import { SettingsLayouts } from "@opal/layouts";
+import UsageSummarySection from "./UsageSummary";
 
 const route = ADMIN_ROUTES.USAGE;
 
@@ -27,6 +28,7 @@ export default function AnalyticsPage() {
           value={timeRange}
           onValueChange={(value) => setTimeRange(value as any)}
         />
+        <UsageSummarySection timeRange={timeRange} />
         <QueryPerformanceChart timeRange={timeRange} />
         <FeedbackChart timeRange={timeRange} />
         <OnyxBotChart timeRange={timeRange} />
