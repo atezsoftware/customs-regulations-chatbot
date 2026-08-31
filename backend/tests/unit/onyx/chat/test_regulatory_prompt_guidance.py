@@ -44,6 +44,16 @@ def test_regulatory_guidance_is_dataset_blind() -> None:
     assert "prior examples" in all_regulatory_guidance
 
 
+def test_grounding_guidance_resolves_source_supported_priority_before_conflict() -> (
+    None
+):
+    prompt = append_grounding_guidance("Custom prompt")
+
+    assert "source roles, scope, specificity, cross-references, or validity" in prompt
+    assert "lead with the controlling passage" in prompt
+    assert "If the supplied material does not establish priority" in prompt
+
+
 def test_regulatory_search_remains_dynamic_and_evidence_led() -> None:
     assert "You decide what to search" in REGULATORY_SEARCH_GUIDANCE
     assert "There is no required call count" in REGULATORY_SEARCH_GUIDANCE
