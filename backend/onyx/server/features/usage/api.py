@@ -25,7 +25,6 @@ from onyx.db.token_limit import (
     fetch_user_group_token_rate_limits,
 )
 from onyx.db.user_usage import (
-    calculate_usage_rate_metrics,
     get_cost_window_start,
     get_group_cost_cents_buckets_since,
     get_total_cost_cents_buckets_since,
@@ -36,6 +35,7 @@ from onyx.db.user_usage import (
     get_user_cost_cents_since,
     get_user_usage_by_day_and_model,
     reset_user_usage,
+    summarize_usage_by_email,
 )
 from onyx.db.users import get_user_by_email
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -306,45 +306,27 @@ def export_usage(
             UsageExportRecord.model_validate(row.model_dump(exclude={"email"}))
         )
 
-    activity_by_email = {
-        row.email: row
-        for row in get_user_activity_counts_by_email(
+    summaries = summarize_usage_by_email(
+        rows,
+        get_user_activity_counts_by_email(
             db_session,
             start=start_dt,
             end=end_dt,
-        )
-    }
-    emails = set(records_by_email)
-    # A model-filtered export cannot attribute sessions or prompts to one model,
-    # so it keeps the filtered ledger users and adds their period-wide activity.
-    if model is None:
-        emails.update(activity_by_email)
+        ),
+        # A model-filtered export cannot attribute sessions or prompts to one
+        # model, so it does not add users found only in period-wide activity.
+        include_activity_only=model is None,
+    )
 
     users: list[UsageExportUser] = []
-    for email in sorted(emails):
-        records = records_by_email[email]
-        input_tokens = sum(record.input_tokens for record in records)
-        output_tokens = sum(record.output_tokens for record in records)
-        cache_read_tokens = sum(record.cache_read_tokens for record in records)
-        cost_cents = sum(record.cost_cents for record in records)
-        activity = activity_by_email.get(email)
-        rate_metrics = calculate_usage_rate_metrics(
-            query_count=activity.query_count if activity else 0,
-            session_count=activity.session_count if activity else 0,
-            token_count=input_tokens + output_tokens,
-            cost_cents=cost_cents,
-        )
+    for summary in summaries:
         users.append(
             UsageExportUser(
-                email=email,
+                email=summary.email,
                 totals=UsageExportTotals(
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cache_read_tokens=cache_read_tokens,
-                    cost_cents=cost_cents,
-                    **rate_metrics.model_dump(),
+                    **summary.model_dump(exclude={"email"}),
                 ),
-                records=records,
+                records=records_by_email[summary.email],
             )
         )
 

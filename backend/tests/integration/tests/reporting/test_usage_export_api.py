@@ -293,6 +293,7 @@ class TestUsageExportAPI:
             assert "chat_messages.csv" in file_names
             assert "users.csv" in file_names
             assert "usage_summary.csv" in file_names
+            assert "per_user_usage.csv" in file_names
 
             with zip_file.open("usage_summary.csv") as summary_file:
                 summary_rows = list(
@@ -309,6 +310,24 @@ class TestUsageExportAPI:
                 assert float(summary["average_tokens_per_query"]) >= 0
                 assert float(summary["average_tokens_per_session"]) >= 0
                 assert float(summary["average_queries_per_session"]) > 0
+
+            with zip_file.open("per_user_usage.csv") as per_user_file:
+                per_user_rows = list(
+                    csv.DictReader(StringIO(per_user_file.read().decode("utf-8")))
+                )
+                assert per_user_rows
+                admin_row = next(
+                    row for row in per_user_rows if row["email"] == admin_user.email
+                )
+                assert int(admin_row["total_user_queries"]) > 0
+                assert int(admin_row["total_user_sessions"]) > 0
+                assert int(admin_row["total_tokens"]) >= 0
+                assert float(admin_row["cost_cents"]) >= 0
+                assert float(admin_row["average_tokens_per_query"]) >= 0
+                assert float(admin_row["average_tokens_per_session"]) >= 0
+                assert float(admin_row["average_cost_cents_per_query"]) >= 0
+                assert float(admin_row["average_cost_cents_per_session"]) >= 0
+                assert float(admin_row["average_queries_per_session"]) > 0
 
             # Verify chat_messages.csv has the expected columns
             with zip_file.open("chat_messages.csv") as csv_file:

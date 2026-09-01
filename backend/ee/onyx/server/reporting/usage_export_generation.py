@@ -3,7 +3,7 @@ import io
 import tempfile
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi_users_db_sqlalchemy import UUID_ID
 from sqlalchemy import cast
@@ -22,6 +22,12 @@ from ee.onyx.server.reporting.usage_export_models import (
 )
 from onyx.configs.constants import FileOrigin
 from onyx.db.models import User
+from onyx.db.user_usage import (
+    PerUserUsageSummary,
+    get_usage_totals_by_email,
+    get_user_activity_counts_by_email,
+    summarize_usage_by_email,
+)
 from onyx.db.users import get_all_users
 from onyx.file_store.constants import MAX_IN_MEMORY_SIZE
 from onyx.file_store.file_store import FileStore, get_default_file_store
@@ -78,15 +84,54 @@ def render_usage_summary_csv(
     return stream.getvalue()
 
 
+def render_per_user_usage_csv(summaries: list[PerUserUsageSummary]) -> str:
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream)
+    writer.writerow(
+        [
+            "email",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cost_cents",
+            "total_tokens",
+            "total_user_queries",
+            "total_user_sessions",
+            "average_tokens_per_query",
+            "average_tokens_per_session",
+            "average_cost_cents_per_query",
+            "average_cost_cents_per_session",
+            "average_queries_per_session",
+        ]
+    )
+    for summary in summaries:
+        writer.writerow(
+            [
+                sanitize_csv_cell_or_none(summary.email),
+                summary.input_tokens,
+                summary.output_tokens,
+                summary.cache_read_tokens,
+                summary.cost_cents,
+                summary.total_tokens,
+                summary.total_user_queries,
+                summary.total_user_sessions,
+                summary.average_tokens_per_query,
+                summary.average_tokens_per_session,
+                summary.average_cost_cents_per_query,
+                summary.average_cost_cents_per_session,
+                summary.average_queries_per_session,
+            ]
+        )
+    return stream.getvalue()
+
+
 def generate_chat_messages_report(
     db_session: Session,
     file_store: FileStore,
     report_id: str,
-    period: tuple[datetime, datetime] | None,
+    period: tuple[datetime, datetime],
 ) -> str:
     file_name = f"{report_id}_chat_sessions"
-
-    resolved_period = resolve_report_period(period)
 
     with tempfile.SpooledTemporaryFile(
         max_size=MAX_IN_MEMORY_SIZE, mode="w+"
@@ -105,7 +150,7 @@ def generate_chat_messages_report(
             ]
         )
         for chat_message_skeleton_batch in get_all_empty_chat_message_entries(
-            db_session, resolved_period
+            db_session, period
         ):
             for chat_message_skeleton in chat_message_skeleton_batch:
                 # assistant_name and user_email are user-supplied — sanitize
@@ -176,13 +221,34 @@ def create_new_usage_report(
 ) -> UsageReportMetadata:
     report_id = str(uuid.uuid4())
     file_store = get_default_file_store()
+    resolved_period = resolve_report_period(period)
 
     messages_file_id = generate_chat_messages_report(
-        db_session, file_store, report_id, period
+        db_session, file_store, report_id, resolved_period
     )
     users_file_id = generate_user_report(db_session, file_store, report_id)
-    summary = get_usage_summary(db_session, resolve_report_period(period))
+    summary = get_usage_summary(db_session, resolved_period)
     summary_csv = render_usage_summary_csv(summary, period)
+    # The UI sends an inclusive end-of-day timestamp. The ledger/activity
+    # helpers use half-open ranges, so advance by one microsecond for parity.
+    end_exclusive = resolved_period[1] + timedelta(microseconds=1)
+    usage_rows = get_usage_totals_by_email(
+        db_session,
+        start=resolved_period[0],
+        end=end_exclusive,
+    )
+    activity_rows = get_user_activity_counts_by_email(
+        db_session,
+        start=resolved_period[0],
+        end=end_exclusive,
+    )
+    per_user_usage_csv = render_per_user_usage_csv(
+        summarize_usage_by_email(
+            usage_rows,
+            activity_rows,
+            include_activity_only=True,
+        )
+    )
 
     with tempfile.SpooledTemporaryFile(max_size=MAX_IN_MEMORY_SIZE) as zip_buffer:
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file:
@@ -201,6 +267,7 @@ def create_new_usage_report(
             )
             zip_file.writestr("users.csv", users_tmpfile.read())
             zip_file.writestr("usage_summary.csv", summary_csv)
+            zip_file.writestr("per_user_usage.csv", per_user_usage_csv)
 
         zip_buffer.seek(0)
 

@@ -138,12 +138,40 @@ class UsageExportRow(BaseModel):
     cost_cents: float
 
 
+class UserUsageTotalsByEmail(BaseModel):
+    """Tenant usage ledger totals collapsed to one row per email."""
+
+    email: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cost_cents: float
+
+
 class UserActivityCounts(BaseModel):
     """Query and session counts attributable to one user email."""
 
     email: str
     query_count: int
     session_count: int
+
+
+class PerUserUsageSummary(BaseModel):
+    """Token, cost, query, and session totals attributable to one email."""
+
+    email: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cost_cents: float
+    total_tokens: int
+    total_user_queries: int
+    total_user_sessions: int
+    average_tokens_per_query: float
+    average_tokens_per_session: float
+    average_cost_cents_per_query: float
+    average_cost_cents_per_session: float
+    average_queries_per_session: float
 
 
 class UsageRateMetrics(BaseModel):
@@ -181,6 +209,52 @@ def calculate_usage_rate_metrics(
             query_count / session_count if session_count else 0.0
         ),
     )
+
+
+def summarize_usage_by_email(
+    usage_rows: Sequence[UsageExportRow | UserUsageTotalsByEmail],
+    activity_rows: Sequence[UserActivityCounts],
+    *,
+    include_activity_only: bool,
+) -> list[PerUserUsageSummary]:
+    """Combine usage-ledger totals and chat activity with shared rate formulas."""
+    usage_by_email: dict[str, list[UsageExportRow | UserUsageTotalsByEmail]] = (
+        defaultdict(list)
+    )
+    for row in usage_rows:
+        usage_by_email[row.email].append(row)
+
+    activity_by_email = {row.email: row for row in activity_rows}
+    emails = set(usage_by_email)
+    if include_activity_only:
+        emails.update(activity_by_email)
+
+    summaries: list[PerUserUsageSummary] = []
+    for email in sorted(emails):
+        email_usage_rows = usage_by_email[email]
+        input_tokens = sum(row.input_tokens for row in email_usage_rows)
+        output_tokens = sum(row.output_tokens for row in email_usage_rows)
+        cache_read_tokens = sum(row.cache_read_tokens for row in email_usage_rows)
+        cost_cents = sum(row.cost_cents for row in email_usage_rows)
+        activity = activity_by_email.get(email)
+        rate_metrics = calculate_usage_rate_metrics(
+            query_count=activity.query_count if activity else 0,
+            session_count=activity.session_count if activity else 0,
+            token_count=input_tokens + output_tokens,
+            cost_cents=cost_cents,
+        )
+        summaries.append(
+            PerUserUsageSummary(
+                email=email,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cost_cents=cost_cents,
+                **rate_metrics.model_dump(),
+            )
+        )
+
+    return summaries
 
 
 def record_user_usage(
@@ -260,6 +334,49 @@ def get_user_usage_by_day_and_model(
             cost_cents=float(cost or 0.0),
         )
         for day, model, in_tok, out_tok, cache_tok, cost in rows
+    ]
+
+
+def get_usage_totals_by_email(
+    db_session: Session,
+    start: datetime,
+    end: datetime,
+) -> list[UserUsageTotalsByEmail]:
+    """Aggregate the usage ledger directly to bounded per-email report rows."""
+    email_label = func.coalesce(User.email, DELETED_USER_EXPORT_EMAIL)
+    rows = db_session.execute(
+        select(
+            email_label,
+            func.sum(UserUsage.input_tokens),
+            func.sum(UserUsage.output_tokens),
+            func.sum(UserUsage.cache_read_tokens),
+            func.sum(UserUsage.cost_cents),
+        )
+        .select_from(UserUsage)
+        .outerjoin(User, UserUsage.user_id == User.id)
+        .where(
+            UserUsage.window_start >= start,
+            UserUsage.window_start < end,
+        )
+        .group_by(email_label)
+        .order_by(email_label)
+    ).all()
+
+    return [
+        UserUsageTotalsByEmail(
+            email=str(email),
+            input_tokens=int(input_tokens or 0),
+            output_tokens=int(output_tokens or 0),
+            cache_read_tokens=int(cache_read_tokens or 0),
+            cost_cents=float(cost_cents or 0.0),
+        )
+        for (
+            email,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cost_cents,
+        ) in rows
     ]
 
 

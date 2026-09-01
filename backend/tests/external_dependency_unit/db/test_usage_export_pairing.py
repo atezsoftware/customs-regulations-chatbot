@@ -16,7 +16,10 @@ from onyx.db.chat import (
     get_or_create_root_message,
 )
 from onyx.db.models import ChatMessage, UserUsage
-from onyx.db.user_usage import get_user_activity_counts_by_email
+from onyx.db.user_usage import (
+    get_usage_totals_by_email,
+    get_user_activity_counts_by_email,
+)
 from tests.external_dependency_unit.conftest import create_test_user
 
 
@@ -279,6 +282,70 @@ def test_user_activity_counts_group_queries_and_sessions_by_email(
             "email": first_user.email,
             "query_count": 3,
             "session_count": 2,
+        }
+    ]
+
+
+def test_usage_totals_group_directly_by_email_with_exact_period(
+    db_session: Session,
+) -> None:
+    user = create_test_user(db_session, "usage-email-totals")
+    usage_time = datetime(2400, 1, 1, tzinfo=timezone.utc) + timedelta(
+        seconds=user.id.int % 1_000_000_000
+    )
+    db_session.add_all(
+        [
+            UserUsage(
+                user_id=user.id,
+                window_start=usage_time,
+                model="model-a",
+                flow="chat_response",
+                provider="provider-a",
+                input_tokens=1_000,
+                output_tokens=500,
+                cache_read_tokens=200,
+                cost_cents=25.0,
+            ),
+            UserUsage(
+                user_id=user.id,
+                window_start=usage_time + timedelta(microseconds=1),
+                model="model-b",
+                flow="query_rephrase",
+                provider="provider-a",
+                input_tokens=2_000,
+                output_tokens=1_000,
+                cache_read_tokens=300,
+                cost_cents=75.0,
+            ),
+            UserUsage(
+                user_id=user.id,
+                window_start=usage_time + timedelta(seconds=1),
+                model="excluded-model",
+                flow="chat_response",
+                provider="provider-a",
+                input_tokens=9_000,
+                output_tokens=9_000,
+                cache_read_tokens=9_000,
+                cost_cents=900.0,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    rows = get_usage_totals_by_email(
+        db_session,
+        start=usage_time,
+        end=usage_time + timedelta(seconds=1),
+    )
+
+    matching = [row for row in rows if row.email == user.email]
+    assert [row.model_dump() for row in matching] == [
+        {
+            "email": user.email,
+            "input_tokens": 3_000,
+            "output_tokens": 1_500,
+            "cache_read_tokens": 500,
+            "cost_cents": 100.0,
         }
     ]
 
