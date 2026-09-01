@@ -212,6 +212,15 @@ jobs:
             supervisorctl -c /etc/supervisor/conf.d/supervisord.conf \
             status celery_beat_regulatory_indexing || true
 
+          echo "Amendment worker Celery task state"
+          for state in active reserved scheduled registered; do
+            echo "celery inspect ${state}"
+            kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+              timeout 10s celery \
+                -A onyx.background.celery.apps.regulatory_benchmark:celery_app \
+                inspect "$state" --timeout=5 || true
+          done
+
           echo "API/background Celery broker and amendment queue state"
           for component in api background; do
             component_selector="app=${env_x}-customs-regulations-${component}"
@@ -238,7 +247,7 @@ jobs:
           broker_url = str(app.conf.broker_url)
           print("broker_fingerprint=" + hashlib.sha256(broker_url.encode()).hexdigest()[:16])
           redis_client = celery_get_broker_client(app)
-          queue = str(OnyxCeleryQueues.REGULATORY_AMENDMENT.value)
+          queue = str(OnyxCeleryQueues.REGULATORY_AMENDMENT)
           for priority in range(len(OnyxCeleryPriority)):
               queue_name = queue if priority == 0 else f"{queue}:{priority}"
               messages = redis_client.lrange(queue_name, 0, -1)
