@@ -8,6 +8,7 @@ onyx/regulatory/indexing.py).
 
 import datetime
 import hashlib
+import json
 import math
 import re
 import unicodedata
@@ -2133,12 +2134,26 @@ def get_bounded_referenced_provisions(
     )
 
 
-def make_regulatory_chunk_id(user_file_id: UUID, position: int, text: str) -> str:
+def make_regulatory_chunk_id(
+    user_file_id: UUID,
+    position: int,
+    text: str,
+    *,
+    version_key: str | None = None,
+) -> str:
     """Deterministic chunk id: re-processing an unchanged file yields the same
-    ids, so re-indexing is idempotent."""
-    digest = hashlib.sha256(
-        f"{user_file_id}:{position}:{text}".encode("utf-8")
-    ).hexdigest()
+    ids, so re-indexing is idempotent. Versioned rows can supply a stable key
+    when their persisted text and position intentionally match an older row."""
+    if version_key is None:
+        identity = f"{user_file_id}:{position}:{text}".encode("utf-8")
+    else:
+        versioned_identity = json.dumps(
+            [str(user_file_id), position, text, version_key],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        identity = b"regulatory-chunk-version:v1\0" + versioned_identity
+    digest = hashlib.sha256(identity).hexdigest()
     return f"rc_{digest[:40]}"
 
 

@@ -13,7 +13,11 @@ from onyx.db.regulatory_amendments import (
     queue_amendment_proposal_approval,
     reject_proposal,
 )
-from onyx.db.regulatory_chunks import get_active_chunks_by_ids, get_next_chunk_position
+from onyx.db.regulatory_chunks import (
+    get_active_chunks_by_ids,
+    get_next_chunk_position,
+    make_regulatory_chunk_id,
+)
 from onyx.regulatory.amendments import candidate_finder, pipeline
 from onyx.regulatory.amendments.drafter import DraftResult
 from onyx.regulatory.amendments.models import (
@@ -251,6 +255,70 @@ def test_amendment_approval_locks_and_refreshes_stale_proposal_and_old_chunk_row
     assert all(
         call.args[0].get_execution_options()["populate_existing"] is True
         for call in db_session.scalar.call_args_list
+    )
+
+
+def test_amendment_approval_versions_unchanged_chunk_text_with_a_distinct_id() -> None:
+    user_file_id = UUID("00000000-0000-0000-0000-000000000123")
+    position = 34
+    text = "Taşıt onay belgesi dört yıl süreyle geçerlidir."
+    old_chunk_id = make_regulatory_chunk_id(user_file_id, position, text)
+    proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(
+            id=71,
+            status="approving",
+            old_chunk_id=old_chunk_id,
+            old_chunk_snapshot={},
+            new_chunk_draft={
+                "user_file_id": str(user_file_id),
+                "position": position,
+                "text": text,
+                "effective_start_date": "2026-07-04",
+            },
+        ),
+    )
+    old_chunk = SimpleNamespace(
+        id=old_chunk_id,
+        status="active",
+        chunk_type=None,
+        chunk_metadata={"chunk_variant": "atomic"},
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.side_effect = [proposal, old_chunk]
+
+    result = approve_amendment_proposal(db_session, proposal, decided_by=None)
+
+    assert result.new_chunk.id != old_chunk_id
+    assert result.new_chunk.supersedes_chunk_id == old_chunk_id
+    assert old_chunk.superseded_by_chunk_id == result.new_chunk.id
+
+
+def test_versioned_regulatory_chunk_ids_are_domain_separated_and_stable() -> None:
+    user_file_id = UUID("00000000-0000-0000-0000-000000000123")
+    position = 34
+    text = "Taşıt onay belgesi dört yıl süreyle geçerlidir."
+
+    legacy_id = make_regulatory_chunk_id(user_file_id, position, text)
+    versioned_id = make_regulatory_chunk_id(
+        user_file_id,
+        position,
+        text,
+        version_key="amendment:71",
+    )
+
+    assert legacy_id == "rc_308507b7276ac5fb2ecdf8baf7714b7c428c9f20"
+    assert versioned_id == make_regulatory_chunk_id(
+        user_file_id,
+        position,
+        text,
+        version_key="amendment:71",
+    )
+    assert versioned_id != legacy_id
+    assert versioned_id != make_regulatory_chunk_id(
+        user_file_id,
+        position,
+        f"{text}:amendment:71",
     )
 
 

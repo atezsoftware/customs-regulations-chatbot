@@ -957,7 +957,10 @@ def approve_amendment_proposal(
     new_chunk_metadata.setdefault("source_regulatory_chunk_ids", [])
 
     new_chunk_id = make_regulatory_chunk_id(
-        user_file_id, draft["position"], draft["text"]
+        user_file_id,
+        draft["position"],
+        draft["text"],
+        version_key=f"amendment:{proposal.id}",
     )
     projection_ordinal = _AMENDMENT_PROJECTION_ORDINAL_BASE + proposal.id
     if proposal.id > _MAX_AMENDMENT_PROPOSAL_ID:
