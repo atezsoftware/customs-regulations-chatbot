@@ -212,6 +212,15 @@ jobs:
             supervisorctl -c /etc/supervisor/conf.d/supervisord.conf \
             status celery_beat_regulatory_indexing || true
 
+          echo "Amendment worker Celery task state"
+          for state in active reserved scheduled registered; do
+            echo "celery inspect ${state}"
+            kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+              timeout 10s celery \
+                -A onyx.background.celery.apps.regulatory_benchmark:celery_app \
+                inspect "$state" --timeout=5 || true
+          done
+
           echo "Container memory counters"
           kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
             sh -c 'for file in memory.current memory.peak memory.max memory.events; do if [ -r "/sys/fs/cgroup/$file" ]; then printf "%s=" "$file"; tr "\n" "," < "/sys/fs/cgroup/$file"; printf "\n"; fi; done' || true
