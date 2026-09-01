@@ -440,6 +440,7 @@ def test_recovery_redelivers_applied_unlinked_approvals() -> None:
     batch_context.__enter__.return_value = MagicMock()
     proposal_context = MagicMock()
     proposal_context.__enter__.return_value = MagicMock()
+    task_app = MagicMock()
 
     with (
         patch.object(
@@ -455,19 +456,20 @@ def test_recovery_redelivers_applied_unlinked_approvals() -> None:
         ),
         patch.object(tasks, "enqueue_amendment_batch") as enqueue_batch,
         patch.object(tasks, "enqueue_amendment_proposal_approval") as enqueue_approval,
+        patch.object(tasks.regulatory_amendment_recover_stale, "app", task_app),
     ):
         tasks.regulatory_amendment_recover_stale.run(tenant_id="tenant-a")
 
-    enqueue_batch.assert_called_once()
-    enqueue_approval.assert_called_once()
-    assert enqueue_batch.call_args.kwargs == {
-        "batch_id": 42,
-        "tenant_id": "tenant-a",
-    }
-    assert enqueue_approval.call_args.kwargs == {
-        "proposal_id": 9,
-        "tenant_id": "tenant-a",
-    }
+    enqueue_batch.assert_called_once_with(
+        task_app,
+        batch_id=42,
+        tenant_id="tenant-a",
+    )
+    enqueue_approval.assert_called_once_with(
+        task_app,
+        proposal_id=9,
+        tenant_id="tenant-a",
+    )
 
 
 def test_runtime_lite_worker_consumes_amendment_queue() -> None:

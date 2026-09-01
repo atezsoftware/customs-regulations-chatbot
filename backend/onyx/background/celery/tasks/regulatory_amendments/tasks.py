@@ -6,7 +6,7 @@ from threading import Event, Thread
 from typing import Any
 from uuid import UUID
 
-from celery import Celery, shared_task
+from celery import Celery, Task, shared_task
 from sqlalchemy.orm import Session
 
 from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryQueues, OnyxCeleryTask
@@ -332,10 +332,12 @@ def regulatory_amendment_approve(
 
 @shared_task(
     name=OnyxCeleryTask.REGULATORY_AMENDMENT_RECOVER_STALE,
+    bind=True,
     ignore_result=True,
     trail=False,
 )
 def regulatory_amendment_recover_stale(
+    self: Task,
     *,
     tenant_id: str,  # noqa: ARG001 - TenantAwareTask consumes it
 ) -> None:
@@ -353,12 +355,10 @@ def regulatory_amendment_recover_stale(
             recovered_at=now,
         )
 
-    from onyx.background.celery.versioned_apps.client import app as celery_app
-
     for batch_id in batch_ids:
         try:
             enqueue_amendment_batch(
-                celery_app,
+                self.app,
                 batch_id=batch_id,
                 tenant_id=tenant_id,
             )
@@ -367,7 +367,7 @@ def regulatory_amendment_recover_stale(
     for proposal_id in proposal_ids:
         try:
             enqueue_amendment_proposal_approval(
-                celery_app,
+                self.app,
                 proposal_id=proposal_id,
                 tenant_id=tenant_id,
             )
