@@ -216,9 +216,9 @@ jobs:
           for state in active reserved scheduled registered; do
             echo "celery inspect ${state}"
             kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
-              timeout 10s celery \
+              bash -lc 'source /vault/secrets/config && exec timeout 10s celery \
                 -A onyx.background.celery.apps.regulatory_benchmark:celery_app \
-                inspect "$state" --timeout=5 || true
+                inspect "$1" --timeout=5' _ "$state" || true
           done
 
           echo "API/background Celery broker and amendment queue state"
@@ -235,7 +235,7 @@ jobs:
               | jq -r '.spec.containers[0].name')
             echo "${component}: pod=${component_pod}"
             kubectl exec -i "$component_pod" --namespace "${namespace}" -c "$component_container" -- \
-              timeout 60s python - <<'PY' || true
+              bash -lc 'source /vault/secrets/config && exec timeout 60s python -' <<'PY' || true
           import base64
           import hashlib
           import json
