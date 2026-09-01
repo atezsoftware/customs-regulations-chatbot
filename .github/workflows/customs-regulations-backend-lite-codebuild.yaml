@@ -218,7 +218,7 @@ jobs:
 
           echo "Filtered regulatory worker runtime logs"
           kubectl logs "$pod" --namespace "${namespace}" -c "$container" --tail=5000 \
-            | grep -E -i 'benchmark|regulatory.?index|oom|out of memory|memoryerror|sigkill|killed|worker lost|terminated by' \
+            | grep -E -i 'amendment|benchmark|regulatory.?index|unregistered|unknown task|not registered|oom|out of memory|memoryerror|sigkill|killed|worker lost|terminated by' \
             | tail -n 800 || true
 
       - name: Set up Helm
