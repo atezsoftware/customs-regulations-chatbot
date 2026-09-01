@@ -9,7 +9,8 @@ from uuid import UUID
 from celery import Celery, Task, shared_task
 from sqlalchemy.orm import Session
 
-from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryQueues, OnyxCeleryTask
+from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
+from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryTask
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import AmendmentProposalStatus
 from onyx.db.models import UserFile
@@ -155,7 +156,7 @@ def enqueue_amendment_batch(
     for countdown in (None, 5):
         options: dict[str, Any] = {
             "kwargs": {"batch_id": batch_id, "tenant_id": tenant_id},
-            "queue": OnyxCeleryQueues.REGULATORY_AMENDMENT,
+            "queue": REGULATORY_AMENDMENT_QUEUE,
             "priority": OnyxCeleryPriority.HIGH,
             "expires": _DELIVERY_EXPIRES_SECONDS,
             "retry": False,
@@ -188,7 +189,7 @@ def enqueue_amendment_proposal_approval(
     celery_app.send_task(
         OnyxCeleryTask.REGULATORY_AMENDMENT_APPROVE,
         kwargs={"proposal_id": proposal_id, "tenant_id": tenant_id},
-        queue=OnyxCeleryQueues.REGULATORY_AMENDMENT,
+        queue=REGULATORY_AMENDMENT_QUEUE,
         priority=OnyxCeleryPriority.HIGH,
         expires=_DELIVERY_EXPIRES_SECONDS,
         retry=False,

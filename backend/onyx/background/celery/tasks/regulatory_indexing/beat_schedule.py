@@ -1,6 +1,7 @@
 from datetime import timedelta
 from typing import Any
 
+from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
 from onyx.configs.constants import (
     OnyxCeleryPriority,
     OnyxCeleryQueues,
@@ -18,7 +19,7 @@ PRODUCTION_LITE_TASK_TEMPLATES: tuple[dict[str, Any], ...] = (
         "options": {
             "priority": OnyxCeleryPriority.LOW,
             "expires": 5 * 60,
-            "queue": OnyxCeleryQueues.REGULATORY_AMENDMENT,
+            "queue": REGULATORY_AMENDMENT_QUEUE,
         },
     },
     {

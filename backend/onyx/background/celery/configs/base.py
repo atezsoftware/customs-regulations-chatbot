@@ -23,7 +23,6 @@ from onyx.configs.app_configs import (
 from onyx.configs.constants import REDIS_SOCKET_KEEPALIVE_OPTIONS, OnyxCeleryPriority
 
 CELERY_SEPARATOR = ":"
-
 CELERY_PASSWORD_PART = ""
 if REDIS_PASSWORD:
     CELERY_PASSWORD_PART = ":" + urllib.parse.quote(REDIS_PASSWORD, safe="") + "@"

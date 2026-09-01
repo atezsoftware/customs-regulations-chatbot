@@ -812,7 +812,7 @@ def _review_snapshot_value(chunk: RegulatoryChunk, key: str) -> Any:
     if key in {"validity_start_date", "validity_end_date"}:
         value = getattr(chunk, key)
         return value.isoformat() if value is not None else None
-    if key in {"created_at", "updated_at"}:
+    if key == "created_at":
         return getattr(chunk, key).isoformat()
     return getattr(chunk, key)
 
@@ -836,7 +836,6 @@ def _ensure_old_chunk_matches_review_snapshot(
         "supersedes_chunk_id",
         "superseded_by_chunk_id",
         "created_at",
-        "updated_at",
     }
     for key in snapshot.keys() & supported_keys:
         if snapshot[key] != _review_snapshot_value(chunk, key):

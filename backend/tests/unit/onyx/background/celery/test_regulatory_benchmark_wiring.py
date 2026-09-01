@@ -1306,15 +1306,12 @@ assert "onyx.regulatory.benchmark.runner" not in sys.modules
 def test_full_and_lite_supervisors_consume_regulatory_benchmark_queue() -> None:
     backend_root = _backend_root()
     expected_program = "[program:celery_worker_regulatory_benchmark]"
-    expected_app = (
-        "-A onyx.background.celery.versioned_apps.regulatory_benchmark worker"
-    )
+    expected_app = "python -m onyx.background.celery.regulatory_worker"
 
     for config_name in ("supervisord.conf", "supervisord-lite.conf"):
         config = (backend_root / config_name).read_text(encoding="utf-8")
         assert expected_program in config
         assert expected_app in config
-        assert "-Q regulatory_benchmark,regulatory_amendment" in config
 
     lite_config = (backend_root / "supervisord-lite.conf").read_text(encoding="utf-8")
     assert "celery_worker_scheduled_tasks" not in lite_config

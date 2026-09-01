@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -5,9 +8,45 @@ from uuid import UUID
 
 import pytest
 
+from onyx.background.celery import regulatory_worker
+from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
 from onyx.background.celery.tasks.regulatory_amendments import tasks
-from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryQueues, OnyxCeleryTask
+from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryTask
 from shared_configs.enums import EmbeddingProvider
+
+
+def test_amendment_queue_is_isolated_by_database_identity() -> None:
+    script = (
+        "from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE; "
+        "print(REGULATORY_AMENDMENT_QUEUE)"
+    )
+
+    def read_prefix(database_name: str) -> str:
+        environment = os.environ.copy()
+        environment["POSTGRES_DB"] = database_name
+        environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[5])
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        return result.stdout.rstrip("\n")
+
+    dev_queue = read_prefix("customs-regulations-dev")
+    test_queue = read_prefix("customs-regulations-test")
+
+    assert dev_queue.startswith("regulatory_amendment_")
+    assert test_queue.startswith("regulatory_amendment_")
+    assert dev_queue != test_queue
+    assert dev_queue == read_prefix("customs-regulations-dev")
+
+
+def test_amendment_queue_does_not_namespace_unrelated_broker_keys() -> None:
+    from onyx.background.celery.configs.base import broker_transport_options
+
+    assert "global_keyprefix" not in broker_transport_options
 
 
 def test_enqueue_routes_redundant_expiring_deliveries() -> None:
@@ -18,7 +57,7 @@ def test_enqueue_routes_redundant_expiring_deliveries() -> None:
     expected = call(
         OnyxCeleryTask.REGULATORY_AMENDMENT_RUN,
         kwargs={"batch_id": 42, "tenant_id": "public"},
-        queue=OnyxCeleryQueues.REGULATORY_AMENDMENT,
+        queue=REGULATORY_AMENDMENT_QUEUE,
         priority=OnyxCeleryPriority.HIGH,
         expires=24 * 60 * 60,
         retry=False,
@@ -26,7 +65,7 @@ def test_enqueue_routes_redundant_expiring_deliveries() -> None:
     delayed = call(
         OnyxCeleryTask.REGULATORY_AMENDMENT_RUN,
         kwargs={"batch_id": 42, "tenant_id": "public"},
-        queue=OnyxCeleryQueues.REGULATORY_AMENDMENT,
+        queue=REGULATORY_AMENDMENT_QUEUE,
         priority=OnyxCeleryPriority.HIGH,
         expires=24 * 60 * 60,
         retry=False,
@@ -47,7 +86,7 @@ def test_enqueue_approval_routes_expiring_background_delivery() -> None:
     app.send_task.assert_called_once_with(
         OnyxCeleryTask.REGULATORY_AMENDMENT_APPROVE,
         kwargs={"proposal_id": 9, "tenant_id": "public"},
-        queue=OnyxCeleryQueues.REGULATORY_AMENDMENT,
+        queue=REGULATORY_AMENDMENT_QUEUE,
         priority=OnyxCeleryPriority.HIGH,
         expires=24 * 60 * 60,
         retry=False,
@@ -476,4 +515,23 @@ def test_runtime_lite_worker_consumes_amendment_queue() -> None:
     backend_root = Path(__file__).resolve().parents[5]
     supervisor = (backend_root / "supervisord-lite.conf").read_text(encoding="utf-8")
 
-    assert "-Q regulatory_benchmark,regulatory_amendment" in supervisor
+    assert "python -m onyx.background.celery.regulatory_worker" in supervisor
+
+
+def test_regulatory_worker_launcher_consumes_scoped_amendment_queue() -> None:
+    with (
+        patch.object(sys, "argv", ["regulatory_worker", "--hostname=worker@%n"]),
+        patch.object(regulatory_worker.os, "execvp") as execvp,
+    ):
+        regulatory_worker.main()
+
+    command = [
+        "celery",
+        "-A",
+        "onyx.background.celery.versioned_apps.regulatory_benchmark",
+        "worker",
+        "--hostname=worker@%n",
+        "-Q",
+        f"regulatory_benchmark,{REGULATORY_AMENDMENT_QUEUE}",
+    ]
+    execvp.assert_called_once_with(command[0], command)

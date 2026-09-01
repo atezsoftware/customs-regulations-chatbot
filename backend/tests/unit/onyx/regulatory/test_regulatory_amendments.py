@@ -505,6 +505,52 @@ def test_amendment_approval_rejects_old_chunk_changed_after_analysis() -> None:
     db_session.add.assert_not_called()
 
 
+def test_amendment_approval_allows_projection_only_timestamp_change() -> None:
+    proposal = cast(
+        AmendmentProposal,
+        SimpleNamespace(id=51, status="approving", old_chunk_id="old-chunk"),
+    )
+    locked_proposal = SimpleNamespace(
+        id=51,
+        status="approving",
+        old_chunk_id="old-chunk",
+        old_chunk_snapshot={
+            "id": "old-chunk",
+            "text": "İncelenen eski metin",
+            "updated_at": "2026-08-31T10:00:00+00:00",
+        },
+        new_chunk_draft={
+            "user_file_id": "00000000-0000-0000-0000-000000000123",
+            "position": 15,
+            "text": "Yeni metin",
+            "effective_start_date": "2026-09-01",
+        },
+    )
+    projected_old_chunk = SimpleNamespace(
+        id="old-chunk",
+        text="İncelenen eski metin",
+        updated_at=datetime(
+            2026,
+            9,
+            1,
+            10,
+            0,
+            tzinfo=timezone.utc,
+        ),
+        status="active",
+        chunk_type="article",
+        chunk_metadata={"chunk_variant": "atomic"},
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.side_effect = [locked_proposal, projected_old_chunk]
+
+    result = approve_amendment_proposal(db_session, proposal, decided_by=None)
+
+    assert result.old_chunk is projected_old_chunk
+    assert result.new_chunk.text == "Yeni metin"
+    assert projected_old_chunk.status == "superseded"
+
+
 def test_reviewed_draft_rejects_string_position() -> None:
     with pytest.raises(ValueError):
         ReviewedAmendmentChunkDraft.model_validate(

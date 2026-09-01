@@ -160,8 +160,10 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
         "regulatory_indexing_recover_stale",
         "monitor_celery_queues",
     }
+    from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
+
     assert {template["options"]["queue"] for template in templates} == {
-        OnyxCeleryQueues.REGULATORY_AMENDMENT,
+        REGULATORY_AMENDMENT_QUEUE,
         OnyxCeleryQueues.REGULATORY_INDEXING,
         OnyxCeleryQueues.MONITORING,
     }

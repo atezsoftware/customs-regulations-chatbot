@@ -4,6 +4,7 @@ from typing import Any
 
 from celery.schedules import crontab
 
+from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
 from onyx.configs.app_configs import (
     AUTO_LLM_CONFIG_URL,
     AUTO_LLM_UPDATE_INTERVAL_SECONDS,
@@ -48,7 +49,7 @@ beat_task_templates: list[dict] = [
         "options": {
             "priority": OnyxCeleryPriority.LOW,
             "expires": 5 * 60,
-            "queue": OnyxCeleryQueues.REGULATORY_AMENDMENT,
+            "queue": REGULATORY_AMENDMENT_QUEUE,
         },
     },
     {
