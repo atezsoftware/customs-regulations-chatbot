@@ -46,7 +46,9 @@ from onyx.indexing.contextual_settings import (
 )
 from onyx.indexing.embedder import DefaultIndexingEmbedder
 from onyx.indexing.models import DocAwareChunk, DocMetadataAwareIndexChunk, IndexChunk
-from onyx.natural_language_processing.utils import get_tokenizer
+from onyx.llm.constants import LlmProviderNames
+from onyx.llm.interfaces import LLM
+from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
 from onyx.regulatory.contextual import (
     context_reference_date,
     contextual_reserve_for_embedding_text,
@@ -54,10 +56,25 @@ from onyx.regulatory.contextual import (
     visible_regulatory_snapshot_for_target,
 )
 from onyx.regulatory.heading_path import normalize_regulatory_heading_path
+from onyx.regulatory.indexing_jobs.contextual import (
+    get_contextual_token_budget_tokenizer,
+)
 from onyx.utils.logger import setup_logger
 from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 
 logger = setup_logger()
+
+
+def _get_contextual_tokenizer(llm: LLM) -> BaseTokenizer:
+    if llm.config.model_provider == LlmProviderNames.VERTEX_AI:
+        return get_contextual_token_budget_tokenizer(
+            model_provider=LlmProviderNames.VERTEX_AI,
+            model_name=llm.config.model_name,
+        )
+    return get_tokenizer(
+        model_name=llm.config.model_name,
+        provider_type=llm.config.model_provider,
+    )
 
 
 def _build_document_shell(
@@ -232,10 +249,7 @@ def _contextualize_chunks(
             )
         return
 
-    llm_tokenizer = get_tokenizer(
-        model_name=llm.config.model_name,
-        provider_type=llm.config.model_provider,
-    )
+    llm_tokenizer = _get_contextual_tokenizer(llm)
     try:
         # Lazy import avoids loading the full indexing pipeline for projections
         # that do not use contextual retrieval.

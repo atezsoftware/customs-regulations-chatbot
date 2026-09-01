@@ -9,6 +9,8 @@ import pytest
 from onyx.db.models import RegulatoryChunk, UserFileStatus
 from onyx.document_index.interfaces_new import IndexingMetadata
 from onyx.indexing.models import DocAwareChunk
+from onyx.llm.constants import LlmProviderNames
+from onyx.regulatory import projection
 from onyx.regulatory.projection import (
     _affected_amendment_row_ids,
     _build_document_shell,
@@ -601,6 +603,29 @@ def test_contextual_projection_rejects_incomplete_eligible_chunks() -> None:
 
     assert add_summaries.call_args.kwargs["raise_on_failure"] is True
     assert all(chunk.source_document is canonical_document for chunk in chunks)
+
+
+def test_vertex_contextual_projection_uses_offline_budget_tokenizer() -> None:
+    llm = MagicMock()
+    llm.config.model_provider = "vertex_ai"
+    llm.config.model_name = "gemini-3.6-flash"
+    tokenizer = MagicMock()
+
+    with (
+        patch(
+            "onyx.regulatory.projection.get_contextual_token_budget_tokenizer",
+            return_value=tokenizer,
+        ) as get_vertex_tokenizer,
+        patch("onyx.regulatory.projection.get_tokenizer") as get_generic_tokenizer,
+    ):
+        selected = projection._get_contextual_tokenizer(llm)
+
+    assert selected is tokenizer
+    get_vertex_tokenizer.assert_called_once_with(
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name="gemini-3.6-flash",
+    )
+    get_generic_tokenizer.assert_not_called()
 
 
 def test_projection_and_context_use_reverse_article_anchor() -> None:
