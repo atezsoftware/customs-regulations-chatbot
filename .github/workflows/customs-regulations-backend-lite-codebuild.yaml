@@ -212,6 +212,55 @@ jobs:
             supervisorctl -c /etc/supervisor/conf.d/supervisord.conf \
             status celery_beat_regulatory_indexing || true
 
+          echo "API/background Celery broker and amendment queue state"
+          for component in api background; do
+            component_selector="app=${env_x}-customs-regulations-${component}"
+            component_pod=$(kubectl get pods --namespace "${namespace}" -l "$component_selector" -o json \
+              | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name' \
+              | head -n 1)
+            if [[ -z "$component_pod" ]]; then
+              echo "${component}: no active pod"
+              continue
+            fi
+            component_container=$(kubectl get pod "$component_pod" --namespace "${namespace}" -o json \
+              | jq -r '.spec.containers[0].name')
+            echo "${component}: pod=${component_pod}"
+            kubectl exec -i "$component_pod" --namespace "${namespace}" -c "$component_container" -- \
+              timeout 60s python - <<'PY' || true
+          import base64
+          import hashlib
+          import json
+
+          from onyx.background.celery.celery_redis import celery_get_broker_client
+          from onyx.background.celery.versioned_apps.client import app
+          from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryQueues
+
+          broker_url = str(app.conf.broker_url)
+          print("broker_fingerprint=" + hashlib.sha256(broker_url.encode()).hexdigest()[:16])
+          redis_client = celery_get_broker_client(app)
+          queue = str(OnyxCeleryQueues.REGULATORY_AMENDMENT.value)
+          for priority in range(len(OnyxCeleryPriority)):
+              queue_name = queue if priority == 0 else f"{queue}:{priority}"
+              messages = redis_client.lrange(queue_name, 0, -1)
+              print(f"queue={queue_name} length={len(messages)}")
+              for raw_message in messages:
+                  message = json.loads(raw_message)
+                  headers = message.get("headers", {})
+                  body = json.loads(base64.b64decode(message["body"]))
+                  kwargs = body[1] if len(body) > 1 and isinstance(body[1], dict) else {}
+                  print(
+                      "queued_task=%s id=%s proposal_id=%s batch_id=%s"
+                      % (
+                          headers.get("task"),
+                          headers.get("id"),
+                          kwargs.get("proposal_id"),
+                          kwargs.get("batch_id"),
+                      )
+                  )
+          print("unacked_length=%s" % redis_client.hlen("unacked"))
+          PY
+          done
+
           echo "Container memory counters"
           kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
             sh -c 'for file in memory.current memory.peak memory.max memory.events; do if [ -r "/sys/fs/cgroup/$file" ]; then printf "%s=" "$file"; tr "\n" "," < "/sys/fs/cgroup/$file"; printf "\n"; fi; done' || true
