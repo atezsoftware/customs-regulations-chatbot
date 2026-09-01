@@ -22,7 +22,12 @@ from onyx.auth.users import current_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import UserUsage
-from onyx.db.user_usage import UsageExportRow, get_usage_export
+from onyx.db.user_usage import (
+    UsageExportRow,
+    UserActivityCounts,
+    get_usage_export,
+    get_user_activity_counts_by_email,
+)
 from onyx.error_handling.exceptions import register_onyx_exception_handlers
 from onyx.server.features.usage.api import admin_usage_router
 from onyx.server.features.usage.models import ResetUsageResponse
@@ -65,6 +70,20 @@ def db_session() -> Generator[Session, None, None]:
     with engine.begin() as conn:
         conn.execute(
             text('CREATE TABLE "user" (id CHAR(36) PRIMARY KEY, email VARCHAR)')
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE chat_session ("
+                "id CHAR(36) PRIMARY KEY, user_id CHAR(36), "
+                "time_created DATETIME, benchmark_flow BOOLEAN NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE chat_message ("
+                "id INTEGER PRIMARY KEY, chat_session_id CHAR(36), "
+                "message_type VARCHAR NOT NULL, time_sent DATETIME)"
+            )
         )
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
@@ -202,10 +221,66 @@ class TestGetUsageExportHelper:
         days = {r.day for r in rows}
         assert days == {"2026-06-01"}
 
+    def test_activity_counts_exclude_benchmarks_and_group_sessions(
+        self, db_session: Session
+    ) -> None:
+        alice_id = _add_user(db_session, "alice@example.com")
+        db_session.execute(
+            text(
+                "INSERT INTO chat_session "
+                "(id, user_id, time_created, benchmark_flow) VALUES "
+                "('session-1', :user_id, :created, 0), "
+                "('session-2', :user_id, :created, 0), "
+                "('benchmark', :user_id, :created, 1)"
+            ),
+            {"user_id": alice_id, "created": _W1 + datetime.timedelta(seconds=1)},
+        )
+        db_session.execute(
+            text(
+                "INSERT INTO chat_message "
+                "(id, chat_session_id, message_type, time_sent) VALUES "
+                "(1, 'session-1', 'USER', :sent), "
+                "(2, 'session-1', 'USER', :sent), "
+                "(3, 'session-1', 'ASSISTANT', :sent), "
+                "(4, 'session-2', 'USER', :sent), "
+                "(5, 'benchmark', 'USER', :sent)"
+            ),
+            {"sent": _W1 + datetime.timedelta(seconds=1)},
+        )
+        db_session.commit()
+
+        rows = get_user_activity_counts_by_email(
+            db_session,
+            start=_W1,
+            end=_W2,
+        )
+
+        assert rows == [
+            UserActivityCounts(
+                email="alice@example.com", query_count=3, session_count=2
+            )
+        ]
+
 
 class TestExportEndpoint:
-    def test_nested_per_user_with_totals(self, db_session: Session) -> None:
+    def test_nested_per_user_with_activity_rates(
+        self, db_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import onyx.server.features.usage.api as api
+
         _seed_two_users(db_session)
+        monkeypatch.setattr(
+            api,
+            "get_user_activity_counts_by_email",
+            lambda *_args, **_kwargs: [
+                UserActivityCounts(
+                    email="alice@example.com", query_count=3, session_count=2
+                ),
+                UserActivityCounts(
+                    email="activity-only@example.com", query_count=4, session_count=1
+                ),
+            ],
+        )
         client = TestClient(_make_app(db_session, _ADMIN))
         resp = client.get(
             "/admin/usage/export", params={"start": "2026-06-01", "end": "2026-06-14"}
@@ -216,7 +291,11 @@ class TestExportEndpoint:
         assert body["end"] == "2026-06-14"
 
         users = {u["email"]: u for u in body["users"]}
-        assert set(users) == {"alice@example.com", "bob@example.com"}
+        assert set(users) == {
+            "alice@example.com",
+            "bob@example.com",
+            "activity-only@example.com",
+        }
 
         alice = users["alice@example.com"]
         assert len(alice["records"]) == 3
@@ -225,10 +304,26 @@ class TestExportEndpoint:
         assert alice["totals"]["output_tokens"] == 180  # 50 + 60 + 70
         assert alice["totals"]["cache_read_tokens"] == 5
         assert alice["totals"]["cost_cents"] == pytest.approx(6.0)
+        assert alice["totals"]["total_tokens"] == 780
+        assert alice["totals"]["total_user_queries"] == 3
+        assert alice["totals"]["total_user_sessions"] == 2
+        assert alice["totals"]["average_tokens_per_query"] == 260.0
+        assert alice["totals"]["average_tokens_per_session"] == 390.0
+        assert alice["totals"]["average_cost_cents_per_query"] == 2.0
+        assert alice["totals"]["average_cost_cents_per_session"] == 3.0
+        assert alice["totals"]["average_queries_per_session"] == 1.5
 
         bob = users["bob@example.com"]
         assert len(bob["records"]) == 1
         assert bob["totals"]["input_tokens"] == 400
+        assert bob["totals"]["total_user_queries"] == 0
+        assert bob["totals"]["average_tokens_per_query"] == 0.0
+
+        activity_only = users["activity-only@example.com"]
+        assert activity_only["records"] == []
+        assert activity_only["totals"]["total_tokens"] == 0
+        assert activity_only["totals"]["total_user_queries"] == 4
+        assert activity_only["totals"]["total_user_sessions"] == 1
 
     def test_model_filter_endpoint(self, db_session: Session) -> None:
         _seed_two_users(db_session)
@@ -251,6 +346,50 @@ class TestExportEndpoint:
         all_days = {r["day"] for u in body["users"] for r in u["records"]}
         assert all_days == {"2026-06-01"}
         assert "bob@example.com" not in {u["email"] for u in body["users"]}
+
+    def test_timestamp_period_is_forwarded_exactly(
+        self, db_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import onyx.server.features.usage.api as api
+
+        calls: list[tuple[datetime.datetime, datetime.datetime]] = []
+
+        def _capture_period(
+            _db: Session,
+            start: datetime.datetime,
+            end: datetime.datetime,
+            **_kwargs: object,
+        ) -> list[object]:
+            calls.append((start, end))
+            return []
+
+        monkeypatch.setattr(api, "get_usage_export", _capture_period)
+        monkeypatch.setattr(api, "get_user_activity_counts_by_email", _capture_period)
+        client = TestClient(_make_app(db_session, _ADMIN))
+
+        response = client.get(
+            "/admin/usage/export",
+            params={
+                "period_from": "2026-05-31T21:00:00Z",
+                "period_to": "2026-06-14T20:59:59.999000Z",
+            },
+        )
+
+        assert response.status_code == 200
+        assert calls == [
+            (
+                datetime.datetime(2026, 5, 31, 21, tzinfo=datetime.timezone.utc),
+                datetime.datetime(
+                    2026, 6, 14, 20, 59, 59, 999001, tzinfo=datetime.timezone.utc
+                ),
+            ),
+            (
+                datetime.datetime(2026, 5, 31, 21, tzinfo=datetime.timezone.utc),
+                datetime.datetime(
+                    2026, 6, 14, 20, 59, 59, 999001, tzinfo=datetime.timezone.utc
+                ),
+            ),
+        ]
 
     def test_non_admin_rejected(self, db_session: Session) -> None:
         client = TestClient(_make_app(db_session, _NON_ADMIN))

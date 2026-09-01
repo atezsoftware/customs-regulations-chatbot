@@ -15,7 +15,15 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine.cursor import CursorResult
 from sqlalchemy.orm import Session
 
-from onyx.db.models import TokenRateLimit, User, User__UserGroup, UserUsage
+from onyx.configs.constants import MessageType
+from onyx.db.models import (
+    ChatMessage,
+    ChatSession,
+    TokenRateLimit,
+    User,
+    User__UserGroup,
+    UserUsage,
+)
 from onyx.utils.datetime import datetime_to_utc, get_window_start
 from onyx.utils.logger import setup_logger
 
@@ -128,6 +136,51 @@ class UsageExportRow(BaseModel):
     output_tokens: int
     cache_read_tokens: int
     cost_cents: float
+
+
+class UserActivityCounts(BaseModel):
+    """Query and session counts attributable to one user email."""
+
+    email: str
+    query_count: int
+    session_count: int
+
+
+class UsageRateMetrics(BaseModel):
+    total_user_queries: int
+    total_user_sessions: int
+    total_tokens: int
+    average_tokens_per_query: float
+    average_tokens_per_session: float
+    average_cost_cents_per_query: float
+    average_cost_cents_per_session: float
+    average_queries_per_session: float
+
+
+def calculate_usage_rate_metrics(
+    *,
+    query_count: int,
+    session_count: int,
+    token_count: int,
+    cost_cents: float,
+) -> UsageRateMetrics:
+    """Calculate query/session rates with consistent zero-denominator handling."""
+    return UsageRateMetrics(
+        total_user_queries=query_count,
+        total_user_sessions=session_count,
+        total_tokens=token_count,
+        average_tokens_per_query=(token_count / query_count if query_count else 0.0),
+        average_tokens_per_session=(
+            token_count / session_count if session_count else 0.0
+        ),
+        average_cost_cents_per_query=(cost_cents / query_count if query_count else 0.0),
+        average_cost_cents_per_session=(
+            cost_cents / session_count if session_count else 0.0
+        ),
+        average_queries_per_session=(
+            query_count / session_count if session_count else 0.0
+        ),
+    )
 
 
 def record_user_usage(
@@ -258,6 +311,42 @@ def get_usage_export(
             cost_cents=float(cost or 0.0),
         )
         for email, mdl, day, in_tok, out_tok, cache_tok, cost in rows
+    ]
+
+
+def get_user_activity_counts_by_email(
+    db_session: Session,
+    start: datetime,
+    end: datetime,
+) -> list[UserActivityCounts]:
+    """Count non-benchmark user queries and distinct sessions over [start, end)."""
+    email_label = func.coalesce(User.email, DELETED_USER_EXPORT_EMAIL)
+    rows = db_session.execute(
+        select(
+            email_label,
+            func.count(ChatMessage.id),
+            func.count(func.distinct(ChatSession.id)),
+        )
+        .select_from(ChatMessage)
+        .join(ChatSession, ChatSession.id == ChatMessage.chat_session_id)
+        .outerjoin(User, ChatSession.user_id == User.id)
+        .where(
+            ChatMessage.time_sent >= start,
+            ChatMessage.time_sent < end,
+            ChatSession.benchmark_flow.is_(False),
+            ChatMessage.message_type == MessageType.USER,
+        )
+        .group_by(email_label)
+        .order_by(email_label)
+    ).all()
+
+    return [
+        UserActivityCounts(
+            email=str(email),
+            query_count=int(query_count or 0),
+            session_count=int(session_count or 0),
+        )
+        for email, query_count, session_count in rows
     ]
 
 

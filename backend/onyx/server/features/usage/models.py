@@ -53,6 +53,14 @@ class UsageExportTotals(BaseModel):
     output_tokens: int
     cache_read_tokens: int
     cost_cents: float
+    total_tokens: int
+    total_user_queries: int
+    total_user_sessions: int
+    average_tokens_per_query: float
+    average_tokens_per_session: float
+    average_cost_cents_per_query: float
+    average_cost_cents_per_session: float
+    average_queries_per_session: float
 
 
 class UsageExportUser(BaseModel):

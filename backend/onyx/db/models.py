@@ -3274,6 +3274,12 @@ class ChatMessage(Base):
         # failed-session check, retention/GC deletes and the cascade delete of
         # a session's messages), which otherwise seq-scan chat_message.
         Index("ix_chat_message_chat_session_id", "chat_session_id"),
+        Index(
+            "ix_chat_message_user_time_sent_session_id",
+            "time_sent",
+            "chat_session_id",
+            postgresql_where=text("message_type = 'USER'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

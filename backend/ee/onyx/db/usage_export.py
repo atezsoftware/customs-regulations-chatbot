@@ -17,6 +17,7 @@ from ee.onyx.server.reporting.usage_export_models import (
 )
 from onyx.configs.constants import MessageType
 from onyx.db.models import ChatMessage, ChatSession, UsageReport, User, UserUsage
+from onyx.db.user_usage import calculate_usage_rate_metrics
 from onyx.file_store.file_store import get_default_file_store
 
 
@@ -124,7 +125,7 @@ def get_usage_summary(
         )
         .join(ChatSession, ChatSession.id == ChatMessage.chat_session_id)
         .filter(
-            ChatSession.time_created.between(period[0], period[1]),
+            ChatMessage.time_sent.between(period[0], period[1]),
             ChatSession.benchmark_flow.is_(False),
             ChatMessage.message_type == MessageType.USER,
         )
@@ -145,22 +146,15 @@ def get_usage_summary(
     token_count = int(total_tokens or 0)
     cost_cents = float(total_cost_cents or 0.0)
 
+    rate_metrics = calculate_usage_rate_metrics(
+        query_count=query_count,
+        session_count=session_count,
+        token_count=token_count,
+        cost_cents=cost_cents,
+    )
     return UsageSummary(
-        total_user_queries=query_count,
-        total_user_sessions=session_count,
-        total_tokens=token_count,
+        **rate_metrics.model_dump(),
         total_cost_cents=cost_cents,
-        average_tokens_per_query=(token_count / query_count if query_count else 0.0),
-        average_tokens_per_session=(
-            token_count / session_count if session_count else 0.0
-        ),
-        average_cost_cents_per_query=(cost_cents / query_count if query_count else 0.0),
-        average_cost_cents_per_session=(
-            cost_cents / session_count if session_count else 0.0
-        ),
-        average_queries_per_session=(
-            query_count / session_count if session_count else 0.0
-        ),
     )
 
 

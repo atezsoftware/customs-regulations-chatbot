@@ -3,12 +3,30 @@
 import useSWR from "swr";
 import { errorHandlingFetcher } from "@/lib/fetcher";
 import { SWR_KEYS } from "@/lib/swr-keys";
+import { buildApiPath } from "@/lib/urlBuilder";
+import {
+  convertDateToEndOfDay,
+  convertDateToStartOfDay,
+} from "@/components/dateRangeSelectors/dateUtils";
+
+interface UsageExportDateRange {
+  from: Date;
+  to: Date;
+}
 
 export interface UsageExportTotals {
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
   cost_cents: number;
+  total_tokens: number;
+  total_user_queries: number;
+  total_user_sessions: number;
+  average_tokens_per_query: number;
+  average_tokens_per_session: number;
+  average_cost_cents_per_query: number;
+  average_cost_cents_per_session: number;
+  average_queries_per_session: number;
 }
 
 export interface UsageExportUser {
@@ -22,10 +40,19 @@ export interface UsageExportResponse {
   users: UsageExportUser[];
 }
 
+export function buildUsageExportUrl(timeRange?: UsageExportDateRange): string {
+  if (!timeRange) return SWR_KEYS.adminUsageExport;
+  return buildApiPath(SWR_KEYS.adminUsageExport, {
+    period_from: convertDateToStartOfDay(timeRange.from)?.toISOString(),
+    period_to: convertDateToEndOfDay(timeRange.to)?.toISOString(),
+  });
+}
+
 /** Company-wide per-user usage with a revalidation callback. */
-export function useUsageExport() {
+export function useUsageExport(timeRange?: UsageExportDateRange) {
+  const url = buildUsageExportUrl(timeRange);
   const { data, error, isLoading, mutate } = useSWR<UsageExportResponse>(
-    SWR_KEYS.adminUsageExport,
+    url,
     errorHandlingFetcher,
     { revalidateOnFocus: false }
   );

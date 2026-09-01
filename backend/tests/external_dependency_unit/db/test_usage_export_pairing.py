@@ -16,6 +16,7 @@ from onyx.db.chat import (
     get_or_create_root_message,
 )
 from onyx.db.models import ChatMessage, UserUsage
+from onyx.db.user_usage import get_user_activity_counts_by_email
 from tests.external_dependency_unit.conftest import create_test_user
 
 
@@ -159,8 +160,8 @@ def test_usage_summary_uses_ledger_tokens_and_cost_for_query_session_rates(
         user_id=user.id,
         persona_id=None,
     )
-    first_session.time_created = summary_time
-    second_session.time_created = summary_time
+    first_session.time_created = summary_time - timedelta(days=10)
+    second_session.time_created = summary_time + timedelta(days=10)
     first_root = get_or_create_root_message(first_session.id, db_session)
     second_root = get_or_create_root_message(second_session.id, db_session)
 
@@ -170,6 +171,9 @@ def test_usage_summary_uses_ledger_tokens_and_cost_for_query_session_rates(
     first_query.token_count = 10
     second_query.token_count = 20
     third_query.token_count = 60
+    first_query.time_sent = summary_time
+    second_query.time_sent = summary_time
+    third_query.time_sent = summary_time
     db_session.add_all(
         [
             UserUsage(
@@ -215,6 +219,68 @@ def test_usage_summary_uses_ledger_tokens_and_cost_for_query_session_rates(
     assert summary.average_cost_cents_per_query == pytest.approx(100.0 / 3)
     assert summary.average_cost_cents_per_session == 50.0
     assert summary.average_queries_per_session == 1.5
+
+
+def test_user_activity_counts_group_queries_and_sessions_by_email(
+    db_session: Session,
+) -> None:
+    first_user = create_test_user(db_session, "usage-activity-first")
+    second_user = create_test_user(db_session, "usage-activity-second")
+    activity_time = datetime(2300, 1, 1, tzinfo=timezone.utc) + timedelta(
+        seconds=first_user.id.int % 1_000_000_000
+    )
+
+    first_session = create_chat_session(
+        db_session=db_session,
+        description="first activity session",
+        user_id=first_user.id,
+        persona_id=None,
+    )
+    second_session = create_chat_session(
+        db_session=db_session,
+        description="second activity session",
+        user_id=first_user.id,
+        persona_id=None,
+    )
+    benchmark_session = create_chat_session(
+        db_session=db_session,
+        description="benchmark activity session",
+        user_id=second_user.id,
+        persona_id=None,
+    )
+    first_session.time_created = activity_time - timedelta(days=10)
+    second_session.time_created = activity_time + timedelta(days=10)
+    benchmark_session.time_created = activity_time
+    benchmark_session.benchmark_flow = True
+
+    first_root = get_or_create_root_message(first_session.id, db_session)
+    second_root = get_or_create_root_message(second_session.id, db_session)
+    benchmark_root = get_or_create_root_message(benchmark_session.id, db_session)
+    first_query = _make_user_message(db_session, first_session.id, first_root)
+    second_query = _make_user_message(db_session, first_session.id, first_query)
+    third_query = _make_user_message(db_session, second_session.id, second_root)
+    benchmark_query = _make_user_message(
+        db_session, benchmark_session.id, benchmark_root
+    )
+    first_query.time_sent = activity_time
+    second_query.time_sent = activity_time
+    third_query.time_sent = activity_time
+    benchmark_query.time_sent = activity_time
+    db_session.commit()
+
+    activity = get_user_activity_counts_by_email(
+        db_session,
+        start=activity_time - timedelta(seconds=1),
+        end=activity_time + timedelta(seconds=1),
+    )
+
+    assert [row.model_dump() for row in activity] == [
+        {
+            "email": first_user.email,
+            "query_count": 3,
+            "session_count": 2,
+        }
+    ]
 
 
 def test_usage_export_includes_session_at_period_start(db_session: Session) -> None:

@@ -7,17 +7,15 @@ import { PageLoader, toast } from "@opal/layouts";
 import {
   resetUserUsage,
   useUsageExport,
+  UsageExportTotals,
   UsageExportUser,
 } from "@/lib/usage/userUsage";
+import { DateRangePickerValue } from "@/components/dateRangeSelectors/AdminDateRangeSelector";
 
 const PAGE_SIZE = 10;
 
-type SortKey =
-  | "email"
-  | "input_tokens"
-  | "output_tokens"
-  | "cache_read_tokens"
-  | "cost_cents";
+type MetricSortKey = keyof UsageExportTotals;
+type SortKey = "email" | MetricSortKey;
 type SortDir = "asc" | "desc";
 
 function formatTokens(n: number): string {
@@ -27,6 +25,78 @@ function formatTokens(n: number): string {
 function formatCost(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
 }
+
+function formatAverageCost(cents: number): string {
+  return `$${(cents / 100).toFixed(4)}`;
+}
+
+function formatAverage(value: number): string {
+  return value.toLocaleString(undefined, { maximumFractionDigits: 1 });
+}
+
+const METRIC_COLUMNS: {
+  label: string;
+  sortKey: MetricSortKey;
+  format: (value: number) => string;
+  muted?: boolean;
+}[] = [
+  {
+    label: "Input",
+    sortKey: "input_tokens",
+    format: formatTokens,
+    muted: true,
+  },
+  {
+    label: "Output",
+    sortKey: "output_tokens",
+    format: formatTokens,
+    muted: true,
+  },
+  {
+    label: "Cache",
+    sortKey: "cache_read_tokens",
+    format: formatTokens,
+    muted: true,
+  },
+  { label: "Total tokens", sortKey: "total_tokens", format: formatTokens },
+  { label: "Queries", sortKey: "total_user_queries", format: formatTokens },
+  {
+    label: "Sessions",
+    sortKey: "total_user_sessions",
+    format: formatTokens,
+  },
+  {
+    label: "Tokens / query",
+    sortKey: "average_tokens_per_query",
+    format: formatAverage,
+    muted: true,
+  },
+  {
+    label: "Tokens / session",
+    sortKey: "average_tokens_per_session",
+    format: formatAverage,
+    muted: true,
+  },
+  {
+    label: "Cost / query",
+    sortKey: "average_cost_cents_per_query",
+    format: formatAverageCost,
+    muted: true,
+  },
+  {
+    label: "Cost / session",
+    sortKey: "average_cost_cents_per_session",
+    format: formatAverageCost,
+    muted: true,
+  },
+  {
+    label: "Queries / session",
+    sortKey: "average_queries_per_session",
+    format: formatAverage,
+    muted: true,
+  },
+  { label: "Cost", sortKey: "cost_cents", format: formatCost },
+];
 
 function sortValue(user: UsageExportUser, key: SortKey): number | string {
   if (key === "email") return user.email.toLowerCase();
@@ -64,24 +134,16 @@ function UsageRow({ user, onReset }: UsageRowProps) {
       <div className="flex-1 truncate">
         <Text font="main-ui-body">{user.email}</Text>
       </div>
-      <div className="w-24 text-right">
-        <Text font="main-ui-body" color="text-03">
-          {formatTokens(totals.input_tokens)}
-        </Text>
-      </div>
-      <div className="w-24 text-right">
-        <Text font="main-ui-body" color="text-03">
-          {formatTokens(totals.output_tokens)}
-        </Text>
-      </div>
-      <div className="w-24 text-right">
-        <Text font="main-ui-body" color="text-03">
-          {formatTokens(totals.cache_read_tokens)}
-        </Text>
-      </div>
-      <div className="w-24 text-right">
-        <Text font="main-ui-body">{formatCost(totals.cost_cents)}</Text>
-      </div>
+      {METRIC_COLUMNS.map((column) => (
+        <div className="w-28 text-right" key={column.sortKey}>
+          <Text
+            font="main-ui-body"
+            color={column.muted ? "text-03" : undefined}
+          >
+            {column.format(totals[column.sortKey])}
+          </Text>
+        </div>
+      ))}
       <Button
         variant="default"
         prominence="tertiary"
@@ -126,7 +188,7 @@ function SortHeader({
         }
       }}
       className={`cursor-pointer select-none ${
-        align === "right" ? "w-24 text-right" : "flex-1"
+        align === "right" ? "w-28 text-right" : "flex-1"
       }`}
     >
       <Text font="main-ui-action" color={active ? "text-05" : "text-03"}>
@@ -137,8 +199,12 @@ function SortHeader({
 }
 
 /** Searchable, sortable admin per-user usage totals. */
-export default function PerUserUsagePanel() {
-  const { usage, isLoading, error, refetch } = useUsageExport();
+export default function PerUserUsagePanel({
+  timeRange,
+}: {
+  timeRange: DateRangePickerValue;
+}) {
+  const { usage, isLoading, error, refetch } = useUsageExport(timeRange);
   const [page, setPage] = useState(0);
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("cost_cents");
@@ -205,9 +271,10 @@ export default function PerUserUsagePanel() {
       <div className="flex flex-col gap-2">
         <Text font="heading-h3">Per-user usage</Text>
         <Text font="secondary-body" color="text-03">
-          Tokens (input, output, cache reads) and cost per user over the report
-          window. Click a column to rank by it, or search by email. Reset clears
-          usage from every currently active limit window.
+          Query, session, token, and cost rates per user for the selected
+          period. Total tokens are input + output; cache reads remain separate.
+          Click a column to rank by it, or search by email. Reset clears usage
+          from every currently active limit window.
         </Text>
 
         <InputTypeIn
@@ -227,7 +294,7 @@ export default function PerUserUsagePanel() {
         ) : (
           <>
             <div className="overflow-x-auto">
-              <div className="min-w-[740px] flex flex-col divide-y divide-border-01">
+              <div className="min-w-[1900px] flex flex-col divide-y divide-border-01">
                 <div className="flex flex-row items-center gap-4 py-2">
                   <SortHeader
                     label="User"
@@ -237,38 +304,17 @@ export default function PerUserUsagePanel() {
                     onSort={handleSort}
                     align="left"
                   />
-                  <SortHeader
-                    label="Input"
-                    sortKey="input_tokens"
-                    activeKey={sortKey}
-                    dir={sortDir}
-                    onSort={handleSort}
-                    align="right"
-                  />
-                  <SortHeader
-                    label="Output"
-                    sortKey="output_tokens"
-                    activeKey={sortKey}
-                    dir={sortDir}
-                    onSort={handleSort}
-                    align="right"
-                  />
-                  <SortHeader
-                    label="Cache"
-                    sortKey="cache_read_tokens"
-                    activeKey={sortKey}
-                    dir={sortDir}
-                    onSort={handleSort}
-                    align="right"
-                  />
-                  <SortHeader
-                    label="Cost"
-                    sortKey="cost_cents"
-                    activeKey={sortKey}
-                    dir={sortDir}
-                    onSort={handleSort}
-                    align="right"
-                  />
+                  {METRIC_COLUMNS.map((column) => (
+                    <SortHeader
+                      key={column.sortKey}
+                      label={column.label}
+                      sortKey={column.sortKey}
+                      activeKey={sortKey}
+                      dir={sortDir}
+                      onSort={handleSort}
+                      align="right"
+                    />
+                  ))}
                   <div className="w-[68px]" />
                 </div>
                 {pageUsers.map((user) => (
