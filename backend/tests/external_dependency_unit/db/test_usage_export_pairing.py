@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+import pytest
 from sqlalchemy.orm import Session
 
 from ee.onyx.db.usage_export import (
@@ -14,7 +15,7 @@ from onyx.db.chat import (
     create_new_chat_message,
     get_or_create_root_message,
 )
-from onyx.db.models import ChatMessage
+from onyx.db.models import ChatMessage, UserUsage
 from tests.external_dependency_unit.conftest import create_test_user
 
 
@@ -139,7 +140,7 @@ def test_orphan_user_message_emits_row_with_null_model(db_session: Session) -> N
     assert matching[0].llm_model is None
 
 
-def test_usage_summary_counts_unique_queries_sessions_and_token_rates(
+def test_usage_summary_uses_ledger_tokens_and_cost_for_query_session_rates(
     db_session: Session,
 ) -> None:
     user = create_test_user(db_session, "usage-summary")
@@ -169,6 +170,32 @@ def test_usage_summary_counts_unique_queries_sessions_and_token_rates(
     first_query.token_count = 10
     second_query.token_count = 20
     third_query.token_count = 60
+    db_session.add_all(
+        [
+            UserUsage(
+                user_id=user.id,
+                window_start=summary_time,
+                model="model-a",
+                flow="chat_response",
+                provider="provider-a",
+                input_tokens=1_000,
+                output_tokens=500,
+                cache_read_tokens=200,
+                cost_cents=25.0,
+            ),
+            UserUsage(
+                user_id=user.id,
+                window_start=summary_time,
+                model="model-a",
+                flow="query_rephrase",
+                provider="provider-a",
+                input_tokens=2_000,
+                output_tokens=1_000,
+                cache_read_tokens=300,
+                cost_cents=75.0,
+            ),
+        ]
+    )
     db_session.commit()
 
     summary = get_usage_summary(
@@ -181,9 +208,12 @@ def test_usage_summary_counts_unique_queries_sessions_and_token_rates(
 
     assert summary.total_user_queries == 3
     assert summary.total_user_sessions == 2
-    assert summary.total_query_tokens == 90
-    assert summary.average_tokens_per_query == 30.0
-    assert summary.average_tokens_per_session == 45.0
+    assert summary.total_tokens == 4_500
+    assert summary.total_cost_cents == 100.0
+    assert summary.average_tokens_per_query == 1_500.0
+    assert summary.average_tokens_per_session == 2_250.0
+    assert summary.average_cost_cents_per_query == pytest.approx(100.0 / 3)
+    assert summary.average_cost_cents_per_session == 50.0
     assert summary.average_queries_per_session == 1.5
 
 

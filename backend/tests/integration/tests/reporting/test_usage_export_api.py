@@ -302,7 +302,10 @@ class TestUsageExportAPI:
                 summary = summary_rows[0]
                 assert int(summary["total_user_queries"]) > 0
                 assert int(summary["total_user_sessions"]) > 0
-                assert int(summary["total_query_tokens"]) >= 0
+                assert int(summary["total_tokens"]) >= 0
+                assert float(summary["total_cost_cents"]) >= 0
+                assert float(summary["average_cost_cents_per_query"]) >= 0
+                assert float(summary["average_cost_cents_per_session"]) >= 0
                 assert float(summary["average_tokens_per_query"]) >= 0
                 assert float(summary["average_tokens_per_session"]) >= 0
                 assert float(summary["average_queries_per_session"]) > 0

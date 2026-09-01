@@ -16,7 +16,7 @@ from ee.onyx.server.reporting.usage_export_models import (
     UsageSummary,
 )
 from onyx.configs.constants import MessageType
-from onyx.db.models import ChatMessage, ChatSession, UsageReport, User
+from onyx.db.models import ChatMessage, ChatSession, UsageReport, User, UserUsage
 from onyx.file_store.file_store import get_default_file_store
 
 
@@ -117,11 +117,10 @@ def get_usage_summary(
     db_session: Session,
     period: tuple[datetime, datetime],
 ) -> UsageSummary:
-    total_queries, total_sessions, total_tokens = (
+    total_queries, total_sessions = (
         db_session.query(
             func.count(ChatMessage.id),
             func.count(func.distinct(ChatSession.id)),
-            func.coalesce(func.sum(ChatMessage.token_count), 0),
         )
         .join(ChatSession, ChatSession.id == ChatMessage.chat_session_id)
         .filter(
@@ -131,17 +130,33 @@ def get_usage_summary(
         )
         .one()
     )
+    total_tokens, total_cost_cents = (
+        db_session.query(
+            func.coalesce(
+                func.sum(UserUsage.input_tokens + UserUsage.output_tokens), 0
+            ),
+            func.coalesce(func.sum(UserUsage.cost_cents), 0.0),
+        )
+        .filter(UserUsage.window_start.between(period[0], period[1]))
+        .one()
+    )
     query_count = int(total_queries or 0)
     session_count = int(total_sessions or 0)
     token_count = int(total_tokens or 0)
+    cost_cents = float(total_cost_cents or 0.0)
 
     return UsageSummary(
         total_user_queries=query_count,
         total_user_sessions=session_count,
-        total_query_tokens=token_count,
+        total_tokens=token_count,
+        total_cost_cents=cost_cents,
         average_tokens_per_query=(token_count / query_count if query_count else 0.0),
         average_tokens_per_session=(
             token_count / session_count if session_count else 0.0
+        ),
+        average_cost_cents_per_query=(cost_cents / query_count if query_count else 0.0),
+        average_cost_cents_per_session=(
+            cost_cents / session_count if session_count else 0.0
         ),
         average_queries_per_session=(
             query_count / session_count if session_count else 0.0

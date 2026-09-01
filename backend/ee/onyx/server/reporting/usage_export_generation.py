@@ -51,9 +51,12 @@ def render_usage_summary_csv(
             "period_to",
             "total_user_queries",
             "total_user_sessions",
-            "total_query_tokens",
+            "total_tokens",
+            "total_cost_cents",
             "average_tokens_per_query",
             "average_tokens_per_session",
+            "average_cost_cents_per_query",
+            "average_cost_cents_per_session",
             "average_queries_per_session",
         ]
     )
@@ -63,9 +66,12 @@ def render_usage_summary_csv(
             period[1].isoformat() if period else "all_time",
             summary.total_user_queries,
             summary.total_user_sessions,
-            summary.total_query_tokens,
+            summary.total_tokens,
+            summary.total_cost_cents,
             summary.average_tokens_per_query,
             summary.average_tokens_per_session,
+            summary.average_cost_cents_per_query,
+            summary.average_cost_cents_per_session,
             summary.average_queries_per_session,
         ]
     )

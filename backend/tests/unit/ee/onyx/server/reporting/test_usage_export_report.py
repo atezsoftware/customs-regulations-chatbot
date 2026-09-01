@@ -48,13 +48,16 @@ def test_generate_report_dispatches_to_consumed_csv_queue(
     assert sent["expires"] == JOB_TIMEOUT
 
 
-def test_usage_summary_csv_contains_counts_tokens_and_rates() -> None:
+def test_usage_summary_csv_contains_counts_tokens_cost_and_rates() -> None:
     summary = UsageSummary(
         total_user_queries=4,
         total_user_sessions=2,
-        total_query_tokens=120,
+        total_tokens=1_200,
+        total_cost_cents=250.0,
         average_tokens_per_query=30.0,
         average_tokens_per_session=60.0,
+        average_cost_cents_per_query=62.5,
+        average_cost_cents_per_session=125.0,
         average_queries_per_session=2.0,
     )
 
@@ -67,6 +70,6 @@ def test_usage_summary_csv_contains_counts_tokens_and_rates() -> None:
     ).splitlines()
 
     assert rows == [
-        "period_from,period_to,total_user_queries,total_user_sessions,total_query_tokens,average_tokens_per_query,average_tokens_per_session,average_queries_per_session",
-        "2026-08-01T00:00:00+00:00,2026-08-31T00:00:00+00:00,4,2,120,30.0,60.0,2.0",
+        "period_from,period_to,total_user_queries,total_user_sessions,total_tokens,total_cost_cents,average_tokens_per_query,average_tokens_per_session,average_cost_cents_per_query,average_cost_cents_per_session,average_queries_per_session",
+        "2026-08-01T00:00:00+00:00,2026-08-31T00:00:00+00:00,4,2,1200,250.0,30.0,60.0,62.5,125.0,2.0",
     ]

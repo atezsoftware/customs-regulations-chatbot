@@ -72,8 +72,11 @@ export interface UsageReport {
 export interface UsageSummary {
   total_user_queries: number;
   total_user_sessions: number;
-  total_query_tokens: number;
+  total_tokens: number;
+  total_cost_cents: number;
   average_tokens_per_query: number;
   average_tokens_per_session: number;
+  average_cost_cents_per_query: number;
+  average_cost_cents_per_session: number;
   average_queries_per_session: number;
 }
