@@ -2345,6 +2345,126 @@ def get_active_chunks_by_ids(
     return {row.id: row for row in rows}
 
 
+def get_current_chunks_by_ids(
+    db_session: Session, chunk_ids: Sequence[str]
+) -> dict[str, RegulatoryChunk]:
+    """Resolve exact projected identities to their current active descendants."""
+
+    requested_ids = list(dict.fromkeys(chunk_ids))
+    if not requested_ids:
+        return {}
+
+    rows_by_id: dict[str, RegulatoryChunk] = {}
+    frontier = set(requested_ids)
+    for _ in range(64):
+        rows = db_session.scalars(
+            select(RegulatoryChunk).where(RegulatoryChunk.id.in_(frontier))
+        ).all()
+        rows_by_id.update((row.id, row) for row in rows)
+        frontier = {
+            row.superseded_by_chunk_id
+            for row in rows
+            if row.superseded_by_chunk_id
+            and row.superseded_by_chunk_id not in rows_by_id
+        }
+        if not frontier:
+            break
+
+    resolved: dict[str, RegulatoryChunk] = {}
+    for requested_id in requested_ids:
+        row = rows_by_id.get(requested_id)
+        seen: set[str] = set()
+        while row is not None and row.superseded_by_chunk_id:
+            if row.id in seen:
+                row = None
+                break
+            seen.add(row.id)
+            descendant = rows_by_id.get(row.superseded_by_chunk_id)
+            if descendant is None or (
+                descendant.user_file_id != row.user_file_id
+                or descendant.position != row.position
+            ):
+                row = None
+                break
+            row = descendant
+        if (
+            row is not None
+            and row.status == RegulatoryChunkStatus.ACTIVE.value
+            and row.chunk_type != HIERARCHICAL_AGGREGATE_CHUNK_VARIANT
+        ):
+            resolved[requested_id] = row
+    return resolved
+
+
+def has_active_structural_descendants(
+    db_session: Session, chunk: RegulatoryChunk
+) -> bool:
+    """Return whether an active atomic row is structurally nested under ``chunk``."""
+
+    article_no = chunk.chunk_metadata.get("article_no")
+    conditions = [
+        RegulatoryChunk.user_file_id == chunk.user_file_id,
+        RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value,
+        RegulatoryChunk.id != chunk.id,
+        RegulatoryChunk.position > chunk.position,
+    ]
+    if article_no is not None:
+        conditions.append(
+            RegulatoryChunk.chunk_metadata["article_no"].astext == str(article_no)
+        )
+    rows = db_session.scalars(
+        select(RegulatoryChunk).where(*conditions).order_by(RegulatoryChunk.position)
+    ).all()
+    parent_path = list(chunk.heading_path)
+    parent_paragraph_no = chunk.chunk_metadata.get("paragraph_no")
+    parent_clause_label = chunk.chunk_metadata.get("clause_label")
+    for row in rows:
+        row_path = list(row.heading_path)
+        if (
+            len(row_path) > len(parent_path)
+            and row_path[: len(parent_path)] == parent_path
+        ):
+            return True
+        if chunk.chunk_type == "paragraph":
+            if row.chunk_type == "paragraph":
+                return False
+            row_paragraph_no = row.chunk_metadata.get("paragraph_no")
+            if (
+                parent_paragraph_no is not None
+                and row_paragraph_no is not None
+                and str(row_paragraph_no) != str(parent_paragraph_no)
+            ):
+                return False
+            if row.chunk_type in {"clause", "subclause"} and (
+                parent_paragraph_no is None
+                or row_paragraph_no is None
+                or str(row_paragraph_no) == str(parent_paragraph_no)
+            ):
+                return True
+        if chunk.chunk_type == "clause":
+            if row.chunk_type == "paragraph":
+                return False
+            if row.chunk_type == "clause":
+                return False
+            row_paragraph_no = row.chunk_metadata.get("paragraph_no")
+            row_clause_label = row.chunk_metadata.get("clause_label")
+            if (
+                row.chunk_type == "subclause"
+                and (
+                    parent_paragraph_no is None
+                    or row_paragraph_no is None
+                    or str(row_paragraph_no) == str(parent_paragraph_no)
+                )
+                and (
+                    parent_clause_label is None
+                    or row_clause_label is None
+                    or str(row_clause_label) == str(parent_clause_label)
+                )
+            ):
+                return True
+    return False
+
+
 def get_active_chunks_by_structural_reference(
     db_session: Session,
     *,

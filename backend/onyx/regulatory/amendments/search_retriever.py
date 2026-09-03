@@ -18,8 +18,8 @@ from onyx.context.search.models import (
 from onyx.db.document_set import get_document_set_by_id
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.regulatory_chunks import (
-    get_active_chunks_by_ids,
     get_active_chunks_by_structural_reference,
+    get_current_chunks_by_ids,
 )
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.tools import get_tools
@@ -137,6 +137,7 @@ class AmendmentSearchRetriever:
             candidate = canonical_candidates.get(chunk_id)
             if (
                 candidate is None
+                or candidate.chunk_id in seen_candidate_ids
                 or candidate.user_file_id not in self._allowed_user_file_ids
             ):
                 continue
@@ -234,10 +235,10 @@ def build_amendment_search_retriever(
         chunk_ids: Sequence[str],
     ) -> Mapping[str, CandidateChunk]:
         with get_session_with_current_tenant() as canonical_session:
-            rows = get_active_chunks_by_ids(canonical_session, chunk_ids)
+            rows = get_current_chunks_by_ids(canonical_session, chunk_ids)
             return {
                 chunk_id: CandidateChunk(
-                    chunk_id=chunk_id,
+                    chunk_id=row.id,
                     user_file_id=str(row.user_file_id),
                     text=row.text,
                     metadata={

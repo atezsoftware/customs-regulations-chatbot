@@ -28,9 +28,16 @@ from onyx.db.models import (
     RegulatoryChunk,
 )
 from onyx.db.regulatory_chunks import (
+    has_active_structural_descendants,
     is_hierarchical_aggregate_chunk,
     make_regulatory_chunk_id,
     supersede_hierarchical_aggregates_referencing_chunk,
+)
+from onyx.regulatory.amendments.draft_integrity import (
+    explicit_replacement_body,
+    reconcile_existing_heading_path,
+    reject_unsupported_descendant_replacement_texts,
+    validate_explicit_replacement_texts,
 )
 from onyx.regulatory.amendments.models import ProposalDraft, ReviewedAmendmentChunkDraft
 from onyx.regulatory.chunker import ATOMIC_CHUNK_VARIANT
@@ -551,11 +558,17 @@ def queue_amendment_proposal_approval(
         raise ValueError(
             f"Amendment proposal {proposal.id} is already {proposal.status}."
         )
-    if reviewed_new_chunk_draft is not None:
-        proposal.new_chunk_draft = _validated_reviewed_chunk_draft(
-            proposal.new_chunk_draft,
-            reviewed_new_chunk_draft,
-        )
+    effective_draft = reviewed_new_chunk_draft or proposal.new_chunk_draft
+    reviewed_draft = _validated_reviewed_chunk_draft(
+        proposal.new_chunk_draft,
+        effective_draft,
+        old_chunk_snapshot=getattr(proposal, "old_chunk_snapshot", None) or {},
+    )
+    validate_explicit_replacement_texts(
+        _proposal_instruction_texts(proposal),
+        reviewed_draft["text"],
+    )
+    proposal.new_chunk_draft = reviewed_draft
     proposal.status = AmendmentProposalStatus.APPROVING.value
     proposal.decided_by = decided_by
     proposal.decided_at = None
@@ -787,6 +800,8 @@ class ApprovalResult:
 def _validated_reviewed_chunk_draft(
     stored_draft: dict[str, Any],
     reviewed_draft: dict[str, Any],
+    *,
+    old_chunk_snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     try:
         stored = ReviewedAmendmentChunkDraft.model_validate(stored_draft)
@@ -798,7 +813,77 @@ def _validated_reviewed_chunk_draft(
         raise ValueError("Reviewed chunk draft cannot change user_file_id")
     if reviewed.position != stored.position:
         raise ValueError("Reviewed chunk draft cannot change position")
-    return reviewed.model_dump(mode="json")
+    canonical_chunk_type = old_chunk_snapshot.get("chunk_type")
+    if (
+        canonical_chunk_type is not None
+        and reviewed.chunk_type is not None
+        and reviewed.chunk_type != canonical_chunk_type
+    ):
+        raise ValueError("Reviewed chunk draft cannot change chunk_type")
+    chunk_type = canonical_chunk_type or reviewed.chunk_type or stored.chunk_type
+    metadata = dict(reviewed.metadata)
+    canonical_metadata = dict(old_chunk_snapshot.get("metadata") or {})
+    if "metadata" in old_chunk_snapshot:
+        for key in (
+            "article_no",
+            "paragraph_no",
+            "clause_label",
+            "subclause_label",
+        ):
+            if canonical_metadata.get(key) is None:
+                metadata.pop(key, None)
+            else:
+                metadata[key] = canonical_metadata[key]
+    canonical_heading_path = old_chunk_snapshot.get("heading_path")
+    heading_path = reconcile_existing_heading_path(
+        (
+            canonical_heading_path
+            if canonical_heading_path is not None
+            else reviewed.heading_path or stored.heading_path
+        ),
+        amended_text=reviewed.text,
+        chunk_type=chunk_type,
+        article_no=(
+            str(metadata["article_no"])
+            if metadata.get("article_no") is not None
+            else None
+        ),
+        article_title=(
+            str(metadata["article_title"])
+            if metadata.get("article_title") is not None
+            else None
+        ),
+        paragraph_no=(
+            str(metadata["paragraph_no"])
+            if metadata.get("paragraph_no") is not None
+            else None
+        ),
+        clause_label=(
+            str(metadata["clause_label"])
+            if metadata.get("clause_label") is not None
+            else None
+        ),
+        subclause_label=(
+            str(metadata["subclause_label"])
+            if metadata.get("subclause_label") is not None
+            else None
+        ),
+    )
+    metadata["heading_path"] = list(heading_path)
+    payload = reviewed.model_dump(mode="json")
+    payload.update(
+        chunk_type=chunk_type,
+        heading_path=heading_path,
+        metadata=metadata,
+    )
+    return payload
+
+
+def _proposal_instruction_texts(proposal: AmendmentProposal) -> list[str]:
+    return list(
+        getattr(proposal, "instruction_texts", None)
+        or [getattr(proposal, "instruction_text", "")]
+    )
 
 
 def _review_snapshot_value(chunk: RegulatoryChunk, key: str) -> Any:
@@ -914,7 +999,15 @@ def approve_amendment_proposal(
             f"Old chunk {snapshot_target_id} no longer exists; cannot approve."
         )
 
-    draft = proposal.new_chunk_draft
+    draft = _validated_reviewed_chunk_draft(
+        proposal.new_chunk_draft,
+        proposal.new_chunk_draft,
+        old_chunk_snapshot=getattr(proposal, "old_chunk_snapshot", None) or {},
+    )
+    validate_explicit_replacement_texts(
+        _proposal_instruction_texts(proposal),
+        draft["text"],
+    )
     user_file_id = UUID(draft["user_file_id"])
     today = datetime.date.today()
     start_date_str = draft.get("effective_start_date")
@@ -949,6 +1042,14 @@ def approve_amendment_proposal(
             old_chunk,
             getattr(proposal, "old_chunk_snapshot", None) or {},
         )
+        instruction_texts = _proposal_instruction_texts(proposal)
+        if any(explicit_replacement_body(text) for text in instruction_texts):
+            reject_unsupported_descendant_replacement_texts(
+                instruction_texts,
+                has_active_descendants=has_active_structural_descendants(
+                    db_session, old_chunk
+                ),
+            )
 
     new_chunk_metadata = dict(draft.get("metadata") or {})
     new_chunk_metadata.setdefault("chunk_variant", ATOMIC_CHUNK_VARIANT)

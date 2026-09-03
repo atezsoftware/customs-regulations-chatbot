@@ -14,9 +14,18 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from onyx.db.models import RegulatoryChunk
-from onyx.db.regulatory_chunks import get_chunk_by_id, get_next_chunk_position
+from onyx.db.regulatory_chunks import (
+    get_chunk_by_id,
+    get_next_chunk_position,
+    has_active_structural_descendants,
+)
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.candidate_finder import find_candidates
+from onyx.regulatory.amendments.draft_integrity import (
+    reconcile_existing_heading_path,
+    reject_unsupported_descendant_replacement,
+    validate_explicit_replacements,
+)
 from onyx.regulatory.amendments.drafter import draft_combined_chunk, draft_new_chunk
 from onyx.regulatory.amendments.matcher import confirm_match
 from onyx.regulatory.amendments.models import (
@@ -73,6 +82,7 @@ class InstructionDraftContext:
     sibling_reference: dict[str, Any] | None
     base_metadata: dict[str, Any]
     base_heading_path: list[str]
+    has_active_descendants: bool = False
 
 
 def confirm_instruction_match(
@@ -138,6 +148,11 @@ def load_instruction_draft_context(
         sibling_reference=sibling_reference,
         base_metadata=dict(old_chunk.chunk_metadata) if old_chunk else {},
         base_heading_path=list(old_chunk.heading_path) if old_chunk else [],
+        has_active_descendants=(
+            has_active_structural_descendants(db_session, old_chunk)
+            if old_chunk is not None
+            else False
+        ),
     )
 
 
@@ -173,16 +188,71 @@ def _build_proposal_draft(
     context: InstructionDraftContext,
     draft: DraftResult,
 ) -> ProposalDraft:
+    validate_explicit_replacements(instructions, draft.new_chunk.text)
+    canonical_chunk_type = context.old_chunk_snapshot.get("chunk_type")
+    chunk_type = (
+        canonical_chunk_type
+        if context.old_chunk_snapshot
+        else draft.new_chunk.chunk_type
+    )
     merged_metadata = {
         **context.base_metadata,
         **draft.new_chunk.metadata_changes,
     }
-    heading_path = draft.new_chunk.heading_path or context.base_heading_path
+    if context.old_chunk_snapshot:
+        canonical_metadata = dict(context.old_chunk_snapshot.get("metadata") or {})
+        for key in (
+            "article_no",
+            "paragraph_no",
+            "clause_label",
+            "subclause_label",
+        ):
+            if canonical_metadata.get(key) is None:
+                merged_metadata.pop(key, None)
+            else:
+                merged_metadata[key] = canonical_metadata[key]
+    heading_path = (
+        list(context.base_heading_path)
+        if context.old_chunk_snapshot
+        else list(draft.new_chunk.heading_path or [])
+    )
+    if context.old_chunk_snapshot:
+        heading_path = reconcile_existing_heading_path(
+            heading_path,
+            amended_text=draft.new_chunk.text,
+            chunk_type=chunk_type,
+            article_no=(
+                str(merged_metadata["article_no"])
+                if merged_metadata.get("article_no") is not None
+                else None
+            ),
+            article_title=(
+                str(merged_metadata["article_title"])
+                if merged_metadata.get("article_title") is not None
+                else None
+            ),
+            paragraph_no=(
+                str(merged_metadata["paragraph_no"])
+                if merged_metadata.get("paragraph_no") is not None
+                else None
+            ),
+            clause_label=(
+                str(merged_metadata["clause_label"])
+                if merged_metadata.get("clause_label") is not None
+                else None
+            ),
+            subclause_label=(
+                str(merged_metadata["subclause_label"])
+                if merged_metadata.get("subclause_label") is not None
+                else None
+            ),
+        )
+    merged_metadata["heading_path"] = list(heading_path)
     new_chunk_draft: dict[str, Any] = {
         "user_file_id": str(context.target_user_file_id),
         "position": context.target_position,
         "text": draft.new_chunk.text,
-        "chunk_type": draft.new_chunk.chunk_type,
+        "chunk_type": chunk_type,
         "heading_path": heading_path,
         "metadata": merged_metadata,
         "effective_start_date": draft.dates.effective_start_date,
@@ -229,6 +299,10 @@ def draft_instruction_group_proposal(
         raise ValueError(
             "Grouped amendment drafting requires one match per instruction"
         )
+    reject_unsupported_descendant_replacement(
+        instructions,
+        has_active_descendants=context.has_active_descendants,
+    )
     old_chunk_ids = {match.old_chunk_id for match in matches}
     if len(old_chunk_ids) != 1:
         raise ValueError("Grouped amendment instructions must share one target chunk")

@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 
 from onyx.regulatory.amendments import drafter, job, pipeline
+from onyx.regulatory.amendments.draft_integrity import DraftIntegrityError
 from onyx.regulatory.amendments.models import (
     AmendmentInstruction,
     MatchResult,
@@ -47,6 +48,7 @@ def _run_grouping_job(
     processed_instruction_count: int = 0,
     processed_instruction_indices: list[int] | None = None,
     heartbeat_result: bool = True,
+    draft_error: Exception | None = None,
 ) -> SimpleNamespace:
     instructions = [
         AmendmentInstruction(
@@ -133,6 +135,8 @@ def _run_grouping_job(
     def draft_group(*_args: object, **kwargs: Any) -> SimpleNamespace:
         assert session_depth == 0
         events.append(("draft", list(kwargs["instruction_indices"])))
+        if draft_error is not None:
+            raise draft_error
         return SimpleNamespace(
             instruction_indices=list(kwargs["instruction_indices"]),
             instruction_texts=[
@@ -142,6 +146,7 @@ def _run_grouping_job(
         )
 
     persisted = MagicMock(return_value=True)
+    unmatched = MagicMock(return_value=True)
     heartbeat = MagicMock(return_value=heartbeat_result)
     draft_group_mock = MagicMock(side_effect=draft_group)
     monkeypatch.setattr(job, "_session", _session)
@@ -158,9 +163,7 @@ def _run_grouping_job(
     )
     monkeypatch.setattr(job, "touch_batch_heartbeat", heartbeat, raising=False)
     monkeypatch.setattr(job, "persist_proposal_checkpoint", persisted)
-    monkeypatch.setattr(
-        job, "persist_unmatched_checkpoint", MagicMock(return_value=True)
-    )
+    monkeypatch.setattr(job, "persist_unmatched_checkpoint", unmatched)
     monkeypatch.setattr(job, "mark_batch_analyzed", MagicMock(return_value=True))
     monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=MagicMock()))
     job.run_amendment_batch(batch_id=batch_id, lease_generation=2)
@@ -168,8 +171,30 @@ def _run_grouping_job(
         draft=draft_group_mock,
         persist=persisted,
         heartbeat=heartbeat,
+        unmatched=unmatched,
         events=events,
         instructions=instructions,
+    )
+
+
+def test_invalid_generated_draft_becomes_an_attention_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=27,
+        targets=["target-a"],
+        processed_instruction_indices=[],
+        draft_error=DraftIntegrityError(
+            "The generated draft does not contain the explicit replacement body."
+        ),
+    )
+
+    result.persist.assert_not_called()
+    result.unmatched.assert_called_once()
+    assert (
+        "explicit replacement body"
+        in result.unmatched.call_args.kwargs["instruction_text"]
     )
 
 

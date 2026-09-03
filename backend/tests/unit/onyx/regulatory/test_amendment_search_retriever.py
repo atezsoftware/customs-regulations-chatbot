@@ -195,6 +195,45 @@ def test_explicit_clause_candidate_is_kept_when_search_tool_omits_it() -> None:
     ]
 
 
+def test_stale_search_ids_resolve_to_one_current_amendment_candidate() -> None:
+    stale = _search_doc(file_id=None, chunk_id="article-20-v1")
+    current = _search_doc(file_id=None, chunk_id="article-20-v2")
+    search_tool = MagicMock()
+    search_tool.run.return_value = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[stale, current],
+            displayed_docs=[stale, current],
+            citation_mapping={},
+        ),
+        llm_facing_response="",
+    )
+    current_candidate = CandidateChunk(
+        chunk_id="article-20-v2",
+        user_file_id=str(_FILE_ID),
+        text="(1) Toplam sayı yediyi geçemez.",
+        metadata={"article_no": "20", "paragraph_no": "1"},
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: search_tool,
+        canonical_candidate_loader=lambda _chunk_ids: {
+            "article-20-v1": current_candidate,
+            "article-20-v2": current_candidate,
+        },
+        allowed_user_file_ids=[_FILE_ID],
+    )
+
+    candidates = retriever.search(
+        AmendmentInstruction(
+            instruction_text="20 nci maddenin birinci fıkrası değiştirilmiştir.",
+            article_reference="Madde 20 fıkra 1",
+            target_source="Gümrük Genel Tebliği (TIR İşlemleri) (Seri No: 1)",
+        )
+    )
+
+    assert [candidate.chunk_id for candidate in candidates] == ["article-20-v2"]
+    assert candidates[0].text == "(1) Toplam sayı yediyi geçemez."
+
+
 def test_structural_expansion_is_disabled_without_distinguishing_source_identity() -> (
     None
 ):

@@ -18,6 +18,7 @@ from onyx.db.regulatory_amendments import (
 )
 from onyx.llm.factory import get_default_llm
 from onyx.llm.interfaces import LLM
+from onyx.regulatory.amendments.draft_integrity import DraftIntegrityError
 from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
 from onyx.regulatory.amendments.pipeline import (
     confirm_instruction_match,
@@ -256,14 +257,30 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
             continue
 
-        proposal = draft_instruction_group_proposal(
-            llm,
-            instruction_indices=instruction_indices,
-            instructions=[item.instruction for item in ordered_group],
-            matches=[item.match for item in ordered_group],
-            reference_date=reference_date,
-            context=context,
-        )
+        try:
+            proposal = draft_instruction_group_proposal(
+                llm,
+                instruction_indices=instruction_indices,
+                instructions=[item.instruction for item in ordered_group],
+                matches=[item.match for item in ordered_group],
+                reference_date=reference_date,
+                context=context,
+            )
+        except DraftIntegrityError as error:
+            for item in ordered_group:
+                with _session() as db_session:
+                    persisted = persist_unmatched_checkpoint(
+                        db_session,
+                        batch_id=batch_id,
+                        lease_generation=lease_generation,
+                        instruction_index=item.instruction_index,
+                        instruction_text=(
+                            f"{item.instruction.instruction_text}\n\nAttention: {error}"
+                        ),
+                    )
+                if not persisted:
+                    raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
+            continue
         with _session() as db_session:
             persisted = persist_proposal_checkpoint(
                 db_session,

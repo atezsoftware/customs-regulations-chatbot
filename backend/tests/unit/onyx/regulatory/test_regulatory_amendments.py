@@ -15,7 +15,9 @@ from onyx.db.regulatory_amendments import (
 )
 from onyx.db.regulatory_chunks import (
     get_active_chunks_by_ids,
+    get_current_chunks_by_ids,
     get_next_chunk_position,
+    has_active_structural_descendants,
     make_regulatory_chunk_id,
 )
 from onyx.regulatory.amendments import candidate_finder, pipeline
@@ -101,6 +103,111 @@ def test_exact_search_projection_ids_load_canonical_active_chunks() -> None:
     statement = str(db_session.scalars.call_args.args[0])
     assert "regulatory_chunk.status" in statement
     assert "IS DISTINCT FROM" in statement
+
+
+def test_stale_search_projection_ids_follow_the_active_version_lineage() -> None:
+    user_file_id = UUID("00000000-0000-0000-0000-000000000123")
+    old = SimpleNamespace(
+        id="article-20-v1",
+        user_file_id=user_file_id,
+        position=132,
+        status="superseded",
+        chunk_type="paragraph",
+        superseded_by_chunk_id="article-20-v2",
+    )
+    current = SimpleNamespace(
+        id="article-20-v2",
+        user_file_id=user_file_id,
+        position=132,
+        status="active",
+        chunk_type="paragraph",
+        superseded_by_chunk_id=None,
+    )
+    scalars = MagicMock()
+    scalars.all.return_value = [old, current]
+    db_session = MagicMock(spec=Session)
+    db_session.scalars.return_value = scalars
+
+    chunks = get_current_chunks_by_ids(
+        db_session,
+        ["article-20-v1", "article-20-v2"],
+    )
+
+    assert chunks == {
+        "article-20-v1": current,
+        "article-20-v2": current,
+    }
+    db_session.scalars.assert_called_once()
+
+
+def test_active_structural_descendants_require_an_exact_heading_prefix() -> None:
+    user_file_id = UUID("00000000-0000-0000-0000-000000000123")
+    parent_path = ["MADDE 20", "(3) Yediden fazla idare için"]
+    parent = cast(
+        RegulatoryChunk,
+        SimpleNamespace(
+            id="paragraph-3",
+            user_file_id=user_file_id,
+            position=136,
+            heading_path=parent_path,
+            chunk_metadata={"article_no": "20"},
+        ),
+    )
+    child = SimpleNamespace(
+        id="clause-a",
+        heading_path=[*parent_path, "a) Birinci yöntem"],
+    )
+    peer = SimpleNamespace(
+        id="paragraph-4",
+        heading_path=["MADDE 20", "(4) Başka hüküm"],
+    )
+    scalars = MagicMock()
+    scalars.all.return_value = [child, peer]
+    db_session = MagicMock(spec=Session)
+    db_session.scalars.return_value = scalars
+
+    assert has_active_structural_descendants(db_session, parent) is True
+
+    statement = str(db_session.scalars.call_args.args[0])
+    assert "regulatory_chunk.status" in statement
+    assert "regulatory_chunk.user_file_id" in statement
+
+
+def test_active_structural_descendants_survive_stale_child_heading() -> None:
+    user_file_id = UUID("00000000-0000-0000-0000-000000000123")
+    parent = cast(
+        RegulatoryChunk,
+        SimpleNamespace(
+            id="paragraph-1-v2",
+            user_file_id=user_file_id,
+            position=136,
+            chunk_type="paragraph",
+            heading_path=["MADDE 20", "(1) Yediyi geçemez"],
+            chunk_metadata={"article_no": "20", "paragraph_no": "1"},
+        ),
+    )
+    stale_heading_child = SimpleNamespace(
+        id="clause-a-v1",
+        chunk_type="clause",
+        heading_path=["MADDE 20", "(1) Sekizi geçemez", "a) Birinci yöntem"],
+        chunk_metadata={
+            "article_no": "20",
+            "paragraph_no": "1",
+            "clause_label": "a",
+        },
+    )
+    next_paragraph = SimpleNamespace(
+        id="paragraph-2",
+        chunk_type="paragraph",
+        heading_path=["MADDE 20", "(2) Başka hüküm"],
+        chunk_metadata={"article_no": "20", "paragraph_no": "2"},
+    )
+    scalars = MagicMock()
+    scalars.all.return_value = [stale_heading_child, next_paragraph]
+    db_session = MagicMock(spec=Session)
+    db_session.scalars.return_value = scalars
+
+    assert has_active_structural_descendants(db_session, parent) is True
 
 
 def test_candidate_lookup_keeps_large_dataset_out_of_llm_context() -> None:
@@ -370,10 +477,182 @@ def test_amendment_approval_applies_reviewed_draft_atomically() -> None:
         decided_by=None,
     )
 
-    assert locked_proposal.new_chunk_draft == reviewed_draft
+    assert locked_proposal.new_chunk_draft == {
+        **reviewed_draft,
+        "metadata": {
+            "article_no": "15",
+            "heading_path": ["TIR İşlemleri", "MADDE 15"],
+        },
+    }
     assert result.new_chunk.text == "MADDE 15 - (2) a) (Mülga)"
     assert result.new_chunk.validity_start_date == date(2026, 8, 28)
     assert old_chunk.validity_end_date == date(2026, 8, 28)
+
+
+def test_reviewed_text_reconciles_inherited_type_and_heading_metadata() -> None:
+    old_heading = ["MADDE 20", "(1) Toplam sayı yediyi geçemez"]
+    stored_draft = {
+        "user_file_id": "00000000-0000-0000-0000-000000000123",
+        "position": 132,
+        "text": "(1) Toplam sayı yediyi geçemez.",
+        "chunk_type": "paragraph",
+        "heading_path": old_heading,
+        "metadata": {
+            "article_no": "20",
+            "paragraph_no": "1",
+            "heading_path": old_heading,
+        },
+    }
+    locked_proposal = SimpleNamespace(
+        id=72,
+        status="pending",
+        old_chunk_id="article-20-v2",
+        old_chunk_snapshot={
+            "chunk_type": "paragraph",
+            "heading_path": old_heading,
+            "metadata": {"article_no": "20", "paragraph_no": "1"},
+        },
+        new_chunk_draft=stored_draft,
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.return_value = locked_proposal
+
+    queue_amendment_proposal_approval(
+        db_session,
+        cast(AmendmentProposal, locked_proposal),
+        decided_by=None,
+        reviewed_new_chunk_draft={
+            **stored_draft,
+            "text": "(1) Toplam sayı sekizi geçemez.",
+            "chunk_type": None,
+            "heading_path": ["INVENTED DOCUMENT", "INVENTED ARTICLE"],
+            "metadata": {
+                **stored_draft["metadata"],
+                "clause_label": "a",
+                "subclause_label": "i",
+            },
+        },
+    )
+
+    expected_heading = ["MADDE 20", "(1) Toplam sayı sekizi geçemez"]
+    assert locked_proposal.new_chunk_draft["chunk_type"] == "paragraph"
+    assert "clause_label" not in locked_proposal.new_chunk_draft["metadata"]
+    assert "subclause_label" not in locked_proposal.new_chunk_draft["metadata"]
+    assert locked_proposal.new_chunk_draft["heading_path"] == expected_heading
+    assert (
+        locked_proposal.new_chunk_draft["metadata"]["heading_path"] == expected_heading
+    )
+
+
+def test_reviewed_text_cannot_drop_an_explicit_replacement_body() -> None:
+    instruction_text = (
+        "20 nci maddenin birinci fıkrası aşağıdaki şekilde değiştirilmiştir. "
+        "“(1) Toplam sayı sekizi geçemez.”"
+    )
+    stored_draft = {
+        "user_file_id": "00000000-0000-0000-0000-000000000123",
+        "position": 132,
+        "text": "(1) Toplam sayı sekizi geçemez.",
+        "chunk_type": "paragraph",
+        "heading_path": ["MADDE 20", "(1) Toplam sayı sekizi geçemez"],
+        "metadata": {"article_no": "20", "paragraph_no": "1"},
+    }
+    locked_proposal = SimpleNamespace(
+        id=73,
+        status="pending",
+        old_chunk_id="article-20-v2",
+        instruction_text=instruction_text,
+        instruction_texts=[instruction_text],
+        new_chunk_draft=stored_draft,
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.return_value = locked_proposal
+
+    with pytest.raises(ValueError, match="explicit replacement"):
+        queue_amendment_proposal_approval(
+            db_session,
+            cast(AmendmentProposal, locked_proposal),
+            decided_by=None,
+            reviewed_new_chunk_draft={
+                **stored_draft,
+                "text": "(1) Toplam sayı yediyi geçemez.",
+            },
+        )
+
+    assert locked_proposal.status == "pending"
+
+
+def test_reviewed_existing_chunk_cannot_change_chunk_type() -> None:
+    stored_draft = {
+        "user_file_id": "00000000-0000-0000-0000-000000000123",
+        "position": 132,
+        "text": "(1) Toplam sayı sekizi geçemez.",
+        "chunk_type": "paragraph",
+        "heading_path": ["MADDE 20", "(1) Toplam sayı sekizi geçemez"],
+        "metadata": {"article_no": "20", "paragraph_no": "1"},
+    }
+    locked_proposal = SimpleNamespace(
+        id=74,
+        status="pending",
+        old_chunk_id="article-20-v2",
+        old_chunk_snapshot={
+            "chunk_type": "paragraph",
+            "heading_path": stored_draft["heading_path"],
+            "metadata": stored_draft["metadata"],
+        },
+        new_chunk_draft=stored_draft,
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.return_value = locked_proposal
+
+    with pytest.raises(ValueError, match="cannot change chunk_type"):
+        queue_amendment_proposal_approval(
+            db_session,
+            cast(AmendmentProposal, locked_proposal),
+            decided_by=None,
+            reviewed_new_chunk_draft={**stored_draft, "chunk_type": "clause"},
+        )
+
+    assert locked_proposal.status == "pending"
+
+
+def test_approval_without_review_body_still_validates_replacement_text() -> None:
+    instruction_text = (
+        "20 nci maddenin birinci fıkrası aşağıdaki şekilde değiştirilmiştir. "
+        "“(1) Toplam sayı sekizi geçemez.”"
+    )
+    stored_draft = {
+        "user_file_id": "00000000-0000-0000-0000-000000000123",
+        "position": 132,
+        "text": "(1) Toplam sayı yediyi geçemez.",
+        "chunk_type": "paragraph",
+        "heading_path": ["MADDE 20", "(1) Toplam sayı yediyi geçemez"],
+        "metadata": {"article_no": "20", "paragraph_no": "1"},
+    }
+    locked_proposal = SimpleNamespace(
+        id=75,
+        status="pending",
+        old_chunk_id="article-20-v2",
+        old_chunk_snapshot={
+            "chunk_type": "paragraph",
+            "heading_path": stored_draft["heading_path"],
+            "metadata": stored_draft["metadata"],
+        },
+        instruction_text=instruction_text,
+        instruction_texts=[instruction_text],
+        new_chunk_draft=stored_draft,
+    )
+    db_session = MagicMock(spec=Session)
+    db_session.scalar.return_value = locked_proposal
+
+    with pytest.raises(ValueError, match="explicit replacement"):
+        queue_amendment_proposal_approval(
+            db_session,
+            cast(AmendmentProposal, locked_proposal),
+            decided_by=None,
+        )
+
+    assert locked_proposal.status == "pending"
 
 
 def test_amendment_approval_rejects_reviewed_draft_identity_changes() -> None:
