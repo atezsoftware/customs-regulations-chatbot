@@ -41,6 +41,7 @@ _cached_recommendations: LLMRecommendations | None = None
 _cached_recommendations_time: float = 0.0
 
 _DEPLOYMENT_VISIBLE_VERTEX_MODELS: dict[str, str] = {
+    "gemini-3.8-flash": "Gemini 3.8 Flash",
     "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
 }
 
@@ -220,7 +221,7 @@ def get_vertexai_model_names() -> list[str]:
     # Combine all vertex model sets
     # Keep deployment-supported models discoverable if a LiteLLM catalog
     # release temporarily lags Vertex availability.
-    vertex_models: set[str] = {"gemini-3.1-flash-lite"}
+    vertex_models: set[str] = set(_DEPLOYMENT_VISIBLE_VERTEX_MODELS)
     vertex_model_sets = [
         "vertex_chat_models",
         "vertex_language_models",

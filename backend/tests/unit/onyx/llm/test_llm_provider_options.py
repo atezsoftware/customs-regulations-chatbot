@@ -94,11 +94,13 @@ def test_model_configurations_vertex_are_sorted_by_name(
         "Beta-model",
         "gamma-model",
         "gemini-3.1-flash-lite",
+        "gemini-3.8-flash",
         "zeta-model",
     ]
     assert [model.is_visible for model in model_configurations] == [
         True,
         False,
+        True,
         True,
         True,
         False,
@@ -109,12 +111,26 @@ def test_vertex_catalog_pins_gemini_31_flash_lite() -> None:
     assert "gemini-3.1-flash-lite" in get_vertexai_model_names()
 
 
+def test_vertex_catalog_pins_gemini_38_flash() -> None:
+    assert "gemini-3.8-flash" in get_vertexai_model_names()
+
+
 def test_vertex_recommendations_expose_gemini_31_flash_lite_in_chat() -> None:
     visible_models = _load_bundled_recommendations().get_visible_models(
         VERTEXAI_PROVIDER_NAME
     )
 
     assert ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite") in {
+        (model.name, model.display_name) for model in visible_models
+    }
+
+
+def test_vertex_recommendations_expose_gemini_38_flash_in_chat() -> None:
+    visible_models = _load_bundled_recommendations().get_visible_models(
+        VERTEXAI_PROVIDER_NAME
+    )
+
+    assert ("gemini-3.8-flash", "Gemini 3.8 Flash") in {
         (model.name, model.display_name) for model in visible_models
     }
 
@@ -147,6 +163,34 @@ def test_vertex_flash_lite_stays_visible_when_remote_recommendations_lag(
     )
     assert flash_lite.is_visible is True
     assert flash_lite.display_name == "Gemini 3.1 Flash Lite"
+
+
+def test_vertex_38_flash_stays_visible_when_remote_recommendations_lag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "onyx.llm.well_known_providers.llm_provider_options.fetch_models_for_provider",
+        lambda _provider_name: [],
+    )
+    monkeypatch.setattr(
+        "onyx.llm.well_known_providers.llm_provider_options.get_max_input_tokens",
+        lambda _model_name, _provider_name: None,
+    )
+    monkeypatch.setattr(
+        "onyx.llm.well_known_providers.llm_provider_options.model_supports_image_input",
+        lambda _model_name, _provider_name: False,
+    )
+    lagging_recommendations = _build_recommendations(
+        VERTEXAI_PROVIDER_NAME, ["gemini-3.1-pro-preview"]
+    )
+
+    configurations = model_configurations_for_provider(
+        VERTEXAI_PROVIDER_NAME, lagging_recommendations
+    )
+
+    flash = next(model for model in configurations if model.name == "gemini-3.8-flash")
+    assert flash.is_visible is True
+    assert flash.display_name == "Gemini 3.8 Flash"
 
 
 def test_model_configurations_carry_display_name_and_dedupe_default(

@@ -1,6 +1,6 @@
 {
-  "version": "1.10",
-  "updated_at": "2026-07-24T00:00:00Z",
+  "version": "1.11",
+  "updated_at": "2026-09-04T00:00:00Z",
   "providers": {
     "openai": {
       "default_model": "gpt-5.6-sol",
@@ -43,6 +43,10 @@
     "vertex_ai": {
       "default_model": "gemini-3.1-pro-preview",
       "additional_visible_models": [
+        {
+          "name": "gemini-3.8-flash",
+          "display_name": "Gemini 3.8 Flash"
+        },
         {
           "name": "gemini-3.1-pro-preview",
           "display_name": "Gemini 3.1 Pro"
