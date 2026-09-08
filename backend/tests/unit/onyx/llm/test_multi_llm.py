@@ -791,12 +791,30 @@ def test_vertex_gemini_reasoning_effort_works_without_litellm_metadata(
     assert kwargs["reasoning_effort"] == expected_effort
 
 
-def test_vertex_gemini_37_reasoning_off_uses_supported_low_floor() -> None:
+@pytest.mark.parametrize(
+    ("model_name", "deployment_name"),
+    [
+        ("gemini-3.7-flash", None),
+        ("gemini-3.8-flash", None),
+        ("gemini-3.9-flash-preview", None),
+        ("gemini-3.10-flash", None),
+        ("custom-deployment", "publishers/google/models/gemini-3.8-flash"),
+    ],
+)
+@pytest.mark.parametrize("provider", [LlmProviderNames.VERTEX_AI, "gemini"])
+def test_gemini_reasoning_off_uses_supported_low_floor(
+    model_name: str, deployment_name: str | None, provider: str
+) -> None:
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+        VertexGeminiConfig,
+    )
+
     llm = LitellmLLM(
         api_key="test_key",
         timeout=30,
-        model_provider=LlmProviderNames.VERTEX_AI,
-        model_name="gemini-3.7-flash",
+        model_provider=provider,
+        model_name=model_name,
+        deployment_name=deployment_name,
         max_input_tokens=100_000,
     )
 
@@ -806,6 +824,12 @@ def test_vertex_gemini_37_reasoning_off_uses_supported_low_floor() -> None:
         list(llm.stream(messages, reasoning_effort=ReasoningEffort.OFF))
 
     assert mock_completion.call_args.kwargs["reasoning_effort"] == "low"
+    # Exercise the pinned LiteLLM translation that previously sent MINIMAL.
+    thinking_config = VertexGeminiConfig._map_reasoning_effort_to_thinking_level(
+        mock_completion.call_args.kwargs["reasoning_effort"],
+        model=deployment_name or model_name,
+    )
+    assert thinking_config["thinkingLevel"] == "low"
 
 
 def test_claude_reasoning_off_keeps_thinking_configuration_omitted() -> None:

@@ -6,6 +6,7 @@ import time
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import lru_cache
+from itertools import chain
 from typing import TYPE_CHECKING, Any, Union, cast
 
 from readerwriterlock import rwlock
@@ -69,7 +70,8 @@ logger = setup_logger()
 _env_rwlock = rwlock.RWLockWrite()
 
 if TYPE_CHECKING:
-    from litellm import CustomStreamWrapper, HTTPHandler
+    from litellm import HTTPHandler
+    from litellm.types.utils import ModelResponseStream as LiteLLMModelResponseStream
 
 
 _LLM_PROMPT_LONG_TERM_LOG_CATEGORY = "llm_prompt"
@@ -112,7 +114,13 @@ _KWARG_ERROR_ALIASES: dict[str, tuple[str, ...]] = {
     "thinking": ("thinking", "budget_tokens"),
     "output_config": ("output_config", "effort"),
     "reasoning": ("reasoning", "effort"),
-    "reasoning_effort": ("reasoning_effort", "effort"),
+    "reasoning_effort": (
+        "reasoning_effort",
+        "effort",
+        "thinking_level",
+        "thinking level",
+        "thinkinglevel",
+    ),
     "temperature": ("temperature",),
 }
 
@@ -138,12 +146,13 @@ _ANTHROPIC_VERSION_PATTERN = r"\d+(?:[.-]\d+)?"
 def _gemini_rejects_minimal_thinking(model_name: str) -> bool:
     """Whether a Gemini release requires LOW as its thinking floor."""
 
-    return bool(
-        re.search(
-            r"(?:^|[/_.-])gemini[-_.]?3[.-]7(?:[/_.-]|$)",
-            model_name.lower(),
-        )
+    # Gemini 3.7 removed MINIMAL; use LOW for subsequent 3.x releases too.
+    # Earlier Flash releases retain LiteLLM's MINIMAL mapping for OFF.
+    match = re.search(
+        r"(?:^|[/_.-])gemini[-_.]?3[.-](\d+)(?:[/_.-]|$)",
+        model_name.lower(),
     )
+    return match is not None and int(match.group(1)) >= 7
 
 
 class LLMTimeoutError(Exception):
@@ -577,7 +586,7 @@ class LitellmLLM(LLM):
         max_tokens: int | None = None,
         user_identity: LLMUserIdentity | None = None,
         client: "HTTPHandler | None" = None,
-    ) -> Union["ModelResponse", "CustomStreamWrapper"]:
+    ) -> Union["ModelResponse", Iterator["LiteLLMModelResponseStream"]]:
         # Lazy loading to avoid memory bloat for non-inference flows
         from litellm.exceptions import BadRequestError, RateLimitError, Timeout
 
@@ -948,7 +957,18 @@ class LitellmLLM(LLM):
                     }
                 )
                 try:
-                    return _call_litellm(opts)
+                    response = _call_litellm(opts)
+                    if not stream:
+                        return response
+                    # Some providers defer the HTTP request until iteration.
+                    # Catch their parameter rejections before exposing a chunk;
+                    # never replay a stream once any chunk has been returned.
+                    chunks = iter(response)
+                    try:
+                        first_chunk = next(chunks)
+                    except StopIteration:
+                        return iter(())
+                    return chain((first_chunk,), chunks)
                 except BadRequestError as e:
                     if i == len(attempts) - 1:
                         raise
@@ -1073,11 +1093,13 @@ class LitellmLLM(LLM):
                 # setup (not the full inference). The chunks are then collected
                 # outside the lock and reassembled into a single ModelResponse
                 # via stream_chunk_builder.
-                from litellm import CustomStreamWrapper as LiteLLMCustomStreamWrapper
                 from litellm import stream_chunk_builder
+                from litellm.types.utils import (
+                    ModelResponseStream as LiteLLMModelResponseStream,
+                )
 
                 stream_response = cast(
-                    LiteLLMCustomStreamWrapper,
+                    Iterator[LiteLLMModelResponseStream],
                     completion_response,
                 )
                 chunks = list(stream_response)
@@ -1110,7 +1132,6 @@ class LitellmLLM(LLM):
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         user_identity: LLMUserIdentity | None = None,
     ) -> Iterator[ModelResponseStream]:
-        from litellm import CustomStreamWrapper as LiteLLMCustomStreamWrapper
         from litellm import HTTPHandler
         from litellm.exceptions import APIConnectionError as LiteLLMAPIConnectionError
         from litellm.exceptions import InternalServerError as LiteLLMInternalServerError
@@ -1118,11 +1139,15 @@ class LitellmLLM(LLM):
             ServiceUnavailableError as LiteLLMServiceUnavailableError,
         )
         from litellm.exceptions import Timeout as LiteLLMTimeout
+        from litellm.types.utils import (
+            ModelResponseStream as LiteLLMModelResponseStream,
+        )
 
         from onyx.llm.model_response import from_litellm_model_response_stream
 
         retryable_exceptions = (
             LiteLLMTimeout,
+            LLMTimeoutError,
             LiteLLMAPIConnectionError,
             LiteLLMServiceUnavailableError,
             LiteLLMInternalServerError,
@@ -1167,7 +1192,7 @@ class LitellmLLM(LLM):
 
             try:
                 response = cast(
-                    LiteLLMCustomStreamWrapper,
+                    Iterator[LiteLLMModelResponseStream],
                     self._completion(
                         prompt=prompt,
                         tools=tools,

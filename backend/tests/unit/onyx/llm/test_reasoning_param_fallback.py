@@ -1,12 +1,13 @@
 """Guards the degrade-and-retry behavior for provider-rejected reasoning params."""
 
+from collections.abc import Iterator
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from litellm.exceptions import BadRequestError, RateLimitError
 
-from onyx.llm.models import ReasoningEffort, UserMessage
+from onyx.llm.models import ReasoningEffort, ToolChoiceOptions, UserMessage
 from onyx.llm.multi_llm import LitellmLLM, LLMRateLimitError
 
 _SENTINEL = object()
@@ -59,6 +60,52 @@ def test_rejected_reasoning_params_are_stripped_and_retried() -> None:
         assert key not in calls[1]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Thinking level is unsupported: THINKING_LEVEL_MINIMAL",
+        "Invalid value at generation_config.thinking_config.thinking_level",
+        "generationConfig.thinkingConfig.thinkingLevel is not supported",
+    ],
+)
+def test_vertex_thinking_level_rejection_retries_without_changing_request(
+    stream: bool, message: str
+) -> None:
+    llm = _make_llm(model_name="gemini-3.8-flash", model_provider="vertex_ai")
+    calls: list[dict[str, Any]] = []
+
+    def response(**kwargs: Any) -> Any:
+        if "reasoning_effort" in kwargs:
+            raise BadRequestError(
+                message=message, model="gemini-3.8-flash", llm_provider="vertex_ai"
+            )
+        return _SENTINEL
+
+    def deferred_response(**kwargs: Any) -> Iterator[Any]:
+        yield response(**kwargs)
+
+    def completion(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return deferred_response(**kwargs) if stream else response(**kwargs)
+
+    with patch("onyx.llm.litellm_singleton.litellm.completion", side_effect=completion):
+        result = llm._completion(
+            prompt=[UserMessage(content="hello")],
+            tools=[{"type": "function", "function": {"name": "search"}}],
+            tool_choice=ToolChoiceOptions.REQUIRED,
+            stream=stream,
+            parallel_tool_calls=False,
+            reasoning_effort=ReasoningEffort.OFF,
+        )
+
+    assert list(result) == [_SENTINEL] if stream else result is _SENTINEL
+    assert len(calls) == 2
+    assert calls[1] == {
+        key: value for key, value in calls[0].items() if key != "reasoning_effort"
+    }
+
+
 def test_bad_request_without_reasoning_params_raises() -> None:
     calls: list[dict[str, Any]] = []
 
@@ -85,16 +132,63 @@ def test_bad_request_after_strip_propagates() -> None:
     assert len(calls) == 2
 
 
-def test_unrelated_bad_request_is_not_retried() -> None:
+@pytest.mark.parametrize("yield_first", [False, True])
+@pytest.mark.parametrize(
+    "message", ["Thinking level is unsupported", "missing thought signature"]
+)
+def test_deferred_bad_request_only_retries_before_first_chunk(
+    yield_first: bool, message: str
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def completion(**kwargs: Any) -> Iterator[Any]:
+        calls.append(kwargs)
+        if yield_first:
+            yield _SENTINEL
+        raise _bad_request(message)
+
+    with pytest.raises(BadRequestError):
+        result = _run(
+            _make_llm("gemini-3.8-flash", "vertex_ai"),
+            completion,
+            ReasoningEffort.OFF,
+            stream=True,
+        )
+        if yield_first:
+            assert next(result) is _SENTINEL
+        list(result)
+
+    assert len(calls) == (2 if not yield_first and "level" in message else 1)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_name", "message"),
+    [
+        (
+            "anthropic",
+            "claude-sonnet-5",
+            "prompt is too long: 250000 tokens > 200000 maximum",
+        ),
+        (
+            "vertex_ai",
+            "gemini-3.8-flash",
+            "prompt exceeds the maximum number of tokens",
+        ),
+        ("vertex_ai", "gemini-3.8-flash", "missing thought signature in function call"),
+    ],
+)
+def test_unrelated_bad_request_is_not_retried(
+    provider: str, model_name: str, message: str
+) -> None:
     calls: list[dict[str, Any]] = []
 
     def completion(**kwargs: Any) -> Any:
         calls.append(kwargs)
-        raise _bad_request("prompt is too long: 250000 tokens > 200000 maximum")
+        raise BadRequestError(message=message, model=model_name, llm_provider=provider)
 
     # The 400 names no strippable kwarg, so the ladder must not burn retries.
     with pytest.raises(BadRequestError):
-        _run(_make_llm(), completion, ReasoningEffort.HIGH)
+        _run(_make_llm(model_name, provider), completion, ReasoningEffort.HIGH)
     assert len(calls) == 1
 
 

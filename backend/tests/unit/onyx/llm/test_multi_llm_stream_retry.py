@@ -97,3 +97,34 @@ def test_stream_does_not_retry_after_first_chunk() -> None:
     assert fake_llm._completion.call_count == 1
     sleep.assert_not_called()
     mock_logger.warning.assert_not_called()
+
+
+def test_real_llm_retries_timeout_deferred_until_first_chunk() -> None:
+    llm = LitellmLLM(
+        api_key="test-key",
+        model_provider="vertex_ai",
+        model_name="gemini-3.8-flash",
+        max_input_tokens=100000,
+    )
+    attempt_count = 0
+
+    def completion(**_kwargs: object) -> Iterator[object]:
+        nonlocal attempt_count
+        attempt_count += 1
+        if attempt_count == 1:
+            raise LiteLLMTimeout("timed out", "gemini-3.8-flash", "vertex_ai")
+        yield object()
+
+    with (
+        patch("onyx.llm.litellm_singleton.litellm.completion", side_effect=completion),
+        patch("onyx.llm.multi_llm.LLM_FIRST_CHUNK_MAX_RETRIES", 1),
+        patch("onyx.llm.multi_llm.time.sleep"),
+        patch(
+            "onyx.llm.model_response.from_litellm_model_response_stream",
+            return_value=_make_stream_response("hello"),
+        ),
+    ):
+        results = list(llm.stream(prompt=_make_prompt()))
+
+    assert [result.choice.delta.content for result in results] == ["hello"]
+    assert attempt_count == 2
