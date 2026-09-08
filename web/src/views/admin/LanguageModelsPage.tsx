@@ -330,6 +330,7 @@ function NewCustomProviderCard({
 
 export default function LanguageModelsPage() {
   const { mutate } = useSWRConfig();
+  const [isSavingDefault, setIsSavingDefault] = useState(false);
   const { llmProviders: existingLlmProviders, defaultText } =
     useAdminLLMProviders();
   const isConfigurationDisabled = usePHFeatureFlag(
@@ -365,31 +366,32 @@ export default function LanguageModelsPage() {
     return 0;
   });
 
-  // Pre-filter to providers that have at least one visible model
-  const providersWithVisibleModels = existingLlmProviders
-    .map((provider) => ({
-      provider,
-      visibleModels: provider.model_configurations.filter((m) => m.is_visible),
-    }))
-    .filter(({ visibleModels }) => visibleModels.length > 0);
+  async function handleDefaultModelChange(
+    modelConfigurationId?: number | null
+  ) {
+    const provider = existingLlmProviders?.find((p) =>
+      p.model_configurations.some((m) => m.id === modelConfigurationId)
+    );
+    const model = provider?.model_configurations.find(
+      (m) => m.id === modelConfigurationId
+    );
+    if (modelConfigurationId == null || !provider || !model) {
+      toast.error(
+        "The selected model is no longer available. Refresh and try again."
+      );
+      return;
+    }
 
-  // Default model logic — use the global default from the API response
-  const currentDefaultValue = defaultText
-    ? `${defaultText.provider_id}:${defaultText.model_name}`
-    : undefined;
-
-  async function handleDefaultModelChange(compositeValue: string) {
-    const separatorIndex = compositeValue.indexOf(":");
-    const providerId = Number(compositeValue.slice(0, separatorIndex));
-    const modelName = compositeValue.slice(separatorIndex + 1);
-
+    setIsSavingDefault(true);
     try {
-      await setDefaultLlmModel(providerId, modelName);
+      await setDefaultLlmModel(provider.id, model.name);
       await refreshLlmProviderCaches(mutate);
       toast.success("Default model updated successfully!");
     } catch (e) {
       const message = e instanceof Error ? e.message : "Unknown error";
       toast.error(`Failed to set default model: ${message}`);
+    } finally {
+      setIsSavingDefault(false);
     }
   }
 
@@ -408,17 +410,10 @@ export default function LanguageModelsPage() {
             >
               <ModelSelector
                 value={defaultModelConfigId}
+                providerOptions={existingLlmProviders}
+                disabled={isSavingDefault}
                 onChange={(opt) => {
-                  const provider = existingLlmProviders?.find(
-                    (p) =>
-                      p.provider === opt.provider &&
-                      (p.name === opt.name || (!p.name && !opt.name))
-                  );
-                  if (provider) {
-                    void handleDefaultModelChange(
-                      `${provider.id}:${opt.modelName}`
-                    );
-                  }
+                  void handleDefaultModelChange(opt.modelConfigurationId);
                 }}
                 side="bottom"
               />

@@ -247,7 +247,11 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
   const [presentingDocument, setPresentingDocument] =
     useState<MinimalOnyxDocument | null>(null);
 
-  const llmManager = useLlmManager(currentChatSession ?? undefined, liveAgent);
+  const llmManager = useLlmManager(
+    currentChatSession ?? undefined,
+    liveAgent,
+    currentChatSessionId
+  );
 
   const {
     showOnboarding,
@@ -421,7 +425,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
   const autoScrollEnabled = autoScrollPreference && !isStreamDraining;
   const isStreaming = currentChatState === "streaming";
 
-  const multiModel = useMultiModelChat(llmManager);
+  const multiModel = useMultiModelChat(llmManager, currentChatSessionId);
 
   const { fullWidthChat } = useFullWidthChat();
 

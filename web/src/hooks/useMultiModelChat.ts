@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import {
   MAX_MODELS,
   SelectedModel,
@@ -41,9 +41,16 @@ export interface UseMultiModelChatReturn {
 }
 
 export default function useMultiModelChat(
-  llmManager: LlmManager
+  llmManager: LlmManager,
+  activeChatSessionId: string | null = null
 ): UseMultiModelChatReturn {
   const [selectedModels, setSelectedModels] = useState<SelectedModel[]>([]);
+  const prevActiveSessionIdRef = useRef(activeChatSessionId);
+  const startingNewChat =
+    prevActiveSessionIdRef.current !== null && activeChatSessionId === null;
+  useEffect(() => {
+    prevActiveSessionIdRef.current = activeChatSessionId;
+  }, [activeChatSessionId]);
 
   // Eligibility is tied to a provider/model identity; sharing a raw model
   // name with the current selection does not make another hidden row valid.
@@ -116,8 +123,8 @@ export default function useMultiModelChat(
     [llmOptions, llmManager.llmProviders]
   );
   const reconciledModels = useMemo(
-    () => reconcileModels(selectedModels),
-    [reconcileModels, selectedModels]
+    () => (startingNewChat ? [] : reconcileModels(selectedModels)),
+    [startingNewChat, reconcileModels, selectedModels]
   );
 
   // Persist removals so a model that reappears is not silently reselected.

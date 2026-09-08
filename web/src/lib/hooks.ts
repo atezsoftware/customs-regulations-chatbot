@@ -407,11 +407,7 @@ export function shouldClearManualLlmForSessionChange(
   nextSession: ChatSession | undefined,
   manualLlm: LlmDescriptor
 ): boolean {
-  if (
-    !nextSession ||
-    previousDefinedSessionId === undefined ||
-    previousDefinedSessionId === nextSession.id
-  ) {
+  if (!nextSession || previousDefinedSessionId === nextSession.id) {
     return false;
   }
   return (
@@ -612,7 +608,8 @@ export function getValidLlmDescriptorForProviders(
 
 export function useLlmManager(
   currentChatSession?: ChatSession,
-  liveAgent?: MinimalAgent
+  liveAgent?: MinimalAgent,
+  activeChatSessionId: string | null = currentChatSession?.id ?? null
 ): LlmManager {
   const { user } = useUser();
 
@@ -667,9 +664,15 @@ export function useLlmManager(
   // different model. A newly-created session binds the just-selected model,
   // so its A → new-chat → B transition must preserve that selection.
   const prevDefinedSessionIdRef = useRef<string | undefined>(undefined);
+  const prevActiveSessionIdRef = useRef(activeChatSessionId);
+  const startingNewChat =
+    prevActiveSessionIdRef.current !== null && activeChatSessionId === null;
   useEffect(() => {
     const nextId = currentChatSession?.id;
-    if (
+    if (startingNewChat) {
+      setUserHasManuallyOverriddenLLM(false);
+      prevDefinedSessionIdRef.current = undefined;
+    } else if (
       shouldClearManualLlmForSessionChange(
         prevDefinedSessionIdRef.current,
         currentChatSession,
@@ -681,7 +684,10 @@ export function useLlmManager(
     if (nextId !== undefined) {
       prevDefinedSessionIdRef.current = nextId;
     }
+    prevActiveSessionIdRef.current = activeChatSessionId;
   }, [
+    activeChatSessionId,
+    startingNewChat,
     currentChatSession?.id,
     currentChatSession?.current_alternate_model,
     manualLlm.name,
@@ -714,7 +720,7 @@ export function useLlmManager(
 
     if (llmProviders === undefined || llmProviders === null) {
       resolved = manualLlm;
-    } else if (userHasManuallyOverriddenLLM) {
+    } else if (userHasManuallyOverriddenLLM && !startingNewChat) {
       // Manual override wins over session's `current_alternate_model`.
       // Revalidate it when the catalog changes so removed models fall back.
       resolved = getValidLlmDescriptorForProviders(
@@ -766,7 +772,9 @@ export function useLlmManager(
     defaultText,
     currentChatSession,
     userHasManuallyOverriddenLLM,
+    startingNewChat,
     manualLlm,
+    liveAgent?.id,
     liveAgent?.default_model_configuration_id,
     user?.preferences?.default_model,
   ]);

@@ -260,6 +260,122 @@ describe("provider catalog synchronization", () => {
     expect(result.current.currentLlm.modelName).toBe("gemini-current-pro");
   });
 
+  it("starts a new chat with the current default and preserves its subsequent manual selection", async () => {
+    response = updatedResponse;
+    const session: ChatSession = {
+      id: "old-chat",
+      name: "Old chat",
+      persona_id: 0,
+      project_id: null,
+      time_created: "2026-09-08T00:00:00Z",
+      time_updated: "2026-09-08T00:00:00Z",
+      shared_status: ChatSessionSharedStatus.Private,
+      current_alternate_model: "Gemini__vertex_ai__gemini-current-pro",
+      current_temperature_override: null,
+      current_reasoning_effort_override: null,
+    };
+    const initialProps: {
+      currentSession?: ChatSession;
+      activeId: string | null;
+    } = { currentSession: session, activeId: session.id };
+    const { result, rerender } = renderHook(
+      ({
+        currentSession,
+        activeId,
+      }: {
+        currentSession?: ChatSession;
+        activeId: string | null;
+      }) => useLlmManager(currentSession, undefined, activeId),
+      {
+        wrapper: Wrapper,
+        initialProps,
+      }
+    );
+    await waitFor(() =>
+      expect(result.current.currentLlm.modelName).toBe("gemini-current-pro")
+    );
+    act(() =>
+      result.current.updateCurrentLlm({
+        name: "Gemini",
+        provider: "vertex_ai",
+        modelName: "gemini-current-pro",
+      })
+    );
+
+    rerender({ currentSession: undefined, activeId: null });
+    expect(result.current.currentLlm.modelName).toBe("gemini-future-flash");
+
+    act(() =>
+      result.current.updateCurrentLlm({
+        name: "Gemini",
+        provider: "vertex_ai",
+        modelName: "gemini-current-pro",
+      })
+    );
+    expect(result.current.currentLlm.modelName).toBe("gemini-current-pro");
+    // Binding a new session can precede the session-list response.
+    rerender({ currentSession: undefined, activeId: "new-chat" });
+    expect(result.current.currentLlm.modelName).toBe("gemini-current-pro");
+    rerender({
+      currentSession: { ...session, id: "new-chat" },
+      activeId: "new-chat",
+    });
+    expect(result.current.currentLlm.modelName).toBe("gemini-current-pro");
+    rerender({ currentSession: undefined, activeId: null });
+    act(() =>
+      result.current.updateCurrentLlm({
+        name: "Gemini",
+        provider: "vertex_ai",
+        modelName: "gemini-current-pro",
+      })
+    );
+    rerender({
+      currentSession: {
+        ...session,
+        current_alternate_model: "Gemini__vertex_ai__gemini-future-flash",
+      },
+      activeId: session.id,
+    });
+    expect(result.current.currentLlm.modelName).toBe("gemini-future-flash");
+  });
+
+  it("resets comparison models on a new chat but preserves selections when binding it", async () => {
+    response = updatedResponse;
+    const { result, rerender } = renderHook(
+      ({ activeId }: { activeId: string | null }) =>
+        useMultiModelChat(
+          useLlmManager(undefined, undefined, activeId),
+          activeId
+        ),
+      {
+        wrapper: Wrapper,
+        initialProps: { activeId: "old-chat" as string | null },
+      }
+    );
+    await waitFor(() => expect(result.current.selectedModels).toHaveLength(1));
+    const alternative: SelectedModel = {
+      name: "Gemini",
+      provider: "vertex_ai",
+      modelName: "gemini-current-pro",
+      modelConfigurationId: 70,
+      displayName: "Current Pro",
+    };
+    act(() => result.current.addModel(alternative));
+    expect(result.current.isMultiModelActive).toBe(true);
+    rerender({ activeId: null });
+    expect(result.current.isMultiModelActive).toBe(false);
+    expect(result.current.selectedModels.map((m) => m.modelName)).toEqual([
+      "gemini-future-flash",
+    ]);
+    act(() => result.current.addModel(alternative));
+    rerender({ activeId: "new-chat" });
+    expect(result.current.isMultiModelActive).toBe(true);
+    expect(result.current.selectedModels.map((m) => m.modelName)).toEqual([
+      "gemini-future-flash",
+      "gemini-current-pro",
+    ]);
+  });
+
   it("replaces a removed manual model with the refreshed default", async () => {
     const { result } = renderHook(() => useLlmManager(), { wrapper: Wrapper });
     await waitFor(() =>

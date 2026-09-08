@@ -13,6 +13,19 @@ import { LLMProviderDescriptor } from "@/lib/languageModels/types";
 import { makeProvider } from "@tests/setup/llmProviderTestUtils";
 
 describe("LLM resolver helpers", () => {
+  test("clears a blank-chat selection when opening a saved chat with another model", () => {
+    expect(
+      shouldClearManualLlmForSessionChange(
+        undefined,
+        {
+          id: "saved-chat",
+          current_alternate_model: "Gemini__vertex_ai__gemini-saved",
+        } as ChatSession,
+        { name: "Gemini", provider: "vertex_ai", modelName: "gemini-manual" }
+      )
+    ).toBe(true);
+  });
+
   test("preserves a manual model when a newly bound session confirms it", () => {
     const manualModel = {
       name: "OpenRouter",
