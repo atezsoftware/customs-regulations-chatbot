@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import isEqual from "lodash/isEqual";
 import { useSWRConfig } from "swr";
 import { useFormikContext } from "formik";
 import { FileUploadFormField } from "@/components/Field";
@@ -20,6 +21,7 @@ import {
   useInitialValues,
   buildValidationSchema,
   BaseLLMFormValues,
+  mergeFetchedModelConfigurations,
 } from "@/sections/modals/languageModels/utils";
 import { submitProvider } from "@/sections/modals/languageModels/svc";
 import { LLMProviderConfiguredSource } from "@/lib/analytics/utils";
@@ -31,6 +33,7 @@ import {
 } from "@/sections/modals/languageModels/shared";
 import { refreshLlmProviderCaches } from "@/lib/languageModels/cache";
 import { useSettings } from "@/lib/settings/hooks";
+import { fetchModels } from "@/lib/languageModels/svc";
 
 const VERTEXAI_DEFAULT_LOCATION = "global";
 
@@ -61,6 +64,7 @@ function VertexAIModalInternals({
   isOnboarding,
 }: VertexAIModalInternalsProps) {
   const formikProps = useFormikContext<VertexAIModalValues>();
+  const { mutate } = useSWRConfig();
   const authMethod = formikProps.values.custom_config?.vertex_auth_method;
   const settings = useSettings();
   const isMultiTenant = !settings.hooks_enabled;
@@ -75,6 +79,61 @@ function VertexAIModalInternals({
   }, [authMethod]);
 
   const showAuthMethodSelector = !isMultiTenant;
+
+  async function handleFetchModels(signal: AbortSignal) {
+    const requestedConfig = formikProps.values.custom_config;
+    const result = await fetchModels(
+      LLMProviderName.VERTEX_AI,
+      {
+        id: existingLlmProvider?.id,
+        custom_config: requestedConfig,
+      },
+      signal
+    );
+    if (signal.aborted) return;
+    if (result.error) throw new Error(result.error);
+    if (result.models.length === 0) {
+      throw new Error(
+        "Google returned no chat models for this connection. Check the project and region."
+      );
+    }
+    await formikProps.setValues((current) => {
+      if (!isEqual(current.custom_config, requestedConfig)) return current;
+      const previous = new Map(
+        current.model_configurations.map((model) => [model.name, model])
+      );
+      const fetchedNames = new Set(result.models.map((model) => model.name));
+      const models = mergeFetchedModelConfigurations(
+        result.models,
+        current.model_configurations
+      ).map((model) => {
+        const prior = previous.get(model.name);
+        const customDisplayName = prior?.custom_display_name;
+        return {
+          ...model,
+          id: prior?.id,
+          max_input_tokens: prior
+            ? prior.max_input_tokens
+            : model.max_input_tokens,
+          is_visible: current.is_auto_mode || model.is_visible,
+          custom_display_name: customDisplayName,
+          effectiveDisplayName: customDisplayName || model.effectiveDisplayName,
+        };
+      });
+      return {
+        ...current,
+        model_configurations: [
+          ...models,
+          ...current.model_configurations.filter(
+            (model) => !fetchedNames.has(model.name)
+          ),
+        ],
+      };
+    });
+    if (existingLlmProvider) {
+      await refreshLlmProviderCaches(mutate);
+    }
+  }
 
   return (
     <>
@@ -162,7 +221,11 @@ function VertexAIModalInternals({
       )}
 
       <InputDivider />
-      <ModelSelectionField shouldShowAutoUpdateToggle={true} />
+      <ModelSelectionField
+        shouldShowAutoUpdateToggle={true}
+        autoModeIncludesAllModels
+        onRefetch={handleFetchModels}
+      />
 
       {!isOnboarding && (
         <>

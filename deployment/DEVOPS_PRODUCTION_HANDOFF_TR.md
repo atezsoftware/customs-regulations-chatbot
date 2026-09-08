@@ -72,17 +72,18 @@ iş yükü de kontrollü olarak yeniden başlatılır. Bayrağın yalnız bir po
 migration'dan önce açılması kabul edilmez. Admin’de seçili Vertex modelinin service-account JSON’u
 şifreli Admin yapılandırmasında kalır; environment değişkenine veya teslim dokümanına yazılmaz.
 
-Background podunun supervisor sözleşmesi tam olarak beş worker, iki ayrık Beat ve bir log yönlendirici
-olmak üzere sekiz process'tir:
+Background podunun supervisor sözleşmesi tam olarak altı worker, iki ayrık Beat ve bir log yönlendirici
+olmak üzere dokuz process'tir:
 
 | Process | Queue/görev |
 | --- | --- |
 | `celery_worker_regulatory_benchmark` | `regulatory_benchmark` |
 | `celery_worker_user_file_processing` | `user_file_processing,user_file_project_sync,user_file_delete,user_file_port` |
 | `celery_worker_regulatory_indexing` | `regulatory_indexing` |
-| `celery_worker_light` | Onaylı hafif bakım queue'ları |
+| `celery_worker_light` | Hafif bakım ve `llm_model_update` queue'ları |
+| `celery_worker_csv_generation` | `csv_generation` queue'su |
 | `celery_worker_monitoring` | `monitoring` |
-| `celery_beat` | Yalnız user-file processing/project-sync/delete recovery |
+| `celery_beat` | User-file recovery ve otomatik LLM model keşfi |
 | `celery_beat_regulatory_indexing` | Yalnız stale recovery ve queue monitoring |
 | `log-redirect-handler` | Yedi Celery logunu stdout'a aktarır |
 

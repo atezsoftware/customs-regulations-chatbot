@@ -6,6 +6,22 @@ import type {
 } from "@/lib/languageModels/types";
 import { LlmDescriptor } from "@/lib/hooks";
 
+/** Hidden models are executable only when they are the configured default. */
+export function getSelectableLlmProviders(
+  providers: LLMProviderDescriptor[],
+  defaultText?: DefaultModel | null
+): LLMProviderDescriptor[] {
+  return providers.map((provider) => ({
+    ...provider,
+    model_configurations: provider.model_configurations.filter(
+      (model) =>
+        model.is_visible ||
+        (defaultText?.provider_id === provider.id &&
+          defaultText.model_name === model.name)
+    ),
+  }));
+}
+
 export function getFinalLLM(
   llmProviders: LLMProviderDescriptor[],
   agent: MinimalAgent | null,

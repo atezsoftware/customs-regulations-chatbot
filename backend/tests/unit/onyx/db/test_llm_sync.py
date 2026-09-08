@@ -7,6 +7,7 @@ import pytest
 
 from onyx.db.enums import LLMModelFlowType
 from onyx.db.llm import sync_auto_mode_models, sync_model_configurations
+from onyx.db.models import LLMProvider
 from onyx.llm.constants import LlmProviderNames
 from onyx.server.manage.llm.models import SyncModelEntry
 
@@ -21,6 +22,90 @@ def _make_existing_model(name: str, flow_types: list[LLMModelFlowType]) -> Magic
 
 class TestSyncModelConfigurations:
     """Tests for sync_model_configurations function."""
+
+    @pytest.mark.parametrize("auto_mode", [True, False])
+    def test_vertex_discovery_exposes_new_models_only_in_auto_mode(
+        self, auto_mode: bool
+    ) -> None:
+        existing = _make_existing_model("gemini-current-pro", [LLMModelFlowType.CHAT])
+        existing.is_visible = False
+        provider = SimpleNamespace(
+            id=7,
+            provider=LlmProviderNames.VERTEX_AI,
+            is_auto_mode=auto_mode,
+            model_configurations=[existing],
+        )
+        with (
+            patch(
+                "onyx.db.llm.fetch_existing_llm_provider_by_id", return_value=provider
+            ),
+            patch(
+                "onyx.db.llm.insert_new_model_configuration__no_commit"
+            ) as insert_model,
+        ):
+            sync_model_configurations(
+                MagicMock(),
+                7,
+                [
+                    SyncModelEntry(
+                        name="gemini-current-pro", display_name="Current Pro"
+                    ),
+                    SyncModelEntry(
+                        name="gemini-future-flash", display_name="Future Flash"
+                    ),
+                ],
+            )
+        assert existing.is_visible is auto_mode
+        assert insert_model.call_args.kwargs["is_visible"] is auto_mode
+
+    def test_vertex_discovery_preserves_models_absent_from_publisher_catalog(
+        self,
+    ) -> None:
+        existing = _make_existing_model(
+            "gemini-pinned-version", [LLMModelFlowType.CHAT]
+        )
+        existing.is_visible = True
+        provider = SimpleNamespace(
+            id=7,
+            provider=LlmProviderNames.VERTEX_AI,
+            is_auto_mode=True,
+            model_configurations=[existing],
+        )
+        with (
+            patch(
+                "onyx.db.llm.fetch_existing_llm_provider_by_id", return_value=provider
+            ),
+            patch("onyx.db.llm.insert_new_model_configuration__no_commit"),
+            patch("onyx.db.llm._update_default_model__no_commit") as change_default,
+        ):
+            sync_model_configurations(
+                MagicMock(),
+                7,
+                [
+                    SyncModelEntry(
+                        name="gemini-future-flash", display_name="Future Flash"
+                    )
+                ],
+            )
+        assert existing.is_visible is True
+        change_default.assert_not_called()
+
+    def test_vertex_visibility_is_not_replaced_by_static_recommendations(self) -> None:
+        from datetime import datetime
+
+        from onyx.llm.well_known_providers.auto_update_models import LLMRecommendations
+
+        provider = LLMProvider(
+            id=7, name="Gemini", provider=LlmProviderNames.VERTEX_AI, is_auto_mode=True
+        )
+        session = MagicMock()
+        result = sync_auto_mode_models(
+            session,
+            provider,
+            LLMRecommendations(version="test", updated_at=datetime.now(), providers={}),
+        )
+        assert result == 0
+        session.commit.assert_not_called()
 
     def test_inserts_new_models(self) -> None:
         """Test that new models are inserted."""

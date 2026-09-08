@@ -172,6 +172,20 @@ export interface BedrockFetchParams {
   provider_id?: number;
 }
 
+export interface VertexAIFetchParams {
+  provider_id?: number;
+  custom_config?: Record<string, string>;
+  signal?: AbortSignal;
+}
+
+export interface VertexModelResponse {
+  name: string;
+  display_name: string;
+  max_input_tokens: number | null;
+  supports_image_input: boolean;
+  supports_reasoning: boolean;
+}
+
 export interface OllamaFetchParams {
   api_base?: string;
   provider_id?: number;
@@ -262,10 +276,6 @@ export interface PortkeyModelResponse {
   max_input_tokens: number | null;
   supports_image_input: boolean;
   supports_reasoning: boolean;
-}
-
-export interface VertexAIFetchParams {
-  model_configurations?: ModelConfiguration[];
 }
 
 export interface LMStudioFetchParams {

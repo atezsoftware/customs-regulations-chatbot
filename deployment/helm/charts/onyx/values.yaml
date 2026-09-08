@@ -1488,6 +1488,15 @@ configMap:
   LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S: "60"
   LLM_FIRST_CHUNK_RETRY_JITTER_RATIO: "0.2"
   MAX_CHUNKS_FED_TO_CHAT: ""
+  # Optional comma-separated global Beat task allowlist. Leave unset for the full
+  # schedule; production-lite images provide their own recovery/model-update list.
+  # BEAT_TASK_ALLOWLIST: ""
+  # Auto model discovery interval in seconds.
+  # AUTO_LLM_UPDATE_INTERVAL_SECONDS: "1800"
+  # Amendment source extraction bounds (bytes, characters, minimum PDF text).
+  # MAX_AMENDMENT_SOURCE_BYTES: "26214400"
+  # MAX_AMENDMENT_SOURCE_TEXT_CHARS: "200000"
+  # MIN_AMENDMENT_PDF_TEXT_CHARS: "40"
   # Usage / cost accounting
   # Records priced generation spans into the per-user usage ledger (default on).
   # Set to "false" to disable the recording processor entirely.

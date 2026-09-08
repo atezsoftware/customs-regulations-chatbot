@@ -30,6 +30,7 @@ from onyx.db.llm import (
     fetch_user_group_ids,
     remove_llm_provider,
     sync_model_configurations,
+    sync_vertex_model_configurations,
     update_default_chat_naming_provider,
     update_default_provider,
     update_default_vision_provider,
@@ -108,6 +109,8 @@ from onyx.server.manage.llm.models import (
     PortkeyModelsRequest,
     SyncModelEntry,
     TestLLMRequest,
+    VertexModelResponse,
+    VertexModelsRequest,
     VisionProviderResponse,
 )
 from onyx.server.manage.llm.provider_cache import (
@@ -382,6 +385,71 @@ def _validate_and_normalize_vertex_auth(
     )
 
 
+@admin_router.post("/vertex-ai/available-models")
+def get_vertex_available_models(
+    request: VertexModelsRequest,
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> list[VertexModelResponse]:
+    from onyx.llm.well_known_providers.vertex_models import (
+        discover_vertex_models,
+        vertex_connection_settings,
+    )
+
+    custom_config = request.custom_config
+    saved_config: dict[str, str] | None = None
+    if request.provider_id is not None:
+        provider = fetch_existing_llm_provider_by_id(request.provider_id, db_session)
+        if provider is None:
+            raise OnyxError(OnyxErrorCode.NOT_FOUND, "LLM provider not found.")
+        if provider.provider != LlmProviderNames.VERTEX_AI:
+            raise OnyxError(
+                OnyxErrorCode.VALIDATION_ERROR,
+                "Provider is not a Vertex AI connection.",
+            )
+        saved_config = dict(provider.custom_config or {})
+        custom_config = (
+            provider.custom_config
+            if custom_config is None
+            else _restore_masked_custom_config_values(
+                provider.custom_config, custom_config
+            )
+        )
+
+    custom_config = (
+        _validate_and_normalize_vertex_auth(
+            LlmProviderNames.VERTEX_AI, custom_config or {}
+        )
+        or {}
+    )
+    models = discover_vertex_models(custom_config)
+    if (
+        request.provider_id is not None
+        and saved_config is not None
+        and vertex_connection_settings(custom_config)
+        == vertex_connection_settings(saved_config)
+    ):
+        added = sync_vertex_model_configurations(
+            db_session,
+            request.provider_id,
+            saved_config,
+            [
+                SyncModelEntry(
+                    name=model.name,
+                    display_name=model.display_name,
+                    max_input_tokens=model.max_input_tokens,
+                    supports_image_input=model.supports_image_input,
+                    supports_reasoning=model.supports_reasoning,
+                )
+                for model in models
+            ],
+            require_auto_mode=False,
+        )
+        if added is not None:
+            invalidate_provider_listing_cache()
+    return models
+
+
 @admin_router.get("/custom-provider-names")
 def fetch_custom_provider_names(
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
@@ -642,7 +710,21 @@ def put_llm_provider(
     # lifecycle afterward — adding new models, hiding removed ones, and
     # updating the default. This is safe even if sync fails: the provider
     # keeps its old models and default rather than losing them.
-    if transitioning_to_auto_mode and existing_provider:
+    vertex_auto_mode = (
+        llm_provider_upsert_request.provider == LlmProviderNames.VERTEX_AI
+        and llm_provider_upsert_request.is_auto_mode
+    )
+    if vertex_auto_mode and existing_provider:
+        # A modal opened before a scheduled discovery must not delete those models.
+        submitted_names = {
+            mc.name for mc in llm_provider_upsert_request.model_configurations
+        }
+        llm_provider_upsert_request.model_configurations.extend(
+            ModelConfigurationUpsertRequest.from_model(mc)
+            for mc in existing_provider.model_configurations
+            if mc.name not in submitted_names
+        )
+    elif transitioning_to_auto_mode and existing_provider:
         llm_provider_upsert_request.model_configurations = [
             ModelConfigurationUpsertRequest.from_model(mc)
             for mc in existing_provider.model_configurations
@@ -654,8 +736,31 @@ def put_llm_provider(
             db_session=db_session,
         )
 
-        # If newly enabling Auto mode, sync models immediately from GitHub config
-        if transitioning_to_auto_mode:
+        if vertex_auto_mode:
+            from onyx.llm.well_known_providers.vertex_models import (
+                discover_vertex_models,
+            )
+
+            try:
+                saved_config = dict(llm_provider_upsert_request.custom_config or {})
+                discovered = discover_vertex_models(saved_config)
+                sync_vertex_model_configurations(
+                    db_session,
+                    result.id,
+                    saved_config,
+                    [SyncModelEntry(**model.model_dump()) for model in discovered],
+                )
+            except Exception as exc:
+                db_session.rollback()
+                logger.warning(
+                    "Vertex discovery failed after saving provider id=%s (%s); retaining models",
+                    result.id,
+                    type(exc).__name__,
+                )
+            updated_provider = fetch_existing_llm_provider_by_id(result.id, db_session)
+            if updated_provider:
+                result = LLMProviderView.from_model(updated_provider)
+        elif transitioning_to_auto_mode:
             from onyx.db.llm import sync_auto_mode_models
 
             config = fetch_llm_recommendations_from_github()

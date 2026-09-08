@@ -754,7 +754,7 @@ repository tests. It must change with supervisor, Compose health, workflow readi
 
 <!-- production-lite-runtime-contract:start -->
 ```yaml
-supervisor_process_count: 8
+supervisor_process_count: 9
 workers:
   celery_worker_regulatory_benchmark:
     - regulatory_benchmark
@@ -773,6 +773,9 @@ workers:
     - checkpoint_cleanup
     - index_attempt_cleanup
     - chat_ttl_deletion
+    - llm_model_update
+  celery_worker_csv_generation:
+    - csv_generation
   celery_worker_monitoring:
     - monitoring
 scheduler:
@@ -798,6 +801,7 @@ user_file_recovery_scheduler:
     - check_for_user_file_processing
     - check_for_user_file_project_sync
     - check_for_user_file_delete
+    - check_for_auto_llm_update
   schedule_file: /app/beat-state/celerybeat-schedule
 forbidden_queues:
   - primary

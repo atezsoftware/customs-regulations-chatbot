@@ -192,6 +192,7 @@ def test_lite_global_and_regulatory_beat_schedules_do_not_overlap() -> None:
         OnyxCeleryTask.CHECK_FOR_USER_FILE_PROCESSING,
         OnyxCeleryTask.CHECK_FOR_USER_FILE_PROJECT_SYNC,
         OnyxCeleryTask.CHECK_FOR_USER_FILE_DELETE,
+        OnyxCeleryTask.CHECK_FOR_AUTO_LLM_UPDATE,
     }
     assert global_beat_tasks.isdisjoint(regulatory_beat_tasks)
 
@@ -889,6 +890,7 @@ def test_production_lite_health_requires_every_worker_including_regulatory_index
         "celery_worker_regulatory_indexing",
         "celery_worker_light",
         "celery_worker_monitoring",
+        "celery_worker_csv_generation",
         "celery_beat",
         "celery_beat_regulatory_indexing",
         "log-redirect-handler",
@@ -1241,13 +1243,14 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
     forbidden_queues = contract["forbidden_queues"]
     assert isinstance(forbidden_queues, list)
 
-    assert contract["supervisor_process_count"] == 8
+    assert contract["supervisor_process_count"] == 9
     assert set(workers) == {
         "celery_worker_regulatory_benchmark",
         "celery_worker_user_file_processing",
         "celery_worker_regulatory_indexing",
         "celery_worker_light",
         "celery_worker_monitoring",
+        "celery_worker_csv_generation",
     }
     assert workers["celery_worker_user_file_processing"] == [
         "user_file_processing",
@@ -1286,6 +1289,7 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
             "check_for_user_file_processing",
             "check_for_user_file_project_sync",
             "check_for_user_file_delete",
+            "check_for_auto_llm_update",
         ],
         "schedule_file": "/app/beat-state/celerybeat-schedule",
     }
@@ -1315,15 +1319,32 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         "log-redirect-handler",
     }
     for worker_name, documented_queues in workers.items():
+        assert isinstance(documented_queues, list)
         command = " ".join(parser.get(f"program:{worker_name}", "command").split())
+        if " -m onyx.background.celery.regulatory_worker " in command:
+            from onyx.background.celery import regulatory_worker
+
+            with (
+                patch.object(sys, "argv", shlex.split(command)[2:]),
+                patch.object(regulatory_worker.os, "execvp") as execvp,
+            ):
+                regulatory_worker.main()
+            command = " ".join(execvp.call_args.args[1])
         queue_match = re.search(r"(?:^|\s)-Q ([^\s]+)", command)
         assert queue_match is not None
-        assert queue_match.group(1).split(",") == documented_queues
+        from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
+
+        # The runbook names the base queue; the launcher applies deployment isolation.
+        expected_queues = [
+            REGULATORY_AMENDMENT_QUEUE if queue == "regulatory_amendment" else queue
+            for queue in documented_queues
+        ]
+        assert queue_match.group(1).split(",") == expected_queues
 
     handoff = _HANDOFF_PATH.read_text(encoding="utf-8")
     for process_name in supervisor_programs:
         assert f"`{process_name}`" in handoff
-    assert "tam olarak beş worker, iki ayrık Beat ve bir log yönlendirici" in handoff
+    assert "tam olarak altı worker, iki ayrık Beat ve bir log yönlendirici" in handoff
     assert "API ve background için birlikte `true`" in handoff
     assert "Admin’de seçili Vertex modelinin service-account JSON’u" in handoff
     assert "REGULATORY_INDEXING_GCS_URI" not in handoff

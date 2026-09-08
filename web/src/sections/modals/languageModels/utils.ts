@@ -15,6 +15,9 @@ function buildModelConfigurations(
   wellKnownLLMProvider?: WellKnownLLMProviderDescriptor
 ): ModelConfiguration[] {
   const existingModels = existingLlmProvider?.model_configurations ?? [];
+  if (existingLlmProvider?.provider === LLMProviderName.VERTEX_AI) {
+    return existingModels;
+  }
   const wellKnownModels = wellKnownLLMProvider?.known_models ?? [];
 
   const modelMap = new Map<string, ModelConfiguration>();

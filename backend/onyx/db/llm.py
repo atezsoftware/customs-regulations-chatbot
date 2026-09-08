@@ -379,7 +379,9 @@ def sync_model_configurations(
     Inserts NEW models and, for existing ones, adds any newly-reported capability
     flag (VISION/REASONING). Flags are only added, never removed; max_input_tokens
     is preserved. OpenRouter auto mode exposes its complete dynamic catalog;
-    visibility is otherwise preserved. Caveat: an admin-removed flow is re-added
+    Vertex auto mode exposes discovered models without retiring pinned versions
+    absent from Google's publisher catalog. Manual visibility is preserved.
+    Caveat: an admin-removed flow is re-added
     on the next sync (ENG-4233).
 
     Args:
@@ -397,6 +399,9 @@ def sync_model_configurations(
     existing_by_name = {mc.name: mc for mc in provider.model_configurations}
     show_dynamic_catalog = (
         provider.provider == LlmProviderNames.OPENROUTER and provider.is_auto_mode
+    )
+    show_discovered_models = show_dynamic_catalog or (
+        provider.provider == LlmProviderNames.VERTEX_AI and provider.is_auto_mode
     )
     discovered_model_names = {model.name for model in models}
     current_default = (
@@ -437,12 +442,16 @@ def sync_model_configurations(
                 llm_provider_id=provider.id,
                 model_name=model.name,
                 supported_flows=supported_flows,
-                is_visible=show_dynamic_catalog,
+                is_visible=show_discovered_models,
                 max_input_tokens=model.max_input_tokens,
                 display_name=model.display_name,
             )
             new_count += 1
             continue
+
+        if show_discovered_models and not existing.is_visible:
+            existing.is_visible = True
+            visibility_change_count += 1
 
         # Existing model: add newly-reported capability flags (additive only).
         # TODO(ENG-4233): durable admin flow removals; avoid per-model lazy-load.
@@ -482,6 +491,44 @@ def sync_model_configurations(
         db_session.commit()
 
     return new_count
+
+
+def sync_vertex_model_configurations(
+    db_session: Session,
+    provider_id: int,
+    expected_config: dict[str, str],
+    models: list[SyncModelEntry],
+    *,
+    require_auto_mode: bool = True,
+) -> int | None:
+    """Publish discovery only while the saved connection still matches its input."""
+    provider = db_session.scalar(
+        select(LLMProviderModel)
+        .where(LLMProviderModel.id == provider_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        provider is None
+        or provider.provider != LlmProviderNames.VERTEX_AI
+        or (provider.custom_config or {}) != expected_config
+        or (require_auto_mode and not provider.is_auto_mode)
+    ):
+        return None
+    added = sync_model_configurations(db_session, provider_id, models)
+    # Core inserts do not update already-loaded ORM relationships. The save API
+    # must return the same catalog that subsequent chat requests will receive.
+    db_session.scalar(
+        select(LLMProviderModel)
+        .where(LLMProviderModel.id == provider_id)
+        .options(
+            selectinload(LLMProviderModel.model_configurations).selectinload(
+                ModelConfiguration.llm_model_flows
+            )
+        )
+        .execution_options(populate_existing=True)
+    )
+    return added
 
 
 def fetch_existing_embedding_providers(
@@ -1157,6 +1204,11 @@ def sync_auto_mode_models(
     Returns:
         The number of changes made.
     """
+    # Google's live catalog owns Vertex discovery and visibility. A static
+    # recommendation refresh must not hide newly published Gemini models.
+    if provider.provider == LlmProviderNames.VERTEX_AI:
+        return 0
+
     changes = 0
     show_dynamic_catalog = (
         provider.provider == LlmProviderNames.OPENROUTER and provider.is_auto_mode

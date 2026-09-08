@@ -362,6 +362,19 @@ class LLMCost(BaseModel):
     cost: float
 
 
+class VertexModelsRequest(BaseModel):
+    provider_id: int | None = None
+    custom_config: dict[str, str] | None = None
+
+
+class VertexModelResponse(BaseModel):
+    name: str
+    display_name: str
+    max_input_tokens: int | None
+    supports_image_input: bool
+    supports_reasoning: bool
+
+
 class BedrockModelsRequest(BaseModel):
     aws_region_name: str
     aws_access_key_id: str | None = None

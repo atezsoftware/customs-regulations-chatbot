@@ -29,6 +29,7 @@ import { markdown } from "@opal/utils";
 import { getImageGenForm } from "@/views/admin/ImageGenerationPage/forms";
 import ProviderCard from "@/sections/admin/ProviderCard";
 import { getModelIcon } from "@/lib/languageModels";
+import { LLM_PROVIDER_REFRESH_OPTIONS } from "@/lib/languageModels/cache";
 
 const NO_DEFAULT_VALUE = "__none__";
 
@@ -39,7 +40,8 @@ export default function ImageGenerationContent() {
     mutate: refetchProviders,
   } = useSWR<LLMProviderResponse<LLMProviderView>>(
     SWR_KEYS.llmProvidersWithImageGen,
-    errorHandlingFetcher
+    errorHandlingFetcher,
+    LLM_PROVIDER_REFRESH_OPTIONS
   );
   const llmProviders = llmProviderResponse?.providers ?? [];
 

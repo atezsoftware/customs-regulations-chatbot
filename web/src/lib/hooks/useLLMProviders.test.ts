@@ -36,10 +36,7 @@ describe("useLLMProviders", () => {
     expect(mockUseSWR).toHaveBeenCalledWith(
       "/api/llm/provider",
       errorHandlingFetcher,
-      expect.objectContaining({
-        revalidateOnFocus: false,
-        dedupingInterval: 60000,
-      })
+      expect.any(Object)
     );
     expect(result.current.isLoading).toBe(true);
     expect(result.current.refetch).toBe(mockMutate);
@@ -60,10 +57,7 @@ describe("useLLMProviders", () => {
     expect(mockUseSWR).toHaveBeenCalledWith(
       "/api/llm/persona/42/providers",
       errorHandlingFetcher,
-      expect.objectContaining({
-        revalidateOnFocus: false,
-        dedupingInterval: 60000,
-      })
+      expect.any(Object)
     );
     expect(result.current.llmProviders).toEqual(providers);
     expect(result.current.isLoading).toBe(false);

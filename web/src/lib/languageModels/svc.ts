@@ -32,6 +32,8 @@ import {
   type NebiusTokenfactoryModelResponse,
   type PortkeyFetchParams,
   type PortkeyModelResponse,
+  type VertexAIFetchParams,
+  type VertexModelResponse,
 } from "@/lib/languageModels/types";
 
 /**
@@ -531,10 +533,48 @@ export const fetchLiteLLMProxyModels = async (
   }
 };
 
-/**
- * Fetches models for a provider. Accepts form values directly and maps them
- * to the expected fetch params format internally.
- */
+/** Discovers Vertex models using saved credentials or unsaved connection fields. */
+export async function fetchVertexModels(
+  params: VertexAIFetchParams
+): Promise<{ models: ModelConfiguration[]; error?: string }> {
+  try {
+    const response = await fetch("/api/admin/llm/vertex-ai/available-models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider_id: params.provider_id,
+        custom_config: params.custom_config,
+      }),
+      signal: params.signal,
+    });
+    if (!response.ok) {
+      const error: { detail?: string } = await response.json();
+      return {
+        models: [],
+        error: error.detail || "Failed to refresh Google models",
+      };
+    }
+    const data: VertexModelResponse[] = await response.json();
+    return {
+      models: data.map((model) => ({
+        ...model,
+        is_visible: false,
+        effectiveDisplayName: model.display_name || model.name,
+      })),
+    };
+  } catch (error) {
+    if (params.signal?.aborted) throw error;
+    return {
+      models: [],
+      error:
+        error instanceof Error
+          ? error.message
+          : "Failed to refresh Google models",
+    };
+  }
+}
+
+/** Fetches provider models by mapping form values to the discovery API parameters. */
 export const fetchModels = async (
   providerName: string,
   formValues: {
@@ -550,6 +590,12 @@ export const fetchModels = async (
   const customConfig = formValues.custom_config || {};
 
   switch (providerName) {
+    case LLMProviderName.VERTEX_AI:
+      return fetchVertexModels({
+        provider_id: formValues.id,
+        custom_config: formValues.custom_config,
+        signal,
+      });
     case LLMProviderName.BEDROCK:
       return fetchBedrockModels({
         aws_region_name: customConfig.AWS_REGION_NAME || "",

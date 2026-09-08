@@ -7,6 +7,7 @@ import { errorHandlingFetcher } from "@/lib/fetcher";
 import { SWR_KEYS } from "@/lib/swr-keys";
 import { isAuthPath } from "@/lib/auth/paths";
 import { useCurrentAgent } from "@/lib/agents/hooks";
+import { LLM_PROVIDER_REFRESH_OPTIONS } from "@/lib/languageModels/cache";
 import {
   LLMProviderDescriptor,
   LLMProviderName,
@@ -112,11 +113,6 @@ export function useLLMProviders(agentId?: number) {
       ? SWR_KEYS.llmProvidersForPersona(agentId)
       : SWR_KEYS.llmProviders;
 
-  // `revalidateIfStale` is intentionally left at its default (true), unlike
-  // `useAdminLLMProviders` below. Admin edits call `refreshLlmProviderCaches`,
-  // but agent-scoped keys are orphaned when that runs, so `mutate` on them
-  // is a no-op. Mount-time revalidation picks up the edits on next nav.
-  // `dedupingInterval: 60000` keeps this off the hot path.
   const {
     data: raw,
     error,
@@ -124,10 +120,7 @@ export function useLLMProviders(agentId?: number) {
   } = useSWR<LLMProviderResponse<RawLLMProviderDescriptor>>(
     url,
     errorHandlingFetcher,
-    {
-      revalidateOnFocus: false,
-      dedupingInterval: 60000,
-    }
+    LLM_PROVIDER_REFRESH_OPTIONS
   );
 
   const data = useMemo(
@@ -188,11 +181,7 @@ export function useAdminLLMProviders() {
   } = useSWR<LLMProviderResponse<RawLLMProviderView>>(
     SWR_KEYS.adminLlmProviders,
     errorHandlingFetcher,
-    {
-      revalidateOnFocus: false,
-      revalidateIfStale: false,
-      dedupingInterval: 60000,
-    }
+    LLM_PROVIDER_REFRESH_OPTIONS
   );
 
   const data = useMemo(

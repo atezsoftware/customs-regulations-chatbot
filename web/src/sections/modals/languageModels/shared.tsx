@@ -408,6 +408,8 @@ function RefetchButton({ onRefetch }: RefetchButtonProps) {
     <Button
       prominence="tertiary"
       icon={isFetching ? SvgSimpleLoader : SvgRefreshCw}
+      aria-label="Refresh models"
+      tooltip="Refresh models"
       onClick={async () => {
         abortRef.current?.abort();
         const controller = new AbortController();
@@ -574,6 +576,8 @@ function ModelRow({
 
 export interface ModelSelectionFieldProps {
   shouldShowAutoUpdateToggle: boolean;
+  /** Dynamic catalogs make every discovered model available in Auto mode. */
+  autoModeIncludesAllModels?: boolean;
   onRefetch?: (signal: AbortSignal) => Promise<void> | void;
   /** Called when the user adds a custom model by name. Enables the "Add Model" input. */
   onAddModel?: (modelName: string) => void;
@@ -582,6 +586,7 @@ export interface ModelSelectionFieldProps {
 }
 export function ModelSelectionField({
   shouldShowAutoUpdateToggle,
+  autoModeIncludesAllModels = false,
   onRefetch,
   onAddModel,
   emptyMessage,
@@ -634,7 +639,9 @@ export function ModelSelectionField({
     if (nextIsAutoMode) {
       formikProps.setFieldValue(
         "model_configurations",
-        originalModelsRef.current
+        autoModeIncludesAllModels
+          ? models.map((model) => ({ ...model, is_visible: true }))
+          : originalModelsRef.current
       );
     }
   }

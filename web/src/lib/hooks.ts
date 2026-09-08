@@ -18,6 +18,7 @@ import { DateRangePickerValue } from "@/components/dateRangeSelectors/AdminDateR
 import { SourceMetadata } from "./search/interfaces";
 import {
   getProviderOverrideForAgent,
+  getSelectableLlmProviders,
   parseLlmDescriptor,
   structureValue,
 } from "@/lib/languageModels/utils";
@@ -421,6 +422,7 @@ export function shouldClearManualLlmForSessionChange(
 
 export interface LlmManager {
   currentLlm: LlmDescriptor;
+  defaultText: DefaultModel | null;
   updateCurrentLlm: (newOverride: LlmDescriptor) => void;
   temperature: number;
   updateTemperature: (temperature: number) => void;
@@ -525,12 +527,16 @@ export function getValidLlmDescriptorForProviders(
   if (llmProviders === undefined || llmProviders === null) {
     return { name: "", provider: "", modelName: "" };
   }
+  const selectableProviders = getSelectableLlmProviders(
+    llmProviders,
+    defaultText
+  );
 
   if (modelName) {
     const model = parseLlmDescriptor(modelName);
     // If we have no parsed modelName, try to find the provider by the raw modelName string
     if (!(model.modelName && model.modelName.length > 0)) {
-      const provider = llmProviders.find((p) =>
+      const provider = selectableProviders.find((p) =>
         p.model_configurations
           .map((modelConfiguration) => modelConfiguration.name)
           .includes(modelName)
@@ -550,7 +556,7 @@ export function getValidLlmDescriptorForProviders(
     if (model.provider && model.provider.length > 0) {
       const hasModel = (p: LLMProviderDescriptor) =>
         p.model_configurations.some((mc) => mc.name === model.modelName);
-      const typeMatches = llmProviders.filter(
+      const typeMatches = selectableProviders.filter(
         (p) => p.provider === model.provider && hasModel(p)
       );
       const selectorMatches = typeMatches.filter((provider) => {
@@ -575,7 +581,7 @@ export function getValidLlmDescriptorForProviders(
       // Provider info was present but not found - fall through to default
     } else {
       // Only search by model name when no provider info was parsed
-      const provider = llmProviders.find((p) =>
+      const provider = selectableProviders.find((p) =>
         p.model_configurations
           .map((modelConfiguration) => modelConfiguration.name)
           .includes(model.modelName)
@@ -596,7 +602,7 @@ export function getValidLlmDescriptorForProviders(
   // Without this, a stale personal default (e.g. its provider was deleted)
   // would silently land on an arbitrary provider instead of the global default.
   return (
-    getDefaultLlmDescriptor(llmProviders, defaultText) ?? {
+    getDefaultLlmDescriptor(selectableProviders, defaultText) ?? {
       name: "",
       provider: "",
       modelName: "",
@@ -710,8 +716,12 @@ export function useLlmManager(
       resolved = manualLlm;
     } else if (userHasManuallyOverriddenLLM) {
       // Manual override wins over session's `current_alternate_model`.
-      // Cleared on cross-session navigation by the effect above.
-      resolved = manualLlm;
+      // Revalidate it when the catalog changes so removed models fall back.
+      resolved = getValidLlmDescriptorForProviders(
+        structureValue(manualLlm.name, manualLlm.provider, manualLlm.modelName),
+        llmProviders,
+        defaultText
+      );
     } else if (currentChatSession?.current_alternate_model) {
       resolved = getValidLlmDescriptorForProviders(
         currentChatSession.current_alternate_model,
@@ -971,6 +981,7 @@ export function useLlmManager(
   return {
     updateModelOverrideBasedOnChatSession,
     currentLlm,
+    defaultText,
     updateCurrentLlm,
     temperature,
     updateTemperature,

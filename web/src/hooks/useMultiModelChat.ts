@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import {
   MAX_MODELS,
   SelectedModel,
@@ -8,6 +8,7 @@ import {
 import { LLMOverride } from "@/app/app/services/lib";
 import { LlmManager } from "@/lib/hooks";
 import { buildLlmOptions, llmOptionKey } from "@/lib/languageModels/options";
+import { getSelectableLlmProviders } from "@/lib/languageModels/utils";
 
 export interface UseMultiModelChatReturn {
   /** Currently selected models for multi-model comparison. */
@@ -44,19 +45,21 @@ export default function useMultiModelChat(
 ): UseMultiModelChatReturn {
   const [selectedModels, setSelectedModels] = useState<SelectedModel[]>([]);
 
-  // Keep the current model in the option list even if `is_visible` is off
-  // (e.g. a stale admin/personal default pointing at a hidden model), so
-  // `currentLlmModel` below can still match it — mirrors ModelSelector's
-  // `currentModelName` param.
+  // Eligibility is tied to a provider/model identity; sharing a raw model
+  // name with the current selection does not make another hidden row valid.
   const llmOptions = useMemo(
     () =>
       llmManager.llmProviders
         ? buildLlmOptions(
-            llmManager.llmProviders,
-            llmManager.currentLlm.modelName
+            getSelectableLlmProviders(
+              llmManager.llmProviders,
+              llmManager.defaultText
+            ),
+            undefined,
+            true
           )
         : [],
-    [llmManager.llmProviders, llmManager.currentLlm.modelName]
+    [llmManager.llmProviders, llmManager.defaultText]
   );
 
   // In single-model mode, derive the displayed model directly from
@@ -86,27 +89,73 @@ export default function useMultiModelChat(
     };
   }, [llmOptions, llmManager.currentLlm]);
 
-  const isMultiModelActive = selectedModels.length > 1;
+  const reconcileModels = useCallback(
+    (models: SelectedModel[]): SelectedModel[] => {
+      if (llmManager.llmProviders === undefined) return models;
+      return models.flatMap((model) => {
+        const current = llmOptions.find((option) =>
+          model.modelConfigurationId != null
+            ? option.modelConfigurationId === model.modelConfigurationId
+            : option.name === model.name &&
+              option.provider === model.provider &&
+              option.modelName === model.modelName
+        );
+        return current
+          ? [
+              {
+                name: current.name,
+                provider: current.provider,
+                modelName: current.modelName,
+                modelConfigurationId: current.modelConfigurationId ?? null,
+                displayName: current.displayName,
+              },
+            ]
+          : [];
+      });
+    },
+    [llmOptions, llmManager.llmProviders]
+  );
+  const reconciledModels = useMemo(
+    () => reconcileModels(selectedModels),
+    [reconcileModels, selectedModels]
+  );
 
-  // Expose the effective selection: multi-model state when active,
-  // otherwise the single model derived from llmManager.
+  // Persist removals so a model that reappears is not silently reselected.
+  // If only one comparison model survives, make it the single-chat model too.
+  useEffect(() => {
+    if (reconciledModels.length === selectedModels.length) return;
+    if (selectedModels.length > 1 && reconciledModels.length === 1) {
+      const survivor = reconciledModels[0]!;
+      llmManager.updateCurrentLlm({
+        name: survivor.name,
+        provider: survivor.provider,
+        modelName: survivor.modelName,
+      });
+    }
+    setSelectedModels(reconciledModels);
+  }, [reconciledModels, selectedModels, llmManager]);
+
   const effectiveSelectedModels = useMemo(
     () =>
-      isMultiModelActive
-        ? selectedModels
+      selectedModels.length > 1 && reconciledModels.length > 0
+        ? reconciledModels
         : currentLlmModel
           ? [currentLlmModel]
           : [],
-    [isMultiModelActive, selectedModels, currentLlmModel]
+    [selectedModels.length, reconciledModels, currentLlmModel]
   );
+  const isMultiModelActive = effectiveSelectedModels.length > 1;
 
   const addModel = useCallback(
     (model: SelectedModel) => {
       setSelectedModels((prev) => {
-        // When in effective single-model mode (prev <= 1), always re-seed from
-        // the current derived model so stale state from a prior remove doesn't persist.
+        const available = reconcileModels(prev);
         const base =
-          prev.length <= 1 && currentLlmModel ? [currentLlmModel] : prev;
+          prev.length > 1 && available.length > 0
+            ? available
+            : currentLlmModel
+              ? [currentLlmModel]
+              : [];
         if (base.length >= MAX_MODELS) return base;
         if (base.some((m) => llmOptionKey(m) === llmOptionKey(model))) {
           return base;
@@ -114,12 +163,12 @@ export default function useMultiModelChat(
         return [...base, model];
       });
     },
-    [currentLlmModel]
+    [currentLlmModel, reconcileModels]
   );
 
   const removeModel = useCallback(
     (index: number) => {
-      const next = selectedModels.filter((_, i) => i !== index);
+      const next = effectiveSelectedModels.filter((_, i) => i !== index);
       // When dropping to single-model, switch llmManager to the surviving
       // model so it becomes the active model instead of reverting to the
       // user's default.
@@ -132,7 +181,7 @@ export default function useMultiModelChat(
       }
       setSelectedModels(next);
     },
-    [selectedModels, llmManager]
+    [effectiveSelectedModels, llmManager]
   );
 
   const replaceModel = useCallback(
@@ -147,21 +196,29 @@ export default function useMultiModelChat(
         });
         return;
       }
+      const target = effectiveSelectedModels[index];
+      if (!target) return;
       setSelectedModels((prev) => {
+        const available = reconcileModels(prev);
+        const targetIndex = available.findIndex(
+          (item) => llmOptionKey(item) === llmOptionKey(target)
+        );
+        if (targetIndex < 0) return available;
         // Don't replace with a model that's already selected elsewhere
         if (
-          prev.some(
-            (m, i) => i !== index && llmOptionKey(m) === llmOptionKey(model)
+          available.some(
+            (m, i) =>
+              i !== targetIndex && llmOptionKey(m) === llmOptionKey(model)
           )
         ) {
-          return prev;
+          return available;
         }
-        const next = [...prev];
-        next[index] = model;
+        const next = [...available];
+        next[targetIndex] = model;
         return next;
       });
     },
-    [isMultiModelActive, llmManager]
+    [isMultiModelActive, llmManager, effectiveSelectedModels, reconcileModels]
   );
 
   const clearModels = useCallback(() => {

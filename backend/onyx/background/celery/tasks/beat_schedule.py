@@ -6,7 +6,6 @@ from celery.schedules import crontab
 
 from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
 from onyx.configs.app_configs import (
-    AUTO_LLM_CONFIG_URL,
     AUTO_LLM_UPDATE_INTERVAL_SECONDS,
     BEAT_TASK_ALLOWLIST,
     DISABLE_ELASTICSEARCH_MIGRATION_TASK,
@@ -274,19 +273,19 @@ if ENTERPRISE_EDITION_ENABLED or _LICENSE_ENFORCEMENT_ENABLED:
         ]
     )
 
-# Add the Auto LLM update task if the config URL is set (has a default)
-if AUTO_LLM_CONFIG_URL:
-    beat_task_templates.append(
-        {
-            "name": "check-for-auto-llm-update",
-            "task": OnyxCeleryTask.CHECK_FOR_AUTO_LLM_UPDATE,
-            "schedule": timedelta(seconds=AUTO_LLM_UPDATE_INTERVAL_SECONDS),
-            "options": {
-                "priority": OnyxCeleryPriority.LOW,
-                "expires": BEAT_EXPIRES_DEFAULT,
-            },
-        }
-    )
+# Google discovery runs independently of the optional recommendation feed.
+beat_task_templates.append(
+    {
+        "name": "check-for-auto-llm-update",
+        "task": OnyxCeleryTask.CHECK_FOR_AUTO_LLM_UPDATE,
+        "schedule": timedelta(seconds=AUTO_LLM_UPDATE_INTERVAL_SECONDS),
+        "options": {
+            "priority": OnyxCeleryPriority.LOW,
+            "expires": BEAT_EXPIRES_DEFAULT,
+            "queue": OnyxCeleryQueues.LLM_MODEL_UPDATE,
+        },
+    }
+)
 
 # Add scheduled eval task if datasets are configured
 if SCHEDULED_EVAL_DATASET_NAMES:
