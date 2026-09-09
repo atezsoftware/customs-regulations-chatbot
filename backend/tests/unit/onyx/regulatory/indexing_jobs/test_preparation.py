@@ -389,6 +389,7 @@ MADDE 12 - (1) Transit rejiminde teminat aranır.
                 SimpleNamespace(
                     id=f"rc_{index}",
                     position=chunk.metadata.chunk_order,
+                    chunk_metadata=chunk.metadata.to_storage_dict(),
                     heading_path=list(chunk.metadata.heading_path),
                     validity_start_date=None,
                     validity_end_date=None,
@@ -440,6 +441,7 @@ def test_public_boundary_aggregates_same_file_documents_before_one_replacement(
                 SimpleNamespace(
                     id=f"rc_{index}",
                     position=chunk.metadata.chunk_order,
+                    chunk_metadata=chunk.metadata.to_storage_dict(),
                     heading_path=list(chunk.metadata.heading_path),
                     validity_start_date=None,
                     validity_end_date=None,
@@ -490,6 +492,7 @@ def test_legacy_chunker_keeps_different_user_files_as_separate_replacements(
                 SimpleNamespace(
                     id=f"{user_file_id}-{index}",
                     position=chunk.metadata.chunk_order,
+                    chunk_metadata=chunk.metadata.to_storage_dict(),
                     heading_path=list(chunk.metadata.heading_path),
                     validity_start_date=None,
                     validity_end_date=None,

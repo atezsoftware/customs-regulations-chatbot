@@ -283,6 +283,11 @@ class ChunkMetadata:
     appendix_label: str | None = None
     table_index: int | None = None
     table_row_index: int | None = None
+    image_file_id: str | None = None
+    image_file_ids: list[str] = field(default_factory=list)
+    source_links: dict[int, str] = field(default_factory=lambda: {0: ""})
+    source_asset_ids: list[str] = field(default_factory=list)
+    annex_element_ids: list[str] = field(default_factory=list)
     source_start_char: int = 0
     source_end_char: int = 0
     source_start_block: int = 0
@@ -315,6 +320,11 @@ class ChunkMetadata:
             "appendix_label": self.appendix_label,
             "table_index": self.table_index,
             "table_row_index": self.table_row_index,
+            "image_file_id": self.image_file_id,
+            "image_file_ids": self.image_file_ids,
+            "source_links": self.source_links,
+            "source_asset_ids": self.source_asset_ids,
+            "annex_element_ids": self.annex_element_ids,
         }
 
 

@@ -25,8 +25,10 @@ from onyx.llm.model_response import ModelResponse
 from onyx.llm.models import (
     AssistantMessage,
     ChatCompletionMessage,
+    ImageContentPart,
     ReasoningEffort,
     SystemMessage,
+    TextContentPart,
     UserMessage,
 )
 from onyx.llm.multi_llm import LLMRateLimitError, LLMTimeoutError
@@ -174,6 +176,7 @@ def generate_structured(
     system_prompt: str,
     user_prompt: str,
     response_model: type[ResponseModel],
+    image_parts: list[ImageContentPart] | None = None,
     timeout_override: int | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
@@ -217,7 +220,11 @@ def generate_structured(
 
     messages: list[ChatCompletionMessage] = [
         SystemMessage(content=full_system_prompt),
-        UserMessage(content=user_prompt),
+        UserMessage(
+            content=[TextContentPart(text=user_prompt), *image_parts]
+            if image_parts
+            else user_prompt
+        ),
     ]
 
     structured_response_format = {

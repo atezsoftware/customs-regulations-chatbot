@@ -21,7 +21,8 @@ from sqlalchemy import delete, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db.enums import RegulatoryChunkSource, RegulatoryChunkStatus
-from onyx.db.models import RegulatoryChunk, UserFile
+from onyx.db.models import RegulatoryAnnexElementChunk, RegulatoryChunk, UserFile
+from onyx.regulatory.chunk_evidence import RegulatoryChunkEvidence
 from onyx.regulatory.chunker import (
     ATOMIC_CHUNK_VARIANT,
     HIERARCHICAL_AGGREGATE_CHUNK_VARIANT,
@@ -2230,6 +2231,41 @@ def replace_indexed_chunks_for_file(
             .with_for_update()
         ).all()
     ]
+    if any(
+        state.source == RegulatoryChunkSource.AMENDMENT.value
+        or state.status == RegulatoryChunkStatus.SUPERSEDED.value
+        or state.supersedes_chunk_id is not None
+        or state.superseded_by_chunk_id is not None
+        for state in existing_states
+    ):
+        raise ValueError(
+            "Versioned regulatory rows require canonical re-projection, not raw re-chunking"
+        )
+    linked = db_session.scalar(
+        select(RegulatoryAnnexElementChunk.chunk_id)
+        .join(RegulatoryChunk)
+        .where(RegulatoryChunk.user_file_id == user_file_id)
+        .limit(1)
+    )
+    if isinstance(linked, str):
+        raise ValueError(
+            "Annex-linked regulatory rows require canonical re-projection, not raw re-chunking"
+        )
+    existing_evidence = {
+        row["id"]: row["chunk_metadata"]
+        for row in db_session.execute(
+            select(RegulatoryChunk.id, RegulatoryChunk.chunk_metadata).where(
+                RegulatoryChunk.user_file_id == user_file_id
+            )
+        ).mappings()
+    }
+    if any(
+        metadata.get("chunk_variant") == "image_companion"
+        for metadata in existing_evidence.values()
+    ):
+        raise ValueError(
+            "Image companion rows require canonical re-projection, not raw re-chunking"
+        )
     inherited_window = common_reindex_validity_window(existing_states)
 
     db_session.execute(
@@ -2251,6 +2287,15 @@ def replace_indexed_chunks_for_file(
     for chunk in chunker_chunks:
         meta = chunk.metadata
         stored_metadata = meta.to_storage_dict()
+        previous_metadata = existing_evidence.get(
+            chunk_id_by_order[meta.chunk_order], {}
+        )
+        for key in RegulatoryChunkEvidence.model_fields:
+            if (
+                stored_metadata.get(key) in (None, [], {}, {0: ""})
+                and previous_metadata.get(key) is not None
+            ):
+                stored_metadata[key] = previous_metadata[key]
         source_regulatory_chunk_ids: list[str] = []
         if meta.chunk_variant == HIERARCHICAL_AGGREGATE_CHUNK_VARIANT:
             for source_order in meta.source_chunk_orders:

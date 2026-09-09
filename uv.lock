@@ -4461,6 +4461,7 @@ backend-runtime = [
     { name = "pycryptodome" },
     { name = "pygithub" },
     { name = "pypdf" },
+    { name = "pypdfium2" },
     { name = "python-dateutil" },
     { name = "python-docx" },
     { name = "python-dotenv" },
@@ -4532,7 +4533,6 @@ dev = [
 ]
 document-import = [
     { name = "markitdown", extra = ["docx", "pdf", "pptx", "xls", "xlsx"] },
-    { name = "pypdfium2" },
     { name = "unstructured" },
     { name = "unstructured-client" },
 ]
@@ -4734,6 +4734,7 @@ backend-runtime = [
     { name = "pycryptodome", specifier = "==3.19.1" },
     { name = "pygithub", specifier = "==2.5.0" },
     { name = "pypdf", specifier = "==6.14.2" },
+    { name = "pypdfium2", specifier = "==5.9.0" },
     { name = "python-dateutil", specifier = "==2.9.0.post0" },
     { name = "python-docx", specifier = "==1.1.2" },
     { name = "python-dotenv", specifier = "==1.2.2" },
@@ -4803,7 +4804,6 @@ dev = [
 ]
 document-import = [
     { name = "markitdown", extras = ["pdf", "docx", "pptx", "xlsx", "xls"], specifier = "==0.1.2" },
-    { name = "pypdfium2", specifier = "==5.9.0" },
     { name = "unstructured", specifier = "==0.18.27" },
     { name = "unstructured-client", specifier = "==0.42.6" },
 ]

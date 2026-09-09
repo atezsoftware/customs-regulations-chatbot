@@ -1598,7 +1598,9 @@ def test_submission_external_lease_prevents_stale_recovery_during_create(
                 assert release.wait(timeout=5)
                 lease.commit()
 
-    future_time = _NOW + datetime.timedelta(days=1)
+    future_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        days=1
+    )
     with ThreadPoolExecutor(max_workers=1) as executor:
         held = executor.submit(hold_create_lease)
         assert entered.wait(timeout=5)

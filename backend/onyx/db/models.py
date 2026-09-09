@@ -8222,3 +8222,108 @@ class RegulatorySourceAsset(Base):
             name="regulatory_source_asset_size_check",
         ),
     )
+
+
+class RegulatoryAnnex(Base):
+    __tablename__ = "regulatory_annex"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="CASCADE")
+    )
+    user_file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_file.id", ondelete="CASCADE")
+    )
+    label: Mapped[str] = mapped_column(Text)
+    latest_approved_revision_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "document_set_id", "user_file_id", "label", name="uq_regulatory_annex_scope"
+        ),
+    )
+
+
+class RegulatoryAnnexRevision(Base):
+    __tablename__ = "regulatory_annex_revision"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    annex_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_annex.id", ondelete="CASCADE")
+    )
+    predecessor_revision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("regulatory_annex_revision.id"), nullable=True
+    )
+    source_asset_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("regulatory_source_asset.id"), nullable=True
+    )
+    baseline_sha256: Mapped[str] = mapped_column(Text)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    effective_start: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    effective_end: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    approved_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "annex_id", "baseline_sha256", name="uq_annex_revision_baseline"
+        ),
+        CheckConstraint(
+            "effective_end IS NULL OR effective_start IS NULL OR effective_end > effective_start",
+            name="annex_revision_dates_check",
+        ),
+        Index(
+            "ix_annex_revision_effective",
+            "annex_id",
+            "effective_start",
+            "effective_end",
+        ),
+    )
+
+
+class RegulatoryAnnexElement(Base):
+    """Identity only: content and location belong to the revision element."""
+
+    __tablename__ = "regulatory_annex_element"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    annex_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_annex.id", ondelete="CASCADE")
+    )
+
+
+class RegulatoryAnnexRevisionElement(Base):
+    __tablename__ = "regulatory_annex_revision_element"
+    revision_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_annex_revision.id", ondelete="CASCADE"), primary_key=True
+    )
+    element_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_annex_element.id", ondelete="CASCADE"), primary_key=True
+    )
+    position: Mapped[int] = mapped_column(Integer)
+    payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    __table_args__ = (
+        UniqueConstraint(
+            "revision_id", "position", name="uq_annex_revision_element_position"
+        ),
+    )
+
+
+class RegulatoryAnnexElementChunk(Base):
+    __tablename__ = "regulatory_annex_element_chunk"
+    revision_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    element_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    chunk_id: Mapped[str] = mapped_column(
+        ForeignKey("regulatory_chunk.id", ondelete="CASCADE"), primary_key=True
+    )
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["revision_id", "element_id"],
+            [
+                "regulatory_annex_revision_element.revision_id",
+                "regulatory_annex_revision_element.element_id",
+            ],
+            ondelete="CASCADE",
+        ),
+    )

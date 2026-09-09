@@ -6,6 +6,7 @@ Uses subprocess, not multiprocessing: the indexing worker is a daemon process, a
 daemons can't have multiprocessing children.
 """
 
+import os
 import pickle
 import signal
 import subprocess
@@ -61,6 +62,7 @@ def run_in_isolated_process(
         result = subprocess.run(
             [sys.executable, "-m", _RUNNER_MODULE],
             input=request,
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=timeout,

@@ -203,7 +203,7 @@ def test_replace_indexed_chunks_preserves_uniform_file_window() -> None:
     assert all(row.validity_start_date == datetime.date(2025, 1, 1) for row in rows)
     assert all(row.validity_end_date is None for row in rows)
     assert db_session.add.call_count == len(rows)
-    assert db_session.execute.call_count == 2
+    assert db_session.execute.call_count == 3
 
 
 def test_first_index_and_mixed_reindex_leave_new_rows_unbounded() -> None:

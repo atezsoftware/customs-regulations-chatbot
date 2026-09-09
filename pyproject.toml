@@ -28,6 +28,7 @@ dependencies = [
 # API/chat/search runtime. Document ingestion and browser automation are kept
 # in opt-in groups so production can ship a materially smaller image.
 backend-runtime = [
+    "pypdfium2==5.9.0",
     "aiohttp==3.14.1",
     "alembic==1.18.4",
     "asyncpg==0.30.0",
@@ -134,7 +135,6 @@ document-import = [
     # backend/onyx/file_processing/extract_file_text.py and what impacts
     # updating might have on this behavior.
     "markitdown[pdf, docx, pptx, xlsx, xls]==0.1.2",
-    "pypdfium2==5.9.0",
     "unstructured==0.18.27",
     "unstructured-client==0.42.6",
 ]

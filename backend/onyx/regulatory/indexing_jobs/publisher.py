@@ -44,6 +44,7 @@ from onyx.indexing.models import (
     DocMetadataAwareIndexChunk,
     IndexChunk,
 )
+from onyx.regulatory.chunk_evidence import chunk_evidence
 from onyx.regulatory.heading_path import normalize_regulatory_heading_path
 from onyx.regulatory.indexing_jobs.models import (
     IndexingPublicationIndeterminateError,
@@ -227,8 +228,8 @@ def _build_hidden_chunks(
             chunk_id=chunk_id,
             blurb=row.text,
             content=row.text,
-            source_links={0: ""},
-            image_file_id=None,
+            source_links=chunk_evidence(row.chunk_metadata).source_links,
+            image_file_id=chunk_evidence(row.chunk_metadata).image_file_id,
             section_continuation=False,
             title_prefix="",
             metadata_suffix_semantic="",

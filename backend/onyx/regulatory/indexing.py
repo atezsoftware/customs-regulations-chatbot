@@ -14,6 +14,7 @@ of the indexing bookkeeping.
 """
 
 from collections.abc import Sequence
+from dataclasses import replace
 from uuid import UUID
 
 from chonkie import SentenceChunker
@@ -27,6 +28,7 @@ from onyx.indexing.chunking import extract_blurb
 from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.indexing.models import DocAwareChunk
 from onyx.natural_language_processing.utils import BaseTokenizer
+from onyx.regulatory.chunk_evidence import chunk_evidence
 from onyx.regulatory.chunker import ChunkedDocument, RegulatoryChunker
 from onyx.regulatory.contextual import (
     MIN_CONTEXTUAL_RAG_RESERVED_TOKENS,
@@ -173,8 +175,48 @@ class RegulatoryIndexingChunker:
                 "RegulatoryChunker warning for user_file=%s: %s", user_file_id, warning
             )
 
+        linked_chunks = []
+        sections = document.processed_sections or document.sections
+        offsets: list[tuple[int, int, str | None, str | None]] = []
+        cursor = 0
+        for section in sections:
+            section_text = (section.text or "").strip()
+            if section_text:
+                offsets.append(
+                    (
+                        cursor,
+                        cursor + len(section_text),
+                        section.image_file_id,
+                        section.link,
+                    )
+                )
+                cursor += len(section_text) + 2
+        for chunk in chunked.chunks:
+            overlapping = [
+                item
+                for item in offsets
+                if item[0] < chunk.metadata.source_end_char
+                and item[1] > chunk.metadata.source_start_char
+            ]
+            image_ids = {item[2] for item in overlapping if item[2]}
+            links = {
+                max(0, start - chunk.metadata.source_start_char): link
+                for start, _end, _image, link in overlapping
+                if link
+            }
+            linked_chunks.append(
+                replace(
+                    chunk,
+                    metadata=replace(
+                        chunk.metadata,
+                        image_file_id=sorted(image_ids)[0] if image_ids else None,
+                        image_file_ids=sorted(image_ids),
+                        source_links=links or {0: ""},
+                    ),
+                )
+            )
         rows = replace_indexed_chunks_for_file(
-            self.db_session, user_file_id, chunked.chunks
+            self.db_session, user_file_id, linked_chunks
         )
         # Assign ids before the session commits so the emitted DocAwareChunks
         # can reference them.
@@ -192,8 +234,8 @@ class RegulatoryIndexingChunker:
                     chunk_id=row.position,
                     blurb=extract_blurb(chunk.text, self._blurb_splitter),
                     content=chunk.text,
-                    source_links={0: ""},
-                    image_file_id=None,
+                    source_links=chunk_evidence(row.chunk_metadata).source_links,
+                    image_file_id=chunk_evidence(row.chunk_metadata).image_file_id,
                     section_continuation=False,
                     title_prefix="",
                     metadata_suffix_semantic="",

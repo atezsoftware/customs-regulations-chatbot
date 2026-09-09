@@ -683,3 +683,43 @@ def test_projection_and_context_repair_legacy_article_metadata_lineage() -> None
         "Belge > Teminatlar > MADDE 75 > 2. Kapsamlı teminatın tutarı\n"
         "2. Kapsamlı teminatın tutarı:"
     )
+
+
+def test_projection_preserves_image_and_source_links() -> None:
+    from chonkie import SentenceChunker
+
+    from onyx.configs.constants import DocumentSource
+    from onyx.connectors.models import Document, TextSection
+
+    row = RegulatoryChunk(
+        id="image-row",
+        user_file_id=uuid4(),
+        text="Approved image transcript",
+        position=0,
+        projection_ordinal=0,
+        heading_path=["EK-1"],
+        chunk_type="image",
+        chunk_metadata={
+            "image_file_id": "original-image",
+            "source_links": {"0": "https://example.gov/annex"},
+        },
+    )
+    document = Document(
+        id=str(row.user_file_id),
+        source=DocumentSource.USER_FILE,
+        metadata={},
+        semantic_identifier="Annex",
+        sections=[TextSection(text=row.text, link=None)],
+    )
+    chunks = _rows_to_doc_aware_chunks(
+        document,
+        [row],
+        SentenceChunker(
+            tokenizer_or_token_counter=lambda text: len(text.split()),
+            chunk_size=100,
+            chunk_overlap=0,
+            return_type="texts",
+        ),
+    )
+    assert chunks[0].image_file_id == "original-image"
+    assert chunks[0].source_links == {0: "https://example.gov/annex"}

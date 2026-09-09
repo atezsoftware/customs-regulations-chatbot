@@ -1052,6 +1052,13 @@ def approve_amendment_proposal(
             )
 
     new_chunk_metadata = dict(draft.get("metadata") or {})
+    # Model-authored references do not grant access to source images or elements.
+    from onyx.regulatory.chunk_evidence import RegulatoryChunkEvidence
+
+    for key in RegulatoryChunkEvidence.model_fields:
+        new_chunk_metadata.pop(key, None)
+        if old_chunk is not None and key in old_chunk.chunk_metadata:
+            new_chunk_metadata[key] = old_chunk.chunk_metadata[key]
     new_chunk_metadata.setdefault("chunk_variant", ATOMIC_CHUNK_VARIANT)
     new_chunk_metadata.setdefault("source_chunk_orders", [])
     new_chunk_metadata.setdefault("source_regulatory_chunk_ids", [])
@@ -1084,6 +1091,11 @@ def approve_amendment_proposal(
     db_session.flush()
 
     if old_chunk is not None:
+        from onyx.db.regulatory_annexes import copy_annex_chunk_links
+
+        copy_annex_chunk_links(
+            db_session, old_chunk_id=old_chunk.id, new_chunk_id=new_chunk.id
+        )
         supersede_hierarchical_aggregates_referencing_chunk(
             db_session,
             user_file_id=user_file_id,

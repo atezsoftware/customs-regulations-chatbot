@@ -1205,3 +1205,27 @@ def test_elasticsearch_mget_parser_correlates_out_of_order_chunks() -> None:
             for chunk_id in chunk_ids
         ],
     )
+
+
+def test_hidden_projection_preserves_original_image_and_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job, user_file, settings, rows, items = _fixture()
+    rows[0].chunk_metadata = {
+        **rows[0].chunk_metadata,
+        "image_file_id": "old-image",
+        "source_links": {"0": "https://example.gov/annex"},
+    }
+    _install_metadata(monkeypatch, job, user_file, settings, rows, items)
+    index = _RecordingDocumentIndex([])
+    _stage(
+        job=job,
+        user_file=user_file,
+        settings=settings,
+        rows=rows,
+        items=items,
+        document_index=index,
+    )
+    chunk = index.index_calls[0][0][0]
+    assert chunk.image_file_id == "old-image"
+    assert chunk.source_links == {0: "https://example.gov/annex"}

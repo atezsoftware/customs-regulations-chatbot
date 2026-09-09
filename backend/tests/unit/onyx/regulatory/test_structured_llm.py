@@ -274,3 +274,32 @@ def test_generate_structured_sends_portable_provider_schema() -> None:
     ):
         assert unsupported_key not in serialized_schema
     assert provider_schema["properties"]["values"]["minItems"] == 1
+
+
+def test_structured_image_parts_survive_validation_retry() -> None:
+    from onyx.llm.models import ImageContentPart, ImageUrlDetail
+
+    llm = MagicMock()
+    llm.invoke.side_effect = [_response('{"wrong":1}'), _response('{"value":"ok"}')]
+    part = ImageContentPart(
+        image_url=ImageUrlDetail(url="data:image/png;base64,aGVsbG8=")
+    )
+    with (
+        patch(
+            "onyx.regulatory.structured_llm.llm_generation_span",
+            return_value=nullcontext(MagicMock()),
+        ),
+        patch("onyx.regulatory.structured_llm.record_llm_response"),
+    ):
+        result = generate_structured(
+            llm,
+            flow=LLMFlow.REGULATORY_ANSWER_AUDIT,
+            system_prompt="Extract",
+            user_prompt="Evidence",
+            image_parts=[part],
+            response_model=_TinyResult,
+        )
+    assert result.value == "ok"
+    for call in llm.invoke.call_args_list:
+        assert call.args[0][1].content[1] == part
+        assert call.args[0][1].content[0].text == "Evidence"

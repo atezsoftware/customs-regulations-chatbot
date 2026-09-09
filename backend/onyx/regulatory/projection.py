@@ -49,6 +49,7 @@ from onyx.indexing.models import DocAwareChunk, DocMetadataAwareIndexChunk, Inde
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.interfaces import LLM
 from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
+from onyx.regulatory.chunk_evidence import chunk_evidence
 from onyx.regulatory.contextual import (
     context_reference_date,
     contextual_reserve_for_embedding_text,
@@ -105,8 +106,8 @@ def _rows_to_doc_aware_chunks(
             chunk_id=row.projection_ordinal,
             blurb=extract_blurb(row.text, blurb_splitter),
             content=row.text,
-            source_links={0: ""},
-            image_file_id=None,
+            source_links=chunk_evidence(row.chunk_metadata).source_links,
+            image_file_id=chunk_evidence(row.chunk_metadata).image_file_id,
             section_continuation=False,
             title_prefix="",
             metadata_suffix_semantic="",
