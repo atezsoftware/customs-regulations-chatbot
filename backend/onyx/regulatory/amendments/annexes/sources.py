@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from urllib.parse import urldefrag, urljoin, urlsplit
+from xml.etree.ElementTree import Element
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -187,11 +188,31 @@ def _detect_mime(content: bytes, declared: str | None) -> str:
         detected = mime
     if detected is None:
         raise SourceAcquisitionError("unsupported_format")
+    _validate_occurrence_mime(detected, declared)
+    return detected
+
+
+def _validate_occurrence_mime(
+    detected: str, declared: str | None, name: str = ""
+) -> None:
+    mime = (declared or "").split(";", 1)[0].strip().lower()
     if mime not in ("", "application/octet-stream", detected) and not (
         detected == "text/html" and mime == "application/xhtml+xml"
     ):
         raise SourceAcquisitionError("mime_mismatch")
-    return detected
+    expected_mime = {
+        ".pdf": "application/pdf",
+        ".docx": _DOCX_MIME,
+        ".xlsx": _XLSX_MIME,
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+    }.get(Path(name).suffix.lower())
+    if expected_mime and expected_mime != detected:
+        raise SourceAcquisitionError("mime_mismatch")
 
 
 def _inspect_html(content: bytes, mime: str) -> SourceInspection:
@@ -381,6 +402,53 @@ def _inspect_pdf(content: bytes) -> SourceInspection:
     )
 
 
+@dataclass(frozen=True)
+class _OfficeReference:
+    label: str
+    context: str
+    position: int
+
+
+def _office_relationship_references(root: Element) -> dict[str, list[_OfficeReference]]:
+    parents = {child: parent for parent in root.iter() for child in parent}
+    references: dict[str, list[_OfficeReference]] = {}
+    heading = ""
+    relationship_namespace = (
+        "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    )
+    word_namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    for position, element in enumerate(root.iter()):
+        if element.tag == f"{word_namespace}p":
+            style = element.find(f"{word_namespace}pPr/{word_namespace}pStyle")
+            if style is not None and re.fullmatch(
+                "Heading[1-9]", style.get(f"{word_namespace}val", ""), re.I
+            ):
+                heading = " ".join(element.itertext())[:4096]
+        relation_ids = [
+            value
+            for key, value in element.attrib.items()
+            if key.startswith(relationship_namespace)
+        ]
+        if not relation_ids:
+            continue
+        context = [heading]
+        ancestor: Element | None = element
+        for _ in range(32):
+            if ancestor is None:
+                break
+            if ancestor.tag.rsplit("}", 1)[-1] in ("p", "tc", "c"):
+                context.append(" ".join(ancestor.itertext())[:4096])
+            ancestor = parents.get(ancestor)
+        reference = _OfficeReference(
+            label=" ".join(element.itertext()),
+            context=" ".join(context),
+            position=position,
+        )
+        for relation_id in relation_ids:
+            references.setdefault(relation_id, []).append(reference)
+    return references
+
+
 def _inspect_office(content: bytes, mime: str) -> SourceInspection:
     texts: list[str] = []
     links: list[DiscoveredLink] = []
@@ -399,41 +467,41 @@ def _inspect_office(content: bytes, mime: str) -> SourceInspection:
             if rel_path not in names:
                 continue
             relationships = ElementTree.fromstring(archive.read(rel_path))
+            references = _office_relationship_references(root)
             for relation in relationships:
                 rel_id, target = relation.get("Id", ""), relation.get("Target", "")
-                contexts = []
-                for element in root.iter():
-                    if rel_id in element.attrib.values():
-                        contexts.append(" ".join(element.itertext()))
-                label = " ".join(contexts)
-                if not _ANNEX.search(label + " " + target):
-                    continue
-                if relation.get("TargetMode") == "External":
-                    links.append(
-                        DiscoveredLink(
-                            kind="url",
-                            target=target,
-                            label=label,
-                            source_field=f"{part}:{rel_id}",
+                for reference in references.get(rel_id, []):
+                    label = reference.label
+                    if not _ANNEX.search(
+                        label + " " + reference.context + " " + target
+                    ):
+                        continue
+                    if relation.get("TargetMode") == "External":
+                        links.append(
+                            DiscoveredLink(
+                                kind="url",
+                                target=target,
+                                label=label,
+                                source_field=f"{part}:{rel_id}:{reference.position}",
+                            )
                         )
-                    )
-                else:
-                    from posixpath import normpath
+                    else:
+                        from posixpath import normpath
 
-                    embedded_path = normpath(str(Path(part).parent / target))
-                    if embedded_path not in names:
-                        raise SourceAcquisitionError("missing_embedded_source")
-                    links.append(
-                        DiscoveredLink(
-                            kind="embedded",
-                            target=embedded_path,
-                            label=label,
-                            source_field=f"{part}:{rel_id}",
-                            embedded_base64=base64.b64encode(
-                                archive.read(embedded_path)
-                            ).decode(),
+                        embedded_path = normpath(str(Path(part).parent / target))
+                        if embedded_path not in names:
+                            raise SourceAcquisitionError("missing_embedded_source")
+                        links.append(
+                            DiscoveredLink(
+                                kind="embedded",
+                                target=embedded_path,
+                                label=label,
+                                source_field=f"{part}:{rel_id}:{reference.position}",
+                                embedded_base64=base64.b64encode(
+                                    archive.read(embedded_path)
+                                ).decode(),
+                            )
                         )
-                    )
     return SourceInspection(mime_type=mime, text="\n".join(texts), links=links)
 
 
@@ -504,7 +572,7 @@ def acquire_source_package(
     )
     result = AcquisitionResult(status="processing")
     by_hash: dict[str, AcquiredAsset] = {}
-    by_url: dict[str, str] = {}
+    by_url: dict[str, tuple[str, str | None]] = {}
     inspections: dict[str, SourceInspection] = {}
     expanded: set[tuple[str, str | None]] = set()
     pending: deque[
@@ -516,10 +584,14 @@ def acquire_source_package(
         try:
             if time.monotonic() >= deadline:
                 raise SourceAcquisitionError("time_limit")
-            if address in by_url:
+            if address is not None and address in by_url:
+                cached_hash, cached_final_url = by_url[address]
+                _validate_occurrence_mime(
+                    inspections[cached_hash].mime_type, None, name
+                )
                 if relation is not None:
-                    relation.target_asset_hash = by_url[address]
-                    relation.final_url = by_hash[by_url[address]].final_url
+                    relation.target_asset_hash = cached_hash
+                    relation.final_url = cached_final_url
                 continue
             if depth > MAX_LINK_DEPTH:
                 raise SourceAcquisitionError("depth_limit")
@@ -533,30 +605,21 @@ def acquire_source_package(
                     downloaded.mime_type,
                     downloaded.final_url,
                 )
+            if relation is not None:
+                relation.final_url = final_url
             if len(payload) > MAX_ASSET_BYTES:
                 raise SourceAcquisitionError("asset_byte_limit")
             digest = hashlib.sha256(payload).hexdigest()
             total += len(payload)
             if total > MAX_PACKAGE_BYTES:
                 raise SourceAcquisitionError("package_byte_limit")
+            if digest not in inspections:
+                inspections[digest] = _bounded_inspect(payload, declared, deadline)
+            inspection = inspections[digest]
+            _validate_occurrence_mime(inspection.mime_type, declared, name)
             if digest not in by_hash:
                 if len(by_hash) >= MAX_ANNEX_ASSETS + 1:
                     raise SourceAcquisitionError("asset_count_limit")
-                inspection = _bounded_inspect(payload, declared, deadline)
-                inspections[digest] = inspection
-                expected_mime = {
-                    ".pdf": "application/pdf",
-                    ".docx": _DOCX_MIME,
-                    ".xlsx": _XLSX_MIME,
-                    ".png": "image/png",
-                    ".jpg": "image/jpeg",
-                    ".jpeg": "image/jpeg",
-                    ".webp": "image/webp",
-                    ".tif": "image/tiff",
-                    ".tiff": "image/tiff",
-                }.get(Path(name).suffix.lower())
-                if expected_mime and expected_mime != inspection.mime_type:
-                    raise SourceAcquisitionError("mime_mismatch")
                 asset = AcquiredAsset(
                     sha256=digest,
                     content=payload,
@@ -574,6 +637,7 @@ def acquire_source_package(
                     if len(result.links) >= MAX_RELATIONSHIPS:
                         raise SourceAcquisitionError("relationship_limit")
                     link = SourceLink(
+                        parent_url=final_url,
                         parent_asset_hash=digest,
                         source_page=discovered.source_page,
                         source_field=discovered.source_field,
@@ -620,6 +684,7 @@ def acquire_source_package(
                         )
                         continue
                     target = urldefrag(target)[0]
+                    link.requested_url = target
                     pending.append(
                         (
                             target,
@@ -631,9 +696,9 @@ def acquire_source_package(
                         )
                     )
             if address:
-                by_url[address] = digest
+                by_url[address] = (digest, final_url)
             if final_url:
-                by_url[final_url] = digest
+                by_url[final_url] = (digest, final_url)
             if relation:
                 relation.target_asset_hash = digest
                 relation.final_url = final_url

@@ -12,6 +12,8 @@ class SourceIssue(BaseModel):
 
 
 class SourceLink(BaseModel):
+    parent_url: str | None = None
+    requested_url: str | None = None
     parent_asset_hash: str
     target_asset_hash: str | None = None
     source_page: int | None = None

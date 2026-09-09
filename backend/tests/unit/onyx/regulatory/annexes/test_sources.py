@@ -464,3 +464,105 @@ def test_identical_html_at_distinct_bases_preserves_each_relative_annex() -> Non
     assert result.status == "ready"
     assert not fixtures
     assert len(result.assets) == 3
+
+
+@pytest.mark.parametrize(
+    "extension, declared", [("pdf", "text/html"), ("html", "application/pdf")]
+)
+def test_duplicate_bytes_do_not_bypass_occurrence_mime_validation(
+    extension: str, declared: str
+) -> None:
+    from onyx.regulatory.amendments.annexes.sources import (
+        DownloadedSource,
+        acquire_source_package,
+    )
+
+    root = f'<main><a href="https://example.gov/annex.{extension}">Annex</a></main>'.encode()
+    result = acquire_source_package(
+        content=root,
+        mime_type="text/html",
+        fetch=lambda url: DownloadedSource(root, declared, url),
+    )
+    assert result.status == "partial"
+    assert result.issues[0].code == "mime_mismatch"
+    assert result.links[0].target_asset_hash is None
+
+
+@pytest.mark.parametrize("context", ["paragraph", "heading", "cell"])
+def test_docx_annex_context_keeps_generic_link_label_and_ignores_unrelated_links(
+    context: str,
+) -> None:
+    from docx import Document
+    from docx.opc.constants import RELATIONSHIP_TYPE
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    from onyx.regulatory.amendments.annexes.sources import (
+        DownloadedSource,
+        acquire_source_package,
+    )
+
+    document = Document()
+    if context == "heading":
+        document.add_heading("Annex 1", level=2)
+        paragraph = document.add_paragraph()
+    elif context == "cell":
+        cell = document.add_table(rows=1, cols=1).cell(0, 0)
+        cell.paragraphs[0].add_run("Annex 1")
+        paragraph = cell.add_paragraph()
+    else:
+        paragraph = document.add_paragraph("Annex 1: ")
+
+    from docx.text.paragraph import Paragraph
+
+    def append_link(paragraph: Paragraph, target: str, label: str) -> None:
+        hyperlink = OxmlElement("w:hyperlink")
+        hyperlink.set(
+            qn("r:id"),
+            document.part.relate_to(
+                target, RELATIONSHIP_TYPE.HYPERLINK, is_external=True
+            ),
+        )
+        run = OxmlElement("w:r")
+        text = OxmlElement("w:t")
+        text.text = label
+        run.append(text)
+        hyperlink.append(run)
+        paragraph._p.append(hyperlink)
+
+    append_link(paragraph, "https://example.gov/download?id=1", "Click here")
+    document.add_heading("Help", level=2)
+    append_link(
+        document.add_paragraph("Contact details: "),
+        "https://example.gov/contact",
+        "Contact us",
+    )
+    output = BytesIO()
+    document.save(output)
+    fixtures = {
+        "https://example.gov/download?id=1": DownloadedSource(
+            pdf_bytes(), "application/pdf", "https://example.gov/download?id=1"
+        )
+    }
+    result = acquire_source_package(
+        content=output.getvalue(),
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        fetch=fixtures.pop,
+    )
+    assert result.status == "ready"
+    assert not fixtures
+    assert len(result.links) == 1
+    assert result.links[0].label == "Click here"
+
+
+def test_cached_url_still_validates_the_annex_expected_format() -> None:
+    from onyx.regulatory.amendments.annexes.sources import acquire_source_package
+
+    result = acquire_source_package(
+        url="https://example.gov/annex.pdf",
+        content=b'<main><a href="https://example.gov/annex.pdf">Annex</a></main>',
+        mime_type="text/html",
+    )
+    assert result.status == "partial"
+    assert result.issues[0].code == "mime_mismatch"
+    assert result.links[0].target_asset_hash is None

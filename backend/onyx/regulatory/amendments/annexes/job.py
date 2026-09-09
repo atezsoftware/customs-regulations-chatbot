@@ -2,7 +2,8 @@ import hashlib
 import io
 import json
 import time
-from urllib.parse import urljoin
+from dataclasses import dataclass
+from urllib.parse import urljoin, urlsplit
 from uuid import UUID
 
 from onyx.configs.constants import FileOrigin
@@ -15,6 +16,7 @@ from onyx.db.amendment_sources import (
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import RegulatorySourceAsset
 from onyx.file_store.file_store import FileStore, get_default_file_store
+from onyx.regulatory.amendments.annexes.models import SourceLink
 from onyx.regulatory.amendments.annexes.sources import (
     MAX_ASSET_BYTES,
     MAX_PACKAGE_SECONDS,
@@ -24,6 +26,12 @@ from onyx.regulatory.amendments.annexes.sources import (
 from onyx.regulatory.amendments.annexes.sources import (
     download_source_bounded as download_source,
 )
+
+
+@dataclass(frozen=True)
+class _CachedSourceOccurrence:
+    asset: RegulatorySourceAsset
+    final_url: str
 
 
 def _read_verified_asset(store: FileStore, asset: RegulatorySourceAsset) -> bytes:
@@ -56,25 +64,38 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
         mime_type = spec.get("mime_type")
         payload: bytes | None = None
         existing_by_hash = {asset.sha256: asset for asset in existing_assets}
-        cached_by_url: dict[str, RegulatorySourceAsset] = {}
+        cached_by_url: dict[str, _CachedSourceOccurrence] = {}
         for asset in existing_assets:
             for address in (asset.original_url, asset.final_url):
                 if address:
-                    cached_by_url[address] = asset
+                    cached_by_url[address] = _CachedSourceOccurrence(
+                        asset, asset.final_url or address
+                    )
         if previous_manifest_id:
             with store.read_file(previous_manifest_id) as stream:
                 previous_manifest = json.load(stream)
-            for link in previous_manifest["links"]:
-                target_hash = link.get("target_asset_hash")
-                if link["kind"] == "url" and target_hash in existing_by_hash:
-                    if link.get("final_url"):
-                        cached_by_url[link["final_url"]] = existing_by_hash[target_hash]
-                    parent = existing_by_hash[link["parent_asset_hash"]]
-                    address = urljoin(
-                        parent.final_url or "", link.get("original_url") or ""
-                    )
-                    if address:
-                        cached_by_url[address] = existing_by_hash[target_hash]
+            for raw_link in previous_manifest["links"]:
+                link = SourceLink.model_validate(raw_link)
+                if (
+                    link.kind != "url"
+                    or link.target_asset_hash not in existing_by_hash
+                    or not link.final_url
+                ):
+                    continue
+                occurrence = _CachedSourceOccurrence(
+                    existing_by_hash[link.target_asset_hash], link.final_url
+                )
+                cached_by_url[link.final_url] = occurrence
+                address = link.requested_url
+                if not address and link.parent_url:
+                    address = urljoin(link.parent_url, link.original_url or "")
+                if not address and urlsplit(link.original_url or "").scheme in (
+                    "http",
+                    "https",
+                ):
+                    address = link.original_url
+                if address:
+                    cached_by_url[address] = occurrence
             if previous_manifest["assets"]:
                 root = existing_by_hash[previous_manifest["assets"][0]["sha256"]]
                 payload = _read_verified_asset(store, root)
@@ -87,9 +108,9 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
         def fetch(address: str) -> DownloadedSource:
             if cached := cached_by_url.get(address):
                 return DownloadedSource(
-                    _read_verified_asset(store, cached),
-                    cached.mime_type,
-                    cached.final_url or address,
+                    _read_verified_asset(store, cached.asset),
+                    cached.asset.mime_type,
+                    cached.final_url,
                 )
             return download_source(address, deadline=deadline)
 

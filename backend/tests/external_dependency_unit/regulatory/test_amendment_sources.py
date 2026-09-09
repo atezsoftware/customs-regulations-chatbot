@@ -256,3 +256,120 @@ def test_retry_refreshes_locked_state_before_clearing_worker_lease(
             document_set_id=document_set.id,
             environment="local-test",
         )
+
+
+def test_retry_retains_distinct_url_occurrences_and_retries_unresolved_child(
+    source_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    from contextlib import contextmanager
+    from io import BytesIO
+
+    from pypdf import PdfWriter
+
+    from onyx.db.amendment_sources import (
+        create_source_package,
+        get_source_package,
+        retry_source_package,
+    )
+    from onyx.file_store.file_store import get_default_file_store
+    from onyx.regulatory.amendments.annexes import job
+    from onyx.regulatory.amendments.annexes.sources import (
+        DownloadedSource,
+        SourceAcquisitionError,
+    )
+
+    @contextmanager
+    def session_context() -> Generator[Session, None, None]:
+        yield source_session
+
+    monkeypatch.setattr(job, "get_session_with_current_tenant", session_context)
+    document_set = DocumentSet(
+        name=f"annex-{uuid4()}", description="annex test", is_up_to_date=True
+    )
+    source_session.add(document_set)
+    source_session.flush()
+    writer = PdfWriter()
+    writer.add_blank_page(width=300, height=300)
+    pdf = BytesIO()
+    writer.write(pdf)
+    root = "https://example.gov/update"
+    missing = "https://example.gov/b/annex.pdf"
+    fixtures = {
+        root: DownloadedSource(
+            b'<a href="a/step">Annex A</a><a href="b/step">Annex B</a>',
+            "text/html",
+            root,
+        ),
+        **{
+            f"https://example.gov/{part}/step": DownloadedSource(
+                b'<a href="annex.pdf">Ek 1</a>',
+                "text/html",
+                f"https://example.gov/{part}/step",
+            )
+            for part in ("a", "b")
+        },
+        **{
+            f"https://example.gov/{part}/annex.pdf": DownloadedSource(
+                pdf.getvalue(),
+                "application/pdf",
+                f"https://example.gov/{part}/annex.pdf",
+            )
+            for part in ("a", "b")
+        },
+    }
+    calls: list[str] = []
+    available = False
+
+    def download(url: str, **_kwargs: object) -> DownloadedSource:
+        calls.append(url)
+        if url == missing and not available:
+            raise SourceAcquisitionError("404")
+        return fixtures[url]
+
+    monkeypatch.setattr(job, "download_source", download)
+    package, _ = create_source_package(
+        source_session,
+        document_set_id=document_set.id,
+        environment="local-test",
+        idempotency_key=str(uuid4()),
+        request_hash="a" * 64,
+        input_spec={"url": root},
+        created_by=None,
+    )
+    package_id, document_set_id = package.id, document_set.id
+    for attempt in range(3):
+        if attempt:
+            retry_source_package(
+                source_session,
+                package_id=package_id,
+                document_set_id=document_set_id,
+                environment="local-test",
+            )
+            calls.clear()
+        available = attempt == 2
+        job.run_source_package(package_id=package_id, environment="local-test")
+        source_session.expire_all()
+        updated = get_source_package(
+            source_session,
+            package_id=package_id,
+            document_set_id=document_set_id,
+            environment="local-test",
+        )
+        assert updated is not None and updated.manifest_file_id is not None
+        assert updated.status == ("ready" if available else "partial")
+        with get_default_file_store().read_file(updated.manifest_file_id) as stream:
+            manifest = json.load(stream)
+        assert len(manifest["links"]) == 4
+        if attempt:
+            assert calls == [missing]
+        if not available:
+            assert manifest["issues"][0]["code"] == "404"
+            unresolved = [
+                link for link in manifest["links"] if link["target_asset_hash"] is None
+            ]
+            assert len(unresolved) == 1
+            assert unresolved[0]["parent_url"] == "https://example.gov/b/step"
+            assert unresolved[0]["requested_url"] == missing
+        else:
+            assert manifest["issues"] == []
