@@ -903,3 +903,51 @@ def test_durable_model_snapshot_mismatch_blocks_generation(
             embedding_model=model,
         )
     generate.assert_not_called()
+
+
+def test_expired_durable_view_prepares_retirement_without_encoder_or_generation() -> (
+    None
+):
+    from datetime import date
+
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        compare_context_views,
+    )
+    from onyx.regulatory.amendments.annexes.models import (
+        FrozenContextProjection,
+        PreparedContextView,
+    )
+    from onyx.regulatory.indexing_jobs.contextual import prepare_durable_context_view
+
+    job, row, tokenizer = _durable_fixture()
+    row.validity_start_date = date(2026, 1, 1)
+    row.validity_end_date = date(2026, 9, 10)
+    before = PreparedContextView(
+        projections=[
+            FrozenContextProjection(
+                canonical_chunk_id=row.id,
+                source_snapshot_sha256="source",
+                generation_path="durable",
+                request_hashes=[],
+                embedding_input_sha256="input",
+                embedding_config_sha256="config",
+                embedding_texts=[row.text],
+                canonical_text_sha256="text",
+                metadata_sha256="metadata",
+            )
+        ]
+    )
+    generate = MagicMock()
+    after = prepare_durable_context_view(
+        job=job,
+        rows=[row],
+        embedding_tokenizer=tokenizer,
+        contextual_tokenizer=tokenizer,
+        generate=generate,
+        as_of_date=date(2026, 9, 10),
+    )
+    assert after == PreparedContextView()
+    generate.assert_not_called()
+    impact = compare_context_views(old=before, new=after, direct_canonical_changes=[])
+    assert impact.ready and impact.retire_history == [row.id]
+    assert not impact.embedding_changes and not impact.contextual_candidates

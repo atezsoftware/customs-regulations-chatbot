@@ -849,8 +849,20 @@ def prepare_durable_context_view(
     SearchSettings. Its tokenizer controls fitting and its encode preprocessing
     controls submitted text. Batch jobs use the job's frozen raw-input contract.
     """
+    if any(row.user_file_id != job.user_file_id for row in rows):
+        raise ContextualMappingError("canonical rows do not belong to the indexing job")
     if changed_ids:
         rows = rebuild_context_aggregates(list(rows), changed_ids=changed_ids)
+    ordered = [
+        row
+        for row in _ordered_rows(rows)
+        if as_of_date is None
+        or validity_window_contains(
+            row.validity_start_date, row.validity_end_date, as_of_date
+        )
+    ]
+    if not ordered:
+        return PreparedContextView()
     snapshot = job.config_snapshot
     required = ("embedding_provider", "embedding_model_name", "effective_dimension")
     if any(snapshot.get(key) is None for key in required):
@@ -922,12 +934,7 @@ def prepare_durable_context_view(
     calls: dict[str, ContextGenerationCall] = {}
     snapshots: dict[str, ContextSourceSnapshot] = {}
     projections: list[FrozenContextProjection] = []
-    ordered = _ordered_rows(rows)
     for row in ordered:
-        if as_of_date is not None and not validity_window_contains(
-            row.validity_start_date, row.validity_end_date, as_of_date
-        ):
-            continue
         source_snapshot = factory.source_snapshot(row)
         snapshot_hash = source_snapshot.sha256
         snapshots[snapshot_hash] = source_snapshot
