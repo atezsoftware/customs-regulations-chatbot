@@ -4,11 +4,10 @@ import base64
 import hashlib
 from collections import Counter
 from io import BytesIO
-from typing import cast
 from uuid import UUID
 from zipfile import ZipFile
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from defusedxml import ElementTree as etree
 from sqlalchemy.orm import Session
 
@@ -66,38 +65,226 @@ def _table_elements(
 def _html_elements(content: bytes) -> list[ExtractedAnnexElement]:
     soup = BeautifulSoup(content, "html.parser")
     elements: list[ExtractedAnnexElement] = []
-    for index, table in enumerate(soup.find_all("table"), 1):
-        heading = table.find_previous(["h1", "h2", "h3", "h4"])
-        caption = table.find("caption")
-        scope = f"{heading.get_text(' ', strip=True) if heading else ''}/table:{caption.get_text(' ', strip=True) if caption else index}"
-        rows = [
-            [
-                cell.get_text(" ", strip=True)
-                for cell in row.find_all(["th", "td"], recursive=False)
-            ]
-            for row in table.find_all("tr")
-            if row.find_parent("table") is table
-        ]
-        table_elements = _table_elements(rows, scope)
-        if table.find(attrs={"rowspan": True}) or table.find(attrs={"colspan": True}):
+    blocks = {
+        "[document]",
+        "html",
+        "body",
+        "article",
+        "section",
+        "main",
+        "header",
+        "footer",
+        "nav",
+        "div",
+        "p",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "aside",
+        "ul",
+        "ol",
+        "li",
+        "dl",
+        "dt",
+        "dd",
+        "blockquote",
+        "pre",
+        "figure",
+        "figcaption",
+        "address",
+        "details",
+        "summary",
+        "table",
+    }
+    inline = {
+        "a",
+        "span",
+        "strong",
+        "b",
+        "em",
+        "i",
+        "u",
+        "s",
+        "small",
+        "sup",
+        "sub",
+        "abbr",
+        "cite",
+        "q",
+        "code",
+        "time",
+        "mark",
+        "del",
+        "ins",
+        "br",
+        "hr",
+        "wbr",
+    }
+    ignored = {"head", "script", "style", "template"}
+    table_number = 0
+    heading = ""
+
+    def visit(tag: Tag, footnote: bool = False, issues: tuple[str, ...] = ()) -> None:
+        nonlocal table_number, heading
+        if tag.name in ignored:
+            return
+        footnote = footnote or tag.get("role") == "doc-footnote"
+        if tag.name not in blocks | inline:
+            issues = (*issues, f"unsupported_html_structure:{tag.name}")
+        if tag.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            heading = tag.get_text(" ", strip=True)
+        if tag.name == "table":
+            table_number += 1
+            caption = tag.find("caption")
+            scope = f"{heading}/table:{caption.get_text(' ', strip=True) if caption else table_number}"
+            # Flatten unsupported nested grids once, without inventing cell anchors.
+            if tag.find("table") is not None:
+                elements.append(
+                    ExtractedAnnexElement(
+                        kind="text",
+                        text=tag.get_text(" ", strip=True),
+                        status="uncertain",
+                        issues=[*issues, "nested_html_table_unsupported"],
+                        locator=AnnexLocator(path=scope),
+                    )
+                )
+                return
+            rows = tag.find_all("tr")
+            unsupported = {
+                f"unsupported_html_structure:{child.name}"
+                for child in tag.find_all(True)
+                if child.name
+                not in blocks
+                | inline
+                | {
+                    "caption",
+                    "col",
+                    "colgroup",
+                    "thead",
+                    "tbody",
+                    "tfoot",
+                    "tr",
+                    "th",
+                    "td",
+                }
+                | ignored
+            }
+            table_issues = [*issues, *sorted(unsupported)]
+            table_elements = _table_elements(
+                [
+                    [
+                        cell.get_text(" ", strip=True)
+                        for cell in row.find_all(["th", "td"], recursive=False)
+                    ]
+                    for row in rows
+                ],
+                scope,
+            )
+            if tag.find(attrs={"rowspan": True}) or tag.find(attrs={"colspan": True}):
+                for element in table_elements:
+                    element.status = "uncertain"
+                    element.issues.append("merged_table_cells")
+                    element.semantic_key = None
+                    element.locator.column = None
+            by_row: dict[int, list[ExtractedAnnexElement]] = {}
             for element in table_elements:
-                element.status = "uncertain"
-                element.issues.append("merged_table_cells")
-        elements.extend(table_elements)
-    for tag in soup.find_all(["p", "h1", "h2", "h3", "h4", "aside"]):
-        if tag.find_parent("table") is not None:
-            continue
-        text = tag.get_text(" ", strip=True)
-        if text:
-            footnote = tag.get("role") == "doc-footnote"
+                assert element.locator.row is not None
+                by_row.setdefault(element.locator.row, []).append(element)
+                if table_issues:
+                    element.status = "uncertain"
+                    element.issues.extend(table_issues)
+                    element.semantic_key = None
+            row_index = 0
+            for descendant in tag.descendants:
+                if isinstance(descendant, Tag) and descendant.name == "tr":
+                    row_index += 1
+                    elements.extend(by_row[row_index])
+                elif isinstance(descendant, Tag) and descendant.name == "caption":
+                    elements.append(
+                        ExtractedAnnexElement(
+                            kind="footnote" if footnote else "text",
+                            text=descendant.get_text(" ", strip=True),
+                            status="uncertain" if table_issues else "readable",
+                            issues=table_issues,
+                            locator=AnnexLocator(path=scope),
+                        )
+                    )
+                elif isinstance(descendant, NavigableString) and not isinstance(
+                    descendant, Comment
+                ):
+                    if (
+                        descendant.find_parent(["td", "th", "caption", *ignored])
+                        is None
+                        and descendant.strip()
+                    ):
+                        elements.append(
+                            ExtractedAnnexElement(
+                                kind="footnote" if footnote else "text",
+                                text=str(descendant).strip(),
+                                status="uncertain",
+                                issues=[
+                                    *table_issues,
+                                    "unsupported_html_table_content",
+                                ],
+                                locator=AnnexLocator(path=scope),
+                            )
+                        )
+            return
+        pending: list[str] = []
+
+        def flush() -> None:
+            text = " ".join(" ".join(pending).split())
+            if text:
+                elements.append(
+                    ExtractedAnnexElement(
+                        kind="footnote" if footnote else "text",
+                        text=text,
+                        semantic_key=str(tag.get("id")) if tag.get("id") else None,
+                        status="uncertain" if issues else "readable",
+                        issues=list(dict.fromkeys(issues)),
+                        locator=AnnexLocator(path=tag.name),
+                    )
+                )
+            pending.clear()
+
+        def collect(node: Tag | NavigableString) -> None:
+            if isinstance(node, Comment):
+                return
+            if isinstance(node, NavigableString):
+                pending.append(str(node))
+            elif node.name in ignored:
+                return
+            elif (
+                node.name in blocks
+                or node.name not in inline
+                or node.get("role") == "doc-footnote"
+            ):
+                flush()
+                visit(node, footnote, issues)
+            else:
+                for child in node.children:
+                    if isinstance(child, (Tag, NavigableString)):
+                        collect(child)
+
+        for child in tag.children:
+            if isinstance(child, (Tag, NavigableString)):
+                collect(child)
+        flush()
+        if tag.name not in blocks | inline and not tag.get_text(strip=True):
             elements.append(
                 ExtractedAnnexElement(
-                    kind="footnote" if footnote else "text",
-                    text=text,
-                    semantic_key=str(tag.get("id")) if tag.get("id") else None,
-                    locator=AnnexLocator(path=cast(Tag, tag).name),
+                    kind="image_region",
+                    text=str(tag.get("alt") or ""),
+                    status="unreadable",
+                    issues=list(issues),
+                    locator=AnnexLocator(path=tag.name),
                 )
             )
+
+    visit(soup)
     return elements
 
 
@@ -129,9 +316,25 @@ def _docx_elements(content: bytes) -> list[ExtractedAnnexElement]:
                     ]
                     for row in node.findall("w:tr", namespace)
                 ]
-                elements.extend(
-                    _table_elements(rows, f"{heading}/table:{table_number}")
+                table_elements = _table_elements(
+                    rows, f"{heading}/table:{table_number}"
                 )
+                if any(
+                    node.find(f".//w:{property_name}", namespace) is not None
+                    for property_name in (
+                        "gridSpan",
+                        "vMerge",
+                        "hMerge",
+                        "gridBefore",
+                        "gridAfter",
+                    )
+                ):
+                    for element in table_elements:
+                        element.status = "uncertain"
+                        element.issues.append("docx_table_grid_unsupported")
+                        element.semantic_key = None
+                        element.locator.column = None
+                elements.extend(table_elements)
             elif text:
                 if any(
                     (style.get(f"{{{namespace['w']}}}val") or "").startswith("Heading")

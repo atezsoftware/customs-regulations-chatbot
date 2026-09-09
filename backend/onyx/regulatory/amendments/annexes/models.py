@@ -126,7 +126,7 @@ class AnnexRenderedPage(BaseModel):
 
 class AnnexVisionElement(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: AnnexElementKind
+    kind: Literal["text", "table_cell", "footnote", "image_region"]
     text: str = Field(max_length=20000)
     box: tuple[float, float, float, float]
     status: Literal["readable", "uncertain", "unreadable"]

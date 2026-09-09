@@ -1,6 +1,7 @@
 from io import BytesIO
 from unittest.mock import MagicMock
 
+import pytest
 from PIL import Image
 
 
@@ -21,6 +22,164 @@ def test_html_rows_cells_and_footnotes_preserve_anchors() -> None:
         "A | 5",
         "B | 8",
     ]
+
+
+def test_html_retains_legal_text_in_document_order_without_container_duplicates() -> (
+    None
+):
+    from onyx.regulatory.amendments.annexes.extraction import extract_annex_structure
+
+    result = extract_annex_structure(
+        b"<h1>EK-1</h1><div>Before <strong>table</strong>"
+        b"<ul><li>Exception <em>A</em><ul><li>Nested exception</li></ul></li></ul>"
+        b"<div>Condition</div>Direct text</div>"
+        b"<table><tr><td>A</td><td>5%</td></tr></table>"
+        b'<aside role="doc-footnote" id="n1"><p>Note <b>one</b></p>'
+        b"<div>Note two</div></aside><p>After table</p>"
+        b"<svg><text>Diagram condition</text></svg>",
+        "text/html",
+    )
+    atomic = [element for element in result.elements if not element.aggregate]
+    assert [element.text for element in atomic] == [
+        "EK-1",
+        "Before table",
+        "Exception A",
+        "Nested exception",
+        "Condition",
+        "Direct text",
+        "A",
+        "5%",
+        "Note one",
+        "Note two",
+        "After table",
+        "Diagram condition",
+    ]
+    assert [element.text for element in atomic if element.kind == "footnote"] == [
+        "Note one",
+        "Note two",
+    ]
+    assert atomic[-1].status == "uncertain"
+    assert "unsupported_html_structure:svg" in atomic[-1].issues
+
+
+def test_html_unsupported_table_content_retains_caption_and_image_evidence() -> None:
+    from onyx.regulatory.amendments.annexes.extraction import extract_annex_structure
+
+    result = extract_annex_structure(
+        b"<table><caption>Rates <b>and exceptions</b></caption>"
+        b'<tr><td>A</td><td><img alt="Rate diagram"/>5%</td></tr></table>',
+        "text/html",
+    )
+    atomic = [element for element in result.elements if not element.aggregate]
+    assert [element.text for element in atomic] == ["Rates and exceptions", "A", "5%"]
+    assert atomic[-1].status == "uncertain"
+    assert "unsupported_html_structure:img" in atomic[-1].issues
+    assert atomic[-1].semantic_key is None
+
+
+@pytest.mark.parametrize(
+    "layout", ["gridSpan", "vMerge", "hMerge", "gridBefore", "gridAfter"]
+)
+def test_docx_unsupported_grid_disables_false_column_anchors(layout: str) -> None:
+    from zipfile import ZipFile
+
+    from onyx.regulatory.amendments.annexes.extraction import extract_annex_structure
+
+    row_properties = (
+        f'<w:trPr><w:{layout} w:val="1"/></w:trPr>'
+        if layout.startswith("gridB") or layout == "gridAfter"
+        else ""
+    )
+    cell_value = "restart" if layout in {"vMerge", "hMerge"} else "2"
+    cell_properties = (
+        f'<w:tcPr><w:{layout} w:val="{cell_value}"/></w:tcPr>'
+        if not row_properties
+        else ""
+    )
+    buffer = BytesIO()
+    with ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
+        )
+        archive.writestr(
+            "word/document.xml",
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl>'
+            "<w:tr><w:tc><w:p><w:t>Code</w:t></w:p></w:tc><w:tc><w:p><w:t>Description</w:t></w:p></w:tc><w:tc><w:p><w:t>Rate</w:t></w:p></w:tc></w:tr>"
+            f"<w:tr>{row_properties}<w:tc>{cell_properties}<w:p><w:t>A</w:t></w:p></w:tc><w:tc><w:p><w:t>5%</w:t></w:p></w:tc></w:tr>"
+            "</w:tbl></w:body></w:document>",
+        )
+    result = extract_annex_structure(
+        buffer.getvalue(),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    rate = next(element for element in result.elements if element.text == "5%")
+    assert rate.locator.row == 2
+    assert rate.locator.column is None
+    assert all(element.semantic_key is None for element in result.elements)
+    assert all(element.status == "uncertain" for element in result.elements)
+    assert all(
+        "docx_table_grid_unsupported" in element.issues for element in result.elements
+    )
+
+
+@pytest.mark.parametrize("corrected", [True, False])
+def test_vision_rejects_row_plus_cells_and_retries_with_atomic_cells(
+    corrected: bool,
+) -> None:
+    import json
+
+    from onyx.llm.model_response import Choice, Message, ModelResponse
+    from onyx.regulatory.amendments.annexes.extraction import extract_annex_structure
+
+    stream = BytesIO()
+    Image.new("RGB", (200, 100), "white").save(stream, format="PNG")
+    row = {
+        "kind": "table_row",
+        "text": "A | 5%",
+        "box": [0, 0, 1, 1],
+        "status": "readable",
+    }
+    cells = [
+        {
+            "kind": "table_cell",
+            "text": "A",
+            "box": [0, 0, 0.5, 1],
+            "status": "readable",
+        },
+        {
+            "kind": "table_cell",
+            "text": "5%",
+            "box": [0.5, 0, 1, 1],
+            "status": "readable",
+        },
+    ]
+    llm = MagicMock()
+    llm.config.model_name = "configured-model"
+    llm.config.model_provider = "configured-provider"
+    llm.invoke.side_effect = [
+        ModelResponse(
+            id="vision",
+            created="2026-01-01",
+            choice=Choice(message=Message(content=json.dumps({"elements": elements}))),
+        )
+        for elements in [[row, *cells], cells if corrected else [row, *cells]]
+    ]
+    if not corrected:
+        with pytest.raises(
+            ValueError,
+            match="LLM failed to produce valid AnnexVisionResult after 2 attempts",
+        ):
+            extract_annex_structure(stream.getvalue(), "image/png", vision_llm=llm)
+        return
+    result = extract_annex_structure(stream.getvalue(), "image/png", vision_llm=llm)
+    assert [
+        (element.kind, element.text, element.aggregate) for element in result.elements
+    ] == [
+        ("table_cell", "A", False),
+        ("table_cell", "5%", False),
+    ]
+    assert llm.invoke.call_count == 2
 
 
 def test_xlsx_retains_formula_and_cached_value() -> None:
