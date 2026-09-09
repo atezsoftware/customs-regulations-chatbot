@@ -850,6 +850,8 @@ def prepare_normal_context_view(
             row.validity_start_date, row.validity_end_date, as_of_date
         )
     ]
+    if not ordered:
+        return PreparedContextView()
     recorder = ContextGenerationRecorder(cached_calls=cached.calls if cached else [])
     splitter = SentenceChunker(
         tokenizer_or_token_counter=lambda text: len(

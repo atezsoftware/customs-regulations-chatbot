@@ -189,6 +189,11 @@ def compare_context_views(
                 contextual.append(identifier)
                 chunk_reasons.append("context_input_changed")
             if (
+                before.embedding_config_sha256 != after.embedding_config_sha256
+                and identifier not in contextual
+            ):
+                contextual.append(identifier)
+            if (
                 before.embedding_input_sha256 != after.embedding_input_sha256
                 or before.embedding_config_sha256 != after.embedding_config_sha256
             ):
@@ -236,9 +241,6 @@ def freeze_embedding_inputs(
     from onyx.document_index.chunk_content_enrichment import (
         generate_enriched_content_for_chunk_embedding,
     )
-    from onyx.natural_language_processing.utils import tokenizer_trim_content
-    from onyx.utils.text_processing import remove_invalid_unicode_chars
-    from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
 
     if chunk.large_chunk_reference_ids:
         raise ValueError("regulatory_context_large_chunk_requires_batch_scope")
@@ -247,6 +249,21 @@ def freeze_embedding_inputs(
     if not main:
         raise ValueError("empty_embedding_input")
     texts = [main, *(chunk.mini_chunk_texts or []), *([title] if title else [])]
+    return freeze_encoder_inputs(
+        texts, model, model_dim=model_dim, formatter="normal-v1"
+    )
+
+
+def freeze_encoder_inputs(
+    texts: list[str], model: "EmbeddingModel", *, model_dim: int, formatter: str
+) -> tuple[list[str], dict[str, str | int | float | bool | None]]:
+    """Freeze the text and configuration reaching the actual encoder transport."""
+    from onyx.natural_language_processing.utils import tokenizer_trim_content
+    from onyx.utils.text_processing import remove_invalid_unicode_chars
+    from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
+
+    if not texts or not all(texts):
+        raise ValueError("empty_embedding_input")
     if model.retrim_content:
         texts = [
             tokenizer_trim_content(
@@ -257,6 +274,16 @@ def freeze_embedding_inputs(
             for text in texts
         ]
     texts = [remove_invalid_unicode_chars(text) or "<>" for text in texts]
+    return texts, encoder_model_fingerprint(
+        model, model_dim=model_dim, formatter=formatter
+    )
+
+
+def encoder_model_fingerprint(
+    model: "EmbeddingModel", *, model_dim: int, formatter: str
+) -> dict[str, str | int | float | bool | None]:
+    from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
+
     config: dict[str, str | int | float | bool | None] = {
         "provider": str(model.provider_type) if model.provider_type else None,
         "model": model.model_name,
@@ -270,10 +297,10 @@ def freeze_embedding_inputs(
         "deployment_name": model.deployment_name,
         "tokenizer": f"{type(model.tokenizer).__module__}.{type(model.tokenizer).__qualname__}",
         "max_sequence_length": DOC_EMBEDDING_CONTEXT_SIZE,
-        "formatter": "normal-v1",
+        "formatter": formatter,
         "text_type": "passage",
     }
-    return texts, config
+    return config
 
 
 def canonical_dependency_closure(

@@ -5,7 +5,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
@@ -32,6 +32,8 @@ from onyx.prompts.contextual_retrieval import (
 from onyx.regulatory.amendments.annexes.context_dependencies import (
     canonical_dependency_ids,
     context_hash,
+    encoder_model_fingerprint,
+    freeze_encoder_inputs,
     rebuild_context_aggregates,
 )
 from onyx.regulatory.amendments.annexes.models import (
@@ -48,12 +50,16 @@ from onyx.regulatory.contextual import (
     validity_window_contains,
     visible_regulatory_snapshot_for_target,
 )
+from onyx.regulatory.indexing_jobs.models import OpenRouterBatchConfig
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchRequest,
     VertexBatchResult,
     vertex_jsonl_line_size,
 )
 from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
+
+if TYPE_CHECKING:
+    from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
 
 _MAX_CACHED_DOCUMENT_CONTEXTS = 4
 
@@ -832,20 +838,19 @@ def prepare_durable_context_view(
     embedding_tokenizer: BaseTokenizer,
     contextual_tokenizer: BaseTokenizer,
     generate: Callable[[VertexBatchRequest], str],
+    embedding_model: EmbeddingModel | None = None,
     cached: PreparedContextView | None = None,
     as_of_date: datetime.date | None = None,
     changed_ids: list[str] | None = None,
 ) -> PreparedContextView:
-    """Replay the exact durable request factory and freeze fitted embedding input."""
+    """Freeze the existing durable transport's exact inputs and configuration.
+
+    Synchronous jobs require the actual encoder built from the writer's frozen
+    SearchSettings. Its tokenizer controls fitting and its encode preprocessing
+    controls submitted text. Batch jobs use the job's frozen raw-input contract.
+    """
     if changed_ids:
         rows = rebuild_context_aggregates(list(rows), changed_ids=changed_ids)
-    factory = ContextualRequestFactory(
-        job=job,
-        rows=rows,
-        embedding_tokenizer=embedding_tokenizer,
-        contextual_tokenizer=contextual_tokenizer,
-        reference_date_override=as_of_date,
-    )
     snapshot = job.config_snapshot
     required = ("embedding_provider", "embedding_model_name", "effective_dimension")
     if any(snapshot.get(key) is None for key in required):
@@ -853,21 +858,55 @@ def prepare_durable_context_view(
     dimension = snapshot["effective_dimension"]
     if not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0:
         raise ContextualMappingError("embedding_dimension_unavailable")
-    batch_config = snapshot.get("openrouter_batch")
-    endpoint = (
-        cast(dict[str, object], batch_config).get("api_url")
-        if isinstance(batch_config, dict)
+    batch_payload = snapshot.get("openrouter_batch")
+    batch_config = (
+        OpenRouterBatchConfig.model_validate(batch_payload)
+        if batch_payload is not None
         else None
     )
-    config: dict[str, str | int | float | bool | None] = {
-        "provider": str(snapshot["embedding_provider"]),
-        "model": str(snapshot["embedding_model_name"]),
-        "dimension": dimension,
-        "endpoint_sha256": context_hash(endpoint),
-        "formatter": "durable-context-before-text-v1",
-        "tokenizer": type(embedding_tokenizer).__qualname__,
-        "max_sequence_length": DOC_EMBEDDING_CONTEXT_SIZE,
-    }
+    if batch_config is not None:
+        if (
+            batch_config.model_name != snapshot["embedding_model_name"]
+            or batch_config.effective_dimension != dimension
+        ):
+            raise ContextualMappingError("embedding_configuration_mismatch")
+        config: dict[str, str | int | float | bool | None] = {
+            "transport": "openrouter_batch",
+            "provider": str(snapshot["embedding_provider"]),
+            "model": batch_config.model_name,
+            "dimension": dimension,
+            "endpoint_sha256": context_hash(batch_config.api_url),
+            "embedding_endpoint": "/v1/embeddings",
+            "formatter": "durable-context-before-text-v1",
+        }
+    else:
+        if embedding_model is None:
+            raise ContextualMappingError("embedding_configuration_unavailable")
+        if (
+            (
+                embedding_model.provider_type.value
+                if embedding_model.provider_type
+                else None
+            )
+            != snapshot["embedding_provider"]
+            or embedding_model.model_name != snapshot["embedding_model_name"]
+            or embedding_model.reduced_dimension != dimension
+        ):
+            raise ContextualMappingError("embedding_configuration_mismatch")
+        embedding_tokenizer = embedding_model.tokenizer
+        config = encoder_model_fingerprint(
+            embedding_model,
+            model_dim=dimension,
+            formatter="durable-context-before-text-v1",
+        )
+        config["transport"] = "synchronous_encoder"
+    factory = ContextualRequestFactory(
+        job=job,
+        rows=rows,
+        embedding_tokenizer=embedding_tokenizer,
+        contextual_tokenizer=contextual_tokenizer,
+        reference_date_override=as_of_date,
+    )
     context_config: dict[str, str | int | float | bool | None] = {
         "model_provider": LlmProviderNames.VERTEX_AI.value,
         "model_name": _contextual_model_name(job),
@@ -889,40 +928,9 @@ def prepare_durable_context_view(
             row.validity_start_date, row.validity_end_date, as_of_date
         ):
             continue
-        visible = visible_regulatory_snapshot_for_target(
-            ordered, row, reference_date=as_of_date
-        )
-        ranges: list[ContextSourceRange] = []
-        parts: list[str] = []
-        offset = 0
-        for source in visible:
-            block = _row_block(source)
-            ranges.append(
-                ContextSourceRange(
-                    canonical_chunk_id=source.id, start=offset, end=offset + len(block)
-                )
-            )
-            parts.append(block)
-            offset += len(block) + 2
-        document = "\n\n".join(parts)
-        reference_date = as_of_date or context_reference_date(
-            row.validity_start_date, row.validity_end_date
-        )
-        snapshot_hash = context_hash(
-            [
-                str(job.user_file_id),
-                document,
-                [part.model_dump() for part in ranges],
-                reference_date,
-            ]
-        )
-        snapshots[snapshot_hash] = ContextSourceSnapshot(
-            sha256=snapshot_hash,
-            selector="visible_regulatory_snapshot_for_target:durable-v1",
-            reference_date=reference_date,
-            text=document,
-            ordered_ranges=ranges,
-        )
+        source_snapshot = factory.source_snapshot(row)
+        snapshot_hash = source_snapshot.sha256
+        snapshots[snapshot_hash] = source_snapshot
         item = RegulatoryIndexingItem(
             regulatory_chunk_id=row.id,
             status=RegulatoryIndexingItemStatus.SKIPPED.value,
@@ -963,6 +971,15 @@ def prepare_durable_context_view(
             context_metadata: dict[str, object] = {"contextual_text": output}
             item.context = context_metadata
         text = contextualized_embedding_text(row, item)
+        texts = [text]
+        if batch_config is None:
+            assert embedding_model is not None
+            texts, _ = freeze_encoder_inputs(
+                texts,
+                embedding_model,
+                model_dim=dimension,
+                formatter="durable-context-before-text-v1",
+            )
         projections.append(
             FrozenContextProjection(
                 canonical_chunk_id=row.id,
@@ -970,9 +987,9 @@ def prepare_durable_context_view(
                 source_snapshot_sha256=snapshot_hash,
                 generation_path="durable",
                 request_hashes=request_hashes,
-                embedding_input_sha256=context_hash([text]),
+                embedding_input_sha256=context_hash(texts),
                 embedding_config_sha256=context_hash(config),
-                embedding_texts=[text],
+                embedding_texts=texts,
                 canonical_text_sha256=context_hash(row.text),
                 metadata_sha256=context_hash(
                     [

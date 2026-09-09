@@ -420,3 +420,26 @@ def test_ready_comparison_cannot_hide_extraction_uncertainty() -> None:
         package_complete=True,
     )
     assert not result.ready and "incomplete_extraction" in result.issues
+
+
+@pytest.mark.parametrize("approved", ["15%", "5%5", "0.5%", "5% surcharge"])
+def test_partial_cell_value_cannot_patch_an_approved_numeric_overlay(
+    approved: str,
+) -> None:
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    current = baseline(f"| A | {approved} |")
+    current.elements[0].semantic_key = "approved-row-lineage"
+    old, new = extraction("5%"), extraction("7%")
+    result = prepare_annex_patch(
+        baseline=current,
+        old=old,
+        new=new,
+        comparison=compare_annexes(old=old, new=new),
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert not result.ready
+    assert "canonical_correspondence_unresolved" in result.issues
+    assert not result.patches

@@ -173,6 +173,18 @@ def prepare_annex_patch(
             elif element.text and candidate.text.count(element.text) == 1:
                 start = candidate.text.index(element.text)
                 end = start + len(element.text)
+                if element.kind == "table_cell":
+                    cell_start = candidate.text.rfind("|", 0, start) + 1
+                    cell_end = candidate.text.find("|", end)
+                    if cell_end < 0:
+                        cell_end = len(candidate.text)
+                    if candidate.text[cell_start:cell_end].strip() != element.text:
+                        continue
+                elif (start and re.match(r"[\w.,%]", candidate.text[start - 1])) or (
+                    end < len(candidate.text)
+                    and re.match(r"[\w.,%]", candidate.text[end])
+                ):
+                    continue
             else:
                 continue
             matches.append(

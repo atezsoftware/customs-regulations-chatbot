@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
@@ -5,6 +8,13 @@ import pytest
 from onyx.llm.interfaces import LLMConfig
 from onyx.llm.models import UserMessage
 from onyx.tracing.flows import LLMFlow
+
+if TYPE_CHECKING:
+    from onyx.db.models import RegulatoryChunk, RegulatoryIndexingJob
+    from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
+    from onyx.natural_language_processing.utils import BaseTokenizer
+    from onyx.regulatory.amendments.annexes.models import ContextSourceSnapshot
+    from onyx.regulatory.indexing_jobs.contextual import ContextualRequestFactory
 
 
 def test_recorder_reuses_exact_prompt_with_same_config_and_records_changed_input() -> (
@@ -282,7 +292,7 @@ def test_actual_durable_path_captures_boundary_and_exact_no_delimiter_embedding(
     job = _job()
     job.config_snapshot.update(
         {
-            "embedding_provider": "configured",
+            "embedding_provider": "openrouter",
             "embedding_model_name": "embedding",
             "effective_dimension": 3,
         }
@@ -306,6 +316,7 @@ def test_actual_durable_path_captures_boundary_and_exact_no_delimiter_embedding(
             embedding_tokenizer=_CharacterTokenizer(),
             contextual_tokenizer=_CharacterTokenizer(),
             generate=generate,
+            embedding_model=_durable_embedding_model(),
         )
         after = prepare_durable_context_view(
             job=job,
@@ -313,6 +324,7 @@ def test_actual_durable_path_captures_boundary_and_exact_no_delimiter_embedding(
             embedding_tokenizer=_CharacterTokenizer(),
             contextual_tokenizer=_CharacterTokenizer(),
             generate=generate,
+            embedding_model=_durable_embedding_model(),
             cached=before,
         )
     assert generate.call_count == 2
@@ -542,3 +554,352 @@ def test_durable_snapshot_identity_includes_context_reference_date() -> None:
     assert before.text == after.text
     assert before.sha256 != after.sha256
     assert after.reference_date == date(2026, 9, 10)
+
+
+def test_expired_normal_view_prepares_retirement_without_context_generation() -> None:
+    from datetime import date
+    from unittest.mock import patch
+    from uuid import uuid4
+
+    from onyx.db.models import RegulatoryChunk, SearchSettings, UserFile
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        compare_context_views,
+    )
+    from onyx.regulatory.amendments.annexes.models import (
+        FrozenContextProjection,
+        PreparedContextView,
+    )
+    from onyx.regulatory.projection import prepare_normal_context_view
+
+    file = UserFile(id=uuid4(), name="Expiry fixture")
+    row = RegulatoryChunk(
+        id="expired",
+        user_file_id=file.id,
+        text="Old rule",
+        position=1,
+        projection_ordinal=1,
+        heading_path=[],
+        chunk_metadata={},
+        validity_start_date=date(2026, 1, 1),
+        validity_end_date=date(2026, 9, 10),
+    )
+    before = PreparedContextView(
+        projections=[
+            FrozenContextProjection(
+                canonical_chunk_id=row.id,
+                source_snapshot_sha256="source",
+                generation_path="normal",
+                request_hashes=[],
+                embedding_input_sha256="input",
+                embedding_config_sha256="config",
+                embedding_texts=[row.text],
+                canonical_text_sha256="text",
+                metadata_sha256="metadata",
+            )
+        ]
+    )
+    with patch(
+        "onyx.regulatory.projection.effective_contextual_rag_enabled", return_value=True
+    ):
+        after = prepare_normal_context_view(
+            rows=[row],
+            user_file=file,
+            search_settings=SearchSettings(),
+            embedder=MagicMock(),
+            llm=MagicMock(),
+            as_of_date=date(2026, 9, 10),
+        )
+    assert after == PreparedContextView()
+    impact = compare_context_views(old=before, new=after, direct_canonical_changes=[])
+    assert impact.ready and impact.retire_history == [row.id]
+    assert not impact.embedding_changes and not impact.contextual_candidates
+
+
+def _durable_embedding_model() -> EmbeddingModel:
+    from unittest.mock import patch
+
+    from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
+    from shared_configs.enums import EmbeddingProvider
+    from tests.unit.onyx.regulatory.indexing_jobs.test_contextual import (
+        _CharacterTokenizer,
+    )
+
+    with patch(
+        "onyx.natural_language_processing.search_nlp_models.get_tokenizer",
+        return_value=_CharacterTokenizer(),
+    ):
+        return EmbeddingModel(
+            server_host="localhost",
+            server_port=9000,
+            model_name="embedding",
+            normalize=True,
+            query_prefix=None,
+            passage_prefix=None,
+            api_key=None,
+            api_url="https://encoder.example/v1",
+            provider_type=EmbeddingProvider.OPENROUTER,
+            retrim_content=True,
+            reduced_dimension=3,
+            api_version="v1",
+            deployment_name="deployment",
+        )
+
+
+def _durable_fixture() -> tuple[RegulatoryIndexingJob, RegulatoryChunk, BaseTokenizer]:
+    from shared_configs.enums import EmbeddingProvider
+    from tests.unit.onyx.regulatory.indexing_jobs.test_contextual import (
+        _CharacterTokenizer,
+        _job,
+        _row,
+    )
+
+    job = _job()
+    job.config_snapshot.update(
+        {
+            "embedding_provider": EmbeddingProvider.OPENROUTER.value,
+            "embedding_model_name": "embedding",
+            "effective_dimension": 3,
+        }
+    )
+    row = _row(job, row_id="a", position=1, text="5%", heading_path=["EK-1"])
+    row.chunk_metadata = {}
+    return job, row, _CharacterTokenizer()
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("normalize", False),
+        ("passage_prefix", "passage: "),
+        ("api_url", "https://other.example/v1"),
+        ("api_version", "v2"),
+        ("deployment_name", "other-deployment"),
+    ],
+)
+def test_durable_actual_encoder_configuration_change_cannot_reuse_vector(
+    attribute: str, value: object
+) -> None:
+    from unittest.mock import patch
+
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        compare_context_views,
+    )
+    from onyx.regulatory.indexing_jobs.contextual import prepare_durable_context_view
+
+    job, row, tokenizer = _durable_fixture()
+    model = _durable_embedding_model()
+    generate = MagicMock(return_value="context")
+    with patch(
+        "onyx.regulatory.indexing_jobs.contextual._contextual_safe_input_limit",
+        return_value=1200,
+    ):
+        before = prepare_durable_context_view(
+            job=job,
+            rows=[row],
+            embedding_tokenizer=tokenizer,
+            contextual_tokenizer=tokenizer,
+            generate=generate,
+            embedding_model=model,
+        )
+        setattr(model, attribute, value)
+        after = prepare_durable_context_view(
+            job=job,
+            rows=[row],
+            embedding_tokenizer=tokenizer,
+            contextual_tokenizer=tokenizer,
+            generate=generate,
+            embedding_model=model,
+            cached=before,
+        )
+    # A lone canonical row has no external context to generate.
+    assert generate.call_count == 0
+    before = before.model_copy(
+        update={
+            "projections": [
+                before.projections[0].model_copy(update={"vector_reuse_verified": True})
+            ]
+        }
+    )
+    impact = compare_context_views(old=before, new=after, direct_canonical_changes=[])
+    assert impact.embedding_changes == [row.id]
+    assert impact.contextual_candidates == [row.id]
+    assert "embedding_configuration_changed" in impact.reasons[row.id]
+    assert (
+        before.projections[0].embedding_input_sha256
+        == after.projections[0].embedding_input_sha256
+    )
+
+
+def test_durable_missing_actual_encoder_blocks_before_generation() -> None:
+    from onyx.regulatory.indexing_jobs.contextual import prepare_durable_context_view
+
+    job, row, tokenizer = _durable_fixture()
+    generate = MagicMock(return_value="context")
+    with pytest.raises(ValueError, match="embedding_configuration_unavailable"):
+        prepare_durable_context_view(
+            job=job,
+            rows=[row],
+            embedding_tokenizer=tokenizer,
+            contextual_tokenizer=tokenizer,
+            generate=generate,
+        )
+    generate.assert_not_called()
+
+
+def test_durable_freezes_actual_encoder_text_and_reuses_factory_snapshots() -> None:
+    from unittest.mock import patch
+
+    from onyx.regulatory.indexing_jobs.contextual import (
+        ContextualRequestFactory,
+        prepare_durable_context_view,
+    )
+    from shared_configs.enums import EmbedTextType
+
+    job, row, tokenizer = _durable_fixture()
+    row.text = "Long legal text exceeds limit"
+    model = _durable_embedding_model()
+    observed: list[ContextSourceSnapshot] = []
+    source_snapshot = ContextualRequestFactory.source_snapshot
+
+    def capture(
+        factory: ContextualRequestFactory, target: RegulatoryChunk
+    ) -> ContextSourceSnapshot:
+        result = source_snapshot(factory, target)
+        observed.append(result)
+        return result
+
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.contextual._contextual_safe_input_limit",
+            return_value=1200,
+        ),
+        patch.object(ContextualRequestFactory, "reserve", return_value=0),
+        patch.object(ContextualRequestFactory, "source_snapshot", capture),
+        patch("shared_configs.configs.DOC_EMBEDDING_CONTEXT_SIZE", 8),
+    ):
+        prepared = prepare_durable_context_view(
+            job=job,
+            rows=[row],
+            embedding_tokenizer=tokenizer,
+            contextual_tokenizer=tokenizer,
+            generate=MagicMock(),
+            embedding_model=model,
+        )
+    with patch.object(
+        model, "_batch_encode_texts", return_value=[[1.0, 0.0, 0.0]]
+    ) as encode:
+        model.encode([row.text], text_type=EmbedTextType.PASSAGE, max_seq_length=8)
+    assert prepared.projections[0].embedding_texts == encode.call_args.kwargs["texts"]
+    assert prepared.projections[0].embedding_texts != [row.text]
+    assert len(observed) == 1 and prepared.snapshots[0] is observed[0]
+
+
+def test_durable_batch_freezes_raw_payload_and_ignores_unused_synchronous_settings() -> (
+    None
+):
+    from unittest.mock import patch
+
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        compare_context_views,
+    )
+    from onyx.regulatory.indexing_jobs.contextual import prepare_durable_context_view
+    from onyx.regulatory.indexing_jobs.models import OpenRouterBatchConfig
+    from onyx.regulatory.indexing_jobs.openrouter_batch import (
+        OpenRouterEmbeddingBatchRequest,
+        openrouter_embedding_payload,
+    )
+
+    job, row, tokenizer = _durable_fixture()
+    row.text = "Long unchanged legal text outside the encoder trim"
+    config = OpenRouterBatchConfig(
+        api_url="https://batch.example/api/beta/batches",
+        model_name="embedding",
+        effective_dimension=3,
+    )
+    job.config_snapshot["openrouter_batch"] = config.model_dump(mode="json")
+    model = _durable_embedding_model()
+    model.normalize = False
+    model.passage_prefix = "UNUSED: "
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.contextual._contextual_safe_input_limit",
+            return_value=1200,
+        ),
+        patch("shared_configs.configs.DOC_EMBEDDING_CONTEXT_SIZE", 8),
+    ):
+        before = prepare_durable_context_view(
+            job=job,
+            rows=[row],
+            embedding_tokenizer=tokenizer,
+            contextual_tokenizer=tokenizer,
+            generate=MagicMock(),
+        )
+        same = prepare_durable_context_view(
+            job=job,
+            rows=[row],
+            embedding_tokenizer=tokenizer,
+            contextual_tokenizer=tokenizer,
+            generate=MagicMock(),
+            embedding_model=model,
+        )
+        job.config_snapshot["openrouter_batch"] = config.model_copy(
+            update={"api_url": "https://other.example/api/beta/batches"}
+        ).model_dump(mode="json")
+        after = prepare_durable_context_view(
+            job=job,
+            rows=[row],
+            embedding_tokenizer=tokenizer,
+            contextual_tokenizer=tokenizer,
+            generate=MagicMock(),
+        )
+    assert same == before
+    assert before.projections[0].embedding_texts == [row.text]
+    request = OpenRouterEmbeddingBatchRequest(custom_id="fixture", inputs=[row.text])
+    assert openrouter_embedding_payload([request], config=config) == {
+        "endpoint": "/v1/embeddings",
+        "model": "embedding",
+        "requests": [
+            {
+                "custom_id": "fixture",
+                "body": {
+                    "model": "embedding",
+                    "input": before.projections[0].embedding_texts,
+                    "dimensions": 3,
+                },
+            }
+        ],
+    }
+    verified = before.model_copy(
+        update={
+            "projections": [
+                before.projections[0].model_copy(update={"vector_reuse_verified": True})
+            ]
+        }
+    )
+    impact = compare_context_views(old=verified, new=after, direct_canonical_changes=[])
+    assert impact.contextual_candidates == [row.id] == impact.embedding_changes
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [("model_name", "wrong"), ("reduced_dimension", 8), ("provider_type", None)],
+)
+def test_durable_model_snapshot_mismatch_blocks_generation(
+    attribute: str, value: object
+) -> None:
+    from onyx.regulatory.indexing_jobs.contextual import prepare_durable_context_view
+
+    job, row, tokenizer = _durable_fixture()
+    model = _durable_embedding_model()
+    setattr(model, attribute, value)
+    generate = MagicMock()
+    with pytest.raises(ValueError, match="embedding_configuration_mismatch"):
+        prepare_durable_context_view(
+            job=job,
+            rows=[row],
+            embedding_tokenizer=tokenizer,
+            contextual_tokenizer=tokenizer,
+            generate=generate,
+            embedding_model=model,
+        )
+    generate.assert_not_called()
