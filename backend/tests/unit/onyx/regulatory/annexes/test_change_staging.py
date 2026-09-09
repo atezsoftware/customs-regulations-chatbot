@@ -525,3 +525,107 @@ def test_candidate_insertion_uses_explicit_anchor_without_mutating_baseline() ->
         ("next", 2),
     ]
     assert [row.position for row in scope] == [0, 1]
+
+
+@pytest.mark.parametrize("depth", [1, 3])
+def test_pure_delete_retires_empty_aggregate_chain_and_preserves_history(
+    depth: int,
+) -> None:
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        compare_context_views,
+        validate_complete_context_view,
+    )
+    from onyx.regulatory.amendments.annexes.models import AnnexChangeItemDraft
+    from onyx.regulatory.amendments.annexes.staging import (
+        canonical_snapshot_rows,
+        prepare_staged_candidate_rows,
+    )
+
+    scope = baseline()
+    for index in range(depth):
+        scope.append(
+            scope[0].model_copy(
+                update={
+                    "id": f"aggregate-{index}",
+                    "position": index + 1,
+                    "projection_ordinal": index + 1,
+                    "text": f"historical aggregate {index}",
+                    "metadata": {
+                        "chunk_variant": "hierarchical_aggregate",
+                        "hierarchy_root_path": ["EK-1"],
+                        "source_regulatory_chunk_ids": [scope[-1].id],
+                    },
+                }
+            )
+        )
+    day = date(2026, 9, 10)
+    old = _prepared_view(canonical_snapshot_rows(scope), day)
+    items = [
+        AnnexChangeItemDraft(
+            operation="remove",
+            old_chunk_ids=["one"],
+            new_chunks=[],
+            old_positions=[0],
+            new_positions=[],
+        )
+    ]
+    rows = prepare_staged_candidate_rows(
+        baseline_scope=scope, items=items, effective_date=day
+    )
+    assert len(rows) == len(scope)
+    for original, row in zip(scope, rows, strict=True):
+        assert row.id == original.id and row.text == original.text
+        assert row.chunk_metadata == original.metadata
+        assert row.status == "superseded" and row.validity_end_date == day
+        assert original.status == "active" and original.validity_end_date is None
+    prepared = _prepared_view(rows, day)
+    assert not prepared.projections and not prepared.snapshots
+    validate_complete_context_view(rows=rows, view=prepared, as_of_date=day)
+    impact = compare_context_views(old=old, new=prepared, direct_canonical_changes=[])
+    assert impact.ready and impact.retire_history == sorted(row.id for row in scope)
+
+
+@pytest.mark.parametrize(
+    "sources,root,error",
+    [
+        ([], ["EK-1"], "aggregate_provenance_unavailable"),
+        (["unknown"], ["EK-1"], "aggregate_source_unavailable"),
+        (["one", "unknown"], ["EK-1"], "aggregate_source_unavailable"),
+        (["one"], [], "aggregate_provenance_unavailable"),
+    ],
+)
+def test_aggregate_retirement_does_not_hide_unknown_provenance(
+    sources: list[str], root: list[str], error: str
+) -> None:
+    from onyx.regulatory.amendments.annexes.models import AnnexChangeItemDraft
+    from onyx.regulatory.amendments.annexes.staging import prepare_staged_candidate_rows
+
+    scope = baseline()
+    scope.append(
+        scope[0].model_copy(
+            update={
+                "id": "aggregate",
+                "position": 1,
+                "projection_ordinal": 1,
+                "metadata": {
+                    "chunk_variant": "hierarchical_aggregate",
+                    "hierarchy_root_path": root,
+                    "source_regulatory_chunk_ids": sources,
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match=error):
+        prepare_staged_candidate_rows(
+            baseline_scope=scope,
+            items=[
+                AnnexChangeItemDraft(
+                    operation="remove",
+                    old_chunk_ids=["one"],
+                    new_chunks=[],
+                    old_positions=[0],
+                    new_positions=[],
+                )
+            ],
+            effective_date=date(2026, 9, 10),
+        )

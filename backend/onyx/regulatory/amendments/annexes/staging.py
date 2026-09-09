@@ -255,6 +255,45 @@ def prepare_staged_candidate_rows(
                 row.position += len(item.new_chunks)
         for offset, chunk in enumerate(item.new_chunks, 1):
             by_id[chunk.id].position = anchor.position + offset
+    retired = {
+        identifier
+        for identifier, targets in replacements.items()
+        if not targets and identifier in by_id
+    }
+    pending_aggregates = [
+        row
+        for row in rows
+        if row.chunk_metadata.get("chunk_variant") == "hierarchical_aggregate"
+        and validity_window_contains(
+            row.validity_start_date, row.validity_end_date, effective_date
+        )
+    ]
+    while pending_aggregates:
+        newly_retired: set[str] = set()
+        for row in pending_aggregates:
+            sources = row.chunk_metadata.get("source_regulatory_chunk_ids")
+            if (
+                not isinstance(sources, list)
+                or not sources
+                or not all(
+                    isinstance(source, str) and source in retired for source in sources
+                )
+            ):
+                continue
+            root = row.chunk_metadata.get("hierarchy_root_path")
+            if not isinstance(root, list) or not root or not isinstance(root[-1], str):
+                raise ValueError("aggregate_provenance_unavailable")
+            # Keep the historical text and source bindings before any rewriting.
+            row.validity_end_date = effective_date
+            row.status = "superseded"
+            replacements[row.id] = []
+            newly_retired.add(row.id)
+        if not newly_retired:
+            break
+        retired.update(newly_retired)
+        pending_aggregates = [
+            row for row in pending_aggregates if row.id not in newly_retired
+        ]
     for row in rows:
         if not validity_window_contains(
             row.validity_start_date, row.validity_end_date, effective_date
