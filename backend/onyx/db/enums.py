@@ -878,3 +878,11 @@ class BenchmarkRunItemPhase(str, PyEnum):
 class BenchmarkCostSource(str, PyEnum):
     MEASURED = "measured"
     UNAVAILABLE = "unavailable"
+
+
+class AmendmentSourcePackageStatus(str, PyEnum):
+    PROCESSING = "processing"
+    READY = "ready"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    FAILED = "failed"

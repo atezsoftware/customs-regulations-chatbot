@@ -1655,6 +1655,13 @@ MAX_FILE_SIZE_BYTES = int(
 # One-off amendment sources are synchronously extracted and then sent to the
 # default LLM. Keep their network and prompt footprint bounded independently
 # from normal user-file ingestion.
+REGULATORY_ANNEX_UPDATES_ENABLED = (
+    os.environ.get("REGULATORY_ANNEX_UPDATES_ENABLED", "false").lower() == "true"
+)
+REGULATORY_ANNEX_ENVIRONMENT = (
+    os.environ.get("REGULATORY_ANNEX_ENVIRONMENT") or POSTGRES_DB
+)
+
 MAX_AMENDMENT_SOURCE_BYTES = _non_negative_int_env(
     "MAX_AMENDMENT_SOURCE_BYTES", 25 * 1024 * 1024
 )

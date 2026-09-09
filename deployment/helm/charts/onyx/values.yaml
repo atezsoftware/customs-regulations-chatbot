@@ -1494,6 +1494,10 @@ configMap:
   # Auto model discovery interval in seconds.
   # AUTO_LLM_UPDATE_INTERVAL_SECONDS: "1800"
   # Amendment source extraction bounds (bytes, characters, minimum PDF text).
+  # Annex sources are opt-in; API and workers must use the same environment label.
+  REGULATORY_ANNEX_UPDATES_ENABLED: "false"
+  # Empty defaults to POSTGRES_DB; the queue also includes the database identity.
+  REGULATORY_ANNEX_ENVIRONMENT: ""
   # MAX_AMENDMENT_SOURCE_BYTES: "26214400"
   # MAX_AMENDMENT_SOURCE_TEXT_CHARS: "200000"
   # MIN_AMENDMENT_PDF_TEXT_CHARS: "40"

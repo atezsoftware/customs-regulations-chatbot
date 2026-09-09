@@ -6030,6 +6030,11 @@ class AmendmentBatch(Base):
 
     __tablename__ = "amendment_batch"
 
+    source_package_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("amendment_source_package.id"), nullable=True
+    )
+    source_text_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     document_set_id: Mapped[int] = mapped_column(
         ForeignKey("document_set.id", ondelete="CASCADE"), nullable=False
@@ -8126,4 +8131,94 @@ class SSOProvider(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+
+class AmendmentSourcePackage(Base):
+    """Scoped, idempotent source acquisition with immutable evidence blobs."""
+
+    __tablename__ = "amendment_source_package"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="CASCADE")
+    )
+    environment: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(Text)
+    request_hash: Mapped[str] = mapped_column(Text)
+    input_spec: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    input_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(
+        Text, default="processing", server_default="processing"
+    )
+    asset_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    total_bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    issues: Mapped[list[dict[str, Any]]] = mapped_column(
+        PGJSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    manifest_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    manifest_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_token: Mapped[UUID | None] = mapped_column(nullable=True)
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user.id"), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_set_id",
+            "environment",
+            "idempotency_key",
+            name="uq_amendment_source_request",
+        ),
+        CheckConstraint(
+            "status IN ('processing', 'ready', 'partial', 'blocked', 'failed')",
+            name="amendment_source_status_check",
+        ),
+        CheckConstraint(
+            "asset_count >= 0 AND asset_count <= 21 AND total_bytes >= 0 AND total_bytes <= 104857600",
+            name="amendment_source_limits_check",
+        ),
+        Index("ix_amendment_source_package_document_set_id", "document_set_id"),
+    )
+
+
+class RegulatorySourceAsset(Base):
+    """Append-only metadata for a content-addressed source within one package."""
+
+    __tablename__ = "regulatory_source_asset"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    package_id: Mapped[UUID] = mapped_column(
+        ForeignKey("amendment_source_package.id", ondelete="CASCADE")
+    )
+    sha256: Mapped[str] = mapped_column(Text)
+    file_id: Mapped[str] = mapped_column(Text)
+    text_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    text_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mime_type: Mapped[str] = mapped_column(Text)
+    display_name: Mapped[str] = mapped_column(Text)
+    byte_count: Mapped[int] = mapped_column(BigInteger)
+    original_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    final_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "package_id", "sha256", name="uq_regulatory_source_asset_hash"
+        ),
+        CheckConstraint(
+            "byte_count > 0 AND byte_count <= 26214400",
+            name="regulatory_source_asset_size_check",
+        ),
     )

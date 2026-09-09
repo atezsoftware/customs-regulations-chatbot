@@ -5,21 +5,37 @@ re-project the whole file; file-level validity uses an exact metadata-only
 Elasticsearch patch and rejects unsafe projections.
 """
 
+import hashlib
+import io
+import json
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
 from onyx.auth.schemas import UserRole
+from onyx.background.celery.tasks.regulatory_amendments.sources import (
+    enqueue_source_package,
+)
 from onyx.background.celery.tasks.regulatory_amendments.tasks import (
     enqueue_amendment_batch,
     enqueue_amendment_proposal_approval,
 )
 from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_BYTES
-from onyx.configs.constants import PUBLIC_API_TAGS
+from onyx.configs.constants import PUBLIC_API_TAGS, FileOrigin
+from onyx.db.amendment_sources import (
+    attach_source_package_to_batch,
+    create_source_package,
+    get_source_asset,
+    get_source_package,
+    list_source_assets,
+    mark_source_package_failed,
+    require_ready_source_package,
+    retry_source_package,
+)
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import AmendmentBatchStatus, Permission
@@ -51,6 +67,8 @@ from onyx.db.user_file import lock_completed_user_file_for_projection
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
+from onyx.regulatory.amendments.annexes import config as annex_config
+from onyx.regulatory.amendments.annexes.sources import MAX_ASSET_BYTES
 from onyx.regulatory.amendments.source_extraction import (
     AmendmentSourceExtractionError,
     fetch_and_extract_amendment_url,
@@ -71,11 +89,14 @@ from onyx.server.features.projects.models import UserFileSnapshot
 from onyx.server.features.regulatory.models import (
     AmendmentBatchSnapshot,
     AmendmentProposalSnapshot,
+    AmendmentSourceAssetSnapshot,
     AmendmentSourceExtractionSnapshot,
+    AmendmentSourcePackageSnapshot,
     AmendmentSourceUrlRequest,
     AnalyzeAmendmentRequest,
     AnalyzeAmendmentResponse,
     ApproveAmendmentProposalRequest,
+    CreateAmendmentSourcePackageRequest,
     RegulatoryChunkSnapshot,
     RegulatoryChunkUpdateRequest,
     RegulatoryFileValidityUpdateRequest,
@@ -461,6 +482,17 @@ def analyze_amendment_text(
     document_set = _get_editable_document_set(
         db_session, analyze_request.document_set_id, user
     )
+    if analyze_request.source_package_id is not None:
+        _require_annex_updates()
+        try:
+            require_ready_source_package(
+                db_session,
+                package_id=analyze_request.source_package_id,
+                document_set_id=document_set.id,
+                environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+            )
+        except ValueError as exc:
+            raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
     user_file_ids = [user_file.id for user_file in document_set.user_files]
     if not user_file_ids:
         raise OnyxError(
@@ -476,6 +508,13 @@ def analyze_amendment_text(
         raw_text=analyze_request.raw_text,
         created_by=user.id,
     )
+    if analyze_request.source_package_id is not None:
+        attach_source_package_to_batch(
+            db_session,
+            batch=batch,
+            package_id=analyze_request.source_package_id,
+            environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+        )
     db_session.commit()
     try:
         enqueue_amendment_batch(
@@ -718,3 +757,259 @@ def reject_proposal_endpoint(
     db_session.commit()
 
     return AmendmentProposalSnapshot.from_model(proposal)
+
+
+def _require_annex_updates() -> None:
+    if not annex_config.REGULATORY_ANNEX_UPDATES_ENABLED:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Annex source packages are disabled")
+
+
+def _source_package_snapshot(
+    db_session: Session, package_id: UUID, document_set_id: int
+) -> AmendmentSourcePackageSnapshot:
+    package = get_source_package(
+        db_session,
+        package_id=package_id,
+        document_set_id=document_set_id,
+        environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+    )
+    if package is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Source package not found")
+    snapshot = AmendmentSourcePackageSnapshot.model_validate(package)
+    snapshot.assets = [
+        AmendmentSourceAssetSnapshot.model_validate(asset)
+        for asset in list_source_assets(db_session, package_id)
+    ]
+    return snapshot
+
+
+def _create_source_package_request(
+    *,
+    db_session: Session,
+    document_set_id: int,
+    idempotency_key: str,
+    user: User,
+    tenant_id: str,
+    spec: dict[str, str],
+    content: bytes | None,
+) -> AmendmentSourcePackageSnapshot:
+    request_hash = hashlib.sha256(
+        json.dumps(spec, sort_keys=True).encode() + b"\0" + (content or b"")
+    ).hexdigest()
+    store = get_default_file_store()
+    input_file_id = (
+        store.save_file(
+            io.BytesIO(content),
+            display_name=spec.get("display_name", "source"),
+            file_origin=FileOrigin.OTHER,
+            file_type=spec.get("mime_type", "application/octet-stream"),
+        )
+        if content is not None
+        else None
+    )
+    try:
+        package, created = create_source_package(
+            db_session,
+            document_set_id=document_set_id,
+            environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            input_spec=spec,
+            created_by=user.id,
+            input_file_id=input_file_id,
+        )
+    except ValueError as exc:
+        if input_file_id:
+            store.delete_file(input_file_id)
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    db_session.commit()
+    if not created and input_file_id:
+        store.delete_file(input_file_id)
+    if created:
+        try:
+            enqueue_source_package(package_id=package.id, tenant_id=tenant_id)
+        except Exception:
+            mark_source_package_failed(
+                db_session,
+                package_id=package.id,
+                environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+            )
+            logger.warning(
+                "Source package dispatch failed; retry package %s", package.id
+            )
+    return _source_package_snapshot(db_session, package.id, document_set_id)
+
+
+@router.post("/amendments/source-packages", tags=PUBLIC_API_TAGS, status_code=202)
+def create_amendment_source_package(
+    request: CreateAmendmentSourcePackageRequest,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> AmendmentSourcePackageSnapshot:
+    _require_annex_updates()
+    _get_editable_document_set(db_session, request.document_set_id, user)
+    spec = (
+        {"url": request.url}
+        if request.url is not None
+        else {"mime_type": "text/plain", "display_name": "amendment.txt"}
+    )
+    return _create_source_package_request(
+        db_session=db_session,
+        document_set_id=request.document_set_id,
+        idempotency_key=request.idempotency_key,
+        user=user,
+        tenant_id=tenant_id,
+        spec=spec,
+        content=request.text.encode() if request.text is not None else None,
+    )
+
+
+@router.post(
+    "/amendments/source-packages/upload", tags=PUBLIC_API_TAGS, status_code=202
+)
+def upload_amendment_source_package(
+    file: UploadFile = File(...),
+    document_set_id: int = Form(...),
+    idempotency_key: str = Form(..., min_length=1, max_length=200),
+    base_url: str | None = Form(default=None, max_length=8192),
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> AmendmentSourcePackageSnapshot:
+    _require_annex_updates()
+    _get_editable_document_set(db_session, document_set_id, user)
+    content = file.file.read(MAX_ASSET_BYTES + 1)
+    if not content or len(content) > MAX_ASSET_BYTES:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Source file must contain between 1 byte and 25 MiB",
+        )
+    spec = {
+        "mime_type": file.content_type or "application/octet-stream",
+        "display_name": file.filename or "source",
+    }
+    if base_url:
+        spec["base_url"] = base_url
+    return _create_source_package_request(
+        db_session=db_session,
+        document_set_id=document_set_id,
+        idempotency_key=idempotency_key,
+        user=user,
+        tenant_id=tenant_id,
+        spec=spec,
+        content=content,
+    )
+
+
+@router.get("/amendments/source-packages/{package_id}", tags=PUBLIC_API_TAGS)
+def get_amendment_source_package(
+    package_id: UUID,
+    document_set_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> AmendmentSourcePackageSnapshot:
+    _require_annex_updates()
+    _get_editable_document_set(db_session, document_set_id, user)
+    return _source_package_snapshot(db_session, package_id, document_set_id)
+
+
+@router.post(
+    "/amendments/source-packages/{package_id}/retry",
+    tags=PUBLIC_API_TAGS,
+    status_code=202,
+)
+def retry_amendment_source_package(
+    package_id: UUID,
+    document_set_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> AmendmentSourcePackageSnapshot:
+    _require_annex_updates()
+    _get_editable_document_set(db_session, document_set_id, user)
+    try:
+        retry_source_package(
+            db_session,
+            package_id=package_id,
+            document_set_id=document_set_id,
+            environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+        )
+    except ValueError as exc:
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    try:
+        enqueue_source_package(package_id=package_id, tenant_id=tenant_id)
+    except Exception:
+        mark_source_package_failed(
+            db_session,
+            package_id=package_id,
+            environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+        )
+        logger.warning("Source package retry dispatch failed for %s", package_id)
+    return _source_package_snapshot(db_session, package_id, document_set_id)
+
+
+@router.get(
+    "/amendments/source-packages/{package_id}/assets/{asset_id}", tags=PUBLIC_API_TAGS
+)
+def download_amendment_source_asset(
+    package_id: UUID,
+    asset_id: UUID,
+    document_set_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> Response:
+    _require_annex_updates()
+    _get_editable_document_set(db_session, document_set_id, user)
+    _source_package_snapshot(db_session, package_id, document_set_id)
+    asset = get_source_asset(db_session, package_id=package_id, asset_id=asset_id)
+    if asset is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Source asset not found")
+    with get_default_file_store().read_file(asset.file_id) as stream:
+        content = stream.read(MAX_ASSET_BYTES + 1)
+    if (
+        len(content) != asset.byte_count
+        or hashlib.sha256(content).hexdigest() != asset.sha256
+    ):
+        raise OnyxError(
+            OnyxErrorCode.INTERNAL_ERROR, "Source asset integrity check failed"
+        )
+    return Response(
+        content,
+        media_type=asset.mime_type,
+        headers={
+            "Content-Disposition": 'attachment; filename="source"',
+            "Content-Security-Policy": "sandbox",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/amendments/source-packages/{package_id}/evidence", tags=PUBLIC_API_TAGS)
+def get_amendment_source_evidence(
+    package_id: UUID,
+    document_set_id: int,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> Response:
+    _require_annex_updates()
+    _get_editable_document_set(db_session, document_set_id, user)
+    package = get_source_package(
+        db_session,
+        package_id=package_id,
+        document_set_id=document_set_id,
+        environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+    )
+    if package is None or package.manifest_file_id is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Source evidence is not available yet")
+    with get_default_file_store().read_file(package.manifest_file_id) as stream:
+        content = stream.read(150 * 1024 * 1024 + 1)
+    if hashlib.sha256(content).hexdigest() != package.manifest_sha256:
+        raise OnyxError(
+            OnyxErrorCode.INTERNAL_ERROR, "Source manifest integrity check failed"
+        )
+    return Response(
+        content,
+        media_type="application/json",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )

@@ -1,7 +1,8 @@
 import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
+from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_TEXT_CHARS
 from onyx.db.models import RegulatoryChunk
@@ -84,6 +85,7 @@ class UserFileRenameRequest(BaseModel):
 
 
 class AnalyzeAmendmentRequest(BaseModel):
+    source_package_id: UUID | None = None
     document_set_id: int
     raw_text: str = Field(min_length=1, max_length=MAX_AMENDMENT_SOURCE_TEXT_CHARS)
 
@@ -209,3 +211,46 @@ class AnalyzeAmendmentResponse(BaseModel):
     batch: AmendmentBatchSnapshot
     proposals: list[AmendmentProposalSnapshot]
     unmatched_instructions: list[str]
+
+
+class CreateAmendmentSourcePackageRequest(BaseModel):
+    document_set_id: int
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    url: str | None = Field(default=None, min_length=1, max_length=8192)
+    text: str | None = Field(
+        default=None, min_length=1, max_length=MAX_AMENDMENT_SOURCE_TEXT_CHARS
+    )
+
+    @model_validator(mode="after")
+    def exactly_one_source(self) -> Self:
+        if (self.url is None) == (self.text is None):
+            raise ValueError("Provide exactly one URL or text source")
+        return self
+
+
+class AmendmentSourceAssetSnapshot(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    sha256: str
+    mime_type: str
+    display_name: str
+    byte_count: int
+    original_url: str | None
+    final_url: str | None
+    text_sha256: str | None
+
+
+class AmendmentSourcePackageSnapshot(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    document_set_id: int
+    status: Literal["processing", "ready", "partial", "blocked", "failed"]
+    asset_count: int
+    total_bytes: int
+    issues: list[dict[str, Any]]
+    manifest_sha256: str | None
+    assets: list[AmendmentSourceAssetSnapshot] = Field(default_factory=list)
+    created_at: datetime.datetime
+    updated_at: datetime.datetime

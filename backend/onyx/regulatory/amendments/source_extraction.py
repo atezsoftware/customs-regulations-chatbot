@@ -303,3 +303,17 @@ def fetch_and_extract_amendment_url(url: str) -> AmendmentSourceExtraction:
         source_type="html",
         display_name=display_name,
     )
+
+
+@dataclass(frozen=True)
+class AmendmentSourceHttpOptions:
+    headers: dict[str, str]
+    verify: bool | str
+
+
+def amendment_source_http_options(url: str) -> AmendmentSourceHttpOptions:
+    """Shared public transport settings for original and annex source downloads."""
+    return AmendmentSourceHttpOptions(
+        headers=dict(_AMENDMENT_SOURCE_HEADERS),
+        verify=_resmi_gazete_ca_bundle_path() if _is_resmi_gazete_url(url) else True,
+    )
