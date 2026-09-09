@@ -8,6 +8,8 @@ from typing import cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, case, delete, func, or_, select, update
+from sqlalchemy import cast as sqlalchemy_cast
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -31,6 +33,11 @@ from onyx.db.models import (
 )
 from onyx.db.regulatory_amendments import (
     finalize_amendment_proposals_for_indexing_job,
+)
+from onyx.db.regulatory_context_projections import persist_context_view
+from onyx.regulatory.amendments.annexes.models import (
+    ContextSourceSnapshot,
+    PreparedContextView,
 )
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
@@ -140,6 +147,8 @@ class RegulatoryIndexingPreparedItem:
     regulatory_chunk_id: str
     request_hash: str
     skip_context: bool
+    source_snapshot: ContextSourceSnapshot | None = None
+    context_input: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -1702,6 +1711,17 @@ def persist_regulatory_indexing_preparation(
                 RegulatoryIndexingItem.job_id == job_id
             )
         )
+        source_snapshots = {
+            item.source_snapshot.sha256: item.source_snapshot
+            for item in prepared_items
+            if item.source_snapshot is not None
+        }
+        if source_snapshots:
+            persist_context_view(
+                db_session,
+                user_file_id=locked_job.user_file_id,
+                view=PreparedContextView(snapshots=list(source_snapshots.values())),
+            )
         for item in prepared_items:
             db_session.add(
                 RegulatoryIndexingItem(
@@ -1709,6 +1729,9 @@ def persist_regulatory_indexing_preparation(
                     job_id=job_id,
                     regulatory_chunk_id=item.regulatory_chunk_id,
                     request_hash=item.request_hash,
+                    context={"context_input": item.context_input}
+                    if item.context_input is not None
+                    else None,
                     status=(
                         RegulatoryIndexingItemStatus.SKIPPED.value
                         if item.skip_context
@@ -1789,7 +1812,9 @@ def persist_regulatory_indexing_item_context(
         allowed_statuses=(RegulatoryIndexingItemStatus.PENDING.value,),
         values={
             "status": RegulatoryIndexingItemStatus.CONTEXT_READY.value,
-            "context": context,
+            "context": func.coalesce(
+                RegulatoryIndexingItem.context, sqlalchemy_cast({}, JSONB)
+            ).op("||")(sqlalchemy_cast(context, JSONB)),
             "error_code": None,
             "error_message": None,
             "updated_at": func.now(),

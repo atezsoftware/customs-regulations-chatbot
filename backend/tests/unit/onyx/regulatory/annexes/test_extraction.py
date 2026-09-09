@@ -222,7 +222,7 @@ def test_image_vision_extracts_real_pixels_and_retains_uncertainty() -> None:
         created="2026-01-01",
         choice=Choice(
             message=Message(
-                content='{"elements":[{"kind":"image_region","text":"unclear","box":[0.1,0.2,0.8,0.9],"status":"uncertain","issues":["illegible rate"]}]}'
+                content='{"elements":[{"kind":"image_region","text":"unclear","box":[0.1,0.2,0.8,0.9],"status":"uncertain","issues":["low_readability"]}]}'
             )
         ),
     )
@@ -397,3 +397,33 @@ def test_rotated_pdf_preserves_native_coordinates_without_false_normalization() 
     assert native.locator.normalized_box is None
     assert native.status == "uncertain"
     assert "rotated_pdf_native_coordinates" in native.issues
+
+
+def test_descriptive_vision_issue_retries_as_region_text_without_hiding_uncertainty() -> (
+    None
+):
+    import json
+
+    from pydantic import ValidationError
+
+    from onyx.regulatory.amendments.annexes.models import AnnexVisionResult
+
+    response = {
+        "elements": [
+            {
+                "kind": "image_region",
+                "text": "",
+                "box": [0.1, 0.1, 0.9, 0.9],
+                "status": "readable",
+                "issues": ["Horizontal rule"],
+            }
+        ]
+    }
+    with pytest.raises(ValidationError):
+        AnnexVisionResult.model_validate(response)
+    response["elements"][0]["text"] = "Horizontal rule"
+    response["elements"][0]["issues"] = []
+    assert (
+        AnnexVisionResult.model_validate_json(json.dumps(response)).elements[0].text
+        == "Horizontal rule"
+    )

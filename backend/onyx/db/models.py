@@ -8327,3 +8327,88 @@ class RegulatoryAnnexElementChunk(Base):
             ondelete="CASCADE",
         ),
     )
+
+
+class RegulatoryContextSnapshot(Base):
+    """Shared source selection, ordered ranges and exact document input."""
+
+    __tablename__ = "regulatory_context_snapshot"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    user_file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_file.id", ondelete="CASCADE")
+    )
+    sha256: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    __table_args__ = (
+        UniqueConstraint(
+            "user_file_id", "sha256", name="uq_context_snapshot_file_hash"
+        ),
+    )
+
+
+class RegulatoryContextGeneration(Base):
+    """A captured prompt/config/output shared by its actual consumers."""
+
+    __tablename__ = "regulatory_context_generation"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    user_file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_file.id", ondelete="CASCADE")
+    )
+    request_sha256: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    __table_args__ = (
+        UniqueConstraint(
+            "user_file_id", "request_sha256", name="uq_context_generation_file_hash"
+        ),
+    )
+
+
+class RegulatoryContextProjection(Base):
+    """Retrieval context/embedding history independent of canonical legal identity."""
+
+    __tablename__ = "regulatory_context_projection"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    canonical_chunk_id: Mapped[str] = mapped_column(
+        ForeignKey("regulatory_chunk.id", ondelete="CASCADE")
+    )
+    source_snapshot_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_context_snapshot.id")
+    )
+    payload_sha256: Mapped[str] = mapped_column(Text)
+    embedding_input_sha256: Mapped[str] = mapped_column(Text)
+    embedding_config_sha256: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    effective_start: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    effective_end: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    published_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "canonical_chunk_id", "payload_sha256", name="uq_context_projection_payload"
+        ),
+        CheckConstraint(
+            "effective_end IS NULL OR effective_start IS NULL OR effective_end > effective_start",
+            name="context_projection_dates_check",
+        ),
+        Index(
+            "ix_context_projection_effective",
+            "canonical_chunk_id",
+            "effective_start",
+            "effective_end",
+        ),
+    )
+
+
+class RegulatoryContextProjectionCall(Base):
+    __tablename__ = "regulatory_context_projection_call"
+    projection_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_context_projection.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    generation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_context_generation.id"), primary_key=True
+    )

@@ -824,9 +824,10 @@ def test_apply_results_persists_only_fitted_generated_context(
 
     assert persisted == [
         {
+            "raw_contextual_text": "Bu parça, transit teminatının aranmasını düzenler.",
             "contextual_text": (
                 "Bu parça, transit teminatının aranmasını düzenler." + RETURN_SEPARATOR
-            )
+            ),
         }
     ]
     assert summary == ContextApplySummary(

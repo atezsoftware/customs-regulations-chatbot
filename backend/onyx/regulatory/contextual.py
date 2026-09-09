@@ -70,10 +70,11 @@ def visible_regulatory_snapshot_for_target(
     target: _RegulatoryValidityRowT,
     *,
     today: datetime.date | None = None,
+    reference_date: datetime.date | None = None,
 ) -> list[_RegulatoryValidityRowT]:
     """Select one unambiguous legal version per position for a target row."""
 
-    reference_date = context_reference_date(
+    reference_date = reference_date or context_reference_date(
         target.validity_start_date,
         target.validity_end_date,
         today=today,

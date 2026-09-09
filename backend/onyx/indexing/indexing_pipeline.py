@@ -3,7 +3,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
-from typing import NamedTuple, Protocol
+from typing import Literal, NamedTuple, Protocol
 
 import sentry_sdk
 from pydantic import BaseModel, ConfigDict
@@ -108,6 +108,9 @@ from onyx.prompts.contextual_retrieval import (
     CONTEXTUAL_RAG_PROMPT1,
     CONTEXTUAL_RAG_PROMPT2,
     DOCUMENT_SUMMARY_PROMPT,
+)
+from onyx.regulatory.amendments.annexes.context_dependencies import (
+    ContextGenerationRecorder,
 )
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
@@ -960,6 +963,42 @@ def process_image_sections(documents: list[Document]) -> list[IndexingDocument]:
     return indexed_documents
 
 
+def _invoke_recorded_context(
+    *,
+    llm: LLM,
+    flow: LLMFlow,
+    prompt: LanguageModelInput,
+    recorder: ContextGenerationRecorder | None,
+    chunks: list[DocAwareChunk],
+    stage: Literal["summary", "chunk", "fallback_summary"],
+    source_text: str,
+    token_budget: int,
+    tokenizer: BaseTokenizer,
+) -> str:
+    def generate() -> str:
+        return _invoke_contextual_llm_with_retry(llm=llm, flow=flow, prompt=prompt)
+
+    if recorder is None:
+        return generate()
+    consumer_ids = [
+        chunk.regulatory_chunk_id or f"{chunk.source_document.id}:{chunk.chunk_id}"
+        for chunk in chunks
+    ]
+    output = recorder.invoke(
+        llm=llm,
+        flow=flow,
+        prompt=prompt,
+        generate=generate,
+        consumer_id=consumer_ids[0],
+        stage=stage,
+        source_text=source_text,
+        token_budget=token_budget,
+        tokenizer=f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
+    )
+    recorder.share(consumer_ids[0], consumer_ids[1:])
+    return output
+
+
 def add_document_summaries(
     chunks_by_doc: list[DocAwareChunk],
     llm: LLM,
@@ -967,6 +1006,7 @@ def add_document_summaries(
     trunc_doc_tokens: int,
     *,
     raise_on_failure: bool = False,
+    recorder: ContextGenerationRecorder | None = None,
 ) -> list[int] | None:
     """
     Adds a document summary to a list of chunks from the same document.
@@ -994,10 +1034,16 @@ def add_document_summaries(
     summary_prompt = DOCUMENT_SUMMARY_PROMPT.format(document=doc_content)
     prompt_msg = UserMessage(content=summary_prompt)
 
-    doc_summary = _invoke_contextual_llm_with_retry(
+    doc_summary = _invoke_recorded_context(
         llm=llm,
         flow=LLMFlow.CONTEXTUAL_RAG_DOC_SUMMARY,
         prompt=prompt_msg,
+        recorder=recorder,
+        chunks=chunks_by_doc,
+        stage="summary",
+        source_text=doc_content,
+        token_budget=trunc_doc_tokens,
+        tokenizer=tokenizer,
     )
     if not doc_summary.strip():
         message = (
@@ -1022,6 +1068,7 @@ def add_chunk_summaries(
     doc_tokens: list[int] | None,
     *,
     raise_on_failure: bool = False,
+    recorder: ContextGenerationRecorder | None = None,
 ) -> None:
     """
     Adds chunk summaries to the chunks grouped by document id.
@@ -1054,10 +1101,16 @@ def add_chunk_summaries(
         fallback_prompt = UserMessage(
             content=DOCUMENT_SUMMARY_PROMPT.format(document=doc_content)
         )
-        doc_info = _invoke_contextual_llm_with_retry(
+        doc_info = _invoke_recorded_context(
             llm=llm,
             flow=LLMFlow.CONTEXTUAL_RAG_DOC_SUMMARY,
             prompt=fallback_prompt,
+            recorder=recorder,
+            chunks=chunks_by_doc,
+            stage="fallback_summary",
+            source_text=doc_content,
+            token_budget=trunc_doc_chunk_tokens,
+            tokenizer=tokenizer,
         )
         if not doc_info.strip():
             message = (
@@ -1084,10 +1137,16 @@ def add_chunk_summaries(
                 continuation=True,  # Append chunk to the document context
             )
 
-            chunk_context = _invoke_contextual_llm_with_retry(
+            chunk_context = _invoke_recorded_context(
                 llm=llm,
                 flow=LLMFlow.CONTEXTUAL_RAG_CHUNK_CONTEXT,
                 prompt=processed_prompt,
+                recorder=recorder,
+                chunks=[chunk],
+                stage="chunk",
+                source_text=doc_info,
+                token_budget=trunc_doc_chunk_tokens,
+                tokenizer=tokenizer,
             )
             if not chunk_context.strip():
                 raise ContextualEnrichmentError(
@@ -1121,6 +1180,7 @@ def add_contextual_summaries(
     chunk_token_limit: int,
     *,
     raise_on_failure: bool = False,
+    recorder: ContextGenerationRecorder | None = None,
 ) -> list[DocAwareChunk]:
     """
     Adds Document summary and chunk-within-document context to the chunks
@@ -1165,6 +1225,7 @@ def add_contextual_summaries(
                 tokenizer,
                 trunc_doc_summary_tokens,
                 raise_on_failure=raise_on_failure,
+                recorder=recorder,
             )
 
         if USE_CHUNK_SUMMARY:
@@ -1175,6 +1236,7 @@ def add_contextual_summaries(
                 trunc_doc_chunk_tokens,
                 doc_tokens,
                 raise_on_failure=raise_on_failure,
+                recorder=recorder,
             )
 
     return chunks

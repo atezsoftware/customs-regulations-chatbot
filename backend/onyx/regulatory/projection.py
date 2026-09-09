@@ -28,6 +28,10 @@ from onyx.db.regulatory_chunks import (
     get_bounded_same_provision_siblings,
     get_chunks_for_file,
 )
+from onyx.db.regulatory_context_projections import (
+    load_context_generation_calls,
+    persist_context_view,
+)
 from onyx.db.search_settings import get_active_search_settings_list
 from onyx.db.user_file import (
     fetch_document_set_names_for_user_files,
@@ -49,11 +53,26 @@ from onyx.indexing.models import DocAwareChunk, DocMetadataAwareIndexChunk, Inde
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.interfaces import LLM
 from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
+from onyx.regulatory.amendments.annexes.context_dependencies import (
+    ContextGenerationRecorder,
+    canonical_dependency_ids,
+    context_hash,
+    contextual_model_fingerprint,
+    freeze_embedding_inputs,
+    rebuild_context_aggregates,
+)
+from onyx.regulatory.amendments.annexes.models import (
+    ContextSourceRange,
+    ContextSourceSnapshot,
+    FrozenContextProjection,
+    PreparedContextView,
+)
 from onyx.regulatory.chunk_evidence import chunk_evidence
 from onyx.regulatory.contextual import (
     context_reference_date,
     contextual_reserve_for_embedding_text,
     fit_context_fields_to_embedding_budget,
+    validity_window_contains,
     visible_regulatory_snapshot_for_target,
 )
 from onyx.regulatory.heading_path import normalize_regulatory_heading_path
@@ -182,10 +201,13 @@ def _contextualize_chunks(
     embedder: DefaultIndexingEmbedder,
     search_settings: SearchSettings,
     context_rows: list[RegulatoryChunk] | None = None,
+    context_llm: LLM | None = None,
+    recorder: ContextGenerationRecorder | None = None,
+    context_date: datetime.date | None = None,
 ) -> None:
     """Add temporally isolated context without crowding out legal text."""
 
-    llm = require_contextual_rag_llm(search_settings)
+    llm = context_llm or require_contextual_rag_llm(search_settings)
     assert llm is not None, "contextualization called while disabled"
 
     canonical_document = chunks[0].source_document
@@ -196,7 +218,7 @@ def _contextualize_chunks(
 
     snapshot_rows = context_rows if context_rows is not None else rows
     for chunk, row in zip(chunks, rows, strict=True):
-        reference_date = context_reference_date(
+        reference_date = context_date or context_reference_date(
             row.validity_start_date,
             row.validity_end_date,
             today=today,
@@ -205,6 +227,7 @@ def _contextualize_chunks(
             snapshot_rows,
             row,
             today=today,
+            reference_date=context_date,
         )
         if len(visible_rows) <= 1:
             continue
@@ -262,6 +285,7 @@ def _contextualize_chunks(
             tokenizer=llm_tokenizer,
             chunk_token_limit=DOC_EMBEDDING_CONTEXT_SIZE * 2,
             raise_on_failure=True,
+            **({"recorder": recorder} if recorder is not None else {}),
         )
         for chunk in contextual_chunks:
             chunk.doc_summary, chunk.chunk_context = (
@@ -349,6 +373,7 @@ def _project_rows_to_search_settings(
     document_set_names: dict[str, list[str]],
     user_file_access: dict[str, DocumentAccess],
     indexing_metadata: IndexingMetadata,
+    db_session: Session | None = None,
 ) -> int:
     """Project immutable PostgreSQL rows into exactly one search setting."""
 
@@ -373,6 +398,18 @@ def _project_rows_to_search_settings(
         ordered_rows,
         blurb_splitter,
     )
+    recorder = ContextGenerationRecorder(
+        cached_calls=load_context_generation_calls(
+            db_session, user_file_id=user_file.id
+        )
+        if db_session is not None
+        else []
+    )
+    llm = (
+        require_contextual_rag_llm(search_settings)
+        if effective_contextual_rag_enabled(search_settings)
+        else None
+    )
     if effective_contextual_rag_enabled(search_settings):
         _contextualize_chunks(
             chunks=doc_chunks,
@@ -380,6 +417,8 @@ def _project_rows_to_search_settings(
             user_file=user_file,
             embedder=embedder,
             search_settings=search_settings,
+            context_llm=llm,
+            recorder=recorder,
         )
 
     index_chunks = embedder.embed_chunks(doc_chunks, tenant_id=tenant_id)
@@ -402,6 +441,18 @@ def _project_rows_to_search_settings(
             chunks=enriched_chunks,
             indexing_metadata=indexing_metadata,
         )
+    if db_session is not None:
+        prepared_view = _freeze_normal_context_view(
+            rows=ordered_rows,
+            context_rows=ordered_rows,
+            chunks=doc_chunks,
+            user_file=user_file,
+            search_settings=search_settings,
+            embedder=embedder,
+            llm=llm,
+            recorder=recorder,
+        )
+        persist_context_view(db_session, user_file_id=user_file.id, view=prepared_view)
     logger.info(
         "project_user_file_to_index: wrote %d chunks for user_file=%s "
         "search_settings=%s",
@@ -473,6 +524,7 @@ def _project_amendment_rows_to_search_settings(
     persona_ids: dict[str, list[int]],
     document_set_names: dict[str, list[str]],
     user_file_access: dict[str, DocumentAccess],
+    db_session: Session | None = None,
 ) -> int:
     """Embed and upsert only the bounded rows affected by an amendment."""
 
@@ -513,6 +565,18 @@ def _project_amendment_rows_to_search_settings(
     )
     rows = projection_rows
     doc_chunks = _rows_to_doc_aware_chunks(canonical_document, rows, blurb_splitter)
+    recorder = ContextGenerationRecorder(
+        cached_calls=load_context_generation_calls(
+            db_session, user_file_id=user_file.id
+        )
+        if db_session is not None
+        else []
+    )
+    llm = (
+        require_contextual_rag_llm(search_settings)
+        if effective_contextual_rag_enabled(search_settings)
+        else None
+    )
     if effective_contextual_rag_enabled(search_settings):
         _contextualize_chunks(
             chunks=doc_chunks,
@@ -521,6 +585,8 @@ def _project_amendment_rows_to_search_settings(
             user_file=user_file,
             embedder=embedder,
             search_settings=search_settings,
+            context_llm=llm,
+            recorder=recorder,
         )
 
     index_chunks = embedder.embed_chunks(doc_chunks, tenant_id=tenant_id)
@@ -535,6 +601,18 @@ def _project_amendment_rows_to_search_settings(
     )
     for document_index in document_indices:
         document_index.upsert_chunks(enriched_chunks)
+    if db_session is not None:
+        prepared_view = _freeze_normal_context_view(
+            rows=rows,
+            context_rows=all_rows,
+            chunks=doc_chunks,
+            user_file=user_file,
+            search_settings=search_settings,
+            embedder=embedder,
+            llm=llm,
+            recorder=recorder,
+        )
+        persist_context_view(db_session, user_file_id=user_file.id, view=prepared_view)
     logger.info(
         "project_amendment_to_index: upserted %d/%d chunks for user_file=%s "
         "search_settings=%s",
@@ -602,6 +680,7 @@ def project_amendment_to_index(
     user_file_access = get_access_for_user_files([file_id], db_session)
     projected_count = _project_amendment_rows_to_search_settings(
         user_file=locked_user_file,
+        db_session=db_session,
         all_rows=ordered_rows,
         projection_rows=projection_rows,
         search_settings=current_settings[0],
@@ -717,6 +796,7 @@ def project_user_file_to_index(
                 document_set_names=document_set_names,
                 user_file_access=user_file_access,
                 indexing_metadata=indexing_metadata,
+                db_session=db_session,
             )
         except Exception:
             if search_settings.status.is_current():
@@ -737,3 +817,163 @@ def project_user_file_to_index(
         user_file.status = UserFileStatus.COMPLETED
     db_session.add(user_file)
     return len(rows)
+
+
+def prepare_normal_context_view(
+    *,
+    rows: list[RegulatoryChunk],
+    user_file: UserFile,
+    search_settings: SearchSettings,
+    embedder: DefaultIndexingEmbedder,
+    llm: LLM | None,
+    cached: PreparedContextView | None = None,
+    as_of_date: datetime.date | None = None,
+    changed_ids: list[str] | None = None,
+) -> PreparedContextView:
+    """Prepare every potential consumer using the same normal projection path.
+
+    No provider vectors or index writes occur here. Generated context and exact
+    embedding inputs are frozen for the approval/publication manifest.
+    """
+    if not rows:
+        return PreparedContextView()
+    if any(row.user_file_id != user_file.id for row in rows):
+        raise ValueError("context file scope mismatch")
+    if changed_ids:
+        rows = rebuild_context_aggregates(rows, changed_ids=changed_ids)
+    all_rows = _rows_in_structural_order(rows)
+    ordered = [
+        row
+        for row in all_rows
+        if as_of_date is None
+        or validity_window_contains(
+            row.validity_start_date, row.validity_end_date, as_of_date
+        )
+    ]
+    recorder = ContextGenerationRecorder(cached_calls=cached.calls if cached else [])
+    splitter = SentenceChunker(
+        tokenizer_or_token_counter=lambda text: len(
+            embedder.embedding_model.tokenizer.encode(text)
+        ),
+        chunk_size=BLURB_SIZE,
+        chunk_overlap=0,
+        return_type="texts",
+    )
+    chunks = _rows_to_doc_aware_chunks(
+        _build_document_shell(user_file), ordered, splitter
+    )
+    if effective_contextual_rag_enabled(search_settings):
+        if llm is None:
+            raise ValueError("contextual_configuration_unavailable")
+        _contextualize_chunks(
+            chunks=chunks,
+            rows=ordered,
+            user_file=user_file,
+            embedder=embedder,
+            search_settings=search_settings,
+            context_llm=llm,
+            recorder=recorder,
+            context_rows=all_rows,
+            context_date=as_of_date,
+        )
+    return _freeze_normal_context_view(
+        rows=ordered,
+        context_rows=all_rows,
+        chunks=chunks,
+        user_file=user_file,
+        search_settings=search_settings,
+        embedder=embedder,
+        llm=llm,
+        recorder=recorder,
+        as_of_date=as_of_date,
+    )
+
+
+def _freeze_normal_context_view(
+    *,
+    rows: list[RegulatoryChunk],
+    context_rows: list[RegulatoryChunk],
+    chunks: list[DocAwareChunk],
+    user_file: UserFile,
+    search_settings: SearchSettings,
+    embedder: DefaultIndexingEmbedder,
+    llm: LLM | None,
+    recorder: ContextGenerationRecorder,
+    as_of_date: datetime.date | None = None,
+) -> PreparedContextView:
+    ordered, all_rows = rows, context_rows
+    snapshots: dict[str, ContextSourceSnapshot] = {}
+    projections: list[FrozenContextProjection] = []
+    for row, chunk in zip(ordered, chunks, strict=True):
+        visible = visible_regulatory_snapshot_for_target(
+            all_rows, row, reference_date=as_of_date
+        )
+        ranges: list[ContextSourceRange] = []
+        text_parts: list[str] = []
+        offset = 0
+        for source in visible:
+            text = _row_context_text(source)
+            ranges.append(
+                ContextSourceRange(
+                    canonical_chunk_id=source.id, start=offset, end=offset + len(text)
+                )
+            )
+            text_parts.append(text)
+            offset += len(text) + 2
+        source_text = "\n\n".join(text_parts)
+        reference = as_of_date or context_reference_date(
+            row.validity_start_date, row.validity_end_date
+        )
+        snapshot_hash = context_hash(
+            [
+                str(user_file.id),
+                source_text,
+                [item.model_dump() for item in ranges],
+                reference,
+            ]
+        )
+        snapshots[snapshot_hash] = ContextSourceSnapshot(
+            sha256=snapshot_hash,
+            selector="visible_regulatory_snapshot_for_target:normal-v1",
+            reference_date=reference,
+            text=source_text,
+            ordered_ranges=ranges,
+        )
+        embedding_texts, embedding_config = freeze_embedding_inputs(
+            chunk, embedder.embedding_model, model_dim=search_settings.model_dim
+        )
+        projections.append(
+            FrozenContextProjection(
+                canonical_chunk_id=row.id,
+                canonical_dependency_ids=canonical_dependency_ids(row),
+                source_snapshot_sha256=snapshot_hash,
+                generation_path="normal",
+                request_hashes=recorder.consumer_requests.get(row.id, []),
+                embedding_input_sha256=context_hash(embedding_texts),
+                embedding_config_sha256=context_hash(embedding_config),
+                embedding_texts=embedding_texts,
+                canonical_text_sha256=context_hash(row.text),
+                metadata_sha256=context_hash(
+                    [
+                        row.chunk_metadata,
+                        row.heading_path,
+                        row.position,
+                        row.validity_start_date,
+                        row.validity_end_date,
+                    ]
+                ),
+                doc_summary=chunk.doc_summary,
+                chunk_context=chunk.chunk_context,
+                title=chunk.source_document.get_title_for_document_index(),
+                mini_chunk_texts=chunk.mini_chunk_texts or [],
+                contextual_config=contextual_model_fingerprint(llm) if llm else {},
+                embedding_config=embedding_config,
+                validity_start=as_of_date or row.validity_start_date,
+                validity_end=row.validity_end_date,
+            )
+        )
+    return PreparedContextView(
+        projections=projections,
+        snapshots=list(snapshots.values()),
+        calls=list(recorder.calls.values()),
+    )

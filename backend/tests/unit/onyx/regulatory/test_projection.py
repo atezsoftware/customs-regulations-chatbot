@@ -497,6 +497,10 @@ def test_amendment_projection_embeds_only_selected_rows_and_partial_upserts() ->
 
     with (
         patch(
+            "onyx.regulatory.projection.require_contextual_rag_llm",
+            return_value=MagicMock(),
+        ),
+        patch(
             "onyx.regulatory.projection.DefaultIndexingEmbedder.from_db_search_settings",
             return_value=embedder,
         ),

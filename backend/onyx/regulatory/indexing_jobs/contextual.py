@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import cast
@@ -29,10 +29,23 @@ from onyx.prompts.contextual_retrieval import (
     CONTEXTUAL_RAG_PROMPT1,
     CONTEXTUAL_RAG_PROMPT2,
 )
+from onyx.regulatory.amendments.annexes.context_dependencies import (
+    canonical_dependency_ids,
+    context_hash,
+    rebuild_context_aggregates,
+)
+from onyx.regulatory.amendments.annexes.models import (
+    ContextGenerationCall,
+    ContextSourceRange,
+    ContextSourceSnapshot,
+    FrozenContextProjection,
+    PreparedContextView,
+)
 from onyx.regulatory.contextual import (
     context_reference_date,
     contextual_reserve_for_embedding_text,
     fit_context_fields_to_embedding_budget,
+    validity_window_contains,
     visible_regulatory_snapshot_for_target,
 )
 from onyx.regulatory.indexing_jobs.vertex_batch import (
@@ -339,6 +352,10 @@ class ContextualRequestFactory:
     rows: Sequence[RegulatoryChunk]
     contextual_tokenizer: BaseTokenizer
     embedding_tokenizer: BaseTokenizer | None = None
+    reference_date_override: datetime.date | None = None
+    _source_snapshots: dict[
+        tuple[datetime.date, tuple[str, ...]], ContextSourceSnapshot
+    ] = field(init=False, default_factory=dict)
     _ordered_rows: tuple[RegulatoryChunk, ...] = field(init=False)
     _row_by_id: dict[str, RegulatoryChunk] = field(init=False)
     _documents: OrderedDict[datetime.date, _PreparedDocumentContext] = field(
@@ -363,7 +380,7 @@ class ContextualRequestFactory:
 
     def _document(self, row: RegulatoryChunk) -> _PreparedDocumentContext:
         canonical_row = self._canonical_row(row)
-        reference_date = context_reference_date(
+        reference_date = self.reference_date_override or context_reference_date(
             canonical_row.validity_start_date,
             canonical_row.validity_end_date,
         )
@@ -372,7 +389,11 @@ class ContextualRequestFactory:
             self._documents.move_to_end(reference_date)
             return cached
         visible_rows = _ordered_rows(
-            visible_regulatory_snapshot_for_target(self._ordered_rows, canonical_row)
+            visible_regulatory_snapshot_for_target(
+                self._ordered_rows,
+                canonical_row,
+                reference_date=self.reference_date_override,
+            )
         )
         prepared = _prepare_document_context(
             visible_rows,
@@ -384,6 +405,69 @@ class ContextualRequestFactory:
         if len(self._documents) > _MAX_CACHED_DOCUMENT_CONTEXTS:
             self._documents.popitem(last=False)
         return prepared
+
+    def source_snapshot(self, row: RegulatoryChunk) -> ContextSourceSnapshot:
+        canonical = self._canonical_row(row)
+        visible = visible_regulatory_snapshot_for_target(
+            self._ordered_rows, canonical, reference_date=self.reference_date_override
+        )
+        reference = self.reference_date_override or context_reference_date(
+            canonical.validity_start_date, canonical.validity_end_date
+        )
+        key = (reference, tuple(source.id for source in visible))
+        if key in self._source_snapshots:
+            return self._source_snapshots[key]
+        ranges: list[ContextSourceRange] = []
+        parts: list[str] = []
+        offset = 0
+        for source in visible:
+            block = _row_block(source)
+            ranges.append(
+                ContextSourceRange(
+                    canonical_chunk_id=source.id, start=offset, end=offset + len(block)
+                )
+            )
+            parts.append(block)
+            offset += len(block) + 2
+        document = "\n\n".join(parts)
+        digest = context_hash(
+            [
+                str(self.job.user_file_id),
+                document,
+                [span.model_dump() for span in ranges],
+                reference,
+            ]
+        )
+        snapshot = ContextSourceSnapshot(
+            sha256=digest,
+            selector="visible_regulatory_snapshot_for_target:durable-v1",
+            reference_date=reference,
+            text=document,
+            ordered_ranges=ranges,
+        )
+        self._source_snapshots[key] = snapshot
+        return snapshot
+
+    def request_provenance(
+        self, row: RegulatoryChunk, request: VertexBatchRequest
+    ) -> dict[str, object]:
+        prepared = self._document(row)
+        return {
+            "generation_path": "durable",
+            "request_hash": request.request_hash,
+            "prompt": request.prompt,
+            "source_snapshot_sha256": self.source_snapshot(row).sha256,
+            "model_name": _contextual_model_name(self.job),
+            "model_provider": LlmProviderNames.VERTEX_AI.value,
+            "temperature": 0,
+            "max_output_tokens": _VERTEX_BATCH_MAX_OUTPUT_TOKENS,
+            "tokenizer": f"{type(self.contextual_tokenizer).__module__}.{type(self.contextual_tokenizer).__qualname__}",
+            "safe_input_limit": _contextual_safe_input_limit(self.job),
+            "utf8_byte_limit": _document_context_utf8_byte_limit(self.job),
+            "bounded_document": prepared.text,
+            "boundary_anchors": prepared.boundary_anchors,
+            "pre_truncated": prepared.truncated,
+        }
 
     def reserve(self, row: RegulatoryChunk) -> int:
         if self.embedding_tokenizer is None:
@@ -666,7 +750,10 @@ def _persist_result(
                 db_session,
                 item_id=item.id,
                 expected_generation=job.lease_generation,
-                context={"contextual_text": contextual_text},
+                context={
+                    "contextual_text": contextual_text,
+                    "raw_contextual_text": result.context,
+                },
             )
             next_status = RegulatoryIndexingItemStatus.CONTEXT_READY.value
     if not persisted:
@@ -735,4 +822,176 @@ def apply_contextual_results(
         skipped_count=resulting_statuses.count(
             RegulatoryIndexingItemStatus.SKIPPED.value
         ),
+    )
+
+
+def prepare_durable_context_view(
+    *,
+    job: RegulatoryIndexingJob,
+    rows: Sequence[RegulatoryChunk],
+    embedding_tokenizer: BaseTokenizer,
+    contextual_tokenizer: BaseTokenizer,
+    generate: Callable[[VertexBatchRequest], str],
+    cached: PreparedContextView | None = None,
+    as_of_date: datetime.date | None = None,
+    changed_ids: list[str] | None = None,
+) -> PreparedContextView:
+    """Replay the exact durable request factory and freeze fitted embedding input."""
+    if changed_ids:
+        rows = rebuild_context_aggregates(list(rows), changed_ids=changed_ids)
+    factory = ContextualRequestFactory(
+        job=job,
+        rows=rows,
+        embedding_tokenizer=embedding_tokenizer,
+        contextual_tokenizer=contextual_tokenizer,
+        reference_date_override=as_of_date,
+    )
+    snapshot = job.config_snapshot
+    required = ("embedding_provider", "embedding_model_name", "effective_dimension")
+    if any(snapshot.get(key) is None for key in required):
+        raise ContextualMappingError("embedding_configuration_unavailable")
+    dimension = snapshot["effective_dimension"]
+    if not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0:
+        raise ContextualMappingError("embedding_dimension_unavailable")
+    batch_config = snapshot.get("openrouter_batch")
+    endpoint = (
+        cast(dict[str, object], batch_config).get("api_url")
+        if isinstance(batch_config, dict)
+        else None
+    )
+    config: dict[str, str | int | float | bool | None] = {
+        "provider": str(snapshot["embedding_provider"]),
+        "model": str(snapshot["embedding_model_name"]),
+        "dimension": dimension,
+        "endpoint_sha256": context_hash(endpoint),
+        "formatter": "durable-context-before-text-v1",
+        "tokenizer": type(embedding_tokenizer).__qualname__,
+        "max_sequence_length": DOC_EMBEDDING_CONTEXT_SIZE,
+    }
+    context_config: dict[str, str | int | float | bool | None] = {
+        "model_provider": LlmProviderNames.VERTEX_AI.value,
+        "model_name": _contextual_model_name(job),
+        "temperature": 0,
+        "max_output_tokens": _VERTEX_BATCH_MAX_OUTPUT_TOKENS,
+        "max_input_tokens": _contextual_safe_input_limit(job),
+        "utf8_byte_limit": _document_context_utf8_byte_limit(job),
+    }
+    config_hash = context_hash(context_config)
+    cached_calls = (
+        {call.request_sha256: call for call in cached.calls} if cached else {}
+    )
+    calls: dict[str, ContextGenerationCall] = {}
+    snapshots: dict[str, ContextSourceSnapshot] = {}
+    projections: list[FrozenContextProjection] = []
+    ordered = _ordered_rows(rows)
+    for row in ordered:
+        if as_of_date is not None and not validity_window_contains(
+            row.validity_start_date, row.validity_end_date, as_of_date
+        ):
+            continue
+        visible = visible_regulatory_snapshot_for_target(
+            ordered, row, reference_date=as_of_date
+        )
+        ranges: list[ContextSourceRange] = []
+        parts: list[str] = []
+        offset = 0
+        for source in visible:
+            block = _row_block(source)
+            ranges.append(
+                ContextSourceRange(
+                    canonical_chunk_id=source.id, start=offset, end=offset + len(block)
+                )
+            )
+            parts.append(block)
+            offset += len(block) + 2
+        document = "\n\n".join(parts)
+        reference_date = as_of_date or context_reference_date(
+            row.validity_start_date, row.validity_end_date
+        )
+        snapshot_hash = context_hash(
+            [
+                str(job.user_file_id),
+                document,
+                [part.model_dump() for part in ranges],
+                reference_date,
+            ]
+        )
+        snapshots[snapshot_hash] = ContextSourceSnapshot(
+            sha256=snapshot_hash,
+            selector="visible_regulatory_snapshot_for_target:durable-v1",
+            reference_date=reference_date,
+            text=document,
+            ordered_ranges=ranges,
+        )
+        item = RegulatoryIndexingItem(
+            regulatory_chunk_id=row.id,
+            status=RegulatoryIndexingItemStatus.SKIPPED.value,
+        )
+        request_hashes: list[str] = []
+        output = ""
+        if factory.reserve(row):
+            request = factory.request(row)
+            request_hash = context_hash([request.request_hash, config_hash])
+            prior = cached_calls.get(request_hash)
+            raw_output = prior.output if prior is not None else generate(request)
+            if not raw_output.strip():
+                raise ContextualMappingError("context_generation_incomplete")
+            output, _ = fit_context_fields_to_embedding_budget(
+                title_prefix="",
+                content=row.text,
+                metadata_suffix="",
+                doc_summary=raw_output,
+                chunk_context="",
+                tokenizer=embedding_tokenizer,
+                embedding_token_limit=DOC_EMBEDDING_CONTEXT_SIZE,
+            )
+            if not output:
+                raise ContextualMappingError("context_generation_incomplete")
+            calls[request_hash] = ContextGenerationCall(
+                request_sha256=request_hash,
+                stage="durable_chunk",
+                prompt_json=request.model_dump_json(),
+                config_sha256=config_hash,
+                output=raw_output,
+                source_text=request.prompt,
+                token_budget=_contextual_safe_input_limit(job),
+                tokenizer=f"{type(contextual_tokenizer).__module__}.{type(contextual_tokenizer).__qualname__}",
+                generation_path="durable",
+            )
+            request_hashes.append(request_hash)
+            item.status = RegulatoryIndexingItemStatus.CONTEXT_READY.value
+            context_metadata: dict[str, object] = {"contextual_text": output}
+            item.context = context_metadata
+        text = contextualized_embedding_text(row, item)
+        projections.append(
+            FrozenContextProjection(
+                canonical_chunk_id=row.id,
+                canonical_dependency_ids=canonical_dependency_ids(row),
+                source_snapshot_sha256=snapshot_hash,
+                generation_path="durable",
+                request_hashes=request_hashes,
+                embedding_input_sha256=context_hash([text]),
+                embedding_config_sha256=context_hash(config),
+                embedding_texts=[text],
+                canonical_text_sha256=context_hash(row.text),
+                metadata_sha256=context_hash(
+                    [
+                        row.chunk_metadata,
+                        row.heading_path,
+                        row.position,
+                        row.validity_start_date,
+                        row.validity_end_date,
+                    ]
+                ),
+                doc_summary=output,
+                contextual_config=context_config,
+                embedding_config=config,
+                validity_start=as_of_date or row.validity_start_date,
+                validity_end=row.validity_end_date,
+            )
+        )
+    return PreparedContextView(
+        projections=projections,
+        snapshots=list(snapshots.values()),
+        calls=list(calls.values()),
     )

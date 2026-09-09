@@ -1,0 +1,422 @@
+from datetime import date
+
+import pytest
+
+from onyx.regulatory.amendments.annexes.models import (
+    AnnexBaseline,
+    AnnexExtraction,
+    ExtractedAnnexElement,
+)
+from tests.unit.onyx.regulatory.annexes.test_comparison import extraction
+
+
+def baseline(text: str) -> AnnexBaseline:
+    return AnnexBaseline(
+        baseline_sha256="a" * 64,
+        canonical_text=text,
+        elements=[
+            ExtractedAnnexElement(
+                kind="table_cell",
+                text=text,
+                canonical_chunk_id="canonical-rate",
+                semantic_key="rate:A",
+            )
+        ],
+        originals=[],
+        visual_evidence_available=True,
+        canonical_amendment_chunk_ids=["canonical-rate"],
+    )
+
+
+@pytest.mark.parametrize("new_value,expected", [("5%", ["canonical-rate"]), ("7%", [])])
+def test_approved_canonical_overlay_controls_patch_despite_old_raw_pixels(
+    new_value: str, expected: list[str]
+) -> None:
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    old, new = extraction("5%"), extraction(new_value)
+    comparison = compare_annexes(old=old, new=new)
+    result = prepare_annex_patch(
+        baseline=baseline("7%"),
+        old=old,
+        new=new,
+        comparison=comparison,
+        effective_date=date(2026, 9, 10),
+        package_complete=True,
+    )
+    assert result.ready
+    assert result.direct_canonical_changes == expected
+    if expected:
+        assert result.patches[0].old_text == "7%" and result.patches[0].new_text == "5%"
+
+
+def test_changed_unmapped_visual_region_cannot_authorize_arbitrary_chunk() -> None:
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    old, new = extraction("5%"), extraction("7%")
+    old.elements[0].semantic_key = None
+    comparison = compare_annexes(old=old, new=new)
+    result = prepare_annex_patch(
+        baseline=baseline("8%"),
+        old=old,
+        new=new,
+        comparison=comparison,
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert not result.ready and "canonical_correspondence_unresolved" in result.issues
+
+
+def test_partial_package_and_unknown_effective_date_block_patch() -> None:
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    old, new = extraction("5%"), extraction("7%")
+    result = prepare_annex_patch(
+        baseline=baseline("5%"),
+        old=old,
+        new=new,
+        comparison=compare_annexes(old=old, new=new),
+        effective_date=None,
+        package_complete=False,
+    )
+    assert not result.ready
+    assert {"incomplete_source_package", "effective_date_unresolved"} <= set(
+        result.issues
+    )
+
+
+@pytest.mark.parametrize("label", ["EK-1/A", "EK-1/B", "EK iiia", "EK a", "EK ivb"])
+def test_new_annex_routing_preserves_full_corroborated_labels(label: str) -> None:
+    from onyx.regulatory.amendments.annexes.patch_plan import resolve_annex_instruction
+
+    assert (
+        resolve_annex_instruction(
+            f"{label} aşağıdaki şekilde değiştirilmiştir.",
+            source_labels=[label],
+            file_labels=[label],
+        )
+        == label
+    )
+    with pytest.raises(ValueError, match="scope"):
+        resolve_annex_instruction(
+            f"{label} değiştirilmiştir.", source_labels=[label], file_labels=["EK-1"]
+        )
+
+
+def test_non_annex_keeps_legacy_route_and_noise_blocks() -> None:
+    from onyx.regulatory.amendments.annexes.patch_plan import resolve_annex_instruction
+
+    assert (
+        resolve_annex_instruction(
+            "Madde 5 değiştirilmiştir", source_labels=[], file_labels=[]
+        )
+        is None
+    )
+    with pytest.raises(ValueError):
+        resolve_annex_instruction(
+            "EK EK değiştirilmiştir", source_labels=["EK EK"], file_labels=["EK EK"]
+        )
+
+
+def test_cell_patch_preserves_rest_of_existing_canonical_row() -> None:
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    current = baseline("A | 5% | exception retained")
+    current.elements[0].semantic_key = "canonical-row-lineage"
+    old, new = extraction("5%"), extraction("7%")
+    result = prepare_annex_patch(
+        baseline=current,
+        old=old,
+        new=new,
+        comparison=compare_annexes(old=old, new=new),
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert result.ready
+    assert result.patches[0].old_text == "A | 5% | exception retained"
+    assert result.patches[0].new_text == "A | 7% | exception retained"
+
+
+def test_merge_does_not_duplicate_new_content_in_two_canonical_chunks() -> None:
+    from onyx.regulatory.amendments.annexes.comparison import annex_snapshot_hash
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexComparison,
+        AnnexCoverage,
+        AnnexDifference,
+        AnnexElementReference,
+    )
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    current = baseline("A")
+    current.elements.append(
+        ExtractedAnnexElement(kind="text", text="B", canonical_chunk_id="second")
+    )
+    old = AnnexExtraction(
+        source_sha256="a",
+        mime_type="text/html",
+        elements=[
+            ExtractedAnnexElement(kind="text", text="A"),
+            ExtractedAnnexElement(kind="text", text="B"),
+        ],
+    )
+    new = AnnexExtraction(
+        source_sha256="b",
+        mime_type="text/html",
+        elements=[ExtractedAnnexElement(kind="text", text="Merged AB")],
+    )
+    comparison = AnnexComparison(
+        old_source_sha256="a",
+        new_source_sha256="b",
+        old_snapshot_sha256=annex_snapshot_hash(old),
+        new_snapshot_sha256=annex_snapshot_hash(new),
+        coverage=AnnexCoverage(
+            old_positions=[0, 1],
+            new_positions=[0],
+            old_pages=[],
+            new_pages=[],
+            method="native_structure",
+        ),
+        changes=[
+            AnnexDifference(
+                operation="merge",
+                old=[
+                    AnnexElementReference(
+                        position=index, text=element.text, locator=element.locator
+                    )
+                    for index, element in enumerate(old.elements)
+                ],
+                new=[
+                    AnnexElementReference(
+                        position=0, text="Merged AB", locator=new.elements[0].locator
+                    )
+                ],
+                explanation="Merged rows",
+            )
+        ],
+        issues=[],
+        ready=True,
+    )
+    result = prepare_annex_patch(
+        baseline=current,
+        old=old,
+        new=new,
+        comparison=comparison,
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert result.ready
+    assert [patch.new_text for patch in result.patches] == ["Merged AB", None]
+
+
+@pytest.mark.parametrize(
+    "changed_cell,overlay,ready",
+    [(False, False, True), (True, False, False), (False, True, False)],
+)
+def test_source_backed_placeholder_companion_only_allows_independent_visual_change(
+    changed_cell: bool, overlay: bool, ready: bool
+) -> None:
+    from onyx.regulatory.amendments.annexes.comparison import annex_snapshot_hash
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexComparison,
+        AnnexCoverage,
+        AnnexDifference,
+        AnnexElementReference,
+        AnnexOriginalEvidence,
+    )
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    current = baseline("Diagram header")
+    current.canonical_amendment_chunk_ids = ["canonical-rate"] if overlay else []
+    current.elements[0].semantic_key = "header-lineage"
+    current.elements.append(
+        ExtractedAnnexElement(
+            kind="image_region",
+            text="Diagram header\n\n[Görsel: needs review]",
+            canonical_chunk_id="caption",
+            canonical_role="supporting",
+            image_file_id="old-image",
+            bound_to_regulatory_chunk_id="canonical-rate",
+        )
+    )
+    old = AnnexExtraction(
+        source_sha256="a",
+        mime_type="image/png",
+        page_count=1,
+        elements=[
+            ExtractedAnnexElement(
+                kind="table_cell" if changed_cell else "image_region",
+                text="5%" if changed_cell else "Green square",
+            )
+        ],
+    )
+    new = AnnexExtraction(
+        source_sha256="b",
+        mime_type="image/png",
+        page_count=1,
+        elements=[
+            ExtractedAnnexElement(
+                kind="table_cell" if changed_cell else "image_region",
+                text="7%" if changed_cell else "Blue square",
+            )
+        ],
+    )
+    current.originals = [
+        AnnexOriginalEvidence(
+            file_id="old-image",
+            sha256="a",
+            available=True,
+            canonical_chunk_ids=["caption"],
+            mime_type="image/png",
+        )
+    ]
+    comparison = AnnexComparison(
+        old_source_sha256="a",
+        new_source_sha256="b",
+        old_snapshot_sha256=annex_snapshot_hash(old),
+        new_snapshot_sha256=annex_snapshot_hash(new),
+        coverage=AnnexCoverage(
+            old_positions=[0],
+            new_positions=[0],
+            old_pages=[1],
+            new_pages=[1],
+            method="simultaneous_vision",
+        ),
+        changes=[
+            AnnexDifference(
+                operation="replace" if changed_cell else "visual",
+                old=[
+                    AnnexElementReference(
+                        position=0,
+                        text=old.elements[0].text,
+                        locator=old.elements[0].locator,
+                    )
+                ],
+                new=[
+                    AnnexElementReference(
+                        position=0,
+                        text=new.elements[0].text,
+                        locator=new.elements[0].locator,
+                    )
+                ],
+                explanation="Observed source change",
+            )
+        ],
+        ready=True,
+        issues=[],
+    )
+    result = prepare_annex_patch(
+        baseline=current,
+        old=old,
+        new=new,
+        comparison=comparison,
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert result.ready == ready
+    if ready:
+        caption = next(
+            patch for patch in result.patches if patch.old_chunk_id == "caption"
+        )
+        assert (
+            caption.canonical_role == "supporting" and caption.new_text == "Blue square"
+        )
+        assert "canonical-rate" in result.metadata_only
+        assert not any(
+            patch.old_chunk_id == "canonical-rate" and patch.old_text != patch.new_text
+            for patch in result.patches
+        )
+
+
+def test_serialized_ready_flag_cannot_bypass_reference_validation() -> None:
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexDifference,
+        AnnexElementReference,
+    )
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    old, new = extraction("5%"), extraction("7%")
+    comparison = compare_annexes(old=old, new=new)
+    corrupt = comparison.model_copy(
+        update={
+            "changes": [
+                AnnexDifference(
+                    operation="replace",
+                    old=[
+                        AnnexElementReference(
+                            position=0, text="invented", locator=old.elements[0].locator
+                        )
+                    ],
+                    new=[
+                        AnnexElementReference(
+                            position=0, text="7%", locator=new.elements[0].locator
+                        )
+                    ],
+                    explanation="untrusted",
+                )
+            ],
+            "ready": True,
+        }
+    )
+    result = prepare_annex_patch(
+        baseline=baseline("5%"),
+        old=old,
+        new=new,
+        comparison=corrupt,
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert not result.ready and result.patches == []
+
+
+def test_padded_markdown_row_preserves_separate_nonlegal_delimiter() -> None:
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    current = baseline("| A     | 5%    | retained |")
+    current.elements[0].semantic_key = "row-lineage"
+    current.elements.append(
+        ExtractedAnnexElement(
+            kind="text", text="| :--- | ---: | --- |", canonical_chunk_id="scaffold"
+        )
+    )
+    old, new = extraction("5%"), extraction("7%")
+    result = prepare_annex_patch(
+        baseline=current,
+        old=old,
+        new=new,
+        comparison=compare_annexes(old=old, new=new),
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert result.ready
+    assert result.patches[0].new_text == "| A     | 7%    | retained |"
+    assert "scaffold" in result.unchanged
+
+
+def test_ready_comparison_cannot_hide_extraction_uncertainty() -> None:
+    from onyx.regulatory.amendments.annexes.comparison import (
+        annex_snapshot_hash,
+        compare_annexes,
+    )
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    old, new = extraction("5%"), extraction("7%")
+    comparison = compare_annexes(old=old, new=new)
+    new.elements[0].status = "uncertain"
+    comparison = comparison.model_copy(
+        update={"new_snapshot_sha256": annex_snapshot_hash(new)}
+    )
+    result = prepare_annex_patch(
+        baseline=baseline("5%"),
+        old=old,
+        new=new,
+        comparison=comparison,
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert not result.ready and "incomplete_extraction" in result.issues

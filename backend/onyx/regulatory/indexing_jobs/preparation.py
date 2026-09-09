@@ -334,6 +334,8 @@ def prepare_claimed_regulatory_indexing_job_from_chunks(
                     regulatory_chunk_id=row.id,
                     request_hash=request.request_hash,
                     skip_context=contextual_reserve == 0,
+                    source_snapshot=request_factory.source_snapshot(row),
+                    context_input=request_factory.request_provenance(row, request),
                 )
             )
         return prepared_items
@@ -424,6 +426,8 @@ def prepare_claimed_regulatory_indexing_job(
                     regulatory_chunk_id=row.id,
                     request_hash=request.request_hash,
                     skip_context=contextual_reserve == 0,
+                    source_snapshot=request_factory.source_snapshot(row),
+                    context_input=request_factory.request_provenance(row, request),
                 )
             )
         return prepared_items

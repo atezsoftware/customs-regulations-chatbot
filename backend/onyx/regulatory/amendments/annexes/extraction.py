@@ -473,6 +473,7 @@ def extract_annex_structure(
             )
         else:
             result.issues.append("vision_model_unavailable")
+        result.page_count = len(pages)
         original_image_input = (
             mime_type in ("image/png", "image/jpeg", "image/webp")
             and len(pages) == 1
@@ -528,7 +529,7 @@ def extract_annex_structure(
                         kind=item.kind,
                         text=item.text,
                         status=item.status,
-                        issues=item.issues,
+                        issues=list(item.issues),
                         evidence_kind=evidence_kind,
                         locator=AnnexLocator(
                             page=page.page,

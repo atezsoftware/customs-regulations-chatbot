@@ -2189,13 +2189,20 @@ def _hierarchical_aggregate_text(
     node: StructureNode,
     source_chunks: list[RegulatoryChunk],
 ) -> str:
-    parts = [chunk.text.strip() for chunk in source_chunks if chunk.text.strip()]
-    folded_root_label = _fold_text(node.label).strip()
+    return hierarchical_aggregate_text(
+        node.label, [chunk.text for chunk in source_chunks]
+    )
+
+
+def hierarchical_aggregate_text(root_label: str, source_texts: list[str]) -> str:
+    """Use the same aggregate text for initial chunking and prepared projections."""
+    parts = [text.strip() for text in source_texts if text.strip()]
+    folded_root_label = _fold_text(root_label).strip()
     root_is_present = any(
         folded_root_label and folded_root_label in _fold_text(part) for part in parts
     )
-    if node.label.strip() and not root_is_present:
-        parts.insert(0, node.label.strip())
+    if root_label.strip() and not root_is_present:
+        parts.insert(0, root_label.strip())
     return "\n\n".join(parts)
 
 
