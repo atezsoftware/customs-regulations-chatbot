@@ -8,8 +8,14 @@ from io import BytesIO
 from onyx.llm.interfaces import LLM
 from onyx.llm.models import ImageContentPart, ImageUrlDetail
 from onyx.prompts.regulatory_annex_comparison import ANNEX_COMPARISON_PROMPT
+from onyx.regulatory.amendments.annexes.evidence import (
+    identical_evidence_scope,
+    selected_evidence_pages,
+    validate_evidence_view,
+)
 from onyx.regulatory.amendments.annexes.models import (
     AnnexComparison,
+    AnnexComparisonImage,
     AnnexComparisonResponse,
     AnnexCoverage,
     AnnexDifference,
@@ -117,35 +123,80 @@ def _native_changes(
     return changes
 
 
-def _page_images(page: AnnexRenderedPage) -> list[ImageContentPart]:
+def comparison_page_evidence(
+    page: AnnexRenderedPage,
+    *,
+    normalized_box: tuple[float, float, float, float] = (0, 0, 1, 1),
+) -> list[AnnexComparisonImage]:
+    """The exact compared bytes and original-page coordinates, also frozen for review."""
     from PIL import Image
 
-    images: list[bytes] = [page.png]
+    images = [
+        AnnexComparisonImage(
+            png=page.png, kind="comparison_page", normalized_box=(0, 0, 1, 1)
+        )
+    ]
     with Image.open(BytesIO(page.png)) as image:
         width, height = image.size
         if width > DETAIL_TILE_PIXELS or height > DETAIL_TILE_PIXELS:
             for top in range(0, height, DETAIL_TILE_PIXELS):
                 for left in range(0, width, DETAIL_TILE_PIXELS):
+                    right, bottom = (
+                        min(left + DETAIL_TILE_PIXELS, width),
+                        min(top + DETAIL_TILE_PIXELS, height),
+                    )
                     buffer = BytesIO()
-                    image.crop(
-                        (
-                            left,
-                            top,
-                            min(left + DETAIL_TILE_PIXELS, width),
-                            min(top + DETAIL_TILE_PIXELS, height),
+                    image.crop((left, top, right, bottom)).save(buffer, format="PNG")
+                    images.append(
+                        AnnexComparisonImage(
+                            png=buffer.getvalue(),
+                            kind="comparison_tile",
+                            normalized_box=(
+                                left / width,
+                                top / height,
+                                right / width,
+                                bottom / height,
+                            ),
                         )
-                    ).save(buffer, format="PNG")
-                    images.append(buffer.getvalue())
-                    if len(images) > MAX_PAGE_IMAGES // 2:
-                        raise ValueError("comparison_image_budget")
+                    )
+        if normalized_box != (0, 0, 1, 1):
+            left, top, right, bottom = normalized_box
+            if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+                raise ValueError("invalid_selection_region")
+            buffer = BytesIO()
+            image.crop(
+                (
+                    int(left * width),
+                    int(top * height),
+                    int(right * width),
+                    int(bottom * height),
+                )
+            ).save(buffer, format="PNG")
+            images.append(
+                AnnexComparisonImage(
+                    png=buffer.getvalue(),
+                    kind="comparison_region",
+                    normalized_box=normalized_box,
+                )
+            )
+    if len(images) > MAX_PAGE_IMAGES // 2:
+        raise ValueError("comparison_image_budget")
+    return images
+
+
+def _page_images(
+    page: AnnexRenderedPage,
+    *,
+    normalized_box: tuple[float, float, float, float] = (0, 0, 1, 1),
+) -> list[ImageContentPart]:
     return [
         ImageContentPart(
             image_url=ImageUrlDetail(
-                url="data:image/png;base64," + base64.b64encode(content).decode(),
+                url="data:image/png;base64," + base64.b64encode(image.png).decode(),
                 detail="high",
             )
         )
-        for content in images
+        for image in comparison_page_evidence(page, normalized_box=normalized_box)
     ]
 
 
@@ -159,7 +210,7 @@ def _validate_response(
     old_pages: list[int],
     new_pages: list[int],
 ) -> list[str]:
-    issues = list(response.issues)
+    issues: list[str] = list(response.issues)
     for actual, expected in (
         (response.old_positions, old_positions),
         (response.new_positions, new_positions),
@@ -200,6 +251,19 @@ def _validate_response(
     return issues
 
 
+def _scope_prompt(extraction: AnnexExtraction) -> str:
+    view = extraction.evidence_view
+    if view is None:
+        return "whole original"
+    return (
+        f"label={view.label}; view_sha256={view.sha256}; selected page regions="
+        + "; ".join(
+            f"view_page={page.view_page}, parent_sha256={view.parents[page.parent_index].sha256}, original_page={page.original_page}, normalized_box={page.normalized_box}"
+            for page in view.pages
+        )
+    )
+
+
 def compare_annexes(
     *,
     old: AnnexExtraction,
@@ -216,7 +280,12 @@ def compare_annexes(
     """
     before_pages, after_pages = old_pages or [], new_pages or []
     old_positions, new_positions = _atomic_positions(old), _atomic_positions(new)
-    issues = [*old.issues, *new.issues]
+    issues = [
+        *old.issues,
+        *new.issues,
+        *validate_evidence_view(old),
+        *validate_evidence_view(new),
+    ]
     if any(
         element.status != "readable" or element.issues
         for extraction in (old, new)
@@ -231,7 +300,7 @@ def compare_annexes(
     )
     method = (
         "identical_asset"
-        if old.source_sha256 == new.source_sha256
+        if identical_evidence_scope(old, new)
         else "simultaneous_vision"
         if visual
         else "native_structure"
@@ -254,9 +323,7 @@ def compare_annexes(
         for extraction, pages in ((old, before_pages), (new, after_pages)):
             if extraction.page_count is None:
                 issues.append("page_count_unverified")
-            elif [page.page for page in pages] != list(
-                range(1, extraction.page_count + 1)
-            ):
+            elif [page.page for page in pages] != selected_evidence_pages(extraction):
                 issues.append("page_coverage_mismatch")
             if not pages:
                 issues.append("visual_evidence_unavailable")
@@ -276,19 +343,32 @@ def compare_annexes(
             for side, pages in (("OLD", before_pages), ("NEW", after_pages)):
                 for page in pages:
                     try:
-                        page_images = _page_images(page)
+                        extraction = old if side == "OLD" else new
+                        region = (
+                            next(
+                                (
+                                    mapping.normalized_box
+                                    for mapping in extraction.evidence_view.pages
+                                    if mapping.view_page == page.page
+                                ),
+                                (0, 0, 1, 1),
+                            )
+                            if extraction.evidence_view
+                            else (0, 0, 1, 1)
+                        )
+                        page_images = _page_images(page, normalized_box=region)
                     except ValueError as error:
                         issues.append(str(error))
                         break
                     manifest.append(
-                        f"{side} page {page.page}: image {len(images) + 1} full page; images {len(images) + 2}..{len(images) + len(page_images)} detail tiles in top-to-bottom, left-to-right order at {DETAIL_TILE_PIXELS}px"
+                        f"{side} page {page.page}: image {len(images) + 1} full page; images {len(images) + 2}..{len(images) + len(page_images)} detail tiles in top-to-bottom, left-to-right order at {DETAIL_TILE_PIXELS}px; if selected region is smaller than the page, the final image is its crop"
                     )
                     images.extend(page_images)
                     if len(images) > MAX_PAGE_IMAGES:
                         issues.append("comparison_image_budget")
                         break
             prompt = (
-                f"Instruction (evidence only): {instruction}\nOLD source hash: {old.source_sha256}\nNEW source hash: {new.source_sha256}\nOLD complete elements:\n"
+                f"EXACT required old_positions: {old_positions}\nEXACT required new_positions: {new_positions}\nEXACT required old_pages: {coverage.old_pages}\nEXACT required new_pages: {coverage.new_pages}\nUse only these local positions for coverage and references. Parent provenance does not define a second element index namespace.\nSelected OLD scope (only these regions/elements may change): {_scope_prompt(old)}\nSelected NEW scope (only these regions/elements may change): {_scope_prompt(new)}\nInstruction (evidence only): {instruction}\nOLD source hash: {old.source_sha256}\nNEW source hash: {new.source_sha256}\nOLD complete elements:\n"
                 + "\n".join(
                     _reference(old, index).model_dump_json() for index in old_positions
                 )
@@ -340,7 +420,13 @@ def validate_annex_comparison(
     comparison: AnnexComparison, *, old: AnnexExtraction, new: AnnexExtraction
 ) -> list[str]:
     """Revalidate persisted/editable comparison data before deriving write targets."""
-    issues = [*comparison.issues, *old.issues, *new.issues]
+    issues = [
+        *comparison.issues,
+        *old.issues,
+        *new.issues,
+        *validate_evidence_view(old),
+        *validate_evidence_view(new),
+    ]
     if any(
         element.status != "readable" or element.issues
         for extraction in (old, new)
@@ -355,7 +441,7 @@ def validate_annex_comparison(
     )
     expected_method = (
         "identical_asset"
-        if old.source_sha256 == new.source_sha256
+        if identical_evidence_scope(old, new)
         else "simultaneous_vision"
         if visual
         else "native_structure"
@@ -369,7 +455,7 @@ def validate_annex_comparison(
         ):
             if extraction.page_count is None:
                 issues.append("page_count_unverified")
-            elif pages != list(range(1, extraction.page_count + 1)):
+            elif pages != selected_evidence_pages(extraction):
                 issues.append("page_coverage_mismatch")
     if (
         comparison.old_snapshot_sha256 != annex_snapshot_hash(old)

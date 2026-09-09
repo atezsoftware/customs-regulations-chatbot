@@ -1,7 +1,8 @@
 from datetime import date
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 SourcePackageStatus = Literal["processing", "ready", "partial", "blocked", "failed"]
 
@@ -88,6 +89,7 @@ AnnexElementKind = Literal[
 
 
 class ExtractedAnnexElement(BaseModel):
+    extraction_method: Literal["native", "vision", "canonical", "unknown"] = "unknown"
     canonical_chunk_id: str | None = None
     bound_to_regulatory_chunk_id: str | None = None
     canonical_role: Literal["authoritative", "supporting"] = "authoritative"
@@ -106,7 +108,54 @@ class ExtractedAnnexElement(BaseModel):
     source_asset_id: str | None = None
 
 
+class AnnexEvidenceParent(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    file_id: str
+    sha256: str
+    mime_type: str
+    extraction_sha256: str
+    element_count: int
+    page_count: int | None
+    canonical_chunk_ids: list[str]
+
+
+class AnnexEvidencePage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    parent_index: int
+    original_page: int
+    view_page: int
+    normalized_box: tuple[float, float, float, float]
+
+
+class AnnexEvidenceElementMap(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    parent_index: int
+    original_position: int
+    original_locator: AnnexLocator
+    view_position: int
+
+
+class AnnexEvidenceView(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    sha256: str
+    label: str
+    parents: list[AnnexEvidenceParent]
+    pages: list[AnnexEvidencePage]
+    selected_positions: list[int]
+    element_mappings: list[AnnexEvidenceElementMap]
+    boundary_positions: list[int]
+    selection_method: Literal[
+        "native_boundaries",
+        "bound_whole_original",
+        "native_sheet",
+        "ordered_bound_originals",
+    ]
+    extraction_version: str = "annex-extraction-v1"
+    renderer_version: str = "annex-rendering-v1"
+
+
 class AnnexExtraction(BaseModel):
+    evidence_view: AnnexEvidenceView | None = None
     page_count: int | None = Field(default=None, ge=1)
     model_config = ConfigDict(extra="forbid")
     schema_version: int = 1
@@ -204,7 +253,17 @@ class AnnexComparisonResponse(BaseModel):
     new_positions: list[int] = Field(default_factory=list)
     old_pages: list[int] = Field(default_factory=list)
     new_pages: list[int] = Field(default_factory=list)
-    issues: list[str] = Field(default_factory=list)
+    issues: list[
+        Literal[
+            "low_readability",
+            "missing_evidence",
+            "ambiguous_structure",
+            "uncertain_value",
+            "unsupported_visual",
+            "incomplete_coverage",
+            "formula_change_requires_review",
+        ]
+    ] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def reject_overlapping_operations(self) -> "AnnexComparisonResponse":
@@ -240,7 +299,7 @@ class AnnexComparison(BaseModel):
     changes: list[AnnexDifference]
     coverage: AnnexCoverage
     model_snapshot: AnnexModelSnapshot | None = None
-    prompt_version: str = "annex-comparison-v1"
+    prompt_version: str = "annex-comparison-v2"
     issues: list[str]
     ready: bool
 
@@ -374,3 +433,106 @@ class ExistingIndexEmbeddingEvidence(BaseModel):
     canonical_text_sha256: str
     vector_dimension: int = Field(gt=0)
     expected_dimension: int = Field(gt=0)
+
+
+class AnnexCanonicalSnapshot(BaseModel):
+    """Complete canonical publication input, including historical/source metadata."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: str
+    user_file_id: str
+    chunk_type: str | None
+    status: str
+    projection_ordinal: int
+    supersedes_chunk_id: str | None
+    superseded_by_chunk_id: str | None
+    position: int
+    text: str
+    heading_path: list[str]
+    metadata: dict[str, JsonValue]
+    source: str
+    validity_start_date: date | None
+    validity_end_date: date | None
+
+
+class AnnexChangeItemDraft(BaseModel):
+    insertion_after_chunk_id: str | None = None
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    operation: Literal[
+        "replace", "insert", "remove", "split", "merge", "move", "visual"
+    ]
+    old_chunk_ids: list[str]
+    new_chunks: list[AnnexCanonicalSnapshot]
+    old_positions: list[int]
+    new_positions: list[int]
+
+
+class AnnexReviewEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: UUID
+    side: Literal["old", "new"]
+    kind: Literal["original", "comparison_page", "comparison_tile", "comparison_region"]
+    file_id: str
+    sha256: str
+    mime_type: str
+    byte_count: int
+    parent_file_id: str
+    parent_sha256: str
+    source_asset_id: UUID | None = None
+    locator: AnnexLocator = Field(default_factory=AnnexLocator)
+
+
+class AnnexChangeDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    instruction_indices: list[int]
+    instruction_texts: list[str]
+    annex_label: str
+    user_file_id: UUID | None = None
+    effective_date: date | None = None
+    source_package_id: UUID | None = None
+    source_text_sha256: str | None = None
+    source_manifest_sha256: str | None = None
+    baseline_scope: list[AnnexCanonicalSnapshot] = Field(default_factory=list)
+    baseline: AnnexBaseline | None = None
+    old_extraction: AnnexExtraction | None = None
+    new_extraction: AnnexExtraction | None = None
+    comparison: AnnexComparison | None = None
+    patch_plan: AnnexPatchPlan | None = None
+    items: list[AnnexChangeItemDraft] = Field(default_factory=list)
+    impact: AnnexContextImpact | None = None
+    evidence: list[AnnexReviewEvidence] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_instruction_coverage(self) -> "AnnexChangeDraft":
+        if (
+            not self.instruction_indices
+            or min(self.instruction_indices) < 0
+            or self.instruction_indices != sorted(set(self.instruction_indices))
+            or len(self.instruction_texts) != len(self.instruction_indices)
+        ):
+            raise ValueError("invalid grouped instruction coverage")
+        return self
+
+
+class AnnexReviewEvidenceScope(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    batch_id: int
+    document_set_id: int
+    user_file_id: UUID
+    created_by: UUID | None
+    environment: str
+    old_original_file_ids: list[str]
+    new_original_file_ids: list[str]
+
+    def storage_identity(self) -> dict[str, JsonValue]:
+        return self.model_dump(
+            mode="json", exclude={"old_original_file_ids", "new_original_file_ids"}
+        )
+
+
+class AnnexComparisonImage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    png: bytes
+    kind: Literal["comparison_page", "comparison_tile", "comparison_region"]
+    normalized_box: tuple[float, float, float, float]

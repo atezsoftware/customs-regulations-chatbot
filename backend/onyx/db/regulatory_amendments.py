@@ -339,7 +339,13 @@ def mark_batch_analyzed(
             )
         ).where(AmendmentProposal.batch_id == batch_id)
     )
-    if (proposal_coverage or 0) + len(
+    from onyx.db.regulatory_annex_changes import list_annex_changes
+
+    annex_coverage = sum(
+        len(change.instruction_indices)
+        for change in list_annex_changes(db_session, batch_id)
+    )
+    if (proposal_coverage or 0) + annex_coverage + len(
         batch.unmatched_instructions
     ) != batch.instruction_count:
         db_session.rollback()

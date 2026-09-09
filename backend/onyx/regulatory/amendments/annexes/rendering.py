@@ -49,6 +49,7 @@ def render_annex_pages(content: bytes, mime_type: str) -> list[AnnexRenderedPage
                             elements.append(
                                 ExtractedAnnexElement(
                                     kind="text",
+                                    extraction_method="native",
                                     text=text,
                                     locator=AnnexLocator(
                                         page=index + 1,

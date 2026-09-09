@@ -463,7 +463,10 @@ def extract_annex_structure(
     result = AnnexExtraction(
         source_sha256=hashlib.sha256(content).hexdigest(),
         mime_type=mime_type,
-        elements=elements,
+        elements=[
+            element.model_copy(update={"extraction_method": "native"})
+            for element in elements
+        ],
     )
     if pages:
         if vision_llm is not None:
@@ -527,6 +530,7 @@ def extract_annex_structure(
                 result.elements.append(
                     ExtractedAnnexElement(
                         kind=item.kind,
+                        extraction_method="vision",
                         text=item.text,
                         status=item.status,
                         issues=list(item.issues),

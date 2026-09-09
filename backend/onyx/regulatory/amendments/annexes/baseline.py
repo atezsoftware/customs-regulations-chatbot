@@ -137,7 +137,9 @@ def prepare_legacy_baseline(
         file.file_type not in ("text/markdown", "text/plain")
         and file.file_id not in seen
     ):
-        originals.append(verify_legacy_original(store, file.file_id))
+        original = verify_legacy_original(store, file.file_id)
+        original.canonical_chunk_ids = [row.id for row in rows]
+        originals.append(original)
     else:
         issues.append("canonical_only_user_file")
     canonical_text = "\n\n".join(

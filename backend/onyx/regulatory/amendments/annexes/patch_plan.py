@@ -10,6 +10,7 @@ from onyx.regulatory.amendments.annexes.comparison import (
     annex_snapshot_hash,
     validate_annex_comparison,
 )
+from onyx.regulatory.amendments.annexes.evidence import validate_baseline_evidence_view
 from onyx.regulatory.amendments.annexes.models import (
     AnnexBaseline,
     AnnexCanonicalPatch,
@@ -64,7 +65,10 @@ def prepare_annex_patch(
     Ambiguous mappings retain comparison evidence but never become approval-ready.
     Raw OCR cannot override an approved correction as the OLD legal value.
     """
-    issues = validate_annex_comparison(comparison, old=old, new=new)
+    issues = [
+        *validate_annex_comparison(comparison, old=old, new=new),
+        *validate_baseline_evidence_view(baseline, old),
+    ]
     if not comparison.ready:
         issues.append("comparison_not_ready")
     if not package_complete:
