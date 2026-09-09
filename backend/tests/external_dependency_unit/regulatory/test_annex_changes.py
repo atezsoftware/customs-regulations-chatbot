@@ -206,6 +206,18 @@ def test_frozen_original_is_independent_and_evidence_cannot_cross_scope(
         environment="local-test",
         created_by=None,
     )
+    with pytest.raises(ValueError, match="MIME"):
+        freeze_review_original(
+            store,
+            scope=scope,
+            side="old",
+            original=AnnexOriginalEvidence(
+                file_id=file_id,
+                sha256=sha256(content).hexdigest(),
+                mime_type="application/pdf",
+                available=True,
+            ),
+        )
     frozen = freeze_review_original(
         store,
         scope=scope,
@@ -458,8 +470,27 @@ def test_approvable_domain_contract_rejects_incomplete_preparation(
         )
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        None,
+        "old_hash",
+        "new_hash",
+        "new_mime",
+        "whole_new",
+        "empty_context",
+        "impact",
+        "source_ranges",
+        "missing_baseline_context",
+        "operation",
+        "positions",
+        "metadata",
+        "supersession",
+    ],
+)
 def test_complete_prepared_group_freezes_context_and_stages_before_approval(
     source_session: Session,
+    corruption: str | None,
 ) -> None:
     from hashlib import sha256
     from io import BytesIO
@@ -476,7 +507,6 @@ def test_complete_prepared_group_freezes_context_and_stages_before_approval(
     from onyx.regulatory.amendments.annexes.comparison import compare_annexes
     from onyx.regulatory.amendments.annexes.context_dependencies import (
         compare_context_views,
-        context_hash,
     )
     from onyx.regulatory.amendments.annexes.evidence import (
         freeze_review_original,
@@ -487,10 +517,7 @@ def test_complete_prepared_group_freezes_context_and_stages_before_approval(
         AnnexBaseline,
         AnnexChangeDraft,
         AnnexOriginalEvidence,
-        ContextSourceRange,
-        ContextSourceSnapshot,
         ExtractedAnnexElement,
-        FrozenContextProjection,
         PreparedContextView,
     )
     from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
@@ -593,34 +620,22 @@ def test_complete_prepared_group_freezes_context_and_stages_before_approval(
     canonical_scope = capture_canonical_scope(source_session, file.id)
     items = stage_canonical_items(plan=plan, baseline_scope=canonical_scope)
     candidate = items[0].new_chunks[0]
-    snapshot = ContextSourceSnapshot(
-        sha256=context_hash("new"),
-        selector="fixture",
-        reference_date=date(2026, 9, 10),
-        text="new",
-        ordered_ranges=[
-            ContextSourceRange(canonical_chunk_id=candidate.id, start=0, end=3)
-        ],
+    from onyx.regulatory.amendments.annexes.staging import (
+        canonical_snapshot_rows,
+        prepare_staged_candidate_rows,
     )
-    prepared = PreparedContextView(
-        snapshots=[snapshot],
-        projections=[
-            FrozenContextProjection(
-                canonical_chunk_id=candidate.id,
-                source_snapshot_sha256=snapshot.sha256,
-                generation_path="normal",
-                request_hashes=[],
-                embedding_input_sha256=context_hash(["new"]),
-                embedding_config_sha256=context_hash({"model": "fixture"}),
-                embedding_config={"model": "fixture"},
-                embedding_texts=["new"],
-                canonical_text_sha256=context_hash("new"),
-                metadata_sha256=context_hash({}),
-            )
-        ],
+    from tests.unit.onyx.regulatory.annexes.test_change_staging import _prepared_view
+
+    day = date(2026, 9, 10)
+    baseline_context = _prepared_view(canonical_snapshot_rows(canonical_scope), day)
+    prepared = _prepared_view(
+        prepare_staged_candidate_rows(
+            baseline_scope=canonical_scope, items=items, effective_date=day
+        ),
+        day,
     )
     impact = compare_context_views(
-        old=PreparedContextView(), new=prepared, direct_canonical_changes=[candidate.id]
+        old=baseline_context, new=prepared, direct_canonical_changes=[candidate.id]
     )
     evidence = [
         freeze_review_original(store, scope=scope, side=side, original=original)
@@ -642,9 +657,143 @@ def test_complete_prepared_group_freezes_context_and_stages_before_approval(
         comparison=comparison,
         patch_plan=plan,
         items=items,
+        baseline_context=baseline_context,
         impact=impact,
         evidence=evidence,
     )
+    from onyx.db.regulatory_annex_changes import validate_prepared_annex_change
+
+    if corruption is not None:
+        if corruption == "old_hash":
+            draft = draft.model_copy(
+                update={
+                    "evidence": [
+                        evidence[0].model_copy(
+                            update={"sha256": "a" * 64, "parent_sha256": "a" * 64}
+                        ),
+                        evidence[1],
+                    ]
+                }
+            )
+        elif corruption in ("new_hash", "new_mime"):
+            from onyx.regulatory.amendments.annexes.evidence import evidence_view_hash
+
+            view = views[1].evidence_view
+            assert view is not None
+            parent = view.parents[0].model_copy(
+                update={"sha256": "a" * 64}
+                if corruption == "new_hash"
+                else {"mime_type": "application/pdf"}
+            )
+            altered = views[1].model_copy(
+                update={
+                    "evidence_view": view.model_copy(update={"parents": [parent]}),
+                    "source_sha256": parent.sha256,
+                }
+            )
+            assert altered.evidence_view is not None
+            altered = altered.model_copy(
+                update={
+                    "evidence_view": altered.evidence_view.model_copy(
+                        update={"sha256": evidence_view_hash(altered)}
+                    )
+                }
+            )
+            compared = compare_annexes(old=views[0], new=altered)
+            patched = prepare_annex_patch(
+                baseline=baseline,
+                old=views[0],
+                new=altered,
+                comparison=compared,
+                effective_date=plan.effective_date,
+                package_complete=True,
+            )
+            assert patched.ready
+            draft = draft.model_copy(
+                update={
+                    "new_extraction": altered,
+                    "comparison": compared,
+                    "patch_plan": patched,
+                }
+            )
+        elif corruption == "whole_new":
+            whole = views[1].model_copy(
+                update={"evidence_view": None, "source_sha256": "a" * 64}
+            )
+            compared = compare_annexes(old=views[0], new=whole)
+            patched = prepare_annex_patch(
+                baseline=baseline,
+                old=views[0],
+                new=whole,
+                comparison=compared,
+                effective_date=plan.effective_date,
+                package_complete=True,
+            )
+            assert patched.ready
+            draft = draft.model_copy(
+                update={
+                    "new_extraction": whole,
+                    "comparison": compared,
+                    "patch_plan": patched,
+                }
+            )
+        elif corruption == "missing_baseline_context":
+            draft = draft.model_copy(update={"baseline_context": None})
+        elif corruption == "impact":
+            draft = draft.model_copy(
+                update={"impact": impact.model_copy(update={"embedding_changes": []})}
+            )
+        elif corruption == "source_ranges":
+            incomplete = prepared.model_copy(
+                update={
+                    "snapshots": [
+                        prepared.snapshots[0].model_copy(update={"ordered_ranges": []})
+                    ]
+                }
+            )
+            draft = draft.model_copy(
+                update={"impact": impact.model_copy(update={"prepared": incomplete})}
+            )
+        elif corruption == "empty_context":
+            draft = draft.model_copy(
+                update={
+                    "impact": compare_context_views(
+                        old=PreparedContextView(),
+                        new=PreparedContextView(),
+                        direct_canonical_changes=[candidate.id],
+                    )
+                }
+            )
+        else:
+            changed = items[0]
+            if corruption == "operation":
+                changed = changed.model_copy(update={"operation": "remove"})
+            elif corruption == "positions":
+                changed = changed.model_copy(update={"old_positions": [99]})
+            elif corruption == "metadata":
+                changed = changed.model_copy(
+                    update={
+                        "new_chunks": [
+                            candidate.model_copy(update={"metadata": {"forged": True}})
+                        ]
+                    }
+                )
+            elif corruption == "supersession":
+                changed = changed.model_copy(
+                    update={
+                        "new_chunks": [
+                            candidate.model_copy(
+                                update={"supersedes_chunk_id": "foreign"}
+                            )
+                        ]
+                    }
+                )
+            draft = draft.model_copy(update={"items": [changed]})
+        with pytest.raises(ValueError):
+            validate_prepared_annex_change(
+                source_session, batch=batch, draft=draft, environment="local-test"
+            )
+        return
     change = persist_annex_checkpoint(
         source_session,
         batch_id=batch.id,

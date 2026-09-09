@@ -289,6 +289,18 @@ class AnnexCoverage(BaseModel):
     method: Literal["identical_asset", "native_structure", "simultaneous_vision"]
 
 
+class AnnexComparedImage(BaseModel):
+    """Exact image submitted to comparison, in extraction-local page coordinates."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    side: Literal["old", "new"]
+    page: int
+    kind: Literal["comparison_page", "comparison_tile", "comparison_region"]
+    normalized_box: tuple[float, float, float, float]
+    sha256: str
+    byte_count: int
+
+
 class AnnexComparison(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     schema_version: int = 1
@@ -297,6 +309,7 @@ class AnnexComparison(BaseModel):
     old_snapshot_sha256: str
     new_snapshot_sha256: str
     changes: list[AnnexDifference]
+    image_manifest: list[AnnexComparedImage] = Field(default_factory=list)
     coverage: AnnexCoverage
     model_snapshot: AnnexModelSnapshot | None = None
     prompt_version: str = "annex-comparison-v2"
@@ -492,6 +505,7 @@ class AnnexChangeDraft(BaseModel):
     source_package_id: UUID | None = None
     source_text_sha256: str | None = None
     source_manifest_sha256: str | None = None
+    insertion_after_chunk_id: str | None = None
     baseline_scope: list[AnnexCanonicalSnapshot] = Field(default_factory=list)
     baseline: AnnexBaseline | None = None
     old_extraction: AnnexExtraction | None = None
@@ -499,6 +513,7 @@ class AnnexChangeDraft(BaseModel):
     comparison: AnnexComparison | None = None
     patch_plan: AnnexPatchPlan | None = None
     items: list[AnnexChangeItemDraft] = Field(default_factory=list)
+    baseline_context: PreparedContextView | None = None
     impact: AnnexContextImpact | None = None
     evidence: list[AnnexReviewEvidence] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)

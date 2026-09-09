@@ -58,11 +58,12 @@ from onyx.regulatory.amendments.annexes.context_dependencies import (
     canonical_dependency_ids,
     context_hash,
     contextual_model_fingerprint,
+    effective_context_rows,
+    freeze_context_source_snapshot,
     freeze_embedding_inputs,
     rebuild_context_aggregates,
 )
 from onyx.regulatory.amendments.annexes.models import (
-    ContextSourceRange,
     ContextSourceSnapshot,
     FrozenContextProjection,
     PreparedContextView,
@@ -72,7 +73,6 @@ from onyx.regulatory.contextual import (
     context_reference_date,
     contextual_reserve_for_embedding_text,
     fit_context_fields_to_embedding_budget,
-    validity_window_contains,
     visible_regulatory_snapshot_for_target,
 )
 from onyx.regulatory.heading_path import normalize_regulatory_heading_path
@@ -842,14 +842,7 @@ def prepare_normal_context_view(
     if changed_ids:
         rows = rebuild_context_aggregates(rows, changed_ids=changed_ids)
     all_rows = _rows_in_structural_order(rows)
-    ordered = [
-        row
-        for row in all_rows
-        if as_of_date is None
-        or validity_window_contains(
-            row.validity_start_date, row.validity_end_date, as_of_date
-        )
-    ]
+    ordered = effective_context_rows(all_rows, as_of_date)
     if not ordered:
         return PreparedContextView()
     recorder = ContextGenerationRecorder(cached_calls=cached.calls if cached else [])
@@ -903,44 +896,21 @@ def _freeze_normal_context_view(
     recorder: ContextGenerationRecorder,
     as_of_date: datetime.date | None = None,
 ) -> PreparedContextView:
+    if any(row.user_file_id != user_file.id for row in rows):
+        raise ValueError("context file scope mismatch")
     ordered, all_rows = rows, context_rows
     snapshots: dict[str, ContextSourceSnapshot] = {}
     projections: list[FrozenContextProjection] = []
     for row, chunk in zip(ordered, chunks, strict=True):
-        visible = visible_regulatory_snapshot_for_target(
-            all_rows, row, reference_date=as_of_date
+        snapshot = freeze_context_source_snapshot(
+            rows=all_rows,
+            target=row,
+            reference_date=as_of_date,
+            generation_path="normal",
+            row_text=_row_context_text,
         )
-        ranges: list[ContextSourceRange] = []
-        text_parts: list[str] = []
-        offset = 0
-        for source in visible:
-            text = _row_context_text(source)
-            ranges.append(
-                ContextSourceRange(
-                    canonical_chunk_id=source.id, start=offset, end=offset + len(text)
-                )
-            )
-            text_parts.append(text)
-            offset += len(text) + 2
-        source_text = "\n\n".join(text_parts)
-        reference = as_of_date or context_reference_date(
-            row.validity_start_date, row.validity_end_date
-        )
-        snapshot_hash = context_hash(
-            [
-                str(user_file.id),
-                source_text,
-                [item.model_dump() for item in ranges],
-                reference,
-            ]
-        )
-        snapshots[snapshot_hash] = ContextSourceSnapshot(
-            sha256=snapshot_hash,
-            selector="visible_regulatory_snapshot_for_target:normal-v1",
-            reference_date=reference,
-            text=source_text,
-            ordered_ranges=ranges,
-        )
+        snapshot_hash = snapshot.sha256
+        snapshots[snapshot_hash] = snapshot
         embedding_texts, embedding_config = freeze_embedding_inputs(
             chunk, embedder.embedding_model, model_dim=search_settings.model_dim
         )

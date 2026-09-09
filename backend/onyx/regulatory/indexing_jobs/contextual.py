@@ -32,13 +32,14 @@ from onyx.prompts.contextual_retrieval import (
 from onyx.regulatory.amendments.annexes.context_dependencies import (
     canonical_dependency_ids,
     context_hash,
+    effective_context_rows,
     encoder_model_fingerprint,
+    freeze_context_source_snapshot,
     freeze_encoder_inputs,
     rebuild_context_aggregates,
 )
 from onyx.regulatory.amendments.annexes.models import (
     ContextGenerationCall,
-    ContextSourceRange,
     ContextSourceSnapshot,
     FrozenContextProjection,
     PreparedContextView,
@@ -47,7 +48,6 @@ from onyx.regulatory.contextual import (
     context_reference_date,
     contextual_reserve_for_embedding_text,
     fit_context_fields_to_embedding_budget,
-    validity_window_contains,
     visible_regulatory_snapshot_for_target,
 )
 from onyx.regulatory.indexing_jobs.models import OpenRouterBatchConfig
@@ -423,33 +423,12 @@ class ContextualRequestFactory:
         key = (reference, tuple(source.id for source in visible))
         if key in self._source_snapshots:
             return self._source_snapshots[key]
-        ranges: list[ContextSourceRange] = []
-        parts: list[str] = []
-        offset = 0
-        for source in visible:
-            block = _row_block(source)
-            ranges.append(
-                ContextSourceRange(
-                    canonical_chunk_id=source.id, start=offset, end=offset + len(block)
-                )
-            )
-            parts.append(block)
-            offset += len(block) + 2
-        document = "\n\n".join(parts)
-        digest = context_hash(
-            [
-                str(self.job.user_file_id),
-                document,
-                [span.model_dump() for span in ranges],
-                reference,
-            ]
-        )
-        snapshot = ContextSourceSnapshot(
-            sha256=digest,
-            selector="visible_regulatory_snapshot_for_target:durable-v1",
-            reference_date=reference,
-            text=document,
-            ordered_ranges=ranges,
+        snapshot = freeze_context_source_snapshot(
+            rows=self._ordered_rows,
+            target=canonical,
+            reference_date=self.reference_date_override,
+            generation_path="durable",
+            row_text=_row_block,
         )
         self._source_snapshots[key] = snapshot
         return snapshot
@@ -853,14 +832,7 @@ def prepare_durable_context_view(
         raise ContextualMappingError("canonical rows do not belong to the indexing job")
     if changed_ids:
         rows = rebuild_context_aggregates(list(rows), changed_ids=changed_ids)
-    ordered = [
-        row
-        for row in _ordered_rows(rows)
-        if as_of_date is None
-        or validity_window_contains(
-            row.validity_start_date, row.validity_end_date, as_of_date
-        )
-    ]
+    ordered = effective_context_rows(list(rows), as_of_date)
     if not ordered:
         return PreparedContextView()
     snapshot = job.config_snapshot

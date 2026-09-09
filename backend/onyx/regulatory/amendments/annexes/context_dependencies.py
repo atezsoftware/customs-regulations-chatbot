@@ -3,7 +3,8 @@
 import hashlib
 import json
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from datetime import date
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import TypeAdapter
@@ -13,6 +14,7 @@ from onyx.llm.models import LanguageModelInput
 from onyx.regulatory.amendments.annexes.models import (
     AnnexContextImpact,
     ContextGenerationCall,
+    ContextSourceSnapshot,
     ExistingIndexEmbeddingEvidence,
     FrozenContextProjection,
     PreparedContextView,
@@ -416,3 +418,149 @@ def rebuild_context_aggregates(
         if not progress:
             raise ValueError("cyclic_aggregate_dependencies")
     return [by_id[row.id] for row in rows]
+
+
+def effective_context_rows(
+    rows: list["RegulatoryChunk"], as_of_date: "date | None"
+) -> list["RegulatoryChunk"]:
+    from onyx.regulatory.contextual import validity_window_contains
+
+    ordered = sorted(rows, key=lambda row: (row.position, row.id))
+    if len({row.id for row in ordered}) != len(ordered):
+        raise ValueError("duplicate_context_consumer")
+    return [
+        row
+        for row in ordered
+        if as_of_date is None
+        or validity_window_contains(
+            row.validity_start_date, row.validity_end_date, as_of_date
+        )
+    ]
+
+
+def freeze_context_source_snapshot(
+    *,
+    rows: Sequence["RegulatoryChunk"],
+    target: "RegulatoryChunk",
+    reference_date: "date | None",
+    generation_path: Literal["normal", "durable"],
+    row_text: Callable[["RegulatoryChunk"], str],
+) -> "ContextSourceSnapshot":
+    from onyx.regulatory.amendments.annexes.models import (
+        ContextSourceRange,
+        ContextSourceSnapshot,
+    )
+    from onyx.regulatory.contextual import (
+        context_reference_date,
+        visible_regulatory_snapshot_for_target,
+    )
+
+    visible = visible_regulatory_snapshot_for_target(
+        rows, target, reference_date=reference_date
+    )
+    reference = reference_date or context_reference_date(
+        target.validity_start_date, target.validity_end_date
+    )
+    ranges: list[ContextSourceRange] = []
+    parts: list[str] = []
+    offset = 0
+    for source in visible:
+        text = row_text(source)
+        ranges.append(
+            ContextSourceRange(
+                canonical_chunk_id=source.id, start=offset, end=offset + len(text)
+            )
+        )
+        parts.append(text)
+        offset += len(text) + 2
+    text = "\n\n".join(parts)
+    return ContextSourceSnapshot(
+        sha256=context_hash(
+            [
+                str(target.user_file_id),
+                text,
+                [span.model_dump() for span in ranges],
+                reference,
+            ]
+        ),
+        selector=f"visible_regulatory_snapshot_for_target:{generation_path}-v1",
+        reference_date=reference,
+        text=text,
+        ordered_ranges=ranges,
+    )
+
+
+def validate_complete_context_view(
+    *,
+    rows: list["RegulatoryChunk"],
+    view: PreparedContextView,
+    as_of_date: "date",
+) -> None:
+    """Require the exact effective consumers and shared source-selection output."""
+    from onyx.regulatory.indexing_jobs.contextual import _row_block
+    from onyx.regulatory.projection import _row_context_text
+
+    expected = effective_context_rows(rows, as_of_date)
+    if view.issues or [item.canonical_chunk_id for item in view.projections] != [
+        row.id for row in expected
+    ]:
+        raise ValueError("prepared context consumer coverage is incomplete")
+    snapshots = {snapshot.sha256: snapshot for snapshot in view.snapshots}
+    calls = {call.request_sha256: call for call in view.calls}
+    if len(snapshots) != len(view.snapshots) or len(calls) != len(view.calls):
+        raise ValueError("duplicate prepared context dependency")
+    used_snapshots: set[str] = set()
+    used_calls: set[str] = set()
+    for row, projection in zip(expected, view.projections, strict=True):
+        snapshot = freeze_context_source_snapshot(
+            rows=rows,
+            target=row,
+            reference_date=as_of_date,
+            generation_path=projection.generation_path,
+            row_text=_row_context_text
+            if projection.generation_path == "normal"
+            else _row_block,
+        )
+        if snapshots.get(projection.source_snapshot_sha256) != snapshot:
+            raise ValueError("prepared context source range coverage changed")
+        used_snapshots.add(snapshot.sha256)
+        if not set(projection.request_hashes).issubset(calls):
+            raise ValueError("prepared context generation dependencies missing")
+        used_calls.update(projection.request_hashes)
+        if (
+            projection.canonical_text_sha256 != context_hash(row.text)
+            or projection.metadata_sha256
+            != context_hash(
+                [
+                    row.chunk_metadata,
+                    row.heading_path,
+                    row.position,
+                    row.validity_start_date,
+                    row.validity_end_date,
+                ]
+            )
+            or projection.canonical_dependency_ids != canonical_dependency_ids(row)
+        ):
+            raise ValueError("prepared context canonical input changed")
+        if (
+            not projection.embedding_texts
+            or not all(projection.embedding_texts)
+            or not projection.embedding_config
+            or projection.embedding_input_sha256
+            != context_hash(projection.embedding_texts)
+            or projection.embedding_config_sha256
+            != context_hash(projection.embedding_config)
+        ):
+            raise ValueError("prepared context embedding identity changed")
+        if (
+            projection.validity_start != as_of_date
+            or projection.validity_end != row.validity_end_date
+        ):
+            raise ValueError("prepared context effective interval changed")
+        if projection.vector_reuse_verified:
+            evidence = ExistingIndexEmbeddingEvidence.model_validate(
+                projection.existing_index_evidence
+            )
+            verify_existing_index_evidence(projection, evidence)
+    if used_snapshots != set(snapshots) or used_calls != set(calls):
+        raise ValueError("prepared context has unrelated dependencies")

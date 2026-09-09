@@ -1,4 +1,5 @@
 from datetime import date
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 
@@ -7,6 +8,10 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexCanonicalSnapshot,
     AnnexPatchPlan,
 )
+
+if TYPE_CHECKING:
+    from onyx.db.models import RegulatoryChunk
+    from onyx.regulatory.amendments.annexes.models import PreparedContextView
 
 
 def baseline() -> list[AnnexCanonicalSnapshot]:
@@ -226,3 +231,297 @@ def test_physical_merge_stages_multi_chunk_lineage_as_one_item() -> None:
     assert len(items) == 1 and items[0].operation == "merge"
     assert items[0].old_chunk_ids == ["one", "two"]
     assert [chunk.text for chunk in items[0].new_chunks] == ["combined"]
+
+
+def test_staged_validation_binds_each_replacement_to_its_canonical_old_text() -> None:
+    from onyx.regulatory.amendments.annexes.staging import (
+        stage_canonical_items,
+        validate_staged_items,
+    )
+
+    rows = baseline()
+    rows.append(
+        rows[0].model_copy(
+            update={
+                "id": "two",
+                "text": "second",
+                "position": 1,
+                "projection_ordinal": 1,
+            }
+        )
+    )
+    plan = AnnexPatchPlan(
+        baseline_sha256="baseline",
+        comparison_sha256="comparison",
+        effective_date=date(2026, 9, 10),
+        patches=[
+            AnnexCanonicalPatch(
+                old_chunk_id=row.id,
+                old_text=row.text,
+                new_text=f"new {row.text}",
+                old_positions=[index],
+                new_positions=[index],
+                operation="replace",
+            )
+            for index, row in enumerate(rows)
+        ],
+        direct_canonical_changes=[row.id for row in rows],
+        metadata_only=[],
+        retire_history=[],
+        unchanged=[],
+        issues=[],
+        ready=True,
+    )
+    items = stage_canonical_items(plan=plan, baseline_scope=rows)
+    validate_staged_items(plan=plan, baseline_scope=rows, items=items)
+    swapped = [
+        item.model_copy(update={"old_chunk_ids": items[1 - index].old_chunk_ids})
+        for index, item in enumerate(items)
+    ]
+    with pytest.raises(ValueError, match="staged"):
+        validate_staged_items(plan=plan, baseline_scope=rows, items=swapped)
+    forged = plan.model_copy(
+        update={
+            "patches": [
+                plan.patches[0].model_copy(update={"old_text": "forged"}),
+                plan.patches[1],
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="scope"):
+        validate_staged_items(plan=forged, baseline_scope=rows, items=items)
+
+
+def _prepared_view(
+    rows: list["RegulatoryChunk"],
+    day: date,
+    path: "Literal['normal', 'durable']" = "normal",
+) -> "PreparedContextView":
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        canonical_dependency_ids,
+        context_hash,
+        effective_context_rows,
+        freeze_context_source_snapshot,
+    )
+    from onyx.regulatory.amendments.annexes.models import (
+        FrozenContextProjection,
+        PreparedContextView,
+    )
+    from onyx.regulatory.indexing_jobs.contextual import _row_block
+    from onyx.regulatory.projection import _row_context_text
+
+    projections = []
+    snapshots = {}
+    for row in effective_context_rows(rows, day):
+        snapshot = freeze_context_source_snapshot(
+            rows=rows,
+            target=row,
+            reference_date=day,
+            generation_path=path,
+            row_text=_row_context_text if path == "normal" else _row_block,
+        )
+        snapshots[snapshot.sha256] = snapshot
+        projections.append(
+            FrozenContextProjection(
+                canonical_chunk_id=row.id,
+                source_snapshot_sha256=snapshot.sha256,
+                generation_path=path,
+                request_hashes=[],
+                embedding_input_sha256=context_hash([row.text]),
+                embedding_config_sha256=context_hash({"model": "fixture"}),
+                embedding_config={"model": "fixture"},
+                embedding_texts=[row.text],
+                canonical_text_sha256=context_hash(row.text),
+                metadata_sha256=context_hash(
+                    [
+                        row.chunk_metadata,
+                        row.heading_path,
+                        row.position,
+                        row.validity_start_date,
+                        row.validity_end_date,
+                    ]
+                ),
+                validity_start=day,
+                validity_end=row.validity_end_date,
+                canonical_dependency_ids=canonical_dependency_ids(row),
+            )
+        )
+    return PreparedContextView(
+        projections=projections, snapshots=list(snapshots.values())
+    )
+
+
+@pytest.mark.parametrize("path", ["normal", "durable"])
+def test_context_validation_distinguishes_omitted_consumers_from_true_empty_retirement(
+    path: "Literal['normal', 'durable']",
+) -> None:
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        compare_context_views,
+        validate_complete_context_view,
+    )
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexChangeItemDraft,
+        PreparedContextView,
+    )
+    from onyx.regulatory.amendments.annexes.staging import (
+        canonical_snapshot_rows,
+        prepare_staged_candidate_rows,
+    )
+
+    day = date(2026, 9, 10)
+    scope = baseline()
+    rows = canonical_snapshot_rows(scope)
+    old = _prepared_view(rows, day, path)
+    validate_complete_context_view(rows=rows, view=old, as_of_date=day)
+    with pytest.raises(ValueError, match="coverage"):
+        validate_complete_context_view(
+            rows=rows, view=PreparedContextView(), as_of_date=day
+        )
+    omitted_range = old.model_copy(
+        update={
+            "snapshots": [old.snapshots[0].model_copy(update={"ordered_ranges": []})]
+        }
+    )
+    with pytest.raises(ValueError, match="range"):
+        validate_complete_context_view(rows=rows, view=omitted_range, as_of_date=day)
+    removed = prepare_staged_candidate_rows(
+        baseline_scope=scope,
+        items=[
+            AnnexChangeItemDraft(
+                operation="remove",
+                old_chunk_ids=[scope[0].id],
+                new_chunks=[],
+                old_positions=[0],
+                new_positions=[],
+            )
+        ],
+        effective_date=day,
+    )
+    validate_complete_context_view(
+        rows=removed, view=PreparedContextView(), as_of_date=day
+    )
+    impact = compare_context_views(
+        old=old, new=PreparedContextView(), direct_canonical_changes=[]
+    )
+    assert impact.ready and impact.retire_history == [scope[0].id]
+    expired = canonical_snapshot_rows(
+        [scope[0].model_copy(update={"validity_end_date": day})]
+    )
+    validate_complete_context_view(
+        rows=expired, view=PreparedContextView(), as_of_date=day
+    )
+
+
+def test_complete_candidate_keeps_non_annex_consumers_and_rewrites_aggregate_sources() -> (
+    None
+):
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        validate_complete_context_view,
+    )
+    from onyx.regulatory.amendments.annexes.models import AnnexChangeItemDraft
+    from onyx.regulatory.amendments.annexes.staging import prepare_staged_candidate_rows
+
+    scope = baseline()
+    scope.extend(
+        [
+            scope[0].model_copy(
+                update={
+                    "id": "outside",
+                    "position": 1,
+                    "projection_ordinal": 1,
+                    "heading_path": ["Article 2"],
+                    "text": "unchanged other provision",
+                }
+            ),
+            scope[0].model_copy(
+                update={
+                    "id": "aggregate",
+                    "position": 2,
+                    "projection_ordinal": 2,
+                    "text": "old aggregate",
+                    "metadata": {
+                        "chunk_variant": "hierarchical_aggregate",
+                        "hierarchy_root_path": ["EK-1"],
+                        "source_regulatory_chunk_ids": ["one"],
+                    },
+                }
+            ),
+        ]
+    )
+    candidate = scope[0].model_copy(
+        update={
+            "id": "prospective",
+            "text": "new",
+            "projection_ordinal": 3,
+            "validity_start_date": date(2026, 9, 10),
+        }
+    )
+    rows = prepare_staged_candidate_rows(
+        baseline_scope=scope,
+        items=[
+            AnnexChangeItemDraft(
+                operation="replace",
+                old_chunk_ids=["one"],
+                new_chunks=[candidate],
+                old_positions=[0],
+                new_positions=[0],
+            )
+        ],
+        effective_date=date(2026, 9, 10),
+    )
+    aggregate = next(row for row in rows if row.id == "aggregate")
+    assert aggregate.chunk_metadata["source_regulatory_chunk_ids"] == ["prospective"]
+    assert "new" in aggregate.text and "old" not in aggregate.text
+    assert scope[2].text == "old aggregate" and scope[0].validity_end_date is None
+    prepared = _prepared_view(rows, date(2026, 9, 10))
+    assert {projection.canonical_chunk_id for projection in prepared.projections} == {
+        "prospective",
+        "outside",
+        "aggregate",
+    }
+    omitted = prepared.model_copy(
+        update={
+            "projections": [
+                projection
+                for projection in prepared.projections
+                if projection.canonical_chunk_id != "outside"
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="coverage"):
+        validate_complete_context_view(
+            rows=rows, view=omitted, as_of_date=date(2026, 9, 10)
+        )
+
+
+def test_candidate_insertion_uses_explicit_anchor_without_mutating_baseline() -> None:
+    from onyx.regulatory.amendments.annexes.models import AnnexChangeItemDraft
+    from onyx.regulatory.amendments.annexes.staging import prepare_staged_candidate_rows
+
+    scope = baseline()
+    scope.append(
+        scope[0].model_copy(
+            update={"id": "next", "position": 1, "projection_ordinal": 1}
+        )
+    )
+    inserted = scope[0].model_copy(update={"id": "inserted", "projection_ordinal": 2})
+    rows = prepare_staged_candidate_rows(
+        baseline_scope=scope,
+        items=[
+            AnnexChangeItemDraft(
+                operation="insert",
+                old_chunk_ids=[],
+                new_chunks=[inserted],
+                old_positions=[],
+                new_positions=[1],
+                insertion_after_chunk_id="one",
+            )
+        ],
+        effective_date=date(2026, 9, 10),
+    )
+    assert [(row.id, row.position) for row in rows] == [
+        ("one", 0),
+        ("inserted", 1),
+        ("next", 2),
+    ]
+    assert [row.position for row in scope] == [0, 1]

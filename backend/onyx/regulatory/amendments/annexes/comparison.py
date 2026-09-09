@@ -14,6 +14,7 @@ from onyx.regulatory.amendments.annexes.evidence import (
     validate_evidence_view,
 )
 from onyx.regulatory.amendments.annexes.models import (
+    AnnexComparedImage,
     AnnexComparison,
     AnnexComparisonImage,
     AnnexComparisonResponse,
@@ -312,6 +313,38 @@ def compare_annexes(
         new_pages=[page.page for page in after_pages],
         method=method,
     )
+    image_manifest: list[AnnexComparedImage] = []
+    for side, extraction, pages in (
+        ("old", old, before_pages),
+        ("new", new, after_pages),
+    ):
+        for page in pages:
+            region = (
+                next(
+                    (
+                        mapping.normalized_box
+                        for mapping in extraction.evidence_view.pages
+                        if mapping.view_page == page.page
+                    ),
+                    (0, 0, 1, 1),
+                )
+                if extraction.evidence_view
+                else (0, 0, 1, 1)
+            )
+            try:
+                for image in comparison_page_evidence(page, normalized_box=region):
+                    image_manifest.append(
+                        AnnexComparedImage(
+                            side="old" if side == "old" else "new",
+                            page=page.page,
+                            kind=image.kind,
+                            normalized_box=image.normalized_box,
+                            sha256=hashlib.sha256(image.png).hexdigest(),
+                            byte_count=len(image.png),
+                        )
+                    )
+            except ValueError as error:
+                issues.append(str(error))
     changes: list[AnnexDifference] = []
     model_snapshot = None
     if method == "native_structure" and not issues:
@@ -409,6 +442,7 @@ def compare_annexes(
         old_snapshot_sha256=annex_snapshot_hash(old),
         new_snapshot_sha256=annex_snapshot_hash(new),
         changes=changes,
+        image_manifest=image_manifest,
         coverage=coverage,
         model_snapshot=model_snapshot,
         issues=sorted(set(issues)),

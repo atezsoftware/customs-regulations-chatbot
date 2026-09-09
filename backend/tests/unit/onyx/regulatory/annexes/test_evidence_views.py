@@ -279,6 +279,96 @@ def test_selected_comparison_uses_original_page_mapping_and_exact_region_images(
         for part in call.call_args.kwargs["image_parts"]
     ]
     assert submitted == expected + expected
+    from hashlib import sha256
+    from uuid import uuid4
+
+    import pytest
+
+    from onyx.regulatory.amendments.annexes.evidence import validate_compared_evidence
+    from onyx.regulatory.amendments.annexes.models import AnnexReviewEvidence
+
+    assert [item.sha256 for item in result.image_manifest] == [
+        sha256(content).hexdigest() for content in submitted
+    ]
+    originals = [
+        AnnexOriginalEvidence(
+            file_id=view.evidence_view.parents[0].file_id,
+            sha256=view.source_sha256,
+            mime_type=view.mime_type,
+            available=True,
+        )
+        for view in views
+    ]
+    frozen = [
+        AnnexReviewEvidence(
+            id=uuid4(),
+            side="old" if index == 0 else "new",
+            kind="original",
+            file_id=f"frozen-{index}",
+            sha256=original.sha256 or "",
+            mime_type=original.mime_type or "",
+            byte_count=1,
+            parent_file_id=original.file_id,
+            parent_sha256=original.sha256 or "",
+        )
+        for index, original in enumerate(originals)
+    ]
+    for item in result.image_manifest:
+        original = originals[0 if item.side == "old" else 1]
+        frozen.append(
+            AnnexReviewEvidence(
+                id=uuid4(),
+                side=item.side,
+                kind=item.kind,
+                file_id=str(uuid4()),
+                sha256=item.sha256,
+                mime_type="image/png",
+                byte_count=item.byte_count,
+                parent_file_id=original.file_id,
+                parent_sha256=original.sha256 or "",
+                locator=AnnexLocator(
+                    page=item.page, normalized_box=item.normalized_box
+                ),
+            )
+        )
+    validate_compared_evidence(
+        old=views[0],
+        new=views[1],
+        old_originals=[originals[0]],
+        new_originals=[originals[1]],
+        comparison=result,
+        evidence=frozen,
+    )
+    for changed in [
+        frozen[:-1],
+        [*frozen[:-1], frozen[-1].model_copy(update={"sha256": "wrong"})],
+    ]:
+        with pytest.raises(ValueError, match="manifest"):
+            validate_compared_evidence(
+                old=views[0],
+                new=views[1],
+                old_originals=[originals[0]],
+                new_originals=[originals[1]],
+                comparison=result,
+                evidence=changed,
+            )
+    with pytest.raises(ValueError, match="region"):
+        validate_compared_evidence(
+            old=views[0],
+            new=views[1],
+            old_originals=[originals[0]],
+            new_originals=[originals[1]],
+            comparison=result.model_copy(
+                update={
+                    "image_manifest": [
+                        item
+                        for item in result.image_manifest
+                        if item.kind != "comparison_region"
+                    ]
+                }
+            ),
+            evidence=frozen,
+        )
     prompt = call.call_args.kwargs["user_prompt"]
     assert "selected_positions" not in prompt
     assert "original_position" not in prompt

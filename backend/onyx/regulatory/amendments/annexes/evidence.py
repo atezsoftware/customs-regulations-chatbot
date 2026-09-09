@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+from collections import Counter
 from collections.abc import Mapping
 from io import BytesIO
 from typing import Literal, cast
@@ -13,6 +14,7 @@ from onyx.file_store.file_store import FileStore
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.amendments.annexes.models import (
     AnnexBaseline,
+    AnnexComparison,
     AnnexEvidenceElementMap,
     AnnexEvidencePage,
     AnnexEvidenceParent,
@@ -479,6 +481,8 @@ def freeze_review_original(
         raise ValueError("original outside authorized review scope")
     if not original.available or not original.sha256 or not original.mime_type:
         raise ValueError("original unavailable")
+    if store.read_file_record(original.file_id).file_type != original.mime_type:
+        raise ValueError("original MIME differs from stored evidence")
     with store.read_file(original.file_id) as stream:
         content = stream.read(25 * 1024 * 1024 + 1)
     if (
@@ -495,6 +499,10 @@ def freeze_review_original(
         file_metadata={
             "annex_review_scope": scope.storage_identity(),
             "sha256": original.sha256,
+            "byte_count": len(content),
+            "side": side,
+            "kind": "original",
+            "locator": AnnexLocator().model_dump(mode="json"),
             "parent_sha256": original.sha256,
             "parent_file_id": original.file_id,
         },
@@ -576,6 +584,21 @@ def freeze_review_pages(
         for image in comparison_page_evidence(page, normalized_box=region):
             digest = hashlib.sha256(image.png).hexdigest()
             evidence_id = uuid4()
+            locator = AnnexLocator(
+                page=page.page,
+                normalized_box=image.normalized_box,
+                original_box=(
+                    image.normalized_box[0] * page.width,
+                    image.normalized_box[1] * page.height,
+                    image.normalized_box[2] * page.width,
+                    image.normalized_box[3] * page.height,
+                ),
+                original_width=page.width,
+                original_height=page.height,
+                coordinate_system="top_left_points"
+                if original.mime_type == "application/pdf"
+                else "top_left_pixels",
+            )
             file_id = store.save_file(
                 BytesIO(image.png),
                 "Frozen annex comparison",
@@ -584,6 +607,10 @@ def freeze_review_pages(
                 file_metadata={
                     "annex_review_scope": scope.storage_identity(),
                     "sha256": digest,
+                    "byte_count": len(image.png),
+                    "side": original.side,
+                    "kind": image.kind,
+                    "locator": locator.model_dump(mode="json"),
                     "parent_sha256": original.parent_sha256,
                     "parent_file_id": original.parent_file_id,
                 },
@@ -599,21 +626,7 @@ def freeze_review_pages(
                     byte_count=len(image.png),
                     parent_file_id=original.parent_file_id,
                     parent_sha256=original.parent_sha256,
-                    locator=AnnexLocator(
-                        page=page.page,
-                        normalized_box=image.normalized_box,
-                        original_box=(
-                            image.normalized_box[0] * page.width,
-                            image.normalized_box[1] * page.height,
-                            image.normalized_box[2] * page.width,
-                            image.normalized_box[3] * page.height,
-                        ),
-                        original_width=page.width,
-                        original_height=page.height,
-                        coordinate_system="top_left_points"
-                        if original.mime_type == "application/pdf"
-                        else "top_left_pixels",
-                    ),
+                    locator=locator,
                 )
             )
     return compared_pages, evidence
@@ -707,3 +720,126 @@ def combine_annex_evidence_views(
         update={"sha256": evidence_view_hash(result)}
     )
     return result
+
+
+def validate_compared_evidence(
+    *,
+    old: AnnexExtraction,
+    new: AnnexExtraction,
+    old_originals: list[AnnexOriginalEvidence],
+    new_originals: list[AnnexOriginalEvidence],
+    comparison: AnnexComparison,
+    evidence: list[AnnexReviewEvidence],
+) -> None:
+    """Bind every compared parent and image to authorized frozen review bytes."""
+    expected_images: list[tuple[object, ...]] = []
+    actual_images: list[tuple[object, ...]] = []
+    for side, extraction, originals in (
+        ("old", old, old_originals),
+        ("new", new, new_originals),
+    ):
+        if extraction.evidence_view:
+            parents = [
+                (parent.file_id, parent.sha256, parent.mime_type)
+                for parent in extraction.evidence_view.parents
+            ]
+        else:
+            parents = [
+                (original.file_id, original.sha256, original.mime_type)
+                for original in originals
+                if original.available
+                and original.sha256 == extraction.source_sha256
+                and original.mime_type == extraction.mime_type
+            ]
+            if len(parents) != 1:
+                raise ValueError(
+                    "compared whole original identity is missing or ambiguous"
+                )
+        authorized = {
+            (original.file_id, original.sha256, original.mime_type)
+            for original in originals
+            if original.available
+        }
+        if not parents or not set(parents).issubset(authorized):
+            raise ValueError("compared parent identity outside authorized originals")
+        for parent_id, digest, mime in parents:
+            frozen = [
+                item
+                for item in evidence
+                if item.side == side
+                and item.kind == "original"
+                and item.parent_file_id == parent_id
+            ]
+            if len(frozen) != 1 or (
+                frozen[0].parent_sha256,
+                frozen[0].sha256,
+                frozen[0].mime_type,
+            ) != (digest, digest, mime):
+                raise ValueError("compared original differs from frozen review bytes")
+        manifest = [item for item in comparison.image_manifest if item.side == side]
+        if extraction.mime_type.startswith(("image/", "application/pdf")):
+            pages = selected_evidence_pages(extraction)
+            if not pages or sorted(
+                item.page for item in manifest if item.kind == "comparison_page"
+            ) != sorted(pages):
+                raise ValueError("compared page manifest is incomplete")
+        elif manifest:
+            raise ValueError("nonvisual original has comparison image manifest")
+        for item in manifest:
+            if extraction.evidence_view:
+                mappings = [
+                    page
+                    for page in extraction.evidence_view.pages
+                    if page.view_page == item.page
+                ]
+                if len(mappings) != 1:
+                    raise ValueError("comparison image page outside selected view")
+                mapping = mappings[0]
+                parent_id, digest, _ = parents[mapping.parent_index]
+                original_page = mapping.original_page
+            else:
+                parent_id, digest, _ = parents[0]
+                original_page = item.page
+            expected_images.append(
+                (
+                    side,
+                    parent_id,
+                    digest,
+                    original_page,
+                    item.kind,
+                    item.normalized_box,
+                    item.sha256,
+                    item.byte_count,
+                    "image/png",
+                )
+            )
+        if extraction.evidence_view:
+            for mapping in extraction.evidence_view.pages:
+                if mapping.normalized_box != (0, 0, 1, 1) and not any(
+                    item.page == mapping.view_page
+                    and item.kind == "comparison_region"
+                    and item.normalized_box == mapping.normalized_box
+                    for item in manifest
+                ):
+                    raise ValueError(
+                        "selected comparison region manifest is incomplete"
+                    )
+    for item in evidence:
+        if item.kind != "original":
+            actual_images.append(
+                (
+                    item.side,
+                    item.parent_file_id,
+                    item.parent_sha256,
+                    item.locator.page,
+                    item.kind,
+                    item.locator.normalized_box,
+                    item.sha256,
+                    item.byte_count,
+                    item.mime_type,
+                )
+            )
+    if Counter(actual_images) != Counter(expected_images):
+        raise ValueError(
+            "frozen comparison images differ from exact comparison manifest"
+        )

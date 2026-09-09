@@ -270,7 +270,12 @@ def validate_frozen_evidence(
             raise ValueError("frozen evidence scope mismatch")
         metadata = cast(Mapping[str, object], record.file_metadata)
         if (
-            metadata.get("sha256") != item.sha256
+            record.file_type != item.mime_type
+            or metadata.get("byte_count") != item.byte_count
+            or metadata.get("side") != item.side
+            or metadata.get("kind") != item.kind
+            or metadata.get("locator") != item.locator.model_dump(mode="json")
+            or metadata.get("sha256") != item.sha256
             or metadata.get("parent_sha256") != item.parent_sha256
             or metadata.get("parent_file_id") != item.parent_file_id
         ):
@@ -322,6 +327,7 @@ def validate_prepared_annex_change(
         or draft.comparison is None
         or draft.patch_plan is None
         or draft.impact is None
+        or draft.baseline_context is None
         or draft.effective_date is None
         or not draft.evidence
     ):
@@ -351,50 +357,65 @@ def validate_prepared_annex_change(
     )
     if not actual_plan.ready or actual_plan != draft.patch_plan:
         raise ValueError("prepared patch validation changed")
-    sources = {asset.file_id for asset in list_source_assets(session, package.id)}
-    if draft.new_extraction.evidence_view is not None and any(
-        parent.file_id not in sources
-        for parent in draft.new_extraction.evidence_view.parents
-    ):
-        raise ValueError("prepared NEW parent outside source package")
-    old_ids = {chunk_id for item in draft.items for chunk_id in item.old_chunk_ids}
-    if old_ids != {
-        patch.old_chunk_id for patch in actual_plan.patches if patch.old_chunk_id
-    }:
-        raise ValueError("staged lineage differs from reviewed patch")
-    expected_text = "\n".join(
-        patch.new_text for patch in actual_plan.patches if patch.new_text is not None
+    from onyx.regulatory.amendments.annexes.evidence import validate_compared_evidence
+    from onyx.regulatory.amendments.annexes.models import AnnexOriginalEvidence
+
+    validate_compared_evidence(
+        old=draft.old_extraction,
+        new=draft.new_extraction,
+        old_originals=draft.baseline.originals,
+        new_originals=[
+            AnnexOriginalEvidence(
+                file_id=asset.file_id,
+                sha256=asset.sha256,
+                mime_type=asset.mime_type,
+                available=True,
+            )
+            for asset in list_source_assets(session, package.id)
+        ],
+        comparison=draft.comparison,
+        evidence=draft.evidence,
     )
-    new_chunks = [chunk for item in draft.items for chunk in item.new_chunks]
-    if expected_text != "\n".join(chunk.text for chunk in new_chunks) or any(
-        chunk.validity_start_date != draft.effective_date for chunk in new_chunks
-    ):
-        raise ValueError("staged canonical content differs from reviewed patch")
-    allowed_ids = {row.id for row in draft.baseline_scope} | {
-        chunk.id for chunk in new_chunks
-    }
-    if any(
-        projection.canonical_chunk_id not in allowed_ids
-        for projection in draft.impact.prepared.projections
-    ) or any(
-        source.canonical_chunk_id not in allowed_ids
-        for snapshot in draft.impact.prepared.snapshots
-        for source in snapshot.ordered_ranges
-    ):
-        raise ValueError("prepared context outside canonical scope")
-    parent_ids = (
-        {parent.file_id for parent in draft.old_extraction.evidence_view.parents}
-        if draft.old_extraction.evidence_view
-        else {
-            original.file_id
-            for original in draft.baseline.originals
-            if original.available
-        }
+    from onyx.regulatory.amendments.annexes.staging import validate_staged_items
+
+    validate_staged_items(
+        plan=actual_plan,
+        baseline_scope=draft.baseline_scope,
+        items=draft.items,
+        comparison=draft.comparison,
+        insertion_after_chunk_id=draft.insertion_after_chunk_id,
     )
-    frozen_ids = {
-        evidence.parent_file_id
-        for evidence in draft.evidence
-        if evidence.side == "old" and evidence.kind == "original"
-    }
-    if not parent_ids or not parent_ids.issubset(frozen_ids):
-        raise ValueError("frozen OLD review originals missing")
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        compare_context_views,
+        validate_complete_context_view,
+    )
+    from onyx.regulatory.amendments.annexes.staging import (
+        canonical_snapshot_rows,
+        prepare_staged_candidate_rows,
+    )
+
+    candidate_rows = prepare_staged_candidate_rows(
+        baseline_scope=draft.baseline_scope,
+        items=draft.items,
+        effective_date=draft.effective_date,
+    )
+    validate_complete_context_view(
+        rows=canonical_snapshot_rows(draft.baseline_scope),
+        view=draft.baseline_context,
+        as_of_date=draft.effective_date,
+    )
+    validate_complete_context_view(
+        rows=candidate_rows, view=draft.impact.prepared, as_of_date=draft.effective_date
+    )
+    expected_impact = compare_context_views(
+        old=draft.baseline_context,
+        new=draft.impact.prepared,
+        direct_canonical_changes=[
+            chunk.id for item in draft.items for chunk in item.new_chunks
+        ],
+        metadata_only=actual_plan.metadata_only,
+    )
+    if expected_impact != draft.impact:
+        raise ValueError(
+            "prepared context impact differs from complete candidate views"
+        )

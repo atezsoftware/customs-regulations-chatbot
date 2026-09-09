@@ -1,6 +1,8 @@
 """Allocate prospective canonical identities without mutating live legal history."""
 
 import hashlib
+from datetime import date
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from onyx.regulatory.amendments.annexes.models import (
@@ -10,6 +12,9 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexPatchPlan,
 )
 
+if TYPE_CHECKING:
+    from onyx.db.models import RegulatoryChunk
+
 
 def stage_canonical_items(
     *,
@@ -17,6 +22,7 @@ def stage_canonical_items(
     baseline_scope: list[AnnexCanonicalSnapshot],
     insertion_after_chunk_id: str | None = None,
     comparison: AnnexComparison | None = None,
+    prospective_ids: list[str] | None = None,
 ) -> list[AnnexChangeItemDraft]:
     if (
         comparison is not None
@@ -33,6 +39,13 @@ def stage_canonical_items(
         raise ValueError("insertion anchor outside canonical scope")
     next_ordinal = max(row.projection_ordinal for row in baseline_scope) + 1
     items: list[AnnexChangeItemDraft] = []
+    expected_count = sum(patch.operation != "remove" for patch in plan.patches)
+    if prospective_ids is not None and (
+        len(prospective_ids) != expected_count
+        or len(set(prospective_ids)) != expected_count
+    ):
+        raise ValueError("prospective identity count mismatch")
+    identifiers = iter(prospective_ids) if prospective_ids is not None else None
     for patch in plan.patches:
         old = rows.get(patch.old_chunk_id) if patch.old_chunk_id else None
         if patch.old_chunk_id and (old is None or old.text != patch.old_text):
@@ -55,7 +68,9 @@ def stage_canonical_items(
             new_chunks.append(
                 template.model_copy(
                     update={
-                        "id": str(uuid4()),
+                        "id": next(identifiers)
+                        if identifiers is not None
+                        else str(uuid4()),
                         "text": patch.new_text,
                         "source": "amendment",
                         "status": "active",
@@ -143,3 +158,147 @@ def stage_canonical_items(
             )
         )
     return grouped
+
+
+def validate_staged_items(
+    *,
+    plan: AnnexPatchPlan,
+    baseline_scope: list[AnnexCanonicalSnapshot],
+    items: list[AnnexChangeItemDraft],
+    comparison: AnnexComparison | None = None,
+    insertion_after_chunk_id: str | None = None,
+) -> None:
+    """Reconstruct each reviewed operation while retaining allocated identities."""
+    chunks = sorted(
+        (chunk for item in items for chunk in item.new_chunks),
+        key=lambda chunk: chunk.projection_ordinal,
+    )
+    expected = stage_canonical_items(
+        plan=plan,
+        baseline_scope=baseline_scope,
+        comparison=comparison,
+        insertion_after_chunk_id=insertion_after_chunk_id,
+        prospective_ids=[chunk.id for chunk in chunks],
+    )
+    if expected != items:
+        raise ValueError("staged operation differs from reviewed canonical patch")
+
+
+def canonical_snapshot_rows(
+    snapshots: list[AnnexCanonicalSnapshot],
+) -> list["RegulatoryChunk"]:
+    from uuid import UUID
+
+    from onyx.db.models import RegulatoryChunk
+
+    return [
+        RegulatoryChunk(
+            id=row.id,
+            user_file_id=UUID(row.user_file_id),
+            chunk_type=row.chunk_type,
+            status=row.status,
+            projection_ordinal=row.projection_ordinal,
+            supersedes_chunk_id=row.supersedes_chunk_id,
+            superseded_by_chunk_id=row.superseded_by_chunk_id,
+            position=row.position,
+            text=row.text,
+            heading_path=list(row.heading_path),
+            chunk_metadata=dict(row.metadata),
+            source=row.source,
+            validity_start_date=row.validity_start_date,
+            validity_end_date=row.validity_end_date,
+        )
+        for row in snapshots
+    ]
+
+
+def prepare_staged_candidate_rows(
+    *,
+    baseline_scope: list[AnnexCanonicalSnapshot],
+    items: list[AnnexChangeItemDraft],
+    effective_date: "date",
+) -> list["RegulatoryChunk"]:
+    """Build the complete candidate, preserving history and explicit insertion order."""
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        rebuild_context_aggregates,
+    )
+    from onyx.regulatory.contextual import validity_window_contains
+
+    replacements = {
+        old_id: [chunk.id for chunk in item.new_chunks]
+        for item in items
+        for old_id in item.old_chunk_ids
+    }
+    snapshots = [
+        row.model_copy(
+            update={
+                "validity_end_date": min(row.validity_end_date, effective_date)
+                if row.validity_end_date
+                else effective_date,
+                "status": "superseded",
+            }
+        )
+        if row.id in replacements
+        else row
+        for row in baseline_scope
+    ]
+    snapshots.extend(chunk for item in items for chunk in item.new_chunks)
+    rows = canonical_snapshot_rows(snapshots)
+    by_id = {row.id: row for row in rows}
+    insertions = [item for item in items if not item.old_chunk_ids]
+    for item in reversed(insertions):
+        anchor = by_id.get(item.insertion_after_chunk_id or "")
+        if anchor is None:
+            raise ValueError("candidate insertion anchor missing")
+        for row in rows:
+            if row.position > anchor.position:
+                row.position += len(item.new_chunks)
+        for offset, chunk in enumerate(item.new_chunks, 1):
+            by_id[chunk.id].position = anchor.position + offset
+    for row in rows:
+        if not validity_window_contains(
+            row.validity_start_date, row.validity_end_date, effective_date
+        ):
+            continue
+        metadata = dict(row.chunk_metadata)
+        sources = metadata.get("source_regulatory_chunk_ids")
+        if isinstance(sources, list):
+            if not all(isinstance(source, str) for source in sources):
+                raise ValueError("invalid candidate source references")
+            metadata["source_regulatory_chunk_ids"] = list(
+                dict.fromkeys(
+                    new_id
+                    for source in sources
+                    for new_id in replacements.get(source, [source])
+                )
+            )
+        binding = metadata.get("bound_to_regulatory_chunk_id")
+        if isinstance(binding, str) and binding in replacements:
+            targets = replacements[binding]
+            if len(targets) != 1:
+                raise ValueError("candidate image binding is ambiguous")
+            metadata["bound_to_regulatory_chunk_id"] = targets[0]
+        row.chunk_metadata = metadata
+    changed = [chunk.id for item in items for chunk in item.new_chunks]
+    effective = [
+        row
+        for row in rows
+        if validity_window_contains(
+            row.validity_start_date, row.validity_end_date, effective_date
+        )
+    ]
+    aggregate_roots = [
+        row.id
+        for row in effective
+        if row.chunk_metadata.get("chunk_variant") == "hierarchical_aggregate"
+    ]
+    rebuilt = {
+        row.id: row
+        for row in rebuild_context_aggregates(
+            effective, changed_ids=[*changed, *aggregate_roots]
+        )
+    }
+    return sorted(
+        [rebuilt.get(row.id, row) for row in rows],
+        key=lambda row: (row.position, row.id),
+    )
