@@ -1139,10 +1139,18 @@ def update_db_session_with_messages(
 def invalidate_publication_chat_message(message_id: int, error: str) -> None:
     """Discard this ongoing run's saved source-dependent result after epoch drift."""
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
+    from onyx.db.regulatory_chat_reads import MessagePublicationRead
 
     with get_session_with_current_tenant() as session:
-        message = session.get(ChatMessage, message_id)
+        message = session.get(ChatMessage, message_id, with_for_update=True)
         if message is None:
+            return
+        if (
+            message.publication_read is not None
+            and MessagePublicationRead.model_validate(
+                message.publication_read
+            ).finalized
+        ):
             return
         message.message = error
         message.error = error

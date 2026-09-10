@@ -10,7 +10,9 @@ from elasticsearch import Elasticsearch
 from onyx.document_index.elasticsearch.client import (
     ElasticsearchDocumentMissingError,
     ElasticsearchIndexClient,
+    SearchHit,
 )
+from onyx.document_index.elasticsearch.schema import DocumentChunkWithoutVectors
 from tests.external_dependency_unit.regulatory.test_publication_primitives import (
     adapter_for,
     store,
@@ -485,9 +487,12 @@ def test_chat_history_attachment_uses_dated_search_for_versioned_original(
             _ = loaded.content
 
 
+@pytest.mark.parametrize("race_stage", [None, "transport", "bindings", "unchanged"])
 def test_actual_temporal_es_reads_keep_sparse_ordinals_and_own_dated_siblings(
     owned_file: UUID,
     es: tuple[Elasticsearch, str],
+    monkeypatch: pytest.MonkeyPatch,
+    race_stage: str | None,
 ) -> None:
     import json
     from datetime import date, datetime, time, timezone
@@ -676,6 +681,124 @@ def test_actual_temporal_es_reads_keep_sparse_ordinals_and_own_dated_siblings(
                     update={"index_uuid": "recreated"}
                 ),
             )
+        if race_stage is not None:
+            from concurrent.futures import ThreadPoolExecutor
+            from threading import Event
+
+            from onyx.db import regulatory_public_reads
+            from onyx.db.regulatory_annex_activation import (
+                close_preapproved_temporal_binding,
+            )
+
+            unrelated = json.loads(bindings[1].projection.source_json)
+            unrelated.update(
+                document_id="unrelated-connector", regulatory_chunk_id=None
+            )
+            es[0].index(index=es[1], id="unrelated", document=unrelated, refresh=True)
+            reached, release = Event(), Event()
+            if race_stage == "bindings":
+                actual = regulatory_public_reads.query_temporal_bindings
+
+                def paused_bindings(*args: Any, **kwargs: Any) -> object:
+                    reached.set()
+                    assert release.wait(10)
+                    return actual(*args, **kwargs)
+
+                monkeypatch.setattr(
+                    regulatory_public_reads, "query_temporal_bindings", paused_bindings
+                )
+            else:
+                actual_search = reader._client.search
+
+                def paused_search(**kwargs: Any) -> object:
+                    response = actual_search(**kwargs)
+                    reached.set()
+                    assert release.wait(10)
+                    return response
+
+                monkeypatch.setattr(reader._client, "search", paused_search)
+            try:
+                with ThreadPoolExecutor(1) as executor:
+                    from onyx.regulatory.publication_reads import (
+                        PublicationReadTracker,
+                        track_publication_reads,
+                    )
+
+                    tracker = PublicationReadTracker()
+
+                    def query() -> list[SearchHit[DocumentChunkWithoutVectors]]:
+                        with track_publication_reads(tracker):
+                            return reader.search(
+                                {"query": {"match_all": {}}, "size": 20},
+                                None,
+                                as_of_date=date(2026, 9, 10),
+                                publication_index=adapter.snapshot,
+                            )
+
+                    future = executor.submit(query)
+                    assert reached.wait(10)
+                    old = bindings[1]
+                    source = json.loads(old.projection.source_json)
+                    end = date(2026, 10, 1)
+                    source["validity_end_date"] = int(
+                        datetime.combine(end, time.min, timezone.utc).timestamp()
+                    )
+                    updated = old.model_copy(
+                        update={
+                            "effective_end": end,
+                            "projection": old.projection.model_copy(
+                                update={"source_json": json.dumps(source)}
+                            ),
+                        }
+                    )
+                    if race_stage != "unchanged":
+                        authority.release(owner)
+                        owner = authority.acquire(
+                            owned_file, owner_id=uuid4(), ttl=timedelta(seconds=60)
+                        )
+                        authority.close_gate(owner)
+                        inventory = authority.reservations(owner)
+                        adapter.seal(inventory)
+                        for binding in bindings:
+                            adapter.upsert(
+                                inventory,
+                                updated.projection
+                                if binding.id == old.id
+                                else binding.projection,
+                            )
+                        proof = adapter.verify(
+                            inventory,
+                            tuple(
+                                updated.projection
+                                if binding.id == old.id
+                                else binding.projection
+                                for binding in bindings
+                            ),
+                        )
+                    with get_session_with_tenant(tenant_id="public") as session:
+                        close_preapproved_temporal_binding(
+                            session,
+                            previous=old,
+                            updated=updated,
+                            user_file_id=owned_file,
+                        )
+                        if race_stage != "unchanged":
+                            authority.finalize(session, owner, proof)
+                        session.commit()
+                    release.set()
+                    if race_stage == "unchanged":
+                        with pytest.raises(
+                            ValueError, match="differs from activated binding"
+                        ):
+                            future.result(timeout=10)
+                    else:
+                        assert [
+                            hit.document_chunk.document_id
+                            for hit in future.result(timeout=10)
+                        ] == ["unrelated-connector"]
+                        tracker.validate()
+            finally:
+                release.set()
     finally:
         reader.close()
         from sqlalchemy import delete
@@ -836,8 +959,11 @@ def test_actual_http_reconnect_and_304_cannot_reuse_inflight_changed_sources(
         store.delete_file(unrelated_id)
 
 
+@pytest.mark.parametrize("fallback_completed", [False, True])
 def test_writer_drain_does_not_finalize_an_unconsumed_live_answer(
     owned_file: UUID,
+    es: tuple[Elasticsearch, str],
+    fallback_completed: bool,
 ) -> None:
     from threading import Event
     from unittest.mock import MagicMock, patch
@@ -930,7 +1056,31 @@ def test_writer_drain_does_not_finalize_an_unconsumed_live_answer(
                 assert attached is not None
                 state = MessagePublicationRead.model_validate(attached.publication_read)
                 assert state.generation_done and not state.finalized
+            if fallback_completed:
+                from onyx.db.models import User, UserFile
+                from onyx.server.query_and_chat.chat_backend import get_chat_session
+
+                with get_session_with_tenant(tenant_id="public") as session:
+                    file = session.get(UserFile, owned_file)
+                    assert file is not None
+                    user = session.get(User, file.user_id)
+                    assert user is not None
+                    detail = get_chat_session(chat_id, user=user, db_session=session)
+                    assert any(
+                        item.message == "queued stale answer"
+                        for item in detail.messages
+                    )
             authority.close_gate(owner)
+            if fallback_completed:
+                inventory = authority.reservations(owner)
+                adapter = adapter_for(es)
+                adapter.seal(inventory)
+                for ordinal in inventory.ordinals:
+                    adapter.tombstone(inventory, ordinal)
+                proof = adapter.verify(inventory, ())
+                with get_session_with_tenant(tenant_id="public") as session:
+                    authority.finalize(session, owner, proof)
+                    session.commit()
             packets = list(stream)
             assert not any(
                 isinstance(item, Packet) and isinstance(item.obj, AgentResponseDelta)
@@ -939,8 +1089,332 @@ def test_writer_drain_does_not_finalize_an_unconsumed_live_answer(
             with get_session_with_tenant(tenant_id="public") as session:
                 attached = session.get(ChatMessage, message_id)
                 assert attached is not None
-                assert attached.message != "queued stale answer"
+                if fallback_completed:
+                    assert attached.message == "queued stale answer"
+                    assert MessagePublicationRead.model_validate(
+                        attached.publication_read
+                    ).finalized
+                else:
+                    assert attached.message != "queued stale answer"
     finally:
+        with get_session_with_tenant(tenant_id="public") as session:
+            session.execute(
+                delete(ChatMessage).where(ChatMessage.chat_session_id == chat_id)
+            )
+            session.execute(delete(ChatSession).where(ChatSession.id == chat_id))
+            session.commit()
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_memoized_tool_file_revalidates_for_each_model(
+    owned_file: UUID,
+    es: tuple[Elasticsearch, str],
+    monkeypatch: pytest.MonkeyPatch,
+    overflow: bool,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from io import BytesIO
+    from threading import Event
+    from types import SimpleNamespace
+
+    from onyx.chat.process_message import (
+        _load_context_user_files_for_tools,
+        extract_context_files,
+    )
+    from onyx.db.engine.sql_engine import get_session_with_tenant
+    from onyx.db.models import UserFile
+    from onyx.regulatory.publication_reads import (
+        PublicationReadTracker,
+        public_read_store,
+        track_publication_reads,
+    )
+    from tests.external_dependency_unit.regulatory.test_publication_primitives import (
+        create_owned_file,
+    )
+
+    authority = public_read_store()
+    monkeypatch.setattr(
+        "onyx.chat.process_message.get_default_file_store",
+        lambda: SimpleNamespace(read_file=lambda *_a, **_k: BytesIO(b"original table")),
+    )
+    monkeypatch.setattr(
+        "onyx.chat.process_message.load_in_memory_chat_files", lambda *_a, **_k: []
+    )
+    with create_owned_file() as unrelated:
+        with get_session_with_tenant(tenant_id="public") as session:
+            files: list[UserFile] = []
+            for identity in (owned_file, unrelated):
+                file = session.get(UserFile, identity)
+                assert file is not None
+                file.file_type = "text/csv"
+                files.append(file)
+            context = extract_context_files(files, 100, 100 if overflow else 0, session)
+            assert context.use_as_search_filter == overflow
+            staged = _load_context_user_files_for_tools(files, set())
+        first, second = PublicationReadTracker(), PublicationReadTracker()
+        materialized, resume = Event(), Event()
+
+        def model_b() -> bytes:
+            assert materialized.wait(10)
+            assert resume.wait(10)
+            with track_publication_reads(second):
+                assert staged[1].content == b"original table"
+                return staged[0].content
+
+        with ThreadPoolExecutor(1) as executor:
+            pending = executor.submit(model_b)
+            with track_publication_reads(first):
+                assert staged[0].content == b"original table"
+            with track_publication_reads(second):
+                assert staged[0].content == b"original table"
+            assert second.evidence() is not None
+            materialized.set()
+            owner = authority.acquire(
+                owned_file, owner_id=uuid4(), ttl=timedelta(seconds=30)
+            )
+            authority.close_gate(owner)
+            inventory = authority.reservations(owner)
+            adapter = adapter_for(es)
+            adapter.seal(inventory)
+            for ordinal in inventory.ordinals:
+                adapter.tombstone(inventory, ordinal)
+            proof = adapter.verify(inventory, ())
+            with get_session_with_tenant(tenant_id="public") as session:
+                authority.finalize(session, owner, proof)
+                session.commit()
+            resume.set()
+            with pytest.raises(Exception, match="dated search|source changed"):
+                pending.result(timeout=10)
+
+
+def test_retained_pending_history_carries_evidence_and_regeneration_excludes_stale(
+    owned_file: UUID,
+) -> None:
+    from sqlalchemy import delete
+
+    from onyx.configs.constants import MessageType
+    from onyx.db.engine.sql_engine import get_session_with_tenant
+    from onyx.db.models import ChatMessage, ChatSession
+    from onyx.db.regulatory_chat_reads import stage_message_publication_read
+    from onyx.regulatory.publication_reads import (
+        PublicationReadChanged,
+        PublicationReadEvidence,
+        PublicationReadTracker,
+        public_read_store,
+    )
+    from onyx.server.query_and_chat.models import AUTO_PLACE_AFTER_LATEST_MESSAGE
+
+    authority = public_read_store()
+    owner = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=30))
+    evidence = PublicationReadEvidence(
+        observation=authority.observe(), user_file_ids=(owned_file,)
+    )
+    with get_session_with_tenant(tenant_id="public") as session:
+        chat = ChatSession(description="5c retained history", persona_id=0)
+        session.add(chat)
+        session.flush()
+        root = ChatMessage(
+            chat_session_id=chat.id,
+            message="",
+            token_count=0,
+            message_type=MessageType.SYSTEM,
+        )
+        session.add(root)
+        session.flush()
+        query = ChatMessage(
+            chat_session_id=chat.id,
+            parent_message=root,
+            message="old query",
+            token_count=2,
+            message_type=MessageType.USER,
+        )
+        session.add(query)
+        session.flush()
+        pending = ChatMessage(
+            chat_session_id=chat.id,
+            parent_message=query,
+            message="pending answer",
+            token_count=2,
+            message_type=MessageType.ASSISTANT,
+        )
+        session.add(pending)
+        session.flush()
+        root.latest_child_message_id = query.id
+        query.latest_child_message_id = pending.id
+        stage_message_publication_read(session, pending, evidence)
+        session.commit()
+        chat_id, query_id = chat.id, query.id
+    try:
+        from onyx.chat.chat_utils import load_chat_history_for_turn
+
+        with get_session_with_tenant(tenant_id="public") as session:
+            history, parent, inherited = load_chat_history_for_turn(
+                chat_id, AUTO_PLACE_AFTER_LATEST_MESSAGE, session
+            )
+            assert [message.message for message in history] == [
+                "old query",
+                "pending answer",
+            ]
+            assert parent.message == "pending answer"
+            assert inherited is not None
+        tracker = PublicationReadTracker()
+        tracker.include_evidence(inherited)
+        authority.close_gate(owner)
+        with pytest.raises(PublicationReadChanged):
+            tracker.validate()
+        from unittest.mock import MagicMock, patch
+
+        from onyx.chat.models import StreamingError
+        from onyx.chat.process_message import _run_models
+        from onyx.server.query_and_chat.placement import Placement
+        from onyx.server.query_and_chat.streaming_models import (
+            AgentResponseDelta,
+            Packet,
+        )
+        from tests.unit.onyx.chat.test_multi_model_streaming import _make_setup
+
+        setup = _make_setup()
+        setup.extracted_context_files.publication_evidence = inherited
+
+        def model(**kwargs: Any) -> None:
+            kwargs["state_container"].set_answer_tokens("answer from pending history")
+            kwargs["emitter"].emit(
+                Packet(
+                    placement=Placement(turn_index=0),
+                    obj=AgentResponseDelta(content="answer from pending history"),
+                )
+            )
+
+        with (
+            patch("onyx.chat.process_message.run_llm_loop", side_effect=model),
+            patch("onyx.chat.process_message.construct_tools", return_value={}),
+            patch(
+                "onyx.chat.process_message.get_llm_token_counter",
+                return_value=lambda _: 0,
+            ),
+            patch("onyx.chat.process_message.llm_loop_completion_handle") as saved,
+            patch("onyx.chat.process_message.get_session_with_current_tenant"),
+            patch("onyx.db.chat.invalidate_publication_chat_message"),
+            patch("onyx.db.regulatory_chat_reads.mark_message_publication_generated"),
+            patch("onyx.db.regulatory_chat_reads.finalize_message_publication_read"),
+        ):
+            packets = list(_run_models(setup, MagicMock()))
+            assert any(
+                isinstance(item, StreamingError)
+                and item.error_code == "PUBLICATION_SOURCE_CHANGED"
+                for item in packets
+            )
+            assert not any(
+                isinstance(item, Packet) and isinstance(item.obj, AgentResponseDelta)
+                for item in packets
+            )
+            saved.assert_not_called()
+        with get_session_with_tenant(tenant_id="public") as session:
+            with pytest.raises(PublicationReadChanged):
+                load_chat_history_for_turn(
+                    chat_id, AUTO_PLACE_AFTER_LATEST_MESSAGE, session
+                )
+            history, parent, inherited = load_chat_history_for_turn(
+                chat_id, query_id, session
+            )
+            assert [message.message for message in history] == ["old query"]
+            assert parent.id == query_id and inherited is None
+            history, parent, inherited = load_chat_history_for_turn(
+                chat_id, None, session
+            )
+            assert history == [] and inherited is None
+    finally:
+        with get_session_with_tenant(tenant_id="public") as session:
+            session.execute(
+                delete(ChatMessage).where(ChatMessage.chat_session_id == chat_id)
+            )
+            session.execute(delete(ChatSession).where(ChatSession.id == chat_id))
+            session.commit()
+
+
+def test_message_invalidation_serializes_with_final_delivery(
+    owned_file: UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from threading import Event
+
+    from sqlalchemy import delete
+
+    from onyx.configs.constants import MessageType
+    from onyx.db.chat import invalidate_publication_chat_message
+    from onyx.db.engine.sql_engine import get_session_with_tenant
+    from onyx.db.models import ChatMessage, ChatSession
+    from onyx.db.regulatory_chat_reads import (
+        MessagePublicationRead,
+        finalize_message_publication_read,
+        mark_message_publication_generated,
+        stage_message_publication_read,
+    )
+    from onyx.db.regulatory_publication import PublicationStore
+    from onyx.regulatory.publication_reads import (
+        PublicationReadEvidence,
+        public_read_store,
+    )
+
+    authority = public_read_store()
+    authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=30))
+    with get_session_with_tenant(tenant_id="public") as session:
+        chat = ChatSession(description="5c finalization locking", persona_id=0)
+        session.add(chat)
+        session.flush()
+        message = ChatMessage(
+            chat_session_id=chat.id,
+            message="finalized answer",
+            token_count=2,
+            message_type=MessageType.ASSISTANT,
+        )
+        session.add(message)
+        session.flush()
+        stage_message_publication_read(
+            session,
+            message,
+            PublicationReadEvidence(
+                observation=authority.observe(), user_file_ids=(owned_file,)
+            ),
+        )
+        session.commit()
+        chat_id, message_id = chat.id, message.id
+    assert mark_message_publication_generated(message_id)
+    reached, release, invalidator_started = Event(), Event(), Event()
+    actual_lock = PublicationStore.lock_public_read
+
+    def pause_finalization(*args: Any, **kwargs: Any) -> bool:
+        result = actual_lock(*args, **kwargs)
+        reached.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(PublicationStore, "lock_public_read", pause_finalization)
+
+    def invalidate() -> None:
+        invalidator_started.set()
+        invalidate_publication_chat_message(message_id, "late stale consumer")
+
+    try:
+        with ThreadPoolExecutor(2) as executor:
+            finalizing = executor.submit(finalize_message_publication_read, message_id)
+            assert reached.wait(10)
+            invalidating = executor.submit(invalidate)
+            assert invalidator_started.wait(10)
+            with pytest.raises(TimeoutError):
+                invalidating.result(timeout=0.1)
+            release.set()
+            assert finalizing.result(timeout=10)
+            invalidating.result(timeout=10)
+        with get_session_with_tenant(tenant_id="public") as session:
+            message = session.get(ChatMessage, message_id)
+            assert message is not None
+            assert message.message == "finalized answer"
+            assert MessagePublicationRead.model_validate(
+                message.publication_read
+            ).finalized
+    finally:
+        release.set()
         with get_session_with_tenant(tenant_id="public") as session:
             session.execute(
                 delete(ChatMessage).where(ChatMessage.chat_session_id == chat_id)

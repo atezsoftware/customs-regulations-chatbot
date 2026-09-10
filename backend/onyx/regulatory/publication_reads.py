@@ -61,6 +61,16 @@ class PublicationReadTracker:
         with self._lock:
             self._files.update(files)
 
+    def include_evidence(self, evidence: PublicationReadEvidence) -> None:
+        with self._lock:
+            if (
+                self._observation is None
+                or evidence.observation.committed_epoch
+                < self._observation.committed_epoch
+            ):
+                self._observation = evidence.observation
+            self._files.update(evidence.user_file_ids)
+
     def evidence(self) -> PublicationReadEvidence | None:
         with self._lock:
             if self._observation is None or not self._files:
@@ -102,7 +112,11 @@ def file_uuid(document_id: str) -> UUID | None:
 
 
 def filter_publication_read(
-    observation: ReadObservation, items: Sequence[T], document_id: Callable[[T], str]
+    observation: ReadObservation,
+    items: Sequence[T],
+    document_id: Callable[[T], str],
+    *,
+    record_evidence: bool = True,
 ) -> list[T]:
     files = {
         file for item in items if (file := file_uuid(document_id(item))) is not None
@@ -114,7 +128,7 @@ def filter_publication_read(
         item for item in items if file_uuid(document_id(item)) not in unavailable
     ]
     tracker = _CURRENT_READ.get()
-    if tracker is not None:
+    if tracker is not None and record_evidence:
         tracker.include(tuple(files - unavailable))
     return retained
 
@@ -132,4 +146,6 @@ def require_publication_files(
         )
     tracker = _CURRENT_READ.get()
     if tracker is not None:
-        tracker.include(files)
+        tracker.include_evidence(
+            PublicationReadEvidence(observation=observation, user_file_ids=files)
+        )

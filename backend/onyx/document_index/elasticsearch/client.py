@@ -1913,6 +1913,12 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         )
         from onyx.regulatory.publication_reads import file_uuid
 
+        search_hits = filter_publication_read(
+            observation,
+            search_hits,
+            lambda hit: hit.document_chunk.document_id,
+            record_evidence=False,
+        )
         file_ids = tuple(
             {
                 file_id
@@ -1958,6 +1964,15 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                     binding.projection.source_json
                 )
                 if expected != chunk:
+                    # A publication may commit between the initial epoch check and
+                    # binding hydration. Discard that file, retaining unrelated hits.
+                    if not filter_publication_read(
+                        observation,
+                        [hit],
+                        lambda item: item.document_chunk.document_id,
+                        record_evidence=False,
+                    ):
+                        continue
                     raise ValueError(
                         "indexed temporal representation differs from activated binding"
                     )

@@ -12,10 +12,14 @@ from typing_extensions import TypedDict  # noreorder
 _LAZY_LOADER_ATTR = "_lazy_content_loader"
 _LAZY_DONE_ATTR = "_lazy_content_materialized"
 _LAZY_LOCK_ATTR = "_lazy_content_lock"
+_CONTENT_GUARD_ATTR = "_content_access_guard"
 
 
 def install_lazy_content_loader(
-    instance: BaseModel, loader: Callable[[], bytes]
+    instance: BaseModel,
+    loader: Callable[[], bytes],
+    *,
+    guard: Callable[[], None] | None = None,
 ) -> None:
     """Stash a lazy ``content`` loader + per-instance lock on a Pydantic model.
 
@@ -28,6 +32,7 @@ def install_lazy_content_loader(
     instance ``__dict__`` without becoming Pydantic fields — serialization
     (``model_dump``) and equality are unaffected.
     """
+    object.__setattr__(instance, _CONTENT_GUARD_ATTR, guard)
     object.__setattr__(instance, _LAZY_LOADER_ATTR, loader)
     object.__setattr__(instance, _LAZY_DONE_ATTR, False)
     object.__setattr__(instance, _LAZY_LOCK_ATTR, threading.Lock())
@@ -36,14 +41,17 @@ def install_lazy_content_loader(
 def maybe_materialize_lazy_content(instance: BaseModel) -> None:
     """If a lazy loader is stashed and bytes haven't been read yet, invoke
     the loader under a per-instance lock and write the bytes back through
-    Pydantic so subsequent reads of ``.content`` are zero-overhead field
-    accesses.
+    Pydantic so subsequent reads reuse the bytes. The optional access guard
+    runs on every read and again after materialization.
 
     Two threads racing on first access must not both call the loader (that
     would double-GET from S3), hence the per-instance ``threading.Lock``
     with a double-checked guard inside the critical section.
     """
     d = object.__getattribute__(instance, "__dict__")
+    guard = d.get(_CONTENT_GUARD_ATTR)
+    if guard is not None:
+        guard()
     if d.get(_LAZY_LOADER_ATTR) is None or d.get(_LAZY_DONE_ATTR, False):
         return
     lock = d.get(_LAZY_LOCK_ATTR)
@@ -60,6 +68,9 @@ def maybe_materialize_lazy_content(instance: BaseModel) -> None:
         data = d[_LAZY_LOADER_ATTR]()
         BaseModel.__setattr__(instance, "content", data)
         object.__setattr__(instance, _LAZY_DONE_ATTR, True)
+
+    if guard is not None:
+        guard()
 
 
 class ChatFileType(str, Enum):

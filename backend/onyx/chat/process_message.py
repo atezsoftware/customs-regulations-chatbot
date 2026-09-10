@@ -75,7 +75,6 @@ from onyx.context.search.models import BaseFilters, SearchDoc
 from onyx.db.chat import (
     create_new_chat_message,
     get_chat_session_by_id,
-    get_or_create_root_message,
     reserve_message_id,
     reserve_multi_model_message_ids,
 )
@@ -117,7 +116,6 @@ from onyx.prompts.prompt_utils import substitute_user_placeholders
 from onyx.regulatory.temporal_query import extract_regulatory_as_of_date
 from onyx.server.query_and_chat.chat_utils import mime_type_to_chat_file_type
 from onyx.server.query_and_chat.models import (
-    AUTO_PLACE_AFTER_LATEST_MESSAGE,
     MessageResponseIDInfo,
     ModelResponseSlot,
     MultiModelMessageResponseIDInfo,
@@ -309,29 +307,35 @@ def _load_context_user_files_for_tools(
             str(user_file.id),
         )
 
-        def _load(
-            file_id: str = user_file.file_id, user_file_id: UUID = user_file.id
-        ) -> bytes:
-            from onyx.db.regulatory_public_reads import current_protected_file_ids
-            from onyx.regulatory.publication_reads import (
-                observe_publication_read,
-                require_publication_files,
-            )
+        from onyx.db.regulatory_public_reads import current_protected_file_ids
+        from onyx.document_index.publication_models import ReadObservation
+        from onyx.regulatory.publication_reads import (
+            observe_publication_read,
+            require_publication_files,
+        )
 
-            observation = observe_publication_read()
+        observation = observe_publication_read()
+
+        def _guard(
+            user_file_id: UUID = user_file.id,
+            observation: ReadObservation = observation,
+        ) -> None:
+            require_publication_files(observation, (user_file_id,))
             if current_protected_file_ids((user_file_id,)):
                 raise OnyxError(
                     OnyxErrorCode.SERVICE_UNAVAILABLE,
                     "This versioned source requires dated search; its original cannot be staged as current evidence.",
                 )
-            require_publication_files(observation, (user_file_id,))
+
+        def _load(
+            file_id: str = user_file.file_id, user_file_id: UUID = user_file.id
+        ) -> bytes:
             # Preserve the pre-lazy degraded-but-functional behavior: if the
             # underlying file is gone or temporarily unreachable, log it and
             # hand PythonTool an empty payload instead of letting the
             # exception propagate out of ChatFile.__getattribute__.
             try:
                 content = get_default_file_store().read_file(file_id, mode="b").read()
-                require_publication_files(observation, (user_file_id,))
                 return content
             except OnyxError:
                 raise
@@ -343,7 +347,9 @@ def _load_context_user_files_for_tools(
                 )
                 return b""
 
-        chat_files.append(ChatFile.lazy_from_filename(filename=filename, loader=_load))
+        chat_files.append(
+            ChatFile.lazy_from_filename(filename=filename, loader=_load, guard=_guard)
+        )
 
     return chat_files
 
@@ -883,41 +889,11 @@ def build_chat_turn(
         project_id=chat_session.project_id,
     )
 
-    # Re-create linear history of messages
-    chat_history = create_chat_history_chain(
-        chat_session_id=chat_session.id, db_session=db_session
+    from onyx.chat.chat_utils import load_chat_history_for_turn
+
+    chat_history, parent_message, history_evidence = load_chat_history_for_turn(
+        chat_session.id, new_msg_req.parent_message_id, db_session
     )
-
-    # Determine the parent message based on the request:
-    # - AUTO_PLACE_AFTER_LATEST_MESSAGE (-1): auto-place after latest message in chain
-    # - None or root ID: regeneration from root (first message)
-    # - positive int: place after that specific parent message
-    root_message = get_or_create_root_message(
-        chat_session_id=chat_session.id, db_session=db_session
-    )
-
-    if new_msg_req.parent_message_id == AUTO_PLACE_AFTER_LATEST_MESSAGE:
-        parent_message = chat_history[-1] if chat_history else root_message
-    elif (
-        new_msg_req.parent_message_id is None
-        or new_msg_req.parent_message_id == root_message.id
-    ):
-        # Regeneration from root — clear history so we start fresh
-        parent_message = root_message
-        chat_history = []
-    else:
-        parent_message = None
-        for i in range(len(chat_history) - 1, -1, -1):
-            if chat_history[i].id == new_msg_req.parent_message_id:
-                parent_message = chat_history[i]
-                # Truncate to only messages up to and including the parent
-                chat_history = chat_history[: i + 1]
-                break
-
-    if parent_message is None:
-        raise ValueError(
-            "The new message sent is not on the latest mainline of messages"
-        )
 
     # ── Query Processing hook + user message ─────────────────────────────────
     # Skipped on regeneration (parent is USER type): message already exists/was accepted.
@@ -1099,6 +1075,8 @@ def build_chat_turn(
         for item in files
         if item.publication_evidence is not None
     ]
+    if history_evidence is not None:
+        source_evidence.append(history_evidence)
     if extracted_context_files.publication_evidence is not None:
         source_evidence.append(extracted_context_files.publication_evidence)
     if source_evidence:

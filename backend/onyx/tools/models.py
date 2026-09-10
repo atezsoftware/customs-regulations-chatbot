@@ -216,6 +216,7 @@ class ChatFile(BaseModel):
         *,
         filename: str,
         loader: Callable[[], bytes],
+        guard: Callable[[], None] | None = None,
     ) -> "ChatFile":
         """Construct a ChatFile whose ``content`` is loaded on first access.
 
@@ -224,7 +225,7 @@ class ChatFile(BaseModel):
         the loader and memoizes the result.
         """
         inst = cls(filename=filename, content=b"")
-        install_lazy_content_loader(inst, loader)
+        install_lazy_content_loader(inst, loader, guard=guard)
         return inst
 
     def __getattribute__(self, name: str):  # type: ignore[no-untyped-def]

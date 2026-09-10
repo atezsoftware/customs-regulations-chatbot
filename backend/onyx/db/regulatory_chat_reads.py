@@ -48,7 +48,7 @@ def finalize_message_publication_read(message_id: int) -> bool:
 
 def _advance_message_publication_read(message_id: int, *, finalize: bool) -> bool:
     with get_session_with_current_tenant() as session:
-        message = session.get(ChatMessage, message_id)
+        message = session.get(ChatMessage, message_id, with_for_update=True)
         if message is None or message.publication_read is None:
             return True
         state = MessagePublicationRead.model_validate(message.publication_read)

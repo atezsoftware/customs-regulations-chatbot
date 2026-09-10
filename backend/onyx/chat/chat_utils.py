@@ -39,6 +39,7 @@ from onyx.db.models import SearchDoc as DbSearchDoc
 from onyx.db.persona import user_can_access_persona
 from onyx.db.projects import check_project_access
 from onyx.db.user_file import get_user_file_by_id
+from onyx.document_index.publication_models import PublicationReadEvidence
 from onyx.file_processing.extract_file_text import extract_file_text
 from onyx.file_store.file_store import get_default_file_store
 from onyx.file_store.models import ChatFileType, FileDescriptor
@@ -260,6 +261,41 @@ def create_chat_history_chain(
     if any(not message_publication_available(message) for message in mainline_messages):
         raise PublicationReadChanged()
     return mainline_messages
+
+
+def load_chat_history_for_turn(
+    chat_session_id: UUID,
+    parent_message_id: int | None,
+    db_session: Session,
+) -> tuple[list[ChatMessage], ChatMessage, PublicationReadEvidence | None]:
+    """Validate only the retained branch and carry its pending source dependencies."""
+    from onyx.db.regulatory_chat_reads import MessagePublicationRead
+    from onyx.regulatory.publication_reads import PublicationReadTracker
+    from onyx.server.query_and_chat.models import AUTO_PLACE_AFTER_LATEST_MESSAGE
+
+    root = get_or_create_root_message(
+        chat_session_id=chat_session_id, db_session=db_session
+    )
+    automatic = parent_message_id == AUTO_PLACE_AFTER_LATEST_MESSAGE
+    requested_parent_id = root.id if parent_message_id is None else parent_message_id
+    history = create_chat_history_chain(
+        chat_session_id=chat_session_id,
+        db_session=db_session,
+        stop_at_message_id=None if automatic else requested_parent_id,
+    )
+    parent = history[-1] if history else root
+    if not automatic and parent.id != requested_parent_id:
+        raise ValueError(
+            "The new message sent is not on the latest mainline of messages"
+        )
+    tracker = PublicationReadTracker()
+    for message in history:
+        if message.publication_read is not None:
+            state = MessagePublicationRead.model_validate(message.publication_read)
+            if not state.finalized:
+                tracker.include_evidence(state.evidence)
+    tracker.validate()
+    return history, parent, tracker.evidence()
 
 
 def reorganize_citations(
