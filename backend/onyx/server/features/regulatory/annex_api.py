@@ -296,15 +296,24 @@ def retry_group(
         review.status in ("pending", "blocked", "rejected", "failed")
         and not review.publication_generation
     ):
-        return edit_group(
-            batch_id,
-            review_id,
-            AnnexReviewEditRequest(
-                expected_review_sha256=request.expected_review_sha256
-            ),
-            user,
-            db_session,
+        from onyx.db.regulatory_annex_changes import resume_unpublished_annex_review
+        from onyx.regulatory.amendments.annexes.analysis import (
+            validate_live_review_configuration,
         )
+
+        try:
+            draft = AnnexChangeDraft.model_validate(review.review_payload)
+            if not draft.issues and draft.impact is not None and draft.impact.ready:
+                validate_live_review_configuration(draft)
+            resumed = resume_unpublished_annex_review(
+                db_session,
+                change_set_id=review_id,
+                expected_review_sha256=request.expected_review_sha256,
+                environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            )
+            return AnnexReviewSnapshot.model_validate(resumed)
+        except ValueError as exc:
+            raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
     return _queue_review(
         db_session, batch_id, review_id, request, user, tenant_id, True
     )

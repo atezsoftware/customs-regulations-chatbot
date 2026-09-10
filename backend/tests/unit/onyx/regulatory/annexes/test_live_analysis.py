@@ -345,3 +345,20 @@ def test_new_source_selection_uses_ordered_disjoint_parts_and_native_containment
         select_new_annex_sources(
             [parent, attachment], [links[1].model_copy(update={"kind": "embedded"})]
         )
+
+
+@pytest.mark.parametrize(
+    "wording", ["2 nci maddesinde", "ikinci fıkrasında", "(a) bendinde", "article 2"]
+)
+def test_explicit_annex_target_owns_internal_article_wording(wording: str) -> None:
+    from onyx.regulatory.amendments.annexes.analysis import group_annex_instructions
+
+    groups = group_annex_instructions(
+        [
+            AmendmentInstruction(
+                article_reference="EK-1",
+                instruction_text=f"EK-1’in {wording} yer alan eski ibaresi yeni olarak değiştirilmiştir.",
+            )
+        ]
+    )
+    assert len(groups) == 1 and groups[0].annex_label == "ek:1"

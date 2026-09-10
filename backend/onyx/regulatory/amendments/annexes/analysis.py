@@ -79,7 +79,7 @@ def group_annex_instructions(
             and extract_single_regulatory_provision_reference(reference) is not None
         ):
             continue
-        if re.search(
+        if not reference_labels and re.search(
             r"(?:maddesin(?:de|in)|fıkrasın(?:da|ın)|bendin(?:de|in)|article\s+\d+)",
             instruction.instruction_text,
             re.IGNORECASE,

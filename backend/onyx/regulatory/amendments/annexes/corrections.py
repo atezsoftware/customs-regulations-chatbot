@@ -95,30 +95,126 @@ def frozen_comparison_pages(
     return sorted(pages, key=lambda item: item.page)
 
 
+def correction_source_inputs(
+    draft: AnnexChangeDraft,
+    corrections: list[AnnexElementCorrection],
+) -> tuple[list[ImageContentPart], list[str]]:
+    """Re-read independent originals and require evidence at every corrected locator."""
+    from onyx.regulatory.amendments.annexes.evidence import validate_evidence_view
+    from onyx.regulatory.amendments.annexes.extraction import extract_annex_structure
+
+    raw = draft.raw_new_extraction
+    if raw is None or validate_evidence_view(raw):
+        raise ValueError("correction source scope missing or invalid")
+    store = get_default_file_store()
+    native: list[str] = []
+    images: list[ImageContentPart] = []
+    parsed: dict[str, AnnexExtraction] = {}
+    supplied_images: set[UUID] = set()
+    for correction in corrections:
+        position = correction.position
+        locator = raw.elements[position].locator
+        original_position = position
+        if raw.evidence_view is not None:
+            mapping = raw.evidence_view.element_mappings[position]
+            parent = raw.evidence_view.parents[mapping.parent_index]
+            parent_id, parent_hash, mime = (
+                parent.file_id,
+                parent.sha256,
+                parent.mime_type,
+            )
+            original_position, locator = (
+                mapping.original_position,
+                mapping.original_locator,
+            )
+        else:
+            matches = [
+                evidence
+                for evidence in draft.evidence
+                if evidence.side == "new"
+                and evidence.kind == "original"
+                and evidence.parent_sha256 == raw.source_sha256
+                and evidence.mime_type == raw.mime_type
+            ]
+            if len(matches) != 1:
+                raise ValueError("correction source original missing or ambiguous")
+            parent_id, parent_hash, mime = (
+                matches[0].parent_file_id,
+                raw.source_sha256,
+                raw.mime_type,
+            )
+        originals = [
+            evidence
+            for evidence in draft.evidence
+            if evidence.side == "new"
+            and evidence.kind == "original"
+            and evidence.parent_file_id == parent_id
+            and evidence.parent_sha256 == parent_hash
+            and evidence.sha256 == parent_hash
+            and evidence.mime_type == mime
+        ]
+        if len(originals) != 1:
+            raise ValueError("correction source original missing or ambiguous")
+        original = originals[0]
+        content = read_frozen_evidence(store, original)
+        if mime.startswith("text/") or mime.endswith(
+            ("wordprocessingml.document", "spreadsheetml.sheet")
+        ):
+            if original.file_id not in parsed:
+                parsed[original.file_id] = extract_annex_structure(content, mime)
+            source = parsed[original.file_id]
+            if original_position >= len(source.elements):
+                raise ValueError("correction source position missing")
+            element = source.elements[original_position]
+            if (
+                element.locator != locator
+                or element.extraction_method != "native"
+                or element.status != "readable"
+                or element.issues
+                or not element.text.strip()
+            ):
+                raise ValueError("correction source native locator unavailable")
+            native.append(
+                f"parent_file_id={parent_id}; parent_sha256={parent_hash}; original_position={original_position}; original_locator="
+                + locator.model_dump_json()
+                + "\n"
+                + element.model_dump_json()
+            )
+        else:
+            pages = [
+                evidence
+                for evidence in draft.evidence
+                if evidence.side == "new"
+                and evidence.kind == "comparison_page"
+                and evidence.parent_file_id == parent_id
+                and evidence.parent_sha256 == parent_hash
+                and locator.page is not None
+                and evidence.locator.page == locator.page
+            ]
+            if not pages:
+                raise ValueError("correction source visual locator unavailable")
+            for evidence in pages:
+                if evidence.id not in supplied_images:
+                    image = read_frozen_evidence(store, evidence)
+                    images.append(
+                        ImageContentPart(
+                            image_url=ImageUrlDetail(
+                                url="data:image/png;base64,"
+                                + base64.b64encode(image).decode()
+                            )
+                        )
+                    )
+                    supplied_images.add(evidence.id)
+    return images, native
+
+
 def reconcile_corrections(
     *, draft: AnnexChangeDraft, corrections: list[AnnexElementCorrection], llm: LLM
 ) -> AnnexCorrectionReconciliation:
     if draft.raw_new_extraction is None:
         raise ValueError("immutable raw extraction missing")
     apply_bound_corrections(draft.raw_new_extraction, corrections)
-    store = get_default_file_store()
-    images: list[ImageContentPart] = []
-    native: list[str] = []
-    for evidence in draft.evidence:
-        if evidence.side != "new":
-            continue
-        content = read_frozen_evidence(store, evidence)
-        if evidence.kind in ("comparison_page", "comparison_region"):
-            images.append(
-                ImageContentPart(
-                    image_url=ImageUrlDetail(
-                        url="data:image/png;base64,"
-                        + base64.b64encode(content).decode()
-                    )
-                )
-            )
-        elif evidence.kind == "original" and evidence.mime_type.startswith("text/"):
-            native.append(content.decode("utf-8", errors="replace"))
+    images, native = correction_source_inputs(draft, corrections)
     verdict = generate_structured(
         llm,
         flow=LLMFlow.REGULATORY_ANNEX_CORRECTION,

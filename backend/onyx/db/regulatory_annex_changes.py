@@ -1059,3 +1059,50 @@ def legacy_text_annex_is_complete(
         if appendix_replacement_attention_message(instruction, [candidate]) is not None:
             return False
     return True
+
+
+def resume_unpublished_annex_review(
+    session: Session,
+    *,
+    change_set_id: UUID,
+    expected_review_sha256: str,
+    environment: str,
+) -> AnnexChangeSet:
+    """Resume only existing frozen preparation; changed inputs require revalidation."""
+    review = require_current_annex_review(
+        session,
+        change_set_id=change_set_id,
+        expected_review_sha256=expected_review_sha256,
+        environment=environment,
+    )
+    if review.publication_generation or review.status not in (
+        "pending",
+        "blocked",
+        "rejected",
+        "failed",
+    ):
+        raise ValueError("review state does not allow unpublished resume")
+    batch = session.get(AmendmentBatch, review.batch_id)
+    assert batch is not None
+    draft = AnnexChangeDraft.model_validate(review.review_payload)
+    validate_annex_review_scope(
+        session, batch=batch, draft=draft, environment=environment
+    )
+    if (
+        not draft.issues
+        and draft.patch_plan is not None
+        and draft.patch_plan.ready
+        and draft.impact is not None
+        and draft.impact.ready
+    ):
+        lock_annex_preparation_scope(session, draft.user_file_id)
+        validate_prepared_annex_change(
+            session, batch=batch, draft=draft, environment=environment
+        )
+        if review.status in ("rejected", "failed"):
+            review.status = "pending"
+            review.error_message = None
+            review.decided_by = None
+            review.decided_at = None
+    session.commit()
+    return review

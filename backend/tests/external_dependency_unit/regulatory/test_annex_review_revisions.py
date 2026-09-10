@@ -411,6 +411,32 @@ def test_live_batch_prepares_annex_once_without_legacy_or_canonical_writes(
     assert capture_canonical_scope(source_session, file.id) == before
     repeated = queue()
     assert repeated.id == intent.id
+    frozen = (
+        groups[0].id,
+        groups[0].review_revision,
+        groups[0].review_sha256,
+        groups[0].review_payload,
+    )
+    groups[0].status = "failed"
+    source_session.commit()
+    retried = queue_annex_publication(
+        source_session,
+        change_set_id=groups[0].id,
+        expected_review_sha256=groups[0].review_sha256,
+        environment="local-test",
+        tenant_id="public",
+        database_identity="local-db",
+        decided_by=file.user_id,
+        retry=True,
+    )
+    assert retried.id != intent.id and retried.publication_generation == 2
+    assert (
+        groups[0].id,
+        groups[0].review_revision,
+        groups[0].review_sha256,
+        groups[0].review_payload,
+    ) == frozen
+    assert queue().id == retried.id
 
 
 def test_source_text_edits_create_new_batch_and_invalidate_previous_review(
@@ -518,6 +544,58 @@ def test_group_api_enforces_owner_and_returns_exact_frozen_bytes(
         response.status_code == 200
         and response.content == b'<h1>EK-1</h1><p id="rate">new</p>'
     )
+    revalidate = MagicMock(side_effect=AssertionError("retry must not reprepare"))
+    monkeypatch.setattr(annex_api, "revalidate_annex_review", revalidate)
+    identity = (
+        live_review.review.id,
+        live_review.review.review_sha256,
+        live_review.review.review_payload,
+    )
+    for status in ("pending", "rejected", "failed", "blocked"):
+        live_review.review.status = status
+        source_session.commit()
+        response = client.post(
+            f"{path}/{live_review.review.id}/retry",
+            json={"expected_review_sha256": identity[1]},
+        )
+        assert response.status_code == 200, response.text
+        assert (
+            response.json()["id"],
+            response.json()["review_sha256"],
+            response.json()["review_payload"],
+        ) == (str(identity[0]), identity[1], identity[2])
+        assert response.json()["review_revision"] == 1
+    revalidate.assert_not_called()
+    assert (
+        client.post(
+            f"{path}/{live_review.review.id}/retry",
+            json={"expected_review_sha256": "0" * 64},
+        ).status_code
+        == 400
+    )
+    live_review.review.status = "pending"
+    source_session.commit()
+    monkeypatch.setattr(annex_api, "enqueue_annex_publication", MagicMock())
+    decision = {"expected_review_sha256": identity[1]}
+    response = client.post(f"{path}/{live_review.review.id}/approve", json=decision)
+    assert response.status_code == 200, response.text
+    response = client.post(f"{path}/{live_review.review.id}/retry", json=decision)
+    assert (
+        response.status_code == 200 and response.json()["publication_generation"] == 1
+    )
+    live_review.review.status = "failed"
+    source_session.commit()
+    response = client.post(f"{path}/{live_review.review.id}/retry", json=decision)
+    assert (
+        response.status_code == 200 and response.json()["publication_generation"] == 2
+    )
+    assert (
+        response.json()["id"],
+        response.json()["review_sha256"],
+        response.json()["review_payload"],
+    ) == (str(identity[0]), identity[1], identity[2])
+    assert response.json()["review_revision"] == 1
+    revalidate.assert_not_called()
     owner.id = uuid4()
     assert client.get(path).status_code == 404
     assert client.get(evidence_path).status_code == 404
