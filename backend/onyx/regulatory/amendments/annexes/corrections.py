@@ -219,7 +219,7 @@ def reconcile_corrections(
         llm,
         flow=LLMFlow.REGULATORY_ANNEX_CORRECTION,
         system_prompt=ANNEX_CORRECTION_RECONCILIATION_PROMPT,
-        user_prompt="Raw extraction with server-controlled locators:\n"
+        user_prompt="Derived transcription under correction (not original source authority):\n"
         + draft.raw_new_extraction.model_dump_json()
         + "\nOriginal native source:\n"
         + "\n".join(native)

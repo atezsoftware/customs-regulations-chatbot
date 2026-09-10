@@ -1,12 +1,17 @@
 from unittest.mock import patch
 
 import litellm
+import pytest
 
 from onyx.configs.model_configs import GEN_AI_MODEL_FALLBACK_MAX_TOKENS
 from onyx.llm.constants import LlmProviderNames
+from onyx.llm.litellm_singleton.config import load_model_metadata_enrichments
 from onyx.llm.model_capabilities import (
     find_model_obj,
+    get_llm_max_output_tokens,
     get_model_map,
+    litellm_thinks_model_supports_image_input,
+    llm_max_input_tokens,
     model_is_reasoning_model,
 )
 
@@ -134,3 +139,82 @@ def test_twelvelabs_pegasus_override_present() -> None:
         assert model_obj["supports_reasoning"] is False
     finally:
         get_model_map.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "provider_metadata", [None, {"supports_vision": False, "max_input_tokens": 2048}]
+)
+def test_display_only_alias_does_not_mask_base_capabilities(
+    provider_metadata: dict[str, object] | None,
+) -> None:
+    base = {
+        "supports_vision": True,
+        "max_input_tokens": 32000,
+        "max_output_tokens": 4096,
+    }
+    alias: dict[str, object] = {
+        "display_name": "Friendly model",
+        "model_vendor": "Vendor",
+        "model_version": "1",
+    }
+    if provider_metadata:
+        alias.update(provider_metadata)
+    registry = {"fictional-model": base, "proxy/fictional-model": alias}
+    with patch.object(litellm, "model_cost", registry):
+        get_model_map.cache_clear()
+        try:
+            model_map = get_model_map()
+            assert litellm_thinks_model_supports_image_input(
+                "fictional-model", "proxy"
+            ) is (provider_metadata is None)
+            assert llm_max_input_tokens(model_map, "fictional-model", "proxy") == (
+                2048 if provider_metadata else 32000
+            )
+            if provider_metadata is None:
+                assert (
+                    get_llm_max_output_tokens(model_map, "fictional-model", "proxy")
+                    == 4096
+                )
+            assert registry["proxy/fictional-model"] == alias
+            assert registry["fictional-model"] == base
+        finally:
+            get_model_map.cache_clear()
+
+
+def test_display_only_unknown_model_does_not_imply_vision() -> None:
+    with patch.object(
+        litellm, "model_cost", {"proxy/unknown": {"display_name": "Unknown"}}
+    ):
+        get_model_map.cache_clear()
+        try:
+            assert not litellm_thinks_model_supports_image_input("unknown", "proxy")
+            assert (
+                llm_max_input_tokens(get_model_map(), "unknown", "proxy")
+                == GEN_AI_MODEL_FALLBACK_MAX_TOKENS
+            )
+        finally:
+            get_model_map.cache_clear()
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_enrichment_refreshes_cached_capabilities(warm_cache: bool) -> None:
+    from io import StringIO
+
+    registry = {"fictional-model": {"supports_vision": True, "max_input_tokens": 32000}}
+    enrichment = '{"proxy/fictional-model": {"display_name": "Friendly model"}, "fictional-model": {"display_name": "Base display"}}'
+    with (
+        patch.object(litellm, "model_cost", registry),
+        patch("builtins.open", return_value=StringIO(enrichment)),
+    ):
+        get_model_map.cache_clear()
+        try:
+            if warm_cache:
+                get_model_map()
+            load_model_metadata_enrichments()
+            assert (
+                get_model_map()["proxy/fictional-model"]["display_name"]
+                == "Friendly model"
+            )
+            assert litellm_thinks_model_supports_image_input("fictional-model", "proxy")
+        finally:
+            get_model_map.cache_clear()

@@ -46,7 +46,16 @@ def office_original(format: str) -> tuple[bytes, str]:
 
 @pytest.mark.parametrize("format", ["docx", "xlsx"])
 @pytest.mark.parametrize("selected_view", [False, True])
-@pytest.mark.parametrize("source_problem", [None, "missing_original", "wrong_locator"])
+@pytest.mark.parametrize(
+    "source_problem",
+    [
+        None,
+        "missing_original",
+        "wrong_locator",
+        "ambiguous_original",
+        "unreadable_original",
+    ],
+)
 def test_office_correction_supplies_independent_bound_source_or_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     format: str,
@@ -94,6 +103,12 @@ def test_office_correction_supplies_independent_bound_source_or_fails_closed(
             canonical_labels=["EK-1"],
             canonical_chunk_ids=["legal-scope"],
         )
+    if source_problem == "unreadable_original":
+        original.elements[position].status = "unreadable"
+        monkeypatch.setattr(
+            "onyx.regulatory.amendments.annexes.extraction.extract_annex_structure",
+            lambda _content, _mime: original,
+        )
     draft = AnnexChangeDraft(
         instruction_indices=[0],
         instruction_texts=["EK-1"],
@@ -102,6 +117,10 @@ def test_office_correction_supplies_independent_bound_source_or_fails_closed(
         new_extraction=raw,
         evidence=[] if source_problem == "missing_original" else [evidence],
     )
+    if source_problem == "ambiguous_original":
+        draft.evidence.append(
+            evidence.model_copy(update={"id": uuid4(), "file_id": "other-original"})
+        )
     edit = AnnexElementCorrection(
         position=position,
         before_text="OCR transcription error",
@@ -136,6 +155,15 @@ def test_office_correction_supplies_independent_bound_source_or_fails_closed(
         native_input = prompt.split("Original native source:\n", 1)[1].split(
             "\nProposed corrections:", 1
         )[0]
+        assert prompt.startswith(
+            "Derived transcription under correction (not original source authority):\n"
+        )
+        system = transport.call_args.kwargs["system_prompt"]
+        assert (
+            "A mismatch between the derived transcription and an original is the error being corrected"
+            in system
+        )
+        assert "If the original sources themselves conflict" in system
         assert "Printed source value" in native_input
         assert "OCR transcription error" not in native_input
         assert evidence.sha256 in native_input

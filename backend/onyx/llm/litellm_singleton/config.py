@@ -144,6 +144,10 @@ def load_model_metadata_enrichments() -> None:
 
         logger.info("Loaded model metadata enrichments for %s models", len(enrichments))
 
+        from onyx.llm.model_capabilities import get_model_map
+
+        get_model_map.cache_clear()
+
         # Clear the model name parser cache since enrichments are now loaded
         # This ensures any parsing done before enrichments were loaded gets refreshed
         try:

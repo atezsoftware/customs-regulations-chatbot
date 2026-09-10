@@ -106,6 +106,9 @@ def _strip_colon_from_model_name(model_name: str) -> str:
     return ":".join(model_name.split(":")[:-1]) if ":" in model_name else model_name
 
 
+_MODEL_DISPLAY_FIELDS = frozenset({"display_name", "model_vendor", "model_version"})
+
+
 def find_model_obj(model_map: dict, provider: str, model_name: str) -> dict | None:
     stripped_model_name = _strip_extra_provider_from_model_name(model_name)
 
@@ -125,13 +128,15 @@ def find_model_obj(model_map: dict, provider: str, model_name: str) -> dict | No
     # First try all model names with provider prefix
     for model_name in filtered_model_names:
         model_obj = model_map.get(f"{provider}/{model_name}")
-        if model_obj:
+        # Display-only aliases do not assert capabilities or token limits.
+        if model_obj and model_obj.keys() - _MODEL_DISPLAY_FIELDS:
             return model_obj
 
     # Then try all model names without provider prefix
     for model_name in filtered_model_names:
         model_obj = model_map.get(model_name)
-        if model_obj:
+        # Display-only aliases do not assert capabilities or token limits.
+        if model_obj and model_obj.keys() - _MODEL_DISPLAY_FIELDS:
             return model_obj
 
     return None
