@@ -14,34 +14,113 @@ import { SettingsLayouts, toast } from "@opal/layouts";
 import SvgHistory from "@opal/icons/history";
 import { useDocumentSets } from "@/lib/hooks/useDocumentSets";
 import {
-  AmendmentBatch,
-  AmendmentProposal,
+  type AmendmentSourcePackage,
+  type AnnexCapabilities,
+  type AnnexReview,
+  type AmendmentBatch,
+  type AmendmentProposal,
   RegulatoryRequestError,
   analyzeAmendment,
   approveProposal,
+  createAmendmentSourcePackage,
   extractAmendmentDocx,
   extractAmendmentPdf,
   extractAmendmentUrl,
   getAmendmentAnalysis,
+  getAmendmentSourcePackage,
+  getAmendmentSourceText,
+  getAnnexCapabilities,
+  listAnnexReviews,
   listAmendmentBatches,
   listAmendmentProposals,
   rejectProposal,
   retryAmendmentBatch,
+  retryAmendmentSourcePackage,
   retryProposalIndexing,
+  uploadAmendmentSourcePackage,
 } from "@/lib/regulatory/amendments";
+import AnnexChangeReview from "@/views/admin/AnnexChangeReview";
 
-type AmendmentSourceMode = "text" | "url" | "pdf" | "docx";
+type AmendmentSourceMode =
+  | "text"
+  | "url"
+  | "pdf"
+  | "docx"
+  | "image"
+  | "html"
+  | "xlsx";
+
+const FILE_SOURCE_MODES = new Set<AmendmentSourceMode>([
+  "pdf",
+  "docx",
+  "image",
+  "html",
+  "xlsx",
+]);
+
+const sourceModeDetails: Record<
+  Exclude<AmendmentSourceMode, "text" | "url">,
+  { button: string; choose: string; label: string; accept: string }
+> = {
+  pdf: {
+    button: "PDF",
+    choose: "PDF",
+    label: "Amendment source PDF",
+    accept: "application/pdf,.pdf",
+  },
+  docx: {
+    button: "Word (.docx)",
+    choose: "Word document",
+    label: "Amendment source Word document",
+    accept:
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx",
+  },
+  image: {
+    button: "Image",
+    choose: "image",
+    label: "Amendment source image",
+    accept:
+      "image/png,image/jpeg,image/webp,image/tiff,.png,.jpg,.jpeg,.webp,.tif,.tiff",
+  },
+  html: {
+    button: "HTML",
+    choose: "HTML file",
+    label: "Amendment source HTML file",
+    accept: "text/html,application/xhtml+xml,.html,.htm",
+  },
+  xlsx: {
+    button: "Excel (.xlsx)",
+    choose: "Excel workbook",
+    label: "Amendment source Excel workbook",
+    accept:
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx",
+  },
+};
 
 function sourceIdentity(
   mode: AmendmentSourceMode,
   url: string,
-  file: File | null
+  file: File | null,
+  text = ""
 ) {
+  if (mode === "text") {
+    const normalizedText = text.trim();
+    if (!normalizedText) return null;
+    let hash = 2166136261;
+    for (let index = 0; index < normalizedText.length; index += 1) {
+      hash = Math.imul(hash ^ normalizedText.charCodeAt(index), 16777619);
+    }
+    return `text:${normalizedText.length}:${(hash >>> 0).toString(16)}`;
+  }
   if (mode === "url") return url.trim() ? `url:${url.trim()}` : null;
-  if ((mode === "pdf" || mode === "docx") && file) {
+  if (FILE_SOURCE_MODES.has(mode) && file) {
     return `${mode}:${file.name}:${file.size}:${file.lastModified}`;
   }
   return null;
+}
+
+function sourceRequestIdentity() {
+  return `annex-source-${globalThis.crypto.randomUUID()}`;
 }
 
 function analysisProgressLabel(batch: AmendmentBatch) {
@@ -681,6 +760,8 @@ function ProposalCard({
 
 export default function AmendmentsPage() {
   const { documentSets } = useDocumentSets();
+  const [annexCapabilities, setAnnexCapabilities] =
+    useState<AnnexCapabilities | null>(null);
   const [selectedDocumentSetId, setSelectedDocumentSetId] = useState<
     string | null
   >(null);
@@ -692,6 +773,13 @@ export default function AmendmentsPage() {
     string | null
   >(null);
   const [extracting, setExtracting] = useState(false);
+  const [sourcePackage, setSourcePackage] =
+    useState<AmendmentSourcePackage | null>(null);
+  const [sourcePackageIdentity, setSourcePackageIdentity] = useState<
+    string | null
+  >(null);
+  const [retryingSourcePackage, setRetryingSourcePackage] = useState(false);
+  const sourceRequestTokenRef = useRef<string | null>(null);
   const sourceFileInputRef = useRef<HTMLInputElement>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [retrying, setRetrying] = useState(false);
@@ -700,7 +788,29 @@ export default function AmendmentsPage() {
   const [batches, setBatches] = useState<AmendmentBatch[]>([]);
   const [selectedBatchId, setSelectedBatchId] = useState<number | null>(null);
   const [proposals, setProposals] = useState<AmendmentProposal[]>([]);
+  const [annexReviews, setAnnexReviews] = useState<AnnexReview[]>([]);
   const [unmatched, setUnmatched] = useState<string[]>([]);
+
+  const annexEnabled =
+    annexCapabilities?.enabled === true &&
+    annexCapabilities.grouped_review &&
+    annexCapabilities.immutable_review_revisions &&
+    annexCapabilities.asynchronous_source_preparation &&
+    annexCapabilities.publication_requires_verified_index;
+
+  useEffect(() => {
+    let cancelled = false;
+    void getAnnexCapabilities()
+      .then((capabilities) => {
+        if (!cancelled) setAnnexCapabilities(capabilities);
+      })
+      .catch(() => {
+        if (!cancelled) setAnnexCapabilities(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refreshBatches = useCallback(async (documentSetId: number) => {
     const result = await listAmendmentBatches(documentSetId);
@@ -724,6 +834,7 @@ export default function AmendmentsPage() {
   useEffect(() => {
     if (selectedBatchId === null) {
       setProposals([]);
+      setAnnexReviews([]);
       setUnmatched([]);
       return;
     }
@@ -749,6 +860,7 @@ export default function AmendmentsPage() {
             : [result.batch, ...current];
         });
         setProposals(result.proposals);
+        setAnnexReviews(result.annex_groups ?? []);
         setUnmatched(result.unmatched_instructions);
 
         if (
@@ -783,6 +895,64 @@ export default function AmendmentsPage() {
       if (timeoutId !== null) clearTimeout(timeoutId);
     };
   }, [selectedBatchId, pollRevision]);
+
+  const activeAnnexReviewKey = useMemo(
+    () =>
+      annexReviews
+        .filter((review) =>
+          ["approving", "preparing", "publishing"].includes(review.status)
+        )
+        .map((review) => `${review.id}:${review.status}`)
+        .sort()
+        .join(","),
+    [annexReviews]
+  );
+
+  useEffect(() => {
+    if (!annexEnabled || selectedBatchId === null || !activeAnnexReviewKey) {
+      return;
+    }
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let delayMs = 1500;
+    const pollReviews = async () => {
+      try {
+        const reviews = await listAnnexReviews(selectedBatchId);
+        if (cancelled) return;
+        setAnnexReviews(reviews);
+        delayMs = 1500;
+        if (
+          reviews.some((review) =>
+            ["approving", "preparing", "publishing"].includes(review.status)
+          )
+        ) {
+          timeoutId = setTimeout(() => void pollReviews(), delayMs);
+        }
+      } catch {
+        if (cancelled) return;
+        delayMs = Math.min(delayMs * 2, 30_000);
+        timeoutId = setTimeout(() => void pollReviews(), delayMs);
+      }
+    };
+    timeoutId = setTimeout(() => void pollReviews(), delayMs);
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    };
+  }, [activeAnnexReviewKey, annexEnabled, selectedBatchId]);
+
+  const updateAnnexReview = useCallback((updatedReview: AnnexReview) => {
+    setAnnexReviews((current) => {
+      const others = current.filter(
+        (review) => review.logical_group_id !== updatedReview.logical_group_id
+      );
+      return [...others, updatedReview].sort(
+        (left, right) =>
+          (left.review_payload.instruction_indices[0] ?? 0) -
+          (right.review_payload.instruction_indices[0] ?? 0)
+      );
+    });
+  }, []);
 
   const approvingProposalIdsKey = useMemo(
     () =>
@@ -861,15 +1031,82 @@ export default function AmendmentsPage() {
   const currentSourceIdentity = sourceIdentity(
     sourceMode,
     sourceUrl,
-    sourceFile
+    sourceFile,
+    rawText
   );
-  const hasCurrentSourceExtraction =
-    sourceMode === "text" ||
-    (currentSourceIdentity !== null &&
-      currentSourceIdentity === extractedSourceIdentity);
+  const hasCurrentSourceExtraction = annexEnabled
+    ? sourcePackage?.status === "ready" &&
+      currentSourceIdentity !== null &&
+      currentSourceIdentity === sourcePackageIdentity
+    : sourceMode === "text" ||
+      (currentSourceIdentity !== null &&
+        currentSourceIdentity === extractedSourceIdentity);
   const canAnalyze = Boolean(rawText.trim()) && hasCurrentSourceExtraction;
+  const sourcePackageId = sourcePackage?.id ?? null;
+  const sourcePackageStatus = sourcePackage?.status ?? null;
+
+  useEffect(() => {
+    if (
+      !annexEnabled ||
+      !selectedDocumentSetId ||
+      !sourcePackageId ||
+      !["processing", "ready"].includes(sourcePackageStatus ?? "") ||
+      !sourcePackageIdentity
+    ) {
+      return;
+    }
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const expectedIdentity = sourcePackageIdentity;
+    const pollPackage = async () => {
+      try {
+        if (sourcePackageStatus === "ready") {
+          const sourceText = await getAmendmentSourceText(
+            Number(selectedDocumentSetId),
+            sourcePackageId
+          );
+          if (cancelled) return;
+          if (sourceText.original_text.trim()) {
+            setRawText(sourceText.original_text);
+          }
+          setExtractedSourceIdentity(expectedIdentity);
+          toast.success("Frozen source package is ready for analysis.");
+          return;
+        }
+        const refreshed = await getAmendmentSourcePackage(
+          Number(selectedDocumentSetId),
+          sourcePackageId
+        );
+        if (cancelled) return;
+        setSourcePackage(refreshed);
+        if (refreshed.status === "processing") {
+          timeoutId = setTimeout(() => void pollPackage(), 1500);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : "Could not refresh source preparation."
+          );
+        }
+      }
+    };
+    void pollPackage();
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    };
+  }, [
+    annexEnabled,
+    selectedDocumentSetId,
+    sourcePackageId,
+    sourcePackageIdentity,
+    sourcePackageStatus,
+  ]);
 
   const handleSourceModeChange = useCallback((mode: AmendmentSourceMode) => {
+    sourceRequestTokenRef.current = null;
     setSourceMode(mode);
     setSourceFile(null);
     if (sourceFileInputRef.current) {
@@ -877,49 +1114,118 @@ export default function AmendmentsPage() {
     }
     setRawText("");
     setExtractedSourceIdentity(null);
+    setSourcePackage(null);
+    setSourcePackageIdentity(null);
+    setExtracting(false);
   }, []);
 
   const handleExtract = useCallback(async () => {
-    const identity = sourceIdentity(sourceMode, sourceUrl, sourceFile);
+    const identity = sourceIdentity(sourceMode, sourceUrl, sourceFile, rawText);
     if (!identity) {
       toast.error(
         sourceMode === "url"
           ? "Enter an amendment source URL."
-          : sourceMode === "pdf"
-            ? "Choose a PDF file."
-            : "Choose a Word .docx file."
+          : "Choose a supported annex source file."
       );
       return;
     }
 
+    const requestToken = sourceRequestIdentity();
+    sourceRequestTokenRef.current = requestToken;
     setExtracting(true);
     try {
+      if (annexEnabled && selectedDocumentSetId) {
+        const prepared =
+          sourceMode === "url"
+            ? await createAmendmentSourcePackage(
+                Number(selectedDocumentSetId),
+                requestToken,
+                { url: sourceUrl.trim() }
+              )
+            : await uploadAmendmentSourcePackage(
+                Number(selectedDocumentSetId),
+                requestToken,
+                sourceFile as File
+              );
+        if (sourceRequestTokenRef.current !== requestToken) return;
+        setSourcePackageIdentity(identity);
+        setSourcePackage(prepared);
+        toast.info(
+          "Source preparation started. Status will update automatically."
+        );
+        return;
+      }
       const result =
         sourceMode === "url"
           ? await extractAmendmentUrl(sourceUrl.trim())
           : sourceMode === "pdf"
             ? await extractAmendmentPdf(sourceFile as File)
             : await extractAmendmentDocx(sourceFile as File);
+      if (sourceRequestTokenRef.current !== requestToken) return;
       setRawText(result.text);
       setExtractedSourceIdentity(identity);
       toast.success(
         `Extracted text from ${result.display_name}. Review it before analysis.`
       );
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Source extraction failed.");
+      if (sourceRequestTokenRef.current === requestToken) {
+        toast.error(
+          e instanceof Error ? e.message : "Source extraction failed."
+        );
+      }
     } finally {
-      setExtracting(false);
+      if (sourceRequestTokenRef.current === requestToken) {
+        setExtracting(false);
+      }
     }
-  }, [sourceFile, sourceMode, sourceUrl]);
+  }, [
+    annexEnabled,
+    rawText,
+    selectedDocumentSetId,
+    sourceFile,
+    sourceMode,
+    sourceUrl,
+  ]);
 
   const handleAnalyze = useCallback(async () => {
-    if (!selectedDocumentSetId || !canAnalyze) return;
+    if (!selectedDocumentSetId || !rawText.trim()) return;
+    let sourcePreparationToken: string | null = null;
     setAnalyzing(true);
     try {
-      const result = await analyzeAmendment(
-        Number(selectedDocumentSetId),
-        rawText
-      );
+      if (
+        annexEnabled &&
+        sourceMode === "text" &&
+        !hasCurrentSourceExtraction
+      ) {
+        const identity = sourceIdentity(
+          sourceMode,
+          sourceUrl,
+          sourceFile,
+          rawText
+        );
+        sourcePreparationToken = sourceRequestIdentity();
+        sourceRequestTokenRef.current = sourcePreparationToken;
+        const prepared = await createAmendmentSourcePackage(
+          Number(selectedDocumentSetId),
+          sourcePreparationToken,
+          { text: rawText }
+        );
+        if (sourceRequestTokenRef.current !== sourcePreparationToken) return;
+        setSourcePackageIdentity(identity);
+        setSourcePackage(prepared);
+        toast.info(
+          "Source preparation started. Analyze again when the frozen package is ready."
+        );
+        return;
+      }
+      if (!canAnalyze) return;
+      const result = annexEnabled
+        ? await analyzeAmendment(
+            Number(selectedDocumentSetId),
+            rawText,
+            sourcePackage?.id
+          )
+        : await analyzeAmendment(Number(selectedDocumentSetId), rawText);
       toast.success("Analysis queued. Progress will update automatically.");
       setRawText("");
       setBatches((current) => [
@@ -928,13 +1234,53 @@ export default function AmendmentsPage() {
       ]);
       setSelectedBatchId(result.id);
       setProposals([]);
+      setAnnexReviews([]);
       setUnmatched([]);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Analysis failed.");
+      if (
+        sourcePreparationToken === null ||
+        sourceRequestTokenRef.current === sourcePreparationToken
+      ) {
+        toast.error(e instanceof Error ? e.message : "Analysis failed.");
+      }
     } finally {
-      setAnalyzing(false);
+      if (
+        sourcePreparationToken === null ||
+        sourceRequestTokenRef.current === sourcePreparationToken
+      ) {
+        setAnalyzing(false);
+      }
     }
-  }, [selectedDocumentSetId, rawText, canAnalyze]);
+  }, [
+    annexEnabled,
+    canAnalyze,
+    hasCurrentSourceExtraction,
+    rawText,
+    selectedDocumentSetId,
+    sourceFile,
+    sourceMode,
+    sourcePackage?.id,
+    sourceUrl,
+  ]);
+
+  const handleSourcePackageRetry = useCallback(async () => {
+    if (!selectedDocumentSetId || !sourcePackage) return;
+    setRetryingSourcePackage(true);
+    try {
+      const retried = await retryAmendmentSourcePackage(
+        Number(selectedDocumentSetId),
+        sourcePackage.id
+      );
+      setSourcePackage(retried);
+      toast.info("Source preparation retry queued.");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Source retry failed."
+      );
+    } finally {
+      setRetryingSourcePackage(false);
+    }
+  }, [selectedDocumentSetId, sourcePackage]);
 
   const handleRetry = useCallback(async () => {
     if (selectedBatchId === null) return;
@@ -976,8 +1322,13 @@ export default function AmendmentsPage() {
             <InputSelect
               value={selectedDocumentSetId ?? ""}
               onValueChange={(value) => {
+                sourceRequestTokenRef.current = null;
                 setSelectedDocumentSetId(value);
                 setSelectedBatchId(null);
+                setSourcePackage(null);
+                setSourcePackageIdentity(null);
+                setExtracting(false);
+                setAnalyzing(false);
               }}
             >
               <InputSelect.Trigger />
@@ -1033,6 +1384,20 @@ export default function AmendmentsPage() {
                   >
                     Word (.docx)
                   </Button>
+                  {annexEnabled &&
+                    (["image", "html", "xlsx"] as const).map((mode) => (
+                      <Button
+                        key={mode}
+                        type="button"
+                        size="sm"
+                        prominence={
+                          sourceMode === mode ? "primary" : "secondary"
+                        }
+                        onClick={() => handleSourceModeChange(mode)}
+                      >
+                        {sourceModeDetails[mode].button}
+                      </Button>
+                    ))}
                 </div>
 
                 {sourceMode === "url" && (
@@ -1041,9 +1406,13 @@ export default function AmendmentsPage() {
                       aria-label="Amendment source URL"
                       value={sourceUrl}
                       onChange={(event) => {
+                        sourceRequestTokenRef.current = null;
                         setSourceUrl(event.target.value);
                         setRawText("");
                         setExtractedSourceIdentity(null);
+                        setSourcePackage(null);
+                        setSourcePackageIdentity(null);
+                        setExtracting(false);
                       }}
                       placeholder="https://www.resmigazete.gov.tr/..."
                     />
@@ -1052,31 +1421,47 @@ export default function AmendmentsPage() {
                       onClick={() => void handleExtract()}
                       disabled={extracting || !sourceUrl.trim()}
                     >
-                      {extracting ? "Extracting…" : "Extract"}
+                      {extracting
+                        ? annexEnabled
+                          ? "Preparing…"
+                          : "Extracting…"
+                        : annexEnabled
+                          ? "Prepare source"
+                          : "Extract"}
                     </Button>
                   </div>
                 )}
 
-                {(sourceMode === "pdf" || sourceMode === "docx") && (
+                {FILE_SOURCE_MODES.has(sourceMode) && (
                   <div className="flex flex-wrap items-center gap-2">
                     <input
                       ref={sourceFileInputRef}
                       aria-label={
-                        sourceMode === "pdf"
-                          ? "Amendment source PDF"
-                          : "Amendment source Word document"
+                        sourceModeDetails[
+                          sourceMode as Exclude<
+                            AmendmentSourceMode,
+                            "text" | "url"
+                          >
+                        ].label
                       }
                       className="hidden"
                       type="file"
                       accept={
-                        sourceMode === "pdf"
-                          ? "application/pdf,.pdf"
-                          : "application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx"
+                        sourceModeDetails[
+                          sourceMode as Exclude<
+                            AmendmentSourceMode,
+                            "text" | "url"
+                          >
+                        ].accept
                       }
                       onChange={(event) => {
+                        sourceRequestTokenRef.current = null;
                         setSourceFile(event.target.files?.[0] ?? null);
                         setRawText("");
                         setExtractedSourceIdentity(null);
+                        setSourcePackage(null);
+                        setSourcePackageIdentity(null);
+                        setExtracting(false);
                       }}
                     />
                     <Button
@@ -1084,13 +1469,7 @@ export default function AmendmentsPage() {
                       prominence="secondary"
                       onClick={() => sourceFileInputRef.current?.click()}
                     >
-                      {sourceMode === "pdf"
-                        ? sourceFile
-                          ? "Choose another PDF"
-                          : "Choose PDF"
-                        : sourceFile
-                          ? "Choose another Word document"
-                          : "Choose Word document"}
+                      {`${sourceFile ? "Choose another" : "Choose"} ${sourceModeDetails[sourceMode as Exclude<AmendmentSourceMode, "text" | "url">].choose}`}
                     </Button>
                     {sourceFile && (
                       <Text font="main-ui-body" color="text-03">
@@ -1102,8 +1481,58 @@ export default function AmendmentsPage() {
                       onClick={() => void handleExtract()}
                       disabled={extracting || !sourceFile}
                     >
-                      {extracting ? "Extracting…" : "Extract"}
+                      {extracting
+                        ? annexEnabled
+                          ? "Preparing…"
+                          : "Extracting…"
+                        : annexEnabled
+                          ? "Prepare source"
+                          : "Extract"}
                     </Button>
+                  </div>
+                )}
+
+                {annexEnabled && sourcePackage && (
+                  <div className="flex flex-col gap-2 rounded-08 border border-border-02 bg-background-tint-01 p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <Text font="main-ui-action" color="text-04">
+                        {`Source package ${sourcePackage.status}`}
+                      </Text>
+                      <Tag title={`${sourcePackage.asset_count} assets`} />
+                    </div>
+                    {sourcePackage.manifest_sha256 && (
+                      <Text as="p" font="secondary-body" color="text-03">
+                        {`Immutable manifest ${sourcePackage.manifest_sha256}`}
+                      </Text>
+                    )}
+                    {sourcePackage.issues.map((issue) => (
+                      <Text
+                        key={`${issue.code}-${issue.locator ?? ""}`}
+                        as="p"
+                        font="secondary-body"
+                        color="status-error-05"
+                      >
+                        {`${issue.code.replaceAll("_", " ")}${issue.locator ? ` · ${issue.locator}` : ""}`}
+                      </Text>
+                    ))}
+                    {["partial", "blocked", "failed"].includes(
+                      sourcePackage.status
+                    ) &&
+                      sourcePackage.issues.some(
+                        (issue) => issue.retryable !== false
+                      ) && (
+                        <div className="flex justify-end">
+                          <Button
+                            size="sm"
+                            disabled={retryingSourcePackage}
+                            onClick={() => void handleSourcePackageRetry()}
+                          >
+                            {retryingSourcePackage
+                              ? "Retrying…"
+                              : "Retry source preparation"}
+                          </Button>
+                        </div>
+                      )}
                   </div>
                 )}
 
@@ -1118,7 +1547,15 @@ export default function AmendmentsPage() {
                 <InputTextArea
                   aria-label="Amendment text"
                   value={rawText}
-                  onChange={(e) => setRawText(e.target.value)}
+                  onChange={(event) => {
+                    sourceRequestTokenRef.current = null;
+                    setRawText(event.target.value);
+                    if (annexEnabled && sourceMode === "text") {
+                      setSourcePackage(null);
+                      setSourcePackageIdentity(null);
+                      setAnalyzing(false);
+                    }
+                  }}
                   rows={8}
                   autoResize
                   maxRows={20}
@@ -1127,9 +1564,19 @@ export default function AmendmentsPage() {
                 <div className="flex justify-end">
                   <Button
                     onClick={() => void handleAnalyze()}
-                    disabled={analyzing || !canAnalyze}
+                    disabled={
+                      analyzing ||
+                      !rawText.trim() ||
+                      (!canAnalyze && !(annexEnabled && sourceMode === "text"))
+                    }
                   >
-                    {analyzing ? "Analyzing…" : "Analyze"}
+                    {analyzing
+                      ? "Analyzing…"
+                      : annexEnabled &&
+                          sourceMode === "text" &&
+                          !hasCurrentSourceExtraction
+                        ? "Prepare source"
+                        : "Analyze"}
                   </Button>
                 </div>
               </div>
@@ -1190,6 +1637,26 @@ export default function AmendmentsPage() {
                             {instr}
                           </Text>
                         </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {annexEnabled && annexReviews.length > 0 && (
+                    <div className="flex flex-col gap-3">
+                      <Text as="h2" font="heading-h3" color="text-05">
+                        Annex review groups
+                      </Text>
+                      <Text as="p" font="secondary-body" color="text-03">
+                        Each annex and all of its linked instructions are
+                        reviewed, edited, approved, rejected, or retried as one
+                        immutable unit.
+                      </Text>
+                      {annexReviews.map((review) => (
+                        <AnnexChangeReview
+                          key={review.id}
+                          review={review}
+                          onUpdated={updateAnnexReview}
+                        />
                       ))}
                     </div>
                   )}

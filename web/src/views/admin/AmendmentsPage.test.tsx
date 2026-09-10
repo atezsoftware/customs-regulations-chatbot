@@ -4,19 +4,29 @@ import {
   render,
   screen,
   setupUser,
+  waitFor,
 } from "@tests/setup/test-utils";
 
 import {
+  type AmendmentSourcePackage,
+  type AnnexReview,
   analyzeAmendment,
   approveProposal,
+  createAmendmentSourcePackage,
   extractAmendmentDocx,
   extractAmendmentPdf,
   extractAmendmentUrl,
+  getAmendmentSourcePackage,
+  getAmendmentSourceText,
+  getAnnexCapabilities,
   getAmendmentAnalysis,
+  listAnnexReviews,
   listAmendmentBatches,
   listAmendmentProposals,
   retryAmendmentBatch,
+  retryAmendmentSourcePackage,
   retryProposalIndexing,
+  uploadAmendmentSourcePackage,
 } from "@/lib/regulatory/amendments";
 import AmendmentsPage from "@/views/admin/AmendmentsPage";
 
@@ -34,14 +44,21 @@ jest.mock("@/lib/regulatory/amendments", () => ({
   analyzeAmendment: jest.fn(),
   extractAmendmentDocx: jest.fn(),
   approveProposal: jest.fn(),
+  createAmendmentSourcePackage: jest.fn(),
   extractAmendmentPdf: jest.fn(),
   extractAmendmentUrl: jest.fn(),
+  getAmendmentSourcePackage: jest.fn(),
+  getAmendmentSourceText: jest.fn(),
+  getAnnexCapabilities: jest.fn(),
   getAmendmentAnalysis: jest.fn(),
+  listAnnexReviews: jest.fn(),
   listAmendmentBatches: jest.fn(),
   listAmendmentProposals: jest.fn(),
   rejectProposal: jest.fn(),
   retryAmendmentBatch: jest.fn(),
+  retryAmendmentSourcePackage: jest.fn(),
   retryProposalIndexing: jest.fn(),
+  uploadAmendmentSourcePackage: jest.fn(),
 }));
 
 const queuedBatch = {
@@ -65,12 +82,32 @@ const queuedBatch = {
 const mockedAnalyzeAmendment = analyzeAmendment as jest.MockedFunction<
   typeof analyzeAmendment
 >;
+const mockedCreateAmendmentSourcePackage =
+  createAmendmentSourcePackage as jest.MockedFunction<
+    typeof createAmendmentSourcePackage
+  >;
 const mockedApproveProposal = approveProposal as jest.MockedFunction<
   typeof approveProposal
 >;
 const mockedGetAmendmentAnalysis = getAmendmentAnalysis as jest.MockedFunction<
   typeof getAmendmentAnalysis
 >;
+const mockedGetAnnexCapabilities = getAnnexCapabilities as jest.MockedFunction<
+  typeof getAnnexCapabilities
+>;
+const mockedGetAmendmentSourcePackage =
+  getAmendmentSourcePackage as jest.MockedFunction<
+    typeof getAmendmentSourcePackage
+  >;
+const mockedGetAmendmentSourceText =
+  getAmendmentSourceText as jest.MockedFunction<typeof getAmendmentSourceText>;
+const mockedListAnnexReviews = listAnnexReviews as jest.MockedFunction<
+  typeof listAnnexReviews
+>;
+const mockedUploadAmendmentSourcePackage =
+  uploadAmendmentSourcePackage as jest.MockedFunction<
+    typeof uploadAmendmentSourcePackage
+  >;
 
 const mockedExtractAmendmentUrl = extractAmendmentUrl as jest.MockedFunction<
   typeof extractAmendmentUrl
@@ -89,6 +126,10 @@ const mockedListAmendmentProposals =
 const mockedRetryAmendmentBatch = retryAmendmentBatch as jest.MockedFunction<
   typeof retryAmendmentBatch
 >;
+const mockedRetryAmendmentSourcePackage =
+  retryAmendmentSourcePackage as jest.MockedFunction<
+    typeof retryAmendmentSourcePackage
+  >;
 const mockedRetryProposalIndexing =
   retryProposalIndexing as jest.MockedFunction<typeof retryProposalIndexing>;
 
@@ -100,6 +141,13 @@ beforeEach(() => {
   mockDocumentSets = [{ id: 7, name: "Transit rules" }];
   mockedListAmendmentBatches.mockReset();
   mockedListAmendmentBatches.mockResolvedValue([]);
+  mockedGetAnnexCapabilities.mockReset();
+  mockedGetAnnexCapabilities.mockResolvedValue(null);
+  mockedGetAmendmentSourcePackage.mockReset();
+  mockedGetAmendmentSourceText.mockReset();
+  mockedListAnnexReviews.mockReset();
+  mockedListAnnexReviews.mockResolvedValue([]);
+  mockedUploadAmendmentSourcePackage.mockReset();
   mockedListAmendmentProposals.mockReset();
   mockedListAmendmentProposals.mockResolvedValue([]);
   mockedExtractAmendmentUrl.mockReset();
@@ -122,6 +170,7 @@ beforeEach(() => {
   });
   mockedAnalyzeAmendment.mockReset();
   mockedAnalyzeAmendment.mockResolvedValue(queuedBatch);
+  mockedCreateAmendmentSourcePackage.mockReset();
   mockedApproveProposal.mockReset();
   mockedApproveProposal.mockResolvedValue({} as never);
   mockedGetAmendmentAnalysis.mockReset();
@@ -138,8 +187,339 @@ beforeEach(() => {
   });
   mockedRetryAmendmentBatch.mockReset();
   mockedRetryAmendmentBatch.mockResolvedValue(queuedBatch);
+  mockedRetryAmendmentSourcePackage.mockReset();
   mockedRetryProposalIndexing.mockReset();
   mockedRetryProposalIndexing.mockResolvedValue({} as never);
+});
+
+test("keeps legacy source controls usable when grouped capabilities are absent", async () => {
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+
+  expect(await screen.findByRole("button", { name: "Text" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "URL" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "PDF" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Word (.docx)" })).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Image" })
+  ).not.toBeInTheDocument();
+});
+
+test("keeps legacy controls when grouped annex support is disabled", async () => {
+  mockedGetAnnexCapabilities.mockResolvedValue({
+    enabled: false,
+    grouped_review: false,
+    immutable_review_revisions: false,
+    asynchronous_source_preparation: false,
+    publication_requires_verified_index: true,
+  });
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+
+  expect(await screen.findByRole("button", { name: "Text" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Word (.docx)" })).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Excel (.xlsx)" })
+  ).not.toBeInTheDocument();
+});
+
+test("exposes all supported upload formats only with grouped annex capability", async () => {
+  mockedGetAnnexCapabilities.mockResolvedValue({
+    enabled: true,
+    grouped_review: true,
+    immutable_review_revisions: true,
+    asynchronous_source_preparation: true,
+    publication_requires_verified_index: true,
+  });
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+
+  expect(await screen.findByRole("button", { name: "Image" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "HTML" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Excel (.xlsx)" })).toBeVisible();
+});
+
+test("prepares an XLSX package asynchronously before enabling analysis", async () => {
+  mockedGetAnnexCapabilities.mockResolvedValue({
+    enabled: true,
+    grouped_review: true,
+    immutable_review_revisions: true,
+    asynchronous_source_preparation: true,
+    publication_requires_verified_index: true,
+  });
+  const processingPackage = {
+    id: "package-1",
+    document_set_id: 7,
+    status: "processing" as const,
+    asset_count: 0,
+    total_bytes: 0,
+    issues: [],
+    manifest_sha256: null,
+    assets: [],
+    created_at: "2026-09-10T00:00:00Z",
+    updated_at: "2026-09-10T00:00:00Z",
+  };
+  mockedUploadAmendmentSourcePackage.mockResolvedValue(processingPackage);
+  mockedGetAmendmentSourcePackage.mockResolvedValue({
+    ...processingPackage,
+    status: "ready",
+    asset_count: 1,
+    manifest_sha256: "a".repeat(64),
+  });
+  mockedGetAmendmentSourceText.mockResolvedValue({
+    package_id: "package-1",
+    manifest_sha256: "a".repeat(64),
+    original_text: "EK-1 spreadsheet text",
+    original_text_sha256: "b".repeat(64),
+  });
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
+  );
+  const file = new File(["sheet"], "EK-1.xlsx", {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  await user.upload(
+    screen.getByLabelText("Amendment source Excel workbook"),
+    file
+  );
+  await user.click(screen.getByRole("button", { name: "Prepare source" }));
+
+  expect(mockedUploadAmendmentSourcePackage).toHaveBeenCalledWith(
+    7,
+    expect.any(String),
+    file
+  );
+  await waitFor(() =>
+    expect(screen.getByDisplayValue("EK-1 spreadsheet text")).toBeVisible()
+  );
+  expect(screen.getByRole("button", { name: "Analyze" })).toBeEnabled();
+});
+
+test("ignores a late package response after the source identity changes", async () => {
+  mockedGetAnnexCapabilities.mockResolvedValue({
+    enabled: true,
+    grouped_review: true,
+    immutable_review_revisions: true,
+    asynchronous_source_preparation: true,
+    publication_requires_verified_index: true,
+  });
+  const processingPackage: AmendmentSourcePackage = {
+    id: "package-late",
+    document_set_id: 7,
+    status: "processing",
+    asset_count: 0,
+    total_bytes: 0,
+    issues: [],
+    manifest_sha256: null,
+    assets: [],
+    created_at: "2026-09-10T00:00:00Z",
+    updated_at: "2026-09-10T00:00:00Z",
+  };
+  let resolvePackage: (value: AmendmentSourcePackage) => void = () => {};
+  mockedUploadAmendmentSourcePackage.mockResolvedValue(processingPackage);
+  mockedGetAmendmentSourcePackage.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolvePackage = resolve;
+      })
+  );
+  mockedGetAmendmentSourceText.mockResolvedValue({
+    package_id: "package-late",
+    manifest_sha256: "a".repeat(64),
+    original_text: "stale spreadsheet text",
+    original_text_sha256: "b".repeat(64),
+  });
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
+  );
+  await user.upload(
+    screen.getByLabelText("Amendment source Excel workbook"),
+    new File(["sheet"], "EK-1.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })
+  );
+  await user.click(screen.getByRole("button", { name: "Prepare source" }));
+  await waitFor(() =>
+    expect(mockedGetAmendmentSourcePackage).toHaveBeenCalled()
+  );
+  await user.click(screen.getByRole("button", { name: "PDF" }));
+  await act(async () => {
+    resolvePackage({
+      ...processingPackage,
+      status: "ready",
+      manifest_sha256: "a".repeat(64),
+    });
+  });
+
+  expect(mockedGetAmendmentSourceText).not.toHaveBeenCalled();
+  expect(
+    screen.queryByDisplayValue("stale spreadsheet text")
+  ).not.toBeInTheDocument();
+});
+
+test("ignores a late package creation after the selected source changes", async () => {
+  mockedGetAnnexCapabilities.mockResolvedValue({
+    enabled: true,
+    grouped_review: true,
+    immutable_review_revisions: true,
+    asynchronous_source_preparation: true,
+    publication_requires_verified_index: true,
+  });
+  const processingPackage: AmendmentSourcePackage = {
+    id: "package-stale-create",
+    document_set_id: 7,
+    status: "processing",
+    asset_count: 0,
+    total_bytes: 0,
+    issues: [],
+    manifest_sha256: null,
+    assets: [],
+    created_at: "2026-09-10T00:00:00Z",
+    updated_at: "2026-09-10T00:00:00Z",
+  };
+  let resolveCreation: (value: AmendmentSourcePackage) => void = () => {};
+  mockedUploadAmendmentSourcePackage.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveCreation = resolve;
+      })
+  );
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
+  );
+  await user.upload(
+    screen.getByLabelText("Amendment source Excel workbook"),
+    new File(["sheet"], "EK-1.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })
+  );
+  await user.click(screen.getByRole("button", { name: "Prepare source" }));
+  await user.click(screen.getByRole("button", { name: "PDF" }));
+  await act(async () => resolveCreation(processingPackage));
+
+  expect(
+    screen.queryByText("Source package processing")
+  ).not.toBeInTheDocument();
+  expect(mockedGetAmendmentSourcePackage).not.toHaveBeenCalled();
+});
+
+test("renders a grouped blocked review from the real analysis response shape", async () => {
+  mockedGetAnnexCapabilities.mockResolvedValue({
+    enabled: true,
+    grouped_review: true,
+    immutable_review_revisions: true,
+    asynchronous_source_preparation: true,
+    publication_requires_verified_index: true,
+  });
+  const analyzedBatch = {
+    ...queuedBatch,
+    status: "analyzed" as const,
+    stage: "finalizing" as const,
+    annex_group_count: 1,
+  };
+  const blockedReview = {
+    id: "review-blocked",
+    logical_group_id: "group-blocked",
+    review_revision: 1,
+    batch_id: 42,
+    status: "blocked",
+    review_sha256: "a".repeat(64),
+    publication_generation: 0,
+    error_message: null,
+    created_at: "2026-09-10T00:00:00Z",
+    review_payload: {
+      instruction_indices: [0],
+      instruction_texts: ["EK-1 ekteki şekilde değiştirilmiştir."],
+      annex_label: "ek:1",
+      effective_date: null,
+      source_package_id: null,
+      source_text_sha256: null,
+      source_manifest_sha256: null,
+      original_source_text_sha256: null,
+      submitted_source_text: "EK-1 ekteki şekilde değiştirilmiştir.",
+      raw_new_extraction: null,
+      old_extraction: null,
+      new_extraction: null,
+      corrections: [],
+      correction_reconciliation: null,
+      baseline_scope: [],
+      comparison: null,
+      patch_plan: null,
+      items: [],
+      impact: null,
+      evidence: [],
+      source_only_canonical_ids: [],
+      after_window_authority: null,
+      publication: null,
+      issues: ["source_package_missing"],
+    },
+  } as AnnexReview;
+  mockedListAmendmentBatches.mockResolvedValue([analyzedBatch]);
+  mockedGetAmendmentAnalysis.mockResolvedValue({
+    batch: analyzedBatch,
+    annex_groups: [blockedReview],
+    proposals: [],
+    unmatched_instructions: [],
+  });
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
+  );
+
+  expect(await screen.findByText("Annex review groups")).toBeVisible();
+  expect(screen.getByText("Source package missing")).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Approve group" })
+  ).not.toBeInTheDocument();
 });
 
 test("places extracted URL text in the editable amendment text area", async () => {
