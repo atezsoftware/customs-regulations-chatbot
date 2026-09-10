@@ -164,6 +164,18 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             for payload in instruction_payloads
         ]
     )
+    from onyx.regulatory.amendments.annexes.analysis import run_annex_groups
+
+    processed_instruction_indices.update(
+        run_annex_groups(
+            batch_id=batch_id,
+            lease_generation=lease_generation,
+            instructions=instructions,
+            processed_indices=processed_instruction_indices,
+            reference_date=reference_date,
+            llm=llm,
+        )
+    )
     matched_instructions: list[_MatchedInstruction] = []
     for instruction_index, instruction in enumerate(instructions):
         if instruction_index in processed_instruction_indices:

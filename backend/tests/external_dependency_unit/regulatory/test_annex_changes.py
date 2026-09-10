@@ -708,7 +708,7 @@ def test_complete_prepared_group_freezes_context_and_stages_before_approval(
                 effective_date=plan.effective_date,
                 package_complete=True,
             )
-            assert patched.ready
+            assert patched.ready == (corruption == "new_hash")
             draft = draft.model_copy(
                 update={
                     "new_extraction": altered,

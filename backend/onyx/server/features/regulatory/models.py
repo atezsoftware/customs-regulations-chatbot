@@ -5,7 +5,11 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_TEXT_CHARS
-from onyx.db.models import RegulatoryChunk
+from onyx.db.models import AnnexChangeSet, RegulatoryChunk
+from onyx.regulatory.amendments.annexes.models import (
+    AnnexChangeDraft,
+    AnnexElementCorrection,
+)
 
 
 class RegulatoryChunkSnapshot(BaseModel):
@@ -167,7 +171,68 @@ class AmendmentProposalSnapshot(BaseModel):
         )
 
 
+class AnnexReviewSnapshot(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    logical_group_id: UUID
+    review_revision: int
+    batch_id: int
+    status: Literal[
+        "pending",
+        "blocked",
+        "approving",
+        "preparing",
+        "publishing",
+        "approved",
+        "rejected",
+        "failed",
+    ]
+    review_sha256: str
+    publication_generation: int
+    review_payload: AnnexChangeDraft
+    error_message: str | None
+    created_at: datetime.datetime
+
+
+class AnnexReviewDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_review_sha256: str = Field(min_length=64, max_length=64)
+
+
+class AnnexReviewEditRequest(AnnexReviewDecisionRequest):
+    corrections: list[AnnexElementCorrection] | None = None
+
+
+class AnnexCapabilities(BaseModel):
+    enabled: bool
+    grouped_review: bool
+    immutable_review_revisions: bool
+    asynchronous_source_preparation: bool
+    publication_requires_verified_index: bool = True
+
+
+class AnnexSourceTextSnapshot(BaseModel):
+    package_id: UUID
+    manifest_sha256: str
+    original_text: str
+    original_text_sha256: str
+
+
+class AmendmentSourceTextRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_source_text_sha256: str = Field(min_length=64, max_length=64)
+    raw_text: str = Field(min_length=1, max_length=MAX_AMENDMENT_SOURCE_TEXT_CHARS)
+    source_package_id: UUID | None = None
+
+
 class AmendmentBatchSnapshot(BaseModel):
+    source_package_id: UUID | None = None
+    source_text_sha256: str | None = None
+    source_parent_batch_id: int | None = None
+    superseded_by_batch_id: int | None = None
+    annex_group_count: int = 0
+    annex_review_revision_count: int = 0
+    annex_pending_count: int = 0
     id: int
     document_set_id: int
     raw_text: str
@@ -185,8 +250,21 @@ class AmendmentBatchSnapshot(BaseModel):
     completed_at: datetime.datetime | None = None
 
     @classmethod
-    def from_model(cls, batch: Any) -> "AmendmentBatchSnapshot":
+    def from_model(
+        cls, batch: Any, annex_groups: list[AnnexChangeSet] | None = None
+    ) -> "AmendmentBatchSnapshot":
         return cls(
+            source_package_id=getattr(batch, "source_package_id", None),
+            source_text_sha256=getattr(batch, "source_text_sha256", None),
+            source_parent_batch_id=getattr(batch, "source_parent_batch_id", None),
+            superseded_by_batch_id=getattr(batch, "superseded_by_batch_id", None),
+            annex_group_count=len(annex_groups or []),
+            annex_review_revision_count=sum(
+                group.review_revision for group in annex_groups or []
+            ),
+            annex_pending_count=sum(
+                group.status == "pending" for group in annex_groups or []
+            ),
             id=batch.id,
             document_set_id=batch.document_set_id,
             raw_text=batch.raw_text,
@@ -208,6 +286,7 @@ class AmendmentBatchSnapshot(BaseModel):
 
 
 class AnalyzeAmendmentResponse(BaseModel):
+    annex_groups: list[AnnexReviewSnapshot] = Field(default_factory=list)
     batch: AmendmentBatchSnapshot
     proposals: list[AmendmentProposalSnapshot]
     unmatched_instructions: list[str]

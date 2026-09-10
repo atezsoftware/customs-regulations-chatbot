@@ -56,7 +56,12 @@ def test_enqueue_routes_redundant_expiring_deliveries() -> None:
 
     expected = call(
         OnyxCeleryTask.REGULATORY_AMENDMENT_RUN,
-        kwargs={"batch_id": 42, "tenant_id": "public"},
+        kwargs={
+            "batch_id": 42,
+            "tenant_id": "public",
+            "environment": tasks.annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+            "database_identity": tasks.annex_config.ANNEX_DATABASE_IDENTITY,
+        },
         queue=REGULATORY_AMENDMENT_QUEUE,
         priority=OnyxCeleryPriority.HIGH,
         expires=24 * 60 * 60,
@@ -64,7 +69,12 @@ def test_enqueue_routes_redundant_expiring_deliveries() -> None:
     )
     delayed = call(
         OnyxCeleryTask.REGULATORY_AMENDMENT_RUN,
-        kwargs={"batch_id": 42, "tenant_id": "public"},
+        kwargs={
+            "batch_id": 42,
+            "tenant_id": "public",
+            "environment": tasks.annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+            "database_identity": tasks.annex_config.ANNEX_DATABASE_IDENTITY,
+        },
         queue=REGULATORY_AMENDMENT_QUEUE,
         priority=OnyxCeleryPriority.HIGH,
         expires=24 * 60 * 60,

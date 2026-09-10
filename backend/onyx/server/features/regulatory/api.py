@@ -54,6 +54,7 @@ from onyx.db.regulatory_amendments import (
     reset_failed_batch_for_retry,
     retry_amendment_proposal_projection,
 )
+from onyx.db.regulatory_annex_changes import list_annex_changes
 from onyx.db.regulatory_chunks import (
     ValidityDateUpdate,
     delete_hierarchical_aggregates_referencing_chunk,
@@ -86,6 +87,7 @@ from onyx.regulatory.validity_projection import (
     patch_user_file_validity_in_active_indices,
 )
 from onyx.server.features.projects.models import UserFileSnapshot
+from onyx.server.features.regulatory.annex_api import router as annex_router
 from onyx.server.features.regulatory.models import (
     AmendmentBatchSnapshot,
     AmendmentProposalSnapshot,
@@ -95,6 +97,7 @@ from onyx.server.features.regulatory.models import (
     AmendmentSourceUrlRequest,
     AnalyzeAmendmentRequest,
     AnalyzeAmendmentResponse,
+    AnnexReviewSnapshot,
     ApproveAmendmentProposalRequest,
     CreateAmendmentSourcePackageRequest,
     RegulatoryChunkSnapshot,
@@ -485,12 +488,14 @@ def analyze_amendment_text(
     if analyze_request.source_package_id is not None:
         _require_annex_updates()
         try:
-            require_ready_source_package(
+            package = require_ready_source_package(
                 db_session,
                 package_id=analyze_request.source_package_id,
                 document_set_id=document_set.id,
                 environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
             )
+            if package.created_by != user.id:
+                raise ValueError("Source package owner mismatch")
         except ValueError as exc:
             raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
     user_file_ids = [user_file.id for user_file in document_set.user_files]
@@ -526,7 +531,12 @@ def analyze_amendment_text(
             "Initial dispatch failed for amendment batch=%s; recovery will retry",
             batch.id,
         )
-    return AmendmentBatchSnapshot.from_model(batch)
+    return AmendmentBatchSnapshot.from_model(
+        batch,
+        annex_groups=list_annex_changes(db_session, batch.id)
+        if batch.created_by == user.id
+        else [],
+    )
 
 
 @router.get("/amendments/batches", tags=PUBLIC_API_TAGS)
@@ -537,7 +547,15 @@ def list_amendment_batches(
 ) -> list[AmendmentBatchSnapshot]:
     _get_editable_document_set(db_session, document_set_id, user)
     batches = list_batches_for_document_set(db_session, document_set_id)
-    return [AmendmentBatchSnapshot.from_model(b) for b in batches]
+    return [
+        AmendmentBatchSnapshot.from_model(
+            b,
+            annex_groups=list_annex_changes(db_session, b.id)
+            if b.created_by == user.id
+            else [],
+        )
+        for b in batches
+    ]
 
 
 @router.get("/amendments/batches/{batch_id}/proposals", tags=PUBLIC_API_TAGS)
@@ -577,7 +595,20 @@ def get_amendment_analysis(
     proposals = list_proposals_for_batch(db_session, batch_id)
     duplicates = compute_duplicate_targets(proposals)
     return AnalyzeAmendmentResponse(
-        batch=AmendmentBatchSnapshot.from_model(batch),
+        annex_groups=[
+            AnnexReviewSnapshot.model_validate(group)
+            for group in (
+                list_annex_changes(db_session, batch_id)
+                if batch.created_by == user.id
+                else []
+            )
+        ],
+        batch=AmendmentBatchSnapshot.from_model(
+            batch,
+            annex_groups=list_annex_changes(db_session, batch.id)
+            if batch.created_by == user.id
+            else [],
+        ),
         proposals=[
             AmendmentProposalSnapshot.from_model(
                 proposal,
@@ -1013,3 +1044,6 @@ def get_amendment_source_evidence(
         media_type="application/json",
         headers={"X-Content-Type-Options": "nosniff"},
     )
+
+
+router.include_router(annex_router)

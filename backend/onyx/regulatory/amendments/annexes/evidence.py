@@ -1,14 +1,16 @@
 """Server-derived annex scope with original coordinates and immutable view identity."""
 
 import hashlib
+import json
 import re
 from collections import Counter
 from collections.abc import Mapping
 from io import BytesIO
 from typing import Literal, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from onyx.configs.constants import FileOrigin
+from onyx.db.models import RegulatorySourceAsset
 from onyx.db.regulatory_annexes import normalize_annex_label
 from onyx.file_store.file_store import FileStore
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
@@ -21,11 +23,13 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexEvidenceView,
     AnnexExtraction,
     AnnexLocator,
+    AnnexNewEvidenceRemapping,
     AnnexOriginalEvidence,
     AnnexRenderedPage,
     AnnexReviewEvidence,
     AnnexReviewEvidenceScope,
     ExtractedAnnexElement,
+    SourceLink,
 )
 
 _STANDALONE_LABEL = re.compile(
@@ -78,7 +82,12 @@ def evidence_view_hash(extraction: AnnexExtraction) -> str:
         raise ValueError("scoped evidence view missing")
     return context_hash(
         {
-            "view": view.model_dump(mode="json", exclude={"sha256"}),
+            "view": view.model_dump(
+                mode="json",
+                exclude={"sha256"}
+                if view.source_occurrences
+                else {"sha256", "source_occurrences"},
+            ),
             "source_sha256": extraction.source_sha256,
             "mime_type": extraction.mime_type,
             "elements": [
@@ -349,6 +358,11 @@ def validate_evidence_view(extraction: AnnexExtraction) -> list[str]:
     issues: list[str] = []
     if evidence_view_hash(extraction) != view.sha256:
         issues.append("evidence_view_integrity_mismatch")
+    if view.selection_method == "ordered_source_occurrences":
+        try:
+            validate_source_occurrence_order([view], view.source_occurrences)
+        except ValueError:
+            issues.append("source_occurrence_scope_mismatch")
     if not view.parents or extraction.source_sha256 != view.parents[0].sha256:
         issues.append("evidence_parent_hash_mismatch")
     if len(view.selected_positions) != len(
@@ -633,14 +647,17 @@ def freeze_review_pages(
 
 
 def combine_annex_evidence_views(
-    views: list[AnnexExtraction], *, canonical_chunk_ids: list[str]
+    views: list[AnnexExtraction],
+    *,
+    canonical_chunk_ids: list[str],
+    source_occurrences: list[SourceLink] | None = None,
 ) -> AnnexExtraction:
     if not views or any(
         view.evidence_view is None or validate_evidence_view(view) for view in views
     ):
         raise ValueError("original scope missing or invalid")
     scopes = [view.evidence_view for view in views if view.evidence_view is not None]
-    if any(not scope.pages for scope in scopes):
+    if source_occurrences is None and any(not scope.pages for scope in scopes):
         raise ValueError("combined native originals need explicit structural ordering")
     if len({parent.file_id for scope in scopes for parent in scope.parents}) != len(
         scopes
@@ -656,7 +673,9 @@ def combine_annex_evidence_views(
         for parent in scope.parents
         for chunk_id in parent.canonical_chunk_ids
     ]
-    if covered != canonical_chunk_ids or len(set(covered)) != len(covered):
+    if source_occurrences is not None:
+        validate_source_occurrence_order(scopes, source_occurrences)
+    elif covered != canonical_chunk_ids or len(set(covered)) != len(covered):
         raise ValueError("original scope unordered or incomplete")
     parents: list[AnnexEvidenceParent] = []
     pages: list[AnnexEvidencePage] = []
@@ -706,7 +725,10 @@ def combine_annex_evidence_views(
         selected_positions=positions,
         boundary_positions=boundaries,
         element_mappings=mappings,
-        selection_method="ordered_bound_originals",
+        selection_method="ordered_source_occurrences"
+        if source_occurrences is not None
+        else "ordered_bound_originals",
+        source_occurrences=source_occurrences or [],
     )
     result = views[0].model_copy(
         deep=True,
@@ -843,3 +865,280 @@ def validate_compared_evidence(
         raise ValueError(
             "frozen comparison images differ from exact comparison manifest"
         )
+
+
+def build_new_evidence_remapping(
+    *,
+    new: AnnexExtraction,
+    evidence: list[AnnexReviewEvidence],
+    asset_ids: dict[str, UUID],
+) -> "AnnexNewEvidenceRemapping":
+    from uuid import NAMESPACE_URL, uuid5
+
+    from onyx.regulatory.amendments.annexes.comparison import annex_snapshot_hash
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexNewElementEvidence,
+        AnnexNewEvidenceRemapping,
+    )
+
+    digest = annex_snapshot_hash(new)
+    view = new.evidence_view
+    elements: list[AnnexNewElementEvidence] = []
+    for position, element in enumerate(new.elements):
+        locator = element.locator
+        if view is not None:
+            mappings = [
+                item for item in view.element_mappings if item.view_position == position
+            ]
+            if len(mappings) != 1:
+                raise ValueError("NEW evidence mapping position ambiguous")
+            parent = view.parents[mappings[0].parent_index]
+            parent_file_id, parent_sha256 = parent.file_id, parent.sha256
+            locator = mappings[0].original_locator
+        else:
+            originals = [
+                item
+                for item in evidence
+                if item.side == "new"
+                and item.kind == "original"
+                and item.parent_sha256 == new.source_sha256
+            ]
+            if len(originals) != 1:
+                raise ValueError("NEW evidence mapping original ambiguous")
+            parent_file_id, parent_sha256 = (
+                originals[0].parent_file_id,
+                originals[0].parent_sha256,
+            )
+        if parent_file_id not in asset_ids:
+            raise ValueError("NEW evidence mapping asset outside package")
+        selected = [
+            item
+            for item in evidence
+            if item.side == "new"
+            and item.parent_file_id == parent_file_id
+            and item.parent_sha256 == parent_sha256
+            and (item.kind == "original" or item.locator.page == locator.page)
+        ]
+        if not any(item.kind == "original" for item in selected):
+            raise ValueError("NEW evidence mapping original missing")
+        images = [
+            item.file_id for item in selected if item.kind == "comparison_region"
+        ] or [item.file_id for item in selected if item.kind == "comparison_page"]
+        elements.append(
+            AnnexNewElementEvidence(
+                position=position,
+                element_id=uuid5(NAMESPACE_URL, f"annex:{digest}:{position}"),
+                source_asset_id=asset_ids[parent_file_id],
+                parent_file_id=parent_file_id,
+                evidence_ids=[item.id for item in selected],
+                image_file_ids=images,
+            )
+        )
+    return AnnexNewEvidenceRemapping(extraction_sha256=digest, elements=elements)
+
+
+def validate_new_evidence_remapping(
+    *,
+    mapping: "AnnexNewEvidenceRemapping",
+    new: AnnexExtraction,
+    evidence: list[AnnexReviewEvidence],
+    asset_ids: dict[str, UUID],
+) -> None:
+    if mapping != build_new_evidence_remapping(
+        new=new, evidence=evidence, asset_ids=asset_ids
+    ):
+        raise ValueError("NEW evidence mapping differs from reviewed package/view")
+
+
+def read_original_source_text(
+    store: FileStore, assets: list["RegulatorySourceAsset"]
+) -> tuple[str, str]:
+    parts: list[str] = []
+    for asset in assets:
+        if asset.text_file_id is None:
+            continue
+        with store.read_file(asset.text_file_id) as stream:
+            content = stream.read(2_000_000 + 1)
+        if (
+            len(content) > 2_000_000
+            or hashlib.sha256(content).hexdigest() != asset.text_sha256
+        ):
+            raise ValueError("original extracted source text integrity changed")
+        parts.append(content.decode("utf-8"))
+    text = "\n\n".join(parts)
+    if len(text) > 2_000_000:
+        raise ValueError("original extracted source text limit")
+    return text, hashlib.sha256(text.encode()).hexdigest()
+
+
+def read_source_graph(
+    store: FileStore,
+    *,
+    manifest_file_id: str,
+    manifest_sha256: str,
+    assets: list[RegulatorySourceAsset],
+) -> list[SourceLink]:
+    with store.read_file(manifest_file_id) as stream:
+        content = stream.read(150 * 1024 * 1024 + 1)
+    if hashlib.sha256(content).hexdigest() != manifest_sha256:
+        raise ValueError("source_manifest_integrity_mismatch")
+    manifest = json.loads(content)
+    expected_assets = {(asset.sha256, asset.mime_type) for asset in assets}
+    actual_assets = {
+        (asset["sha256"], asset["mime_type"]) for asset in manifest.get("assets", [])
+    }
+    if (
+        manifest.get("status") != "ready"
+        or manifest.get("issues")
+        or actual_assets != expected_assets
+    ):
+        raise ValueError("source_manifest_graph_incomplete")
+    links = [SourceLink.model_validate(value) for value in manifest["links"]]
+    hashes = {asset.sha256 for asset in assets}
+    if any(
+        link.parent_asset_hash not in hashes or link.target_asset_hash not in hashes
+        for link in links
+    ):
+        raise ValueError("source_manifest_graph_incomplete")
+    return links
+
+
+def source_occurrence_key(link: SourceLink) -> tuple[int, str, int]:
+    prefix, separator, ordinal = link.source_field.rpartition(":")
+    if not separator or not ordinal.isdigit() or prefix.startswith("pdf:attachment"):
+        raise ValueError("source occurrence has no native document order")
+    return link.source_page or 0, prefix, int(ordinal)
+
+
+def validate_source_occurrence_order(
+    scopes: list[AnnexEvidenceView], links: list[SourceLink]
+) -> None:
+    parents = [parent for scope in scopes for parent in scope.parents]
+    keys = [source_occurrence_key(link) for link in links]
+    if (
+        len(links) != len(parents)
+        or not links
+        or len({link.parent_asset_hash for link in links}) != 1
+        or len({key[1] for key in keys}) != 1
+        or keys != sorted(set(keys))
+        or [link.target_asset_hash for link in links]
+        != [parent.sha256 for parent in parents]
+        or len({parent.sha256 for parent in parents}) != len(parents)
+    ):
+        raise ValueError("source occurrence order or complete parent identity mismatch")
+    labels = {scope.label for scope in scopes}
+    if any(normalize_annex_label(link.label) not in labels for link in links):
+        raise ValueError("source occurrence annex label mismatch")
+
+
+def select_new_annex_sources(
+    selected: list[tuple[AnnexOriginalEvidence, AnnexExtraction]],
+    links: list[SourceLink],
+) -> tuple[list[AnnexOriginalEvidence], AnnexExtraction]:
+    """Resolve disjoint NEW parts from native graph order, never OLD row bindings."""
+    if not selected:
+        raise ValueError("new_annex_evidence_missing")
+    by_hash = {original.sha256: (original, view) for original, view in selected}
+    if len(by_hash) != len(selected):
+        raise ValueError("new_annex_evidence_duplicate")
+
+    def native_content(
+        view: AnnexExtraction,
+    ) -> list[tuple[str, str, str | None]] | None:
+        atomic = [
+            element
+            for element in view.elements
+            if not element.aggregate and _boundary_label(element) is None
+        ]
+        if not atomic or any(
+            element.extraction_method != "native" or element.kind == "image_region"
+            for element in atomic
+        ):
+            return None
+        return [(element.kind, element.text, element.formula) for element in atomic]
+
+    label = selected[0][1].evidence_view.label if selected[0][1].evidence_view else ""
+    if any(
+        normalize_annex_label(link.label) == label
+        and link.target_asset_hash not in by_hash
+        for link in links
+    ):
+        raise ValueError("new_annex_evidence_incomplete_linked_parts")
+    contained: set[str | None] = set()
+    for link in links:
+        if (
+            link.parent_asset_hash not in by_hash
+            or link.target_asset_hash not in by_hash
+            or link.target_asset_hash == link.parent_asset_hash
+        ):
+            continue
+        parent_content = native_content(by_hash[link.parent_asset_hash][1])
+        child_content = native_content(by_hash[link.target_asset_hash][1])
+        if (
+            parent_content is not None
+            and child_content is not None
+            and any(
+                parent_content[start : start + len(child_content)] == child_content
+                for start in range(len(parent_content) - len(child_content) + 1)
+            )
+        ):
+            contained.add(link.target_asset_hash)
+    selected = [pair for pair in selected if pair[0].sha256 not in contained]
+    if len(selected) == 1:
+        return [selected[0][0]], selected[0][1]
+    hashes = {original.sha256 for original, _ in selected}
+    occurrences = [
+        link
+        for link in links
+        if link.target_asset_hash in hashes and link.parent_asset_hash not in hashes
+    ]
+    if len(occurrences) != len(selected):
+        raise ValueError("new_annex_evidence_missing_or_overlapping_source_order")
+    occurrences.sort(key=source_occurrence_key)
+    ordered = [by_hash[link.target_asset_hash] for link in occurrences]
+    seen: set[tuple[str, str, str | None]] = set()
+    for _, view in ordered:
+        content = {
+            (element.kind, element.text, element.formula)
+            for element in view.elements
+            if not element.aggregate
+            and element.text.strip()
+            and _boundary_label(element) is None
+        }
+        if content & seen:
+            raise ValueError("new_annex_evidence_overlapping_parts")
+        seen.update(content)
+    combined = combine_annex_evidence_views(
+        [view for _, view in ordered],
+        canonical_chunk_ids=[],
+        source_occurrences=occurrences,
+    )
+    return [original for original, _ in ordered], combined
+
+
+def visual_element_positions(extraction: AnnexExtraction) -> list[int]:
+    if extraction.evidence_view is None:
+        return (
+            list(range(len(extraction.elements)))
+            if extraction.mime_type.startswith(("image/", "application/pdf"))
+            else []
+        )
+    view = extraction.evidence_view
+    return [
+        mapping.view_position
+        for mapping in view.element_mappings
+        if view.parents[mapping.parent_index].mime_type.startswith(
+            ("image/", "application/pdf")
+        )
+    ]
+
+
+def has_visual_original(extraction: AnnexExtraction) -> bool:
+    return (
+        any(
+            parent.mime_type.startswith(("image/", "application/pdf"))
+            for parent in extraction.evidence_view.parents
+        )
+        if extraction.evidence_view
+        else extraction.mime_type.startswith(("image/", "application/pdf"))
+    )

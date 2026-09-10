@@ -21,6 +21,8 @@ class LLMFlow(StrEnum):
     # Secondary LLM flows
     SEMANTIC_QUERY_REPHRASE = "semantic_query_rephrase"
     KEYWORD_QUERY_EXPANSION = "keyword_query_expansion"
+    REGULATORY_ANNEX_CORRECTION = "regulatory_annex_correction"
+    REGULATORY_ANNEX_EFFECTIVE_DATE = "regulatory_annex_effective_date"
     REGULATORY_ANNEX_COMPARISON = "regulatory_annex_comparison"
     REGULATORY_ANNEX_EXTRACTION = "regulatory_annex_extraction"
     SOURCE_FILTER_EXTRACTION = "source_filter_extraction"

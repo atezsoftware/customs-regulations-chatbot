@@ -154,6 +154,7 @@ def compare_context_views(
     new: PreparedContextView,
     direct_canonical_changes: list[str],
     metadata_only: list[str] | None = None,
+    canonical_predecessors: dict[str, str] | None = None,
 ) -> AnnexContextImpact:
     """Compare every potential consumer after replaying old/new source selection.
 
@@ -166,6 +167,14 @@ def compare_context_views(
     new_by_id = {item.canonical_chunk_id: item for item in new.projections}
     if len(old_by_id) != len(old.projections) or len(new_by_id) != len(new.projections):
         raise ValueError("duplicate_context_consumer")
+    predecessors = canonical_predecessors or {}
+    if (
+        not set(predecessors).issubset(new_by_id)
+        or not set(predecessors.values()).issubset(old_by_id)
+        or len(set(predecessors.values())) != len(predecessors)
+        or set(predecessors).intersection(old_by_id)
+    ):
+        raise ValueError("invalid one-to-one canonical predecessor mapping")
     contextual: list[str] = []
     embeddings: list[str] = []
     unchanged: list[str] = []
@@ -173,14 +182,16 @@ def compare_context_views(
     metadata = set(metadata_only or [])
     reasons: dict[str, list[str]] = {}
     for identifier, after in new_by_id.items():
-        before = old_by_id.get(identifier)
+        before = old_by_id.get(
+            (canonical_predecessors or {}).get(identifier, identifier)
+        )
         chunk_reasons: list[str] = []
         if before is None or not before.vector_reuse_verified:
             contextual.append(identifier)
             embeddings.append(identifier)
             chunk_reasons.append(
                 "legacy_provenance_unavailable"
-                if identifier not in direct_canonical_changes
+                if before is not None or identifier not in direct_canonical_changes
                 else "new_canonical_content"
             )
         else:

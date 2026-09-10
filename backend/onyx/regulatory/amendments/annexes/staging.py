@@ -5,10 +5,13 @@ from datetime import date
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from pydantic import JsonValue
+
 from onyx.regulatory.amendments.annexes.models import (
     AnnexCanonicalSnapshot,
     AnnexChangeItemDraft,
     AnnexComparison,
+    AnnexNewEvidenceRemapping,
     AnnexPatchPlan,
 )
 
@@ -23,6 +26,7 @@ def stage_canonical_items(
     insertion_after_chunk_id: str | None = None,
     comparison: AnnexComparison | None = None,
     prospective_ids: list[str] | None = None,
+    evidence_remapping: AnnexNewEvidenceRemapping | None = None,
 ) -> list[AnnexChangeItemDraft]:
     if (
         comparison is not None
@@ -72,6 +76,20 @@ def stage_canonical_items(
                         if identifiers is not None
                         else str(uuid4()),
                         "text": patch.new_text,
+                        "metadata": remap_new_chunk_evidence(
+                            template.metadata,
+                            patch.new_positions
+                            or (
+                                [
+                                    element.position
+                                    for element in evidence_remapping.elements
+                                ]
+                                if evidence_remapping is not None
+                                and patch.operation == "visual"
+                                else []
+                            ),
+                            evidence_remapping,
+                        ),
                         "source": "amendment",
                         "status": "active",
                         "projection_ordinal": next_ordinal,
@@ -167,6 +185,7 @@ def validate_staged_items(
     items: list[AnnexChangeItemDraft],
     comparison: AnnexComparison | None = None,
     insertion_after_chunk_id: str | None = None,
+    evidence_remapping: AnnexNewEvidenceRemapping | None = None,
 ) -> None:
     """Reconstruct each reviewed operation while retaining allocated identities."""
     chunks = sorted(
@@ -179,6 +198,7 @@ def validate_staged_items(
         comparison=comparison,
         insertion_after_chunk_id=insertion_after_chunk_id,
         prospective_ids=[chunk.id for chunk in chunks],
+        evidence_remapping=evidence_remapping,
     )
     if expected != items:
         raise ValueError("staged operation differs from reviewed canonical patch")
@@ -217,6 +237,7 @@ def prepare_staged_candidate_rows(
     baseline_scope: list[AnnexCanonicalSnapshot],
     items: list[AnnexChangeItemDraft],
     effective_date: "date",
+    evidence_remapping: AnnexNewEvidenceRemapping | None = None,
 ) -> list["RegulatoryChunk"]:
     """Build the complete candidate, preserving history and explicit insertion order."""
     from onyx.regulatory.amendments.annexes.context_dependencies import (
@@ -317,6 +338,17 @@ def prepare_staged_candidate_rows(
             if len(targets) != 1:
                 raise ValueError("candidate image binding is ambiguous")
             metadata["bound_to_regulatory_chunk_id"] = targets[0]
+            if evidence_remapping is not None:
+                target = by_id[targets[0]]
+                for key in (
+                    "image_file_id",
+                    "image_file_ids",
+                    "source_asset_ids",
+                    "annex_element_ids",
+                ):
+                    metadata.pop(key, None)
+                    if key in target.chunk_metadata:
+                        metadata[key] = target.chunk_metadata[key]
         row.chunk_metadata = metadata
     changed = [chunk.id for item in items for chunk in item.new_chunks]
     effective = [
@@ -341,3 +373,48 @@ def prepare_staged_candidate_rows(
         [rebuilt.get(row.id, row) for row in rows],
         key=lambda row: (row.position, row.id),
     )
+
+
+def remap_new_chunk_evidence(
+    metadata: dict[str, "JsonValue"],
+    positions: list[int],
+    mapping: AnnexNewEvidenceRemapping | None,
+) -> dict[str, "JsonValue"]:
+    if mapping is None:
+        return dict(metadata)
+    bindings = {element.position: element for element in mapping.elements}
+    if any(position not in bindings for position in positions) or not positions:
+        raise ValueError("NEW canonical evidence positions missing")
+    selected = [bindings[position] for position in positions]
+    result = {
+        key: value
+        for key, value in metadata.items()
+        if key
+        not in (
+            "image_file_id",
+            "image_file_ids",
+            "source_asset_ids",
+            "annex_element_ids",
+        )
+    }
+    images = list(
+        dict.fromkeys(
+            file_id for element in selected for file_id in element.image_file_ids
+        )
+    )
+    if images:
+        result["image_file_id"] = images[0]
+        result["image_file_ids"] = images
+    result["source_asset_ids"] = list(
+        dict.fromkeys(str(element.source_asset_id) for element in selected)
+    )
+    result["annex_element_ids"] = [str(element.element_id) for element in selected]
+    return result
+
+
+def staged_canonical_predecessors(items: list[AnnexChangeItemDraft]) -> dict[str, str]:
+    return {
+        item.new_chunks[0].id: item.old_chunk_ids[0]
+        for item in items
+        if len(item.new_chunks) == len(item.old_chunk_ids) == 1
+    }

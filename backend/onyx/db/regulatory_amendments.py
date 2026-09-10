@@ -522,6 +522,20 @@ def compute_duplicate_targets(
 def _lock_proposal_for_transition(
     db_session: Session, proposal_id: int
 ) -> AmendmentProposal:
+    batch_id = db_session.scalar(
+        select(AmendmentProposal.batch_id).where(AmendmentProposal.id == proposal_id)
+    )
+    if batch_id is not None:
+        batch = db_session.scalar(
+            select(AmendmentBatch)
+            .where(AmendmentBatch.id == batch_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if batch is not None and batch.superseded_by_batch_id is not None:
+            raise ValueError(
+                "Amendment proposal belongs to a superseded source revision"
+            )
     proposal = db_session.scalar(
         select(AmendmentProposal)
         .where(AmendmentProposal.id == proposal_id)

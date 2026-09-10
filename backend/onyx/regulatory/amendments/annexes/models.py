@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from onyx.regulatory.amendments.models import DateResolution
+
 SourcePackageStatus = Literal["processing", "ready", "partial", "blocked", "failed"]
 
 
@@ -149,7 +151,9 @@ class AnnexEvidenceView(BaseModel):
         "bound_whole_original",
         "native_sheet",
         "ordered_bound_originals",
+        "ordered_source_occurrences",
     ]
+    source_occurrences: list[SourceLink] = Field(default_factory=list)
     extraction_version: str = "annex-extraction-v1"
     renderer_version: str = "annex-rendering-v1"
 
@@ -495,7 +499,52 @@ class AnnexReviewEvidence(BaseModel):
     locator: AnnexLocator = Field(default_factory=AnnexLocator)
 
 
+class AnnexNewElementEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    position: int
+    element_id: UUID
+    source_asset_id: UUID
+    parent_file_id: str
+    evidence_ids: list[UUID]
+    image_file_ids: list[str]
+
+
+class AnnexNewEvidenceRemapping(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    extraction_sha256: str
+    elements: list[AnnexNewElementEvidence]
+
+
+class AnnexInstructionGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    annex_label: str
+    instruction_indices: list[int]
+    instruction_texts: list[str]
+    target_sources: list[str]
+
+
+class AnnexElementCorrection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    position: int = Field(ge=0)
+    before_text: str
+    corrected_text: str = Field(min_length=1, max_length=100000)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class AnnexCorrectionReconciliation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    supported: bool
+    rationale: str
+    input_sha256: str | None = None
+    model_snapshot: AnnexModelSnapshot | None = None
+
+
 class AnnexChangeDraft(BaseModel):
+    batch_id: int | None = None
+    date_resolution: DateResolution | None = None
+    target_sources: list[str] = Field(default_factory=list)
+    indexing_configuration: dict[str, JsonValue] | None = None
+    source_only_canonical_ids: list[str] = Field(default_factory=list)
     model_config = ConfigDict(extra="forbid", frozen=True)
     instruction_indices: list[int]
     instruction_texts: list[str]
@@ -505,6 +554,16 @@ class AnnexChangeDraft(BaseModel):
     source_package_id: UUID | None = None
     source_text_sha256: str | None = None
     source_manifest_sha256: str | None = None
+    original_source_text_sha256: str | None = None
+    source_graph_sha256: str | None = None
+    source_graph: list[SourceLink] = Field(default_factory=list)
+    submitted_source_text: str | None = None
+    preparation_configuration: dict[str, str] = Field(default_factory=dict)
+    new_evidence_remapping: AnnexNewEvidenceRemapping | None = None
+    raw_new_extraction: AnnexExtraction | None = None
+    corrections: list[AnnexElementCorrection] = Field(default_factory=list)
+    correction_reconciliation: AnnexCorrectionReconciliation | None = None
+    corrected_by: UUID | None = None
     insertion_after_chunk_id: str | None = None
     baseline_scope: list[AnnexCanonicalSnapshot] = Field(default_factory=list)
     baseline: AnnexBaseline | None = None

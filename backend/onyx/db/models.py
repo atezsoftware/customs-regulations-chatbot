@@ -6034,6 +6034,12 @@ class AmendmentBatch(Base):
         ForeignKey("amendment_source_package.id"), nullable=True
     )
     source_text_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_parent_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("amendment_batch.id"), nullable=True
+    )
+    superseded_by_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("amendment_batch.id"), nullable=True
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     document_set_id: Mapped[int] = mapped_column(
@@ -8422,6 +8428,8 @@ class AnnexChangeSet(Base):
     batch_id: Mapped[int] = mapped_column(
         ForeignKey("amendment_batch.id", ondelete="CASCADE")
     )
+    logical_group_id: Mapped[UUID] = mapped_column(default=uuid4)
+    review_revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     instruction_index: Mapped[int] = mapped_column(Integer)
     instruction_indices: Mapped[list[int]] = mapped_column(PGJSONB)
     environment: Mapped[str] = mapped_column(Text)
@@ -8452,7 +8460,7 @@ class AnnexChangeSet(Base):
     )
     __table_args__ = (
         UniqueConstraint(
-            "batch_id", "instruction_index", name="uq_annex_change_instruction"
+            "logical_group_id", "review_revision", name="uq_annex_review_revision"
         ),
         CheckConstraint(
             "status IN ('pending', 'blocked', 'approving', 'preparing', 'publishing', 'approved', 'rejected', 'failed')",
@@ -8497,3 +8505,28 @@ class AnnexChangeEvidence(Base):
     evidence_id: Mapped[UUID] = mapped_column(primary_key=True)
     file_id: Mapped[str] = mapped_column(Text)
     payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+
+
+class AnnexPublicationIntent(Base):
+    """Immutable outbox delivery; Task5 owns canonical/index publication."""
+
+    __tablename__ = "annex_publication_intent"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    change_set_id: Mapped[UUID] = mapped_column(ForeignKey("annex_change_set.id"))
+    logical_group_id: Mapped[UUID] = mapped_column()
+    review_revision: Mapped[int] = mapped_column(Integer)
+    review_sha256: Mapped[str] = mapped_column(Text)
+    publication_generation: Mapped[int] = mapped_column(Integer)
+    tenant_id: Mapped[str] = mapped_column(Text)
+    environment: Mapped[str] = mapped_column(Text)
+    database_identity: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "change_set_id",
+            "publication_generation",
+            name="uq_annex_publication_generation",
+        ),
+    )

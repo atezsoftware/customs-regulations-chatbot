@@ -21,3 +21,14 @@ def source_queue_name(
     return database_scoped_queue_name(
         f"regulatory_annex_sources_{scope}", database_identity=database_identity
     )
+
+
+def publication_queue_name(
+    *,
+    environment: str = REGULATORY_ANNEX_ENVIRONMENT,
+    database_identity: str = ANNEX_DATABASE_IDENTITY,
+) -> str:
+    scope = hashlib.sha256(environment.encode()).hexdigest()[:16]
+    return database_scoped_queue_name(
+        f"regulatory_annex_publication_{scope}", database_identity=database_identity
+    )

@@ -10,7 +10,10 @@ from onyx.regulatory.amendments.annexes.comparison import (
     annex_snapshot_hash,
     validate_annex_comparison,
 )
-from onyx.regulatory.amendments.annexes.evidence import validate_baseline_evidence_view
+from onyx.regulatory.amendments.annexes.evidence import (
+    has_visual_original,
+    validate_baseline_evidence_view,
+)
 from onyx.regulatory.amendments.annexes.models import (
     AnnexBaseline,
     AnnexCanonicalPatch,
@@ -80,10 +83,7 @@ def prepare_annex_patch(
     ) or comparison.new_snapshot_sha256 != annex_snapshot_hash(new):
         issues.append("comparison_snapshot_changed")
     if (
-        any(
-            item.mime_type.startswith(("image/", "application/pdf"))
-            for item in (old, new)
-        )
+        any(has_visual_original(item) for item in (old, new))
         and not baseline.visual_evidence_available
     ):
         issues.append("original_visual_evidence_unavailable")

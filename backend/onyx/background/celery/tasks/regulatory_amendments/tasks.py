@@ -27,6 +27,7 @@ from onyx.db.regulatory_amendments import (
     touch_batch_heartbeat,
 )
 from onyx.db.search_settings import get_current_search_settings
+from onyx.regulatory.amendments.annexes import config as annex_config
 from onyx.regulatory.amendments.job import run_amendment_batch
 from onyx.regulatory.projection import project_amendment_to_index
 from onyx.utils.logger import setup_logger
@@ -155,7 +156,12 @@ def enqueue_amendment_batch(
     errors: list[Exception] = []
     for countdown in (None, 5):
         options: dict[str, Any] = {
-            "kwargs": {"batch_id": batch_id, "tenant_id": tenant_id},
+            "kwargs": {
+                "batch_id": batch_id,
+                "tenant_id": tenant_id,
+                "environment": annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+                "database_identity": annex_config.ANNEX_DATABASE_IDENTITY,
+            },
             "queue": REGULATORY_AMENDMENT_QUEUE,
             "priority": OnyxCeleryPriority.HIGH,
             "expires": _DELIVERY_EXPIRES_SECONDS,
@@ -206,8 +212,20 @@ def enqueue_amendment_proposal_approval(
 def regulatory_amendment_run(
     *,
     batch_id: int,
-    tenant_id: str,  # noqa: ARG001 - TenantAwareTask consumes it
+    tenant_id: str,
+    environment: str | None = None,
+    database_identity: str | None = None,
 ) -> None:
+    from shared_configs.contextvars import get_current_tenant_id
+
+    if environment is not None or database_identity is not None:
+        if (
+            environment != annex_config.REGULATORY_ANNEX_ENVIRONMENT
+            or database_identity != annex_config.ANNEX_DATABASE_IDENTITY
+            or not tenant_id
+            or tenant_id != get_current_tenant_id()
+        ):
+            raise ValueError("amendment analysis worker scope mismatch")
     with get_session_with_current_tenant() as db_session:
         lease = claim_batch_for_analysis(db_session, batch_id=batch_id)
     if lease is None:

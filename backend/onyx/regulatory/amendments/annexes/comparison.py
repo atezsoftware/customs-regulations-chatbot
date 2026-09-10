@@ -9,9 +9,11 @@ from onyx.llm.interfaces import LLM
 from onyx.llm.models import ImageContentPart, ImageUrlDetail
 from onyx.prompts.regulatory_annex_comparison import ANNEX_COMPARISON_PROMPT
 from onyx.regulatory.amendments.annexes.evidence import (
+    has_visual_original,
     identical_evidence_scope,
     selected_evidence_pages,
     validate_evidence_view,
+    visual_element_positions,
 )
 from onyx.regulatory.amendments.annexes.models import (
     AnnexComparedImage,
@@ -44,18 +46,35 @@ def _reference(extraction: AnnexExtraction, position: int) -> AnnexElementRefere
     )
 
 
-def _atomic_positions(extraction: AnnexExtraction) -> list[int]:
+def _atomic_positions(
+    extraction: AnnexExtraction, *, omit_scope_boundaries: bool = False
+) -> list[int]:
     return [
         index
         for index, element in enumerate(extraction.elements)
         if not element.aggregate
+        and not (
+            omit_scope_boundaries
+            and extraction.evidence_view is not None
+            and extraction.evidence_view.selected_positions[index]
+            in extraction.evidence_view.boundary_positions
+            and element.extraction_method == "native"
+        )
     ]
 
 
 def _native_changes(
     old: AnnexExtraction, new: AnnexExtraction
 ) -> list[AnnexDifference]:
-    old_positions, new_positions = _atomic_positions(old), _atomic_positions(new)
+    multipart = any(
+        extraction.evidence_view is not None
+        and len(extraction.evidence_view.parents) > 1
+        for extraction in (old, new)
+    )
+    old_positions, new_positions = (
+        _atomic_positions(old, omit_scope_boundaries=multipart),
+        _atomic_positions(new, omit_scope_boundaries=multipart),
+    )
 
     # Unique structural keys anchor changed cells; exact content can anchor moves.
     def keys(
@@ -75,6 +94,7 @@ def _native_changes(
     old_counts, new_counts = Counter(old_keys.values()), Counter(new_keys.values())
     if any(count > 1 for count in [*old_counts.values(), *new_counts.values()]):
         raise ValueError("ambiguous_native_correspondence")
+    same_order = list(old_keys.values()) == list(new_keys.values())
     by_key = {key: index for index, key in new_keys.items()}
     changes: list[AnnexDifference] = []
     matched: set[int] = set()
@@ -103,7 +123,24 @@ def _native_changes(
                     explanation="Exact anchored value changed",
                 )
             )
-        elif before.locator != after.locator:
+        elif not (
+            same_order
+            and (
+                before.locator.sheet,
+                before.locator.cell,
+                before.locator.row,
+                before.locator.column,
+            )
+            == (
+                after.locator.sheet,
+                after.locator.cell,
+                after.locator.row,
+                after.locator.column,
+            )
+        ) and (
+            before.locator != after.locator
+            or old_positions.index(index) != new_positions.index(target)
+        ):
             changes.append(
                 AnnexDifference(
                     operation="move",
@@ -280,7 +317,15 @@ def compare_annexes(
     Patch preparation separately verifies canonical baseline, dates and mappings.
     """
     before_pages, after_pages = old_pages or [], new_pages or []
-    old_positions, new_positions = _atomic_positions(old), _atomic_positions(new)
+    multipart = any(
+        extraction.evidence_view is not None
+        and len(extraction.evidence_view.parents) > 1
+        for extraction in (old, new)
+    )
+    old_positions, new_positions = (
+        _atomic_positions(old, omit_scope_boundaries=multipart),
+        _atomic_positions(new, omit_scope_boundaries=multipart),
+    )
     issues = [
         *old.issues,
         *new.issues,
@@ -295,10 +340,7 @@ def compare_annexes(
         issues.append("incomplete_extraction")
     if not old_positions or not new_positions:
         issues.append("empty_extraction")
-    visual = any(
-        extraction.mime_type.startswith(("image/", "application/pdf"))
-        for extraction in (old, new)
-    )
+    visual = any(has_visual_original(extraction) for extraction in (old, new))
     method = (
         "identical_asset"
         if identical_evidence_scope(old, new)
@@ -354,15 +396,20 @@ def compare_annexes(
             issues.append(str(error))
     elif method == "simultaneous_vision":
         for extraction, pages in ((old, before_pages), (new, after_pages)):
-            if extraction.page_count is None:
+            if (
+                has_visual_original(extraction)
+                and extraction.evidence_view is None
+                and extraction.page_count is None
+            ):
                 issues.append("page_count_unverified")
             elif [page.page for page in pages] != selected_evidence_pages(extraction):
                 issues.append("page_coverage_mismatch")
-            if not pages:
+            if has_visual_original(extraction) and not pages:
                 issues.append("visual_evidence_unavailable")
-            if not {element.locator.page for element in extraction.elements}.issubset(
-                {page.page for page in pages}
-            ):
+            if not {
+                extraction.elements[position].locator.page
+                for position in visual_element_positions(extraction)
+            }.issubset({page.page for page in pages}):
                 issues.append("extraction_page_unmapped")
         if llm is None:
             issues.append("vision_model_unavailable")
@@ -467,12 +514,16 @@ def validate_annex_comparison(
         for element in extraction.elements
     ):
         issues.append("incomplete_extraction")
-    if not _atomic_positions(old) or not _atomic_positions(new):
-        issues.append("empty_extraction")
-    visual = any(
-        extraction.mime_type.startswith(("image/", "application/pdf"))
+    multipart = any(
+        extraction.evidence_view is not None
+        and len(extraction.evidence_view.parents) > 1
         for extraction in (old, new)
     )
+    old_positions = _atomic_positions(old, omit_scope_boundaries=multipart)
+    new_positions = _atomic_positions(new, omit_scope_boundaries=multipart)
+    if not old_positions or not new_positions:
+        issues.append("empty_extraction")
+    visual = any(has_visual_original(extraction) for extraction in (old, new))
     expected_method = (
         "identical_asset"
         if identical_evidence_scope(old, new)
@@ -487,7 +538,11 @@ def validate_annex_comparison(
             (old, comparison.coverage.old_pages),
             (new, comparison.coverage.new_pages),
         ):
-            if extraction.page_count is None:
+            if (
+                has_visual_original(extraction)
+                and extraction.evidence_view is None
+                and extraction.page_count is None
+            ):
                 issues.append("page_count_unverified")
             elif pages != selected_evidence_pages(extraction):
                 issues.append("page_coverage_mismatch")
@@ -513,8 +568,8 @@ def validate_annex_comparison(
             response,
             old=old,
             new=new,
-            old_positions=_atomic_positions(old),
-            new_positions=_atomic_positions(new),
+            old_positions=old_positions,
+            new_positions=new_positions,
             old_pages=comparison.coverage.old_pages,
             new_pages=comparison.coverage.new_pages,
         )
