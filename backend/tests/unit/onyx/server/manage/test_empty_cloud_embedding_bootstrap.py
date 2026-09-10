@@ -333,6 +333,11 @@ def test_index_swap_commits_present_and_past_statuses_atomically() -> None:
     with (
         patch.object(swap_index, "lock_index_publication_barrier", return_value=True),
         patch.object(swap_index, "unreconciled_user_files", return_value=[]),
+        patch.object(
+            swap_index,
+            "has_active_regulatory_indexing_jobs_for_search_settings",
+            return_value=False,
+        ) as has_active_jobs,
         patch.object(swap_index, "transfer_reranker_configuration__no_commit"),
         patch.object(swap_index, "get_current_search_settings", return_value=current),
         patch.object(swap_index, "update_search_settings_status") as update_status,
@@ -346,6 +351,11 @@ def test_index_swap_commits_present_and_past_statuses_atomically() -> None:
         )
 
     assert result is current
+    assert has_active_jobs.call_args_list == [
+        call(db_session, current.id),
+        call(db_session, future.id),
+    ]
+    db_session.rollback.assert_not_called()
     assert update_status.call_args_list == [
         call(
             search_settings=current,

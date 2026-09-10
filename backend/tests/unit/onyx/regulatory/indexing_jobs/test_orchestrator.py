@@ -1697,16 +1697,14 @@ def test_terminal_file_status_requests_typed_cancellation_without_external_work(
         user_file_status=user_file_status,
     )
     gateway = MagicMock()
-    document_index = MagicMock()
     with (
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator._build_vertex_gateway",
             return_value=gateway,
         ),
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index",
-            return_value=document_index,
-        ),
+            "onyx.regulatory.indexing_jobs.owned_publication.execute_owned_cancellation"
+        ) as owned_cancel,
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.request_regulatory_indexing_cancellation",
             return_value=True,
@@ -1723,7 +1721,7 @@ def test_terminal_file_status_requests_typed_cancellation_without_external_work(
 
     gateway.cancel.assert_not_called()
     gateway.cleanup.assert_not_called()
-    document_index.delete.assert_not_called()
+    owned_cancel.assert_not_called()
     request_cancellation.assert_called_once()
     assert (
         request_cancellation.call_args.kwargs["cancellation_intent"] is expected_intent
@@ -1749,8 +1747,8 @@ def test_cancellation_vertex_phase_performs_only_remote_cancel() -> None:
             return_value=True,
         ) as advance,
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index"
-        ) as build_index,
+            "onyx.regulatory.indexing_jobs.owned_publication.execute_owned_cancellation"
+        ) as owned_cancel,
     ):
         from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
 
@@ -1763,7 +1761,7 @@ def test_cancellation_vertex_phase_performs_only_remote_cancel() -> None:
 
     gateway.cancel.assert_called_once_with("remote-1")
     gateway.cleanup.assert_not_called()
-    build_index.assert_not_called()
+    owned_cancel.assert_not_called()
     assert advance.call_args.kwargs["next_phase"] is (
         RegulatoryIndexingCancellationPhase.GCS_CLEANUP
     )
@@ -1786,8 +1784,8 @@ def test_cancellation_gcs_phase_progresses_when_gateway_config_is_missing() -> N
             return_value=True,
         ) as advance,
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index"
-        ) as build_index,
+            "onyx.regulatory.indexing_jobs.owned_publication.execute_owned_cancellation"
+        ) as owned_cancel,
     ):
         from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
 
@@ -1798,7 +1796,7 @@ def test_cancellation_gcs_phase_progresses_when_gateway_config_is_missing() -> N
             now=_NOW,
         )
 
-    build_index.assert_not_called()
+    owned_cancel.assert_not_called()
     assert advance.call_args.kwargs["next_phase"] is (
         RegulatoryIndexingCancellationPhase.INDEX_DELETE
     )
@@ -1982,17 +1980,12 @@ def test_required_index_cleanup_failure_never_advances_to_finalize(
         cancellation_phase=RegulatoryIndexingCancellationPhase.INDEX_DELETE.value,
         cancellation_intent=intent,
     )
-    document_index = MagicMock()
-    document_index.delete.side_effect = error
+    session = MagicMock(spec=Session)
     with (
         patch(
             "onyx.regulatory.indexing_jobs.owned_publication.execute_owned_cancellation",
             side_effect=error,
-        ),
-        patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index",
-            return_value=document_index,
-        ),
+        ) as owned_cancel,
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_cancellation"
         ) as advance,
@@ -2006,9 +1999,18 @@ def test_required_index_cleanup_failure_never_advances_to_finalize(
         result = _execute_claimed_step(
             runtime,
             tenant_id="tenant-a",
-            db_session=cast(Session, MagicMock()),
+            db_session=session,
             now=_NOW,
         )
+
+    owned_cancel.assert_called_once_with(
+        job_id=runtime.job.id,
+        user_file_id=runtime.user_file.id,
+        expected_generation=runtime.job.lease_generation,
+        tenant_id="tenant-a",
+    )
+    session.rollback.assert_called_once_with()
+    session.commit.assert_not_called()
 
     advance.assert_not_called()
     schedule_retry.assert_called_once()
@@ -2031,17 +2033,12 @@ def test_user_cancel_index_cleanup_remains_bounded_best_effort() -> None:
         cancellation_phase=RegulatoryIndexingCancellationPhase.INDEX_DELETE.value,
         cancellation_intent=RegulatoryIndexingCancellationIntent.USER_CANCEL,
     )
-    document_index = MagicMock()
-    document_index.delete.side_effect = RuntimeError("terminal cleanup failure")
+    session = MagicMock(spec=Session)
     with (
         patch(
             "onyx.regulatory.indexing_jobs.owned_publication.execute_owned_cancellation",
             side_effect=RuntimeError("terminal cleanup failure"),
-        ),
-        patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index",
-            return_value=document_index,
-        ),
+        ) as owned_cancel,
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_cancellation",
             return_value=True,
@@ -2055,9 +2052,18 @@ def test_user_cancel_index_cleanup_remains_bounded_best_effort() -> None:
         result = _execute_claimed_step(
             runtime,
             tenant_id="tenant-a",
-            db_session=cast(Session, MagicMock()),
+            db_session=session,
             now=_NOW,
         )
+
+    owned_cancel.assert_called_once_with(
+        job_id=runtime.job.id,
+        user_file_id=runtime.user_file.id,
+        expected_generation=runtime.job.lease_generation,
+        tenant_id="tenant-a",
+    )
+    session.rollback.assert_called_once_with()
+    session.commit.assert_not_called()
 
     assert (
         advance.call_args.kwargs["next_phase"]
