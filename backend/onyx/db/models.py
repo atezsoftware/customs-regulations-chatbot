@@ -8530,3 +8530,39 @@ class AnnexPublicationIntent(Base):
             name="uq_annex_publication_generation",
         ),
     )
+
+
+class RegulatoryPublicationClock(Base):
+    """Transactional, commit-ordered observation clock, shared within a tenant."""
+
+    __tablename__ = "regulatory_publication_clock"
+    scope_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+
+class RegulatoryFilePublication(Base):
+    """Retained after file deletion so ownership and read epochs never reset."""
+
+    __tablename__ = "regulatory_file_publication"
+    user_file_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lease_expires_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    gate_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    next_ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+
+class RegulatoryPublicationOrdinal(Base):
+    __tablename__ = "regulatory_publication_ordinal"
+    user_file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_file_publication.user_file_id"), primary_key=True
+    )
+    allocation_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("user_file_id", "ordinal", name="uq_publication_file_ordinal"),
+    )

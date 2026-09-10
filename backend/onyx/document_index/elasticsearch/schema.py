@@ -443,6 +443,13 @@ class DocumentSchema:
             # contains unexpected fields.
             "dynamic": "strict",
             "properties": {
+                "publication_floor": {"type": "long"},
+                "publication_token": {"type": "long"},
+                "publication_scope": {"type": "keyword"},
+                "publication_payload": {"type": "keyword"},
+                "publication_operation": {"type": "keyword"},
+                "publication_tombstone": {"type": "boolean"},
+                "publication_evidence": {"type": "object", "enabled": False},
                 TITLE_FIELD_NAME: {
                     "type": "text",
                     # Language analyzer (e.g. english) stems at index and search
