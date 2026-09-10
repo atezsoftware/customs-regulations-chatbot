@@ -393,15 +393,53 @@ def activate_temporal_projection(
             )
         ):
             raise ValueError("derived dependency exceeds its legal source window")
+        # The lookup anchor selects source authority, not the context generation date.
         qualified = get_indexed_temporal_projection(
             session,
             row.id,
             index=binding.index,
-            as_of_date=binding.reference_date
-            or context_reference_date(binding.effective_start, binding.effective_end),
+            as_of_date=context_reference_date(
+                binding.effective_start, binding.effective_end
+            ),
         )
         if qualified is None:
+            overlapping = select(RegulatoryTemporalProjection.id).where(
+                RegulatoryTemporalProjection.canonical_chunk_id == row.id,
+                RegulatoryTemporalProjection.index_identity_sha256
+                == binding.index.temporal_lookup_identity(),
+            )
+            if binding.effective_start is not None:
+                overlapping = overlapping.where(
+                    or_(
+                        RegulatoryTemporalProjection.effective_end.is_(None),
+                        RegulatoryTemporalProjection.effective_end
+                        > binding.effective_start,
+                    )
+                )
+            if binding.effective_end is not None:
+                overlapping = overlapping.where(
+                    or_(
+                        RegulatoryTemporalProjection.effective_start.is_(None),
+                        RegulatoryTemporalProjection.effective_start
+                        < binding.effective_end,
+                    )
+                )
+            if session.scalar(overlapping.limit(1)) is not None:
+                raise ValueError("qualified dependency window does not cover parent")
             return row
+        if (
+            qualified.effective_start is not None
+            and (
+                binding.effective_start is None
+                or qualified.effective_start > binding.effective_start
+            )
+            or qualified.effective_end is not None
+            and (
+                binding.effective_end is None
+                or qualified.effective_end < binding.effective_end
+            )
+        ):
+            raise ValueError("qualified dependency window does not cover parent")
         return RegulatoryChunk(
             id=row.id,
             user_file_id=row.user_file_id,

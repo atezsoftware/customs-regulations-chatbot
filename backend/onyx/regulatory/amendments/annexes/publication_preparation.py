@@ -43,6 +43,7 @@ from onyx.regulatory.amendments.annexes.publication_evidence import (
     _encoder_receipt,
     _historical_plan,
     _uncovered_history,
+    _validate_physical_encoder_authority,
     read_publication_preparation,
 )
 from onyx.regulatory.amendments.annexes.publication_representations import (
@@ -233,19 +234,7 @@ def prepare_publication_review(draft: AnnexChangeDraft) -> AnnexChangeDraft:
                     )
                 ]
                 for actual in actuals:
-                    previous = actual.evidence.index
-                    if actual.evidence.frozen_projection is not None and (
-                        previous.model_provider,
-                        previous.model_name,
-                        previous.vector_dimension,
-                    ) != (
-                        index.model_provider,
-                        index.model_name,
-                        index.vector_dimension,
-                    ):
-                        raise ValueError(
-                            "incompatible encoder model requires a distinct physical index"
-                        )
+                    _validate_physical_encoder_authority(actual, index)
                 all_evidence.extend(actuals)
                 historical_actuals = actuals
                 if settings.status.is_current():

@@ -1,6 +1,7 @@
 from datetime import date, datetime, time, timezone
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy.orm import Session
 
 from onyx.db.models import DocumentSet
@@ -141,8 +142,12 @@ def test_context_snapshot_cannot_cross_file_scope(source_session: Session) -> No
         )
 
 
+@pytest.mark.parametrize("open_start", [False, True])
+@pytest.mark.parametrize("gap_at_anchor", [False, True])
 def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_history(
     source_session: Session,
+    open_start: bool,
+    gap_at_anchor: bool,
 ) -> None:
     from importlib import import_module
 
@@ -170,7 +175,7 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
     source_session.flush()
     file = _file(source_session, group)
     canonical = _chunk(source_session, file, 0, "Legal text")
-    canonical.validity_start_date = date(2020, 1, 1)
+    canonical.validity_start_date = None if open_start else date(2020, 1, 1)
     source_session.flush()
     indices = [
         PublicationIndexSnapshot(
@@ -190,7 +195,7 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
         index: PublicationIndexSnapshot,
         ordinal: int,
         image: str,
-        start: date,
+        start: date | None,
         end: date | None,
     ) -> AnnexTemporalProjection:
         frozen = frozen_projection(file.id, ordinal, "Legal text")
@@ -201,7 +206,9 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
             source_links=json.dumps({0: ""}),
             validity_start_date=int(
                 datetime.combine(start, time.min, timezone.utc).timestamp()
-            ),
+            )
+            if start
+            else None,
             validity_end_date=int(
                 datetime.combine(end, time.min, timezone.utc).timestamp()
             )
@@ -232,7 +239,9 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
             semantic_position=canonical.position,
         )
 
-    first = binding(indices[0], 0, "old-image", date(2020, 1, 1), date(2026, 1, 1))
+    first = binding(
+        indices[0], 0, "old-image", canonical.validity_start_date, date(2026, 1, 1)
+    )
     second = binding(indices[0], 2, "new-image", date(2026, 1, 1), None)
     future = binding(indices[1], 3, "future-image", date(2020, 1, 1), None)
     for item in (first, second, future):
@@ -311,7 +320,7 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
             as_of_date=date(2025, 1, 1),
         )
     companion = _chunk(source_session, file, 4, "Image caption")
-    companion.validity_start_date = date(2020, 1, 1)
+    companion.validity_start_date = canonical.validity_start_date
     companion.chunk_metadata = {"bound_to_regulatory_chunk_id": canonical.id}
     source_session.flush()
     companions = []
@@ -345,6 +354,52 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
                 "semantic_position": companion.position,
             }
         )
+        if ordinal == 4:
+            # A lookup of OLD at the reference date cannot prove the whole window.
+            invalid_source = {**source, "validity_end_date": None}
+            spanning = item.model_copy(
+                update={
+                    "effective_end": None,
+                    "projection": projection.model_copy(
+                        update={"source_json": json.dumps(invalid_source)}
+                    ),
+                }
+            )
+            if not gap_at_anchor:
+                with pytest.raises(ValueError, match="qualified dependency window"):
+                    repository.activate_temporal_projection(
+                        source_session, user_file_id=file.id, binding=spanning
+                    )
+            # No binding at the anchor must not hide known later qualified history.
+            gap_index = indices[0].model_copy(update={"index_uuid": str(uuid4())})
+            later = second.model_copy(update={"id": uuid4(), "index": gap_index})
+            later = later.model_copy(
+                update={
+                    "projection": later.projection.model_copy(
+                        update={"context_projection_id": str(later.id)}
+                    )
+                }
+            )
+            repository.activate_temporal_projection(
+                source_session, user_file_id=file.id, binding=later
+            )
+            invalid_source["image_file_id"] = None
+            gap = spanning.model_copy(
+                update={
+                    "index": gap_index,
+                    "representation_metadata": {
+                        "bound_to_regulatory_chunk_id": canonical.id
+                    },
+                    "projection": projection.model_copy(
+                        update={"source_json": json.dumps(invalid_source)}
+                    ),
+                }
+            )
+            if gap_at_anchor:
+                with pytest.raises(ValueError, match="qualified dependency window"):
+                    repository.activate_temporal_projection(
+                        source_session, user_file_id=file.id, binding=gap
+                    )
         repository.activate_temporal_projection(
             source_session, user_file_id=file.id, binding=item
         )

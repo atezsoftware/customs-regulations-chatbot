@@ -76,6 +76,51 @@ def _encoder_receipt(
     )
 
 
+def _validate_physical_encoder_authority(
+    actual: AnnexIndexedBaseline,
+    index: PublicationIndexSnapshot,
+) -> None:
+    """Known model-space authority cannot change within one physical index."""
+    previous = actual.evidence.index
+    verified = actual.evidence.frozen_projection
+    if verified is None or previous.index_uuid != index.index_uuid:
+        return
+    configuration = json.loads(verified.embedding_config_json)
+    known_facts = {
+        key: value
+        for key, value in configuration.items()
+        if key in PublicationEncoderAuthority.model_fields
+    }
+    if "dimension" in configuration:
+        known_facts["effective_dimension"] = (
+            configuration.get("reduced_dimension") or configuration["dimension"]
+        )
+    previous_authority = previous.encoder_authority
+    if previous_authority is None:
+        try:
+            previous_authority = _encoder_receipt(
+                configuration,
+                resolution="0" * 64,
+            ).authority
+        except ValueError:
+            # Incomplete legacy receipts remain unverified for missing facts.
+            pass
+    if (
+        (previous.model_provider, previous.model_name, previous.vector_dimension)
+        != (index.model_provider, index.model_name, index.vector_dimension)
+        or previous_authority is not None
+        and previous_authority != index.encoder_authority
+        or index.encoder_authority is not None
+        and any(
+            value != index.encoder_authority.model_dump()[key]
+            for key, value in known_facts.items()
+        )
+    ):
+        raise ValueError(
+            "incompatible encoder authority requires a distinct physical index"
+        )
+
+
 def read_publication_preparation(
     review: AnnexPublicationReview,
 ) -> AnnexPublicationPreparation:
@@ -168,6 +213,7 @@ def _historical_plan(
     cutoff: date,
     embedding_model: "EmbeddingModel",
 ) -> AnnexPublicationProjectionPlan | None:
+    _validate_physical_encoder_authority(actual, index)
     raw = json.loads(actual.evidence.source_json)
     source = {
         key: value for key, value in raw.items() if not key.startswith("publication_")
@@ -185,7 +231,10 @@ def _historical_plan(
         raise ValueError(
             "historical indexed content does not match its canonical/derived source authority"
         )
+    canonical_base_sha256 = context_hash(row.text)
     if actual.binding is not None:
+        if actual.binding.canonical_base_sha256 != canonical_base_sha256:
+            raise ValueError("historical canonical base changed")
         bound = actual.binding.projection
         if (
             context_hash(json.loads(bound.source_json)) != context_hash(source)
@@ -295,8 +344,15 @@ def _historical_plan(
         id=identity,
         index=index,
         ordinal=source["chunk_index"] if same_index else -1,
-        row=row,
-        canonical_base_sha256=context_hash(row.text),
+        row=row.model_copy(
+            update={
+                "text": actual.binding.representation_text,
+                "metadata": actual.binding.representation_metadata,
+                "position": actual.binding.semantic_position,
+                "heading_path": source.get("heading_path", row.heading_path),
+            }
+        ),
+        canonical_base_sha256=canonical_base_sha256,
         context=context,
         view_sha256=context_hash(
             PreparedContextView(projections=[context]).model_dump(mode="json")

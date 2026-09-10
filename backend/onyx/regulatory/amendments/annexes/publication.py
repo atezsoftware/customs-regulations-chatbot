@@ -234,21 +234,29 @@ def validate_after_window_authority(draft: AnnexChangeDraft) -> None:
         raise ValueError(
             "after-window source does not support the exact transition date"
         )
-    quote = authority.source_quote.lower().replace("ı", "i")
+    quote = authority.source_quote.casefold().replace("ı", "i")
     if re.search(
-        r"(?:uygulanmay|yürürlüğe girmez|shall not|will not|not restore|not resume)",
+        r"\b(?:not|never|may|might|could|would|should|if|unless|proposed|eğer|şayet|halinde|durumunda|mi|midir)\b"
+        r"|\böner\w*\b"
+        r"|\b(?:değil\w*|kalkma\w*|kaldirilma\w*|erme\w*|ermeye\w*|uygulanmay\w*|girme\w*|girmeye\w*)\b"
+        r"|[?]",
         quote,
     ):
-        raise ValueError("after-window source contradicts restoration")
+        raise ValueError("after-window source is negated or conditional")
     restoration = bool(
-        re.search(r"(?:önceki|eski|previous|prior)", quote)
+        re.search(r"\b(?:önceki|eski|previous|prior)\b", quote)
         and re.search(
-            r"(?:yeniden uygulan|uygulanmaya devam|yeniden yürür|restore|resume)", quote
+            r"\b(?:yeniden uygulan(?:ir|acaktir)|uygulanmaya devam (?:eder|edilir|edilecektir)"
+            r"|yeniden yürürlüğe (?:girer|girecektir|konulur|konulacaktir)"
+            r"|(?:are|is|shall be|will be) restored|(?:shall|will) resume|resumes)\b",
+            quote,
         )
     )
     cessation = bool(
         re.search(
-            r"(?:yürürlükten kalk|yürürlükten kaldir|uygulanmaz|sona er|cease|repeal)",
+            r"\b(?:yürürlükten (?:kalkar|kalkacaktir|kaldirilir|kaldirilacaktir)"
+            r"|uygulanmaz|sona (?:erer|erecektir)|(?:shall|will) cease|ceases|ceased"
+            r"|(?:is|was|shall be|will be) (?:hereby )?repealed)\b",
             quote,
         )
     )

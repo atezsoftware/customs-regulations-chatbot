@@ -230,3 +230,69 @@ def test_exact_scheduled_successor_is_the_after_window_authority() -> None:
         next(row for row in timeline.canonical_rows if row.id == "scheduled")
         == source.baseline_scope[1]
     )
+
+
+@pytest.mark.parametrize(
+    "transition",
+    [
+        "yürürlükten kalkmayacaktır",
+        "yürürlükten kalkmaz",
+        "yürürlükten kaldırılmayacaktır",
+        "sona ermeyecektir",
+        "sona ermez",
+        "uygulanmaz değildir",
+        "yürürlükten kalkması önerilmektedir",
+        "yürürlükten kalkabilir",
+        "will not cease",
+        "is not repealed",
+        "may cease",
+        "repeal is proposed",
+        "eğer yeni kanun kabul edilirse yürürlükten kalkar",
+        "yürürlükten kalkar şeklinde değiştirilmesi önerilmektedir",
+        "yürürlükten kalkar mı",
+        "it is proposed that it will cease",
+    ],
+)
+def test_nonpositive_cessation_cannot_authorize_a_legal_end(transition: str) -> None:
+    from onyx.regulatory.amendments.annexes.publication import (
+        resolve_after_window_authority,
+    )
+
+    source = draft().model_copy(
+        update={
+            "submitted_source_text": f"EK-1 01.07.2026 tarihinde {transition}.",
+            "after_window_authority": None,
+        }
+    )
+    with pytest.raises(ValueError, match="after-window"):
+        resolve_after_window_authority(source)
+
+
+@pytest.mark.parametrize(
+    "transition",
+    [
+        "yürürlükten kalkar",
+        "yürürlükten kalkacaktır",
+        "yürürlükten kaldırılır",
+        "yürürlükten kaldırılacaktır",
+        "sona erer",
+        "sona erecektir",
+        "uygulanmaz",
+        "shall cease",
+        "will be repealed",
+    ],
+)
+def test_bounded_positive_cessation_remains_supported(transition: str) -> None:
+    from onyx.regulatory.amendments.annexes.publication import (
+        resolve_after_window_authority,
+    )
+
+    source = draft().model_copy(
+        update={
+            "submitted_source_text": f"EK-1 01.07.2026 tarihinde {transition}.",
+            "after_window_authority": None,
+        }
+    )
+    resolved = resolve_after_window_authority(source)
+    assert resolved.after_window_authority is not None
+    assert resolved.after_window_authority.kind == "cessation"

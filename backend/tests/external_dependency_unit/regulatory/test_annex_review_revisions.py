@@ -297,6 +297,13 @@ def live_review(
     )
     source_session.add(batch)
     source_session.flush()
+    if mode == "historical-derived-verified":
+        outside.chunk_metadata = {
+            "chunk_variant": "hierarchical_aggregate",
+            "source_regulatory_chunk_ids": [old.id],
+            "hierarchy_root_path": ["Root"],
+        }
+        source_session.flush()
     before = capture_canonical_scope(source_session, file.id)
     from onyx.db.enums import IndexModelStatus
 
@@ -422,6 +429,31 @@ def live_review(
 
     source_session.commit()
     baseline_rows = canonical_snapshot_rows(before)
+    retained_image_id = None
+    if mode in ("historical-source-verified", "historical-derived-verified"):
+        from base64 import b64decode
+
+        from onyx.regulatory.chunker import hierarchical_aggregate_text
+
+        retained_image_id = store.save_file(
+            BytesIO(
+                b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aHosAAAAASUVORK5CYII="
+                )
+            ),
+            "historical.png",
+            FileOrigin.OTHER,
+            "image/png",
+        )
+        retained = next(row for row in baseline_rows if row.id == outside.id)
+        retained.chunk_metadata = {
+            **retained.chunk_metadata,
+            "source_links": {"0": file.file_id},
+            "image_file_id": retained_image_id,
+        }
+        retained.position = 8
+        if mode == "historical-derived-verified":
+            retained.text = hierarchical_aggregate_text("Root", [old.text])
     indexed_view = prepare_normal_context_view(
         rows=baseline_rows,
         user_file=file,
@@ -430,13 +462,37 @@ def live_review(
         llm=llm,
         as_of_date=date(2020, 1, 1),
     )
+    if mode in ("verified-compatible-receipt", "verified-partial-receipt"):
+        from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
+
+        updated = []
+        for item in indexed_view.projections:
+            receipt = {**item.embedding_config, "transport": "synchronous_encoder"}
+            if mode == "verified-partial-receipt":
+                receipt.pop("normalize")
+            updated.append(
+                item.model_copy(
+                    update={
+                        "embedding_config": receipt,
+                        "embedding_config_sha256": context_hash(receipt),
+                    }
+                )
+            )
+        indexed_view = indexed_view.model_copy(update={"projections": updated})
     access = AnnexProjectionAccess(
         access=get_access_for_user_files([str(file.id)], source_session)[str(file.id)],
         project_ids=[],
         persona_ids=[],
         document_sets=[docset.name],
     )
-    verified = getattr(request, "param", None) in ("verified", "source-only-verified")
+    verified = mode in (
+        "verified",
+        "source-only-verified",
+        "historical-source-verified",
+        "historical-derived-verified",
+        "verified-compatible-receipt",
+        "verified-partial-receipt",
+    )
     from datetime import timedelta
 
     from onyx.db.regulatory_context_projections import activate_temporal_projection
@@ -528,9 +584,16 @@ def live_review(
                     id=identity,
                     index=index,
                     projection=projection,
-                    canonical_base_sha256=context_hash(canonical.text),
-                    derived_role="canonical",
-                    dependency_ids=[],
+                    canonical_base_sha256=context_hash(
+                        next(row.text for row in before if row.id == canonical.id)
+                    ),
+                    derived_role="hierarchical_aggregate"
+                    if canonical.chunk_metadata.get("chunk_variant")
+                    == "hierarchical_aggregate"
+                    else "canonical",
+                    dependency_ids=canonical.chunk_metadata.get(
+                        "source_regulatory_chunk_ids", []
+                    ),
                     representation_text=canonical.text,
                     representation_metadata=canonical.chunk_metadata,
                     context=context,
@@ -584,6 +647,7 @@ def live_review(
             es[0].indices.delete(index=future_name)
         for file_id in [
             file.file_id,
+            retained_image_id,
             asset.file_id,
             *[item.file_id for item in extra_assets],
             package.manifest_file_id,

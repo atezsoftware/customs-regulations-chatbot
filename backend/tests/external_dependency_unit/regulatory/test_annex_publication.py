@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from elasticsearch import Elasticsearch
+from sqlalchemy.orm import Session
 
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.amendments.annexes.models import FrozenContextProjection
@@ -244,7 +245,9 @@ def test_live_group_freezes_actual_index_evidence_and_complete_preapproval_scope
 
 
 @pytest.mark.parametrize(
-    "live_review", ["verified", "source-only-verified"], indirect=True
+    "live_review",
+    ["verified", "source-only-verified", "verified-compatible-receipt"],
+    indirect=True,
 )
 def test_verified_preapproval_reuses_actual_vectors_and_preserves_outside_identity(
     live_review: LiveReview,
@@ -438,3 +441,126 @@ def test_expired_indexed_history_is_frozen_and_reencoded_before_approval(
     )
     assert plan.reuse_from is None and frozen.views[plan.view_sha256].snapshots
     assert frozen.counts.historical_projections == 3
+
+
+@pytest.mark.parametrize(
+    "live_review,field,value",
+    [
+        ("verified", "api_url", "https://different-encoder.invalid"),
+        ("verified", "normalize", False),
+        ("verified", "deployment_name", "other-deployment"),
+        ("verified", "api_version", "2099-01-01"),
+        ("verified", "passage_prefix", "different: "),
+        ("verified-partial-receipt", "api_url", "https://different-encoder.invalid"),
+    ],
+    indirect=["live_review"],
+)
+def test_preparation_refuses_known_encoder_authority_change_on_actual_index(
+    live_review: LiveReview,
+    field: str,
+    value: str | bool,
+) -> None:
+    from onyx.db.models import SearchSettings
+    from onyx.file_store.file_store import get_default_file_store
+    from onyx.indexing.embedder import DefaultIndexingEmbedder
+    from onyx.regulatory.amendments.annexes.models import AnnexChangeDraft
+    from onyx.regulatory.amendments.annexes.publication_preparation import (
+        prepare_publication_review,
+    )
+
+    draft = AnnexChangeDraft.model_validate(live_review.review.review_payload)
+    model = DefaultIndexingEmbedder.from_db_search_settings(
+        search_settings=SearchSettings()
+    ).embedding_model
+    setattr(model, field, value)
+    prepared = None
+    try:
+        with pytest.raises(ValueError, match="distinct physical index"):
+            prepared = prepare_publication_review(draft)
+    finally:
+        if prepared is not None and prepared.publication is not None:
+            get_default_file_store().delete_file(prepared.publication.artifact_file_id)
+
+
+@pytest.mark.parametrize(
+    "live_review",
+    ["historical-source-verified", "historical-derived-verified"],
+    indirect=True,
+)
+def test_real_preparation_preserves_retained_binding_representation(
+    live_review: LiveReview,
+    source_session: "Session",
+) -> None:
+    import json
+
+    from sqlalchemy import delete
+
+    from onyx.db.models import RegulatoryTemporalProjection
+    from onyx.db.regulatory_annex_changes import capture_canonical_scope
+    from onyx.db.regulatory_context_projections import activate_temporal_projection
+    from onyx.document_index.publication_models import FrozenPublicationProjection
+    from onyx.regulatory.amendments.annexes.models import AnnexChangeDraft
+    from onyx.regulatory.amendments.annexes.publication_preparation import (
+        validate_frozen_publication_review,
+    )
+
+    draft = AnnexChangeDraft.model_validate(live_review.review.review_payload)
+    frozen = validate_frozen_publication_review(draft)
+    actual = next(
+        item
+        for item in frozen.indexed_baseline
+        if item.binding is not None
+        and item.binding.projection.ordinal == live_review.outside.projection_ordinal
+    )
+    retained = actual.binding
+    assert retained is not None
+    plan = next(item for item in frozen.projections if item.id == retained.id)
+    assert plan.row.text == retained.representation_text
+    assert plan.row.metadata == retained.representation_metadata
+    assert plan.row.position == retained.semantic_position == 8
+    assert plan.canonical_base_sha256 == context_hash(live_review.outside.text)
+    assert plan.reuse_from is not None
+    source = json.loads(plan.source_template_json)
+    original_source = json.loads(plan.reuse_from.source_json)
+    source.update(
+        {
+            key: original_source[key]
+            for key in ("content_vector", "title_vector")
+            if key in original_source
+        }
+    )
+    projection = FrozenPublicationProjection(
+        ordinal=plan.ordinal,
+        context_projection_id=str(plan.id),
+        source_json=json.dumps(source),
+        embedding_inputs=tuple(plan.context.embedding_texts),
+        embedding_config_json=json.dumps(plan.context.embedding_config),
+    )
+    binding = retained.model_copy(
+        update={
+            "index": plan.index,
+            "projection": projection,
+            "canonical_base_sha256": plan.canonical_base_sha256,
+            "representation_text": plan.row.text,
+            "representation_metadata": plan.row.metadata,
+            "semantic_position": plan.row.position,
+            "context": plan.context,
+            "reference_date": plan.reference_date,
+            "effective_start": plan.effective_start,
+            "effective_end": plan.effective_end,
+        }
+    )
+    with source_session.begin_nested() as savepoint:
+        source_session.execute(
+            delete(RegulatoryTemporalProjection).where(
+                RegulatoryTemporalProjection.id == retained.id
+            )
+        )
+        activate_temporal_projection(
+            source_session, user_file_id=live_review.file.id, binding=binding
+        )
+        savepoint.rollback()
+    assert (
+        capture_canonical_scope(source_session, live_review.file.id)
+        == live_review.before
+    )
