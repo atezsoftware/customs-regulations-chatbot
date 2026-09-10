@@ -46,6 +46,29 @@ export class ChatPage {
     await this.inputBar.textbox.waitFor({ state: "visible", timeout: 15000 });
   }
 
+  async openSavedCitation(
+    chatId: string,
+    answer: string,
+    sourceName: string,
+    screenshotPath: string
+  ): Promise<void> {
+    await this.page.goto(`/app?chatId=${encodeURIComponent(chatId)}`);
+    await expect(this.aiMessage()).toContainText(answer, { timeout: 30000 });
+    await this.aiMessage()
+      .getByRole("button", { name: "Sources", exact: true })
+      .click();
+    await expect(
+      this.page.getByText("Cited Sources", { exact: true })
+    ).toBeVisible();
+    const content = this.page.waitForResponse((response) =>
+      response.url().includes("/api/document/chunk-info?")
+    );
+    await this.page.getByText(sourceName, { exact: true }).last().click();
+    expect((await content).ok()).toBe(true);
+    await expect(this.page.getByRole("dialog")).toContainText(answer);
+    await this.page.screenshot({ path: screenshotPath, fullPage: true });
+  }
+
   async scrollTo(position: "top" | "bottom"): Promise<void> {
     await this.scrollContainer.evaluate(async (el, pos) => {
       el.scrollTo({ top: pos === "top" ? 0 : el.scrollHeight });

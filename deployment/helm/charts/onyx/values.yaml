@@ -1498,6 +1498,8 @@ configMap:
   REGULATORY_ANNEX_UPDATES_ENABLED: "false"
   # Empty defaults to POSTGRES_DB; the queue also includes the database identity.
   REGULATORY_ANNEX_ENVIRONMENT: ""
+  # Supplied per-process by the fixed DEV acceptance runner, not by Helm values.
+  # ANNEX_ACCEPTANCE_RELEASE_SHA: ""
   # MAX_AMENDMENT_SOURCE_BYTES: "26214400"
   # MAX_AMENDMENT_SOURCE_TEXT_CHARS: "200000"
   # MIN_AMENDMENT_PDF_TEXT_CHARS: "40"

@@ -5,6 +5,25 @@ import pytest
 from scripts import regulatory_annex_dev_cutover as cutover
 
 
+def test_fixed_acceptance_passes_validated_release_ownership_metadata() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    driver.pods.return_value = [
+        {
+            "metadata": {"name": "background"},
+            "spec": {
+                "containers": [
+                    {"name": "worker", "image": cutover.REPOSITORY + ":" + driver.sha}
+                ]
+            },
+        }
+    ]
+    cutover.acceptance(driver, "preflight")
+    command = driver.command.call_args.args[0]
+    assert "ANNEX_ACCEPTANCE_RELEASE_SHA=" + driver.sha in command
+    assert command[-1] == "preflight"
+
+
 def test_cutover_orders_barrier_before_deployment_and_release() -> None:
     driver = Mock(spec=cutover.Driver)
     driver.continue_protected_release.return_value = False
@@ -450,3 +469,84 @@ def test_unknown_scope_refuses_without_task_inventory() -> None:
         validate_scope_evidence(client, {}, ["chunks_dev_exact"])
     client.tasks.list.assert_not_called()
     client.cluster.pending_tasks.assert_not_called()
+
+
+def test_failed_acceptance_retains_only_bounded_probe_evidence(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+    import subprocess
+
+    driver = cutover.Driver("a" * 40)
+    report = {
+        "phase": "preflight",
+        "status": "failed",
+        "release_sha_metadata": driver.sha,
+        "calibration": {
+            "status": "failed",
+            "cases": [
+                {
+                    "format": "docx",
+                    "supported": False,
+                    "rationale": "Fixture mismatch",
+                    "api_key": "secret",
+                }
+            ],
+            "attempt_count": 1,
+        },
+        "raw_prompt": "private prompt",
+    }
+    result = subprocess.CompletedProcess(
+        ["kubectl"],
+        1,
+        stdout="provider noise\n" + json.dumps(report),
+        stderr="secret stderr",
+    )
+    with patch.object(cutover.subprocess, "run", return_value=result):
+        with pytest.raises(cutover.CutoverRefusal):
+            driver.command(["kubectl"], acceptance_phase="preflight")
+    output = capsys.readouterr().out
+    assert '"supported": false' in output
+    assert "Fixture mismatch" in output
+    assert "secret" not in output and "private prompt" not in output
+    assert "provider noise" not in output
+
+
+def test_acceptance_refuses_unbound_output(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(
+        cutover.CutoverRefusal, match="fixed_acceptance_report_required"
+    ):
+        cutover.emit_acceptance_report(
+            '{"phase":"preflight","status":"passed"}', "preflight", "a" * 40
+        )
+    assert not capsys.readouterr().out
+
+
+def test_acceptance_retains_maximum_escaped_unicode_calibration(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    rationale = "😀" * 4000
+    report = {
+        "phase": "preflight",
+        "status": "passed",
+        "release_sha_metadata": "a" * 40,
+        "calibration": {
+            "status": "passed",
+            "cases": [
+                {"rationale": rationale, "supported": value}
+                for value in [True, False, True, False]
+            ],
+            "attempt_count": 4,
+            "attempt_count_complete": True,
+        },
+    }
+    serialized = json.dumps(report)
+    assert len(serialized) > 100_000
+    cutover.emit_acceptance_report(serialized, "preflight", "a" * 40)
+    emitted = json.loads(capsys.readouterr().out)
+    assert [case["rationale"] for case in emitted["calibration"]["cases"]] == [
+        rationale
+    ] * 4
+    assert emitted["calibration"]["attempt_count_complete"] is True

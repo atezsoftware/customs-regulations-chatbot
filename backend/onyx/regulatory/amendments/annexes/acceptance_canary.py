@@ -1,0 +1,477 @@
+"""Bounded fictional end-to-end release proof through the existing frontend."""
+
+import hashlib
+import json
+import signal
+import time
+from typing import Any
+from uuid import UUID
+
+import httpx
+
+from onyx.db.regulatory_annex_acceptance import (
+    CanaryRun,
+    bootstrap_canary_file,
+    canary_file_state,
+    canary_index_names,
+    cleanup_empty_canary_scope,
+    issue_canary_token,
+    reserve_canary,
+    revoke_canary_token,
+    save_canary,
+)
+from onyx.regulatory.amendments.annexes.dev_acceptance import load_fixtures
+
+DEV_FRONTEND = "https://dev-customs-regulations.singlewindow.io"
+DEV_ADMIN = "kubilay.payci@atez.com"
+NOTICE = """Temsili Oran Yonetmeligi
+MADDE 1 - Yonetmeligin EK-1 Oran Tablosu, devam sayfasi ve dipnotuyla birlikte,
+ekli kaynakta yer alan iki sayfalik yeni tablo ile degistirilmistir.
+MADDE 2 - Bu temsili degisiklik 10/09/2026 tarihinde yururluge girer.
+Yalniz yazilim testi icindir; hukuki bir kaynak degildir."""
+
+
+def bootstrap_original(run: CanaryRun) -> None:
+    from onyx.configs.constants import DocumentSource
+    from onyx.connectors.models import Document, TextSection
+    from onyx.regulatory.amendments.annexes.extraction import extract_annex_structure
+    from onyx.regulatory.writer_publication import chunk_owned_file, republish_user_file
+    from shared_configs.contextvars import get_current_tenant_id
+
+    content = load_fixtures()["old.pdf"]
+    bootstrap_canary_file(run, content)
+    parsed = extract_annex_structure(content, "application/pdf")
+    if parsed.page_count != 4 or parsed.issues != ["vision_model_unavailable"]:
+        raise ValueError("fictional_native_baseline_incomplete")
+    native = "\n".join(item.text for item in parsed.elements if item.text)
+    document = Document(
+        id=str(run.file_id),
+        source=DocumentSource.FILE,
+        semantic_identifier="Temsili Oran Yonetmeligi",
+        sections=[TextSection(text=native, link="")],
+        metadata={},
+    )
+    tenant = get_current_tenant_id()
+    chunk_owned_file(run.file_id, tenant, [document])
+    if republish_user_file(run.file_id, tenant, include_chunked=True) <= 0:
+        raise ValueError("fictional_baseline_publication_empty")
+    deadline = time.monotonic() + 30
+    while not (snapshot := index_evidence(run)):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("fictional_baseline_search_visibility_deadline")
+        time.sleep(1)
+    run.evidence["physical_indices"] = json.dumps(
+        {item["index"]: item["index_uuid"] for item in snapshot}, sort_keys=True
+    )
+    run.phase = "baseline_published"
+    save_canary(run)
+
+
+def request_json(client: httpx.Client, method: str, path: str, **kwargs: Any) -> Any:
+    response = client.request(method, "/api" + path, **kwargs)
+    response.raise_for_status()
+    return response.json() if response.content else None
+
+
+def wait_package(
+    client: httpx.Client, run: CanaryRun, deadline: float
+) -> dict[str, Any]:
+    while time.monotonic() < deadline:
+        result = request_json(
+            client,
+            "GET",
+            f"/regulatory/amendments/source-packages/{run.package_id}",
+            params={"document_set_id": run.document_set_id},
+        )
+        if result["status"] == "ready":
+            return result
+        if result["status"] in {"failed", "blocked"}:
+            raise ValueError("fictional_source_package_failed")
+        time.sleep(1)
+    raise TimeoutError("fictional_source_package_deadline")
+
+
+def wait_review(
+    client: httpx.Client, run: CanaryRun, deadline: float, *, approved: bool = False
+) -> dict[str, Any]:
+    while time.monotonic() < deadline:
+        reviews = request_json(
+            client, "GET", f"/regulatory/amendments/batches/{run.batch_id}/annex-groups"
+        )
+        if reviews:
+            if len(reviews) != 1:
+                raise ValueError("fictional_canary_requires_one_group")
+            review = reviews[0]
+            if review["status"] == ("approved" if approved else "pending"):
+                return review
+            if review["status"] in {"blocked", "failed", "rejected"}:
+                raise ValueError("fictional_annex_review_not_ready")
+        batches = request_json(
+            client,
+            "GET",
+            "/regulatory/amendments/batches",
+            params={"document_set_id": run.document_set_id},
+        )
+        batch = next((item for item in batches if item["id"] == run.batch_id), None)
+        if batch is None or batch["status"] == "failed":
+            raise ValueError("fictional_amendment_batch_failed")
+        time.sleep(1)
+    raise TimeoutError("fictional_annex_review_deadline")
+
+
+def prepare_review(
+    client: httpx.Client,
+    run: CanaryRun,
+    deadline: float,
+    *,
+    source: bytes | None = None,
+) -> dict[str, Any]:
+    content = source if source is not None else load_fixtures()["new.pdf"]
+    if run.package_id is None:
+        result = request_json(
+            client,
+            "POST",
+            "/regulatory/amendments/source-packages/upload",
+            data={
+                "document_set_id": str(run.document_set_id),
+                "idempotency_key": "annex-canary-" + str(run.run_id),
+            },
+            files={"file": ("fictional-update.pdf", content, "application/pdf")},
+        )
+        run.package_id = UUID(result["id"])
+        save_canary(run)
+    package = wait_package(client, run, deadline)
+    for asset in package["assets"]:
+        response = client.get(
+            f"/api/regulatory/amendments/source-packages/{run.package_id}/assets/{asset['id']}",
+            params={"document_set_id": run.document_set_id},
+        )
+        response.raise_for_status()
+        if hashlib.sha256(response.content).hexdigest() != asset["sha256"]:
+            raise ValueError("fictional_immutable_source_hash_mismatch")
+    run.evidence["source_assets"] = len(package["assets"])
+    if run.batch_id is None:
+        result = request_json(
+            client,
+            "POST",
+            "/regulatory/amendments/analyze",
+            json={
+                "document_set_id": run.document_set_id,
+                "source_package_id": str(run.package_id),
+                "raw_text": NOTICE,
+            },
+        )
+        run.batch_id = int(result["id"])
+        save_canary(run)
+    review = wait_review(client, run, deadline)
+    run.review_id = UUID(review["id"])
+    run.phase = "review_ready"
+    run.evidence["review_sha256"] = review["review_sha256"]
+    save_canary(run)
+    return review
+
+
+def approve_review(
+    client: httpx.Client, run: CanaryRun, review: dict[str, Any], deadline: float
+) -> dict[str, Any]:
+    draft = review["review_payload"]
+    comparison = draft["comparison"]
+    changes = comparison["changes"]
+    if (
+        len(changes) != 1
+        or [item["text"] for item in changes[0]["old"]] != ["5%"]
+        or [item["text"] for item in changes[0]["new"]] != ["7%"]
+    ):
+        raise ValueError("fictional_expected_single_rate_change_required")
+    run.phase = "approval_requested"
+    save_canary(run)
+    request_json(
+        client,
+        "POST",
+        f"/regulatory/amendments/batches/{run.batch_id}/annex-groups/{run.review_id}/approve",
+        json={"expected_review_sha256": review["review_sha256"]},
+    )
+    approved = wait_review(client, run, deadline, approved=True)
+    run.phase = "approved"
+    run.evidence["publication_generation"] = approved["publication_generation"]
+    for name, count in draft["publication"]["counts"].items():
+        run.evidence[name] = int(count)
+    save_canary(run)
+    return approved
+
+
+def cleanup_canary(run: CanaryRun) -> None:
+    from onyx.db.regulatory_writer_publication import writer_file_exists
+    from onyx.regulatory.writer_publication import (
+        delete_owned_file,
+        request_owned_file_deletion,
+    )
+    from shared_configs.contextvars import get_current_tenant_id
+
+    tenant = get_current_tenant_id()
+    for identifier in [run.file_id, *run.markdown_file_ids]:
+        if writer_file_exists(identifier, tenant):
+            request_owned_file_deletion(identifier, tenant)
+            delete_owned_file(identifier, tenant)
+    if canary_file_state(run)["file_exists"]:
+        raise ValueError("fictional_cleanup_file_still_present")
+    deadline = time.monotonic() + 30
+    snapshot = index_evidence(run)
+    while any(not item["tombstone"] for item in snapshot):
+        if time.monotonic() >= deadline:
+            raise ValueError("fictional_cleanup_live_search_projection_remains")
+        time.sleep(1)
+        snapshot = index_evidence(run)
+    run.evidence["retained_tombstones"] = len(snapshot)
+    run.evidence["cleanup_live_projections"] = 0
+    cleanup_empty_canary_scope(run)
+    run.phase = "cleaned"
+    save_canary(run)
+
+
+def index_evidence(run: CanaryRun) -> list[dict[str, Any]]:
+    from onyx.document_index.elasticsearch.client import ElasticsearchClient
+
+    saved = run.evidence.get("physical_indices")
+    expected: dict[str, str] = json.loads(saved) if isinstance(saved, str) else {}
+    names = list(expected) if expected else canary_index_names()
+    output: list[dict[str, Any]] = []
+    with ElasticsearchClient() as transport:
+        client = transport.publication_client()
+        for name in names:
+            metadata = client.indices.get(index=name)
+            if set(metadata) != {name}:
+                raise ValueError("canary_requires_physical_index")
+            if (
+                expected
+                and metadata[name]["settings"]["index"]["uuid"] != expected[name]
+            ):
+                raise ValueError("canary_physical_index_changed")
+            result = client.search(
+                index=name,
+                size=1000,
+                track_total_hits=True,
+                query={
+                    "terms": {
+                        "document_id": [
+                            str(run.file_id),
+                            *[str(value) for value in run.markdown_file_ids],
+                        ]
+                    }
+                },
+            )
+            if result["hits"]["total"]["value"] > 1000:
+                raise ValueError("canary_projection_inventory_exceeds_bound")
+            for hit in result["hits"]["hits"]:
+                source = hit["_source"]
+                vector = source.get("content_vector", [])
+                output.append(
+                    {
+                        "index": name,
+                        "index_uuid": metadata[name]["settings"]["index"]["uuid"],
+                        "id": hit["_id"],
+                        "ordinal": source["chunk_index"],
+                        "tombstone": bool(source.get("publication_tombstone")),
+                        "hidden": bool(source.get("hidden")),
+                        "vector_dimension": len(vector),
+                        "vector_sha256": hashlib.sha256(
+                            json.dumps(vector).encode()
+                        ).hexdigest(),
+                        "source_sha256": hashlib.sha256(
+                            json.dumps(source, sort_keys=True).encode()
+                        ).hexdigest(),
+                    }
+                )
+    return output
+
+
+def chat_canary(client: httpx.Client, run: CanaryRun, *, as_of: str, rate: str) -> None:
+    tools = request_json(client, "GET", "/tool")
+    search = next(
+        (tool for tool in tools if tool.get("display_name") == "Internal Search"), None
+    )
+    if search is None:
+        raise ValueError("canary_search_tool_missing")
+    session = request_json(
+        client, "POST", "/chat/create-chat-session", json={"description": run.name}
+    )
+    chat_id = UUID(session["chat_session_id"])
+    run.chat_ids.append(chat_id)
+    save_canary(run)
+    result = request_json(
+        client,
+        "POST",
+        "/chat/send-chat-message",
+        json={
+            "chat_session_id": str(chat_id),
+            "message": f"{as_of} tarihinde Temsili Oran Yonetmeligi EK-1 tablosunda1001.10 kodunun orani nedir? Kaynagi goster.",
+            "internal_search_filters": {
+                "document_set": [run.name],
+                "as_of_date": as_of,
+            },
+            "forced_tool_id": search["id"],
+            "stream": False,
+        },
+    )
+    if (
+        result.get("error_msg")
+        or rate not in result["answer"]
+        or not result["top_documents"]
+        or not result["citation_info"]
+    ):
+        raise ValueError("canary_dated_chat_evidence_failed")
+    if not any(
+        str(run.file_id) in str(document.get("document_id", ""))
+        for document in result["top_documents"]
+    ):
+        raise ValueError("canary_chat_did_not_retrieve_owned_file")
+    run.evidence["chat_" + as_of] = True
+    save_canary(run)
+
+
+def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> None:
+    marker = "ANNEXCANARY" + run.run_id.hex
+    result = request_json(
+        client,
+        "POST",
+        f"/admin/document-set/{run.document_set_id}/file/upload",
+        files={
+            "files": (
+                marker + ".md",
+                "# Fictional canary\nVerification marker: " + marker,
+                "text/markdown",
+            )
+        },
+    )
+    if result["rejected_files"] or len(result["user_files"]) != 1:
+        raise ValueError("ordinary_markdown_upload_failed")
+    file = result["user_files"][0]
+    identifier = UUID(file["id"])
+    run.markdown_file_ids.append(identifier)
+    save_canary(run)
+    while time.monotonic() < deadline:
+        files = request_json(
+            client, "GET", f"/admin/document-set/{run.document_set_id}/files"
+        )
+        current = next(item for item in files if item["id"] == str(identifier))
+        if current["status"] == "CHUNKED":
+            request_json(
+                client,
+                "POST",
+                f"/admin/document-set/{run.document_set_id}/files/{identifier}/index",
+            )
+        elif current["status"] == "COMPLETED":
+            break
+        elif current["status"] in {"FAILED", "CANCELED"}:
+            raise ValueError("ordinary_markdown_index_failed")
+        time.sleep(1)
+    else:
+        raise TimeoutError("ordinary_markdown_index_deadline")
+    session = request_json(
+        client, "POST", "/chat/create-chat-session", json={"description": run.name}
+    )
+    chat_id = UUID(session["chat_session_id"])
+    run.chat_ids.append(chat_id)
+    save_canary(run)
+    response = request_json(
+        client,
+        "POST",
+        "/chat/send-chat-message",
+        json={
+            "chat_session_id": str(chat_id),
+            "message": "Return the verification marker from the attached fictional file.",
+            "file_descriptors": [
+                {
+                    "id": file["file_id"],
+                    "type": file["chat_file_type"],
+                    "name": file["name"],
+                    "user_file_id": file["id"],
+                }
+            ],
+            "stream": False,
+        },
+    )
+    if response.get("error_msg") or marker not in response["answer"]:
+        raise ValueError("ordinary_markdown_attachment_chat_failed")
+    run.evidence["ordinary_markdown_upload_index_attachment_chat"] = True
+    save_canary(run)
+
+
+def run_canary(release_sha: str) -> dict[str, Any]:
+    from onyx.regulatory.amendments.annexes import config
+
+    if not config.REGULATORY_ANNEX_UPDATES_ENABLED:
+        raise ValueError("canary_requires_explicit_creation_activation")
+    run = reserve_canary(release_sha, admin_email=DEV_ADMIN)
+    if run.phase == "cleaned" and run.evidence.get("acceptance_passed") is True:
+        return {"canary": run.model_dump(mode="json"), "reused_completed_run": True}
+    if run.phase != "reserved":
+        raise ValueError("unfinished_canary_requires_owned_recovery")
+
+    def deadline_expired(_signum: int, _frame: object) -> None:
+        raise TimeoutError("fixed_canary_wall_time_limit")
+
+    previous_handler = signal.signal(signal.SIGALRM, deadline_expired)
+    signal.alarm(720)
+    token: str | None = None
+    failed = False
+    try:
+        token = issue_canary_token(run)
+        with httpx.Client(
+            base_url=DEV_FRONTEND,
+            headers={"Authorization": "Bearer " + token},
+            timeout=90,
+            follow_redirects=False,
+        ) as client:
+            request_json(client, "GET", "/regulatory/amendments/capabilities")
+            bootstrap_original(run)
+            deadline = time.monotonic() + 600
+            review = prepare_review(client, run, deadline)
+            approve_review(client, run, review, deadline)
+            chat_canary(client, run, as_of="2026-09-09", rate="5%")
+            chat_canary(client, run, as_of="2026-09-10", rate="7%")
+            markdown_canary(client, run, deadline)
+    except Exception:
+        failed = True
+        run.evidence["failure"] = "canary_phase_failed"
+    finally:
+        signal.alarm(120)
+        try:
+            cleanup_canary(run)
+        except Exception:
+            failed = True
+            run.evidence["cleanup_failure"] = "canary_cleanup_failed"
+        finally:
+            try:
+                if token is not None:
+                    with httpx.Client(
+                        base_url=DEV_FRONTEND,
+                        headers={"Authorization": "Bearer " + token},
+                        timeout=30,
+                        follow_redirects=False,
+                    ) as client:
+                        for chat_id in run.chat_ids:
+                            request_json(
+                                client, "DELETE", f"/chat/delete-chat-session/{chat_id}"
+                            )
+            except Exception:
+                failed = True
+                run.evidence["chat_cleanup_failure"] = "canary_chat_cleanup_failed"
+            finally:
+                try:
+                    revoke_canary_token(run)
+                except Exception:
+                    failed = True
+                    run.evidence["token_cleanup_failure"] = (
+                        "canary_token_cleanup_failed"
+                    )
+                finally:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, previous_handler)
+    run.evidence["acceptance_passed"] = not failed
+    save_canary(run)
+    return {
+        "status": "failed" if failed else "passed",
+        "canary": run.model_dump(mode="json"),
+        "retained": "private document-set, immutable source/review history, publication ownership and tombstones, expired PAT audit",
+    }

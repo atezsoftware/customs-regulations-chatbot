@@ -15,6 +15,8 @@ REPOSITORY = "255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulation
 APPS = ("api", "background")
 STATE = "regulatory-annex-dev-cutover"
 PROBE = "regulatory-annex-dev-cutover-probe"
+# Includes the bounded calibration record plus native/runtime evidence.
+MAX_ACCEPTANCE_REPORT_BYTES = 400_000
 
 
 class CutoverRefusal(RuntimeError):
@@ -58,6 +60,145 @@ def release(driver: "Driver") -> None:
     driver.delete_probe()
 
 
+def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
+    """Retain only the fixed probe evidence, including a failed calibration verdict."""
+    keys = {
+        "phase",
+        "status",
+        "release_sha_metadata",
+        "configuration",
+        "native",
+        "calibration",
+        "canary",
+        "retained",
+        "reused_completed_run",
+        "database",
+        "indices",
+        "contextual",
+        "index_name",
+        "contextual_enabled",
+        "default_provider",
+        "default_model",
+        "vision_provider",
+        "vision_model",
+        "native_machine",
+        "pdf_pages",
+        "module_sha256",
+        "fixture_sha256",
+        "render_sha256",
+        "dependencies",
+        "source_fetches",
+        "parser_limits_relaxed",
+        "planned_cases",
+        "cases",
+        "format",
+        "proposed_value",
+        "expected_supported",
+        "original_value",
+        "raw_transcription",
+        "supported",
+        "rationale",
+        "input_sha256",
+        "failure",
+        "attempt_count",
+        "http_request_count",
+        "attempt_count_complete",
+        "model_snapshot",
+        "model_provider",
+        "model_name",
+        "database_read_only",
+        "fixture_verified",
+        "rationale_truncated",
+        "release_sha",
+        "run_id",
+        "user_id",
+        "file_id",
+        "document_set_id",
+        "pat_id",
+        "package_id",
+        "batch_id",
+        "review_id",
+        "chat_ids",
+        "markdown_file_ids",
+        "created_at",
+        "evidence",
+        "physical_indices",
+        "source_assets",
+        "review_sha256",
+        "approval_count",
+        "ordinary_markdown_upload_index_attachment_chat",
+        "acceptance_passed",
+        "retained_tombstones",
+        "cleanup_live_projections",
+        "retained_source_scope",
+        "cleanup_failure",
+        "chat_cleanup_failure",
+        "token_cleanup_failure",
+        "chat_2026-09-09",
+        "chat_2026-09-10",
+    }
+
+    def sanitize(value: Any, parent: str = "", depth: int = 0) -> Any:
+        if depth > 8:
+            raise CutoverRefusal("acceptance_report_depth_exceeded")
+        if isinstance(value, dict):
+            if len(value) > 100:
+                raise CutoverRefusal("acceptance_report_mapping_exceeded")
+            if parent in {"module_sha256", "fixture_sha256"}:
+                return {
+                    key: item
+                    for key, item in value.items()
+                    if re.fullmatch(r"[a-zA-Z0-9_.-]{1,160}", key)
+                    and isinstance(item, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", item)
+                }
+            if parent == "dependencies":
+                return {
+                    key: item
+                    for key, item in value.items()
+                    if key in {"pypdfium2", "pillow", "openpyxl", "python-docx"}
+                    and isinstance(item, str)
+                    and re.fullmatch(r"[a-zA-Z0-9.+-]{1,40}", item)
+                }
+            return {
+                key: sanitize(item, key, depth + 1)
+                for key, item in value.items()
+                if key in keys
+            }
+        if isinstance(value, list):
+            if len(value) > 100:
+                raise CutoverRefusal("acceptance_report_list_exceeded")
+            return [sanitize(item, parent, depth + 1) for item in value]
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str) and len(value) <= 4000:
+            return value
+        raise CutoverRefusal("acceptance_report_value_refused")
+
+    reports = []
+    for line in stdout.splitlines():
+        if (
+            not line.startswith("{")
+            or len(line.encode("utf-8")) > MAX_ACCEPTANCE_REPORT_BYTES
+        ):
+            continue
+        try:
+            report = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(report, dict)
+            and report.get("phase") == phase
+            and report.get("release_sha_metadata") == sha
+        ):
+            reports.append(report)
+    if len(reports) != 1 or reports[0].get("status") not in {"passed", "failed"}:
+        raise CutoverRefusal("fixed_acceptance_report_required")
+    print(json.dumps(sanitize(reports[0]), sort_keys=True), flush=True)
+    if reports[0]["status"] != "passed":
+        raise CutoverRefusal("fixed_acceptance_probe_failed")
+
+
 class Driver:
     def __init__(self, sha: str) -> None:
         self.sha = sha
@@ -67,11 +208,20 @@ class Driver:
         self.writer_nodes: set[str] = set()
 
     def command(
-        self, args: list[str], stdin: str | None = None, timeout: int = 900
+        self,
+        args: list[str],
+        stdin: str | None = None,
+        timeout: int = 900,
+        *,
+        acceptance_phase: str | None = None,
     ) -> str:
         result = subprocess.run(
             args, input=stdin, text=True, capture_output=True, timeout=timeout
         )
+        if acceptance_phase is not None:
+            if acceptance_phase not in {"preflight", "canary"}:
+                raise CutoverRefusal("fixed_acceptance_phase_required")
+            emit_acceptance_report(result.stdout, acceptance_phase, self.sha)
         if result.returncode:
             # kubectl/provider errors can contain credentials or source text.
             raise CutoverRefusal(f"command_failed:{args[0]}")
@@ -525,6 +675,8 @@ def acceptance(driver: Driver, phase: str) -> None:
     # Its absence fails the command; an operator cannot substitute arbitrary code.
     if phase not in {"preflight", "canary"}:
         raise ValueError("fixed_acceptance_phase_required")
+    if not re.fullmatch(r"[0-9a-f]{40}", driver.sha):
+        raise ValueError("exact_acceptance_release_sha_required")
     pod = driver.pods("background")[0]
     container = next(
         item
@@ -541,13 +693,16 @@ def acceptance(driver: Driver, phase: str) -> None:
             "-c",
             container["name"],
             "--",
+            "env",
+            "ANNEX_ACCEPTANCE_RELEASE_SHA=" + driver.sha,
             "sh",
             "-eu",
             "-c",
             '. /vault/secrets/config; exec python -m onyx.regulatory.amendments.annexes.dev_acceptance "$@"',
             "acceptance",
             phase,
-        ]
+        ],
+        acceptance_phase=phase,
     )
 
 
