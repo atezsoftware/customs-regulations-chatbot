@@ -38,6 +38,45 @@ _STANDALONE_LABEL = re.compile(
 )
 
 
+_SOURCE_ANNEX_WORD = re.compile(r"\b(?:EK|annex|appendix)\b", re.IGNORECASE)
+_SOURCE_ANNEX_REFERENCE = re.compile(
+    r"(?<![\w/\\.-])" + _STANDALONE_LABEL.pattern + r"(?![\w/\\.–—…-])",
+    re.IGNORECASE,
+)
+_SOURCE_SHORTHAND = re.compile(
+    r"^\s*(?:(?:ve|and|or|ile)\b|[,;&+/–—-])\s*(?:[0-9]|[ivxlcdm]+\b|[a-z]\b)",
+    re.IGNORECASE,
+)
+
+
+def _source_occurrence_label(value: str) -> str | None:
+    """Read one complete reference from acquired link text, never a file location."""
+    text = re.sub(
+        r"(?:[a-z][a-z0-9+.-]*://|www\.)[^\s]+", "", value, flags=re.IGNORECASE
+    ).strip()
+    if re.search(
+        r"\.(?:pdf|png|jpe?g|webp|tiff?|html?|docx?|xlsx?)(?:[?#].*)?$",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
+    words = list(_SOURCE_ANNEX_WORD.finditer(text))
+    if not words:
+        return None
+    references = list(_SOURCE_ANNEX_REFERENCE.finditer(text))
+    if len(words) != 1 or len(references) != 1:
+        raise ValueError("source occurrence annex label missing or ambiguous")
+    reference = references[0]
+    remainder = text[reference.end() :].strip()
+    if (
+        remainder.startswith(("/", ".", "…"))
+        or re.fullmatch(r"[-–—]", remainder)
+        or _SOURCE_SHORTHAND.match(remainder.lstrip("(["))
+    ):
+        raise ValueError("source occurrence annex label shorthand is ambiguous")
+    return normalize_annex_label(reference.group())
+
+
 def _boundary_label(element: ExtractedAnnexElement) -> str | None:
     if element.extraction_method != "native" or element.kind != "text":
         return None
@@ -182,7 +221,9 @@ def select_annex_evidence_view(
             "native_sheet",
         )
     if not starts and extraction.mime_type.startswith("image/"):
-        source_scope = {normalize_annex_label(value) for value in source_labels or []}
+        source_scope = {
+            _source_occurrence_label(value) for value in source_labels or []
+        }
         if set(original.canonical_chunk_ids) != set(
             canonical_chunk_ids
         ) and source_scope != {label}:
@@ -1027,8 +1068,123 @@ def validate_source_occurrence_order(
     ):
         raise ValueError("source occurrence order or complete parent identity mismatch")
     labels = {scope.label for scope in scopes}
-    if any(normalize_annex_label(link.label) not in labels for link in links):
+    if any(_source_occurrence_label(link.label) not in labels for link in links):
         raise ValueError("source occurrence annex label mismatch")
+
+
+def _visual_table_rows(
+    view: AnnexExtraction,
+) -> list[list[ExtractedAnnexElement]] | None:
+    if not view.mime_type.startswith("image/"):
+        return None
+    atomic = [element for element in view.elements if not element.aggregate]
+    if any(
+        element.locator.page is None or element.locator.normalized_box is None
+        for element in atomic
+    ):
+        return None
+    cells = [element for element in atomic if element.kind == "table_cell"]
+    rows: list[list[ExtractedAnnexElement]] = []
+    # Group horizontal cell bands by their vertical centers, not rounded text values.
+    for cell in sorted(
+        cells,
+        key=lambda element: (
+            element.locator.page,
+            cast(tuple[float, float, float, float], element.locator.normalized_box)[1],
+            cast(tuple[float, float, float, float], element.locator.normalized_box)[0],
+        ),
+    ):
+        box = cell.locator.normalized_box
+        assert box is not None
+        previous = rows[-1][0] if rows else None
+        previous_box = previous.locator.normalized_box if previous else None
+        if (
+            previous is not None
+            and previous_box is not None
+            and previous.locator.page == cell.locator.page
+            and previous_box[1] < (box[1] + box[3]) / 2 < previous_box[3]
+        ):
+            rows[-1].append(cell)
+        else:
+            rows.append([cell])
+    if len(rows) < 2 or any(len(row) < 2 for row in rows):
+        return None
+    for row in rows:
+        row.sort(
+            key=lambda element: cast(
+                tuple[float, float, float, float], element.locator.normalized_box
+            )[0]
+        )
+        for left, right in zip(row, row[1:]):
+            left_box, right_box = (
+                left.locator.normalized_box,
+                right.locator.normalized_box,
+            )
+            assert left_box is not None and right_box is not None
+            if left_box[2] > right_box[0]:
+                return None
+    return rows
+
+
+def _source_parts_overlap(left: AnnexExtraction, right: AnnexExtraction) -> bool:
+    def content(element: ExtractedAnnexElement) -> tuple[str, str, str | None]:
+        return element.kind, element.text, element.formula
+
+    atoms = [
+        [
+            element
+            for element in view.elements
+            if not element.aggregate
+            and element.text.strip()
+            and _boundary_label(element) is None
+        ]
+        for view in (left, right)
+    ]
+    shared = {content(element) for element in atoms[0]} & {
+        content(element) for element in atoms[1]
+    }
+    if not shared:
+        return False
+    left_rows, right_rows = _visual_table_rows(left), _visual_table_rows(right)
+    if left_rows is None or right_rows is None:
+        return True
+    signatures = [
+        [tuple(content(element) for element in row) for row in rows]
+        for rows in (left_rows, right_rows)
+    ]
+    if signatures[0] == signatures[1]:
+        return True
+    if any(
+        row == other and (index != 0 or other_index != 0)
+        for index, row in enumerate(signatures[0])
+        for other_index, other in enumerate(signatures[1])
+    ):
+        return True
+    # Identical leading rows with distinct complete bodies are continuation headers.
+    # Other repeated text inside the table body still lacks disjointness proof.
+    for elements, rows in zip(atoms, (left_rows, right_rows)):
+        for element in elements:
+            if content(element) not in shared or element.kind in {
+                "table_cell",
+                "image_region",
+            }:
+                continue
+            box = element.locator.normalized_box
+            assert box is not None
+            table_boxes = [
+                cell.locator.normalized_box
+                for row in rows
+                for cell in row
+                if cell.locator.page == element.locator.page
+            ]
+            bounds = [value for value in table_boxes if value is not None]
+            if (
+                bounds
+                and box[3] > min(value[1] for value in bounds)
+                and box[1] < max(value[3] for value in bounds)
+            ):
+                return True
+    return False
 
 
 def select_new_annex_sources(
@@ -1058,10 +1214,31 @@ def select_new_annex_sources(
         return [(element.kind, element.text, element.formula) for element in atomic]
 
     label = selected[0][1].evidence_view.label if selected[0][1].evidence_view else ""
+    labeled_links = [(link, _source_occurrence_label(link.label)) for link in links]
+    covered_containers: set[str | None] = set()
+    for parent, parent_label in labeled_links:
+        if parent_label != label:
+            continue
+        children = [
+            (link, child_label)
+            for link, child_label in labeled_links
+            if link.parent_asset_hash == parent.target_asset_hash
+        ]
+        if (
+            children
+            and all(link.source_field.startswith("html:") for link, _ in children)
+            and any(link.target_asset_hash in by_hash for link, _ in children)
+            and all(
+                child_label not in {None, label} or link.target_asset_hash in by_hash
+                for link, child_label in children
+            )
+        ):
+            covered_containers.add(parent.target_asset_hash)
     if any(
-        normalize_annex_label(link.label) == label
+        source_label == label
         and link.target_asset_hash not in by_hash
-        for link in links
+        and link.target_asset_hash not in covered_containers
+        for link, source_label in labeled_links
     ):
         raise ValueError("new_annex_evidence_incomplete_linked_parts")
     contained: set[str | None] = set()
@@ -1096,18 +1273,11 @@ def select_new_annex_sources(
         raise ValueError("new_annex_evidence_missing_or_overlapping_source_order")
     occurrences.sort(key=source_occurrence_key)
     ordered = [by_hash[link.target_asset_hash] for link in occurrences]
-    seen: set[tuple[str, str, str | None]] = set()
-    for _, view in ordered:
-        content = {
-            (element.kind, element.text, element.formula)
-            for element in view.elements
-            if not element.aggregate
-            and element.text.strip()
-            and _boundary_label(element) is None
-        }
-        if content & seen:
+    for index, (_, view) in enumerate(ordered):
+        if any(
+            _source_parts_overlap(previous, view) for _, previous in ordered[:index]
+        ):
             raise ValueError("new_annex_evidence_overlapping_parts")
-        seen.update(content)
     combined = combine_annex_evidence_views(
         [view for _, view in ordered],
         canonical_chunk_ids=[],

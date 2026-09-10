@@ -489,3 +489,298 @@ def test_comparison_rejects_benign_prose_as_blocking_issues() -> None:
         AnnexComparisonResponse.model_validate(
             {"issues": ["The complete selected scope was reviewed"]}
         )
+
+
+def _linked_image(number: int) -> tuple[AnnexOriginalEvidence, AnnexExtraction]:
+    digest = str(number) * 64
+    original = AnnexOriginalEvidence(
+        file_id=f"image-{number}", sha256=digest, mime_type="image/png", available=True
+    )
+    return original, AnnexExtraction(
+        source_sha256=digest,
+        mime_type="image/png",
+        page_count=1,
+        elements=[
+            ExtractedAnnexElement(
+                kind="image_region",
+                text=f"Table part {number}",
+                extraction_method="vision",
+                locator=AnnexLocator(page=1, normalized_box=(0, 0, 1, 1)),
+            )
+        ],
+    )
+
+
+def test_descriptive_image_occurrences_preserve_complete_hash_bound_order() -> None:
+    import hashlib
+    import json
+    from contextlib import contextmanager
+    from io import BytesIO
+    from typing import cast
+
+    import pytest
+
+    from onyx.db.models import RegulatorySourceAsset
+    from onyx.db.regulatory_annexes import normalize_annex_label
+    from onyx.file_store.file_store import FileStore
+    from onyx.regulatory.amendments.annexes.evidence import (
+        evidence_view_hash,
+        read_source_graph,
+        select_annex_evidence_view,
+        select_new_annex_sources,
+        validate_source_occurrence_order,
+    )
+    from onyx.regulatory.amendments.annexes.models import SourceLink
+
+    titles = ["EK-1 Oran Tablosu - sayfa 1", "EK-1 Oran Tablosu - devam ve dipnot"]
+    parts = [_linked_image(number) for number in (1, 2)]
+    links = [
+        SourceLink(
+            parent_asset_hash="0" * 64,
+            target_asset_hash=original.sha256,
+            source_field=f"html:img:{index}",
+            label=title,
+            kind="url",
+        )
+        for index, ((original, _), title) in enumerate(zip(parts, titles))
+    ]
+    links = [
+        SourceLink(
+            parent_asset_hash="9" * 64,
+            target_asset_hash="0" * 64,
+            source_page=1,
+            source_field="pdf:annotation:0",
+            kind="url",
+            label="EKLER - EK-1 Oran Tablosu (iki sayfa)\n https://annex-fixture.invalid/updates/annexes.html\n",
+        ),
+        SourceLink(
+            parent_asset_hash="9" * 64,
+            target_asset_hash="0" * 64,
+            source_page=1,
+            source_field="pdf:text:0",
+            kind="url",
+            label="",
+        ),
+        *links,
+    ]
+    assets = [
+        RegulatorySourceAsset(sha256=digest, mime_type=mime)
+        for digest, mime in [
+            ("9" * 64, "application/pdf"),
+            ("0" * 64, "text/html"),
+            ("1" * 64, "image/png"),
+            ("2" * 64, "image/png"),
+        ]
+    ]
+    raw = json.dumps(
+        {
+            "status": "ready",
+            "issues": [],
+            "assets": [
+                {"sha256": asset.sha256, "mime_type": asset.mime_type}
+                for asset in assets
+            ],
+            "links": [link.model_dump(mode="json") for link in links],
+        }
+    ).encode()
+
+    class Store:
+        @contextmanager
+        def read_file(self, _identifier: str):
+            yield BytesIO(raw)
+
+    store = cast(FileStore, Store())
+    verified_links = read_source_graph(
+        store,
+        manifest_file_id="manifest",
+        manifest_sha256=hashlib.sha256(raw).hexdigest(),
+        assets=assets,
+    )
+    selected = [
+        (
+            original,
+            select_annex_evidence_view(
+                extraction=extraction,
+                original=original,
+                annex_label="EK-1",
+                canonical_labels=["EK-1"],
+                canonical_chunk_ids=["canonical"],
+                source_labels=[
+                    link.label
+                    for link in verified_links
+                    if link.target_asset_hash == original.sha256
+                ],
+            ),
+        )
+        for original, extraction in parts
+    ]
+    originals, combined = select_new_annex_sources(selected[::-1], verified_links)
+    assert [original.sha256 for original in originals] == ["1" * 64, "2" * 64]
+    view = combined.evidence_view
+    assert view is not None and view.label == "ek:1"
+    assert view.source_occurrences == verified_links[-2:]
+    assert evidence_view_hash(combined) == view.sha256
+    with pytest.raises(ValueError, match="incomplete"):
+        select_new_annex_sources(selected[:1], verified_links)
+    with pytest.raises(ValueError, match="incomplete"):
+        select_new_annex_sources(
+            selected[:1],
+            [*verified_links[:-1], verified_links[-1].model_copy(update={"label": ""})],
+        )
+    with pytest.raises(ValueError, match="identity mismatch"):
+        validate_source_occurrence_order([view], verified_links[::-1])
+    with pytest.raises(ValueError, match="integrity"):
+        read_source_graph(
+            store, manifest_file_id="manifest", manifest_sha256="f" * 64, assets=assets
+        )
+    for title in titles:
+        with pytest.raises(ValueError, match="ambiguous"):
+            normalize_annex_label(title)
+
+
+def test_image_occurrence_labels_refuse_ambiguous_or_unproven_scope() -> None:
+    import pytest
+
+    from onyx.regulatory.amendments.annexes.evidence import select_annex_evidence_view
+
+    original, extraction = _linked_image(1)
+    refused = [
+        [],
+        ["Oran tablosu"],
+        ["EK-1 ve EK-2"],
+        ["EK-1 ve 2"],
+        ["EK-1, 2"],
+        ["EK-1/"],
+        ["EK-1 /"],
+        ["EK-1 -"],
+        ["EK-1 (ve 2)"],
+        ["EK-1-"],
+        ["EK-1..."],
+        ["EK-1/A/"],
+        ["EK-1A Oran Tablosu"],
+        ["EK-1/A Oran Tablosu"],
+        ["EK-1 Oran Tablosu", "EK-2 Dipnot"],
+        ["EK-1 ve EK-"],
+        ["https://example.test/EK-1"],
+        ["EK-1.png"],
+        ["EK-1 Oran Tablosu.png"],
+        ["EK-1 EK-1"],
+        ["EK-12 Oran Tablosu"],
+    ]
+    for labels in refused:
+        with pytest.raises(ValueError):
+            select_annex_evidence_view(
+                extraction=extraction,
+                original=original,
+                annex_label="EK-1",
+                canonical_labels=["EK-1"],
+                canonical_chunk_ids=["canonical"],
+                source_labels=labels,
+            )
+    extraction.elements[0].text = "EK-2"
+    with pytest.raises(ValueError, match="ambiguous"):
+        select_annex_evidence_view(
+            extraction=extraction,
+            original=original,
+            annex_label="EK-1",
+            canonical_labels=["EK-1"],
+            canonical_chunk_ids=["canonical"],
+            source_labels=["EK-1 Oran Tablosu - sayfa 1"],
+        )
+
+
+def test_image_occurrence_caption_can_corroborate_scope_beside_a_url() -> None:
+    from onyx.regulatory.amendments.annexes.evidence import select_annex_evidence_view
+
+    original, extraction = _linked_image(1)
+    selected = select_annex_evidence_view(
+        extraction=extraction,
+        original=original,
+        annex_label="EK-1",
+        canonical_labels=["EK-1"],
+        canonical_chunk_ids=["canonical"],
+        source_labels=["EK-1 Oran Tablosu - sayfa 1\nhttps://example.test/EK-2.png"],
+    )
+    assert selected.evidence_view is not None and selected.evidence_view.label == "ek:1"
+
+
+def test_visual_continuation_headers_and_values_are_not_body_overlap() -> None:
+    import pytest
+
+    from onyx.regulatory.amendments.annexes.evidence import (
+        select_annex_evidence_view,
+        select_new_annex_sources,
+    )
+    from onyx.regulatory.amendments.annexes.models import SourceLink
+
+    def part(number: int, codes: list[str], *, located: bool = True):
+        original, extraction = _linked_image(number)
+        extraction.elements = [
+            ExtractedAnnexElement(
+                kind="table_cell",
+                text=text,
+                extraction_method="vision",
+                locator=AnnexLocator(
+                    page=1,
+                    normalized_box=(
+                        column * 0.4,
+                        0.2 + row * 0.1,
+                        (column + 1) * 0.4,
+                        0.3 + row * 0.1,
+                    )
+                    if located
+                    else None,
+                ),
+            )
+            for row, cells in enumerate(
+                [["Code", "Rate"], *[[code, "5%"] for code in codes]]
+            )
+            for column, text in enumerate(cells)
+        ]
+        extraction.elements.extend(
+            [
+                ExtractedAnnexElement(
+                    kind="text",
+                    text="Shared footer",
+                    extraction_method="vision",
+                    locator=AnnexLocator(page=1, normalized_box=(0, 0.95, 1, 0.99)),
+                ),
+                ExtractedAnnexElement(
+                    kind="image_region",
+                    text="Horizontal rule",
+                    extraction_method="vision",
+                    locator=AnnexLocator(page=1, normalized_box=(0, 0.35, 1, 0.351)),
+                ),
+            ]
+        )
+        return original, select_annex_evidence_view(
+            extraction=extraction,
+            original=original,
+            annex_label="EK-1",
+            canonical_labels=["EK-1"],
+            canonical_chunk_ids=["canonical"],
+            source_labels=[f"EK-1 Table page {number}"],
+        )
+
+    links = [
+        SourceLink(
+            parent_asset_hash="0" * 64,
+            target_asset_hash=str(number) * 64,
+            source_field=f"html:{number}",
+            label=f"EK-1 Table page {number}",
+            kind="url",
+        )
+        for number in (1, 2)
+    ]
+    first, second = part(1, ["A", "B"]), part(2, ["C", "D"])
+    _, combined = select_new_annex_sources([first, second], links)
+    assert len(combined.elements) == len(first[1].elements) + len(second[1].elements)
+    assert sum(element.text == "5%" for element in combined.elements) == 4
+    assert sum(element.text == "Shared footer" for element in combined.elements) == 2
+    for conflicting in [
+        part(2, ["A", "B"]),
+        part(2, ["B", "D"]),
+        part(2, ["C", "D"], located=False),
+    ]:
+        with pytest.raises(ValueError, match="overlapping"):
+            select_new_annex_sources([first, conflicting], links)
