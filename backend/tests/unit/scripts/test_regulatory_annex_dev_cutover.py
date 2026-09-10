@@ -1,0 +1,452 @@
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import pytest
+from scripts import regulatory_annex_dev_cutover as cutover
+
+
+def test_cutover_orders_barrier_before_deployment_and_release() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.continue_protected_release.return_value = False
+    cutover.prepare(driver)
+    assert [call[0] for call in driver.method_calls] == [
+        "validate_target",
+        "continue_protected_release",
+        "inventory",
+        "create_probe",
+        "inspect_indices",
+        "record_started",
+        "stop_api",
+        "drain_background",
+        "stop_background",
+        "assert_no_writers",
+        "block_indices",
+        "record_blocked",
+        "assert_no_writers",
+        "unblock_indices",
+        "record_installing",
+    ]
+
+
+def test_failed_barrier_never_restarts_old_writers() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.continue_protected_release.return_value = False
+    driver.block_indices.side_effect = RuntimeError("partial acknowledgement")
+    with pytest.raises(RuntimeError):
+        cutover.prepare(driver)
+    assert not driver.record_blocked.called
+    assert not driver.unblock_indices.called
+
+
+def test_release_requires_exact_runtime_before_unblock() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.continue_protected_release.return_value = False
+    driver.verify_runtime.side_effect = RuntimeError("wrong queue")
+    with pytest.raises(RuntimeError):
+        cutover.release(driver)
+    assert not driver.unblock_indices.called
+
+
+@pytest.mark.parametrize(
+    "environment,ref,sha",
+    [
+        ("test", "refs/heads/develop", "a" * 40),
+        ("dev", "refs/heads/test/v1", "a" * 40),
+        ("dev", "refs/heads/develop", "latest"),
+    ],
+)
+def test_scope_refuses_before_commands(environment: str, ref: str, sha: str) -> None:
+    with pytest.raises(ValueError):
+        cutover.validate_scope(environment, ref, sha)
+
+
+def test_fixed_exec_sources_vault_without_input_shell_code() -> None:
+    driver = cutover.Driver("a" * 40)
+    with patch.object(driver, "command", return_value="{}") as command:
+        driver.pod_exec("probe", "backend", "inspect")
+        args = command.call_args.args[0]
+    assert args[-1] == "inspect"
+    assert ". /vault/secrets/config;" in args[-3]
+    assert 'exec python -m onyx.db.regulatory_annex_dev_cutover "$@"' in args[-3]
+
+
+def test_workflow_dev_does_not_enter_legacy_rollback() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(
+        Path(
+            ".github/workflows/customs-regulations-backend-lite-codebuild.yaml"
+        ).read_text()
+    )
+    steps = workflow["jobs"]["build-and-deploy"]["steps"]
+    rollback = next(step for step in steps if step["name"] == "Rollback on Failure")
+    assert "env.env_x != 'dev'" in rollback["if"]
+
+
+def test_real_probe_refuses_aliases_and_lifecycle_without_mutation() -> None:
+    from onyx.db.regulatory_annex_dev_cutover import inspect_indices
+
+    client = Mock()
+    name = "chunks_dev_exact"
+    for metadata in (
+        {"aliases": {"alias": {}}, "settings": {"index.uuid": "u"}},
+        {
+            "aliases": {},
+            "settings": {"index.uuid": "u", "index.lifecycle.name": "rollover"},
+        },
+    ):
+        client.indices.get.return_value = {name: metadata}
+        with pytest.raises(RuntimeError):
+            inspect_indices(client, [name])
+    assert not client.indices.add_block.called
+
+
+def test_shared_scope_never_lists_cluster_tasks() -> None:
+    from onyx.db.regulatory_annex_dev_cutover import drain_server_work
+
+    client = Mock()
+    client.tasks.get.return_value = {"completed": True}
+    drain_server_work(client, {"mode": "shared-scoped", "task_ids": ["devNode:12"]})
+    client.tasks.get.assert_called_once_with(task_id="devNode:12")
+    client.tasks.list.assert_not_called()
+    client.cluster.pending_tasks.assert_not_called()
+
+
+def test_dedicated_scope_waits_for_server_write_and_metadata_work() -> None:
+    from onyx.db.regulatory_annex_dev_cutover import drain_server_work
+
+    client = Mock()
+    client.tasks.list.side_effect = [
+        {"nodes": {"node": {"tasks": {"1": {}}}}},
+        {"nodes": {}},
+    ]
+    client.cluster.pending_tasks.side_effect = [
+        {"tasks": [{"source": "metadata"}]},
+        {"tasks": []},
+    ]
+    with patch("onyx.db.regulatory_annex_dev_cutover.time.sleep") as sleep:
+        drain_server_work(client, {"mode": "dev-dedicated"})
+    assert client.tasks.list.call_count == 2
+    sleep.assert_called_once_with(2)
+
+
+def test_barrier_partial_ack_never_unblocks() -> None:
+    from onyx.db import regulatory_annex_dev_cutover as probe
+
+    name = "chunks_dev_exact"
+    client = Mock()
+    client.info.return_value = {"cluster_uuid": "cluster"}
+    client.indices.get.return_value = {
+        name: {"settings": {"index.uuid": "u"}, "aliases": {}}
+    }
+    client.tasks.list.return_value = {"nodes": {}}
+    client.cluster.pending_tasks.return_value = {"tasks": []}
+    client.indices.add_block.return_value = {
+        "acknowledged": True,
+        "shards_acknowledged": False,
+    }
+    wrapper = Mock()
+    wrapper.__enter__ = Mock(return_value=wrapper)
+    wrapper.__exit__ = Mock(return_value=False)
+    wrapper.publication_client.return_value = client
+    with (
+        patch.object(probe, "configured_indices", return_value=[name]),
+        patch(
+            "onyx.document_index.elasticsearch.client.ElasticsearchClient",
+            return_value=wrapper,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="write_barrier_unacknowledged"):
+            probe.operate(
+                "block",
+                {name: "u"},
+                {
+                    "mode": "dev-dedicated",
+                    "cluster_uuid": "cluster",
+                    "evidence_ref": "review",
+                    "expires_at": 9999999999,
+                    "indices": [name],
+                },
+            )
+    client.indices.put_settings.assert_not_called()
+
+
+def test_old_worker_drain_cancels_before_wait_and_never_purges() -> None:
+    from scripts import regulatory_annex_dev_drain as drain
+
+    events: list[str] = []
+    workers = [name for name in drain.WORKERS if name != "regulatory_annex"]
+    status = "\n".join(
+        [f"celery_worker_{name} RUNNING pid 1, uptime 1:00" for name in workers]
+        + [f"{name} RUNNING pid 2, uptime 1:00" for name in drain.BEATS]
+    )
+    app = Mock()
+
+    def inspection(destination: list[str], timeout: int) -> Mock:
+        assert timeout == 10
+        inspector = Mock()
+        inspector.stats.return_value = {name: {"pid": 1} for name in destination}
+        inspector.active_queues.return_value = {
+            name: [{"name": "old_queue"}] if len(destination) == 1 else []
+            for name in destination
+        }
+        for field in ("active", "reserved", "scheduled"):
+            getattr(inspector, field).return_value = {name: [] for name in destination}
+        events.append("inspect")
+        return inspector
+
+    app.control.inspect.side_effect = inspection
+
+    def cancel(
+        queue: str, destination: list[str], reply: bool, timeout: int
+    ) -> list[dict[str, dict[str, str]]]:
+        assert queue == "old_queue" and reply and timeout == 10
+        events.append("cancel")
+        return [{destination[0]: {"ok": "cancelled"}}]
+
+    app.control.cancel_consumer.side_effect = cancel
+
+    def run(args: list[str]) -> str:
+        events.append(args[-2] + ":" + args[-1])
+        return status if args[-1] == "status" else ""
+
+    with (
+        patch.object(drain, "run", side_effect=run),
+        patch.object(drain, "Celery", return_value=app),
+        patch.object(drain.socket, "gethostname", return_value="pod"),
+    ):
+        drain.drain()
+    last_cancel = max(i for i, event in enumerate(events) if event == "cancel")
+    first_worker_stop = next(
+        i for i, event in enumerate(events) if event.startswith("stop:celery_worker")
+    )
+    assert first_worker_stop > last_cancel
+    app.control.purge.assert_not_called()
+
+
+@pytest.mark.parametrize("env_x,expect_rollback", [("dev", False), ("test-v1", True)])
+def test_actual_workflow_pending_release_branch(
+    env_x: str, expect_rollback: bool, tmp_path: Path
+) -> None:
+    import os
+    import subprocess
+
+    import yaml
+
+    workflow = yaml.safe_load(
+        Path(
+            ".github/workflows/customs-regulations-backend-lite-codebuild.yaml"
+        ).read_text()
+    )
+    deploy = next(
+        step["run"]
+        for step in workflow["jobs"]["build-and-deploy"]["steps"]
+        if step["name"] == "Deploy api and background with Helm"
+    )
+    function = deploy[: deploy.index("verify_benchmark_worker()")]
+    events = tmp_path / "events"
+    harness = (
+        """
+    kubectl() {
+      echo "kubectl $*" >> "$EVENTS"
+      if [[ "$*" == *"get pods"* ]]; then echo '{"items":[]}'; fi
+    }
+    helm() {
+      echo "helm $*" >> "$EVENTS"
+      case "$1" in
+        status) echo '{"info":{"status":"pending-upgrade"}}' ;;
+        history) echo '[{"status":"deployed","revision":1}]' ;;
+        upgrade) return 1 ;;
+      esac
+    }
+    """
+        + function
+        + '\ndeploy_app customs-regulations-api missing true ""\n'
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-c", harness],
+        env={
+            **os.environ,
+            "env_x": env_x,
+            "namespace": "customs-regulations-dev"
+            if env_x == "dev"
+            else "customs-regulations-test",
+            "space_x": env_x,
+            "IMAGE_TAG": "a" * 40,
+            "EVENTS": str(events),
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode != 0
+    commands = events.read_text()
+    assert ("helm rollback" in commands) is expect_rollback
+    assert "--force" not in commands
+
+
+def test_reappearing_autoscaler_refuses_before_unblock() -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(
+            driver, "get", return_value={"items": [{"metadata": {"name": "hpa"}}]}
+        ),
+        patch.object(driver, "pod_exec") as execute,
+    ):
+        with pytest.raises(RuntimeError, match="writer_autoscaler_appeared"):
+            driver.assert_no_writers()
+    execute.assert_not_called()
+
+
+def test_existing_protected_release_does_not_require_another_first_cutover() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.continue_protected_release.return_value = True
+    cutover.prepare(driver)
+    driver.record_installing.assert_called_once()
+    driver.inventory.assert_not_called()
+    driver.block_indices.assert_not_called()
+
+
+def test_actual_prepare_commands_keep_old_pods_gone_before_unblock() -> None:
+    import json
+
+    driver = cutover.Driver("a" * 40)
+    driver.container = "background"
+    driver.indices = {"chunks_dev_exact": "uuid"}
+    driver.scope = {"mode": "dev-dedicated"}
+    events: list[list[str]] = []
+
+    def command(args: list[str], stdin: str | None = None, timeout: int = 900) -> str:
+        assert timeout == 900
+        events.append(args)
+        if "get" in args and "horizontalpodautoscalers" in args:
+            return '{"items":[]}'
+        if "get" in args and "pods" in args:
+            return '{"items":[]}'
+        if "get" in args and "deployment" in args:
+            return '{"spec":{"replicas":0}}'
+        if "apply" in args:
+            assert stdin is not None
+            assert json.loads(stdin)["data"]["phase"] in {"blocked", "installing"}
+        if "exec" in args:
+            assert args[-1] in {"block", "unblock"}
+            assert json.loads(stdin or "{}")["indices"] == driver.indices
+        return "{}"
+
+    with patch.object(driver, "command", side_effect=command):
+        driver.stop_api()
+        driver.stop_background()
+        driver.assert_no_writers()
+        driver.block_indices()
+        driver.record_blocked()
+        driver.assert_no_writers()
+        driver.unblock_indices()
+        driver.record_installing()
+    block = next(i for i, args in enumerate(events) if args[-1] == "block")
+    unblock = next(i for i, args in enumerate(events) if args[-1] == "unblock")
+    assert (
+        len(
+            [
+                args
+                for args in events[:block]
+                if "wait" in args and "--for=delete" in args
+            ]
+        )
+        == 2
+    )
+    assert any("horizontalpodautoscalers" in args for args in events[block:unblock])
+    assert not any("--force" in args or "rollback" in args for args in events)
+
+
+def test_activation_requires_both_workflows_before_provider_probe() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    driver.get.return_value = {"data": {"sha": driver.sha, "phase": "released"}}
+    with (
+        patch.object(
+            cutover, "require_release_runs", side_effect=RuntimeError("web pending")
+        ),
+        patch.object(cutover, "acceptance") as acceptance,
+        patch.object(cutover, "deploy_same_image") as deploy,
+    ):
+        with pytest.raises(RuntimeError):
+            cutover.verify_or_activate(driver, True)
+    acceptance.assert_not_called()
+    deploy.assert_not_called()
+
+
+def test_failed_canary_disables_creation_on_the_same_binary() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    driver.get.return_value = {"data": {"sha": driver.sha, "phase": "released"}}
+    with (
+        patch.object(cutover, "require_release_runs"),
+        patch.object(cutover, "verify_frontend"),
+        patch.object(
+            cutover, "acceptance", side_effect=[None, RuntimeError("canary failed")]
+        ),
+        patch.object(cutover, "deploy_same_image") as deploy,
+    ):
+        with pytest.raises(RuntimeError):
+            cutover.verify_or_activate(driver, True)
+    assert [call.args for call in deploy.call_args_list] == [
+        (driver, True),
+        (driver, False),
+    ]
+
+
+def test_reserved_or_scheduled_work_prevents_worker_stop() -> None:
+    from scripts import regulatory_annex_dev_drain as drain
+
+    destination = "light@pod"
+    app = Mock()
+    inspector = app.control.inspect.return_value
+    inspector.stats.return_value = {destination: {"pid": 1}}
+    inspector.active_queues.side_effect = [
+        {destination: [{"name": "metadata"}]},
+        {destination: []},
+    ]
+    inspector.active.return_value = {destination: []}
+    inspector.reserved.return_value = {destination: []}
+    inspector.scheduled.return_value = {destination: [{"id": "future-delivery"}]}
+    app.control.cancel_consumer.return_value = [{destination: {"ok": "cancelled"}}]
+    with (
+        patch.object(drain, "WORKERS", ("light",)),
+        patch.object(drain, "BEATS", ()),
+        patch.object(
+            drain, "run", return_value="celery_worker_light RUNNING pid 1, uptime 1:00"
+        ) as run,
+        patch.object(drain, "Celery", return_value=app),
+        patch.object(drain.socket, "gethostname", return_value="pod"),
+        patch.object(drain.time, "monotonic", side_effect=[0, 1, 601]),
+        patch.object(drain.time, "sleep"),
+    ):
+        with pytest.raises(RuntimeError, match="drain_timeout_queues_preserved"):
+            drain.drain()
+    assert all("stop" not in call.args[0] for call in run.call_args_list)
+    app.control.purge.assert_not_called()
+
+
+def test_bootstrap_inventory_does_not_stop_writers_or_require_scope() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.container = "backend"
+    driver.pod_exec.return_value = (
+        '{"cluster_uuid":"dev","indices":{"chunks_dev_exact":"uuid"}}'
+    )
+    cutover.inventory_only(driver)
+    driver.inventory.assert_called_once_with(require_scope=False)
+    driver.delete_probe.assert_called_once()
+    driver.stop_api.assert_not_called()
+    driver.block_indices.assert_not_called()
+
+
+def test_unknown_scope_refuses_without_task_inventory() -> None:
+    from onyx.db.regulatory_annex_dev_cutover import validate_scope_evidence
+
+    client = Mock()
+    with pytest.raises(
+        RuntimeError, match="authoritative_DEV_ES_scope_evidence_required"
+    ):
+        validate_scope_evidence(client, {}, ["chunks_dev_exact"])
+    client.tasks.list.assert_not_called()
+    client.cluster.pending_tasks.assert_not_called()

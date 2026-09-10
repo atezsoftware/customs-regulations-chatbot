@@ -21,6 +21,9 @@ on:
         options:
           - deploy
           - redeploy
+          - annex-inventory
+          - annex-verify
+          - annex-activate
       image_tag:
         description: 'Enter the image tag'
         required: false
@@ -35,6 +38,10 @@ on:
       - ".dockerignore"
       - ".github/workflows/customs-regulations-backend-lite-codebuild.yaml"
 
+concurrency:
+  group: backend-lite-${{ github.ref == 'refs/heads/develop' && 'dev' || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
@@ -44,6 +51,7 @@ jobs:
       contents: read
       packages: write
       checks: write
+      actions: read
 
     steps:
       - name: Checkout Source Code
@@ -109,7 +117,7 @@ jobs:
           echo "GIT_COMMIT=$WORKFLOW_GIT_SHA" >> $GITHUB_ENV
           echo "AWS_REGION=eu-central-1" >> $GITHUB_ENV
           echo "AWS_ECR=255114580789.dkr.ecr.eu-central-1.amazonaws.com" >> $GITHUB_ENV
-          if [[ "$DISPATCH_ACTION" == "redeploy" ]]; then
+          if [[ "$DISPATCH_ACTION" == "redeploy" || "$DISPATCH_ACTION" == annex-* ]]; then
             echo "IMAGE_TAG=$DISPATCH_IMAGE_TAG" >> $GITHUB_ENV
           else
             echo "IMAGE_TAG=$WORKFLOW_GIT_SHA" >> $GITHUB_ENV
@@ -127,12 +135,12 @@ jobs:
           echo "Using image tag for redeploy: $REDEPLOY_IMAGE_TAG"
 
       - name: AWS ECR login
-        if: inputs.action != 'redeploy'
+        if: inputs.action != 'redeploy' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
         run: |
           aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ECR }}
 
       - name: Docker Build ve Tag
-        if: inputs.action != 'redeploy'
+        if: inputs.action != 'redeploy' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
         run: |
           docker build backend \
             -t ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} \
@@ -146,7 +154,7 @@ jobs:
           echo "IMAGE_TAG=${{ env.GIT_COMMIT }}" >> $GITHUB_ENV
 
       - name: Docker Push
-        if: inputs.action != 'redeploy'
+        if: inputs.action != 'redeploy' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
         run: |
           docker push ${{ env.DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
           docker push ${{ env.DOCKER_IMAGE_REPO }}:latest
@@ -163,6 +171,7 @@ jobs:
           aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
       - name: Capture pre-deploy worker diagnostics
+        if: env.env_x != 'dev'
         run: |
           set -euo pipefail
 
@@ -226,7 +235,31 @@ jobs:
         with:
           version: v4.2.3
 
+      - name: Prepare DEV cutover tools
+        if: env.env_x == 'dev'
+        run: python3 -m pip install PyYAML==6.0.2
+
+      - name: Inventory, verify or activate reviewed DEV annex release
+        if: inputs.action == 'annex-inventory' || inputs.action == 'annex-verify' || inputs.action == 'annex-activate'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANNEX_ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          python3 backend/scripts/regulatory_annex_dev_cutover.py "$ANNEX_ACTION"
+
+      - name: Drain old DEV writers and acknowledge physical index barrier
+        id: dev_cutover
+        env:
+          ANNEX_DEV_ES_SCOPE_JSON: ${{ vars.ANNEX_DEV_ES_SCOPE_JSON }}
+        if: env.env_x == 'dev' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
+        run: |
+          set -euo pipefail
+          python3 backend/scripts/regulatory_annex_dev_cutover.py prepare
+          python3 backend/scripts/regulatory_annex_dev_cutover.py values
+
       - name: Deploy api and background with Helm
+        if: inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
         id: helm_deploy
         run: |
           deploy_app() {
@@ -243,7 +276,12 @@ jobs:
               memory_override+=(--set "app.mem_limits=$memory_limit")
             fi
 
-            if ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
+            if [[ "$env_x" == "dev" ]]; then
+              if [[ -n "$(kubectl get pods --namespace "$namespace" -l "$selector" -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name')" ]]; then
+                echo "DEV refuses forced terminating-pod deletion" >&2
+                return 1
+              fi
+            elif ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
               echo "Namespace ${namespace} does not exist yet; skipping terminating pod cleanup for ${app_name}."
             else
               terminating_pods=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name')
@@ -258,6 +296,10 @@ jobs:
             if status_json=$(helm status "$release" --namespace "${namespace}" -o json 2>/dev/null); then
               release_status=$(jq -r '.info.status // empty' <<<"$status_json")
               if [[ "$release_status" == pending-* ]]; then
+                if [[ "$env_x" == "dev" ]]; then
+                  echo "DEV pending release requires a reviewed compatible recovery; rollback refused" >&2
+                  return 1
+                fi
                 echo "Release $release is $release_status; recovering the last successful revision."
                 history_json=$(helm history "$release" --namespace "${namespace}" -o json)
                 rollback_revision=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty' <<<"$history_json")
@@ -488,8 +530,19 @@ jobs:
           capture_background_memory_evidence
         continue-on-error: true
 
+      - name: Verify compatible DEV runtime
+        id: dev_readiness
+        if: env.env_x == 'dev' && steps.helm_deploy.outcome == 'success'
+        run: python3 backend/scripts/regulatory_annex_dev_cutover.py release
+
+      - name: Quiesce failed DEV cutover without restoring an old image
+        if: always() && env.env_x == 'dev' && (steps.helm_deploy.outcome == 'failure' || steps.dev_readiness.outcome == 'failure')
+        run: |
+          python3 backend/scripts/regulatory_annex_dev_cutover.py failure
+          exit 1
+
       - name: Check Deployment Status
-        if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'
+        if: env.env_x != 'dev' && (steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure')
         run: |
           for app_name in customs-regulations-api customs-regulations-background; do
             echo "=== Diagnostics for ${app_name} ==="
@@ -505,7 +558,7 @@ jobs:
 
       - name: Rollback on Failure
         id: rollback_step
-        if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'
+        if: env.env_x != 'dev' && (steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure')
         run: |
           for app_name in customs-regulations-api customs-regulations-background; do
             release="${app_name}-${{ env.env_x }}"
