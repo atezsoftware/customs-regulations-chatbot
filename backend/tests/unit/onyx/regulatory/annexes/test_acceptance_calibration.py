@@ -1,0 +1,173 @@
+import json
+from unittest.mock import MagicMock
+
+import pytest
+
+from onyx.regulatory.amendments.annexes import acceptance_calibration as calibration
+
+
+def test_scope_failure_does_not_start_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POSTGRES_DB", "customs-regulations-test")
+    process = MagicMock()
+    monkeypatch.setattr(calibration.subprocess, "Popen", process)
+    report = calibration.run_native_calibration()
+    assert report["status"] == "failed"
+    assert report["failure"] == "dev_scope_required"
+    assert report["attempt_count"] == 0
+    process.assert_not_called()
+
+
+def test_archived_native_fixtures_are_exact() -> None:
+    fixtures = calibration.load_native_fixtures()
+    assert {name: len(content) for name, content in fixtures.items()} == {
+        "docx": 36624,
+        "xlsx": 4837,
+    }
+
+
+@pytest.mark.parametrize("outcome", ["correct", "wrong_positive", "transport_failure"])
+def test_four_actual_reconciliation_paths_keep_verdicts_without_retry(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    import httpx
+
+    from onyx.llm.factory import get_llm
+
+    calls: list[dict[str, object]] = []
+
+    def send(
+        _client: httpx.Client, request: httpx.Request, **_kwargs: object
+    ) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(body)
+        assert body.get("stream", False) is False
+        messages = str(body["messages"])
+        assert "Derived transcription under correction" in messages
+        assert "Original native source" in messages
+        if outcome == "transport_failure":
+            return httpx.Response(
+                500,
+                request=request,
+                json={"error": {"message": "SENSITIVE_PROVIDER_ERROR"}},
+            )
+        supported = len(calls) in (1, 3) and outcome != "wrong_positive"
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "id": "fixture-response",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "openai/fictional-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "supported": supported,
+                                    "rationale": "Fixed fixture verdict",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(httpx.Client, "send", send)
+    llm = get_llm(
+        provider="openrouter",
+        model="openai/fictional-model",
+        max_input_tokens=32000,
+        deployment_name=None,
+        api_key="fixture-only",
+        temperature=0,
+        timeout=60,
+    )
+    reports: list[calibration.CalibrationReport] = []
+    report = calibration.CalibrationReport()
+    calibration.run_cases(
+        llm, report, lambda value: reports.append(value.model_copy(deep=True))
+    )
+    assert len(calls) == report.attempt_count == 4
+    assert all(case.http_request_count == 1 for case in report.cases)
+    assert [case.proposed_value for case in report.cases] == ["7%", "9%", "7%", "9%"]
+    assert [case.original_value for case in report.cases] == ["7%"] * 4
+    assert report.status == ("passed" if outcome == "correct" else "failed"), [
+        (case.supported, case.status, case.failure, case.rationale)
+        for case in report.cases
+    ]
+    if outcome == "transport_failure":
+        assert all(case.failure for case in report.cases)
+        assert "SENSITIVE_PROVIDER_ERROR" not in report.model_dump_json()
+        return
+    assert len([case for case in report.cases if case.rationale]) == 4
+    assert all(case.input_sha256 for case in report.cases)
+    assert reports[-1].cases[-1].rationale == "Fixed fixture verdict"
+
+
+def test_partial_report_survives_process_timeout() -> None:
+    report = calibration.CalibrationReport(attempt_count=2)
+    report.cases = [
+        calibration.CalibrationCase(
+            format="docx",
+            proposed_value="7%",
+            expected_supported=True,
+            supported=True,
+            rationale="First response retained",
+            status="passed",
+        )
+    ]
+    output = (report.model_dump_json() + "\n").encode()
+    result = calibration.report_from_output(output, failure="process_timeout")
+    assert result["status"] == "failed"
+    assert result["attempt_count"] == 2
+    parsed = calibration.CalibrationReport.model_validate(result)
+    assert parsed.cases[0].rationale == "First response retained"
+    assert "process_timeout" == result["failure"]
+
+
+def test_subprocess_forces_readonly_and_retains_timeout_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POSTGRES_DB", "customs-regulations-dev")
+    monkeypatch.setenv("REGULATORY_ANNEX_ENVIRONMENT", "dev")
+    monkeypatch.setenv("PGOPTIONS", "-c default_transaction_read_only=off")
+    process = MagicMock()
+    partial_report = (
+        calibration.CalibrationReport(attempt_count=1).model_dump_json().encode()
+        + b"\n"
+    )
+    process.communicate.side_effect = [
+        calibration.subprocess.TimeoutExpired("fixed-child", 330),
+        (partial_report, None),
+    ]
+    process.returncode = -9
+    start = MagicMock(return_value=process)
+    monkeypatch.setattr(calibration.subprocess, "Popen", start)
+    result = calibration.run_native_calibration()
+    assert result["failure"] == "process_timeout"
+    assert result["attempt_count"] == 1
+    assert result["attempt_count_complete"] is False
+    assert (
+        start.call_args.kwargs["env"]["PGOPTIONS"]
+        == "-c default_transaction_read_only=on"
+    )
+    process.kill.assert_called_once()
+    assert calibration.os.environ["PGOPTIONS"] == "-c default_transaction_read_only=off"
+
+
+def test_native_fixture_tampering_refuses_before_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        calibration.Path, "read_bytes", lambda _path: b"changed ZIP bytes"
+    )
+    with pytest.raises(ValueError, match="fixed_fixture_hash_mismatch"):
+        calibration.load_native_fixtures()
