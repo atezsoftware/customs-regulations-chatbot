@@ -328,6 +328,21 @@ def test_owned_checkpoint_uses_fresh_runtime_and_exact_caller_scope(
         return runtime
 
     monkeypatch.setattr(owned_publication, "execute_owned_durable_stage", execute)
+    expected_verification = publisher._expected_verification
+
+    def verify_fresh(**kwargs: object) -> PublishVerification:
+        assert kwargs["rows"] is runtime.regulatory_chunks
+        assert kwargs["items"] is runtime.indexing_items
+        assert runtime.regulatory_chunks[0].text == "Persisted canonical update"
+        return expected_verification(
+            job_id=job.id,
+            user_file_id=file.id,
+            rows=runtime.regulatory_chunks,
+            items=runtime.indexing_items,
+            snapshot=_snapshot(),
+        )
+
+    monkeypatch.setattr(publisher, "_expected_verification", verify_fresh)
     token = CURRENT_TENANT_ID_CONTEXTVAR.set("tenant-a")
     try:
         if stage == "INDEX_WRITE":
