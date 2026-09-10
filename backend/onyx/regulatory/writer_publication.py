@@ -12,7 +12,7 @@ from onyx.db.regulatory_writer_publication import (
     stage_writer_publication,
 )
 from onyx.document_index.elasticsearch.publication import FencedPublicationIndex
-from onyx.document_index.publication_models import FileOwnership
+from onyx.document_index.publication_models import FileOwnership, publication_digest
 from onyx.regulatory.amendments.annexes.publication_execution import (
     publication_heartbeat,
 )
@@ -398,8 +398,13 @@ def correct_owned_chunk(
     validity_start_date: "date | None | Literal['unset']" = "unset",
     validity_end_date: "date | None | Literal['unset']" = "unset",
 ) -> FileOwnership:
+    from datetime import date
+
     from onyx.db.regulatory_chunks import update_chunk
-    from onyx.db.regulatory_writer_publication import load_owned_writer_inputs
+    from onyx.db.regulatory_writer_publication import (
+        apply_owned_deferred_edit,
+        load_owned_writer_inputs,
+    )
     from onyx.regulatory.amendments.annexes.publication_representations import _snapshot
     from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
     from onyx.regulatory.writer_projection import prepare_owned_correction
@@ -423,8 +428,21 @@ def correct_owned_chunk(
             validity_start_date=validity_start_date,
             validity_end_date=validity_end_date,
         )
+        if (target.validity_start_date or date.min) >= (
+            target.validity_end_date or date.max
+        ):
+            raise ValueError("correction validity window is empty")
+        after = [_snapshot(row) for row in rows]
+        if apply_owned_deferred_edit(
+            owner,
+            canonical_before_sha256=publication_digest(
+                [row.model_dump(mode="json") for row in inputs.canonical]
+            ),
+            canonical_after=after,
+        ):
+            return owner
         manifest = prepare_owned_correction(
-            owner, client, inputs, [_snapshot(row) for row in rows], changed_id=chunk_id
+            owner, client, inputs, after, changed_id=chunk_id
         )
         if lost.is_set():
             raise ValueError("correction publication ownership heartbeat lost")
@@ -540,6 +558,7 @@ def rename_owned_file(user_file_id: "UUID", tenant_id: str, name: str) -> None:
     from uuid import uuid4
 
     from onyx.db.regulatory_writer_publication import (
+        apply_owned_deferred_edit,
         load_owned_writer_inputs,
         rename_owned_unprojected_file,
     )
@@ -562,6 +581,14 @@ def rename_owned_file(user_file_id: "UUID", tenant_id: str, name: str) -> None:
         inputs = load_owned_writer_inputs(owner)
         if not inputs.canonical:
             rename_owned_unprojected_file(owner, name)
+            return
+        if apply_owned_deferred_edit(
+            owner,
+            canonical_before_sha256=publication_digest(
+                [row.model_dump(mode="json") for row in inputs.canonical]
+            ),
+            name=name,
+        ):
             return
         with publication_heartbeat(owner) as lost:
             inputs.file.name = name

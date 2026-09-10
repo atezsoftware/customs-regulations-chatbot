@@ -165,21 +165,26 @@ def stage_writer_publication(
 
 
 def _apply_canonical(session: Session, manifest: WriterPublicationManifest) -> None:
+    if manifest.canonical_after is not None:
+        _apply_canonical_rows(session, manifest.user_file_id, manifest.canonical_after)
+
+
+def _apply_canonical_rows(
+    session: Session, user_file_id: UUID, after: list[AnnexCanonicalSnapshot]
+) -> None:
     from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
 
-    if manifest.canonical_after is None:
-        return
     existing = {
         row.id: row
         for row in session.scalars(
             select(RegulatoryChunk)
-            .where(RegulatoryChunk.user_file_id == manifest.user_file_id)
+            .where(RegulatoryChunk.user_file_id == user_file_id)
             .with_for_update()
         )
     }
-    if not set(existing).issubset({row.id for row in manifest.canonical_after}):
+    if not set(existing).issubset({row.id for row in after}):
         raise ValueError("writer cannot discard canonical history")
-    for desired in canonical_snapshot_rows(manifest.canonical_after):
+    for desired in canonical_snapshot_rows(after):
         current = existing.get(desired.id)
         if current is None:
             session.add(desired)
@@ -663,6 +668,50 @@ def load_owned_writer_inputs(owner: FileOwnership) -> OwnedWriterInputs:
         session.commit()
         session.expunge_all()
         return result
+
+
+def apply_owned_deferred_edit(
+    owner: FileOwnership,
+    *,
+    canonical_before_sha256: str,
+    canonical_after: list[AnnexCanonicalSnapshot] | None = None,
+    name: str | None = None,
+) -> bool:
+    """Edit never-published deferred chunks without admitting a search publication."""
+    from onyx.db.enums import UserFileStatus
+
+    with get_session_with_tenant(tenant_id=owner.scope.tenant_id) as session:
+        reservations = PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
+        publication = session.get_one(RegulatoryFilePublication, owner.user_file_id)
+        file = session.get(UserFile, owner.user_file_id, with_for_update=True)
+        if file is None:
+            raise ValueError("owned file no longer exists")
+        if (
+            file.status not in {UserFileStatus.CHUNKED, UserFileStatus.INDEXING}
+            or reservations.gate_closed
+            or publication.epoch != 0
+            or publication.writer_manifest is not None
+            or session.scalar(
+                select(RegulatoryTemporalProjection.id)
+                .where(RegulatoryTemporalProjection.user_file_id == owner.user_file_id)
+                .limit(1)
+            )
+            is not None
+        ):
+            return False
+        if (
+            canonical_scope_digest(session, owner.user_file_id)
+            != canonical_before_sha256
+        ):
+            raise ValueError("deferred edit canonical baseline changed")
+        if canonical_after is not None:
+            archive_canonical_revisions(session, owner)
+            _apply_canonical_rows(session, owner.user_file_id, canonical_after)
+            archive_canonical_revisions(session, owner)
+        if name is not None:
+            file.name = name
+        session.commit()
+        return True
 
 
 def rename_owned_unprojected_file(owner: FileOwnership, name: str) -> None:

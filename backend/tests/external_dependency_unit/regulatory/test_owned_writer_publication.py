@@ -332,6 +332,10 @@ def test_owned_correction_preserves_predecessor_successor_windows_and_approval(
         if row.source == "amendment"
         and row.validity_start_date == prepared.legal.effective_start
     )
+    from onyx.db.enums import UserFileStatus
+
+    live_review.file.status = UserFileStatus.INDEXING
+    source_session.commit()
     writer_publication.correct_owned_chunk(
         owner,
         es[0],
@@ -620,7 +624,9 @@ def test_initial_chunking_reserves_after_abandoned_projection_identity(
     authority.release(owner)
 
 
-@pytest.mark.parametrize("after_interrupt", ["resume", "delete_request"])
+@pytest.mark.parametrize(
+    "after_interrupt", ["resume", "delete_request", "deferred_edit"]
+)
 def test_initial_ingestion_resumes_frozen_owned_publication(
     owned_file: UUID,
     live_review: LiveReview,
@@ -698,6 +704,28 @@ def test_initial_ingestion_resumes_frozen_owned_publication(
     monkeypatch.setattr(
         writer_publication, "finalize_writer_publication", real_finalize
     )
+    if after_interrupt == "deferred_edit":
+        source_session.expire_all()
+        source_session.get_one(UserFile, owned_file).status = UserFileStatus.INDEXING
+        source_session.commit()
+        from unittest.mock import MagicMock
+
+        completed_intents = MagicMock(wraps=real_finalize)
+        monkeypatch.setattr(
+            writer_publication, "finalize_writer_publication", completed_intents
+        )
+        writer_publication.rename_owned_file(
+            owned_file, "public", "Renamed after pending recovery"
+        )
+        source_session.expire_all()
+        recovered = source_session.get_one(UserFile, owned_file)
+        assert recovered.name == "Renamed after pending recovery"
+        assert completed_intents.call_count == 2, (
+            "pending ingestion must recover before a new fenced rename"
+        )
+        assert load_file_temporal_bindings(source_session, owned_file)
+        assert not authority.unavailable(authority.observe(), (owned_file,))
+        return
     if after_interrupt == "delete_request":
         writer_publication.request_owned_file_deletion(owned_file, "public")
         owner = authority.acquire(
@@ -1552,3 +1580,167 @@ def test_new_writer_intent_cannot_restart_cancelled_or_deleting_file(
         assert not authority.reservations(owner).gate_closed
     finally:
         authority.release(owner)
+
+
+@pytest.mark.parametrize("status", ["CHUNKED", "INDEXING"])
+@pytest.mark.parametrize("first_edit", ["rename", "patch"])
+def test_deferred_edits_wait_for_explicit_indexing(
+    owned_file: UUID,
+    live_review: LiveReview,
+    source_session: Session,
+    es: tuple[Elasticsearch, str],
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    first_edit: str,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from onyx.background.celery.tasks.user_file_processing import tasks as file_tasks
+    from onyx.db.enums import UserFileStatus
+    from onyx.db.models import (
+        RegulatoryFilePublication,
+        RegulatoryIndexingJob,
+        User,
+        UserFile,
+    )
+    from onyx.db.regulatory_annex_changes import capture_canonical_scope
+    from onyx.db.regulatory_annex_publication import (
+        load_annex_publication_inputs,
+        load_file_temporal_bindings,
+    )
+    from onyx.db.regulatory_canonical_revisions import list_canonical_revisions
+    from onyx.indexing.embedder import DefaultIndexingEmbedder
+    from onyx.regulatory import writer_projection
+    from onyx.regulatory.amendments.annexes.models import AnnexChangeDraft
+    from onyx.regulatory.projection import project_user_file_to_index
+    from onyx.server.features.regulatory import api
+    from onyx.server.features.regulatory.models import (
+        RegulatoryChunkUpdateRequest,
+        UserFileRenameRequest,
+    )
+
+    monkeypatch.setattr(file_tasks, "DEFER_USER_FILE_INDEXING", True)
+    contextual_requests = MagicMock(wraps=writer_projection.resolve_review_context_llm)
+    monkeypatch.setattr(
+        writer_projection, "resolve_review_context_llm", contextual_requests
+    )
+    draft = AnnexChangeDraft.model_validate(live_review.review.review_payload)
+    _, settings, _ = load_annex_publication_inputs(source_session, draft)
+    encoded: list[list[str]] = []
+
+    def encode(*, texts: list[str], **_kwargs: object) -> list[list[float]]:
+        encoded.append(texts)
+        return [[0.25, 0.5, 0.75] for _ in texts]
+
+    for setting in settings:
+        monkeypatch.setattr(
+            DefaultIndexingEmbedder.from_db_search_settings(
+                search_settings=setting
+            ).embedding_model,
+            "encode",
+            encode,
+        )
+    file = source_session.get_one(UserFile, owned_file)
+    file.status = UserFileStatus(status)
+    job_id = uuid4()
+    if status == "INDEXING":
+        source_session.add(
+            RegulatoryIndexingJob(
+                id=job_id,
+                user_file_id=owned_file,
+                content_hash="a" * 64,
+                chunk_generation_hash="b" * 64,
+                search_settings_id=settings[0].id,
+                prompt_hash="c" * 64,
+                config_snapshot={},
+                status="QUEUED",
+                stage="PREPARING",
+                lease_generation=0,
+            )
+        )
+    source_session.commit()
+    user = source_session.get_one(User, file.user_id)
+    before = capture_canonical_scope(source_session, owned_file)
+    target = before[0]
+    source_session.rollback()
+    for operation in [first_edit, "patch" if first_edit == "rename" else "rename"]:
+        if operation == "rename":
+            response = api.rename_user_file(
+                owned_file,
+                UserFileRenameRequest(name="Deferred corrected name"),
+                user=user,
+                db_session=source_session,
+            )
+            assert response.name == "Deferred corrected name"
+        else:
+            response = api.patch_chunk(
+                target.id,
+                RegulatoryChunkUpdateRequest(text="Edited before indexing."),
+                user=user,
+                db_session=source_session,
+            )
+            assert (
+                response.id == target.id and response.text == "Edited before indexing."
+            )
+        source_session.expire_all()
+        assert not encoded, "ordinary deferred edits must not request embeddings"
+        assert not contextual_requests.called, (
+            "deferred edits must not resolve a context provider"
+        )
+        assert source_session.get_one(UserFile, owned_file).status == UserFileStatus(
+            status
+        )
+        assert not load_file_temporal_bindings(source_session, owned_file)
+        if status == "INDEXING":
+            pending = source_session.get_one(RegulatoryIndexingJob, job_id)
+            assert (pending.status, pending.stage, pending.lease_generation) == (
+                "QUEUED",
+                "PREPARING",
+                0,
+            )
+            assert pending.content_hash == "a" * 64 and pending.config_snapshot == {}
+        publication = source_session.get_one(RegulatoryFilePublication, owned_file)
+        assert publication.epoch == 0 and not publication.gate_closed
+        assert publication.writer_manifest is None
+        es[0].indices.refresh(index=es[1])
+        assert (
+            es[0].count(index=es[1], query={"term": {"document_id": str(owned_file)}})[
+                "count"
+            ]
+            == 0
+        )
+        source_session.rollback()
+    after = capture_canonical_scope(source_session, owned_file)
+    assert [row for row in after if row.id != target.id] == before[1:]
+    corrected = next(row for row in after if row.id == target.id)
+    assert corrected.projection_ordinal == target.projection_ordinal
+    assert corrected.validity_start_date == target.validity_start_date
+    assert corrected.validity_end_date == target.validity_end_date
+    revisions = list_canonical_revisions(source_session, target.id)
+    assert target in [revision.snapshot for revision in revisions]
+    assert corrected in [revision.snapshot for revision in revisions]
+    file = source_session.get_one(UserFile, owned_file)
+    count = project_user_file_to_index(
+        source_session, file, "public", include_chunked=True
+    )
+    source_session.expire_all()
+    if status == "INDEXING":
+        assert count == 0 and not encoded
+        assert (
+            source_session.get_one(UserFile, owned_file).status
+            == UserFileStatus.INDEXING
+        )
+        return
+    assert count == len(after) and encoded
+    assert (
+        source_session.get_one(UserFile, owned_file).status == UserFileStatus.COMPLETED
+    )
+    bindings = load_file_temporal_bindings(source_session, owned_file)
+    assert any(binding.representation_text == corrected.text for binding in bindings)
+    es[0].indices.refresh(index=es[1])
+    assert (
+        es[0].count(index=es[1], query={"term": {"document_id": str(owned_file)}})[
+            "count"
+        ]
+        > 0
+    )
