@@ -713,7 +713,14 @@ def test_visual_continuation_headers_and_values_are_not_body_overlap() -> None:
     )
     from onyx.regulatory.amendments.annexes.models import SourceLink
 
-    def part(number: int, codes: list[str], *, located: bool = True):
+    def part(
+        number: int,
+        codes: list[str],
+        *,
+        located: bool = True,
+        header: bool = True,
+        rates: list[str] | None = None,
+    ):
         original, extraction = _linked_image(number)
         extraction.elements = [
             ExtractedAnnexElement(
@@ -733,7 +740,13 @@ def test_visual_continuation_headers_and_values_are_not_body_overlap() -> None:
                 ),
             )
             for row, cells in enumerate(
-                [["Code", "Rate"], *[[code, "5%"] for code in codes]]
+                [
+                    *([["Code", "Rate"]] if header else []),
+                    *[
+                        [code, rate]
+                        for code, rate in zip(codes, rates or ["5%"] * len(codes))
+                    ],
+                ]
             )
             for column, text in enumerate(cells)
         ]
@@ -784,3 +797,34 @@ def test_visual_continuation_headers_and_values_are_not_body_overlap() -> None:
     ]:
         with pytest.raises(ValueError, match="overlapping"):
             select_new_annex_sources([first, conflicting], links)
+
+    for unclassified in [
+        [
+            part(1, ["1001.10", "2001.20"], header=False, rates=["5%", "15%"]),
+            part(2, ["1001.10", "3001.30"], header=False, rates=["5%", "25%"]),
+        ],
+        [
+            part(1, ["Apples", "Berries"], header=False, rates=["Fresh", "Dried"]),
+            part(2, ["Apples", "Citrus"], header=False, rates=["Fresh", "Whole"]),
+        ],
+    ]:
+        with pytest.raises(ValueError, match="overlapping"):
+            select_new_annex_sources(unclassified, links)
+
+
+def test_alternative_annex_shorthand_does_not_authorize_an_image() -> None:
+    import pytest
+
+    from onyx.regulatory.amendments.annexes.evidence import select_annex_evidence_view
+
+    original, extraction = _linked_image(1)
+    for connector in ("veya", "yahut", "veyahut", "ya da", "ve/veya", "and/or"):
+        with pytest.raises(ValueError, match="ambiguous"):
+            select_annex_evidence_view(
+                extraction=extraction,
+                original=original,
+                annex_label="EK-1",
+                canonical_labels=["EK-1"],
+                canonical_chunk_ids=["canonical"],
+                source_labels=[f"EK-1 {connector} 2"],
+            )
