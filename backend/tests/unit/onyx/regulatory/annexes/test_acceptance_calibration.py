@@ -133,6 +133,90 @@ def test_partial_report_survives_process_timeout() -> None:
     assert "process_timeout" == result["failure"]
 
 
+@pytest.fixture
+def completed_calibration_report() -> calibration.CalibrationReport:
+    return calibration.CalibrationReport(
+        status="passed",
+        attempt_count=4,
+        database_read_only=True,
+        fixture_verified=True,
+        model_snapshot={
+            "model_provider": "openrouter",
+            "model_name": "openai/fictional-model",
+        },
+        module_sha256={name: "a" * 64 for name in calibration.MODULES},
+        cases=[
+            calibration.CalibrationCase(
+                format=format,
+                proposed_value=proposed,
+                expected_supported=expected,
+                supported=expected,
+                rationale="Retained verdict",
+                status="passed",
+                attempt_count=1,
+                http_request_count=1,
+                input_sha256="b" * 64,
+            )
+            for format in ("docx", "xlsx")
+            for proposed, expected in (("7%", True), ("9%", False))
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("character", "ensure_ascii"),
+    [("ğ", False), ("😀", False), ("\u0000", False), ("😀", True)],
+)
+@pytest.mark.parametrize("failure", [None, "process_timeout"])
+def test_maximum_unicode_rationales_retain_all_completed_verdicts(
+    completed_calibration_report: calibration.CalibrationReport,
+    character: str,
+    ensure_ascii: bool,
+    failure: str | None,
+) -> None:
+    report = completed_calibration_report
+    for case in report.cases:
+        case.rationale = character * 4000
+    output = (
+        json.dumps(report.model_dump(mode="json"), ensure_ascii=ensure_ascii) + "\n"
+    ).encode()
+    result = calibration.CalibrationReport.model_validate(
+        calibration.report_from_output(output, failure=failure)
+    )
+    assert result.status == ("failed" if failure else "passed")
+    assert result.failure == failure
+    assert result.attempt_count_complete is (failure is None)
+    assert result.attempt_count == 4
+    assert [case.supported for case in result.cases] == [True, False, True, False]
+    assert [case.status for case in result.cases] == ["passed"] * 4
+    assert [case.rationale for case in result.cases] == [character * 4000] * 4
+    assert [case.input_sha256 for case in result.cases] == ["b" * 64] * 4
+
+
+@pytest.mark.parametrize("invalid_tail", ["malformed", "oversized", "unterminated"])
+@pytest.mark.parametrize("failure", [None, "process_timeout"])
+def test_invalid_newest_report_retains_prior_evidence_but_fails_incomplete(
+    completed_calibration_report: calibration.CalibrationReport,
+    invalid_tail: str,
+    failure: str | None,
+) -> None:
+    valid = completed_calibration_report.model_dump_json().encode()
+    tail = {
+        "malformed": b"{\n",
+        "oversized": b" " * 300_000 + valid + b"\n",
+        "unterminated": valid,
+    }[invalid_tail]
+    result = calibration.CalibrationReport.model_validate(
+        calibration.report_from_output(valid + b"\n" + tail, failure=failure)
+    )
+    assert result.status == "failed"
+    assert result.failure == (failure or "child_report_invalid")
+    assert result.attempt_count_complete is False
+    assert result.attempt_count == 4
+    assert [case.supported for case in result.cases] == [True, False, True, False]
+    assert [case.rationale for case in result.cases] == ["Retained verdict"] * 4
+
+
 def test_subprocess_forces_readonly_and_retains_timeout_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

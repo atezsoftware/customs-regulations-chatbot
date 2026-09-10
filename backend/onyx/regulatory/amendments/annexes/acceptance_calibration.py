@@ -28,6 +28,9 @@ MODULES = (
     "onyx.regulatory.amendments.annexes.extraction",
     "onyx.prompts.regulatory_annex_review",
 )
+MAX_RATIONALE_CHARACTERS = 4000
+# Escaped astral characters need 12 bytes each; reserve 64 KiB for metadata.
+MAX_REPORT_LINE_BYTES = 4 * MAX_RATIONALE_CHARACTERS * 12 + 64 * 1024
 
 
 class CalibrationCase(BaseModel):
@@ -38,7 +41,7 @@ class CalibrationCase(BaseModel):
     original_value: Literal["7%"] = "7%"
     raw_transcription: Literal["5%"] = "5%"
     supported: bool | None = None
-    rationale: str | None = Field(default=None, max_length=4000)
+    rationale: str | None = Field(default=None, max_length=MAX_RATIONALE_CHARACTERS)
     rationale_truncated: bool = False
     input_sha256: str | None = None
     status: Literal["running", "passed", "failed"] = "running"
@@ -216,8 +219,10 @@ def run_cases(
                         draft=draft, corrections=[edit], llm=llm
                     )
                 case.supported = receipt.supported
-                case.rationale = receipt.rationale[:4000]
-                case.rationale_truncated = len(receipt.rationale) > 4000
+                case.rationale = receipt.rationale[:MAX_RATIONALE_CHARACTERS]
+                case.rationale_truncated = (
+                    len(receipt.rationale) > MAX_RATIONALE_CHARACTERS
+                )
                 case.input_sha256 = receipt.input_sha256
                 case.status = (
                     "passed"
@@ -292,16 +297,18 @@ def _child() -> None:
 
 def report_from_output(output: bytes, *, failure: str | None) -> dict[str, object]:
     report = CalibrationReport(failure=failure or "child_report_missing")
-    for line in output.splitlines():
-        if len(line) > 30_000:
+    invalid_output = False
+    for line in output.splitlines(keepends=True):
+        if not line.endswith(b"\n") or len(line) > MAX_REPORT_LINE_BYTES:
+            invalid_output = True
             continue
         try:
             report = CalibrationReport.model_validate_json(line)
         except ValueError:
-            continue
-    if failure:
+            invalid_output = True
+    if failure or invalid_output:
         report.status = "failed"
-        report.failure = failure
+        report.failure = failure or "child_report_invalid"
         report.attempt_count_complete = False
     return report.model_dump(mode="json")
 
