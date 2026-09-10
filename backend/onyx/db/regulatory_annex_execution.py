@@ -600,3 +600,90 @@ def load_validated_runtime_settings(
         ):
             raise ValueError("publication file/ACL/index configuration changed")
         return settings
+
+
+def validate_publication_retry(
+    session: Session,
+    *,
+    change_set_id: UUID,
+    expected_review_sha256: str,
+    tenant_id: str,
+    environment: str,
+    database_identity: str,
+) -> bool:
+    """Retain authority locks until the caller commits the current review's intent."""
+    from onyx.db.regulatory_annex_changes import require_current_annex_review
+    from onyx.document_index.publication_models import PublicationScope
+    from onyx.regulatory.amendments.annexes.publication_execution import (
+        runtime_embedders,
+    )
+    from onyx.regulatory.amendments.annexes.publication_preparation import (
+        validate_frozen_publication_review,
+    )
+
+    manifest = session.get(AnnexPublicationManifest, change_set_id)
+    if manifest is None or not manifest.es_started:
+        return False
+    prepared = AnnexPublicationPreparation.model_validate(manifest.payload)
+    scope = PublicationScope(
+        tenant_id=tenant_id,
+        environment=environment,
+        database_identity=database_identity,
+    )
+    if prepared.scope != scope:
+        raise ValueError("publication recovery manifest scope mismatch")
+    # Authority precedes the batch/review/file/settings locks used by the producer.
+    ordinals = PublicationStore(scope).lock_recovery_reservations(
+        session, prepared.user_file_id
+    )
+    review = require_current_annex_review(
+        session,
+        change_set_id=change_set_id,
+        expected_review_sha256=expected_review_sha256,
+        environment=environment,
+    )
+    if review.status not in ("failed", "approving", "preparing", "publishing"):
+        raise ValueError("review state does not allow publication recovery")
+    if publication_digest(review.review_payload) != review.review_sha256:
+        raise ValueError("immutable review payload changed")
+    draft = AnnexChangeDraft.model_validate(review.review_payload)
+    current = session.scalar(
+        select(AnnexPublicationIntent).where(
+            AnnexPublicationIntent.change_set_id == review.id,
+            AnnexPublicationIntent.publication_generation
+            == review.publication_generation,
+        )
+    )
+    first = session.get(AnnexPublicationIntent, manifest.first_intent_id)
+    for intent in (current, first):
+        if intent is None or (
+            intent.change_set_id,
+            intent.logical_group_id,
+            intent.review_revision,
+            intent.review_sha256,
+            intent.tenant_id,
+            intent.environment,
+            intent.database_identity,
+        ) != (
+            review.id,
+            review.logical_group_id,
+            review.review_revision,
+            review.review_sha256,
+            tenant_id,
+            environment,
+            database_identity,
+        ):
+            raise ValueError("publication recovery intent scope mismatch")
+    if (
+        validate_frozen_publication_review(draft) != prepared
+        or manifest.payload_sha256 != publication_digest(manifest.payload)
+        or manifest.operations is None
+        or manifest.operations_sha256 != publication_digest(manifest.operations)
+        or manifest.approved_at is not None
+        or list(ordinals) != prepared.reserved_ordinals
+    ):
+        raise ValueError("publication recovery manifest or reservations changed")
+    validate_database_baseline(session, draft, prepared)
+    validate_staged_history(session, draft, prepared, manifest)
+    runtime_embedders(draft, prepared)
+    return True

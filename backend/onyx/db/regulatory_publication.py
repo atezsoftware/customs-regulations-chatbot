@@ -217,6 +217,21 @@ class PublicationStore:
             gate_closed=row.gate_closed,
         )
 
+    def lock_recovery_reservations(
+        self, session: Session, user_file_id: UUID
+    ) -> tuple[int, ...]:
+        """Serialize intent recovery without replacing an active writer's lease."""
+        self._check_session(session)
+        row = session.scalar(
+            select(RegulatoryFilePublication)
+            .where(RegulatoryFilePublication.user_file_id == user_file_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if row is None or row.scope_key != self.scope_key or not row.gate_closed:
+            raise ValueError("publication recovery requires its scoped closed gate")
+        return self._ordinals(session, user_file_id)
+
     def reservations(self, owner: FileOwnership) -> FileReservations:
         with get_session_with_tenant(tenant_id=self.scope.tenant_id) as session:
             return self.lock_owned_snapshot(session, owner)

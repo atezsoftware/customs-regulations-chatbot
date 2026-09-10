@@ -245,7 +245,15 @@ def test_actual_worker_activates_frozen_complete_history(
 
 
 @pytest.mark.parametrize(
-    "failure", ["second-item", "commit", "takeover", "new-generation"]
+    "failure",
+    [
+        "second-item",
+        "commit",
+        "takeover",
+        "new-generation",
+        "api-commit",
+        "api-active-owner",
+    ],
 )
 def test_partial_publication_recovery_retains_manifest_vectors_and_gate(
     live_review: LiveReview,
@@ -318,7 +326,7 @@ def test_partial_publication_recovery_retains_manifest_vectors_and_gate(
         ):
             raise RuntimeError("injected activation commit failure")
 
-    if failure == "commit":
+    if failure in ("commit", "api-commit"):
         event.listen(Session, "before_commit", fail_commit)
     else:
         monkeypatch.setattr(FencedPublicationIndex, "upsert", fail_item)
@@ -326,7 +334,7 @@ def test_partial_publication_recovery_retains_manifest_vectors_and_gate(
         with pytest.raises(Exception):
             invoke(payload)
     finally:
-        if failure == "commit":
+        if failure in ("commit", "api-commit"):
             event.remove(Session, "before_commit", fail_commit)
         monkeypatch.setattr(FencedPublicationIndex, "upsert", original)
     source_session.expire_all()
@@ -356,10 +364,96 @@ def test_partial_publication_recovery_retains_manifest_vectors_and_gate(
             live_review.review.error_message
             == "Publication interrupted; the frozen manifest will be retried."
         )
-    if failure == "new-generation":
+    if failure in ("new-generation", "api-commit", "api-active-owner"):
+        calls_before_retry = list(calls)
+        vectors_before_retry = {
+            row.projection_id: (row.request_sha256, row.vectors_sha256, row.vectors)
+            for row in vectors
+        }
         live_review.review.status = "failed"
         source_session.commit()
-        next_payload = approve(source_session, live_review, retry=True)
+        from onyx.db.models import User
+        from onyx.server.features.regulatory import annex_api
+        from onyx.server.features.regulatory.models import AnnexReviewDecisionRequest
+
+        dispatched = []
+        monkeypatch.setattr(annex_api, "enqueue_annex_publication", dispatched.append)
+        monkeypatch.setattr(
+            annex_api,
+            "get_document_set_by_id_for_user",
+            lambda **_kwargs: live_review.batch,
+        )
+        from onyx.error_handling.exceptions import OnyxError
+
+        for rejected_hash, rejected_tenant in (
+            ("0" * 64, payload.tenant_id),
+            (payload.review_sha256, payload.tenant_id + "-foreign"),
+        ):
+            with pytest.raises(OnyxError):
+                annex_api.retry_group(
+                    live_review.batch.id,
+                    live_review.review.id,
+                    AnnexReviewDecisionRequest(expected_review_sha256=rejected_hash),
+                    User(id=live_review.file.user_id),
+                    source_session,
+                    rejected_tenant,
+                )
+            source_session.rollback()
+            assert (
+                live_review.review.publication_generation
+                == payload.publication_generation
+            )
+            assert not dispatched
+        predecessor = (
+            authority.acquire(
+                prepared.user_file_id, owner_id=uuid4(), ttl=timedelta(minutes=2)
+            )
+            if failure == "api-active-owner"
+            else None
+        )
+        try:
+            annex_api.retry_group(
+                live_review.batch.id,
+                live_review.review.id,
+                AnnexReviewDecisionRequest(
+                    expected_review_sha256=payload.review_sha256
+                ),
+                User(id=live_review.file.user_id),
+                source_session,
+                payload.tenant_id,
+            )
+            if predecessor:
+                annex_api.retry_group(
+                    live_review.batch.id,
+                    live_review.review.id,
+                    AnnexReviewDecisionRequest(
+                        expected_review_sha256=payload.review_sha256
+                    ),
+                    User(id=live_review.file.user_id),
+                    source_session,
+                    payload.tenant_id,
+                )
+                assert authority.reservations(predecessor).ownership == predecessor
+        finally:
+            if predecessor:
+                authority.release(predecessor)
+        assert authority.unavailable(authority.observe(), (prepared.user_file_id,))
+        source_session.expire_all()
+        assert manifest.operations == operations
+        assert all(row.status == "complete" for row in vectors)
+        assert {
+            row.projection_id: (row.request_sha256, row.vectors_sha256, row.vectors)
+            for row in vectors
+        } == vectors_before_retry
+        assert calls == calls_before_retry
+        assert len(dispatched) == (2 if predecessor else 1)
+        assert all(intent.id == dispatched[0].id for intent in dispatched)
+        next_payload = payload.model_copy(
+            update={
+                "intent_id": dispatched[0].id,
+                "publication_generation": dispatched[0].publication_generation,
+            }
+        )
         assert next_payload.publication_generation == payload.publication_generation + 1
         with pytest.raises(ValueError):
             invoke(payload)
@@ -877,3 +971,56 @@ def test_scoped_recovery_redelivers_expired_or_lost_intent_without_new_generatio
     ):
         with pytest.raises(ValueError):
             invoke(delivery.model_copy(update=changed))
+
+
+@pytest.mark.parametrize("live_review", ["verified"], indirect=True)
+def test_initial_api_approval_still_refuses_changed_indexed_baseline(
+    live_review: LiveReview, source_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from onyx.db.models import User
+    from onyx.document_index.elasticsearch.client import ElasticsearchClient
+    from onyx.document_index.interfaces_new import DocumentChunkVerificationError
+    from onyx.regulatory.amendments.annexes.models import AnnexChangeDraft
+    from onyx.regulatory.amendments.annexes.publication_preparation import (
+        validate_frozen_publication_review,
+    )
+    from onyx.server.features.regulatory import annex_api
+    from onyx.server.features.regulatory.models import AnnexReviewDecisionRequest
+    from shared_configs.contextvars import get_current_tenant_id
+
+    draft = AnnexChangeDraft.model_validate(live_review.review.review_payload)
+    prepared = validate_frozen_publication_review(draft)
+    with ElasticsearchClient() as transport:
+        client = transport.publication_client()
+        name = prepared.indexes[0].index_name
+        hit = client.search(index=name, size=1)["hits"]["hits"][0]
+        client.update(
+            index=name,
+            id=hit["_id"],
+            doc={"content": "unreviewed indexed change"},
+            refresh=True,
+        )
+    monkeypatch.setattr(
+        annex_api,
+        "get_document_set_by_id_for_user",
+        lambda **_kwargs: live_review.batch,
+    )
+    with pytest.raises(
+        DocumentChunkVerificationError,
+        match="stored embedding evidence identity mismatch",
+    ):
+        annex_api.approve_group(
+            live_review.batch.id,
+            live_review.review.id,
+            AnnexReviewDecisionRequest(
+                expected_review_sha256=live_review.review.review_sha256
+            ),
+            User(id=live_review.file.user_id),
+            source_session,
+            get_current_tenant_id(),
+        )
+    source_session.rollback()
+    assert (
+        live_review.review.status == "pending"
+        and live_review.review.publication_generation == 0
+    )

@@ -236,14 +236,26 @@ def _queue_review(
 ) -> AnnexReviewSnapshot:
     _authorized_review(session, batch_id, review_id, user)
     try:
+        from onyx.db.regulatory_annex_execution import validate_publication_retry
         from onyx.regulatory.amendments.annexes.analysis import (
             validate_live_review_configuration,
+            validate_live_review_runtime,
         )
 
         review = _authorized_review(session, batch_id, review_id, user)
-        validate_live_review_configuration(
-            AnnexChangeDraft.model_validate(review.review_payload)
+        recovery = retry and validate_publication_retry(
+            session,
+            change_set_id=review_id,
+            expected_review_sha256=request.expected_review_sha256,
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            tenant_id=tenant_id,
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
         )
+        draft = AnnexChangeDraft.model_validate(review.review_payload)
+        if recovery:
+            validate_live_review_runtime(draft)
+        else:
+            validate_live_review_configuration(draft)
         intent = queue_annex_publication(
             session,
             change_set_id=review_id,
@@ -254,6 +266,9 @@ def _queue_review(
             decided_by=user.id,
             retry=retry,
         )
+        if recovery:
+            # The producer may return an existing active intent without committing.
+            session.commit()
     except ValueError as exc:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
     try:

@@ -612,7 +612,7 @@ def draft_batch_id(draft: AnnexChangeDraft) -> int:
     return draft.batch_id
 
 
-def validate_live_review_configuration(draft: AnnexChangeDraft) -> None:
+def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
     from onyx.configs.app_configs import REGULATORY_BATCH_INDEXING_ENABLED
     from onyx.db.amendment_sources import (
         list_source_assets,
@@ -689,6 +689,9 @@ def validate_live_review_configuration(draft: AnnexChangeDraft) -> None:
     if original_text_hash != draft.original_source_text_sha256:
         raise ValueError("original extracted source text changed")
 
+
+def validate_live_review_configuration(draft: AnnexChangeDraft) -> None:
+    validate_live_review_runtime(draft)
     from onyx.regulatory.amendments.annexes.publication_preparation import (
         validate_indexed_publication_baseline,
     )
