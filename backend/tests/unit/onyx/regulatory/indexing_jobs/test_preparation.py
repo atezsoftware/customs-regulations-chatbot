@@ -17,6 +17,7 @@ from onyx.db.models import (
     RegulatoryIndexingItem,
     RegulatoryIndexingJob,
 )
+from onyx.document_index.publication_models import FileOwnership
 from onyx.natural_language_processing.utils import BaseTokenizer
 from onyx.regulatory.chunker import RegulatoryChunk as ChunkerRegulatoryChunk
 from onyx.regulatory.chunker import RegulatoryChunker
@@ -273,7 +274,7 @@ def test_new_preparation_snapshots_use_canonical_v2_hashing(
     )
     monkeypatch.setattr(
         preparation,
-        "create_or_get_regulatory_indexing_job",
+        "_create_owned_regulatory_indexing_job",
         lambda *_args, **_kwargs: job,
     )
     monkeypatch.setattr(
@@ -330,7 +331,7 @@ def test_duplicate_delivery_does_not_prepare_an_active_older_chunk_generation(
     )
     monkeypatch.setattr(
         preparation,
-        "create_or_get_regulatory_indexing_job",
+        "_create_owned_regulatory_indexing_job",
         lambda *_args, **_kwargs: active_job,
     )
     monkeypatch.setattr(
@@ -342,7 +343,7 @@ def test_duplicate_delivery_does_not_prepare_an_active_older_chunk_generation(
     )
     monkeypatch.setattr(
         preparation,
-        "documents_to_regulatory_chunks",
+        "_prepare_claimed_owned_items",
         lambda **_kwargs: pytest.fail("canonical chunks must remain untouched"),
     )
 
@@ -380,7 +381,10 @@ MADDE 12 - (1) Transit rejiminde teminat aranır.
         _db_session: Session,
         persisted_user_file_id: UUID,
         chunks: list[ChunkerRegulatoryChunk],
+        *,
+        publication_owner: FileOwnership | None = None,
     ) -> list[RegulatoryChunk]:
+        assert publication_owner is None
         assert persisted_user_file_id == user_file_id
         captured_chunks.extend(chunks)
         return cast(
@@ -389,6 +393,7 @@ MADDE 12 - (1) Transit rejiminde teminat aranır.
                 SimpleNamespace(
                     id=f"rc_{index}",
                     position=chunk.metadata.chunk_order,
+                    projection_ordinal=chunk.metadata.chunk_order,
                     chunk_metadata=chunk.metadata.to_storage_dict(),
                     heading_path=list(chunk.metadata.heading_path),
                     validity_start_date=None,
@@ -432,7 +437,10 @@ def test_public_boundary_aggregates_same_file_documents_before_one_replacement(
         _db_session: Session,
         persisted_user_file_id: UUID,
         chunks: list[ChunkerRegulatoryChunk],
+        *,
+        publication_owner: FileOwnership | None = None,
     ) -> list[RegulatoryChunk]:
+        assert publication_owner is None
         assert persisted_user_file_id == user_file_id
         replacement_batches.append(chunks)
         return cast(
@@ -441,6 +449,7 @@ def test_public_boundary_aggregates_same_file_documents_before_one_replacement(
                 SimpleNamespace(
                     id=f"rc_{index}",
                     position=chunk.metadata.chunk_order,
+                    projection_ordinal=chunk.metadata.chunk_order,
                     chunk_metadata=chunk.metadata.to_storage_dict(),
                     heading_path=list(chunk.metadata.heading_path),
                     validity_start_date=None,
@@ -484,7 +493,10 @@ def test_legacy_chunker_keeps_different_user_files_as_separate_replacements(
         _db_session: Session,
         user_file_id: UUID,
         chunks: list[ChunkerRegulatoryChunk],
+        *,
+        publication_owner: FileOwnership | None = None,
     ) -> list[RegulatoryChunk]:
+        assert publication_owner is None
         replaced_file_ids.append(user_file_id)
         return cast(
             list[RegulatoryChunk],
@@ -492,6 +504,7 @@ def test_legacy_chunker_keeps_different_user_files_as_separate_replacements(
                 SimpleNamespace(
                     id=f"{user_file_id}-{index}",
                     position=chunk.metadata.chunk_order,
+                    projection_ordinal=chunk.metadata.chunk_order,
                     chunk_metadata=chunk.metadata.to_storage_dict(),
                     heading_path=list(chunk.metadata.heading_path),
                     validity_start_date=None,
@@ -519,337 +532,260 @@ def test_legacy_chunker_keeps_different_user_files_as_separate_replacements(
 
 
 @pytest.mark.parametrize(
-    ("row_count", "row_text"),
+    "row_count,row_text",
     [
         (1, "MADDE 1 - Kısa ve kendi bağlamını taşıyan hüküm."),
         (2, "MADDE 1 - " + "kesintisiz" * 60),
     ],
 )
 def test_context_ineligible_item_is_skipped_but_keeps_original_embedding_text(
-    monkeypatch: pytest.MonkeyPatch,
-    row_count: int,
-    row_text: str,
+    monkeypatch: pytest.MonkeyPatch, row_count: int, row_text: str
 ) -> None:
-    user_file_id = uuid4()
-    job_id = uuid4()
-    content_hash = preparation.regulatory_documents_content_hash(
-        [_document(user_file_id, row_text)],
-        RegulatoryInputHashVersion.CANONICAL_V2,
-    )
-    snapshot = _snapshot(input_content_hash=content_hash)
-    job = cast(
-        RegulatoryIndexingJob,
-        SimpleNamespace(
-            id=job_id,
-            user_file_id=user_file_id,
-            content_hash=content_hash,
-            chunk_generation_hash=snapshot.chunk_generation_hash,
-            lease_generation=0,
-            config_snapshot=snapshot.model_dump(mode="json"),
-        ),
-    )
-    rows = cast(
-        list[RegulatoryChunk],
-        [
-            SimpleNamespace(
-                id=f"rc_{index}",
-                user_file_id=user_file_id,
-                position=index,
-                text=row_text if index == 0 else "MADDE 2 - Kısa hüküm.",
-                heading_path=[f"MADDE {index + 1}"],
-                validity_start_date=None,
-                validity_end_date=None,
-            )
-            for index in range(row_count)
-        ],
-    )
-    prepared_items: list[indexing_job_repository.RegulatoryIndexingPreparedItem] = []
-
-    monkeypatch.setattr(
-        preparation,
-        "resolve_regulatory_indexing_snapshot",
-        lambda _session, **_kwargs: snapshot,
-    )
-    monkeypatch.setattr(
-        preparation,
-        "get_tokenizer",
-        lambda _model_name, _provider: _CharacterTokenizer(),
-    )
-    monkeypatch.setattr(
-        preparation,
-        "create_or_get_regulatory_indexing_job",
-        lambda *_args, **_kwargs: job,
-    )
-    monkeypatch.setattr(
-        preparation,
-        "claim_regulatory_indexing_job",
-        lambda *_args, **_kwargs: True,
-    )
-    monkeypatch.setattr(
-        preparation,
-        "get_regulatory_indexing_job",
-        lambda *_args, **_kwargs: job,
-    )
-    monkeypatch.setattr(
-        preparation, "documents_to_regulatory_chunks", lambda **_kwargs: []
-    )
-    monkeypatch.setattr(
-        preparation,
-        "get_chunks_for_file",
-        lambda *_args, **_kwargs: rows,
+    from onyx.regulatory.indexing_jobs import projection_preparation
+    from tests.unit.onyx.regulatory.indexing_jobs.owned_publication_test_helpers import (
+        OwnedAuthority,
+        canonical_row,
+        writer_inputs,
     )
 
-    def persist_preparation(
-        _session: Session,
-        **kwargs: object,
-    ) -> bool:
-        callback = cast(
-            Callable[[], list[indexing_job_repository.RegulatoryIndexingPreparedItem]],
-            kwargs["prepare_items"],
-        )
-        prepared_items.extend(callback())
-        return True
-
-    monkeypatch.setattr(
-        indexing_job_repository,
-        "persist_regulatory_indexing_preparation",
-        persist_preparation,
+    file_id = uuid4()
+    authority = OwnedAuthority(file_id)
+    job = RegulatoryIndexingJob(
+        id=uuid4(),
+        user_file_id=file_id,
+        search_settings_id=41,
+        config_snapshot=_snapshot().model_dump(mode="json"),
     )
-
-    preparation.prepare_regulatory_indexing_job(
-        user_file_id=user_file_id,
-        documents=[_document(user_file_id, row_text)],
-        tenant_id="tenant-a",
-        db_session=cast(Session, SimpleNamespace()),
+    rows = [
+        canonical_row(file_id, i, row_text if i == 0 else "MADDE 2 - Kısa hüküm.")
+        for i in range(row_count)
+    ]
+    monkeypatch.setattr(projection_preparation, "PublicationStore", authority.for_scope)
+    prepared = projection_preparation.prepare_owned_durable_items(
+        owner=authority.owner,
+        job=job,
+        inputs=writer_inputs(file_id, rows),
+        embedding_tokenizer=_CharacterTokenizer(),
+        contextual_tokenizer=_CharacterTokenizer(),
     )
-
-    first_spec = next(
-        item for item in prepared_items if item.regulatory_chunk_id == rows[0].id
+    first = next(item for item in prepared if item.regulatory_chunk_id == rows[0].id)
+    assert first.skip_context
+    item = RegulatoryIndexingItem(
+        regulatory_chunk_id=first.regulatory_chunk_id,
+        status=RegulatoryIndexingItemStatus.SKIPPED.value,
+        context=None,
     )
-    first_item = cast(
-        RegulatoryIndexingItem,
-        SimpleNamespace(
-            regulatory_chunk_id=first_spec.regulatory_chunk_id,
-            status=(
-                RegulatoryIndexingItemStatus.SKIPPED.value
-                if first_spec.skip_context
-                else RegulatoryIndexingItemStatus.PENDING.value
-            ),
-            context=None,
-        ),
-    )
-    assert first_spec.skip_context
-    assert first_item.status == RegulatoryIndexingItemStatus.SKIPPED.value
-    assert contextualized_embedding_text(rows[0], first_item) == row_text
+    assert contextualized_embedding_text(rows[0], item) == row_text
+    assert first.projection_ordinal == rows[0].projection_ordinal
+    assert first.projection_input is not None
+    assert first.projection_input.representation.text == row_text
 
 
 def test_duplicate_preparation_does_not_replace_successful_item_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    user_file_id = uuid4()
-    job_id = uuid4()
-    document = _document(user_file_id, "MADDE 1 - Transit hükmü.")
-    content_hash = preparation.regulatory_documents_content_hash(
-        [document], RegulatoryInputHashVersion.CANONICAL_V2
+    file_id = uuid4()
+    document = _document(file_id, "MADDE 1 - Transit hükmü.")
+    snapshot = _snapshot(
+        input_content_hash=preparation.regulatory_documents_content_hash(
+            [document], RegulatoryInputHashVersion.CANONICAL_V2
+        )
     )
-    snapshot = _snapshot(input_content_hash=content_hash)
-    job = cast(
-        RegulatoryIndexingJob,
-        SimpleNamespace(
-            id=job_id,
-            user_file_id=user_file_id,
-            content_hash=content_hash,
-            chunk_generation_hash=snapshot.chunk_generation_hash,
-            lease_generation=0,
-            config_snapshot=snapshot.model_dump(mode="json"),
-        ),
-    )
-    rows = cast(
-        list[RegulatoryChunk],
-        [
-            SimpleNamespace(
-                id=f"rc_{index}",
-                user_file_id=user_file_id,
-                position=index,
-                text=f"MADDE {index + 1} - Transit hükmü.",
-                heading_path=[f"MADDE {index + 1}"],
-                validity_start_date=None,
-                validity_end_date=None,
-            )
-            for index in range(2)
-        ],
-    )
-    raw_item = SimpleNamespace(
+    job = RegulatoryIndexingJob(
         id=uuid4(),
-        job_id=job_id,
-        regulatory_chunk_id=rows[0].id,
-        request_hash="",
-        status=RegulatoryIndexingItemStatus.PENDING.value,
-        context=None,
+        user_file_id=file_id,
+        content_hash=snapshot.input_content_hash,
+        chunk_generation_hash=snapshot.chunk_generation_hash,
+        lease_generation=0,
+        config_snapshot=snapshot.model_dump(mode="json"),
     )
-    item = cast(RegulatoryIndexingItem, raw_item)
+    item = RegulatoryIndexingItem(
+        id=uuid4(),
+        job_id=job.id,
+        regulatory_chunk_id="row-0",
+        status=RegulatoryIndexingItemStatus.CONTEXT_READY.value,
+        context={"contextual_text": "Başarıyla üretilen bağlam."},
+    )
+    monkeypatch.setattr(
+        preparation, "resolve_regulatory_indexing_snapshot", lambda *_a, **_k: snapshot
+    )
+    monkeypatch.setattr(
+        preparation, "_create_owned_regulatory_indexing_job", lambda *_a, **_k: job
+    )
     claims = iter([True, False])
-    replacement_calls = 0
+    monkeypatch.setattr(
+        preparation, "claim_regulatory_indexing_job", lambda *_a, **_k: next(claims)
+    )
+    prepared_generations: list[int] = []
 
-    monkeypatch.setattr(
-        preparation,
-        "resolve_regulatory_indexing_snapshot",
-        lambda _session, **_kwargs: snapshot,
-    )
-    monkeypatch.setattr(
-        preparation,
-        "get_tokenizer",
-        lambda _model_name, _provider: _CharacterTokenizer(),
-    )
-    monkeypatch.setattr(
-        preparation,
-        "create_or_get_regulatory_indexing_job",
-        lambda *_args, **_kwargs: job,
-    )
-    monkeypatch.setattr(
-        preparation,
-        "claim_regulatory_indexing_job",
-        lambda *_args, **_kwargs: next(claims),
-    )
-    monkeypatch.setattr(
-        preparation,
-        "get_regulatory_indexing_job",
-        lambda *_args, **_kwargs: job,
-    )
+    def prepare(**kwargs: object) -> UUID:
+        prepared_generations.append(cast(int, kwargs["expected_generation"]))
+        return job.id
 
-    def replace_chunks(**_kwargs: object) -> list[object]:
-        nonlocal replacement_calls
-        replacement_calls += 1
-        return []
-
-    monkeypatch.setattr(preparation, "documents_to_regulatory_chunks", replace_chunks)
-    monkeypatch.setattr(
-        preparation,
-        "get_chunks_for_file",
-        lambda *_args, **_kwargs: rows,
+    monkeypatch.setattr(preparation, "prepare_claimed_regulatory_indexing_job", prepare)
+    assert (
+        preparation.prepare_regulatory_indexing_job(
+            file_id, [document], "tenant-a", MagicMock(spec=Session)
+        )
+        == job.id
     )
-
-    monkeypatch.setattr(
-        indexing_job_repository,
-        "persist_regulatory_indexing_preparation",
-        lambda _session, **kwargs: bool(kwargs["prepare_items"]()),
+    assert (
+        preparation.prepare_regulatory_indexing_job(
+            file_id, [document], "tenant-a", MagicMock(spec=Session)
+        )
+        == job.id
     )
-    first_job_id = preparation.prepare_regulatory_indexing_job(
-        user_file_id, [document], "tenant-a", cast(Session, SimpleNamespace())
-    )
-    raw_item.status = RegulatoryIndexingItemStatus.CONTEXT_READY.value
-    raw_item.context = {"contextual_text": "Başarıyla üretilen bağlam."}
-    second_job_id = preparation.prepare_regulatory_indexing_job(
-        user_file_id, [document], "tenant-a", cast(Session, SimpleNamespace())
-    )
-
-    assert first_job_id == second_job_id == job_id
-    assert replacement_calls == 1
+    assert prepared_generations == [1]
     assert item.status == RegulatoryIndexingItemStatus.CONTEXT_READY.value
     assert item.context == {"contextual_text": "Başarıyla üretilen bağlam."}
 
 
-def test_claimed_preparation_resumes_without_claiming_again_and_advances_once(
+def test_claimed_preparation_resolves_input_identity_before_owned_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    user_file_id = uuid4()
-    job_id = uuid4()
-    document = _document(user_file_id, "MADDE 1 - Kurtarılan hazırlık.")
+    file_id = uuid4()
+    document = _document(file_id, "MADDE 1 - Kurtarılan hazırlık.")
     content_hash = preparation.regulatory_documents_content_hash(
         [document], RegulatoryInputHashVersion.CANONICAL_V2
     )
     snapshot = _snapshot(input_content_hash=content_hash).model_copy(
         update={"input_hash_version": RegulatoryInputHashVersion.LEGACY_OR_CANONICAL}
     )
-    job = cast(
-        RegulatoryIndexingJob,
-        SimpleNamespace(
-            id=job_id,
-            user_file_id=user_file_id,
-            content_hash=content_hash,
-            chunk_generation_hash=snapshot.chunk_generation_hash,
-            lease_generation=3,
-            status="RUNNING",
-            stage="PREPARING",
-            config_snapshot=snapshot.model_dump(mode="json"),
-        ),
+    job = RegulatoryIndexingJob(
+        id=uuid4(),
+        user_file_id=file_id,
+        content_hash=content_hash,
+        chunk_generation_hash=snapshot.chunk_generation_hash,
+        config_snapshot=snapshot.model_dump(mode="json"),
     )
-    row = cast(
-        RegulatoryChunk,
-        SimpleNamespace(
-            id="rc_recovered",
-            user_file_id=user_file_id,
-            position=0,
-            text="MADDE 1 - Kurtarılan hazırlık.",
-            heading_path=["MADDE 1"],
-            validity_start_date=None,
-            validity_end_date=None,
-        ),
-    )
-    tokenizer_calls: list[tuple[str | None, object]] = []
-    atomic_calls: list[tuple[UUID, int, str]] = []
-
-    monkeypatch.setattr(
-        preparation,
-        "get_regulatory_indexing_job",
-        lambda _session, persisted_job_id: job if persisted_job_id == job_id else None,
-        raising=False,
-    )
+    monkeypatch.setattr(preparation, "get_regulatory_indexing_job", lambda *_a: job)
     monkeypatch.setattr(
         preparation,
         "claim_regulatory_indexing_job",
-        lambda *_args, **_kwargs: pytest.fail("claimed recovery must not claim again"),
+        lambda *_a, **_k: pytest.fail("claimed recovery must not claim again"),
     )
-
-    def get_distinct_tokenizer(
-        model_name: str | None, provider: object
-    ) -> _CharacterTokenizer:
-        tokenizer_calls.append((model_name, provider))
-        return _CharacterTokenizer()
-
-    monkeypatch.setattr(preparation, "get_tokenizer", get_distinct_tokenizer)
-    monkeypatch.setattr(
-        preparation, "documents_to_regulatory_chunks", lambda **_kwargs: []
+    embedding_tokenizer, contextual_tokenizer = (
+        _CharacterTokenizer(),
+        _CharacterTokenizer(),
     )
+    monkeypatch.setattr(preparation, "get_tokenizer", lambda *_a: embedding_tokenizer)
     monkeypatch.setattr(
         preparation,
-        "get_chunks_for_file",
-        lambda *_args, **_kwargs: [row],
+        "get_contextual_token_budget_tokenizer",
+        lambda **_k: contextual_tokenizer,
+    )
+    captured: list[dict[str, object]] = []
+
+    def prepare(**kwargs: object) -> UUID:
+        captured.append(kwargs)
+        return job.id
+
+    monkeypatch.setattr(preparation, "_prepare_claimed_owned_items", prepare)
+    assert (
+        preparation.prepare_claimed_regulatory_indexing_job(
+            job_id=job.id,
+            expected_generation=3,
+            documents=[document],
+            tenant_id="tenant-a",
+            db_session=MagicMock(spec=Session),
+        )
+        == job.id
+    )
+    assert len(captured) == 1
+    assert captured[0]["expected_generation"] == 3
+    assert (
+        captured[0]["resolved_input_hash_version"]
+        is RegulatoryInputHashVersion.CANONICAL_V2
+    )
+    assert captured[0]["documents"] == [document]
+    assert captured[0]["embedding_tokenizer"] is embedding_tokenizer
+    assert captured[0]["contextual_tokenizer"] is contextual_tokenizer
+
+
+@pytest.mark.parametrize("persisted", [True, False])
+def test_owned_preparation_persists_exact_dated_items_and_releases_authority(
+    monkeypatch: pytest.MonkeyPatch, persisted: bool
+) -> None:
+    from contextlib import nullcontext
+
+    from onyx.db import regulatory_publication, regulatory_writer_publication
+    from onyx.regulatory import writer_publication
+    from onyx.regulatory.amendments.annexes import publication_execution
+    from onyx.regulatory.indexing_jobs import projection_preparation
+    from tests.unit.onyx.regulatory.indexing_jobs.owned_publication_test_helpers import (
+        OwnedAuthority,
+        canonical_row,
+        writer_inputs,
     )
 
-    def persist_atomically(
-        _session: Session,
-        *,
-        job_id: UUID,
-        expected_generation: int,
-        prepare_items: Callable[
-            [], list[indexing_job_repository.RegulatoryIndexingPreparedItem]
-        ],
-        resolved_input_hash_version: str,
-        now: object,
-    ) -> bool:
-        del now
-        atomic_calls.append((job_id, expected_generation, resolved_input_hash_version))
-        prepared_items = prepare_items()
-        assert len(prepared_items) == 1
-        return True
+    file_id = uuid4()
+    authority = OwnedAuthority(file_id)
+    job = RegulatoryIndexingJob(
+        id=uuid4(),
+        user_file_id=file_id,
+        search_settings_id=41,
+        config_snapshot=_snapshot().model_dump(mode="json"),
+    )
+    rows = [canonical_row(file_id, 0, "MADDE 1 - Retained canonical text.")]
+    inputs = writer_inputs(file_id, rows)
+    monkeypatch.setattr(regulatory_publication, "PublicationStore", authority.for_scope)
+    monkeypatch.setattr(projection_preparation, "PublicationStore", authority.for_scope)
+    monkeypatch.setattr(
+        writer_publication, "recover_owned_writer_before_next", lambda owner: owner
+    )
+    monkeypatch.setattr(
+        regulatory_writer_publication, "load_owned_writer_inputs", lambda _owner: inputs
+    )
+    monkeypatch.setattr(
+        publication_execution, "publication_heartbeat", lambda _owner: nullcontext()
+    )
+    monkeypatch.setattr(
+        regulatory_writer_publication,
+        "persist_owned_initial_chunks",
+        lambda *_a, **_k: pytest.fail("retained canonical input must not be reparsed"),
+    )
+    seen: list[indexing_job_repository.RegulatoryIndexingPreparedItem] = []
+
+    def persist(_session: Session, **kwargs: object) -> bool:
+        assert kwargs["job_id"] == job.id and kwargs["expected_generation"] == 3
+        assert kwargs["publication_owner"] == authority.owner
+        assert (
+            kwargs["resolved_input_hash_version"]
+            == RegulatoryInputHashVersion.CANONICAL_V2.value
+        )
+        callback = cast(
+            Callable[[], list[indexing_job_repository.RegulatoryIndexingPreparedItem]],
+            kwargs["prepare_items"],
+        )
+        seen.extend(callback())
+        return persisted
 
     monkeypatch.setattr(
-        indexing_job_repository,
-        "persist_regulatory_indexing_preparation",
-        persist_atomically,
-        raising=False,
-    )
-    result = preparation.prepare_claimed_regulatory_indexing_job(
-        job_id=job_id,
-        expected_generation=3,
-        documents=[document],
-        tenant_id="tenant-a",
-        db_session=cast(Session, SimpleNamespace()),
+        indexing_job_repository, "persist_regulatory_indexing_preparation", persist
     )
 
-    assert result == job_id
-    assert atomic_calls == [(job_id, 3, RegulatoryInputHashVersion.CANONICAL_V2.value)]
-    assert tokenizer_calls == [
-        (snapshot.embedding_model_name, snapshot.embedding_provider),
-    ]
+    def prepare() -> UUID:
+        return preparation._prepare_claimed_owned_items(
+            job=job,
+            snapshot=_snapshot(),
+            expected_generation=3,
+            tenant_id="tenant-a",
+            db_session=MagicMock(spec=Session),
+            embedding_tokenizer=_CharacterTokenizer(),
+            contextual_tokenizer=_CharacterTokenizer(),
+            resolved_input_hash_version=RegulatoryInputHashVersion.CANONICAL_V2,
+        )
+
+    if persisted:
+        assert prepare() == job.id
+    else:
+        with pytest.raises(RuntimeError, match="lease was lost"):
+            prepare()
+    assert authority.released == [authority.owner]
+    assert len(seen) == 1 and seen[0].projection_id is not None
+    assert seen[0].projection_input is not None
+    assert (
+        seen[0].projection_input.canonical_revision_id
+        == inputs.canonical_revisions[rows[0].id]
+    )
+    assert seen[0].projection_input.representation.text == rows[0].text

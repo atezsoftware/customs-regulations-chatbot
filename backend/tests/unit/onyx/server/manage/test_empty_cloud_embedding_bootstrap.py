@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -122,7 +123,9 @@ def test_empty_cloud_bootstrap_cleans_up_if_promotion_does_not_complete() -> Non
         patch(f"{_MODULE}._elasticsearch_index_exists", return_value=False),
         patch(f"{_MODULE}.get_all_document_indices", return_value=[]),
         patch(f"{_MODULE}.check_and_perform_index_swap"),
-        patch(f"{_MODULE}.reclaim_index_data") as reclaim_index,
+        patch(
+            "onyx.document_index.elasticsearch.physical_operations.run_empty_physical_operation"
+        ) as reclaim_index,
         patch(
             f"{_MODULE}.delete_search_settings_if_not_present", return_value=True
         ) as delete_settings,
@@ -133,12 +136,14 @@ def test_empty_cloud_bootstrap_cleans_up_if_promotion_does_not_complete() -> Non
         )
 
     assert exc_info.value.error_code == OnyxErrorCode.INTERNAL_ERROR
-    delete_settings.assert_called_once_with(
-        db_session=db_session,
-        search_settings_id=future.id,
-    )
+    delete_settings.assert_not_called()
     reclaim_index.assert_called_once()
-    assert reclaim_index.call_args.kwargs["index_name"] == future.index_name
+    assert reclaim_index.call_args.kwargs == {
+        "index_name": future.index_name,
+        "multitenant": False,
+        "operation": "delete",
+        "discard_search_settings_id": future.id,
+    }
 
 
 def test_empty_cloud_bootstrap_cleans_up_if_swap_raises_before_promotion() -> None:
@@ -180,7 +185,9 @@ def test_empty_cloud_bootstrap_cleans_up_if_swap_raises_before_promotion() -> No
             f"{_MODULE}.check_and_perform_index_swap",
             side_effect=RuntimeError("swap failed"),
         ),
-        patch(f"{_MODULE}.reclaim_index_data") as reclaim_index,
+        patch(
+            "onyx.document_index.elasticsearch.physical_operations.run_empty_physical_operation"
+        ) as reclaim_index,
         patch(
             f"{_MODULE}.delete_search_settings_if_not_present", return_value=True
         ) as delete_settings,
@@ -191,17 +198,20 @@ def test_empty_cloud_bootstrap_cleans_up_if_swap_raises_before_promotion() -> No
         )
 
     assert exc_info.value.error_code == OnyxErrorCode.INTERNAL_ERROR
-    db_session.rollback.assert_called_once_with()
+    assert db_session.rollback.call_count == 2
     reclaim_index.assert_called_once()
-    delete_settings.assert_called_once_with(
-        db_session=db_session,
-        search_settings_id=future.id,
-    )
+    assert reclaim_index.call_args.kwargs == {
+        "index_name": future.index_name,
+        "multitenant": False,
+        "operation": "delete",
+        "discard_search_settings_id": future.id,
+    }
+    delete_settings.assert_not_called()
 
 
-def test_empty_cloud_bootstrap_never_reclaims_a_promoted_index_after_swap_error() -> (
-    None
-):
+def test_empty_cloud_bootstrap_never_reclaims_a_promoted_index_after_swap_error(
+    bootstrap_database: MagicMock,
+) -> None:
     current = MagicMock(
         id=1,
         use_port_flow=False,
@@ -218,6 +228,7 @@ def test_empty_cloud_bootstrap_never_reclaims_a_promoted_index_after_swap_error(
     promoted = MagicMock(id=2)
     db_session = MagicMock()
 
+    bootstrap_database.return_value.status = IndexModelStatus.PRESENT
     with (
         patch.object(search_settings, "DOCUMENT_IMPORT_ENABLED", False),
         patch(f"{_MODULE}.check_docs_exist", return_value=False),
@@ -241,7 +252,9 @@ def test_empty_cloud_bootstrap_never_reclaims_a_promoted_index_after_swap_error(
             f"{_MODULE}.check_and_perform_index_swap",
             side_effect=RuntimeError("late swap failure"),
         ),
-        patch(f"{_MODULE}.reclaim_index_data") as reclaim_index,
+        patch(
+            "onyx.document_index.elasticsearch.physical_operations.run_empty_physical_operation"
+        ) as reclaim_index,
         patch(
             f"{_MODULE}.delete_search_settings_if_not_present", return_value=False
         ) as delete_settings,
@@ -252,10 +265,7 @@ def test_empty_cloud_bootstrap_never_reclaims_a_promoted_index_after_swap_error(
 
     assert result.id == future.id
     reclaim_index.assert_not_called()
-    delete_settings.assert_called_once_with(
-        db_session=db_session,
-        search_settings_id=future.id,
-    )
+    delete_settings.assert_not_called()
 
 
 def test_empty_cloud_bootstrap_never_reclaims_a_preexisting_index() -> None:
@@ -267,7 +277,9 @@ def test_empty_cloud_bootstrap_never_reclaims_a_preexisting_index() -> None:
 
     with (
         patch(f"{_MODULE}.delete_search_settings_if_not_present", return_value=True),
-        patch(f"{_MODULE}.reclaim_index_data") as reclaim_index,
+        patch(
+            "onyx.document_index.elasticsearch.physical_operations.run_empty_physical_operation"
+        ) as reclaim_index,
     ):
         removed = search_settings._cleanup_unpromoted_empty_cloud_bootstrap(
             db_session=db_session,
@@ -279,18 +291,21 @@ def test_empty_cloud_bootstrap_never_reclaims_a_preexisting_index() -> None:
     reclaim_index.assert_not_called()
 
 
-def test_empty_cloud_bootstrap_never_reclaims_when_conditional_delete_loses_race() -> (
-    None
-):
+def test_empty_cloud_bootstrap_never_reclaims_when_fresh_read_finds_promotion(
+    bootstrap_database: MagicMock,
+) -> None:
     future = MagicMock(
         id=2,
         index_name="danswer_chunk_new",
     )
     db_session = MagicMock()
 
+    bootstrap_database.return_value.status = IndexModelStatus.PRESENT
     with (
         patch(f"{_MODULE}.delete_search_settings_if_not_present", return_value=False),
-        patch(f"{_MODULE}.reclaim_index_data") as reclaim_index,
+        patch(
+            "onyx.document_index.elasticsearch.physical_operations.run_empty_physical_operation"
+        ) as reclaim_index,
     ):
         removed = search_settings._cleanup_unpromoted_empty_cloud_bootstrap(
             db_session=db_session,
@@ -303,16 +318,22 @@ def test_empty_cloud_bootstrap_never_reclaims_when_conditional_delete_loses_race
 
 
 def test_index_swap_commits_present_and_past_statuses_atomically() -> None:
-    current = MagicMock(id=1)
+    current = MagicMock(id=1, status=IndexModelStatus.PRESENT, index_name="old-index")
     future = MagicMock(
         id=2,
+        status=IndexModelStatus.FUTURE,
+        index_name="new-index",
         use_port_flow=False,
         enable_contextual_rag=False,
         contextual_rag_model_configuration_id=None,
     )
     db_session = MagicMock()
 
+    db_session.scalars.return_value = [current, future]
     with (
+        patch.object(swap_index, "lock_index_publication_barrier", return_value=True),
+        patch.object(swap_index, "unreconciled_user_files", return_value=[]),
+        patch.object(swap_index, "transfer_reranker_configuration__no_commit"),
         patch.object(swap_index, "get_current_search_settings", return_value=current),
         patch.object(swap_index, "update_search_settings_status") as update_status,
         patch.object(swap_index, "update_default_contextual_model"),
@@ -369,3 +390,21 @@ def test_parser_free_production_rejects_embedding_change_when_data_exists(
         search_settings.set_new_search_settings(
             _cloud_request(), _=MagicMock(), db_session=MagicMock()
         )
+
+
+@pytest.fixture(autouse=True)
+def bootstrap_database() -> Iterator[MagicMock]:
+    from onyx.db.models import SearchSettings
+
+    row = SearchSettings(id=2, status=IndexModelStatus.FUTURE)
+    with (
+        patch(
+            "onyx.db.regulatory_index_lifecycle.require_index_publication_barrier",
+            return_value=None,
+        ),
+        patch(
+            "onyx.db.search_settings.get_search_settings_by_id", return_value=row
+        ) as lookup,
+        patch(f"{_MODULE}.ElasticsearchIndexClient"),
+    ):
+        yield lookup

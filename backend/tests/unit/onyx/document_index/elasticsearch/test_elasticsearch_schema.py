@@ -1,4 +1,5 @@
-from unittest.mock import MagicMock
+from collections.abc import Iterator
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -80,6 +81,7 @@ def test_schema_honors_explicit_custom_text_analyzer(
 
 def _mismatched_index_client(indexed_chunk_count: int) -> MagicMock:
     client = MagicMock()
+    client.index_name = "regulatory-index"
     client.get_index_mapping.return_value = {
         "properties": {CONTENT_FIELD_NAME: {"type": "text", "analyzer": "english"}}
     }
@@ -88,7 +90,9 @@ def _mismatched_index_client(indexed_chunk_count: int) -> MagicMock:
     return client
 
 
-def test_existing_empty_index_is_recreated_for_turkish_mapping() -> None:
+def test_existing_empty_index_is_recreated_for_turkish_mapping(
+    physical_operation: MagicMock,
+) -> None:
     client = _mismatched_index_client(indexed_chunk_count=0)
     expected_mappings = DocumentSchema.get_document_schema(768, multitenant=False)
     index_settings = DocumentSchema.get_index_settings_based_on_environment()
@@ -100,11 +104,16 @@ def test_existing_empty_index_is_recreated_for_turkish_mapping() -> None:
         database_has_indexed_documents=False,
     )
 
-    client.delete_index.assert_called_once_with()
-    client.create_index.assert_called_once_with(
+    physical_operation.assert_called_once_with(
+        client.publication_client(),
+        index_name=client.index_name,
+        multitenant=False,
+        operation="recreate",
         mappings=expected_mappings,
         settings=index_settings,
     )
+    client.delete_index.assert_not_called()
+    client.create_index.assert_not_called()
     client.put_mapping.assert_not_called()
 
 
@@ -115,6 +124,7 @@ def test_existing_empty_index_is_recreated_for_turkish_mapping() -> None:
 def test_mismatched_nonempty_index_is_never_destroyed(
     database_has_indexed_documents: bool,
     indexed_chunk_count: int,
+    physical_operation: MagicMock,
 ) -> None:
     client = _mismatched_index_client(indexed_chunk_count=indexed_chunk_count)
 
@@ -133,10 +143,14 @@ def test_mismatched_nonempty_index_is_never_destroyed(
 
     client.delete_index.assert_not_called()
     client.create_index.assert_not_called()
+    physical_operation.assert_not_called()
 
 
-def test_compatible_index_receives_additive_mapping_update() -> None:
+def test_compatible_index_receives_additive_mapping_update(
+    physical_operation: MagicMock,
+) -> None:
     client = MagicMock()
+    client.index_name = "regulatory-index"
     expected_mappings = DocumentSchema.get_document_schema(768, multitenant=False)
     client.get_index_mapping.return_value = expected_mappings
 
@@ -150,3 +164,19 @@ def test_compatible_index_receives_additive_mapping_update() -> None:
     client.put_mapping.assert_called_once_with(expected_mappings)
     client.count_by_query.assert_not_called()
     client.delete_index.assert_not_called()
+    physical_operation.assert_not_called()
+
+
+@pytest.fixture(autouse=True)
+def physical_operation() -> Iterator[MagicMock]:
+    with (
+        patch(
+            "onyx.db.regulatory_physical_indexes.pending_physical_operation",
+            return_value=None,
+        ),
+        patch(
+            "onyx.document_index.elasticsearch.physical_operations.run_empty_physical_operation",
+            return_value="replacement-uuid",
+        ) as operation,
+    ):
+        yield operation

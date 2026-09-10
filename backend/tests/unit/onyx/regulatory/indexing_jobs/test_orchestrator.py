@@ -65,6 +65,8 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
 )
 from shared_configs.enums import EmbeddingProvider
 
+_RUNTIMES: dict[object, indexing_job_repository.RegulatoryIndexingRuntime] = {}
+
 _NOW = datetime.datetime(2026, 8, 19, tzinfo=datetime.timezone.utc)
 
 
@@ -175,13 +177,15 @@ def _runtime(
         status=user_file_status,
         chunk_count=2,
     )
-    return indexing_job_repository.RegulatoryIndexingRuntime(
+    runtime = indexing_job_repository.RegulatoryIndexingRuntime(
         job=cast(RegulatoryIndexingJob, job),
         user_file=cast(UserFile, user_file),
         search_settings=cast(SearchSettings, SimpleNamespace(id=9)),
         regulatory_chunks=(),
         indexing_items=(),
     )
+    _RUNTIMES[job_id] = runtime
+    return runtime
 
 
 @contextmanager
@@ -1007,11 +1011,48 @@ def test_openrouter_ambiguous_create_persists_manual_stop_and_never_reposts() ->
     request = OpenRouterEmbeddingBatchRequest(
         custom_id="embedding-1", inputs=["context\nchunk"]
     )
-    plan = SimpleNamespace(
-        requests=[request],
+    from onyx.regulatory.indexing_jobs.embedding import OpenRouterEmbeddingBatchPlan
+    from onyx.regulatory.indexing_jobs.embedding_receipts import DurableEmbeddingReceipt
+    from tests.unit.onyx.regulatory.indexing_jobs.owned_publication_test_helpers import (
+        canonical_row,
+    )
+
+    row = canonical_row(runtime.user_file.id, 0, "context\nchunk")
+    item = RegulatoryIndexingItem(
+        id=item_id,
+        job_id=runtime.job.id,
+        regulatory_chunk_id=row.id,
+        status=RegulatoryIndexingItemStatus.SKIPPED.value,
+        context=None,
+    )
+    runtime = replace(runtime, regulatory_chunks=(row,), indexing_items=(item,))
+    _RUNTIMES[runtime.job.id] = runtime
+    plan = OpenRouterEmbeddingBatchPlan(
+        requests=(request,),
         item_ids_by_custom_id={request.custom_id: (item_id,)},
+        selected_item_count=1,
         remaining_item_count=0,
     )
+
+    def freeze(
+        _session: Session,
+        *,
+        job_id: object,
+        expected_generation: int,
+        receipts: dict[object, DurableEmbeddingReceipt],
+    ) -> int:
+        assert (
+            job_id == runtime.job.id
+            and expected_generation == runtime.job.lease_generation
+        )
+        assert set(receipts) == {item_id}
+        receipt = receipts[item_id]
+        assert receipt.texts == ["context\nchunk"]
+        assert receipt.configuration["dimension"] == 1024
+        assert receipt.configuration["transport"] == "openrouter_batch"
+        item.context = {"embedding_receipt": receipt.model_dump(mode="json")}
+        return 0
+
     snapshot = runtime.job.config_snapshot
     snapshot["openrouter_batch"] = {
         "api_url": "https://openrouter.test/api/beta/batches",
@@ -1030,6 +1071,11 @@ def test_openrouter_ambiguous_create_persists_manual_stop_and_never_reposts() ->
     )
 
     with (
+        patch.object(
+            indexing_job_repository,
+            "freeze_regulatory_embedding_receipts",
+            side_effect=freeze,
+        ),
         patch("onyx.regulatory.indexing_jobs.orchestrator.validate_snapshot_for_stage"),
         patch(
             "onyx.regulatory.indexing_jobs.orchestrator.build_openrouter_embedding_batch",
@@ -1070,7 +1116,7 @@ def test_openrouter_ambiguous_create_persists_manual_stop_and_never_reposts() ->
         )
 
     assert first.outcome is OrchestrationOutcome.NEXT_STEP
-    gateway.submit.assert_called_once_with([request], submission_key=submission_key)
+    gateway.submit.assert_called_once_with((request,), submission_key=submission_key)
     record_ambiguous.assert_called_once()
     request_cleanup.assert_called_once()
 
@@ -1940,6 +1986,10 @@ def test_required_index_cleanup_failure_never_advances_to_finalize(
     document_index.delete.side_effect = error
     with (
         patch(
+            "onyx.regulatory.indexing_jobs.owned_publication.execute_owned_cancellation",
+            side_effect=error,
+        ),
+        patch(
             "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index",
             return_value=document_index,
         ),
@@ -1985,6 +2035,10 @@ def test_user_cancel_index_cleanup_remains_bounded_best_effort() -> None:
     document_index.delete.side_effect = RuntimeError("terminal cleanup failure")
     with (
         patch(
+            "onyx.regulatory.indexing_jobs.owned_publication.execute_owned_cancellation",
+            side_effect=RuntimeError("terminal cleanup failure"),
+        ),
+        patch(
             "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index",
             return_value=document_index,
         ),
@@ -2013,55 +2067,59 @@ def test_user_cancel_index_cleanup_remains_bounded_best_effort() -> None:
     assert result.outcome is OrchestrationOutcome.NEXT_STEP
 
 
-def test_cancellation_index_delete_and_finalize_are_separate_deliveries() -> None:
-    deleting = _runtime(
+@pytest.mark.parametrize(
+    "phase",
+    [
+        RegulatoryIndexingCancellationPhase.INDEX_DELETE,
+        RegulatoryIndexingCancellationPhase.FINALIZE,
+    ],
+)
+def test_cancellation_owned_checkpoint_finishes_atomically(
+    phase: RegulatoryIndexingCancellationPhase,
+) -> None:
+    runtime = _runtime(
         RegulatoryIndexingStage.INDEX_WRITE,
         status=RegulatoryIndexingJobStatus.CANCELLING,
-        cancellation_phase=RegulatoryIndexingCancellationPhase.INDEX_DELETE.value,
+        cancellation_phase=phase.value,
     )
-    document_index = MagicMock()
+    session = MagicMock(spec=Session)
     with (
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.build_elasticsearch_document_index",
-            return_value=document_index,
-        ),
+            "onyx.regulatory.indexing_jobs.owned_publication.execute_owned_cancellation"
+        ) as cancel,
         patch(
-            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_cancellation",
-            return_value=True,
+            "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.advance_regulatory_indexing_cancellation"
         ) as advance,
     ):
         from onyx.regulatory.indexing_jobs.orchestrator import _execute_claimed_step
 
-        delete_result = _execute_claimed_step(
-            deleting,
-            tenant_id="tenant-a",
-            db_session=cast(Session, MagicMock()),
-            now=_NOW,
+        result = _execute_claimed_step(
+            runtime, tenant_id="tenant-a", db_session=session, now=_NOW
         )
-
-    document_index.delete.assert_called_once_with(
-        str(deleting.user_file.id), chunk_count=2, refresh=True
+    cancel.assert_called_once_with(
+        job_id=runtime.job.id,
+        user_file_id=runtime.user_file.id,
+        expected_generation=runtime.job.lease_generation,
+        tenant_id="tenant-a",
     )
-    assert advance.call_args.kwargs["next_phase"] is (
-        RegulatoryIndexingCancellationPhase.FINALIZE
-    )
-    assert delete_result.outcome is OrchestrationOutcome.NEXT_STEP
+    session.rollback.assert_called_once_with()
+    advance.assert_not_called()
+    assert result.outcome is OrchestrationOutcome.COMPLETE
 
-    finalizing = _runtime(
-        RegulatoryIndexingStage.INDEX_WRITE,
-        status=RegulatoryIndexingJobStatus.CANCELLING,
-        cancellation_phase=RegulatoryIndexingCancellationPhase.FINALIZE.value,
-    )
-    with patch(
-        "onyx.regulatory.indexing_jobs.orchestrator.indexing_job_repository.finalize_regulatory_indexing_cancellation",
-        return_value=True,
-    ) as finalize:
-        finalize_result = _execute_claimed_step(
-            finalizing,
-            tenant_id="tenant-a",
-            db_session=cast(Session, MagicMock()),
-            now=_NOW,
-        )
 
-    finalize.assert_called_once()
-    assert finalize_result.outcome is OrchestrationOutcome.COMPLETE
+@pytest.fixture(autouse=True)
+def owned_repair_boundary() -> Iterator[None]:
+    """Orchestrator tests begin after the independently tested receipt repair step."""
+    with (
+        patch(
+            "onyx.regulatory.indexing_jobs.owned_publication.repair_owned_durable_items",
+            return_value=False,
+        ),
+        patch.object(
+            indexing_job_repository,
+            "get_regulatory_indexing_runtime",
+            side_effect=lambda _session, job_id: _RUNTIMES.get(job_id),
+        ),
+    ):
+        yield
+    _RUNTIMES.clear()
