@@ -1,6 +1,7 @@
 """Scoped immutable context inputs and independently effective retrieval versions."""
 
 import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import or_, select
@@ -21,6 +22,10 @@ from onyx.regulatory.amendments.annexes.models import (
     FrozenContextProjection,
     PreparedContextView,
 )
+
+if TYPE_CHECKING:
+    from onyx.document_index.publication_models import PublicationIndexSnapshot
+    from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
 
 
 def persist_context_view(
@@ -316,3 +321,289 @@ def retire_context_projection(
         raise ValueError("cannot reopen context projection history")
     projection.effective_end = effective_end
     session.flush()
+
+
+def activate_temporal_projection(
+    session: Session, *, user_file_id: UUID, binding: "AnnexTemporalProjection"
+) -> None:
+    """Join an owned publication transaction; never alter another index's history."""
+    import json
+
+    from onyx.db.models import RegulatoryTemporalProjection
+    from onyx.document_index.publication_models import publication_digest
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        canonical_dependency_ids,
+        rebuild_context_aggregates,
+    )
+    from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+    from onyx.utils.text_processing import remove_invalid_unicode_chars
+
+    binding = AnnexTemporalProjection.model_validate(binding.model_dump(mode="json"))
+    source = json.loads(binding.projection.source_json)
+
+    def epoch(value: datetime.date | None) -> int | None:
+        return (
+            int(
+                datetime.datetime.combine(
+                    value, datetime.time.min, datetime.timezone.utc
+                ).timestamp()
+            )
+            if value is not None
+            else None
+        )
+
+    if source.get("validity_start_date") != epoch(
+        binding.effective_start
+    ) or source.get("validity_end_date") != epoch(binding.effective_end):
+        raise ValueError("temporal source interval mismatch")
+    if (
+        source.get("chunk_index") != binding.projection.ordinal
+        or len(source["content_vector"]) != binding.index.vector_dimension
+        or not binding.index.accepts_encoder_configuration(
+            json.loads(binding.projection.embedding_config_json)
+        )
+    ):
+        raise ValueError("temporal encoder/source identity mismatch")
+    canonical = session.get(RegulatoryChunk, source["regulatory_chunk_id"])
+    if (
+        canonical is None
+        or canonical.user_file_id != user_file_id
+        or binding.canonical_base_sha256 != context_hash(canonical.text)
+    ):
+        raise ValueError("temporal canonical base changed")
+    if source["document_id"] != str(
+        user_file_id
+    ) or binding.projection.context_projection_id != str(binding.id):
+        raise ValueError("temporal projection identity mismatch")
+
+    def dated_dependency(row: RegulatoryChunk) -> RegulatoryChunk:
+        from onyx.regulatory.contextual import context_reference_date
+
+        if (
+            row.user_file_id != user_file_id
+            or row.validity_start_date is not None
+            and (
+                binding.effective_start is None
+                or row.validity_start_date > binding.effective_start
+            )
+            or row.validity_end_date is not None
+            and (
+                binding.effective_end is None
+                or row.validity_end_date < binding.effective_end
+            )
+        ):
+            raise ValueError("derived dependency exceeds its legal source window")
+        qualified = get_indexed_temporal_projection(
+            session,
+            row.id,
+            index=binding.index,
+            as_of_date=binding.reference_date
+            or context_reference_date(binding.effective_start, binding.effective_end),
+        )
+        if qualified is None:
+            return row
+        return RegulatoryChunk(
+            id=row.id,
+            user_file_id=row.user_file_id,
+            text=qualified.representation_text,
+            position=qualified.semantic_position,
+            projection_ordinal=row.projection_ordinal,
+            heading_path=row.heading_path,
+            chunk_metadata=qualified.representation_metadata,
+            chunk_type=row.chunk_type,
+            source=row.source,
+            status=row.status,
+            validity_start_date=row.validity_start_date,
+            validity_end_date=row.validity_end_date,
+            supersedes_chunk_id=row.supersedes_chunk_id,
+        )
+
+    if binding.derived_role == "canonical":
+        if binding.representation_text != canonical.text:
+            raise ValueError("direct canonical text mismatch")
+    elif binding.derived_role == "hierarchical_aggregate":
+        if canonical.chunk_metadata.get("chunk_variant") != "hierarchical_aggregate":
+            raise ValueError("canonical row is not a derived aggregate")
+        candidate = RegulatoryChunk(
+            id=canonical.id,
+            user_file_id=user_file_id,
+            text=canonical.text,
+            position=canonical.position,
+            projection_ordinal=canonical.projection_ordinal,
+            heading_path=canonical.heading_path,
+            chunk_metadata=binding.representation_metadata,
+            chunk_type=canonical.chunk_type,
+            source=canonical.source,
+            status=canonical.status,
+            validity_start_date=canonical.validity_start_date,
+            validity_end_date=canonical.validity_end_date,
+        )
+        if canonical_dependency_ids(candidate) != binding.dependency_ids:
+            raise ValueError("derived dependency provenance mismatch")
+        dependencies = list(
+            session.scalars(
+                select(RegulatoryChunk).where(
+                    RegulatoryChunk.user_file_id == user_file_id,
+                    RegulatoryChunk.id.in_(binding.dependency_ids),
+                )
+            )
+        )
+        rebuilt = rebuild_context_aggregates(
+            [*(dated_dependency(row) for row in dependencies), candidate],
+            changed_ids=[canonical.id],
+        )[-1]
+        if rebuilt.text != binding.representation_text:
+            raise ValueError("derived aggregate content mismatch")
+    else:
+        predecessor = canonical.chunk_metadata.get("bound_to_regulatory_chunk_id")
+        target_id = binding.representation_metadata.get("bound_to_regulatory_chunk_id")
+        target = (
+            session.get(RegulatoryChunk, target_id)
+            if isinstance(target_id, str)
+            else None
+        )
+        if (
+            not isinstance(predecessor, str)
+            or binding.representation_text != canonical.text
+            or target is None
+            or target.user_file_id != user_file_id
+            or binding.dependency_ids != [target.id]
+        ):
+            raise ValueError("image companion provenance mismatch")
+        ancestor = target
+        visited: set[str] = set()
+        while ancestor.id != predecessor:
+            if ancestor.id in visited or ancestor.supersedes_chunk_id is None:
+                raise ValueError("image companion target has no reviewed legal lineage")
+            visited.add(ancestor.id)
+            parent = session.get(RegulatoryChunk, ancestor.supersedes_chunk_id)
+            if parent is None or parent.user_file_id != user_file_id:
+                raise ValueError("image companion target lineage leaves file scope")
+            ancestor = parent
+        target = dated_dependency(target)
+        for key in (
+            "image_file_id",
+            "image_file_ids",
+            "source_asset_ids",
+            "annex_element_ids",
+        ):
+            if binding.representation_metadata.get(key) != target.chunk_metadata.get(
+                key
+            ):
+                raise ValueError("image companion source evidence mismatch")
+    from onyx.regulatory.chunk_evidence import chunk_evidence
+
+    evidence = chunk_evidence(binding.representation_metadata)
+    if source.get("image_file_id") != evidence.image_file_id or source.get(
+        "source_links"
+    ) != (json.dumps(evidence.source_links) if evidence.source_links else None):
+        raise ValueError("temporal source/image evidence mismatch")
+    expected = remove_invalid_unicode_chars(
+        source["doc_summary"]
+        + binding.representation_text
+        + source["chunk_context"]
+        + (source.get("metadata_suffix") or "")
+    )
+    if source["content"] != expected:
+        raise ValueError(
+            "projection source does not represent canonical/derived content"
+        )
+    starts = [
+        value
+        for value in (canonical.validity_start_date, binding.effective_start)
+        if value is not None
+    ]
+    ends = [
+        value
+        for value in (canonical.validity_end_date, binding.effective_end)
+        if value is not None
+    ]
+    if (max(starts) if starts else None) != binding.effective_start or (
+        min(ends) if ends else None
+    ) != binding.effective_end:
+        raise ValueError("temporal projection exceeds canonical legal window")
+    identity = binding.index.temporal_lookup_identity()
+    payload = binding.model_dump(mode="json")
+    existing = session.get(RegulatoryTemporalProjection, binding.id)
+    if existing is not None:
+        if existing.payload != payload:
+            raise ValueError(
+                "temporal projection identity reused with different payload"
+            )
+        return
+    overlapping = session.scalar(
+        select(RegulatoryTemporalProjection.id).where(
+            RegulatoryTemporalProjection.canonical_chunk_id == canonical.id,
+            RegulatoryTemporalProjection.index_identity_sha256 == identity,
+            or_(
+                RegulatoryTemporalProjection.effective_end.is_(None),
+                RegulatoryTemporalProjection.effective_end
+                > (binding.effective_start or datetime.date.min),
+            ),
+            or_(
+                RegulatoryTemporalProjection.effective_start.is_(None),
+                RegulatoryTemporalProjection.effective_start
+                < (binding.effective_end or datetime.date.max),
+            ),
+        )
+    )
+    if overlapping is not None:
+        raise ValueError("temporal projection overlaps qualified history")
+    session.add(
+        RegulatoryTemporalProjection(
+            id=binding.id,
+            user_file_id=user_file_id,
+            canonical_chunk_id=canonical.id,
+            index_uuid=binding.index.index_uuid,
+            index_identity_sha256=identity,
+            projection_ordinal=binding.projection.ordinal,
+            effective_start=binding.effective_start,
+            effective_end=binding.effective_end,
+            payload=payload,
+            payload_sha256=publication_digest(payload),
+        )
+    )
+    session.flush()
+
+
+def get_indexed_temporal_projection(
+    session: Session,
+    canonical_chunk_id: str,
+    *,
+    index: "PublicationIndexSnapshot",
+    as_of_date: datetime.date,
+) -> "AnnexTemporalProjection | None":
+    """Public caller supplies its frozen actual query index/model configuration."""
+    from onyx.db.models import RegulatoryTemporalProjection
+    from onyx.document_index.publication_models import publication_digest
+    from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+
+    row = session.scalars(
+        select(RegulatoryTemporalProjection).where(
+            RegulatoryTemporalProjection.canonical_chunk_id == canonical_chunk_id,
+            RegulatoryTemporalProjection.index_identity_sha256
+            == index.temporal_lookup_identity(),
+            or_(
+                RegulatoryTemporalProjection.effective_start.is_(None),
+                RegulatoryTemporalProjection.effective_start <= as_of_date,
+            ),
+            or_(
+                RegulatoryTemporalProjection.effective_end.is_(None),
+                RegulatoryTemporalProjection.effective_end > as_of_date,
+            ),
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    if publication_digest(row.payload) != row.payload_sha256:
+        raise ValueError("temporal binding payload changed")
+    binding = AnnexTemporalProjection.model_validate(row.payload)
+    import json
+
+    if not index.accepts_encoder_configuration(
+        json.loads(binding.projection.embedding_config_json)
+    ):
+        raise ValueError(
+            "temporal binding encoder receipt is not accepted by query configuration"
+        )
+    return binding

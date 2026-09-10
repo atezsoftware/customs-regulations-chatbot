@@ -3,6 +3,7 @@
 import hashlib
 import re
 from datetime import date
+from typing import TYPE_CHECKING
 
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import SearchSettings
@@ -61,6 +62,13 @@ _ANNEX_REFERENCE = re.compile(
     r"(?<![\w])(?:ek|annex|appendix)[\s:–—-]*(?:[0-9]+[a-z]?|[ivxlcdm]+[a-z]?|[a-z])(?:[/.-][0-9a-z]+)*(?![\w/])",
     re.IGNORECASE,
 )
+
+
+if TYPE_CHECKING:
+    from onyx.db.models import RegulatoryChunk, SearchSettings, UserFile
+    from onyx.indexing.embedder import DefaultIndexingEmbedder
+    from onyx.regulatory.amendments.annexes.models import PreparedContextView
+    from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
 
 
 def group_annex_instructions(
@@ -470,15 +478,20 @@ def run_annex_groups(
             cache=cache,
         )
         draft = draft.model_copy(update={"date_resolution": resolved})
-        if resolved.effective_end_date is not None:
-            draft = draft.model_copy(
-                update={
-                    "issues": [
-                        *draft.issues,
-                        "temporary_annex_publication_contract_required",
-                    ]
-                }
+        if draft.impact is not None and not draft.issues:
+            from onyx.regulatory.amendments.annexes.publication_preparation import (
+                prepare_publication_review,
             )
+
+            try:
+                draft = prepare_publication_review(draft)
+            except ValueError as error:
+                draft = draft.model_copy(
+                    update={
+                        "publication": None,
+                        "issues": [*draft.issues, f"publication_preparation:{error}"],
+                    }
+                )
         with get_session_with_current_tenant() as session:
             if (
                 persist_annex_checkpoint(
@@ -496,13 +509,11 @@ def run_annex_groups(
 
 def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
     from onyx.configs.app_configs import REGULATORY_BATCH_INDEXING_ENABLED
-    from onyx.db.models import RegulatoryIndexingJob
     from onyx.db.search_settings import get_current_search_settings
     from onyx.indexing.embedder import DefaultIndexingEmbedder
     from onyx.regulatory.indexing_jobs.configuration import (
         resolve_regulatory_indexing_snapshot,
     )
-    from onyx.regulatory.projection import prepare_normal_context_view
 
     if (
         draft.user_file_id is None
@@ -543,86 +554,26 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         effective_date=draft.effective_date,
         evidence_remapping=draft.new_evidence_remapping,
     )
-    if snapshot is None:
-        before = prepare_normal_context_view(
-            rows=old_rows,
-            user_file=file,
-            search_settings=settings,
-            embedder=embedder,
-            llm=context_llm,
-            as_of_date=draft.effective_date,
-            cached=draft.baseline_context,
-        )
-        after = prepare_normal_context_view(
-            rows=candidate,
-            user_file=file,
-            search_settings=settings,
-            embedder=embedder,
-            llm=context_llm,
-            cached=before,
-            as_of_date=draft.effective_date,
-        )
-    else:
-        from onyx.llm.constants import LlmProviderNames
-        from onyx.llm.models import ChatCompletionMessage, TextContentPart, UserMessage
-        from onyx.llm.utils import llm_response_to_string
-        from onyx.regulatory.indexing_jobs.contextual import (
-            get_contextual_token_budget_tokenizer,
-            prepare_durable_context_view,
-        )
-        from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
-        from onyx.tracing.flows import LLMFlow
-        from onyx.tracing.llm_utils import llm_generation_span
-
-        if (
-            context_llm is None
-            or context_llm.config.model_provider != LlmProviderNames.VERTEX_AI
-            or context_llm.config.model_name != snapshot.vertex.model_name
-        ):
-            raise ValueError(
-                "durable contextual model differs from frozen configuration"
-            )
-        job = RegulatoryIndexingJob(
-            user_file_id=file.id, config_snapshot=snapshot.model_dump(mode="json")
-        )
-        tokenizer = get_contextual_token_budget_tokenizer(
-            model_provider=LlmProviderNames.VERTEX_AI,
-            model_name=snapshot.vertex.model_name,
-        )
-
-        def generate(request: VertexBatchRequest) -> str:
-            messages: list[ChatCompletionMessage] = [
-                UserMessage(content=[TextContentPart(text=request.prompt)])
-            ]
-            with llm_generation_span(
-                llm=context_llm,
-                flow=LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
-                input_messages=messages,
-            ):
-                return llm_response_to_string(
-                    context_llm.invoke(messages, timeout_override=60, max_tokens=256)
-                )
-
-        before = prepare_durable_context_view(
-            job=job,
-            rows=old_rows,
-            embedding_tokenizer=embedder.embedding_model.tokenizer,
-            contextual_tokenizer=tokenizer,
-            embedding_model=embedder.embedding_model,
-            generate=generate,
-            cached=draft.baseline_context,
-            as_of_date=draft.effective_date,
-        )
-        after = prepare_durable_context_view(
-            job=job,
-            rows=candidate,
-            embedding_tokenizer=embedder.embedding_model.tokenizer,
-            contextual_tokenizer=tokenizer,
-            embedding_model=embedder.embedding_model,
-            generate=generate,
-            cached=before,
-            as_of_date=draft.effective_date,
-        )
+    before = prepare_publication_context_view(
+        rows=old_rows,
+        file=file,
+        settings=settings,
+        snapshot=snapshot,
+        embedder=embedder,
+        context_llm=context_llm,
+        reference_date=draft.effective_date,
+        cached=draft.baseline_context,
+    )
+    after = prepare_publication_context_view(
+        rows=candidate,
+        file=file,
+        settings=settings,
+        snapshot=snapshot,
+        embedder=embedder,
+        context_llm=context_llm,
+        reference_date=draft.effective_date,
+        cached=before,
+    )
     impact = compare_context_views(
         old=before,
         new=after,
@@ -632,7 +583,7 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         metadata_only=draft.patch_plan.metadata_only,
         canonical_predecessors=staged_canonical_predecessors(draft.items),
     )
-    return draft.model_copy(
+    prepared = draft.model_copy(
         update={
             "baseline_context": before,
             "impact": impact,
@@ -645,6 +596,14 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
             else None,
         }
     )
+
+    if draft.date_resolution is not None:
+        from onyx.regulatory.amendments.annexes.publication_preparation import (
+            prepare_publication_review,
+        )
+
+        return prepare_publication_review(prepared)
+    return prepared
 
 
 def draft_batch_id(draft: AnnexChangeDraft) -> int:
@@ -730,6 +689,12 @@ def validate_live_review_configuration(draft: AnnexChangeDraft) -> None:
     if original_text_hash != draft.original_source_text_sha256:
         raise ValueError("original extracted source text changed")
 
+    from onyx.regulatory.amendments.annexes.publication_preparation import (
+        validate_indexed_publication_baseline,
+    )
+
+    validate_indexed_publication_baseline(draft)
+
 
 def resolve_group_effective_date(
     *,
@@ -777,4 +742,78 @@ def resolve_review_context_llm(
         llm_provider=provider,
         timeout=60,
         temperature=0,
+    )
+
+
+def prepare_publication_context_view(
+    *,
+    rows: list["RegulatoryChunk"],
+    file: "UserFile",
+    settings: "SearchSettings",
+    snapshot: "RegulatoryIndexingConfigSnapshot | None",
+    embedder: "DefaultIndexingEmbedder",
+    context_llm: "LLM | None",
+    reference_date: date,
+    cached: "PreparedContextView | None",
+) -> "PreparedContextView":
+    from onyx.regulatory.projection import prepare_normal_context_view
+
+    if snapshot is None:
+        return prepare_normal_context_view(
+            rows=rows,
+            user_file=file,
+            search_settings=settings,
+            embedder=embedder,
+            llm=context_llm,
+            as_of_date=reference_date,
+            cached=cached,
+        )
+    from onyx.db.models import RegulatoryIndexingJob
+    from onyx.llm.constants import LlmProviderNames
+    from onyx.llm.models import ChatCompletionMessage, TextContentPart, UserMessage
+    from onyx.llm.utils import llm_response_to_string
+    from onyx.regulatory.indexing_jobs.contextual import (
+        get_contextual_token_budget_tokenizer,
+        prepare_durable_context_view,
+    )
+    from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
+    from onyx.tracing.flows import LLMFlow
+    from onyx.tracing.llm_utils import llm_generation_span
+
+    if (
+        context_llm is None
+        or context_llm.config.model_provider != LlmProviderNames.VERTEX_AI
+        or context_llm.config.model_name != snapshot.vertex.model_name
+    ):
+        raise ValueError("durable contextual model differs from frozen configuration")
+    job = RegulatoryIndexingJob(
+        user_file_id=file.id, config_snapshot=snapshot.model_dump(mode="json")
+    )
+    tokenizer = get_contextual_token_budget_tokenizer(
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name=snapshot.vertex.model_name,
+    )
+
+    def generate(request: VertexBatchRequest) -> str:
+        messages: list[ChatCompletionMessage] = [
+            UserMessage(content=[TextContentPart(text=request.prompt)])
+        ]
+        with llm_generation_span(
+            llm=context_llm,
+            flow=LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
+            input_messages=messages,
+        ):
+            return llm_response_to_string(
+                context_llm.invoke(messages, timeout_override=60, max_tokens=256)
+            )
+
+    return prepare_durable_context_view(
+        job=job,
+        rows=rows,
+        embedding_tokenizer=embedder.embedding_model.tokenizer,
+        contextual_tokenizer=tokenizer,
+        embedding_model=embedder.embedding_model,
+        generate=generate,
+        cached=cached,
+        as_of_date=reference_date,
     )

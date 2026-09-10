@@ -13,7 +13,16 @@ from onyx.db.models import AmendmentSourcePackage, DocumentSet
 def source_session(
     db_session: Session,  # noqa: ARG001
     tenant_context: None,  # noqa: ARG001
+    request: pytest.FixtureRequest,
 ) -> Generator[Session, None, None]:
+    if "live_review" in request.fixturenames:
+        from tests.external_dependency_unit.regulatory.publication_fixtures import (
+            committed_review_session,
+        )
+
+        with committed_review_session() as session:
+            yield session
+        return
     engine = get_sqlalchemy_engine()
     with engine.connect() as connection:
         transaction = connection.begin()

@@ -40,6 +40,48 @@ class ReadObservation(PublicationModel):
     committed_epoch: int = Field(ge=0)
 
 
+class PublicationEncoderAuthority(PublicationModel):
+    provider: str | None
+    model: str
+    effective_dimension: int = Field(gt=0)
+    endpoint_sha256: str
+    deployment_name: str | None
+    api_version: str | None
+    normalize: bool | None
+    passage_prefix: str | None
+
+
+class PublicationEncoderReceipt(PublicationModel):
+    """Full transport receipt plus explicit resolution of omitted authority facts."""
+
+    configuration_json: str
+    authority: PublicationEncoderAuthority
+    resolution_sha256: str = Field(min_length=64, max_length=64)
+    resolved_fields: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_encoder_authority(self) -> Self:
+        configuration = json.loads(self.configuration_json)
+        if not isinstance(configuration, dict) or set(configuration).intersection(
+            self.resolved_fields
+        ):
+            raise ValueError(
+                "encoder authority resolution conflicts with actual receipt"
+            )
+        resolved = {**configuration, **self.resolved_fields}
+        expected = self.authority.model_dump(mode="json")
+        dimension = resolved.get("reduced_dimension") or resolved.get("dimension")
+        for key, value in expected.items():
+            actual_key = "dimension" if key == "effective_dimension" else key
+            if (
+                actual_key not in resolved
+                or (dimension if key == "effective_dimension" else resolved[actual_key])
+                != value
+            ):
+                raise ValueError(f"unresolved or incompatible encoder authority: {key}")
+        return self
+
+
 class PublicationIndexSnapshot(PublicationModel):
     index_name: str = Field(min_length=1)
     index_uuid: str = Field(min_length=1)
@@ -49,6 +91,54 @@ class PublicationIndexSnapshot(PublicationModel):
     vector_dimension: int = Field(gt=0)
     embedding_config_sha256: str = Field(min_length=64, max_length=64)
     multitenant: bool
+    encoder_authority: PublicationEncoderAuthority | None = None
+    encoder_receipts: tuple[PublicationEncoderReceipt, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_receipts(self) -> Self:
+        if self.encoder_authority is None:
+            if self.encoder_receipts:
+                raise ValueError("encoder receipts require compatible authority")
+            return self
+        authority = self.encoder_authority
+        if (
+            authority.provider or "",
+            authority.model,
+            authority.effective_dimension,
+        ) != (self.model_provider, self.model_name, self.vector_dimension):
+            raise ValueError("index encoder authority mismatch")
+        if not self.encoder_receipts or any(
+            receipt.authority != authority for receipt in self.encoder_receipts
+        ):
+            raise ValueError("incompatible accepted encoder receipt")
+        if self.embedding_config_sha256 not in {
+            publication_digest(json.loads(receipt.configuration_json))
+            for receipt in self.encoder_receipts
+        }:
+            raise ValueError("default encoder configuration receipt missing")
+        return self
+
+    def temporal_lookup_identity(self) -> str:
+        """Physical/model selector remains stable as approved formatter receipts grow."""
+        return publication_digest(
+            self.model_dump(
+                mode="json",
+                exclude={
+                    "embedding_config_sha256",
+                    "encoder_authority",
+                    "encoder_receipts",
+                },
+            )
+        )
+
+    def accepts_encoder_configuration(self, configuration: JsonValue) -> bool:
+        digest = publication_digest(configuration)
+        if self.encoder_authority is None:
+            return digest == self.embedding_config_sha256
+        return any(
+            json.loads(receipt.configuration_json) == configuration
+            for receipt in self.encoder_receipts
+        )
 
 
 def publication_digest(value: JsonValue) -> str:

@@ -302,6 +302,13 @@ def _date_to_epoch_seconds(value: datetime.date | None) -> int | None:
     return int(as_datetime.timestamp()) if as_datetime is not None else None
 
 
+def serialize_publication_chunk(chunk: DocMetadataAwareIndexChunk) -> str:
+    """Use the identical production search-source serializer for frozen plans."""
+    return _convert_onyx_chunk_to_elasticsearch_document(chunk).model_dump_json(
+        exclude_none=True
+    )
+
+
 def _convert_onyx_chunk_to_elasticsearch_document(
     chunk: DocMetadataAwareIndexChunk,
 ) -> DocumentChunk:

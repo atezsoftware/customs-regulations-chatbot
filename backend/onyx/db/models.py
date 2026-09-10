@@ -8566,3 +8566,41 @@ class RegulatoryPublicationOrdinal(Base):
     __table_args__ = (
         UniqueConstraint("user_file_id", "ordinal", name="uq_publication_file_ordinal"),
     )
+
+
+class RegulatoryTemporalProjection(Base):
+    """Index/config-qualified dated source, context and vector association."""
+
+    __tablename__ = "regulatory_temporal_projection"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    user_file_id: Mapped[UUID] = mapped_column(ForeignKey("user_file.id"))
+    canonical_chunk_id: Mapped[str] = mapped_column(ForeignKey("regulatory_chunk.id"))
+    index_uuid: Mapped[str] = mapped_column(Text)
+    index_identity_sha256: Mapped[str] = mapped_column(Text)
+    projection_ordinal: Mapped[int] = mapped_column(BigInteger)
+    effective_start: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    effective_end: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    payload_sha256: Mapped[str] = mapped_column(Text)
+    published_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "user_file_id",
+            "index_uuid",
+            "projection_ordinal",
+            name="uq_temporal_projection_ordinal",
+        ),
+        Index(
+            "ix_temporal_projection_lookup",
+            "canonical_chunk_id",
+            "index_identity_sha256",
+            "effective_start",
+            "effective_end",
+        ),
+        CheckConstraint(
+            "effective_end IS NULL OR effective_start IS NULL OR effective_end > effective_start",
+            name="temporal_projection_dates_check",
+        ),
+    )

@@ -282,6 +282,10 @@ class ElasticsearchClient(AbstractContextManager):
             client_options["client_key"] = client_key
         self._client = Elasticsearch(f"{scheme}://{host}:{port}", **client_options)
 
+    def publication_client(self) -> Elasticsearch:
+        """Expose the configured transport to the fenced publication adapter."""
+        return self._client
+
     def __exit__(self, *_: Any) -> None:
         self.close()
 

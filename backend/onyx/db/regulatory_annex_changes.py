@@ -339,9 +339,23 @@ def validate_prepared_annex_change(
         raise ValueError("submitted source text changed")
     if draft.date_resolution is not None and (
         draft.date_resolution.effective_start_date != draft.effective_date.isoformat()
-        or draft.date_resolution.effective_end_date is not None
     ):
         raise ValueError("prepared effective date differs from reviewed resolution")
+    if draft.publication is not None:
+        from onyx.regulatory.amendments.annexes.publication import (
+            validate_after_window_authority,
+        )
+        from onyx.regulatory.amendments.annexes.publication_preparation import (
+            validate_frozen_publication_review,
+        )
+
+        validate_frozen_publication_review(draft)
+        validate_after_window_authority(draft)
+    elif (
+        draft.date_resolution is not None
+        and draft.date_resolution.effective_end_date is not None
+    ):
+        raise ValueError("temporary publication requires final temporal preparation")
     if draft.new_extraction.evidence_view is not None and any(
         occurrence not in draft.source_graph
         for occurrence in draft.new_extraction.evidence_view.source_occurrences
@@ -805,7 +819,11 @@ def queue_annex_publication(
     batch = session.get(AmendmentBatch, review.batch_id)
     assert batch is not None
     draft = AnnexChangeDraft.model_validate(review.review_payload)
-    if not draft.preparation_configuration or draft.new_evidence_remapping is None:
+    if (
+        not draft.preparation_configuration
+        or draft.new_evidence_remapping is None
+        or draft.publication is None
+    ):
         raise ValueError("live preparation must be revalidated before approval")
     lock_annex_preparation_scope(session, draft.user_file_id)
     validate_annex_review_scope(

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+from elasticsearch import Elasticsearch
 from sqlalchemy.orm import Session
 
 from onyx.db.models import (
@@ -20,6 +21,9 @@ from onyx.regulatory.amendments.annexes.models import (
 )
 from tests.external_dependency_unit.regulatory.test_amendment_sources import (
     source_session as source_session,
+)
+from tests.external_dependency_unit.regulatory.test_publication_primitives import (
+    es as es,
 )
 
 
@@ -109,6 +113,7 @@ class LiveReview:
 @pytest.fixture
 def live_review(
     source_session: Session,
+    es: tuple[Elasticsearch, str],
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
 ) -> Generator[LiveReview, None, None]:
@@ -159,12 +164,33 @@ def live_review(
     source_session.add(docset)
     source_session.flush()
     file = _file(source_session, docset)
-    _chunk(source_session, file, 0, "old")
+    old = _chunk(source_session, file, 0, "old")
+    from datetime import date
+
+    old.validity_start_date = (
+        None if getattr(request, "param", None) == "open-start" else date(2020, 1, 1)
+    )
     outside = _chunk(source_session, file, 1, "outside")
     outside.heading_path, outside.chunk_metadata = ["Madde 2"], {}
+    outside.validity_start_date = old.validity_start_date
+    expired = None
+    if getattr(request, "param", None) == "expired":
+        expired = _chunk(source_session, file, 2, "expired")
+        expired.position = 0
+        expired.validity_start_date, expired.validity_end_date = (
+            date(2010, 1, 1),
+            date(2020, 1, 1),
+        )
+        expired.status = "superseded"
+        expired.superseded_by_chunk_id = old.id
+        old.supersedes_chunk_id = expired.id
     store = get_default_file_store()
     old_bytes = b'<h1>EK-1</h1><p id="rate">old</p>'
-    source_only = getattr(request, "param", None) in ("source-only", "layout")
+    source_only = getattr(request, "param", None) in (
+        "source-only",
+        "layout",
+        "source-only-verified",
+    )
     multipart = getattr(request, "param", None) == "multipart"
     new_bytes = (
         b'<h1>EK-1</h1><p id="rate">old</p><!-- new source bytes -->'
@@ -246,7 +272,12 @@ def live_review(
     )
     package.manifest_sha256 = sha256(manifest).hexdigest()
     package.status, package.asset_count = "ready", 1 + len(extra_assets)
+    mode = getattr(request, "param", None)
     raw_text = "EK-1 replaced\nEK-1 second instruction"
+    if mode == "temporary":
+        raw_text = "EK-1 replaced\nEK-1 01.01.2027 tarihinde önceki hükümler yeniden uygulanır."
+    elif mode == "cessation":
+        raw_text = "EK-1 replaced\nEK-1 01.01.2027 tarihinde yürürlükten kalkar."
     from datetime import date
 
     batch = AmendmentBatch(
@@ -267,8 +298,12 @@ def live_review(
     source_session.add(batch)
     source_session.flush()
     before = capture_canonical_scope(source_session, file.id)
+    from onyx.db.enums import IndexModelStatus
+
     settings = SearchSettings(
         id=1,
+        status=IndexModelStatus.PRESENT,
+        index_name=es[1],
         model_name="embedding",
         model_dim=3,
         normalize=True,
@@ -277,6 +312,10 @@ def live_review(
     monkeypatch.setattr(
         "onyx.db.search_settings.get_current_search_settings",
         lambda *_args, **_kwargs: settings,
+    )
+    monkeypatch.setattr(
+        "onyx.db.search_settings.get_active_search_settings_list",
+        lambda *_args, **_kwargs: [settings],
     )
     monkeypatch.setattr(
         "onyx.indexing.contextual_settings.require_contextual_rag_llm",
@@ -301,6 +340,38 @@ def live_review(
         "onyx.indexing.embedder.DefaultIndexingEmbedder.from_db_search_settings",
         lambda **_kwargs: embedder,
     )
+    future_name = None
+    if mode == "future":
+        from copy import deepcopy
+
+        future_name = es[1] + "-future"
+        es[0].indices.create(
+            index=future_name,
+            mappings=es[0].indices.get_mapping(index=es[1])[es[1]]["mappings"],
+        )
+        future = SearchSettings(
+            id=2,
+            status=IndexModelStatus.FUTURE,
+            index_name=future_name,
+            model_name="future-embedding",
+            model_dim=6,
+            reduced_dimension=3,
+            normalize=True,
+            enable_contextual_rag=False,
+        )
+        future_embedder = deepcopy(embedder)
+        future_embedder.embedding_model.model_name = "future-embedding"
+        future_embedder.embedding_model.reduced_dimension = 3
+        monkeypatch.setattr(
+            "onyx.db.search_settings.get_active_search_settings_list",
+            lambda *_args, **_kwargs: [settings, future],
+        )
+        monkeypatch.setattr(
+            "onyx.indexing.embedder.DefaultIndexingEmbedder.from_db_search_settings",
+            lambda *, search_settings: (
+                future_embedder if search_settings.id == 2 else embedder
+            ),
+        )
     llm = MagicMock()
     llm.config = LLMConfig(
         model_provider="configured",
@@ -329,9 +400,163 @@ def live_review(
         analysis,
         "resolve_group_effective_date",
         lambda **_kwargs: DateResolution(
-            effective_start_date="2026-09-10", rationale="explicit date"
+            effective_start_date="2026-09-10",
+            effective_end_date="2027-01-01"
+            if mode in ("temporary", "cessation")
+            else None,
+            rationale="explicit date",
         ),
     )
+    import json
+    from datetime import date
+
+    from onyx.access.access import get_access_for_user_files
+    from onyx.document_index.elasticsearch.schema import get_elasticsearch_doc_chunk_id
+    from onyx.document_index.interfaces_new import TenantState
+    from onyx.regulatory.amendments.annexes.models import AnnexProjectionAccess
+    from onyx.regulatory.amendments.annexes.publication_preparation import (
+        _source_template,
+    )
+    from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+    from onyx.regulatory.projection import prepare_normal_context_view
+
+    source_session.commit()
+    baseline_rows = canonical_snapshot_rows(before)
+    indexed_view = prepare_normal_context_view(
+        rows=baseline_rows,
+        user_file=file,
+        search_settings=settings,
+        embedder=embedder,
+        llm=llm,
+        as_of_date=date(2020, 1, 1),
+    )
+    access = AnnexProjectionAccess(
+        access=get_access_for_user_files([str(file.id)], source_session)[str(file.id)],
+        project_ids=[],
+        persona_ids=[],
+        document_sets=[docset.name],
+    )
+    verified = getattr(request, "param", None) in ("verified", "source-only-verified")
+    from datetime import timedelta
+
+    from onyx.db.regulatory_context_projections import activate_temporal_projection
+    from onyx.db.regulatory_publication import PublicationStore
+    from onyx.document_index.elasticsearch.publication import FencedPublicationIndex
+    from onyx.document_index.publication_models import (
+        FrozenPublicationProjection,
+        PublicationIndexSnapshot,
+        PublicationScope,
+    )
+    from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
+    from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+
+    authority = PublicationStore(
+        PublicationScope(
+            tenant_id="public",
+            environment="local-test",
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
+        )
+    )
+    index = PublicationIndexSnapshot(
+        index_name=es[1],
+        index_uuid=es[0].indices.get(index=es[1])[es[1]]["settings"]["index"]["uuid"],
+        search_settings_id=1,
+        model_provider="",
+        model_name="embedding",
+        vector_dimension=3,
+        embedding_config_sha256=indexed_view.projections[0].embedding_config_sha256,
+        multitenant=False,
+    )
+    adapter = FencedPublicationIndex(es[0], index)
+    seeded: list[FrozenPublicationProjection] = []
+    owner = reservations = None
+    if verified:
+        owner = authority.acquire(file.id, owner_id=uuid4(), ttl=timedelta(minutes=5))
+        authority.close_gate(owner)
+        reservations = authority.reservations(owner)
+        adapter.seal(reservations)
+    from onyx.regulatory.amendments.annexes.context_dependencies import (
+        effective_context_rows,
+    )
+
+    indexed_rows = effective_context_rows(baseline_rows, date(2020, 1, 1))
+    indexed_pairs = list(zip(indexed_rows, indexed_view.projections, strict=True))
+    if expired is not None:
+        expired_view = prepare_normal_context_view(
+            rows=baseline_rows,
+            user_file=file,
+            search_settings=settings,
+            embedder=embedder,
+            llm=llm,
+            as_of_date=date(2010, 1, 1),
+        )
+        indexed_pairs.extend(
+            zip(
+                effective_context_rows(baseline_rows, date(2010, 1, 1)),
+                expired_view.projections,
+                strict=True,
+            )
+        )
+    for canonical, context in indexed_pairs:
+        raw = json.loads(
+            _source_template(
+                canonical,
+                context,
+                file_name=file.name,
+                access=access,
+                tenant_id="public",
+                dimension=3,
+            )
+        )
+        raw.update(content_vector=[0.1, 0.2, 0.3], title_vector=[0.1, 0.2, 0.3])
+        if verified:
+            assert reservations is not None
+            identity = uuid4()
+            projection = FrozenPublicationProjection(
+                ordinal=canonical.projection_ordinal,
+                context_projection_id=str(identity),
+                source_json=json.dumps(raw),
+                embedding_inputs=tuple(context.embedding_texts),
+                embedding_config_json=json.dumps(context.embedding_config),
+            )
+            adapter.upsert(reservations, projection)
+            seeded.append(projection)
+            activate_temporal_projection(
+                source_session,
+                user_file_id=file.id,
+                binding=AnnexTemporalProjection(
+                    id=identity,
+                    index=index,
+                    projection=projection,
+                    canonical_base_sha256=context_hash(canonical.text),
+                    derived_role="canonical",
+                    dependency_ids=[],
+                    representation_text=canonical.text,
+                    representation_metadata=canonical.chunk_metadata,
+                    context=context,
+                    reference_date=date(2020, 1, 1),
+                    effective_start=canonical.validity_start_date,
+                    effective_end=canonical.validity_end_date,
+                    semantic_position=canonical.position,
+                ),
+            )
+        else:
+            es[0].index(
+                index=es[1],
+                id=get_elasticsearch_doc_chunk_id(
+                    TenantState(tenant_id="public", multitenant=False),
+                    str(file.id),
+                    canonical.projection_ordinal,
+                ),
+                document=raw,
+            )
+    if verified:
+        assert owner is not None and reservations is not None
+        authority.finalize(
+            source_session, owner, adapter.verify(reservations, tuple(seeded))
+        )
+        source_session.commit()
+        authority.release(owner)
     job.run_amendment_batch(batch_id=batch.id, lease_generation=1)
     groups = list_annex_changes(source_session, batch.id)
     assert len(groups) == 1
@@ -355,12 +580,15 @@ def live_review(
     try:
         yield LiveReview(batch, groups[0], file, outside, before, llm)
     finally:
+        if future_name:
+            es[0].indices.delete(index=future_name)
         for file_id in [
             file.file_id,
             asset.file_id,
             *[item.file_id for item in extra_assets],
             package.manifest_file_id,
             *[evidence.file_id for evidence in draft.evidence],
+            draft.publication.artifact_file_id if draft.publication else None,
         ]:
             if file_id:
                 store.delete_file(file_id)

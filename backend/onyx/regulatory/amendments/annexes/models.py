@@ -4,6 +4,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from onyx.document_index.publication_models import (
+    FrozenPublicationProjection,
+    IndexedProjectionEvidence,
+    PublicationIndexSnapshot,
+    PublicationScope,
+)
 from onyx.regulatory.amendments.models import DateResolution
 
 SourcePackageStatus = Literal["processing", "ready", "partial", "blocked", "failed"]
@@ -539,7 +545,25 @@ class AnnexCorrectionReconciliation(BaseModel):
     model_snapshot: AnnexModelSnapshot | None = None
 
 
+class AnnexAfterWindowAuthority(BaseModel):
+    """Exact retained source support or an existing scheduled legal authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: Literal[
+        "restore_predecessor", "scheduled_successor", "cessation", "unresolved"
+    ]
+    effective_date: date
+    source_text_sha256: str
+    source_start: int = Field(ge=0)
+    source_end: int = Field(ge=0)
+    source_quote: str
+    predecessor_ids: list[str]
+    successor_ids: list[str]
+
+
 class AnnexChangeDraft(BaseModel):
+    after_window_authority: AnnexAfterWindowAuthority | None = None
+    publication: "AnnexPublicationReview | None" = None
     batch_id: int | None = None
     date_resolution: DateResolution | None = None
     target_sources: list[str] = Field(default_factory=list)
@@ -610,3 +634,110 @@ class AnnexComparisonImage(BaseModel):
     png: bytes
     kind: Literal["comparison_page", "comparison_tile", "comparison_region"]
     normalized_box: tuple[float, float, float, float]
+
+
+class AnnexLegalPublicationTimeline(BaseModel):
+    """Frozen legal rows; derived representations are separately dated projections."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    canonical_rows: list[AnnexCanonicalSnapshot]
+    restoration_predecessors: dict[str, str] = Field(default_factory=dict)
+    effective_start: date
+    effective_end: date | None
+
+
+class AnnexTemporalProjection(BaseModel):
+    """One dated, index-qualified search representation of a legal identity."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: UUID
+    index: "PublicationIndexSnapshot"
+    projection: "FrozenPublicationProjection"
+    canonical_base_sha256: str
+    derived_role: Literal["canonical", "hierarchical_aggregate", "image_companion"]
+    dependency_ids: list[str]
+    representation_text: str
+    representation_metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    context: FrozenContextProjection | None = None
+    reference_date: date | None
+    effective_start: date | None
+    effective_end: date | None
+    semantic_position: int
+
+
+class AnnexIndexedBaseline(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    evidence: IndexedProjectionEvidence
+    reference_date: date | None
+    binding: AnnexTemporalProjection | None = None
+
+
+class AnnexPublicationProjectionPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: UUID
+    index: PublicationIndexSnapshot
+    ordinal: int
+    row: AnnexCanonicalSnapshot
+    canonical_base_sha256: str
+    context: FrozenContextProjection
+    view_sha256: str
+    effective_start: date | None
+    effective_end: date | None
+    reference_date: date | None
+    source_template_json: str
+    reuse_from: FrozenPublicationProjection | None = None
+    reason: str
+
+
+class AnnexPublicationPreparation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    user_file_id: UUID
+    batch_id: int
+    review_input_sha256: str
+    input_scope_sha256: str
+    runtime_configuration: dict[str, str]
+    counts: "AnnexPublicationImpactCounts"
+    scope: PublicationScope
+    indexes: list[PublicationIndexSnapshot]
+    legal: AnnexLegalPublicationTimeline
+    indexed_baseline: list[AnnexIndexedBaseline]
+    projections: list[AnnexPublicationProjectionPlan]
+    views: dict[str, PreparedContextView]
+    reserved_ordinals: list[int]
+    retired_ordinals: dict[str, list[int]]
+
+
+class AnnexPublicationImpactCounts(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    canonical_changes: int
+    context_consumers: int
+    embeddings: int
+    exact_vector_reuses: int
+    historical_projections: int
+    retired_projections: int
+    total_projections: int
+
+
+class AnnexPublicationReview(BaseModel):
+    """Browser-safe final scope; full sources/vectors live in immutable FileStore."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    artifact_file_id: str
+    artifact_sha256: str
+    artifact_byte_count: int
+    scope: PublicationScope
+    indexes: list[PublicationIndexSnapshot]
+    counts: AnnexPublicationImpactCounts
+    effective_dates: list[date]
+    projection_ids: list[UUID]
+
+
+class AnnexProjectionAccess(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    access: "DocumentAccess"
+    project_ids: list[int]
+    persona_ids: list[int]
+    document_sets: list[str]
+
+
+from onyx.access.models import DocumentAccess  # noqa: E402

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, time, timezone
 from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session
@@ -139,3 +139,389 @@ def test_context_snapshot_cannot_cross_file_scope(source_session: Session) -> No
             user_file_id=file.id,
             view=PreparedContextView(snapshots=[snapshot]),
         )
+
+
+def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_history(
+    source_session: Session,
+) -> None:
+    from importlib import import_module
+
+    import pytest
+
+    repository = import_module("onyx.db.regulatory_context_projections")
+    assert hasattr(repository, "activate_temporal_projection"), (
+        "qualified activation is missing"
+    )
+    import json
+
+    from onyx.document_index.publication_models import (
+        FrozenPublicationProjection,
+        PublicationIndexSnapshot,
+        publication_digest,
+    )
+    from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
+    from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+    from tests.external_dependency_unit.regulatory.test_publication_primitives import (
+        frozen_projection,
+    )
+
+    group = DocumentSet(name=str(uuid4()), description="", is_up_to_date=True)
+    source_session.add(group)
+    source_session.flush()
+    file = _file(source_session, group)
+    canonical = _chunk(source_session, file, 0, "Legal text")
+    canonical.validity_start_date = date(2020, 1, 1)
+    source_session.flush()
+    indices = [
+        PublicationIndexSnapshot(
+            index_name=f"index-{i}",
+            index_uuid=str(uuid4()),
+            search_settings_id=i,
+            model_provider="fixture",
+            model_name="fixture",
+            vector_dimension=3,
+            embedding_config_sha256=publication_digest({"model": "fixture"}),
+            multitenant=False,
+        )
+        for i in (1, 2)
+    ]
+
+    def binding(
+        index: PublicationIndexSnapshot,
+        ordinal: int,
+        image: str,
+        start: date,
+        end: date | None,
+    ) -> AnnexTemporalProjection:
+        frozen = frozen_projection(file.id, ordinal, "Legal text")
+        source = json.loads(frozen.source_json)
+        source.update(
+            regulatory_chunk_id=canonical.id,
+            image_file_id=image,
+            source_links=json.dumps({0: ""}),
+            validity_start_date=int(
+                datetime.combine(start, time.min, timezone.utc).timestamp()
+            ),
+            validity_end_date=int(
+                datetime.combine(end, time.min, timezone.utc).timestamp()
+            )
+            if end
+            else None,
+            doc_summary="",
+            chunk_context="",
+        )
+        frozen = FrozenPublicationProjection(
+            ordinal=ordinal,
+            context_projection_id=str(uuid4()),
+            source_json=json.dumps(source),
+            embedding_inputs=frozen.embedding_inputs,
+            embedding_config_json=frozen.embedding_config_json,
+        )
+        return AnnexTemporalProjection(
+            id=UUID(frozen.context_projection_id),
+            index=index,
+            projection=frozen,
+            canonical_base_sha256=context_hash(canonical.text),
+            derived_role="canonical",
+            dependency_ids=[],
+            representation_text=canonical.text,
+            representation_metadata={"image_file_id": image},
+            reference_date=start,
+            effective_start=start,
+            effective_end=end,
+            semantic_position=canonical.position,
+        )
+
+    first = binding(indices[0], 0, "old-image", date(2020, 1, 1), date(2026, 1, 1))
+    second = binding(indices[0], 2, "new-image", date(2026, 1, 1), None)
+    future = binding(indices[1], 3, "future-image", date(2020, 1, 1), None)
+    for item in (first, second, future):
+        repository.activate_temporal_projection(
+            source_session, user_file_id=file.id, binding=item
+        )
+    for index, when, expected in (
+        (indices[0], date(2025, 1, 1), first),
+        (indices[0], date(2026, 2, 1), second),
+        (indices[1], date(2026, 2, 1), future),
+    ):
+        result = repository.get_indexed_temporal_projection(
+            source_session, canonical.id, index=index, as_of_date=when
+        )
+        assert result == expected
+    from onyx.document_index.publication_models import (
+        PublicationEncoderAuthority,
+        PublicationEncoderReceipt,
+    )
+
+    authority = PublicationEncoderAuthority(
+        provider="fixture",
+        model="fixture",
+        effective_dimension=3,
+        endpoint_sha256="endpoint",
+        deployment_name=None,
+        api_version=None,
+        normalize=True,
+        passage_prefix=None,
+    )
+    from pydantic import JsonValue
+
+    resolved: dict[str, JsonValue] = {
+        "provider": "fixture",
+        "dimension": 3,
+        "endpoint_sha256": "endpoint",
+        "deployment_name": None,
+        "api_version": None,
+        "normalize": True,
+        "passage_prefix": None,
+    }
+    receipts = tuple(
+        PublicationEncoderReceipt(
+            configuration_json=json.dumps(config),
+            authority=authority,
+            resolved_fields=resolved,
+            resolution_sha256="a" * 64,
+        )
+        for config in (
+            {"model": "fixture"},
+            {"model": "fixture", "formatter": "additional"},
+        )
+    )
+    expanded = indices[0].model_copy(
+        update={"encoder_authority": authority, "encoder_receipts": receipts}
+    )
+    assert (
+        repository.get_indexed_temporal_projection(
+            source_session, canonical.id, index=expanded, as_of_date=date(2025, 1, 1)
+        )
+        == first
+    )
+    incompatible = expanded.model_copy(
+        update={
+            "encoder_receipts": (receipts[1],),
+            "embedding_config_sha256": publication_digest(
+                json.loads(receipts[1].configuration_json)
+            ),
+        }
+    )
+    with pytest.raises(ValueError, match="receipt"):
+        repository.get_indexed_temporal_projection(
+            source_session,
+            canonical.id,
+            index=incompatible,
+            as_of_date=date(2025, 1, 1),
+        )
+    companion = _chunk(source_session, file, 4, "Image caption")
+    companion.validity_start_date = date(2020, 1, 1)
+    companion.chunk_metadata = {"bound_to_regulatory_chunk_id": canonical.id}
+    source_session.flush()
+    companions = []
+    for ordinal, target in ((4, first), (5, second)):
+        identity = uuid4()
+        source = json.loads(target.projection.source_json)
+        source.update(
+            chunk_index=ordinal,
+            regulatory_chunk_id=companion.id,
+            content=companion.text,
+        )
+        projection = target.projection.model_copy(
+            update={
+                "ordinal": ordinal,
+                "context_projection_id": str(identity),
+                "source_json": json.dumps(source),
+            }
+        )
+        item = target.model_copy(
+            update={
+                "id": identity,
+                "projection": projection,
+                "canonical_base_sha256": context_hash(companion.text),
+                "derived_role": "image_companion",
+                "dependency_ids": [canonical.id],
+                "representation_text": companion.text,
+                "representation_metadata": {
+                    "bound_to_regulatory_chunk_id": canonical.id,
+                    "image_file_id": target.representation_metadata["image_file_id"],
+                },
+                "semantic_position": companion.position,
+            }
+        )
+        repository.activate_temporal_projection(
+            source_session, user_file_id=file.id, binding=item
+        )
+        companions.append(item)
+    assert (
+        repository.get_indexed_temporal_projection(
+            source_session, companion.id, index=indices[0], as_of_date=date(2025, 1, 1)
+        )
+        == companions[0]
+    )
+    assert (
+        repository.get_indexed_temporal_projection(
+            source_session, companion.id, index=indices[0], as_of_date=date(2026, 2, 1)
+        )
+        == companions[1]
+    )
+    assert companion.chunk_metadata == {"bound_to_regulatory_chunk_id": canonical.id}
+    assert canonical.text == "Legal text"
+    assert canonical.chunk_metadata.get("image_file_id") is None
+    wrong = second.model_copy(update={"id": uuid4(), "canonical_base_sha256": "wrong"})
+    with pytest.raises(ValueError, match="canonical"):
+        repository.activate_temporal_projection(
+            source_session, user_file_id=file.id, binding=wrong
+        )
+
+
+def test_derived_binding_requires_actual_aggregate_dependencies_and_keeps_old_canonical(
+    source_session: Session,
+) -> None:
+    import json
+    from datetime import datetime, timezone
+
+    import pytest
+
+    from onyx.db.regulatory_context_projections import activate_temporal_projection
+    from onyx.document_index.publication_models import (
+        PublicationIndexSnapshot,
+        publication_digest,
+    )
+    from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
+    from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+    from onyx.regulatory.chunker import hierarchical_aggregate_text
+    from tests.external_dependency_unit.regulatory.test_publication_primitives import (
+        frozen_projection,
+    )
+
+    group = DocumentSet(name=str(uuid4()), description="", is_up_to_date=True)
+    source_session.add(group)
+    source_session.flush()
+    file = _file(source_session, group)
+    child = _chunk(source_session, file, 0, "New leaf")
+    child.validity_start_date = date(2026, 1, 1)
+    old_child = _chunk(source_session, file, 3, "Old leaf")
+    old_child.position = 0
+    old_child.validity_start_date, old_child.validity_end_date = (
+        date(2020, 1, 1),
+        date(2026, 1, 1),
+    )
+    aggregate = _chunk(
+        source_session, file, 1, hierarchical_aggregate_text("Root", [old_child.text])
+    )
+    aggregate.chunk_metadata = {
+        "chunk_variant": "hierarchical_aggregate",
+        "source_regulatory_chunk_ids": [old_child.id],
+        "hierarchy_root_path": ["Root"],
+    }
+    source_session.flush()
+    text = hierarchical_aggregate_text("Root", [child.text])
+    frozen = frozen_projection(file.id, 2, text)
+    source = json.loads(frozen.source_json)
+    source.update(
+        regulatory_chunk_id=aggregate.id,
+        image_file_id=None,
+        source_links=json.dumps({0: ""}),
+        doc_summary="",
+        chunk_context="",
+        validity_start_date=int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()),
+        validity_end_date=None,
+    )
+    identity = uuid4()
+    binding = AnnexTemporalProjection(
+        id=identity,
+        index=PublicationIndexSnapshot(
+            index_name="fixture",
+            index_uuid=str(uuid4()),
+            search_settings_id=1,
+            model_provider="fixture",
+            model_name="fixture",
+            vector_dimension=3,
+            embedding_config_sha256=publication_digest({"model": "fixture"}),
+            multitenant=False,
+        ),
+        projection=frozen.model_copy(
+            update={
+                "context_projection_id": str(identity),
+                "source_json": json.dumps(source),
+            }
+        ),
+        canonical_base_sha256=context_hash(aggregate.text),
+        derived_role="hierarchical_aggregate",
+        dependency_ids=[child.id],
+        representation_text=text,
+        representation_metadata={
+            **aggregate.chunk_metadata,
+            "source_regulatory_chunk_ids": [child.id],
+        },
+        reference_date=date(2026, 1, 1),
+        effective_start=date(2026, 1, 1),
+        effective_end=None,
+        semantic_position=1,
+    )
+    with pytest.raises(ValueError, match="direct canonical"):
+        activate_temporal_projection(
+            source_session,
+            user_file_id=file.id,
+            binding=binding.model_copy(update={"derived_role": "canonical"}),
+        )
+    with pytest.raises(ValueError, match="aggregate content"):
+        activate_temporal_projection(
+            source_session,
+            user_file_id=file.id,
+            binding=binding.model_copy(
+                update={"representation_text": "fabricated content"}
+            ),
+        )
+    old_id = uuid4()
+    old_source = {
+        **source,
+        "chunk_index": 3,
+        "content": aggregate.text,
+        "validity_start_date": int(
+            datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+        ),
+        "validity_end_date": int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()),
+    }
+    old_binding = binding.model_copy(
+        update={
+            "id": old_id,
+            "projection": binding.projection.model_copy(
+                update={
+                    "ordinal": 3,
+                    "context_projection_id": str(old_id),
+                    "source_json": json.dumps(old_source),
+                }
+            ),
+            "representation_text": aggregate.text,
+            "representation_metadata": aggregate.chunk_metadata,
+            "dependency_ids": [old_child.id],
+            "effective_start": date(2020, 1, 1),
+            "effective_end": date(2026, 1, 1),
+            "reference_date": date(2020, 1, 1),
+        }
+    )
+    activate_temporal_projection(
+        source_session, user_file_id=file.id, binding=old_binding
+    )
+    activate_temporal_projection(source_session, user_file_id=file.id, binding=binding)
+    from onyx.db.regulatory_context_projections import get_indexed_temporal_projection
+
+    assert (
+        get_indexed_temporal_projection(
+            source_session,
+            aggregate.id,
+            index=binding.index,
+            as_of_date=date(2025, 1, 1),
+        )
+        == old_binding
+    )
+    assert (
+        get_indexed_temporal_projection(
+            source_session,
+            aggregate.id,
+            index=binding.index,
+            as_of_date=date(2026, 2, 1),
+        )
+        == binding
+    )
+
+    assert aggregate.text == hierarchical_aggregate_text("Root", [old_child.text])
+    assert binding.canonical_base_sha256 != context_hash(binding.representation_text)

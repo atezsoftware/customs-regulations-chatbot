@@ -198,7 +198,7 @@ class FencedPublicationIndex:
             ):
                 raise ValueError("projection vector dimension/content mismatch")
             config = cast(JsonValue, json.loads(projection.embedding_config_json))
-            if publication_digest(config) != self.snapshot.embedding_config_sha256:
+            if not self.snapshot.accepts_encoder_configuration(config):
                 raise ValueError("projection model configuration mismatch")
             payload["publication_evidence"] = {
                 "context_projection_id": projection.context_projection_id,
@@ -401,9 +401,11 @@ class FencedPublicationIndex:
             stored.pop("publication_operation", None)
             # Sealing advances the floor while retaining the previous frozen payload.
             stored["publication_floor"] = stored.get("publication_token")
-            if publication_digest(stored) != digest or evidence[
-                "index"
-            ] != self.snapshot.model_dump(mode="json"):
+            if (
+                publication_digest(stored) != digest
+                or PublicationIndexSnapshot.model_validate(evidence["index"])
+                != self.snapshot
+            ):
                 raise DocumentChunkVerificationError(
                     "stored embedding evidence identity mismatch"
                 )
@@ -420,9 +422,8 @@ class FencedPublicationIndex:
                 embedding_inputs=tuple(evidence["embedding_inputs"]),
                 embedding_config_json=json.dumps(evidence["embedding_config"]),
             )
-            if (
-                publication_digest(evidence["embedding_config"])
-                != self.snapshot.embedding_config_sha256
+            if not self.snapshot.accepts_encoder_configuration(
+                evidence["embedding_config"]
             ):
                 raise DocumentChunkVerificationError(
                     "stored embedding configuration mismatch"
@@ -432,4 +433,54 @@ class FencedPublicationIndex:
             source_json=json.dumps(source),
             frozen_projection=frozen,
             payload_sha256=digest,
+        )
+
+    def inventory_evidence(
+        self, reservations: FileReservations
+    ) -> tuple[IndexedProjectionEvidence, ...]:
+        """Freeze actual live inventory, including historical/expired projections."""
+        self._check_index()
+        self.client.indices.refresh(index=self.snapshot.index_name)
+        filters: list[dict[str, JsonValue]] = [
+            {"term": {"document_id": str(reservations.ownership.user_file_id)}}
+        ]
+        if self.snapshot.multitenant:
+            filters.append(
+                {"term": {"tenant_id": reservations.ownership.scope.tenant_id}}
+            )
+        inventory: list[IndexedProjectionEvidence] = []
+        for hit in scan(
+            self.client,
+            index=self.snapshot.index_name,
+            query={"query": {"bool": {"filter": filters}}},
+        ):
+            source = hit["_source"]
+            ordinal = source.get("chunk_index")
+            if (
+                not isinstance(ordinal, int)
+                or ordinal not in reservations.ordinals
+                or hit["_id"] != self._id(reservations, ordinal)
+            ):
+                raise ValueError(
+                    "indexed evidence contains an unreserved/foreign projection"
+                )
+            if source.get("publication_tombstone") is True:
+                continue
+            stored = source.get("publication_evidence")
+            adapter = self
+            if stored is not None:
+                previous = PublicationIndexSnapshot.model_validate(stored["index"])
+                if (previous.index_name, previous.index_uuid) != (
+                    self.snapshot.index_name,
+                    self.snapshot.index_uuid,
+                ):
+                    raise ValueError(
+                        "indexed evidence physical index identity mismatch"
+                    )
+                adapter = FencedPublicationIndex(self.client, previous)
+            inventory.append(adapter.read_evidence(reservations, ordinal))
+        return tuple(
+            sorted(
+                inventory, key=lambda item: json.loads(item.source_json)["chunk_index"]
+            )
         )
