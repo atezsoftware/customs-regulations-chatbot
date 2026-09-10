@@ -10,4 +10,9 @@ schema issue codes, never captions or neutral descriptions. A readable region
 without an evidence problem has issues=[]. Unknown issue text is invalid and
 must be corrected; do not discard an actual uncertainty.
 Do not produce identifiers or URLs. Table rows are represented by their cells.
+For each table_cell, set table_role to column_header only when the image clearly
+shows that cell as a column heading. Repetition, first-row position, or text versus
+numeric values alone does not establish a heading. Legal status/value cells are
+data, not headings. Set data for clearly observed body cells and unknown
+when the role is uncertain. For other kinds omit table_role or use unknown.
 """

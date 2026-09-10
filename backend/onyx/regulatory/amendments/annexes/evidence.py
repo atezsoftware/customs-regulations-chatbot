@@ -1128,30 +1128,16 @@ def _visual_table_rows(
     return rows
 
 
-def _has_column_header_contrast(rows: list[list[ExtractedAnnexElement]]) -> bool:
-    """Require textual column labels above a consistently numeric body column."""
+def _has_explicit_column_headers(rows: list[list[ExtractedAnnexElement]]) -> bool:
+    """Only explicit visual heading evidence can exempt a repeated leading row."""
     header = rows[0]
-    if any(len(row) != len(header) for row in rows[1:]):
-        return False
-    for cell in header:
-        text = cell.text.strip()
-        if (
-            cell.status != "readable"
-            or cell.issues
-            or cell.formula is not None
-            or cell.value not in (None, text)
-            or sum(character.isalpha() for character in text) < 2
-            or not all(character.isalpha() or character.isspace() for character in text)
-        ):
-            return False
-    return any(
-        all(
-            row[column].status == "readable"
-            and not row[column].issues
-            and re.fullmatch(r"[+-]?[0-9][0-9.,/%: -]*", row[column].text.strip())
-            for row in rows[1:]
-        )
-        for column in range(len(header))
+    return all(len(row) == len(header) for row in rows[1:]) and all(
+        cell.table_role == "column_header"
+        and cell.extraction_method == "vision"
+        and cell.status == "readable"
+        and not cell.issues
+        and bool(cell.text.strip())
+        for cell in header
     )
 
 
@@ -1183,16 +1169,16 @@ def _source_parts_overlap(left: AnnexExtraction, right: AnnexExtraction) -> bool
     ]
     if signatures[0] == signatures[1]:
         return True
-    leading_header = _has_column_header_contrast(
+    leading_header = _has_explicit_column_headers(
         left_rows
-    ) and _has_column_header_contrast(right_rows)
+    ) and _has_explicit_column_headers(right_rows)
     if any(
         row == other and (index != 0 or other_index != 0 or not leading_header)
         for index, row in enumerate(signatures[0])
         for other_index, other in enumerate(signatures[1])
     ):
         return True
-    # A leading-row exemption also requires the same text-to-numeric type contrast.
+    # Unknown header roles retain strict duplicate-row refusal.
     # Other repeated text inside the table body still lacks disjointness proof.
     for elements, rows in zip(atoms, (left_rows, right_rows)):
         for element in elements:

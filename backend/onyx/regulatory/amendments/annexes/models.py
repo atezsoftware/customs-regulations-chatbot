@@ -97,6 +97,9 @@ AnnexElementKind = Literal[
 
 
 class ExtractedAnnexElement(BaseModel):
+    table_role: Literal["column_header", "data", "unknown"] = Field(
+        default="unknown", exclude_if=lambda role: role == "unknown"
+    )
     extraction_method: Literal["native", "vision", "canonical", "unknown"] = "unknown"
     canonical_chunk_id: str | None = None
     bound_to_regulatory_chunk_id: str | None = None
@@ -114,6 +117,12 @@ class ExtractedAnnexElement(BaseModel):
     aggregate: bool = False
     image_file_id: str | None = None
     source_asset_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_table_role(self) -> "ExtractedAnnexElement":
+        if self.table_role != "unknown" and self.kind != "table_cell":
+            raise ValueError("table_role requires a table_cell")
+        return self
 
 
 class AnnexEvidenceParent(BaseModel):
@@ -186,6 +195,9 @@ class AnnexRenderedPage(BaseModel):
 
 
 class AnnexVisionElement(BaseModel):
+    table_role: Literal["column_header", "data", "unknown"] = Field(
+        default="unknown", exclude_if=lambda role: role == "unknown"
+    )
     model_config = ConfigDict(extra="forbid")
     kind: Literal["text", "table_cell", "footnote", "image_region"]
     text: str = Field(max_length=20000)
@@ -200,6 +212,12 @@ class AnnexVisionElement(BaseModel):
             "unsupported_visual",
         ]
     ] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_table_role(self) -> "AnnexVisionElement":
+        if self.table_role != "unknown" and self.kind != "table_cell":
+            raise ValueError("table_role requires a table_cell")
+        return self
 
 
 class AnnexVisionResult(BaseModel):

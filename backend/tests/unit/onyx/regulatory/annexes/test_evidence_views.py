@@ -720,13 +720,18 @@ def test_visual_continuation_headers_and_values_are_not_body_overlap() -> None:
         located: bool = True,
         header: bool = True,
         rates: list[str] | None = None,
+        roles: bool = True,
+        vision: bool = True,
     ):
         original, extraction = _linked_image(number)
         extraction.elements = [
             ExtractedAnnexElement(
                 kind="table_cell",
+                table_role=("column_header" if header and row == 0 else "data")
+                if roles
+                else "unknown",
                 text=text,
-                extraction_method="vision",
+                extraction_method="vision" if vision else "native",
                 locator=AnnexLocator(
                     page=1,
                     normalized_box=(
@@ -794,11 +799,17 @@ def test_visual_continuation_headers_and_values_are_not_body_overlap() -> None:
         part(2, ["A", "B"]),
         part(2, ["B", "D"]),
         part(2, ["C", "D"], located=False),
+        part(2, ["C", "D"], roles=False),
+        part(2, ["C", "D"], vision=False),
     ]:
         with pytest.raises(ValueError, match="overlapping"):
             select_new_annex_sources([first, conflicting], links)
 
     for unclassified in [
+        [
+            part(1, ["Buğday", "Pirinç"], header=False, rates=["Muaf", "5%"]),
+            part(2, ["Buğday", "Mısır"], header=False, rates=["Muaf", "10%"]),
+        ],
         [
             part(1, ["1001.10", "2001.20"], header=False, rates=["5%", "15%"]),
             part(2, ["1001.10", "3001.30"], header=False, rates=["5%", "25%"]),
@@ -828,3 +839,48 @@ def test_alternative_annex_shorthand_does_not_authorize_an_image() -> None:
                 canonical_chunk_ids=["canonical"],
                 source_labels=[f"EK-1 {connector} 2"],
             )
+
+
+def test_optional_table_role_preserves_legacy_nested_json_and_hash() -> None:
+    import json
+    from pathlib import Path
+
+    from onyx.regulatory.amendments.annexes.evidence import evidence_view_hash
+    from onyx.regulatory.amendments.annexes.models import AnnexVisionResult
+
+    frozen = (
+        (Path(__file__).parent / "fixtures" / "roleless_evidence_view.json")
+        .read_text()
+        .strip()
+    )
+    payload = json.loads(frozen)
+    for explicit_unknown in (False, True):
+        if explicit_unknown:
+            payload["elements"][0]["table_role"] = "unknown"
+        restored = AnnexExtraction.model_validate(payload)
+        assert restored.model_dump_json() == frozen
+        assert "table_role" not in restored.model_dump()["elements"][0]
+        assert restored.evidence_view is not None
+        assert evidence_view_hash(restored) == restored.evidence_view.sha256
+        marked = restored.model_copy(deep=True)
+        marked.elements[0].table_role = "data"
+        assert marked.model_dump_json() != frozen
+        assert evidence_view_hash(marked) != restored.evidence_view.sha256
+    old_vision = {
+        "elements": [
+            {
+                "kind": "table_cell",
+                "text": "Legacy cell",
+                "box": [0, 0, 1, 1],
+                "status": "readable",
+                "issues": [],
+            }
+        ]
+    }
+    result = AnnexVisionResult.model_validate(old_vision)
+    assert result.model_dump(mode="json") == old_vision
+    old_vision["elements"][0]["table_role"] = "unknown"
+    assert (
+        AnnexVisionResult.model_validate(old_vision).model_dump_json()
+        == result.model_dump_json()
+    )

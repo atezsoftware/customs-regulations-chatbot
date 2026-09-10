@@ -530,6 +530,7 @@ def extract_annex_structure(
                 result.elements.append(
                     ExtractedAnnexElement(
                         kind=item.kind,
+                        table_role=item.table_role,
                         extraction_method="vision",
                         text=item.text,
                         status=item.status,

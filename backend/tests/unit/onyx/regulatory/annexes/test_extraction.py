@@ -427,3 +427,88 @@ def test_descriptive_vision_issue_retries_as_region_text_without_hiding_uncertai
         AnnexVisionResult.model_validate_json(json.dumps(response)).elements[0].text
         == "Horizontal rule"
     )
+
+
+def test_explicit_vision_table_roles_keep_original_text_and_coordinates() -> None:
+    import hashlib
+    import json
+
+    from onyx.llm.model_response import Choice, Message, ModelResponse
+    from onyx.regulatory.amendments.annexes.extraction import extract_annex_structure
+
+    stream = BytesIO()
+    Image.new("RGB", (200, 100), "white").save(stream, format="PNG")
+    response = {
+        "elements": [
+            {
+                "kind": "table_cell",
+                "text": text,
+                "box": [0, row * 0.3, 1, (row + 1) * 0.3],
+                "status": "readable",
+                "issues": [],
+                "table_role": role,
+            }
+            for row, (text, role) in enumerate(
+                [
+                    ("Heading", "column_header"),
+                    ("Buğday", "data"),
+                    ("Unclassified", "unknown"),
+                ]
+            )
+        ]
+    }
+    llm = MagicMock()
+    llm.config.model_name = "configured-model"
+    llm.config.model_provider = "configured-provider"
+    llm.invoke.return_value = ModelResponse(
+        id="vision",
+        created="2026-09-11",
+        choice=Choice(message=Message(content=json.dumps(response))),
+    )
+    result = extract_annex_structure(stream.getvalue(), "image/png", vision_llm=llm)
+    assert result.source_sha256 == hashlib.sha256(stream.getvalue()).hexdigest()
+    assert [element.table_role for element in result.elements] == [
+        "column_header",
+        "data",
+        "unknown",
+    ]
+    assert [element.text for element in result.elements] == [
+        "Heading",
+        "Buğday",
+        "Unclassified",
+    ]
+    assert all(
+        element.extraction_method == "vision" and element.locator.page == 1
+        for element in result.elements
+    )
+    assert result.elements[0].locator.normalized_box == (0, 0, 1, 0.3)
+    assert result.elements[0].locator.original_box == (0, 0, 200, 30)
+    assert (
+        result.model_dump(mode="json")["elements"][0]["table_role"] == "column_header"
+    )
+    assert "table_role" not in result.model_dump(mode="json")["elements"][2]
+
+
+def test_table_roles_cannot_label_non_cell_evidence() -> None:
+    from pydantic import ValidationError
+
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexVisionElement,
+        ExtractedAnnexElement,
+    )
+
+    for role in ("column_header", "data"):
+        with pytest.raises(ValidationError, match="table_role requires a table_cell"):
+            AnnexVisionElement.model_validate(
+                {
+                    "kind": "text",
+                    "text": "Heading",
+                    "box": [0, 0, 1, 1],
+                    "status": "readable",
+                    "table_role": role,
+                }
+            )
+        with pytest.raises(ValidationError, match="table_role requires a table_cell"):
+            ExtractedAnnexElement.model_validate(
+                {"kind": "text", "text": "Heading", "table_role": role}
+            )
