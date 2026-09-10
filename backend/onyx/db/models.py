@@ -8585,12 +8585,17 @@ class RegulatoryTemporalProjection(Base):
     published_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    retired_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_temporal_projection_ordinal",
             "user_file_id",
             "index_uuid",
             "projection_ordinal",
-            name="uq_temporal_projection_ordinal",
+            unique=True,
+            postgresql_where=text("retired_at IS NULL"),
         ),
         Index(
             "ix_temporal_projection_lookup",
@@ -8602,5 +8607,53 @@ class RegulatoryTemporalProjection(Base):
         CheckConstraint(
             "effective_end IS NULL OR effective_start IS NULL OR effective_end > effective_start",
             name="temporal_projection_dates_check",
+        ),
+    )
+
+
+class AnnexPublicationManifest(Base):
+    """One immutable preapproved inventory and operation set across all deliveries."""
+
+    __tablename__ = "annex_publication_manifest"
+    change_set_id: Mapped[UUID] = mapped_column(
+        ForeignKey("annex_change_set.id", ondelete="CASCADE"), primary_key=True
+    )
+    first_intent_id: Mapped[UUID] = mapped_column(
+        ForeignKey("annex_publication_intent.id", ondelete="CASCADE")
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    source_history: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    payload_sha256: Mapped[str] = mapped_column(Text)
+    operations: Mapped[dict[str, Any] | None] = mapped_column(PGJSONB, nullable=True)
+    operations_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    es_started: Mapped[bool] = mapped_column(Boolean, default=False)
+    approved_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AnnexPublicationEmbedding(Base):
+    __tablename__ = "annex_publication_embedding"
+    change_set_id: Mapped[UUID] = mapped_column(
+        ForeignKey("annex_publication_manifest.change_set_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    projection_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    request: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    request_sha256: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, default="pending")
+    remote_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vectors: Mapped[list[list[float]] | None] = mapped_column(PGJSONB, nullable=True)
+    provider_receipt: Mapped[dict[str, Any] | None] = mapped_column(
+        PGJSONB, nullable=True
+    )
+    vectors_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'submitting', 'submitted', 'complete', 'indeterminate')",
+            name="annex_embedding_status_check",
         ),
     )

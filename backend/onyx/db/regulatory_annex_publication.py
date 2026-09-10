@@ -68,7 +68,8 @@ def load_file_temporal_bindings(
     bindings = []
     for row in session.scalars(
         select(RegulatoryTemporalProjection).where(
-            RegulatoryTemporalProjection.user_file_id == user_file_id
+            RegulatoryTemporalProjection.user_file_id == user_file_id,
+            RegulatoryTemporalProjection.retired_at.is_(None),
         )
     ):
         if publication_digest(row.payload) != row.payload_sha256:

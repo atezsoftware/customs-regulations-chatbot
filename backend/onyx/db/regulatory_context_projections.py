@@ -51,50 +51,9 @@ def persist_context_view(
     }
     if set(rows) != ids:
         raise ValueError("context canonical scope mismatch")
-    snapshots: dict[str, UUID] = {}
-    for snapshot in view.snapshots:
-        payload = snapshot.model_dump(mode="json")
-        session.execute(
-            insert(RegulatoryContextSnapshot)
-            .values(
-                id=uuid4(),
-                user_file_id=user_file_id,
-                sha256=snapshot.sha256,
-                payload=payload,
-            )
-            .on_conflict_do_nothing(constraint="uq_context_snapshot_file_hash")
-        )
-        stored = session.scalars(
-            select(RegulatoryContextSnapshot).where(
-                RegulatoryContextSnapshot.user_file_id == user_file_id,
-                RegulatoryContextSnapshot.sha256 == snapshot.sha256,
-            )
-        ).one()
-        if stored.payload != payload:
-            raise ValueError("context snapshot hash conflicts with frozen payload")
-        snapshots[snapshot.sha256] = stored.id
-    calls: dict[str, UUID] = {}
-    for call in view.calls:
-        payload = call.model_dump(mode="json")
-        session.execute(
-            insert(RegulatoryContextGeneration)
-            .values(
-                id=uuid4(),
-                user_file_id=user_file_id,
-                request_sha256=call.request_sha256,
-                payload=payload,
-            )
-            .on_conflict_do_nothing(constraint="uq_context_generation_file_hash")
-        )
-        stored_call = session.scalars(
-            select(RegulatoryContextGeneration).where(
-                RegulatoryContextGeneration.user_file_id == user_file_id,
-                RegulatoryContextGeneration.request_sha256 == call.request_sha256,
-            )
-        ).one()
-        if stored_call.payload != payload:
-            raise ValueError("context request conflicts with frozen output")
-        calls[call.request_sha256] = stored_call.id
+    snapshots, calls = persist_context_evidence(
+        session, user_file_id=user_file_id, view=view
+    )
     result: list[str] = []
     for projection in view.projections:
         row = rows[projection.canonical_chunk_id]
@@ -143,6 +102,76 @@ def persist_context_view(
         result.append(str(stored_projection.id))
     session.flush()
     return result
+
+
+def persist_context_evidence(
+    session: Session, *, user_file_id: UUID, view: PreparedContextView
+) -> tuple[dict[str, UUID], dict[str, UUID]]:
+    """Persist immutable contextual inputs independently of a dated representation."""
+    if view.issues:
+        raise ValueError("cannot persist incomplete context evidence")
+    ids = {
+        item.canonical_chunk_id
+        for snapshot in view.snapshots
+        for item in snapshot.ordered_ranges
+    }
+    if (
+        set(
+            session.scalars(
+                select(RegulatoryChunk.id).where(
+                    RegulatoryChunk.user_file_id == user_file_id,
+                    RegulatoryChunk.id.in_(ids),
+                )
+            )
+        )
+        != ids
+    ):
+        raise ValueError("context evidence canonical scope mismatch")
+    snapshots: dict[str, UUID] = {}
+    for snapshot in view.snapshots:
+        payload = snapshot.model_dump(mode="json")
+        session.execute(
+            insert(RegulatoryContextSnapshot)
+            .values(
+                id=uuid4(),
+                user_file_id=user_file_id,
+                sha256=snapshot.sha256,
+                payload=payload,
+            )
+            .on_conflict_do_nothing(constraint="uq_context_snapshot_file_hash")
+        )
+        stored = session.scalars(
+            select(RegulatoryContextSnapshot).where(
+                RegulatoryContextSnapshot.user_file_id == user_file_id,
+                RegulatoryContextSnapshot.sha256 == snapshot.sha256,
+            )
+        ).one()
+        if stored.payload != payload:
+            raise ValueError("context snapshot hash conflicts with frozen payload")
+        snapshots[snapshot.sha256] = stored.id
+    calls: dict[str, UUID] = {}
+    for call in view.calls:
+        payload = call.model_dump(mode="json")
+        session.execute(
+            insert(RegulatoryContextGeneration)
+            .values(
+                id=uuid4(),
+                user_file_id=user_file_id,
+                request_sha256=call.request_sha256,
+                payload=payload,
+            )
+            .on_conflict_do_nothing(constraint="uq_context_generation_file_hash")
+        )
+        stored_call = session.scalars(
+            select(RegulatoryContextGeneration).where(
+                RegulatoryContextGeneration.user_file_id == user_file_id,
+                RegulatoryContextGeneration.request_sha256 == call.request_sha256,
+            )
+        ).one()
+        if stored_call.payload != payload:
+            raise ValueError("context request conflicts with frozen output")
+        calls[call.request_sha256] = stored_call.id
+    return snapshots, calls
 
 
 def activate_context_projection(
@@ -405,6 +434,7 @@ def activate_temporal_projection(
         if qualified is None:
             overlapping = select(RegulatoryTemporalProjection.id).where(
                 RegulatoryTemporalProjection.canonical_chunk_id == row.id,
+                RegulatoryTemporalProjection.retired_at.is_(None),
                 RegulatoryTemporalProjection.index_identity_sha256
                 == binding.index.temporal_lookup_identity(),
             )
@@ -564,6 +594,8 @@ def activate_temporal_projection(
     payload = binding.model_dump(mode="json")
     existing = session.get(RegulatoryTemporalProjection, binding.id)
     if existing is not None:
+        if existing.retired_at is not None:
+            raise ValueError("retired temporal identity cannot be reactivated")
         if existing.payload != payload:
             raise ValueError(
                 "temporal projection identity reused with different payload"
@@ -572,6 +604,7 @@ def activate_temporal_projection(
     overlapping = session.scalar(
         select(RegulatoryTemporalProjection.id).where(
             RegulatoryTemporalProjection.canonical_chunk_id == canonical.id,
+            RegulatoryTemporalProjection.retired_at.is_(None),
             RegulatoryTemporalProjection.index_identity_sha256 == identity,
             or_(
                 RegulatoryTemporalProjection.effective_end.is_(None),
@@ -619,6 +652,7 @@ def get_indexed_temporal_projection(
     row = session.scalars(
         select(RegulatoryTemporalProjection).where(
             RegulatoryTemporalProjection.canonical_chunk_id == canonical_chunk_id,
+            RegulatoryTemporalProjection.retired_at.is_(None),
             RegulatoryTemporalProjection.index_identity_sha256
             == index.temporal_lookup_identity(),
             or_(
