@@ -57,8 +57,18 @@ if (ctx._source.publication_token == params.token) {
     }
     ctx.op = 'none';
 } else {
-    if (params.base != null && ctx._source.publication_payload != params.base) {
-        throw new IllegalArgumentException('metadata base payload changed');
+    if (params.base != null) {
+        if (ctx._source.publication_payload != params.base) {
+            throw new IllegalArgumentException('metadata base payload changed');
+        }
+        def actual = new HashMap(ctx._source);
+        actual.remove('publication_floor');
+        actual.remove('publication_token');
+        actual.remove('publication_payload');
+        actual.remove('publication_operation');
+        if (!actual.equals(params.previous)) {
+            throw new IllegalArgumentException('metadata base content/evidence changed');
+        }
     }
     ctx._source = params.source;
 }
@@ -211,12 +221,23 @@ class FencedPublicationIndex:
         source: dict[str, JsonValue],
         *,
         base: str | None = None,
+        previous: dict[str, JsonValue] | None = None,
     ) -> None:
         self._check_index()
         params = self._params(reservations, ordinal)
-        operation = publication_digest({"source": source, "base": base})
+        operation_payload: dict[str, JsonValue] = {"source": source, "base": base}
+        if previous is not None:
+            operation_payload["previous"] = previous
+        operation = publication_digest(operation_payload)
         source["publication_operation"] = operation
-        params.update({"source": source, "operation": operation, "base": base})
+        params.update(
+            {
+                "source": source,
+                "operation": operation,
+                "base": base,
+                "previous": previous,
+            }
+        )
         # Intentionally no upsert: an unseen/uninitialized ID cannot become live.
         self.client.update(
             index=self.snapshot.index_name,
@@ -269,11 +290,17 @@ class FencedPublicationIndex:
             raise ValueError(
                 "metadata update changes frozen embedding/content identity"
             )
+        # Bind the supplied previous projection to the actual stored content and
+        # encoder evidence atomically in ES. A separately valid digest is insufficient.
+        previous_source = self._source(reservations, previous, previous.ordinal)
+        for field in ("publication_floor", "publication_token", "publication_payload"):
+            previous_source.pop(field)
         self._write(
             reservations,
             updated.ordinal,
             self._source(reservations, updated, updated.ordinal),
             base=previous_payload_sha256,
+            previous=previous_source,
         )
 
     def verify(

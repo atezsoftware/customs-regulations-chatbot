@@ -516,6 +516,18 @@ def test_targeted_metadata_retains_ownership_and_exact_input_identity(
         updated=metadata,
         previous_payload_sha256=evidence.payload_sha256,
     )
+    different_result = json.loads(metadata.source_json)
+    different_result["document_sets"] = ["different-access-set"]
+    with pytest.raises(BadRequestError) as rejected:
+        adapter.update_metadata(
+            current,
+            previous=projection,
+            updated=FrozenPublicationProjection.model_validate(
+                {**metadata.model_dump(), "source_json": json.dumps(different_result)}
+            ),
+            previous_payload_sha256=evidence.payload_sha256,
+        )
+    assert "different equal-token" in json.dumps(rejected.value.body)
     adapter.tombstone(current, 1_000_000_042)
     adapter.verify(current, (metadata,))
     actual = adapter.read_evidence(current, 0)
@@ -752,3 +764,69 @@ def test_canonical_transaction_can_lock_owned_inventory_before_other_rows(
             finally:
                 session.rollback()
             assert pending.result(timeout=5) == 1_000_000_043
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["content", "vector", "context", "inputs", "config", "projection_identity"],
+)
+def test_metadata_actual_digest_cannot_authorize_a_different_prepared_base(
+    owned_file: UUID, es: tuple[Elasticsearch, str], mismatch: str
+) -> None:
+    authority = store()
+    owner = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=30))
+    authority.close_gate(owner)
+    inventory = authority.reservations(owner)
+    adapter = adapter_for(es)
+    adapter.seal(inventory)
+    stored = frozen_projection(owned_file, 0)
+    adapter.upsert(inventory, stored)
+    evidence = adapter.read_evidence(inventory, 0)
+    assert evidence.payload_sha256 is not None
+    authority.release(owner)
+    newer = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=30))
+    current = authority.reservations(newer)
+    adapter.seal(current)
+    prepared = stored.model_dump()
+    source = json.loads(stored.source_json)
+    metadata_adapter = adapter
+    if mismatch == "content":
+        source["content"] = "content that was never stored"
+    elif mismatch == "vector":
+        source["content_vector"] = [0.2, 0.3, 0.1]
+    elif mismatch == "context":
+        source["doc_summary"] = "context that was never stored"
+    elif mismatch == "inputs":
+        prepared["embedding_inputs"] = ("input that was never stored",)
+    elif mismatch == "projection_identity":
+        prepared["context_projection_id"] = "other-context-projection"
+    else:
+        config = {"model": "different-prepared-model"}
+        prepared["embedding_config_json"] = json.dumps(config)
+        metadata_adapter = FencedPublicationIndex(
+            es[0],
+            adapter.snapshot.model_copy(
+                update={"embedding_config_sha256": publication_digest(config)}
+            ),
+        )
+    prepared["source_json"] = json.dumps(source)
+    previous = FrozenPublicationProjection.model_validate(prepared)
+    source["document_sets"] = ["new-access-set"]
+    updated = FrozenPublicationProjection.model_validate(
+        {**prepared, "source_json": json.dumps(source)}
+    )
+    with pytest.raises(BadRequestError) as rejected:
+        metadata_adapter.update_metadata(
+            current,
+            previous=previous,
+            updated=updated,
+            previous_payload_sha256=evidence.payload_sha256,
+        )
+    assert "metadata base" in json.dumps(rejected.value.body)
+    after = adapter.read_evidence(current, 0)
+    assert after.payload_sha256 == evidence.payload_sha256
+    assert after.frozen_projection == evidence.frozen_projection
+    # Rejected metadata must not consume the token's final operation slot.
+    adapter.upsert(current, stored)
+    adapter.tombstone(current, 1_000_000_042)
+    adapter.verify(current, (stored,))

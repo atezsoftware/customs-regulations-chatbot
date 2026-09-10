@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-from onyx.document_index.elasticsearch.schema import DocumentChunk
+from onyx.document_index.elasticsearch.constants import DEFAULT_MAX_CHUNK_SIZE
 
 
 class PublicationModel(BaseModel):
@@ -63,6 +63,63 @@ def publication_digest(value: JsonValue) -> str:
     ).hexdigest()
 
 
+class SerializedPublicationSource(PublicationModel):
+    """Strict ES JSON shapes emitted by DocumentChunk's serializer.
+
+    Timestamps are epoch seconds and tenant identity is an explicit string here;
+    validation must not use DocumentChunk's process-global tenant deserializer.
+    The original JSON is retained by FrozenPublicationProjection without coercion.
+    """
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", strict=True, allow_inf_nan=False
+    )
+
+    document_id: str = Field(min_length=1)
+    chunk_index: int = Field(ge=0)
+    max_chunk_size: int = Field(default=DEFAULT_MAX_CHUNK_SIZE, gt=0)
+    title: str | None = None
+    title_vector: list[float] | None = None
+    content: str
+    content_vector: list[float] = Field(min_length=1)
+    source_type: str
+    metadata_list: list[str] | None = None
+    last_updated: int | None = None
+    created_at: int | None = None
+    public: bool
+    access_control_list: list[str]
+    hidden: bool = False
+    written_by_port: bool | None = None
+    global_boost: int
+    semantic_identifier: str
+    image_file_id: str | None = None
+    source_links: str | None = None
+    blurb: str
+    doc_summary: str
+    chunk_context: str
+    metadata_suffix: str | None = None
+    document_sets: list[str] | None = None
+    user_projects: list[int] | None = None
+    personas: list[int] | None = None
+    primary_owners: list[str] | None = None
+    secondary_owners: list[str] | None = None
+    ancestor_hierarchy_node_ids: list[int] | None = None
+    regulatory_chunk_id: str = Field(min_length=1)
+    heading_path: list[str] | None = None
+    provision_identifiers: list[str] | None = None
+    decision_numbers: list[str] | None = None
+    legal_dates: list[str] | None = None
+    validity_start_date: int | None = None
+    validity_end_date: int | None = None
+    tenant_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_title_vector_pair(self) -> Self:
+        if (self.title is None) != (self.title_vector is None):
+            raise ValueError("title and title vector must both be present or absent")
+        return self
+
+
 class FrozenPublicationProjection(PublicationModel):
     """Exact serialized source and actual encoder inputs/configuration.
 
@@ -82,24 +139,9 @@ class FrozenPublicationProjection(PublicationModel):
         config = json.loads(self.embedding_config_json)
         if not isinstance(source, dict) or not isinstance(config, dict):
             raise ValueError("projection source/config must be JSON objects")
-        required = {
-            name
-            for name, field in DocumentChunk.model_fields.items()
-            if field.is_required()
-        }
-        if not required.issubset(source):
-            raise ValueError("full projection is missing required search fields")
-        if (
-            source.get("chunk_index") != self.ordinal
-            or not isinstance(source.get("regulatory_chunk_id"), str)
-            or not source["regulatory_chunk_id"]
-        ):
+        serialized = SerializedPublicationSource.model_validate(source)
+        if serialized.chunk_index != self.ordinal:
             raise ValueError("projection ordinal/canonical identity mismatch")
-        for key in ("content", "doc_summary", "chunk_context"):
-            if not isinstance(source.get(key), str):
-                raise ValueError("projection text/context missing")
-        if any(key.startswith("publication_") for key in source):
-            raise ValueError("reserved publication field in source")
         publication_digest(source)
         publication_digest(config)
         return self
