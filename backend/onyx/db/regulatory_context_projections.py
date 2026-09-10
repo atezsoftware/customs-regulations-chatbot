@@ -620,8 +620,13 @@ def activate_temporal_projection(
     )
     if overlapping is not None:
         raise ValueError("temporal projection overlaps qualified history")
+    from onyx.db.regulatory_canonical_revisions import retain_canonical_revision
+    from onyx.regulatory.amendments.annexes.publication_representations import _snapshot
+
+    canonical_revision_id = retain_canonical_revision(session, _snapshot(canonical))
     session.add(
         RegulatoryTemporalProjection(
+            canonical_revision_id=canonical_revision_id,
             id=binding.id,
             user_file_id=user_file_id,
             canonical_chunk_id=canonical.id,
@@ -669,6 +674,11 @@ def get_indexed_temporal_projection(
         return None
     if publication_digest(row.payload) != row.payload_sha256:
         raise ValueError("temporal binding payload changed")
+    from onyx.db.regulatory_canonical_revisions import (
+        validate_temporal_canonical_revision,
+    )
+
+    validate_temporal_canonical_revision(session, row)
     binding = AnnexTemporalProjection.model_validate(row.payload)
     import json
 

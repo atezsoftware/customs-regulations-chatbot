@@ -14,6 +14,7 @@ from onyx.db.models import (
     AnnexChangeSet,
     AnnexPublicationIntent,
     DocumentSet,
+    RegulatoryCanonicalRevision,
     RegulatoryFilePublication,
     RegulatoryPublicationOrdinal,
     RegulatoryTemporalProjection,
@@ -68,6 +69,11 @@ def committed_review_session() -> Generator[Session, None, None]:
             session.execute(
                 delete(RegulatoryFilePublication).where(
                     RegulatoryFilePublication.user_file_id.in_(files)
+                )
+            )
+            session.execute(
+                delete(RegulatoryCanonicalRevision).where(
+                    RegulatoryCanonicalRevision.user_file_id.in_(files)
                 )
             )
             session.execute(delete(UserFile).where(UserFile.id.in_(files)))

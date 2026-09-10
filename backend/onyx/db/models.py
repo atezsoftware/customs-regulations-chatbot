@@ -8439,7 +8439,7 @@ class AnnexChangeSet(Base):
     instruction_indices: Mapped[list[int]] = mapped_column(PGJSONB)
     environment: Mapped[str] = mapped_column(Text)
     user_file_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("user_file.id"), nullable=True
+        PGUUID(as_uuid=True), nullable=True
     )
     status: Mapped[str] = mapped_column(Text, default="pending")
     review_sha256: Mapped[str] = mapped_column(Text)
@@ -8573,13 +8573,35 @@ class RegulatoryPublicationOrdinal(Base):
     )
 
 
+class RegulatoryCanonicalRevision(Base):
+    """Immutable correction/audit authority; survives deletion of the live file."""
+
+    __tablename__ = "regulatory_canonical_revision"
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    user_file_id: Mapped[UUID] = mapped_column(index=True)
+    canonical_chunk_id: Mapped[str] = mapped_column(Text, index=True)
+    payload_sha256: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "canonical_chunk_id", "payload_sha256", name="uq_canonical_revision_payload"
+        ),
+    )
+
+
 class RegulatoryTemporalProjection(Base):
     """Index/config-qualified dated source, context and vector association."""
 
     __tablename__ = "regulatory_temporal_projection"
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
-    user_file_id: Mapped[UUID] = mapped_column(ForeignKey("user_file.id"))
-    canonical_chunk_id: Mapped[str] = mapped_column(ForeignKey("regulatory_chunk.id"))
+    user_file_id: Mapped[UUID] = mapped_column()
+    canonical_chunk_id: Mapped[str] = mapped_column(Text)
+    canonical_revision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("regulatory_canonical_revision.id"), nullable=True
+    )
     index_uuid: Mapped[str] = mapped_column(Text)
     index_identity_sha256: Mapped[str] = mapped_column(Text)
     projection_ordinal: Mapped[int] = mapped_column(BigInteger)

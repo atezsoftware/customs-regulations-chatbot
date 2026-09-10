@@ -56,6 +56,10 @@ from onyx.db.regulatory_amendments import (
     retry_amendment_proposal_projection,
 )
 from onyx.db.regulatory_annex_changes import list_annex_changes
+from onyx.db.regulatory_canonical_revisions import (
+    CanonicalRevision,
+    list_canonical_revisions,
+)
 from onyx.db.regulatory_chunks import (
     ValidityDateUpdate,
     delete_hierarchical_aggregates_referencing_chunk,
@@ -275,6 +279,19 @@ def get_chunk_pdf(
     )
     require_publication_files(observation, (chunk.user_file_id,))
     return _pdf_response(pdf, f"chunk-{chunk.position + 1}.pdf")
+
+
+@router.get("/chunks/{chunk_id}/revisions", tags=PUBLIC_API_TAGS)
+def get_chunk_revisions(
+    chunk_id: str,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> list[CanonicalRevision]:
+    chunk = get_chunk_snapshot_by_id(db_session, chunk_id)
+    if chunk is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found")
+    _get_owned_user_file(db_session, chunk.user_file_id, user)
+    return list_canonical_revisions(db_session, chunk_id)
 
 
 @router.patch("/chunks/{chunk_id}", tags=PUBLIC_API_TAGS)

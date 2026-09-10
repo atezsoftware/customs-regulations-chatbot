@@ -44,6 +44,7 @@ def create_owned_file(tenant_id: str = "public") -> Generator[UUID, None, None]:
     yield file_id
     with get_session_with_tenant(tenant_id=tenant_id) as session:
         from onyx.db.models import (
+            RegulatoryCanonicalRevision,
             RegulatoryFilePublication,
             RegulatoryPublicationOrdinal,
         )
@@ -56,6 +57,11 @@ def create_owned_file(tenant_id: str = "public") -> Generator[UUID, None, None]:
         session.execute(
             delete(RegulatoryFilePublication).where(
                 RegulatoryFilePublication.user_file_id == file_id
+            )
+        )
+        session.execute(
+            delete(RegulatoryCanonicalRevision).where(
+                RegulatoryCanonicalRevision.user_file_id == file_id
             )
         )
         session.execute(delete(UserFile).where(UserFile.id == file_id))

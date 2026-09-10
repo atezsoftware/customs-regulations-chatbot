@@ -76,6 +76,11 @@ def load_file_temporal_bindings(
     ):
         if publication_digest(row.payload) != row.payload_sha256:
             raise ValueError("temporal binding payload changed")
+        from onyx.db.regulatory_canonical_revisions import (
+            validate_temporal_canonical_revision,
+        )
+
+        validate_temporal_canonical_revision(session, row)
         bindings.append(AnnexTemporalProjection.model_validate(row.payload))
     return bindings
 
