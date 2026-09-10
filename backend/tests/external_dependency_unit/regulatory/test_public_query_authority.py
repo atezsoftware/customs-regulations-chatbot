@@ -37,15 +37,17 @@ from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
 from onyx.regulatory.publication_reads import public_read_store
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
+from shared_configs.enums import EmbeddingProvider
 from tests.external_dependency_unit.regulatory.test_publication_primitives import (
     create_owned_file,
     frozen_projection,
 )
 
 
-def test_public_queries_resolve_actual_present_future_authority_without_injected_snapshot() -> (
-    None
-):
+@pytest.mark.parametrize("provider_mode", ["local", "openrouter"])
+def test_public_queries_resolve_actual_present_future_authority_without_injected_snapshot(
+    provider_mode: str,
+) -> None:
     from shared_configs.configs import MULTI_TENANT
 
     if not MULTI_TENANT:
@@ -57,6 +59,8 @@ def test_public_queries_resolve_actual_present_future_authority_without_injected
                 "-q",
                 "--tb=short",
                 str(Path(__file__).resolve()),
+                "-k",
+                provider_mode,
             ],
             env={**os.environ, "MULTI_TENANT": "true"},
             check=True,
@@ -115,6 +119,14 @@ def test_public_queries_resolve_actual_present_future_authority_without_injected
                     ]
                     # Migration-seeded settings, if any, are confined to this new schema.
                     session.execute(delete(SearchSettings))
+                    if provider_mode == "openrouter":
+                        from onyx.db.models import CloudEmbeddingProvider
+
+                        session.add(
+                            CloudEmbeddingProvider(
+                                provider_type=EmbeddingProvider.OPENROUTER
+                            )
+                        )
                     session.commit()
                 for status in (IndexModelStatus.PRESENT, IndexModelStatus.FUTURE):
                     authority.close_gate(owner)
@@ -131,7 +143,9 @@ def test_public_queries_resolve_actual_present_future_authority_without_injected
                             normalize=True,
                             status=status,
                             index_name=name,
-                            provider_type=None,
+                            provider_type=EmbeddingProvider.OPENROUTER
+                            if provider_mode == "openrouter"
+                            else None,
                             query_prefix="",
                             passage_prefix="",
                         )
@@ -166,18 +180,34 @@ def test_public_queries_resolve_actual_present_future_authority_without_injected
                             resolved_fields=resolved,
                             resolution_sha256=context_hash(config),
                         )
+                        if provider_mode == "openrouter":
+                            from onyx.regulatory.amendments.annexes.publication_evidence import (
+                                _encoder_receipt,
+                            )
+                            from tests.unit.onyx.regulatory.indexing_jobs.test_encoder_authority import (
+                                _batch,
+                                _sync,
+                            )
+
+                            config = (_sync() if number == 0 else _batch()) | {
+                                "model": "fixture",
+                                "formatter": f"compatible-{number}",
+                            }
+                            receipt = _encoder_receipt(
+                                config, resolution=context_hash(config)
+                            )
                         snapshot = PublicationIndexSnapshot(
                             index_name=name,
                             index_uuid=client.indices.get(index=name)[name]["settings"][
                                 "index"
                             ]["uuid"],
                             search_settings_id=settings_id,
-                            model_provider="",
+                            model_provider=receipt.authority.provider or "",
                             model_name="fixture",
                             vector_dimension=3,
                             embedding_config_sha256=publication_digest(config),
                             multitenant=True,
-                            encoder_authority=encoder,
+                            encoder_authority=receipt.authority,
                             encoder_receipts=(receipt,),
                         )
                         source = json.loads(

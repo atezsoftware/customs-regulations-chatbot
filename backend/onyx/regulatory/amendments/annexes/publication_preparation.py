@@ -460,7 +460,10 @@ def prepare_publication_review(draft: AnnexChangeDraft) -> AnnexChangeDraft:
                     additional = _encoder_receipt(
                         cfg, resolution=context_hash(draft.preparation_configuration)
                     )
-                    if additional.authority != receipt.authority:
+                    if (
+                        additional.effective_authority()
+                        != receipt.effective_authority()
+                    ):
                         raise ValueError(
                             "historical encoder authority is incompatible with the target index"
                         )

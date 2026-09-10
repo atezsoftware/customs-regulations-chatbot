@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import datetime
 import math
 from collections.abc import Sequence
 from enum import StrEnum
+from typing import cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,7 +17,6 @@ from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.enums import (
     RegulatoryIndexingItemStatus,
     RegulatoryIndexingStage,
-    UserFileStatus,
 )
 from onyx.db.models import (
     RegulatoryChunk,
@@ -31,13 +30,11 @@ from onyx.db.user_file import (
     fetch_persona_ids_for_user_files,
     fetch_user_project_ids_for_user_files,
 )
-from onyx.document_index.factory import build_elasticsearch_document_index
 from onyx.document_index.interfaces_new import (
     DocumentChunkVerificationExpectation,
     DocumentChunkVerificationRequest,
     DocumentChunkVerificationResult,
     DocumentIndex,
-    IndexingMetadata,
 )
 from onyx.indexing.models import (
     ChunkEmbedding,
@@ -47,9 +44,9 @@ from onyx.indexing.models import (
 from onyx.regulatory.chunk_evidence import chunk_evidence
 from onyx.regulatory.heading_path import normalize_regulatory_heading_path
 from onyx.regulatory.indexing_jobs.models import (
-    IndexingPublicationIndeterminateError,
     RegulatoryIndexingConfigSnapshot,
 )
+from onyx.regulatory.indexing_jobs.projection_identity import projection_ordinal
 
 
 class PublishVerification(BaseModel):
@@ -88,26 +85,13 @@ def _ordered_projection(
     items: Sequence[RegulatoryIndexingItem],
     expected_dimension: int,
 ) -> list[tuple[RegulatoryChunk, RegulatoryIndexingItem]]:
-    ordered_rows = sorted(rows, key=lambda row: (row.position, row.id))
-    if not ordered_rows:
-        raise ValueError("regulatory indexing job has no canonical chunks")
-    if any(row.user_file_id != user_file_id for row in ordered_rows):
-        raise ValueError("canonical chunk belongs to a different user file")
-    row_ids = [row.id for row in ordered_rows]
-    if len(set(row_ids)) != len(row_ids):
-        raise ValueError("canonical chunks contain duplicate ids")
+    from onyx.regulatory.indexing_jobs.projection_identity import (
+        ordered_projection_items,
+    )
 
-    item_by_row_id: dict[str, RegulatoryIndexingItem] = {}
-    for item in items:
-        if item.job_id != job_id:
-            raise ValueError("indexing item belongs to a different job")
-        if item.regulatory_chunk_id in item_by_row_id:
-            raise ValueError("indexing items contain duplicate canonical chunks")
-        item_by_row_id[item.regulatory_chunk_id] = item
-    if set(item_by_row_id) != set(row_ids):
-        raise ValueError("embedded items do not exactly cover canonical chunks")
-
-    ordered = [(row, item_by_row_id[row.id]) for row in ordered_rows]
+    ordered = ordered_projection_items(
+        job_id=job_id, user_file_id=user_file_id, rows=rows, items=items
+    )
     for _row, item in ordered:
         if item.status != RegulatoryIndexingItemStatus.EMBEDDED.value:
             raise ValueError("every canonical chunk must be embedded before indexing")
@@ -134,7 +118,7 @@ def _expected_verification(
     return PublishVerification(
         job_id=job_id,
         document_id=str(user_file_id),
-        canonical_chunk_count=len(ordered),
+        canonical_chunk_count=len({row.id for row, _ in ordered}),
         embedded_item_count=len(ordered),
         vector_dimension=snapshot.effective_dimension,
         insertion_record_count=1,
@@ -170,6 +154,22 @@ def _contextual_text(item: RegulatoryIndexingItem) -> str:
     if not isinstance(item.context, dict):
         raise ValueError("embedded item context is invalid")
     value = item.context.get("contextual_text")
+    raw_checkpoint = item.context.get("context_input")
+    checkpoint = (
+        cast(dict[str, object], raw_checkpoint)
+        if isinstance(raw_checkpoint, dict)
+        else None
+    )
+    if (
+        value is None
+        and isinstance(checkpoint, dict)
+        and (
+            checkpoint.get("request_hash") == item.request_hash
+            and checkpoint.get("prompt")
+            == f"Context skipped for canonical chunk {item.regulatory_chunk_id}"
+        )
+    ):
+        return ""
     if not isinstance(value, str) or not value.strip():
         raise ValueError("embedded item contextual text is invalid")
     return value
@@ -225,7 +225,7 @@ def _build_hidden_chunks(
         vector = [float(value) for value in item.vector or []]
         index_chunk = IndexChunk(
             source_document=document,
-            chunk_id=chunk_id,
+            chunk_id=projection_ordinal(row, item, chunk_id),
             blurb=row.text,
             content=row.text,
             source_links=chunk_evidence(row.chunk_metadata).source_links,
@@ -241,8 +241,12 @@ def _build_hidden_chunks(
             contextual_rag_reserved_tokens=0,
             regulatory_chunk_id=row.id,
             heading_path=_normalized_heading_path(row),
-            validity_start_date=row.validity_start_date,
-            validity_end_date=row.validity_end_date,
+            validity_start_date=item.effective_start
+            if getattr(item, "projection_id", None) is not None
+            else row.validity_start_date,
+            validity_end_date=item.effective_end
+            if getattr(item, "projection_id", None) is not None
+            else row.validity_end_date,
             embeddings=ChunkEmbedding(
                 full_embedding=vector,
                 mini_chunk_embeddings=[],
@@ -294,17 +298,36 @@ def _verification_request(
     expected: PublishVerification,
     rows: Sequence[RegulatoryChunk],
     hidden: bool,
+    items: Sequence[RegulatoryIndexingItem] | None = None,
 ) -> DocumentChunkVerificationRequest:
-    ordered_rows = sorted(rows, key=lambda row: (row.position, row.id))
-    return DocumentChunkVerificationRequest(
-        document_id=expected.document_id,
-        expected_chunks=tuple(
+    if items is None:
+        expected_chunks = tuple(
             DocumentChunkVerificationExpectation(
-                chunk_index=chunk_index,
+                chunk_index=ordinal, regulatory_chunk_id=row.id
+            )
+            for ordinal, row in enumerate(
+                sorted(rows, key=lambda row: (row.position, row.id))
+            )
+        )
+    else:
+        mapped = _ordered_projection(
+            job_id=expected.job_id,
+            user_file_id=UUID(expected.document_id),
+            rows=rows,
+            items=items,
+            expected_dimension=expected.vector_dimension,
+        )
+        expected_chunks = tuple(
+            DocumentChunkVerificationExpectation(
+                chunk_index=projection_ordinal(row, item, ordinal),
                 regulatory_chunk_id=row.id,
             )
-            for chunk_index, row in enumerate(ordered_rows)
-        ),
+            for ordinal, (row, item) in enumerate(mapped)
+        )
+    return DocumentChunkVerificationRequest(
+        document_id=expected.document_id,
+        expected_chunks=expected_chunks,
+        require_contiguous=items is None,
         expected_hidden=hidden,
         content_vector_dimension=expected.vector_dimension,
     )
@@ -318,8 +341,8 @@ def _validate_index_verification(
 ) -> None:
     if (
         result.document_id != expected.document_id
-        or result.chunk_count != expected.canonical_chunk_count
-        or len(result.document_chunk_ids) != expected.canonical_chunk_count
+        or result.chunk_count != expected.embedded_item_count
+        or len(result.document_chunk_ids) != expected.embedded_item_count
         or result.hidden is not hidden
     ):
         raise ValueError("document index verification returned unexpected invariants")
@@ -356,94 +379,18 @@ def stage_regulatory_job_in_index(
     db_session: Session,
     document_index: DocumentIndex | None = None,
 ) -> PublishVerification:
-    """Write one complete deterministic file generation with hidden chunks."""
-
-    if not tenant_id.strip():
-        raise ValueError("tenant_id must not be empty")
-    job_id = job.id
-    expected_generation = job.lease_generation
-    with indexing_job_repository.regulatory_indexing_external_mutation_lease(
-        db_session,
-        job_id=job_id,
-        expected_stage=RegulatoryIndexingStage.INDEX_WRITE,
-        expected_generation=expected_generation,
-    ) as lease:
-        if lease is None:
-            raise RuntimeError("regulatory indexing lease was lost before index write")
-        _validate_call_identity(
-            lease,
-            user_file=user_file,
-            search_settings=search_settings,
-            rows=rows,
-            items=items,
-        )
-        if lease.user_file_status in {
-            UserFileStatus.CANCELED,
-            UserFileStatus.DELETING,
-        }:
-            raise ValueError("cancelled or deleting user file cannot be staged")
-        snapshot = RegulatoryIndexingConfigSnapshot.model_validate(
-            lease.config_snapshot
-        )
-        locked_settings = lease.search_settings
-        if locked_settings is None:
-            raise RuntimeError("regulatory indexing SearchSettings disappeared")
-        _validate_search_settings(locked_settings, snapshot)
-        expected = _expected_verification(
-            job_id=lease.job_id,
-            user_file_id=lease.user_file_id,
-            rows=lease.regulatory_chunks,
-            items=lease.indexing_items,
-            snapshot=snapshot,
-        )
-        chunks = _build_hidden_chunks(
-            job_id=lease.job_id,
-            user_file_id=lease.user_file_id,
-            user_file_name=lease.user_file_name,
-            rows=lease.regulatory_chunks,
-            items=lease.indexing_items,
-            snapshot=snapshot,
-            tenant_id=tenant_id,
-            db_session=db_session,
-        )
-        target_index = document_index or build_elasticsearch_document_index(
-            locked_settings
-        )
-        old_chunk_count = lease.user_file_chunk_count or 0
-        indexing_metadata = IndexingMetadata(
-            doc_id_to_chunk_cnt_diff={
-                expected.document_id: IndexingMetadata.ChunkCounts(
-                    old_chunk_cnt=max(old_chunk_count, expected.canonical_chunk_count),
-                    new_chunk_cnt=expected.canonical_chunk_count,
-                )
-            }
-        )
-        insertion_records = target_index.index(
-            chunks=chunks,
-            indexing_metadata=indexing_metadata,
-        )
-        if len(insertion_records) != 1:
-            raise ValueError(
-                "regulatory publication requires exactly one insertion record"
-            )
-        if insertion_records[0].document_id != expected.document_id:
-            raise ValueError(
-                "regulatory insertion record has an unexpected document id"
-            )
-        verification_result = target_index.verify_document_chunks(
-            _verification_request(
-                expected=expected,
-                rows=lease.regulatory_chunks,
-                hidden=True,
-            )
-        )
-        _validate_index_verification(
-            verification_result,
-            expected,
-            hidden=True,
-        )
-        lease.commit()
-        return expected
+    """Stage the frozen job with hidden sources under shared actual ES fencing."""
+    return _owned_checkpoint(
+        job=job,
+        user_file=user_file,
+        rows=rows,
+        items=items,
+        search_settings=search_settings,
+        tenant_id=tenant_id,
+        db_session=db_session,
+        document_index=document_index,
+        stage=RegulatoryIndexingStage.INDEX_WRITE,
+    )
 
 
 def verify_staged_regulatory_job(
@@ -456,54 +403,20 @@ def verify_staged_regulatory_job(
     document_index: DocumentIndex | None = None,
     search_settings: SearchSettings | None = None,
 ) -> PublishVerification:
-    """Verify the hidden projection under the separately claimed VERIFY lease."""
+    """Reseal and verify the same hidden inventory under the new delivery token."""
+    from shared_configs.contextvars import get_current_tenant_id
 
-    with indexing_job_repository.regulatory_indexing_external_mutation_lease(
-        db_session,
-        job_id=job.id,
-        expected_stage=RegulatoryIndexingStage.VERIFY,
-        expected_generation=job.lease_generation,
-    ) as lease:
-        if lease is None:
-            raise RuntimeError("regulatory indexing lease was lost before verification")
-        _validate_call_identity(
-            lease,
-            user_file=user_file,
-            search_settings=search_settings,
-            rows=rows,
-            items=items,
-        )
-        if lease.user_file_status in {
-            UserFileStatus.CANCELED,
-            UserFileStatus.DELETING,
-        }:
-            raise ValueError("cancelled or deleting user file cannot be verified")
-        snapshot = RegulatoryIndexingConfigSnapshot.model_validate(
-            lease.config_snapshot
-        )
-        expected = _expected_verification(
-            job_id=lease.job_id,
-            user_file_id=lease.user_file_id,
-            rows=lease.regulatory_chunks,
-            items=lease.indexing_items,
-            snapshot=snapshot,
-        )
-        if lease.search_settings is None:
-            raise RuntimeError("regulatory indexing SearchSettings disappeared")
-        _validate_search_settings(lease.search_settings, snapshot)
-        target_index = document_index or build_elasticsearch_document_index(
-            lease.search_settings
-        )
-        result = target_index.verify_document_chunks(
-            _verification_request(
-                expected=expected,
-                rows=lease.regulatory_chunks,
-                hidden=True,
-            )
-        )
-        _validate_index_verification(result, expected, hidden=True)
-        lease.commit()
-        return expected
+    return _owned_checkpoint(
+        job=job,
+        user_file=user_file,
+        rows=rows,
+        items=items,
+        search_settings=search_settings,
+        tenant_id=get_current_tenant_id(),
+        db_session=db_session,
+        document_index=document_index,
+        stage=RegulatoryIndexingStage.VERIFY,
+    )
 
 
 def publish_regulatory_job(
@@ -517,101 +430,77 @@ def publish_regulatory_job(
     document_index: DocumentIndex | None = None,
     search_settings: SearchSettings | None = None,
 ) -> PublishOutcome:
-    """Converge a hidden or already-visible projection to atomic DB completion."""
+    """Publish and complete the durable job in the canonical activation transaction."""
+    from shared_configs.contextvars import get_current_tenant_id
 
-    with indexing_job_repository.regulatory_indexing_external_mutation_lease(
-        db_session,
+    if verification is not None and verification != _expected_verification(
         job_id=job.id,
-        expected_stage=RegulatoryIndexingStage.PUBLISH,
-        expected_generation=job.lease_generation,
-    ) as lease:
-        if lease is None:
-            raise RuntimeError("regulatory indexing lease was lost before publishing")
-        _validate_call_identity(
-            lease,
-            user_file=user_file,
-            search_settings=search_settings,
-            rows=rows,
-            items=items,
-        )
-        if lease.user_file_status in {
-            UserFileStatus.CANCELED,
-            UserFileStatus.DELETING,
-        }:
-            raise ValueError("cancelled or deleting user file cannot be published")
-        snapshot = RegulatoryIndexingConfigSnapshot.model_validate(
-            lease.config_snapshot
-        )
-        expected = _expected_verification(
-            job_id=lease.job_id,
-            user_file_id=lease.user_file_id,
-            rows=lease.regulatory_chunks,
-            items=lease.indexing_items,
-            snapshot=snapshot,
-        )
-        if verification is not None and verification != expected:
-            raise ValueError(
-                "publication verification no longer matches persisted state"
-            )
+        user_file_id=user_file.id,
+        rows=rows,
+        items=items,
+        snapshot=RegulatoryIndexingConfigSnapshot.model_validate(job.config_snapshot),
+    ):
+        raise ValueError("durable publication verification identity mismatch")
+    _owned_checkpoint(
+        job=job,
+        user_file=user_file,
+        rows=rows,
+        items=items,
+        search_settings=search_settings,
+        tenant_id=get_current_tenant_id(),
+        db_session=db_session,
+        document_index=document_index,
+        stage=RegulatoryIndexingStage.PUBLISH,
+    )
+    return PublishOutcome.COMPLETED
 
-        if lease.search_settings is None:
-            raise RuntimeError("regulatory indexing SearchSettings disappeared")
-        _validate_search_settings(lease.search_settings, snapshot)
 
-        target_index = document_index or build_elasticsearch_document_index(
-            lease.search_settings
+def _owned_checkpoint(
+    *,
+    job: RegulatoryIndexingJob,
+    user_file: UserFile,
+    rows: Sequence[RegulatoryChunk],
+    items: Sequence[RegulatoryIndexingItem],
+    search_settings: SearchSettings | None,
+    tenant_id: str,
+    db_session: Session,
+    document_index: DocumentIndex | None,
+    stage: RegulatoryIndexingStage,
+) -> PublishVerification:
+    from onyx.regulatory.indexing_jobs.owned_publication import (
+        execute_owned_durable_stage,
+    )
+
+    if document_index is not None:
+        raise ValueError(
+            "durable publication requires the configured fenced Elasticsearch transport"
         )
-        hidden_request = _verification_request(
-            expected=expected,
-            rows=lease.regulatory_chunks,
-            hidden=True,
+    if (
+        not tenant_id.strip()
+        or user_file.id != job.user_file_id
+        or (
+            search_settings is not None and search_settings.id != job.search_settings_id
         )
-        visible_request = hidden_request.model_copy(update={"expected_hidden": False})
-        # Elasticsearch bulk visibility is not transactional. A killed process can
-        # therefore leave a mixed generation that verifies as neither hidden nor
-        # visible. Re-establish the safe all-hidden baseline before every publish;
-        # the two idempotent bulk updates then converge hidden, visible, or mixed
-        # projections through the same path.
-        try:
-            target_index.update_document_visibility(hidden_request)
-            hidden_result = target_index.verify_document_chunks(hidden_request)
-            _validate_index_verification(hidden_result, expected, hidden=True)
-        except Exception as baseline_error:
-            raise IndexingPublicationIndeterminateError() from baseline_error
-        try:
-            target_index.update_document_visibility(visible_request)
-            visible_result = target_index.verify_document_chunks(visible_request)
-            _validate_index_verification(visible_result, expected, hidden=False)
-            completed = (
-                indexing_job_repository.complete_regulatory_indexing_publication(
-                    db_session,
-                    job_id=lease.job_id,
-                    expected_generation=lease.lease_generation,
-                    chunk_count=expected.canonical_chunk_count,
-                    now=datetime.datetime.now(datetime.timezone.utc),
-                    commit=False,
-                )
-            )
-            if not completed:
-                raise RuntimeError(
-                    "regulatory indexing lease was lost while publishing"
-                )
-            try:
-                lease.commit()
-            except Exception as commit_error:
-                raise IndexingPublicationIndeterminateError() from commit_error
-            return PublishOutcome.COMPLETED
-        except Exception as publish_error:
-            if isinstance(publish_error, IndexingPublicationIndeterminateError):
-                raise
-            try:
-                target_index.update_document_visibility(hidden_request)
-                restored_result = target_index.verify_document_chunks(hidden_request)
-                _validate_index_verification(restored_result, expected, hidden=True)
-            except Exception as restore_error:
-                publish_error.add_note(
-                    "Failed to restore hidden regulatory chunks after publication "
-                    f"failure: {restore_error!r}"
-                )
-                raise IndexingPublicationIndeterminateError() from publish_error
-            raise
+    ):
+        raise ValueError("durable publication caller scope mismatch")
+    job_id, file_id, generation = job.id, user_file.id, job.lease_generation
+    row_ids, item_ids = {row.id for row in rows}, {item.id for item in items}
+    db_session.rollback()
+    runtime = execute_owned_durable_stage(
+        job_id=job_id,
+        file_id=file_id,
+        generation=generation,
+        stage=stage,
+        tenant_id=tenant_id,
+        caller_row_ids=row_ids,
+        caller_item_ids=item_ids,
+    )
+    return _expected_verification(
+        job_id=job_id,
+        user_file_id=file_id,
+        rows=runtime.regulatory_chunks,
+        items=runtime.indexing_items,
+        snapshot=RegulatoryIndexingConfigSnapshot.model_validate(
+            runtime.job.config_snapshot
+        ),
+    )

@@ -99,35 +99,22 @@ def _ordered_mapping(
     rows: Sequence[RegulatoryChunk],
     items: Sequence[RegulatoryIndexingItem],
 ) -> list[tuple[RegulatoryChunk, RegulatoryIndexingItem]]:
-    ordered_rows = sorted(rows, key=lambda row: (row.position, row.id))
-    if not ordered_rows:
-        raise ValueError("regulatory indexing job has no canonical chunks")
-    if any(row.user_file_id != job.user_file_id for row in ordered_rows):
-        raise ValueError("canonical chunk belongs to a different user file")
-    row_ids = [row.id for row in ordered_rows]
-    if len(set(row_ids)) != len(row_ids):
-        raise ValueError("canonical chunks contain duplicate ids")
+    from onyx.regulatory.indexing_jobs.projection_identity import (
+        ordered_projection_items,
+    )
 
-    item_by_row_id: dict[str, RegulatoryIndexingItem] = {}
-    for item in items:
-        if item.job_id != job.id:
-            raise ValueError("embedding item belongs to a different job")
-        if item.regulatory_chunk_id in item_by_row_id:
-            raise ValueError("embedding items contain a duplicate canonical chunk")
-        item_by_row_id[item.regulatory_chunk_id] = item
-    if set(item_by_row_id) != set(row_ids):
-        raise ValueError("embedding items do not exactly cover canonical chunks")
-    return [(row, item_by_row_id[row.id]) for row in ordered_rows]
+    return ordered_projection_items(
+        job_id=job.id, user_file_id=job.user_file_id, rows=rows, items=items
+    )
 
 
 def _text_for_embedding(
     row: RegulatoryChunk,
     item: RegulatoryIndexingItem,
 ) -> str:
-    if (
-        item.status == RegulatoryIndexingItemStatus.EMBEDDED.value
-        and item.context is None
-    ):
+    if item.status == RegulatoryIndexingItemStatus.EMBEDDED.value and not (
+        item.context or {}
+    ).get("contextual_text"):
         return row.text
     return contextualized_embedding_text(row, item)
 
@@ -286,27 +273,6 @@ def embed_pending_regulatory_items(
     _validate_search_settings(search_settings, snapshot)
     ordered = _ordered_mapping(job, rows, items)
 
-    pending = [
-        (row, item)
-        for row, item in ordered
-        if not (
-            item.status == RegulatoryIndexingItemStatus.EMBEDDED.value
-            and _is_valid_vector(item.vector, snapshot.effective_dimension)
-        )
-    ]
-    invalid_statuses = [
-        item.status
-        for _row, item in pending
-        if item.status
-        not in {
-            RegulatoryIndexingItemStatus.CONTEXT_READY.value,
-            RegulatoryIndexingItemStatus.SKIPPED.value,
-            RegulatoryIndexingItemStatus.EMBEDDED.value,
-        }
-    ]
-    if invalid_statuses:
-        raise ValueError("regulatory indexing item is not ready for embedding")
-
     embedder = DefaultIndexingEmbedder(
         model_name=snapshot.embedding_model_name,
         normalize=search_settings.normalize,
@@ -320,6 +286,45 @@ def embed_pending_regulatory_items(
         reduced_dimension=snapshot.effective_dimension,
     )
 
+    from onyx.regulatory.indexing_jobs.embedding_receipts import (
+        has_proven_vector,
+        synchronous_embedding_receipts,
+    )
+
+    receipts = synchronous_embedding_receipts(
+        job=job,
+        rows=rows,
+        items=items,
+        model=embedder.embedding_model,
+    )
+    pending = [
+        (row, item)
+        for row, item in ordered
+        if not has_proven_vector(item, receipts[item.id])
+    ]
+    if (
+        indexing_job_repository.freeze_regulatory_embedding_receipts(
+            db_session,
+            job_id=job.id,
+            expected_generation=job.lease_generation,
+            receipts=receipts,
+        )
+        is None
+    ):
+        raise RuntimeError("regulatory indexing lease was lost before embedding")
+    invalid_statuses = [
+        item.status
+        for _row, item in pending
+        if item.status
+        not in {
+            RegulatoryIndexingItemStatus.CONTEXT_READY.value,
+            RegulatoryIndexingItemStatus.SKIPPED.value,
+            RegulatoryIndexingItemStatus.EMBEDDED.value,
+        }
+    ]
+    if invalid_statuses:
+        raise ValueError("regulatory indexing item is not ready for embedding")
+
     embedded_count = 0
     request_size = snapshot.embedding_request_size
     request_starts = list(range(0, len(pending), request_size))
@@ -327,7 +332,7 @@ def embed_pending_regulatory_items(
         request_starts = request_starts[:max_batches]
     for start in request_starts:
         batch = pending[start : start + request_size]
-        texts = [_text_for_embedding(row, item) for row, item in batch]
+        texts = [receipts[item.id].texts[0] for _row, item in batch]
         raw_vectors = embedder.embedding_model.encode(
             texts=texts,
             text_type=EmbedTextType.PASSAGE,

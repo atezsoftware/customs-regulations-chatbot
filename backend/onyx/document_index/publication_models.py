@@ -3,7 +3,10 @@
 import json
 from datetime import datetime
 from hashlib import sha256
-from typing import Self
+from typing import TYPE_CHECKING, Self
+
+if TYPE_CHECKING:
+    from onyx.document_index.encoder_authority import EffectiveEncoderAuthority
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -64,6 +67,11 @@ class PublicationEncoderReceipt(PublicationModel):
     resolution_sha256: str = Field(min_length=64, max_length=64)
     resolved_fields: dict[str, JsonValue] = Field(default_factory=dict)
 
+    def effective_authority(self) -> "EffectiveEncoderAuthority":
+        from onyx.document_index.encoder_authority import effective_receipt_authority
+
+        return effective_receipt_authority(self)
+
     @model_validator(mode="after")
     def validate_encoder_authority(self) -> Self:
         configuration = json.loads(self.configuration_json)
@@ -112,8 +120,17 @@ class PublicationIndexSnapshot(PublicationModel):
             authority.effective_dimension,
         ) != (self.model_provider, self.model_name, self.vector_dimension):
             raise ValueError("index encoder authority mismatch")
-        if not self.encoder_receipts or any(
-            receipt.authority != authority for receipt in self.encoder_receipts
+        representative = next(
+            (
+                receipt
+                for receipt in self.encoder_receipts
+                if receipt.authority == authority
+            ),
+            None,
+        )
+        if representative is None or any(
+            receipt.effective_authority() != representative.effective_authority()
+            for receipt in self.encoder_receipts
         ):
             raise ValueError("incompatible accepted encoder receipt")
         if self.embedding_config_sha256 not in {
@@ -122,6 +139,19 @@ class PublicationIndexSnapshot(PublicationModel):
         }:
             raise ValueError("default encoder configuration receipt missing")
         return self
+
+    def effective_authority(self) -> "EffectiveEncoderAuthority | None":
+        representative = next(
+            (
+                receipt
+                for receipt in self.encoder_receipts
+                if receipt.authority == self.encoder_authority
+            ),
+            None,
+        )
+        return (
+            representative.effective_authority() if representative is not None else None
+        )
 
     def temporal_lookup_identity(self) -> str:
         """Physical/model selector remains stable as approved formatter receipts grow."""
@@ -133,6 +163,45 @@ class PublicationIndexSnapshot(PublicationModel):
                     "encoder_authority",
                     "encoder_receipts",
                 },
+            )
+        )
+
+    def temporal_lookup_identities(self) -> tuple[str, ...]:
+        """Retain stored hashes; recognize only proven OpenRouter enum/value spelling."""
+        from shared_configs.enums import EmbeddingProvider
+
+        identity = self.temporal_lookup_identity()
+        effective = self.effective_authority()
+        spellings = (
+            EmbeddingProvider.OPENROUTER.value,
+            str(EmbeddingProvider.OPENROUTER),
+        )
+        if (
+            effective is None
+            or effective.version != "openrouter-native-v1"
+            or self.model_provider not in spellings
+            or (self.model_name, self.vector_dimension)
+            != (effective.authority.model, effective.authority.effective_dimension)
+        ):
+            return (identity,)
+        return tuple(
+            dict.fromkeys(
+                [
+                    identity,
+                    *[
+                        self.model_copy(
+                            update={"model_provider": spelling}
+                        ).temporal_lookup_identity()
+                        for spelling in spellings
+                    ],
+                ]
+            )
+        )
+
+    def matches_temporal_index(self, other: "PublicationIndexSnapshot") -> bool:
+        return bool(
+            set(self.temporal_lookup_identities()).intersection(
+                other.temporal_lookup_identities()
             )
         )
 

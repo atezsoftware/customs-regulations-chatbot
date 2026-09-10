@@ -1,4 +1,5 @@
 import datetime
+from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 from sqlalchemy import exists, func, select, update
@@ -277,6 +278,36 @@ def get_user_file_by_file_id(file_id: str, db_session: Session) -> UserFile | No
     return db_session.query(UserFile).filter(UserFile.file_id == file_id).first()
 
 
+@dataclass(frozen=True)
+class UserFileDeletionAssociations:
+    project_names: list[str]
+    assistant_names: list[str]
+    document_set_names: list[str]
+
+
+def get_user_file_deletion_associations(
+    db_session: Session, user_file_id: UUID, user_id: UUID
+) -> UserFileDeletionAssociations | None:
+    file = db_session.scalar(
+        select(UserFile)
+        .where(UserFile.id == user_file_id, UserFile.user_id == user_id)
+        .options(
+            selectinload(UserFile.projects),
+            selectinload(UserFile.assistants),
+            selectinload(UserFile.document_sets),
+        )
+    )
+    if file is None:
+        return None
+    return UserFileDeletionAssociations(
+        project_names=[project.name for project in file.projects],
+        assistant_names=[assistant.name for assistant in file.assistants],
+        document_set_names=[
+            item.name for item in file.document_sets if not item.is_deleting
+        ],
+    )
+
+
 def get_file_id_by_user_file_id(user_file_id: str, db_session: Session) -> str | None:
     """Resolve a `UserFile.id` to its underlying `FileRecord.file_id`.
 
@@ -515,3 +546,23 @@ def any_user_file_reconcile_pending_for_users(
             )
         )
     )
+
+
+def fetch_user_file_metadata_sync_candidates(db_session: Session) -> list[UUID]:
+    """FAILED files may still own current qualified history requiring reconciliation."""
+    from sqlalchemy import or_
+
+    return [
+        UUID(str(identifier))
+        for identifier in db_session.scalars(
+            select(UserFile.id).where(
+                UserFile.status.in_([UserFileStatus.COMPLETED, UserFileStatus.FAILED]),
+                or_(
+                    UserFile.needs_project_sync.is_(True),
+                    UserFile.needs_persona_sync.is_(True),
+                    UserFile.needs_document_set_sync.is_(True),
+                    UserFile.secondary_reconcile_pending.is_(True),
+                ),
+            )
+        )
+    ]

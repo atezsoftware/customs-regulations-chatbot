@@ -5968,6 +5968,15 @@ class RegulatoryIndexingItem(Base):
         ForeignKey("regulatory_chunk.id", ondelete="CASCADE"),
         nullable=False,
     )
+    projection_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True
+    )
+    projection_ordinal: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effective_start: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    effective_end: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    projection_input: Mapped[dict[str, Any] | None] = mapped_column(
+        PGJSONB(none_as_null=True), nullable=True
+    )
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
@@ -6000,10 +6009,20 @@ class RegulatoryIndexingItem(Base):
     regulatory_chunk: Mapped["RegulatoryChunk"] = relationship("RegulatoryChunk")
 
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_regulatory_indexing_item_job_chunk",
             "job_id",
             "regulatory_chunk_id",
-            name="uq_regulatory_indexing_item_job_chunk",
+            unique=True,
+            postgresql_where=text("projection_id IS NULL"),
+        ),
+        UniqueConstraint(
+            "job_id", "projection_id", name="uq_regulatory_indexing_item_job_projection"
+        ),
+        CheckConstraint(
+            "(projection_id IS NULL AND projection_ordinal IS NULL AND projection_input IS NULL) OR "
+            "(projection_id IS NOT NULL AND projection_ordinal >= 0 AND projection_input IS NOT NULL)",
+            name="regulatory_indexing_item_projection_identity_check",
         ),
         Index(
             "ix_regulatory_indexing_item_job_status",
@@ -8545,6 +8564,42 @@ class RegulatoryPublicationClock(Base):
     epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
 
+class RegulatoryPhysicalIndexOperation(Base):
+    """Retained physical UUID claim, independent of removable SearchSettings rows."""
+
+    __tablename__ = "regulatory_physical_index_operation"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    index_name: Mapped[str] = mapped_column(Text, nullable=False)
+    index_uuid: Mapped[str] = mapped_column(Text, nullable=False)
+    operation: Mapped[str] = mapped_column(Text, nullable=False)
+    request: Mapped[dict[str, Any]] = mapped_column(PGJSONB, nullable=False)
+    request_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    phase: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    lease_expires_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    result_index_uuid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    terminal_evidence: Mapped[dict[str, Any] | None] = mapped_column(
+        PGJSONB(none_as_null=True), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    __table_args__ = (
+        Index(
+            "uq_active_physical_index_operation",
+            "index_name",
+            unique=True,
+            postgresql_where=text("completed_at IS NULL"),
+        ),
+    )
+
+
 class RegulatoryFilePublication(Base):
     """Retained after file deletion so ownership and read epochs never reset."""
 
@@ -8559,6 +8614,13 @@ class RegulatoryFilePublication(Base):
     gate_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     next_ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    writer_manifest: Mapped[dict[str, Any] | None] = mapped_column(
+        PGJSONB(none_as_null=True), nullable=True
+    )
+    writer_manifest_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    original_ingestion_receipt: Mapped[dict[str, Any] | None] = mapped_column(
+        PGJSONB(none_as_null=True), nullable=True
+    )
 
 
 class RegulatoryPublicationOrdinal(Base):

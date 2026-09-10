@@ -121,11 +121,18 @@ class RegulatoryIndexingScheduler(PersistentScheduler):
                 task_logger.info("Skipping ignored tenant %s", tenant_id)
                 continue
             for template in PRODUCTION_LITE_TASK_TEMPLATES:
+                from onyx.regulatory.amendments.annexes import config as annex_config
+
+                if (
+                    template["task"] == "recover_annex_publications"
+                    and not annex_config.REGULATORY_ANNEX_WORKER_ENABLED
+                ):
+                    continue
                 name = f"{template['name']}-{tenant_id}"
                 schedule[name] = {
                     "task": template["task"],
                     "schedule": template["schedule"],
-                    "kwargs": {"tenant_id": tenant_id},
+                    "kwargs": {**template.get("kwargs", {}), "tenant_id": tenant_id},
                     "options": template["options"],
                 }
         return schedule

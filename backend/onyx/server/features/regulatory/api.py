@@ -62,16 +62,11 @@ from onyx.db.regulatory_canonical_revisions import (
 )
 from onyx.db.regulatory_chunks import (
     ValidityDateUpdate,
-    delete_hierarchical_aggregates_referencing_chunk,
     get_chunk_by_id,
     get_chunk_snapshot_by_id,
     get_chunks_for_file,
-    get_chunks_for_file_snapshot,
     is_hierarchical_aggregate_chunk,
-    update_chunk,
-    update_file_validity_window,
 )
-from onyx.db.user_file import lock_completed_user_file_for_projection
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
@@ -88,11 +83,6 @@ from onyx.regulatory.amendments.source_extraction import (
     extract_amendment_pdf as extract_amendment_pdf_text,
 )
 from onyx.regulatory.pdf import render_chunk_pdf, render_document_pdf
-from onyx.regulatory.projection import project_user_file_to_index
-from onyx.regulatory.validity_projection import (
-    compensate_regulatory_validity_patch,
-    patch_user_file_validity_in_active_indices,
-)
 from onyx.server.features.projects.models import UserFileSnapshot
 from onyx.server.features.regulatory.annex_api import router as annex_router
 from onyx.server.features.regulatory.models import (
@@ -304,7 +294,8 @@ def patch_chunk(
     chunk = get_chunk_snapshot_by_id(db_session, chunk_id)
     if chunk is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found")
-    user_file = _get_owned_user_file(db_session, chunk.user_file_id, user)
+    _get_owned_user_file(db_session, chunk.user_file_id, user)
+    file_id = chunk.user_file_id
 
     if is_hierarchical_aggregate_chunk(chunk):
         raise OnyxError(
@@ -315,7 +306,7 @@ def patch_chunk(
     if update_request.text is not None and not update_request.text.strip():
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, "Chunk text cannot be emptied")
 
-    validity_start: object = (
+    validity_start: ValidityDateUpdate = (
         None
         if update_request.clear_validity_start_date
         else (
@@ -324,7 +315,7 @@ def patch_chunk(
             else "unset"
         )
     )
-    validity_end: object = (
+    validity_end: ValidityDateUpdate = (
         None
         if update_request.clear_validity_end_date
         else (
@@ -334,27 +325,45 @@ def patch_chunk(
         )
     )
 
-    delete_hierarchical_aggregates_referencing_chunk(
-        db_session,
-        user_file_id=chunk.user_file_id,
-        source_chunk_id=chunk.id,
-    )
-    update_chunk(
-        chunk,
-        text=update_request.text,
-        heading_path=update_request.heading_path,
-        chunk_metadata=update_request.chunk_metadata,
-        validity_start_date=validity_start,  # type: ignore[arg-type]
-        validity_end_date=validity_end,  # type: ignore[arg-type]
-    )
-    db_session.flush()
+    from uuid import uuid4
 
-    # Same transaction: if the Elasticsearch projection fails, the row edit rolls
-    # back too, so Postgres and the index never diverge.
-    project_user_file_to_index(db_session, user_file, get_current_tenant_id())
-    db_session.commit()
+    from onyx.db.regulatory_publication import PublicationStore
+    from onyx.document_index.elasticsearch.client import ElasticsearchClient
+    from onyx.document_index.publication_models import PublicationScope
+    from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
+    from onyx.regulatory.writer_publication import correct_owned_chunk
 
-    return RegulatoryChunkSnapshot.from_model(chunk)
+    # No canonical or UserFile locks cross ownership acquisition or model/index I/O.
+    db_session.rollback()
+    authority = PublicationStore(
+        PublicationScope(
+            tenant_id=get_current_tenant_id(),
+            environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+            database_identity=annex_config.ANNEX_DATABASE_IDENTITY,
+        )
+    )
+    owner = authority.acquire(file_id, owner_id=uuid4(), ttl=LEASE_TTL)
+    try:
+        with ElasticsearchClient() as transport:
+            owner = correct_owned_chunk(
+                owner,
+                transport.publication_client(),
+                chunk_id,
+                text=update_request.text,
+                heading_path=update_request.heading_path,
+                chunk_metadata=update_request.chunk_metadata,
+                validity_start_date=validity_start,
+                validity_end_date=validity_end,
+            )
+    finally:
+        try:
+            authority.release(owner)
+        except ValueError:
+            pass
+    current = get_chunk_snapshot_by_id(db_session, chunk_id)
+    if current is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found")
+    return RegulatoryChunkSnapshot.from_model(current)
 
 
 @router.patch("/files/{user_file_id}/validity", tags=PUBLIC_API_TAGS)
@@ -367,12 +376,6 @@ def patch_file_validity(
     """Set explicit snapshot dates only when metadata projection is exact."""
 
     _get_owned_user_file(db_session, user_file_id, user)
-    user_file = lock_completed_user_file_for_projection(db_session, user_file_id)
-    if user_file is None:
-        raise OnyxError(
-            OnyxErrorCode.INVALID_INPUT,
-            "Validity can only be updated for a completed file.",
-        )
     if (
         update_request.validity_start_date is not None
         and update_request.clear_validity_start_date
@@ -409,69 +412,23 @@ def patch_file_validity(
         if update_request.clear_validity_end_date
         else (update_request.validity_end_date if updates_end else "unset")
     )
+    from onyx.regulatory.writer_publication import (
+        FileValidityPublicationConflict,
+        update_owned_file_validity,
+    )
+
+    db_session.rollback()
     try:
-        result = update_file_validity_window(
-            db_session,
+        result = update_owned_file_validity(
             user_file_id,
+            get_current_tenant_id(),
             validity_start_date=validity_start,
             validity_end_date=validity_end,
         )
+    except FileValidityPublicationConflict as error:
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(error)) from error
     except ValueError as error:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(error)) from error
-
-    if result.updated_chunk_count == 0:
-        raise OnyxError(
-            OnyxErrorCode.INVALID_INPUT,
-            "The file has no unversioned indexed chunks to update.",
-        )
-
-    db_session.flush()
-    if (
-        result.skipped_versioned_chunk_count != 0
-        or result.previous_window is None
-        or result.updated_window is None
-    ):
-        db_session.rollback()
-        raise OnyxError(
-            OnyxErrorCode.CONFLICT,
-            _FILE_VALIDITY_REINDEX_REQUIRED,
-        )
-
-    try:
-        applied_metadata_patch = patch_user_file_validity_in_active_indices(
-            db_session,
-            user_file,
-            previous_window=result.previous_window,
-            updated_window=result.updated_window,
-        )
-    except Exception:
-        db_session.rollback()
-        raise
-    if applied_metadata_patch is None:
-        db_session.rollback()
-        raise OnyxError(
-            OnyxErrorCode.CONFLICT,
-            _FILE_VALIDITY_REINDEX_REQUIRED,
-        )
-    try:
-        db_session.commit()
-    except Exception:
-        logger.exception(
-            "PostgreSQL commit failed after regulatory validity projection for "
-            "user_file=%s",
-            user_file_id,
-        )
-        if applied_metadata_patch is not None:
-            try:
-                compensate_regulatory_validity_patch(applied_metadata_patch)
-            except Exception as compensation_error:
-                db_session.rollback()
-                raise RuntimeError(
-                    "PostgreSQL commit and Elasticsearch validity compensation both "
-                    f"failed for user_file={user_file_id}."
-                ) from compensation_error
-        db_session.rollback()
-        raise
 
     return RegulatoryFileValidityUpdateResponse(
         updated_chunk_count=result.updated_chunk_count,
@@ -486,18 +443,14 @@ def rename_user_file(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> UserFileSnapshot:
+    from onyx.regulatory.writer_publication import rename_owned_file
+
+    _get_owned_user_file(db_session, user_file_id, user)
+    db_session.rollback()
+    rename_owned_file(
+        user_file_id, get_current_tenant_id(), rename_request.name.strip()
+    )
     user_file = _get_owned_user_file(db_session, user_file_id, user)
-    user_file.name = rename_request.name.strip()
-    db_session.add(user_file)
-    db_session.flush()
-
-    # File name is embedded in each chunk's semantic identifier (citations),
-    # so a rename re-projects the file's chunks as well.
-    chunks = get_chunks_for_file_snapshot(db_session, user_file_id)
-    if chunks:
-        project_user_file_to_index(db_session, user_file, get_current_tenant_id())
-    db_session.commit()
-
     return UserFileSnapshot.from_model(user_file)
 
 

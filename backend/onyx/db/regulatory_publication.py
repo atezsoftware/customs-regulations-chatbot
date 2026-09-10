@@ -164,6 +164,16 @@ class PublicationStore:
             session.commit()
             return result
 
+    def advance_after_publication(self, owner: FileOwnership) -> FileOwnership:
+        """A different logical payload requires a fresh token, even in one caller."""
+        with get_session_with_tenant(tenant_id=self.scope.tenant_id) as session:
+            row = self._locked(session, owner)
+            if row.gate_closed or row.writer_manifest is not None:
+                raise ValueError("cannot advance unfinished publication ownership")
+            row.fencing_token += 1
+            session.commit()
+            return self._ownership(row)
+
     def release(self, owner: FileOwnership) -> None:
         """Release ownership; a closed gate survives expiry, release and takeover."""
         with get_session_with_tenant(tenant_id=self.scope.tenant_id) as session:
@@ -174,24 +184,56 @@ class PublicationStore:
             session.commit()
 
     def allocate(self, owner: FileOwnership, allocation_key: str) -> int:
-        if not allocation_key:
-            raise ValueError("allocation key required")
         with get_session_with_tenant(tenant_id=self.scope.tenant_id) as session:
-            row = self._locked(session, owner)
-            allocation = session.get(
-                RegulatoryPublicationOrdinal, (owner.user_file_id, allocation_key)
-            )
-            if allocation is None:
-                allocation = RegulatoryPublicationOrdinal(
-                    user_file_id=owner.user_file_id,
-                    allocation_key=allocation_key,
-                    ordinal=row.next_ordinal,
-                )
-                row.next_ordinal += 1
-                session.add(allocation)
-            result = allocation.ordinal
+            result = self.allocate_in_session(session, owner, allocation_key)
             session.commit()
             return result
+
+    def allocate_in_session(
+        self, session: Session, owner: FileOwnership, allocation_key: str
+    ) -> int:
+        """Reserve inside a short canonical transaction; no independent heartbeat."""
+        if not allocation_key:
+            raise ValueError("allocation key required")
+        row = self._locked(session, owner)
+        allocation = session.get(
+            RegulatoryPublicationOrdinal, (owner.user_file_id, allocation_key)
+        )
+        if allocation is None:
+            allocation = RegulatoryPublicationOrdinal(
+                user_file_id=owner.user_file_id,
+                allocation_key=allocation_key,
+                ordinal=row.next_ordinal,
+            )
+            row.next_ordinal += 1
+            session.add(allocation)
+        return allocation.ordinal
+
+    def reserve_existing_ordinals(
+        self, owner: FileOwnership, ordinals: tuple[int, ...]
+    ) -> None:
+        """Adopt positively identified legacy ES IDs before the first fenced write."""
+        if any(
+            type(value) is not int or value < 0 or value >= 2**63 for value in ordinals
+        ):
+            raise ValueError("legacy projection ordinal is invalid")
+        with get_session_with_tenant(tenant_id=self.scope.tenant_id) as session:
+            row = self._locked(session, owner)
+            missing = set(ordinals) - set(self._ordinals(session, owner.user_file_id))
+            if missing and row.gate_closed:
+                raise ValueError(
+                    "a staged publication cannot acquire unplanned legacy IDs"
+                )
+            for ordinal in sorted(missing):
+                session.add(
+                    RegulatoryPublicationOrdinal(
+                        user_file_id=owner.user_file_id,
+                        allocation_key=f"legacy-index:{ordinal}",
+                        ordinal=ordinal,
+                    )
+                )
+                row.next_ordinal = max(row.next_ordinal, ordinal + 1)
+            session.commit()
 
     def _ordinals(self, session: Session, user_file_id: UUID) -> tuple[int, ...]:
         return tuple(
@@ -256,18 +298,26 @@ class PublicationStore:
         row.gate_closed = True
         self._event(session, row)
 
-    def _event(self, session: Session, row: RegulatoryFilePublication) -> None:
+    def lock_clock(self, session: Session) -> RegulatoryPublicationClock:
+        """Serialize a short local transition; never retain this lock over I/O."""
+        self._check_session(session)
         session.execute(
             insert(RegulatoryPublicationClock)
             .values(scope_key=self.scope_key, epoch=0)
             .on_conflict_do_nothing()
         )
-        clock = session.scalars(
+        return session.scalars(
             select(RegulatoryPublicationClock)
             .where(RegulatoryPublicationClock.scope_key == self.scope_key)
             .with_for_update()
             .execution_options(populate_existing=True)
         ).one()
+
+    def _event(self, session: Session, row: RegulatoryFilePublication) -> None:
+        clock = self.lock_clock(session)
+        from onyx.db.regulatory_physical_indexes import require_physical_index_available
+
+        require_physical_index_available(session)
         clock.epoch += 1
         row.epoch = clock.epoch
         session.flush()

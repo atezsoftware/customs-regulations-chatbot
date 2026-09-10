@@ -195,8 +195,7 @@ def validate_delivery_scope(delivery: AnnexPublicationDelivery) -> None:
     from shared_configs.contextvars import get_current_tenant_id
 
     if (
-        not config.REGULATORY_ANNEX_UPDATES_ENABLED
-        or delivery.environment != config.REGULATORY_ANNEX_ENVIRONMENT
+        delivery.environment != config.REGULATORY_ANNEX_ENVIRONMENT
         or delivery.database_identity != config.ANNEX_DATABASE_IDENTITY
         or delivery.tenant_id != get_current_tenant_id()
         or not MULTI_TENANT

@@ -47,6 +47,7 @@ def create_owned_file(tenant_id: str = "public") -> Generator[UUID, None, None]:
             RegulatoryCanonicalRevision,
             RegulatoryFilePublication,
             RegulatoryPublicationOrdinal,
+            RegulatoryTemporalProjection,
         )
 
         session.execute(
@@ -57,6 +58,11 @@ def create_owned_file(tenant_id: str = "public") -> Generator[UUID, None, None]:
         session.execute(
             delete(RegulatoryFilePublication).where(
                 RegulatoryFilePublication.user_file_id == file_id
+            )
+        )
+        session.execute(
+            delete(RegulatoryTemporalProjection).where(
+                RegulatoryTemporalProjection.user_file_id == file_id
             )
         )
         session.execute(

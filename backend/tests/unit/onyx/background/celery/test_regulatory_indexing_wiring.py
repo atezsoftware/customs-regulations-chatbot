@@ -158,11 +158,15 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
     assert {template["task"] for template in templates} == {
         "regulatory_amendment_recover_stale",
         "regulatory_indexing_recover_stale",
+        "recover_annex_publications",
         "monitor_celery_queues",
     }
     from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
 
+    from onyx.regulatory.amendments.annexes.config import publication_queue_name
+
     assert {template["options"]["queue"] for template in templates} == {
+        publication_queue_name(),
         REGULATORY_AMENDMENT_QUEUE,
         OnyxCeleryQueues.REGULATORY_INDEXING,
         OnyxCeleryQueues.MONITORING,
@@ -206,12 +210,20 @@ def test_production_lite_scheduler_expands_every_task_with_each_tenant_id() -> N
         ["public", "tenant-a"]
     )
 
-    assert len(schedule) == 6
+    assert len(schedule) == 8
     assert {entry["kwargs"]["tenant_id"] for entry in schedule.values()} == {
         "public",
         "tenant-a",
     }
-    assert all(set(entry["kwargs"]) == {"tenant_id"} for entry in schedule.values())
+    assert all(
+        set(entry["kwargs"])
+        == (
+            {"tenant_id", "environment", "database_identity"}
+            if entry["task"] == "recover_annex_publications"
+            else {"tenant_id"}
+        )
+        for entry in schedule.values()
+    )
     assert (
         beat_app.celery_app.conf.task_default_base is beat_app.app_base.TenantAwareTask
     )
@@ -232,6 +244,7 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
     with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
         scheduler.update_schedule()
     expected_names = {
+        "recover-annex-publications-public",
         "recover-stale-regulatory-amendments-public",
         "recover-stale-regulatory-indexing-public",
         "monitor-celery-queues-public",
@@ -292,6 +305,7 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
         "monitor_celery_queues": 10,
         "regulatory_amendment_recover_stale": 60,
         "regulatory_indexing_recover_stale": 60,
+        "recover_annex_publications": 60,
     }
     entry_names = {
         f"{entry_prefix}-{tenant}"
@@ -299,6 +313,7 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
             "monitor-celery-queues",
             "recover-stale-regulatory-amendments",
             "recover-stale-regulatory-indexing",
+            "recover-annex-publications",
         )
         for tenant in tenants
     }
@@ -369,7 +384,7 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
         assert Counter(publications) == Counter(
             {publication: 1 for publication in expected_publications}
         )
-        assert len(claim_store.claims) == 6
+        assert len(claim_store.claims) == 8
         assert {claim[0] for claim in claim_store.claims} == set(tenants)
         for tenant_id, claim_key, ttl in claim_store.claims:
             tenant_entry_names = {
@@ -533,6 +548,7 @@ def test_scheduler_recovers_a_corrupt_pod_local_schedule(tmp_path: Path) -> None
         with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
             scheduler.update_schedule()
         assert set(scheduler.schedule) == {
+            "recover-annex-publications-public",
             "recover-stale-regulatory-amendments-public",
             "recover-stale-regulatory-indexing-public",
             "monitor-celery-queues-public",
@@ -1021,7 +1037,6 @@ def test_production_lite_background_has_no_model_server_dependency() -> None:
         "docling",
         "markitdown",
         "nvidia-",
-        "pypdfium2",
         "torch",
         "triton",
         "unstructured",
@@ -1312,6 +1327,16 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         for section in parser.sections()
         if section.startswith("program:")
     }
+    # The existing production topology excludes the explicitly opt-in DEV lane.
+    assert (
+        parser.get("program:celery_worker_regulatory_annex", "autostart")
+        == "%(ENV_REGULATORY_ANNEX_WORKER_ENABLED)s"
+    )
+    assert (
+        'ENV REGULATORY_ANNEX_WORKER_ENABLED="false"'
+        in (_BACKEND_ROOT / "Dockerfile.runtime-lite").read_text()
+    )
+    supervisor_programs.remove("celery_worker_regulatory_annex")
     assert supervisor_programs == {
         *workers,
         scheduler["name"],

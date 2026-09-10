@@ -3,13 +3,12 @@ import threading
 import time
 from uuid import UUID
 
-import sqlalchemy as sa
 from celery import Celery, Task, shared_task
 from redis.exceptions import LockNotOwnedError, RedisError
 from redis.lock import Lock as RedisLock
 from sqlalchemy import select
 
-from onyx.access.access import build_access_for_user_files, get_access_for_user_files
+from onyx.access.access import build_access_for_user_files
 from onyx.access.models import DocumentAccess
 from onyx.background.celery.apps.app_base import task_logger
 from onyx.background.celery.celery_redis import (
@@ -44,70 +43,47 @@ from onyx.configs.constants import (
 )
 from onyx.connectors.file.connector import LocalFileConnector
 from onyx.connectors.models import Document
-from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.engine.sql_engine import (
+    get_session_with_current_tenant,
+    get_session_with_tenant,
+)
 from onyx.db.enums import UserFileStatus
 from onyx.db.models import SearchSettings, UserFile
 from onyx.db.port_attempt import port_backfill_has_pending_work
-from onyx.db.port_orphan_candidate import record_port_orphan_candidates_for_user_file
 from onyx.db.regulatory_chunks import (
     get_chunk_counts_for_files,
-    get_chunks_for_file_snapshot,
     has_regulatory_chunks_for_file,
 )
 from onyx.db.regulatory_indexing_jobs import (
     get_regulatory_indexing_job,
-    request_user_file_deletion_cleanup,
 )
 from onyx.db.search_settings import (
     active_secondary_port_target,
     get_active_search_settings,
-    get_active_search_settings_list,
 )
 from onyx.db.user_file import (
-    fetch_document_set_names_for_user_files,
-    fetch_persona_ids_for_user_files,
     fetch_user_files_with_access_relationships,
-    fetch_user_project_ids_for_user_files,
     finish_user_file_projection_repair,
-    lock_completed_user_file_for_projection,
     mark_user_file_reconcile_pending,
     start_user_file_projection_repair,
 )
 from onyx.document_index.factory import get_all_document_indices
 from onyx.document_index.interfaces_new import (
-    IndexingMetadata,
     MetadataUpdateRequest,
     SecondaryIndexDocumentMissingError,
 )
 from onyx.file_processing.user_file_loader import load_user_file_documents
-from onyx.file_store.file_store import get_default_file_store
 from onyx.file_store.staging import delete_files_best_effort
 from onyx.file_store.utils import (
     store_user_file_plaintext,
-    user_file_id_to_plaintext_file_name,
 )
 from onyx.httpx.httpx_pool import HttpxPool
-from onyx.indexing.adapters.user_file_indexing_adapter import (
-    UserFileDeletingSkip,
-    UserFileIndexingAdapter,
-)
-from onyx.indexing.contextual_settings import effective_contextual_rag_enabled
-from onyx.indexing.embedder import DefaultIndexingEmbedder
-from onyx.indexing.indexing_pipeline import (
-    process_image_sections,
-    run_indexing_pipeline,
-)
 from onyx.redis.redis_pool import get_redis_client
 from onyx.redis.tenant_redis_client import TenantRedisClient
-from onyx.regulatory.indexing import RegulatoryIndexingChunker
-from onyx.regulatory.indexing_jobs.configuration import (
-    compute_regulatory_chunk_generation_hash,
-)
 from onyx.regulatory.indexing_jobs.preparation import (
     prepare_regulatory_indexing_job_from_chunks,
 )
 from onyx.regulatory.projection import (
-    _project_rows_to_search_settings,
     project_user_file_to_index,
 )
 from onyx.utils.variable_functionality import global_version
@@ -497,67 +473,10 @@ def _chunk_user_file_without_indexing(
     no contextualization model configured yet.
     """
 
-    with get_session_with_current_tenant() as db_session:
-        user_file = db_session.get(UserFile, _as_uuid(user_file_id))
-        if user_file is None or user_file.status == UserFileStatus.DELETING:
-            task_logger.info(
-                f"_chunk_user_file_without_indexing - user file {user_file_id} is gone "
-                "or being deleted; skipping"
-            )
-            return
+    from onyx.regulatory.writer_publication import chunk_owned_file
 
-        search_settings_list = get_active_search_settings_list(db_session)
-        current_search_settings = next(
-            (ss for ss in search_settings_list if ss.status.is_current()),
-            None,
-        )
-        if current_search_settings is None:
-            raise RuntimeError(
-                "_chunk_user_file_without_indexing - No current search settings found "
-                f"for tenant={tenant_id}"
-            )
-
-        # The embedder is built only for its tokenizer: chunk sizing is measured
-        # in embedding tokens, so the boundaries must be computed against it.
-        embedding_model = DefaultIndexingEmbedder.from_db_search_settings(
-            search_settings=current_search_settings,
-        )
-        contextual_rag_enabled = effective_contextual_rag_enabled(
-            current_search_settings
-        )
-        chunker = RegulatoryIndexingChunker(
-            db_session=db_session,
-            tokenizer=embedding_model.embedding_model.tokenizer,
-            enable_contextual_rag=contextual_rag_enabled,
-        )
-        # The same Document -> IndexingDocument conversion the pipeline performs,
-        # so the chunker sees exactly the sections it would see when indexing.
-        indexable_documents = process_image_sections(documents)
-        # Writes the chunk rows; the emitted DocAwareChunks belong to the
-        # indexing phase and are discarded here.
-        chunker.chunk(indexable_documents)
-
-        rows = get_chunks_for_file_snapshot(db_session, _as_uuid(user_file_id))
-        if not rows:
-            raise RuntimeError(
-                f"_chunk_user_file_without_indexing - produced no chunks for {user_file_id}"
-            )
-
-        if user_file.status != UserFileStatus.DELETING:
-            user_file.status = UserFileStatus.CHUNKED
-        user_file.chunk_count = len(rows)
-        user_file.regulatory_chunk_generation_hash = (
-            compute_regulatory_chunk_generation_hash(
-                embedding_provider=current_search_settings.provider_type,
-                embedding_model_name=current_search_settings.model_name,
-                enable_contextual_rag=contextual_rag_enabled,
-            )
-        )
-        db_session.add(user_file)
-        # The session does not commit on exit, and the chunk rows were written
-        # into this same transaction.
-        db_session.commit()
-
+    if not chunk_owned_file(_as_uuid(user_file_id), tenant_id, documents):
+        return
     text = " ".join(
         section_text
         for document in documents
@@ -566,11 +485,6 @@ def _chunk_user_file_without_indexing(
     )
     store_user_file_plaintext(
         user_file_id=_as_uuid(user_file_id), plaintext_content=text
-    )
-
-    task_logger.info(
-        f"_chunk_user_file_without_indexing - Chunked id={user_file_id} "
-        f"chunks={len(rows)}; awaiting an explicit index request"
     )
 
 
@@ -697,96 +611,14 @@ def _process_user_file_with_indexing(
     Opens its own DB session for the indexing pipeline.  The caller should
     not hold an open session when calling this function.
     """
-    # 20 is the documented default for httpx max_keepalive_connections
-    if MANAGED_VESPA:
-        httpx_init_vespa_pool(
-            20, ssl_cert=VESPA_CLOUD_CERT_PATH, ssl_key=VESPA_CLOUD_KEY_PATH
-        )
-    else:
-        httpx_init_vespa_pool(20)
+    from onyx.regulatory.writer_publication import republish_user_file
 
-    with get_session_with_current_tenant() as db_session:
-        user_file = db_session.get(UserFile, _as_uuid(user_file_id))
-        if user_file is None or user_file.status == UserFileStatus.DELETING:
-            task_logger.info(
-                f"_process_user_file_with_indexing - user file {user_file_id} is gone or "
-                "being deleted; skipping indexing (the delete owns removal)"
-            )
-            return
-        search_settings_list = get_active_search_settings_list(db_session)
-        current_search_settings = next(
-            (ss for ss in search_settings_list if ss.status.is_current()),
-            None,
-        )
-        if current_search_settings is None:
-            raise RuntimeError(
-                f"_process_user_file_with_indexing - No current search settings found for tenant={tenant_id}"
-            )
-        embedding_model = DefaultIndexingEmbedder.from_db_search_settings(
-            search_settings=current_search_settings,
-        )
-        document_indices = get_all_document_indices(
-            current_search_settings,
-            None,
-            httpx_client=HttpxPool.get("vespa"),
-        )
-        adapter = UserFileIndexingAdapter(
-            tenant_id=tenant_id,
-            db_session=db_session,
-        )
-        # User files go through the structure-aware regulatory chunker: chunk
-        # rows land in Postgres (source of truth) within this same session's
-        # transaction, and the pipeline projects them into Elasticsearch.
-        regulatory_chunker = RegulatoryIndexingChunker(
-            db_session=db_session,
-            tokenizer=embedding_model.embedding_model.tokenizer,
-            enable_contextual_rag=effective_contextual_rag_enabled(
-                current_search_settings
-            ),
-        )
-        try:
-            index_pipeline_result = run_indexing_pipeline(
-                embedder=embedding_model,
-                document_indices=document_indices,
-                ignore_time_skip=True,
-                db_session=db_session,
-                tenant_id=tenant_id,
-                document_batch=documents,
-                request_id=None,
-                adapter=adapter,
-                chunker=regulatory_chunker,
-                search_settings_override=current_search_settings,
-            )
-        except UserFileDeletingSkip:
-            # File began deleting mid-pipeline — the delete owns removal; skip cleanly
-            # rather than fail. (The early-out above catches the already-deleting case.)
-            task_logger.info(
-                f"_process_user_file_with_indexing - user file {user_file_id} began "
-                "deleting mid-indexing; skipping"
-            )
-            return
-
-    task_logger.info(
-        f"_process_user_file_with_indexing - Indexing pipeline completed ={index_pipeline_result}"
+    _chunk_user_file_without_indexing(user_file_id, documents, tenant_id)
+    count = republish_user_file(
+        _as_uuid(user_file_id), tenant_id, include_chunked=True, include_failed=True
     )
-
-    if (
-        index_pipeline_result.failures
-        or index_pipeline_result.total_docs != len(documents)
-        or index_pipeline_result.total_chunks == 0
-    ):
-        task_logger.error(
-            f"_process_user_file_with_indexing - Indexing pipeline failed id={user_file_id}"
-        )
-        with get_session_with_current_tenant() as db_session:
-            uf = db_session.get(UserFile, _as_uuid(user_file_id))
-            if uf is not None and uf.status != UserFileStatus.DELETING:
-                uf.status = UserFileStatus.FAILED
-                db_session.add(uf)
-                db_session.commit()
-        raise RuntimeError(f"Indexing pipeline failed for user file {user_file_id}")
-
-    _dual_write_new_file_to_secondary(user_file_id, tenant_id)
+    if not count:
+        raise ValueError("user file has no eligible canonical chunks to publish")
 
 
 def _enqueue_durable_regulatory_indexing(
@@ -833,111 +665,18 @@ def _index_user_file_to_secondary(
     tenant_id: str,
 ) -> bool:
     """Project canonical PostgreSQL chunks into one FUTURE search setting."""
-    user_file_uuid = _as_uuid(user_file_id)
-    user_file_id_str = str(user_file_uuid)
-    with get_session_with_current_tenant() as db_session:
-        # Callers resolve `secondary` in a separate, already-closed session, so it arrives
-        # detached. Re-bind before from_db_search_settings reads its cloud_provider-backed
-        # properties (api_key/api_url/api_version/deployment_name), which would otherwise
-        # lazy-load and raise DetachedInstanceError.
-        bound_secondary = db_session.get(SearchSettings, secondary.id)
-        if bound_secondary is None:
-            raise RuntimeError(
-                f"secondary search settings gone for user file {user_file_id}"
-            )
-        # Don't resurrect a file already being deleted into the target index — the delete
-        # owns removing it, and the port orphan sweep can't remove these non-port chunks.
-        # (the adapter's DELETING skip re-checks under the row lock to close the race.)
-        user_file = lock_completed_user_file_for_projection(db_session, user_file_uuid)
-        if user_file is None:
-            task_logger.info(
-                f"_index_user_file_to_secondary - user file {user_file_id} is gone or "
-                "not completed; skipping secondary write"
-            )
-            return False
-        rows = get_chunks_for_file_snapshot(db_session, user_file_uuid)
-        if not rows:
-            raise RuntimeError(
-                f"No regulatory chunks found for secondary projection {user_file_id}"
-            )
-        project_ids = fetch_user_project_ids_for_user_files(
-            [user_file_id_str], db_session
-        )
-        persona_ids = fetch_persona_ids_for_user_files([user_file_id_str], db_session)
-        document_set_names = fetch_document_set_names_for_user_files(
-            [user_file_id_str], db_session
-        )
-        user_file_access = get_access_for_user_files([user_file_id_str], db_session)
-        new_chunk_count = len(rows)
-        indexing_metadata = IndexingMetadata(
-            doc_id_to_chunk_cnt_diff={
-                user_file_id_str: IndexingMetadata.ChunkCounts(
-                    old_chunk_cnt=max(user_file.chunk_count or 0, new_chunk_count),
-                    new_chunk_cnt=new_chunk_count,
-                )
-            }
-        )
-        _project_rows_to_search_settings(
-            user_file=user_file,
-            rows=rows,
-            search_settings=bound_secondary,
-            tenant_id=tenant_id,
-            project_ids=project_ids,
-            persona_ids=persona_ids,
-            document_set_names=document_set_names,
-            user_file_access=user_file_access,
-            indexing_metadata=indexing_metadata,
-        )
-        return True
+    from onyx.regulatory.writer_publication import republish_user_file
 
-
-def _index_legacy_user_file_to_secondary(
-    user_file_id: str,
-    documents: list[Document],
-    secondary: SearchSettings,
-    tenant_id: str,
-) -> None:
-    """Preserve the ordinary user-file fallback for legacy non-regulatory rows."""
-
-    with get_session_with_current_tenant() as db_session:
-        bound_secondary = db_session.get(SearchSettings, secondary.id)
-        user_file = db_session.get(UserFile, _as_uuid(user_file_id))
-        if bound_secondary is None:
-            raise RuntimeError(
-                f"secondary search settings gone for user file {user_file_id}"
-            )
-        if user_file is None or user_file.status == UserFileStatus.DELETING:
-            return
-        embedder = DefaultIndexingEmbedder.from_db_search_settings(bound_secondary)
-        document_indices = get_all_document_indices(
-            bound_secondary,
-            None,
-            httpx_client=HttpxPool.get("vespa"),
+    return (
+        republish_user_file(
+            _as_uuid(user_file_id),
+            tenant_id,
+            target_search_settings_id=secondary.id,
+            include_chunked=True,
+            adopt_original=True,
         )
-        result = run_indexing_pipeline(
-            embedder=embedder,
-            document_indices=document_indices,
-            ignore_time_skip=True,
-            index_to_secondary=True,
-            db_session=db_session,
-            tenant_id=tenant_id,
-            document_batch=documents,
-            request_id=None,
-            adapter=UserFileIndexingAdapter(
-                tenant_id=tenant_id,
-                db_session=db_session,
-            ),
-            search_settings_override=bound_secondary,
-        )
-    if (
-        result.failures
-        or result.total_docs != len(documents)
-        or result.total_chunks == 0
-    ):
-        raise RuntimeError(
-            f"legacy secondary index write incomplete for user file {user_file_id}: "
-            f"{result}"
-        )
+        > 0
+    )
 
 
 def _dual_write_new_file_to_secondary(user_file_id: str, tenant_id: str) -> None:
@@ -960,52 +699,21 @@ def _dual_write_new_file_to_secondary(user_file_id: str, tenant_id: str) -> None
 
 
 def _supply_user_file_to_secondary(user_file_id: str, tenant_id: str) -> bool:
-    """Reconcile a missing FUTURE document from canonical PostgreSQL chunks."""
-    with get_session_with_current_tenant() as db_session:
+    """Reconcile FUTURE under file ownership, adopting originals only without canonical rows."""
+    with get_session_with_tenant(tenant_id=tenant_id) as db_session:
         secondary = active_secondary_port_target(db_session)
-        user_file = db_session.get(UserFile, _as_uuid(user_file_id))
-        file_id = user_file.file_id if user_file is not None else None
-        file_name = user_file.name if user_file is not None else None
-        has_regulatory_chunks = bool(
-            get_chunks_for_file_snapshot(db_session, _as_uuid(user_file_id))
-        )
-    if secondary is None or user_file is None:
-        return False
-
-    # Fully isolated: any failure keeps the flag and never propagates into the
-    # sync task. Regulatory files use PostgreSQL rows; only a legacy file with
-    # no regulatory rows falls back to its uploaded blob.
-    staged_csv_ids: list[str] = []
+        if secondary is None:
+            return False
+        db_session.expunge(secondary)
     try:
-        if has_regulatory_chunks:
-            return _index_user_file_to_secondary(user_file_id, secondary, tenant_id)
-        else:
-            if file_id is None:
-                return False
-            documents, staged_csv_ids = _load_user_file_documents(
-                user_file_id,
-                file_id,
-                file_name,
-                tenant_id,
-            )
-            _index_legacy_user_file_to_secondary(
-                user_file_id,
-                documents,
-                secondary,
-                tenant_id,
-            )
-        return True
-    except Exception as e:
+        return bool(_index_user_file_to_secondary(user_file_id, secondary, tenant_id))
+    except Exception as error:
         task_logger.exception(
-            f"_supply_user_file_to_secondary - failed id={user_file_id} "
-            f"- {e.__class__.__name__}"
+            "Secondary user-file supply failed id=%s error_type=%s",
+            user_file_id,
+            error.__class__.__name__,
         )
         return False
-    finally:
-        delete_files_best_effort(
-            staged_csv_ids,
-            context=f"legacy user-file secondary supply cleanup uf={user_file_id}",
-        )
 
 
 def _sync_metadata_and_reconcile_secondary(
@@ -1316,129 +1024,9 @@ def delete_user_file_impl(
             return
 
     try:
-        with get_session_with_current_tenant() as db_session:
-            deletion_plan = request_user_file_deletion_cleanup(
-                db_session,
-                user_file_id=_as_uuid(user_file_id),
-                now=datetime.datetime.now(datetime.timezone.utc),
-            )
-        if not deletion_plan.ready_to_delete:
-            from onyx.background.celery.apps.client import celery_app
-            from onyx.background.celery.tasks.regulatory_indexing.tasks import (
-                enqueue_regulatory_indexing_step,
-            )
-            from onyx.regulatory.indexing_jobs.orchestrator import (
-                OrchestrationDeliveryKind,
-            )
+        from onyx.regulatory.writer_publication import delete_owned_file
 
-            for delivery in deletion_plan.deliveries:
-                try:
-                    enqueue_regulatory_indexing_step(
-                        celery_app,
-                        job_id=delivery.job_id,
-                        expected_generation=delivery.expected_generation,
-                        tenant_id=tenant_id,
-                        delivery_kind=OrchestrationDeliveryKind.NORMAL,
-                    )
-                except Exception as error:
-                    task_logger.warning(
-                        "durable regulatory cancellation enqueue failed "
-                        "user_file_id=%s job_id=%s error_type=%s",
-                        user_file_id,
-                        delivery.job_id,
-                        error.__class__.__name__,
-                    )
-            task_logger.info(
-                "delete_user_file_impl - Waiting for durable cancellation id=%s",
-                user_file_id,
-            )
-            return
-
-        skip_vespa = DISABLE_VECTOR_DB
-        retry_document_indices: list[RetryDocumentIndex] = []
-        chunk_count_from_db: int | None = None
-        file_id: str = ""
-
-        if not skip_vespa:
-            if MANAGED_VESPA:
-                httpx_init_vespa_pool(
-                    20, ssl_cert=VESPA_CLOUD_CERT_PATH, ssl_key=VESPA_CLOUD_KEY_PATH
-                )
-            else:
-                httpx_init_vespa_pool(20)
-
-        # Phase 1: short read session — extract everything needed for slow I/O
-        with get_session_with_current_tenant() as db_session:
-            user_file = db_session.get(UserFile, _as_uuid(user_file_id))
-            if not user_file:
-                task_logger.info(
-                    f"delete_user_file_impl - User file not found id={user_file_id}"
-                )
-                return
-
-            file_id = user_file.file_id
-            chunk_count_from_db = user_file.chunk_count
-
-            if not skip_vespa:
-                active_search_settings = get_active_search_settings(db_session)
-                document_indices = get_all_document_indices(
-                    search_settings=active_search_settings.primary,
-                    secondary_search_settings=active_search_settings.secondary,
-                    httpx_client=HttpxPool.get("vespa"),
-                )
-                retry_document_indices = [
-                    RetryDocumentIndex(document_index)
-                    for document_index in document_indices
-                ]
-
-                # Record the deletion before the index delete (below) so a racing port's
-                # sweep removes any chunk its create-only copy resurrects. No-op when no
-                # port targets this file.
-                if user_file.user_id is not None:
-                    recorded = record_port_orphan_candidates_for_user_file(
-                        db_session,
-                        port_user_id=user_file.user_id,
-                        document_id=str(user_file.id),
-                        primary=active_search_settings.primary,
-                        secondary=active_search_settings.secondary,
-                    )
-                    if recorded:
-                        db_session.commit()
-
-        # Phase 2: vector DB deletes + file store deletes (no DB session held).
-        # Pass the DB chunk count when known; otherwise None, which each document
-        # index resolves itself (Vespa fans out to find chunks, Elasticsearch deletes
-        # by document id). This keeps the path backend-agnostic.
-        if not skip_vespa:
-            chunk_count: int | None = (
-                chunk_count_from_db
-                if chunk_count_from_db is not None and chunk_count_from_db > 0
-                else None
-            )
-            for retry_document_index in retry_document_indices:
-                retry_document_index.delete(
-                    user_file_id,
-                    chunk_count=chunk_count,
-                )
-
-        file_store = get_default_file_store()
-        try:
-            file_store.delete_file(file_id)
-            file_store.delete_file(
-                user_file_id_to_plaintext_file_name(_as_uuid(user_file_id))
-            )
-        except Exception as e:
-            task_logger.exception(
-                f"delete_user_file_impl - Error deleting file id={user_file_id} - {e.__class__.__name__}"
-            )
-
-        # Phase 3: short write session — remove the DB record
-        with get_session_with_current_tenant() as db_session:
-            user_file = db_session.get(UserFile, _as_uuid(user_file_id))
-            if user_file is not None:
-                db_session.delete(user_file)
-                db_session.commit()
-        task_logger.info(f"delete_user_file_impl - Completed id={user_file_id}")
+        delete_owned_file(_as_uuid(user_file_id), tenant_id)
     except Exception as e:
         task_logger.exception(
             f"delete_user_file_impl - Error processing file id={user_file_id} - {e.__class__.__name__}"
@@ -1501,30 +1089,9 @@ def check_for_user_file_project_sync(self: Task, *, tenant_id: str) -> None:
         available_queue_slots = queue_limit - queue_depth
 
         with get_session_with_current_tenant() as db_session:
-            user_file_ids = (
-                db_session.execute(
-                    select(UserFile.id).where(
-                        sa.or_(
-                            sa.and_(
-                                UserFile.status == UserFileStatus.COMPLETED,
-                                sa.or_(
-                                    UserFile.needs_project_sync.is_(True),
-                                    UserFile.needs_persona_sync.is_(True),
-                                    UserFile.needs_document_set_sync.is_(True),
-                                    # re-enqueue un-reconciled files so the reconciler retries
-                                    UserFile.secondary_reconcile_pending.is_(True),
-                                ),
-                            ),
-                            sa.and_(
-                                UserFile.status == UserFileStatus.FAILED,
-                                UserFile.needs_document_set_sync.is_(True),
-                            ),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
+            from onyx.db.user_file import fetch_user_file_metadata_sync_candidates
+
+            user_file_ids = fetch_user_file_metadata_sync_candidates(db_session)
 
             for user_file_id in user_file_ids:
                 if enqueued >= available_queue_slots:
@@ -1584,6 +1151,11 @@ def project_sync_user_file_impl(
     try:
         if lock_heartbeat is not None:
             lock_heartbeat.start()
+
+        from onyx.regulatory.writer_publication import sync_qualified_file_metadata
+
+        if sync_qualified_file_metadata(user_file_id, tenant_id):
+            return
 
         # Phase 1: short read session — extract all data needed for Vespa, then
         # release the connection before the network-bound update calls.

@@ -24,6 +24,10 @@ def load_user_file_documents(
         file_names=[file_name] if file_name else None,
     )
     connector.load_credentials({})
+    observed: dict[str, str] = {}
+    connector.set_original_file_observer(
+        lambda identifier, digest: observed.__setitem__(identifier, digest)
+    )
     staging_callback, staged_csv_ids = build_tracking_raw_file_callback(
         metadata={"user_file_id": user_file_id, "tenant_id": tenant_id}
     )
@@ -49,4 +53,14 @@ def load_user_file_documents(
     for document in documents:
         document.id = user_file_id
         document.source = DocumentSource.USER_FILE
+    if observed:
+        from onyx.file_processing.original_ingestion import LoadedUserFileDocuments
+
+        if set(observed) != {file_id}:
+            raise ValueError(
+                "original extraction receipt has unexpected file identities"
+            )
+        documents = LoadedUserFileDocuments(
+            documents, file_id=file_id, raw_sha256=observed[file_id]
+        )
     return documents, staged_csv_ids

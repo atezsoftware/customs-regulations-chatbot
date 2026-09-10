@@ -435,6 +435,41 @@ class FencedPublicationIndex:
             payload_sha256=digest,
         )
 
+    def existing_ordinals(self, reservations: FileReservations) -> tuple[int, ...]:
+        """Identify legacy physical IDs without inventing embedding provenance."""
+        self._check_index()
+        self.client.indices.refresh(index=self.snapshot.index_name)
+        filters: list[dict[str, JsonValue]] = [
+            {"term": {"document_id": str(reservations.ownership.user_file_id)}}
+        ]
+        if self.snapshot.multitenant:
+            filters.append(
+                {"term": {"tenant_id": reservations.ownership.scope.tenant_id}}
+            )
+        ordinals: set[int] = set()
+        for hit in scan(
+            self.client,
+            index=self.snapshot.index_name,
+            query={"query": {"bool": {"filter": filters}}},
+        ):
+            source = hit["_source"]
+            ordinal = source.get("chunk_index")
+            if (
+                type(ordinal) is not int
+                or ordinal < 0
+                or ordinal >= 2**63
+                or hit["_id"] != self._id(reservations, ordinal)
+            ):
+                raise ValueError("legacy indexed projection identity is invalid")
+            if ordinal not in reservations.ordinals and any(
+                key.startswith("publication_") for key in source
+            ):
+                raise ValueError(
+                    "protected indexed projection has no durable reservation"
+                )
+            ordinals.add(ordinal)
+        return tuple(sorted(ordinals))
+
     def inventory_evidence(
         self, reservations: FileReservations
     ) -> tuple[IndexedProjectionEvidence, ...]:

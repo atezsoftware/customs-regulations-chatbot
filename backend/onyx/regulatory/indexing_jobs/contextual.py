@@ -608,31 +608,53 @@ def build_contextual_requests(
     if max_attempts is not None and max_attempts < 1:
         raise ValueError("max_attempts must be positive")
     ordered_rows = _ordered_rows(rows)
-    row_by_id = {row.id: row for row in ordered_rows}
     requests: list[VertexBatchRequest] = []
-    item_by_row_id: dict[str, RegulatoryIndexingItem] = {}
-    for item in items:
-        if item.job_id != job.id:
-            raise ContextualMappingError("contextual item does not belong to the job")
-        if item.regulatory_chunk_id in item_by_row_id:
-            raise ContextualMappingError("contextual items contain a duplicate chunk")
-        if item.regulatory_chunk_id not in row_by_id:
-            raise ContextualMappingError("contextual item has no canonical chunk")
-        item_by_row_id[item.regulatory_chunk_id] = item
-
-    request_factory = ContextualRequestFactory(
-        job=job,
-        rows=ordered_rows,
-        embedding_tokenizer=embedding_tokenizer,
-        contextual_tokenizer=contextual_tokenizer,
+    from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+    from onyx.regulatory.indexing_jobs.projection_identity import (
+        ordered_projection_items,
+        projection_input,
     )
+
+    try:
+        mapped = ordered_projection_items(
+            job_id=job.id,
+            user_file_id=job.user_file_id,
+            rows=rows,
+            items=items,
+            require_complete=False,
+        )
+    except ValueError as exc:
+        raise ContextualMappingError(str(exc)) from exc
     used_jsonl_bytes = 0
-    for row in ordered_rows:
-        item = item_by_row_id.get(row.id)
-        if item is None:
-            continue
+    submitted_hashes: set[str] = set()
+    factories: dict[str, ContextualRequestFactory] = {}
+    for row, item in mapped:
         if item.status != RegulatoryIndexingItemStatus.PENDING.value:
             continue
+        frozen = projection_input(item)
+        scope_key = (
+            context_hash(
+                {
+                    "rows": [
+                        value.model_dump(mode="json") for value in frozen.context_rows
+                    ],
+                    "date": frozen.reference_date,
+                }
+            )
+            if frozen
+            else "legacy"
+        )
+        if scope_key not in factories:
+            factories[scope_key] = ContextualRequestFactory(
+                job=job,
+                rows=canonical_snapshot_rows(frozen.context_rows)
+                if frozen
+                else ordered_rows,
+                embedding_tokenizer=embedding_tokenizer,
+                contextual_tokenizer=contextual_tokenizer,
+                reference_date_override=frozen.reference_date if frozen else None,
+            )
+        request_factory = factories[scope_key]
         context_attempt_count = getattr(item, "context_attempt_count", 0)
         if max_attempts is not None and context_attempt_count >= max_attempts:
             raise ContextAttemptBudgetExhaustedError(
@@ -649,6 +671,8 @@ def build_contextual_requests(
             raise ContextualMappingError(
                 "contextual request hash does not match the persisted item"
             )
+        if request.request_hash in submitted_hashes:
+            continue
         request_bytes = vertex_jsonl_line_size(request)
         if (
             max_jsonl_bytes is not None
@@ -660,9 +684,8 @@ def build_contextual_requests(
                 )
             break
         requests.append(request)
+        submitted_hashes.add(request.request_hash)
         used_jsonl_bytes += request_bytes
-    if len({request.request_hash for request in requests}) != len(requests):
-        raise ContextualMappingError("contextual requests contain a duplicate hash")
     return requests
 
 
@@ -757,20 +780,28 @@ def apply_contextual_results(
     ordered_rows = _ordered_rows(rows)
     if any(row.user_file_id != job.user_file_id for row in ordered_rows):
         raise ContextualMappingError("canonical rows do not belong to the indexing job")
-    row_by_id = {row.id: row for row in ordered_rows}
     known_hashes = {item.request_hash for item in items}
     if not set(results).issubset(known_hashes):
         raise ContextualMappingError(
             "Vertex results contain an unexpected request hash"
         )
 
+    from onyx.regulatory.indexing_jobs.projection_identity import (
+        ordered_projection_items,
+    )
+
     resulting_statuses: list[str] = []
-    for item in items:
-        if item.job_id != job.id:
-            raise ContextualMappingError("contextual item does not belong to the job")
-        row = row_by_id.get(item.regulatory_chunk_id)
-        if row is None:
-            raise ContextualMappingError("contextual item has no canonical chunk")
+    try:
+        mapped = ordered_projection_items(
+            job_id=job.id,
+            user_file_id=job.user_file_id,
+            rows=rows,
+            items=items,
+            require_complete=False,
+        )
+    except ValueError as exc:
+        raise ContextualMappingError(str(exc)) from exc
+    for row, item in mapped:
         status = item.status
         result = results.get(item.request_hash)
         if status == RegulatoryIndexingItemStatus.PENDING.value and result is not None:
@@ -854,15 +885,14 @@ def prepare_durable_context_view(
             or batch_config.effective_dimension != dimension
         ):
             raise ContextualMappingError("embedding_configuration_mismatch")
-        config: dict[str, str | int | float | bool | None] = {
-            "transport": "openrouter_batch",
-            "provider": str(snapshot["embedding_provider"]),
-            "model": batch_config.model_name,
-            "dimension": dimension,
-            "endpoint_sha256": context_hash(batch_config.api_url),
-            "embedding_endpoint": "/v1/embeddings",
-            "formatter": "durable-context-before-text-v1",
-        }
+        from onyx.regulatory.indexing_jobs.embedding_receipts import (
+            batch_embedding_configuration,
+        )
+
+        config = batch_embedding_configuration(
+            provider=str(snapshot["embedding_provider"]),
+            config=batch_config,
+        )
     else:
         if embedding_model is None:
             raise ContextualMappingError("embedding_configuration_unavailable")

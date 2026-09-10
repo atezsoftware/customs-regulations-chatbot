@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from onyx.db.enums import RegulatoryChunkSource, RegulatoryChunkStatus
 from onyx.db.models import RegulatoryAnnexElementChunk, RegulatoryChunk, UserFile
 from onyx.document_index.publication_models import (
+    FileOwnership,
     PublicationIndexSnapshot,
     ReadObservation,
 )
@@ -2408,6 +2409,8 @@ def replace_indexed_chunks_for_file(
     db_session: Session,
     user_file_id: UUID,
     chunker_chunks: list[ChunkerChunk],
+    *,
+    publication_owner: FileOwnership | None = None,
 ) -> list[RegulatoryChunk]:
     """Replace all pipeline-produced chunks for a file with a fresh chunking.
 
@@ -2417,6 +2420,21 @@ def replace_indexed_chunks_for_file(
     and carries that same window. Does not commit; caller owns the transaction
     and the Elasticsearch re-projection.
     """
+    from onyx.db.regulatory_publication import PublicationStore
+
+    authority = (
+        PublicationStore(publication_owner.scope)
+        if publication_owner is not None
+        else None
+    )
+    if publication_owner is not None and authority is not None:
+        if publication_owner.user_file_id != user_file_id:
+            raise ValueError("chunking file differs from publication owner")
+        authority = PublicationStore(publication_owner.scope)
+        if authority.lock_owned_snapshot(db_session, publication_owner).gate_closed:
+            raise ValueError("chunking requires publication recovery first")
+        if has_regulatory_chunks_for_file(db_session, user_file_id):
+            raise ValueError("existing canonical history requires owned re-projection")
     # Read only scalar columns here. Loading the old ORM objects into the
     # identity map before the bulk delete can conflict with adding replacement
     # rows that intentionally reuse the same deterministic primary keys.
@@ -2527,7 +2545,15 @@ def replace_indexed_chunks_for_file(
             chunk_metadata=stored_metadata,
             status=RegulatoryChunkStatus.ACTIVE.value,
             source=RegulatoryChunkSource.INDEXED.value,
-            projection_ordinal=meta.chunk_order,
+            projection_ordinal=(
+                authority.allocate_in_session(
+                    db_session,
+                    publication_owner,
+                    "canonical:" + chunk_id_by_order[meta.chunk_order],
+                )
+                if publication_owner is not None and authority is not None
+                else meta.chunk_order
+            ),
             validity_start_date=(
                 inherited_window.start if inherited_window is not None else None
             ),

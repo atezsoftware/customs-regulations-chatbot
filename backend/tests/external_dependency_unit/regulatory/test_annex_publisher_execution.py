@@ -131,6 +131,9 @@ def test_actual_worker_activates_frozen_complete_history(
             encode,
         )
     payload = approve(source_session, live_review)
+    from onyx.regulatory.amendments.annexes import config
+
+    monkeypatch.setattr(config, "REGULATORY_ANNEX_UPDATES_ENABLED", False)
     result = invoke(payload)
     assert result == "approved"
     source_session.expire_all()
@@ -941,6 +944,8 @@ def test_scoped_recovery_redelivers_expired_or_lost_intent_without_new_generatio
     from onyx.regulatory.amendments.annexes import config
 
     delivery = approve(source_session, live_review)
+    # Disabling creation cannot strand an already authorized publication.
+    monkeypatch.setattr(config, "REGULATORY_ANNEX_UPDATES_ENABLED", False)
     sent: list[dict[str, object]] = []
 
     def send_task(name: str, **kwargs: object) -> None:

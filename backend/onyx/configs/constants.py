@@ -105,6 +105,7 @@ POSTGRES_CELERY_WORKER_SCHEDULED_TASKS_APP_NAME = "celery_worker_scheduled_tasks
 POSTGRES_CELERY_WORKER_REGULATORY_BENCHMARK_APP_NAME = (
     "celery_worker_regulatory_benchmark"
 )
+POSTGRES_CELERY_WORKER_REGULATORY_ANNEX_APP_NAME = "celery_regulatory_annex"
 POSTGRES_CELERY_WORKER_REGULATORY_INDEXING_APP_NAME = (
     "celery_worker_regulatory_indexing"
 )

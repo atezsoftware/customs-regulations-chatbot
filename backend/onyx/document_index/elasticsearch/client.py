@@ -534,6 +534,10 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             self._index_name,
         )
 
+    @property
+    def index_name(self) -> str:
+        return self._index_name
+
     @log_function_time(print_only=True, debug_only=True, include_args=True)
     def create_index(self, mappings: dict[str, Any], settings: dict[str, Any]) -> None:
         """Creates the index.
@@ -548,6 +552,11 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         Raises:
             Exception: There was an error creating the index.
         """
+        from onyx.document_index.elasticsearch.physical_operations import (
+            require_fresh_index_name,
+        )
+
+        require_fresh_index_name(self._index_name)
         logger.debug("Creating index %s.", self._index_name)
         response = self._client.indices.create(
             index=self._index_name,

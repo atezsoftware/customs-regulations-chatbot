@@ -41,9 +41,10 @@ class IndexingGatewayIndeterminateSubmissionError(IndexingGatewayError):
 
 
 class IndexingPublicationIndeterminateError(RuntimeError):
-    def __init__(self) -> None:
+    def __init__(self, detail: str | None = None) -> None:
         super().__init__(
-            "Regulatory indexing publication visibility requires reconciliation"
+            detail
+            or "Regulatory indexing publication visibility requires reconciliation"
         )
 
 

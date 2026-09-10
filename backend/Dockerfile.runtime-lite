@@ -63,6 +63,8 @@ ENV ONYX_RUNNING_IN_DOCKER="true" \
 # per-environment configuration before a production deployment, which should
 # keep the upload-and-index flow.
 ENV DEFER_USER_FILE_INDEXING="true"
+# Enabled only by the DEV fencing cutover after legacy writers are drained.
+ENV REGULATORY_ANNEX_WORKER_ENABLED="false"
 
 # Retry expired user-file work and refresh Auto model catalogs. Other global
 # tasks target queues this image does not consume.

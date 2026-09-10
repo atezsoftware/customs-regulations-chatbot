@@ -4,7 +4,6 @@ from contextlib import contextmanager
 from contextvars import copy_context
 from threading import Event, Thread
 from typing import Any
-from uuid import UUID
 
 from celery import Celery, Task, shared_task
 from sqlalchemy.orm import Session
@@ -12,24 +11,17 @@ from sqlalchemy.orm import Session
 from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
 from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryTask
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.enums import AmendmentProposalStatus
-from onyx.db.models import UserFile
 from onyx.db.regulatory_amendments import (
-    approve_amendment_proposal,
     claim_batch_for_analysis,
     claim_stale_batches_for_recovery,
-    finalize_amendment_proposal_projection,
-    get_proposal,
     mark_batch_failed,
     recover_stale_amendment_proposal_approvals,
-    reset_amendment_proposal_approval,
     touch_amendment_proposal_approval,
     touch_batch_heartbeat,
 )
 from onyx.db.search_settings import get_current_search_settings
 from onyx.regulatory.amendments.annexes import config as annex_config
 from onyx.regulatory.amendments.job import run_amendment_batch
-from onyx.regulatory.projection import project_amendment_to_index
 from onyx.utils.logger import setup_logger
 from shared_configs.enums import EmbeddingProvider
 
@@ -162,7 +154,7 @@ def enqueue_amendment_batch(
                 "environment": annex_config.REGULATORY_ANNEX_ENVIRONMENT,
                 "database_identity": annex_config.ANNEX_DATABASE_IDENTITY,
             },
-            "queue": REGULATORY_AMENDMENT_QUEUE,
+            "queue": annex_config.analysis_delivery_queue_name(),
             "priority": OnyxCeleryPriority.HIGH,
             "expires": _DELIVERY_EXPIRES_SECONDS,
             "retry": False,
@@ -265,87 +257,17 @@ def regulatory_amendment_approve(
 ) -> None:
     """Apply and project one approval outside the Cloudflare request window."""
 
-    version_applied = False
+    from onyx.db.regulatory_writer_publication import record_owned_amendment_failure
+    from onyx.regulatory.writer_publication import approve_owned_amendment
+
     try:
         with get_session_with_current_tenant() as db_session:
-            proposal = get_proposal(db_session, proposal_id)
-            if proposal is None:
-                logger.warning("Amendment proposal %s no longer exists", proposal_id)
-                return
-            if proposal.status != AmendmentProposalStatus.APPROVING.value:
-                logger.info(
-                    "Skipping amendment approval proposal=%s status=%s",
-                    proposal_id,
-                    proposal.status,
-                )
-                return
-
-            result = approve_amendment_proposal(db_session, proposal)
-            user_file_id = UUID(str(result.new_chunk.user_file_id))
-            new_chunk_id = str(result.new_chunk.id)
-            old_chunk_id = (
-                str(result.old_chunk.id) if result.old_chunk is not None else None
-            )
-            db_session.commit()
-            version_applied = True
-            logger.info(
-                "Amendment approval version committed proposal=%s user_file=%s",
-                proposal_id,
-                user_file_id,
-            )
-
+            current_id = validate_amendment_projection_search_settings(db_session)
         with _renew_amendment_approval(proposal_id=proposal_id):
-            with get_session_with_current_tenant() as db_session:
-                user_file = db_session.get(UserFile, user_file_id)
-                if user_file is None:
-                    raise RuntimeError(f"User file {user_file_id} no longer exists")
-                current_search_settings_id = (
-                    validate_amendment_projection_search_settings(db_session)
-                )
-                projected_chunk_count = project_amendment_to_index(
-                    db_session,
-                    user_file,
-                    tenant_id,
-                    old_chunk_id=old_chunk_id,
-                    new_chunk_id=new_chunk_id,
-                    current_search_settings_id=current_search_settings_id,
-                )
-                if projected_chunk_count <= 0:
-                    raise RuntimeError("Amendment projection did not write any chunks")
-                validate_amendment_projection_search_settings(
-                    db_session,
-                    expected_id=current_search_settings_id,
-                    for_update=True,
-                )
-                if not finalize_amendment_proposal_projection(
-                    db_session,
-                    proposal_id=proposal_id,
-                    succeeded=True,
-                ):
-                    raise RuntimeError("amendment proposal could not be finalized")
-                db_session.commit()
-        logger.info(
-            "Amendment approval projected proposal=%s user_file=%s",
-            proposal_id,
-            user_file_id,
-        )
+            approve_owned_amendment(proposal_id, tenant_id, current_id)
     except Exception:
         logger.exception("Amendment proposal %s approval failed", proposal_id)
-        if version_applied:
-            with get_session_with_current_tenant() as db_session:
-                finalize_amendment_proposal_projection(
-                    db_session,
-                    proposal_id=proposal_id,
-                    succeeded=False,
-                    error_message=_SAFE_APPROVAL_FAILURE_MESSAGE,
-                )
-                db_session.commit()
-        else:
-            with get_session_with_current_tenant() as db_session:
-                reset_amendment_proposal_approval(
-                    db_session,
-                    proposal_id=proposal_id,
-                )
+        record_owned_amendment_failure(proposal_id, tenant_id)
         raise
 
 

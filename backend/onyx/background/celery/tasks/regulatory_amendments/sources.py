@@ -5,6 +5,7 @@ from celery import shared_task
 from onyx.configs.constants import OnyxCeleryPriority
 from onyx.regulatory.amendments.annexes import config
 from onyx.regulatory.amendments.annexes.job import run_source_package
+from shared_configs.configs import MULTI_TENANT, POSTGRES_DEFAULT_SCHEMA
 from shared_configs.contextvars import get_current_tenant_id
 
 _TASK_NAME = "acquire_amendment_sources"
@@ -37,6 +38,7 @@ def acquire_amendment_sources(
         or database_identity != config.ANNEX_DATABASE_IDENTITY
         or not tenant_id
         or tenant_id != get_current_tenant_id()
+        or (not MULTI_TENANT and tenant_id != POSTGRES_DEFAULT_SCHEMA)
     ):
         raise ValueError("Source acquisition worker scope mismatch")
     if not config.REGULATORY_ANNEX_UPDATES_ENABLED:

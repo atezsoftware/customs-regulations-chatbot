@@ -145,6 +145,21 @@ def _rows_and_items(
 
 
 class _RecordingEmbeddingModel:
+    from tests.unit.onyx.regulatory.indexing_jobs.test_contextual import (
+        _CharacterTokenizer,
+    )
+
+    provider_type = EmbeddingProvider.OPENROUTER
+    model_name = "openai/text-embedding-3-large"
+    reduced_dimension = 3
+    normalize = True
+    passage_prefix = None
+    retrim_content = False
+    api_url = None
+    api_version = None
+    deployment_name = None
+    tokenizer = _CharacterTokenizer()
+
     def __init__(self, responses: Sequence[list[list[float]] | Exception]) -> None:
         self._responses = iter(responses)
         self.calls: list[dict[str, object]] = []
@@ -181,6 +196,11 @@ def _install_embedder(
         return _RecordingEmbedder(model, constructed_with)
 
     monkeypatch.setattr(embedding, "DefaultIndexingEmbedder", build_embedder)
+    monkeypatch.setattr(
+        embedding.indexing_job_repository,
+        "freeze_regulatory_embedding_receipts",
+        lambda *_args, **_kwargs: 0,
+    )
     return model, constructed_with
 
 
@@ -198,6 +218,20 @@ def test_embedding_uses_snapshot_model_dimension_context_and_bounded_order(
             [[0.1, 0.2, 0.3], [0.7, 0.8, 0.9]],
             [[1.0, 1.1, 1.2]],
         ],
+    )
+    from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
+    from onyx.regulatory.indexing_jobs.embedding_receipts import (
+        synchronous_embedding_receipts,
+        vector_receipt_context,
+    )
+
+    receipts = synchronous_embedding_receipts(
+        job=job, rows=rows, items=items, model=cast(EmbeddingModel, model)
+    )
+    assert items[1].vector is not None
+    items[1].context = vector_receipt_context(
+        {"embedding_receipt": receipts[items[1].id].model_dump(mode="json")},
+        items[1].vector,
     )
     persisted: list[tuple[list[tuple[object, list[float]]], int]] = []
 

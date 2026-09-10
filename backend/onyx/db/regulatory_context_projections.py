@@ -353,7 +353,11 @@ def retire_context_projection(
 
 
 def activate_temporal_projection(
-    session: Session, *, user_file_id: UUID, binding: "AnnexTemporalProjection"
+    session: Session,
+    *,
+    user_file_id: UUID,
+    binding: "AnnexTemporalProjection",
+    canonical_revision_id: UUID | None = None,
 ) -> None:
     """Join an owned publication transaction; never alter another index's history."""
     import json
@@ -394,6 +398,18 @@ def activate_temporal_projection(
     ):
         raise ValueError("temporal encoder/source identity mismatch")
     canonical = session.get(RegulatoryChunk, source["regulatory_chunk_id"])
+    retained_revision_id = canonical_revision_id
+    if retained_revision_id is not None:
+        from onyx.db.regulatory_canonical_revisions import get_canonical_revision
+        from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+
+        revision = get_canonical_revision(session, retained_revision_id)
+        if (
+            revision.snapshot.id != source["regulatory_chunk_id"]
+            or UUID(revision.snapshot.user_file_id) != user_file_id
+        ):
+            raise ValueError("temporal retained canonical scope mismatch")
+        canonical = canonical_snapshot_rows([revision.snapshot])[0]
     if (
         canonical is None
         or canonical.user_file_id != user_file_id
@@ -435,8 +451,9 @@ def activate_temporal_projection(
             overlapping = select(RegulatoryTemporalProjection.id).where(
                 RegulatoryTemporalProjection.canonical_chunk_id == row.id,
                 RegulatoryTemporalProjection.retired_at.is_(None),
-                RegulatoryTemporalProjection.index_identity_sha256
-                == binding.index.temporal_lookup_identity(),
+                RegulatoryTemporalProjection.index_identity_sha256.in_(
+                    binding.index.temporal_lookup_identities()
+                ),
             )
             if binding.effective_start is not None:
                 overlapping = overlapping.where(
@@ -623,7 +640,9 @@ def activate_temporal_projection(
     from onyx.db.regulatory_canonical_revisions import retain_canonical_revision
     from onyx.regulatory.amendments.annexes.publication_representations import _snapshot
 
-    canonical_revision_id = retain_canonical_revision(session, _snapshot(canonical))
+    canonical_revision_id = retained_revision_id or retain_canonical_revision(
+        session, _snapshot(canonical)
+    )
     session.add(
         RegulatoryTemporalProjection(
             canonical_revision_id=canonical_revision_id,
@@ -658,8 +677,9 @@ def get_indexed_temporal_projection(
         select(RegulatoryTemporalProjection).where(
             RegulatoryTemporalProjection.canonical_chunk_id == canonical_chunk_id,
             RegulatoryTemporalProjection.retired_at.is_(None),
-            RegulatoryTemporalProjection.index_identity_sha256
-            == index.temporal_lookup_identity(),
+            RegulatoryTemporalProjection.index_identity_sha256.in_(
+                index.temporal_lookup_identities()
+            ),
             or_(
                 RegulatoryTemporalProjection.effective_start.is_(None),
                 RegulatoryTemporalProjection.effective_start <= as_of_date,

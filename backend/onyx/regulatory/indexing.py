@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from onyx.configs.app_configs import BLURB_SIZE
 from onyx.connectors.models import Document, IndexingDocument
 from onyx.db.regulatory_chunks import replace_indexed_chunks_for_file
+from onyx.document_index.publication_models import FileOwnership
 from onyx.indexing.chunker import DEFAULT_CONTEXTUAL_RAG_RESERVED_TOKENS
 from onyx.indexing.chunking import extract_blurb
 from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
@@ -77,6 +78,7 @@ def documents_to_regulatory_chunks(
     *,
     callback: IndexingHeartbeatInterface | None = None,
     enable_contextual_rag: bool = True,
+    publication_owner: FileOwnership | None = None,
 ) -> list[DocAwareChunk]:
     """Persist canonical chunks through the maintained indexing chunker boundary."""
 
@@ -86,6 +88,7 @@ def documents_to_regulatory_chunks(
         tokenizer=tokenizer,
         callback=callback,
         enable_contextual_rag=enable_contextual_rag,
+        publication_owner=publication_owner,
     ).chunk(indexing_documents)
 
 
@@ -121,8 +124,10 @@ class RegulatoryIndexingChunker:
         tokenizer: BaseTokenizer,
         callback: IndexingHeartbeatInterface | None = None,
         enable_contextual_rag: bool = False,
+        publication_owner: FileOwnership | None = None,
     ) -> None:
         self.db_session = db_session
+        self.publication_owner = publication_owner
         self.chunk_token_limit = DOC_EMBEDDING_CONTEXT_SIZE
         self.callback = callback
         self.tokenizer = tokenizer
@@ -216,7 +221,10 @@ class RegulatoryIndexingChunker:
                 )
             )
         rows = replace_indexed_chunks_for_file(
-            self.db_session, user_file_id, linked_chunks
+            self.db_session,
+            user_file_id,
+            linked_chunks,
+            publication_owner=self.publication_owner,
         )
         # Assign ids before the session commits so the emitted DocAwareChunks
         # can reference them.
@@ -231,7 +239,7 @@ class RegulatoryIndexingChunker:
             doc_chunks.append(
                 DocAwareChunk(
                     source_document=document,
-                    chunk_id=row.position,
+                    chunk_id=row.projection_ordinal,
                     blurb=extract_blurb(chunk.text, self._blurb_splitter),
                     content=chunk.text,
                     source_links=chunk_evidence(row.chunk_metadata).source_links,

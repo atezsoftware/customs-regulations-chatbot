@@ -128,6 +128,10 @@ def validate_database_baseline(
 
     lock_annex_preparation_scope(session, draft.user_file_id)
     file, settings, access = load_annex_publication_inputs(session, draft)
+    PublicationStore(prepared.scope).lock_clock(session)
+    from onyx.db.regulatory_physical_indexes import validate_physical_index_snapshots
+
+    validate_physical_index_snapshots(session, prepared.indexes)
     # Lock all concrete targets, including FUTURE, before checking the frozen set.
     from sqlalchemy import inspect
 

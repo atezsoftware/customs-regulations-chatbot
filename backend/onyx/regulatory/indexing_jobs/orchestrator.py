@@ -25,7 +25,6 @@ from onyx.db.enums import (
     UserFileStatus,
 )
 from onyx.db.llm import fetch_model_configuration_by_id
-from onyx.document_index.factory import build_elasticsearch_document_index
 from onyx.file_processing.user_file_loader import load_user_file_documents
 from onyx.file_store.staging import delete_files_best_effort
 from onyx.llm.constants import LlmProviderNames
@@ -53,6 +52,7 @@ from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayError,
     IndexingGatewayHTTPError,
     IndexingGatewayIndeterminateSubmissionError,
+    IndexingPublicationIndeterminateError,
     RegulatoryIndexingConfigSnapshot,
     RegulatoryInputHashVersion,
     RetryReason,
@@ -732,6 +732,34 @@ def _openrouter_embedding_batch(
     config = snapshot.openrouter_batch
     if config is None:
         raise ValueError("regulatory job has no OpenRouter Batch snapshot")
+    if (
+        runtime.job.openrouter_submission_state
+        == RegulatoryIndexingSubmissionState.NONE.value
+    ):
+        from onyx.regulatory.indexing_jobs.embedding_receipts import (
+            batch_embedding_receipts,
+        )
+
+        receipts = batch_embedding_receipts(
+            job=runtime.job,
+            rows=runtime.regulatory_chunks,
+            items=runtime.indexing_items,
+            config=config,
+        )
+        frozen = indexing_job_repository.freeze_regulatory_embedding_receipts(
+            db_session,
+            job_id=runtime.job.id,
+            expected_generation=runtime.job.lease_generation,
+            receipts=receipts,
+        )
+        if frozen is None:
+            return _skipped(runtime.job.id)
+        refreshed = indexing_job_repository.get_regulatory_indexing_runtime(
+            db_session, runtime.job.id
+        )
+        if refreshed is None:
+            return _skipped(runtime.job.id)
+        runtime = refreshed
     plan = build_openrouter_embedding_batch(
         job=runtime.job,
         rows=runtime.regulatory_chunks,
@@ -1100,29 +1128,27 @@ def _execute_cancellation_phase(
             next_phase=RegulatoryIndexingCancellationPhase.INDEX_DELETE,
             now=now,
         )
-    if phase is RegulatoryIndexingCancellationPhase.INDEX_DELETE:
-        if runtime.search_settings is not None:
-            document_index = build_elasticsearch_document_index(runtime.search_settings)
-            document_index.delete(
-                str(runtime.user_file.id),
-                chunk_count=runtime.user_file.chunk_count,
-                refresh=True,
-            )
-        return _advance_cancellation(
-            runtime,
-            db_session,
-            expected_phase=phase,
-            next_phase=RegulatoryIndexingCancellationPhase.FINALIZE,
-            now=now,
+    if phase in {
+        RegulatoryIndexingCancellationPhase.INDEX_DELETE,
+        RegulatoryIndexingCancellationPhase.FINALIZE,
+    }:
+        from onyx.regulatory.indexing_jobs.owned_publication import (
+            execute_owned_cancellation,
         )
-    if phase is RegulatoryIndexingCancellationPhase.FINALIZE:
-        finalized = indexing_job_repository.finalize_regulatory_indexing_cancellation(
-            db_session,
-            job_id=runtime.job.id,
-            expected_generation=runtime.job.lease_generation,
-            now=now,
+
+        job_id, file_id, generation = (
+            runtime.job.id,
+            runtime.user_file.id,
+            runtime.job.lease_generation,
         )
-        return _complete(runtime.job.id) if finalized else _skipped(runtime.job.id)
+        db_session.rollback()
+        execute_owned_cancellation(
+            job_id=job_id,
+            user_file_id=file_id,
+            expected_generation=generation,
+            tenant_id=tenant_id,
+        )
+        return _complete(job_id)
     raise ValueError("cancelling regulatory job has no cancellation phase")
 
 
@@ -1181,6 +1207,37 @@ def _execute_claimed_step_impl(
         raise ValueError(
             "CHUNKED user file generation identity is absent or mismatched"
         )
+
+    if stage in {
+        RegulatoryIndexingStage.EMBEDDING,
+        RegulatoryIndexingStage.INDEX_WRITE,
+        RegulatoryIndexingStage.VERIFY,
+        RegulatoryIndexingStage.PUBLISH,
+    }:
+        from onyx.regulatory.indexing_jobs.owned_publication import (
+            repair_owned_durable_items,
+        )
+
+        job_id, file_id, generation = (
+            runtime.job.id,
+            runtime.user_file.id,
+            runtime.job.lease_generation,
+        )
+        db_session.rollback()
+        if repair_owned_durable_items(
+            job_id=job_id,
+            user_file_id=file_id,
+            expected_generation=generation,
+            stage=stage,
+            tenant_id=tenant_id,
+        ):
+            return _next_step(job_id, generation)
+        refreshed = indexing_job_repository.get_regulatory_indexing_runtime(
+            db_session, job_id
+        )
+        if refreshed is None:
+            return _skipped(job_id)
+        runtime = refreshed
 
     if stage is RegulatoryIndexingStage.PREPARING:
         if snapshot.input_hash_version is RegulatoryInputHashVersion.CHUNK_ROWS_V3:
@@ -1375,7 +1432,9 @@ def _execute_claimed_step(
                     expected_phase=phase,
                     next_retry_at=now + datetime.timedelta(seconds=delay),
                     error_code=decision.error_code,
-                    error_message=error.__class__.__name__,
+                    error_message=str(error)
+                    if isinstance(error, IndexingPublicationIndeterminateError)
+                    else error.__class__.__name__,
                 )
             )
             return (
@@ -1407,7 +1466,9 @@ def _execute_claimed_step(
                 expected_generation=runtime.job.lease_generation,
                 next_retry_at=now + datetime.timedelta(seconds=delay),
                 error_code=decision.error_code,
-                error_message=error.__class__.__name__,
+                error_message=str(error)
+                if isinstance(error, IndexingPublicationIndeterminateError)
+                else error.__class__.__name__,
             )
             return (
                 _next_step(
@@ -1424,7 +1485,9 @@ def _execute_claimed_step(
             expected_stage=RegulatoryIndexingStage(runtime.job.stage),
             expected_generation=runtime.job.lease_generation,
             error_code=decision.error_code,
-            error_message=error.__class__.__name__,
+            error_message=str(error)
+            if isinstance(error, IndexingPublicationIndeterminateError)
+            else error.__class__.__name__,
             now=now,
         )
         return (
@@ -1615,7 +1678,9 @@ def _run_claimed_regulatory_provider_cleanup(
                     cleanup_generation=cleanup_generation,
                     next_retry_at=now + datetime.timedelta(seconds=delay),
                     error_code=decision.error_code,
-                    error_message=error.__class__.__name__,
+                    error_message=str(error)
+                    if isinstance(error, IndexingPublicationIndeterminateError)
+                    else error.__class__.__name__,
                     exhausted=exhausted,
                 )
             )

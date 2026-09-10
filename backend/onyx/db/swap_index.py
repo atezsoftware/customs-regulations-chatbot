@@ -36,6 +36,11 @@ from onyx.db.port_attempt import (
     get_active_port_attempt,
     get_latest_port_attempt,
 )
+from onyx.db.regulatory_index_lifecycle import (
+    lock_index_publication_barrier,
+    schedule_user_file_index_reconciliation,
+    unreconciled_user_files,
+)
 from onyx.db.regulatory_indexing_jobs import (
     has_active_regulatory_indexing_jobs_for_search_settings,
 )
@@ -67,34 +72,45 @@ def _perform_index_swap(
     Returns the old search settings if the swap was successful, otherwise None.
     """
     current_search_settings = get_current_search_settings(db_session)
-    if len(all_cc_pairs) > 0:
-        kv_store = get_kv_store()
-        kv_store.store(KV_REINDEX_KEY, False)
-
-        # Expire jobs for the now past index/embedding model
-        cancel_indexing_attempts_for_search_settings(
-            search_settings_id=current_search_settings.id,
-            db_session=db_session,
-        )
-
-        # Recount aggregates
-        for cc_pair in all_cc_pairs:
-            resync_cc_pair(
-                cc_pair=cc_pair,
-                # sync based on the new search settings
-                search_settings_id=new_search_settings.id,
-                db_session=db_session,
-            )
-
-        if cleanup_documents:
-            # clean up all DocumentByConnectorCredentialPair / Document rows, since we're
-            # doing an instant swap and no documents will exist in the new index.
-            for cc_pair in all_cc_pairs:
-                delete_all_documents_for_connector_credential_pair(
-                    db_session=db_session,
-                    connector_id=cc_pair.connector_id,
-                    credential_id=cc_pair.credential_id,
+    # File writers take the same clock before staging; no external work or
+    # connector cleanup runs until this short status transition has committed.
+    if not lock_index_publication_barrier(db_session):
+        db_session.rollback()
+        return None
+    locked = list(
+        db_session.scalars(
+            select(SearchSettings)
+            .where(
+                SearchSettings.id.in_(
+                    [current_search_settings.id, new_search_settings.id]
                 )
+            )
+            .order_by(SearchSettings.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    if (
+        len(locked) != 2
+        or current_search_settings.status != IndexModelStatus.PRESENT
+        or new_search_settings.status != IndexModelStatus.FUTURE
+    ):
+        db_session.rollback()
+        return None
+
+    if any(
+        has_active_regulatory_indexing_jobs_for_search_settings(db_session, setting.id)
+        for setting in locked
+    ):
+        db_session.rollback()
+        return None
+    unreconciled = unreconciled_user_files(
+        db_session, current_search_settings.index_name, new_search_settings.index_name
+    )
+    if unreconciled:
+        db_session.rollback()
+        schedule_user_file_index_reconciliation(db_session, unreconciled)
+        return None
 
     # Record the index being promoted-from so the INSTANT post-swap port keeps
     # reading it once it becomes PAST. Only INSTANT backfills after the swap; setting
@@ -129,6 +145,35 @@ def _perform_index_swap(
         commit=False,
     )
     db_session.commit()
+
+    if len(all_cc_pairs) > 0:
+        kv_store = get_kv_store()
+        kv_store.store(KV_REINDEX_KEY, False)
+
+        # Expire jobs for the now past index/embedding model
+        cancel_indexing_attempts_for_search_settings(
+            search_settings_id=current_search_settings.id,
+            db_session=db_session,
+        )
+
+        # Recount aggregates
+        for cc_pair in all_cc_pairs:
+            resync_cc_pair(
+                cc_pair=cc_pair,
+                # sync based on the new search settings
+                search_settings_id=new_search_settings.id,
+                db_session=db_session,
+            )
+
+        if cleanup_documents:
+            # clean up all DocumentByConnectorCredentialPair / Document rows, since we're
+            # doing an instant swap and no documents will exist in the new index.
+            for cc_pair in all_cc_pairs:
+                delete_all_documents_for_connector_credential_pair(
+                    db_session=db_session,
+                    connector_id=cc_pair.connector_id,
+                    credential_id=cc_pair.credential_id,
+                )
 
     # FUTURE is now live: cancel stragglers that dropped out of the required set
     # (paused/INVALID) so they stop writing into the live index. Skip for INSTANT —
@@ -304,7 +349,6 @@ def check_and_perform_index_swap(db_session: Session) -> SearchSettings | None:
                 )
             )
             .order_by(SearchSettings.id)
-            .with_for_update()
         ).all()
     )
     new_search_settings = next(

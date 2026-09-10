@@ -569,6 +569,15 @@ def load_chat_file(
     # cached-plaintext path avoids reading the original bytes on the steady
     # state; only the cache miss branch opens the binary stream.
     content_text: str | None = None
+    from onyx.db.regulatory_original_ingestion import current_original_receipts
+    from onyx.file_processing.original_attachment import (
+        require_original_attachment_bytes,
+    )
+
+    retained_original = bool(current_original_receipts(file_id))
+    if retained_original:
+        raw = get_default_file_store().read_file(file_id, mode="b").read()
+        require_original_attachment_bytes(file_id, raw)
     if file_type.is_text_file():
 
         def _extract() -> str:
@@ -599,6 +608,11 @@ def load_chat_file(
                 str(e),
             )
 
+    if retained_original and content_text is not None:
+        require_original_attachment_bytes(
+            file_id, content_text.encode(), plaintext=True
+        )
+
     def _load_content() -> bytes:
         # Chat messages keep file references in their JSONB `files` column, but
         # user-file deletion does not scrub those references — a file in the
@@ -611,6 +625,7 @@ def load_chat_file(
         require_publication_files(observation, parents)
         try:
             content = get_default_file_store().read_file(file_id, mode="b").read()
+            require_original_attachment_bytes(file_id, content)
             require_publication_files(observation, parents)
             return content
         except OnyxError:

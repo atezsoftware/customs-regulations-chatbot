@@ -100,11 +100,15 @@ class DocumentChunkVerificationRequest(BaseModel):
     expected_hidden: bool
     content_vector_dimension: int = Field(gt=0)
 
+    require_contiguous: bool = True
+
     @model_validator(mode="after")
     def check_chunk_indexes_are_contiguous(self) -> Self:
         indexes = [chunk.chunk_index for chunk in self.expected_chunks]
-        if indexes != list(range(len(indexes))):
+        if self.require_contiguous and indexes != list(range(len(indexes))):
             raise ValueError("expected chunk indexes must be contiguous and ordered")
+        if len(set(indexes)) != len(indexes):
+            raise ValueError("expected chunk indexes must be unique")
         return self
 
 

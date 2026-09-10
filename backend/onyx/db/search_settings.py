@@ -53,7 +53,16 @@ def create_search_settings(
     # False flushes instead of committing, so the caller can commit this row
     # atomically with its port seeds (a seedless FUTURE makes workers re-scan).
     commit: bool = True,
+    publication_barrier_deferred: bool = False,
 ) -> SearchSettings:
+    from onyx.db.regulatory_index_lifecycle import require_index_publication_barrier
+
+    if not publication_barrier_deferred:
+        require_index_publication_barrier(db_session)
+    elif commit:
+        raise ValueError(
+            "deferred publication barrier requires an explicit final commit"
+        )
     embedding_model = SearchSettings(
         model_name=search_settings.model_name,
         model_dim=search_settings.model_dim,
@@ -120,6 +129,9 @@ def get_current_db_embedding_provider(
 
 def delete_search_settings(db_session: Session, search_settings_id: int) -> None:
     from onyx.db.port_attempt import is_active_port_backfill_source
+    from onyx.db.regulatory_index_lifecycle import require_index_publication_barrier
+
+    require_index_publication_barrier(db_session)
 
     current_settings = get_current_search_settings(db_session)
 
@@ -155,6 +167,9 @@ def delete_search_settings_if_not_present(
     db_session: Session, search_settings_id: int
 ) -> bool:
     """Atomically discard a non-active setting without racing promotion."""
+    from onyx.db.regulatory_index_lifecycle import require_index_publication_barrier
+
+    require_index_publication_barrier(db_session)
 
     search_settings = (
         db_session.execute(
@@ -358,6 +373,9 @@ def update_search_settings_status(
     *,
     commit: bool = True,
 ) -> None:
+    from onyx.db.regulatory_index_lifecycle import require_index_publication_barrier
+
+    require_index_publication_barrier(db_session)
     search_settings.status = new_status
     if commit:
         db_session.commit()

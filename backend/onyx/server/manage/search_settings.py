@@ -57,12 +57,10 @@ from onyx.db.search_settings import (
 from onyx.db.swap_index import check_and_perform_index_swap
 from onyx.db.user_file import mark_regulatory_user_files_reconcile_pending__no_commit
 from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
-from onyx.document_index.elasticsearch.index_reclaim import reclaim_index_data
 from onyx.document_index.factory import (
     get_all_document_indices,
     get_default_document_index,
 )
-from onyx.document_index.interfaces_new import TenantState
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_processing.import_capability import ensure_document_import_available
@@ -114,35 +112,28 @@ def _cleanup_unpromoted_empty_cloud_bootstrap(
 ) -> bool:
     """Remove the failed FUTURE row and its empty Elasticsearch index."""
 
-    removed = delete_search_settings_if_not_present(
-        db_session=db_session,
-        search_settings_id=new_search_settings.id,
+    from onyx.db.search_settings import get_search_settings_by_id
+    from onyx.document_index.elasticsearch.physical_operations import (
+        run_empty_physical_operation,
     )
-    if not removed:
+
+    identifier, index_name = new_search_settings.id, new_search_settings.index_name
+    current = get_search_settings_by_id(db_session, identifier)
+    if current is not None and current.status.is_current():
+        db_session.rollback()
         return False
-
-    # Reclaim only after the row-lock-protected delete commits. A concurrent
-    # promotion can no longer turn this setting into PRESENT. Never delete an
-    # index that existed before this request; it may be the current index or a
-    # sanitized-name collision shared by another setting.
     if ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX and not elasticsearch_index_preexisted:
-        try:
-            reclaim_index_data(
-                index_name=new_search_settings.index_name,
-                tenant_state=TenantState(
-                    tenant_id=get_current_tenant_id(), multitenant=MULTI_TENANT
-                ),
+        db_session.rollback()
+        with ElasticsearchIndexClient(index_name=index_name) as client:
+            run_empty_physical_operation(
+                client.publication_client(),
+                index_name=index_name,
+                multitenant=MULTI_TENANT,
+                operation="delete",
+                discard_search_settings_id=identifier,
             )
-        except Exception:
-            # The database row must still be removed so a retry is not blocked by
-            # a stale FUTURE setting. The idempotent reclaim path can remove an
-            # empty leftover index on a later attempt.
-            logger.exception(
-                "Failed to reclaim index %s after cloud embedding bootstrap failure",
-                new_search_settings.index_name,
-            )
-
-    return True
+        return True
+    return delete_search_settings_if_not_present(db_session, identifier)
 
 
 def _elasticsearch_index_exists(index_name: str) -> bool:
@@ -239,15 +230,21 @@ def set_new_search_settings(
 
     if secondary_search_settings:
         # Cancel any background indexing jobs.
+        # Mark previous model as a past model directly.
+        try:
+            update_search_settings_status(
+                search_settings=secondary_search_settings,
+                new_status=IndexModelStatus.PAST,
+                db_session=db_session,
+            )
+        except ValueError as error:
+            db_session.rollback()
+            raise OnyxError(
+                OnyxErrorCode.CONFLICT,
+                "Index transition waits for current publication work.",
+            ) from error
         expire_index_attempts(
             search_settings_id=secondary_search_settings.id, db_session=db_session
-        )
-
-        # Mark previous model as a past model directly.
-        update_search_settings_status(
-            search_settings=secondary_search_settings,
-            new_status=IndexModelStatus.PAST,
-            db_session=db_session,
         )
 
         # Cancel in-flight reindex ports for the superseded FUTURE. After the PAST
@@ -267,6 +264,7 @@ def set_new_search_settings(
         db_session=db_session,
         use_port_flow=not empty_cloud_bootstrap,
         commit=False,
+        publication_barrier_deferred=True,
     )
 
     # If an empty-bootstrap activation fails, physical cleanup is allowed only
@@ -286,6 +284,15 @@ def set_new_search_settings(
             embedding_dim=search_settings.final_embedding_dim,
             embedding_precision=search_settings.embedding_precision,
         )
+
+    # Physical-index calls finish before the short publication-clock transaction.
+    from onyx.db.regulatory_index_lifecycle import require_index_publication_barrier
+
+    try:
+        require_index_publication_barrier(db_session)
+    except ValueError as error:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(error)) from error
 
     # Pause index attempts for the currently in-use index to preserve resources.
     if DISABLE_INDEX_UPDATE_ON_SWAP and not empty_cloud_bootstrap:
@@ -399,14 +406,20 @@ def cancel_new_embedding(
     secondary_search_settings = get_secondary_search_settings(db_session)
 
     if secondary_search_settings:
+        try:
+            update_search_settings_status(
+                search_settings=secondary_search_settings,
+                new_status=IndexModelStatus.PAST,
+                db_session=db_session,
+            )
+        except ValueError as error:
+            db_session.rollback()
+            raise OnyxError(
+                OnyxErrorCode.CONFLICT,
+                "Index transition waits for current publication work.",
+            ) from error
         expire_index_attempts(
             search_settings_id=secondary_search_settings.id, db_session=db_session
-        )
-
-        update_search_settings_status(
-            search_settings=secondary_search_settings,
-            new_status=IndexModelStatus.PAST,
-            db_session=db_session,
         )
 
         # Stop any in-flight reindex port for the canceled FUTURE; the running

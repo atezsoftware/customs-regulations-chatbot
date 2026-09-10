@@ -67,7 +67,7 @@ def load_public_temporal_bindings(
     }
     selected = []
     for binding in load_file_temporal_bindings(session, user_file_id, refresh=True):
-        if binding.index.temporal_lookup_identity() != index.temporal_lookup_identity():
+        if not binding.index.matches_temporal_index(index):
             continue
         source = json.loads(binding.projection.source_json)
         row = canonical.get(source["regulatory_chunk_id"])
@@ -185,6 +185,7 @@ def resolve_public_query_index(
     """Freeze activated positive receipts against actual runtime encoder facts."""
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
     from onyx.db.models import SearchSettings
+    from onyx.document_index.encoder_authority import effective_runtime_authority
     from onyx.document_index.publication_models import (
         PublicationEncoderAuthority,
         publication_digest,
@@ -229,15 +230,13 @@ def resolve_public_query_index(
                 or index.multitenant != MULTI_TENANT
             ):
                 continue
-            if index.encoder_authority != actual:
+            if index.effective_authority() != effective_runtime_authority(
+                actual, query_prefix=settings.query_prefix
+            ):
                 raise ValueError(
                     "qualified query runtime encoder differs from activated authority"
                 )
-            if (
-                accepted is not None
-                and accepted.temporal_lookup_identity()
-                != index.temporal_lookup_identity()
-            ):
+            if accepted is not None and not accepted.matches_temporal_index(index):
                 raise ValueError("ambiguous activated query index authority")
             accepted = index
             receipts.update(
@@ -266,7 +265,9 @@ def current_file_read_owners(file_id: str) -> tuple[tuple[UUID, ...], frozenset[
         originals = tuple(
             session.scalars(select(UserFile.id).where(UserFile.file_id == file_id))
         )
-        return parents, protected_file_ids(session, originals)
+        from onyx.db.regulatory_original_ingestion import unavailable_original_file_ids
+
+        return parents, unavailable_original_file_ids(session, originals)
 
 
 def current_canonical_positions(chunk_ids: tuple[str, ...]) -> dict[str, int]:

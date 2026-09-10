@@ -33,6 +33,7 @@ from onyx.db.regulatory_chunks import (
     make_regulatory_chunk_id,
     supersede_hierarchical_aggregates_referencing_chunk,
 )
+from onyx.document_index.publication_models import FileOwnership
 from onyx.regulatory.amendments.draft_integrity import (
     explicit_replacement_body,
     reconcile_existing_heading_path,
@@ -758,7 +759,6 @@ def touch_amendment_proposal_approval(
         .where(
             AmendmentProposal.id == proposal_id,
             AmendmentProposal.status == AmendmentProposalStatus.APPROVING.value,
-            AmendmentProposal.applied_new_chunk_id.is_not(None),
             AmendmentProposal.approval_indexing_job_id.is_(None),
         )
         .values(updated_at=func.now())
@@ -791,7 +791,19 @@ def recover_stale_amendment_proposal_approvals(
     )
     resume_ids: list[int] = []
     for proposal in proposals:
-        if proposal.applied_new_chunk_id:
+        from onyx.db.models import RegulatoryFilePublication
+
+        retained_writer = db_session.scalar(
+            select(RegulatoryFilePublication.user_file_id)
+            .where(
+                RegulatoryFilePublication.writer_manifest[
+                    "amendment_proposal_id"
+                ].as_integer()
+                == proposal.id
+            )
+            .limit(1)
+        )
+        if proposal.applied_new_chunk_id or retained_writer is not None:
             proposal.updated_at = recovered_at
             resume_ids.append(proposal.id)
             continue
@@ -955,6 +967,7 @@ def approve_amendment_proposal(
     proposal: AmendmentProposal,
     *,
     decided_by: UUID | None = None,
+    publication_owner: FileOwnership | None = None,
 ) -> ApprovalResult:
     """Apply one durably queued proposal:
 
@@ -983,6 +996,12 @@ def approve_amendment_proposal(
     it after a successful approval, same as chunk edits from the Files
     panel.
     """
+    from onyx.db.regulatory_publication import PublicationStore
+
+    if publication_owner is not None:
+        PublicationStore(publication_owner.scope).lock_owned_snapshot(
+            db_session, publication_owner
+        )
     proposal = _lock_proposal_for_transition(db_session, proposal.id)
     if proposal.status != AmendmentProposalStatus.APPROVING.value:
         raise ValueError(
@@ -1089,9 +1108,18 @@ def approve_amendment_proposal(
         draft["text"],
         version_key=f"amendment:{proposal.id}",
     )
-    projection_ordinal = _AMENDMENT_PROJECTION_ORDINAL_BASE + proposal.id
-    if proposal.id > _MAX_AMENDMENT_PROPOSAL_ID:
-        raise ValueError("Amendment projection ordinal range is exhausted")
+    if publication_owner is not None:
+        if publication_owner.user_file_id != user_file_id:
+            raise ValueError("amendment file differs from publication ownership")
+        projection_ordinal = PublicationStore(
+            publication_owner.scope
+        ).allocate_in_session(
+            db_session, publication_owner, "canonical:" + new_chunk_id
+        )
+    else:
+        projection_ordinal = _AMENDMENT_PROJECTION_ORDINAL_BASE + proposal.id
+        if proposal.id > _MAX_AMENDMENT_PROPOSAL_ID:
+            raise ValueError("Amendment projection ordinal range is exhausted")
     new_chunk = RegulatoryChunk(
         id=new_chunk_id,
         user_file_id=user_file_id,

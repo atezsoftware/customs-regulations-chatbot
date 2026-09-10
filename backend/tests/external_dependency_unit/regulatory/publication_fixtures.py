@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from contextlib import contextmanager
 
-from sqlalchemy import delete, event, select
+from sqlalchemy import delete, event, inspect, select
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import column
 
@@ -41,7 +41,11 @@ def committed_review_session() -> Generator[Session, None, None]:
         finally:
             session.rollback()
             groups = [item.id for item in created if isinstance(item, DocumentSet)]
-            files = [item.id for item in created if isinstance(item, UserFile)]
+            files = [
+                (inspect(item).identity or (item.id,))[0]
+                for item in created
+                if isinstance(item, UserFile)
+            ]
             users = [item.id for item in created if isinstance(item, User)]
             changes = (
                 select(AnnexChangeSet.id)

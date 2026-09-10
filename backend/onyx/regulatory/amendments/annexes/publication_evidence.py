@@ -95,22 +95,25 @@ def _validate_physical_encoder_authority(
         known_facts["effective_dimension"] = (
             configuration.get("reduced_dimension") or configuration["dimension"]
         )
-    previous_authority = previous.encoder_authority
+    previous_authority = previous.effective_authority()
     if previous_authority is None:
         try:
             previous_authority = _encoder_receipt(
                 configuration,
                 resolution="0" * 64,
-            ).authority
+            ).effective_authority()
         except ValueError:
             # Incomplete legacy receipts remain unverified for missing facts.
             pass
     if (
-        (previous.model_provider, previous.model_name, previous.vector_dimension)
-        != (index.model_provider, index.model_name, index.vector_dimension)
+        (previous.model_name, previous.vector_dimension)
+        != (index.model_name, index.vector_dimension)
+        or previous_authority is None
+        and previous.model_provider != index.model_provider
         or previous_authority is not None
-        and previous_authority != index.encoder_authority
-        or index.encoder_authority is not None
+        and previous_authority != index.effective_authority()
+        or previous_authority is None
+        and index.encoder_authority is not None
         and any(
             value != index.encoder_authority.model_dump()[key]
             for key, value in known_facts.items()
@@ -279,8 +282,10 @@ def _historical_plan(
         # Different encoders cannot reuse vectors, but retain the exact old input.
         try:
             compatible = (
-                _encoder_receipt(encoder_config, resolution="0" * 64).authority
-                == index.encoder_authority
+                _encoder_receipt(
+                    encoder_config, resolution="0" * 64
+                ).effective_authority()
+                == index.effective_authority()
             )
         except ValueError:
             compatible = False

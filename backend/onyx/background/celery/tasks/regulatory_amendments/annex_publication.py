@@ -68,8 +68,7 @@ def publish_annex_change(
         and tenant_id != POSTGRES_DEFAULT_SCHEMA
     ):
         raise ValueError("publication worker scope mismatch")
-    if not config.REGULATORY_ANNEX_UPDATES_ENABLED:
-        raise ValueError("Annex updates are disabled")
+    # The creation flag cannot strand a persisted, reviewed publication intent.
     return execute_publication(
         AnnexPublicationDelivery.model_validate(
             dict(
@@ -97,8 +96,7 @@ def recover_annex_publications(
     from shared_configs.contextvars import get_current_tenant_id
 
     if (
-        not config.REGULATORY_ANNEX_UPDATES_ENABLED
-        or environment != config.REGULATORY_ANNEX_ENVIRONMENT
+        environment != config.REGULATORY_ANNEX_ENVIRONMENT
         or database_identity != config.ANNEX_DATABASE_IDENTITY
         or tenant_id != get_current_tenant_id()
         or not MULTI_TENANT

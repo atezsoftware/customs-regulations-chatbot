@@ -1,4 +1,3 @@
-import datetime
 import json
 from uuid import UUID
 
@@ -31,7 +30,6 @@ from onyx.db.projects import (
     get_project_token_count,
     upload_files_to_user_files_with_indexing,
 )
-from onyx.db.regulatory_indexing_jobs import request_user_file_deletion_cleanup
 from onyx.file_processing.import_capability import ensure_document_import_available
 from onyx.server.features.projects.models import (
     CategorizedFilesSnapshot,
@@ -419,23 +417,16 @@ def delete_user_file(
 
     This will also remove any project associations for the file.
     """
-    user_id = user.id
-    user_file = (
-        db_session.query(UserFile)
-        .filter(UserFile.id == file_id, UserFile.user_id == user_id)
-        .one_or_none()
-    )
-    if user_file is None:
-        raise HTTPException(status_code=404, detail="File not found")
+    from onyx.db.user_file import get_user_file_deletion_associations
+    from onyx.error_handling.error_codes import OnyxErrorCode
+    from onyx.error_handling.exceptions import OnyxError
 
-    # Check associations with projects and assistants (personas)
-    project_names = [project.name for project in user_file.projects]
-    assistant_names = [assistant.name for assistant in user_file.assistants]
-    document_set_names = [
-        document_set.name
-        for document_set in user_file.document_sets
-        if not document_set.is_deleting
-    ]
+    associations = get_user_file_deletion_associations(db_session, file_id, user.id)
+    if associations is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "File not found")
+    project_names = associations.project_names
+    assistant_names = associations.assistant_names
+    document_set_names = associations.document_set_names
 
     if project_names or assistant_names or document_set_names:
         return UserFileDeleteResult(
@@ -445,32 +436,37 @@ def delete_user_file(
             document_set_names=document_set_names,
         )
 
-    # The tombstone and all durable generation fences commit before any external
-    # artifact or database row can be deleted.
-    request_user_file_deletion_cleanup(
-        db_session,
-        user_file_id=user_file.id,
-        now=datetime.datetime.now(datetime.timezone.utc),
-    )
+    from onyx.regulatory.writer_publication import request_owned_file_deletion
 
     tenant_id = get_current_tenant_id()
+    db_session.rollback()
+    try:
+        request_owned_file_deletion(file_id, tenant_id)
+    except ValueError as error:
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT,
+            "File publication is in progress. Retry deletion after it finishes or is reconciled.",
+        ) from error
+
     if DISABLE_VECTOR_DB:
         from onyx.background.task_utils import drain_delete_loop
 
         bg_tasks.add_task(drain_delete_loop, tenant_id)
-        logger.info("Queued in-process delete for user_file_id=%s", user_file.id)
+        logger.info("Queued in-process delete for user_file_id=%s", file_id)
     else:
         from onyx.background.celery.versioned_apps.client import app as client_app
+        from onyx.configs.constants import CELERY_USER_FILE_DELETE_TASK_EXPIRES
 
         task = client_app.send_task(
             OnyxCeleryTask.DELETE_SINGLE_USER_FILE,
-            kwargs={"user_file_id": str(user_file.id), "tenant_id": tenant_id},
+            kwargs={"user_file_id": str(file_id), "tenant_id": tenant_id},
             queue=OnyxCeleryQueues.USER_FILE_DELETE,
             priority=OnyxCeleryPriority.HIGH,
+            expires=CELERY_USER_FILE_DELETE_TASK_EXPIRES,
         )
         logger.info(
             "Triggered delete for user_file_id=%s with task_id=%s",
-            user_file.id,
+            file_id,
             task.id,
         )
 

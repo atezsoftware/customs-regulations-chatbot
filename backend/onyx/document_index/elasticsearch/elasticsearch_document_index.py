@@ -164,6 +164,25 @@ def ensure_current_schema(
 ) -> None:
     """Apply additive mappings or safely replace an incompatible empty index."""
 
+    from onyx.db.regulatory_physical_indexes import pending_physical_operation
+    from onyx.document_index.elasticsearch.physical_operations import (
+        physical_scope,
+        run_empty_physical_operation,
+    )
+
+    if (
+        pending_physical_operation(physical_scope(), index_client.index_name)
+        is not None
+    ):
+        run_empty_physical_operation(
+            index_client.publication_client(),
+            index_name=index_client.index_name,
+            multitenant=MULTI_TENANT,
+            operation="recreate",
+            mappings=expected_mappings,
+            settings=index_settings,
+        )
+        return
     current_mappings = index_client.get_index_mapping()
     if not _mapping_requires_recreation(current_mappings, expected_mappings):
         index_client.put_mapping(expected_mappings)
@@ -182,12 +201,14 @@ def ensure_current_schema(
             "search index and reindex; the existing index was left untouched."
         )
 
-    if not index_client.delete_index():
-        raise ElasticsearchSchemaMigrationRequiredError(
-            "The incompatible empty Elasticsearch index disappeared during schema "
-            "verification. Retry setup; no index was recreated."
-        )
-    index_client.create_index(mappings=expected_mappings, settings=index_settings)
+    run_empty_physical_operation(
+        index_client.publication_client(),
+        index_name=index_client.index_name,
+        multitenant=MULTI_TENANT,
+        operation="recreate",
+        mappings=expected_mappings,
+        settings=index_settings,
+    )
 
 
 def _database_has_indexed_documents() -> bool:
@@ -454,6 +475,10 @@ class ElasticsearchDocumentIndex(DocumentIndex):
             )
             _verified_index_names_for_current_process.add(index_name)
 
+    @property
+    def index_name(self) -> str:
+        return self._index_name
+
     def verify_and_create_index_if_necessary(
         self,
         embedding_dim: int,
@@ -489,7 +514,15 @@ class ElasticsearchDocumentIndex(DocumentIndex):
                 embedding_dim, self._tenant_state.multitenant
             )
 
-            if not self._client.index_exists():
+            from onyx.db.regulatory_physical_indexes import pending_physical_operation
+            from onyx.document_index.elasticsearch.physical_operations import (
+                physical_scope,
+            )
+
+            pending_physical = pending_physical_operation(
+                physical_scope(), self._index_name
+            )
+            if not self._client.index_exists() and pending_physical is None:
                 index_settings = (
                     DocumentSchema.get_index_settings_based_on_environment()
                 )
@@ -835,7 +868,15 @@ class ElasticsearchDocumentIndex(DocumentIndex):
         unmarked). Dedups and batches the ids under the Elasticsearch terms cap so a large
         mid-port purge can't build an oversized terms query. Returns chunks deleted.
         """
-        unique_ids = list(dict.fromkeys(document_ids))
+        from onyx.db.regulatory_index_lifecycle import port_user_file_ids
+        from shared_configs.contextvars import get_current_tenant_id
+
+        owned = port_user_file_ids(document_ids, get_current_tenant_id())
+        unique_ids = list(
+            dict.fromkeys(
+                identifier for identifier in document_ids if identifier not in owned
+            )
+        )
         if not unique_ids:
             return 0
         deleted = 0

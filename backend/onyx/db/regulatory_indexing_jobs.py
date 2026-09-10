@@ -35,10 +35,17 @@ from onyx.db.regulatory_amendments import (
     finalize_amendment_proposals_for_indexing_job,
 )
 from onyx.db.regulatory_context_projections import persist_context_view
+from onyx.db.regulatory_publication import PublicationStore
+from onyx.document_index.publication_models import FileOwnership, publication_digest
 from onyx.regulatory.amendments.annexes.models import (
     ContextSourceSnapshot,
     PreparedContextView,
 )
+from onyx.regulatory.indexing_jobs.embedding_receipts import (
+    DurableEmbeddingReceipt,
+    vector_receipt_context,
+)
+from onyx.regulatory.indexing_jobs.projection_identity import DurableProjectionInput
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
 _MAX_ERROR_CODE_LENGTH = 128
@@ -147,6 +154,11 @@ class RegulatoryIndexingPreparedItem:
     regulatory_chunk_id: str
     request_hash: str
     skip_context: bool
+    projection_id: UUID | None = None
+    projection_ordinal: int | None = None
+    effective_start: datetime.date | None = None
+    effective_end: datetime.date | None = None
+    projection_input: DurableProjectionInput | None = None
     source_snapshot: ContextSourceSnapshot | None = None
     context_input: dict[str, object] | None = None
 
@@ -413,6 +425,7 @@ def create_or_get_regulatory_indexing_job(
     chunk_generation_hash: str,
     config_snapshot: RegulatoryIndexingConfigSnapshot,
     now: datetime.datetime,
+    publication_owner: FileOwnership | None = None,
 ) -> RegulatoryIndexingJob:
     """Create one active job, or reuse the file's existing active generation.
 
@@ -436,6 +449,23 @@ def create_or_get_regulatory_indexing_job(
         character not in "0123456789abcdef" for character in chunk_generation_hash
     ):
         raise ValueError("chunk generation hash must be a lowercase SHA-256 hash")
+    from onyx.db.models import RegulatoryFilePublication
+
+    reservations = None
+    if publication_owner is not None:
+        if publication_owner.user_file_id != user_file_id:
+            raise ValueError("durable creation ownership scope mismatch")
+        reservations = PublicationStore(publication_owner.scope).lock_owned_snapshot(
+            db_session, publication_owner
+        )
+    elif db_session.get(RegulatoryFilePublication, user_file_id) is not None:
+        raise ValueError("protected durable creation requires publication ownership")
+    from onyx.db.regulatory_index_lifecycle import lock_index_publication_clock
+
+    lock_index_publication_clock(db_session)
+    target = db_session.get(SearchSettings, search_settings_id, populate_existing=True)
+    if target is None or not (target.status.is_current() or target.status.is_future()):
+        raise ValueError("durable creation target is no longer an active index")
     locked_user_file = db_session.scalar(
         select(UserFile).where(UserFile.id == user_file_id).with_for_update()
     )
@@ -496,6 +526,31 @@ def create_or_get_regulatory_indexing_job(
                 f"active regulatory indexing job {active_job_id} disappeared"
             )
         return persisted_active_job
+    if reservations is not None and reservations.gate_closed:
+        from onyx.regulatory.indexing_jobs.models import (
+            IndexingPublicationIndeterminateError,
+        )
+
+        raise IndexingPublicationIndeterminateError(
+            "new durable job must wait for pending publication"
+        )
+    if (
+        publication_owner is not None
+        and config_snapshot.get("input_hash_version") == "chunk-rows-v3"
+    ):
+        from onyx.db.regulatory_chunks import get_chunks_for_file_snapshot
+        from onyx.regulatory.indexing_jobs.preparation import (
+            regulatory_chunks_content_hash,
+        )
+
+        if (
+            locked_user_file.regulatory_chunk_generation_hash != chunk_generation_hash
+            or regulatory_chunks_content_hash(
+                get_chunks_for_file_snapshot(db_session, user_file_id)
+            )
+            != content_hash
+        ):
+            raise ValueError("canonical job creation input changed before ownership")
     db_session.scalar(
         select(SearchSettings)
         .where(SearchSettings.id == search_settings_id)
@@ -829,8 +884,28 @@ def request_user_file_deletion_cleanup(
     *,
     user_file_id: UUID,
     now: datetime.datetime,
+    publication_owner: FileOwnership | None = None,
 ) -> UserFileDeletionCleanupPlan:
     """Tombstone a file and clean one durable generation at a time."""
+
+    from onyx.db.models import RegulatoryFilePublication
+
+    if publication_owner is None:
+        if db_session.get(RegulatoryFilePublication, user_file_id) is not None:
+            raise ValueError("protected deletion requires publication ownership")
+    else:
+        if publication_owner.user_file_id != user_file_id:
+            raise ValueError("deletion ownership file mismatch")
+        reservations = PublicationStore(publication_owner.scope).lock_owned_snapshot(
+            db_session, publication_owner
+        )
+        publication = db_session.get(RegulatoryFilePublication, user_file_id)
+        if (
+            reservations.gate_closed
+            and publication is not None
+            and publication.writer_manifest is None
+        ):
+            raise ValueError("pending annex publication must finish before deletion")
 
     locked_user_file = db_session.scalar(
         select(UserFile).where(UserFile.id == user_file_id).with_for_update()
@@ -1588,13 +1663,20 @@ def create_or_get_regulatory_indexing_item(
             request_hash=request_hash,
             status=RegulatoryIndexingItemStatus.PENDING.value,
         )
-        .on_conflict_do_nothing(constraint="uq_regulatory_indexing_item_job_chunk")
+        .on_conflict_do_nothing(
+            index_elements=[
+                RegulatoryIndexingItem.job_id,
+                RegulatoryIndexingItem.regulatory_chunk_id,
+            ],
+            index_where=RegulatoryIndexingItem.projection_id.is_(None),
+        )
         .returning(RegulatoryIndexingItem.id)
     )
     item = db_session.scalar(
         select(RegulatoryIndexingItem).where(
             RegulatoryIndexingItem.job_id == job_id,
             RegulatoryIndexingItem.regulatory_chunk_id == regulatory_chunk_id,
+            RegulatoryIndexingItem.projection_id.is_(None),
         )
     )
     if item is None:
@@ -1634,6 +1716,7 @@ def persist_regulatory_indexing_preparation(
     prepare_items: Callable[[], Sequence[RegulatoryIndexingPreparedItem]],
     resolved_input_hash_version: str,
     now: datetime.datetime,
+    publication_owner: FileOwnership | None = None,
 ) -> bool:
     """Atomically replace chunks, create items, and finish PREPARING."""
 
@@ -1643,6 +1726,13 @@ def persist_regulatory_indexing_preparation(
         "chunk-rows-v3",
     }:
         raise ValueError("resolved input hash version is unsupported")
+
+    if publication_owner is not None:
+        reservations = PublicationStore(publication_owner.scope).lock_owned_snapshot(
+            db_session, publication_owner
+        )
+        if reservations.gate_closed:
+            raise ValueError("durable preparation requires open publication authority")
 
     locked_user_file = _lock_user_file_for_regulatory_job(db_session, job_id)
     if locked_user_file is None or locked_user_file.status not in {
@@ -1671,6 +1761,12 @@ def persist_regulatory_indexing_preparation(
     if locked_job.user_file_id != locked_user_file.id:
         db_session.rollback()
         return False
+    if (
+        publication_owner is not None
+        and locked_job.user_file_id != publication_owner.user_file_id
+    ):
+        db_session.rollback()
+        raise ValueError("durable job preparation ownership mismatch")
     persisted_input_hash_version = locked_job.config_snapshot.get("input_hash_version")
     if persisted_input_hash_version not in {
         "legacy-or-canonical",
@@ -1684,16 +1780,25 @@ def persist_regulatory_indexing_preparation(
         if not prepared_items:
             raise ValueError("regulatory indexing preparation produced no items")
         chunk_ids = [item.regulatory_chunk_id for item in prepared_items]
-        if len(set(chunk_ids)) != len(chunk_ids):
+        identities = [
+            str(item.projection_id) if item.projection_id else item.regulatory_chunk_id
+            for item in prepared_items
+        ]
+        if len(set(identities)) != len(identities):
             raise ValueError(
-                "regulatory indexing preparation contains duplicate chunks"
+                "regulatory indexing preparation contains duplicate projections"
             )
-        request_hashes = [item.request_hash for item in prepared_items]
-        if len(set(request_hashes)) != len(request_hashes):
-            raise ValueError(
-                "regulatory indexing preparation contains duplicate hashes"
-            )
-
+        for item in prepared_items:
+            if item.projection_id is not None:
+                frozen = DurableProjectionInput.model_validate(item.projection_input)
+                if (
+                    item.projection_ordinal is None
+                    or item.projection_ordinal < 0
+                    or frozen.representation.id != item.regulatory_chunk_id
+                    or UUID(frozen.representation.user_file_id)
+                    != locked_job.user_file_id
+                ):
+                    raise ValueError("durable projection preparation scope mismatch")
         db_session.flush()
         canonical_chunk_ids = set(
             db_session.scalars(
@@ -1728,6 +1833,13 @@ def persist_regulatory_indexing_preparation(
                     id=uuid4(),
                     job_id=job_id,
                     regulatory_chunk_id=item.regulatory_chunk_id,
+                    projection_id=item.projection_id,
+                    projection_ordinal=item.projection_ordinal,
+                    effective_start=item.effective_start,
+                    effective_end=item.effective_end,
+                    projection_input=item.projection_input.model_dump(mode="json")
+                    if item.projection_input
+                    else None,
                     request_hash=item.request_hash,
                     context={"context_input": item.context_input}
                     if item.context_input is not None
@@ -1813,7 +1925,10 @@ def persist_regulatory_indexing_item_context(
         values={
             "status": RegulatoryIndexingItemStatus.CONTEXT_READY.value,
             "context": func.coalesce(
-                RegulatoryIndexingItem.context, sqlalchemy_cast({}, JSONB)
+                func.nullif(
+                    RegulatoryIndexingItem.context, sqlalchemy_cast(None, JSONB)
+                ),
+                sqlalchemy_cast({}, JSONB),
             ).op("||")(sqlalchemy_cast(context, JSONB)),
             "error_code": None,
             "error_message": None,
@@ -1899,6 +2014,8 @@ def persist_regulatory_indexing_item_vectors(
         return False
 
     for item_id, vector in item_vectors:
+        item = db_session.get(RegulatoryIndexingItem, item_id)
+        assert item is not None
         db_session.execute(
             update(RegulatoryIndexingItem)
             .where(
@@ -1908,6 +2025,7 @@ def persist_regulatory_indexing_item_vectors(
             .values(
                 status=RegulatoryIndexingItemStatus.EMBEDDED.value,
                 vector=vector,
+                context=vector_receipt_context(item.context, vector),
                 error_code=None,
                 error_message=None,
                 updated_at=func.now(),
@@ -2159,6 +2277,10 @@ def apply_openrouter_embedding_batch(
         if not vector or any(not math.isfinite(value) for value in vector):
             db_session.rollback()
             raise ValueError("OpenRouter Batch returned an invalid vector")
+        item = db_session.get(RegulatoryIndexingItem, item_id)
+        if item is None:
+            db_session.rollback()
+            return False
         persisted_id = db_session.scalar(
             update(RegulatoryIndexingItem)
             .where(
@@ -2175,6 +2297,7 @@ def apply_openrouter_embedding_batch(
             .values(
                 status=RegulatoryIndexingItemStatus.EMBEDDED.value,
                 vector=vector,
+                context=vector_receipt_context(item.context, vector),
                 error_code=None,
                 error_message=None,
                 updated_at=func.now(),
@@ -2800,6 +2923,8 @@ def finalize_regulatory_indexing_cancellation(
     job_id: UUID,
     expected_generation: int,
     now: datetime.datetime,
+    commit: bool = True,
+    preserve_published_history: bool = False,
 ) -> bool:
     """Clear derived payloads and terminalize the final cancellation phase."""
 
@@ -2869,7 +2994,13 @@ def finalize_regulatory_indexing_cancellation(
         locked_user_file.status = UserFileStatus.DELETING
     elif locked_user_file.status is not UserFileStatus.DELETING:
         locked_user_file.status = UserFileStatus.CANCELED
-    db_session.commit()
+    if (
+        preserve_published_history
+        and locked_user_file.status is not UserFileStatus.DELETING
+    ):
+        locked_user_file.status = UserFileStatus.COMPLETED
+    if commit:
+        db_session.commit()
     return True
 
 
@@ -3130,3 +3261,60 @@ def complete_regulatory_provider_cleanup(
     )
     db_session.commit()
     return completed_id is not None
+
+
+def freeze_regulatory_embedding_receipts(
+    db_session: Session,
+    *,
+    job_id: UUID,
+    expected_generation: int,
+    receipts: dict[UUID, "DurableEmbeddingReceipt"],
+) -> int | None:
+    """Freeze new requests and requeue only unproven completed vectors."""
+    from onyx.regulatory.indexing_jobs.embedding_receipts import has_proven_vector
+
+    job = _lock_openrouter_embedding_job(
+        db_session,
+        job_id=job_id,
+        expected_generation=expected_generation,
+    )
+    if job is None:
+        db_session.rollback()
+        return None
+    if job.openrouter_submission_state != "NONE":
+        db_session.rollback()
+        raise ValueError("cannot replace encoder receipts during an active submission")
+    items = list(
+        db_session.scalars(
+            select(RegulatoryIndexingItem)
+            .where(
+                RegulatoryIndexingItem.job_id == job_id,
+            )
+            .with_for_update()
+        )
+    )
+    if {item.id for item in items} != set(receipts):
+        db_session.rollback()
+        raise ValueError("embedding receipts do not cover the exact job items")
+    requeued = 0
+    for item in items:
+        receipt = receipts[item.id]
+        if has_proven_vector(item, receipt):
+            continue
+        context = dict(item.context or {})
+        if item.status == "EMBEDDED":
+            context["replaced_unproven_embedding"] = {
+                "vector_sha256": publication_digest(item.vector),
+                "attempt_count": item.embedding_attempt_count,
+            }
+            item.status = (
+                "CONTEXT_READY" if context.get("contextual_text") else "SKIPPED"
+            )
+            item.vector = None
+            item.embedding_attempt_count = 0
+            requeued += 1
+        context.pop("embedding_vector_receipt_sha256", None)
+        context["embedding_receipt"] = receipt.model_dump(mode="json")
+        item.context = context
+    db_session.commit()
+    return requeued

@@ -382,7 +382,13 @@ class ContextGenerationCall(BaseModel):
     generation_input_sha256: str = ""
     model_config = ConfigDict(extra="forbid", frozen=True)
     request_sha256: str
-    stage: Literal["summary", "chunk", "fallback_summary", "durable_chunk"]
+    stage: Literal[
+        "summary",
+        "chunk",
+        "fallback_summary",
+        "durable_chunk",
+        "durable_fitted_checkpoint",
+    ]
     prompt_json: str
     config_sha256: str
     output: str

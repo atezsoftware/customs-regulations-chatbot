@@ -160,6 +160,9 @@ def live_review(
     monkeypatch.setattr(job, "_session", session_context)
     monkeypatch.setattr(config, "REGULATORY_ANNEX_UPDATES_ENABLED", True)
     monkeypatch.setattr(config, "REGULATORY_ANNEX_ENVIRONMENT", "local-test")
+    monkeypatch.setattr(
+        "onyx.regulatory.publication_reads.REGULATORY_ANNEX_ENVIRONMENT", "local-test"
+    )
     docset = DocumentSet(name=str(uuid4()), description="", is_up_to_date=True)
     source_session.add(docset)
     source_session.flush()
@@ -640,13 +643,14 @@ def live_review(
     assert batch.processed_instruction_count == 2 and batch.status == "analyzed"
     assert capture_canonical_scope(source_session, file.id) == before
     retriever.search.assert_not_called()
+    original_file_id = file.file_id
     try:
         yield LiveReview(batch, groups[0], file, outside, before, llm)
     finally:
         if future_name:
             es[0].indices.delete(index=future_name)
         for file_id in [
-            file.file_id,
+            original_file_id,
             retained_image_id,
             asset.file_id,
             *[item.file_id for item in extra_assets],
@@ -655,7 +659,7 @@ def live_review(
             draft.publication.artifact_file_id if draft.publication else None,
         ]:
             if file_id:
-                store.delete_file(file_id)
+                store.delete_file(file_id, error_on_missing=False)
 
 
 def test_live_batch_prepares_annex_once_without_legacy_or_canonical_writes(

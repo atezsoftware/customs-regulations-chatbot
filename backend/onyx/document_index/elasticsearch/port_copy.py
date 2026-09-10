@@ -221,6 +221,48 @@ def copy_present_chunks_to_future(
     should_abort brackets each re-embed and precedes each write — it aborts a cancelled
     attempt and heartbeats so a slow-but-live port isn't stall-failed. surviving_doc_ids
     drops chunks of docs deleted mid-batch (no resurrection)."""
+    from uuid import UUID
+
+    from onyx.db.regulatory_index_lifecycle import (
+        active_port_setting_id,
+        port_user_file_ids,
+    )
+    from onyx.db.regulatory_writer_publication import writer_file_exists
+    from onyx.regulatory.writer_publication import republish_user_file
+    from shared_configs.contextvars import get_current_tenant_id
+
+    tenant_id = get_current_tenant_id()
+    owned_ids = port_user_file_ids(doc_ids, tenant_id)
+    chunks_written = 0
+    for identifier in doc_ids:
+        if identifier not in owned_ids:
+            continue
+        if should_abort is not None and should_abort():
+            return chunks_written, True
+        if not writer_file_exists(UUID(identifier), tenant_id):
+            continue
+
+        def may_publish() -> bool:
+            return (should_abort is None or not should_abort()) and (
+                surviving_doc_ids is None or identifier in surviving_doc_ids()
+            )
+
+        if may_publish():
+            chunks_written += republish_user_file(
+                UUID(identifier),
+                tenant_id,
+                target_search_settings_id=active_port_setting_id(
+                    future_index.index_name, tenant_id
+                ),
+                include_chunked=True,
+                adopt_original=True,
+                before_stage=may_publish,
+            )
+        if should_abort is not None and should_abort():
+            return chunks_written, True
+    doc_ids = [identifier for identifier in doc_ids if identifier not in owned_ids]
+    if not doc_ids:
+        return chunks_written, False
     pages: Iterable[list[DocumentChunkWithoutVectors]]
     # Contextual RAG-on AUGMENTATION: buffer to reassemble each doc (chunks span PIT pages), then
     # re-embed one doc per page so the unheartbeated per-chunk LLM re-enrichment is bounded
@@ -247,7 +289,6 @@ def copy_present_chunks_to_future(
     else:
         pages = present_client.iter_chunks_for_doc_ids(doc_ids)
 
-    chunks_written = 0
     for page_chunks in pages:
         # Heartbeat before re_embed (the longest gap), not just before writes; also
         # skips a needless re_embed on cancel.

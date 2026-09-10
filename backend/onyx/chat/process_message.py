@@ -307,7 +307,9 @@ def _load_context_user_files_for_tools(
             str(user_file.id),
         )
 
-        from onyx.db.regulatory_public_reads import current_protected_file_ids
+        from onyx.db.regulatory_original_ingestion import (
+            current_unavailable_original_file_ids,
+        )
         from onyx.document_index.publication_models import ReadObservation
         from onyx.regulatory.publication_reads import (
             observe_publication_read,
@@ -321,7 +323,7 @@ def _load_context_user_files_for_tools(
             observation: ReadObservation = observation,
         ) -> None:
             require_publication_files(observation, (user_file_id,))
-            if current_protected_file_ids((user_file_id,)):
+            if current_unavailable_original_file_ids((user_file_id,)):
                 raise OnyxError(
                     OnyxErrorCode.SERVICE_UNAVAILABLE,
                     "This versioned source requires dated search; its original cannot be staged as current evidence.",
@@ -336,6 +338,11 @@ def _load_context_user_files_for_tools(
             # exception propagate out of ChatFile.__getattribute__.
             try:
                 content = get_default_file_store().read_file(file_id, mode="b").read()
+                from onyx.file_processing.original_attachment import (
+                    require_original_attachment_bytes,
+                )
+
+                require_original_attachment_bytes(file_id, content)
                 return content
             except OnyxError:
                 raise
@@ -459,7 +466,7 @@ def extract_context_files(
     if not user_files:
         return _empty_extracted_context_files()
 
-    from onyx.db.regulatory_public_reads import protected_file_ids
+    from onyx.db.regulatory_original_ingestion import unavailable_original_file_ids
     from onyx.regulatory.publication_reads import (
         PublicationReadEvidence,
         observe_publication_read,
@@ -467,7 +474,9 @@ def extract_context_files(
     )
 
     observation = observe_publication_read()
-    protected = protected_file_ids(db_session, tuple(file.id for file in user_files))
+    protected = unavailable_original_file_ids(
+        db_session, tuple(file.id for file in user_files)
+    )
     if protected:
         if DISABLE_VECTOR_DB:
             raise OnyxError(

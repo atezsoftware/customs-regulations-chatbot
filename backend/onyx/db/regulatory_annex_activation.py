@@ -65,8 +65,7 @@ def close_preapproved_temporal_binding(
     )
     if (
         previous.id != updated.id
-        or previous.index.temporal_lookup_identity()
-        != updated.index.temporal_lookup_identity()
+        or not previous.index.matches_temporal_index(updated.index)
         or previous.effective_start != updated.effective_start
         or updated.effective_end is None
         or previous.effective_end is not None

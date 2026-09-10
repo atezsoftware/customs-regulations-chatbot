@@ -1,6 +1,8 @@
 import json
 import os
+from collections.abc import Callable
 from datetime import datetime, timezone
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from typing import IO, Any
@@ -304,6 +306,10 @@ class LocalFileConnector(LoadConnector):
         self.pdf_pass: str | None = None
         self._zip_metadata_file_id = zip_metadata_file_id
         self._zip_metadata_deprecated = zip_metadata
+        self._original_file_observer: Callable[[str, str], None] | None = None
+
+    def set_original_file_observer(self, observer: Callable[[str, str], None]) -> None:
+        self._original_file_observer = observer
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
         self.pdf_pass = credentials.get("pdf_password")
@@ -353,6 +359,13 @@ class LocalFileConnector(LoadConnector):
                 file_record.display_name, {}
             ) or zip_metadata.get(os.path.basename(file_record.display_name), {})
             file_io = file_store.read_file(file_id=file_id, mode="b")
+            if self._original_file_observer is not None:
+                content_hash = sha256()
+                while block := file_io.read(262144):
+                    content_hash.update(block)
+                digest = content_hash.hexdigest()
+                file_io.seek(0)
+                self._original_file_observer(file_id, digest)
             new_docs = _process_file(
                 file_id=file_id,
                 file_name=file_record.display_name,

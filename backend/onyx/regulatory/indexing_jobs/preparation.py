@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from onyx.connectors.models import Document
 from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.enums import RegulatoryIndexingStage, UserFileStatus
-from onyx.db.models import RegulatoryChunk, UserFile
+from onyx.db.models import RegulatoryChunk, RegulatoryIndexingJob, UserFile
 from onyx.db.regulatory_chunks import get_chunks_for_file_snapshot
 from onyx.db.regulatory_indexing_jobs import (
     claim_regulatory_indexing_job,
@@ -19,23 +19,21 @@ from onyx.db.regulatory_indexing_jobs import (
     get_regulatory_indexing_job,
 )
 from onyx.llm.constants import LlmProviderNames
-from onyx.natural_language_processing.utils import get_tokenizer
+from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
+from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
 from onyx.regulatory.indexing import (
     document_text_for_regulatory_indexing,
-    documents_to_regulatory_chunks,
 )
 from onyx.regulatory.indexing_jobs.configuration import (
     resolve_regulatory_indexing_snapshot,
 )
 from onyx.regulatory.indexing_jobs.contextual import (
-    ContextualRequestFactory,
     get_contextual_token_budget_tokenizer,
 )
 from onyx.regulatory.indexing_jobs.models import (
     RegulatoryIndexingConfigSnapshot,
     RegulatoryInputHashVersion,
 )
-from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchRequest
 
 
 def regulatory_documents_content_hash(
@@ -146,6 +144,47 @@ def resolve_regulatory_documents_input_hash_version(
     return matching_versions[0]
 
 
+def _create_owned_regulatory_indexing_job(
+    db_session: Session,
+    *,
+    user_file_id: UUID,
+    tenant_id: str,
+    snapshot: RegulatoryIndexingConfigSnapshot,
+    now: datetime.datetime,
+) -> RegulatoryIndexingJob:
+    from uuid import uuid4
+
+    from onyx.db.regulatory_publication import PublicationStore
+    from onyx.document_index.publication_models import PublicationScope
+    from onyx.regulatory.amendments.annexes import config
+    from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
+
+    db_session.rollback()
+    authority = PublicationStore(
+        PublicationScope(
+            tenant_id=tenant_id,
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
+        )
+    )
+    owner = authority.acquire(user_file_id, owner_id=uuid4(), ttl=LEASE_TTL)
+    try:
+        return create_or_get_regulatory_indexing_job(
+            db_session,
+            user_file_id=user_file_id,
+            content_hash=snapshot.input_content_hash,
+            search_settings_id=snapshot.search_settings_id,
+            prompt_hash=snapshot.prompt_hash,
+            chunk_generation_hash=snapshot.chunk_generation_hash,
+            config_snapshot=snapshot.model_dump(mode="json"),
+            now=now,
+            publication_owner=owner,
+        )
+    finally:
+        db_session.rollback()
+        authority.release(owner)
+
+
 def prepare_regulatory_indexing_job(
     user_file_id: UUID,
     documents: Sequence[Document],
@@ -169,14 +208,11 @@ def prepare_regulatory_indexing_job(
         input_hash_version=input_hash_version,
     )
     now = datetime.datetime.now(datetime.timezone.utc)
-    job = create_or_get_regulatory_indexing_job(
+    job = _create_owned_regulatory_indexing_job(
         db_session,
         user_file_id=user_file_id,
-        content_hash=content_hash,
-        search_settings_id=snapshot.search_settings_id,
-        prompt_hash=snapshot.prompt_hash,
-        chunk_generation_hash=snapshot.chunk_generation_hash,
-        config_snapshot=snapshot.model_dump(mode="json"),
+        tenant_id=tenant_id,
+        snapshot=snapshot,
         now=now,
     )
     if job.chunk_generation_hash != snapshot.chunk_generation_hash:
@@ -235,14 +271,11 @@ def prepare_regulatory_indexing_job_from_chunks(
         raise ValueError("CHUNKED user file generation does not match indexing config")
 
     now = datetime.datetime.now(datetime.timezone.utc)
-    job = create_or_get_regulatory_indexing_job(
+    job = _create_owned_regulatory_indexing_job(
         db_session,
         user_file_id=user_file_id,
-        content_hash=content_hash,
-        search_settings_id=snapshot.search_settings_id,
-        prompt_hash=snapshot.prompt_hash,
-        chunk_generation_hash=snapshot.chunk_generation_hash,
-        config_snapshot=snapshot.model_dump(mode="json"),
+        tenant_id=tenant_id,
+        snapshot=snapshot,
         now=now,
     )
     if job.content_hash != content_hash:
@@ -307,50 +340,16 @@ def prepare_claimed_regulatory_indexing_job_from_chunks(
         model_name=snapshot.vertex.model_name,
     )
 
-    def prepare_items() -> list[indexing_job_repository.RegulatoryIndexingPreparedItem]:
-        rows = get_chunks_for_file_snapshot(db_session, job.user_file_id)
-        if regulatory_chunks_content_hash(rows) != job.content_hash:
-            raise ValueError("canonical chunks changed after durable job creation")
-        request_factory = ContextualRequestFactory(
-            job=job,
-            rows=rows,
-            embedding_tokenizer=embedding_tokenizer,
-            contextual_tokenizer=contextual_tokenizer,
-        )
-        prepared_items: list[
-            indexing_job_repository.RegulatoryIndexingPreparedItem
-        ] = []
-        for row in rows:
-            contextual_reserve = request_factory.reserve(row)
-            request = (
-                request_factory.request(row)
-                if contextual_reserve > 0
-                else VertexBatchRequest(
-                    prompt=f"Context skipped for canonical chunk {row.id}"
-                )
-            )
-            prepared_items.append(
-                indexing_job_repository.RegulatoryIndexingPreparedItem(
-                    regulatory_chunk_id=row.id,
-                    request_hash=request.request_hash,
-                    skip_context=contextual_reserve == 0,
-                    source_snapshot=request_factory.source_snapshot(row),
-                    context_input=request_factory.request_provenance(row, request),
-                )
-            )
-        return prepared_items
-
-    persisted = indexing_job_repository.persist_regulatory_indexing_preparation(
-        db_session,
-        job_id=job.id,
+    return _prepare_claimed_owned_items(
+        job=job,
+        snapshot=snapshot,
         expected_generation=expected_generation,
-        prepare_items=prepare_items,
-        resolved_input_hash_version=RegulatoryInputHashVersion.CHUNK_ROWS_V3.value,
-        now=datetime.datetime.now(datetime.timezone.utc),
+        tenant_id=tenant_id,
+        db_session=db_session,
+        embedding_tokenizer=embedding_tokenizer,
+        contextual_tokenizer=contextual_tokenizer,
+        resolved_input_hash_version=RegulatoryInputHashVersion.CHUNK_ROWS_V3,
     )
-    if not persisted:
-        raise RuntimeError("regulatory indexing lease was lost during preparation")
-    return job.id
 
 
 def prepare_claimed_regulatory_indexing_job(
@@ -392,54 +391,106 @@ def prepare_claimed_regulatory_indexing_job(
         model_name=snapshot.vertex.model_name,
     )
 
-    def prepare_items() -> list[indexing_job_repository.RegulatoryIndexingPreparedItem]:
-        documents_to_regulatory_chunks(
-            documents=documents,
-            db_session=db_session,
-            tokenizer=embedding_tokenizer,
-            enable_contextual_rag=True,
-        )
-        rows = get_chunks_for_file_snapshot(db_session, job.user_file_id)
-        if not rows:
-            raise ValueError("regulatory indexing produced no canonical chunks")
-
-        prepared_items: list[
-            indexing_job_repository.RegulatoryIndexingPreparedItem
-        ] = []
-        request_factory = ContextualRequestFactory(
-            job=job,
-            rows=rows,
-            embedding_tokenizer=embedding_tokenizer,
-            contextual_tokenizer=contextual_tokenizer,
-        )
-        for row in rows:
-            contextual_reserve = request_factory.reserve(row)
-            request = (
-                request_factory.request(row)
-                if contextual_reserve > 0
-                else VertexBatchRequest(
-                    prompt=f"Context skipped for canonical chunk {row.id}"
-                )
-            )
-            prepared_items.append(
-                indexing_job_repository.RegulatoryIndexingPreparedItem(
-                    regulatory_chunk_id=row.id,
-                    request_hash=request.request_hash,
-                    skip_context=contextual_reserve == 0,
-                    source_snapshot=request_factory.source_snapshot(row),
-                    context_input=request_factory.request_provenance(row, request),
-                )
-            )
-        return prepared_items
-
-    persisted = indexing_job_repository.persist_regulatory_indexing_preparation(
-        db_session,
-        job_id=job.id,
+    return _prepare_claimed_owned_items(
+        job=job,
+        snapshot=snapshot,
         expected_generation=expected_generation,
-        prepare_items=prepare_items,
-        resolved_input_hash_version=resolved_input_hash_version.value,
-        now=datetime.datetime.now(datetime.timezone.utc),
+        tenant_id=tenant_id,
+        db_session=db_session,
+        embedding_tokenizer=embedding_tokenizer,
+        contextual_tokenizer=contextual_tokenizer,
+        resolved_input_hash_version=resolved_input_hash_version,
+        documents=documents,
     )
-    if not persisted:
-        raise RuntimeError("regulatory indexing lease was lost during preparation")
-    return job.id
+
+
+def _prepare_claimed_owned_items(
+    *,
+    job: RegulatoryIndexingJob,
+    snapshot: RegulatoryIndexingConfigSnapshot,
+    expected_generation: int,
+    tenant_id: str,
+    db_session: Session,
+    embedding_tokenizer: BaseTokenizer,
+    contextual_tokenizer: BaseTokenizer,
+    resolved_input_hash_version: RegulatoryInputHashVersion,
+    documents: Sequence[Document] | None = None,
+) -> UUID:
+    from datetime import timedelta
+    from uuid import uuid4
+
+    from onyx.db.regulatory_publication import PublicationStore
+    from onyx.db.regulatory_writer_publication import load_owned_writer_inputs
+    from onyx.document_index.publication_models import PublicationScope
+    from onyx.regulatory.amendments.annexes import config
+    from onyx.regulatory.amendments.annexes.publication_execution import (
+        publication_heartbeat,
+    )
+    from onyx.regulatory.indexing_jobs.projection_preparation import (
+        prepare_owned_durable_items,
+    )
+    from onyx.regulatory.writer_publication import recover_owned_writer_before_next
+
+    file_id = job.user_file_id
+    db_session.rollback()
+    authority = PublicationStore(
+        PublicationScope(
+            tenant_id=tenant_id,
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
+        )
+    )
+    owner = authority.acquire(file_id, owner_id=uuid4(), ttl=timedelta(minutes=2))
+    try:
+        owner = recover_owned_writer_before_next(owner)
+        inputs = load_owned_writer_inputs(owner)
+        if not inputs.canonical:
+            if not documents:
+                raise ValueError(
+                    "durable preparation has no canonical chunks or original document"
+                )
+            from onyx.db.regulatory_writer_publication import (
+                persist_owned_initial_chunks,
+            )
+
+            persist_owned_initial_chunks(
+                owner,
+                documents,
+                embedding_tokenizer,
+                contextual=True,
+                generation_hash=snapshot.chunk_generation_hash,
+                preparing_job_id=job.id,
+                preparing_job_generation=expected_generation,
+            )
+            inputs = load_owned_writer_inputs(owner)
+        if (
+            resolved_input_hash_version is RegulatoryInputHashVersion.CHUNK_ROWS_V3
+            and regulatory_chunks_content_hash(
+                canonical_snapshot_rows(inputs.canonical)
+            )
+            != job.content_hash
+        ):
+            raise ValueError("canonical chunks changed after durable job creation")
+        with publication_heartbeat(owner):
+            prepared_items = prepare_owned_durable_items(
+                owner=owner,
+                job=job,
+                inputs=inputs,
+                embedding_tokenizer=embedding_tokenizer,
+                contextual_tokenizer=contextual_tokenizer,
+            )
+        persisted = indexing_job_repository.persist_regulatory_indexing_preparation(
+            db_session,
+            job_id=job.id,
+            expected_generation=expected_generation,
+            prepare_items=lambda: prepared_items,
+            resolved_input_hash_version=resolved_input_hash_version.value,
+            now=datetime.datetime.now(datetime.timezone.utc),
+            publication_owner=owner,
+        )
+        if not persisted:
+            raise RuntimeError("regulatory indexing lease was lost during preparation")
+        return job.id
+    finally:
+        db_session.rollback()
+        authority.release(owner)

@@ -97,6 +97,11 @@ def load_chat_file_by_id(file_id: str) -> InMemoryChatFile:
 
     file_io = file_store.read_file(file_id, mode="b")
     content = file_io.read()
+    from onyx.file_processing.original_attachment import (
+        require_original_attachment_bytes,
+    )
+
+    require_original_attachment_bytes(file_id, content)
     require_publication_files(observation, parents)
     return InMemoryChatFile(
         file_id=file_id,
@@ -115,7 +120,7 @@ def load_user_file(file_id: UUID, db_session: Session) -> InMemoryChatFile:
 
     # Get the file record to determine the appropriate chat file type
     file_store = get_default_file_store()
-    from onyx.db.regulatory_public_reads import protected_file_ids
+    from onyx.db.regulatory_original_ingestion import unavailable_original_file_ids
     from onyx.error_handling.error_codes import OnyxErrorCode
     from onyx.error_handling.exceptions import OnyxError
     from onyx.regulatory.publication_reads import (
@@ -124,13 +129,22 @@ def load_user_file(file_id: UUID, db_session: Session) -> InMemoryChatFile:
     )
 
     observation = observe_publication_read()
-    if protected_file_ids(db_session, (user_file.id,)):
+    if unavailable_original_file_ids(db_session, (user_file.id,)):
         raise OnyxError(
             OnyxErrorCode.SERVICE_UNAVAILABLE,
             "This versioned source requires dated search instead of its original file.",
         )
     require_publication_files(observation, (user_file.id,))
     file_record = file_store.read_file_record(user_file.file_id)
+    from onyx.db.regulatory_public_reads import protected_file_ids
+    from onyx.file_processing.original_attachment import (
+        require_original_attachment_bytes,
+    )
+
+    protected = bool(protected_file_ids(db_session, (user_file.id,)))
+    if protected:
+        original_bytes = file_store.read_file(user_file.file_id, mode="b").read()
+        require_original_attachment_bytes(user_file.file_id, original_bytes)
 
     # Determine appropriate chat file type based on the original file's MIME type
     chat_file_type = mime_type_to_chat_file_type(file_record.file_type)
@@ -142,6 +156,10 @@ def load_user_file(file_id: UUID, db_session: Session) -> InMemoryChatFile:
     try:
         file_io = file_store.read_file(plaintext_file_name, mode="b")
         plaintext_bytes = file_io.read()
+        if protected:
+            require_original_attachment_bytes(
+                user_file.file_id, plaintext_bytes, plaintext=True
+            )
         # An empty plaintext entry is a "we tried and there is no text"
         # sentinel written by `_get_or_extract_plaintext` / `store_plaintext`
         # for unprocessable files (e.g. .zip).  Treat it as a cache miss
@@ -179,9 +197,11 @@ def load_user_file(file_id: UUID, db_session: Session) -> InMemoryChatFile:
         # Fall back to original file if plaintext not available
         file_io = file_store.read_file(user_file.file_id, mode="b")
 
+        original_content = file_io.read()
+        require_original_attachment_bytes(user_file.file_id, original_content)
         chat_file = InMemoryChatFile(
             file_id=str(user_file.file_id),
-            content=file_io.read(),
+            content=original_content,
             file_type=chat_file_type,
             filename=user_file.name,
         )

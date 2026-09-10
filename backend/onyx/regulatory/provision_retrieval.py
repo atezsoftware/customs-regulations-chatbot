@@ -131,10 +131,8 @@ def _query_indexes(
             continue
         file_id = UUID(chunk.document_id)
         previous = indexes.get(file_id)
-        if (
-            previous is not None
-            and previous.temporal_lookup_identity()
-            != chunk.publication_index.temporal_lookup_identity()
+        if previous is not None and not previous.matches_temporal_index(
+            chunk.publication_index
         ):
             raise ValueError("cannot mix physical query index identities")
         indexes[file_id] = chunk.publication_index

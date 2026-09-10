@@ -1154,7 +1154,21 @@ def test_elasticsearch_verification_count_is_tenant_scoped() -> None:
     ]["filter"]
 
 
-def test_elasticsearch_mget_parser_correlates_out_of_order_chunks() -> None:
+def test_elasticsearch_mget_parser_correlates_out_of_order_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory import publication_reads
+    from onyx.document_index.publication_models import PublicationScope, ReadObservation
+
+    store = MagicMock()
+    store.observe.return_value = ReadObservation(
+        scope=PublicationScope(
+            tenant_id="public", environment="unit", database_identity="unit"
+        ),
+        committed_epoch=0,
+    )
+    store.unavailable.return_value = frozenset()
+    monkeypatch.setattr(publication_reads, "public_read_store", lambda: store)
     document_id = str(uuid4())
     chunk_ids = [f"chunk-{index}" for index in range(2)]
     chunks = [
