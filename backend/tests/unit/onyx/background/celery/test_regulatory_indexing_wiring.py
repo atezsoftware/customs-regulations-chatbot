@@ -162,7 +162,6 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
         "monitor_celery_queues",
     }
     from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
-
     from onyx.regulatory.amendments.annexes.config import publication_queue_name
 
     assert {template["options"]["queue"] for template in templates} == {
@@ -201,7 +200,13 @@ def test_lite_global_and_regulatory_beat_schedules_do_not_overlap() -> None:
     assert global_beat_tasks.isdisjoint(regulatory_beat_tasks)
 
 
-def test_production_lite_scheduler_expands_every_task_with_each_tenant_id() -> None:
+@pytest.mark.parametrize("annex_enabled", [False, True])
+def test_production_lite_scheduler_expands_every_task_with_each_tenant_id(
+    monkeypatch: pytest.MonkeyPatch, annex_enabled: bool
+) -> None:
+    from onyx.regulatory.amendments.annexes import config as annex_config
+
+    monkeypatch.setattr(annex_config, "REGULATORY_ANNEX_WORKER_ENABLED", annex_enabled)
     beat_app = importlib.import_module(
         "onyx.background.celery.apps.regulatory_indexing_beat"
     )
@@ -210,7 +215,8 @@ def test_production_lite_scheduler_expands_every_task_with_each_tenant_id() -> N
         ["public", "tenant-a"]
     )
 
-    assert len(schedule) == 8
+    assert len(schedule) == (8 if annex_enabled else 6)
+    assert ("recover-annex-publications-public" in schedule) is annex_enabled
     assert {entry["kwargs"]["tenant_id"] for entry in schedule.values()} == {
         "public",
         "tenant-a",
@@ -229,9 +235,13 @@ def test_production_lite_scheduler_expands_every_task_with_each_tenant_id() -> N
     )
 
 
+@pytest.mark.parametrize("annex_enabled", [False, True])
 def test_production_lite_scheduler_rebuilds_schedule_across_restart(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, annex_enabled: bool
 ) -> None:
+    from onyx.regulatory.amendments.annexes import config as annex_config
+
+    monkeypatch.setattr(annex_config, "REGULATORY_ANNEX_WORKER_ENABLED", annex_enabled)
     beat_app = importlib.import_module(
         "onyx.background.celery.apps.regulatory_indexing_beat"
     )
@@ -249,6 +259,8 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
         "recover-stale-regulatory-indexing-public",
         "monitor-celery-queues-public",
     }
+    if not annex_enabled:
+        expected_names.remove("recover-annex-publications-public")
     assert set(scheduler.schedule) == expected_names
     scheduler.close()
 
@@ -265,9 +277,13 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
         restarted.close()
 
 
+@pytest.mark.parametrize("annex_enabled", [False, True])
 def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, annex_enabled: bool
 ) -> None:
+    from onyx.regulatory.amendments.annexes import config as annex_config
+
+    monkeypatch.setattr(annex_config, "REGULATORY_ANNEX_WORKER_ENABLED", annex_enabled)
     beat_app = importlib.import_module(
         "onyx.background.celery.apps.regulatory_indexing_beat"
     )
@@ -307,6 +323,8 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
         "regulatory_indexing_recover_stale": 60,
         "recover_annex_publications": 60,
     }
+    if not annex_enabled:
+        del tasks["recover_annex_publications"]
     entry_names = {
         f"{entry_prefix}-{tenant}"
         for entry_prefix in (
@@ -316,6 +334,7 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
             "recover-annex-publications",
         )
         for tenant in tenants
+        if annex_enabled or entry_prefix != "recover-annex-publications"
     }
     scheduler_app = Celery(
         "regulatory_indexing_beat_entry_isolation_test",
@@ -384,7 +403,7 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
         assert Counter(publications) == Counter(
             {publication: 1 for publication in expected_publications}
         )
-        assert len(claim_store.claims) == 8
+        assert len(claim_store.claims) == (8 if annex_enabled else 6)
         assert {claim[0] for claim in claim_store.claims} == set(tenants)
         for tenant_id, claim_key, ttl in claim_store.claims:
             tenant_entry_names = {
@@ -532,7 +551,13 @@ def test_scheduler_tick_fails_closed_when_redis_claim_fails(tmp_path: Path) -> N
         scheduler.close()
 
 
-def test_scheduler_recovers_a_corrupt_pod_local_schedule(tmp_path: Path) -> None:
+@pytest.mark.parametrize("annex_enabled", [False, True])
+def test_scheduler_recovers_a_corrupt_pod_local_schedule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, annex_enabled: bool
+) -> None:
+    from onyx.regulatory.amendments.annexes import config as annex_config
+
+    monkeypatch.setattr(annex_config, "REGULATORY_ANNEX_WORKER_ENABLED", annex_enabled)
     beat_app = importlib.import_module(
         "onyx.background.celery.apps.regulatory_indexing_beat"
     )
@@ -547,12 +572,15 @@ def test_scheduler_recovers_a_corrupt_pod_local_schedule(tmp_path: Path) -> None
     try:
         with patch.object(beat_app, "get_all_tenant_ids", return_value=["public"]):
             scheduler.update_schedule()
-        assert set(scheduler.schedule) == {
+        expected_names = {
             "recover-annex-publications-public",
             "recover-stale-regulatory-amendments-public",
             "recover-stale-regulatory-indexing-public",
             "monitor-celery-queues-public",
         }
+        if not annex_enabled:
+            expected_names.remove("recover-annex-publications-public")
+        assert set(scheduler.schedule) == expected_names
     finally:
         scheduler.close()
 
