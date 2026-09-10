@@ -210,6 +210,12 @@ def search_chunks(
     embedding_model: EmbeddingModel | None = None,
     prefetched_federated_retrieval_infos: list[FederatedRetrievalInfo] | None = None,
 ) -> list[InferenceChunk]:
+    from onyx.regulatory.publication_reads import (
+        filter_publication_read,
+        observe_publication_read,
+    )
+
+    observation = observe_publication_read()
     run_queries: list[tuple[Callable, tuple]] = []
 
     source_filters = (
@@ -278,7 +284,9 @@ def search_chunks(
             query_request.filters,
         )
 
-    return top_chunks
+    return filter_publication_read(
+        observation, top_chunks, lambda chunk: chunk.document_id
+    )
 
 
 # TODO: This is unused code.

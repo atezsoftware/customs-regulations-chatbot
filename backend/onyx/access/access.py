@@ -284,6 +284,19 @@ def user_can_access_chat_file(file_id: str, user: User, db_session: Session) -> 
     if db_session.execute(chat_file_stmt).first() is not None:
         return True
 
+    from onyx.db.regulatory_public_reads import public_file_source_owners
+
+    source_owners = public_file_source_owners(db_session, file_id)
+    if source_owners:
+        user_acl = get_acl_for_user(user, db_session)
+        if any(
+            access.to_acl() & user_acl
+            for access in get_access_for_user_files(
+                [str(owner) for owner in source_owners], db_session
+            ).values()
+        ):
+            return True
+
     # TODO: CHAT_IMAGE_GEN files are public because the bytes land in the
     # store before the linking tool-call row is written; tightening this
     # requires reordering the streaming/tool-call writes. Kept above the

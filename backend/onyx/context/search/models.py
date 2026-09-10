@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from onyx.configs.constants import DocumentSource
 from onyx.db.models import SearchSettings
+from onyx.document_index.publication_models import (
+    PublicationIndexSnapshot,
+    ReadObservation,
+)
 from onyx.indexing.models import BaseChunk, IndexingSetting
 from onyx.tools.tool_implementations.web_search.models import WEB_SEARCH_PREFIX
 
@@ -213,6 +217,13 @@ class ContextExpansionType(str, Enum):
 
 
 class InferenceChunk(BaseChunk):
+    publication_index: "PublicationIndexSnapshot | None" = Field(
+        default=None, exclude=True
+    )
+    structural_position: int | None = Field(default=None, exclude=True)
+    retrieval_index_name: str | None = Field(default=None, exclude=True)
+    publication_observation: ReadObservation | None = Field(default=None, exclude=True)
+
     document_id: str
     source_type: DocumentSource
     semantic_identifier: str
@@ -312,7 +323,13 @@ class InferenceChunkUncleaned(InferenceChunk):
             if k
             not in ["metadata_suffix"]  # May be other fields to throw out in the future
         }
-        return InferenceChunk(**inference_chunk_data)
+        return InferenceChunk(
+            **inference_chunk_data,
+            publication_index=self.publication_index,
+            structural_position=self.structural_position,
+            retrieval_index_name=self.retrieval_index_name,
+            publication_observation=self.publication_observation,
+        )
 
 
 class InferenceSection(BaseModel):

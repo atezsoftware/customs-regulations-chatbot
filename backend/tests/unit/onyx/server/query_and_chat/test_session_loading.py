@@ -17,6 +17,7 @@ def test_reloaded_citation_packet_preserves_exact_source_identity() -> None:
         ChatMessage,
         SimpleNamespace(
             id=10,
+            publication_read=None,
             message_type=MessageType.ASSISTANT,
             tool_calls=[],
             citations={1: 77},

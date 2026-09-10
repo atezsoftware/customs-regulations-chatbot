@@ -259,6 +259,7 @@ def _make_setup(n_models: int = 1) -> MagicMock:
     setup.check_is_connected = MagicMock(return_value=True)
     setup.reserved_messages = [MagicMock() for _ in range(n_models)]
     setup.reserved_token_count = 100
+    setup.extracted_context_files.publication_evidence = None
     # Fields consumed by SearchToolConfig / CustomToolConfig / FileReaderToolConfig
     # constructors inside _run_model — must be typed correctly for Pydantic.
     setup.new_msg_req.deep_research = False

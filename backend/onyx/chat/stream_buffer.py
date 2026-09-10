@@ -21,6 +21,10 @@ from onyx.configs.chat_configs import (
     CHAT_STREAM_BUFFER_MAX_BYTES,
     CHAT_STREAM_BUFFER_TTL_S,
 )
+from onyx.regulatory.publication_reads import (
+    PublicationReadEvidence,
+    evidence_unavailable,
+)
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -35,6 +39,8 @@ class StreamBufferMeta(BaseModel):
     chunk_count: int = 0
     done: bool = False
     truncated: bool = False
+    publication_evidence: list[PublicationReadEvidence] = []
+    publication_message_ids: list[int] = []
 
 
 class StreamChunkRead(BaseModel):
@@ -45,6 +51,18 @@ class StreamChunkRead(BaseModel):
     next_cursor: int
     done: bool
     gap: bool
+    publication_evidence: list[PublicationReadEvidence] = []
+    publication_message_ids: list[int] = []
+
+    def finalize_consumed_sources(self) -> None:
+        from onyx.db.regulatory_chat_reads import finalize_message_publication_read
+
+        if self.sources_available():
+            for message_id in self.publication_message_ids:
+                finalize_message_publication_read(message_id)
+
+    def sources_available(self) -> bool:
+        return not any(evidence_unavailable(item) for item in self.publication_evidence)
 
 
 def _chunk_key(chat_session_id: UUID, run_id: int, chunk_n: int) -> str:
@@ -77,9 +95,41 @@ class StreamBufferWriter:
     def run_id(self) -> int:
         return self._run_id
 
-    def append_line(self, line: str) -> None:
+    def append_line(
+        self,
+        line: str,
+        *,
+        evidence: PublicationReadEvidence | None = None,
+        message_id: int | None = None,
+    ) -> None:
         if self._meta.truncated or self._meta.done:
             return
+        if evidence is not None:
+            if (
+                message_id is not None
+                and message_id not in self._meta.publication_message_ids
+            ):
+                self._meta.publication_message_ids.append(message_id)
+            for index, previous in enumerate(self._meta.publication_evidence):
+                if previous.observation == evidence.observation:
+                    self._meta.publication_evidence[index] = PublicationReadEvidence(
+                        observation=evidence.observation,
+                        user_file_ids=tuple(
+                            sorted(
+                                set(previous.user_file_ids)
+                                | set(evidence.user_file_ids)
+                            )
+                        ),
+                    )
+                    break
+            else:
+                self._meta.publication_evidence.append(evidence)
+            if evidence_unavailable(evidence):
+                self._meta.truncated = True
+                self._pending = []
+                self._pending_bytes = 0
+                self._write_meta(CHAT_STREAM_BUFFER_TTL_S)
+                return
         self._pending.append(line)
         self._pending_bytes += len(line)
         if self._pending_bytes >= _FLUSH_THRESHOLD_BYTES:
@@ -87,6 +137,12 @@ class StreamBufferWriter:
 
     def flush(self) -> None:
         if not self._pending or self._meta.truncated or self._meta.done:
+            return
+        if any(evidence_unavailable(item) for item in self._meta.publication_evidence):
+            self._meta.truncated = True
+            self._pending = []
+            self._pending_bytes = 0
+            self._write_meta(CHAT_STREAM_BUFFER_TTL_S)
             return
         payload = zlib.compress("".join(self._pending).encode("utf-8"))
         self._pending = []
@@ -186,6 +242,16 @@ def read_stream_chunks(
         )
         return None
 
+    if any(evidence_unavailable(item) for item in meta.publication_evidence):
+        return StreamChunkRead(
+            blocks=[],
+            next_cursor=cursor,
+            done=meta.done,
+            gap=True,
+            publication_evidence=meta.publication_evidence,
+            publication_message_ids=meta.publication_message_ids,
+        )
+
     blocks: list[str] = []
     chunk_n = cursor
     gap = meta.truncated
@@ -209,4 +275,15 @@ def read_stream_chunks(
             break
         chunk_n += 1
 
-    return StreamChunkRead(blocks=blocks, next_cursor=chunk_n, done=meta.done, gap=gap)
+    read = StreamChunkRead(
+        blocks=blocks,
+        next_cursor=chunk_n,
+        done=meta.done,
+        gap=gap,
+        publication_evidence=meta.publication_evidence,
+        publication_message_ids=meta.publication_message_ids,
+    )
+    if not read.sources_available():
+        read.blocks = []
+        read.gap = True
+    return read

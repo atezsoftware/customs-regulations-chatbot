@@ -975,6 +975,21 @@ def translate_db_message_to_chat_message_detail(
         model_display_name=chat_message.model_display_name,
     )
 
+    from onyx.db.regulatory_chat_reads import message_publication_available
+    from onyx.regulatory.publication_reads import PublicationReadChanged
+
+    if not message_publication_available(chat_message):
+        error = str(PublicationReadChanged())
+        return chat_msg_detail.model_copy(
+            update={
+                "message": error,
+                "error": error,
+                "context_docs": [],
+                "citations": None,
+                "reasoning_tokens": None,
+                "files": [],
+            }
+        )
     return chat_msg_detail
 
 
@@ -1119,3 +1134,26 @@ def update_db_session_with_messages(
         db_session.flush()
 
     return chat_message
+
+
+def invalidate_publication_chat_message(message_id: int, error: str) -> None:
+    """Discard this ongoing run's saved source-dependent result after epoch drift."""
+    from onyx.db.engine.sql_engine import get_session_with_current_tenant
+
+    with get_session_with_current_tenant() as session:
+        message = session.get(ChatMessage, message_id)
+        if message is None:
+            return
+        message.message = error
+        message.error = error
+        message.reasoning_tokens = None
+        message.citations = None
+        message.search_docs = []
+        pending = list(message.tool_calls or [])
+        while pending:
+            tool = pending.pop()
+            pending.extend(tool.tool_call_children)
+            tool.tool_call_response = ""
+            tool.reasoning_tokens = None
+            tool.search_docs = []
+        session.commit()

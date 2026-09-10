@@ -1,4 +1,5 @@
 import copy
+import datetime
 import json
 import logging
 import statistics
@@ -51,6 +52,7 @@ from onyx.document_index.elasticsearch.search import (
     DEFAULT_ELASTICSEARCH_MAX_RESULT_WINDOW,
 )
 from onyx.document_index.interfaces_new import TenantState
+from onyx.document_index.publication_models import PublicationIndexSnapshot
 from onyx.server.metrics.elasticsearch_search import (
     observe_elasticsearch_search,
     record_elasticsearch_search_error,
@@ -1585,7 +1587,11 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                     DOCUMENT_ID_FIELD_NAME: {"value": document_id},
                 }
             },
-            source_includes=[CHUNK_INDEX_FIELD_NAME, REGULATORY_CHUNK_ID_FIELD_NAME],
+            source_includes=[
+                CHUNK_INDEX_FIELD_NAME,
+                REGULATORY_CHUNK_ID_FIELD_NAME,
+                "publication_tombstone",
+            ],
         )
         response = (
             raw_response if isinstance(raw_response, dict) else dict(raw_response.body)
@@ -1613,6 +1619,8 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 raise ElasticsearchUpdateError(
                     "Elasticsearch returned an incomplete regulatory identity."
                 )
+            if source.get("publication_tombstone") is True:
+                continue
             chunk_index = source.get(CHUNK_INDEX_FIELD_NAME)
             regulatory_chunk_id = source.get(REGULATORY_CHUNK_ID_FIELD_NAME)
             if not isinstance(chunk_index, int) or not isinstance(
@@ -1634,6 +1642,12 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             return {}
         if len(set(document_chunk_ids)) != len(document_chunk_ids):
             raise ValueError("document_chunk_ids must be unique")
+        from onyx.regulatory.publication_reads import (
+            filter_publication_read,
+            observe_publication_read,
+        )
+
+        observation = observe_publication_read()
         expected_ids = set(document_chunk_ids)
         response = self._client.mget(
             index=self._index_name,
@@ -1681,6 +1695,9 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 raise ElasticsearchUpdateError(
                     "Elasticsearch returned a chunk without a source during verification."
                 )
+            if source.get("publication_tombstone") is True:
+                missing.append(chunk_id)
+                continue
             try:
                 chunks[chunk_id] = DocumentChunk.model_validate(source)
             except ValueError as error:
@@ -1688,6 +1705,14 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                     "Elasticsearch returned an invalid chunk during verification."
                 ) from error
 
+        available = filter_publication_read(
+            observation, list(chunks.values()), lambda chunk: chunk.document_id
+        )
+        available_ids = {id(chunk) for chunk in available}
+        for chunk_id, chunk in list(chunks.items()):
+            if id(chunk) not in available_ids:
+                missing.append(chunk_id)
+                del chunks[chunk_id]
         missing.extend(sorted(expected_ids - set(chunks) - set(missing)))
         if missing:
             raise ElasticsearchDocumentMissingError(sorted(missing))
@@ -1718,6 +1743,12 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             document_chunk_id,
             self._index_name,
         )
+        from onyx.regulatory.publication_reads import (
+            filter_publication_read,
+            observe_publication_read,
+        )
+
+        observation = observe_publication_read()
         result = self._client.get(
             index=self._index_name,
             id=document_chunk_id,
@@ -1739,12 +1770,24 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 f'Document chunk with ID "{document_chunk_id}" has no data.'
             )
 
+        if document_chunk_source.get("publication_tombstone") is True:
+            raise RuntimeError(
+                f'Document chunk with ID "{document_chunk_id}" was not found.'
+            )
+
         logger.debug(
             "Successfully got document chunk %s from index %s.",
             document_chunk_id,
             self._index_name,
         )
-        return DocumentChunk.model_validate(document_chunk_source)
+        chunk = DocumentChunk.model_validate(document_chunk_source)
+        if not filter_publication_read(
+            observation, [chunk], lambda item: item.document_id
+        ):
+            raise RuntimeError(
+                f'Document chunk with ID "{document_chunk_id}" was not found.'
+            )
+        return chunk
 
     @log_function_time(print_only=True, debug_only=True)
     def search(
@@ -1752,6 +1795,8 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         body: dict[str, Any],
         normalization_method: str | None,
         search_type: ElasticsearchSearchType = ElasticsearchSearchType.UNKNOWN,
+        as_of_date: datetime.date | None = None,
+        publication_index: PublicationIndexSnapshot | None = None,
     ) -> list[SearchHit[DocumentChunkWithoutVectors]]:
         """Searches the index.
 
@@ -1784,6 +1829,12 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             self._index_name,
             normalization_method,
         )
+        from onyx.regulatory.publication_reads import (
+            filter_publication_read,
+            observe_publication_read,
+        )
+
+        observation = observe_publication_read()
         result: dict[str, Any]
         ctx = self._get_emit_metrics_context_manager(search_type)
         with ctx:
@@ -1836,6 +1887,8 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 raise RuntimeError(
                     f'Document chunk with ID "{hit.get("_id", "")}" has no data.'
                 )
+            if document_chunk_source.get("publication_tombstone") is True:
+                continue
             document_chunk_score = hit.get("_score", None)
             match_highlights: dict[str, list[str]] = hit.get("highlight", {})
             explanation: dict[str, Any] | None = hit.get("_explanation", None)
@@ -1853,7 +1906,105 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             self._index_name,
             len(search_hits),
         )
-        return search_hits
+        from onyx.db.regulatory_public_reads import (
+            current_qualified_file_ids,
+            query_temporal_bindings,
+            resolve_public_query_index,
+        )
+        from onyx.regulatory.publication_reads import file_uuid
+
+        file_ids = tuple(
+            {
+                file_id
+                for hit in search_hits
+                if (file_id := file_uuid(hit.document_chunk.document_id)) is not None
+            }
+        )
+        qualified = current_qualified_file_ids(file_ids) if file_ids else frozenset()
+        if qualified:
+            index_uuid = self._client.indices.get(index=self._index_name)[
+                self._index_name
+            ]["settings"]["index"]["uuid"]
+            query_index = publication_index or resolve_public_query_index(
+                self._index_name, index_uuid
+            )
+            if (
+                query_index.index_name != self._index_name
+                or query_index.index_uuid != index_uuid
+            ):
+                raise ValueError(
+                    "qualified query physical index differs from frozen authority"
+                )
+            bindings = query_temporal_bindings(
+                tuple(qualified),
+                index=query_index,
+                as_of_date=as_of_date or datetime.date.today(),
+            )
+            by_slot = {
+                (str(file_id), binding.projection.ordinal): binding
+                for file_id, items in bindings.items()
+                for binding in items
+            }
+            qualified_hits = []
+            for hit in search_hits:
+                chunk = hit.document_chunk
+                if file_uuid(chunk.document_id) not in qualified:
+                    qualified_hits.append(hit)
+                    continue
+                binding = by_slot.get((chunk.document_id, chunk.chunk_index))
+                if binding is None:
+                    continue
+                expected = DocumentChunkWithoutVectors.model_validate_json(
+                    binding.projection.source_json
+                )
+                if expected != chunk:
+                    raise ValueError(
+                        "indexed temporal representation differs from activated binding"
+                    )
+                qualified_hits.append(
+                    hit.model_copy(
+                        update={
+                            "document_chunk": chunk.model_copy(
+                                update={
+                                    "publication_index": query_index,
+                                    "semantic_position": binding.semantic_position,
+                                }
+                            ),
+                        }
+                    )
+                )
+            search_hits = qualified_hits
+        from onyx.db.regulatory_public_reads import current_canonical_positions
+
+        canonical_ids = tuple(
+            {
+                hit.document_chunk.regulatory_chunk_id
+                for hit in search_hits
+                if hit.document_chunk.regulatory_chunk_id
+            }
+        )
+        positions = current_canonical_positions(canonical_ids) if canonical_ids else {}
+        search_hits = [
+            hit.model_copy(
+                update={
+                    "document_chunk": hit.document_chunk.model_copy(
+                        update={
+                            "retrieval_index_name": self._index_name,
+                            "publication_observation": observation,
+                            "semantic_position": hit.document_chunk.semantic_position
+                            if hit.document_chunk.semantic_position is not None
+                            else positions.get(
+                                hit.document_chunk.regulatory_chunk_id or ""
+                            ),
+                        }
+                    ),
+                }
+            )
+            for hit in search_hits
+        ]
+        return filter_publication_read(
+            observation, search_hits, lambda hit: hit.document_chunk.document_id
+        )
 
     def _search_hybrid_fusion(self, body: dict[str, Any]) -> dict[str, Any]:
         """Fuse independent query lanes without requiring the retriever API."""
@@ -1964,104 +2115,24 @@ class ElasticsearchIndexClient(ElasticsearchClient):
         body: dict[str, Any],
         search_type: ElasticsearchSearchType = ElasticsearchSearchType.UNKNOWN,
     ) -> list[str]:
-        """Searches the index and returns only document chunk IDs.
+        """Return IDs from the same guarded, current qualified public inventory."""
+        from shared_configs.configs import MULTI_TENANT
+        from shared_configs.contextvars import get_current_tenant_id
 
-        In order to take advantage of the performance benefits of only returning
-        IDs, the body should have a key, value pair of "_source": False.
-        Otherwise, Elasticsearch will return the entire document body and this
-        method's performance will be the same as the search method's.
-
-        TODO(andrei): Ideally we could check that every field in the body is
-        present in the index, to avoid a class of runtime bugs that could easily
-        be caught during development.
-
-        Args:
-            body: The body of the search request. See the Elasticsearch
-                documentation for more information on search request bodies.
-                TODO(andrei): Make this a more deep interface; callers shouldn't
-                need to know to set _source: False for example.
-            search_type: Label for Prometheus metrics. Does not affect search
-                behavior.
-
-        Raises:
-            Exception: There was an error searching the index.
-
-        Returns:
-            List of document chunk IDs that match the search request.
-        """
-        logger.debug(
-            "Trying to search for document chunk IDs in index %s.",
-            self._index_name,
+        query = {**body, "_source": {"excludes": ["content_vector", "title_vector"]}}
+        hits = self.search(query, None, search_type=search_type)
+        tenant = TenantState(
+            tenant_id=get_current_tenant_id(), multitenant=MULTI_TENANT
         )
-        if "_source" not in body or body["_source"] is not False:
-            logger.warning(
-                "The body of the search request for document chunk IDs is missing the key, "
-                'value pair of "_source": False. This query will therefore be inefficient.'
+        return [
+            get_elasticsearch_doc_chunk_id(
+                tenant_state=tenant,
+                document_id=hit.document_chunk.document_id,
+                chunk_index=hit.document_chunk.chunk_index,
+                max_chunk_size=hit.document_chunk.max_chunk_size,
             )
-
-        ctx = self._get_emit_metrics_context_manager(search_type)
-        with ctx:
-            try:
-                t0 = time.perf_counter()
-                raw_result = self._client.search(
-                    index=self._index_name,
-                    **self._search_kwargs_from_body(body),
-                )
-                result = (
-                    raw_result
-                    if isinstance(raw_result, dict)
-                    else dict(raw_result.body)
-                )
-                client_duration_s = time.perf_counter() - t0
-                hits, time_took, timed_out, phase_took, profile = (
-                    self._get_hits_and_profile_from_search_result(result)
-                )
-                # Inside the try/except so that server-side timeouts (which
-                # raise inside this helper) land in
-                # record_elasticsearch_search_error and never reach
-                # observe_elasticsearch_search — keeping the latency histograms
-                # clean of timed-out queries.
-                self._log_search_result_perf(
-                    time_took=time_took,
-                    timed_out=timed_out,
-                    phase_took=phase_took,
-                    profile=profile,
-                    body=body,
-                    raise_on_timeout=True,
-                )
-                if self._emit_metrics:
-                    observe_elasticsearch_search(
-                        search_type, client_duration_s, time_took
-                    )
-            except Exception as e:
-                if self._emit_metrics:
-                    record_elasticsearch_search_error(search_type, e)
-                raise
-
-        # TODO(andrei): Implement scroll/point in time for results so that we
-        # can return arbitrarily-many IDs.
-        if len(hits) == DEFAULT_ELASTICSEARCH_MAX_RESULT_WINDOW:
-            logger.warning(
-                "The search request for document chunk IDs returned the maximum number of "
-                "results. It is extremely likely that there are more hits in Elasticsearch than the "
-                "returned results."
-            )
-
-        # Extract only the _id field from each hit.
-        document_chunk_ids: list[str] = []
-        for hit in hits:
-            document_chunk_id = hit.get("_id")
-            if not document_chunk_id:
-                raise RuntimeError(
-                    "Received a hit from Elasticsearch but the _id field is missing."
-                )
-            document_chunk_ids.append(document_chunk_id)
-        logger.debug(
-            "Successfully searched for document chunk IDs in index %s and got %s hits.",
-            self._index_name,
-            len(document_chunk_ids),
-        )
-        return document_chunk_ids
+            for hit in hits
+        ]
 
     def open_pit(self, keep_alive: str = PIT_KEEP_ALIVE) -> str:
         """Opens a point-in-time (PIT) over this index for a consistent scan.
@@ -2181,8 +2252,10 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 raise RuntimeError(
                     f'Document chunk with ID "{hit.get("_id", "")}" has no data.'
                 )
-            chunks.append(DocumentChunkWithoutVectors.model_validate(source))
             last_sort = hit.get("sort")
+            if source.get("publication_tombstone") is True:
+                continue
+            chunks.append(DocumentChunkWithoutVectors.model_validate(source))
 
         # A short page means the batch is exhausted; a full page means resume from
         # the last hit's sort values on the next call.

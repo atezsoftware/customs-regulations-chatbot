@@ -42,6 +42,7 @@ import unicodedata
 from collections.abc import Callable
 from datetime import date
 from typing import Any, Generic, TypeVar, cast
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
@@ -2396,6 +2397,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                         is not None
                     ],
                     as_of_date=provision_as_of_date,
+                    query_indexes={
+                        UUID(
+                            section.center_chunk.document_id
+                        ): section.center_chunk.publication_index
+                        for section in navigation_seed_sections
+                        if section.center_chunk.publication_index is not None
+                    },
                 )
                 navigation_seed_sections = _filter_visible_regulatory_sections(
                     navigation_seed_sections,

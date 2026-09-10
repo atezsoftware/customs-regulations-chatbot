@@ -254,6 +254,11 @@ def create_chat_history_chain(
 
         previous_message = current_message
 
+    from onyx.db.regulatory_chat_reads import message_publication_available
+    from onyx.regulatory.publication_reads import PublicationReadChanged
+
+    if any(not message_publication_available(message) for message in mainline_messages):
+        raise PublicationReadChanged()
     return mainline_messages
 
 
@@ -468,11 +473,46 @@ def load_chat_file(
     reading the original bytes entirely on the common path, and token_count
     is a single DB lookup.
     """
+    from onyx.configs.app_configs import DISABLE_VECTOR_DB
+    from onyx.db.regulatory_public_reads import current_file_read_owners
+    from onyx.error_handling.error_codes import OnyxErrorCode
+    from onyx.error_handling.exceptions import OnyxError
+    from onyx.regulatory.publication_reads import (
+        PublicationReadEvidence,
+        observe_publication_read,
+        require_publication_files,
+    )
+
+    observation = observe_publication_read()
     file_id = file_descriptor["id"]
     # `FileDescriptor` is often JSON-roundtripped (e.g. JSONB / API), so `type`
     # may arrive as a raw string value instead of a `ChatFileType`.
     file_type = ChatFileType(file_descriptor["type"])
     filename = file_descriptor.get("name")
+
+    parents, protected_originals = current_file_read_owners(file_id)
+    require_publication_files(observation, parents)
+    if protected_originals:
+        if DISABLE_VECTOR_DB:
+            raise OnyxError(
+                OnyxErrorCode.SERVICE_UNAVAILABLE,
+                "This versioned attachment requires dated search, which is unavailable.",
+            )
+
+        def unavailable_original() -> bytes:
+            raise OnyxError(
+                OnyxErrorCode.SERVICE_UNAVAILABLE,
+                "This versioned source requires dated search; its original bytes cannot be staged as current content.",
+            )
+
+        return ChatLoadedFile.lazy_loaded(
+            file_id=file_id,
+            file_type=ChatFileType.PLAIN_TEXT,
+            filename=filename,
+            content_text="This versioned attachment requires dated search for its current or requested effective-date evidence. Its uploaded original is not current legal content.",
+            token_count=40,
+            loader=unavailable_original,
+        )
 
     # Look up the UserFile row first (when one exists) — it supplies the token
     # count and tells us whether the user-file worker is still processing.
@@ -532,8 +572,13 @@ def load_chat_file(
         # to empty content instead. Deletion is expected and logs at warning;
         # anything else (e.g. transient object-store failure) logs at error so
         # outages remain distinguishable in alerting.
+        require_publication_files(observation, parents)
         try:
-            return get_default_file_store().read_file(file_id, mode="b").read()
+            content = get_default_file_store().read_file(file_id, mode="b").read()
+            require_publication_files(observation, parents)
+            return content
+        except OnyxError:
+            raise
         except FileRecordNotFoundError:
             logger.warning(
                 "Chat file %s no longer exists (deleted after being referenced "
@@ -550,7 +595,8 @@ def load_chat_file(
             )
             return b""
 
-    return ChatLoadedFile.lazy_loaded(
+    require_publication_files(observation, parents)
+    loaded = ChatLoadedFile.lazy_loaded(
         file_id=file_id,
         file_type=file_type,
         filename=filename,
@@ -559,6 +605,13 @@ def load_chat_file(
         loader=_load_content,
         content_pending=content_pending,
     )
+
+    loaded.publication_evidence = (
+        PublicationReadEvidence(observation=observation, user_file_ids=parents)
+        if parents
+        else None
+    )
+    return loaded
 
 
 _MAX_PARALLEL_CHAT_FILE_LOADS = 16

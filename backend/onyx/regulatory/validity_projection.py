@@ -10,7 +10,7 @@ from onyx.db.regulatory_chunks import (
     RegulatoryChunkValidityState,
     RegulatoryFileValidityWindow,
     common_reindex_validity_window,
-    get_chunks_for_file,
+    get_chunks_for_file_snapshot,
 )
 from onyx.db.search_settings import get_active_search_settings_list
 from onyx.document_index.elasticsearch.elasticsearch_document_index import (
@@ -54,7 +54,7 @@ def patch_user_file_validity_in_active_indices(
     if not ENABLE_ELASTICSEARCH_INDEXING_FOR_ONYX:
         return None
 
-    rows = get_chunks_for_file(db_session, user_file.id)
+    rows = get_chunks_for_file_snapshot(db_session, user_file.id)
     if not rows or user_file.chunk_count is None:
         return None
     if user_file.chunk_count != len(rows):

@@ -29,6 +29,10 @@ from onyx.document_index.elasticsearch.string_filtering import (
     filter_and_validate_document_id,
 )
 from onyx.document_index.interfaces_new import TenantState
+from onyx.document_index.publication_models import (
+    PublicationIndexSnapshot,
+    ReadObservation,
+)
 from onyx.utils.datetime import datetime_to_utc
 from onyx.utils.tenant import get_tenant_id_short_string
 from shared_configs.configs import MULTI_TENANT
@@ -140,6 +144,13 @@ def get_elasticsearch_doc_chunk_id(
 
 
 class DocumentChunkWithoutVectors(BaseModel):
+    publication_index: "PublicationIndexSnapshot | None" = Field(
+        default=None, exclude=True
+    )
+    semantic_position: int | None = Field(default=None, exclude=True)
+    retrieval_index_name: str | None = Field(default=None, exclude=True)
+    publication_observation: ReadObservation | None = Field(default=None, exclude=True)
+
     """
     Represents a chunk of a document in the Elasticsearch index without vectors.
 

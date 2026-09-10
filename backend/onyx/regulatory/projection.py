@@ -26,7 +26,7 @@ from onyx.db.models import RegulatoryChunk, SearchSettings, UserFile, UserFileSt
 from onyx.db.regulatory_chunks import (
     get_bounded_adjacent_provisions,
     get_bounded_same_provision_siblings,
-    get_chunks_for_file,
+    get_chunks_for_file_snapshot,
 )
 from onyx.db.regulatory_context_projections import (
     load_context_generation_calls,
@@ -645,7 +645,7 @@ def project_amendment_to_index(
     if locked_user_file is None:
         return 0
 
-    all_rows = get_chunks_for_file(db_session, user_file_id)
+    all_rows = get_chunks_for_file_snapshot(db_session, user_file_id)
     rows_by_id = {row.id: row for row in all_rows}
     new_chunk = rows_by_id.get(new_chunk_id)
     if new_chunk is None:
@@ -741,7 +741,7 @@ def project_user_file_to_index(
         )
         return 0
     user_file = locked_user_file
-    rows = get_chunks_for_file(db_session, UUID(user_file_id))
+    rows = get_chunks_for_file_snapshot(db_session, UUID(user_file_id))
     if not rows:
         logger.warning(
             "project_user_file_to_index: no chunk rows for user_file=%s", user_file_id

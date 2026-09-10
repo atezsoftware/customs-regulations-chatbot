@@ -450,6 +450,31 @@ def get_chat_session(
             )
             # msg_packet_list.append(Packet(ind=end_step_nr, obj=OverallStop()))
 
+    from onyx.db.regulatory_chat_reads import (
+        finalize_message_publication_read,
+        message_publication_available,
+    )
+
+    for index, message in enumerate(session_messages):
+        if message.publication_read is not None:
+            finalize_message_publication_read(message.id)
+            if not message_publication_available(message):
+                chat_message_details[index] = (
+                    translate_db_message_to_chat_message_detail(message)
+                )
+    replay_packet_lists = [
+        packets if message_publication_available(message) else []
+        for message, packets in zip(
+            [
+                message
+                for message in session_messages
+                if message.message_type == MessageType.ASSISTANT
+            ],
+            replay_packet_lists,
+            strict=True,
+        )
+    ]
+
     return ChatSessionDetailResponse(
         chat_session_id=session_id,
         description=chat_session.description,
@@ -1024,6 +1049,16 @@ def fetch_chat_file(
     user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> Response:
+    from onyx.db.regulatory_public_reads import (
+        protected_file_ids,
+        public_file_source_owners,
+    )
+    from onyx.regulatory.publication_reads import (
+        observe_publication_read,
+        require_publication_files,
+    )
+
+    observation = observe_publication_read()
     # For user files, we need to get the file id from the user file id
     file_id_from_user_file = get_file_id_by_user_file_id(file_id, db_session)
     if file_id_from_user_file:
@@ -1034,6 +1069,8 @@ def fetch_chat_file(
         # existence across ownership boundaries.
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "File not found")
 
+    source_owners = public_file_source_owners(db_session, file_id)
+    require_publication_files(observation, source_owners)
     file_store = get_default_file_store()
     file_record = file_store.read_file_record(file_id)
     if not file_record:
@@ -1053,7 +1090,11 @@ def fetch_chat_file(
         "Vary": "Cookie",
     }
 
+    if protected_file_ids(db_session, source_owners):
+        cache_headers["Cache-Control"] = "private, no-cache"
+
     if request.headers.get("if-none-match") == etag:
+        require_publication_files(observation, source_owners)
         return Response(status_code=304, headers=cache_headers)
 
     if parse_spreadsheet:
@@ -1063,10 +1104,21 @@ def fetch_chat_file(
             preview = parse_spreadsheet_for_preview(
                 xlsx_io, file_record.display_name or ""
             )
+        require_publication_files(observation, source_owners)
         return JSONResponse(content=preview.model_dump(), headers=cache_headers)
 
     file_io = file_store.read_file(file_id, mode="b")
-    return StreamingResponse(file_io, media_type=media_type, headers=cache_headers)
+    require_publication_files(observation, source_owners)
+
+    def original_bytes() -> Generator[bytes, None, None]:
+        with file_io:
+            while block := file_io.read(64 * 1024):
+                require_publication_files(observation, source_owners)
+                yield block
+
+    return StreamingResponse(
+        original_bytes(), media_type=media_type, headers=cache_headers
+    )
 
 
 @router.get("/search", tags=PUBLIC_API_TAGS)
@@ -1201,6 +1253,8 @@ def resume_chat_stream(
             if read is None or read.gap:
                 return
             if read.blocks:
+                if not read.sources_available():
+                    return
                 yield "".join(read.blocks)
                 chunk_cursor = read.next_cursor
                 last_emit = time.monotonic()
@@ -1208,6 +1262,7 @@ def resume_chat_stream(
                 # a read comes back empty (a capped read can precede the tail).
                 continue
             if read.done:
+                read.finalize_consumed_sources()
                 return
             # A dead writer never marks done; its fence lapsing is the signal.
             # A final drain catches anything written between the read above
@@ -1221,7 +1276,12 @@ def resume_chat_stream(
                         chunk_cursor,
                         max_chunks=_RESUME_MAX_CHUNKS_PER_READ,
                     )
-                    if read is None or read.gap or not read.blocks:
+                    if read is None or read.gap:
+                        return
+                    if not read.blocks:
+                        read.finalize_consumed_sources()
+                        return
+                    if not read.sources_available():
                         return
                     yield "".join(read.blocks)
                     chunk_cursor = read.next_cursor

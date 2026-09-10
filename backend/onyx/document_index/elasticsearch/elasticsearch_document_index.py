@@ -231,6 +231,10 @@ def convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned(
     """
     return InferenceChunkUncleaned(
         chunk_id=chunk.chunk_index,
+        publication_index=chunk.publication_index,
+        structural_position=chunk.semantic_position,
+        retrieval_index_name=chunk.retrieval_index_name,
+        publication_observation=chunk.publication_observation,
         blurb=chunk.blurb,
         # Includes extra content prepended/appended during indexing.
         content=chunk.content,
@@ -1097,6 +1101,7 @@ class ElasticsearchDocumentIndex(DocumentIndex):
                 body=query_body,
                 normalization_method=None,
                 search_type=ElasticsearchSearchType.DOC_ID_RETRIEVAL,
+                as_of_date=filters.as_of_date,
             )
             inference_chunks_uncleaned: list[InferenceChunkUncleaned] = [
                 convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned(
@@ -1150,6 +1155,7 @@ class ElasticsearchDocumentIndex(DocumentIndex):
             body=query_body,
             normalization_method=normalization_method,
             search_type=ElasticsearchSearchType.HYBRID,
+            as_of_date=filters.as_of_date,
         )
 
         # Good place for a breakpoint to inspect the search hits if you have
@@ -1199,6 +1205,7 @@ class ElasticsearchDocumentIndex(DocumentIndex):
             body=query_body,
             normalization_method=None,
             search_type=ElasticsearchSearchType.KEYWORD,
+            as_of_date=filters.as_of_date,
         )
 
         inference_chunks_uncleaned: list[InferenceChunkUncleaned] = [
@@ -1243,6 +1250,7 @@ class ElasticsearchDocumentIndex(DocumentIndex):
             body=query_body,
             normalization_method=None,
             search_type=ElasticsearchSearchType.SEMANTIC,
+            as_of_date=filters.as_of_date,
         )
 
         inference_chunks_uncleaned: list[InferenceChunkUncleaned] = [
@@ -1277,6 +1285,7 @@ class ElasticsearchDocumentIndex(DocumentIndex):
             body=query_body,
             normalization_method=None,
             search_type=ElasticsearchSearchType.RANDOM,
+            as_of_date=filters.as_of_date,
         )
         inference_chunks_uncleaned: list[InferenceChunkUncleaned] = [
             convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned(

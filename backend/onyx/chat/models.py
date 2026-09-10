@@ -2,10 +2,11 @@ from collections.abc import Iterator
 from typing import Any, Callable
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import SearchDoc
+from onyx.document_index.publication_models import PublicationReadEvidence
 from onyx.file_store.models import ChatFileType, InMemoryChatFile
 from onyx.server.query_and_chat.models import (
     MessageResponseIDInfo,
@@ -97,6 +98,9 @@ class ChatFullResponse(BaseModel):
 
 
 class ChatLoadedFile(InMemoryChatFile):
+    publication_evidence: PublicationReadEvidence | None = Field(
+        default=None, exclude=True
+    )
     content_text: str | None
     token_count: int
     # True while the user-file worker is still processing the file — its
@@ -207,6 +211,10 @@ class ChatHistoryResult(BaseModel):
 
 
 class ExtractedContextFiles(BaseModel):
+    publication_evidence: PublicationReadEvidence | None = Field(
+        default=None, exclude=True
+    )
+
     """Result of attempting to load user files (from a project or persona) into context."""
 
     file_texts: list[str]

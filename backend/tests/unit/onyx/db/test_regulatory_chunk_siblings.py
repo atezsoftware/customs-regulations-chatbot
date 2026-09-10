@@ -28,6 +28,19 @@ FILE_A = UUID("00000000-0000-0000-0000-000000000001")
 FILE_B = UUID("00000000-0000-0000-0000-000000000002")
 
 
+@pytest.fixture(autouse=True)
+def unversioned_public_read_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    from onyx.db import regulatory_public_reads
+    from onyx.regulatory import publication_reads
+
+    authority = MagicMock()
+    authority.unavailable.return_value = frozenset()
+    monkeypatch.setattr(publication_reads, "public_read_store", lambda: authority)
+    monkeypatch.setattr(
+        regulatory_public_reads, "qualified_file_ids", lambda *_args: frozenset()
+    )
+
+
 def _candidate(
     regulatory_chunk_id: str,
     position: int,
@@ -67,7 +80,22 @@ def _ids(rows: list[RegulatoryChunkProjection]) -> list[str]:
 
 def test_visible_regulatory_chunk_ids_are_authoritative_and_deduplicated() -> None:
     db_session = MagicMock()
-    db_session.scalars.return_value.all.return_value = ["active-one"]
+    from onyx.db.models import RegulatoryChunk
+
+    db_session.scalars.return_value.__iter__.return_value = iter(
+        [
+            RegulatoryChunk(
+                id="active-one",
+                user_file_id=FILE_A,
+                position=0,
+                projection_ordinal=0,
+                text="Active",
+                heading_path=[],
+                chunk_metadata={},
+                status="active",
+            )
+        ]
+    )
 
     assert get_visible_regulatory_chunk_ids(
         db_session,

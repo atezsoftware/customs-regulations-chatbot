@@ -40,6 +40,11 @@ class ReadObservation(PublicationModel):
     committed_epoch: int = Field(ge=0)
 
 
+class PublicationReadEvidence(PublicationModel):
+    observation: ReadObservation
+    user_file_ids: tuple[UUID, ...] = Field(default_factory=tuple)
+
+
 class PublicationEncoderAuthority(PublicationModel):
     provider: str | None
     model: str

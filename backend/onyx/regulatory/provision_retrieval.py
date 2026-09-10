@@ -26,6 +26,7 @@ from onyx.db.regulatory_chunks import (
     get_regulatory_provision_heading_source,
     is_regulatory_navigation_candidate_visible,
 )
+from onyx.document_index.publication_models import PublicationIndexSnapshot
 from onyx.regulatory.heading_path import (
     RegulatoryProvisionReference,
     extract_regulatory_provision_references,
@@ -119,6 +120,25 @@ class _ArticleHeadingOption:
     position: int
     label_priority: int
     regulatory_chunk_id: str | None
+
+
+def _query_indexes(
+    chunks: Sequence[InferenceChunk],
+) -> dict[UUID, PublicationIndexSnapshot]:
+    indexes: dict[UUID, PublicationIndexSnapshot] = {}
+    for chunk in chunks:
+        if chunk.publication_index is None:
+            continue
+        file_id = UUID(chunk.document_id)
+        previous = indexes.get(file_id)
+        if (
+            previous is not None
+            and previous.temporal_lookup_identity()
+            != chunk.publication_index.temporal_lookup_identity()
+        ):
+            raise ValueError("cannot mix physical query index identities")
+        indexes[file_id] = chunk.publication_index
+    return indexes
 
 
 def _fold_heading(value: str) -> str:
@@ -431,6 +451,7 @@ def build_regulatory_provision_navigation(
         db_session,
         seed_chunk_ids,
         as_of_date=as_of_date,
+        query_indexes=_query_indexes([section.center_chunk for section in sections]),
     )
     if source is None:
         return None
@@ -554,6 +575,7 @@ def expand_selected_regulatory_navigation_leads(
         projections = get_bounded_same_provision_siblings(
             db_session,
             [entry.regulatory_chunk_id],
+            query_indexes=_query_indexes([template]),
             query=query,
             as_of_date=as_of_date,
             max_chunks_per_provision=2,
@@ -625,6 +647,7 @@ def expand_selected_regulatory_source_lexical_matches(
     source_matches = get_bounded_source_lexical_matches(
         db_session,
         user_file_id=UUID(navigation.user_file_id),
+        query_indexes=_query_indexes([source_template]),
         query=query,
         as_of_date=as_of_date,
         excluded_chunk_ids=existing_chunk_ids,
@@ -636,6 +659,7 @@ def expand_selected_regulatory_source_lexical_matches(
     sibling_projections = get_bounded_same_provision_siblings(
         db_session,
         [match.regulatory_chunk_id for match in source_matches],
+        query_indexes=_query_indexes([source_template]),
         query=query,
         as_of_date=as_of_date,
         max_chunks_per_provision=2,
@@ -752,6 +776,7 @@ def build_regulatory_rerank_packets(
         projections = get_bounded_same_provision_siblings(
             db_session,
             seed_ids,
+            query_indexes=_query_indexes(deduplicated),
             query=query,
             as_of_date=as_of_date,
             max_chunks_per_provision=max_chunks_per_provision,
@@ -964,6 +989,72 @@ def _chunk_from_projection(
     *,
     relevance_explanation: str = "Same bounded regulatory provision",
 ) -> InferenceChunk:
+    from onyx.regulatory.publication_reads import require_publication_files
+
+    if template.publication_observation is not None:
+        require_publication_files(
+            template.publication_observation, (projection.user_file_id,)
+        )
+    source_json = projection.source_json
+    if source_json is None and template.retrieval_index_name is not None:
+        from onyx.document_index.elasticsearch.client import ElasticsearchIndexClient
+        from onyx.document_index.elasticsearch.schema import (
+            TenantState,
+            get_elasticsearch_doc_chunk_id,
+        )
+        from shared_configs.configs import MULTI_TENANT
+        from shared_configs.contextvars import get_current_tenant_id
+
+        reader = ElasticsearchIndexClient(template.retrieval_index_name)
+        try:
+            stored = reader.get_document(
+                get_elasticsearch_doc_chunk_id(
+                    tenant_state=TenantState(
+                        tenant_id=get_current_tenant_id(), multitenant=MULTI_TENANT
+                    ),
+                    document_id=str(projection.user_file_id),
+                    chunk_index=projection.projection_index,
+                )
+            )
+            if stored.regulatory_chunk_id != projection.regulatory_chunk_id:
+                raise ValueError(
+                    "sibling index identity does not match canonical source"
+                )
+            source_json = stored.model_dump_json()
+        finally:
+            reader.close()
+    if source_json is not None:
+        from onyx.document_index.chunk_content_enrichment import (
+            cleanup_content_for_chunks,
+        )
+        from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+            convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned,
+        )
+        from onyx.document_index.elasticsearch.schema import DocumentChunkWithoutVectors
+
+        source = DocumentChunkWithoutVectors.model_validate_json(source_json)
+        source = source.model_copy(
+            update={
+                "publication_index": template.publication_index,
+                "semantic_position": projection.position,
+                "retrieval_index_name": template.retrieval_index_name,
+                "publication_observation": template.publication_observation,
+            }
+        )
+        chunk = cleanup_content_for_chunks(
+            [
+                convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned(
+                    source, template.score, {}
+                )
+            ]
+        )[0]
+        chunk.is_relevant = True
+        chunk.relevance_explanation = relevance_explanation
+        if template.publication_observation is not None:
+            require_publication_files(
+                template.publication_observation, (projection.user_file_id,)
+            )
+        return chunk
     heading_path = normalize_regulatory_heading_path(
         projection.heading_path,
         article_no=projection.article_no,
@@ -980,6 +1071,11 @@ def _chunk_from_projection(
         deep=True,
         update={
             "chunk_id": projection.projection_index,
+            "structural_position": projection.position,
+            "doc_summary": "",
+            "chunk_context": "",
+            "image_file_id": projection.image_file_id,
+            "source_links": None,
             "content": projection.text,
             "blurb": projection.text[:_SIBLING_BLURB_CHARS],
             "semantic_identifier": semantic_identifier,
@@ -1037,6 +1133,9 @@ def expand_selected_regulatory_references(
         db_session,
         seed_chunk_ids,
         references,
+        query_indexes=_query_indexes(
+            [section.center_chunk for section in reference_sections]
+        ),
         as_of_date=as_of_date,
         query=query,
     )
@@ -1051,7 +1150,7 @@ def expand_selected_regulatory_references(
         key=lambda item: (
             item.expansion_priority,
             -_focused_query_overlap_score(query_terms, item.text),
-            item.projection_index,
+            item.structural_index,
             item.regulatory_chunk_id,
         ),
     )
@@ -1086,7 +1185,7 @@ def expand_selected_regulatory_references(
     for projection, template in sorted(
         admitted,
         key=lambda item: (
-            item[0].projection_index,
+            item[0].structural_index,
             item[0].regulatory_chunk_id,
         ),
     ):
@@ -1123,6 +1222,9 @@ def expand_selected_regulatory_adjacent_provisions(
     projections = get_bounded_adjacent_provisions(
         db_session,
         seed_chunk_ids,
+        query_indexes=_query_indexes(
+            [section.center_chunk for section in seed_sections]
+        ),
         query=query,
         as_of_date=as_of_date,
     )
@@ -1238,6 +1340,7 @@ def expand_selected_regulatory_sections(
     projections = get_bounded_same_provision_siblings(
         db_session,
         expansion_seed_chunk_ids,
+        query_indexes=_query_indexes(list(expansion_seed_by_id.values())),
         query=query,
         as_of_date=as_of_date,
     )
@@ -1318,7 +1421,7 @@ def expand_selected_regulatory_sections(
         key=lambda item: (
             item.expansion_priority,
             -_focused_query_overlap_score(query_terms, item.text),
-            item.projection_index,
+            item.structural_index,
             item.regulatory_chunk_id,
         ),
     ):
@@ -1339,7 +1442,14 @@ def expand_selected_regulatory_sections(
         closest_seed = min(
             compatible_seeds,
             key=lambda seed: (
-                abs(seed.chunk_id - projection.projection_index),
+                abs(
+                    (
+                        seed.structural_position
+                        if seed.structural_position is not None
+                        else seed.chunk_id
+                    )
+                    - projection.position
+                ),
                 seed.chunk_id,
                 seed.regulatory_chunk_id or "",
             ),
@@ -1368,7 +1478,7 @@ def expand_selected_regulatory_sections(
                         query_terms, sibling_queues[seed_id][0].text
                     ),
                     seed_rank_by_id[seed_id],
-                    sibling_queues[seed_id][0].projection_index,
+                    sibling_queues[seed_id][0].structural_index,
                     sibling_queues[seed_id][0].regulatory_chunk_id,
                 ),
             )
@@ -1401,7 +1511,7 @@ def expand_selected_regulatory_sections(
                     query_terms, sibling_queues[seed_id][0].text
                 ),
                 seed_rank_by_id[seed_id],
-                sibling_queues[seed_id][0].projection_index,
+                sibling_queues[seed_id][0].structural_index,
                 sibling_queues[seed_id][0].regulatory_chunk_id,
             )
         )

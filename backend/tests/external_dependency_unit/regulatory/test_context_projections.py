@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from onyx.db.models import DocumentSet
+from onyx.db.regulatory_public_reads import load_public_temporal_bindings
 from tests.external_dependency_unit.regulatory.test_amendment_sources import (
     source_session as source_session,
 )
@@ -257,6 +258,55 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
             source_session, canonical.id, index=index, as_of_date=when
         )
         assert result == expected
+
+        inventory = load_public_temporal_bindings(
+            source_session,
+            file.id,
+            index=index,
+            as_of_date=when,
+        )
+        assert inventory == [expected]
+        from onyx.db.regulatory_chunks import get_bounded_same_provision_siblings
+        from onyx.document_index.elasticsearch.elasticsearch_document_index import (
+            convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned,
+        )
+        from onyx.document_index.elasticsearch.schema import DocumentChunkWithoutVectors
+        from onyx.regulatory.provision_retrieval import _chunk_from_projection
+
+        own_source = DocumentChunkWithoutVectors.model_validate_json(
+            expected.projection.source_json
+        )
+        seed = convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned(
+            own_source, 1, {}
+        )
+        seed.publication_index = index
+        seed.image_file_id = "wrong-seed-image"
+        seed.doc_summary = "wrong-seed-summary"
+        seed.chunk_context = "wrong-seed-context"
+        selected = get_bounded_same_provision_siblings(
+            source_session,
+            [canonical.id],
+            query="Legal",
+            as_of_date=when,
+            query_indexes={file.id: index},
+        )
+        assert len(selected) == 1
+        hydrated = _chunk_from_projection(selected[0], seed)
+        assert hydrated.image_file_id == own_source.image_file_id
+        assert hydrated.doc_summary == own_source.doc_summary
+        assert hydrated.chunk_context == own_source.chunk_context
+        assert hydrated.chunk_id == expected.projection.ordinal
+        assert hydrated.structural_position == expected.semantic_position
+        assert hydrated.publication_index == index
+        assert (
+            load_public_temporal_bindings(
+                source_session,
+                file.id,
+                index=index.model_copy(update={"index_uuid": "recreated-index"}),
+                as_of_date=when,
+            )
+            == []
+        )
     from onyx.document_index.publication_models import (
         PublicationEncoderAuthority,
         PublicationEncoderReceipt,
@@ -304,6 +354,9 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
         )
         == first
     )
+    assert load_public_temporal_bindings(
+        source_session, file.id, index=expanded, as_of_date=date(2025, 1, 1)
+    ) == [first]
     incompatible = expanded.model_copy(
         update={
             "encoder_receipts": (receipts[1],),
@@ -318,6 +371,10 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
             canonical.id,
             index=incompatible,
             as_of_date=date(2025, 1, 1),
+        )
+    with pytest.raises(ValueError, match="receipt"):
+        load_public_temporal_bindings(
+            source_session, file.id, index=incompatible, as_of_date=date(2025, 1, 1)
         )
     companion = _chunk(source_session, file, 4, "Image caption")
     companion.validity_start_date = canonical.validity_start_date

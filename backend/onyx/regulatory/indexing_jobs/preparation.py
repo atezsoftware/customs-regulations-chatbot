@@ -12,7 +12,7 @@ from onyx.connectors.models import Document
 from onyx.db import regulatory_indexing_jobs as indexing_job_repository
 from onyx.db.enums import RegulatoryIndexingStage, UserFileStatus
 from onyx.db.models import RegulatoryChunk, UserFile
-from onyx.db.regulatory_chunks import get_chunks_for_file
+from onyx.db.regulatory_chunks import get_chunks_for_file_snapshot
 from onyx.db.regulatory_indexing_jobs import (
     claim_regulatory_indexing_job,
     create_or_get_regulatory_indexing_job,
@@ -222,7 +222,7 @@ def prepare_regulatory_indexing_job_from_chunks(
             "durable regulatory indexing requires a CHUNKED, INDEXING, or "
             "COMPLETED user file"
         )
-    rows = get_chunks_for_file(db_session, user_file_id)
+    rows = get_chunks_for_file_snapshot(db_session, user_file_id)
     content_hash = regulatory_chunks_content_hash(rows)
     snapshot = resolve_regulatory_indexing_snapshot(
         db_session,
@@ -308,7 +308,7 @@ def prepare_claimed_regulatory_indexing_job_from_chunks(
     )
 
     def prepare_items() -> list[indexing_job_repository.RegulatoryIndexingPreparedItem]:
-        rows = get_chunks_for_file(db_session, job.user_file_id)
+        rows = get_chunks_for_file_snapshot(db_session, job.user_file_id)
         if regulatory_chunks_content_hash(rows) != job.content_hash:
             raise ValueError("canonical chunks changed after durable job creation")
         request_factory = ContextualRequestFactory(
@@ -399,7 +399,7 @@ def prepare_claimed_regulatory_indexing_job(
             tokenizer=embedding_tokenizer,
             enable_contextual_rag=True,
         )
-        rows = get_chunks_for_file(db_session, job.user_file_id)
+        rows = get_chunks_for_file_snapshot(db_session, job.user_file_id)
         if not rows:
             raise ValueError("regulatory indexing produced no canonical chunks")
 

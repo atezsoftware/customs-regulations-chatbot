@@ -8,6 +8,7 @@ Elasticsearch patch and rejects unsafe projections.
 import hashlib
 import io
 import json
+from datetime import date
 from typing import Literal
 from uuid import UUID
 
@@ -59,7 +60,9 @@ from onyx.db.regulatory_chunks import (
     ValidityDateUpdate,
     delete_hierarchical_aggregates_referencing_chunk,
     get_chunk_by_id,
+    get_chunk_snapshot_by_id,
     get_chunks_for_file,
+    get_chunks_for_file_snapshot,
     is_hierarchical_aggregate_chunk,
     update_chunk,
     update_file_validity_window,
@@ -135,9 +138,18 @@ def list_chunks_for_file(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> list[RegulatoryChunkSnapshot]:
+    from onyx.regulatory.publication_reads import (
+        observe_publication_read,
+        require_publication_files,
+    )
+
+    observation = observe_publication_read()
+
     _get_owned_user_file(db_session, user_file_id, user)
     chunks = get_chunks_for_file(db_session, user_file_id)
-    return [RegulatoryChunkSnapshot.from_model(chunk) for chunk in chunks]
+    result = [RegulatoryChunkSnapshot.from_model(chunk) for chunk in chunks]
+    require_publication_files(observation, (user_file_id,))
+    return result
 
 
 def _pdf_response(pdf: bytes, filename: str) -> Response:
@@ -157,13 +169,22 @@ def get_file_pdf(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> Response:
+    from onyx.regulatory.publication_reads import (
+        observe_publication_read,
+        require_publication_files,
+    )
+
+    observation = observe_publication_read()
+
     """The document as uploaded, before chunking, rendered for reading."""
 
     user_file = _get_owned_user_file(db_session, user_file_id, user)
+    require_publication_files(observation, (user_file_id,))
     with get_default_file_store().read_file(user_file.file_id, mode="b") as handle:
         markdown = handle.read().decode("utf-8", errors="replace")
 
     pdf = render_document_pdf(name=user_file.name, markdown=markdown)
+    require_publication_files(observation, (user_file_id,))
     return _pdf_response(pdf, f"{user_file.name.rsplit('.', 1)[0]}.pdf")
 
 
@@ -172,20 +193,87 @@ def get_chunk_pdf(
     chunk_id: str,
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
+    as_of_date: date | None = None,
 ) -> Response:
+    from onyx.regulatory.publication_reads import (
+        observe_publication_read,
+        require_publication_files,
+    )
+
+    observation = observe_publication_read()
+
     chunk = get_chunk_by_id(db_session, chunk_id)
     if chunk is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found")
     # Access is granted on the file, so it is checked there.
     _get_owned_user_file(db_session, chunk.user_file_id, user)
 
-    pdf = render_chunk_pdf(
-        text=chunk.text,
-        heading_path=list(chunk.heading_path),
-        validity_start_date=chunk.validity_start_date,
-        validity_end_date=chunk.validity_end_date,
-        position=chunk.position,
+    text, headings, position = chunk.text, list(chunk.heading_path), chunk.position
+    start, end = chunk.validity_start_date, chunk.validity_end_date
+    import json
+
+    from onyx.db.regulatory_public_reads import (
+        load_public_temporal_bindings,
+        qualified_file_ids,
+        resolve_public_query_index,
     )
+    from onyx.db.search_settings import get_current_search_settings
+    from onyx.document_index.elasticsearch.client import ElasticsearchClient
+
+    if qualified_file_ids(db_session, (chunk.user_file_id,)):
+        settings = get_current_search_settings(db_session)
+        with ElasticsearchClient() as transport:
+            info = transport.publication_client().indices.get(index=settings.index_name)
+        if set(info) != {settings.index_name}:
+            raise OnyxError(
+                OnyxErrorCode.SERVICE_UNAVAILABLE,
+                "Chunk view requires a concrete active index.",
+            )
+        index = resolve_public_query_index(
+            settings.index_name, info[settings.index_name]["settings"]["index"]["uuid"]
+        )
+        bindings = load_public_temporal_bindings(
+            db_session,
+            chunk.user_file_id,
+            index=index,
+            as_of_date=as_of_date or date.today(),
+        )
+        binding = next(
+            (
+                item
+                for item in bindings
+                if json.loads(item.projection.source_json)["regulatory_chunk_id"]
+                == chunk.id
+            ),
+            None,
+        )
+        if binding is None:
+            raise OnyxError(
+                OnyxErrorCode.NOT_FOUND,
+                "Chunk has no active representation at the requested date.",
+            )
+        source = json.loads(binding.projection.source_json)
+        text, headings, position = (
+            binding.representation_text,
+            source.get("heading_path") or headings,
+            binding.semantic_position,
+        )
+        start, end = binding.effective_start, binding.effective_end
+    elif as_of_date is not None:
+        from onyx.regulatory.contextual import validity_window_contains
+
+        if not validity_window_contains(start, end, as_of_date):
+            raise OnyxError(
+                OnyxErrorCode.NOT_FOUND, "Chunk is not valid at the requested date."
+            )
+    pdf = render_chunk_pdf(
+        text=text,
+        heading_path=headings,
+        validity_start_date=start,
+        validity_end_date=end,
+        position=position,
+    )
+    require_publication_files(observation, (chunk.user_file_id,))
     return _pdf_response(pdf, f"chunk-{chunk.position + 1}.pdf")
 
 
@@ -196,7 +284,7 @@ def patch_chunk(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> RegulatoryChunkSnapshot:
-    chunk = get_chunk_by_id(db_session, chunk_id)
+    chunk = get_chunk_snapshot_by_id(db_session, chunk_id)
     if chunk is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found")
     user_file = _get_owned_user_file(db_session, chunk.user_file_id, user)
@@ -388,7 +476,7 @@ def rename_user_file(
 
     # File name is embedded in each chunk's semantic identifier (citations),
     # so a rename re-projects the file's chunks as well.
-    chunks = get_chunks_for_file(db_session, user_file_id)
+    chunks = get_chunks_for_file_snapshot(db_session, user_file_id)
     if chunks:
         project_user_file_to_index(db_session, user_file, get_current_tenant_id())
     db_session.commit()

@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from onyx.db.models import RegulatoryChunk
 from onyx.db.regulatory_chunks import (
-    get_chunk_by_id,
+    get_chunk_snapshot_by_id,
     get_next_chunk_position,
     has_active_structural_descendants,
 )
@@ -118,7 +118,7 @@ def load_instruction_draft_context(
 ) -> InstructionDraftContext | None:
     old_chunk: RegulatoryChunk | None = None
     if match.old_chunk_id:
-        old_chunk = get_chunk_by_id(db_session, match.old_chunk_id)
+        old_chunk = get_chunk_snapshot_by_id(db_session, match.old_chunk_id)
         if old_chunk is None:
             logger.warning(
                 "Matched amendment chunk %s no longer exists; marking instruction unmatched",

@@ -1597,7 +1597,9 @@ class DocumentQuery:
                 "document_id and attached_document_ids cannot be used together."
             )
 
-        filter_clauses: list[dict[str, Any]] = []
+        filter_clauses: list[dict[str, Any]] = [
+            {"bool": {"must_not": [{"term": {"publication_tombstone": True}}]}}
+        ]
 
         if not include_hidden:
             filter_clauses.append({"term": {HIDDEN_FIELD_NAME: {"value": False}}})
@@ -1688,6 +1690,24 @@ class DocumentQuery:
 
         if as_of_date is not None:
             filter_clauses.append(_get_validity_filter(as_of_date))
+        else:
+            filter_clauses.append(
+                {
+                    "bool": {
+                        "minimum_should_match": 1,
+                        "should": [
+                            {
+                                "bool": {
+                                    "must_not": [
+                                        {"exists": {"field": "publication_scope"}}
+                                    ]
+                                }
+                            },
+                            _get_validity_filter(date.today()),
+                        ],
+                    }
+                }
+            )
 
         if regulatory_chunks_only:
             filter_clauses.append({"exists": {"field": REGULATORY_CHUNK_ID_FIELD_NAME}})

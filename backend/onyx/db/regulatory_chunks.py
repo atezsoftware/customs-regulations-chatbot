@@ -22,6 +22,10 @@ from sqlalchemy.orm import Session
 
 from onyx.db.enums import RegulatoryChunkSource, RegulatoryChunkStatus
 from onyx.db.models import RegulatoryAnnexElementChunk, RegulatoryChunk, UserFile
+from onyx.document_index.publication_models import (
+    PublicationIndexSnapshot,
+    ReadObservation,
+)
 from onyx.regulatory.chunk_evidence import RegulatoryChunkEvidence
 from onyx.regulatory.chunker import (
     ATOMIC_CHUNK_VARIANT,
@@ -107,6 +111,9 @@ class RegulatoryChunkSiblingCandidate:
     clause_label: str | None = None
     validity_start_date: datetime.date | None = None
     validity_end_date: datetime.date | None = None
+    projection_ordinal: int | None = None
+    source_json: str | None = None
+    image_file_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +142,17 @@ class RegulatoryChunkProjection:
     # Lower values are consumed first when the caller has a tighter global
     # evidence budget than this provision's local selection budget.
     expansion_priority: int = 1
+    structural_order: int | None = None
+    source_json: str | None = None
+    image_file_id: str | None = None
+
+    @property
+    def structural_index(self) -> int:
+        return (
+            self.structural_order
+            if self.structural_order is not None
+            else self.position
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,7 +634,12 @@ def _project_candidates(
             projected = RegulatoryChunkProjection(
                 regulatory_chunk_id=candidate.regulatory_chunk_id,
                 user_file_id=user_file_id,
-                projection_index=projection_index,
+                projection_index=candidate.projection_ordinal
+                if candidate.projection_ordinal is not None
+                else projection_index,
+                structural_order=projection_index,
+                source_json=candidate.source_json,
+                image_file_id=candidate.image_file_id,
                 position=candidate.position,
                 text=candidate.text,
                 heading_path=normalized_heading_path,
@@ -682,7 +705,7 @@ def _provision_span_for_seed(
                         != numbered_family_anchor
                     ):
                         break
-                    family_indices.add(candidate.projection_index)
+                    family_indices.add(candidate.structural_index)
             if len(family_indices) > 1:
                 return family_indices
 
@@ -703,7 +726,7 @@ def _provision_span_for_seed(
                         and candidate_identity[0] == peer_scope
                         and candidate_identity[1] == seed_number + direction
                     ):
-                        peer_indices.add(candidate.projection_index)
+                        peer_indices.add(candidate.structural_index)
                     break
             return peer_indices
 
@@ -783,7 +806,7 @@ def _merge_seed_spans(
         file_rows = projected_by_file[seed.user_file_id]
         span = _provision_span_for_seed(
             file_rows,
-            seed.projection_index,
+            seed.structural_index,
             as_of_date=as_of_date,
         )
         if _has_overlapping_visible_positions(
@@ -1020,8 +1043,8 @@ def _structural_companion_ids(
                     nearest_parent = min(
                         article_parents,
                         key=lambda row: (
-                            abs(row.projection_index - seed.projection_index),
-                            row.projection_index,
+                            abs(row.structural_index - seed.structural_index),
+                            row.structural_index,
                             row.regulatory_chunk_id,
                         ),
                     )
@@ -1034,7 +1057,7 @@ def _structural_companion_ids(
                         min(
                             article_parents,
                             key=lambda row: (
-                                row.projection_index,
+                                row.structural_index,
                                 row.regulatory_chunk_id,
                             ),
                         )
@@ -1151,7 +1174,7 @@ def _select_group_within_budget(
             for index in group.projection_indices
             if _is_valid_on(rows[index], as_of_date)
         ],
-        key=lambda row: (row.projection_index, row.regulatory_chunk_id),
+        key=lambda row: (row.structural_index, row.regulatory_chunk_id),
     )
     visible_article_numbers = {
         article_no
@@ -1180,7 +1203,7 @@ def _select_group_within_budget(
         ]
     seed_id_set = set(group.seed_ids)
     seeds = [row for row in visible_rows if row.regulatory_chunk_id in seed_id_set]
-    seed_projection_indices = [seed.projection_index for seed in seeds]
+    seed_projection_indices = [seed.structural_index for seed in seeds]
 
     # Seed inclusion has priority when caller input itself exceeds a budget;
     # sibling expansion never makes that exceptional overage larger.
@@ -1211,10 +1234,10 @@ def _select_group_within_budget(
         key=lambda row: (
             -_focused_term_overlap_score(query_terms, row.text),
             min(
-                abs(row.projection_index - seed_index)
+                abs(row.structural_index - seed_index)
                 for seed_index in seed_projection_indices
             ),
-            row.projection_index,
+            row.structural_index,
             row.regulatory_chunk_id,
         ),
     )
@@ -1249,10 +1272,10 @@ def _select_group_within_budget(
         key=lambda row: (
             -_focused_term_overlap_score(query_terms, row.text),
             min(
-                abs(row.projection_index - seed_index)
+                abs(row.structural_index - seed_index)
                 for seed_index in seed_projection_indices
             ),
-            row.projection_index,
+            row.structural_index,
             row.regulatory_chunk_id,
         ),
     )
@@ -1266,7 +1289,7 @@ def _select_group_within_budget(
 
     return sorted(
         selected_by_id.values(),
-        key=lambda row: (row.projection_index, row.regulatory_chunk_id),
+        key=lambda row: (row.structural_index, row.regulatory_chunk_id),
     )
 
 
@@ -1515,7 +1538,7 @@ def select_bounded_source_lexical_matches(
             -item[0],
             -item[1],
             -item[2],
-            item[3].projection_index,
+            item[3].structural_index,
             item[3].regulatory_chunk_id,
         )
     )
@@ -1552,25 +1575,43 @@ def get_bounded_source_lexical_matches(
     user_file_id: UUID,
     query: str,
     as_of_date: datetime.date | None,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None = None,
     excluded_chunk_ids: Sequence[str] = (),
     max_matches: int = 2,
     max_total_chars: int = 4_000,
 ) -> list[RegulatoryChunkProjection]:
     """Load one known source and return its bounded lexical fallback matches."""
 
+    from onyx.regulatory.publication_reads import (
+        filter_publication_read,
+        observe_publication_read,
+    )
+
+    observation = observe_publication_read()
     all_rows = list(
         db_session.scalars(
-            select(RegulatoryChunk).where(RegulatoryChunk.user_file_id == user_file_id)
+            select(RegulatoryChunk)
+            .execution_options(populate_existing=True)
+            .where(RegulatoryChunk.user_file_id == user_file_id)
         ).all()
     )
-    return select_bounded_source_lexical_matches(
-        [_regulatory_sibling_candidate(row) for row in all_rows],
+    selected = select_bounded_source_lexical_matches(
+        _public_sibling_candidates(
+            db_session,
+            all_rows,
+            as_of_date=as_of_date,
+            query_indexes=query_indexes,
+            observation=observation,
+        ),
         user_file_id=user_file_id,
         query=query,
         as_of_date=as_of_date,
         excluded_chunk_ids=excluded_chunk_ids,
         max_matches=max_matches,
         max_total_chars=max_total_chars,
+    )
+    return filter_publication_read(
+        observation, selected, lambda row: str(row.user_file_id)
     )
 
 
@@ -1802,12 +1843,23 @@ def get_regulatory_provision_heading_source(
     seed_chunk_ids: Sequence[str],
     *,
     as_of_date: datetime.date | None,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None = None,
 ) -> RegulatoryProvisionHeadingSource | None:
     """Load structural headings for one dominant, date-visible source.
 
     Only ids, positions, paths, validity metadata, and the document title are
     loaded. Legal text is deliberately excluded from this navigation query.
     """
+    from onyx.db.regulatory_public_reads import (
+        load_public_temporal_bindings,
+        qualified_file_ids,
+    )
+    from onyx.regulatory.publication_reads import (
+        filter_publication_read,
+        observe_publication_read,
+    )
+
+    observation = observe_publication_read()
     unique_seed_ids = list(dict.fromkeys(seed_chunk_ids))
     if not unique_seed_ids:
         return None
@@ -1840,13 +1892,35 @@ def get_regulatory_provision_heading_source(
             ).where(RegulatoryChunk.id.in_(unique_seed_ids), *visibility_conditions)
         ).all()
     )
+    seed_records = filter_publication_read(
+        observation, seed_records, lambda row: str(row.user_file_id)
+    )
+    qualified = qualified_file_ids(
+        db_session, tuple({row.user_file_id for row in seed_records})
+    )
+    bindings = {}
+    for file_id in qualified:
+        index = (query_indexes or {}).get(file_id)
+        if index is not None:
+            for binding in load_public_temporal_bindings(
+                db_session,
+                file_id,
+                index=index,
+                as_of_date=as_of_date or datetime.date.today(),
+            ):
+                bindings[
+                    json.loads(binding.projection.source_json)["regulatory_chunk_id"]
+                ] = binding
     seed_by_id = {
         record.id: RegulatoryNavigationSeed(
             regulatory_chunk_id=record.id,
             user_file_id=record.user_file_id,
-            position=record.position,
+            position=bindings[record.id].semantic_position
+            if record.id in bindings
+            else record.position,
         )
         for record in seed_records
+        if record.user_file_id not in qualified or record.id in bindings
     }
     ordered_seeds = [
         seed_by_id[seed_id] for seed_id in unique_seed_ids if seed_id in seed_by_id
@@ -1895,6 +1969,21 @@ def get_regulatory_provision_heading_source(
                 else None
             ),
         )
+        if record.user_file_id in qualified:
+            binding = bindings.get(record.id)
+            if binding is None:
+                continue
+            source = json.loads(binding.projection.source_json)
+            candidate = replace(
+                candidate,
+                position=binding.semantic_position,
+                heading_path=tuple(
+                    source.get("heading_path") or candidate.heading_path
+                ),
+                validity_start_date=binding.effective_start,
+                validity_end_date=binding.effective_end,
+                status=RegulatoryChunkStatus.ACTIVE.value,
+            )
         # Recheck the pure visibility rule so mock-backed callers and future
         # query refactors cannot accidentally broaden the outline.
         if is_regulatory_navigation_candidate_visible(candidate, as_of_date=as_of_date):
@@ -1926,11 +2015,71 @@ def get_regulatory_provision_heading_source(
     )
     if document_title is None:
         return None
+    if not filter_publication_read(observation, [user_file_id], str):
+        return None
     return RegulatoryProvisionHeadingSource(
         user_file_id=user_file_id,
         document_title=document_title,
         seed_positions=seed_positions,
         candidates=candidates,
+    )
+
+
+def _public_sibling_candidates(
+    session: Session,
+    rows: list[RegulatoryChunk],
+    *,
+    as_of_date: datetime.date | None,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None,
+    observation: ReadObservation,
+) -> list[RegulatoryChunkSiblingCandidate]:
+    import json
+    from dataclasses import replace
+
+    from onyx.db.regulatory_public_reads import (
+        load_public_temporal_bindings,
+        qualified_file_ids,
+    )
+    from onyx.regulatory.publication_reads import filter_publication_read
+
+    file_ids = tuple({row.user_file_id for row in rows})
+    qualified = qualified_file_ids(session, file_ids)
+    bindings = {}
+    for file_id in qualified:
+        index = (query_indexes or {}).get(file_id)
+        if index is None:
+            continue
+        for binding in load_public_temporal_bindings(
+            session,
+            file_id,
+            index=index,
+            as_of_date=as_of_date or datetime.date.today(),
+        ):
+            source = json.loads(binding.projection.source_json)
+            bindings[source["regulatory_chunk_id"]] = binding
+    candidates = []
+    for row in rows:
+        candidate = _regulatory_sibling_candidate(row)
+        if row.user_file_id in qualified:
+            binding = bindings.get(row.id)
+            if binding is None:
+                continue
+            source = json.loads(binding.projection.source_json)
+            candidate = replace(
+                candidate,
+                position=binding.semantic_position,
+                text=binding.representation_text,
+                status=RegulatoryChunkStatus.ACTIVE.value,
+                heading_path=tuple(source.get("heading_path") or row.heading_path),
+                projection_ordinal=binding.projection.ordinal,
+                source_json=binding.projection.source_json,
+                image_file_id=source.get("image_file_id"),
+                validity_start_date=binding.effective_start,
+                validity_end_date=binding.effective_end,
+            )
+        candidates.append(candidate)
+    return filter_publication_read(
+        observation, candidates, lambda row: str(row.user_file_id)
     )
 
 
@@ -1942,6 +2091,8 @@ def _regulatory_sibling_candidate(
         user_file_id=row.user_file_id,
         position=row.position,
         text=row.text,
+        projection_ordinal=row.projection_ordinal,
+        image_file_id=row.chunk_metadata.get("image_file_id"),
         heading_path=tuple(row.heading_path),
         article_no=(
             str(row.chunk_metadata["article_no"])
@@ -1976,17 +2127,26 @@ def get_bounded_same_provision_siblings(
     *,
     query: str,
     as_of_date: datetime.date | None,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None = None,
     max_chunks_per_provision: int = DEFAULT_PROVISION_MAX_CHUNKS,
     max_chars_per_provision: int = DEFAULT_PROVISION_MAX_CHARS,
 ) -> list[RegulatoryChunkProjection]:
     """Load seed files and return immutable, bounded provision projections."""
+    from onyx.regulatory.publication_reads import (
+        filter_publication_read,
+        observe_publication_read,
+    )
+
+    observation = observe_publication_read()
     unique_seed_ids = list(dict.fromkeys(seed_chunk_ids))
     if not unique_seed_ids:
         return []
 
     seed_rows = list(
         db_session.scalars(
-            select(RegulatoryChunk).where(RegulatoryChunk.id.in_(unique_seed_ids))
+            select(RegulatoryChunk)
+            .execution_options(populate_existing=True)
+            .where(RegulatoryChunk.id.in_(unique_seed_ids))
         ).all()
     )
     user_file_ids = {row.user_file_id for row in seed_rows}
@@ -1995,19 +2155,28 @@ def get_bounded_same_provision_siblings(
 
     all_rows = list(
         db_session.scalars(
-            select(RegulatoryChunk).where(
-                RegulatoryChunk.user_file_id.in_(user_file_ids)
-            )
+            select(RegulatoryChunk)
+            .execution_options(populate_existing=True)
+            .where(RegulatoryChunk.user_file_id.in_(user_file_ids))
         ).all()
     )
-    candidates = [_regulatory_sibling_candidate(row) for row in all_rows]
-    return select_bounded_same_provision_siblings(
+    candidates = _public_sibling_candidates(
+        db_session,
+        all_rows,
+        as_of_date=as_of_date,
+        query_indexes=query_indexes,
+        observation=observation,
+    )
+    selected = select_bounded_same_provision_siblings(
         candidates,
         unique_seed_ids,
         query=query,
         as_of_date=as_of_date,
         max_chunks_per_provision=max_chunks_per_provision,
         max_chars_per_provision=max_chars_per_provision,
+    )
+    return filter_publication_read(
+        observation, selected, lambda row: str(row.user_file_id)
     )
 
 
@@ -2017,18 +2186,27 @@ def get_bounded_adjacent_provisions(
     *,
     query: str,
     as_of_date: datetime.date | None,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None = None,
     max_provisions: int = DEFAULT_ADJACENT_MAX_PROVISIONS,
     max_chunks_per_provision: int = DEFAULT_ADJACENT_MAX_CHUNKS_PER_PROVISION,
     max_total_chars: int = DEFAULT_ADJACENT_MAX_TOTAL_CHARS,
 ) -> list[RegulatoryChunkProjection]:
     """Load seed files and return a bounded adjacent-provision context window."""
 
+    from onyx.regulatory.publication_reads import (
+        filter_publication_read,
+        observe_publication_read,
+    )
+
+    observation = observe_publication_read()
     unique_seed_ids = list(dict.fromkeys(seed_chunk_ids))
     if not unique_seed_ids:
         return []
     seed_rows = list(
         db_session.scalars(
-            select(RegulatoryChunk).where(RegulatoryChunk.id.in_(unique_seed_ids))
+            select(RegulatoryChunk)
+            .execution_options(populate_existing=True)
+            .where(RegulatoryChunk.id.in_(unique_seed_ids))
         ).all()
     )
     user_file_ids = {row.user_file_id for row in seed_rows}
@@ -2036,19 +2214,28 @@ def get_bounded_adjacent_provisions(
         return []
     all_rows = list(
         db_session.scalars(
-            select(RegulatoryChunk).where(
-                RegulatoryChunk.user_file_id.in_(user_file_ids)
-            )
+            select(RegulatoryChunk)
+            .execution_options(populate_existing=True)
+            .where(RegulatoryChunk.user_file_id.in_(user_file_ids))
         ).all()
     )
-    return select_bounded_adjacent_provisions(
-        [_regulatory_sibling_candidate(row) for row in all_rows],
+    selected = select_bounded_adjacent_provisions(
+        _public_sibling_candidates(
+            db_session,
+            all_rows,
+            as_of_date=as_of_date,
+            query_indexes=query_indexes,
+            observation=observation,
+        ),
         unique_seed_ids,
         query=query,
         as_of_date=as_of_date,
         max_provisions=max_provisions,
         max_chunks_per_provision=max_chunks_per_provision,
         max_total_chars=max_total_chars,
+    )
+    return filter_publication_read(
+        observation, selected, lambda row: str(row.user_file_id)
     )
 
 
@@ -2057,39 +2244,45 @@ def get_visible_regulatory_chunk_ids(
     chunk_ids: Sequence[str],
     *,
     as_of_date: datetime.date | None,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None = None,
 ) -> set[str]:
     """Return authoritative chunk ids visible in the requested legal snapshot."""
+
+    from onyx.regulatory.publication_reads import observe_publication_read
 
     unique_chunk_ids = list(dict.fromkeys(chunk_ids))
     if not unique_chunk_ids:
         return set()
-
-    visibility_conditions = []
-    if as_of_date is None:
-        visibility_conditions.append(
-            RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value
-        )
-    else:
-        visibility_conditions.extend(
-            [
-                or_(
-                    RegulatoryChunk.validity_start_date.is_(None),
-                    RegulatoryChunk.validity_start_date <= as_of_date,
-                ),
-                or_(
-                    RegulatoryChunk.validity_end_date.is_(None),
-                    RegulatoryChunk.validity_end_date > as_of_date,
-                ),
-            ]
-        )
-    return set(
-        db_session.scalars(
-            select(RegulatoryChunk.id).where(
-                RegulatoryChunk.id.in_(unique_chunk_ids),
-                *visibility_conditions,
-            )
-        ).all()
+    observation = observe_publication_read()
+    visibility_conditions = (
+        [RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value]
+        if as_of_date is None
+        else [
+            or_(
+                RegulatoryChunk.validity_start_date.is_(None),
+                RegulatoryChunk.validity_start_date <= as_of_date,
+            ),
+            or_(
+                RegulatoryChunk.validity_end_date.is_(None),
+                RegulatoryChunk.validity_end_date > as_of_date,
+            ),
+        ]
     )
+    rows = list(
+        db_session.scalars(
+            select(RegulatoryChunk)
+            .where(RegulatoryChunk.id.in_(unique_chunk_ids), *visibility_conditions)
+            .execution_options(populate_existing=True)
+        )
+    )
+    candidates = _public_sibling_candidates(
+        db_session,
+        rows,
+        as_of_date=as_of_date,
+        query_indexes=query_indexes,
+        observation=observation,
+    )
+    return {row.regulatory_chunk_id for row in candidates}
 
 
 def get_bounded_referenced_provisions(
@@ -2098,6 +2291,7 @@ def get_bounded_referenced_provisions(
     references: Sequence[RegulatoryProvisionReference],
     *,
     as_of_date: datetime.date | None,
+    query_indexes: dict[UUID, PublicationIndexSnapshot] | None = None,
     query: str = "",
     max_provisions: int = DEFAULT_REFERENCE_MAX_PROVISIONS,
     max_chunks_per_provision: int = DEFAULT_REFERENCE_MAX_CHUNKS_PER_PROVISION,
@@ -2105,12 +2299,20 @@ def get_bounded_referenced_provisions(
 ) -> list[RegulatoryChunkProjection]:
     """Load and resolve explicit references inside the selected source only."""
 
+    from onyx.regulatory.publication_reads import (
+        filter_publication_read,
+        observe_publication_read,
+    )
+
+    observation = observe_publication_read()
     unique_seed_ids = list(dict.fromkeys(seed_chunk_ids))
     if not unique_seed_ids or not references:
         return []
     seed_rows = list(
         db_session.scalars(
-            select(RegulatoryChunk).where(RegulatoryChunk.id.in_(unique_seed_ids))
+            select(RegulatoryChunk)
+            .execution_options(populate_existing=True)
+            .where(RegulatoryChunk.id.in_(unique_seed_ids))
         ).all()
     )
     user_file_ids = {row.user_file_id for row in seed_rows}
@@ -2118,13 +2320,19 @@ def get_bounded_referenced_provisions(
         return []
     all_rows = list(
         db_session.scalars(
-            select(RegulatoryChunk).where(
-                RegulatoryChunk.user_file_id.in_(user_file_ids)
-            )
+            select(RegulatoryChunk)
+            .execution_options(populate_existing=True)
+            .where(RegulatoryChunk.user_file_id.in_(user_file_ids))
         ).all()
     )
-    return select_bounded_referenced_provisions(
-        [_regulatory_sibling_candidate(row) for row in all_rows],
+    selected = select_bounded_referenced_provisions(
+        _public_sibling_candidates(
+            db_session,
+            all_rows,
+            as_of_date=as_of_date,
+            query_indexes=query_indexes,
+            observation=observation,
+        ),
         unique_seed_ids,
         references,
         as_of_date=as_of_date,
@@ -2132,6 +2340,9 @@ def get_bounded_referenced_provisions(
         max_provisions=max_provisions,
         max_chunks_per_provision=max_chunks_per_provision,
         max_chars_per_provision=max_chars_per_provision,
+    )
+    return filter_publication_read(
+        observation, selected, lambda row: str(row.user_file_id)
     )
 
 
@@ -2329,14 +2540,16 @@ def replace_indexed_chunks_for_file(
     return rows
 
 
-def get_chunks_for_file(
+def get_chunks_for_file_snapshot(
     db_session: Session,
     user_file_id: UUID,
     *,
     include_superseded: bool = True,
+    refresh: bool = False,
 ) -> list[RegulatoryChunk]:
     stmt = (
         select(RegulatoryChunk)
+        .execution_options(populate_existing=refresh)
         .where(RegulatoryChunk.user_file_id == user_file_id)
         .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
     )
@@ -2366,8 +2579,47 @@ def has_regulatory_chunks_for_file(db_session: Session, user_file_id: UUID) -> b
     )
 
 
-def get_chunk_by_id(db_session: Session, chunk_id: str) -> RegulatoryChunk | None:
+def get_chunk_snapshot_by_id(
+    db_session: Session, chunk_id: str
+) -> RegulatoryChunk | None:
+    """Internal amendment/writer snapshot; caller owns its authorization/transaction."""
     return db_session.get(RegulatoryChunk, chunk_id)
+
+
+def get_chunk_by_id(db_session: Session, chunk_id: str) -> RegulatoryChunk | None:
+    from onyx.regulatory.publication_reads import (
+        filter_publication_read,
+        observe_publication_read,
+    )
+
+    observation = observe_publication_read()
+    chunk = db_session.get(RegulatoryChunk, chunk_id, populate_existing=True)
+    retained = filter_publication_read(
+        observation,
+        [chunk] if chunk is not None else [],
+        lambda row: str(row.user_file_id),
+    )
+    return retained[0] if retained else None
+
+
+def get_chunks_for_file(
+    db_session: Session,
+    user_file_id: UUID,
+    *,
+    include_superseded: bool = True,
+) -> list[RegulatoryChunk]:
+    from onyx.regulatory.publication_reads import (
+        filter_publication_read,
+        observe_publication_read,
+    )
+
+    observation = observe_publication_read()
+    chunks = get_chunks_for_file_snapshot(
+        db_session, user_file_id, include_superseded=include_superseded, refresh=True
+    )
+    return filter_publication_read(
+        observation, chunks, lambda row: str(row.user_file_id)
+    )
 
 
 def get_active_chunks_by_ids(

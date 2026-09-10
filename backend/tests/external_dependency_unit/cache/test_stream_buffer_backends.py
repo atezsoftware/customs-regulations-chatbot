@@ -47,3 +47,37 @@ def test_missing_chunk_is_gap(cache: CacheBackend) -> None:
 
 def test_missing_run_returns_none(cache: CacheBackend) -> None:
     assert read_stream_chunks(cache, uuid4(), 999, cursor=0) is None
+
+
+def test_publication_change_invalidates_buffer_before_replay(
+    cache: CacheBackend,
+) -> None:
+    from datetime import timedelta
+
+    from onyx.regulatory.publication_reads import (
+        PublicationReadEvidence,
+        public_read_store,
+    )
+    from tests.external_dependency_unit.regulatory.test_publication_primitives import (
+        create_owned_file,
+    )
+
+    with create_owned_file() as file_id:
+        authority = public_read_store()
+        owner = authority.acquire(file_id, owner_id=uuid4(), ttl=timedelta(seconds=30))
+        evidence = PublicationReadEvidence(
+            observation=authority.observe(), user_file_ids=(file_id,)
+        )
+        session_id = uuid4()
+        writer = StreamBufferWriter(cache=cache, chat_session_id=session_id, run_id=10)
+        writer.append_line('{"answer":"old"}\n', evidence=evidence)
+        writer.flush()
+        before = read_stream_chunks(cache, session_id, 10, cursor=0)
+        assert before is not None and before.blocks
+        authority.close_gate(owner)
+        after = read_stream_chunks(cache, session_id, 10, cursor=0)
+        assert after is not None and after.gap and not after.blocks
+        writer.append_line('{"answer":"late old"}\n', evidence=evidence)
+        writer.mark_done()
+        final = read_stream_chunks(cache, session_id, 10, cursor=0)
+        assert final is not None and final.gap and not final.blocks

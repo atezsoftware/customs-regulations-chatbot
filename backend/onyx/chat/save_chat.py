@@ -13,6 +13,7 @@ from onyx.db.chat import (
 )
 from onyx.db.models import ChatMessage, ToolCall
 from onyx.db.tools import create_tool_call_no_commit
+from onyx.document_index.publication_models import PublicationReadEvidence
 from onyx.file_store.models import FileDescriptor
 from onyx.natural_language_processing.utils import BaseTokenizer, get_tokenizer
 from onyx.server.query_and_chat.chat_utils import mime_type_to_chat_file_type
@@ -176,6 +177,7 @@ def save_chat_turn(
     is_clarification: bool = False,
     emitted_citations: set[int] | None = None,
     pre_answer_processing_time: float | None = None,
+    publication_evidence: PublicationReadEvidence | None = None,
 ) -> None:
     """
     Save a chat turn by populating the assistant_message and creating related entities.
@@ -347,5 +349,7 @@ def save_chat_turn(
             existing_files = assistant_message.files or []
             assistant_message.files = existing_files + referenced
 
-    # Finally save the messages, tool calls, and docs
+    from onyx.db.regulatory_chat_reads import stage_message_publication_read
+
+    stage_message_publication_read(db_session, assistant_message, publication_evidence)
     db_session.commit()

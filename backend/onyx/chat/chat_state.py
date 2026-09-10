@@ -20,6 +20,7 @@ from onyx.db.models import ChatMessage, ChatSession, Persona
 from onyx.llm.interfaces import LLM, LLMUserIdentity
 from onyx.llm.models import ReasoningEffort
 from onyx.onyxbot.slack.models import SlackContext
+from onyx.regulatory.publication_reads import PublicationReadTracker
 from onyx.server.query_and_chat.models import SendMessageRequest
 from onyx.tools.models import ChatFile, ToolCallInfo
 
@@ -41,6 +42,7 @@ class ChatStateContainer:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self.publication_reads = PublicationReadTracker()
         # These are collected at the end after the entire tool call is completed
         self.tool_calls: list[ToolCallInfo] = []
         # This is accumulated during the streaming

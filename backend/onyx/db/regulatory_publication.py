@@ -308,6 +308,49 @@ class PublicationStore:
                 or row.epoch > observation.committed_epoch
             )
 
+    def lock_public_read(
+        self,
+        session: Session,
+        observation: ReadObservation,
+        candidate_files: tuple[UUID, ...],
+    ) -> bool:
+        """Order a short local save/finalization before any subsequent publication."""
+        self._check_session(session)
+        if observation.scope != self.scope:
+            raise ValueError("read observation scope mismatch")
+        rows = list(
+            session.scalars(
+                select(RegulatoryFilePublication)
+                .where(RegulatoryFilePublication.user_file_id.in_(candidate_files))
+                .order_by(RegulatoryFilePublication.user_file_id)
+                .with_for_update(read=True)
+                .execution_options(populate_existing=True)
+            )
+        )
+        session.execute(
+            insert(RegulatoryPublicationClock)
+            .values(scope_key=self.scope_key, epoch=0)
+            .on_conflict_do_nothing()
+        )
+        session.execute(
+            select(RegulatoryPublicationClock)
+            .where(RegulatoryPublicationClock.scope_key == self.scope_key)
+            .with_for_update(read=True)
+        ).one()
+        rows = list(
+            session.scalars(
+                select(RegulatoryFilePublication)
+                .where(RegulatoryFilePublication.user_file_id.in_(candidate_files))
+                .execution_options(populate_existing=True)
+            )
+        )
+        return not any(
+            row.scope_key != self.scope_key
+            or row.gate_closed
+            or row.epoch > observation.committed_epoch
+            for row in rows
+        )
+
     def finalize(
         self,
         session: Session,

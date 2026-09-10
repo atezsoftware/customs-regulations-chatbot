@@ -3333,6 +3333,11 @@ class ChatMessage(Base):
         postgresql.JSONB(), nullable=True
     )
 
+    # Evidence remains guarded until the run has finished delivering its sources.
+    publication_read: Mapped[dict[str, Any] | None] = mapped_column(
+        postgresql.JSONB(), nullable=True
+    )
+
     # Metadata
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     time_sent: Mapped[datetime.datetime] = mapped_column(

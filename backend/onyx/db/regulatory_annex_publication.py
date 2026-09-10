@@ -61,13 +61,15 @@ def load_annex_publication_inputs(
 
 
 def load_file_temporal_bindings(
-    session: Session, user_file_id: UUID
+    session: Session, user_file_id: UUID, *, refresh: bool = False
 ) -> list[AnnexTemporalProjection]:
     from onyx.document_index.publication_models import publication_digest
 
     bindings = []
     for row in session.scalars(
-        select(RegulatoryTemporalProjection).where(
+        select(RegulatoryTemporalProjection)
+        .execution_options(populate_existing=refresh)
+        .where(
             RegulatoryTemporalProjection.user_file_id == user_file_id,
             RegulatoryTemporalProjection.retired_at.is_(None),
         )

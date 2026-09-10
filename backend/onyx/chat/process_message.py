@@ -312,12 +312,29 @@ def _load_context_user_files_for_tools(
         def _load(
             file_id: str = user_file.file_id, user_file_id: UUID = user_file.id
         ) -> bytes:
+            from onyx.db.regulatory_public_reads import current_protected_file_ids
+            from onyx.regulatory.publication_reads import (
+                observe_publication_read,
+                require_publication_files,
+            )
+
+            observation = observe_publication_read()
+            if current_protected_file_ids((user_file_id,)):
+                raise OnyxError(
+                    OnyxErrorCode.SERVICE_UNAVAILABLE,
+                    "This versioned source requires dated search; its original cannot be staged as current evidence.",
+                )
+            require_publication_files(observation, (user_file_id,))
             # Preserve the pre-lazy degraded-but-functional behavior: if the
             # underlying file is gone or temporarily unreachable, log it and
             # hand PythonTool an empty payload instead of letting the
             # exception propagate out of ChatFile.__getattribute__.
             try:
-                return get_default_file_store().read_file(file_id, mode="b").read()
+                content = get_default_file_store().read_file(file_id, mode="b").read()
+                require_publication_files(observation, (user_file_id,))
+                return content
+            except OnyxError:
+                raise
             except Exception as e:
                 logger.warning(
                     "Failed to load context file %s for Python execution: %s",
@@ -436,6 +453,32 @@ def extract_context_files(
     if not user_files:
         return _empty_extracted_context_files()
 
+    from onyx.db.regulatory_public_reads import protected_file_ids
+    from onyx.regulatory.publication_reads import (
+        PublicationReadEvidence,
+        observe_publication_read,
+        require_publication_files,
+    )
+
+    observation = observe_publication_read()
+    protected = protected_file_ids(db_session, tuple(file.id for file in user_files))
+    if protected:
+        if DISABLE_VECTOR_DB:
+            raise OnyxError(
+                OnyxErrorCode.SERVICE_UNAVAILABLE,
+                "Versioned source evidence requires dated search, which is unavailable.",
+            )
+        result = extract_context_files(
+            [file for file in user_files if file.id not in protected],
+            llm_max_context_window,
+            reserved_token_count,
+            db_session,
+            max_llm_context_percentage=max_llm_context_percentage,
+            force_search_only=force_search_only,
+        )
+        result.use_as_search_filter = True
+        return result
+
     # Aggregate tokens for the file content that will be added
     # Skip tokens for those with metadata only
     aggregate_tokens = sum(
@@ -525,7 +568,11 @@ def extract_context_files(
                 )
             )
 
+    require_publication_files(observation, tuple(file.id for file in user_files))
     return ExtractedContextFiles(
+        publication_evidence=PublicationReadEvidence(
+            observation=observation, user_file_ids=tuple(file.id for file in user_files)
+        ),
         file_texts=file_texts,
         image_files=image_files,
         use_as_search_filter=False,
@@ -1045,6 +1092,32 @@ def build_chat_turn(
         if is_global_regulatory_chat
         else load_all_chat_files(chat_history, db_session)
     )
+    from onyx.document_index.publication_models import PublicationReadEvidence
+
+    source_evidence = [
+        item.publication_evidence
+        for item in files
+        if item.publication_evidence is not None
+    ]
+    if extracted_context_files.publication_evidence is not None:
+        source_evidence.append(extracted_context_files.publication_evidence)
+    if source_evidence:
+        observation = min(
+            (item.observation for item in source_evidence),
+            key=lambda item: item.committed_epoch,
+        )
+        extracted_context_files.publication_evidence = PublicationReadEvidence(
+            observation=observation,
+            user_file_ids=tuple(
+                sorted(
+                    {
+                        file_id
+                        for item in source_evidence
+                        for file_id in item.user_file_ids
+                    }
+                )
+            ),
+        )
     # Convert loaded files to ChatFile format for tools like PythonTool
     chat_files_for_tools = _convert_loaded_files_to_chat_files(files)
     if not is_global_regulatory_chat:
@@ -1272,6 +1345,11 @@ def _run_models(
         containing ``OverallStop`` once all models complete (or one containing
         ``OverallStop(stop_reason="user_cancelled")`` if the connection drops).
     """
+    from onyx.regulatory.publication_reads import (
+        PublicationReadChanged,
+        track_publication_reads,
+    )
+
     n_models = len(setup.llms)
 
     # Workspace toggle: infer source/time filters from the query (default on).
@@ -1287,6 +1365,17 @@ def _run_models(
         )
         for i in range(n_models)
     ]
+    from onyx.regulatory.publication_reads import (
+        PublicationReadTracker,
+    )
+
+    initial_evidence = setup.extracted_context_files.publication_evidence
+    if initial_evidence is not None:
+        for state in state_containers:
+            state.publication_reads = PublicationReadTracker(
+                initial_evidence.observation
+            )
+            state.publication_reads.include(initial_evidence.user_file_ids)
     model_succeeded: list[bool] = [False] * n_models
     # Set to True when a model raises an exception (distinct from "still running").
     # Used in the stop-button path to avoid calling completion for errored models.
@@ -1296,6 +1385,8 @@ def _run_models(
     model_error_info: list[LLMErrorInfo | None] = [None] * n_models
     persist_lock = threading.Lock()
     persisted: list[bool] = [False] * n_models
+    publication_invalidated: list[bool] = [False] * n_models
+    publication_error_emitted: list[bool] = [False] * n_models
     post_steps_done = threading.Event()
 
     # Set only on stop-button: workers can't be interrupted, so their remaining
@@ -1332,6 +1423,12 @@ def _run_models(
             if not succeeded and not errored and not stop_button:
                 return
             persisted[model_idx] = True
+
+        try:
+            state_containers[model_idx].publication_reads.validate()
+        except PublicationReadChanged:
+            _invalidate_publication_model(model_idx)
+            return
 
         if errored:
             _save_errored_message(model_idx, context)
@@ -1390,115 +1487,122 @@ def _run_models(
         sc = state_containers[model_idx]
         model_llm = setup.llms[model_idx]
 
-        try:
-            # Each function opens short-lived DB sessions on demand.
-            # Do NOT pass a long-lived session here — it would hold a
-            # connection for the entire LLM loop (minutes), and cloud
-            # infrastructure may drop idle connections.
-            thread_tool_dict = construct_tools(
-                persona=setup.persona,
-                emitter=model_emitter,
-                user=user,
-                llm=model_llm,
-                search_tool_config=SearchToolConfig(
-                    user_selected_filters=_global_regulatory_search_filters(setup),
-                    document_set_names_override=(
-                        _benchmark_document_set_names_override(setup)
-                    ),
-                    project_id_filter=setup.search_params.project_id_filter,
-                    persona_id_filter=setup.search_params.persona_id_filter,
-                    bypass_acl=setup.bypass_acl,
-                    slack_context=setup.slack_context,
-                    enable_slack_search=(
-                        setup.persona.id != DEFAULT_PERSONA_ID
-                        and _should_enable_slack_search(
-                            setup.persona,
-                            setup.new_msg_req.internal_search_filters,
-                        )
-                    ),
-                    auto_detect_filters=_should_auto_detect_search_filters(
-                        persona_id=setup.persona.id,
-                        workspace_setting_enabled=auto_detect_search_filters,
-                    ),
-                ),
-                custom_tool_config=CustomToolConfig(
-                    chat_session_id=setup.chat_session.id,
-                    message_id=setup.user_message.id,
-                    additional_headers=setup.custom_tool_additional_headers,
-                    mcp_headers=setup.mcp_headers,
-                ),
-                file_reader_tool_config=FileReaderToolConfig(
-                    user_file_ids=setup.available_files.user_file_ids,
-                    chat_file_ids=setup.available_files.chat_file_ids,
-                ),
-                allowed_tool_ids=setup.new_msg_req.allowed_tool_ids,
-                search_usage_forcing_setting=setup.search_params.search_usage,
-            )
-            model_tools = _filter_global_regulatory_chat_tools(
-                [tool for tool_list in thread_tool_dict.values() for tool in tool_list],
-                is_global_regulatory_chat=(setup.persona.id == DEFAULT_PERSONA_ID),
-            )
-
-            if setup.forced_tool_id and setup.forced_tool_id not in {
-                tool.id for tool in model_tools
-            }:
-                raise ValueError(
-                    f"Forced tool {setup.forced_tool_id} not found in tools"
-                )
-
-            # Per-thread copy: run_llm_loop mutates simple_chat_history in-place.
-            # Deep Research receives the same internal-only, global regulatory
-            # SearchTool as the standard loop.
-            if n_models == 1 and setup.new_msg_req.deep_research:
-                _validate_deep_research_scope(setup.persona, model_tools)
-                run_deep_research_llm_loop(
-                    emitter=model_emitter,
-                    state_container=sc,
-                    simple_chat_history=list(setup.simple_chat_history),
-                    tools=model_tools,
-                    custom_agent_prompt=setup.custom_agent_prompt,
-                    llm=model_llm,
-                    token_counter=get_llm_token_counter(model_llm),
-                    reasoning_effort=setup.reasoning_effort,
-                    skip_clarification=setup.skip_clarification,
-                    user_identity=setup.user_identity,
-                    chat_session_id=str(setup.chat_session.id),
-                    all_injected_file_metadata=setup.all_injected_file_metadata,
-                )
-            else:
-                run_llm_loop(
-                    emitter=model_emitter,
-                    state_container=sc,
-                    simple_chat_history=list(setup.simple_chat_history),
-                    tools=model_tools,
-                    custom_agent_prompt=setup.custom_agent_prompt,
-                    context_files=setup.extracted_context_files,
+        with track_publication_reads(sc.publication_reads):
+            try:
+                # Each function opens short-lived DB sessions on demand.
+                # Do NOT pass a long-lived session here — it would hold a
+                # connection for the entire LLM loop (minutes), and cloud
+                # infrastructure may drop idle connections.
+                thread_tool_dict = construct_tools(
                     persona=setup.persona,
-                    user_memory_context=setup.user_memory_context,
+                    emitter=model_emitter,
+                    user=user,
                     llm=model_llm,
-                    token_counter=get_llm_token_counter(model_llm),
-                    forced_tool_id=setup.forced_tool_id,
-                    user_identity=setup.user_identity,
-                    chat_session_id=str(setup.chat_session.id),
-                    chat_files=setup.chat_files_for_tools,
-                    reasoning_effort=setup.reasoning_effort,
-                    include_citations=setup.new_msg_req.include_citations,
-                    all_injected_file_metadata=setup.all_injected_file_metadata,
-                    inject_memories_in_prompt=user.use_memories,
+                    search_tool_config=SearchToolConfig(
+                        user_selected_filters=_global_regulatory_search_filters(setup),
+                        document_set_names_override=(
+                            _benchmark_document_set_names_override(setup)
+                        ),
+                        project_id_filter=setup.search_params.project_id_filter,
+                        persona_id_filter=setup.search_params.persona_id_filter,
+                        bypass_acl=setup.bypass_acl,
+                        slack_context=setup.slack_context,
+                        enable_slack_search=(
+                            setup.persona.id != DEFAULT_PERSONA_ID
+                            and _should_enable_slack_search(
+                                setup.persona,
+                                setup.new_msg_req.internal_search_filters,
+                            )
+                        ),
+                        auto_detect_filters=_should_auto_detect_search_filters(
+                            persona_id=setup.persona.id,
+                            workspace_setting_enabled=auto_detect_search_filters,
+                        ),
+                    ),
+                    custom_tool_config=CustomToolConfig(
+                        chat_session_id=setup.chat_session.id,
+                        message_id=setup.user_message.id,
+                        additional_headers=setup.custom_tool_additional_headers,
+                        mcp_headers=setup.mcp_headers,
+                    ),
+                    file_reader_tool_config=FileReaderToolConfig(
+                        user_file_ids=setup.available_files.user_file_ids,
+                        chat_file_ids=setup.available_files.chat_file_ids,
+                    ),
+                    allowed_tool_ids=setup.new_msg_req.allowed_tool_ids,
+                    search_usage_forcing_setting=setup.search_params.search_usage,
+                )
+                model_tools = _filter_global_regulatory_chat_tools(
+                    [
+                        tool
+                        for tool_list in thread_tool_dict.values()
+                        for tool in tool_list
+                    ],
+                    is_global_regulatory_chat=(setup.persona.id == DEFAULT_PERSONA_ID),
                 )
 
-            model_succeeded[model_idx] = True
+                if setup.forced_tool_id and setup.forced_tool_id not in {
+                    tool.id for tool in model_tools
+                }:
+                    raise ValueError(
+                        f"Forced tool {setup.forced_tool_id} not found in tools"
+                    )
 
-        except Exception as e:
-            model_errored[model_idx] = True
-            model_error_info[model_idx] = litellm_exception_to_safe_error(
-                e, model_llm, fallback_to_error_msg=True
-            )
-            merged_queue.put((model_idx, e))
+                # Per-thread copy: run_llm_loop mutates simple_chat_history in-place.
+                # Deep Research receives the same internal-only, global regulatory
+                # SearchTool as the standard loop.
+                if n_models == 1 and setup.new_msg_req.deep_research:
+                    _validate_deep_research_scope(setup.persona, model_tools)
+                    run_deep_research_llm_loop(
+                        emitter=model_emitter,
+                        state_container=sc,
+                        simple_chat_history=list(setup.simple_chat_history),
+                        tools=model_tools,
+                        custom_agent_prompt=setup.custom_agent_prompt,
+                        llm=model_llm,
+                        token_counter=get_llm_token_counter(model_llm),
+                        reasoning_effort=setup.reasoning_effort,
+                        skip_clarification=setup.skip_clarification,
+                        user_identity=setup.user_identity,
+                        chat_session_id=str(setup.chat_session.id),
+                        all_injected_file_metadata=setup.all_injected_file_metadata,
+                    )
+                else:
+                    run_llm_loop(
+                        emitter=model_emitter,
+                        state_container=sc,
+                        simple_chat_history=list(setup.simple_chat_history),
+                        tools=model_tools,
+                        custom_agent_prompt=setup.custom_agent_prompt,
+                        context_files=setup.extracted_context_files,
+                        persona=setup.persona,
+                        user_memory_context=setup.user_memory_context,
+                        llm=model_llm,
+                        token_counter=get_llm_token_counter(model_llm),
+                        forced_tool_id=setup.forced_tool_id,
+                        user_identity=setup.user_identity,
+                        chat_session_id=str(setup.chat_session.id),
+                        chat_files=setup.chat_files_for_tools,
+                        reasoning_effort=setup.reasoning_effort,
+                        include_citations=setup.new_msg_req.include_citations,
+                        all_injected_file_metadata=setup.all_injected_file_metadata,
+                        inject_memories_in_prompt=user.use_memories,
+                    )
 
-        finally:
-            _persist_model_outcome(model_idx, _PersistContext.WORKER)
-            merged_queue.put((model_idx, _MODEL_DONE))
+                model_succeeded[model_idx] = True
+
+            except Exception as e:
+                model_errored[model_idx] = True
+                model_error_info[model_idx] = litellm_exception_to_safe_error(
+                    e, model_llm, fallback_to_error_msg=True
+                )
+                merged_queue.put((model_idx, e))
+
+            finally:
+                try:
+                    _persist_model_outcome(model_idx, _PersistContext.WORKER)
+                finally:
+                    merged_queue.put((model_idx, _MODEL_DONE))
 
     def _save_errored_message(model_idx: int, context: _PersistContext) -> None:
         """Save an error message to a reserved ChatMessage that failed during execution."""
@@ -1529,11 +1633,48 @@ def _run_models(
                 setup.model_display_names[model_idx],
             )
 
+    def _invalidate_publication_model(model_idx: int) -> StreamingError:
+        from onyx.db.chat import invalidate_publication_chat_message
+
+        error = StreamingError(
+            error=str(PublicationReadChanged()),
+            error_code="PUBLICATION_SOURCE_CHANGED",
+            is_retryable=True,
+            details={"model_index": model_idx},
+        )
+        if not publication_invalidated[model_idx]:
+            try:
+                invalidate_publication_chat_message(
+                    setup.reserved_messages[model_idx].id, error.error
+                )
+                publication_invalidated[model_idx] = True
+            except Exception:
+                logger.exception("Failed to invalidate changed-source chat message")
+        return error
+
     def _publish(item: Packet | StreamingError) -> None:
         """Fan one outbound item to the stream buffer and, while attached, the reader."""
+        evidence = None
+        model_idx = 0
+        if isinstance(item, Packet):
+            model_idx = item.placement.model_index or 0
+            if publication_error_emitted[model_idx]:
+                return
+            evidence = state_containers[model_idx].publication_reads.evidence()
+            try:
+                state_containers[model_idx].publication_reads.validate()
+            except PublicationReadChanged:
+                item = _invalidate_publication_model(model_idx)
+                publication_error_emitted[model_idx] = True
         if stream_buffer is not None:
             try:
-                stream_buffer.append_line(get_json_line(item.model_dump()))
+                stream_buffer.append_line(
+                    get_json_line(item.model_dump()),
+                    evidence=evidence,
+                    message_id=setup.reserved_messages[model_idx].id
+                    if evidence is not None
+                    else None,
+                )
             except Exception:
                 logger.exception("stream buffer append failed")
         # Non-blocking put: a slow reader can't stall the writer.
@@ -1589,6 +1730,17 @@ def _run_models(
                         return
                     continue
                 if item is _MODEL_DONE:
+                    if (
+                        state_containers[model_idx].publication_reads.evidence()
+                        is not None
+                    ):
+                        from onyx.db.regulatory_chat_reads import (
+                            mark_message_publication_generated,
+                        )
+
+                        mark_message_publication_generated(
+                            setup.reserved_messages[model_idx].id
+                        )
                     models_remaining -= 1
                 elif isinstance(item, Exception):
                     # Publish a tagged error for this model but keep the other
@@ -1644,7 +1796,12 @@ def _run_models(
             # Mark done before _run_post_steps clears the fence so resume
             # readers never see a fence-less, not-done buffer and drop the tail.
             if stream_buffer is not None:
-                stream_buffer.mark_done()
+                try:
+                    stream_buffer.mark_done()
+                except Exception:
+                    logger.exception(
+                        "Failed to mark the source-dependent stream complete"
+                    )
             _run_post_steps()
             tee.put(_STREAM_DONE)
             executor.shutdown(wait=False)
@@ -1680,8 +1837,24 @@ def _run_models(
                         last_packet_yield = now
                     continue
                 if item is _STREAM_DONE:
+                    from onyx.db.regulatory_chat_reads import (
+                        finalize_message_publication_read,
+                    )
+
+                    for model_idx, state in enumerate(state_containers):
+                        if state.publication_reads.evidence() is not None:
+                            finalize_message_publication_read(
+                                setup.reserved_messages[model_idx].id
+                            )
                     stream_done = True
                     return
+                if isinstance(item, Packet):
+                    model_idx = item.placement.model_index or 0
+                    try:
+                        state_containers[model_idx].publication_reads.validate()
+                    except PublicationReadChanged:
+                        yield _invalidate_publication_model(model_idx)
+                        continue
                 yield cast(Packet | StreamingError, item)
                 last_packet_yield = time.monotonic()
         finally:
@@ -2016,6 +2189,7 @@ def llm_loop_completion_handle(
     llm: LLM,
     reserved_tokens: int,
 ) -> None:
+    state_container.publication_reads.validate()
     # Snapshot all state under the container's lock before any DB write.
     # Worker threads may still be running (e.g. user-cancellation path), so
     # direct attribute access is not thread-safe — use the provided getters.
@@ -2069,6 +2243,7 @@ def llm_loop_completion_handle(
             is_clarification=is_clarification,
             emitted_citations=emitted_citations,
             pre_answer_processing_time=pre_answer_processing_time,
+            publication_evidence=state_container.publication_reads.evidence(),
         )
 
         updated_chat_history = create_chat_history_chain(

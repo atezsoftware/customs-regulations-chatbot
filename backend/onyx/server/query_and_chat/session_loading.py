@@ -537,6 +537,10 @@ def translate_assistant_message_to_packets(
     It needs to be a list of list of packets combined into indices for "steps".
     The final answer and citations are also a "step".
     """
+    from onyx.db.regulatory_chat_reads import message_publication_available
+
+    if not message_publication_available(chat_message):
+        return []
     packet_list: list[Packet] = []
 
     if chat_message.message_type != MessageType.ASSISTANT:
@@ -902,4 +906,4 @@ def translate_assistant_message_to_packets(
         )
     )
 
-    return packet_list
+    return packet_list if message_publication_available(chat_message) else []

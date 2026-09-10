@@ -75,14 +75,32 @@ def load_chat_file_by_id(file_id: str) -> InMemoryChatFile:
 
     This is the fallback path for chat-attached files that don't have a
     corresponding row in the ``user_file`` table."""
+    from onyx.db.regulatory_public_reads import current_file_read_owners
+    from onyx.error_handling.error_codes import OnyxErrorCode
+    from onyx.error_handling.exceptions import OnyxError
+    from onyx.regulatory.publication_reads import (
+        observe_publication_read,
+        require_publication_files,
+    )
+
+    observation = observe_publication_read()
+    parents, originals = current_file_read_owners(file_id)
+    require_publication_files(observation, parents)
+    if originals:
+        raise OnyxError(
+            OnyxErrorCode.SERVICE_UNAVAILABLE,
+            "This versioned source requires dated search instead of its original file.",
+        )
     file_store = get_default_file_store()
     file_record = file_store.read_file_record(file_id)
     chat_file_type = mime_type_to_chat_file_type(file_record.file_type)
 
     file_io = file_store.read_file(file_id, mode="b")
+    content = file_io.read()
+    require_publication_files(observation, parents)
     return InMemoryChatFile(
         file_id=file_id,
-        content=file_io.read(),
+        content=content,
         file_type=chat_file_type,
         filename=file_record.display_name,
     )
@@ -97,6 +115,21 @@ def load_user_file(file_id: UUID, db_session: Session) -> InMemoryChatFile:
 
     # Get the file record to determine the appropriate chat file type
     file_store = get_default_file_store()
+    from onyx.db.regulatory_public_reads import protected_file_ids
+    from onyx.error_handling.error_codes import OnyxErrorCode
+    from onyx.error_handling.exceptions import OnyxError
+    from onyx.regulatory.publication_reads import (
+        observe_publication_read,
+        require_publication_files,
+    )
+
+    observation = observe_publication_read()
+    if protected_file_ids(db_session, (user_file.id,)):
+        raise OnyxError(
+            OnyxErrorCode.SERVICE_UNAVAILABLE,
+            "This versioned source requires dated search instead of its original file.",
+        )
+    require_publication_files(observation, (user_file.id,))
     file_record = file_store.read_file_record(user_file.file_id)
 
     # Determine appropriate chat file type based on the original file's MIME type
@@ -139,6 +172,7 @@ def load_user_file(file_id: UUID, db_session: Session) -> InMemoryChatFile:
             filename=user_file.name,
         )
         status = "plaintext"
+        require_publication_files(observation, (user_file.id,))
         return chat_file
     except Exception as e:
         logger.warning("Failed to load plaintext for user file %s: %s", user_file.id, e)
@@ -152,6 +186,7 @@ def load_user_file(file_id: UUID, db_session: Session) -> InMemoryChatFile:
             filename=user_file.name,
         )
         status = "original"
+        require_publication_files(observation, (user_file.id,))
         return chat_file
     finally:
         logger.debug(

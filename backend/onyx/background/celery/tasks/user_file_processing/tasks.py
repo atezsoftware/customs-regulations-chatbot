@@ -51,7 +51,7 @@ from onyx.db.port_attempt import port_backfill_has_pending_work
 from onyx.db.port_orphan_candidate import record_port_orphan_candidates_for_user_file
 from onyx.db.regulatory_chunks import (
     get_chunk_counts_for_files,
-    get_chunks_for_file,
+    get_chunks_for_file_snapshot,
     has_regulatory_chunks_for_file,
 )
 from onyx.db.regulatory_indexing_jobs import (
@@ -537,7 +537,7 @@ def _chunk_user_file_without_indexing(
         # indexing phase and are discarded here.
         chunker.chunk(indexable_documents)
 
-        rows = get_chunks_for_file(db_session, _as_uuid(user_file_id))
+        rows = get_chunks_for_file_snapshot(db_session, _as_uuid(user_file_id))
         if not rows:
             raise RuntimeError(
                 f"_chunk_user_file_without_indexing - produced no chunks for {user_file_id}"
@@ -855,7 +855,7 @@ def _index_user_file_to_secondary(
                 "not completed; skipping secondary write"
             )
             return False
-        rows = get_chunks_for_file(db_session, user_file_uuid)
+        rows = get_chunks_for_file_snapshot(db_session, user_file_uuid)
         if not rows:
             raise RuntimeError(
                 f"No regulatory chunks found for secondary projection {user_file_id}"
@@ -967,7 +967,7 @@ def _supply_user_file_to_secondary(user_file_id: str, tenant_id: str) -> bool:
         file_id = user_file.file_id if user_file is not None else None
         file_name = user_file.name if user_file is not None else None
         has_regulatory_chunks = bool(
-            get_chunks_for_file(db_session, _as_uuid(user_file_id))
+            get_chunks_for_file_snapshot(db_session, _as_uuid(user_file_id))
         )
     if secondary is None or user_file is None:
         return False
