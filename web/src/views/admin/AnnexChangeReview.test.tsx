@@ -1,4 +1,5 @@
 import { render, screen, setupUser } from "@tests/setup/test-utils";
+import { toast } from "@opal/layouts";
 
 import type { AnnexReview } from "@/lib/regulatory/amendments";
 import AnnexChangeReview from "@/views/admin/AnnexChangeReview";
@@ -318,6 +319,147 @@ test("submits a corrected NEW element as a full immutable revalidation", async (
       reason: "Verified against the frozen cell.",
     },
   ]);
+});
+
+test("cannot approve the frozen hash while a local correction is unsubmitted", async () => {
+  const user = setupUser();
+  const onApprove = jest.fn().mockResolvedValue(reviewFixture());
+  render(
+    <AnnexChangeReview
+      review={reviewFixture()}
+      onUpdated={jest.fn()}
+      onApprove={onApprove}
+    />
+  );
+
+  expect(screen.getByRole("button", { name: "Approve group" })).toBeEnabled();
+  await user.clear(
+    screen.getByRole("textbox", { name: "Correct NEW element 0" })
+  );
+  await user.type(
+    screen.getByRole("textbox", { name: "Correct NEW element 0" }),
+    "New rate: 11%"
+  );
+
+  expect(
+    screen.getByText(/local correction changes are not submitted/i)
+  ).toBeVisible();
+  expect(screen.getByRole("button", { name: "Approve group" })).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: "Approve group" }));
+  expect(onApprove).not.toHaveBeenCalled();
+});
+
+test("removes an applied correction through an empty immutable revalidation", async () => {
+  const user = setupUser();
+  const correctedReview = reviewFixture({
+    review_payload: {
+      ...reviewFixture().review_payload,
+      raw_new_extraction: reviewFixture().review_payload.new_extraction,
+      corrections: [
+        {
+          position: 0,
+          before_text: "New rate: 12%",
+          corrected_text: "New rate: 11%",
+          reason: "Verified correction.",
+        },
+      ],
+      correction_reconciliation: {
+        supported: true,
+        rationale: "Correction matches the frozen cell.",
+        input_sha256: "c".repeat(64),
+      },
+    },
+  });
+  const onEdit = jest.fn().mockResolvedValue(
+    reviewFixture({
+      review_revision: 4,
+      review_payload: {
+        ...correctedReview.review_payload,
+        corrections: [],
+      },
+    })
+  );
+  render(
+    <AnnexChangeReview
+      review={correctedReview}
+      onUpdated={jest.fn()}
+      onEdit={onEdit}
+    />
+  );
+
+  await user.click(
+    screen.getByRole("button", { name: "Remove correction for element 0" })
+  );
+  await user.click(
+    screen.getByRole("button", { name: "Revalidate full group" })
+  );
+
+  expect(onEdit).toHaveBeenCalledWith([]);
+});
+
+test("keeps raw and applied correction provenance visible after approval", () => {
+  const rawExtraction = reviewFixture().review_payload.new_extraction;
+  render(
+    <AnnexChangeReview
+      review={reviewFixture({
+        status: "approved",
+        publication_generation: 1,
+        review_payload: {
+          ...reviewFixture().review_payload,
+          raw_new_extraction: rawExtraction,
+          corrections: [
+            {
+              position: 0,
+              before_text: "New rate: 12%",
+              corrected_text: "New rate: 11%",
+              reason: "Verified correction.",
+            },
+          ],
+          correction_reconciliation: {
+            supported: true,
+            rationale: "Correction matches the frozen cell.",
+            input_sha256: "c".repeat(64),
+          },
+        },
+      })}
+      onUpdated={jest.fn()}
+    />
+  );
+
+  expect(screen.getByText("Raw extraction 0: New rate: 12%")).toBeVisible();
+  expect(screen.getByText(/Applied correction 0: New rate: 11%/)).toBeVisible();
+  expect(screen.getByText(/Correction matches the frozen cell/)).toBeVisible();
+  expect(
+    screen.queryByRole("textbox", { name: "Correct NEW element 0" })
+  ).not.toBeInTheDocument();
+});
+
+test("reports an unchanged blocked retry from the returned status", async () => {
+  const user = setupUser();
+  const infoSpy = jest.spyOn(toast, "info").mockImplementation(jest.fn());
+  const blocked = reviewFixture({
+    status: "blocked",
+    review_payload: {
+      ...reviewFixture().review_payload,
+      publication: null,
+      impact: null,
+      issues: ["source_package_missing"],
+    },
+  });
+  render(
+    <AnnexChangeReview
+      review={blocked}
+      onUpdated={jest.fn()}
+      onRetry={jest.fn().mockResolvedValue(blocked)}
+    />
+  );
+
+  await user.click(screen.getByRole("button", { name: "Retry review" }));
+
+  expect(infoSpy).toHaveBeenCalledWith(
+    "Blocking checks remain; the review was not resumed."
+  );
+  infoSpy.mockRestore();
 });
 
 test("shows precise blocked and provider-reconciliation states", () => {

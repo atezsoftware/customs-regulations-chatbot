@@ -78,6 +78,48 @@ function displayAnnexLabel(label: string) {
   return normalized ? `EK-${normalized[1]}` : label;
 }
 
+function correctionsEqual(
+  left: AnnexElementCorrection[],
+  right: AnnexElementCorrection[]
+) {
+  if (left.length !== right.length) return false;
+  const byPosition = (items: AnnexElementCorrection[]) =>
+    [...items].sort((a, b) => a.position - b.position);
+  const sortedLeft = byPosition(left);
+  const sortedRight = byPosition(right);
+  return sortedLeft.every((correction, index) => {
+    const other = sortedRight[index];
+    return (
+      other !== undefined &&
+      correction.position === other.position &&
+      correction.before_text === other.before_text &&
+      correction.corrected_text === other.corrected_text &&
+      correction.reason === other.reason
+    );
+  });
+}
+
+function retryResultMessage(review: AnnexReview) {
+  if (review.status === "blocked") {
+    return "Blocking checks remain; the review was not resumed.";
+  }
+  if (review.status === "approved") {
+    return "The annex group is already approved.";
+  }
+  if (review.status === "failed") {
+    return "The retry finished with a failure; review the current error.";
+  }
+  if (review.status === "rejected") {
+    return "The annex group remains rejected.";
+  }
+  if (review.status === "pending") {
+    return "The annex group is ready for review.";
+  }
+  return review.publication_generation > 0
+    ? `Publication retry is ${STATUS_LABELS[review.status].toLowerCase()} for the same frozen revision.`
+    : `Review preparation is ${STATUS_LABELS[review.status].toLowerCase()} without changing its frozen identity.`;
+}
+
 function shorten(value: string | null, length = 12) {
   if (!value) return "—";
   return value.length > length ? `${value.slice(0, length)}…` : value;
@@ -265,15 +307,14 @@ export default function AnnexChangeReview({
     review.publication_generation === 0 &&
     ["pending", "blocked", "rejected", "failed"].includes(review.status) &&
     editableElements.length > 0;
-  const correctionsValid =
-    corrections.length > 0 &&
-    corrections.every(
-      (correction) =>
-        correction.corrected_text.trim() &&
-        correction.reason.trim() &&
-        correction.corrected_text !== correction.before_text
-    );
-  const readyToApprove =
+  const correctionsValid = corrections.every(
+    (correction) =>
+      correction.corrected_text.trim().length > 0 &&
+      correction.reason.trim().length > 0 &&
+      correction.corrected_text !== correction.before_text
+  );
+  const correctionsDirty = !correctionsEqual(corrections, payload.corrections);
+  const frozenReviewReadyToApprove =
     review.status === "pending" &&
     payload.issues.length === 0 &&
     payload.impact?.ready === true &&
@@ -284,13 +325,13 @@ export default function AnnexChangeReview({
 
   const runAction = async (
     action: () => Promise<AnnexReview>,
-    success: string
+    success: string | ((updated: AnnexReview) => string)
   ) => {
     setWorking(true);
     try {
       const updated = await action();
       onUpdated(updated);
-      toast.info(success);
+      toast.info(typeof success === "string" ? success : success(updated));
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Annex review action failed."
@@ -586,71 +627,138 @@ export default function AnnexChangeReview({
         </ReviewSection>
       )}
 
-      {canEdit && (
+      {(editableElements.length > 0 ||
+        payload.corrections.length > 0 ||
+        payload.correction_reconciliation) && (
         <ReviewSection title="Evidence-backed correction">
-          <Text as="p" font="secondary-body" color="text-03">
-            Editing NEW text creates a new immutable review revision and
-            revalidates the complete group against frozen evidence.
-          </Text>
-          {editableElements.map((element, position) => {
-            const correction = correctionByPosition.get(position);
-            return (
-              <div key={position} className="flex flex-col gap-2">
-                <Text as="p" font="secondary-body" color="text-03">
-                  {`Raw extraction ${position}: ${element.text}`}
-                </Text>
-                <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
-                  <InputTextArea
-                    aria-label={`Correct NEW element ${position}`}
-                    value={correction?.corrected_text ?? element.text}
-                    onChange={(event) =>
-                      updateCorrection(
-                        position,
-                        "corrected_text",
-                        event.target.value
-                      )
-                    }
-                    rows={3}
-                  />
-                  <InputTypeIn
-                    aria-label={`Correction reason for element ${position}`}
-                    value={correction?.reason ?? ""}
-                    onChange={(event) =>
-                      updateCorrection(position, "reason", event.target.value)
-                    }
-                    placeholder="How the frozen original supports this correction"
-                  />
-                </div>
-              </div>
-            );
-          })}
+          {editableElements.map((element, position) => (
+            <Text
+              key={`raw-${position}`}
+              as="p"
+              font="secondary-body"
+              color="text-03"
+            >
+              {`Raw extraction ${position}: ${element.text}`}
+            </Text>
+          ))}
+          {payload.corrections.map((correction) => (
+            <div
+              key={`applied-${correction.position}`}
+              className="rounded-08 bg-background-tint-01 p-2"
+            >
+              <Text as="p" font="main-ui-body" color="text-05">
+                {`Applied correction ${correction.position}: ${correction.corrected_text}`}
+              </Text>
+              <Text as="p" font="secondary-body" color="text-03">
+                {`Frozen raw value: ${correction.before_text} · ${correction.reason}`}
+              </Text>
+            </div>
+          ))}
           {payload.correction_reconciliation && (
             <Text as="p" font="secondary-body" color="text-03">
               {`Evidence reconciliation: ${payload.correction_reconciliation.supported ? "supported" : "blocked"} · ${payload.correction_reconciliation.rationale}`}
             </Text>
           )}
-          <div className="flex justify-end">
-            <Button
-              prominence="secondary"
-              disabled={working || !correctionsValid}
-              onClick={() =>
-                void runAction(
-                  () =>
-                    onEdit
-                      ? onEdit(corrections)
-                      : editAnnexReview(
-                          review.batch_id,
-                          review.id,
-                          review.review_sha256,
-                          corrections
-                        ),
-                  "A new immutable review revision was created."
-                )
-              }
-            >
-              Revalidate full group
-            </Button>
-          </div>
+          {canEdit && (
+            <>
+              <Text as="p" font="secondary-body" color="text-03">
+                Editing NEW text creates a new immutable review revision and
+                revalidates the complete group against frozen evidence.
+              </Text>
+              {editableElements.map((element, position) => {
+                const correction = correctionByPosition.get(position);
+                return (
+                  <div key={position} className="flex flex-col gap-2">
+                    <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
+                      <InputTextArea
+                        aria-label={`Correct NEW element ${position}`}
+                        value={correction?.corrected_text ?? element.text}
+                        onChange={(event) =>
+                          updateCorrection(
+                            position,
+                            "corrected_text",
+                            event.target.value
+                          )
+                        }
+                        rows={3}
+                      />
+                      <InputTypeIn
+                        aria-label={`Correction reason for element ${position}`}
+                        value={correction?.reason ?? ""}
+                        onChange={(event) =>
+                          updateCorrection(
+                            position,
+                            "reason",
+                            event.target.value
+                          )
+                        }
+                        placeholder="How the frozen original supports this correction"
+                      />
+                    </div>
+                    {correction && (
+                      <div className="flex justify-end">
+                        <Button
+                          size="sm"
+                          prominence="secondary"
+                          onClick={() =>
+                            setCorrections((current) =>
+                              current.filter(
+                                (item) => item.position !== position
+                              )
+                            )
+                          }
+                        >
+                          {`Remove correction for element ${position}`}
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {correctionsDirty && (
+                <div
+                  role="status"
+                  className="rounded-08 border border-status-warning-02 bg-status-warning-01 p-2"
+                >
+                  <Text as="p" font="main-ui-body" color="text-05">
+                    Local correction changes are not submitted. Revalidate the
+                    full group or discard them before approving this frozen
+                    revision.
+                  </Text>
+                </div>
+              )}
+              <div className="flex flex-wrap justify-end gap-2">
+                {correctionsDirty && (
+                  <Button
+                    prominence="secondary"
+                    onClick={() => setCorrections(payload.corrections)}
+                  >
+                    Discard local edits
+                  </Button>
+                )}
+                <Button
+                  prominence="secondary"
+                  disabled={working || !correctionsDirty || !correctionsValid}
+                  onClick={() =>
+                    void runAction(
+                      () =>
+                        onEdit
+                          ? onEdit(corrections)
+                          : editAnnexReview(
+                              review.batch_id,
+                              review.id,
+                              review.review_sha256,
+                              corrections
+                            ),
+                      "A new immutable review revision was created."
+                    )
+                  }
+                >
+                  Revalidate full group
+                </Button>
+              </div>
+            </>
+          )}
         </ReviewSection>
       )}
 
@@ -677,9 +785,9 @@ export default function AnnexChangeReview({
             Reject group
           </Button>
         )}
-        {readyToApprove && (
+        {frozenReviewReadyToApprove && (
           <Button
-            disabled={working}
+            disabled={working || correctionsDirty}
             onClick={() =>
               void runAction(
                 () =>
@@ -711,9 +819,7 @@ export default function AnnexChangeReview({
                         review.id,
                         review.review_sha256
                       ),
-                review.publication_generation > 0
-                  ? "Publication retry queued for the same frozen revision."
-                  : "Review preparation resumed without changing its frozen identity."
+                retryResultMessage
               )
             }
           >

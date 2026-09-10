@@ -10,6 +10,7 @@ import {
 import {
   type AmendmentSourcePackage,
   type AnnexReview,
+  RegulatoryRequestError,
   analyzeAmendment,
   approveProposal,
   createAmendmentSourcePackage,
@@ -41,6 +42,14 @@ jest.mock("@/lib/hooks/useDocumentSets", () => ({
 }));
 
 jest.mock("@/lib/regulatory/amendments", () => ({
+  RegulatoryRequestError: class extends Error {
+    constructor(
+      message: string,
+      readonly status: number
+    ) {
+      super(message);
+    }
+  },
   analyzeAmendment: jest.fn(),
   extractAmendmentDocx: jest.fn(),
   approveProposal: jest.fn(),
@@ -443,6 +452,194 @@ test("ignores a late package creation after the selected source changes", async 
     screen.queryByText("Source package processing")
   ).not.toBeInTheDocument();
   expect(mockedGetAmendmentSourcePackage).not.toHaveBeenCalled();
+});
+
+test("recovers source package polling after a transient status failure", async () => {
+  jest.useFakeTimers();
+  mockedGetAnnexCapabilities.mockResolvedValue({
+    enabled: true,
+    grouped_review: true,
+    immutable_review_revisions: true,
+    asynchronous_source_preparation: true,
+    publication_requires_verified_index: true,
+  });
+  const processingPackage: AmendmentSourcePackage = {
+    id: "package-transient",
+    document_set_id: 7,
+    status: "processing",
+    asset_count: 0,
+    total_bytes: 0,
+    issues: [],
+    manifest_sha256: null,
+    assets: [],
+    created_at: "2026-09-10T00:00:00Z",
+    updated_at: "2026-09-10T00:00:00Z",
+  };
+  mockedUploadAmendmentSourcePackage.mockResolvedValue(processingPackage);
+  mockedGetAmendmentSourcePackage
+    .mockRejectedValueOnce(new Error("Temporary status failure"))
+    .mockResolvedValueOnce({
+      ...processingPackage,
+      status: "ready",
+      asset_count: 1,
+      manifest_sha256: "a".repeat(64),
+    });
+  mockedGetAmendmentSourceText.mockResolvedValue({
+    package_id: processingPackage.id,
+    manifest_sha256: "a".repeat(64),
+    original_text: "Recovered frozen source text",
+    original_text_sha256: "b".repeat(64),
+  });
+  const user = setupUser({ advanceTimers: jest.advanceTimersByTime });
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
+  );
+  await user.upload(
+    screen.getByLabelText("Amendment source Excel workbook"),
+    new File(["sheet"], "EK-1.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })
+  );
+  await user.click(screen.getByRole("button", { name: "Prepare source" }));
+  await waitFor(() =>
+    expect(mockedGetAmendmentSourcePackage).toHaveBeenCalledTimes(1)
+  );
+  await act(async () => {
+    await jest.advanceTimersByTimeAsync(3000);
+  });
+
+  expect(mockedGetAmendmentSourcePackage).toHaveBeenCalledTimes(2);
+  expect(
+    await screen.findByDisplayValue("Recovered frozen source text")
+  ).toBeVisible();
+  jest.useRealTimers();
+});
+
+test("stops source package polling after a terminal status error", async () => {
+  jest.useFakeTimers();
+  mockedGetAnnexCapabilities.mockResolvedValue({
+    enabled: true,
+    grouped_review: true,
+    immutable_review_revisions: true,
+    asynchronous_source_preparation: true,
+    publication_requires_verified_index: true,
+  });
+  const processingPackage: AmendmentSourcePackage = {
+    id: "package-terminal",
+    document_set_id: 7,
+    status: "processing",
+    asset_count: 0,
+    total_bytes: 0,
+    issues: [],
+    manifest_sha256: null,
+    assets: [],
+    created_at: "2026-09-10T00:00:00Z",
+    updated_at: "2026-09-10T00:00:00Z",
+  };
+  mockedUploadAmendmentSourcePackage.mockResolvedValue(processingPackage);
+  mockedGetAmendmentSourcePackage.mockRejectedValue(
+    new RegulatoryRequestError("Source package not found", 404)
+  );
+  const user = setupUser({ advanceTimers: jest.advanceTimersByTime });
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
+  );
+  await user.upload(
+    screen.getByLabelText("Amendment source Excel workbook"),
+    new File(["sheet"], "EK-1.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })
+  );
+  await user.click(screen.getByRole("button", { name: "Prepare source" }));
+  await waitFor(() =>
+    expect(mockedGetAmendmentSourcePackage).toHaveBeenCalledTimes(1)
+  );
+  expect(
+    await screen.findByText(
+      "Source package status cannot be refreshed: Source package not found"
+    )
+  ).toBeVisible();
+
+  await act(async () => {
+    await jest.advanceTimersByTimeAsync(60_000);
+  });
+
+  expect(mockedGetAmendmentSourcePackage).toHaveBeenCalledTimes(1);
+  jest.useRealTimers();
+});
+
+test("ignores a late source package retry after the source changes", async () => {
+  mockedGetAnnexCapabilities.mockResolvedValue({
+    enabled: true,
+    grouped_review: true,
+    immutable_review_revisions: true,
+    asynchronous_source_preparation: true,
+    publication_requires_verified_index: true,
+  });
+  const blockedPackage: AmendmentSourcePackage = {
+    id: "package-retry",
+    document_set_id: 7,
+    status: "blocked",
+    asset_count: 1,
+    total_bytes: 10,
+    issues: [{ code: "source_unreadable", retryable: true }],
+    manifest_sha256: "a".repeat(64),
+    assets: [],
+    created_at: "2026-09-10T00:00:00Z",
+    updated_at: "2026-09-10T00:00:00Z",
+  };
+  let resolveRetry: (value: AmendmentSourcePackage) => void = () => {};
+  mockedUploadAmendmentSourcePackage.mockResolvedValue(blockedPackage);
+  mockedRetryAmendmentSourcePackage.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveRetry = resolve;
+      })
+  );
+  const user = setupUser();
+  render(<AmendmentsPage />);
+
+  await waitFor(() => expect(mockedGetAnnexCapabilities).toHaveBeenCalled());
+  act(() => screen.getByRole("combobox").focus());
+  await user.keyboard("{ArrowDown}");
+  await screen.findByRole("option", { name: "Transit rules" });
+  await user.keyboard("{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Excel (.xlsx)" })
+  );
+  await user.upload(
+    screen.getByLabelText("Amendment source Excel workbook"),
+    new File(["sheet"], "EK-1.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    })
+  );
+  await user.click(screen.getByRole("button", { name: "Prepare source" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Retry source preparation" })
+  );
+  await user.click(screen.getByRole("button", { name: "PDF" }));
+  await act(async () => {
+    resolveRetry({ ...blockedPackage, status: "processing", issues: [] });
+  });
+
+  expect(
+    screen.queryByText("Source package processing")
+  ).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Prepare source" })).toBeDisabled();
 });
 
 test("renders a grouped blocked review from the real analysis response shape", async () => {

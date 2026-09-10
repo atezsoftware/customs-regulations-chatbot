@@ -779,6 +779,9 @@ export default function AmendmentsPage() {
     string | null
   >(null);
   const [retryingSourcePackage, setRetryingSourcePackage] = useState(false);
+  const [sourcePackagePollError, setSourcePackagePollError] = useState<
+    string | null
+  >(null);
   const sourceRequestTokenRef = useRef<string | null>(null);
   const sourceFileInputRef = useRef<HTMLInputElement>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -1057,7 +1060,12 @@ export default function AmendmentsPage() {
     }
     let cancelled = false;
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let pollDelayMs = 1500;
+    let pollErrorReported = false;
     const expectedIdentity = sourcePackageIdentity;
+    const expectedRequestToken = sourceRequestTokenRef.current;
+    const isCurrentRequest = () =>
+      !cancelled && sourceRequestTokenRef.current === expectedRequestToken;
     const pollPackage = async () => {
       try {
         if (sourcePackageStatus === "ready") {
@@ -1065,7 +1073,8 @@ export default function AmendmentsPage() {
             Number(selectedDocumentSetId),
             sourcePackageId
           );
-          if (cancelled) return;
+          if (!isCurrentRequest()) return;
+          setSourcePackagePollError(null);
           if (sourceText.original_text.trim()) {
             setRawText(sourceText.original_text);
           }
@@ -1077,19 +1086,33 @@ export default function AmendmentsPage() {
           Number(selectedDocumentSetId),
           sourcePackageId
         );
-        if (cancelled) return;
+        if (!isCurrentRequest()) return;
+        pollErrorReported = false;
+        pollDelayMs = 1500;
+        setSourcePackagePollError(null);
         setSourcePackage(refreshed);
         if (refreshed.status === "processing") {
-          timeoutId = setTimeout(() => void pollPackage(), 1500);
+          timeoutId = setTimeout(() => void pollPackage(), pollDelayMs);
         }
       } catch (error) {
-        if (!cancelled) {
+        if (!isCurrentRequest()) return;
+        if (!pollErrorReported) {
           toast.error(
             error instanceof Error
               ? error.message
               : "Could not refresh source preparation."
           );
+          pollErrorReported = true;
         }
+        if (
+          error instanceof RegulatoryRequestError &&
+          [401, 403, 404].includes(error.status)
+        ) {
+          setSourcePackagePollError(error.message);
+          return;
+        }
+        pollDelayMs = Math.min(pollDelayMs * 2, 30_000);
+        timeoutId = setTimeout(() => void pollPackage(), pollDelayMs);
       }
     };
     void pollPackage();
@@ -1117,6 +1140,8 @@ export default function AmendmentsPage() {
     setSourcePackage(null);
     setSourcePackageIdentity(null);
     setExtracting(false);
+    setRetryingSourcePackage(false);
+    setSourcePackagePollError(null);
   }, []);
 
   const handleExtract = useCallback(async () => {
@@ -1132,6 +1157,7 @@ export default function AmendmentsPage() {
 
     const requestToken = sourceRequestIdentity();
     sourceRequestTokenRef.current = requestToken;
+    setSourcePackagePollError(null);
     setExtracting(true);
     try {
       if (annexEnabled && selectedDocumentSetId) {
@@ -1205,6 +1231,7 @@ export default function AmendmentsPage() {
         );
         sourcePreparationToken = sourceRequestIdentity();
         sourceRequestTokenRef.current = sourcePreparationToken;
+        setSourcePackagePollError(null);
         const prepared = await createAmendmentSourcePackage(
           Number(selectedDocumentSetId),
           sourcePreparationToken,
@@ -1264,23 +1291,35 @@ export default function AmendmentsPage() {
   ]);
 
   const handleSourcePackageRetry = useCallback(async () => {
-    if (!selectedDocumentSetId || !sourcePackage) return;
+    if (!selectedDocumentSetId || !sourcePackage || !sourcePackageIdentity) {
+      return;
+    }
+    const documentSetId = Number(selectedDocumentSetId);
+    const packageId = sourcePackage.id;
+    const requestToken = sourceRequestIdentity();
+    sourceRequestTokenRef.current = requestToken;
+    setSourcePackagePollError(null);
     setRetryingSourcePackage(true);
     try {
       const retried = await retryAmendmentSourcePackage(
-        Number(selectedDocumentSetId),
-        sourcePackage.id
+        documentSetId,
+        packageId
       );
+      if (sourceRequestTokenRef.current !== requestToken) return;
       setSourcePackage(retried);
       toast.info("Source preparation retry queued.");
     } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "Source retry failed."
-      );
+      if (sourceRequestTokenRef.current === requestToken) {
+        toast.error(
+          error instanceof Error ? error.message : "Source retry failed."
+        );
+      }
     } finally {
-      setRetryingSourcePackage(false);
+      if (sourceRequestTokenRef.current === requestToken) {
+        setRetryingSourcePackage(false);
+      }
     }
-  }, [selectedDocumentSetId, sourcePackage]);
+  }, [selectedDocumentSetId, sourcePackage, sourcePackageIdentity]);
 
   const handleRetry = useCallback(async () => {
     if (selectedBatchId === null) return;
@@ -1329,6 +1368,8 @@ export default function AmendmentsPage() {
                 setSourcePackageIdentity(null);
                 setExtracting(false);
                 setAnalyzing(false);
+                setRetryingSourcePackage(false);
+                setSourcePackagePollError(null);
               }}
             >
               <InputSelect.Trigger />
@@ -1413,6 +1454,8 @@ export default function AmendmentsPage() {
                         setSourcePackage(null);
                         setSourcePackageIdentity(null);
                         setExtracting(false);
+                        setRetryingSourcePackage(false);
+                        setSourcePackagePollError(null);
                       }}
                       placeholder="https://www.resmigazete.gov.tr/..."
                     />
@@ -1462,6 +1505,8 @@ export default function AmendmentsPage() {
                         setSourcePackage(null);
                         setSourcePackageIdentity(null);
                         setExtracting(false);
+                        setRetryingSourcePackage(false);
+                        setSourcePackagePollError(null);
                       }}
                     />
                     <Button
@@ -1515,6 +1560,11 @@ export default function AmendmentsPage() {
                         {`${issue.code.replaceAll("_", " ")}${issue.locator ? ` · ${issue.locator}` : ""}`}
                       </Text>
                     ))}
+                    {sourcePackagePollError && (
+                      <Text as="p" font="main-ui-body" color="status-error-05">
+                        {`Source package status cannot be refreshed: ${sourcePackagePollError}`}
+                      </Text>
+                    )}
                     {["partial", "blocked", "failed"].includes(
                       sourcePackage.status
                     ) &&
@@ -1554,6 +1604,8 @@ export default function AmendmentsPage() {
                       setSourcePackage(null);
                       setSourcePackageIdentity(null);
                       setAnalyzing(false);
+                      setRetryingSourcePackage(false);
+                      setSourcePackagePollError(null);
                     }
                   }}
                   rows={8}
