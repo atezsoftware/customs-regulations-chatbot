@@ -693,16 +693,22 @@ def capture_preparation_configuration(
         raise ValueError("file unavailable")
     settings = get_current_search_settings(session)
     session.flush()
-    configuration = {
-        name: context_hash(
-            {
-                column.key: getattr(row, column.key)
-                for column in inspect(type(row)).columns
-                if column.key not in ("created_at", "updated_at", "last_accessed_at")
-            }
-        )
-        for name, row in (("user_file", file), ("search_settings", settings))
-    }
+    from onyx.utils.sensitive import SensitiveValue
+
+    configuration: dict[str, str] = {}
+    for name, row in (("user_file", file), ("search_settings", settings)):
+        values: dict[str, object] = {}
+        for column in inspect(type(row)).columns:
+            if column.key in ("created_at", "updated_at", "last_accessed_at"):
+                continue
+            value = getattr(row, column.key)
+            # Hash logical credentials, not ciphertext or a masked placeholder.
+            values[column.key] = (
+                value.get_value(apply_mask=False)
+                if isinstance(value, SensitiveValue)
+                else value
+            )
+        configuration[name] = context_hash(values)
     from onyx.configs import app_configs
     from onyx.prompts.contextual_retrieval import (
         CONTEXTUAL_RAG_PROMPT1,
