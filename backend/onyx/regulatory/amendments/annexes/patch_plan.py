@@ -21,6 +21,7 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexComparison,
     AnnexExtraction,
     AnnexPatchPlan,
+    ExtractedAnnexElement,
 )
 
 _ANNEX_REFERENCE = re.compile(
@@ -51,6 +52,190 @@ def resolve_annex_instruction(
     if len(intended) != 1 or not intended.issubset(sources.keys() & files):
         raise ValueError("annex instruction scope is unresolved or ambiguous")
     return sources[next(iter(intended))]
+
+
+def _source_table_rows(view: AnnexExtraction) -> dict[int, list[int]]:
+    """Require complete, aligned visual rows before binding native linewise cells."""
+    pages: dict[tuple[int, str | None], list[int]] = {}
+    for position, element in enumerate(view.elements):
+        if element.aggregate or element.kind != "table_cell":
+            continue
+        box = element.locator.normalized_box
+        if (
+            element.locator.page is None
+            or box is None
+            or not (0 <= box[0] < box[2] <= 1 and 0 <= box[1] < box[3] <= 1)
+        ):
+            return {}
+        pages.setdefault((element.locator.page, element.source_asset_id), []).append(
+            position
+        )
+    result: dict[int, list[int]] = {}
+    signatures: Counter[tuple[str, ...]] = Counter()
+    all_rows: list[list[int]] = []
+    for positions in pages.values():
+
+        def box_at(position: int) -> tuple[float, float, float, float]:
+            box = view.elements[position].locator.normalized_box
+            assert box is not None
+            return box
+
+        rows: list[list[int]] = []
+        for position in sorted(
+            positions, key=lambda item: (box_at(item)[1], box_at(item)[0])
+        ):
+            box = box_at(position)
+            previous = box_at(rows[-1][0]) if rows else None
+            if (
+                previous is not None
+                and previous[1] < (box[1] + box[3]) / 2 < previous[3]
+            ):
+                rows[-1].append(position)
+            else:
+                rows.append([position])
+        if len(rows) < 2:
+            return {}
+        for row in rows:
+            row.sort(key=lambda item: box_at(item)[0])
+        columns = [(box_at(item)[0], box_at(item)[2]) for item in rows[0]]
+        if len(columns) < 2 or any(
+            len(row) != len(columns)
+            or any(
+                abs(box_at(item)[0] - columns[column][0]) > 0.01
+                or abs(box_at(item)[2] - columns[column][1]) > 0.01
+                or abs(box_at(item)[1] - box_at(row[0])[1]) > 0.01
+                or abs(box_at(item)[3] - box_at(row[0])[3]) > 0.01
+                for column, item in enumerate(row)
+            )
+            or any(
+                box_at(left)[2] > box_at(right)[0] + 1e-9
+                for left, right in zip(row, row[1:])
+            )
+            for row in rows
+        ):
+            return {}
+        for row in rows:
+            signature = tuple(view.elements[item].text for item in row)
+            if any(
+                not text.strip() or "\n" in text or "|" in text for text in signature
+            ):
+                continue
+            signatures[signature] += 1
+            all_rows.append(row)
+    for row in all_rows:
+        if signatures[tuple(view.elements[item].text for item in row)] == 1:
+            for position in row:
+                result[position] = row
+    return result
+
+
+def _complete_cell_spans(text: str, cell: str) -> list[tuple[int, int]]:
+    """Count complete pipe-delimited cells, never substrings of legal values."""
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        if "|" in line or text.strip() == cell:
+            cell_offset = offset
+            for part in line.split("|"):
+                if part.strip() == cell:
+                    start = cell_offset + len(part) - len(part.lstrip())
+                    spans.append((start, start + len(cell)))
+                cell_offset += len(part) + 1
+        offset += len(line)
+    return spans
+
+
+def _linewise_cell_spans(
+    text: str, position: int, row: list[int], old: AnnexExtraction
+) -> list[tuple[int, int]]:
+    lines: list[tuple[str, int]] = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        lines.append((line.strip(), offset + len(line) - len(line.lstrip())))
+        offset += len(line)
+    expected = [old.elements[item].text for item in row]
+    matches = [
+        start
+        for start in range(len(lines) - len(row) + 1)
+        if [value for value, _ in lines[start : start + len(row)]] == expected
+    ]
+    if len(matches) != 1:
+        return []
+    start = lines[matches[0] + row.index(position)][1]
+    return [(start, start + len(old.elements[position].text))]
+
+
+def _aligned_text_kind_drift(
+    old: AnnexExtraction,
+    new: AnnexExtraction,
+    position: int,
+    changed_old: set[int],
+    changed_new: set[int],
+) -> list[int]:
+    element = old.elements[position]
+    if element.kind not in {"text", "footnote"} or not element.text:
+        return []
+    old_atomic = [item for item in old.elements if not item.aggregate]
+    matches = [
+        index
+        for index, item in enumerate(new.elements)
+        if not item.aggregate and item.text == element.text
+    ]
+    if sum(item.text == element.text for item in old_atomic) != 1 or len(matches) != 1:
+        return []
+    target = new.elements[matches[0]]
+    if matches[0] in changed_new or {element.kind, target.kind} != {"text", "footnote"}:
+        return []
+
+    def aligned(left: ExtractedAnnexElement, right: ExtractedAnnexElement) -> bool:
+        a, b = left.locator.normalized_box, right.locator.normalized_box
+        return (
+            left.locator.page is not None
+            and right.locator.page is not None
+            and a is not None
+            and b is not None
+            and all(
+                0 <= box[0] < box[2] <= 1 and 0 <= box[1] < box[3] <= 1
+                for box in (a, b)
+            )
+            and all(abs(x - y) <= 0.01 for x, y in zip(a, b))
+        )
+
+    if not aligned(element, target):
+        return []
+    anchors = 0
+    for index, anchor in enumerate(old.elements):
+        if (
+            index == position
+            or index in changed_old
+            or anchor.aggregate
+            or not anchor.text
+        ):
+            continue
+        if (anchor.locator.page, anchor.source_asset_id) != (
+            element.locator.page,
+            element.source_asset_id,
+        ):
+            continue
+        if sum(item.text == anchor.text for item in old_atomic) != 1:
+            continue
+        candidates = [
+            (index, item)
+            for index, item in enumerate(new.elements)
+            if not item.aggregate and item.text == anchor.text
+        ]
+        if len(candidates) != 1:
+            continue
+        candidate_position, candidate = candidates[0]
+        if (
+            candidate_position not in changed_new
+            and anchor.kind == candidate.kind
+            and (candidate.locator.page, candidate.source_asset_id)
+            == (target.locator.page, target.source_asset_id)
+            and aligned(anchor, candidate)
+        ):
+            anchors += 1
+    return matches if anchors >= 2 else []
 
 
 def prepare_annex_patch(
@@ -153,6 +338,7 @@ def prepare_annex_patch(
             binding = verified_companions[0].bound_to_regulatory_chunk_id
             assert binding is not None
             visual_bound_chunks.add(binding)
+    source_rows = _source_table_rows(old)
     bindings: dict[int, AnnexCanonicalSpan] = {}
     canonical_by_id = {element.canonical_chunk_id: element for element in canonical}
     for old_position, element in enumerate(old.elements):
@@ -174,17 +360,19 @@ def prepare_annex_patch(
                 and element.semantic_key == candidate.semantic_key
             ):
                 start, end = 0, len(candidate.text)
+            elif element.kind == "table_cell" and element.text:
+                spans = _complete_cell_spans(candidate.text, element.text)
+                if not spans and old_position in source_rows:
+                    spans = _linewise_cell_spans(
+                        candidate.text, old_position, source_rows[old_position], old
+                    )
+                if len(spans) != 1:
+                    continue
+                start, end = spans[0]
             elif element.text and candidate.text.count(element.text) == 1:
                 start = candidate.text.index(element.text)
                 end = start + len(element.text)
-                if element.kind == "table_cell":
-                    cell_start = candidate.text.rfind("|", 0, start) + 1
-                    cell_end = candidate.text.find("|", end)
-                    if cell_end < 0:
-                        cell_end = len(candidate.text)
-                    if candidate.text[cell_start:cell_end].strip() != element.text:
-                        continue
-                elif (start and re.match(r"[\w.,%]", candidate.text[start - 1])) or (
+                if (start and re.match(r"[\w.,%]", candidate.text[start - 1])) or (
                     end < len(candidate.text)
                     and re.match(r"[\w.,%]", candidate.text[end])
                 ):
@@ -234,6 +422,10 @@ def prepare_annex_patch(
                 or (element.text == candidate.text and element.kind == candidate.kind)
             )
         ]
+        if not matching_positions:
+            matching_positions = _aligned_text_kind_drift(
+                old, new, old_position, changed_old, changed_new
+            )
         if len(matching_positions) == 1:
             correspondence[old_position] = matching_positions
         elif old_position in bindings:

@@ -5,6 +5,7 @@ import pytest
 from onyx.regulatory.amendments.annexes.models import (
     AnnexBaseline,
     AnnexExtraction,
+    AnnexPatchPlan,
     ExtractedAnnexElement,
 )
 from tests.unit.onyx.regulatory.annexes.test_comparison import extraction
@@ -443,3 +444,219 @@ def test_partial_cell_value_cannot_patch_an_approved_numeric_overlay(
     assert not result.ready
     assert "canonical_correspondence_unresolved" in result.issues
     assert not result.patches
+
+
+def linewise_case() -> tuple[AnnexBaseline, AnnexExtraction, AnnexExtraction]:
+    from onyx.regulatory.amendments.annexes.models import AnnexLocator
+
+    rows = [
+        ("Code", "Product", "Rate"),
+        ("1001", "Wheat", "5%"),
+        ("2001", "Rice", "15%"),
+    ]
+    elements = [
+        ExtractedAnnexElement(
+            kind="table_cell",
+            text=text,
+            extraction_method="vision",
+            locator=AnnexLocator(
+                page=2,
+                normalized_box=(
+                    0.1 + col * 0.25,
+                    0.2 + row * 0.1,
+                    0.35 + col * 0.25,
+                    0.3 + row * 0.1,
+                ),
+            ),
+        )
+        for row, values in enumerate(rows)
+        for col, text in enumerate(values)
+    ]
+    old = AnnexExtraction(source_sha256="old", mime_type="text/html", elements=elements)
+    new = old.model_copy(deep=True)
+    new.source_sha256 = "new"
+    new.elements[5].text = "7%"
+    current = baseline("\n".join(e.text for e in old.elements))
+    current.canonical_amendment_chunk_ids = []
+    current.elements[0].semantic_key = "canonical-row"
+    current.elements[0].kind = "text"
+    return current, old, new
+
+
+def prepare_linewise_case(
+    current: AnnexBaseline, old: AnnexExtraction, new: AnnexExtraction
+) -> AnnexPatchPlan:
+    from onyx.regulatory.amendments.annexes.comparison import annex_snapshot_hash
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexComparison,
+        AnnexCoverage,
+        AnnexDifference,
+        AnnexElementReference,
+    )
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    comparison = AnnexComparison(
+        old_source_sha256=old.source_sha256,
+        new_source_sha256=new.source_sha256,
+        old_snapshot_sha256=annex_snapshot_hash(old),
+        new_snapshot_sha256=annex_snapshot_hash(new),
+        coverage=AnnexCoverage(
+            old_positions=list(range(len(old.elements))),
+            new_positions=list(range(len(new.elements))),
+            old_pages=[2],
+            new_pages=[2],
+            method="native_structure",
+        ),
+        changes=[
+            AnnexDifference(
+                operation="replace",
+                old=[
+                    AnnexElementReference(
+                        position=5,
+                        text=old.elements[5].text,
+                        locator=old.elements[5].locator,
+                    )
+                ],
+                new=[
+                    AnnexElementReference(
+                        position=5,
+                        text=new.elements[5].text,
+                        locator=new.elements[5].locator,
+                    )
+                ],
+                explanation="Changed rate",
+            )
+        ],
+        issues=[],
+        ready=True,
+    )
+    return prepare_annex_patch(
+        baseline=current,
+        old=old,
+        new=new,
+        comparison=comparison,
+        effective_date=date(2026, 9, 10),
+        package_complete=True,
+    )
+
+
+def test_native_linewise_table_maps_complete_cell_with_unique_row_context() -> None:
+    current, old, new = linewise_case()
+    result = prepare_linewise_case(current, old, new)
+    assert result.ready, result.issues
+    assert result.patches[0].new_text == current.elements[0].text.replace(
+        "\n5%\n", "\n7%\n"
+    )
+    assert result.patches[0].new_text is not None
+    assert "15%" in result.patches[0].new_text
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_geometry",
+        "overlapping_cells",
+        "missing_cell",
+        "duplicate_canonical_row",
+        "duplicate_source_row",
+        "stale_overlay",
+        "partial_cell",
+        "wrong_neighbor",
+    ],
+)
+def test_native_linewise_table_refuses_unproven_row_context(defect: str) -> None:
+    current, old, new = linewise_case()
+    if defect == "missing_geometry":
+        old.elements[4].locator.normalized_box = None
+    elif defect == "overlapping_cells":
+        old.elements[4].locator.normalized_box = old.elements[5].locator.normalized_box
+    elif defect == "missing_cell":
+        old.elements[4].kind = "text"
+    elif defect == "duplicate_source_row":
+        for i in range(3):
+            old.elements[6 + i].text = old.elements[3 + i].text
+            new.elements[6 + i].text = old.elements[3 + i].text
+    else:
+        text = current.elements[0].text
+        if defect == "duplicate_canonical_row":
+            text += "\n1001\nWheat\n5%"
+        elif defect == "stale_overlay":
+            text = text.replace("\n5%\n", "\n8%\n") + "\nOther\nThing\n5%"
+            current.canonical_amendment_chunk_ids = ["canonical-rate"]
+        elif defect == "partial_cell":
+            text = text.replace("\n5%\n", "\n5% surcharge\n")
+        else:
+            text = text.replace("Wheat", "Changed product")
+        current.elements[0].text = current.canonical_text = text
+    result = prepare_linewise_case(current, old, new)
+    assert not result.ready
+    assert "canonical_correspondence_unresolved" in result.issues
+
+
+def test_pipe_cell_boundaries_precede_substring_uniqueness() -> None:
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    current = baseline("| A | 5% | B | 15% |")
+    current.elements[0].semantic_key = "canonical-row"
+    old, new = extraction("5%"), extraction("7%")
+    result = prepare_annex_patch(
+        baseline=current,
+        old=old,
+        new=new,
+        comparison=compare_annexes(old=old, new=new),
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert result.ready, result.issues
+    assert result.patches[0].new_text == "| A | 7% | B | 15% |"
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        None,
+        "missing_geometry",
+        "different_page",
+        "no_anchor",
+        "repeated_text",
+        "moved_region",
+    ],
+)
+def test_unchanged_text_footnote_requires_unique_aligned_page_neighborhood(
+    defect: str | None,
+) -> None:
+    from onyx.regulatory.amendments.annexes.models import AnnexLocator
+
+    current, old, new = linewise_case()
+    for view in (old, new):
+        view.elements.append(
+            ExtractedAnnexElement(
+                kind="text",
+                text="Continuation remains",
+                locator=AnnexLocator(page=2, normalized_box=(0.1, 0.6, 0.8, 0.65)),
+            )
+        )
+        view.elements.append(
+            ExtractedAnnexElement(
+                kind="text",
+                text="Original page two",
+                locator=AnnexLocator(page=2, normalized_box=(0.75, 0.9, 0.9, 0.95)),
+            )
+        )
+    new.elements[-1].kind = "footnote"
+    current.elements[0].text += "\nContinuation remains\nOriginal page two"
+    current.canonical_text = current.elements[0].text
+    if defect == "missing_geometry":
+        new.elements[-1].locator.normalized_box = None
+    elif defect == "different_page":
+        new.elements[-1].locator.page = 3
+    elif defect == "no_anchor":
+        for e in new.elements[:-1]:
+            e.locator.normalized_box = None
+    elif defect == "repeated_text":
+        new.elements.append(new.elements[-1].model_copy(deep=True))
+    elif defect == "moved_region":
+        new.elements[-1].locator.normalized_box = (0.1, 0.05, 0.4, 0.1)
+    result = prepare_linewise_case(current, old, new)
+    assert result.ready is (defect is None), result.issues
