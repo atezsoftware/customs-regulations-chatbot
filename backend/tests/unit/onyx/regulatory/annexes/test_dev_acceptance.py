@@ -337,5 +337,88 @@ def test_canary_retains_actual_explicit_vision_roles(
             "column_header",
             "data",
         ]
-        assert [item["position"] for item in run.vision_roles] == [0, 1]
+        assert [item["original_position"] for item in run.vision_roles] == [0, 1]
         assert all(item["source_sha256"] == "c" * 64 for item in run.vision_roles)
+
+
+@pytest.mark.parametrize("mapping_fault", [None, "missing", "duplicate", "parent"])
+def test_two_png_role_receipts_bind_exact_originals(
+    mapping_fault: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import hashlib
+    import json
+    from pathlib import Path
+    from unittest.mock import Mock
+    from uuid import uuid4
+
+    from scripts.regulatory_annex_dev_cutover import emit_acceptance_report
+
+    from onyx.db.regulatory_annex_acceptance import CanaryRun
+    from onyx.regulatory.amendments.annexes import acceptance_canary as canary
+
+    extraction = json.loads(
+        (Path(__file__).parent / "fixtures/two_png_role_extraction.json").read_text()
+    )
+    view = extraction["evidence_view"]
+    mapping = next(
+        item for item in view["element_mappings"] if item["view_position"] == 18
+    )
+    if mapping_fault == "missing":
+        view["element_mappings"].remove(mapping)
+    elif mapping_fault == "duplicate":
+        view["element_mappings"].append(mapping.copy())
+    elif mapping_fault == "parent":
+        mapping["parent_index"] = -1
+    run = CanaryRun(release_sha="a" * 40, user_id=uuid4())
+    monkeypatch.setattr(canary, "save_canary", Mock())
+    review = {
+        "review_payload": {
+            "old_extraction": {"source_sha256": "b" * 64, "elements": []},
+            "new_extraction": extraction,
+        }
+    }
+    if mapping_fault:
+        with pytest.raises(ValueError, match="canary_vision_role_mapping_invalid"):
+            canary.record_vision_roles(run, review)
+        return
+    canary.record_vision_roles(run, review)
+    headers = [
+        item for item in run.vision_roles if item["table_role"] == "column_header"
+    ]
+    assert [item["source_sha256"] for item in headers] == [
+        "5768ac5e2765ba93b207ed8c719a9b5fd95a2a0c7736a1611382f9e26a41c091"
+    ] * 3 + ["6786fff866181da78feb6834133dce01b5cfe0b0a2319e92111cb5838f554789"] * 3
+    assert [item["original_position"] for item in headers] == [3, 4, 5, 3, 4, 5]
+    assert [item["view_position"] for item in headers] == [3, 4, 5, 18, 19, 20]
+    for receipt in run.vision_roles:
+        original = next(
+            item
+            for item in view["element_mappings"]
+            if item["view_position"] == receipt["view_position"]
+        )
+        assert (
+            json.loads(str(receipt["original_locator"])) == original["original_locator"]
+        )
+        assert (
+            receipt["original_locator_sha256"]
+            == hashlib.sha256(str(receipt["original_locator"]).encode()).hexdigest()
+        )
+        assert receipt["view_sha256"] == view["sha256"]
+    emit_acceptance_report(
+        json.dumps(
+            {
+                "phase": "canary",
+                "status": "passed",
+                "release_sha_metadata": run.release_sha,
+                "canary": run.model_dump(mode="json"),
+            }
+        ),
+        "canary",
+        run.release_sha,
+    )
+    assert (
+        json.loads(capsys.readouterr().out)["canary"]["vision_roles"]
+        == run.vision_roles
+    )

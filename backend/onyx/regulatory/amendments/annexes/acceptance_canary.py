@@ -186,17 +186,56 @@ def record_vision_roles(run: CanaryRun, review: dict[str, Any]) -> None:
                 continue
             if element["kind"] != "table_cell" or role not in {"column_header", "data"}:
                 raise ValueError("canary_invalid_vision_table_role")
-            roles.append(
+            receipt: dict[str, str | int] = {"side": side, "table_role": role}
+            original_locator = element["locator"]
+            original_position = position
+            source_hash = extraction["source_sha256"]
+            view_payload = extraction.get("evidence_view")
+            if view_payload is not None:
+                from onyx.regulatory.amendments.annexes.models import AnnexEvidenceView
+
+                try:
+                    view = AnnexEvidenceView.model_validate(view_payload)
+                    mappings = [
+                        item
+                        for item in view.element_mappings
+                        if item.view_position == position
+                    ]
+                    if len(mappings) != 1:
+                        raise ValueError("mapping_not_unique")
+                    mapping = mappings[0]
+                    if not 0 <= mapping.parent_index < len(view.parents):
+                        raise ValueError("mapping_parent_invalid")
+                    parent = view.parents[mapping.parent_index]
+                    if not 0 <= mapping.original_position < parent.element_count:
+                        raise ValueError("mapping_position_invalid")
+                except ValueError as exc:
+                    raise ValueError("canary_vision_role_mapping_invalid") from exc
+                source_hash = parent.sha256
+                original_position = mapping.original_position
+                original_locator = mapping.original_locator.model_dump(mode="json")
+                receipt.update(
+                    {
+                        "source_file_id": parent.file_id,
+                        "view_sha256": view.sha256,
+                        "view_position": position,
+                        "view_locator_sha256": hashlib.sha256(
+                            json.dumps(element["locator"], sort_keys=True).encode()
+                        ).hexdigest(),
+                    }
+                )
+            locator_json = json.dumps(original_locator, sort_keys=True)
+            receipt.update(
                 {
-                    "side": side,
-                    "source_sha256": extraction["source_sha256"],
-                    "position": position,
-                    "table_role": role,
-                    "locator_sha256": hashlib.sha256(
-                        json.dumps(element["locator"], sort_keys=True).encode()
+                    "source_sha256": source_hash,
+                    "original_position": original_position,
+                    "original_locator": locator_json,
+                    "original_locator_sha256": hashlib.sha256(
+                        locator_json.encode()
                     ).hexdigest(),
                 }
             )
+            roles.append(receipt)
     if len(roles) > 100 or {item["table_role"] for item in roles} != {
         "column_header",
         "data",
