@@ -34,6 +34,13 @@ class SourceLink(BaseModel):
     kind: Literal["url", "internal", "embedded"]
 
 
+class PdfVisionReference(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    file_id: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    transcript_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class AcquiredAsset(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -44,6 +51,12 @@ class AcquiredAsset(BaseModel):
     original_url: str | None = None
     final_url: str | None = None
     text: str = ""
+    native_text: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    pdf_vision: PdfVisionReference | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AcquisitionResult(BaseModel):

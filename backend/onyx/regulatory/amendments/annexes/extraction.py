@@ -2,8 +2,10 @@
 
 import base64
 import hashlib
+import time
 from collections import Counter
 from io import BytesIO
+from typing import TypedDict
 from uuid import UUID
 from zipfile import ZipFile
 
@@ -28,6 +30,11 @@ from onyx.regulatory.amendments.annexes.sources import inspect_source
 from onyx.regulatory.structured_llm import generate_structured
 from onyx.tracing.flows import LLMFlow
 from onyx.utils.process_isolation import run_in_isolated_process
+
+
+class _SourceRetryOptions(TypedDict, total=False):
+    max_attempts: int
+    provider_max_attempts: int
 
 
 def _table_elements(
@@ -455,10 +462,19 @@ def _native_structure(
 
 
 def extract_annex_structure(
-    content: bytes, mime_type: str, *, vision_llm: LLM | None = None
+    content: bytes,
+    mime_type: str,
+    *,
+    vision_llm: LLM | None = None,
+    vision_deadline: float | None = None,
 ) -> AnnexExtraction:
+    remaining = (
+        vision_deadline - time.monotonic() if vision_deadline is not None else 30
+    )
+    if remaining <= 0:
+        raise TimeoutError("pdf_vision_preparation_deadline")
     elements, pages = run_in_isolated_process(
-        _native_structure, content, mime_type, timeout=30
+        _native_structure, content, mime_type, timeout=min(30, remaining)
     )
     result = AnnexExtraction(
         source_sha256=hashlib.sha256(content).hexdigest(),
@@ -499,6 +515,12 @@ def extract_annex_structure(
                     )
                 )
                 continue
+            bounded_options: _SourceRetryOptions = {}
+            if vision_deadline is not None:
+                remaining = int(vision_deadline - time.monotonic())
+                if remaining <= 0:
+                    raise TimeoutError("pdf_vision_preparation_deadline")
+                bounded_options = {"max_attempts": 1, "provider_max_attempts": 1}
             response = generate_structured(
                 vision_llm,
                 flow=LLMFlow.REGULATORY_ANNEX_EXTRACTION,
@@ -514,9 +536,14 @@ def extract_annex_structure(
                     )
                 ],
                 response_model=AnnexVisionResult,
-                timeout_override=60,
+                timeout_override=min(45, int(remaining))
+                if vision_deadline is not None
+                else 60,
                 max_tokens=12000,
+                **bounded_options,
             )
+            if vision_deadline is not None and time.monotonic() >= vision_deadline:
+                raise TimeoutError("pdf_vision_preparation_deadline")
             if not response.elements:
                 result.issues.append(f"page_{page.page}_no_visual_structure")
             # Native PDF text remains source evidence but is not double counted
@@ -581,7 +608,7 @@ def extract_source_asset(
     """Consume a trusted package asset; model output never selects a download."""
     from onyx.db.amendment_sources import get_source_asset, require_ready_source_package
 
-    require_ready_source_package(
+    package = require_ready_source_package(
         session,
         package_id=package_id,
         document_set_id=document_set_id,
@@ -597,7 +624,24 @@ def extract_source_asset(
         or hashlib.sha256(content).hexdigest() != asset.sha256
     ):
         raise ValueError("annex source integrity mismatch")
-    result = extract_annex_structure(content, asset.mime_type, vision_llm=vision_llm)
+    result = None
+    if (
+        asset.mime_type == "application/pdf"
+        and package.manifest_file_id
+        and package.manifest_sha256
+    ):
+        from onyx.regulatory.amendments.pdf_vision import load_frozen_pdf_asset
+
+        result = load_frozen_pdf_asset(
+            store,
+            manifest_file_id=package.manifest_file_id,
+            manifest_sha256=package.manifest_sha256,
+            source_sha256=asset.sha256,
+        )
+    if result is None:
+        result = extract_annex_structure(
+            content, asset.mime_type, vision_llm=vision_llm
+        )
     for element in result.elements:
         element.source_asset_id = str(asset.id)
     return result

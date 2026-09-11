@@ -38,6 +38,7 @@ from onyx.regulatory.amendments.models import (
 from onyx.regulatory.amendments.new_provision_policy import (
     explicitly_adds_top_level_provision,
 )
+from onyx.regulatory.amendments.pdf_vision import PdfBatchSource
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.segmenter import segment_amendment_text
 from onyx.utils.logger import setup_logger
@@ -290,6 +291,7 @@ def draft_instruction_group_proposal(
     matches: list[MatchResult],
     reference_date: str | None,
     context: InstructionDraftContext,
+    pdf_source: PdfBatchSource | None = None,
 ) -> ProposalDraft:
     if not instructions or len(instruction_indices) != len(instructions):
         raise ValueError(
@@ -307,20 +309,60 @@ def draft_instruction_group_proposal(
     if len(old_chunk_ids) != 1:
         raise ValueError("Grouped amendment instructions must share one target chunk")
 
+    evidence = None
+    if pdf_source is not None:
+        from onyx.file_store.file_store import get_default_file_store
+        from onyx.llm.factory import get_default_llm_with_vision
+        from onyx.regulatory.amendments.pdf_vision import prepare_pdf_draft_evidence
+
+        evidence = prepare_pdf_draft_evidence(
+            pdf_source, instructions, get_default_file_store()
+        )
+        if evidence is not None:
+            if (
+                context.target_user_file_id not in pdf_source.user_file_ids
+                or context.old_chunk_snapshot.get("user_file_id")
+                != str(context.target_user_file_id)
+                or context.match.old_chunk_id != context.old_chunk_snapshot.get("id")
+            ):
+                raise ValueError("pdf_draft_target_scope_mismatch")
+            vision = get_default_llm_with_vision()
+            if vision is None:
+                raise ValueError("pdf_vision_model_required")
+            llm = vision
     draft = draft_combined_chunk(
         llm,
         instructions=instructions,
         old_chunk=context.old_chunk_snapshot or None,
         sibling_reference=context.sibling_reference,
         reference_date=reference_date,
+        pdf_evidence=evidence,
     )
-    return _build_proposal_draft(
+    proposal = _build_proposal_draft(
         instruction_indices=instruction_indices,
         instructions=instructions,
         matches=matches,
         context=context,
         draft=draft,
     )
+    if evidence is not None:
+        from onyx.regulatory.amendments.pdf_vision import (
+            PDF_EVIDENCE_KEY,
+            verify_pdf_draft,
+        )
+
+        receipt = verify_pdf_draft(
+            llm,
+            evidence=evidence,
+            instructions=instructions,
+            old_chunk=context.old_chunk_snapshot,
+            draft_text=proposal.new_chunk_draft["text"],
+        )
+        proposal.old_chunk_snapshot = {
+            **proposal.old_chunk_snapshot,
+            PDF_EVIDENCE_KEY: receipt.model_dump(mode="json"),
+        }
+    return proposal
 
 
 def analyze_instruction(

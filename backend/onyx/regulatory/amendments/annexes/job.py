@@ -56,6 +56,9 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
         spec = package.input_spec
         input_file_id = package.input_file_id
         previous_manifest_id = package.manifest_file_id
+        previous_manifest_sha256 = (
+            package.manifest_sha256 if previous_manifest_id else None
+        )
         existing_assets = list_source_assets(session, package_id)
     deadline = time.monotonic() + MAX_PACKAGE_SECONDS
     try:
@@ -65,6 +68,8 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
         payload: bytes | None = None
         existing_by_hash = {asset.sha256: asset for asset in existing_assets}
         cached_by_url: dict[str, _CachedSourceOccurrence] = {}
+        previous_pdf_assets: dict[str, dict[str, object]] = {}
+        legacy_pdf_assets: dict[str, dict[str, object]] = {}
         for asset in existing_assets:
             for address in (asset.original_url, asset.final_url):
                 if address:
@@ -72,8 +77,30 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                         asset, asset.final_url or address
                     )
         if previous_manifest_id:
-            with store.read_file(previous_manifest_id) as stream:
-                previous_manifest = json.load(stream)
+            from onyx.regulatory.amendments.pdf_vision import read_verified
+
+            if not previous_manifest_sha256:
+                raise ValueError("source_manifest_missing")
+            previous_manifest = json.loads(
+                read_verified(
+                    store,
+                    previous_manifest_id,
+                    previous_manifest_sha256,
+                    limit=150 * 1024 * 1024,
+                )
+            )
+            previous_pdf_assets = {
+                item["sha256"]: item
+                for item in previous_manifest["assets"]
+                if item.get("pdf_vision")
+            }
+            legacy_pdf_assets = {
+                item["sha256"]: item
+                for item in previous_manifest["assets"]
+                if item["mime_type"] == "application/pdf" and not item.get("pdf_vision")
+            }
+            if legacy_pdf_assets and previous_pdf_assets:
+                raise ValueError("source_pdf_contract_mixed")
             for raw_link in previous_manifest["links"]:
                 link = SourceLink.model_validate(raw_link)
                 if (
@@ -121,6 +148,47 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
             display_name=spec.get("display_name", "source"),
             fetch=fetch,
         )
+        if legacy_pdf_assets:
+            # A retry completes the frozen package; it never partially upgrades its PDFs.
+            result.assets = [
+                asset.model_copy(
+                    update={"text": legacy_pdf_assets[asset.sha256]["text"]}
+                )
+                if asset.sha256 in legacy_pdf_assets
+                else asset
+                for asset in result.assets
+            ]
+        elif any(asset.mime_type == "application/pdf" for asset in result.assets):
+            from onyx.llm.factory import get_default_llm_with_vision
+            from onyx.regulatory.amendments.pdf_vision import (
+                prepare_pdf_source,
+                reuse_pdf_source,
+            )
+
+            vision = None
+            if any(
+                asset.mime_type == "application/pdf"
+                and asset.sha256 not in previous_pdf_assets
+                for asset in result.assets
+            ):
+                vision = get_default_llm_with_vision()
+            prepared = []
+            for asset in result.assets:
+                if asset.mime_type != "application/pdf":
+                    prepared.append(asset)
+                elif asset.sha256 in previous_pdf_assets:
+                    prepared.append(
+                        reuse_pdf_source(
+                            asset, previous_pdf_assets[asset.sha256], store
+                        )
+                    )
+                else:
+                    prepared.append(
+                        prepare_pdf_source(
+                            asset, store=store, llm=vision, deadline=deadline
+                        )
+                    )
+            result.assets = prepared
         stored_assets: list[RegulatorySourceAsset] = []
         for asset in result.assets:
             if asset.sha256 in existing_by_hash:
