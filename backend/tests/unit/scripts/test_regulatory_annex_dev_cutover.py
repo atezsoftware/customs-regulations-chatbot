@@ -1,5 +1,8 @@
+from email.message import Message
 from pathlib import Path
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.request import Request
 
 import pytest
 from scripts import regulatory_annex_dev_cutover as cutover
@@ -392,6 +395,52 @@ def test_activation_requires_both_workflows_before_provider_probe() -> None:
             cutover.verify_or_activate(driver, True)
     acceptance.assert_not_called()
     deploy.assert_not_called()
+
+
+@pytest.mark.parametrize("http_status", [200, 403])
+def test_frontend_health_uses_release_identity_and_reports_http_status(
+    http_status: int,
+) -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    driver.pods.return_value = [
+        {
+            "metadata": {},
+            "spec": {
+                "containers": [
+                    {
+                        "image": "255114580789.dkr.ecr.eu-central-1.amazonaws.com/"
+                        "customs-regulations-web-dev:" + driver.sha
+                    }
+                ]
+            },
+        }
+    ]
+    response = Mock()
+    response.__enter__ = Mock(return_value=Mock(status=200))
+    response.__exit__ = Mock(return_value=False)
+
+    def open_health(request: Request, *, timeout: int) -> Mock:
+        assert isinstance(request, Request)
+        assert request.full_url == (
+            "https://dev-customs-regulations.singlewindow.io/api/health"
+        )
+        assert request.get_header("User-agent") == "Onyx-DEV-Release/1.0"
+        assert timeout == 30
+        if http_status != 200:
+            raise HTTPError(
+                request.full_url, http_status, "private-response", Message(), None
+            )
+        return response
+
+    with patch.object(cutover.urllib.request, "urlopen", side_effect=open_health):
+        if http_status == 200:
+            cutover.verify_frontend(driver)
+        else:
+            with pytest.raises(
+                cutover.CutoverRefusal, match="^frontend_API_health_HTTP_403$"
+            ):
+                cutover.verify_frontend(driver)
 
 
 def test_failed_canary_disables_creation_on_the_same_binary() -> None:

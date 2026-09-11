@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -692,11 +693,16 @@ def verify_frontend(driver: Driver) -> None:
         )
     ):
         raise CutoverRefusal("exact_SHA_web_required")
-    with urllib.request.urlopen(
-        "https://dev-customs-regulations.singlewindow.io/api/health", timeout=30
-    ) as response:
-        if response.status != 200:
-            raise CutoverRefusal("frontend_API_health_required")
+    request = urllib.request.Request(
+        "https://dev-customs-regulations.singlewindow.io/api/health",
+        headers={"User-Agent": "Onyx-DEV-Release/1.0", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 -- fixed DEV HTTPS origin
+            if response.status != 200:
+                raise CutoverRefusal("frontend_API_health_required")
+    except urllib.error.HTTPError as error:
+        raise CutoverRefusal(f"frontend_API_health_HTTP_{error.code}") from None
 
 
 def acceptance(driver: Driver, phase: str) -> None:
