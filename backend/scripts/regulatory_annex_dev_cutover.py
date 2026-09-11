@@ -2730,6 +2730,162 @@ print(json.dumps(report, sort_keys=True))
     print(json.dumps(report, sort_keys=True), flush=True)
 
 
+CHAT50792_RUNTIME = "50792ae3d877577c4dafcf577bc0027b593370d9"
+
+
+def validate_chat50792_report(report: Any) -> None:
+    keys = {
+        "stage",
+        "status",
+        "database_read_only",
+        "configuration_verified",
+        "scope_failure",
+        "assistant_id",
+        "assistant_present",
+        "assistant_scope_count",
+        "assistant_owned_scope_included",
+        "default_present",
+        "default_scope_count",
+        "default_owned_scope_included",
+        "chat_deleted",
+        "messages",
+        "tools",
+        "message_id",
+        "assistant",
+        "document_count",
+        "owned_document_count",
+        "citation_count",
+        "has_error",
+        "error_category",
+        "publication_read_present",
+        "publication_finalized",
+        "tool_call_id",
+        "tool_id",
+        "result_count",
+        "owned_result_count",
+        "failure_type",
+    }
+    words = {
+        "chat50792",
+        "read",
+        "scope_refused",
+        "failed",
+        "env",
+        "run_missing",
+        "run_ownership",
+        "chat_ownership",
+        "evidence_limit",
+        "empty",
+        "agent_document_set_scope",
+        "document_set_access",
+        "publication_changed",
+        "search_configuration_missing",
+        "no_known_error",
+        "ValueError",
+        "RuntimeError",
+        "TimeoutError",
+        "Exception",
+    }
+    if (
+        not isinstance(report, dict)
+        or report.get("stage") != "chat50792"
+        or report.get("database_read_only") is not True
+        or report.get("status") not in {"read", "scope_refused", "failed"}
+    ):
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    pending = [report]
+    visited = 0
+    while pending:
+        value = pending.pop()
+        visited += 1
+        if visited > 2000:
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+        if isinstance(value, dict):
+            if set(value) - keys:
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            if len(value) > 64:
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+            pending.extend(value)
+        elif isinstance(value, str):
+            if value not in words:
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+        elif value is not None and not (
+            type(value) is bool or type(value) is int and 0 <= value <= 2147483647
+        ):
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+
+
+def diagnose_chat50792(driver: Driver, pod: str, container: str) -> None:
+    if driver.sha != CHAT50792_RUNTIME:
+        raise CutoverRefusal("fixed_chat_runtime_required")
+    program = """
+import contextlib, io, json, logging, os, signal
+logging.disable(logging.CRITICAL)
+def expired(*args):
+    raise TimeoutError()
+signal.signal(signal.SIGALRM, expired)
+signal.alarm(60)
+"""
+    program += (
+        "\n"
+        + Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("onyx/db/regulatory_annex_acceptance_diagnostic.py")
+        .read_text()
+    )
+    program += """
+report = {"stage": "chat50792", "status": "scope_refused", "scope_failure": "env", "database_read_only": True}
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        if (os.environ.get("POSTGRES_DB") == "customs-regulations-dev"
+            and os.environ.get("REGULATORY_ANNEX_ENVIRONMENT") == "dev"
+            and os.environ.get("PGOPTIONS") == "-c default_transaction_read_only=on"):
+            from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
+            from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
+            from onyx.db.regulatory_annex_dev_cutover import configured_indices
+            from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
+            set_is_ee_based_on_env_variable()
+            CURRENT_TENANT_ID_CONTEXTVAR.set("public")
+            configured_indices()
+            report.pop("scope_failure")
+            report["configuration_verified"] = True
+            with SqlEngine.scoped_engine(pool_size=2, max_overflow=0, connect_args={"options": "-c default_transaction_read_only=on", "connect_timeout": 10}):
+                with get_session_with_current_tenant() as session:
+                    report.update(load_chat50792_diagnostic(session))
+    except Exception as error:
+        name = type(error).__name__
+        report.update(status="failed", failure_type=name if name in {"ValueError", "RuntimeError", "TimeoutError"} else "Exception")
+print(json.dumps(report, sort_keys=True))
+"""
+    output = driver.command(
+        [
+            "kubectl",
+            "--namespace",
+            NAMESPACE,
+            "exec",
+            pod,
+            "-c",
+            container,
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            '. /vault/secrets/config; export PGOPTIONS="-c default_transaction_read_only=on"; exec python -c "$1"',
+            "chat50792-diagnostic",
+            program,
+        ],
+        timeout=80,
+    )
+    if len(output.encode()) > 24000:
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    report = json.loads(output)
+    validate_chat50792_report(report)
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
 def diagnose_release(driver: Driver, runner_sha: str) -> None:
     driver.validate_target()
     state = driver.get("configmap", STATE)["data"]
@@ -2750,6 +2906,9 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         for item in pod["spec"]["containers"]
         if item["image"] == f"{REPOSITORY}:{driver.sha}"
     )
+    if driver.sha == CHAT50792_RUNTIME:
+        diagnose_chat50792(driver, pod["metadata"]["name"], container["name"])
+        return
     if driver.sha == SOURCE861_RUNTIME:
         diagnose_source861(driver, pod["metadata"]["name"], container["name"])
         return
