@@ -588,6 +588,7 @@ def require_current_annex_review(
         select(AmendmentBatch)
         .where(AmendmentBatch.id == review.batch_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     session.refresh(review)
     latest = session.scalar(
@@ -907,7 +908,10 @@ def create_source_text_revision(
     from onyx.db.regulatory_amendments import create_batch
 
     batch = session.scalar(
-        select(AmendmentBatch).where(AmendmentBatch.id == batch_id).with_for_update()
+        select(AmendmentBatch)
+        .where(AmendmentBatch.id == batch_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if batch is None or batch.created_by != created_by:
         raise ValueError("source batch scope mismatch")
@@ -917,16 +921,20 @@ def create_source_text_revision(
         != expected_source_text_sha256
     ):
         raise ValueError("stale source text revision")
+    current_reviews = list_annex_changes(session, batch_id)
+    for review in current_reviews:
+        session.refresh(review)
     if any(
         review.status in ("approving", "preparing", "publishing", "approved")
         or review.publication_generation
-        for review in list_annex_changes(session, batch_id)
+        for review in current_reviews
     ):
         raise ValueError("publication state prevents source edits")
     legacy_proposals = session.scalars(
         select(AmendmentProposal)
         .where(AmendmentProposal.batch_id == batch.id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if any(
         proposal.status in ("approving", "approved", "approval_failed")
