@@ -1061,6 +1061,7 @@ def diagnose_logging_metadata(driver: Driver) -> None:
         "collectors": [],
         "cloudwatch": [],
     }
+    fluentd: dict[str, Any] | None = None
     for namespace in ("amazon-cloudwatch", "kube-system", "logging", "monitoring"):
         result: dict[str, Any] = {
             "namespace": namespace,
@@ -1085,6 +1086,8 @@ def diagnose_logging_metadata(driver: Driver) -> None:
             )
             for item in data["items"]:
                 name = item["metadata"]["name"]
+                if namespace == "logging" and name == "fluentd":
+                    fluentd = item["spec"]["template"]["spec"]
                 images = [
                     container["image"]
                     for container in item["spec"]["template"]["spec"]["containers"]
@@ -1102,6 +1105,128 @@ def diagnose_logging_metadata(driver: Driver) -> None:
         except (CutoverRefusal, ValueError, TypeError, KeyError):
             result.update(status="unavailable", daemonsets=[])
         report["collectors"].append(result)
+    if fluentd is not None:
+        destination: dict[str, Any] = {
+            "status": "available",
+            "configmaps": [],
+            "destinations": [],
+            "services": [],
+        }
+        fields = {
+            "host": r"[A-Za-z0-9.-]{1,253}",
+            "port": r"[0-9]{1,5}",
+            "scheme": r"https?",
+            "index_name": r"[A-Za-z0-9_.-]{1,253}",
+            "logstash_prefix": r"[A-Za-z0-9_.-]{1,253}",
+        }
+        try:
+            references = set()
+            values: list[tuple[str, str]] = []
+            for volume in fluentd.get("volumes", []):
+                if "configMap" in volume:
+                    references.add(volume["configMap"]["name"])
+                for source in volume.get("projected", {}).get("sources", []):
+                    if "configMap" in source:
+                        references.add(source["configMap"]["name"])
+            for container in fluentd["containers"]:
+                for source in container.get("envFrom", []):
+                    if "configMapRef" in source:
+                        references.add(source["configMapRef"]["name"])
+                for env in container.get("env", []):
+                    if "configMapKeyRef" in env.get("valueFrom", {}):
+                        references.add(env["valueFrom"]["configMapKeyRef"]["name"])
+                    key = (
+                        env.get("name", "")
+                        .removeprefix("FLUENT_ELASTICSEARCH_")
+                        .lower()
+                    )
+                    if key in fields and isinstance(env.get("value"), str):
+                        values.append((key, env["value"]))
+            if len(references) > 8 or not all(
+                isinstance(name, str)
+                and re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", name)
+                and ".." not in name
+                for name in references
+            ):
+                raise CutoverRefusal("invalid_references")
+            for name in sorted(references):
+                config = json.loads(
+                    driver.command(
+                        [
+                            "kubectl",
+                            "get",
+                            "configmap",
+                            name,
+                            "--namespace",
+                            "logging",
+                            "-o",
+                            "json",
+                            "--request-timeout=10s",
+                        ],
+                        timeout=15,
+                    )
+                )
+                if config.get("metadata", {}).get("name") != name:
+                    raise CutoverRefusal("referenced_config_unavailable")
+                destination["configmaps"].append(name)
+                for key, value in config["data"].items():
+                    if not isinstance(value, str):
+                        raise ValueError
+                    field = key.removeprefix("FLUENT_ELASTICSEARCH_").lower()
+                    if field in fields:
+                        values.append((field, value))
+                    if re.search(r"(?m)^\s*@type\s+elasticsearch\s*$", value):
+                        values.extend(
+                            re.findall(
+                                r"(?m)^\s*(host|port|scheme|index_name|logstash_prefix)\s+([^\r\n]+)$",
+                                value,
+                            )
+                        )
+            for field, value in values:
+                value = value.strip().strip("\"'")
+                if re.fullmatch(fields[field], value) and (
+                    field != "port" or 0 < int(value) <= 65535
+                ):
+                    destination["destinations"].append({"field": field, "value": value})
+            services = json.loads(
+                driver.command(
+                    [
+                        "kubectl",
+                        "get",
+                        "services",
+                        "--namespace",
+                        "logging",
+                        "-o",
+                        "json",
+                        "--request-timeout=10s",
+                    ],
+                    timeout=15,
+                )
+            )
+            for service in services["items"]:
+                name = service["metadata"]["name"]
+                if not re.fullmatch(r"[a-z0-9.-]{1,253}", name) or not re.search(
+                    r"elastic|kibana", name
+                ):
+                    continue
+                address = service["spec"].get("clusterIP", "")
+                ports = [port["port"] for port in service["spec"].get("ports", [])]
+                if not re.fullmatch(r"[0-9a-fA-F:.]{1,45}|None", address) or not all(
+                    type(port) is int and 0 < port <= 65535 for port in ports
+                ):
+                    continue
+                destination["services"].append(
+                    {"name": name, "cluster_ip": address, "ports": ports}
+                )
+        except CutoverRefusal as error:
+            destination["status"] = (
+                str(error)
+                if str(error) in {"invalid_references", "referenced_config_unavailable"}
+                else "unavailable"
+            )
+        except (ValueError, TypeError, KeyError, AttributeError):
+            destination["status"] = "invalid_metadata"
+        report["fluentd_destination"] = destination
     try:
         config = json.loads(
             driver.command(
