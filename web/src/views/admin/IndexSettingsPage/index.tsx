@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Formik, type FormikProps } from "formik";
 import { markdown } from "@opal/utils";
 import { useRouter } from "next/navigation";
-import { mutate } from "swr";
+import { mutate, useSWRConfig } from "swr";
 import { PageLoader } from "@opal/layouts";
 import { SWR_KEYS } from "@/lib/swr-keys";
 import { Content, IllustrationContent, toast } from "@opal/layouts";
@@ -86,7 +86,8 @@ import {
   useSecondarySearchSettings,
 } from "@/lib/indexing/hooks";
 import { contextualSetupStatusAfterSave } from "@/lib/indexing/contextual";
-import { useLlmDefaults } from "@/lib/languageModels/hooks";
+import { useAdminLLMProviders } from "@/lib/languageModels/hooks";
+import { refreshLlmProviderCaches } from "@/lib/languageModels/cache";
 import useFilter from "@/hooks/useFilter";
 import ModelSelector from "@/sections/model-selector/ModelSelector";
 import type { RichStr } from "@opal/types";
@@ -583,6 +584,8 @@ interface IndexSettingsFormValues {
 }
 
 export default function IndexSettingsPage() {
+  const { mutate: mutateLlmProviders } = useSWRConfig();
+  const [isSavingCaptioningModel, setIsSavingCaptioningModel] = useState(false);
   const router = useRouter();
   const settings = useSettings();
   const editModal = useCreateModal();
@@ -716,12 +719,17 @@ export default function IndexSettingsPage() {
 
   const {
     llmProviders,
-    hasAnyLlm,
-    hasAnyVisionLlm,
-    defaultLlm,
     defaultVision,
     isLoading: isLoadingLlmProviders,
-  } = useLlmDefaults();
+  } = useAdminLLMProviders();
+  const hasAnyLlm = (llmProviders ?? []).some((provider) =>
+    provider.model_configurations.some((model) => model.is_visible)
+  );
+  const hasAnyVisionLlm = (llmProviders ?? []).some((provider) =>
+    provider.model_configurations.some(
+      (model) => model.is_visible && model.supports_image_input
+    )
+  );
 
   /**
    * Persist a new default vision model. Atez Customs Assistant routes all image-captioning
@@ -731,25 +739,34 @@ export default function IndexSettingsPage() {
    * embeddings of already-indexed documents.
    */
   const handleCaptioningModelChange = useCallback(
-    async ({
-      modelName,
-      providerName,
-    }: {
-      modelName: string;
-      providerName: string | null;
-    }) => {
-      const provider = llmProviders?.find((p) => p.name === providerName);
-      if (!provider) {
-        toast.error("Could not resolve provider");
+    async (modelConfigurationId?: number | null) => {
+      const provider = llmProviders?.find((candidate) =>
+        candidate.model_configurations.some(
+          (model) => model.id === modelConfigurationId
+        )
+      );
+      const model = provider?.model_configurations.find(
+        (candidate) => candidate.id === modelConfigurationId
+      );
+      if (
+        modelConfigurationId == null ||
+        !provider ||
+        !model ||
+        !model.supports_image_input
+      ) {
+        toast.error(
+          "The selected model is no longer available. Refresh and try again."
+        );
         return;
       }
+      setIsSavingCaptioningModel(true);
       try {
         const response = await fetch("/api/admin/llm/default-vision", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             provider_id: provider.id,
-            model_name: modelName,
+            model_name: model.name,
           }),
         });
         if (!response.ok) {
@@ -757,28 +774,28 @@ export default function IndexSettingsPage() {
             (await response.json()).detail ?? "Failed to update captioning LLM"
           );
         }
-        await mutate(SWR_KEYS.llmProviders);
+        await refreshLlmProviderCaches(mutateLlmProviders);
         toast.success("Captioning LLM updated");
       } catch (error) {
         toast.error(
           error instanceof Error ? error.message : "An unknown error occurred"
         );
+      } finally {
+        setIsSavingCaptioningModel(false);
       }
     },
-    [llmProviders]
+    [llmProviders, mutateLlmProviders]
   );
 
-  // Resolve defaultVision (name-based) to a model_configuration_id for ModelSelector
   const captioningModelConfigId = useMemo(() => {
-    if (!defaultVision?.modelName || !llmProviders) return null;
-    for (const p of llmProviders) {
-      if (p.name !== defaultVision.providerName) continue;
-      const mc = p.model_configurations.find(
-        (m) => m.name === defaultVision.modelName
-      );
-      if (mc?.id != null) return mc.id;
-    }
-    return null;
+    const provider = llmProviders?.find(
+      (candidate) => candidate.id === defaultVision?.provider_id
+    );
+    return (
+      provider?.model_configurations.find(
+        (model) => model.name === defaultVision?.model_name
+      )?.id ?? null
+    );
   }, [llmProviders, defaultVision]);
 
   const initialFormValues: IndexSettingsFormValues = useMemo(
@@ -1769,13 +1786,17 @@ export default function IndexSettingsPage() {
                                 >
                                   <ModelSelector
                                     value={captioningModelConfigId}
-                                    disabled={!imageProcessingEnabled}
+                                    providerOptions={llmProviders ?? []}
+                                    fallbackToGlobalDefault={false}
+                                    disabled={
+                                      !imageProcessingEnabled ||
+                                      isSavingCaptioningModel
+                                    }
                                     requiresImageInput
                                     onChange={(opt) =>
-                                      void handleCaptioningModelChange({
-                                        modelName: opt.modelName,
-                                        providerName: opt.name,
-                                      })
+                                      void handleCaptioningModelChange(
+                                        opt.modelConfigurationId
+                                      )
                                     }
                                   />
                                 </InputHorizontal>
