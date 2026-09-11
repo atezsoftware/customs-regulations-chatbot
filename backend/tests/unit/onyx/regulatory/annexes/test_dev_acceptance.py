@@ -481,8 +481,16 @@ def test_markdown_probe_uses_registered_upload_list_and_index_routes(
         assert "ANNEXCANARY" not in _kwargs["json"]["message"]
         return {
             "answer": "ANNEXCANARY" + run.run_id.hex,
-            "top_documents": [{"document_id": file["id"]}],
-            "citation_info": [{"citation_num": 1}],
+            "top_documents": [
+                {
+                    "document_id": file["id"],
+                    "chunk_ind": 0,
+                    "blurb": "Verification marker: ANNEXCANARY" + run.run_id.hex,
+                }
+            ],
+            "citation_info": [
+                {"citation_num": 1, "document_id": file["id"], "chunk_ind": 0}
+            ],
         }
 
     monkeypatch.setattr(canary, "request_json", request)
@@ -493,3 +501,62 @@ def test_markdown_probe_uses_registered_upload_list_and_index_routes(
     assert len(operations) == 4
     assert indexed
     assert run.evidence["ordinary_markdown_upload_index_chat"] is True
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        None,
+        "title_only",
+        "wrong_id",
+        "substring_id",
+        "wrong_citation",
+        "wrong_chunk",
+        "missing_citation",
+        "conflicting_body",
+        "conflicting_answer",
+    ],
+)
+def test_markdown_evidence_binds_marker_body_and_citation(
+    corruption: str | None,
+) -> None:
+    from typing import Any
+    from uuid import uuid4
+
+    from onyx.regulatory.amendments.annexes import acceptance_canary as canary
+
+    identifier = uuid4()
+    marker = "ANNEXCANARY" + "a" * 32
+    document: dict[str, Any] = {
+        "document_id": str(identifier),
+        "chunk_ind": 0,
+        "semantic_identifier": marker + ".md",
+        "blurb": "Verification marker: " + marker,
+    }
+    citation: dict[str, Any] = {"document_id": str(identifier), "chunk_ind": 0}
+    response: dict[str, Any] = {
+        "answer": marker,
+        "top_documents": [document],
+        "citation_info": [citation],
+    }
+    if corruption == "title_only":
+        document["blurb"] = "No marker in actual content"
+    elif corruption == "wrong_id":
+        document["document_id"] = str(uuid4())
+    elif corruption == "substring_id":
+        document["document_id"] = "prefix-" + str(identifier)
+    elif corruption == "wrong_citation":
+        citation["document_id"] = str(uuid4())
+    elif corruption == "wrong_chunk":
+        citation["chunk_ind"] = 1
+    elif corruption == "missing_citation":
+        response["citation_info"] = []
+    elif corruption == "conflicting_body":
+        document["blurb"] += "\nVerification marker: ANNEXCANARY" + "b" * 32
+    elif corruption == "conflicting_answer":
+        response["answer"] += " ANNEXCANARY" + "b" * 32
+    if corruption:
+        with pytest.raises(ValueError, match="ordinary_markdown_indexed_chat_failed"):
+            canary.require_markdown_chat_evidence(response, identifier, marker)
+    else:
+        canary.require_markdown_chat_evidence(response, identifier, marker)

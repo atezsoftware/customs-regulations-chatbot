@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import signal
 import time
 from typing import Any
@@ -469,6 +470,43 @@ def chat_canary(client: httpx.Client, run: CanaryRun, *, as_of: str, rate: str) 
     save_canary(run)
 
 
+def require_markdown_chat_evidence(
+    response: dict[str, Any], identifier: UUID, marker: str
+) -> None:
+    marker_pattern = r"\bANNEXCANARY[0-9a-f]{32}\b"
+    owned_chunks: set[int] = set()
+    body_markers: set[str] = set()
+    for document in response.get("top_documents", []):
+        body = "\n".join(
+            value
+            for key in ("content", "blurb")
+            if isinstance(value := document.get(key), str)
+        )
+        found = set(re.findall(marker_pattern, body))
+        body_markers.update(found)
+        chunk = document.get("chunk_ind")
+        if (
+            document.get("document_id") == str(identifier)
+            and found == {marker}
+            and type(chunk) is int
+            and chunk >= 0
+        ):
+            owned_chunks.add(chunk)
+    cited_owned_chunk = any(
+        citation.get("document_id") == str(identifier)
+        and type(citation.get("chunk_ind")) is int
+        and citation["chunk_ind"] in owned_chunks
+        for citation in response.get("citation_info", [])
+    )
+    if (
+        response.get("error_msg")
+        or set(re.findall(marker_pattern, response.get("answer", ""))) != {marker}
+        or body_markers != {marker}
+        or not cited_owned_chunk
+    ):
+        raise ValueError("ordinary_markdown_indexed_chat_failed")
+
+
 def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> None:
     marker = "ANNEXCANARY" + run.run_id.hex
     file = upload_canary_markdown(client, run)
@@ -510,16 +548,7 @@ def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> No
             "stream": False,
         },
     )
-    if (
-        response.get("error_msg")
-        or marker not in response["answer"]
-        or not response.get("citation_info")
-        or not any(
-            str(identifier) in str(document.get("document_id", ""))
-            for document in response.get("top_documents", [])
-        )
-    ):
-        raise ValueError("ordinary_markdown_indexed_chat_failed")
+    require_markdown_chat_evidence(response, identifier, marker)
     run.evidence["ordinary_markdown_upload_index_chat"] = True
     save_canary(run)
 
