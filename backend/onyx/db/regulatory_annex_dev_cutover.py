@@ -6,8 +6,10 @@ import os
 import re
 import sys
 import time
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, cast
 
+from elastic_transport import ObjectApiResponse
 from sqlalchemy import text
 
 from onyx.db.engine.sql_engine import SqlEngine, get_session_with_tenant
@@ -82,7 +84,8 @@ def validate_scope_evidence(
     client: Any, evidence: dict[str, Any], names: list[str]
 ) -> None:
     if (
-        evidence.get("mode") not in {"dev-dedicated", "shared-scoped"}
+        evidence.get("mode")
+        not in {"dev-dedicated", "shared-scoped", "shared-observed"}
         or evidence.get("expires_at", 0) <= time.time()
         or not evidence.get("evidence_ref")
         or evidence.get("indices") != names
@@ -97,10 +100,74 @@ def validate_scope_evidence(
         raise CutoverRefusal("authoritative_shared_scope_evidence_required")
 
 
+def _observed_work_pending(response: object, *, pending_metadata: bool = False) -> bool:
+    # ES filter_path omits empty arrays: HTTP200 plus this exact shape proves quiet.
+    if not isinstance(response, ObjectApiResponse) or response.meta.status != 200:
+        raise CutoverRefusal("server_task_inventory_incomplete")
+    raw_body = response.body
+    failures = set() if pending_metadata else {"node_failures", "task_failures"}
+    if not isinstance(raw_body, Mapping) or set(raw_body) - {"tasks", *failures}:
+        raise CutoverRefusal("server_task_inventory_incomplete")
+    body = cast(Mapping[str, object], raw_body)
+    if any(body[key] != [] for key in failures if key in body):
+        raise CutoverRefusal("server_task_inventory_incomplete")
+    tasks = body.get("tasks", [])
+    if not isinstance(tasks, list):
+        raise CutoverRefusal("server_task_inventory_incomplete")
+    for task in tasks:
+        expected = {"insert_order"} if pending_metadata else {"node", "id"}
+        if not isinstance(task, Mapping) or set(task) != expected:
+            raise CutoverRefusal("server_task_inventory_incomplete")
+        item = cast(Mapping[str, object], task)
+        identifier = item["insert_order" if pending_metadata else "id"]
+        if (
+            not isinstance(identifier, int)
+            or isinstance(identifier, bool)
+            or identifier < 0
+        ):
+            raise CutoverRefusal("server_task_inventory_incomplete")
+        if not pending_metadata:
+            node = item["node"]
+            if not isinstance(node, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", node):
+                raise CutoverRefusal("server_task_inventory_incomplete")
+    return bool(tasks)
+
+
 def drain_server_work(client: Any, evidence: dict[str, Any]) -> None:
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
-        if evidence["mode"] == "dev-dedicated":
+        if evidence["mode"] == "shared-observed":
+            bounded = client.options(request_timeout=15)
+            active = _observed_work_pending(
+                bounded.tasks.list(
+                    actions=[
+                        "indices:data/write/*",
+                        "indices:admin/*",
+                        "cluster:admin/snapshot/restore*",
+                    ],
+                    detailed=False,
+                    group_by="none",
+                    timeout="10s",
+                    filter_path=[
+                        "tasks.node",
+                        "tasks.id",
+                        "node_failures",
+                        "task_failures",
+                        "error",
+                        "status",
+                    ],
+                )
+            )
+            pending = _observed_work_pending(
+                bounded.cluster.pending_tasks(
+                    filter_path=["tasks.insert_order", "error", "status"],
+                    master_timeout="10s",
+                ),
+                pending_metadata=True,
+            )
+            if not active and not pending and time.monotonic() < deadline:
+                return
+        elif evidence["mode"] == "dev-dedicated":
             # Only a positively identified DEV-exclusive cluster permits this inventory.
             response = client.tasks.list(
                 actions=[

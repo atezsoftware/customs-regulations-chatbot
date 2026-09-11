@@ -34,8 +34,8 @@ not an environment-name heuristic. Required fields:
 Set `expires_at` to a future Unix timestamp covering the bounded deployment. The
 probe verifies the actual cluster UUID and current DEV database search settings;
 these matches alone **do not establish cluster exclusivity**. The evidence must
-establish that independently. Only this dedicated mode permits operational
-cluster task/pending-metadata inventory. It never fetches document contents.
+establish that independently. Dedicated mode uses operational cluster
+task/pending-metadata inventory. It never fetches document contents.
 
 For a genuinely shared cluster, use `mode=shared-scoped`, plus
 `producer_inventory_complete=true`, `index_lifecycle_idle=true`, and `task_ids`
@@ -44,7 +44,34 @@ return `completed=true`; missing/unknown responses refuse. An empty list is vali
 only with authoritative complete scoped producer/lifecycle evidence. Do not
 invent an empty manifest or label a shared cluster dedicated to make deployment
 pass. Unknown scope refuses before old writers are stopped. No shared/global task
-listing is performed in shared mode.
+listing is performed in `shared-scoped` mode.
+
+When producer completeness cannot be independently established, the bounded
+`shared-observed` mode uses runtime operational quiet instead of those two
+attestation booleans. Supply the same exact cluster UUID, sorted DEV index names,
+release SHA, future expiry and evidence reference, with `mode=shared-observed`;
+do not add claims of dedication, `producer_inventory_complete` or
+`index_lifecycle_idle`. The evidence reference identifies the verified DEV
+physical ownership and reviewed release observation, not a complete producer list.
+
+Before both block and unblock, this mode waits up to ten minutes for zero tasks
+matching `indices:data/write/*`, `indices:admin/*` and
+`cluster:admin/snapshot/restore*`, and zero pending cluster metadata work. It
+conservatively waits on matching activity anywhere in the cluster. Requests use
+`detailed=false`, `group_by=none`, and minimal `filter_path` fields: task node/ID
+and pending insertion order, plus failures/error/status for fail-closed handling.
+No task descriptions, query bodies, source fields or document contents are
+requested, and no tasks are cancelled. Failure arrays are retained internally
+only and never logged. Each request has a 15-second transport bound and a
+10-second task-node/master timeout. A failure or malformed response refuses.
+
+With ES8.17, these exact filters omit empty arrays and return `{}` when quiet.
+Only a successful installed-client `ObjectApiResponse` with HTTP200 and the exact
+allowed mapping shape permits that empty result; missing responses, wrong status,
+non-mappings, unexpected fields, malformed identifiers and any node/task failure
+cannot establish quiet. The observation does not certify dedication or future
+producer behavior. Existing DEV database/name/UUID checks, application/controller
+drain, shard-acknowledged write barrier and release SHA/expiry checks still apply.
 
 The supported first-cutover namespace has exactly the known API/background/web
 Deployments, one stable API/background replica, no HPA, Job, CronJob, DaemonSet,

@@ -615,3 +615,202 @@ def test_canary_report_retains_publication_and_cleanup_identities(
         cutover.emit_acceptance_report(json.dumps(report), "canary", "a" * 40)
     emitted = json.loads(capsys.readouterr().out)["canary"]
     assert emitted == {key: value for key, value in canary.items() if key != "api_key"}
+
+
+def _observed_response(body: object, status: int = 200) -> object:
+    from elastic_transport import (
+        ApiResponseMeta,
+        HttpHeaders,
+        NodeConfig,
+        ObjectApiResponse,
+    )
+
+    return ObjectApiResponse(
+        body=body,
+        meta=ApiResponseMeta(
+            status=status,
+            http_version="1.1",
+            headers=HttpHeaders(),
+            duration=0,
+            node=NodeConfig("http", "localhost", 29200),
+        ),
+    )
+
+
+def test_shared_observed_scope_requires_exact_identity_without_attestations() -> None:
+    from onyx.db.regulatory_annex_dev_cutover import validate_scope_evidence
+
+    client = Mock()
+    client.info.return_value = {"cluster_uuid": "actual"}
+    evidence = {
+        "mode": "shared-observed",
+        "cluster_uuid": "actual",
+        "indices": ["chunks_dev_exact"],
+        "expires_at": 9999999999,
+        "evidence_ref": "observed release",
+    }
+    validate_scope_evidence(client, evidence, ["chunks_dev_exact"])
+    for key, value in (
+        ("cluster_uuid", "other"),
+        ("indices", []),
+        ("expires_at", 0),
+        ("evidence_ref", ""),
+    ):
+        with pytest.raises(RuntimeError, match="scope_evidence_required"):
+            validate_scope_evidence(
+                client, {**evidence, key: value}, ["chunks_dev_exact"]
+            )
+
+
+@pytest.mark.parametrize(
+    "endpoint,body,status,wrapped",
+    [
+        ("tasks", {}, 200, False),
+        ("tasks", None, 200, True),
+        ("tasks", [], 200, True),
+        ("tasks", {}, 503, True),
+        ("tasks", {"unexpected": []}, 200, True),
+        ("tasks", {"tasks": {}}, 200, True),
+        ("tasks", {"tasks": [{}]}, 200, True),
+        ("tasks", {"tasks": [{"id": True, "node": "n"}]}, 200, True),
+        (
+            "tasks",
+            {"tasks": [{"id": 1, "node": "n", "description": "hidden"}]},
+            200,
+            True,
+        ),
+        ("tasks", {"node_failures": [{}]}, 200, True),
+        ("tasks", {"task_failures": [{"reason": "never log"}]}, 200, True),
+        ("tasks", {"node_failures": None}, 200, True),
+        ("tasks", {"error": {}}, 200, True),
+        ("pending", {}, 200, False),
+        ("pending", None, 200, True),
+        ("pending", {"tasks": [None]}, 200, True),
+        ("pending", {"tasks": [{"insert_order": -1}]}, 200, True),
+        ("pending", {"tasks": [{"insert_order": 1, "source": "hidden"}]}, 200, True),
+        ("pending", {"status": 500}, 200, True),
+    ],
+)
+def test_shared_observed_refuses_incomplete_operational_responses(
+    endpoint: str, body: object, status: int, wrapped: bool
+) -> None:
+    from onyx.db.regulatory_annex_dev_cutover import drain_server_work
+
+    client = Mock()
+    client.options.return_value = client
+    client.tasks.list.return_value = _observed_response({})
+    client.cluster.pending_tasks.return_value = _observed_response({})
+    response = _observed_response(body, status) if wrapped else body
+    if endpoint == "tasks":
+        client.tasks.list.return_value = response
+    else:
+        client.cluster.pending_tasks.return_value = response
+    with pytest.raises(RuntimeError, match="server_task_inventory_incomplete"):
+        drain_server_work(client, {"mode": "shared-observed"})
+    client.tasks.get.assert_not_called()
+
+
+def test_shared_observed_waits_for_quiet_minimal_metadata() -> None:
+    from onyx.db.regulatory_annex_dev_cutover import drain_server_work
+
+    client = Mock()
+    client.options.return_value = client
+    client.tasks.list.side_effect = [
+        _observed_response({"tasks": [{"id": 3, "node": "node"}]}),
+        _observed_response({}),
+        _observed_response({}),
+    ]
+    client.cluster.pending_tasks.side_effect = [
+        _observed_response({}),
+        _observed_response({"tasks": [{"insert_order": 1}]}),
+        _observed_response({}),
+    ]
+    with patch("onyx.db.regulatory_annex_dev_cutover.time.sleep") as sleep:
+        drain_server_work(client, {"mode": "shared-observed"})
+    assert sleep.call_count == 2
+    client.tasks.list.assert_called_with(
+        actions=[
+            "indices:data/write/*",
+            "indices:admin/*",
+            "cluster:admin/snapshot/restore*",
+        ],
+        detailed=False,
+        group_by="none",
+        timeout="10s",
+        filter_path=[
+            "tasks.node",
+            "tasks.id",
+            "node_failures",
+            "task_failures",
+            "error",
+            "status",
+        ],
+    )
+    client.cluster.pending_tasks.assert_called_with(
+        filter_path=["tasks.insert_order", "error", "status"], master_timeout="10s"
+    )
+    client.options.assert_called_with(request_timeout=15)
+    client.tasks.get.assert_not_called()
+    client.tasks.cancel.assert_not_called()
+
+
+def test_shared_observed_active_work_has_bounded_wait() -> None:
+    from onyx.db import regulatory_annex_dev_cutover as probe
+
+    client = Mock()
+    client.options.return_value = client
+    client.tasks.list.return_value = _observed_response(
+        {"tasks": [{"id": 3, "node": "node"}]}
+    )
+    client.cluster.pending_tasks.return_value = _observed_response({})
+    with (
+        patch.object(probe.time, "monotonic", side_effect=[0, 1, 601]),
+        patch.object(probe.time, "sleep"),
+    ):
+        with pytest.raises(RuntimeError, match="server_work_not_drained"):
+            probe.drain_server_work(client, {"mode": "shared-observed"})
+
+
+def test_shared_observed_rechecks_quiet_before_block_and_unblock() -> None:
+    from onyx.db import regulatory_annex_dev_cutover as probe
+
+    name = "chunks_dev_exact"
+    client = Mock()
+    client.options.return_value = client
+    client.info.return_value = {"cluster_uuid": "actual"}
+    client.indices.get.return_value = {
+        name: {"settings": {"index.uuid": "u"}, "aliases": {}}
+    }
+    client.tasks.list.side_effect = [
+        _observed_response({}),
+        _observed_response({"node_failures": [{}]}),
+    ]
+    client.cluster.pending_tasks.return_value = _observed_response({})
+    client.indices.add_block.return_value = {
+        "acknowledged": True,
+        "shards_acknowledged": True,
+        "indices": [{"name": name, "blocked": True}],
+    }
+    wrapper = Mock()
+    wrapper.__enter__ = Mock(return_value=wrapper)
+    wrapper.__exit__ = Mock(return_value=False)
+    wrapper.publication_client.return_value = client
+    scope = {
+        "mode": "shared-observed",
+        "cluster_uuid": "actual",
+        "indices": [name],
+        "expires_at": 9999999999,
+        "evidence_ref": "release",
+    }
+    with (
+        patch.object(probe, "configured_indices", return_value=[name]),
+        patch(
+            "onyx.document_index.elasticsearch.client.ElasticsearchClient",
+            return_value=wrapper,
+        ),
+    ):
+        assert probe.operate("block", {name: "u"}, scope) == {name: "u"}
+        with pytest.raises(RuntimeError, match="server_task_inventory_incomplete"):
+            probe.operate("unblock", {name: "u"}, scope)
+    client.indices.add_block.assert_called_once()
+    client.indices.put_settings.assert_not_called()
