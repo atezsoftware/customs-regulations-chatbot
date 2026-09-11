@@ -281,8 +281,10 @@ def _normalized(text: str) -> str:
 
 
 _TABLE_DEPENDENT = re.compile(
-    r"tablo|table|cetvel|tarife|satır|satir|sütun|sutun|column|row|oran|rate|gt[iı]p|"
-    r"aşağı|asagi|below|following|şöyle|soyle|%",
+    r"(?<!\w)(?:"
+    r"(?:tablo|cetvel|çizelge|cizelge)(?:su|si|sı|nun|nin|nın|yu|yi|yı|ya|ye|da|de|daki|deki|dan|den|"
+    r"lar|ler|sunun|sinin|sının|sunda|sinde|sında|sunu|sini|sını)?|"
+    r"tables?|columns?|rows?|satır|satir|sütun|sutun)(?!\w)",
     re.IGNORECASE,
 )
 

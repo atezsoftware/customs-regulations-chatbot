@@ -606,8 +606,18 @@ def test_annex_new_pdf_reuses_verified_derivative(
 
 
 @pytest.mark.parametrize("repeated", [False, True])
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "MADDE 9 - Basvuru suresi on gundur.",
+        "MADDE 9 - Replace the following sentence with the sentence below.",
+        "MADDE 9 - Replace corporate growth with annual growth.",
+        "MADDE 9 - Replace the rate of 5% with 7%.",
+        "MADDE 9 - Yuzde 5 orani yuzde 7 olarak degistirilmistir.",
+    ],
+)
 def test_unrelated_table_does_not_require_images_for_plain_text_update(
-    monkeypatch: pytest.MonkeyPatch, repeated: bool
+    monkeypatch: pytest.MonkeyPatch, repeated: bool, instruction: str
 ) -> None:
     import json
 
@@ -618,7 +628,6 @@ def test_unrelated_table_does_not_require_images_for_plain_text_update(
     source, asset, store, blobs, render = frozen_case(monkeypatch)
     assert asset.pdf_vision is not None
     extraction = AnnexExtraction.model_validate_json(blobs[asset.pdf_vision.file_id])
-    instruction = "MADDE 9 - Basvuru suresi on gundur."
     for page in range(2, 4 if repeated else 3):
         text = extraction.elements[0].model_copy(deep=True)
         text.text = instruction
@@ -648,9 +657,13 @@ def test_unrelated_table_does_not_require_images_for_plain_text_update(
 
 
 @pytest.mark.parametrize("mode", ["associated", "multiple", "boundary", "missing"])
+@pytest.mark.parametrize(
+    "table_term", ["tablosu", "çizelge", "cizelge", "tablodaki", "çizelgedeki"]
+)
 def test_cross_page_ordinary_table_update_requires_original_image(
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
+    table_term: str,
 ) -> None:
     import json
 
@@ -661,7 +674,8 @@ def test_cross_page_ordinary_table_update_requires_original_image(
     source, asset, store, blobs, render = frozen_case(monkeypatch)
     assert asset.pdf_vision is not None
     extraction = AnnexExtraction.model_validate_json(blobs[asset.pdf_vision.file_id])
-    instruction = extraction.elements[0].text
+    instruction = f"MADDE 3 - Ekli {table_term} degistirilmistir."
+    extraction.elements[0].text = instruction
     for element in extraction.elements[1:]:
         element.locator.page = 2
     extraction.page_count = 2
