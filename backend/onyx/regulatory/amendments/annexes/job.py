@@ -244,12 +244,13 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 manifest_file_id=manifest_id,
                 manifest_sha256=hashlib.sha256(manifest).hexdigest(),
             )
-    except Exception:
+    except Exception as error:
         with get_session_with_current_tenant() as session:
             mark_source_package_failed(
                 session,
                 package_id=package_id,
                 environment=environment,
                 lease_token=token,
+                failure=error,
             )
         raise

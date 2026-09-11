@@ -2439,3 +2439,27 @@ def test_comparison_diagnostic_transport_refuses_unbounded_fields(
     )
     with pytest.raises(RuntimeError, match="fixed_diagnostic_report_required"):
         cutover.diagnose_batch47_comparison(driver, "pod", "container")
+
+
+def test_source_package_failure_survives_canary_transport(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    detail = (
+        '{"stage":"source_package","exceptions":[{"type":"ValueError","frames":[]}]}'
+    )
+    report = {
+        "phase": "canary",
+        "status": "failed",
+        "release_sha_metadata": "a" * 40,
+        "evidence": {"source_package_status": "failed", "worker_failure": detail},
+    }
+    with pytest.raises(cutover.CutoverRefusal, match="fixed_acceptance_probe_failed"):
+        cutover.emit_acceptance_report(json.dumps(report), "canary", "a" * 40)
+    assert json.loads(capsys.readouterr().out)["evidence"] == report["evidence"]
+    report["evidence"]["source_package_status"] = "SECRET_INPUT"
+    with pytest.raises(
+        cutover.CutoverRefusal, match="acceptance_source_package_status_refused"
+    ):
+        cutover.emit_acceptance_report(json.dumps(report), "canary", "a" * 40)

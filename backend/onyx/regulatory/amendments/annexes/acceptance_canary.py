@@ -95,6 +95,15 @@ def wait_package(
         if result["status"] == "ready":
             return result
         if result["status"] in {"failed", "blocked"}:
+            run.evidence["source_package_status"] = result["status"]
+            for issue in result.get("issues", []):
+                detail = (
+                    issue.get("failure_detail") if isinstance(issue, dict) else None
+                )
+                if isinstance(detail, str) and len(detail) <= 4000:
+                    run.evidence["worker_failure"] = detail
+                    break
+            save_canary(run)
             raise ValueError("fictional_source_package_failed")
         time.sleep(1)
     raise TimeoutError("fictional_source_package_deadline")
