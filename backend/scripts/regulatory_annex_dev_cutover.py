@@ -1054,7 +1054,118 @@ def cloudwatch_metadata(args: list[str]) -> dict[str, Any]:
         raise CutoverRefusal("invalid_response") from None
 
 
-def diagnose_batch44_logs(runtime_sha: str) -> None:
+def diagnose_logging_metadata(driver: Driver) -> None:
+    """Bounded collector/destination inventory; no application log reads."""
+    report: dict[str, Any] = {
+        "stage": "logging_destination_metadata",
+        "collectors": [],
+        "cloudwatch": [],
+    }
+    for namespace in ("amazon-cloudwatch", "kube-system", "logging", "monitoring"):
+        result: dict[str, Any] = {
+            "namespace": namespace,
+            "status": "available",
+            "daemonsets": [],
+        }
+        try:
+            data = json.loads(
+                driver.command(
+                    [
+                        "kubectl",
+                        "get",
+                        "daemonsets",
+                        "--namespace",
+                        namespace,
+                        "-o",
+                        "json",
+                        "--request-timeout=10s",
+                    ],
+                    timeout=15,
+                )
+            )
+            for item in data["items"]:
+                name = item["metadata"]["name"]
+                images = [
+                    container["image"]
+                    for container in item["spec"]["template"]["spec"]["containers"]
+                ]
+                if not re.fullmatch(r"[a-z0-9.-]{1,253}", name) or not all(
+                    re.fullmatch(r"[A-Za-z0-9._/@:-]{1,400}", image) for image in images
+                ):
+                    raise ValueError
+                if re.search(
+                    r"fluent|cloudwatch|filebeat|promtail|vector|opentelemetry|otel",
+                    " ".join([name, *images]),
+                    re.IGNORECASE,
+                ):
+                    result["daemonsets"].append({"name": name, "images": images})
+        except (CutoverRefusal, ValueError, TypeError, KeyError):
+            result.update(status="unavailable", daemonsets=[])
+        report["collectors"].append(result)
+    try:
+        config = json.loads(
+            driver.command(
+                [
+                    "kubectl",
+                    "get",
+                    "configmap",
+                    "aws-logging",
+                    "--namespace",
+                    "aws-observability",
+                    "-o",
+                    "json",
+                    "--request-timeout=10s",
+                ],
+                timeout=15,
+            )
+        )
+        destinations = []
+        for value in config["data"].values():
+            if not isinstance(value, str):
+                raise ValueError
+            for key, destination in re.findall(
+                r"(?im)^\s*(log_group_name|region)\s+([A-Za-z0-9._/#-]{1,512})\s*$",
+                value,
+            ):
+                destinations.append({"field": key.lower(), "value": destination})
+        report["fargate"] = {"status": "available", "destinations": destinations}
+    except (CutoverRefusal, ValueError, TypeError, KeyError, AttributeError):
+        report["fargate"] = {"status": "unavailable", "destinations": []}
+    for pattern in ("atez-dev", "customs-regulations-dev"):
+        entry: dict[str, Any] = {
+            "pattern": pattern,
+            "status": "available",
+            "groups": [],
+            "complete": False,
+        }
+        try:
+            result = cloudwatch_metadata(
+                [
+                    "describe-log-groups",
+                    "--log-group-name-pattern",
+                    pattern,
+                    "--limit",
+                    "50",
+                ]
+            )
+            names = [group["logGroupName"] for group in result["logGroups"]]
+            if not all(
+                isinstance(name, str)
+                and pattern in name
+                and re.fullmatch(r"[A-Za-z0-9._/#-]{1,512}", name)
+                for name in names
+            ):
+                raise ValueError
+            entry.update(groups=names, complete=not bool(result.get("nextToken")))
+        except CutoverRefusal as error:
+            entry["status"] = str(error)
+        except (ValueError, TypeError, KeyError):
+            entry["status"] = "invalid_response"
+        report["cloudwatch"].append(entry)
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
+def diagnose_batch44_logs(runtime_sha: str) -> str:
     """Read only the known failed release's fixed DEV namespace/time window."""
     report: dict[str, Any] = {
         "stage": "batch44_cloudwatch",
@@ -1064,7 +1175,7 @@ def diagnose_batch44_logs(runtime_sha: str) -> None:
     }
     if runtime_sha != BATCH44_RUNTIME:
         print(json.dumps(report, sort_keys=True), flush=True)
-        return
+        return "not_applicable"
     try:
         groups = cloudwatch_metadata(
             [
@@ -1190,6 +1301,7 @@ def diagnose_batch44_logs(runtime_sha: str) -> None:
     except (ValueError, TypeError, KeyError, AttributeError):
         report["status"] = "invalid_response"
     print(json.dumps(report, sort_keys=True), flush=True)
+    return str(report["status"])
 
 
 def diagnose_release(driver: Driver, runner_sha: str) -> None:
@@ -1206,7 +1318,8 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         ),
         flush=True,
     )
-    diagnose_batch44_logs(driver.sha)
+    if diagnose_batch44_logs(driver.sha) == "application_group_absent":
+        diagnose_logging_metadata(driver)
     pod = driver.pods("background")[0]
     container = next(
         item

@@ -1640,3 +1640,84 @@ def test_batch44_cloudwatch_requires_complete_pagination_before_trace(
     assert query.call_count == 3
     assert query.call_args.args[0][-2:] == ["--next-token", "next"]
     assert "trace_found" in capsys.readouterr().out
+
+
+def test_logging_metadata_emits_only_collectors_and_safe_destinations(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    driver = Mock(spec=cutover.Driver)
+    daemonsets = {
+        "items": [
+            {
+                "metadata": {"name": "fluent-bit"},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": "fluent-bit",
+                                    "image": "public.ecr.aws/aws-observability/aws-for-fluent-bit:stable",
+                                    "env": [{"name": "SECRET", "value": "private"}],
+                                }
+                            ]
+                        }
+                    }
+                },
+            }
+        ]
+    }
+    config = {
+        "data": {
+            "output.conf": "[OUTPUT]\n Name cloudwatch_logs\n log_group_name /custom/atez-dev/application\n region eu-central-1\n token private\n"
+        }
+    }
+    driver.command.side_effect = [
+        json.dumps(daemonsets),
+        json.dumps({"items": []}),
+        json.dumps({"items": []}),
+        json.dumps({"items": []}),
+        json.dumps(config),
+    ]
+    with patch.object(
+        cutover,
+        "cloudwatch_metadata",
+        return_value={"logGroups": [{"logGroupName": "/custom/atez-dev/application"}]},
+    ):
+        cutover.diagnose_logging_metadata(driver)
+    output = capsys.readouterr().out
+    assert "fluent-bit" in output and "/custom/atez-dev/application" in output
+    assert (
+        "private" not in output
+        and "SECRET" not in output
+        and "output.conf" not in output
+    )
+    assert driver.command.call_count == 5
+    assert all(
+        call.args[0][1:4] == ["get", "daemonsets", "--namespace"]
+        for call in driver.command.call_args_list[:4]
+    )
+    assert driver.command.call_args.args[0][1:4] == ["get", "configmap", "aws-logging"]
+
+
+def test_logging_metadata_unavailable_is_precise_and_never_reads_events(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.command.side_effect = cutover.CutoverRefusal("command_failed:kubectl:get")
+    with patch.object(
+        cutover,
+        "cloudwatch_metadata",
+        return_value={"logGroups": [], "nextToken": "private"},
+    ) as query:
+        cutover.diagnose_logging_metadata(driver)
+    output = capsys.readouterr().out
+    assert (
+        "unavailable" in output
+        and '"complete": false' in output
+        and "private" not in output
+    )
+    assert all(
+        call.args[0][0] == "describe-log-groups" for call in query.call_args_list
+    )
