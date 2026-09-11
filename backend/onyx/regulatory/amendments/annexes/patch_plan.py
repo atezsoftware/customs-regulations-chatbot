@@ -97,6 +97,12 @@ def _source_table_rows(view: AnnexExtraction) -> dict[int, list[int]]:
             return {}
         for row in rows:
             row.sort(key=lambda item: box_at(item)[0])
+        if any(
+            max(box_at(item)[3] for item in above)
+            > min(box_at(item)[1] for item in below) + 1e-9
+            for above, below in zip(rows, rows[1:])
+        ):
+            return {}
         columns = [(box_at(item)[0], box_at(item)[2]) for item in rows[0]]
         if len(columns) < 2 or any(
             len(row) != len(columns)
@@ -129,40 +135,38 @@ def _source_table_rows(view: AnnexExtraction) -> dict[int, list[int]]:
     return result
 
 
-def _complete_cell_spans(text: str, cell: str) -> list[tuple[int, int]]:
-    """Count complete pipe-delimited cells, never substrings of legal values."""
-    spans: list[tuple[int, int]] = []
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        if "|" in line or text.strip() == cell:
-            cell_offset = offset
-            for part in line.split("|"):
-                if part.strip() == cell:
-                    start = cell_offset + len(part) - len(part.lstrip())
-                    spans.append((start, start + len(cell)))
-                cell_offset += len(part) + 1
-        offset += len(line)
-    return spans
-
-
-def _linewise_cell_spans(
+def _anchored_cell_spans(
     text: str, position: int, row: list[int], old: AnnexExtraction
 ) -> list[tuple[int, int]]:
+    """A complete source row must uniquely identify the cell in either text format."""
+    expected = [old.elements[item].text for item in row]
+    column = row.index(position)
+    matches: list[tuple[int, int]] = []
     lines: list[tuple[str, int]] = []
     offset = 0
     for line in text.splitlines(keepends=True):
         lines.append((line.strip(), offset + len(line) - len(line.lstrip())))
+        if "|" in line:
+            cells: list[tuple[str, int]] = []
+            cell_offset = offset
+            for part in line.split("|"):
+                cells.append(
+                    (part.strip(), cell_offset + len(part) - len(part.lstrip()))
+                )
+                cell_offset += len(part) + 1
+            if cells and not cells[0][0]:
+                cells.pop(0)
+            if cells and not cells[-1][0]:
+                cells.pop()
+            if [value for value, _ in cells] == expected:
+                start = cells[column][1]
+                matches.append((start, start + len(old.elements[position].text)))
         offset += len(line)
-    expected = [old.elements[item].text for item in row]
-    matches = [
-        start
-        for start in range(len(lines) - len(row) + 1)
-        if [value for value, _ in lines[start : start + len(row)]] == expected
-    ]
-    if len(matches) != 1:
-        return []
-    start = lines[matches[0] + row.index(position)][1]
-    return [(start, start + len(old.elements[position].text))]
+    for start in range(len(lines) - len(row) + 1):
+        if [value for value, _ in lines[start : start + len(row)]] == expected:
+            cell_start = lines[start + column][1]
+            matches.append((cell_start, cell_start + len(old.elements[position].text)))
+    return matches
 
 
 def _aligned_text_kind_drift(
@@ -361,11 +365,13 @@ def prepare_annex_patch(
             ):
                 start, end = 0, len(candidate.text)
             elif element.kind == "table_cell" and element.text:
-                spans = _complete_cell_spans(candidate.text, element.text)
-                if not spans and old_position in source_rows:
-                    spans = _linewise_cell_spans(
+                spans = (
+                    _anchored_cell_spans(
                         candidate.text, old_position, source_rows[old_position], old
                     )
+                    if old_position in source_rows
+                    else []
+                )
                 if len(spans) != 1:
                     continue
                 start, end = spans[0]

@@ -123,23 +123,12 @@ def test_non_annex_keeps_legacy_route_and_noise_blocks() -> None:
 
 
 def test_cell_patch_preserves_rest_of_existing_canonical_row() -> None:
-    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
-    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
-
-    current = baseline("A | 5% | exception retained")
-    current.elements[0].semantic_key = "canonical-row-lineage"
-    old, new = extraction("5%"), extraction("7%")
-    result = prepare_annex_patch(
-        baseline=current,
-        old=old,
-        new=new,
-        comparison=compare_annexes(old=old, new=new),
-        effective_date=date.today(),
-        package_complete=True,
-    )
+    current, old, new = linewise_case()
+    current.elements[0].text = current.canonical_text = "1001 | Wheat | 5%"
+    result = prepare_linewise_case(current, old, new)
     assert result.ready
-    assert result.patches[0].old_text == "A | 5% | exception retained"
-    assert result.patches[0].new_text == "A | 7% | exception retained"
+    assert result.patches[0].old_text == "1001 | Wheat | 5%"
+    assert result.patches[0].new_text == "1001 | Wheat | 7%"
 
 
 def test_merge_does_not_duplicate_new_content_in_two_canonical_chunks() -> None:
@@ -375,27 +364,17 @@ def test_serialized_ready_flag_cannot_bypass_reference_validation() -> None:
 
 
 def test_padded_markdown_row_preserves_separate_nonlegal_delimiter() -> None:
-    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
-    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
 
-    current = baseline("| A     | 5%    | retained |")
-    current.elements[0].semantic_key = "row-lineage"
+    current, old, new = linewise_case()
+    current.elements[0].text = current.canonical_text = "| 1001     | Wheat    | 5% |"
     current.elements.append(
         ExtractedAnnexElement(
             kind="text", text="| :--- | ---: | --- |", canonical_chunk_id="scaffold"
         )
     )
-    old, new = extraction("5%"), extraction("7%")
-    result = prepare_annex_patch(
-        baseline=current,
-        old=old,
-        new=new,
-        comparison=compare_annexes(old=old, new=new),
-        effective_date=date.today(),
-        package_complete=True,
-    )
+    result = prepare_linewise_case(current, old, new)
     assert result.ready
-    assert result.patches[0].new_text == "| A     | 7%    | retained |"
+    assert result.patches[0].new_text == "| 1001     | Wheat    | 7% |"
     assert "scaffold" in result.unchanged
 
 
@@ -594,22 +573,16 @@ def test_native_linewise_table_refuses_unproven_row_context(defect: str) -> None
 
 
 def test_pipe_cell_boundaries_precede_substring_uniqueness() -> None:
-    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
-    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
-
-    current = baseline("| A | 5% | B | 15% |")
-    current.elements[0].semantic_key = "canonical-row"
-    old, new = extraction("5%"), extraction("7%")
-    result = prepare_annex_patch(
-        baseline=current,
-        old=old,
-        new=new,
-        comparison=compare_annexes(old=old, new=new),
-        effective_date=date.today(),
-        package_complete=True,
+    current, old, new = linewise_case()
+    current.elements[0].text = current.canonical_text = (
+        "| Code | Product | Rate |\n| 1001 | Wheat | 5% |\n| 2001 | Rice | 15% |"
     )
+    result = prepare_linewise_case(current, old, new)
     assert result.ready, result.issues
-    assert result.patches[0].new_text == "| A | 7% | B | 15% |"
+    assert (
+        result.patches[0].new_text
+        == "| Code | Product | Rate |\n| 1001 | Wheat | 7% |\n| 2001 | Rice | 15% |"
+    )
 
 
 @pytest.mark.parametrize(
@@ -660,3 +633,44 @@ def test_unchanged_text_footnote_requires_unique_aligned_page_neighborhood(
         new.elements[-1].locator.normalized_box = (0.1, 0.05, 0.4, 0.1)
     result = prepare_linewise_case(current, old, new)
     assert result.ready is (defect is None), result.issues
+
+
+def test_pipe_row_cannot_patch_unrelated_scalar_after_approved_correction() -> None:
+    current, old, new = linewise_case()
+    current.elements[0].text = current.canonical_text = (
+        "| Code | Product | Rate |\n| 1001 | Wheat | 8% |\n| 2001 | Rice | 15% |\n| Other | Thing | 5% |"
+    )
+    current.canonical_amendment_chunk_ids = ["canonical-rate"]
+    result = prepare_linewise_case(current, old, new)
+    assert not result.ready
+    assert "canonical_correspondence_unresolved" in result.issues
+    assert not result.patches
+
+
+def test_vertical_row_overlap_cannot_authorize_native_cell() -> None:
+    current, old, new = linewise_case()
+    for element in old.elements[3:6]:
+        box = element.locator.normalized_box
+        assert box is not None
+        element.locator.normalized_box = (box[0], box[1] - 0.03, box[2], box[3] - 0.03)
+    result = prepare_linewise_case(current, old, new)
+    assert not result.ready
+    assert "canonical_correspondence_unresolved" in result.issues
+
+
+def test_pipe_scalar_without_row_or_semantic_authority_refuses() -> None:
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    current = baseline("| A | 5% | B | 15% |")
+    current.elements[0].semantic_key = "unrelated-row"
+    old, new = extraction("5%"), extraction("7%")
+    result = prepare_annex_patch(
+        baseline=current,
+        old=old,
+        new=new,
+        comparison=compare_annexes(old=old, new=new),
+        effective_date=date.today(),
+        package_complete=True,
+    )
+    assert not result.ready
