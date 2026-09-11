@@ -106,45 +106,76 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("phase", choices=("preflight", "canary"))
     args = parser.parse_args()
-    validate_scope(
-        database=os.environ.get("POSTGRES_DB", ""),
-        environment=os.environ.get("REGULATORY_ANNEX_ENVIRONMENT", ""),
-        machine=platform.machine(),
-    )
     release_sha = os.environ.get("ANNEX_ACCEPTANCE_RELEASE_SHA", "")
-    if not re.fullmatch(r"[0-9a-f]{40}", release_sha):
-        raise ValueError("exact_release_ownership_metadata_required")
-    from onyx.db.regulatory_annex_acceptance import verify_dev_configuration
-
-    configuration = verify_dev_configuration()
+    valid_release_sha = bool(re.fullmatch(r"[0-9a-f]{40}", release_sha))
+    report: dict[str, object] = {}
     status = "passed"
-    if args.phase == "preflight":
-        from onyx.regulatory.amendments.annexes.acceptance_calibration import (
-            run_native_calibration,
+    stage = "scope"
+    try:
+        validate_scope(
+            database=os.environ.get("POSTGRES_DB", ""),
+            environment=os.environ.get("REGULATORY_ANNEX_ENVIRONMENT", ""),
+            machine=platform.machine(),
         )
+        if not valid_release_sha:
+            raise ValueError("exact_release_ownership_metadata_required")
+        stage = "startup"
+        from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
 
-        native = native_parser_probe()
-        calibration = run_native_calibration()
-        status = "passed" if calibration.get("status") == "passed" else "failed"
-        report = {
-            "configuration": configuration,
-            "native": native,
-            "calibration": calibration,
-        }
-    else:
-        from onyx.db.engine.sql_engine import SqlEngine
-        from onyx.regulatory.amendments.annexes.acceptance_canary import run_canary
+        set_is_ee_based_on_env_variable()
+        stage = "configuration"
+        from onyx.db.regulatory_annex_acceptance import verify_dev_configuration
 
-        with SqlEngine.scoped_engine(pool_size=5, max_overflow=2):
-            report = run_canary(release_sha)
-        status = str(report.get("status", "passed"))
+        report["configuration"] = verify_dev_configuration()
+        if args.phase == "preflight":
+            stage = "native"
+            report["native"] = native_parser_probe()
+            stage = "calibration"
+            from onyx.regulatory.amendments.annexes.acceptance_calibration import (
+                run_native_calibration,
+            )
+
+            calibration = run_native_calibration()
+            report["calibration"] = calibration
+            status = "passed" if calibration.get("status") == "passed" else "failed"
+        else:
+            stage = "canary"
+            from onyx.db.engine.sql_engine import SqlEngine
+            from onyx.regulatory.amendments.annexes.acceptance_canary import run_canary
+
+            with SqlEngine.scoped_engine(pool_size=5, max_overflow=2):
+                report.update(run_canary(release_sha))
+            status = str(report.get("status", "passed"))
+    except Exception as exc:
+        status = "failed"
+        exception_type = type(exc).__name__
+        report.update(
+            failure_stage=stage,
+            exception_type=exception_type
+            if exception_type
+            in {
+                "UnicodeDecodeError",
+                "ValueError",
+                "RuntimeError",
+                "TypeError",
+                "TimeoutError",
+                "OperationalError",
+                "ImportError",
+                "ModuleNotFoundError",
+                "IsolatedProcessTimeout",
+                "IsolatedProcessCrashed",
+                "AssertionError",
+                "KeyError",
+            }
+            else "Exception",
+        )
     print(
         json.dumps(
             {
+                **report,
                 "phase": args.phase,
                 "status": status,
-                "release_sha_metadata": release_sha,
-                **report,
+                "release_sha_metadata": release_sha if valid_release_sha else None,
             },
             sort_keys=True,
         ),

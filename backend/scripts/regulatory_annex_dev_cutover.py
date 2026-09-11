@@ -67,6 +67,8 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
         "phase",
         "status",
         "release_sha_metadata",
+        "failure_stage",
+        "exception_type",
         "configuration",
         "native",
         "calibration",
@@ -171,6 +173,39 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
     def sanitize(value: Any, parent: str = "", depth: int = 0) -> Any:
         if depth > 8:
             raise CutoverRefusal("acceptance_report_depth_exceeded")
+        if parent == "failure_stage" and (
+            not isinstance(value, str)
+            or value
+            not in {
+                "scope",
+                "startup",
+                "configuration",
+                "native",
+                "calibration",
+                "canary",
+            }
+        ):
+            raise CutoverRefusal("acceptance_failure_stage_refused")
+        if parent == "exception_type" and (
+            not isinstance(value, str)
+            or value
+            not in {
+                "UnicodeDecodeError",
+                "ValueError",
+                "RuntimeError",
+                "TypeError",
+                "TimeoutError",
+                "OperationalError",
+                "ImportError",
+                "ModuleNotFoundError",
+                "IsolatedProcessTimeout",
+                "IsolatedProcessCrashed",
+                "AssertionError",
+                "KeyError",
+                "Exception",
+            }
+        ):
+            raise CutoverRefusal("acceptance_exception_type_refused")
         if isinstance(value, dict):
             if len(value) > 100:
                 raise CutoverRefusal("acceptance_report_mapping_exceeded")

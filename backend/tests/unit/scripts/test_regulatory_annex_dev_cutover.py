@@ -987,3 +987,39 @@ def test_diagnostic_workflow_excludes_every_mutating_step() -> None:
         item for item in steps if "reviewed DEV annex release" in item["name"]
     )
     assert "inputs.action == 'annex-diagnose'" in diagnostic["if"]
+
+
+def test_failed_acceptance_stage_diagnostic_survives_safe_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    report = {
+        "phase": "preflight",
+        "status": "failed",
+        "release_sha_metadata": "a" * 40,
+        "failure_stage": "configuration",
+        "exception_type": "UnicodeDecodeError",
+        "exception_message": "DO_NOT_LOG_source_or_secret",
+    }
+    with pytest.raises(cutover.CutoverRefusal, match="fixed_acceptance_probe_failed"):
+        cutover.emit_acceptance_report(json.dumps(report), "preflight", "a" * 40)
+    output = capsys.readouterr().out
+    retained = json.loads(output)
+    assert retained["failure_stage"] == "configuration"
+    assert retained["exception_type"] == "UnicodeDecodeError"
+    assert "DO_NOT_LOG" not in output
+
+
+@pytest.mark.parametrize("key", ["failure_stage", "exception_type"])
+def test_acceptance_stage_diagnostics_refuse_arbitrary_values(key: str) -> None:
+    import json
+
+    report = {
+        "phase": "preflight",
+        "status": "failed",
+        "release_sha_metadata": "a" * 40,
+        key: "DO_NOT_LOG_source_or_secret",
+    }
+    with pytest.raises(cutover.CutoverRefusal, match="acceptance_.*_refused"):
+        cutover.emit_acceptance_report(json.dumps(report), "preflight", "a" * 40)
