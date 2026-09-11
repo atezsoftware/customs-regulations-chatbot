@@ -220,7 +220,17 @@ def test_dal_only_reads_fixed_key() -> None:
     assert len(session.method_calls) == 1
 
 
-@pytest.mark.parametrize("mode", ["hash_mismatch", "provider_refused", "prepared"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "hash_mismatch",
+        "provider_refused",
+        "prepared",
+        "lazy",
+        "lazy_duplicate",
+        "lazy_error",
+    ],
+)
 def test_generic_failure_requires_original_hash_and_vertex_before_preparation(
     mode: str,
 ) -> None:
@@ -234,7 +244,11 @@ def test_generic_failure_requires_original_hash_and_vertex_before_preparation(
     from onyx.file_store import file_store
     from onyx.llm import factory
     from onyx.regulatory.amendments import pdf_vision
-    from onyx.regulatory.amendments.annexes import sources
+    from onyx.regulatory.amendments.annexes import extraction, sources
+    from onyx.regulatory.amendments.annexes.models import (
+        AcquiredAsset,
+        AnnexRenderedPage,
+    )
 
     content = (
         Path(sources.__file__)
@@ -250,6 +264,39 @@ def test_generic_failure_requires_original_hash_and_vertex_before_preparation(
     llm = Mock()
     llm.config.model_provider = "vertex_ai"
     llm.config.model_dump_json.return_value = '{"test_model":true}'
+    lazy = mode.startswith("lazy")
+    if lazy:
+        import importlib
+
+        import httpx
+
+        with patch.object(
+            httpx.Client,
+            "send",
+            side_effect=lambda _self, request, **_kwargs: httpx.Response(
+                503, request=request
+            ),
+            autospec=True,
+        ):
+            importlib.import_module("onyx.llm.litellm_singleton")
+        from onyx.llm.multi_llm import LitellmLLM
+
+        llm = LitellmLLM(
+            api_key=None,
+            model_provider="vertex_ai",
+            model_name="gemini-fixture",
+            max_input_tokens=32000,
+            timeout=30,
+        )
+        asset = AcquiredAsset(
+            sha256=expected,
+            content=content,
+            mime_type="application/pdf",
+            display_name="new.pdf",
+        )
+    observed = []
+    caught = None
+    prepare = Mock()
     with contextlib.ExitStack() as stack:
         stack.enter_context(
             patch.dict(
@@ -299,19 +346,149 @@ def test_generic_failure_requires_original_hash_and_vertex_before_preparation(
                 ),
             )
         )
-        prepare = stack.enter_context(
-            patch.object(
-                pdf_vision,
-                "prepare_pdf_source",
-                return_value=SimpleNamespace(
-                    pdf_vision=SimpleNamespace(transcript_sha256="a" * 64)
-                ),
+        if lazy:
+            from unittest.mock import MagicMock
+
+            import httpx
+            import litellm
+            from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+            from litellm.types.utils import ModelResponseStream
+
+            from onyx.regulatory import structured_llm
+
+            stack.enter_context(
+                patch.object(structured_llm.time, "sleep", return_value=None)
             )
-        )
+            stack.enter_context(
+                patch.object(
+                    extraction,
+                    "run_in_isolated_process",
+                    return_value=(
+                        [],
+                        [
+                            AnnexRenderedPage(
+                                page=1, width=100, height=100, png=b"fictional-image"
+                            )
+                        ],
+                    ),
+                )
+            )
+
+            def send(
+                _client: httpx.Client, request: httpx.Request, **_kwargs: Any
+            ) -> httpx.Response:
+                observed.append("http")
+                return httpx.Response(200, request=request)
+
+            stack.enter_context(patch.object(httpx.Client, "send", send))
+
+            def completion(*_args: Any, **kwargs: Any) -> Any:
+                assert kwargs["stream"] is True
+                observed.append("completion-return")
+
+                def make_call(**_kwargs: Any) -> Any:
+                    observed.append("iteration")
+                    with httpx.Client() as client:
+                        client.send(
+                            httpx.Request("POST", "https://fixture.invalid/vertex")
+                        )
+                        if mode == "lazy_duplicate":
+                            client.send(
+                                httpx.Request("POST", "https://fixture.invalid/vertex")
+                            )
+                    if mode == "lazy_error":
+                        raise ValueError("PRIVATE LAZY ERROR")
+                    payload = json.dumps(
+                        {
+                            "elements": [
+                                {
+                                    "kind": "text",
+                                    "text": "Fictional rule",
+                                    "box": [0.1, 0.1, 0.8, 0.2],
+                                    "status": "readable",
+                                    "issues": [],
+                                }
+                            ]
+                        }
+                    )
+                    return iter(
+                        [
+                            ModelResponseStream.model_validate(
+                                {
+                                    "model": "gemini-fixture",
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "role": "assistant",
+                                                "content": payload,
+                                            },
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            ),
+                            ModelResponseStream.model_validate(
+                                {
+                                    "model": "gemini-fixture",
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {},
+                                            "finish_reason": "stop",
+                                        }
+                                    ],
+                                }
+                            ),
+                        ]
+                    )
+
+                return CustomStreamWrapper(
+                    completion_stream=None,
+                    model="gemini-fixture",
+                    logging_obj=MagicMock(
+                        model_call_details={}, stream_options=None, messages=[]
+                    ),
+                    custom_llm_provider="vertex_ai",
+                    make_call=make_call,
+                )
+
+            stack.enter_context(patch.object(litellm, "completion", completion))
+        else:
+            prepare = stack.enter_context(
+                patch.object(
+                    pdf_vision,
+                    "prepare_pdf_source",
+                    return_value=SimpleNamespace(
+                        pdf_vision=SimpleNamespace(transcript_sha256="a" * 64)
+                    ),
+                )
+            )
         result = report()
         before = time.monotonic()
-        runner.reproduce_source861(result)
+        try:
+            runner.reproduce_source861(result)
+        except Exception as error:
+            caught = error
+            runner.source861_failure(result, error)
     runner.validate_source861_report(result)
+    if lazy:
+        assert observed[:2] == ["completion-return", "iteration"]
+        expected_attempts = 1 if mode == "lazy" else 3
+        assert (
+            result["attempt_count"] == result["http_request_count"] == expected_attempts
+        )
+        assert observed.count("http") == expected_attempts
+        assert observed.count("completion-return") == expected_attempts
+        if mode == "lazy":
+            assert caught is None
+            assert result["status"] == "reproduction_passed"
+            assert result["extraction"]["page_count"] == 1
+        else:
+            assert caught is not None
+            assert result["status"] == "reproduction_failed"
+            assert "PRIVATE LAZY ERROR" not in json.dumps(result)
+        return
     if mode == "prepared":
         assert (
             result["status"] == "reproduction_passed" and result["reproduction"] is True

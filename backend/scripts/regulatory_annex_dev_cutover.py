@@ -2407,8 +2407,10 @@ def reproduce_source861(report: dict[str, Any]) -> None:
         original_generate = extraction.generate_structured
         original_completion, original_send = litellm.completion, httpx.Client.send
         original_transcript = pdf_vision.pdf_transcript
+        original_invoke = llm.invoke
         active = False
         page_attempts = 0
+        attempt_http_count = 0
 
         def generate(*args: Any, **kwargs: Any) -> Any:
             nonlocal page_attempts
@@ -2418,10 +2420,20 @@ def reproduce_source861(report: dict[str, Any]) -> None:
                 raise ValueError("source_diagnostic_attempt_limit")
             return original_generate(*args, **kwargs)
 
+        def invoke(*args: Any, **kwargs: Any) -> Any:
+            nonlocal active
+            if active:
+                raise ValueError("source_diagnostic_attempt_limit")
+            active = True
+            try:
+                return original_invoke(*args, **kwargs)
+            finally:
+                active = False
+
         def completion(*args: Any, **kwargs: Any) -> Any:
-            nonlocal active, page_attempts
+            nonlocal page_attempts, attempt_http_count
             if (
-                active
+                not active
                 or page_attempts >= 3
                 or report["attempt_count"] >= 12
                 or time.monotonic() >= deadline
@@ -2429,18 +2441,22 @@ def reproduce_source861(report: dict[str, Any]) -> None:
                 raise ValueError("source_diagnostic_attempt_limit")
             page_attempts += 1
             report["attempt_count"] += 1
-            active = True
+            attempt_http_count = 0
             kwargs.update(num_retries=0, max_retries=0)
-            try:
-                return original_completion(*args, **kwargs)
-            finally:
-                active = False
+            return original_completion(*args, **kwargs)
 
         def send(
             client: httpx.Client, request: httpx.Request, **kwargs: Any
         ) -> httpx.Response:
-            if not active or report["http_request_count"] >= report["attempt_count"]:
+            nonlocal attempt_http_count
+            if (
+                not active
+                or page_attempts == 0
+                or attempt_http_count >= 1
+                or report["http_request_count"] >= 12
+            ):
                 raise ValueError("source_diagnostic_http_limit")
+            attempt_http_count += 1
             report["http_request_count"] += 1
             return original_send(client, request, **kwargs)
 
@@ -2459,6 +2475,7 @@ def reproduce_source861(report: dict[str, Any]) -> None:
             return original_transcript(value)
 
         with (
+            patch.object(llm, "invoke", invoke),
             patch.object(extraction, "generate_structured", generate),
             patch.object(litellm, "completion", completion),
             patch.object(httpx.Client, "send", send),
