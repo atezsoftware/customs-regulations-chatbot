@@ -382,9 +382,7 @@ def mark_batch_failed(
     batch.status = AmendmentBatchStatus.FAILED.value
     batch.error_message = error_message[:_MAX_ERROR_MESSAGE_LENGTH]
     if failure is not None:
-        from onyx.regulatory.amendments.annexes.dev_acceptance import (
-            safe_failure_detail,
-        )
+        from onyx.regulatory.failure_details import safe_failure_detail
 
         db_session.add(
             KVStore(

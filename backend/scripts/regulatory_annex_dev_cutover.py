@@ -142,6 +142,7 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
         "evidence",
         "physical_indices",
         "source_assets",
+        "source_package_status",
         "review_sha256",
         "approval_count",
         "publication_generation",
@@ -189,6 +190,8 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
     def sanitize(value: Any, parent: str = "", depth: int = 0) -> Any:
         if depth > 8:
             raise CutoverRefusal("acceptance_report_depth_exceeded")
+        if parent == "source_package_status" and value not in ("failed", "blocked"):
+            raise CutoverRefusal("acceptance_source_package_status_refused")
         if parent == "failure_stage" and (
             not isinstance(value, str)
             or value

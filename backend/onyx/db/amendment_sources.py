@@ -215,6 +215,7 @@ def mark_source_package_failed(
     package_id: UUID,
     environment: str,
     lease_token: UUID | None = None,
+    failure: BaseException | None = None,
 ) -> None:
     statement = update(AmendmentSourcePackage).where(
         AmendmentSourcePackage.id == package_id,
@@ -226,10 +227,15 @@ def mark_source_package_failed(
         if lease_token
         else statement.where(AmendmentSourcePackage.lease_token.is_(None))
     )
+    issue: dict[str, Any] = {"code": "acquisition_failed", "retryable": True}
+    if failure is not None:
+        from onyx.regulatory.failure_details import safe_failure_detail
+
+        issue["failure_detail"] = safe_failure_detail("source_package", failure)
     db_session.execute(
         statement.values(
             status="failed",
-            issues=[{"code": "acquisition_failed", "retryable": True}],
+            issues=[issue],
             lease_expires_at=None,
         )
     )
