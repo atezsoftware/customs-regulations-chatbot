@@ -863,3 +863,127 @@ def test_shared_observed_rechecks_quiet_before_block_and_unblock() -> None:
             probe.operate("unblock", {name: "u"}, scope)
     client.indices.add_block.assert_called_once()
     client.indices.put_settings.assert_not_called()
+
+
+def test_diagnose_alone_can_inspect_an_earlier_exact_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, runner = "a" * 40, "b" * 40
+    for key, value in {
+        "env_x": "dev",
+        "GITHUB_REF": "refs/heads/develop",
+        "IMAGE_TAG": runtime,
+        "GITHUB_SHA": runner,
+    }.items():
+        monkeypatch.setenv(key, value)
+    driver = Mock(spec=cutover.Driver)
+    with (
+        patch.object(cutover, "Driver", return_value=driver),
+        patch.object(cutover, "diagnose_release", create=True) as diagnose,
+    ):
+        monkeypatch.setattr("sys.argv", ["cutover", "annex-diagnose"])
+        cutover.main()
+        diagnose.assert_called_once_with(driver, runner)
+        for phase in (
+            "annex-activate",
+            "annex-verify",
+            "prepare",
+            "release",
+            "failure",
+            "values",
+            "verify",
+            "annex-inventory",
+        ):
+            monkeypatch.setattr("sys.argv", ["cutover", phase])
+            with pytest.raises(RuntimeError, match="checked_out"):
+                cutover.main()
+
+
+def test_diagnose_checks_released_runtime_and_executes_only_fixed_wrapper(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    driver.get.return_value = {"data": {"sha": driver.sha, "phase": "released"}}
+    driver.pods.return_value = [
+        {
+            "metadata": {"name": "background"},
+            "spec": {
+                "containers": [
+                    {"name": "worker", "image": cutover.REPOSITORY + ":" + driver.sha}
+                ]
+            },
+        }
+    ]
+    driver.command.return_value = '{"stages":[{"stage":"configuration","exception_class":"UnicodeDecodeError","frames":[{"filename":"onyx/db/config.py","function":"read","line":7}]},{"stage":"native_parser","exception_class":null,"frames":[]}]}'
+    with (
+        patch.object(cutover, "require_release_runs") as runs,
+        patch.object(cutover, "verify_frontend") as frontend,
+    ):
+        cutover.diagnose_release(driver, "b" * 40)
+    runs.assert_called_once_with(driver.sha)
+    driver.verify_runtime.assert_called_once_with(readiness=False)
+    frontend.assert_called_once_with(driver)
+    call = driver.command.call_args
+    assert call.kwargs["timeout"] == 180
+    command = call.args[0]
+    assert command[:4] == ["kubectl", "--namespace", cutover.NAMESPACE, "exec"]
+    assert command[-1] == cutover.DIAGNOSTIC_PROGRAM
+    assert "UnicodeDecodeError" in capsys.readouterr().out
+    driver.get.return_value["data"]["sha"] = "c" * 40
+    with pytest.raises(RuntimeError, match="matching_cutover"):
+        cutover.diagnose_release(driver, "b" * 40)
+
+
+def test_fixed_diagnostic_preserves_uninitialized_failure_and_omits_messages(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+    from types import ModuleType
+
+    db = ModuleType("onyx.db.regulatory_annex_acceptance")
+    probe = ModuleType("onyx.regulatory.amendments.annexes.dev_acceptance")
+    namespace: dict[str, object] = {}
+    exec(
+        compile(
+            'def verify_dev_configuration():\n    raise UnicodeDecodeError("utf8", b"secret", 0, 1, "PASSWORD=secret")',
+            "/app/onyx/db/fixture.py",
+            "exec",
+        ),
+        namespace,
+    )
+    setattr(db, "verify_dev_configuration", namespace["verify_dev_configuration"])
+    setattr(probe, "validate_scope", lambda **_: None)
+    setattr(probe, "native_parser_probe", lambda: {"untrusted": "DO_NOT_PRINT"})
+    monkeypatch.setitem(sys.modules, db.__name__, db)
+    monkeypatch.setitem(sys.modules, probe.__name__, probe)
+    exec(cutover.DIAGNOSTIC_PROGRAM, {"__name__": "__main__"})
+    output = capsys.readouterr().out
+    assert "UnicodeDecodeError" in output and "onyx/db/fixture.py" in output
+    assert "PASSWORD" not in output and "DO_NOT_PRINT" not in output
+    assert "secret" not in output and "/app/" not in output
+    assert "set_is_ee" not in cutover.DIAGNOSTIC_PROGRAM
+
+
+def test_diagnostic_workflow_excludes_every_mutating_step() -> None:
+    import yaml
+
+    path = (
+        Path(__file__).resolve().parents[4]
+        / ".github/workflows/customs-regulations-backend-lite-codebuild.yaml"
+    )
+    workflow = yaml.safe_load(path.read_text())
+    steps = next(iter(workflow["jobs"].values()))["steps"]
+    for name in (
+        "AWS ECR login",
+        "Docker Build ve Tag",
+        "Docker Push",
+        "Drain old DEV writers and acknowledge physical index barrier",
+        "Deploy api and background with Helm",
+    ):
+        step = next(item for item in steps if item["name"] == name)
+        assert "inputs.action != 'annex-diagnose'" in step["if"]
+    diagnostic = next(
+        item for item in steps if "reviewed DEV annex release" in item["name"]
+    )
+    assert "inputs.action == 'annex-diagnose'" in diagnostic["if"]

@@ -24,6 +24,7 @@ on:
           - annex-inventory
           - annex-verify
           - annex-activate
+          - annex-diagnose
       image_tag:
         description: 'Enter the image tag'
         required: false
@@ -68,6 +69,12 @@ jobs:
           DISPATCH_ACTION: ${{ inputs.action }}
           DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
+          if [[ "$DISPATCH_ACTION" == "annex-diagnose" ]]; then
+            if [[ "$WORKFLOW_EVENT_NAME" != "workflow_dispatch" || "$DISPATCH_ENVIRONMENT" != "dev" || "$WORKFLOW_GIT_REF" != "refs/heads/develop" || ! "$WORKFLOW_GIT_SHA" =~ ^[0-9a-f]{40}$ || ! "$DISPATCH_IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "annex-diagnose requires DEV develop and exact runner/runtime SHAs" >&2
+              exit 1
+            fi
+          fi
           if [[ "$WORKFLOW_EVENT_NAME" == "workflow_dispatch" ]]; then
             deployment_target="$DISPATCH_ENVIRONMENT"
           elif [[ "$WORKFLOW_EVENT_NAME" == "push" ]]; then
@@ -137,12 +144,12 @@ jobs:
           echo "Using image tag for redeploy: $REDEPLOY_IMAGE_TAG"
 
       - name: AWS ECR login
-        if: inputs.action != 'redeploy' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
+        if: inputs.action != 'redeploy' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate' && inputs.action != 'annex-diagnose'
         run: |
           aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ECR }}
 
       - name: Docker Build ve Tag
-        if: inputs.action != 'redeploy' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
+        if: inputs.action != 'redeploy' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate' && inputs.action != 'annex-diagnose'
         run: |
           docker build backend \
             -t ${{ env.SERVICE_NAME }}:${{ env.GIT_COMMIT }} \
@@ -156,7 +163,7 @@ jobs:
           echo "IMAGE_TAG=${{ env.GIT_COMMIT }}" >> $GITHUB_ENV
 
       - name: Docker Push
-        if: inputs.action != 'redeploy' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
+        if: inputs.action != 'redeploy' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate' && inputs.action != 'annex-diagnose'
         run: |
           docker push ${{ env.DOCKER_IMAGE_REPO }}:${{ env.GIT_COMMIT }}
           docker push ${{ env.DOCKER_IMAGE_REPO }}:latest
@@ -242,7 +249,7 @@ jobs:
         run: python3 -m pip install PyYAML==6.0.2
 
       - name: Inventory, verify or activate reviewed DEV annex release
-        if: inputs.action == 'annex-inventory' || inputs.action == 'annex-verify' || inputs.action == 'annex-activate'
+        if: inputs.action == 'annex-inventory' || inputs.action == 'annex-verify' || inputs.action == 'annex-activate' || inputs.action == 'annex-diagnose'
         env:
           GH_TOKEN: ${{ github.token }}
           ANNEX_ACTION: ${{ inputs.action }}
@@ -254,14 +261,14 @@ jobs:
         id: dev_cutover
         env:
           ANNEX_DEV_ES_SCOPE_JSON: ${{ vars.ANNEX_DEV_ES_SCOPE_JSON }}
-        if: env.env_x == 'dev' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
+        if: env.env_x == 'dev' && inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate' && inputs.action != 'annex-diagnose'
         run: |
           set -euo pipefail
           python3 backend/scripts/regulatory_annex_dev_cutover.py prepare
           python3 backend/scripts/regulatory_annex_dev_cutover.py values
 
       - name: Deploy api and background with Helm
-        if: inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate'
+        if: inputs.action != 'annex-inventory' && inputs.action != 'annex-verify' && inputs.action != 'annex-activate' && inputs.action != 'annex-diagnose'
         id: helm_deploy
         run: |
           deploy_app() {

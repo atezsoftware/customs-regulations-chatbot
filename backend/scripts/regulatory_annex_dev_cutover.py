@@ -9,7 +9,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 NAMESPACE = "customs-regulations-dev"
 REPOSITORY = "255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-backend-lite-dev"
@@ -553,7 +553,7 @@ class Driver:
             json.dumps({"indices": self.indices, "scope": self.scope}),
         )
 
-    def verify_runtime(self) -> None:
+    def verify_runtime(self, *, readiness: bool = True) -> None:
         for app in APPS:
             pods = self.pods(app)
             if (
@@ -575,7 +575,7 @@ class Driver:
                 for item in pod["status"]["containerStatuses"]
             ):
                 raise CutoverRefusal("new_pod_restarted")
-            if app == "background":
+            if app == "background" and readiness:
                 self.command(
                     [
                         "kubectl",
@@ -741,6 +741,165 @@ def acceptance(driver: Driver, phase: str) -> None:
     )
 
 
+DIAGNOSTIC_PROGRAM = r"""
+import contextlib
+import io
+import json
+import os
+import platform
+import re
+
+
+def scope():
+    from onyx.regulatory.amendments.annexes.dev_acceptance import validate_scope
+    validate_scope(database=os.environ.get("POSTGRES_DB", ""),
+                   environment=os.environ.get("REGULATORY_ANNEX_ENVIRONMENT", ""),
+                   machine=platform.machine())
+
+
+def configuration():
+    scope()
+    from onyx.db.regulatory_annex_acceptance import verify_dev_configuration
+    value = verify_dev_configuration()
+    if value.get("database") != "customs-regulations-dev":
+        raise ValueError()
+    return {"database": value["database"], "indices": value["indices"]}
+
+
+def native_parser():
+    scope()
+    from onyx.regulatory.amendments.annexes.dev_acceptance import native_parser_probe
+    native_parser_probe()
+
+
+def run(stage, function):
+    result = {"stage": stage, "exception_class": None, "frames": []}
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            value = function()
+            if stage == "configuration":
+                result["configuration"] = value
+        except Exception as error:
+            result["exception_class"] = type(error).__name__
+            trace = error.__traceback__
+            while trace is not None:
+                filename = trace.tb_frame.f_code.co_filename.replace("\\", "/")
+                match = re.search(r"(?:^|/)((?:onyx|shared_configs|ee/onyx)/[A-Za-z0-9_./-]+\.py)$", filename)
+                if match and ".." not in match.group(1).split("/"):
+                    result["frames"].append({"filename": match.group(1), "function": trace.tb_frame.f_code.co_name, "line": trace.tb_lineno})
+                trace = trace.tb_next
+    return result
+
+
+print(json.dumps({"stages": [run("configuration", configuration), run("native_parser", native_parser)]}, sort_keys=True))
+"""
+
+
+def diagnose_release(driver: Driver, runner_sha: str) -> None:
+    driver.validate_target()
+    state = driver.get("configmap", STATE)["data"]
+    if state["sha"] != driver.sha or state["phase"] != "released":
+        raise CutoverRefusal("successful_matching_cutover_required")
+    require_release_runs(driver.sha)
+    driver.verify_runtime(readiness=False)
+    verify_frontend(driver)
+    print(
+        json.dumps(
+            {"runner_sha": runner_sha, "runtime_sha": driver.sha}, sort_keys=True
+        ),
+        flush=True,
+    )
+    pod = driver.pods("background")[0]
+    container = next(
+        item
+        for item in pod["spec"]["containers"]
+        if item["image"] == f"{REPOSITORY}:{driver.sha}"
+    )
+    output = driver.command(
+        [
+            "kubectl",
+            "--namespace",
+            NAMESPACE,
+            "exec",
+            pod["metadata"]["name"],
+            "-c",
+            container["name"],
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            '. /vault/secrets/config; exec python -c "$1"',
+            "annex-diagnose",
+            DIAGNOSTIC_PROGRAM,
+        ],
+        timeout=180,
+    )
+    if len(output.encode()) > 64000:
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    report = json.loads(output)
+    if (
+        not isinstance(report, dict)
+        or set(report) != {"stages"}
+        or not isinstance(report["stages"], list)
+        or len(report["stages"]) != 2
+    ):
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    for raw_item, stage in zip(report["stages"], ("configuration", "native_parser")):
+        if not isinstance(raw_item, dict):
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+        item = cast(dict[str, Any], raw_item)
+        if (
+            not isinstance(item, dict)
+            or set(item) - {"stage", "exception_class", "frames", "configuration"}
+            or item.get("stage") != stage
+        ):
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+        exception = item.get("exception_class")
+        if exception is not None and (
+            not isinstance(exception, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,99}", exception)
+        ):
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+        frames = item.get("frames")
+        if not isinstance(frames, list):
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+        for frame in frames:
+            if (
+                not isinstance(frame, dict)
+                or set(frame) != {"filename", "function", "line"}
+                or not isinstance(frame["filename"], str)
+                or not re.fullmatch(
+                    r"(?:onyx|shared_configs|ee/onyx)/[A-Za-z0-9_./-]+\.py",
+                    frame["filename"],
+                )
+                or ".." in frame["filename"].split("/")
+                or not isinstance(frame["function"], str)
+                or not re.fullmatch(r"[A-Za-z0-9_<>]+", frame["function"])
+                or type(frame["line"]) is not int
+                or frame["line"] < 1
+            ):
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+        if "configuration" in item:
+            config: dict[str, Any] = item["configuration"]
+            if (
+                stage != "configuration"
+                or exception is not None
+                or not isinstance(config, dict)
+                or set(config) != {"database", "indices"}
+                or config["database"] != "customs-regulations-dev"
+                or not isinstance(config["indices"], list)
+                or not config["indices"]
+                or any(
+                    not isinstance(name, str)
+                    or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name)
+                    or "_dev_" not in name
+                    for name in config["indices"]
+                )
+            ):
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
 def deploy_same_image(driver: Driver, enabled: bool) -> None:
     render_values(enabled)
     for app in APPS:
@@ -804,12 +963,17 @@ def main() -> None:
             "annex-inventory",
             "annex-verify",
             "annex-activate",
+            "annex-diagnose",
         ),
     )
     args = parser.parse_args()
     sha = os.environ.get("IMAGE_TAG", "")
     validate_scope(os.environ.get("env_x", ""), os.environ.get("GITHUB_REF", ""), sha)
-    if sha != os.environ.get("GITHUB_SHA"):
+    runner_sha = os.environ.get("GITHUB_SHA", "")
+    validate_scope(
+        os.environ.get("env_x", ""), os.environ.get("GITHUB_REF", ""), runner_sha
+    )
+    if args.phase != "annex-diagnose" and sha != runner_sha:
         raise CutoverRefusal("image_must_match_checked_out_workflow_SHA")
     driver = Driver(sha)
     if args.phase == "prepare":
@@ -822,6 +986,8 @@ def main() -> None:
         render_values()
     elif args.phase == "annex-inventory":
         inventory_only(driver)
+    elif args.phase == "annex-diagnose":
+        diagnose_release(driver, runner_sha)
     elif args.phase in {"annex-verify", "annex-activate"}:
         verify_or_activate(driver, args.phase == "annex-activate")
     else:
