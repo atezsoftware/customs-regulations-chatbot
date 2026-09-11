@@ -4,7 +4,7 @@ These reads never grant access: callers retain the existing file/document ACLs.
 """
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from uuid import UUID
 
 from sqlalchemy import select
@@ -89,6 +89,61 @@ def load_public_temporal_bindings(
     return sorted(
         selected, key=lambda item: (item.semantic_position, item.projection.ordinal)
     )
+
+
+def citation_chunk_as_of_date(
+    session: Session,
+    *,
+    document_id: str,
+    chunk_id: int,
+    search_settings_id: int,
+    index_name: str,
+) -> date | None:
+    """Select an exact retained citation's date; the normal reader still grants access."""
+    try:
+        file_id = UUID(document_id)
+    except ValueError:
+        return None
+    candidates = [
+        binding
+        for binding in load_file_temporal_bindings(session, file_id, refresh=True)
+        if binding.projection.ordinal == chunk_id
+        and binding.index.search_settings_id == search_settings_id
+        and binding.index.index_name == index_name
+    ]
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise ValueError("citation has ambiguous retained index authority")
+    binding = candidates[0]
+    source = json.loads(binding.projection.source_json)
+    canonical = session.get(
+        RegulatoryChunk, source["regulatory_chunk_id"], populate_existing=True
+    )
+    if canonical is None or canonical.user_file_id != file_id:
+        raise ValueError("citation canonical authority is unavailable")
+    lower = max(
+        binding.effective_start or date.min,
+        canonical.validity_start_date or date.min,
+    )
+    ends = [
+        value
+        for value in (binding.effective_end, canonical.validity_end_date)
+        if value is not None
+    ]
+    upper = min(ends) if ends else None
+    if upper is not None and lower >= upper:
+        raise ValueError("citation has no valid retained legal interval")
+    reference = binding.reference_date
+    if (
+        reference is not None
+        and lower <= reference
+        and (upper is None or reference < upper)
+    ):
+        return reference
+    if lower != date.min:
+        return lower
+    return upper - timedelta(days=1) if upper is not None else date.today()
 
 
 def public_file_source_owners(session: Session, file_id: str) -> tuple[UUID, ...]:

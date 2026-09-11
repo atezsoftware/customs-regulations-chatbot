@@ -9,6 +9,7 @@ from onyx.context.search.preprocessing.access_filters import (
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import User
+from onyx.db.regulatory_public_reads import citation_chunk_as_of_date
 from onyx.db.search_settings import get_current_search_settings
 from onyx.document_index.factory import get_default_document_index
 from onyx.document_index.interfaces_new import DocumentSectionRequest
@@ -84,9 +85,22 @@ def get_chunk_info(
         max_chunk_ind=chunk_id,
     )
 
+    try:
+        as_of_date = citation_chunk_as_of_date(
+            db_session,
+            document_id=document_id,
+            chunk_id=chunk_id,
+            search_settings_id=search_settings.id,
+            index_name=search_settings.index_name,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="Chunk not found") from error
+
     inference_chunks = document_index.id_based_retrieval(
         chunk_requests=[chunk_request],
-        filters=IndexFilters(access_control_list=user_acl_filters),
+        filters=IndexFilters(
+            access_control_list=user_acl_filters, as_of_date=as_of_date
+        ),
         batch_retrieval=True,
     )
 
