@@ -2104,3 +2104,338 @@ def test_worker_failure_receipt_survives_runner_output(
     with pytest.raises(cutover.CutoverRefusal, match="fixed_acceptance_probe_failed"):
         cutover.emit_acceptance_report(json.dumps(report), "canary", "a" * 40)
     assert json.loads(capsys.readouterr().out)["canary"] == report["canary"]
+
+
+def test_comparison_diagnostic_sanitizes_validation_shape() -> None:
+    import json
+
+    from pydantic import ValidationError
+
+    from onyx.regulatory.amendments.annexes.models import AnnexComparisonProposal
+
+    payload = {
+        "changes": [
+            {
+                "operation": "replace",
+                "old_positions": [5],
+                "new_positions": [],
+                "explanation": "SECRET",
+            }
+        ],
+        "old_positions": [5],
+        "new_positions": [9],
+        "old_pages": [2],
+        "new_pages": [2],
+        "SECRET_KEY": "SECRET_VALUE",
+    }
+    with pytest.raises(ValidationError) as captured:
+        AnnexComparisonProposal.model_validate(payload)
+    result = cutover.comparison_diagnostic_summary(
+        json.dumps(payload), captured.value, "stop"
+    )
+    encoded = json.dumps(result)
+    assert "SECRET" not in encoded
+    assert result["finish_reason"] == "stop"
+    assert result["change_shapes"][0]["old_positions"] == 1
+    assert result["change_shapes"][0]["new_positions"] == 0
+    assert any(
+        error["validator"] == "invalid_operation_shape" for error in result["errors"]
+    )
+    assert result["unknown_fields"] == 1
+
+
+def test_comparison_diagnostic_only_exact_runtime_and_readonly_wrapper() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    cutover.diagnose_batch47_comparison(driver, "pod", "container")
+    driver.command.assert_not_called()
+    driver.sha = cutover.BATCH47_RUNTIME
+    driver.command.return_value = (
+        '{"stage":"batch47_comparison","status":"scope_refused"}'
+    )
+    cutover.diagnose_batch47_comparison(driver, "pod", "container")
+    command = driver.command.call_args.args[0]
+    assert "PGOPTIONS='-c default_transaction_read_only=on'" in command[-3]
+    assert "signal.alarm(180)" in command[-1]
+    assert "provider_max_attempts" not in command[-1]
+    assert driver.command.call_args.kwargs["timeout"] == 200
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [None, "review_hash", "page_hash", "scope", "provider", "snapshot", "missing_new"],
+)
+def test_fixed_comparison_replay_uses_readonly_dal_and_production_comparator(
+    failure: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+    import json
+    from contextlib import nullcontext
+    from io import BytesIO
+    from types import SimpleNamespace
+    from uuid import UUID, uuid4
+
+    from onyx.regulatory.amendments.annexes import comparison, context_dependencies
+    from onyx.regulatory.amendments.annexes.evidence import select_annex_evidence_view
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexChangeDraft,
+        AnnexLocator,
+        AnnexModelSnapshot,
+        AnnexOriginalEvidence,
+        AnnexReviewEvidence,
+    )
+    from tests.unit.onyx.regulatory.annexes.test_comparison import page
+    from tests.unit.onyx.regulatory.annexes.test_evidence_views import mixed_pdf
+
+    monkeypatch.setenv("POSTGRES_DB", "customs-regulations-dev")
+    monkeypatch.setenv("REGULATORY_ANNEX_ENVIRONMENT", "dev")
+    scope = {
+        "batch_id": 47,
+        "document_set_id": 21,
+        "user_file_id": "e0acea4f-30f6-4b05-9bbf-5909b82ef0ab",
+        "created_by": "7e0d56bc-6f9c-4cec-b29b-5a8c9ec2b844",
+        "environment": "dev",
+    }
+    hashes = [
+        "2a3035058c5a11366604b7e89052a44a7085eb54c705fd3cf09edc1c69f14ffe",
+        "c5a20c8fd76d3dbd4983ceeaacc44eef217716427adec8716475ac5a753a0557",
+    ]
+    views, pages, evidence, files = [], [], [], {}
+    for side, digest in zip(("old", "new"), hashes):
+        original = AnnexOriginalEvidence(
+            file_id=side, sha256=digest, mime_type="application/pdf", available=True
+        )
+        extracted = mixed_pdf().model_copy(update={"source_sha256": digest})
+        view = select_annex_evidence_view(
+            extraction=extracted,
+            original=original,
+            annex_label="EK-1",
+            canonical_labels=["EK-1", "EK-2"],
+            canonical_chunk_ids=["chunk"],
+        )
+        assert view.evidence_view is not None
+        views.append(view)
+        rendered = []
+        for mapping in view.evidence_view.pages:
+            image = page(number=mapping.view_page)
+            rendered.append(image)
+            file_id = side + str(mapping.view_page)
+            files[file_id] = image.png
+            evidence.append(
+                AnnexReviewEvidence(
+                    id=uuid4(),
+                    side=side,
+                    kind="comparison_page",
+                    file_id=file_id,
+                    sha256=hashlib.sha256(image.png).hexdigest(),
+                    mime_type="image/png",
+                    byte_count=len(image.png),
+                    parent_file_id=side,
+                    parent_sha256=digest,
+                    locator=AnnexLocator(
+                        page=mapping.original_page,
+                        original_width=200,
+                        original_height=200,
+                    ),
+                )
+            )
+        pages.append(rendered)
+    retained = comparison.compare_annexes(
+        old=views[0], new=views[1], old_pages=pages[0], new_pages=pages[1]
+    ).model_copy(
+        update={
+            "model_snapshot": AnnexModelSnapshot(
+                model_provider="vertex_ai", model_name="gemini-3.8-flash"
+            )
+        }
+    )
+    package_id = UUID("359c0315-e8ff-4233-8c53-fb5d17cc16ef")
+    manifest = "1679e807427c324ed9c98bc643cd4f648e7055be28defa4e5f91b93042dee16f"
+    draft = AnnexChangeDraft(
+        instruction_indices=[0],
+        instruction_texts=["Fictional instruction"],
+        annex_label="EK-1",
+        user_file_id=UUID(scope["user_file_id"]),
+        source_package_id=package_id,
+        source_manifest_sha256=manifest,
+        old_extraction=views[0],
+        new_extraction=views[1],
+        comparison=retained,
+        evidence=evidence,
+    )
+    payload = draft.model_dump(mode="json")
+    review_hash = "92cfd62f7e29917003afd9a1b76be662d758903f57a5c3f94f02c8d50585cd08"
+    row = SimpleNamespace(
+        batch_id=47,
+        environment="dev",
+        user_file_id=draft.user_file_id,
+        review_revision=1,
+        publication_generation=0,
+        status="blocked",
+        review_sha256="bad" if failure == "review_hash" else review_hash,
+        review_payload=payload,
+    )
+    batch = SimpleNamespace(
+        document_set_id=22 if failure == "scope" else 21,
+        source_package_id=package_id,
+        created_by=UUID(scope["created_by"]),
+    )
+    package = SimpleNamespace(
+        created_by=batch.created_by,
+        idempotency_key="annex-canary-f5c14cd7-fae3-4b13-a67b-15e7eda68c92",
+        manifest_sha256=manifest,
+    )
+    store = Mock()
+    store.read_file_record.return_value = SimpleNamespace(
+        file_metadata={"annex_review_scope": scope}
+    )
+    store.read_file.side_effect = lambda key: BytesIO(
+        b"changed" if failure == "page_hash" else files[key]
+    )
+    llm = Mock()
+    llm.config.model_provider = "openrouter" if failure == "provider" else "vertex_ai"
+    llm.config.model_name = "other" if failure == "snapshot" else "gemini-3.8-flash"
+    response = {
+        "changes": [],
+        "old_positions": comparison._atomic_positions(views[0]),
+        "new_positions": comparison._atomic_positions(views[1]),
+        "old_pages": [1, 2],
+        "new_pages": [1, 2],
+    }
+    if failure == "missing_new":
+        response["changes"] = [
+            {
+                "operation": "replace",
+                "old_positions": [3],
+                "new_positions": [],
+                "explanation": "SECRET_VALUE",
+            }
+        ]
+    llm.invoke.return_value = SimpleNamespace(
+        choice=SimpleNamespace(finish_reason="stop")
+    )
+    real_hash = context_dependencies.context_hash
+    with (
+        patch("onyx.utils.variable_functionality.set_is_ee_based_on_env_variable"),
+        patch(
+            "onyx.db.regulatory_annex_dev_cutover.configured_indices",
+            return_value=["owned_dev_index"],
+        ),
+        patch(
+            "onyx.db.engine.sql_engine.SqlEngine.scoped_engine",
+            return_value=nullcontext(),
+        ) as engine,
+        patch(
+            "onyx.db.engine.sql_engine.get_session_with_current_tenant",
+            side_effect=lambda: nullcontext(Mock()),
+        ),
+        patch("onyx.db.regulatory_amendments.get_batch", return_value=batch),
+        patch("onyx.db.amendment_sources.get_source_package", return_value=package),
+        patch(
+            "onyx.db.regulatory_annex_changes.list_annex_changes", return_value=[row]
+        ),
+        patch.object(
+            context_dependencies,
+            "context_hash",
+            side_effect=lambda value: (
+                review_hash if value == payload else real_hash(value)
+            ),
+        ),
+        patch("onyx.file_store.file_store.get_default_file_store", return_value=store),
+        patch(
+            "onyx.llm.factory.get_default_llm_with_vision", return_value=llm
+        ) as factory,
+        patch(
+            "onyx.regulatory.structured_llm.llm_response_to_string",
+            return_value=json.dumps(response),
+        ),
+        patch(
+            "onyx.regulatory.structured_llm.llm_generation_span",
+            return_value=nullcontext(Mock()),
+        ),
+        patch("onyx.regulatory.structured_llm.record_llm_response"),
+    ):
+        result = cutover.replay_batch47_comparison()
+    assert "SECRET_VALUE" not in json.dumps(result)
+    engine.assert_called_once_with(
+        pool_size=2,
+        max_overflow=0,
+        connect_args={
+            "options": "-c default_transaction_read_only=on",
+            "connect_timeout": 10,
+        },
+    )
+    if failure in {"review_hash", "scope", "page_hash"}:
+        assert result["status"] == "scope_refused"
+        llm.invoke.assert_not_called()
+        factory.assert_not_called()
+    elif failure in {"provider", "snapshot"}:
+        assert result["status"] == "provider_refused"
+        llm.invoke.assert_not_called()
+    else:
+        factory.assert_called_once_with()
+        assert llm.invoke.call_count == (2 if failure == "missing_new" else 1)
+        assert result["status"] == ("blocked" if failure == "missing_new" else "ready")
+        assert result["page_sha256"] == [item.sha256 for item in evidence]
+        assert result["model_name"] == "gemini-3.8-flash"
+        assert len(result["attempts"]) == llm.invoke.call_count
+        assert all(
+            0 < call.kwargs["timeout_override"] <= 150
+            for call in llm.invoke.call_args_list
+        )
+    assert not store.save_file.called
+
+
+def test_comparison_diagnostic_embedded_failure_preserves_safe_details(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import inspect
+    import json
+    import logging
+
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = cutover.BATCH47_RUNTIME
+    driver.command.return_value = (
+        '{"stage":"batch47_comparison","status":"scope_refused"}'
+    )
+    cutover.diagnose_batch47_comparison(driver, "pod", "container")
+    capsys.readouterr()
+    program = driver.command.call_args.args[0][-1]
+    # Execute the exact wrapper failure path without DB, provider, or alarm activity.
+    program = program.replace(
+        inspect.getsource(cutover.replay_batch47_comparison),
+        'def replay_batch47_comparison(report):\n    raise ValueError("SECRET_VALUE")\n',
+    )
+    monkeypatch.setattr("signal.signal", Mock())
+    monkeypatch.setattr("signal.alarm", Mock())
+    monkeypatch.setattr(logging, "disable", Mock())
+    exec(program, {"__name__": "__main__"})
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "failed"
+    assert "SECRET_VALUE" not in report["failure_detail"]
+    assert json.loads(report["failure_detail"])["exceptions"][0]["type"] == "ValueError"
+    assert report["attempts"] == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"secret": "value"},
+        {"model_name": "SECRET"},
+        {"attempts": [{"fields": ["SECRET"]}]},
+    ],
+)
+def test_comparison_diagnostic_transport_refuses_unbounded_fields(
+    extra: dict[str, Any],
+) -> None:
+    import json
+
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = cutover.BATCH47_RUNTIME
+    driver.command.return_value = json.dumps(
+        {"stage": "batch47_comparison", "status": "blocked", **extra}
+    )
+    with pytest.raises(RuntimeError, match="fixed_diagnostic_report_required"):
+        cutover.diagnose_batch47_comparison(driver, "pod", "container")

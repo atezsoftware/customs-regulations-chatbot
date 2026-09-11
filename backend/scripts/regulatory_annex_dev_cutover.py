@@ -1609,6 +1609,543 @@ def diagnose_batch44_elasticsearch(driver: Driver, pod: str, container: str) -> 
     print(json.dumps(report, sort_keys=True), flush=True)
 
 
+BATCH47_RUNTIME = "e156b5d34ac4da03013914ec8581b879368c0050"
+
+
+def comparison_diagnostic_summary(
+    content: str, error: Any, finish_reason: Any
+) -> dict[str, Any]:
+    """Keep schema shape only; response values and arbitrary field names stay private."""
+    from typing import get_args
+
+    from pydantic_core import ErrorType
+
+    fields = {
+        "changes",
+        "operation",
+        "old_positions",
+        "new_positions",
+        "old_pages",
+        "new_pages",
+        "explanation",
+        "uncertain",
+        "issues",
+    }
+    result: dict[str, Any] = {
+        "finish_reason": finish_reason
+        if finish_reason in ("stop", "length", "content_filter", "tool_calls", None)
+        else "other",
+        "errors": [],
+        "fields": [],
+        "unknown_fields": 0,
+        "cardinalities": {},
+        "change_shapes": [],
+    }
+    try:
+        payload = json.loads(content)
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        result["fields"] = sorted(set(payload) & fields)
+        result["unknown_fields"] = min(len(set(payload) - fields), 1000)
+        result["cardinalities"] = {
+            key: min(len(value), 10000)
+            for key, value in payload.items()
+            if key in fields and isinstance(value, list)
+        }
+        changes = payload.get("changes")
+        if isinstance(changes, list):
+            for change in changes[:20]:
+                if not isinstance(change, dict):
+                    result["change_shapes"].append({"object": False})
+                    continue
+                operation = change.get("operation")
+                result["change_shapes"].append(
+                    {
+                        "object": True,
+                        "fields": sorted(set(change) & fields),
+                        "unknown_fields": min(len(set(change) - fields), 1000),
+                        "operation": operation
+                        if isinstance(operation, str)
+                        and operation
+                        in {
+                            "replace",
+                            "insert",
+                            "remove",
+                            "move",
+                            "split",
+                            "merge",
+                            "visual",
+                        }
+                        else "other",
+                        **{
+                            key: min(len(change[key]), 10000)
+                            if isinstance(change.get(key), list)
+                            else None
+                            for key in ("old_positions", "new_positions")
+                        },
+                    }
+                )
+    if error is not None:
+        for detail in error.errors(
+            include_url=False, include_context=True, include_input=False
+        )[:20]:
+            validator = None
+            cause = detail.get("ctx", {}).get("error")
+            if isinstance(cause, ValueError):
+                if str(cause).startswith("invalid_operation_shape:"):
+                    validator = "invalid_operation_shape"
+                elif (
+                    str(cause)
+                    == "overlapping change references: each physical change must appear once"
+                ):
+                    validator = "overlapping_change_references"
+            result["errors"].append(
+                {
+                    "loc": [
+                        item
+                        if (type(item) is int and 0 <= item <= 10000)
+                        or (isinstance(item, str) and item in fields)
+                        else "unknown"
+                        for item in detail["loc"][:8]
+                    ],
+                    "type": detail["type"]
+                    if detail["type"] in get_args(ErrorType)
+                    else "other",
+                    "validator": validator,
+                }
+            )
+    return result
+
+
+def replay_batch47_comparison(report: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One pinned, read-only diagnostic; the deployed production comparator is unchanged."""
+    import base64
+    import hashlib
+    import time
+    from typing import cast
+    from unittest.mock import patch
+    from uuid import UUID
+
+    from onyx.db.amendment_sources import get_source_package
+    from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
+    from onyx.db.regulatory_amendments import get_batch
+    from onyx.db.regulatory_annex_changes import list_annex_changes
+    from onyx.db.regulatory_annex_dev_cutover import configured_indices
+    from onyx.file_store.file_store import get_default_file_store
+    from onyx.llm.factory import get_default_llm_with_vision
+    from onyx.regulatory import structured_llm
+    from onyx.regulatory.amendments.annexes import comparison
+    from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
+    from onyx.regulatory.amendments.annexes.evidence import validate_evidence_view
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexChangeDraft,
+        AnnexRenderedPage,
+    )
+    from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
+    from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
+
+    report = (
+        report
+        if report is not None
+        else {
+            "stage": "batch47_comparison",
+            "status": "scope_refused",
+            "database_read_only": True,
+            "attempts": [],
+        }
+    )
+    if (
+        os.environ.get("POSTGRES_DB") != "customs-regulations-dev"
+        or os.environ.get("REGULATORY_ANNEX_ENVIRONMENT") != "dev"
+    ):
+        return report
+    set_is_ee_based_on_env_variable()
+    CURRENT_TENANT_ID_CONTEXTVAR.set("public")
+    configured_indices()
+    scope = {
+        "batch_id": 47,
+        "document_set_id": 21,
+        "user_file_id": "e0acea4f-30f6-4b05-9bbf-5909b82ef0ab",
+        "created_by": "7e0d56bc-6f9c-4cec-b29b-5a8c9ec2b844",
+        "environment": "dev",
+    }
+    package_id = UUID("359c0315-e8ff-4233-8c53-fb5d17cc16ef")
+    review_hash = "92cfd62f7e29917003afd9a1b76be662d758903f57a5c3f94f02c8d50585cd08"
+    source_hashes = {
+        "old": "2a3035058c5a11366604b7e89052a44a7085eb54c705fd3cf09edc1c69f14ffe",
+        "new": "c5a20c8fd76d3dbd4983ceeaacc44eef217716427adec8716475ac5a753a0557",
+    }
+    with SqlEngine.scoped_engine(
+        pool_size=2,
+        max_overflow=0,
+        connect_args={
+            "options": "-c default_transaction_read_only=on",
+            "connect_timeout": 10,
+        },
+    ):
+        with get_session_with_current_tenant() as session:
+            batch = get_batch(session, 47)
+            package = get_source_package(
+                session, package_id=package_id, document_set_id=21, environment="dev"
+            )
+            reviews = list_annex_changes(session, 47)
+            if batch is None or package is None or len(reviews) != 1:
+                return report
+            row = reviews[0]
+            if (
+                batch.document_set_id != 21
+                or batch.source_package_id != package_id
+                or str(batch.created_by) != scope["created_by"]
+                or str(package.created_by) != scope["created_by"]
+                or package.idempotency_key
+                != "annex-canary-f5c14cd7-fae3-4b13-a67b-15e7eda68c92"
+                or row.batch_id != 47
+                or row.environment != "dev"
+                or str(row.user_file_id) != scope["user_file_id"]
+                or row.review_revision != 1
+                or row.publication_generation != 0
+                or row.status != "blocked"
+                or row.review_sha256 != review_hash
+                or context_hash(row.review_payload) != review_hash
+            ):
+                return report
+            draft = AnnexChangeDraft.model_validate(row.review_payload)
+            if (
+                draft.source_package_id != package_id
+                or draft.user_file_id != row.user_file_id
+                or package.manifest_sha256 != draft.source_manifest_sha256
+                or draft.source_manifest_sha256
+                != "1679e807427c324ed9c98bc643cd4f648e7055be28defa4e5f91b93042dee16f"
+                or draft.corrections
+            ):
+                return report
+        # No session spans model calls. The scoped engine also governs FileStore/factory reads.
+        store = get_default_file_store()
+        sides: dict[str, Any] = {}
+        frozen_hashes: list[str] = []
+        for side, extraction in (
+            ("old", draft.old_extraction),
+            ("new", draft.new_extraction),
+        ):
+            if (
+                extraction is None
+                or extraction.evidence_view is None
+                or validate_evidence_view(extraction)
+            ):
+                return report
+            view = extraction.evidence_view
+            if len(view.parents) != 1 or view.parents[0].sha256 != source_hashes[side]:
+                return report
+            pages = []
+            for mapping in sorted(view.pages, key=lambda item: item.view_page):
+                matching = [
+                    item
+                    for item in draft.evidence
+                    if item.side == side
+                    and item.kind == "comparison_page"
+                    and item.parent_sha256 == source_hashes[side]
+                    and item.parent_file_id == view.parents[0].file_id
+                    and item.locator.page == mapping.original_page
+                ]
+                if len(matching) != 1:
+                    return report
+                item = matching[0]
+                record = store.read_file_record(item.file_id)
+                if (
+                    not isinstance(record.file_metadata, dict)
+                    or cast(dict[str, Any], record.file_metadata).get(
+                        "annex_review_scope"
+                    )
+                    != scope
+                ):
+                    return report
+                with store.read_file(item.file_id) as stream:
+                    content = stream.read(25 * 1024 * 1024 + 1)
+                if (
+                    len(content) != item.byte_count
+                    or len(content) > 25 * 1024 * 1024
+                    or hashlib.sha256(content).hexdigest() != item.sha256
+                    or item.locator.original_width is None
+                    or item.locator.original_height is None
+                ):
+                    return report
+                pages.append(
+                    AnnexRenderedPage(
+                        page=mapping.view_page,
+                        width=item.locator.original_width,
+                        height=item.locator.original_height,
+                        png=content,
+                    )
+                )
+                frozen_hashes.append(item.sha256)
+            sides[side] = (extraction, pages)
+        llm = get_default_llm_with_vision()
+        if (
+            llm is None
+            or llm.config.model_provider != "vertex_ai"
+            or draft.comparison is None
+            or draft.comparison.model_snapshot is None
+            or draft.comparison.model_snapshot.model_provider
+            != llm.config.model_provider
+            or draft.comparison.model_snapshot.model_name != llm.config.model_name
+        ):
+            report["status"] = "provider_refused"
+            return report
+        report.update(
+            {
+                "model_provider": "vertex_ai",
+                "model_name": llm.config.model_name
+                if re.fullmatch(r"gemini-[a-z0-9.-]{1,60}", llm.config.model_name)
+                else "other",
+                "model_snapshot_sha256": context_hash(
+                    {
+                        "model_provider": llm.config.model_provider,
+                        "model_name": llm.config.model_name,
+                    }
+                ),
+                "review_sha256": review_hash,
+                "page_sha256": frozen_hashes,
+                "old_extraction_sha256": context_hash(
+                    sides["old"][0].model_dump(mode="json")
+                ),
+                "new_extraction_sha256": context_hash(
+                    sides["new"][0].model_dump(mode="json")
+                ),
+            }
+        )
+        real_invoke, real_validate, real_generate = (
+            llm.invoke,
+            structured_llm._validate_json_object,
+            comparison.generate_structured,
+        )
+        finish_reason: Any = None
+
+        def observe_invoke(*args: Any, **kwargs: Any) -> Any:
+            nonlocal finish_reason
+            report["provider_attempt_count"] = (
+                report.get("provider_attempt_count", 0) + 1
+            )
+            response = real_invoke(*args, **kwargs)
+            finish_reason = response.choice.finish_reason
+            return response
+
+        def observe_validate(content: str, model: Any) -> Any:
+            from pydantic import ValidationError
+
+            try:
+                result = real_validate(content, model)
+            except ValidationError as error:
+                report["attempts"].append(
+                    comparison_diagnostic_summary(
+                        structured_llm._extract_json_object(content),
+                        error,
+                        finish_reason,
+                    )
+                )
+                raise
+            report["attempts"].append(
+                comparison_diagnostic_summary(
+                    structured_llm._extract_json_object(content), None, finish_reason
+                )
+            )
+            return result
+
+        def observe_generate(*args: Any, **kwargs: Any) -> Any:
+            if draft.comparison is None:
+                raise ValueError("retained_comparison_required")
+            sent = [
+                hashlib.sha256(
+                    base64.b64decode(item.image_url.url.split(",", 1)[1], validate=True)
+                ).hexdigest()
+                for item in kwargs["image_parts"]
+            ]
+            if sent != [item.sha256 for item in draft.comparison.image_manifest]:
+                raise ValueError("retained_comparison_images_differ")
+            return real_generate(*args, **kwargs, deadline=time.monotonic() + 150)
+
+        with (
+            patch.object(llm, "invoke", observe_invoke),
+            patch.object(structured_llm, "_validate_json_object", observe_validate),
+            patch.object(comparison, "generate_structured", observe_generate),
+        ):
+            result = comparison.compare_annexes(
+                old=sides["old"][0],
+                new=sides["new"][0],
+                old_pages=sides["old"][1],
+                new_pages=sides["new"][1],
+                llm=llm,
+                instruction="\n\n".join(draft.instruction_texts),
+            )
+        report.update(
+            {
+                "status": "ready" if result.ready else "blocked",
+                "change_count": len(result.changes),
+                "invalid_proposal": "invalid_comparison_proposal" in result.issues,
+            }
+        )
+    return report
+
+
+def diagnose_batch47_comparison(driver: Driver, pod: str, container: str) -> None:
+    if driver.sha != BATCH47_RUNTIME:
+        return
+    program = (
+        """
+import contextlib, io, json, logging, os, re, signal
+from typing import Any
+logging.disable(logging.CRITICAL)
+def expired(*args):
+    raise TimeoutError()
+signal.signal(signal.SIGALRM, expired)
+signal.alarm(180)
+"""
+        + inspect.getsource(comparison_diagnostic_summary)
+        + "\n"
+        + inspect.getsource(replay_batch47_comparison)
+        + """
+report = {"stage": "batch47_comparison", "status": "scope_refused", "database_read_only": True, "attempts": []}
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        replay_batch47_comparison(report)
+    except Exception as error:
+        from onyx.regulatory.amendments.annexes.dev_acceptance import safe_failure_detail
+        report.update({"status": "failed", "failure_detail": safe_failure_detail("source_review", error)})
+print(json.dumps(report, sort_keys=True))
+"""
+    )
+    output = driver.command(
+        [
+            "kubectl",
+            "--namespace",
+            NAMESPACE,
+            "exec",
+            pod,
+            "-c",
+            container,
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            ". /vault/secrets/config; export PGOPTIONS='-c default_transaction_read_only=on'; exec python -c \"$1\"",
+            "batch47-comparison",
+            program,
+        ],
+        timeout=200,
+    )
+    if len(output.encode()) > 24000:
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    report = json.loads(output)
+    if (
+        not isinstance(report, dict)
+        or report.get("stage") != "batch47_comparison"
+        or report.get("status")
+        not in {"scope_refused", "provider_refused", "failed", "ready", "blocked"}
+    ):
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    allowed_keys = {
+        "stage",
+        "status",
+        "database_read_only",
+        "provider_attempt_count",
+        "attempts",
+        "model_provider",
+        "model_name",
+        "model_snapshot_sha256",
+        "review_sha256",
+        "page_sha256",
+        "old_extraction_sha256",
+        "new_extraction_sha256",
+        "change_count",
+        "invalid_proposal",
+        "failure_detail",
+        "finish_reason",
+        "errors",
+        "fields",
+        "unknown_fields",
+        "cardinalities",
+        "change_shapes",
+        "object",
+        "operation",
+        "old_positions",
+        "new_positions",
+        "old_pages",
+        "new_pages",
+        "changes",
+        "explanation",
+        "uncertain",
+        "issues",
+        "loc",
+        "type",
+        "validator",
+    }
+    allowed_words = allowed_keys | {
+        "batch47_comparison",
+        "scope_refused",
+        "provider_refused",
+        "failed",
+        "ready",
+        "blocked",
+        "vertex_ai",
+        "stop",
+        "length",
+        "content_filter",
+        "tool_calls",
+        "other",
+        "unknown",
+        "replace",
+        "insert",
+        "remove",
+        "move",
+        "split",
+        "merge",
+        "visual",
+        "invalid_operation_shape",
+        "overlapping_change_references",
+        "missing",
+        "extra_forbidden",
+        "list_type",
+        "int_type",
+        "int_parsing",
+        "greater_than_equal",
+        "bool_type",
+        "bool_parsing",
+        "literal_error",
+        "string_type",
+        "json_invalid",
+        "model_type",
+        "model_attributes_type",
+        "value_error",
+        "too_long",
+    }
+    pending = [report]
+    visited = 0
+    while pending:
+        value = pending.pop()
+        visited += 1
+        if visited > 3000:
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+        if isinstance(value, dict):
+            if set(value) - allowed_keys:
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+            for key, child in value.items():
+                if key == "failure_detail":
+                    if not isinstance(child, str) or len(child) > 4000:
+                        raise CutoverRefusal("fixed_diagnostic_report_required")
+                    continue
+                pending.append(child)
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str):
+            if value not in allowed_words and not re.fullmatch(
+                r"[0-9a-f]{64}|gemini-[a-z0-9.-]{1,60}", value
+            ):
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+        elif value is not None and type(value) not in (int, bool):
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
 def diagnose_release(driver: Driver, runner_sha: str) -> None:
     driver.validate_target()
     state = driver.get("configmap", STATE)["data"]
@@ -1631,6 +2168,9 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         for item in pod["spec"]["containers"]
         if item["image"] == f"{REPOSITORY}:{driver.sha}"
     )
+    if driver.sha == BATCH47_RUNTIME:
+        diagnose_batch47_comparison(driver, pod["metadata"]["name"], container["name"])
+        return
     diagnose_batch44_elasticsearch(driver, pod["metadata"]["name"], container["name"])
     output = driver.command(
         [
