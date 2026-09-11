@@ -471,8 +471,10 @@ def test_two_png_role_receipts_bind_exact_originals(
     )
 
 
+@pytest.mark.parametrize("delayed_index_start", [False, True])
 def test_markdown_probe_uses_registered_upload_list_and_index_routes(
     monkeypatch: pytest.MonkeyPatch,
+    delayed_index_start: bool,
 ) -> None:
     import time
     from typing import Any
@@ -497,9 +499,15 @@ def test_markdown_probe_uses_registered_upload_list_and_index_routes(
     monkeypatch.setattr(canary, "require_canary_persona", Mock(return_value=False))
     operations: list[str] = []
     indexed = False
+    server_status = "CHUNKED"
+    statuses = iter(
+        ("CHUNKED", "CHUNKED", "INDEXING", "COMPLETED")
+        if delayed_index_start
+        else ("CHUNKED", "COMPLETED")
+    )
 
     def request(_client: httpx.Client, method: str, path: str, **_kwargs: Any) -> Any:
-        nonlocal indexed
+        nonlocal indexed, server_status
         if "/document-set/" in path:
             routes = [
                 route
@@ -513,9 +521,25 @@ def test_markdown_probe_uses_registered_upload_list_and_index_routes(
             if path.endswith("/file/upload"):
                 return {"rejected_files": [], "user_files": [file]}
             if path.endswith("/index"):
+                if server_status != "CHUNKED":
+                    failed_request = httpx.Request(
+                        "POST", "https://fixture.invalid/index"
+                    )
+                    raise httpx.HTTPStatusError(
+                        "Only chunked files can be indexed",
+                        request=failed_request,
+                        response=httpx.Response(400, request=failed_request),
+                    )
                 indexed = True
                 return {}
-            return [{**file, "status": "COMPLETED" if indexed else "CHUNKED"}]
+            snapshot_status = next(statuses)
+            # The queued worker starts after this CHUNKED snapshot was read.
+            server_status = (
+                "INDEXING"
+                if indexed and snapshot_status == "CHUNKED"
+                else snapshot_status
+            )
+            return [{**file, "status": snapshot_status}]
         if path == "/tool":
             return [{"id": 1, "display_name": "Internal Search"}]
         if path == "/chat/create-chat-session":
@@ -545,7 +569,8 @@ def test_markdown_probe_uses_registered_upload_list_and_index_routes(
     monkeypatch.setattr(canary.time, "sleep", Mock())
     with httpx.Client() as client:
         canary.markdown_canary(client, run, time.monotonic() + 10)
-    assert len(operations) == 4
+    assert len(operations) == (6 if delayed_index_start else 4)
+    assert sum(operation.endswith("/index") for operation in operations) == 1
     assert indexed
     assert run.evidence["ordinary_markdown_upload_index_chat"] is True
 

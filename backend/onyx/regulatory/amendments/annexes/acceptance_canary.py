@@ -614,17 +614,19 @@ def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> No
     marker = "ANNEXCANARY" + run.run_id.hex
     file = upload_canary_markdown(client, run)
     identifier = UUID(file["id"])
+    index_requested = False
     while time.monotonic() < deadline:
         files = request_json(
             client, "GET", f"/manage/admin/document-set/{run.document_set_id}/files"
         )
         current = next(item for item in files if item["id"] == str(identifier))
-        if current["status"] == "CHUNKED":
+        if current["status"] == "CHUNKED" and not index_requested:
             request_json(
                 client,
                 "POST",
                 f"/manage/admin/document-set/{run.document_set_id}/files/{identifier}/index",
             )
+            index_requested = True
         elif current["status"] == "COMPLETED":
             break
         elif current["status"] in {"FAILED", "CANCELED"}:
