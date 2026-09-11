@@ -1,6 +1,7 @@
 """Bounded runner entrypoint for the existing DEV backend-lite deployment."""
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -1290,6 +1291,52 @@ def diagnose_logging_metadata(driver: Driver) -> None:
     print(json.dumps(report, sort_keys=True), flush=True)
 
 
+def sanitize_batch44_trace(streams: dict[str, list[str]]) -> dict[str, Any]:
+    traces = []
+    for lines in streams.values():
+        for position, line in enumerate(lines):
+            if not re.search(r"Amendment batch 44 failed(?:\x1b\[[0-9;]*m)*$", line):
+                continue
+            frames: list[dict[str, Any]] = []
+            started = False
+            for line in lines[position + 1 : position + 101]:
+                line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                if line == "Traceback (most recent call last):":
+                    started = True
+                    continue
+                if not started:
+                    break
+                frame = re.fullmatch(
+                    r'  File "[^"\n]*?((?:onyx|shared_configs|ee/onyx)/[A-Za-z0-9_./-]+\.py)", line ([1-9][0-9]*), in ([A-Za-z0-9_<>]+)',
+                    line,
+                )
+                if frame and ".." not in frame.group(1).split("/"):
+                    frames.append(
+                        {
+                            "filename": frame.group(1),
+                            "line": int(frame.group(2)),
+                            "function": frame.group(3),
+                        }
+                    )
+                error = re.match(r"^([A-Za-z_][A-Za-z0-9_.]{0,99}):(?: |$)", line)
+                if error:
+                    if frames:
+                        traces.append(
+                            {
+                                "frames": frames,
+                                "exception_class": error.group(1).rsplit(".", 1)[-1],
+                            }
+                        )
+                    break
+                if line and not line.startswith(" "):
+                    break
+    if len(traces) != 1:
+        raise CutoverRefusal(
+            "batch_trace_unavailable" if not traces else "batch_trace_ambiguous"
+        )
+    return {**traces[0], "status": "trace_found"}
+
+
 def diagnose_batch44_logs(runtime_sha: str) -> str:
     """Read only the known failed release's fixed DEV namespace/time window."""
     report: dict[str, Any] = {
@@ -1374,59 +1421,179 @@ def diagnose_batch44_logs(runtime_sha: str) -> str:
             seen.add(token)
         else:
             raise CutoverRefusal("pagination_incomplete")
-        traces = []
-        for lines in streams.values():
-            for position, line in enumerate(lines):
-                if not re.search(
-                    r"Amendment batch 44 failed(?:\x1b\[[0-9;]*m)*$", line
-                ):
-                    continue
-                frames: list[dict[str, Any]] = []
-                started = False
-                for line in lines[position + 1 : position + 101]:
-                    line = re.sub(r"\x1b\[[0-9;]*m", "", line)
-                    if line == "Traceback (most recent call last):":
-                        started = True
-                        continue
-                    if not started:
-                        break
-                    frame = re.fullmatch(
-                        r'  File "[^"\n]*?((?:onyx|shared_configs|ee/onyx)/[A-Za-z0-9_./-]+\.py)", line ([1-9][0-9]*), in ([A-Za-z0-9_<>]+)',
-                        line,
-                    )
-                    if frame and ".." not in frame.group(1).split("/"):
-                        frames.append(
-                            {
-                                "filename": frame.group(1),
-                                "line": int(frame.group(2)),
-                                "function": frame.group(3),
-                            }
-                        )
-                    error = re.match(r"^([A-Za-z_][A-Za-z0-9_.]{0,99}):(?: |$)", line)
-                    if error:
-                        if frames:
-                            traces.append(
-                                {
-                                    "frames": frames,
-                                    "exception_class": error.group(1).rsplit(".", 1)[
-                                        -1
-                                    ],
-                                }
-                            )
-                        break
-                    if line and not line.startswith(" "):
-                        break
-        if len(traces) != 1:
-            raise CutoverRefusal(
-                "batch_trace_unavailable" if not traces else "batch_trace_ambiguous"
-            )
-        report.update(traces[0], status="trace_found")
+        report.update(sanitize_batch44_trace(streams))
     except CutoverRefusal as error:
         report["status"] = str(error)
     except (ValueError, TypeError, KeyError, AttributeError):
         report["status"] = "invalid_response"
     print(json.dumps(report, sort_keys=True), flush=True)
     return str(report["status"])
+
+
+BATCH44_ES_PROGRAM = r"""
+import base64
+import json
+import os
+import re
+import ssl
+import urllib.error
+import urllib.request
+from datetime import datetime
+from typing import Any
+
+class CutoverRefusal(RuntimeError):
+    pass
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def main():
+    report = {"stage": "batch44_elasticsearch", "status": "unavailable", "frames": [], "exception_class": None}
+    try:
+        filters = [
+            {"bool": {"minimum_should_match": 1, "should": [{"term": {field: "customs-regulations-dev"}} for field in ("kubernetes.namespace_name.keyword", "kubernetes.namespace_name")]}},
+            {"bool": {"minimum_should_match": 1, "should": [{"regexp": {field: "dev-customs-regulations-background-.*"}} for field in ("kubernetes.pod_name.keyword", "kubernetes.pod_name")]}},
+            {"range": {"@timestamp": {"gte": "2026-09-11T10:47:00Z", "lt": "2026-09-11T10:50:00Z"}}},
+        ]
+        body = {"size": 2000, "track_total_hits": True, "timeout": "15s", "query": {"bool": {"filter": filters}}, "sort": [{"@timestamp": {"order": "asc", "unmapped_type": "date"}}], "_source": ["@timestamp", "kubernetes.namespace_name", "kubernetes.pod_name", "log", "message"]}
+        headers = {"Content-Type": "application/json"}
+        matching = os.environ.get("ELASTICSEARCH_HOST") == "elastic.dev.singlewindow.io" and os.environ.get("ELASTICSEARCH_REST_API_PORT", "9200") == "9200" and os.environ.get("ELASTICSEARCH_USE_SSL", "false").lower() == "true"
+        if matching:
+            user, password = os.environ.get("ELASTICSEARCH_ADMIN_USERNAME"), os.environ.get("ELASTICSEARCH_ADMIN_PASSWORD")
+            if user and password:
+                headers["Authorization"] = "Basic " + base64.b64encode((user + ":" + password).encode()).decode()
+        context = ssl.create_default_context(cafile=os.environ.get("ELASTICSEARCH_CA_CERTS") if matching else None)
+        opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
+        request = urllib.request.Request("https://elastic.dev.singlewindow.io:9200/_search?filter_path=timed_out,_shards.total,_shards.successful,_shards.failed,hits.total,hits.hits._source", data=json.dumps(body).encode(), headers=headers, method="POST")
+        with opener.open(request, timeout=20) as response:
+            if response.status != 200:
+                raise CutoverRefusal("http_failure")
+            raw = response.read(4_000_001)
+        if len(raw) > 4_000_000:
+            raise CutoverRefusal("response_too_large")
+        data = json.loads(raw)
+        shards, total, hits = data["_shards"], data["hits"]["total"], data["hits"]["hits"]
+        if data.get("timed_out") is not False or type(shards.get("total")) is not int or shards["total"] < 1 or shards.get("failed") != 0 or shards.get("successful") != shards["total"] or total.get("relation") != "eq" or type(total.get("value")) is not int or not isinstance(hits, list) or total["value"] != len(hits) or len(hits) > 2000:
+            raise CutoverRefusal("search_incomplete")
+        streams = {}
+        previous = None
+        for hit in hits:
+            source = hit["_source"]
+            metadata = source["kubernetes"]
+            pod = metadata["pod_name"]
+            when = datetime.fromisoformat(source["@timestamp"].replace("Z", "+00:00"))
+            if when.tzinfo is None or not 1789123620 <= when.timestamp() < 1789123800 or metadata.get("namespace_name") != "customs-regulations-dev" or not re.fullmatch(r"dev-customs-regulations-background-[a-z0-9-]+", pod):
+                raise CutoverRefusal("source_scope_mismatch")
+            if previous is not None and when < previous:
+                raise CutoverRefusal("search_incomplete")
+            previous = when
+            text = source.get("log", source.get("message"))
+            if not isinstance(text, str):
+                raise CutoverRefusal("invalid_response")
+            streams.setdefault(pod, []).extend(text.splitlines())
+        report.update(sanitize_batch44_trace(streams))
+    except urllib.error.HTTPError as error:
+        report["status"] = "http_" + str(error.code) if error.code in (301, 302, 303, 307, 308, 400, 401, 403, 404, 429, 500, 502, 503, 504) else "http_failure"
+    except CutoverRefusal as error:
+        report["status"] = str(error)
+    except (urllib.error.URLError, OSError, TimeoutError):
+        report["status"] = "transport_unavailable"
+    except (ValueError, TypeError, KeyError, AttributeError):
+        report["status"] = "invalid_response"
+    print(json.dumps(report, sort_keys=True))
+"""
+
+
+def diagnose_batch44_elasticsearch(driver: Driver, pod: str, container: str) -> None:
+    if driver.sha != BATCH44_RUNTIME:
+        return
+    program = (
+        BATCH44_ES_PROGRAM
+        + "\n"
+        + inspect.getsource(sanitize_batch44_trace)
+        + "\nmain()\n"
+    )
+    output = driver.command(
+        [
+            "kubectl",
+            "--namespace",
+            NAMESPACE,
+            "exec",
+            pod,
+            "-c",
+            container,
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            '. /vault/secrets/config; exec python -c "$1"',
+            "batch44-elasticsearch",
+            program,
+        ],
+        timeout=45,
+    )
+    if len(output.encode()) > 64000:
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    report = json.loads(output)
+    allowed_statuses = {
+        "trace_found",
+        "unavailable",
+        "http_failure",
+        "response_too_large",
+        "search_incomplete",
+        "source_scope_mismatch",
+        "invalid_response",
+        "transport_unavailable",
+        "batch_trace_unavailable",
+        "batch_trace_ambiguous",
+        *(
+            "http_" + str(code)
+            for code in (
+                301,
+                302,
+                303,
+                307,
+                308,
+                400,
+                401,
+                403,
+                404,
+                429,
+                500,
+                502,
+                503,
+                504,
+            )
+        ),
+    }
+    if (
+        not isinstance(report, dict)
+        or set(report) != {"stage", "status", "frames", "exception_class"}
+        or report["stage"] != "batch44_elasticsearch"
+        or report["status"] not in allowed_statuses
+        or not isinstance(report["frames"], list)
+    ):
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    if report["exception_class"] is not None and not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]{0,99}", report["exception_class"]
+    ):
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    for frame in report["frames"]:
+        if (
+            not isinstance(frame, dict)
+            or set(frame) != {"filename", "function", "line"}
+            or not re.fullmatch(
+                r"(?:onyx|shared_configs|ee/onyx)/[A-Za-z0-9_./-]+\.py",
+                frame["filename"],
+            )
+            or ".." in frame["filename"].split("/")
+            or not re.fullmatch(r"[A-Za-z0-9_<>]+", frame["function"])
+            or type(frame["line"]) is not int
+            or frame["line"] < 1
+        ):
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+    print(json.dumps(report, sort_keys=True), flush=True)
 
 
 def diagnose_release(driver: Driver, runner_sha: str) -> None:
@@ -1451,6 +1618,7 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         for item in pod["spec"]["containers"]
         if item["image"] == f"{REPOSITORY}:{driver.sha}"
     )
+    diagnose_batch44_elasticsearch(driver, pod["metadata"]["name"], container["name"])
     output = driver.command(
         [
             "kubectl",

@@ -1863,3 +1863,217 @@ def test_fluentd_unknown_or_excessive_refs_never_trigger_dynamic_reads(
     assert driver.command.call_count == 5
     output = capsys.readouterr().out
     assert "invalid_references" in output and "../unsafe" not in output
+
+
+def es_trace_response() -> dict[str, Any]:
+    lines = [
+        "Amendment batch 44 failed",
+        "Traceback (most recent call last):",
+        '  File "/app/onyx/regulatory/tasks.py", line 235, in run',
+        "    secret_source()",
+        "ValueError: private provider content",
+    ]
+    return {
+        "timed_out": False,
+        "_shards": {"total": 2, "successful": 2, "failed": 0},
+        "hits": {
+            "total": {"value": len(lines), "relation": "eq"},
+            "hits": [
+                {
+                    "_source": {
+                        "@timestamp": "2026-09-11T10:47:30Z",
+                        "kubernetes": {
+                            "namespace_name": cutover.NAMESPACE,
+                            "pod_name": "dev-customs-regulations-background-a",
+                        },
+                        "log": line,
+                    }
+                }
+                for line in lines
+            ],
+        },
+    }
+
+
+def execute_es_diagnostic(
+    data: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], Mock]:
+    import inspect
+    import json
+
+    response = Mock()
+    response.status = 200
+    response.read.return_value = json.dumps(data).encode()
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    opener = Mock()
+    opener.open.return_value = response
+    with (
+        patch.dict("os.environ", env or {}, clear=True),
+        patch("urllib.request.build_opener", return_value=opener),
+    ):
+        exec(
+            cutover.BATCH44_ES_PROGRAM
+            + "\n"
+            + inspect.getsource(cutover.sanitize_batch44_trace)
+            + "\nmain()",
+            {},
+        )
+    output = capsys.readouterr().out
+    assert "private" not in output and "secret" not in output
+    return json.loads(output), opener
+
+
+def test_es_batch44_fixed_server_filters_and_sanitized_split_trace(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    report, opener = execute_es_diagnostic(es_trace_response(), capsys)
+    assert (
+        report["status"] == "trace_found" and report["exception_class"] == "ValueError"
+    )
+    assert report["frames"] == [
+        {"filename": "onyx/regulatory/tasks.py", "function": "run", "line": 235}
+    ]
+    request = opener.open.call_args.args[0]
+    assert (
+        request.full_url.startswith("https://elastic.dev.singlewindow.io:9200/_search?")
+        and request.method == "POST"
+    )
+    query = json.loads(request.data)
+    assert query["size"] == 2000 and query["track_total_hits"] is True
+    assert len(query["query"]["bool"]["filter"]) == 3
+    assert cutover.NAMESPACE in json.dumps(query["query"]["bool"]["filter"][0])
+    assert "dev-customs-regulations-background-.*" in json.dumps(
+        query["query"]["bool"]["filter"][1]
+    )
+    assert query["_source"] == [
+        "@timestamp",
+        "kubernetes.namespace_name",
+        "kubernetes.pod_name",
+        "log",
+        "message",
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation,status",
+    [
+        ("namespace", "source_scope_mismatch"),
+        ("time", "source_scope_mismatch"),
+        ("pod", "source_scope_mismatch"),
+        ("partial", "search_incomplete"),
+        ("shards", "search_incomplete"),
+        ("timeout", "search_incomplete"),
+        ("different_pods", "batch_trace_unavailable"),
+    ],
+)
+def test_es_batch44_refuses_scope_or_incomplete_proof(
+    mutation: str, status: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = es_trace_response()
+    source = data["hits"]["hits"][0]["_source"]
+    if mutation == "namespace":
+        source["kubernetes"]["namespace_name"] = "customs-regulations-test"
+    if mutation == "time":
+        source["@timestamp"] = "2026-09-11T10:50:00Z"
+    if mutation == "pod":
+        source["kubernetes"]["pod_name"] = "another-background"
+    if mutation == "partial":
+        data["hits"]["total"]["value"] += 1
+    if mutation == "shards":
+        data["_shards"]["failed"] = 1
+    if mutation == "timeout":
+        data["timed_out"] = True
+    if mutation == "different_pods":
+        data["hits"]["hits"][1]["_source"]["kubernetes"]["pod_name"] = (
+            "dev-customs-regulations-background-b"
+        )
+    report, _ = execute_es_diagnostic(data, capsys)
+    assert report["status"] == status
+
+
+@pytest.mark.parametrize(
+    "host,authorized", [("elastic.dev.singlewindow.io", True), ("other.example", False)]
+)
+def test_es_batch44_credentials_require_positive_endpoint_match(
+    host: str, authorized: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, opener = execute_es_diagnostic(
+        es_trace_response(),
+        capsys,
+        env={
+            "ELASTICSEARCH_HOST": host,
+            "ELASTICSEARCH_REST_API_PORT": "9200",
+            "ELASTICSEARCH_USE_SSL": "true",
+            "ELASTICSEARCH_ADMIN_USERNAME": "private",
+            "ELASTICSEARCH_ADMIN_PASSWORD": "secret",
+        },
+    )
+    assert bool(opener.open.call_args.args[0].get_header("Authorization")) == authorized
+
+
+def test_es_batch44_cannot_redirect_or_bypass_tls(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import inspect
+    import ssl
+    import urllib.request
+
+    namespace: dict[str, Any] = {}
+    exec(
+        cutover.BATCH44_ES_PROGRAM
+        + "\n"
+        + inspect.getsource(cutover.sanitize_batch44_trace),
+        namespace,
+    )
+    assert (
+        namespace["NoRedirect"]().redirect_request(
+            None, None, 302, "", {}, "https://other.example"
+        )
+        is None
+    )
+    with patch(
+        "ssl.create_default_context", wraps=ssl.create_default_context
+    ) as context:
+        execute_es_diagnostic(es_trace_response(), capsys)
+    context.assert_called_once_with(cafile=None)
+    assert issubclass(namespace["NoRedirect"], urllib.request.HTTPRedirectHandler)
+
+
+@pytest.mark.parametrize("code", [301, 401, 403])
+def test_es_batch44_http_failures_emit_only_fixed_status(
+    code: int, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import inspect
+    import json
+    from urllib.error import HTTPError
+
+    opener = Mock()
+    opener.open.side_effect = HTTPError(
+        "https://elastic.dev.singlewindow.io:9200", code, "secret", Message(), None
+    )
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch("urllib.request.build_opener", return_value=opener),
+    ):
+        exec(
+            cutover.BATCH44_ES_PROGRAM
+            + "\n"
+            + inspect.getsource(cutover.sanitize_batch44_trace)
+            + "\nmain()",
+            {},
+        )
+    output = capsys.readouterr().out
+    assert "secret" not in output and json.loads(output)["status"] == f"http_{code}"
+
+
+def test_es_batch44_other_runtime_never_executes() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    cutover.diagnose_batch44_elasticsearch(driver, "pod", "container")
+    driver.command.assert_not_called()
