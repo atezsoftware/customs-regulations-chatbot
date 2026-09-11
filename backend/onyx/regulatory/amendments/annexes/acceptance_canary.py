@@ -21,6 +21,7 @@ from onyx.db.regulatory_annex_acceptance import (
     issue_canary_token,
     read_canary_worker_failure,
     recover_creation_intents,
+    require_canary_persona,
     reserve_canary,
     retained_canary_audit,
     revoke_canary_token,
@@ -398,9 +399,69 @@ def index_evidence(run: CanaryRun) -> list[dict[str, Any]]:
     return output
 
 
+def ensure_canary_persona(client: httpx.Client, run: CanaryRun) -> int:
+    if run.persona_id is not None:
+        require_canary_persona(run, run.persona_id)
+        return run.persona_id
+    if any(item.kind == "persona" for item in run.creation_intents):
+        if not recover_creation_intents(run) or run.persona_id is None:
+            raise ValueError("canary_persona_creation_unresolved")
+        require_canary_persona(run, run.persona_id)
+        return run.persona_id
+    if run.document_set_id is None:
+        raise ValueError("canary_persona_scope_required")
+    tools = request_json(client, "GET", "/tool")
+    search_ids = [
+        tool["id"] for tool in tools if tool["display_name"] == "Internal Search"
+    ]
+    if len(search_ids) != 1:
+        raise ValueError("canary_search_tool_required")
+    intent = CreationIntent(kind="persona", marker=run.name + " / assistant")
+    run.creation_intents.append(intent)
+    save_canary(run)
+    response = request_json(
+        client,
+        "POST",
+        "/persona",
+        json={
+            "name": intent.marker,
+            "description": "Private fictional release verification scope",
+            "document_set_ids": [run.document_set_id],
+            "is_public": False,
+            "tool_ids": search_ids,
+            "system_prompt": "",
+            "task_prompt": "",
+            "datetime_aware": True,
+        },
+    )
+    identifier = response.get("id")
+    if type(identifier) is not int or identifier <= 0:
+        raise ValueError("canary_persona_identifier_invalid")
+    require_canary_persona(run, identifier)
+    intent.persona_id = identifier
+    run.persona_id = identifier
+    save_canary(run)
+    return identifier
+
+
+def cleanup_canary_persona(client: httpx.Client, run: CanaryRun) -> None:
+    if run.persona_id is None:
+        if any(item.kind == "persona" for item in run.creation_intents):
+            raise ValueError("canary_persona_cleanup_unresolved")
+        return
+    deleted = require_canary_persona(run, run.persona_id, allow_deleted=True)
+    if not deleted:
+        request_json(client, "DELETE", f"/persona/{run.persona_id}")
+        if not require_canary_persona(run, run.persona_id, allow_deleted=True):
+            raise ValueError("canary_persona_cleanup_not_deleted")
+    run.evidence["persona_cleanup_complete"] = True
+    save_canary(run)
+
+
 def create_canary_chat(client: httpx.Client, run: CanaryRun, *, purpose: str) -> UUID:
     if purpose not in {"dated 2026-09-09", "dated 2026-09-10", "markdown"}:
         raise ValueError("canary_chat_purpose_not_supported")
+    persona_id = ensure_canary_persona(client, run)
     marker = run.name + " / " + purpose
     if any(
         item.kind == "chat" and item.marker == marker for item in run.creation_intents
@@ -410,7 +471,10 @@ def create_canary_chat(client: httpx.Client, run: CanaryRun, *, purpose: str) ->
     run.creation_intents.append(intent)
     save_canary(run)
     session = request_json(
-        client, "POST", "/chat/create-chat-session", json={"description": marker}
+        client,
+        "POST",
+        "/chat/create-chat-session",
+        json={"description": marker, "persona_id": persona_id},
     )
     chat_id = UUID(session["chat_session_id"])
     intent.artifact_id = chat_id
@@ -462,7 +526,7 @@ def chat_canary(client: httpx.Client, run: CanaryRun, *, as_of: str, rate: str) 
         "/chat/send-chat-message",
         json={
             "chat_session_id": str(chat_id),
-            "message": f"{as_of} tarihinde Temsili Oran Yonetmeligi EK-1 tablosunda1001.10 kodunun orani nedir? Kaynagi goster.",
+            "message": f"{as_of} tarihinde Temsili Oran Yonetmeligi EK-1 tablosunda 1001.10 kodunun orani nedir? Kaynagi goster.",
             "internal_search_filters": {
                 "document_set": [run.name],
                 "as_of_date": as_of,
@@ -631,10 +695,21 @@ def run_canary(release_sha: str) -> dict[str, Any]:
                         timeout=30,
                         follow_redirects=False,
                     ) as client:
-                        for chat_id in run.chat_ids:
-                            request_json(
-                                client, "DELETE", f"/chat/delete-chat-session/{chat_id}"
-                            )
+                        try:
+                            for chat_id in run.chat_ids:
+                                request_json(
+                                    client,
+                                    "DELETE",
+                                    f"/chat/delete-chat-session/{chat_id}",
+                                )
+                        finally:
+                            try:
+                                cleanup_canary_persona(client, run)
+                            except Exception as exc:
+                                failed = True
+                                run.evidence["persona_cleanup_failure"] = (
+                                    safe_failure_detail("chat_cleanup", exc)
+                                )
             except Exception as exc:
                 failed = True
                 run.evidence["chat_cleanup_failure"] = safe_failure_detail(
@@ -653,7 +728,12 @@ def run_canary(release_sha: str) -> dict[str, Any]:
                     signal.signal(signal.SIGALRM, previous_handler)
     if any(
         key in run.evidence
-        for key in ("cleanup_failure", "chat_cleanup_failure", "token_cleanup_failure")
+        for key in (
+            "cleanup_failure",
+            "chat_cleanup_failure",
+            "persona_cleanup_failure",
+            "token_cleanup_failure",
+        )
     ):
         run.phase = "cleanup_incomplete"
         run.evidence["cleanup_complete"] = False

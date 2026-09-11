@@ -109,13 +109,25 @@ def test_failed_canary_cleans_files_revokes_token_and_returns_owned_evidence(
     from onyx.db.regulatory_annex_acceptance import CanaryRun
     from onyx.regulatory.amendments.annexes import acceptance_canary, config
 
-    run = CanaryRun(release_sha="a" * 40, user_id=uuid4())
+    run = CanaryRun(
+        release_sha="a" * 40, user_id=uuid4(), persona_id=123, chat_ids=[uuid4()]
+    )
     monkeypatch.setattr(config, "REGULATORY_ANNEX_UPDATES_ENABLED", True)
     monkeypatch.setattr(acceptance_canary, "reserve_canary", Mock(return_value=run))
     monkeypatch.setattr(
         acceptance_canary, "issue_canary_token", Mock(return_value="memory-only")
     )
-    monkeypatch.setattr(acceptance_canary, "request_json", Mock())
+
+    def request(_client: object, method: str, _path: str) -> Mock:
+        if cleanup_fails and method == "DELETE":
+            raise ValueError("private chat")
+        return Mock()
+
+    monkeypatch.setattr(acceptance_canary, "request_json", request)
+    persona_cleanup = Mock(
+        side_effect=ValueError("private persona") if cleanup_fails else None
+    )
+    monkeypatch.setattr(acceptance_canary, "cleanup_canary_persona", persona_cleanup)
     monkeypatch.setattr(acceptance_canary, "save_canary", Mock())
     monkeypatch.setattr(
         acceptance_canary,
@@ -138,16 +150,22 @@ def test_failed_canary_cleans_files_revokes_token_and_returns_owned_evidence(
     assert "memory-only" not in str(report)
     cleanup.assert_called_once_with(run)
     revoke.assert_called_once_with(run)
+    persona_cleanup.assert_called_once()
+    assert persona_cleanup.call_args.args[1] is run
     if cleanup_fails:
         assert run.phase == "cleanup_incomplete"
         assert run.evidence["cleanup_complete"] is False
         for key, stage in (
             ("cleanup_failure", "cleanup"),
             ("token_cleanup_failure", "token_cleanup"),
+            ("chat_cleanup_failure", "chat_cleanup"),
+            ("persona_cleanup_failure", "chat_cleanup"),
         ):
             assert json.loads(str(run.evidence[key]))["stage"] == stage
         assert "private cleanup" not in str(report)
         assert "private token" not in str(report)
+        assert "private persona" not in str(report)
+        assert "private chat" not in str(report)
 
 
 def test_preflight_prints_failed_calibration_once_before_gate_failure(
@@ -207,6 +225,8 @@ def test_lost_creation_response_recovers_from_precommitted_intent(
     from onyx.regulatory.amendments.annexes import acceptance_canary as canary
 
     run = ownership.CanaryRun(release_sha="a" * 40, user_id=uuid4(), document_set_id=42)
+    run.persona_id = 123
+    monkeypatch.setattr(canary, "require_canary_persona", Mock(return_value=False))
     durable: dict[str, object] = {}
     created: list[object] = []
 
@@ -473,6 +493,8 @@ def test_markdown_probe_uses_registered_upload_list_and_index_routes(
         "name": "ANNEXCANARY" + run.run_id.hex + ".md",
         "chat_file_type": "plain_text",
     }
+    run.persona_id = 123
+    monkeypatch.setattr(canary, "require_canary_persona", Mock(return_value=False))
     operations: list[str] = []
     indexed = False
 

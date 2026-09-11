@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Literal, cast
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -16,9 +16,18 @@ from onyx.db.models import KVStore, User, UserFile
 
 class CreationIntent(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["chat", "markdown"]
+    kind: Literal["chat", "markdown", "persona"]
     marker: str
     artifact_id: UUID | None = None
+    persona_id: int | None = Field(default=None, strict=True, gt=0)
+
+    @model_validator(mode="after")
+    def identifier_matches_kind(self) -> "CreationIntent":
+        if (self.kind == "persona" and self.artifact_id is not None) or (
+            self.kind != "persona" and self.persona_id is not None
+        ):
+            raise ValueError("canary_intent_identifier_kind_mismatch")
+        return self
 
 
 class RetainedArtifact(BaseModel):
@@ -36,13 +45,14 @@ class CanaryRun(BaseModel):
     user_id: UUID
     file_id: UUID = Field(default_factory=uuid4)
     document_set_id: int | None = None
+    persona_id: int | None = Field(default=None, strict=True, gt=0)
     pat_id: int | None = None
     package_id: UUID | None = None
     batch_id: int | None = None
     review_id: UUID | None = None
     chat_ids: list[UUID] = Field(default_factory=list)
     markdown_file_ids: list[UUID] = Field(default_factory=list)
-    creation_intents: list[CreationIntent] = Field(default_factory=list, max_length=4)
+    creation_intents: list[CreationIntent] = Field(default_factory=list, max_length=5)
     retained_objects: list[RetainedArtifact] = Field(
         default_factory=list, max_length=512
     )
@@ -327,6 +337,69 @@ def cleanup_empty_canary_scope(run: CanaryRun) -> None:
         delete_document_set(scope, session)
 
 
+def _require_canary_persona(
+    session: Session, run: CanaryRun, persona_id: int, *, allow_deleted: bool
+) -> bool:
+    from onyx.db.models import Persona
+
+    persona = session.get(Persona, persona_id)
+    if (
+        persona_id <= 0
+        or persona is None
+        or persona.user_id != run.user_id
+        or persona.name != run.name + " / assistant"
+        or persona.is_public
+        or persona.builtin_persona
+        or (persona.deleted and not allow_deleted)
+        or persona.default_model_configuration_id is not None
+        or persona.search_start_date is not None
+        or persona.user_files
+        or persona.hierarchy_nodes
+        or persona.attached_documents
+        or len(persona.document_sets) != 1
+    ):
+        raise ValueError("canary_persona_ownership_mismatch")
+    scope = persona.document_sets[0]
+    if (
+        scope.id != run.document_set_id
+        or scope.user_id != run.user_id
+        or scope.name != run.name
+        or scope.is_public
+    ):
+        raise ValueError("canary_persona_scope_mismatch")
+    return persona.deleted
+
+
+def require_canary_persona(
+    run: CanaryRun, persona_id: int, *, allow_deleted: bool = False
+) -> bool:
+    with get_session_with_current_tenant() as session:
+        return _require_canary_persona(
+            session, run, persona_id, allow_deleted=allow_deleted
+        )
+
+
+def matching_canary_persona_ids(run: CanaryRun, intent: CreationIntent) -> list[int]:
+    from onyx.db.models import Persona
+
+    if intent.kind != "persona" or intent.marker != run.name + " / assistant":
+        raise ValueError("canary_persona_intent_marker_mismatch")
+    with get_session_with_current_tenant() as session:
+        matches = list(
+            session.scalars(
+                select(Persona.id)
+                .where(
+                    Persona.user_id == run.user_id,
+                    Persona.name == intent.marker,
+                )
+                .limit(2)
+            )
+        )
+        for identifier in matches:
+            _require_canary_persona(session, run, identifier, allow_deleted=True)
+        return matches
+
+
 def matching_creation_ids(run: CanaryRun, intent: CreationIntent) -> list[UUID]:
     """Resolve only the exact persisted marker inside its authorized owner scope."""
     from onyx.db.models import ChatSession, DocumentSet, DocumentSet__UserFile
@@ -370,6 +443,17 @@ def matching_creation_ids(run: CanaryRun, intent: CreationIntent) -> list[UUID]:
 def recover_creation_intents(run: CanaryRun) -> bool:
     complete = True
     for intent in run.creation_intents:
+        if intent.kind == "persona":
+            if intent.persona_id is None:
+                persona_matches = matching_canary_persona_ids(run, intent)
+                if len(persona_matches) != 1:
+                    complete = False
+                    continue
+                intent.persona_id = persona_matches[0]
+            if run.persona_id not in (None, intent.persona_id):
+                raise ValueError("canary_persona_intent_mismatch")
+            run.persona_id = intent.persona_id
+            continue
         if intent.artifact_id is None:
             matches = matching_creation_ids(run, intent)
             if len(matches) != 1:
@@ -480,6 +564,9 @@ def retained_canary_audit(run: CanaryRun) -> list[RetainedArtifact]:
         ):
             raise ValueError("canary_audit_run_ownership_missing")
         retained.append(RetainedArtifact(kind="run_record", id=run.key))
+        if run.persona_id is not None:
+            _require_canary_persona(session, run, run.persona_id, allow_deleted=True)
+            retained.append(RetainedArtifact(kind="persona", id=str(run.persona_id)))
         failure = _read_canary_worker_failure(session, run)
         if failure is not None:
             retained.append(
