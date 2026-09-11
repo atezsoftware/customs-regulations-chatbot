@@ -1,6 +1,7 @@
 """Fixed release probes refuse the wrong environment before touching services."""
 
 import importlib.util
+import json
 import shutil
 from pathlib import Path
 
@@ -89,8 +90,10 @@ def test_failed_batch_refuses_without_polling_until_deadline(
     sleep.assert_not_called()
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_failed_canary_cleans_files_revokes_token_and_returns_owned_evidence(
     monkeypatch: pytest.MonkeyPatch,
+    cleanup_fails: bool,
 ) -> None:
     from unittest.mock import Mock
     from uuid import uuid4
@@ -111,18 +114,32 @@ def test_failed_canary_cleans_files_revokes_token_and_returns_owned_evidence(
         "bootstrap_original",
         Mock(side_effect=RuntimeError("private detail")),
     )
-    cleanup = Mock()
-    revoke = Mock()
+    cleanup = Mock(side_effect=ValueError("private cleanup") if cleanup_fails else None)
+    revoke = Mock(side_effect=RuntimeError("private token") if cleanup_fails else None)
     monkeypatch.setattr(acceptance_canary, "cleanup_canary", cleanup)
     monkeypatch.setattr(acceptance_canary, "revoke_canary_token", revoke)
     report = acceptance_canary.run_canary(run.release_sha)
     assert report["status"] == "failed"
     assert report["canary"]["run_id"] == str(run.run_id)
     assert report["canary"]["evidence"]["acceptance_passed"] is False
+    detail = json.loads(report["canary"]["evidence"]["failure"])
+    assert detail["stage"] == "baseline"
+    assert detail["exceptions"][0]["type"] == "RuntimeError"
+    assert detail["exceptions"][0]["frames"][-1]["function"] == "run_canary"
     assert "private detail" not in str(report)
     assert "memory-only" not in str(report)
     cleanup.assert_called_once_with(run)
     revoke.assert_called_once_with(run)
+    if cleanup_fails:
+        assert run.phase == "cleanup_incomplete"
+        assert run.evidence["cleanup_complete"] is False
+        for key, stage in (
+            ("cleanup_failure", "cleanup"),
+            ("token_cleanup_failure", "token_cleanup"),
+        ):
+            assert json.loads(str(run.evidence[key]))["stage"] == stage
+        assert "private cleanup" not in str(report)
+        assert "private token" not in str(report)
 
 
 def test_preflight_prints_failed_calibration_once_before_gate_failure(

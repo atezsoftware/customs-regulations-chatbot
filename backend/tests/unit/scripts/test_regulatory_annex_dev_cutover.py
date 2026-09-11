@@ -999,6 +999,23 @@ def test_failed_acceptance_stage_diagnostic_survives_safe_output(
         "release_sha_metadata": "a" * 40,
         "failure_stage": "configuration",
         "exception_type": "UnicodeDecodeError",
+        "failure": json.dumps(
+            {
+                "stage": "configuration",
+                "exceptions": [
+                    {
+                        "type": "UnicodeDecodeError",
+                        "frames": [
+                            {
+                                "module": "onyx.utils.encryption",
+                                "function": "_decrypt_bytes",
+                                "line": 34,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
         "exception_message": "DO_NOT_LOG_source_or_secret",
     }
     with pytest.raises(cutover.CutoverRefusal, match="fixed_acceptance_probe_failed"):
@@ -1007,6 +1024,7 @@ def test_failed_acceptance_stage_diagnostic_survives_safe_output(
     retained = json.loads(output)
     assert retained["failure_stage"] == "configuration"
     assert retained["exception_type"] == "UnicodeDecodeError"
+    assert retained["failure"] == report["failure"]
     assert "DO_NOT_LOG" not in output
 
 

@@ -111,4 +111,55 @@ def test_failed_stage_is_reported_without_exception_details(
     assert report["status"] == "failed"
     assert report["failure_stage"] == stage
     assert report["exception_type"] == "RuntimeError"
+    detail = json.loads(report["failure"])
+    assert detail["stage"] == stage
+    assert detail["exceptions"][0]["frames"][-1]["function"] == "main"
     assert "DO_NOT_LOG" not in captured.out + captured.err
+
+
+def test_safe_failure_retains_cause_and_bounds_untrusted_details() -> None:
+    from onyx.regulatory.amendments.annexes import dev_acceptance
+
+    cause = ValueError("DO_NOT_LOG_credential")
+    error = RuntimeError("DO_NOT_LOG_document" * 1000)
+    error.__cause__ = cause
+    cause.__cause__ = error
+    detail = dev_acceptance.safe_failure_detail("baseline", error)
+    parsed = json.loads(detail)
+    assert [item["type"] for item in parsed["exceptions"]] == [
+        "RuntimeError",
+        "ValueError",
+    ]
+    assert all(item["frames"] == [] for item in parsed["exceptions"])
+    assert "DO_NOT_LOG" not in detail
+    assert len(detail) <= 4000
+    unknown = type("DO_NOT_LOG_secret", (Exception,), {})("secret")
+    assert json.loads(dev_acceptance.safe_failure_detail("secret", unknown)) == {
+        "stage": "unknown",
+        "exceptions": [{"type": "Exception", "frames": []}],
+    }
+
+
+def test_failure_detail_limits_cause_depth_and_excludes_external_frames() -> None:
+    from onyx.regulatory.amendments.annexes import dev_acceptance
+
+    previous: BaseException | None = None
+    for _ in range(10):
+        try:
+            dev_acceptance.validate_scope(
+                database="secret", environment="secret", machine="secret"
+            )
+        except ValueError as error:
+            error.__cause__ = previous
+            previous = error
+    assert previous is not None
+    detail = dev_acceptance.safe_failure_detail("baseline", previous)
+    parsed = json.loads(detail)
+    assert len(parsed["exceptions"]) == 3
+    for error in parsed["exceptions"]:
+        assert len(error["frames"]) == 1
+        assert error["frames"][0]["module"] == dev_acceptance.__name__
+        assert error["frames"][0]["function"] == "validate_scope"
+        assert isinstance(error["frames"][0]["line"], int)
+    assert "secret" not in detail
+    assert len(detail) <= 4000

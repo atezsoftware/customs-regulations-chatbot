@@ -25,7 +25,10 @@ from onyx.db.regulatory_annex_acceptance import (
     revoke_canary_token,
     save_canary,
 )
-from onyx.regulatory.amendments.annexes.dev_acceptance import load_fixtures
+from onyx.regulatory.amendments.annexes.dev_acceptance import (
+    load_fixtures,
+    safe_failure_detail,
+)
 
 DEV_FRONTEND = "https://dev-customs-regulations.singlewindow.io"
 DEV_ADMIN = "kubilay.payci@atez.com"
@@ -571,6 +574,7 @@ def run_canary(release_sha: str) -> dict[str, Any]:
     signal.alarm(720)
     token: str | None = None
     failed = False
+    operation = "token"
     try:
         token = issue_canary_token(run)
         with httpx.Client(
@@ -579,24 +583,31 @@ def run_canary(release_sha: str) -> dict[str, Any]:
             timeout=90,
             follow_redirects=False,
         ) as client:
+            operation = "capabilities"
             request_json(client, "GET", "/regulatory/amendments/capabilities")
+            operation = "baseline"
             bootstrap_original(run)
             deadline = time.monotonic() + 600
+            operation = "source_review"
             review = prepare_review(client, run, deadline)
+            operation = "approval"
             approve_review(client, run, review, deadline)
+            operation = "historical_chat"
             chat_canary(client, run, as_of="2026-09-09", rate="5%")
+            operation = "current_chat"
             chat_canary(client, run, as_of="2026-09-10", rate="7%")
+            operation = "markdown"
             markdown_canary(client, run, deadline)
-    except Exception:
+    except Exception as exc:
         failed = True
-        run.evidence["failure"] = "canary_phase_failed"
+        run.evidence["failure"] = safe_failure_detail(operation, exc)
     finally:
         signal.alarm(120)
         try:
             cleanup_canary(run)
-        except Exception:
+        except Exception as exc:
             failed = True
-            run.evidence["cleanup_failure"] = "canary_cleanup_failed"
+            run.evidence["cleanup_failure"] = safe_failure_detail("cleanup", exc)
         finally:
             try:
                 if token is not None:
@@ -610,16 +621,18 @@ def run_canary(release_sha: str) -> dict[str, Any]:
                             request_json(
                                 client, "DELETE", f"/chat/delete-chat-session/{chat_id}"
                             )
-            except Exception:
+            except Exception as exc:
                 failed = True
-                run.evidence["chat_cleanup_failure"] = "canary_chat_cleanup_failed"
+                run.evidence["chat_cleanup_failure"] = safe_failure_detail(
+                    "chat_cleanup", exc
+                )
             finally:
                 try:
                     revoke_canary_token(run)
-                except Exception:
+                except Exception as exc:
                     failed = True
-                    run.evidence["token_cleanup_failure"] = (
-                        "canary_token_cleanup_failed"
+                    run.evidence["token_cleanup_failure"] = safe_failure_detail(
+                        "token_cleanup", exc
                     )
                 finally:
                     signal.alarm(0)

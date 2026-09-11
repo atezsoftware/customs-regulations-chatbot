@@ -12,6 +12,88 @@ from pathlib import Path
 from typing import NoReturn
 
 
+def safe_failure_detail(stage: str, error: BaseException) -> str:
+    """Retain bounded code locations, never messages, source lines or frame locals."""
+    stages = {
+        "scope",
+        "startup",
+        "configuration",
+        "native",
+        "calibration",
+        "canary",
+        "token",
+        "capabilities",
+        "baseline",
+        "source_review",
+        "approval",
+        "historical_chat",
+        "current_chat",
+        "markdown",
+        "cleanup",
+        "chat_cleanup",
+        "token_cleanup",
+    }
+    types = {
+        "UnicodeDecodeError",
+        "ValueError",
+        "RuntimeError",
+        "TypeError",
+        "TimeoutError",
+        "OperationalError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "IsolatedProcessTimeout",
+        "IsolatedProcessCrashed",
+        "AssertionError",
+        "KeyError",
+        "BadRequestError",
+        "AuthenticationError",
+        "RateLimitError",
+        "APIError",
+        "APIConnectionError",
+        "HTTPStatusError",
+        "ConnectError",
+        "ReadTimeout",
+        "PermissionError",
+        "IntegrityError",
+        "NotFoundError",
+    }
+    exceptions: list[dict[str, object]] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen and len(exceptions) < 3:
+        seen.add(id(current))
+        frames: list[dict[str, str | int]] = []
+        trace = current.__traceback__
+        while trace is not None:
+            module = trace.tb_frame.f_globals.get("__name__")
+            function = trace.tb_frame.f_code.co_name
+            if (
+                isinstance(module, str)
+                and re.fullmatch(
+                    r"(?:onyx|ee\.onyx|shared_configs)\.[A-Za-z0-9_.]{1,100}", module
+                )
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", function)
+            ):
+                frames.append(
+                    {"module": module, "function": function, "line": trace.tb_lineno}
+                )
+                frames = frames[:2] + frames[-3:] if len(frames) > 5 else frames
+            trace = trace.tb_next
+        name = type(current).__name__
+        exceptions.append(
+            {"type": name if name in types else "Exception", "frames": frames}
+        )
+        current = current.__cause__ or (
+            None if current.__suppress_context__ else current.__context__
+        )
+    return json.dumps(
+        {"stage": stage if stage in stages else "unknown", "exceptions": exceptions},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def validate_scope(*, database: str, environment: str, machine: str) -> None:
     if (database, environment, machine) != ("customs-regulations-dev", "dev", "x86_64"):
         raise ValueError("native_amd64_dev_scope_required")
@@ -150,6 +232,7 @@ def main() -> None:
         status = "failed"
         exception_type = type(exc).__name__
         report.update(
+            failure=safe_failure_detail(stage, exc),
             failure_stage=stage,
             exception_type=exception_type
             if exception_type
