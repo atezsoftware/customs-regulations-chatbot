@@ -608,7 +608,7 @@ def test_canary_report_retains_publication_and_cleanup_identities(
 ) -> None:
     import json
 
-    evidence = {
+    evidence: dict[str, str | int | bool] = {
         key: value
         for value, key in enumerate(
             (
@@ -624,6 +624,8 @@ def test_canary_report_retains_publication_and_cleanup_identities(
             1,
         )
     }
+    evidence["persona_cleanup_complete"] = status == "passed"
+    evidence["persona_cleanup_failure"] = "safe failure receipt"
     evidence["cleanup_complete"] = status == "passed"
     canary = {
         "evidence": evidence,
@@ -648,6 +650,7 @@ def test_canary_report_retains_publication_and_cleanup_identities(
         "creation_intents": [
             {"kind": "markdown", "marker": "owned-marker", "artifact_id": None}
         ],
+        "persona_id": 123,
         "api_key": "secret",
     }
     report = {
