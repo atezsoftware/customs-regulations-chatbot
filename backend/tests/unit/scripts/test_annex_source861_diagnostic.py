@@ -36,6 +36,7 @@ def scope_objects() -> tuple[Any, Any, Any]:
         batch_id=None,
         phase="cleaned",
         name="private run",
+        created_at=datetime.datetime.fromisoformat("2026-09-11T15:56:39.875587+00:00"),
     )
     package = SimpleNamespace(
         id=run.package_id,
@@ -43,7 +44,7 @@ def scope_objects() -> tuple[Any, Any, Any]:
         environment="dev",
         created_by=run.user_id,
         idempotency_key="annex-canary-" + str(run.run_id),
-        created_at=datetime.datetime.fromisoformat("2026-09-11T15:56:39.875587+00:00"),
+        created_at=datetime.datetime.fromisoformat("2026-09-11T15:57:31.125000+00:00"),
         status="failed",
         issues=[{"code": "parse_failed", "locator": "PRIVATE"}],
         asset_count=0,
@@ -80,19 +81,31 @@ def test_exact_retained_scope_refuses_foreign_state(
     assert not runner.source861_scope_matches(*objects)
 
 
-def test_stored_concrete_issue_prevents_any_original_or_model_read() -> None:
+@pytest.mark.parametrize(
+    "failure", [None, "env", "run_missing", "ownership", "source_spec"]
+)
+def test_stored_concrete_issue_prevents_any_original_or_model_read(
+    failure: str | None,
+) -> None:
     from onyx.db import amendment_sources, document_set, regulatory_annex_acceptance
     from onyx.db.engine import sql_engine
     from onyx.file_store import file_store
     from onyx.llm import factory
 
     run, package, scope = scope_objects()
+    if failure == "ownership":
+        scope.is_public = True
+    if failure == "source_spec":
+        package.issues = [{"code": "acquisition_failed"}]
+        package.input_spec["mime_type"] = "text/plain"
     with contextlib.ExitStack() as stack:
         stack.enter_context(
             patch.dict(
                 "os.environ",
                 {
-                    "POSTGRES_DB": "customs-regulations-dev",
+                    "POSTGRES_DB": "customs-regulations-test"
+                    if failure == "env"
+                    else "customs-regulations-dev",
                     "REGULATORY_ANNEX_ENVIRONMENT": "dev",
                     "PGOPTIONS": "-c default_transaction_read_only=on",
                 },
@@ -103,7 +116,12 @@ def test_stored_concrete_issue_prevents_any_original_or_model_read() -> None:
         )
         stack.enter_context(patch.object(sql_engine, "get_session_with_current_tenant"))
         stack.enter_context(
-            patch.object(runner, "load_source861_canary", return_value=run, create=True)
+            patch.object(
+                runner,
+                "load_source861_canary",
+                return_value=None if failure == "run_missing" else run,
+                create=True,
+            )
         )
         stack.enter_context(
             patch.object(amendment_sources, "get_source_package", return_value=package)
@@ -122,15 +140,22 @@ def test_stored_concrete_issue_prevents_any_original_or_model_read() -> None:
         llm = stack.enter_context(patch.object(factory, "get_default_llm_with_vision"))
         result = report()
         runner.reproduce_source861(result)
-    assert result["status"] == "stored_issues_only"
-    assert result["issues"] == ["parse_failed"]
+    if failure:
+        assert result["status"] == "scope_refused"
+        assert result["scope_failure"] == failure
+    else:
+        assert result["status"] == "stored_issues_only"
+        assert result["issues"] == ["parse_failed"]
     assert "PRIVATE" not in json.dumps(result)
     store.assert_not_called()
     llm.assert_not_called()
-    assert (
-        engine.call_args.kwargs["connect_args"]["options"]
-        == "-c default_transaction_read_only=on"
-    )
+    if failure != "env":
+        assert (
+            engine.call_args.kwargs["connect_args"]["options"]
+            == "-c default_transaction_read_only=on"
+        )
+    else:
+        engine.assert_not_called()
     runner.validate_source861_report(result)
 
 
@@ -162,6 +187,7 @@ def test_safe_failure_preserves_known_code_and_schema_without_values() -> None:
         ("prompt", "PRIVATE"),
         ("issues", ["PRIVATE"]),
         ("database_read_only", False),
+        ("scope_failure", "PRIVATE"),
     ],
 )
 def test_output_rejects_unbounded_or_unexpected_fields(key: str, value: Any) -> None:
@@ -506,6 +532,27 @@ def test_generic_failure_requires_original_hash_and_vertex_before_preparation(
         assert result["status"] == (
             "scope_refused" if mode == "hash_mismatch" else mode
         )
+        if mode == "hash_mismatch":
+            assert result["scope_failure"] == "source_hash"
         prepare.assert_not_called()
         acquire.assert_not_called()
         model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "seconds,expected",
+    [(-0.001, False), (0, True), (51.249413, True), (720, True), (720.001, False)],
+)
+def test_source861_package_creation_follows_exact_run_window(
+    seconds: float, expected: bool
+) -> None:
+    run, package, scope = scope_objects()
+    package.created_at = run.created_at + datetime.timedelta(seconds=seconds)
+    assert runner.source861_scope_matches(run, package, scope) is expected
+
+
+def test_source861_exact_run_timestamp_is_required() -> None:
+    run, package, scope = scope_objects()
+    assert runner.source861_scope_matches(run, package, scope)
+    run.created_at += datetime.timedelta(microseconds=1)
+    assert not runner.source861_scope_matches(run, package, scope)

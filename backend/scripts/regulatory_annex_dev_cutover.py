@@ -2153,6 +2153,9 @@ SOURCE861_RUNTIME = "8612398f20e5d3d03d154fffa196c5bf951b1862"
 
 
 def source861_scope_matches(run: Any, package: Any, scope: Any) -> bool:
+    from datetime import datetime, timedelta
+
+    expected_created = datetime.fromisoformat("2026-09-11T15:56:39.875587+00:00")
     return bool(
         run.release_sha == "8612398f20e5d3d03d154fffa196c5bf951b1862"
         and str(run.run_id) == "5950d8bc-5dac-443b-b143-8494d0b082d1"
@@ -2167,7 +2170,10 @@ def source861_scope_matches(run: Any, package: Any, scope: Any) -> bool:
         and package.environment == "dev"
         and package.created_by == run.user_id
         and package.idempotency_key == "annex-canary-" + str(run.run_id)
-        and package.created_at.isoformat().startswith("2026-09-11T15:56:39.")
+        and run.created_at == expected_created
+        and run.created_at
+        <= package.created_at
+        <= run.created_at + timedelta(seconds=720)
         and scope is not None
         and not scope.is_public
         and scope.user_id == run.user_id
@@ -2316,6 +2322,7 @@ def reproduce_source861(report: dict[str, Any]) -> None:
         or os.environ.get("REGULATORY_ANNEX_ENVIRONMENT") != "dev"
         or os.environ.get("PGOPTIONS") != "-c default_transaction_read_only=on"
     ):
+        report["scope_failure"] = "env"
         return
     set_is_ee_based_on_env_variable()
     CURRENT_TENANT_ID_CONTEXTVAR.set("public")
@@ -2330,6 +2337,7 @@ def reproduce_source861(report: dict[str, Any]) -> None:
         with get_session_with_current_tenant() as session:
             run = load_source861_canary(session)
             if run is None:
+                report["scope_failure"] = "run_missing"
                 return
             package = get_source_package(
                 session,
@@ -2339,6 +2347,7 @@ def reproduce_source861(report: dict[str, Any]) -> None:
             )
             scope = get_document_set_by_id(session, 23)
             if not source861_scope_matches(run, package, scope) or package is None:
+                report["scope_failure"] = "ownership"
                 return
             report.update(
                 package_status=package.status,
@@ -2365,11 +2374,13 @@ def reproduce_source861(report: dict[str, Any]) -> None:
             or spec.get("url")
             or spec.get("base_url")
         ):
+            report["scope_failure"] = "source_spec"
             return
         with get_default_file_store().read_file(input_file_id) as stream:
             content = stream.read(25 * 1024 * 1024 + 1)
         expected = "c5a20c8fd76d3dbd4983ceeaacc44eef217716427adec8716475ac5a753a0557"
         if hashlib.sha256(content).hexdigest() != expected:
+            report["scope_failure"] = "source_hash"
             return
         report["original_sha256"] = expected
         if configuration["vision_provider"] != "vertex_ai":
@@ -2495,6 +2506,7 @@ def reproduce_source861(report: dict[str, Any]) -> None:
 
 def validate_source861_report(report: Any) -> None:
     keys = {
+        "scope_failure",
         "stage",
         "status",
         "database_read_only",
@@ -2525,6 +2537,11 @@ def validate_source861_report(report: Any) -> None:
         "loc",
     }
     words = {
+        "env",
+        "run_missing",
+        "ownership",
+        "source_spec",
+        "source_hash",
         "source861",
         "scope_refused",
         "stored_issues_only",
@@ -2606,6 +2623,14 @@ def validate_source861_report(report: Any) -> None:
             if set(value) - keys:
                 raise CutoverRefusal("fixed_diagnostic_report_required")
             for key, child in value.items():
+                if key == "scope_failure" and child not in {
+                    "env",
+                    "run_missing",
+                    "ownership",
+                    "source_spec",
+                    "source_hash",
+                }:
+                    raise CutoverRefusal("fixed_diagnostic_report_required")
                 if key == "failure_detail":
                     if not isinstance(child, str) or len(child) > 4000:
                         raise CutoverRefusal("fixed_diagnostic_report_required")
