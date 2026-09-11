@@ -281,16 +281,31 @@ class Driver:
         *,
         acceptance_phase: str | None = None,
     ) -> str:
-        result = subprocess.run(
-            args, input=stdin, text=True, capture_output=True, timeout=timeout
+        operation = (
+            next(
+                (part for part in args[1:] if part in {"exec", "rollout", "get"}),
+                "other",
+            )
+            if args[0] == "kubectl"
+            else "other"
         )
+        try:
+            result = subprocess.run(
+                args, input=stdin, text=True, capture_output=True, timeout=timeout
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            print(f"command_transport_failed:{args[0]}:{operation}", flush=True)
+            raise CutoverRefusal(
+                f"command_transport_failed:{args[0]}:{operation}"
+            ) from None
         if acceptance_phase is not None:
             if acceptance_phase not in {"preflight", "canary"}:
                 raise CutoverRefusal("fixed_acceptance_phase_required")
             emit_acceptance_report(result.stdout, acceptance_phase, self.sha)
         if result.returncode:
             # kubectl/provider errors can contain credentials or source text.
-            raise CutoverRefusal(f"command_failed:{args[0]}")
+            print(f"command_failed:{args[0]}:{operation}", flush=True)
+            raise CutoverRefusal(f"command_failed:{args[0]}:{operation}")
         return result.stdout.strip()
 
     def kubectl(self, *args: str, stdin: str | None = None) -> str:
@@ -597,76 +612,120 @@ class Driver:
 
     def verify_runtime(self, *, readiness: bool = True) -> None:
         for app in APPS:
-            deadline = time.monotonic() + 180
-            while True:
-                pods = self.pods(app)
-                wrong_sha = sum(
-                    sum(
-                        container["image"] == f"{REPOSITORY}:{self.sha}"
-                        for container in pod["spec"]["containers"]
-                    )
-                    != 1
-                    for pod in pods
+            self.verify_app(app, readiness=readiness)
+
+    def verify_app(self, app: str, *, readiness: bool = True) -> None:
+        if app not in APPS:
+            raise CutoverRefusal("fixed_runtime_app_required")
+        worker_required = app == "background" and readiness
+        deadline = time.monotonic() + (600 if worker_required else 180)
+        while True:
+            pods = self.pods(app)
+            wrong_sha = sum(
+                sum(
+                    container["image"] == f"{REPOSITORY}:{self.sha}"
+                    for container in pod["spec"]["containers"]
                 )
-                if wrong_sha:
-                    raise CutoverRefusal("compatible_exact_SHA_required")
-                if any(
-                    item.get("restartCount", 0)
-                    for pod in pods
-                    for item in pod["status"].get("containerStatuses", [])
+                != 1
+                for pod in pods
+            )
+            if wrong_sha:
+                raise CutoverRefusal("compatible_exact_SHA_required")
+            if any(
+                item.get("restartCount", 0)
+                for pod in pods
+                for item in pod["status"].get("containerStatuses", [])
+            ):
+                raise CutoverRefusal("new_pod_restarted")
+            if (
+                len(pods) == 1
+                and self.ready(pods[0])
+                and not pods[0]["metadata"].get("deletionTimestamp")
+            ):
+                # A Ready survivor must expose the same restart evidence as before.
+                if not pods[0]["status"].get("containerStatuses"):
+                    raise CutoverRefusal("runtime_container_status_required")
+                if not worker_required:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CutoverRefusal("worker_readiness_timeout")
+                if self.worker_readiness_probe(
+                    pods[0], timeout=min(60, max(1, int(remaining)))
                 ):
-                    raise CutoverRefusal("new_pod_restarted")
-                if (
-                    len(pods) == 1
-                    and self.ready(pods[0])
-                    and not pods[0]["metadata"].get("deletionTimestamp")
-                ):
-                    # A Ready survivor must expose the same restart evidence as before.
-                    if not pods[0]["status"].get("containerStatuses"):
-                        raise CutoverRefusal("runtime_container_status_required")
                     break
                 if time.monotonic() >= deadline:
-                    print(
-                        json.dumps(
-                            {
-                                "stage": "runtime_settle_timeout",
-                                "app": app,
-                                "pods": len(pods),
-                                "ready": sum(self.ready(pod) for pod in pods),
-                                "deleting": sum(
-                                    bool(pod["metadata"].get("deletionTimestamp"))
-                                    for pod in pods
-                                ),
-                                "wrong_sha": wrong_sha,
-                            },
-                            sort_keys=True,
-                        )
+                    raise CutoverRefusal("worker_readiness_timeout")
+                time.sleep(5)
+                continue
+            if time.monotonic() >= deadline:
+                print(
+                    json.dumps(
+                        {
+                            "stage": "runtime_settle_timeout",
+                            "app": app,
+                            "pods": len(pods),
+                            "ready": sum(self.ready(pod) for pod in pods),
+                            "deleting": sum(
+                                bool(pod["metadata"].get("deletionTimestamp"))
+                                for pod in pods
+                            ),
+                            "wrong_sha": wrong_sha,
+                        },
+                        sort_keys=True,
                     )
-                    raise CutoverRefusal("one_ready_compatible_pod_required")
-                time.sleep(2)
-            pod = pods[0]
-            containers = [
-                item
-                for item in pod["spec"]["containers"]
-                if item["image"] == f"{REPOSITORY}:{self.sha}"
-            ]
-            if app == "background" and readiness:
-                self.command(
-                    [
-                        "kubectl",
-                        "--namespace",
-                        NAMESPACE,
-                        "exec",
-                        pod["metadata"]["name"],
-                        "-c",
-                        containers[0]["name"],
-                        "--",
-                        "sh",
-                        "-eu",
-                        "-c",
-                        ". /vault/secrets/config; exec python -m onyx.background.celery.regulatory_annex_readiness",
-                    ]
                 )
+                raise CutoverRefusal("one_ready_compatible_pod_required")
+            time.sleep(2)
+
+    def worker_readiness_probe(self, pod: dict[str, Any], *, timeout: int) -> bool:
+        container = next(
+            item
+            for item in pod["spec"]["containers"]
+            if item["image"] == f"{REPOSITORY}:{self.sha}"
+        )
+        args = [
+            "kubectl",
+            "--namespace",
+            NAMESPACE,
+            "exec",
+            pod["metadata"]["name"],
+            "-c",
+            container["name"],
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            ". /vault/secrets/config; exec python -m onyx.background.celery.regulatory_annex_readiness",
+        ]
+        try:
+            result = subprocess.run(
+                args, text=True, capture_output=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            print("NOT_READY annex_worker ProbeTimeout", flush=True)
+            return False
+        except OSError:
+            print("NOT_READY annex_worker ExecTransportFailure", flush=True)
+            raise CutoverRefusal("command_failed:kubectl:exec") from None
+        reports = [
+            line
+            for line in result.stdout.splitlines()
+            if line.startswith(("READY annex_worker", "NOT_READY annex_worker"))
+        ]
+        ready = "READY annex_worker scoped_queues registered_handlers concurrency_one"
+        if len(reports) == 1:
+            report = reports[0]
+            if result.returncode == 0 and report == ready:
+                print(ready, flush=True)
+                return True
+            if result.returncode == 1 and re.fullmatch(
+                r"NOT_READY annex_worker [A-Za-z_][A-Za-z0-9_]{0,99}", report
+            ):
+                print(report, flush=True)
+                return False
+        print("NOT_READY annex_worker InvalidFixedReport", flush=True)
+        raise CutoverRefusal("worker_readiness_report_required:kubectl:exec")
 
     def delete_probe(self) -> None:
         self.kubectl(
@@ -1055,7 +1114,10 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
 
 def deploy_same_image(driver: Driver, enabled: bool) -> None:
     render_values(enabled)
-    for app in APPS:
+    for app in ("background", "api") if enabled else APPS:
+        print(
+            f"ACTIVATION_STAGE {app}_{'enable' if enabled else 'disable'}", flush=True
+        )
         args = [
             "helm",
             "upgrade",
@@ -1080,6 +1142,9 @@ def deploy_same_image(driver: Driver, enabled: bool) -> None:
             f"deployment/dev-customs-regulations-{app}-deployment",
             "--timeout=600s",
         )
+        if enabled and app == "background":
+            print("ACTIVATION_STAGE background_readiness", flush=True)
+            driver.verify_app("background")
 
 
 def verify_or_activate(driver: Driver, activate: bool) -> None:
@@ -1094,11 +1159,14 @@ def verify_or_activate(driver: Driver, activate: bool) -> None:
     if activate:
         try:
             deploy_same_image(driver, True)
+            print("ACTIVATION_STAGE final_runtime", flush=True)
             driver.verify_runtime()
             verify_frontend(driver)
+            print("ACTIVATION_STAGE canary", flush=True)
             acceptance(driver, "canary")
         except Exception:
             # Same reviewed binary; disable creation without undoing protected data.
+            print("ACTIVATION_STAGE fallback_disable", flush=True)
             deploy_same_image(driver, False)
             raise
 

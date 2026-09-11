@@ -1060,13 +1060,13 @@ def test_runtime_waits_for_all_old_pods_then_checks_worker() -> None:
                 [runtime_pod()],
             ],
         ),
-        patch.object(driver, "command") as command,
+        patch.object(driver, "worker_readiness_probe", return_value=True) as command,
         patch("time.sleep") as sleep,
     ):
         driver.verify_runtime()
     assert sleep.call_count == 3
     assert command.call_count == 1
-    assert "regulatory_annex_readiness" in command.call_args.args[0][-1]
+    assert command.call_args.kwargs["timeout"] <= 60
 
 
 @pytest.mark.parametrize(
@@ -1304,3 +1304,175 @@ def test_runner_comparison_requires_authentication_before_request(
     ):
         cutover.require_runner_compatibility("a" * 40, "b" * 40)
     request.assert_not_called()
+
+
+def test_worker_waits_for_fixed_readiness_and_rechecks_pods(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    driver = cutover.Driver("a" * 40)
+    pending = cutover.subprocess.CompletedProcess(
+        [],
+        1,
+        "private startup log\nNOT_READY annex_worker ValueError\n",
+        "secret stderr",
+    )
+    ready = cutover.subprocess.CompletedProcess(
+        [],
+        0,
+        "READY annex_worker scoped_queues registered_handlers concurrency_one\n",
+        "",
+    )
+    with (
+        patch.object(driver, "pods", return_value=[runtime_pod()]) as pods,
+        patch.object(cutover.subprocess, "run", side_effect=[pending, ready]) as run,
+        patch("time.sleep") as sleep,
+    ):
+        driver.verify_app("background")
+    assert pods.call_count == 2 and sleep.call_count == 1
+    assert run.call_args.kwargs["timeout"] <= 60
+    output = capsys.readouterr().out
+    assert (
+        "NOT_READY annex_worker ValueError" in output and "READY annex_worker" in output
+    )
+    assert "private" not in output and "secret" not in output
+
+
+@pytest.mark.parametrize(
+    "code,stdout",
+    [
+        (0, ""),
+        (1, ""),
+        (0, "NOT_READY annex_worker ValueError"),
+        (1, "READY annex_worker scoped_queues registered_handlers concurrency_one"),
+        (0, "READY annex_worker wrong"),
+        (1, "NOT_READY annex_worker ValueError secret"),
+    ],
+)
+def test_worker_rejects_missing_or_invalid_fixed_report(
+    code: int, stdout: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(driver, "pods", return_value=[runtime_pod()]),
+        patch.object(
+            cutover.subprocess,
+            "run",
+            return_value=cutover.subprocess.CompletedProcess(
+                [], code, stdout, "secret"
+            ),
+        ),
+        pytest.raises(cutover.CutoverRefusal, match="worker_readiness_report_required"),
+    ):
+        driver.verify_app("background")
+    assert "secret" not in capsys.readouterr().out
+
+
+def test_worker_never_ignores_restart_while_waiting() -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(
+            driver, "pods", side_effect=[[runtime_pod()], [runtime_pod(restarts=1)]]
+        ),
+        patch.object(
+            cutover.subprocess,
+            "run",
+            return_value=cutover.subprocess.CompletedProcess(
+                [], 1, "NOT_READY annex_worker ValueError", ""
+            ),
+        ) as run,
+        patch("time.sleep"),
+        pytest.raises(cutover.CutoverRefusal, match="new_pod_restarted"),
+    ):
+        driver.verify_app("background")
+    assert run.call_count == 1
+
+
+def test_worker_timeout_is_bounded_and_safe(capsys: pytest.CaptureFixture[str]) -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(driver, "pods", return_value=[runtime_pod()]),
+        patch.object(
+            cutover.subprocess,
+            "run",
+            side_effect=cutover.subprocess.TimeoutExpired("secret", 60),
+        ),
+        patch("time.monotonic", side_effect=[0, 1, 601]),
+        patch("time.sleep") as sleep,
+        pytest.raises(cutover.CutoverRefusal, match="worker_readiness_timeout"),
+    ):
+        driver.verify_app("background")
+    sleep.assert_not_called()
+    assert "secret" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "enabled,order", [(True, ["background", "api"]), (False, ["api", "background"])]
+)
+def test_activation_consumer_ready_before_api_creation(
+    enabled: bool, order: list[str]
+) -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    with patch.object(cutover, "render_values"):
+        cutover.deploy_same_image(driver, enabled)
+    events = [
+        call for call in driver.method_calls if call[0] in {"command", "verify_app"}
+    ]
+    assert events[0].args[0][3] == f"customs-regulations-{order[0]}-dev"
+    if enabled:
+        assert events[1][0] == "verify_app" and events[1].args == ("background",)
+        assert events[2].args[0][3] == "customs-regulations-api-dev"
+    else:
+        assert events[1].args[0][3] == "customs-regulations-background-dev"
+
+
+def test_failed_consumer_admission_never_enables_api() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    driver.verify_app.side_effect = cutover.CutoverRefusal("worker_readiness_timeout")
+    with patch.object(cutover, "render_values"), pytest.raises(cutover.CutoverRefusal):
+        cutover.deploy_same_image(driver, True)
+    assert driver.command.call_count == 1
+    assert "background" in driver.command.call_args.args[0][3]
+
+
+@pytest.mark.parametrize("operation", ["exec", "get", "rollout"])
+@pytest.mark.parametrize("transport", [False, True])
+def test_command_failure_exposes_only_safe_operation(
+    operation: str, transport: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    driver = cutover.Driver("a" * 40)
+    result = cutover.subprocess.CompletedProcess(
+        [], 1, "secret stdout", "secret stderr"
+    )
+    with (
+        patch.object(
+            cutover.subprocess,
+            "run",
+            side_effect=OSError("secret") if transport else None,
+            return_value=result,
+        ),
+        pytest.raises(cutover.CutoverRefusal, match="kubectl:" + operation),
+    ):
+        driver.command(
+            ["kubectl", "--namespace", cutover.NAMESPACE, operation, "private"]
+        )
+    output = capsys.readouterr().out
+    assert (
+        "kubectl:" + operation in output
+        and "secret" not in output
+        and "private" not in output
+    )
+
+
+def test_worker_exec_transport_failure_has_safe_diagnostic(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(driver, "pods", return_value=[runtime_pod()]),
+        patch.object(cutover.subprocess, "run", side_effect=OSError("secret")),
+        pytest.raises(cutover.CutoverRefusal, match="kubectl:exec"),
+    ):
+        driver.verify_app("background")
+    assert capsys.readouterr().out == "NOT_READY annex_worker ExecTransportFailure\n"
