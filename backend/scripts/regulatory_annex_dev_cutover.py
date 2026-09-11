@@ -126,6 +126,28 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
         "source_assets",
         "review_sha256",
         "approval_count",
+        "publication_generation",
+        "canonical_changes",
+        "context_consumers",
+        "embeddings",
+        "exact_vector_reuses",
+        "historical_projections",
+        "retired_projections",
+        "total_projections",
+        "cleanup_complete",
+        "creation_intents",
+        "kind",
+        "marker",
+        "artifact_id",
+        "retained_objects",
+        "id",
+        "index_uuid",
+        "vision_roles",
+        "side",
+        "position",
+        "table_role",
+        "source_sha256",
+        "locator_sha256",
         "ordinary_markdown_upload_index_attachment_chat",
         "acceptance_passed",
         "retained_tombstones",
@@ -166,7 +188,7 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
                 if key in keys
             }
         if isinstance(value, list):
-            if len(value) > 100:
+            if len(value) > (512 if parent == "retained_objects" else 100):
                 raise CutoverRefusal("acceptance_report_list_exceeded")
             return [sanitize(item, parent, depth + 1) for item in value]
         if value is None or isinstance(value, (bool, int, float)):

@@ -166,3 +166,176 @@ def test_preflight_prints_failed_calibration_once_before_gate_failure(
     assert report["status"] == "failed"
     assert report["calibration"]["cases"] == [{"supported": False}]
     calibration.assert_called_once_with()
+
+
+@pytest.mark.parametrize("kind", ["chat", "markdown"])
+def test_lost_creation_response_recovers_from_precommitted_intent(
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+    from uuid import uuid4
+
+    import httpx
+
+    from onyx.db import regulatory_annex_acceptance as ownership
+    from onyx.regulatory.amendments.annexes import acceptance_canary as canary
+
+    run = ownership.CanaryRun(release_sha="a" * 40, user_id=uuid4(), document_set_id=42)
+    durable: dict[str, object] = {}
+    created: list[object] = []
+
+    def save(value: ownership.CanaryRun) -> None:
+        durable.update(value.model_dump(mode="json"))
+
+    def server_committed_response_lost(*_args: object, **_kwargs: object) -> None:
+        persisted = ownership.CanaryRun.model_validate(durable)
+        assert len(persisted.creation_intents) == 1
+        assert persisted.creation_intents[0].kind == kind
+        assert persisted.creation_intents[0].artifact_id is None
+        created.append(uuid4())
+        raise httpx.ReadTimeout("response lost after commit")
+
+    monkeypatch.setattr(canary, "save_canary", save)
+    monkeypatch.setattr(ownership, "save_canary", save)
+    monkeypatch.setattr(canary, "request_json", server_committed_response_lost)
+    with httpx.Client() as client:
+        with pytest.raises(httpx.ReadTimeout):
+            if kind == "chat":
+                canary.create_canary_chat(client, run, purpose="dated 2026-09-09")
+            else:
+                canary.upload_canary_markdown(client, run)
+    recovered = ownership.CanaryRun.model_validate(durable)
+    monkeypatch.setattr(ownership, "matching_creation_ids", Mock(return_value=created))
+    assert ownership.recover_creation_intents(recovered) is True
+    assert recovered.creation_intents[0].artifact_id == created[0]
+    identifiers = recovered.chat_ids if kind == "chat" else recovered.markdown_file_ids
+    assert identifiers == created
+
+
+def test_unresolved_creation_never_claims_cleaned_or_zero_live_projections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+    from uuid import uuid4
+
+    from onyx.db import regulatory_annex_acceptance as ownership
+    from onyx.db import regulatory_writer_publication
+    from onyx.regulatory.amendments.annexes import acceptance_canary as canary
+
+    run = ownership.CanaryRun(release_sha="a" * 40, user_id=uuid4())
+    monkeypatch.setattr(canary, "recover_creation_intents", Mock(return_value=False))
+    monkeypatch.setattr(canary, "save_canary", Mock())
+    monkeypatch.setattr(
+        regulatory_writer_publication, "writer_file_exists", Mock(return_value=False)
+    )
+    monkeypatch.setattr(
+        canary, "canary_file_state", Mock(return_value={"file_exists": False})
+    )
+    monkeypatch.setattr(canary, "index_evidence", Mock(return_value=[]))
+    monkeypatch.setattr(canary, "cleanup_empty_canary_scope", Mock())
+    monkeypatch.setattr(canary, "retained_canary_audit", Mock(return_value=[]))
+    with pytest.raises(ValueError, match="canary_creation_unresolved"):
+        canary.cleanup_canary(run)
+    assert run.phase == "cleanup_incomplete"
+    assert run.evidence["cleanup_complete"] is False
+    assert "cleanup_live_projections" not in run.evidence
+
+
+@pytest.mark.parametrize("matches_count", [0, 2])
+def test_uncertain_creation_requires_exactly_one_owned_match(
+    matches_count: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+    from uuid import uuid4
+
+    from onyx.db import regulatory_annex_acceptance as ownership
+
+    run = ownership.CanaryRun(release_sha="a" * 40, user_id=uuid4())
+    run.creation_intents = [
+        ownership.CreationIntent(
+            kind="markdown", marker="ANNEXCANARY" + run.run_id.hex + ".md"
+        )
+    ]
+    monkeypatch.setattr(
+        ownership,
+        "matching_creation_ids",
+        Mock(return_value=[uuid4() for _ in range(matches_count)]),
+    )
+    monkeypatch.setattr(ownership, "save_canary", Mock())
+    assert ownership.recover_creation_intents(run) is False
+    assert run.creation_intents[0].artifact_id is None
+    assert run.markdown_file_ids == []
+
+
+def test_retained_source_scope_cannot_hide_remaining_upload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, Mock
+    from uuid import uuid4
+
+    from onyx.db import regulatory_annex_acceptance as ownership
+    from onyx.file_store import file_store
+
+    run = ownership.CanaryRun(release_sha="a" * 40, user_id=uuid4(), document_set_id=42)
+    session = MagicMock()
+    session.get.return_value = SimpleNamespace(
+        id=42,
+        name=run.name,
+        user_id=run.user_id,
+        is_public=False,
+        user_files=[object()],
+    )
+    session.scalar.return_value = uuid4()
+    context = MagicMock()
+    context.__enter__.return_value = session
+    monkeypatch.setattr(
+        ownership, "get_session_with_current_tenant", Mock(return_value=context)
+    )
+    monkeypatch.setattr(file_store, "get_default_file_store", Mock(return_value=Mock()))
+    with pytest.raises(ValueError, match="canary_cleanup_scope_still_has_files"):
+        ownership.cleanup_empty_canary_scope(run)
+    assert "retained_source_scope" not in run.evidence
+
+
+@pytest.mark.parametrize("include_header", [True, False])
+def test_canary_retains_actual_explicit_vision_roles(
+    include_header: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+    from uuid import uuid4
+
+    from onyx.db.regulatory_annex_acceptance import CanaryRun
+    from onyx.regulatory.amendments.annexes import acceptance_canary as canary
+
+    run = CanaryRun(release_sha="a" * 40, user_id=uuid4())
+    monkeypatch.setattr(canary, "save_canary", Mock())
+    elements = [
+        {
+            "kind": "table_cell",
+            "extraction_method": "vision",
+            "table_role": role,
+            "locator": {"page": 1},
+        }
+        for role in (["column_header", "data"] if include_header else ["data"])
+    ]
+    review = {
+        "review_payload": {
+            "old_extraction": {"source_sha256": "b" * 64, "elements": []},
+            "new_extraction": {"source_sha256": "c" * 64, "elements": elements},
+        }
+    }
+    if not include_header:
+        with pytest.raises(
+            ValueError, match="canary_explicit_vision_header_and_data_required"
+        ):
+            canary.record_vision_roles(run, review)
+    else:
+        canary.record_vision_roles(run, review)
+        assert [item["table_role"] for item in run.vision_roles] == [
+            "column_header",
+            "data",
+        ]
+        assert [item["position"] for item in run.vision_roles] == [0, 1]
+        assert all(item["source_sha256"] == "c" * 64 for item in run.vision_roles)

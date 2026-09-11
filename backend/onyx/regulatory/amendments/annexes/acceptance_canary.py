@@ -11,12 +11,16 @@ import httpx
 
 from onyx.db.regulatory_annex_acceptance import (
     CanaryRun,
+    CreationIntent,
+    RetainedArtifact,
     bootstrap_canary_file,
     canary_file_state,
     canary_index_names,
     cleanup_empty_canary_scope,
     issue_canary_token,
+    recover_creation_intents,
     reserve_canary,
+    retained_canary_audit,
     revoke_canary_token,
     save_canary,
 )
@@ -164,11 +168,42 @@ def prepare_review(
         run.batch_id = int(result["id"])
         save_canary(run)
     review = wait_review(client, run, deadline)
+    record_vision_roles(run, review)
     run.review_id = UUID(review["id"])
     run.phase = "review_ready"
     run.evidence["review_sha256"] = review["review_sha256"]
     save_canary(run)
     return review
+
+
+def record_vision_roles(run: CanaryRun, review: dict[str, Any]) -> None:
+    roles: list[dict[str, str | int]] = []
+    for side in ("old", "new"):
+        extraction = review["review_payload"][side + "_extraction"]
+        for position, element in enumerate(extraction["elements"]):
+            role = element.get("table_role", "unknown")
+            if element["extraction_method"] != "vision" or role == "unknown":
+                continue
+            if element["kind"] != "table_cell" or role not in {"column_header", "data"}:
+                raise ValueError("canary_invalid_vision_table_role")
+            roles.append(
+                {
+                    "side": side,
+                    "source_sha256": extraction["source_sha256"],
+                    "position": position,
+                    "table_role": role,
+                    "locator_sha256": hashlib.sha256(
+                        json.dumps(element["locator"], sort_keys=True).encode()
+                    ).hexdigest(),
+                }
+            )
+    if len(roles) > 100 or {item["table_role"] for item in roles} != {
+        "column_header",
+        "data",
+    }:
+        raise ValueError("canary_explicit_vision_header_and_data_required")
+    run.vision_roles = roles
+    save_canary(run)
 
 
 def approve_review(
@@ -208,6 +243,12 @@ def cleanup_canary(run: CanaryRun) -> None:
     )
     from shared_configs.contextvars import get_current_tenant_id
 
+    resolved = recover_creation_intents(run)
+    run.retained_objects = retained_canary_audit(run)
+    run.phase = "cleanup_incomplete"
+    run.evidence["cleanup_complete"] = False
+    run.evidence.pop("cleanup_live_projections", None)
+    save_canary(run)
     tenant = get_current_tenant_id()
     for identifier in [run.file_id, *run.markdown_file_ids]:
         if writer_file_exists(identifier, tenant):
@@ -222,9 +263,24 @@ def cleanup_canary(run: CanaryRun) -> None:
             raise ValueError("fictional_cleanup_live_search_projection_remains")
         time.sleep(1)
         snapshot = index_evidence(run)
-    run.evidence["retained_tombstones"] = len(snapshot)
-    run.evidence["cleanup_live_projections"] = 0
     cleanup_empty_canary_scope(run)
+    run.retained_objects = retained_canary_audit(run) + [
+        RetainedArtifact(
+            kind="tombstone",
+            id=item["id"],
+            index_name=item["index"],
+            index_uuid=item["index_uuid"],
+        )
+        for item in snapshot
+    ]
+    if len(run.retained_objects) > 512:
+        raise ValueError("canary_retained_object_bound_exceeded")
+    run.evidence["retained_tombstones"] = len(snapshot)
+    save_canary(run)
+    if not resolved:
+        raise ValueError("canary_creation_unresolved")
+    run.evidence["cleanup_live_projections"] = 0
+    run.evidence["cleanup_complete"] = True
     run.phase = "cleaned"
     save_canary(run)
 
@@ -285,6 +341,56 @@ def index_evidence(run: CanaryRun) -> list[dict[str, Any]]:
     return output
 
 
+def create_canary_chat(client: httpx.Client, run: CanaryRun, *, purpose: str) -> UUID:
+    if purpose not in {"dated 2026-09-09", "dated 2026-09-10", "markdown"}:
+        raise ValueError("canary_chat_purpose_not_supported")
+    marker = run.name + " / " + purpose
+    if any(
+        item.kind == "chat" and item.marker == marker for item in run.creation_intents
+    ):
+        raise ValueError("canary_chat_creation_already_intended")
+    intent = CreationIntent(kind="chat", marker=marker)
+    run.creation_intents.append(intent)
+    save_canary(run)
+    session = request_json(
+        client, "POST", "/chat/create-chat-session", json={"description": marker}
+    )
+    chat_id = UUID(session["chat_session_id"])
+    intent.artifact_id = chat_id
+    run.chat_ids.append(chat_id)
+    save_canary(run)
+    return chat_id
+
+
+def upload_canary_markdown(client: httpx.Client, run: CanaryRun) -> dict[str, Any]:
+    marker = "ANNEXCANARY" + run.run_id.hex
+    if any(item.kind == "markdown" for item in run.creation_intents):
+        raise ValueError("canary_markdown_creation_already_intended")
+    intent = CreationIntent(kind="markdown", marker=marker + ".md")
+    run.creation_intents.append(intent)
+    save_canary(run)
+    result = request_json(
+        client,
+        "POST",
+        f"/admin/document-set/{run.document_set_id}/file/upload",
+        files={
+            "files": (
+                intent.marker,
+                "# Fictional canary\nVerification marker: " + marker,
+                "text/markdown",
+            )
+        },
+    )
+    if result["rejected_files"] or len(result["user_files"]) != 1:
+        raise ValueError("ordinary_markdown_upload_failed")
+    file = result["user_files"][0]
+    identifier = UUID(file["id"])
+    intent.artifact_id = identifier
+    run.markdown_file_ids.append(identifier)
+    save_canary(run)
+    return file
+
+
 def chat_canary(client: httpx.Client, run: CanaryRun, *, as_of: str, rate: str) -> None:
     tools = request_json(client, "GET", "/tool")
     search = next(
@@ -292,12 +398,7 @@ def chat_canary(client: httpx.Client, run: CanaryRun, *, as_of: str, rate: str) 
     )
     if search is None:
         raise ValueError("canary_search_tool_missing")
-    session = request_json(
-        client, "POST", "/chat/create-chat-session", json={"description": run.name}
-    )
-    chat_id = UUID(session["chat_session_id"])
-    run.chat_ids.append(chat_id)
-    save_canary(run)
+    chat_id = create_canary_chat(client, run, purpose="dated " + as_of)
     result = request_json(
         client,
         "POST",
@@ -331,24 +432,8 @@ def chat_canary(client: httpx.Client, run: CanaryRun, *, as_of: str, rate: str) 
 
 def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> None:
     marker = "ANNEXCANARY" + run.run_id.hex
-    result = request_json(
-        client,
-        "POST",
-        f"/admin/document-set/{run.document_set_id}/file/upload",
-        files={
-            "files": (
-                marker + ".md",
-                "# Fictional canary\nVerification marker: " + marker,
-                "text/markdown",
-            )
-        },
-    )
-    if result["rejected_files"] or len(result["user_files"]) != 1:
-        raise ValueError("ordinary_markdown_upload_failed")
-    file = result["user_files"][0]
+    file = upload_canary_markdown(client, run)
     identifier = UUID(file["id"])
-    run.markdown_file_ids.append(identifier)
-    save_canary(run)
     while time.monotonic() < deadline:
         files = request_json(
             client, "GET", f"/admin/document-set/{run.document_set_id}/files"
@@ -367,12 +452,7 @@ def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> No
         time.sleep(1)
     else:
         raise TimeoutError("ordinary_markdown_index_deadline")
-    session = request_json(
-        client, "POST", "/chat/create-chat-session", json={"description": run.name}
-    )
-    chat_id = UUID(session["chat_session_id"])
-    run.chat_ids.append(chat_id)
-    save_canary(run)
+    chat_id = create_canary_chat(client, run, purpose="markdown")
     response = request_json(
         client,
         "POST",
@@ -468,6 +548,12 @@ def run_canary(release_sha: str) -> dict[str, Any]:
                 finally:
                     signal.alarm(0)
                     signal.signal(signal.SIGALRM, previous_handler)
+    if any(
+        key in run.evidence
+        for key in ("cleanup_failure", "chat_cleanup_failure", "token_cleanup_failure")
+    ):
+        run.phase = "cleanup_incomplete"
+        run.evidence["cleanup_complete"] = False
     run.evidence["acceptance_passed"] = not failed
     save_canary(run)
     return {

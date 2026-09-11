@@ -2,6 +2,7 @@
 
 import datetime
 import hashlib
+from typing import Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -9,6 +10,21 @@ from sqlalchemy import select, text
 
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import KVStore, User, UserFile
+
+
+class CreationIntent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["chat", "markdown"]
+    marker: str
+    artifact_id: UUID | None = None
+
+
+class RetainedArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: str
+    id: str
+    index_name: str | None = None
+    index_uuid: str | None = None
 
 
 class CanaryRun(BaseModel):
@@ -24,6 +40,13 @@ class CanaryRun(BaseModel):
     review_id: UUID | None = None
     chat_ids: list[UUID] = Field(default_factory=list)
     markdown_file_ids: list[UUID] = Field(default_factory=list)
+    creation_intents: list[CreationIntent] = Field(default_factory=list, max_length=4)
+    retained_objects: list[RetainedArtifact] = Field(
+        default_factory=list, max_length=512
+    )
+    vision_roles: list[dict[str, str | int]] = Field(
+        default_factory=list, max_length=100
+    )
     phase: str = "reserved"
     created_at: datetime.datetime = Field(
         default_factory=lambda: datetime.datetime.now(datetime.timezone.utc)
@@ -294,9 +317,196 @@ def cleanup_empty_canary_scope(run: CanaryRun) -> None:
             .where(AmendmentSourcePackage.document_set_id == scope.id)
             .limit(1)
         )
+        if scope.user_files:
+            raise ValueError("canary_cleanup_scope_still_has_files")
         if retained_source is not None:
             run.evidence["retained_source_scope"] = scope.id
             return
-        if scope.user_files:
-            raise ValueError("canary_cleanup_scope_still_has_files")
         delete_document_set(scope, session)
+
+
+def matching_creation_ids(run: CanaryRun, intent: CreationIntent) -> list[UUID]:
+    """Resolve only the exact persisted marker inside its authorized owner scope."""
+    from onyx.db.models import ChatSession, DocumentSet, DocumentSet__UserFile
+
+    with get_session_with_current_tenant() as session:
+        if intent.kind == "chat":
+            if intent.marker not in {
+                run.name + " / dated 2026-09-09",
+                run.name + " / dated 2026-09-10",
+                run.name + " / markdown",
+            }:
+                raise ValueError("canary_chat_intent_marker_mismatch")
+            query = select(ChatSession.id).where(
+                ChatSession.user_id == run.user_id,
+                ChatSession.description == intent.marker,
+            )
+        else:
+            if intent.marker != "ANNEXCANARY" + run.run_id.hex + ".md":
+                raise ValueError("canary_upload_intent_marker_mismatch")
+            query = (
+                select(UserFile.id)
+                .join(
+                    DocumentSet__UserFile,
+                    DocumentSet__UserFile.user_file_id == UserFile.id,
+                )
+                .join(
+                    DocumentSet, DocumentSet.id == DocumentSet__UserFile.document_set_id
+                )
+                .where(
+                    UserFile.user_id == run.user_id,
+                    UserFile.name == intent.marker,
+                    DocumentSet.id == run.document_set_id,
+                    DocumentSet.user_id == run.user_id,
+                    DocumentSet.name == run.name,
+                    DocumentSet.is_public.is_(False),
+                )
+            )
+        return list(session.scalars(query.limit(2)).all())
+
+
+def recover_creation_intents(run: CanaryRun) -> bool:
+    complete = True
+    for intent in run.creation_intents:
+        if intent.artifact_id is None:
+            matches = matching_creation_ids(run, intent)
+            if len(matches) != 1:
+                complete = False
+                continue
+            intent.artifact_id = matches[0]
+        identifiers = run.chat_ids if intent.kind == "chat" else run.markdown_file_ids
+        if intent.artifact_id not in identifiers:
+            identifiers.append(intent.artifact_id)
+    save_canary(run)
+    return complete
+
+
+def retained_canary_audit(run: CanaryRun) -> list[RetainedArtifact]:
+    from onyx.db.models import (
+        AmendmentSourcePackage,
+        AnnexChangeSet,
+        DocumentSet,
+        PersonalAccessToken,
+        RegulatoryFilePublication,
+        RegulatorySourceAsset,
+    )
+
+    retained: list[RetainedArtifact] = []
+    with get_session_with_current_tenant() as session:
+        record = session.get(KVStore, run.key)
+        if (
+            record is None
+            or CanaryRun.model_validate(record.value).run_id != run.run_id
+        ):
+            raise ValueError("canary_audit_run_ownership_missing")
+        retained.append(RetainedArtifact(kind="run_record", id=run.key))
+        tokens = list(
+            session.scalars(
+                select(PersonalAccessToken.id)
+                .where(
+                    PersonalAccessToken.user_id == run.user_id,
+                    PersonalAccessToken.name == run.name,
+                )
+                .limit(21)
+            )
+        )
+        if len(tokens) > 20:
+            raise ValueError("canary_audit_token_bound_exceeded")
+        retained.extend(
+            RetainedArtifact(kind="pat_audit", id=str(identifier))
+            for identifier in tokens
+        )
+        scope = (
+            session.get(DocumentSet, run.document_set_id)
+            if run.document_set_id
+            else None
+        )
+        if scope is not None:
+            if (
+                scope.name != run.name
+                or scope.user_id != run.user_id
+                or scope.is_public
+            ):
+                raise ValueError("canary_audit_scope_ownership_mismatch")
+            retained.append(RetainedArtifact(kind="private_scope", id=str(scope.id)))
+            packages = list(
+                session.scalars(
+                    select(AmendmentSourcePackage)
+                    .where(
+                        AmendmentSourcePackage.document_set_id == scope.id,
+                        AmendmentSourcePackage.created_by == run.user_id,
+                    )
+                    .limit(3)
+                )
+            )
+            if len(packages) > 2:
+                raise ValueError("canary_audit_package_bound_exceeded")
+            for package in packages:
+                retained.append(
+                    RetainedArtifact(kind="source_package", id=str(package.id))
+                )
+                for identifier in (package.input_file_id, package.manifest_file_id):
+                    if identifier:
+                        retained.append(
+                            RetainedArtifact(kind="source_blob", id=identifier)
+                        )
+                assets = list(
+                    session.scalars(
+                        select(RegulatorySourceAsset)
+                        .where(
+                            RegulatorySourceAsset.package_id == package.id,
+                        )
+                        .limit(22)
+                    )
+                )
+                if len(assets) > 21:
+                    raise ValueError("canary_audit_asset_bound_exceeded")
+                for asset in assets:
+                    retained.append(
+                        RetainedArtifact(kind="source_asset", id=str(asset.id))
+                    )
+                    for identifier in (asset.file_id, asset.text_file_id):
+                        if identifier:
+                            retained.append(
+                                RetainedArtifact(kind="source_blob", id=identifier)
+                            )
+        reviews = (
+            list(
+                session.scalars(
+                    select(AnnexChangeSet)
+                    .where(
+                        AnnexChangeSet.batch_id == run.batch_id,
+                        AnnexChangeSet.user_file_id == run.file_id,
+                    )
+                    .limit(11)
+                )
+            )
+            if run.batch_id is not None
+            else []
+        )
+        if len(reviews) > 10:
+            raise ValueError("canary_audit_review_bound_exceeded")
+        for review in reviews:
+            retained.append(RetainedArtifact(kind="review", id=str(review.id)))
+            for evidence in review.review_payload.get("evidence", []):
+                retained.append(
+                    RetainedArtifact(kind="review_evidence", id=str(evidence["id"]))
+                )
+                retained.append(
+                    RetainedArtifact(kind="review_blob", id=str(evidence["file_id"]))
+                )
+        owners = session.scalars(
+            select(RegulatoryFilePublication).where(
+                RegulatoryFilePublication.user_file_id.in_(
+                    [run.file_id, *run.markdown_file_ids]
+                ),
+            )
+        )
+        retained.extend(
+            RetainedArtifact(kind="publication_owner", id=str(owner.user_file_id))
+            for owner in owners
+        )
+    unique = {(item.kind, item.id): item for item in retained}
+    if len(unique) > 500:
+        raise ValueError("canary_audit_total_bound_exceeded")
+    return list(unique.values())

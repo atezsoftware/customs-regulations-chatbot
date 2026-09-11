@@ -550,3 +550,68 @@ def test_acceptance_retains_maximum_escaped_unicode_calibration(
         rationale
     ] * 4
     assert emitted["calibration"]["attempt_count_complete"] is True
+
+
+@pytest.mark.parametrize("status", ["passed", "failed"])
+def test_canary_report_retains_publication_and_cleanup_identities(
+    status: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    evidence = {
+        key: value
+        for value, key in enumerate(
+            (
+                "publication_generation",
+                "canonical_changes",
+                "context_consumers",
+                "embeddings",
+                "exact_vector_reuses",
+                "historical_projections",
+                "retired_projections",
+                "total_projections",
+            ),
+            1,
+        )
+    }
+    evidence["cleanup_complete"] = status == "passed"
+    canary = {
+        "evidence": evidence,
+        "retained_objects": [
+            {
+                "kind": "tombstone",
+                "id": "owned-projection",
+                "index_name": "physical-index",
+                "index_uuid": "physical-uuid",
+            },
+            {"kind": "review", "id": "owned-review"},
+        ],
+        "vision_roles": [
+            {
+                "side": "new",
+                "position": 3,
+                "table_role": "column_header",
+                "source_sha256": "b" * 64,
+                "locator_sha256": "c" * 64,
+            }
+        ],
+        "creation_intents": [
+            {"kind": "markdown", "marker": "owned-marker", "artifact_id": None}
+        ],
+        "api_key": "secret",
+    }
+    report = {
+        "phase": "canary",
+        "status": status,
+        "release_sha_metadata": "a" * 40,
+        "canary": canary,
+    }
+    if status == "failed":
+        with pytest.raises(
+            cutover.CutoverRefusal, match="fixed_acceptance_probe_failed"
+        ):
+            cutover.emit_acceptance_report(json.dumps(report), "canary", "a" * 40)
+    else:
+        cutover.emit_acceptance_report(json.dumps(report), "canary", "a" * 40)
+    emitted = json.loads(capsys.readouterr().out)["canary"]
+    assert emitted == {key: value for key, value in canary.items() if key != "api_key"}
