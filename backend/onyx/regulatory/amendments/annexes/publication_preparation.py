@@ -73,7 +73,7 @@ def _target_configuration(
     configuration: dict[str, str | int | float | bool | None] = (
         encoder_model_fingerprint(
             embedder.embedding_model,
-            model_dim=settings.final_embedding_dim,
+            model_dim=settings.final_embedding_dim if snapshot else settings.model_dim,
             formatter="normal-v1",
         )
     )

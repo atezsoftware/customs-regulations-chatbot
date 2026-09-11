@@ -382,7 +382,7 @@ def prepare_owned_correction(
                     texts, actual_configuration = freeze_encoder_inputs(
                         context.embedding_texts,
                         embedder.embedding_model,
-                        model_dim=index.vector_dimension,
+                        model_dim=settings.model_dim,
                         formatter=str(context.embedding_config["formatter"]),
                     )
                     if (
