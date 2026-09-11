@@ -509,7 +509,7 @@ def run_annex_groups(
 
 def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
     from onyx.configs.app_configs import REGULATORY_BATCH_INDEXING_ENABLED
-    from onyx.db.search_settings import get_current_search_settings
+    from onyx.db.regulatory_annex_publication import load_annex_context_settings
     from onyx.indexing.embedder import DefaultIndexingEmbedder
     from onyx.regulatory.indexing_jobs.configuration import (
         resolve_regulatory_indexing_snapshot,
@@ -528,7 +528,7 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         file = require_annex_file_scope(
             session, batch.document_set_id, draft.user_file_id
         )
-        settings = get_current_search_settings(session)
+        settings = load_annex_context_settings(session)
         snapshot = (
             resolve_regulatory_indexing_snapshot(session)
             if REGULATORY_BATCH_INDEXING_ENABLED
@@ -618,7 +618,7 @@ def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
         list_source_assets,
         require_ready_source_package,
     )
-    from onyx.db.search_settings import get_current_search_settings
+    from onyx.db.regulatory_annex_publication import load_annex_context_settings
     from onyx.llm.factory import get_default_llm, get_default_llm_with_vision
     from onyx.regulatory.indexing_jobs.configuration import (
         resolve_regulatory_indexing_snapshot,
@@ -630,7 +630,7 @@ def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
         actual = capture_preparation_configuration(
             session, user_file_id=draft.user_file_id
         )
-        settings = get_current_search_settings(session)
+        settings = load_annex_context_settings(session)
         snapshot = (
             resolve_regulatory_indexing_snapshot(session)
             if REGULATORY_BATCH_INDEXING_ENABLED

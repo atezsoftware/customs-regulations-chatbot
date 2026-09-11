@@ -13,6 +13,15 @@ from onyx.regulatory.amendments.annexes.models import (
 )
 
 
+def load_annex_context_settings(session: Session) -> SearchSettings:
+    """Materialize provider fields before the caller closes its read session."""
+    from onyx.db.search_settings import get_current_search_settings
+
+    settings = get_current_search_settings(session)
+    _ = settings.cloud_provider
+    return settings
+
+
 def load_annex_publication_inputs(
     session: Session, draft: AnnexChangeDraft
 ) -> tuple[UserFile, list[SearchSettings], AnnexProjectionAccess]:
@@ -38,6 +47,8 @@ def load_annex_publication_inputs(
     )
     file = require_annex_file_scope(session, batch.document_set_id, draft.user_file_id)
     settings = get_active_search_settings_list(session)
+    for setting in settings:
+        _ = setting.cloud_provider
     if sum(item.status.is_current() for item in settings) != 1:
         raise ValueError("publication requires one current index")
     identifier = str(file.id)
