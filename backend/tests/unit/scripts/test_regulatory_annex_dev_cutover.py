@@ -1,5 +1,6 @@
 from email.message import Message
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request
@@ -885,8 +886,6 @@ def test_diagnose_alone_can_inspect_an_earlier_exact_runtime(
         cutover.main()
         diagnose.assert_called_once_with(driver, runner)
         for phase in (
-            "annex-activate",
-            "annex-verify",
             "prepare",
             "release",
             "failure",
@@ -1023,3 +1022,285 @@ def test_acceptance_stage_diagnostics_refuse_arbitrary_values(key: str) -> None:
     }
     with pytest.raises(cutover.CutoverRefusal, match="acceptance_.*_refused"):
         cutover.emit_acceptance_report(json.dumps(report), "preflight", "a" * 40)
+
+
+def runtime_pod(
+    *,
+    deleting: bool = False,
+    ready: bool = True,
+    sha: str = "a" * 40,
+    restarts: int = 0,
+) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "name": "private-pod",
+            **({"deletionTimestamp": "now"} if deleting else {}),
+        },
+        "spec": {
+            "containers": [{"name": "main", "image": f"{cutover.REPOSITORY}:{sha}"}]
+        },
+        "status": {
+            "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+            "containerStatuses": [{"restartCount": restarts}],
+        },
+    }
+
+
+def test_runtime_waits_for_all_old_pods_then_checks_worker() -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(
+            driver,
+            "pods",
+            side_effect=[
+                [runtime_pod(deleting=True), runtime_pod()],
+                [],
+                [runtime_pod(ready=False)],
+                [runtime_pod()],
+                [runtime_pod()],
+            ],
+        ),
+        patch.object(driver, "command") as command,
+        patch("time.sleep") as sleep,
+    ):
+        driver.verify_runtime()
+    assert sleep.call_count == 3
+    assert command.call_count == 1
+    assert "regulatory_annex_readiness" in command.call_args.args[0][-1]
+
+
+@pytest.mark.parametrize(
+    "pod,reason",
+    [
+        (runtime_pod(deleting=True, sha="b" * 40), "compatible_exact_SHA_required"),
+        (runtime_pod(restarts=1), "new_pod_restarted"),
+    ],
+)
+def test_runtime_never_waits_away_wrong_images_or_restarts(
+    pod: dict[str, Any], reason: str
+) -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(driver, "pods", return_value=[pod]),
+        patch("time.sleep") as sleep,
+        pytest.raises(cutover.CutoverRefusal, match=reason),
+    ):
+        driver.verify_runtime()
+    sleep.assert_not_called()
+
+
+def test_runtime_timeout_reports_only_safe_counts(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(
+            driver, "pods", return_value=[runtime_pod(deleting=True), runtime_pod()]
+        ),
+        patch("time.monotonic", side_effect=[0, 181]),
+        patch("time.sleep") as sleep,
+        pytest.raises(
+            cutover.CutoverRefusal, match="one_ready_compatible_pod_required"
+        ),
+    ):
+        driver.verify_runtime()
+    sleep.assert_not_called()
+    output = capsys.readouterr().out
+    assert (
+        '"pods": 2' in output
+        and '"deleting": 1' in output
+        and '"ready": 2' in output
+        and '"wrong_sha": 0' in output
+    )
+    assert "private-pod" not in output
+
+
+def runner_comparison() -> dict[str, Any]:
+    return {
+        "status": "ahead",
+        "ahead_by": 1,
+        "behind_by": 0,
+        "total_commits": 1,
+        "base_commit": {"sha": "a" * 40},
+        "merge_base_commit": {"sha": "a" * 40},
+        "commits": [{"sha": "b" * 40}],
+        "files": [
+            {
+                "filename": "backend/scripts/regulatory_annex_dev_cutover.py",
+                "status": "modified",
+            }
+        ],
+    }
+
+
+def comparison_response(
+    body: dict[str, Any], *, status: int = 200, link: str = ""
+) -> Mock:
+    import json
+
+    response = Mock()
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    response.status = status
+    response.headers = {"Link": link}
+    response.read.return_value = json.dumps(body).encode()
+    return response
+
+
+def test_runner_comparison_authenticates_exact_pins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", "atezsoftware/customs-regulations-chatbot")
+    monkeypatch.setenv("GH_TOKEN", "test-only")
+    with patch.object(
+        cutover.urllib.request,
+        "urlopen",
+        return_value=comparison_response(runner_comparison()),
+    ) as request:
+        cutover.require_runner_compatibility("a" * 40, "b" * 40)
+    args = request.call_args.args[0]
+    assert args.full_url.endswith("/compare/" + "a" * 40 + "..." + "b" * 40)
+    assert args.get_header("Authorization") == "Bearer test-only"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"status": "diverged"},
+        {"behind_by": 1},
+        {"base_commit": {"sha": "c" * 40}},
+        {"merge_base_commit": {"sha": "c" * 40}},
+        {"commits": []},
+        {"commits": [{"sha": "c" * 40}]},
+        {"total_commits": 251},
+        {"files": []},
+        {"files": [{"filename": "backend/onyx/main.py", "status": "modified"}]},
+        {
+            "files": [
+                {
+                    "filename": "backend/scripts/regulatory_annex_dev_cutover.py",
+                    "status": "renamed",
+                    "previous_filename": "other",
+                }
+            ]
+        },
+        {
+            "files": [
+                {
+                    "filename": "backend/scripts/regulatory_annex_dev_cutover.py",
+                    "status": "modified",
+                    "previous_filename": "other",
+                }
+            ]
+        },
+        {"truncated": True},
+        {
+            "files": [
+                {
+                    "filename": "backend/scripts/regulatory_annex_dev_cutover.py",
+                    "status": "modified",
+                }
+            ]
+            * 300
+        },
+    ],
+)
+def test_runner_comparison_refuses_unproven_delta(
+    monkeypatch: pytest.MonkeyPatch, change: dict[str, Any]
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", "atezsoftware/customs-regulations-chatbot")
+    monkeypatch.setenv("GH_TOKEN", "test-only")
+    with (
+        patch.object(
+            cutover.urllib.request,
+            "urlopen",
+            return_value=comparison_response(runner_comparison() | change),
+        ),
+        pytest.raises(cutover.CutoverRefusal, match="runner_only_comparison_required"),
+    ):
+        cutover.require_runner_compatibility("a" * 40, "b" * 40)
+
+
+@pytest.mark.parametrize("status,link", [(206, ""), (200, '<next>; rel="next"')])
+def test_runner_comparison_refuses_incomplete_http(
+    monkeypatch: pytest.MonkeyPatch, status: int, link: str
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", "atezsoftware/customs-regulations-chatbot")
+    monkeypatch.setenv("GH_TOKEN", "test-only")
+    with (
+        patch.object(
+            cutover.urllib.request,
+            "urlopen",
+            return_value=comparison_response(
+                runner_comparison(), status=status, link=link
+            ),
+        ),
+        pytest.raises(cutover.CutoverRefusal, match="runner_only_comparison_required"),
+    ):
+        cutover.require_runner_compatibility("a" * 40, "b" * 40)
+
+
+@pytest.mark.parametrize("phase", ["annex-verify", "annex-activate"])
+def test_only_proven_runner_delta_can_verify_or_activate(
+    phase: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key, value in {
+        "env_x": "dev",
+        "GITHUB_REF": "refs/heads/develop",
+        "IMAGE_TAG": "a" * 40,
+        "GITHUB_SHA": "b" * 40,
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("sys.argv", ["cutover", phase])
+    with (
+        patch.object(cutover, "require_runner_compatibility") as compare,
+        patch.object(cutover, "verify_or_activate") as verify,
+    ):
+        cutover.main()
+        compare.assert_called_once_with("a" * 40, "b" * 40)
+        assert verify.call_args.args[0].sha == "a" * 40
+        assert verify.call_args.args[1] == (phase == "annex-activate")
+        verify.reset_mock()
+        compare.side_effect = cutover.CutoverRefusal("unproven")
+        with pytest.raises(cutover.CutoverRefusal, match="unproven"):
+            cutover.main()
+        verify.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        [],
+        {},
+        {"commits": None},
+        {"commits": [], "files": None, "total_commits": 0},
+    ],
+)
+def test_runner_comparison_refuses_malformed_body(
+    body: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", "atezsoftware/customs-regulations-chatbot")
+    monkeypatch.setenv("GH_TOKEN", "test-only")
+    with (
+        patch.object(
+            cutover.urllib.request, "urlopen", return_value=comparison_response(body)
+        ),
+        pytest.raises(cutover.CutoverRefusal, match="runner_only_comparison_required"),
+    ):
+        cutover.require_runner_compatibility("a" * 40, "b" * 40)
+
+
+def test_runner_comparison_requires_authentication_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", "atezsoftware/customs-regulations-chatbot")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    with (
+        patch.object(cutover.urllib.request, "urlopen") as request,
+        pytest.raises(
+            cutover.CutoverRefusal, match="authenticated_exact_repository_required"
+        ),
+    ):
+        cutover.require_runner_compatibility("a" * 40, "b" * 40)
+    request.assert_not_called()

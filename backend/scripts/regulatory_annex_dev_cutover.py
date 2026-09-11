@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -398,7 +399,13 @@ class Driver:
     def pods(self, app: str) -> list[dict[str, Any]]:
         return json.loads(
             self.kubectl(
-                "get", "pods", "-l", f"app=dev-customs-regulations-{app}", "-o", "json"
+                "get",
+                "pods",
+                "-l",
+                f"app=dev-customs-regulations-{app}",
+                "-o",
+                "json",
+                "--request-timeout=10s",
             )
         )["items"]
 
@@ -590,26 +597,59 @@ class Driver:
 
     def verify_runtime(self, *, readiness: bool = True) -> None:
         for app in APPS:
-            pods = self.pods(app)
-            if (
-                len(pods) != 1
-                or not self.ready(pods[0])
-                or pods[0]["metadata"].get("deletionTimestamp")
-            ):
-                raise CutoverRefusal("one_ready_compatible_pod_required")
+            deadline = time.monotonic() + 180
+            while True:
+                pods = self.pods(app)
+                wrong_sha = sum(
+                    sum(
+                        container["image"] == f"{REPOSITORY}:{self.sha}"
+                        for container in pod["spec"]["containers"]
+                    )
+                    != 1
+                    for pod in pods
+                )
+                if wrong_sha:
+                    raise CutoverRefusal("compatible_exact_SHA_required")
+                if any(
+                    item.get("restartCount", 0)
+                    for pod in pods
+                    for item in pod["status"].get("containerStatuses", [])
+                ):
+                    raise CutoverRefusal("new_pod_restarted")
+                if (
+                    len(pods) == 1
+                    and self.ready(pods[0])
+                    and not pods[0]["metadata"].get("deletionTimestamp")
+                ):
+                    # A Ready survivor must expose the same restart evidence as before.
+                    if not pods[0]["status"].get("containerStatuses"):
+                        raise CutoverRefusal("runtime_container_status_required")
+                    break
+                if time.monotonic() >= deadline:
+                    print(
+                        json.dumps(
+                            {
+                                "stage": "runtime_settle_timeout",
+                                "app": app,
+                                "pods": len(pods),
+                                "ready": sum(self.ready(pod) for pod in pods),
+                                "deleting": sum(
+                                    bool(pod["metadata"].get("deletionTimestamp"))
+                                    for pod in pods
+                                ),
+                                "wrong_sha": wrong_sha,
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    raise CutoverRefusal("one_ready_compatible_pod_required")
+                time.sleep(2)
             pod = pods[0]
             containers = [
                 item
                 for item in pod["spec"]["containers"]
                 if item["image"] == f"{REPOSITORY}:{self.sha}"
             ]
-            if len(containers) != 1:
-                raise CutoverRefusal("compatible_exact_SHA_required")
-            if any(
-                item.get("restartCount", 0)
-                for item in pod["status"]["containerStatuses"]
-            ):
-                raise CutoverRefusal("new_pod_restarted")
             if app == "background" and readiness:
                 self.command(
                     [
@@ -683,6 +723,84 @@ def inventory_only(driver: Driver) -> None:
     evidence = json.loads(driver.pod_exec(PROBE, driver.container, "inventory", "{}"))
     print(json.dumps(evidence, sort_keys=True))
     driver.delete_probe()
+
+
+RUNNER_ONLY_PATHS = frozenset(
+    {
+        "backend/scripts/regulatory_annex_dev_cutover.py",
+        ".github/workflows/customs-regulations-backend-lite-codebuild.yaml",
+        "backend/tests/unit/scripts/test_regulatory_annex_dev_cutover.py",
+    }
+)
+
+
+def require_runner_compatibility(runtime_sha: str, runner_sha: str) -> None:
+    """Accept only a complete, ancestor-based GitHub comparison of runner files."""
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    token = os.environ.get("GH_TOKEN")
+    if repository != "atezsoftware/customs-regulations-chatbot" or not token:
+        raise CutoverRefusal("authenticated_exact_repository_required")
+    if not all(re.fullmatch("[0-9a-f]{40}", sha) for sha in (runtime_sha, runner_sha)):
+        raise CutoverRefusal("exact_comparison_SHAs_required")
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repository}/compare/{runtime_sha}...{runner_sha}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 -- fixed HTTPS GitHub origin
+            if response.status != 200 or response.headers.get("Link"):
+                raise ValueError
+            raw = response.read(2_000_001)
+            if len(raw) > 2_000_000:
+                raise ValueError
+            comparison = json.loads(raw)
+        commits = comparison["commits"]
+        files = comparison["files"]
+        total = comparison["total_commits"]
+        # GitHub's unpaginated comparison caps commits at 250 and files at 300.
+        if (
+            comparison["status"] != "ahead"
+            or comparison["behind_by"] != 0
+            or comparison["ahead_by"] != total
+            or comparison["base_commit"]["sha"] != runtime_sha
+            or comparison["merge_base_commit"]["sha"] != runtime_sha
+            or comparison.get("truncated", False) is not False
+            or type(total) is not int
+            or not 0 < total <= 250
+            or not isinstance(commits, list)
+            or len(commits) != total
+            or commits[-1]["sha"] != runner_sha
+            or any(
+                not re.fullmatch("[0-9a-f]{40}", commit["sha"]) for commit in commits
+            )
+            or len({commit["sha"] for commit in commits}) != total
+            or not isinstance(files, list)
+            or not 0 < len(files) < 300
+            or any(
+                file["filename"] not in RUNNER_ONLY_PATHS
+                or file["status"] != "modified"
+                or "previous_filename" in file
+                for file in files
+            )
+            or len({file["filename"] for file in files}) != len(files)
+        ):
+            raise ValueError
+    except Exception:
+        raise CutoverRefusal("runner_only_comparison_required") from None
+    print(
+        json.dumps(
+            {
+                "runner_sha": runner_sha,
+                "runtime_sha": runtime_sha,
+                "runner_only_comparison": "verified",
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def require_release_runs(sha: str) -> None:
@@ -1009,7 +1127,10 @@ def main() -> None:
         os.environ.get("env_x", ""), os.environ.get("GITHUB_REF", ""), runner_sha
     )
     if args.phase != "annex-diagnose" and sha != runner_sha:
-        raise CutoverRefusal("image_must_match_checked_out_workflow_SHA")
+        if args.phase in {"annex-verify", "annex-activate"}:
+            require_runner_compatibility(sha, runner_sha)
+        else:
+            raise CutoverRefusal("image_must_match_checked_out_workflow_SHA")
     driver = Driver(sha)
     if args.phase == "prepare":
         prepare(driver)
