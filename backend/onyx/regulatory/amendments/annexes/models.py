@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -313,6 +313,78 @@ class AnnexComparisonResponse(BaseModel):
                 reference.position
                 for change in self.changes
                 for reference in getattr(change, side)
+            ]
+            if len(positions) != len(set(positions)):
+                raise ValueError(
+                    "overlapping change references: each physical change must appear once"
+                )
+        return self
+
+
+class AnnexDifferenceProposal(BaseModel):
+    """Model selections only; authoritative references are resolved by the server."""
+
+    model_config = ConfigDict(extra="forbid")
+    operation: Literal[
+        "replace", "insert", "remove", "move", "split", "merge", "visual"
+    ]
+    old_positions: list[Annotated[int, Field(strict=True, ge=0)]] = Field(
+        default_factory=list
+    )
+    new_positions: list[Annotated[int, Field(strict=True, ge=0)]] = Field(
+        default_factory=list
+    )
+    explanation: str
+    uncertain: bool = False
+
+    @model_validator(mode="after")
+    def validate_operation_shape(self) -> "AnnexDifferenceProposal":
+        old, new = len(self.old_positions), len(self.new_positions)
+        if not {
+            "replace": (old, new) == (1, 1),
+            "move": (old, new) == (1, 1),
+            "visual": old > 0 and new > 0,
+            "insert": old == 0 and new > 0,
+            "remove": old > 0 and new == 0,
+            "split": old == 1 and new > 1,
+            "merge": old > 1 and new == 1,
+        }[self.operation]:
+            raise ValueError(
+                "invalid_operation_shape: select OLD and NEW positions required by the operation; replace/move need exactly one on each side"
+            )
+        return self
+
+
+class AnnexComparisonProposal(BaseModel):
+    """Transient model wire format, separate from persisted comparison evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+    changes: list[AnnexDifferenceProposal] = Field(
+        default_factory=list, max_length=2000
+    )
+    old_positions: list[Annotated[int, Field(strict=True, ge=0)]]
+    new_positions: list[Annotated[int, Field(strict=True, ge=0)]]
+    old_pages: list[Annotated[int, Field(strict=True, ge=1)]]
+    new_pages: list[Annotated[int, Field(strict=True, ge=1)]]
+    issues: list[
+        Literal[
+            "low_readability",
+            "missing_evidence",
+            "ambiguous_structure",
+            "uncertain_value",
+            "unsupported_visual",
+            "incomplete_coverage",
+            "formula_change_requires_review",
+        ]
+    ] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def reject_overlapping_operations(self) -> "AnnexComparisonProposal":
+        for side in ("old_positions", "new_positions"):
+            positions = [
+                position
+                for change in self.changes
+                for position in getattr(change, side)
             ]
             if len(positions) != len(set(positions)):
                 raise ValueError(

@@ -15,13 +15,18 @@ Equal OCR is not proof of equal visual meaning. Conversely, a different number o
 extracted regions is NOT evidence of an insertion or removal: reconcile grouping
 against the simultaneous images. A scan/layout difference alone is not a legal
 change. A missing or unreadable page is incomplete evidence, not a deletion.
-References must copy position, text and the COMPLETE locator from the supplied
-OLD/NEW element lists, without inventing IDs, values, or coordinates. A visual
-change can reference elements with identical or empty text; explain its visual
-meaning. Use split/merge only for actual content restructuring, not OCR grouping.
+For each change, select only integer old_positions and new_positions from the
+eligible OLD/NEW reference candidates. Do not return copied text, locators, or
+coordinates: the server resolves them from the frozen extraction. Never invent a
+position or infer a missing selection from an explanation. replace and move need
+exactly one OLD and one NEW position; insert needs no OLD and one or more NEW;
+remove needs one or more OLD and no NEW; split needs one OLD and multiple NEW;
+merge needs multiple OLD and one NEW; visual needs one or more on both sides.
+A visual change may select elements with identical or empty text; explain its
+visual meaning. Use split/merge only for actual content restructuring, not OCR grouping.
 Include ALL reviewed positions/pages in coverage, even when unchanged. Explicitly
 mark uncertainty and incomplete evidence. Never guess a value or effective date.
 
-Coverage arrays must copy the explicitly required local atomic positions and view pages exactly. Never infer ranges from parent/source positions, include aggregate/native duplicates, or substitute original page numbering for view page numbering.
+Coverage arrays must copy the explicitly required local atomic positions and view pages exactly. Never infer ranges from parent/source positions, add ineligible aggregates or duplicate positions, or substitute original page numbering for view page numbering. Distinct eligible entries may have equal native/vision text; retain their listed identities and all required coverage rather than inventing or collapsing positions.
 The issues array contains only the schema's blocking issue codes. A successful review, unchanged content, captions, ordinary page layout/rendering differences, or explanatory observations are NOT issues: return [] for them. Use each change's explanation for its rationale.
 """

@@ -225,7 +225,7 @@ def test_selected_comparison_uses_original_page_mapping_and_exact_region_images(
     )
     from onyx.regulatory.amendments.annexes.evidence import select_annex_evidence_view
     from onyx.regulatory.amendments.annexes.models import AnnexComparisonResponse
-    from tests.unit.onyx.regulatory.annexes.test_comparison import page
+    from tests.unit.onyx.regulatory.annexes.test_comparison import page, wire_proposal
 
     views = []
     for digest in ["a" * 64, "b" * 64]:
@@ -260,7 +260,7 @@ def test_selected_comparison_uses_original_page_mapping_and_exact_region_images(
     pages = [page(number=1), page(number=2)]
     with patch(
         "onyx.regulatory.amendments.annexes.comparison.generate_structured",
-        return_value=response,
+        return_value=wire_proposal(response),
     ) as call:
         result = compare_annexes(
             old=views[0], new=views[1], old_pages=pages, new_pages=pages, llm=llm

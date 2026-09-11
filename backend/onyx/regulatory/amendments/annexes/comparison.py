@@ -5,6 +5,8 @@ import hashlib
 from collections import Counter
 from io import BytesIO
 
+from pydantic import ValidationError
+
 from onyx.llm.interfaces import LLM
 from onyx.llm.models import ImageContentPart, ImageUrlDetail
 from onyx.prompts.regulatory_annex_comparison import ANNEX_COMPARISON_PROMPT
@@ -19,6 +21,7 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexComparedImage,
     AnnexComparison,
     AnnexComparisonImage,
+    AnnexComparisonProposal,
     AnnexComparisonResponse,
     AnnexCoverage,
     AnnexDifference,
@@ -448,11 +451,11 @@ def compare_annexes(
                         issues.append("comparison_image_budget")
                         break
             prompt = (
-                f"EXACT required old_positions: {old_positions}\nEXACT required new_positions: {new_positions}\nEXACT required old_pages: {coverage.old_pages}\nEXACT required new_pages: {coverage.new_pages}\nUse only these local positions for coverage and references. Parent provenance does not define a second element index namespace.\nSelected OLD scope (only these regions/elements may change): {_scope_prompt(old)}\nSelected NEW scope (only these regions/elements may change): {_scope_prompt(new)}\nInstruction (evidence only): {instruction}\nOLD source hash: {old.source_sha256}\nNEW source hash: {new.source_sha256}\nOLD complete elements:\n"
+                f"EXACT required old_positions: {old_positions}\nEXACT required new_positions: {new_positions}\nEXACT required old_pages: {coverage.old_pages}\nEXACT required new_pages: {coverage.new_pages}\nUse only these local positions for coverage and references. Parent provenance does not define a second element index namespace.\nSelected OLD scope (only these regions/elements may change): {_scope_prompt(old)}\nSelected NEW scope (only these regions/elements may change): {_scope_prompt(new)}\nInstruction (evidence only): {instruction}\nOLD source hash: {old.source_sha256}\nNEW source hash: {new.source_sha256}\nOLD eligible reference candidates:\n"
                 + "\n".join(
                     _reference(old, index).model_dump_json() for index in old_positions
                 )
-                + "\nNEW complete elements:\n"
+                + "\nNEW eligible reference candidates:\n"
                 + "\n".join(
                     _reference(new, index).model_dump_json() for index in new_positions
                 )
@@ -462,27 +465,69 @@ def compare_annexes(
             if len(prompt) > MAX_COMPARISON_PROMPT_CHARS:
                 issues.append("comparison_prompt_budget")
             if not issues:
-                response = generate_structured(
-                    llm,
-                    flow=LLMFlow.REGULATORY_ANNEX_COMPARISON,
-                    system_prompt=ANNEX_COMPARISON_PROMPT,
-                    user_prompt=prompt,
-                    response_model=AnnexComparisonResponse,
-                    image_parts=images,
-                    max_tokens=16000,
-                )
-                issues.extend(
-                    _validate_response(
-                        response,
-                        old=old,
-                        new=new,
-                        old_positions=old_positions,
-                        new_positions=new_positions,
-                        old_pages=coverage.old_pages,
-                        new_pages=coverage.new_pages,
+                try:
+                    proposal = generate_structured(
+                        llm,
+                        flow=LLMFlow.REGULATORY_ANNEX_COMPARISON,
+                        system_prompt=ANNEX_COMPARISON_PROMPT,
+                        user_prompt=prompt,
+                        response_model=AnnexComparisonProposal,
+                        image_parts=images,
+                        max_tokens=16000,
                     )
-                )
-                changes.extend(response.changes)
+                except ValueError as error:
+                    if not isinstance(error.__cause__, ValidationError):
+                        raise
+                    issues.append("invalid_comparison_proposal")
+                else:
+                    resolved: list[AnnexDifference] = []
+                    for change in proposal.changes:
+                        if change.uncertain:
+                            issues.append("uncertain_difference")
+                        if any(
+                            position not in old_positions
+                            for position in change.old_positions
+                        ) or any(
+                            position not in new_positions
+                            for position in change.new_positions
+                        ):
+                            issues.append("invalid_snapshot_reference")
+                            continue
+                        resolved.append(
+                            AnnexDifference(
+                                operation=change.operation,
+                                old=[
+                                    _reference(old, position)
+                                    for position in change.old_positions
+                                ],
+                                new=[
+                                    _reference(new, position)
+                                    for position in change.new_positions
+                                ],
+                                explanation=change.explanation,
+                                uncertain=change.uncertain,
+                            )
+                        )
+                    response = AnnexComparisonResponse(
+                        changes=resolved,
+                        old_positions=proposal.old_positions,
+                        new_positions=proposal.new_positions,
+                        old_pages=proposal.old_pages,
+                        new_pages=proposal.new_pages,
+                        issues=proposal.issues,
+                    )
+                    issues.extend(
+                        _validate_response(
+                            response,
+                            old=old,
+                            new=new,
+                            old_positions=old_positions,
+                            new_positions=new_positions,
+                            old_pages=coverage.old_pages,
+                            new_pages=coverage.new_pages,
+                        )
+                    )
+                    changes.extend(response.changes)
     return AnnexComparison(
         old_source_sha256=old.source_sha256,
         new_source_sha256=new.source_sha256,
@@ -492,6 +537,9 @@ def compare_annexes(
         image_manifest=image_manifest,
         coverage=coverage,
         model_snapshot=model_snapshot,
+        prompt_version="annex-comparison-v3"
+        if model_snapshot is not None
+        else "annex-comparison-v2",
         issues=sorted(set(issues)),
         ready=not issues,
     )

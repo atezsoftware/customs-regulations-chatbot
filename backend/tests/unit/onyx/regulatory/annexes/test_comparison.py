@@ -6,6 +6,8 @@ import pytest
 from PIL import Image
 
 from onyx.regulatory.amendments.annexes.models import (
+    AnnexComparisonProposal,
+    AnnexComparisonResponse,
     AnnexExtraction,
     AnnexLocator,
     AnnexRenderedPage,
@@ -38,6 +40,22 @@ def page(color: str = "white", number: int = 1) -> AnnexRenderedPage:
     buffer = BytesIO()
     Image.new("RGB", (200, 200), color).save(buffer, format="PNG")
     return AnnexRenderedPage(page=number, width=200, height=200, png=buffer.getvalue())
+
+
+def wire_proposal(response: AnnexComparisonResponse) -> AnnexComparisonProposal:
+    return AnnexComparisonProposal.model_validate(
+        {
+            **response.model_dump(exclude={"changes"}),
+            "changes": [
+                {
+                    **change.model_dump(exclude={"old", "new"}),
+                    "old_positions": [reference.position for reference in change.old],
+                    "new_positions": [reference.position for reference in change.new],
+                }
+                for change in response.changes
+            ],
+        }
+    )
 
 
 def test_identical_asset_skips_vision_and_covers_all_elements() -> None:
@@ -98,7 +116,7 @@ def test_different_pixels_with_equal_ocr_requires_simultaneous_vision() -> None:
     llm.config.model_name = "vision"
     with patch(
         "onyx.regulatory.amendments.annexes.comparison.generate_structured",
-        return_value=response,
+        return_value=wire_proposal(response),
     ) as invoke:
         result = compare_annexes(
             old=old, new=new, old_pages=[page()], new_pages=[page("red")], llm=llm
@@ -125,10 +143,15 @@ def test_missing_page_or_uncertain_extraction_never_ready() -> None:
 
 
 @pytest.mark.parametrize("invalid", ["position", "text", "locator"])
-def test_model_references_are_checked_against_actual_snapshot(invalid: str) -> None:
-    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+def test_persisted_references_are_checked_against_actual_snapshot(invalid: str) -> None:
+    from onyx.regulatory.amendments.annexes.comparison import (
+        annex_snapshot_hash,
+        validate_annex_comparison,
+    )
     from onyx.regulatory.amendments.annexes.models import (
+        AnnexComparison,
         AnnexComparisonResponse,
+        AnnexCoverage,
         AnnexDifference,
         AnnexElementReference,
     )
@@ -159,17 +182,25 @@ def test_model_references_are_checked_against_actual_snapshot(invalid: str) -> N
         old_pages=[1],
         new_pages=[1],
     )
-    llm = MagicMock()
-    llm.config.model_provider = "configured"
-    llm.config.model_name = "vision"
-    with patch(
-        "onyx.regulatory.amendments.annexes.comparison.generate_structured",
-        return_value=response,
-    ):
-        result = compare_annexes(
-            old=old, new=new, old_pages=[page()], new_pages=[page("red")], llm=llm
-        )
-    assert not result.ready and any("reference" in issue for issue in result.issues)
+    persisted = AnnexComparison(
+        old_source_sha256=old.source_sha256,
+        new_source_sha256=new.source_sha256,
+        old_snapshot_sha256=annex_snapshot_hash(old),
+        new_snapshot_sha256=annex_snapshot_hash(new),
+        changes=response.changes,
+        coverage=AnnexCoverage(
+            old_positions=[0],
+            new_positions=[0],
+            old_pages=[1],
+            new_pages=[1],
+            method="simultaneous_vision",
+        ),
+        issues=[],
+        ready=True,
+    )
+    assert persisted.prompt_version == "annex-comparison-v2"
+    issues = validate_annex_comparison(persisted, old=old, new=new)
+    assert any("reference" in issue for issue in issues)
 
 
 def test_visual_region_count_difference_is_not_legal_deletion() -> None:
@@ -191,7 +222,7 @@ def test_visual_region_count_difference_is_not_legal_deletion() -> None:
     llm.config.model_name = "vision"
     with patch(
         "onyx.regulatory.amendments.annexes.comparison.generate_structured",
-        return_value=response,
+        return_value=wire_proposal(response),
     ):
         result = compare_annexes(
             old=old, new=new, old_pages=[page()], new_pages=[page()], llm=llm
@@ -263,7 +294,7 @@ def test_complete_annex_can_grow_and_move_an_element_across_pages() -> None:
     llm.config.model_name = "vision"
     with patch(
         "onyx.regulatory.amendments.annexes.comparison.generate_structured",
-        return_value=response,
+        return_value=wire_proposal(response),
     ) as invoke:
         result = compare_annexes(
             old=old,
