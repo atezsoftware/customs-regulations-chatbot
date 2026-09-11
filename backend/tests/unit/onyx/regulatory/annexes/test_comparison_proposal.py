@@ -1,5 +1,6 @@
 import json
 from functools import partial
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,6 +21,7 @@ from tests.unit.onyx.regulatory.annexes.test_comparison import extraction, page
     "outcome",
     [
         "repaired",
+        "repaired_omitted",
         "missing_new",
         "outside",
         "aggregate",
@@ -106,6 +108,8 @@ def test_actual_structured_wire_resolves_only_frozen_positions(
             "new_pages": [1],
             "issues": [],
         }
+        if outcome == "repaired_omitted" and len(calls) == 1:
+            del proposal["changes"][0]["new_positions"]
         if outcome == "overlap":
             proposal["changes"] *= 2
         return httpx.Response(
@@ -143,17 +147,33 @@ def test_actual_structured_wire_resolves_only_frozen_positions(
     result = compare_annexes(
         old=old, new=new, old_pages=[page()], new_pages=[page("red")], llm=llm
     )
-    assert result.ready is (outcome in {"repaired", "unchanged"})
-    assert len(calls) == (2 if outcome in {"repaired", "missing_new", "overlap"} else 1)
+    for body in calls:
+        response_format = body["response_format"]
+        assert isinstance(response_format, dict)
+        schema = cast(dict[str, Any], response_format)["json_schema"]["schema"]
+        nested = schema["$defs"]["AnnexDifferenceProposal"]
+        assert {"old_positions", "new_positions"} <= set(nested["required"])
+    assert result.ready is (outcome in {"repaired", "repaired_omitted", "unchanged"})
+    assert len(calls) == (
+        2
+        if outcome in {"repaired", "repaired_omitted", "missing_new", "overlap"}
+        else 1
+    )
     assert result.prompt_version == "annex-comparison-v3"
     assert (old.model_dump_json(), new.model_dump_json()) == original_snapshots
     assert result.coverage.old_positions == [1, 2, 3] == result.coverage.new_positions
-    if outcome == "repaired":
+    if outcome in {"repaired", "repaired_omitted"}:
         change = result.changes[0]
         assert change.old[0].position == change.new[0].position == 1
         assert change.old[0].text == "5%" and change.new[0].text == "7%"
         assert change.new[0].locator == new.elements[1].locator
-        assert "invalid_operation_shape" in str(calls[1]["messages"])
+        feedback = str(calls[1]["messages"])
+        if outcome == "repaired_omitted":
+            assert (
+                "changes.0.new_positions" in feedback and "Field required" in feedback
+            )
+        else:
+            assert "invalid_operation_shape" in feedback
         assert not validate_annex_comparison(result, old=old, new=new)
         assert AnnexComparison.model_validate_json(result.model_dump_json()) == result
     elif outcome in {"outside", "aggregate"}:
@@ -238,3 +258,31 @@ def test_provider_failures_are_not_mislabeled_as_invalid_proposals(
             new_pages=[page()],
             llm=llm,
         )
+
+
+@pytest.mark.parametrize("missing", ["old_positions", "new_positions"])
+def test_wire_side_arrays_are_required_even_when_legally_empty(missing: str) -> None:
+    from pydantic import ValidationError
+
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexComparisonProposal,
+        AnnexDifferenceProposal,
+    )
+    from onyx.regulatory.structured_llm import _portable_structured_output_schema
+
+    schema = AnnexComparisonProposal.model_json_schema()
+    for candidate in (schema, _portable_structured_output_schema(schema)):
+        nested = candidate["$defs"]["AnnexDifferenceProposal"]
+        assert {"old_positions", "new_positions"} <= set(nested["required"])
+    value = {
+        "operation": "insert" if missing == "old_positions" else "remove",
+        "old_positions": [] if missing == "old_positions" else [1],
+        "new_positions": [] if missing == "new_positions" else [1],
+        "explanation": "fixture",
+    }
+    assert AnnexDifferenceProposal.model_validate(value)
+    del value[missing]
+    with pytest.raises(ValidationError) as captured:
+        AnnexDifferenceProposal.model_validate(value)
+    assert captured.value.errors()[0]["loc"] == (missing,)
+    assert captured.value.errors()[0]["type"] == "missing"

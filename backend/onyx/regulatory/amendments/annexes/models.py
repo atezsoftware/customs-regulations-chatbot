@@ -328,12 +328,8 @@ class AnnexDifferenceProposal(BaseModel):
     operation: Literal[
         "replace", "insert", "remove", "move", "split", "merge", "visual"
     ]
-    old_positions: list[Annotated[int, Field(strict=True, ge=0)]] = Field(
-        default_factory=list
-    )
-    new_positions: list[Annotated[int, Field(strict=True, ge=0)]] = Field(
-        default_factory=list
-    )
+    old_positions: list[Annotated[int, Field(strict=True, ge=0)]]
+    new_positions: list[Annotated[int, Field(strict=True, ge=0)]]
     explanation: str
     uncertain: bool = False
 
