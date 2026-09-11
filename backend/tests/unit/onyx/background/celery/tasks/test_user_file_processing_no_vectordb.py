@@ -9,8 +9,10 @@ Verifies that when DISABLE_VECTOR_DB is True:
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
+
+import pytest
 
 from onyx.background.celery.tasks.user_file_processing.tasks import (
     _process_user_file_without_vector_db,
@@ -356,135 +358,105 @@ class TestProcessImplBranching:
 # ------------------------------------------------------------------
 
 
+@pytest.fixture
+def owned_delete_boundary(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    from onyx.configs import app_configs
+    from onyx.db import regulatory_writer_publication as repository
+    from onyx.document_index.elasticsearch import client
+    from onyx.file_store import file_store
+    from onyx.regulatory import writer_publication
+
+    authority = MagicMock()
+    owner = authority.acquire.return_value
+    monkeypatch.setattr(writer_publication, "PublicationStore", lambda _: authority)
+    monkeypatch.setattr(repository, "writer_file_exists", lambda *_: True)
+    monkeypatch.setattr(writer_publication, "pending_writer_manifest", lambda _: None)
+    monkeypatch.setattr(
+        writer_publication, "recover_owned_writer_before_next", lambda _: owner
+    )
+    plan = MagicMock(ready_to_delete=True, deliveries=())
+    begin = MagicMock(return_value=plan)
+    monkeypatch.setattr(repository, "begin_owned_deletion", begin)
+    absence = MagicMock(return_value="original")
+    monkeypatch.setattr(repository, "owned_unindexed_deletion_file_id", absence)
+    finish = MagicMock()
+    monkeypatch.setattr(repository, "finish_owned_deletion", finish)
+    storage = MagicMock()
+    monkeypatch.setattr(file_store, "get_default_file_store", lambda: storage)
+    heartbeat = MagicMock()
+    heartbeat.return_value.__enter__.return_value.is_set.return_value = False
+    monkeypatch.setattr(writer_publication, "publication_heartbeat", heartbeat)
+    es = MagicMock(side_effect=AssertionError("no ES for proven unindexed deletion"))
+    monkeypatch.setattr(client, "ElasticsearchClient", es)
+    monkeypatch.setattr(app_configs, "DISABLE_VECTOR_DB", True)
+    return SimpleNamespace(
+        owner=owner, plan=plan, storage=storage, finish=finish, absence=absence, es=es
+    )
+
+
 class TestDeleteImplNoVectorDb:
-    @patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", True)
-    @patch(f"{TASKS_MODULE}.get_default_file_store")
-    @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
     def test_waits_without_deleting_anything_until_durable_cancellation_finishes(
-        self,
-        mock_get_session: MagicMock,
-        mock_get_file_store: MagicMock,
+        self, owned_delete_boundary: SimpleNamespace
     ) -> None:
-        session = MagicMock()
-        mock_get_session.return_value.__enter__.return_value = session
-        plan = MagicMock(ready_to_delete=False, deliveries=())
-
-        with patch(
-            f"{TASKS_MODULE}.request_user_file_deletion_cleanup",
-            return_value=plan,
-        ):
-            delete_user_file_impl(
-                user_file_id=str(uuid4()),
-                tenant_id="test-tenant",
-                redis_locking=False,
-            )
-
-        mock_get_file_store.assert_not_called()
-        session.delete.assert_not_called()
-
-    @patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", True)
-    @patch(f"{TASKS_MODULE}.get_default_file_store")
-    @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
-    def test_pending_cancellation_is_delivered_without_hard_delete(
-        self,
-        mock_get_session: MagicMock,
-        mock_get_file_store: MagicMock,
-    ) -> None:
-        job_id = uuid4()
-        session = MagicMock()
-        mock_get_session.return_value.__enter__.return_value = session
-        plan = MagicMock(
-            ready_to_delete=False,
-            deliveries=(SimpleNamespace(job_id=job_id, expected_generation=12),),
+        state = owned_delete_boundary
+        state.plan.ready_to_delete = False
+        delete_user_file_impl(
+            user_file_id=str(uuid4()), tenant_id="test-tenant", redis_locking=False
         )
+        state.storage.delete_file.assert_not_called()
+        state.absence.assert_not_called()
+        state.finish.assert_not_called()
 
-        with (
-            patch(
-                f"{TASKS_MODULE}.request_user_file_deletion_cleanup",
-                return_value=plan,
-            ),
-            patch(
-                "onyx.background.celery.tasks.regulatory_indexing.tasks."
-                "enqueue_regulatory_indexing_step"
-            ) as enqueue,
-        ):
+    def test_pending_cancellation_is_delivered_without_hard_delete(
+        self, owned_delete_boundary: SimpleNamespace
+    ) -> None:
+        state = owned_delete_boundary
+        job_id = uuid4()
+        state.plan.ready_to_delete = False
+        state.plan.deliveries = (
+            SimpleNamespace(job_id=job_id, expected_generation=12),
+        )
+        with patch(
+            "onyx.background.celery.tasks.regulatory_indexing.tasks.enqueue_regulatory_indexing_step"
+        ) as enqueue:
             delete_user_file_impl(
-                user_file_id=str(uuid4()),
-                tenant_id="test-tenant",
-                redis_locking=False,
+                user_file_id=str(uuid4()), tenant_id="test-tenant", redis_locking=False
             )
-
         enqueue.assert_called_once()
         assert enqueue.call_args.kwargs["job_id"] == job_id
         assert enqueue.call_args.kwargs["expected_generation"] == 12
-        mock_get_file_store.assert_not_called()
-        session.delete.assert_not_called()
+        state.storage.delete_file.assert_not_called()
+        state.absence.assert_not_called()
+        state.finish.assert_not_called()
 
-    @patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", True)
-    @patch(f"{TASKS_MODULE}.get_default_file_store")
-    @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
     def test_skips_vector_db_deletion(
-        self,
-        mock_get_session: MagicMock,
-        mock_get_file_store: MagicMock,
+        self, owned_delete_boundary: SimpleNamespace
     ) -> None:
-        uf = _make_user_file(status=UserFileStatus.DELETING)
-        session = MagicMock()
-        session.get.return_value = uf
-        mock_get_session.return_value.__enter__.return_value = session
-        mock_get_file_store.return_value = MagicMock()
+        state = owned_delete_boundary
+        delete_user_file_impl(
+            user_file_id=str(uuid4()), tenant_id="test-tenant", redis_locking=False
+        )
+        state.es.assert_not_called()
+        state.absence.assert_called_once_with(state.owner)
+        state.finish.assert_called_once_with(state.owner, without_index_authority=True)
 
-        with (
-            patch(
-                f"{TASKS_MODULE}.request_user_file_deletion_cleanup",
-                return_value=MagicMock(ready_to_delete=True),
-            ),
-            patch(f"{TASKS_MODULE}.get_all_document_indices") as mock_get_indices,
-            patch(f"{TASKS_MODULE}.get_active_search_settings") as mock_get_ss,
-            patch(f"{TASKS_MODULE}.httpx_init_vespa_pool") as mock_vespa_pool,
-        ):
-            delete_user_file_impl(
-                user_file_id=str(uf.id),
-                tenant_id="test-tenant",
-                redis_locking=False,
-            )
-
-            mock_get_indices.assert_not_called()
-            mock_get_ss.assert_not_called()
-            mock_vespa_pool.assert_not_called()
-
-        session.delete.assert_called_once_with(uf)
-        session.commit.assert_called_once()
-
-    @patch(f"{TASKS_MODULE}.DISABLE_VECTOR_DB", True)
-    @patch(f"{TASKS_MODULE}.get_default_file_store")
-    @patch(f"{TASKS_MODULE}.get_session_with_current_tenant")
     def test_still_deletes_file_store_and_db_record(
-        self,
-        mock_get_session: MagicMock,
-        mock_get_file_store: MagicMock,
+        self, owned_delete_boundary: SimpleNamespace
     ) -> None:
-        uf = _make_user_file(status=UserFileStatus.DELETING)
-        session = MagicMock()
-        session.get.return_value = uf
-        mock_get_session.return_value.__enter__.return_value = session
+        from onyx.file_store.utils import user_file_id_to_plaintext_file_name
 
-        file_store = MagicMock()
-        mock_get_file_store.return_value = file_store
-
-        with patch(
-            f"{TASKS_MODULE}.request_user_file_deletion_cleanup",
-            return_value=MagicMock(ready_to_delete=True),
-        ):
-            delete_user_file_impl(
-                user_file_id=str(uf.id),
-                tenant_id="test-tenant",
-                redis_locking=False,
-            )
-
-        assert file_store.delete_file.call_count == 2
-        session.delete.assert_called_once_with(uf)
-        session.commit.assert_called_once()
+        state = owned_delete_boundary
+        identifier = uuid4()
+        delete_user_file_impl(
+            user_file_id=str(identifier), tenant_id="test-tenant", redis_locking=False
+        )
+        assert state.storage.delete_file.call_args_list == [
+            call("original", error_on_missing=False),
+            call(
+                user_file_id_to_plaintext_file_name(identifier), error_on_missing=False
+            ),
+        ]
+        state.finish.assert_called_once_with(state.owner, without_index_authority=True)
 
 
 # ------------------------------------------------------------------

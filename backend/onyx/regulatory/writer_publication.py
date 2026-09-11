@@ -682,11 +682,13 @@ def delete_owned_file(user_file_id: "UUID", tenant_id: str) -> None:
     from onyx.background.celery.tasks.regulatory_indexing.tasks import (
         enqueue_regulatory_indexing_step,
     )
+    from onyx.configs.app_configs import DISABLE_VECTOR_DB
     from onyx.db.regulatory_writer_publication import (
         begin_owned_deletion,
         finish_owned_deletion,
         load_owned_writer_inputs,
         owned_deletion_file_id,
+        owned_unindexed_deletion_file_id,
         writer_file_exists,
     )
     from onyx.document_index.elasticsearch.client import ElasticsearchClient
@@ -727,7 +729,10 @@ def delete_owned_file(user_file_id: "UUID", tenant_id: str) -> None:
                     delivery_kind=OrchestrationDeliveryKind.NORMAL,
                 )
             return
-        if pending_writer_manifest(owner) is None:
+        unindexed_file_id = (
+            owned_unindexed_deletion_file_id(owner) if DISABLE_VECTOR_DB else None
+        )
+        if unindexed_file_id is None and pending_writer_manifest(owner) is None:
             inputs = load_owned_writer_inputs(owner)
             indexes = {
                 binding.index.index_uuid: binding.index for binding in inputs.bindings
@@ -770,7 +775,11 @@ def delete_owned_file(user_file_id: "UUID", tenant_id: str) -> None:
                     bindings=[],
                 )
                 execute_writer_publication(owner, client, manifest)
-        file_id = owned_deletion_file_id(owner)
+        file_id = (
+            unindexed_file_id
+            if unindexed_file_id is not None
+            else owned_deletion_file_id(owner)
+        )
         with publication_heartbeat(owner) as lost:
             file_store = get_default_file_store()
             file_store.delete_file(file_id, error_on_missing=False)
@@ -780,7 +789,9 @@ def delete_owned_file(user_file_id: "UUID", tenant_id: str) -> None:
             )
             if lost.is_set():
                 raise ValueError("file deletion ownership heartbeat lost")
-        finish_owned_deletion(owner)
+        finish_owned_deletion(
+            owner, without_index_authority=unindexed_file_id is not None
+        )
     finally:
         try:
             authority.release(owner)

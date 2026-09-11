@@ -209,11 +209,26 @@ def _apply_canonical_rows(
 
 
 def _validate_history_coverage(
-    active: list[RegulatoryTemporalProjection], manifest: WriterPublicationManifest
+    active: list[RegulatoryTemporalProjection],
+    manifest: WriterPublicationManifest,
+    before: list[AnnexCanonicalSnapshot],
 ) -> None:
     if manifest.kind == "delete":
         return
     after = {row.id: row for row in manifest.canonical_after or []}
+    corrected_windows = (
+        {
+            row.id
+            for row in before
+            if row.id in after
+            and (
+                row.validity_start_date != after[row.id].validity_start_date
+                or row.validity_end_date != after[row.id].validity_end_date
+            )
+        }
+        if manifest.kind == "correction"
+        else set()
+    )
     for previous in active:
         start, end = (
             previous.effective_start or date.min,
@@ -223,7 +238,10 @@ def _validate_history_coverage(
             end = min(
                 end, after[previous.canonical_chunk_id].validity_end_date or date.max
             )
-        if manifest.kind == "validity" and previous.canonical_chunk_id in after:
+        if previous.canonical_chunk_id in after and (
+            manifest.kind == "validity"
+            or previous.canonical_chunk_id in corrected_windows
+        ):
             legal = after[previous.canonical_chunk_id]
             start = max(start, legal.validity_start_date or date.min)
             end = min(end, legal.validity_end_date or date.max)
@@ -319,7 +337,9 @@ def finalize_writer_publication(
                 )
             ):
                 raise ValueError("writer qualified history baseline changed")
-        _validate_history_coverage(active, manifest)
+        _validate_history_coverage(
+            active, manifest, capture_canonical_scope(session, owner.user_file_id)
+        )
         retained = {binding.id: binding for binding in manifest.bindings}
         for previous in active:
             if previous.id in retained:
@@ -825,6 +845,68 @@ def begin_owned_deletion(owner: FileOwnership) -> "UserFileDeletionCleanupPlan":
         )
 
 
+def _unindexed_deletion_file(session: Session, owner: FileOwnership) -> UserFile | None:
+    from sqlalchemy import or_
+
+    from onyx.db.enums import UserFileStatus
+    from onyx.db.models import (
+        AnnexChangeSet,
+        AnnexPublicationIntent,
+        RegulatoryCanonicalRevision,
+        RegulatoryIndexingJob,
+        RegulatoryPublicationOrdinal,
+    )
+
+    reservations = PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
+    row = session.get_one(RegulatoryFilePublication, owner.user_file_id)
+    file = session.get(UserFile, owner.user_file_id, with_for_update=True)
+    if (
+        file is None
+        or file.status != UserFileStatus.DELETING
+        or file.chunk_count != 0
+        or reservations.gate_closed
+        or reservations.ordinals
+        or row.epoch != 0
+        or row.next_ordinal != 0
+        or row.writer_manifest is not None
+        or row.original_ingestion_receipt is not None
+    ):
+        return None
+    has_authority = session.scalar(
+        select(
+            or_(
+                select(RegulatoryChunk.id)
+                .where(RegulatoryChunk.user_file_id == owner.user_file_id)
+                .exists(),
+                select(RegulatoryCanonicalRevision.id)
+                .where(RegulatoryCanonicalRevision.user_file_id == owner.user_file_id)
+                .exists(),
+                select(RegulatoryTemporalProjection.id)
+                .where(RegulatoryTemporalProjection.user_file_id == owner.user_file_id)
+                .exists(),
+                select(RegulatoryPublicationOrdinal.ordinal)
+                .where(RegulatoryPublicationOrdinal.user_file_id == owner.user_file_id)
+                .exists(),
+                select(RegulatoryIndexingJob.id)
+                .where(RegulatoryIndexingJob.user_file_id == owner.user_file_id)
+                .exists(),
+                select(AnnexPublicationIntent.id)
+                .join(AnnexChangeSet)
+                .where(AnnexChangeSet.user_file_id == owner.user_file_id)
+                .exists(),
+            )
+        )
+    )
+    return None if has_authority else file
+
+
+def owned_unindexed_deletion_file_id(owner: FileOwnership) -> str | None:
+    """Prove the completed no-index upload has no historical or pending ES authority."""
+    with get_session_with_tenant(tenant_id=owner.scope.tenant_id) as session:
+        file = _unindexed_deletion_file(session, owner)
+        return file.file_id if file is not None else None
+
+
 def owned_deletion_file_id(owner: FileOwnership) -> str:
     with get_session_with_tenant(tenant_id=owner.scope.tenant_id) as session:
         reservations = PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
@@ -841,8 +923,17 @@ def owned_deletion_file_id(owner: FileOwnership) -> str:
         return file.file_id
 
 
-def finish_owned_deletion(owner: FileOwnership) -> None:
+def finish_owned_deletion(
+    owner: FileOwnership, *, without_index_authority: bool = False
+) -> None:
     with get_session_with_tenant(tenant_id=owner.scope.tenant_id) as session:
+        if without_index_authority:
+            file = _unindexed_deletion_file(session, owner)
+            if file is None:
+                raise ValueError("unindexed deletion lost its positive absence proof")
+            session.delete(file)
+            session.commit()
+            return
         reservations = PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
         row = session.get(RegulatoryFilePublication, owner.user_file_id)
         if (

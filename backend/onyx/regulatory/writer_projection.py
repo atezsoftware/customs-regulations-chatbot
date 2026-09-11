@@ -65,12 +65,22 @@ def prepare_owned_correction(
     previous_canonical = {row.id: row for row in inputs.canonical}
     changed_ids = {row.id for row in after if previous_canonical.get(row.id) != row}
     target = desired[changed_id] if changed_id is not None else None
-    lower, upper = (
-        target.validity_start_date or date.min if target else date.min,
-        target.validity_end_date or date.max if target else date.max,
-    )
-    if lower >= upper:
-        raise ValueError("correction validity window is empty")
+    affected = [(date.min, date.max)]
+    if target is not None:
+        previous_target = previous_canonical[target.id]
+        windows = sorted(
+            (row.validity_start_date or date.min, row.validity_end_date or date.max)
+            for row in (previous_target, target)
+        )
+        if any(start >= end for start, end in windows):
+            raise ValueError("correction validity window is empty")
+        affected = [windows[0]]
+        for start, end in windows[1:]:
+            if start <= affected[-1][1]:
+                affected[-1] = (affected[-1][0], max(end, affected[-1][1]))
+            else:
+                affected.append((start, end))
+    lower, upper = affected[0][0], affected[-1][1]
     bindings: list[AnnexTemporalProjection] = []
     indexes: list[PublicationIndexSnapshot] = []
     views: list[PreparedContextView] = []
@@ -200,14 +210,22 @@ def prepare_owned_correction(
                 previous.effective_start or date.min,
                 previous.effective_end or date.max,
             )
-            if end <= lower or start >= upper:
+            untouched = [(start, end)]
+            for affected_start, affected_end in affected:
+                untouched = [
+                    (part_start, part_end)
+                    for original_start, original_end in untouched
+                    for part_start, part_end in (
+                        (original_start, min(original_end, affected_start)),
+                        (max(original_start, affected_end), original_end),
+                    )
+                    if part_start < part_end
+                ]
+            if untouched == [(start, end)]:
                 bindings.append(previous)
                 used.add(previous.projection.ordinal)
                 continue
-            for part_start, part_end in (
-                (start, min(end, lower)),
-                (max(start, upper), end),
-            ):
+            for part_start, part_end in untouched:
                 if part_start >= part_end:
                     continue
                 new_id = uuid4()
@@ -248,6 +266,12 @@ def prepare_owned_correction(
                 window_upper,
                 *(
                     value
+                    for window in affected
+                    for value in window
+                    if window_lower < value < window_upper
+                ),
+                *(
+                    value
                     for row in after
                     for value in (row.validity_start_date, row.validity_end_date)
                     if value is not None and window_lower < value < window_upper
@@ -262,6 +286,10 @@ def prepare_owned_correction(
         )
         llm = resolve_review_context_llm(settings, None)
         for start, end in zip(boundaries, boundaries[1:]):
+            if prior and not any(
+                lower <= start and end <= upper for lower, upper in affected
+            ):
+                continue
             when = (
                 start
                 if start != date.min

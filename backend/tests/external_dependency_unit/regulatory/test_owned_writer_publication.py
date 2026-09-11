@@ -844,6 +844,41 @@ def test_delete_caller_retains_approved_annex_evidence(
         for evidence in draft.evidence
     }
     assert content
+    from sqlalchemy import select
+
+    from onyx.db.models import RegulatoryFilePublication, RegulatoryTemporalProjection
+
+    publication = source_session.get_one(RegulatoryFilePublication, identifier)
+    assert not publication.gate_closed and publication.writer_manifest is None
+    assert publication.epoch > 0
+    assert (
+        source_session.scalar(
+            select(RegulatoryTemporalProjection.id).where(
+                RegulatoryTemporalProjection.user_file_id == identifier,
+                RegulatoryTemporalProjection.retired_at.is_(None),
+            )
+        )
+        is not None
+    )
+
+    from onyx.configs import app_configs
+    from onyx.document_index.elasticsearch import client as es_module
+
+    def unavailable_es(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("protected deletion still requires Elasticsearch")
+
+    with monkeypatch.context() as disabled:
+        disabled.setattr(app_configs, "DISABLE_VECTOR_DB", True)
+        disabled.setattr(es_module, "ElasticsearchClient", unavailable_es)
+        with pytest.raises(RuntimeError, match="still requires Elasticsearch"):
+            file_tasks.delete_user_file_impl(
+                user_file_id=str(identifier), tenant_id="public", redis_locking=False
+            )
+    source_session.expire_all()
+    assert source_session.get(UserFile, identifier) is not None
+    from onyx.file_store.file_store import get_default_file_store
+
+    assert get_default_file_store().read_file(live_review.file.file_id).read()
 
     def reject_legacy(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("deletion used unfenced legacy ES cleanup")
@@ -1744,3 +1779,323 @@ def test_deferred_edits_wait_for_explicit_indexing(
         ]
         > 0
     )
+
+
+@pytest.mark.parametrize("settings_present", [False, True])
+def test_no_vector_db_delete_uses_real_store_without_es(
+    owned_file: UUID, monkeypatch: pytest.MonkeyPatch, settings_present: bool
+) -> None:
+    from io import BytesIO
+
+    from sqlalchemy import delete
+
+    from onyx.background.celery.tasks.user_file_processing import tasks
+    from onyx.configs import app_configs
+    from onyx.configs.constants import DocumentSource, FileOrigin
+    from onyx.connectors.models import Document, TextSection
+    from onyx.db import search_settings as settings_repository
+    from onyx.db.models import FileRecord, RegulatoryChunk, UserFile
+    from onyx.document_index.elasticsearch import client as es_module
+    from onyx.file_store.file_store import get_default_file_store
+    from onyx.file_store.utils import user_file_id_to_plaintext_file_name
+
+    file_store = get_default_file_store()
+    original = file_store.save_file(
+        BytesIO(b"ordinary no-index upload"),
+        "ordinary.txt",
+        FileOrigin.OTHER,
+        "text/plain",
+    )
+    plaintext = user_file_id_to_plaintext_file_name(owned_file)
+    with get_session_with_tenant(tenant_id="public") as session:
+        session.execute(
+            delete(RegulatoryChunk).where(RegulatoryChunk.user_file_id == owned_file)
+        )
+        file = session.get_one(UserFile, owned_file)
+        file.file_id = original
+        session.commit()
+        settings = (
+            settings_repository.get_active_search_settings_list(session)
+            if settings_present
+            else []
+        )
+        for setting in settings:
+            _ = setting.cloud_provider
+    monkeypatch.setattr(
+        settings_repository, "get_active_search_settings_list", lambda _: settings
+    )
+    monkeypatch.setattr(app_configs, "DISABLE_VECTOR_DB", True)
+    monkeypatch.setattr(tasks, "DISABLE_VECTOR_DB", True)
+    monkeypatch.setattr("onyx.llm.factory.get_default_llm", lambda: None)
+    monkeypatch.setattr(
+        "onyx.llm.factory.get_llm_tokenizer_encode_func",
+        lambda _: lambda text: list(text),
+    )
+
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError(
+            "Elasticsearch must not be constructed for unindexed deletion"
+        )
+
+    monkeypatch.setattr(es_module, "ElasticsearchClient", unavailable)
+    try:
+        tasks._process_user_file_without_vector_db(
+            owned_file,
+            [
+                Document(
+                    id=str(owned_file),
+                    source=DocumentSource.FILE,
+                    semantic_identifier="ordinary.txt",
+                    sections=[TextSection(text="ordinary no-index upload", link="")],
+                    metadata={},
+                )
+            ],
+        )
+        with get_session_with_tenant(tenant_id="public") as session:
+            assert session.get_one(UserFile, owned_file).chunk_count == 0
+            assert session.get(FileRecord, original) is not None
+            assert session.get(FileRecord, plaintext) is not None
+        tasks.delete_user_file_impl(
+            user_file_id=str(owned_file), tenant_id="public", redis_locking=False
+        )
+        with get_session_with_tenant(tenant_id="public") as session:
+            assert session.get(UserFile, owned_file) is None
+            assert session.get(FileRecord, original) is None
+            assert session.get(FileRecord, plaintext) is None
+    finally:
+        file_store.delete_file(original, error_on_missing=False)
+        file_store.delete_file(plaintext, error_on_missing=False)
+
+
+@pytest.mark.parametrize("live_review", ["temporary"], indirect=True)
+@pytest.mark.parametrize("change", ["start_later", "end_earlier", "move"])
+def test_validity_correction_rebuilds_removed_context_windows(
+    live_review: LiveReview,
+    source_session: Session,
+    es: tuple[Elasticsearch, str],
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    import json
+    from datetime import date, datetime, time, timezone
+
+    from onyx.db.enums import UserFileStatus
+    from onyx.db.models import RegulatoryTemporalProjection
+    from onyx.db.regulatory_annex_publication import (
+        load_annex_publication_inputs,
+        load_file_temporal_bindings,
+    )
+    from onyx.db.regulatory_canonical_revisions import (
+        validate_temporal_canonical_revision,
+    )
+    from onyx.db.regulatory_publication import PublicationStore
+    from onyx.indexing.embedder import DefaultIndexingEmbedder
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexChangeDraft,
+        AnnexTemporalProjection,
+    )
+    from onyx.regulatory.amendments.annexes.publication_evidence import (
+        read_publication_preparation,
+    )
+    from onyx.regulatory.writer_publication import correct_owned_chunk
+    from tests.external_dependency_unit.regulatory.test_annex_publisher_execution import (
+        approve,
+        invoke,
+    )
+
+    draft = AnnexChangeDraft.model_validate(live_review.review.review_payload)
+    assert draft.publication is not None
+    prepared = read_publication_preparation(draft.publication)
+    _, settings, _ = load_annex_publication_inputs(source_session, draft)
+    model = DefaultIndexingEmbedder.from_db_search_settings(
+        search_settings=settings[0]
+    ).embedding_model
+    monkeypatch.setattr(
+        model, "encode", lambda *, texts, **_: [[0.25, 0.5, 0.75] for _ in texts]
+    )
+    assert invoke(approve(source_session, live_review)) == "approved"
+    source_session.expire_all()
+    approved = load_file_temporal_bindings(source_session, live_review.file.id)
+    target = next(
+        row
+        for row in prepared.legal.canonical_rows
+        if row.source == "amendment"
+        and row.validity_start_date == prepared.legal.effective_start
+    )
+    neighbor = next(
+        row for row in prepared.legal.canonical_rows if row.text == "outside"
+    )
+    settings[0].enable_contextual_rag = True
+    live_review.file.status = UserFileStatus.COMPLETED
+    source_session.commit()
+    from onyx.llm.factory import get_default_llm
+
+    monkeypatch.setattr(
+        "onyx.regulatory.writer_projection.resolve_review_context_llm",
+        lambda *_: get_default_llm(),
+    )
+    monkeypatch.setattr(
+        "onyx.indexing.indexing_pipeline._invoke_contextual_llm_with_retry",
+        lambda *, prompt, **_: (
+            "Context includes TargetAmarker"
+            if "TargetAmarker" in str(prompt)
+            else "Context has no target"
+        ),
+    )
+    requests: list[tuple[str, ...]] = []
+
+    def encode(*, texts: list[str], **_kwargs: object) -> list[list[float]]:
+        requests.append(tuple(texts))
+        return [
+            [0.9, 0.1, 0.1] if "TargetAmarker" in text else [0.2, 0.3, 0.4]
+            for text in texts
+        ]
+
+    monkeypatch.setattr(model, "encode", encode)
+    authority = PublicationStore(prepared.scope)
+    owner = authority.acquire(
+        live_review.file.id, owner_id=uuid4(), ttl=timedelta(minutes=2)
+    )
+    try:
+        correct_owned_chunk(owner, es[0], target.id, text="TargetAmarker")
+    finally:
+        authority.release(owner)
+    source_session.expire_all()
+    before = load_file_temporal_bindings(source_session, live_review.file.id)
+    starts = {
+        "start_later": date(2026, 11, 1),
+        "end_earlier": date(2026, 9, 10),
+        "move": date(2027, 2, 1),
+    }
+    ends = {
+        "start_later": date(2027, 1, 1),
+        "end_earlier": date(2026, 11, 1),
+        "move": date(2027, 4, 1),
+    }
+    removed = date(2026, 12, 1) if change == "end_earlier" else date(2026, 10, 1)
+
+    def visible(
+        items: list[AnnexTemporalProjection], chunk_id: str, when: date
+    ) -> list[AnnexTemporalProjection]:
+        return [
+            item
+            for item in items
+            if json.loads(item.projection.source_json)["regulatory_chunk_id"]
+            == chunk_id
+            and (item.effective_start is None or item.effective_start <= when)
+            and (item.effective_end is None or when < item.effective_end)
+        ]
+
+    old_b = visible(before, neighbor.id, removed)
+    assert len(old_b) == 1 and "TargetAmarker" in " ".join(
+        old_b[0].projection.embedding_inputs
+    )
+    requests.clear()
+    owner = authority.acquire(
+        live_review.file.id, owner_id=uuid4(), ttl=timedelta(minutes=2)
+    )
+    try:
+        correct_owned_chunk(
+            owner,
+            es[0],
+            target.id,
+            validity_start_date=starts[change],
+            validity_end_date=ends[change],
+        )
+    finally:
+        authority.release(owner)
+    source_session.expire_all()
+    after = load_file_temporal_bindings(source_session, live_review.file.id)
+    new_b = visible(after, neighbor.id, removed)
+    assert len(new_b) == 1
+    assert "TargetAmarker" not in " ".join(new_b[0].projection.embedding_inputs)
+    assert new_b[0].projection.embedding_inputs != old_b[0].projection.embedding_inputs
+    assert not visible(after, target.id, removed)
+    assert visible(after, target.id, starts[change])
+    assert any(new_b[0].projection.embedding_inputs == request for request in requests)
+    unaffected = [
+        item
+        for item in before
+        if item.effective_end is not None and item.effective_end <= date(2026, 9, 10)
+    ]
+    assert unaffected and all(item in after for item in unaffected)
+    for previous in approved:
+        retained = source_session.get_one(RegulatoryTemporalProjection, previous.id)
+        assert retained.payload == previous.model_dump(mode="json")
+        validate_temporal_canonical_revision(source_session, retained)
+    assert read_publication_preparation(draft.publication) == prepared
+    es[0].indices.refresh(index=es[1])
+    timestamp = int(datetime.combine(removed, time(), tzinfo=timezone.utc).timestamp())
+    hits = es[0].search(
+        index=es[1],
+        query={
+            "bool": {
+                "filter": [
+                    {"term": {"document_id": str(live_review.file.id)}},
+                    {"term": {"regulatory_chunk_id": target.id}},
+                    {"range": {"validity_start_date": {"lte": timestamp}}},
+                    {"range": {"validity_end_date": {"gt": timestamp}}},
+                ],
+                "must_not": [{"term": {"publication_tombstone": True}}],
+            }
+        },
+    )["hits"]["hits"]
+    assert hits == []
+
+
+@pytest.mark.parametrize("authority_kind", ["reserved", "pending"])
+def test_no_vector_db_flag_preserves_index_authority(
+    owned_file: UUID, monkeypatch: pytest.MonkeyPatch, authority_kind: str
+) -> None:
+    from sqlalchemy import delete
+
+    from onyx.background.celery.tasks.user_file_processing import tasks
+    from onyx.configs import app_configs
+    from onyx.db import search_settings as settings_repository
+    from onyx.db.models import RegulatoryChunk, UserFile
+    from onyx.db.regulatory_publication import PublicationStore
+    from onyx.document_index.elasticsearch import client as es_module
+    from onyx.document_index.publication_models import PublicationScope
+    from onyx.regulatory.amendments.annexes import config
+
+    with get_session_with_tenant(tenant_id="public") as session:
+        session.execute(
+            delete(RegulatoryChunk).where(RegulatoryChunk.user_file_id == owned_file)
+        )
+        session.get_one(UserFile, owned_file).chunk_count = 0
+        session.commit()
+    authority = PublicationStore(
+        PublicationScope(
+            tenant_id="public",
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
+        )
+    )
+    owner = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(minutes=2))
+    if authority_kind == "reserved":
+        authority.allocate(owner, "unseen-but-owned")
+    else:
+        authority.close_gate(owner)
+    authority.release(owner)
+    monkeypatch.setattr(app_configs, "DISABLE_VECTOR_DB", True)
+    monkeypatch.setattr(
+        settings_repository, "get_active_search_settings_list", lambda _: []
+    )
+
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("fenced recovery requires unavailable Elasticsearch")
+
+    def refuse_storage() -> None:
+        raise AssertionError("protected source storage must remain untouched")
+
+    monkeypatch.setattr(es_module, "ElasticsearchClient", unavailable)
+    monkeypatch.setattr(
+        "onyx.file_store.file_store.get_default_file_store", refuse_storage
+    )
+    error = ValueError if authority_kind == "pending" else RuntimeError
+    with pytest.raises(error, match="pending annex publication|fenced recovery"):
+        tasks.delete_user_file_impl(
+            user_file_id=str(owned_file), tenant_id="public", redis_locking=False
+        )
+    with get_session_with_tenant(tenant_id="public") as session:
+        assert session.get(UserFile, owned_file) is not None
