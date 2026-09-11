@@ -1723,6 +1723,148 @@ def test_logging_metadata_unavailable_is_precise_and_never_reads_events(
     )
 
 
+def test_fluentd_destination_follows_only_exact_referenced_configmaps(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    driver = Mock(spec=cutover.Driver)
+    daemonset = {
+        "items": [
+            {
+                "metadata": {"name": "fluentd"},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": "fluentd",
+                                    "image": "fluent/fluentd-kubernetes-daemonset:v1.16.2-debian-elasticsearch7-1.0",
+                                    "env": [
+                                        {
+                                            "name": "FLUENT_ELASTICSEARCH_HOST",
+                                            "value": "elasticsearch.logging.svc",
+                                        },
+                                        {
+                                            "name": "FLUENT_ELASTICSEARCH_PASSWORD",
+                                            "value": "secret",
+                                        },
+                                    ],
+                                }
+                            ],
+                            "volumes": [
+                                {
+                                    "name": "config",
+                                    "configMap": {"name": "fluentd-config"},
+                                },
+                                {
+                                    "name": "secret",
+                                    "secret": {"secretName": "never-read"},
+                                },
+                            ],
+                        }
+                    }
+                },
+            }
+        ]
+    }
+    configs = {
+        "metadata": {"name": "fluentd-config"},
+        "data": {
+            "fluent.conf": "<match **>\n @type elasticsearch\n host elasticsearch.logging.svc\n port 9200\n scheme http\n logstash_prefix fluentd\n password secret\n</match>"
+        },
+    }
+    services = {
+        "items": [
+            {
+                "metadata": {"name": "elasticsearch"},
+                "spec": {"clusterIP": "10.0.0.1", "ports": [{"port": 9200}]},
+            },
+            {
+                "metadata": {"name": "kibana"},
+                "spec": {"clusterIP": "10.0.0.2", "ports": [{"port": 5601}]},
+            },
+        ]
+    }
+    values = [
+        {"items": []},
+        {"items": []},
+        daemonset,
+        {"items": []},
+        configs,
+        services,
+        {"data": {}},
+    ]
+    driver.command.side_effect = [json.dumps(value) for value in values]
+    with patch.object(cutover, "cloudwatch_metadata", return_value={"logGroups": []}):
+        cutover.diagnose_logging_metadata(driver)
+    output = capsys.readouterr().out
+    assert (
+        "elasticsearch.logging.svc" in output
+        and "9200" in output
+        and "kibana" in output
+    )
+    assert (
+        "secret" not in output
+        and "password" not in output
+        and "never-read" not in output
+    )
+    assert driver.command.call_args_list[4].args[0][1:6] == [
+        "get",
+        "configmap",
+        "fluentd-config",
+        "--namespace",
+        "logging",
+    ]
+    assert driver.command.call_args_list[5].args[0][1:5] == [
+        "get",
+        "services",
+        "--namespace",
+        "logging",
+    ]
+    assert all("secrets" not in call.args[0] for call in driver.command.call_args_list)
+
+
+def test_fluentd_unknown_or_excessive_refs_never_trigger_dynamic_reads(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    driver = Mock(spec=cutover.Driver)
+    daemonset = {
+        "items": [
+            {
+                "metadata": {"name": "fluentd"},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {"name": "fluentd", "image": "fluent/fluentd:1"}
+                            ],
+                            "volumes": [{"configMap": {"name": "../unsafe"}}],
+                        }
+                    }
+                },
+            }
+        ]
+    }
+    driver.command.side_effect = [
+        json.dumps(value)
+        for value in [
+            {"items": []},
+            {"items": []},
+            daemonset,
+            {"items": []},
+            {"data": {}},
+        ]
+    ]
+    with patch.object(cutover, "cloudwatch_metadata", return_value={"logGroups": []}):
+        cutover.diagnose_logging_metadata(driver)
+    assert driver.command.call_count == 5
+    output = capsys.readouterr().out
+    assert "invalid_references" in output and "../unsafe" not in output
+
+
 def test_worker_failure_receipt_survives_runner_output(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
