@@ -189,6 +189,8 @@ def test_lost_creation_response_recovers_from_precommitted_intent(
         durable.update(value.model_dump(mode="json"))
 
     def server_committed_response_lost(*_args: object, **_kwargs: object) -> None:
+        if kind == "markdown":
+            assert _args[2] == "/manage/admin/document-set/42/file/upload"
         persisted = ownership.CanaryRun.model_validate(durable)
         assert len(persisted.creation_intents) == 1
         assert persisted.creation_intents[0].kind == kind
@@ -422,3 +424,72 @@ def test_two_png_role_receipts_bind_exact_originals(
         json.loads(capsys.readouterr().out)["canary"]["vision_roles"]
         == run.vision_roles
     )
+
+
+def test_markdown_probe_uses_registered_upload_list_and_index_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    from typing import Any
+    from unittest.mock import Mock
+    from uuid import uuid4
+
+    import httpx
+    from fastapi.routing import APIRoute
+
+    from onyx.db.regulatory_annex_acceptance import CanaryRun
+    from onyx.regulatory.amendments.annexes import acceptance_canary as canary
+    from onyx.server.features.document_set.api import router
+
+    run = CanaryRun(release_sha="a" * 40, user_id=uuid4(), document_set_id=42)
+    file = {
+        "id": str(uuid4()),
+        "file_id": str(uuid4()),
+        "name": "ANNEXCANARY" + run.run_id.hex + ".md",
+        "chat_file_type": "plain_text",
+    }
+    operations: list[str] = []
+    indexed = False
+
+    def request(_client: httpx.Client, method: str, path: str, **_kwargs: Any) -> Any:
+        nonlocal indexed
+        if "/document-set/" in path:
+            routes = [
+                route
+                for route in router.routes
+                if isinstance(route, APIRoute)
+                and method in route.methods
+                and route.path_regex.fullmatch(path)
+            ]
+            assert len(routes) == 1, (method, path)
+            operations.append(method + " " + routes[0].path)
+            if path.endswith("/file/upload"):
+                return {"rejected_files": [], "user_files": [file]}
+            if path.endswith("/index"):
+                indexed = True
+                return {}
+            return [{**file, "status": "COMPLETED" if indexed else "CHUNKED"}]
+        if path == "/tool":
+            return [{"id": 1, "display_name": "Internal Search"}]
+        if path == "/chat/create-chat-session":
+            return {"chat_session_id": str(uuid4())}
+        assert path == "/chat/send-chat-message"
+        assert _kwargs["json"]["forced_tool_id"] == 1
+        assert _kwargs["json"]["internal_search_filters"] == {
+            "document_set": [run.name]
+        }
+        assert "ANNEXCANARY" not in _kwargs["json"]["message"]
+        return {
+            "answer": "ANNEXCANARY" + run.run_id.hex,
+            "top_documents": [{"document_id": file["id"]}],
+            "citation_info": [{"citation_num": 1}],
+        }
+
+    monkeypatch.setattr(canary, "request_json", request)
+    monkeypatch.setattr(canary, "save_canary", Mock())
+    monkeypatch.setattr(canary.time, "sleep", Mock())
+    with httpx.Client() as client:
+        canary.markdown_canary(client, run, time.monotonic() + 10)
+    assert len(operations) == 4
+    assert indexed
+    assert run.evidence["ordinary_markdown_upload_index_chat"] is True

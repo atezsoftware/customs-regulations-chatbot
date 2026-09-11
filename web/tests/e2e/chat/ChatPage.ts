@@ -49,21 +49,31 @@ export class ChatPage {
   async openSavedCitation(
     chatId: string,
     answer: string,
-    sourceName: string,
+    citation: {
+      semantic_identifier: string;
+      document_id: string;
+      chunk_ind: number;
+    },
     screenshotPath: string
   ): Promise<void> {
     await this.page.goto(`/app?chatId=${encodeURIComponent(chatId)}`);
-    await expect(this.aiMessage()).toContainText(answer, { timeout: 30000 });
-    await this.aiMessage()
-      .getByRole("button", { name: "Sources", exact: true })
-      .click();
-    await expect(
-      this.page.getByText("Cited Sources", { exact: true })
-    ).toBeVisible();
-    const content = this.page.waitForResponse((response) =>
-      response.url().includes("/api/document/chunk-info?")
-    );
-    await this.page.getByText(sourceName, { exact: true }).last().click();
+    const message = this.aiMessages.filter({ hasText: answer }).last();
+    await expect(message).toBeVisible({ timeout: 30000 });
+    const source = message
+      .locator("p")
+      .filter({ hasText: answer })
+      .getByRole("button");
+    await expect(source).toHaveCount(1);
+    await expect(source).toBeInViewport({ timeout: 10000 });
+    const content = this.page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        url.pathname === "/api/document/chunk-info" &&
+        url.searchParams.get("document_id") === citation.document_id &&
+        url.searchParams.get("chunk_id") === String(citation.chunk_ind)
+      );
+    });
+    await source.click({ timeout: 10000 });
     expect((await content).ok()).toBe(true);
     await expect(this.page.getByRole("dialog")).toContainText(answer);
     await this.page.screenshot({ path: screenshotPath, fullPage: true });

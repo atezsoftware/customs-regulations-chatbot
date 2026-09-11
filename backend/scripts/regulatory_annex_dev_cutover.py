@@ -155,7 +155,7 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
         "view_position",
         "view_sha256",
         "view_locator_sha256",
-        "ordinary_markdown_upload_index_attachment_chat",
+        "ordinary_markdown_upload_index_chat",
         "acceptance_passed",
         "retained_tombstones",
         "cleanup_live_projections",

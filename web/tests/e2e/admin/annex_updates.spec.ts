@@ -38,15 +38,20 @@ test("opens both actual dated annex chat citations @annex", async ({
 }) => {
   const fixturePath = process.env.ANNEX_ACCEPTANCE_CHAT_EVIDENCE;
   test.skip(!fixturePath, "Requires the owned actual dated chat evidence.");
-  const fixture: { chat_ids: string[] } = JSON.parse(
-    readFileSync(fixturePath!, "utf8")
-  );
+  const fixture: {
+    chat_ids: string[];
+    dated_citations: {
+      semantic_identifier: string;
+      document_id: string;
+      chunk_ind: number;
+    }[];
+  } = JSON.parse(readFileSync(fixturePath!, "utf8"));
   const chat = new ChatPage(page);
   for (const [index, rate] of ["5%", "7%"].entries()) {
     await chat.openSavedCitation(
       fixture.chat_ids[index]!,
       rate,
-      "Temsili Oran Yonetmeligi.pdf",
+      fixture.dated_citations[index]!,
       fixturePath!.replace(/\.json$/, `-citation-${index}.png`)
     );
   }

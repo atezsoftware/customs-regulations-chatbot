@@ -411,7 +411,7 @@ def upload_canary_markdown(client: httpx.Client, run: CanaryRun) -> dict[str, An
     result = request_json(
         client,
         "POST",
-        f"/admin/document-set/{run.document_set_id}/file/upload",
+        f"/manage/admin/document-set/{run.document_set_id}/file/upload",
         files={
             "files": (
                 intent.marker,
@@ -475,14 +475,14 @@ def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> No
     identifier = UUID(file["id"])
     while time.monotonic() < deadline:
         files = request_json(
-            client, "GET", f"/admin/document-set/{run.document_set_id}/files"
+            client, "GET", f"/manage/admin/document-set/{run.document_set_id}/files"
         )
         current = next(item for item in files if item["id"] == str(identifier))
         if current["status"] == "CHUNKED":
             request_json(
                 client,
                 "POST",
-                f"/admin/document-set/{run.document_set_id}/files/{identifier}/index",
+                f"/manage/admin/document-set/{run.document_set_id}/files/{identifier}/index",
             )
         elif current["status"] == "COMPLETED":
             break
@@ -491,6 +491,12 @@ def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> No
         time.sleep(1)
     else:
         raise TimeoutError("ordinary_markdown_index_deadline")
+    tools = request_json(client, "GET", "/tool")
+    search = next(
+        (tool for tool in tools if tool.get("display_name") == "Internal Search"), None
+    )
+    if search is None:
+        raise ValueError("canary_search_tool_missing")
     chat_id = create_canary_chat(client, run, purpose="markdown")
     response = request_json(
         client,
@@ -498,21 +504,23 @@ def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> No
         "/chat/send-chat-message",
         json={
             "chat_session_id": str(chat_id),
-            "message": "Return the verification marker from the attached fictional file.",
-            "file_descriptors": [
-                {
-                    "id": file["file_id"],
-                    "type": file["chat_file_type"],
-                    "name": file["name"],
-                    "user_file_id": file["id"],
-                }
-            ],
+            "message": "Return the verification marker from the indexed fictional canary document. Cite the source.",
+            "internal_search_filters": {"document_set": [run.name]},
+            "forced_tool_id": search["id"],
             "stream": False,
         },
     )
-    if response.get("error_msg") or marker not in response["answer"]:
-        raise ValueError("ordinary_markdown_attachment_chat_failed")
-    run.evidence["ordinary_markdown_upload_index_attachment_chat"] = True
+    if (
+        response.get("error_msg")
+        or marker not in response["answer"]
+        or not response.get("citation_info")
+        or not any(
+            str(identifier) in str(document.get("document_id", ""))
+            for document in response.get("top_documents", [])
+        )
+    ):
+        raise ValueError("ordinary_markdown_indexed_chat_failed")
+    run.evidence["ordinary_markdown_upload_index_chat"] = True
     save_canary(run)
 
 
