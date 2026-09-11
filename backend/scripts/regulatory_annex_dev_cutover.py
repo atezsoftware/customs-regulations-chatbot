@@ -2326,6 +2326,8 @@ def reproduce_source861(report: dict[str, Any]) -> None:
         return
     set_is_ee_based_on_env_variable()
     CURRENT_TENANT_ID_CONTEXTVAR.set("public")
+    configuration = verify_dev_configuration()
+    report["configuration_verified"] = True
     with SqlEngine.scoped_engine(
         pool_size=2,
         max_overflow=0,
@@ -2358,8 +2360,6 @@ def reproduce_source861(report: dict[str, Any]) -> None:
                 ),
             )
             input_file_id, spec = package.input_file_id, dict(package.input_spec)
-        configuration = verify_dev_configuration()
-        report["configuration_verified"] = True
         if (
             report["issues"] != ["acquisition_failed"]
             or report["manifest_present"]

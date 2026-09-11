@@ -556,3 +556,111 @@ def test_source861_exact_run_timestamp_is_required() -> None:
     assert runner.source861_scope_matches(run, package, scope)
     run.created_at += datetime.timedelta(microseconds=1)
     assert not runner.source861_scope_matches(run, package, scope)
+
+
+def test_configuration_and_reproduction_use_sequential_real_engine_scopes() -> None:
+    from io import BytesIO
+
+    from sqlalchemy.engine import Engine
+
+    from onyx.db import (
+        amendment_sources,
+        document_set,
+        regulatory_annex_acceptance,
+        regulatory_annex_dev_cutover,
+    )
+    from onyx.db.engine import sql_engine
+    from onyx.file_store import file_store
+    from onyx.llm import factory
+
+    run, package, scope = scope_objects()
+    package.issues = [{"code": "acquisition_failed"}]
+    engines = [Mock(spec=Engine), Mock(spec=Engine)]
+    session = Mock()
+    session.scalars.return_value = []
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_provider="vertex_ai", model_name="gemini-fixture")
+    )
+    file_engine = []
+
+    def configured_model() -> Any:
+        assert sql_engine.SqlEngine.get_engine() is engines[0]
+        return model
+
+    def read_original(_identifier: str) -> BytesIO:
+        file_engine.append(sql_engine.SqlEngine.get_engine())
+        # Stop after proving FileStore can resolve its engine; no acquisition/model call.
+        return BytesIO(b"controlled-hash-mismatch")
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch.dict(
+                "os.environ",
+                {
+                    "POSTGRES_DB": "customs-regulations-dev",
+                    "REGULATORY_ANNEX_ENVIRONMENT": "dev",
+                    "PGOPTIONS": "-c default_transaction_read_only=on",
+                },
+            )
+        )
+        stack.enter_context(patch.object(sql_engine.SqlEngine, "_engine", None))
+        stack.enter_context(patch.object(sql_engine.SqlEngine, "_engine_profile", None))
+        stack.enter_context(patch.object(sql_engine.ShardRegistry, "reset"))
+        create = stack.enter_context(
+            patch.object(sql_engine, "create_engine", side_effect=engines)
+        )
+        stack.enter_context(
+            patch.object(
+                sql_engine,
+                "build_connection_string",
+                return_value="postgresql://fixture.invalid/readonly",
+            )
+        )
+        db_session = stack.enter_context(
+            patch.object(sql_engine, "get_session_with_current_tenant")
+        )
+        db_session.return_value.__enter__.return_value = session
+        # verify_dev_configuration imports this already-bound DAL reference.
+        own_session = stack.enter_context(
+            patch.object(regulatory_annex_acceptance, "get_session_with_current_tenant")
+        )
+        own_session.return_value.__enter__.return_value = session
+        stack.enter_context(
+            patch.object(
+                regulatory_annex_dev_cutover,
+                "configured_indices",
+                return_value=["dev-fixture"],
+            )
+        )
+        stack.enter_context(
+            patch.object(factory, "get_default_llm", side_effect=configured_model)
+        )
+        stack.enter_context(
+            patch.object(
+                factory, "get_default_llm_with_vision", side_effect=configured_model
+            )
+        )
+        stack.enter_context(
+            patch.object(runner, "load_source861_canary", return_value=run, create=True)
+        )
+        stack.enter_context(
+            patch.object(amendment_sources, "get_source_package", return_value=package)
+        )
+        stack.enter_context(
+            patch.object(document_set, "get_document_set_by_id", return_value=scope)
+        )
+        store = stack.enter_context(patch.object(file_store, "get_default_file_store"))
+        store.return_value.read_file.side_effect = read_original
+        result = report()
+        runner.reproduce_source861(result)
+        assert sql_engine.SqlEngine._engine is None
+    assert result["configuration_verified"] is True
+    assert result["scope_failure"] == "source_hash"
+    assert file_engine == [engines[1]]
+    assert create.call_count == 2
+    assert (
+        create.call_args.kwargs["connect_args"]["options"]
+        == "-c default_transaction_read_only=on"
+    )
+    for engine in engines:
+        engine.dispose.assert_called_once()
