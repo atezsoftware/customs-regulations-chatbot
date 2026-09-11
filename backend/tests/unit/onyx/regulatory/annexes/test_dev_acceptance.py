@@ -82,12 +82,20 @@ def test_failed_batch_refuses_without_polling_until_deadline(
     )
     request = Mock(side_effect=[[], [{"id": 4, "status": "failed"}]])
     monkeypatch.setattr(acceptance_canary, "request_json", request)
+    detail = '{"stage":"source_review","exceptions":[]}'
+    monkeypatch.setattr(
+        acceptance_canary,
+        "read_canary_worker_failure",
+        Mock(return_value=("regulatory_amendment_failure:4:1", detail)),
+    )
+    monkeypatch.setattr(acceptance_canary, "save_canary", Mock())
     sleep = Mock()
     monkeypatch.setattr(acceptance_canary.time, "sleep", sleep)
     with httpx.Client() as client:
         with pytest.raises(ValueError, match="fictional_amendment_batch_failed"):
             acceptance_canary.wait_review(client, run, time.monotonic() + 600)
     sleep.assert_not_called()
+    assert run.evidence["worker_failure"] == detail
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])

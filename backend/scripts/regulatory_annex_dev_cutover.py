@@ -164,6 +164,7 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
         "retained_tombstones",
         "cleanup_live_projections",
         "retained_source_scope",
+        "worker_failure",
         "cleanup_failure",
         "chat_cleanup_failure",
         "token_cleanup_failure",

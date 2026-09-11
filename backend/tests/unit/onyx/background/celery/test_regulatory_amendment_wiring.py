@@ -456,3 +456,31 @@ def test_approval_task_rejects_invalid_initial_target_before_ownership() -> None
     heartbeat.assert_not_called()
     publish.assert_not_called()
     failure.assert_called_once_with(9, "tenant-a")
+
+
+def test_worker_retains_exception_with_current_failure_lease() -> None:
+    from contextlib import nullcontext
+
+    error = RuntimeError("private-provider-detail")
+    with (
+        patch.object(tasks, "get_session_with_current_tenant") as factory,
+        patch.object(
+            tasks,
+            "claim_batch_for_analysis",
+            return_value=SimpleNamespace(generation=7),
+        ),
+        patch.object(tasks, "_renew_batch_lease", return_value=nullcontext()),
+        patch.object(tasks, "run_amendment_batch", side_effect=error),
+        patch.object(tasks, "mark_batch_failed") as mark_failed,
+        patch.object(tasks.logger, "exception"),
+    ):
+        with pytest.raises(RuntimeError) as raised:
+            tasks.regulatory_amendment_run.run(batch_id=44, tenant_id="public")
+    assert raised.value is error
+    mark_failed.assert_called_once_with(
+        factory.return_value.__enter__.return_value,
+        batch_id=44,
+        lease_generation=7,
+        error_message=tasks._SAFE_FAILURE_MESSAGE,
+        failure=error,
+    )

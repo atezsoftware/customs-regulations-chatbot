@@ -25,6 +25,7 @@ from onyx.db.models import (
     AmendmentBatch,
     AmendmentProposal,
     DocumentSet__UserFile,
+    KVStore,
     RegulatoryChunk,
 )
 from onyx.db.regulatory_chunks import (
@@ -366,6 +367,7 @@ def mark_batch_failed(
     batch_id: int,
     lease_generation: int,
     error_message: str,
+    failure: BaseException | None = None,
     now: datetime.datetime | None = None,
 ) -> bool:
     batch = _get_batch_for_update(db_session, batch_id)
@@ -379,6 +381,25 @@ def mark_batch_failed(
     completed_at = now or datetime.datetime.now(datetime.timezone.utc)
     batch.status = AmendmentBatchStatus.FAILED.value
     batch.error_message = error_message[:_MAX_ERROR_MESSAGE_LENGTH]
+    if failure is not None:
+        from onyx.regulatory.amendments.annexes.dev_acceptance import (
+            safe_failure_detail,
+        )
+
+        db_session.add(
+            KVStore(
+                key=f"regulatory_amendment_failure:{batch.id}:{lease_generation}",
+                value={
+                    "batch_id": batch.id,
+                    "lease_generation": lease_generation,
+                    "document_set_id": batch.document_set_id,
+                    "created_by": str(batch.created_by),
+                    "source_package_id": str(batch.source_package_id),
+                    "user_file_ids": list(batch.user_file_ids),
+                    "detail": safe_failure_detail("source_review", failure),
+                },
+            )
+        )
     batch.heartbeat_at = completed_at
     batch.completed_at = completed_at
     db_session.commit()

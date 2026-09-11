@@ -231,7 +231,7 @@ def regulatory_amendment_run(
                 batch_id=batch_id,
                 lease_generation=lease.generation,
             )
-    except Exception:
+    except Exception as error:
         logger.exception("Amendment batch %s failed", batch_id)
         with get_session_with_current_tenant() as db_session:
             mark_batch_failed(
@@ -239,6 +239,7 @@ def regulatory_amendment_run(
                 batch_id=batch_id,
                 lease_generation=lease.generation,
                 error_message=_SAFE_FAILURE_MESSAGE,
+                failure=error,
             )
         raise
 

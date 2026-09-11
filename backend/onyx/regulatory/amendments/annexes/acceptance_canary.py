@@ -19,6 +19,7 @@ from onyx.db.regulatory_annex_acceptance import (
     canary_index_names,
     cleanup_empty_canary_scope,
     issue_canary_token,
+    read_canary_worker_failure,
     recover_creation_intents,
     reserve_canary,
     retained_canary_audit,
@@ -122,6 +123,10 @@ def wait_review(
         )
         batch = next((item for item in batches if item["id"] == run.batch_id), None)
         if batch is None or batch["status"] == "failed":
+            receipt = read_canary_worker_failure(run)
+            if receipt is not None:
+                run.evidence["worker_failure"] = receipt[1]
+                save_canary(run)
             raise ValueError("fictional_amendment_batch_failed")
         time.sleep(1)
     raise TimeoutError("fictional_annex_review_deadline")

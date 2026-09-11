@@ -1721,3 +1721,30 @@ def test_logging_metadata_unavailable_is_precise_and_never_reads_events(
     assert all(
         call.args[0][0] == "describe-log-groups" for call in query.call_args_list
     )
+
+
+def test_worker_failure_receipt_survives_runner_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    detail = (
+        '{"stage":"source_review","exceptions":[{"type":"RuntimeError","frames":[]}]}'
+    )
+    report = {
+        "phase": "canary",
+        "status": "failed",
+        "release_sha_metadata": "a" * 40,
+        "canary": {
+            "evidence": {"worker_failure": detail},
+            "retained_objects": [
+                {
+                    "kind": "worker_failure_receipt",
+                    "id": "regulatory_amendment_failure:44:3",
+                }
+            ],
+        },
+    }
+    with pytest.raises(cutover.CutoverRefusal, match="fixed_acceptance_probe_failed"):
+        cutover.emit_acceptance_report(json.dumps(report), "canary", "a" * 40)
+    assert json.loads(capsys.readouterr().out)["canary"] == report["canary"]

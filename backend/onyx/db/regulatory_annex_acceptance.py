@@ -2,11 +2,13 @@
 
 import datetime
 import hashlib
-from typing import Literal
+from collections.abc import Mapping
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
+from sqlalchemy.orm import Session
 
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import KVStore, User, UserFile
@@ -381,6 +383,84 @@ def recover_creation_intents(run: CanaryRun) -> bool:
     return complete
 
 
+def _read_canary_worker_failure(
+    session: Session, run: CanaryRun
+) -> tuple[str, str] | None:
+    from onyx.db.models import AmendmentBatch, AmendmentSourcePackage, DocumentSet
+
+    if run.batch_id is None:
+        return None
+    saved = session.get(KVStore, run.key)
+    if saved is None:
+        raise ValueError("canary_worker_failure_run_missing")
+    stored = CanaryRun.model_validate(saved.value)
+    fields = (
+        "run_id",
+        "release_sha",
+        "user_id",
+        "file_id",
+        "document_set_id",
+        "batch_id",
+        "package_id",
+    )
+    if any(getattr(stored, field) != getattr(run, field) for field in fields):
+        raise ValueError("canary_worker_failure_run_mismatch")
+    batch = session.get(AmendmentBatch, run.batch_id)
+    scope = (
+        session.get(DocumentSet, run.document_set_id) if run.document_set_id else None
+    )
+    package = (
+        session.get(AmendmentSourcePackage, run.package_id) if run.package_id else None
+    )
+    if (
+        batch is None
+        or scope is None
+        or scope.is_public
+        or package is None
+        or package.document_set_id != run.document_set_id
+        or package.created_by != run.user_id
+        or scope.user_id != run.user_id
+        or scope.name != run.name
+        or batch.created_by != run.user_id
+        or batch.document_set_id != run.document_set_id
+        or run.package_id is None
+        or batch.source_package_id != run.package_id
+        or batch.user_file_ids != [str(run.file_id)]
+    ):
+        raise ValueError("canary_worker_failure_scope_mismatch")
+    if batch.status != "failed":
+        return None
+    key = f"regulatory_amendment_failure:{batch.id}:{batch.lease_generation}"
+    receipt = session.get(KVStore, key)
+    if receipt is None:
+        return None
+    expected = {
+        "batch_id": batch.id,
+        "lease_generation": batch.lease_generation,
+        "document_set_id": run.document_set_id,
+        "created_by": str(run.user_id),
+        "source_package_id": str(run.package_id),
+        "user_file_ids": [str(run.file_id)],
+    }
+    if not isinstance(receipt.value, Mapping):
+        raise ValueError("canary_worker_failure_receipt_mismatch")
+    value = cast(Mapping[str, object], receipt.value)
+    if any(
+        value.get(field) != expected_value for field, expected_value in expected.items()
+    ):
+        raise ValueError("canary_worker_failure_receipt_mismatch")
+    detail = value.get("detail")
+    if not isinstance(detail, str) or len(detail) > 4000:
+        raise ValueError("canary_worker_failure_detail_invalid")
+    return key, detail
+
+
+def read_canary_worker_failure(run: CanaryRun) -> tuple[str, str] | None:
+    with get_session_with_current_tenant() as session:
+        session.execute(text("SET TRANSACTION READ ONLY"))
+        return _read_canary_worker_failure(session, run)
+
+
 def retained_canary_audit(run: CanaryRun) -> list[RetainedArtifact]:
     from onyx.db.models import (
         AmendmentSourcePackage,
@@ -400,6 +480,11 @@ def retained_canary_audit(run: CanaryRun) -> list[RetainedArtifact]:
         ):
             raise ValueError("canary_audit_run_ownership_missing")
         retained.append(RetainedArtifact(kind="run_record", id=run.key))
+        failure = _read_canary_worker_failure(session, run)
+        if failure is not None:
+            retained.append(
+                RetainedArtifact(kind="worker_failure_receipt", id=failure[0])
+            )
         tokens = list(
             session.scalars(
                 select(PersonalAccessToken.id)
