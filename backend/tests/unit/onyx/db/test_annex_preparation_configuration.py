@@ -12,7 +12,10 @@ from sqlalchemy.orm import Session
 from onyx.db import regulatory_annex_changes as changes
 from onyx.db.models import AmendmentBatch, SearchSettings, UserFile
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
-from onyx.regulatory.amendments.annexes.models import AnnexChangeDraft
+from onyx.regulatory.amendments.annexes.models import (
+    AnnexChangeDraft,
+    AnnexProjectionAccess,
+)
 from onyx.utils.sensitive import SensitiveAccessError, SensitiveValue
 
 
@@ -82,6 +85,20 @@ def test_non_sensitive_mapped_hashes_remain_exactly_legacy(
                 if column.key not in ("created_at", "updated_at", "last_accessed_at")
             }
         )
+    from onyx.db.regulatory_annex_publication import publication_input_scope_hash
+
+    access = projection_access()
+    legacy_rows = [
+        {
+            column.key: getattr(row, column.key)
+            for column in inspect(type(row)).columns
+            if column.key not in ("created_at", "updated_at", "last_accessed_at")
+        }
+        for row in (file, settings)
+    ]
+    assert publication_input_scope_hash(file, [settings], access) == context_hash(
+        [legacy_rows[0], [legacy_rows[1]], access.model_dump(mode="json")]
+    )
     settings.model_dim = 1024
     assert (
         changes.capture_preparation_configuration(session, user_file_id=file.id)[
@@ -161,3 +178,144 @@ def test_prepared_guard_rejects_rotation_before_staging(
         )
     assert reached_staging.call_count == (0 if rotate else 1)
     assert draft.preparation_configuration == frozen
+
+
+def projection_access() -> "AnnexProjectionAccess":
+    from onyx.access.models import DocumentAccess
+    from onyx.regulatory.amendments.annexes.models import AnnexProjectionAccess
+
+    return AnnexProjectionAccess(
+        access=DocumentAccess.build(
+            user_emails=["fixture@example.com"],
+            user_groups=[],
+            external_user_emails=[],
+            external_user_group_ids=[],
+            is_public=False,
+        ),
+        project_ids=[1],
+        persona_ids=[2],
+        document_sets=["fixture"],
+    )
+
+
+def test_publication_mapped_fingerprint_preserves_logical_secrets_order_and_acl(
+    mapped_configuration: tuple[MagicMock, UserFile, SearchSettings],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from onyx.db.regulatory_annex_publication import publication_input_scope_hash
+
+    session, file, settings = mapped_configuration
+    access = projection_access()
+    future = SearchSettings(id=2, model_name="future", model_dim=3072)
+    secret = "fictional-private-reranker"
+    settings.rerank_api_key = credential(secret)
+    prepared = changes.capture_preparation_configuration(session, user_file_id=file.id)
+    published = publication_input_scope_hash(file, [settings, future], access)
+
+    def legacy_columns(row: UserFile | SearchSettings) -> dict[str, object]:
+        return {
+            column.key: secret
+            if column.key == "rerank_api_key" and row is settings
+            else getattr(row, column.key)
+            for column in inspect(type(row)).columns
+            if column.key not in ("created_at", "updated_at", "last_accessed_at")
+        }
+
+    assert published == context_hash(
+        [
+            legacy_columns(file),
+            [legacy_columns(settings), legacy_columns(future)],
+            access.model_dump(mode="json"),
+        ]
+    )
+    settings.rerank_api_key = credential(secret)
+    assert publication_input_scope_hash(file, [future, settings], access) == published
+    assert (
+        changes.capture_preparation_configuration(session, user_file_id=file.id)
+        == prepared
+    )
+    settings.rerank_api_key = credential("fictional-rotated")
+    assert publication_input_scope_hash(file, [settings, future], access) != published
+    assert (
+        changes.capture_preparation_configuration(session, user_file_id=file.id)
+        != prepared
+    )
+    settings.rerank_api_key = credential(secret)
+    assert (
+        publication_input_scope_hash(
+            file, [settings, future], access.model_copy(update={"project_ids": [3]})
+        )
+        != published
+    )
+    future.model_dim = 1024
+    assert publication_input_scope_hash(file, [settings, future], access) != published
+    captured = capsys.readouterr()
+    assert secret not in published + json.dumps(prepared) + captured.out + captured.err
+    with pytest.raises(SensitiveAccessError):
+        context_hash(settings.rerank_api_key)
+
+
+@pytest.mark.parametrize("boundary", ["baseline", "runtime"])
+@pytest.mark.parametrize("rotate", [False, True])
+def test_publication_guards_reject_credential_rotation(
+    mapped_configuration: tuple[MagicMock, UserFile, SearchSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    rotate: bool,
+) -> None:
+    from contextlib import nullcontext
+
+    from onyx.db import regulatory_annex_execution as execution
+    from onyx.db import regulatory_annex_publication as publication
+
+    session, file, settings = mapped_configuration
+    access = projection_access()
+    settings.rerank_api_key = credential("fictional-first")
+    prepared = MagicMock()
+    prepared.input_scope_sha256 = publication.publication_input_scope_hash(
+        file, [settings], access
+    )
+    prepared.scope.tenant_id = "public"
+    prepared.indexes = []
+    draft = MagicMock(spec=AnnexChangeDraft)
+    draft.user_file_id = file.id
+    monkeypatch.setattr(
+        publication,
+        "load_annex_publication_inputs",
+        lambda *_args: (file, [settings], access),
+    )
+    monkeypatch.setattr(
+        execution, "get_session_with_tenant", lambda **_kwargs: nullcontext(session)
+    )
+    monkeypatch.setattr(changes, "lock_annex_preparation_scope", lambda *_args: None)
+    monkeypatch.setattr(execution, "PublicationStore", MagicMock())
+    monkeypatch.setattr(
+        "onyx.db.regulatory_physical_indexes.validate_physical_index_snapshots",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "onyx.db.regulatory_amendments.get_batch", lambda *_args: MagicMock()
+    )
+    retained_guard = MagicMock()
+    monkeypatch.setattr(changes, "validate_prepared_annex_change", retained_guard)
+    settings.rerank_api_key = credential(
+        "fictional-rotated" if rotate else "fictional-first"
+    )
+
+    def check() -> object:
+        if boundary == "baseline":
+            return execution.validate_database_baseline(session, draft, prepared)
+        return execution.load_validated_runtime_settings(draft, prepared)
+
+    if rotate:
+        with pytest.raises(
+            ValueError, match="publication file/ACL/index configuration changed"
+        ):
+            check()
+        retained_guard.assert_not_called()
+    else:
+        result = check()
+        if boundary == "runtime":
+            assert result == [settings]
+        else:
+            retained_guard.assert_called_once()

@@ -683,9 +683,8 @@ def capture_preparation_configuration(
     session: Session, *, user_file_id: UUID
 ) -> dict[str, str]:
     """Hash complete persisted file/settings inputs without exposing credentials."""
-    from sqlalchemy import inspect
-
     from onyx.db.models import UserFile
+    from onyx.db.regulatory_configuration_fingerprint import configuration_fingerprint
     from onyx.db.search_settings import get_current_search_settings
 
     file = session.get(UserFile, user_file_id)
@@ -693,22 +692,10 @@ def capture_preparation_configuration(
         raise ValueError("file unavailable")
     settings = get_current_search_settings(session)
     session.flush()
-    from onyx.utils.sensitive import SensitiveValue
-
-    configuration: dict[str, str] = {}
-    for name, row in (("user_file", file), ("search_settings", settings)):
-        values: dict[str, object] = {}
-        for column in inspect(type(row)).columns:
-            if column.key in ("created_at", "updated_at", "last_accessed_at"):
-                continue
-            value = getattr(row, column.key)
-            # Hash logical credentials, not ciphertext or a masked placeholder.
-            values[column.key] = (
-                value.get_value(apply_mask=False)
-                if isinstance(value, SensitiveValue)
-                else value
-            )
-        configuration[name] = context_hash(values)
+    configuration = {
+        "user_file": configuration_fingerprint(file),
+        "search_settings": configuration_fingerprint(settings),
+    }
     from onyx.configs import app_configs
     from onyx.prompts.contextual_retrieval import (
         CONTEXTUAL_RAG_PROMPT1,

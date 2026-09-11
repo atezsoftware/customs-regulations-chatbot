@@ -100,21 +100,12 @@ def publication_input_scope_hash(
     file: UserFile, settings: list[SearchSettings], access: AnnexProjectionAccess
 ) -> str:
     """Bind every persisted index/file input and current ACL without exposing secrets."""
-    from sqlalchemy import inspect
+    from onyx.db.regulatory_configuration_fingerprint import configuration_fingerprint
 
-    from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
-
-    def columns(row: UserFile | SearchSettings) -> dict[str, object]:
-        return {
-            column.key: getattr(row, column.key)
-            for column in inspect(type(row)).columns
-            if column.key not in ("created_at", "updated_at", "last_accessed_at")
-        }
-
-    return context_hash(
+    return configuration_fingerprint(
         [
-            columns(file),
-            [columns(item) for item in sorted(settings, key=lambda item: item.id)],
+            file,
+            sorted(settings, key=lambda item: item.id),
             access.model_dump(mode="json"),
         ]
     )
