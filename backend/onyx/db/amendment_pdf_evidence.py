@@ -15,6 +15,7 @@ from onyx.regulatory.amendments.pdf_vision import (
     PdfProposalEvidence,
     digest,
     snapshot_digest,
+    validate_pdf_frozen_references,
 )
 
 
@@ -84,3 +85,7 @@ def validate_pdf_proposal_authority(
         originals.get(page.asset_id) != page.source_sha256 for page in evidence.pages
     ):
         raise ValueError("pdf_proposal_original_changed")
+
+    from onyx.file_store.file_store import get_default_file_store
+
+    validate_pdf_frozen_references(source, evidence, get_default_file_store())

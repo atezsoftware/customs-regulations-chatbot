@@ -645,3 +645,194 @@ def test_unrelated_table_does_not_require_images_for_plain_text_update(
         is None
     )
     render.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["associated", "multiple", "boundary", "missing"])
+def test_cross_page_ordinary_table_update_requires_original_image(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    import json
+
+    from onyx.regulatory.amendments import pdf_vision
+    from onyx.regulatory.amendments.annexes.models import AnnexExtraction
+    from onyx.regulatory.amendments.models import AmendmentInstruction
+
+    source, asset, store, blobs, render = frozen_case(monkeypatch)
+    assert asset.pdf_vision is not None
+    extraction = AnnexExtraction.model_validate_json(blobs[asset.pdf_vision.file_id])
+    instruction = extraction.elements[0].text
+    for element in extraction.elements[1:]:
+        element.locator.page = 2
+    extraction.page_count = 2
+    if mode == "multiple":
+        another = [item.model_copy(deep=True) for item in extraction.elements[1:]]
+        for item in another:
+            item.locator.page = 3
+        extraction.elements.extend(another)
+        extraction.page_count = 3
+    if mode == "boundary":
+        boundary = extraction.elements[0].model_copy(deep=True)
+        boundary.text = "MADDE 4 - Farkli degisiklik."
+        boundary.locator.page = 2
+        extraction.elements.insert(1, boundary)
+    if mode == "missing":
+        extraction.elements[0].text = "MADDE 9 - Baska konu."
+    pages = []
+    for page in range(1, (extraction.page_count or 0) + 1):
+        image = Image.new("RGB", (480, 320), "white")
+        draw = ImageDraw.Draw(image)
+        for _, element in pdf_vision.page_elements(extraction, page):
+            box = element.locator.normalized_box
+            assert box is not None
+            draw.text(
+                (int(box[0] * 480), int(box[1] * 320)), element.text, fill="black"
+            )
+        pages.append(image)
+    original_pdf = BytesIO()
+    pages[0].save(original_pdf, "PDF", save_all=True, append_images=pages[1:])
+    blobs["original"] = original_pdf.getvalue()
+    original_sha = hashlib.sha256(blobs["original"]).hexdigest()
+    extraction.source_sha256 = original_sha
+    source = source.model_copy(
+        update={
+            "originals": [
+                source.originals[0].model_copy(update={"sha256": original_sha})
+            ]
+        }
+    )
+    data = extraction.model_dump_json().encode()
+    blobs[asset.pdf_vision.file_id] = data
+    manifest = json.loads(blobs["manifest"])
+    entry = manifest["assets"][0]
+    entry["sha256"] = original_sha
+    entry["text"] = pdf_vision.pdf_transcript(extraction)
+    entry["pdf_vision"]["sha256"] = hashlib.sha256(data).hexdigest()
+    entry["pdf_vision"]["transcript_sha256"] = pdf_vision.digest(entry["text"])
+    blobs["manifest"] = json.dumps(manifest).encode()
+    source = source.model_copy(
+        update={"manifest_sha256": hashlib.sha256(blobs["manifest"]).hexdigest()}
+    )
+    if mode == "associated":
+        from onyx.utils.process_isolation import run_in_isolated_process
+
+        render = MagicMock(wraps=run_in_isolated_process)
+        monkeypatch.setattr(pdf_vision, "run_in_isolated_process", render)
+    if mode != "associated":
+        with pytest.raises(ValueError, match="ambiguous"):
+            pdf_vision.prepare_pdf_draft_evidence(
+                source, [AmendmentInstruction(instruction_text=instruction)], store
+            )
+        render.assert_not_called()
+    else:
+        evidence = pdf_vision.prepare_pdf_draft_evidence(
+            source, [AmendmentInstruction(instruction_text=instruction)], store
+        )
+        assert evidence is not None
+        assert [page.page for page in evidence.pages] == [1, 2]
+        assert len(evidence.image_parts) == 2
+        assert evidence.image_parts[0] != evidence.image_parts[1]
+        assert evidence.pages[1].positions == list(range(1, len(extraction.elements)))
+        assert render.call_args.args[1] == blobs["original"]
+        grounding = MagicMock(
+            return_value=pdf_vision.PdfGroundingVerdict(
+                supported=True, ambiguous=False, rationale="fixture"
+            )
+        )
+        monkeypatch.setattr(pdf_vision, "generate_structured", grounding)
+        receipt = pdf_vision.verify_pdf_draft(
+            MagicMock(),
+            evidence=evidence,
+            instructions=[AmendmentInstruction(instruction_text=instruction)],
+            old_chunk={"id": "old", "text": "Bugday | 5%"},
+            draft_text="Bugday | 17%",
+        )
+        assert receipt.pages == evidence.pages
+        assert grounding.call_args.kwargs["image_parts"] == evidence.image_parts
+
+
+def test_legacy_partial_pdf_retry_keeps_entire_package_text_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from onyx.llm import factory
+    from onyx.regulatory.amendments.annexes import job
+    from onyx.regulatory.amendments.annexes.models import AcquisitionResult
+
+    source, asset, store, blobs, _ = frozen_case(monkeypatch)
+    old = asset.model_copy(
+        update={"pdf_vision": None, "native_text": None, "text": "frozen legacy text"}
+    )
+    previous = (
+        AcquisitionResult(status="partial", assets=[old]).model_dump_json().encode()
+    )
+    blobs["manifest"] = previous
+    cached = SimpleNamespace(
+        id=source.originals[0].asset_id,
+        sha256=asset.sha256,
+        file_id="original",
+        byte_count=len(blobs["original"]),
+        mime_type="application/pdf",
+        original_url="https://fixture.invalid/root.pdf",
+        final_url="https://fixture.invalid/root.pdf",
+    )
+    package = SimpleNamespace(
+        input_spec={"url": cached.final_url},
+        input_file_id=None,
+        manifest_file_id="manifest",
+        manifest_sha256=hashlib.sha256(previous).hexdigest(),
+    )
+    monkeypatch.setattr(
+        job, "claim_source_package", MagicMock(return_value=(package, uuid4()))
+    )
+    monkeypatch.setattr(job, "list_source_assets", MagicMock(return_value=[cached]))
+    monkeypatch.setattr(job, "get_session_with_current_tenant", MagicMock())
+    monkeypatch.setattr(job, "get_default_file_store", lambda: store)
+    vision = MagicMock(side_effect=AssertionError("legacy retry must not use vision"))
+    monkeypatch.setattr(factory, "get_default_llm_with_vision", vision)
+    download = MagicMock(side_effect=AssertionError("cached PDF must not download"))
+    monkeypatch.setattr(job, "download_source", download)
+    new_bytes = b"new linked PDF fixture"
+    new_asset = AcquiredAsset(
+        content=new_bytes,
+        sha256=hashlib.sha256(new_bytes).hexdigest(),
+        mime_type="application/pdf",
+        display_name="linked.pdf",
+        text="linked native text",
+    )
+
+    def acquire(**kwargs):
+        fetched = kwargs["fetch"](cached.final_url)
+        assert fetched.content == blobs["original"]
+        return AcquisitionResult(
+            status="ready",
+            assets=[old.model_copy(update={"text": "parser changed"}), new_asset],
+        )
+
+    monkeypatch.setattr(job, "acquire_source_package", acquire)
+    finish, failed = MagicMock(), MagicMock()
+    monkeypatch.setattr(job, "finish_source_package", finish)
+    monkeypatch.setattr(job, "mark_source_package_failed", failed)
+    job.run_source_package(package_id=source.package_id, environment="local-test")
+    failed.assert_not_called()
+    result = finish.call_args.kwargs["result"]
+    assert [item.text for item in result.assets] == [
+        "frozen legacy text",
+        "linked native text",
+    ]
+    assert all(
+        item.pdf_vision is None and item.native_text is None for item in result.assets
+    )
+    assert len(finish.call_args.kwargs["assets"]) == 1
+    assert blobs["manifest"] == previous
+    assert not any(
+        item.get("pdf_vision")
+        for item in json.loads(blobs[finish.call_args.kwargs["manifest_file_id"]])[
+            "assets"
+        ]
+    )
+    vision.assert_not_called()
+    download.assert_not_called()

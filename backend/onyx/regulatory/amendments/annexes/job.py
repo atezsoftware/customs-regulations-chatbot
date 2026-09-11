@@ -69,6 +69,7 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
         existing_by_hash = {asset.sha256: asset for asset in existing_assets}
         cached_by_url: dict[str, _CachedSourceOccurrence] = {}
         previous_pdf_assets: dict[str, dict[str, object]] = {}
+        legacy_pdf_assets: dict[str, dict[str, object]] = {}
         for asset in existing_assets:
             for address in (asset.original_url, asset.final_url):
                 if address:
@@ -93,6 +94,13 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 for item in previous_manifest["assets"]
                 if item.get("pdf_vision")
             }
+            legacy_pdf_assets = {
+                item["sha256"]: item
+                for item in previous_manifest["assets"]
+                if item["mime_type"] == "application/pdf" and not item.get("pdf_vision")
+            }
+            if legacy_pdf_assets and previous_pdf_assets:
+                raise ValueError("source_pdf_contract_mixed")
             for raw_link in previous_manifest["links"]:
                 link = SourceLink.model_validate(raw_link)
                 if (
@@ -140,7 +148,17 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
             display_name=spec.get("display_name", "source"),
             fetch=fetch,
         )
-        if any(asset.mime_type == "application/pdf" for asset in result.assets):
+        if legacy_pdf_assets:
+            # A retry completes the frozen package; it never partially upgrades its PDFs.
+            result.assets = [
+                asset.model_copy(
+                    update={"text": legacy_pdf_assets[asset.sha256]["text"]}
+                )
+                if asset.sha256 in legacy_pdf_assets
+                else asset
+                for asset in result.assets
+            ]
+        elif any(asset.mime_type == "application/pdf" for asset in result.assets):
             from onyx.llm.factory import get_default_llm_with_vision
             from onyx.regulatory.amendments.pdf_vision import (
                 prepare_pdf_source,
@@ -164,8 +182,6 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                             asset, previous_pdf_assets[asset.sha256], store
                         )
                     )
-                elif asset.sha256 in existing_by_hash:
-                    raise ValueError("legacy_pdf_retry_requires_new_source_package")
                 else:
                     prepared.append(
                         prepare_pdf_source(

@@ -280,6 +280,87 @@ def _normalized(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
+_TABLE_DEPENDENT = re.compile(
+    r"tablo|table|cetvel|tarife|satır|satir|sütun|sutun|column|row|oran|rate|gt[iı]p|"
+    r"aşağı|asagi|below|following|şöyle|soyle|%",
+    re.IGNORECASE,
+)
+
+
+def _continuation_table_page(
+    extraction: AnnexExtraction, page: int, instruction: AmendmentInstruction
+) -> int:
+    """Admit only a direct, unique table-only continuation of the last paragraph."""
+    body = [
+        item for _, item in page_elements(extraction, page) if item.kind != "footnote"
+    ]
+    body.sort(
+        key=lambda item: (
+            item.locator.normalized_box[1] if item.locator.normalized_box else 0
+        )
+    )
+    anchor = _normalized(instruction.instruction_text)
+    if not body or not anchor or anchor not in _normalized(body[-1].text):
+        raise DraftIntegrityError(
+            "PDF instruction image evidence is missing or ambiguous."
+        )
+    candidates: list[int] = []
+    for following in range(page + 1, (extraction.page_count or 0) + 1):
+        elements = [
+            item
+            for _, item in page_elements(extraction, following)
+            if item.kind != "footnote"
+        ]
+        # Any intervening paragraph/heading introduces a separate source boundary.
+        if not elements or any(item.kind != "table_cell" for item in elements):
+            break
+        candidates.append(following)
+    if candidates != [page + 1]:
+        raise DraftIntegrityError(
+            "PDF instruction image evidence is missing or ambiguous."
+        )
+    return candidates[0]
+
+
+def validate_pdf_frozen_references(
+    source: PdfBatchSource, evidence: PdfProposalEvidence, store: FileStore
+) -> None:
+    manifest = read_pdf_manifest(store, source.manifest_file_id, source.manifest_sha256)
+    entries = {item["sha256"]: item for item in manifest["assets"]}
+    originals = {item.asset_id: item for item in source.originals}
+    seen: set[tuple[UUID, int]] = set()
+    verified: dict[UUID, AnnexExtraction] = {}
+    for page in evidence.pages:
+        key = (page.asset_id, page.page)
+        original = originals.get(page.asset_id)
+        if key in seen or original is None:
+            raise ValueError("pdf_proposal_page_reference_invalid")
+        seen.add(key)
+        entry = entries.get(original.sha256)
+        if entry is None or not entry.get("pdf_vision"):
+            raise ValueError("pdf_proposal_extraction_missing")
+        reference = PdfVisionReference.model_validate(entry["pdf_vision"])
+        if (
+            page.source_sha256 != original.sha256
+            or page.extraction_sha256 != reference.sha256
+        ):
+            raise ValueError("pdf_proposal_extraction_changed")
+        if page.asset_id not in verified:
+            read_verified(store, original.file_id, original.sha256)
+            extraction = load_pdf_extraction(entry, original.sha256, store)
+            if extraction is None:
+                raise ValueError("pdf_proposal_extraction_missing")
+            verified[page.asset_id] = extraction
+        extraction = verified[page.asset_id]
+        expected = [position for position, _ in page_elements(extraction, page.page)]
+        if (
+            not expected
+            or page.page > (extraction.page_count or 0)
+            or page.positions != expected
+        ):
+            raise ValueError("pdf_proposal_page_positions_changed")
+
+
 def prepare_pdf_draft_evidence(
     source: PdfBatchSource,
     instructions: Sequence[AmendmentInstruction],
@@ -344,7 +425,19 @@ def prepare_pdf_draft_evidence(
             for key in matches
             for _, item in page_elements(extracted[key[0]][1], key[1])
         ):
-            continue
+            if not _TABLE_DEPENDENT.search(instruction.instruction_text):
+                continue
+            if len(matches) != 1:
+                raise DraftIntegrityError(
+                    "PDF instruction image evidence is missing or ambiguous."
+                )
+            asset_id, page = matches[0]
+            selected.add(
+                (
+                    asset_id,
+                    _continuation_table_page(extracted[asset_id][1], page, instruction),
+                )
+            )
         if len(matches) != 1:
             raise DraftIntegrityError(
                 "PDF instruction image evidence is missing or ambiguous."
