@@ -5,6 +5,7 @@ import json
 import re
 import signal
 import time
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -512,6 +513,27 @@ def upload_canary_markdown(client: httpx.Client, run: CanaryRun) -> dict[str, An
     return file
 
 
+def contains_percentage(answer: str, expected: str) -> bool:
+    expected_match = re.fullmatch(r"([+-]?[0-9]+(?:[.,][0-9]+)?)\s*%", expected)
+    if expected_match is None:
+        raise ValueError("canary_expected_percentage_invalid")
+    expected_value = Decimal(expected_match[1].replace(",", "."))
+    number = r"[+−-]?\s*[0-9]+(?:[.,][0-9]+)?"
+    pattern = (
+        rf"(?<![\w.,%+−-])(?:(?P<sign>[+−-]?)\s*%\s*(?P<prefix>{number})"
+        rf"|(?P<suffix>{number})\s*%)(?![\w%]|[.,][0-9])"
+    )
+    for match in re.finditer(pattern, answer):
+        value = re.sub(r"\s+", "", match["prefix"] or match["suffix"])
+        sign = match["sign"] or ""
+        if sign and value.startswith(("+", "-", "−")):
+            continue
+        parsed = Decimal((sign + value).replace("−", "-").replace(",", "."))
+        if parsed == expected_value:
+            return True
+    return False
+
+
 def chat_canary(client: httpx.Client, run: CanaryRun, *, as_of: str, rate: str) -> None:
     tools = request_json(client, "GET", "/tool")
     search = next(
@@ -537,7 +559,7 @@ def chat_canary(client: httpx.Client, run: CanaryRun, *, as_of: str, rate: str) 
     )
     if (
         result.get("error_msg")
-        or rate not in result["answer"]
+        or not contains_percentage(result["answer"], rate)
         or not result["top_documents"]
         or not result["citation_info"]
     ):
