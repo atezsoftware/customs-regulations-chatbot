@@ -1494,3 +1494,149 @@ def test_worker_exec_transport_failure_has_safe_diagnostic(
     ):
         driver.verify_app("background")
     assert capsys.readouterr().out == "NOT_READY annex_worker ExecTransportFailure\n"
+
+
+def cloudwatch_event(log: str, *, namespace: str = cutover.NAMESPACE) -> dict[str, Any]:
+    import json
+
+    return {
+        "timestamp": 1789123650000,
+        "logStreamName": "private",
+        "message": json.dumps(
+            {
+                "kubernetes": {
+                    "namespace_name": namespace,
+                    "pod_name": "dev-customs-regulations-background-abc",
+                    "container_name": "background",
+                },
+                "log": log,
+            }
+        ),
+    }
+
+
+def test_batch44_cloudwatch_trace_is_scoped_and_sanitized(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    trace = 'Amendment batch 44 failed\nTraceback (most recent call last):\n  File "/app/onyx/regulatory/tasks.py", line 235, in run\n    secret_source()\nValueError: secret provider content\n'
+    with patch.object(
+        cutover,
+        "cloudwatch_metadata",
+        create=True,
+        side_effect=[
+            {
+                "logGroups": [
+                    {
+                        "logGroupName": "/aws/containerinsights/atez-dev-cluster/application"
+                    }
+                ]
+            },
+            {"events": [cloudwatch_event(trace)]},
+        ],
+    ) as query:
+        cutover.diagnose_batch44_logs("4a38658efa5014dfa2b039887bc7db0e12e8153e")
+    output = capsys.readouterr().out
+    assert '"exception_class": "ValueError"' in output
+    assert '"filename": "onyx/regulatory/tasks.py"' in output
+    assert "secret" not in output and "private" not in output
+    args = query.call_args.args[0]
+    assert args[0] == "filter-log-events"
+    assert "kubernetes.namespace_name" in args[args.index("--filter-pattern") + 1]
+    assert cutover.NAMESPACE in args[args.index("--filter-pattern") + 1]
+
+
+def test_batch44_cloudwatch_absent_group_never_reads_content(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with patch.object(
+        cutover, "cloudwatch_metadata", create=True, return_value={"logGroups": []}
+    ) as query:
+        cutover.diagnose_batch44_logs("4a38658efa5014dfa2b039887bc7db0e12e8153e")
+    assert query.call_count == 1
+    assert "application_group_absent" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "response,status",
+    [
+        (
+            {
+                "events": [
+                    cloudwatch_event("secret", namespace="customs-regulations-test")
+                ]
+            },
+            "namespace_scope_mismatch",
+        ),
+        ({"events": []}, "batch_trace_unavailable"),
+        ({}, "invalid_response"),
+        ({"events": [], "nextToken": "same"}, "pagination_incomplete"),
+    ],
+)
+def test_batch44_cloudwatch_refuses_unproven_trace(
+    response: dict[str, Any], status: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with patch.object(
+        cutover,
+        "cloudwatch_metadata",
+        create=True,
+        side_effect=[
+            {
+                "logGroups": [
+                    {
+                        "logGroupName": "/aws/containerinsights/atez-dev-cluster/application"
+                    }
+                ]
+            },
+            response,
+            response,
+        ],
+    ):
+        cutover.diagnose_batch44_logs("4a38658efa5014dfa2b039887bc7db0e12e8153e")
+    output = capsys.readouterr().out
+    assert status in output and "secret" not in output
+
+
+def test_batch44_cloudwatch_other_runtime_does_not_query() -> None:
+    with patch.object(cutover, "cloudwatch_metadata", create=True) as query:
+        cutover.diagnose_batch44_logs("a" * 40)
+    query.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "stderr,status",
+    [
+        ("AccessDeniedException secret", "access_denied"),
+        ("other secret", "aws_query_failed"),
+    ],
+)
+def test_batch44_cloudwatch_permission_errors_are_fixed(
+    stderr: str, status: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with patch.object(
+        cutover.subprocess,
+        "run",
+        return_value=cutover.subprocess.CompletedProcess([], 1, "secret", stderr),
+    ) as command:
+        cutover.diagnose_batch44_logs("4a38658efa5014dfa2b039887bc7db0e12e8153e")
+    output = capsys.readouterr().out
+    assert status in output and "secret" not in output
+    assert command.call_args.args[0][:3] == ["aws", "logs", "describe-log-groups"]
+
+
+def test_batch44_cloudwatch_requires_complete_pagination_before_trace(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    trace = 'Amendment batch 44 failed\nTraceback (most recent call last):\n  File "/app/onyx/task.py", line 3, in run\nValueError: secret'
+    with patch.object(
+        cutover,
+        "cloudwatch_metadata",
+        side_effect=[
+            {"logGroups": [{"logGroupName": cutover.BATCH44_GROUP}]},
+            {"events": [cloudwatch_event(trace)], "nextToken": "next"},
+            {"events": []},
+        ],
+    ) as query:
+        cutover.diagnose_batch44_logs(cutover.BATCH44_RUNTIME)
+    assert query.call_count == 3
+    assert query.call_args.args[0][-2:] == ["--next-token", "next"]
+    assert "trace_found" in capsys.readouterr().out

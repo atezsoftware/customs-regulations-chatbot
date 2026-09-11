@@ -1007,6 +1007,191 @@ print(json.dumps({"stages": [run("configuration", configuration), run("native_pa
 """
 
 
+BATCH44_RUNTIME = "4a38658efa5014dfa2b039887bc7db0e12e8153e"
+BATCH44_GROUP = "/aws/containerinsights/atez-dev-cluster/application"
+BATCH44_START, BATCH44_END = 1789123620000, 1789123800000
+BATCH44_FILTER = '{ $.kubernetes.namespace_name = "customs-regulations-dev" && $.kubernetes.pod_name = %^dev-customs-regulations-background-% }'
+
+
+def cloudwatch_metadata(args: list[str]) -> dict[str, Any]:
+    """Fixed diagnostic callers only; never expose AWS output or error messages."""
+    try:
+        response = subprocess.run(
+            [
+                "aws",
+                "logs",
+                *args,
+                "--region",
+                "eu-central-1",
+                "--output",
+                "json",
+                "--no-cli-pager",
+                "--no-paginate",
+                "--cli-connect-timeout",
+                "5",
+                "--cli-read-timeout",
+                "15",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+        if response.returncode:
+            denied = (
+                "AccessDenied" in response.stderr
+                or "UnauthorizedOperation" in response.stderr
+            )
+            raise CutoverRefusal("access_denied" if denied else "aws_query_failed")
+        if len(response.stdout) > 2_000_000:
+            raise CutoverRefusal("response_too_large")
+        value = json.loads(response.stdout)
+        if not isinstance(value, dict):
+            raise CutoverRefusal("invalid_response")
+        return value
+    except (OSError, subprocess.TimeoutExpired):
+        raise CutoverRefusal("aws_transport_unavailable") from None
+    except (ValueError, TypeError):
+        raise CutoverRefusal("invalid_response") from None
+
+
+def diagnose_batch44_logs(runtime_sha: str) -> None:
+    """Read only the known failed release's fixed DEV namespace/time window."""
+    report: dict[str, Any] = {
+        "stage": "batch44_cloudwatch",
+        "status": "not_applicable",
+        "frames": [],
+        "exception_class": None,
+    }
+    if runtime_sha != BATCH44_RUNTIME:
+        print(json.dumps(report, sort_keys=True), flush=True)
+        return
+    try:
+        groups = cloudwatch_metadata(
+            [
+                "describe-log-groups",
+                "--log-group-name-prefix",
+                "/aws/containerinsights/atez-dev-cluster/",
+                "--limit",
+                "50",
+            ]
+        )
+        if groups.get("nextToken"):
+            raise CutoverRefusal("group_inventory_incomplete")
+        if not isinstance(groups.get("logGroups"), list):
+            raise CutoverRefusal("invalid_response")
+        if not any(
+            group.get("logGroupName") == BATCH44_GROUP for group in groups["logGroups"]
+        ):
+            raise CutoverRefusal("application_group_absent")
+        report["application_group_found"] = True
+        deadline = time.monotonic() + 120
+        token: str | None = None
+        streams: dict[str, list[str]] = {}
+        seen: set[str] = set()
+        for _ in range(6):
+            if time.monotonic() >= deadline:
+                raise CutoverRefusal("pagination_incomplete")
+            args = [
+                "filter-log-events",
+                "--log-group-name",
+                BATCH44_GROUP,
+                "--start-time",
+                str(BATCH44_START),
+                "--end-time",
+                str(BATCH44_END),
+                "--filter-pattern",
+                BATCH44_FILTER,
+                "--limit",
+                "10000",
+            ]
+            if token:
+                args += ["--next-token", token]
+            page = cloudwatch_metadata(args)
+            if not isinstance(page.get("events"), list):
+                raise CutoverRefusal("invalid_response")
+            for event in page["events"]:
+                if (
+                    not isinstance(event, dict)
+                    or type(event.get("timestamp")) is not int
+                    or not BATCH44_START <= event["timestamp"] < BATCH44_END
+                ):
+                    raise CutoverRefusal("invalid_response")
+                value = json.loads(event["message"])
+                kubernetes = value.get("kubernetes", {})
+                if kubernetes.get("namespace_name") != NAMESPACE or not re.fullmatch(
+                    r"dev-customs-regulations-background-[a-z0-9-]+",
+                    kubernetes.get("pod_name", ""),
+                ):
+                    raise CutoverRefusal("namespace_scope_mismatch")
+                if not isinstance(value.get("log"), str) or not isinstance(
+                    event.get("logStreamName"), str
+                ):
+                    raise CutoverRefusal("invalid_response")
+                streams.setdefault(event["logStreamName"], []).extend(
+                    value["log"].splitlines()
+                )
+            token = page.get("nextToken")
+            if not token:
+                break
+            if not isinstance(token, str) or token in seen:
+                raise CutoverRefusal("pagination_incomplete")
+            seen.add(token)
+        else:
+            raise CutoverRefusal("pagination_incomplete")
+        traces = []
+        for lines in streams.values():
+            for position, line in enumerate(lines):
+                if not re.search(
+                    r"Amendment batch 44 failed(?:\x1b\[[0-9;]*m)*$", line
+                ):
+                    continue
+                frames: list[dict[str, Any]] = []
+                started = False
+                for line in lines[position + 1 : position + 101]:
+                    line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                    if line == "Traceback (most recent call last):":
+                        started = True
+                        continue
+                    if not started:
+                        break
+                    frame = re.fullmatch(
+                        r'  File "[^"\n]*?((?:onyx|shared_configs|ee/onyx)/[A-Za-z0-9_./-]+\.py)", line ([1-9][0-9]*), in ([A-Za-z0-9_<>]+)',
+                        line,
+                    )
+                    if frame and ".." not in frame.group(1).split("/"):
+                        frames.append(
+                            {
+                                "filename": frame.group(1),
+                                "line": int(frame.group(2)),
+                                "function": frame.group(3),
+                            }
+                        )
+                    error = re.match(r"^([A-Za-z_][A-Za-z0-9_.]{0,99}):(?: |$)", line)
+                    if error:
+                        if frames:
+                            traces.append(
+                                {
+                                    "frames": frames,
+                                    "exception_class": error.group(1).rsplit(".", 1)[
+                                        -1
+                                    ],
+                                }
+                            )
+                        break
+                    if line and not line.startswith(" "):
+                        break
+        if len(traces) != 1:
+            raise CutoverRefusal(
+                "batch_trace_unavailable" if not traces else "batch_trace_ambiguous"
+            )
+        report.update(traces[0], status="trace_found")
+    except CutoverRefusal as error:
+        report["status"] = str(error)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        report["status"] = "invalid_response"
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
 def diagnose_release(driver: Driver, runner_sha: str) -> None:
     driver.validate_target()
     state = driver.get("configmap", STATE)["data"]
@@ -1021,6 +1206,7 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         ),
         flush=True,
     )
+    diagnose_batch44_logs(driver.sha)
     pod = driver.pods("background")[0]
     container = next(
         item
