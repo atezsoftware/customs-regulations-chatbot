@@ -73,6 +73,15 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
         "configuration",
         "native",
         "calibration",
+        "pdf_vision_probe",
+        "probe_stage",
+        "native_value_absent",
+        "image_evidence",
+        "grounding_verified",
+        "page_count",
+        "transcript_sha256",
+        "draft_sha256",
+        "receipt_sha256",
         "canary",
         "retained",
         "reused_completed_run",
@@ -184,6 +193,7 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
                 "configuration",
                 "native",
                 "calibration",
+                "pdf_vision",
                 "canary",
             }
         ):
@@ -194,6 +204,7 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
             not in {
                 "UnicodeDecodeError",
                 "ValueError",
+                "ValidationError",
                 "RuntimeError",
                 "TypeError",
                 "TimeoutError",

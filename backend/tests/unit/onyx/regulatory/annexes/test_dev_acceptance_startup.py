@@ -15,6 +15,7 @@ def isolated_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     from onyx.regulatory.amendments.annexes import (
         acceptance_calibration,
         acceptance_canary,
+        acceptance_pdf_vision,
         dev_acceptance,
     )
 
@@ -30,6 +31,9 @@ def isolated_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dev_acceptance, "native_parser_probe", lambda: {"pdf_pages": 4})
     monkeypatch.setattr(
         acceptance_calibration, "run_native_calibration", lambda: {"status": "passed"}
+    )
+    monkeypatch.setattr(
+        acceptance_pdf_vision, "run_pdf_vision_probe", lambda: {"status": "passed"}
     )
     monkeypatch.setattr(
         acceptance_canary, "run_canary", lambda _sha: {"status": "passed"}
@@ -76,7 +80,16 @@ def test_cli_initializes_enterprise_before_encrypted_configuration_read(
 
 @pytest.mark.usefixtures("isolated_probe")
 @pytest.mark.parametrize(
-    "stage", ["scope", "startup", "configuration", "native", "calibration", "canary"]
+    "stage",
+    [
+        "scope",
+        "startup",
+        "configuration",
+        "native",
+        "calibration",
+        "pdf_vision",
+        "canary",
+    ],
 )
 def test_failed_stage_is_reported_without_exception_details(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], stage: str
@@ -85,6 +98,7 @@ def test_failed_stage_is_reported_without_exception_details(
     from onyx.regulatory.amendments.annexes import (
         acceptance_calibration,
         acceptance_canary,
+        acceptance_pdf_vision,
         dev_acceptance,
     )
     from onyx.utils import variable_functionality
@@ -95,6 +109,7 @@ def test_failed_stage_is_reported_without_exception_details(
         "configuration": (regulatory_annex_acceptance, "verify_dev_configuration"),
         "native": (dev_acceptance, "native_parser_probe"),
         "calibration": (acceptance_calibration, "run_native_calibration"),
+        "pdf_vision": (acceptance_pdf_vision, "run_pdf_vision_probe"),
         "canary": (acceptance_canary, "run_canary"),
     }
     target, attribute = targets[stage]
@@ -163,3 +178,54 @@ def test_failure_detail_limits_cause_depth_and_excludes_external_frames() -> Non
         assert isinstance(error["frames"][0]["line"], int)
     assert "secret" not in detail
     assert len(detail) <= 4000
+
+
+@pytest.mark.usefixtures("isolated_probe")
+def test_failed_calibration_is_not_overwritten_or_followed_by_pdf_calls(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from onyx.regulatory.amendments.annexes import (
+        acceptance_calibration,
+        acceptance_pdf_vision,
+        dev_acceptance,
+    )
+
+    monkeypatch.setattr(
+        acceptance_calibration,
+        "run_native_calibration",
+        lambda: {"status": "failed", "attempt_count": 4},
+    )
+    pdf = Mock()
+    monkeypatch.setattr(acceptance_pdf_vision, "run_pdf_vision_probe", pdf)
+    monkeypatch.setattr(sys, "argv", ["dev_acceptance", "preflight"])
+    with pytest.raises(SystemExit):
+        dev_acceptance.main()
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == report["calibration"]["status"] == "failed"
+    pdf.assert_not_called()
+
+
+@pytest.mark.usefixtures("isolated_probe")
+def test_pdf_failed_report_keeps_safe_phase_and_passed_calibration(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from onyx.regulatory.amendments.annexes import acceptance_pdf_vision, dev_acceptance
+
+    monkeypatch.setattr(
+        acceptance_pdf_vision,
+        "run_pdf_vision_probe",
+        lambda: {
+            "status": "failed",
+            "probe_stage": "grounding",
+            "attempt_count": 3,
+            "http_request_count": 3,
+            "exception_type": "ValidationError",
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["dev_acceptance", "preflight"])
+    with pytest.raises(SystemExit):
+        dev_acceptance.main()
+    report = json.loads(capsys.readouterr().out)
+    assert report["calibration"]["status"] == "passed"
+    assert report["status"] == "failed" and report["failure_stage"] == "pdf_vision"
+    assert report["exception_type"] == "ValidationError"
