@@ -152,6 +152,32 @@ def _extract_cached(
     return cache[key].model_copy(deep=True)
 
 
+def _extract_prepared_source(
+    store: FileStore,
+    original: AnnexOriginalEvidence,
+    cache: dict[str, AnnexExtraction],
+    vision_llm: LLM | None,
+    *,
+    manifest_file_id: str,
+    manifest_sha256: str,
+) -> AnnexExtraction:
+    if original.mime_type == "application/pdf":
+        from onyx.regulatory.amendments.pdf_vision import load_frozen_pdf_asset
+
+        _verified_bytes(store, original)
+        if original.sha256 is None:
+            raise ValueError("original_integrity_mismatch")
+        frozen = load_frozen_pdf_asset(
+            store,
+            manifest_file_id=manifest_file_id,
+            manifest_sha256=manifest_sha256,
+            source_sha256=original.sha256,
+        )
+        if frozen is not None:
+            return frozen
+    return _extract_cached(store, original, cache, vision_llm)
+
+
 def _freeze_side(
     store: FileStore,
     scope: AnnexReviewEvidenceScope,
@@ -344,7 +370,16 @@ def prepare_annex_group(
                 mime_type=asset.mime_type,
                 available=True,
             )
-            extraction = _extract_cached(store, original, cache, vision_llm)
+            extraction = _extract_prepared_source(
+                store,
+                original,
+                cache,
+                vision_llm,
+                manifest_file_id=manifest_id,
+                manifest_sha256=manifest_sha256,
+            )
+            for element in extraction.elements:
+                element.source_asset_id = str(asset.id)
             labels = [
                 link.label for link in links if link.target_asset_hash == asset.sha256
             ]

@@ -106,10 +106,13 @@ def retrieve_and_confirm_instruction(
 def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
     llm = get_default_llm()
 
+    from onyx.db.amendment_pdf_evidence import load_batch_pdf_source
+
     with _session() as db_session:
         batch = get_batch(db_session, batch_id)
         if batch is None:
             raise RuntimeError(f"Amendment batch {batch_id} no longer exists")
+        pdf_source = load_batch_pdf_source(db_session, batch)
         user_file_ids = [UUID(value) for value in batch.user_file_ids]
         document_set_id = batch.document_set_id
         created_by = batch.created_by
@@ -277,6 +280,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 matches=[item.match for item in ordered_group],
                 reference_date=reference_date,
                 context=context,
+                pdf_source=pdf_source,
             )
         except DraftIntegrityError as error:
             for item in ordered_group:

@@ -9,6 +9,7 @@ from onyx.regulatory.amendments.models import (
     AmendmentInstruction,
     DraftResult,
 )
+from onyx.regulatory.amendments.pdf_vision import PdfDraftEvidence
 from onyx.regulatory.structured_llm import generate_structured
 from onyx.tracing.flows import LLMFlow
 
@@ -80,6 +81,7 @@ def draft_combined_chunk(
     old_chunk: dict[str, Any] | None,
     sibling_reference: dict[str, Any] | None,
     reference_date: str | None,
+    pdf_evidence: PdfDraftEvidence | None = None,
 ) -> DraftResult:
     if not instructions:
         raise ValueError(
@@ -125,6 +127,23 @@ def draft_combined_chunk(
         f"chunk, for heading_path/metadata convention):\n{sibling_json}\n\n"
         "Return one full replacement chunk containing every listed change."
     )
+    if pdf_evidence is not None:
+        prompt += (
+            "\nOriginal PDF page images are attached. Apply the amendment using these images and the old chunk; derived transcription is supporting evidence only. If multiple tables fit, do not guess.\n"
+            + pdf_evidence.transcription
+        )
+    if pdf_evidence is not None:
+        return generate_structured(
+            llm,
+            flow=LLMFlow.AMENDMENT_DRAFTING,
+            system_prompt=_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            response_model=DraftResult,
+            image_parts=pdf_evidence.image_parts,
+            timeout_override=45,
+            max_attempts=1,
+            provider_max_attempts=1,
+        )
     return generate_structured(
         llm,
         flow=LLMFlow.AMENDMENT_DRAFTING,

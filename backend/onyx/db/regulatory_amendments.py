@@ -610,6 +610,9 @@ def queue_amendment_proposal_approval(
         _proposal_instruction_texts(proposal),
         reviewed_draft["text"],
     )
+    from onyx.db.amendment_pdf_evidence import validate_pdf_proposal_authority
+
+    validate_pdf_proposal_authority(db_session, proposal, reviewed_draft)
     proposal.new_chunk_draft = reviewed_draft
     proposal.status = AmendmentProposalStatus.APPROVING.value
     proposal.decided_by = decided_by
@@ -1068,6 +1071,9 @@ def approve_amendment_proposal(
         _proposal_instruction_texts(proposal),
         draft["text"],
     )
+    from onyx.db.amendment_pdf_evidence import validate_pdf_proposal_authority
+
+    validate_pdf_proposal_authority(db_session, proposal, draft)
     user_file_id = UUID(draft["user_file_id"])
     today = datetime.date.today()
     start_date_str = draft.get("effective_start_date")
