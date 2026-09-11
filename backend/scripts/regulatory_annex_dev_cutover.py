@@ -11,7 +11,10 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from onyx.db.regulatory_annex_acceptance_diagnostic import load_source861_canary
 
 NAMESPACE = "customs-regulations-dev"
 REPOSITORY = "255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-backend-lite-dev"
@@ -2146,6 +2149,542 @@ print(json.dumps(report, sort_keys=True))
     print(json.dumps(report, sort_keys=True), flush=True)
 
 
+SOURCE861_RUNTIME = "8612398f20e5d3d03d154fffa196c5bf951b1862"
+
+
+def source861_scope_matches(run: Any, package: Any, scope: Any) -> bool:
+    return bool(
+        run.release_sha == "8612398f20e5d3d03d154fffa196c5bf951b1862"
+        and str(run.run_id) == "5950d8bc-5dac-443b-b143-8494d0b082d1"
+        and str(run.file_id) == "a3e6717c-ac94-4a05-a04c-16302f0f2f75"
+        and run.document_set_id == 23
+        and str(run.package_id) == "4ddd28f3-a9a5-44de-be92-f871fb17469f"
+        and run.batch_id is None
+        and run.phase == "cleaned"
+        and package is not None
+        and str(package.id) == str(run.package_id)
+        and package.document_set_id == 23
+        and package.environment == "dev"
+        and package.created_by == run.user_id
+        and package.idempotency_key == "annex-canary-" + str(run.run_id)
+        and package.created_at.isoformat().startswith("2026-09-11T15:56:39.")
+        and scope is not None
+        and not scope.is_public
+        and scope.user_id == run.user_id
+        and scope.name == run.name
+    )
+
+
+def source861_issue_codes(issues: Any) -> list[str]:
+    allowed = {
+        "acquisition_failed",
+        "404",
+        "archive_limit",
+        "asset_byte_limit",
+        "asset_count_limit",
+        "depth_limit",
+        "download_failed",
+        "download_time_limit",
+        "empty_source",
+        "encrypted_pdf",
+        "mime_mismatch",
+        "missing_embedded_source",
+        "missing_internal_target",
+        "missing_source",
+        "package_byte_limit",
+        "page_limit",
+        "parse_failed",
+        "parse_time_limit",
+        "redirect_loop",
+        "relationship_limit",
+        "text_limit",
+        "time_limit",
+        "truncated",
+        "unsupported_format",
+        "missing_base_url",
+        "unsafe_url",
+    }
+    if not isinstance(issues, list) or len(issues) > 100:
+        return ["unknown_issue"]
+    return [
+        item.get("code")
+        if isinstance(item, dict) and item.get("code") in allowed
+        else "unknown_issue"
+        for item in issues
+    ]
+
+
+def source861_failure(report: dict[str, Any], error: BaseException) -> None:
+    from typing import get_args
+
+    from pydantic import ValidationError
+    from pydantic_core import ErrorType
+
+    from onyx.regulatory.amendments.annexes.dev_acceptance import safe_failure_detail
+
+    known = {
+        "pdf_visual_extraction_incomplete",
+        "pdf_visual_extraction_uncertain",
+        "pdf_table_row_ambiguous",
+        "pdf_table_cells_overlap",
+        "pdf_vision_preparation_deadline",
+        "fixed_pdf_evidence_limit",
+        "source_diagnostic_attempt_limit",
+        "source_diagnostic_http_limit",
+    }
+    report["status"] = "reproduction_failed"
+    report["failure_detail"] = safe_failure_detail("pdf_vision", error)
+    report["failure_code"] = (
+        error.args[0]
+        if (
+            type(error) in {ValueError, TimeoutError}
+            and len(error.args) == 1
+            and isinstance(error.args[0], str)
+            and error.args[0] in known
+        )
+        else "unknown"
+    )
+    report["schema_errors"] = []
+    fields = {
+        "elements",
+        "kind",
+        "text",
+        "normalized_box",
+        "box",
+        "table_role",
+        "status",
+        "issues",
+    }
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen and len(seen) < 8:
+        seen.add(id(error))
+        if isinstance(error, ValidationError):
+            report["schema_errors"] = [
+                {
+                    "type": entry["type"]
+                    if entry["type"] in get_args(ErrorType)
+                    else "unknown",
+                    "loc": [
+                        part
+                        if (type(part) is int and 0 <= part <= 10000)
+                        or (isinstance(part, str) and part in fields)
+                        else "unknown"
+                        for part in entry["loc"][:8]
+                    ],
+                }
+                for entry in error.errors(include_input=False, include_context=False)[
+                    :20
+                ]
+            ]
+            break
+        next_error = error.__cause__ or error.__context__
+        if next_error is None:
+            break
+        error = next_error
+
+
+def reproduce_source861(report: dict[str, Any]) -> None:
+    import hashlib
+    from typing import cast
+    from unittest.mock import patch
+    from uuid import UUID
+
+    import httpx
+    import litellm
+
+    from onyx.db.amendment_sources import get_source_package
+    from onyx.db.document_set import get_document_set_by_id
+    from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
+    from onyx.db.regulatory_annex_acceptance import verify_dev_configuration
+    from onyx.file_store.file_store import FileStore, get_default_file_store
+    from onyx.llm.factory import get_default_llm_with_vision
+    from onyx.regulatory.amendments import pdf_vision
+    from onyx.regulatory.amendments.annexes import extraction
+    from onyx.regulatory.amendments.annexes.acceptance_pdf_vision import (
+        MemoryEvidenceStore,
+    )
+    from onyx.regulatory.amendments.annexes.dev_acceptance import refuse_fetch
+    from onyx.regulatory.amendments.annexes.sources import (
+        MAX_PACKAGE_SECONDS,
+        acquire_source_package,
+    )
+    from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
+    from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
+
+    if (
+        os.environ.get("POSTGRES_DB") != "customs-regulations-dev"
+        or os.environ.get("REGULATORY_ANNEX_ENVIRONMENT") != "dev"
+        or os.environ.get("PGOPTIONS") != "-c default_transaction_read_only=on"
+    ):
+        return
+    set_is_ee_based_on_env_variable()
+    CURRENT_TENANT_ID_CONTEXTVAR.set("public")
+    with SqlEngine.scoped_engine(
+        pool_size=2,
+        max_overflow=0,
+        connect_args={
+            "options": "-c default_transaction_read_only=on",
+            "connect_timeout": 10,
+        },
+    ):
+        with get_session_with_current_tenant() as session:
+            run = load_source861_canary(session)
+            if run is None:
+                return
+            package = get_source_package(
+                session,
+                package_id=UUID("4ddd28f3-a9a5-44de-be92-f871fb17469f"),
+                document_set_id=23,
+                environment="dev",
+            )
+            scope = get_document_set_by_id(session, 23)
+            if not source861_scope_matches(run, package, scope) or package is None:
+                return
+            report.update(
+                package_status=package.status,
+                issues=source861_issue_codes(package.issues),
+                asset_count=package.asset_count,
+                manifest_present=bool(
+                    package.manifest_file_id or package.manifest_sha256
+                ),
+            )
+            input_file_id, spec = package.input_file_id, dict(package.input_spec)
+        configuration = verify_dev_configuration()
+        report["configuration_verified"] = True
+        if (
+            report["issues"] != ["acquisition_failed"]
+            or report["manifest_present"]
+            or report["package_status"] != "failed"
+            or report["asset_count"] != 0
+        ):
+            report["status"] = "stored_issues_only"
+            return
+        if (
+            not input_file_id
+            or spec.get("mime_type") != "application/pdf"
+            or spec.get("url")
+            or spec.get("base_url")
+        ):
+            return
+        with get_default_file_store().read_file(input_file_id) as stream:
+            content = stream.read(25 * 1024 * 1024 + 1)
+        expected = "c5a20c8fd76d3dbd4983ceeaacc44eef217716427adec8716475ac5a753a0557"
+        if hashlib.sha256(content).hexdigest() != expected:
+            return
+        report["original_sha256"] = expected
+        if configuration["vision_provider"] != "vertex_ai":
+            report["status"] = "provider_refused"
+            return
+        llm = get_default_llm_with_vision()
+        if llm is None or llm.config.model_provider != "vertex_ai":
+            report["status"] = "provider_refused"
+            return
+        report["model_provider"] = "vertex_ai"
+        report["model_snapshot_sha256"] = hashlib.sha256(
+            llm.config.model_dump_json().encode()
+        ).hexdigest()
+        report["reproduction"] = True
+        deadline = time.monotonic() + MAX_PACKAGE_SECONDS
+        result = acquire_source_package(
+            content=content,
+            mime_type="application/pdf",
+            display_name=spec.get("display_name", "source"),
+            fetch=refuse_fetch,
+        )
+        report["acquisition_issues"] = source861_issue_codes(
+            [item.model_dump() for item in result.issues]
+        )
+        if (
+            result.status != "ready"
+            or result.issues
+            or result.links
+            or len(result.assets) != 1
+            or result.assets[0].sha256 != expected
+        ):
+            report["status"] = "acquisition_refused"
+            return
+        memory = MemoryEvidenceStore(content)
+        original_generate = extraction.generate_structured
+        original_completion, original_send = litellm.completion, httpx.Client.send
+        original_transcript = pdf_vision.pdf_transcript
+        active = False
+        page_attempts = 0
+
+        def generate(*args: Any, **kwargs: Any) -> Any:
+            nonlocal page_attempts
+            report["page_index"] += 1
+            page_attempts = 0
+            if report["page_index"] > 4:
+                raise ValueError("source_diagnostic_attempt_limit")
+            return original_generate(*args, **kwargs)
+
+        def completion(*args: Any, **kwargs: Any) -> Any:
+            nonlocal active, page_attempts
+            if (
+                active
+                or page_attempts >= 3
+                or report["attempt_count"] >= 12
+                or time.monotonic() >= deadline
+            ):
+                raise ValueError("source_diagnostic_attempt_limit")
+            page_attempts += 1
+            report["attempt_count"] += 1
+            active = True
+            kwargs.update(num_retries=0, max_retries=0)
+            try:
+                return original_completion(*args, **kwargs)
+            finally:
+                active = False
+
+        def send(
+            client: httpx.Client, request: httpx.Request, **kwargs: Any
+        ) -> httpx.Response:
+            if not active or report["http_request_count"] >= report["attempt_count"]:
+                raise ValueError("source_diagnostic_http_limit")
+            report["http_request_count"] += 1
+            return original_send(client, request, **kwargs)
+
+        def transcript(value: Any) -> str:
+            report["extraction"] = {
+                "page_count": value.page_count,
+                "element_count": len(value.elements),
+                "issue_count": len(value.issues),
+                "uncertain_count": sum(
+                    item.status != "readable" for item in value.elements
+                ),
+                "element_issue_count": sum(
+                    bool(item.issues) for item in value.elements
+                ),
+            }
+            return original_transcript(value)
+
+        with (
+            patch.object(extraction, "generate_structured", generate),
+            patch.object(litellm, "completion", completion),
+            patch.object(httpx.Client, "send", send),
+            patch.object(pdf_vision, "pdf_transcript", transcript),
+        ):
+            prepared = pdf_vision.prepare_pdf_source(
+                result.assets[0],
+                store=cast(FileStore, memory),
+                llm=llm,
+                deadline=deadline,
+            )
+        if prepared.pdf_vision is None:
+            raise ValueError("pdf_visual_extraction_incomplete")
+        report["transcript_sha256"] = prepared.pdf_vision.transcript_sha256
+        report["status"] = "reproduction_passed"
+
+
+def validate_source861_report(report: Any) -> None:
+    keys = {
+        "stage",
+        "status",
+        "database_read_only",
+        "reproduction",
+        "attempt_count",
+        "http_request_count",
+        "page_index",
+        "package_status",
+        "issues",
+        "asset_count",
+        "manifest_present",
+        "configuration_verified",
+        "original_sha256",
+        "model_provider",
+        "model_snapshot_sha256",
+        "acquisition_issues",
+        "extraction",
+        "page_count",
+        "element_count",
+        "issue_count",
+        "uncertain_count",
+        "element_issue_count",
+        "transcript_sha256",
+        "failure_detail",
+        "failure_code",
+        "schema_errors",
+        "type",
+        "loc",
+    }
+    words = {
+        "source861",
+        "scope_refused",
+        "stored_issues_only",
+        "provider_refused",
+        "acquisition_refused",
+        "reproduction_failed",
+        "reproduction_passed",
+        "unknown",
+        "processing",
+        "ready",
+        "partial",
+        "blocked",
+        "failed",
+        "vertex_ai",
+        "pdf_visual_extraction_incomplete",
+        "pdf_visual_extraction_uncertain",
+        "pdf_table_row_ambiguous",
+        "pdf_table_cells_overlap",
+        "pdf_vision_preparation_deadline",
+        "fixed_pdf_evidence_limit",
+        "source_diagnostic_attempt_limit",
+        "source_diagnostic_http_limit",
+        "elements",
+        "kind",
+        "text",
+        "normalized_box",
+        "box",
+        "table_role",
+        "status",
+        "issues",
+        "missing",
+        "extra_forbidden",
+        "list_type",
+        "int_type",
+        "int_parsing",
+        "float_type",
+        "float_parsing",
+        "tuple_type",
+        "string_too_long",
+        "string_too_short",
+        "greater_than_equal",
+        "less_than_equal",
+        "bool_type",
+        "bool_parsing",
+        "literal_error",
+        "string_type",
+        "json_invalid",
+        "model_type",
+        "model_attributes_type",
+        "value_error",
+        "too_long",
+        "too_short",
+        "finite_number",
+        "unknown_issue",
+    }
+    if (
+        not isinstance(report, dict)
+        or report.get("stage") != "source861"
+        or report.get("database_read_only") is not True
+        or report.get("status")
+        not in {
+            "scope_refused",
+            "stored_issues_only",
+            "provider_refused",
+            "acquisition_refused",
+            "reproduction_failed",
+            "reproduction_passed",
+        }
+    ):
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    pending = [report]
+    visited = 0
+    while pending:
+        value = pending.pop()
+        visited += 1
+        if visited > 1500:
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+        if isinstance(value, dict):
+            if set(value) - keys:
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+            for key, child in value.items():
+                if key == "failure_detail":
+                    if not isinstance(child, str) or len(child) > 4000:
+                        raise CutoverRefusal("fixed_diagnostic_report_required")
+                    continue
+                if key in {"issues", "acquisition_issues"}:
+                    if (
+                        not isinstance(child, list)
+                        or source861_issue_codes([{"code": code} for code in child])
+                        != child
+                    ):
+                        if child != ["unknown_issue"]:
+                            raise CutoverRefusal("fixed_diagnostic_report_required")
+                    continue
+                pending.append(child)
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str):
+            if value not in words and not re.fullmatch("[0-9a-f]{64}", value):
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+        elif value is not None and not (
+            type(value) is bool or type(value) is int and 0 <= value <= 100000
+        ):
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+    for key, maximum in (
+        ("attempt_count", 12),
+        ("http_request_count", 12),
+        ("page_index", 4),
+    ):
+        if type(report.get(key)) is not int or not 0 <= report[key] <= maximum:
+            raise CutoverRefusal("fixed_diagnostic_report_required")
+
+
+def diagnose_source861(driver: Driver, pod: str, container: str) -> None:
+    if driver.sha != SOURCE861_RUNTIME:
+        raise CutoverRefusal("fixed_source_runtime_required")
+    program = """
+import contextlib, io, json, logging, os, signal, time
+from typing import Any
+from sqlalchemy.orm import Session
+from onyx.db.regulatory_annex_acceptance import CanaryRun
+logging.disable(logging.CRITICAL)
+def expired(*args):
+    raise TimeoutError()
+signal.signal(signal.SIGALRM, expired)
+signal.alarm(220)
+"""
+    program += (
+        "\n"
+        + Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("onyx/db/regulatory_annex_acceptance_diagnostic.py")
+        .read_text()
+    )
+    for function in (
+        source861_scope_matches,
+        source861_issue_codes,
+        source861_failure,
+        reproduce_source861,
+    ):
+        program += "\n" + inspect.getsource(function)
+    program += """
+report = {"stage": "source861", "status": "scope_refused", "database_read_only": True, "reproduction": False, "attempt_count": 0, "http_request_count": 0, "page_index": 0}
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        reproduce_source861(report)
+    except Exception as error:
+        source861_failure(report, error)
+print(json.dumps(report, sort_keys=True))
+"""
+    output = driver.command(
+        [
+            "kubectl",
+            "--namespace",
+            NAMESPACE,
+            "exec",
+            pod,
+            "-c",
+            container,
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            '. /vault/secrets/config; export PGOPTIONS="-c default_transaction_read_only=on"; exec python -c "$1"',
+            "source861-diagnostic",
+            program,
+        ],
+        timeout=240,
+    )
+    if len(output.encode()) > 16000:
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    report = json.loads(output)
+    validate_source861_report(report)
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
 def diagnose_release(driver: Driver, runner_sha: str) -> None:
     driver.validate_target()
     state = driver.get("configmap", STATE)["data"]
@@ -2160,14 +2699,17 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         ),
         flush=True,
     )
-    if diagnose_batch44_logs(driver.sha) == "application_group_absent":
-        diagnose_logging_metadata(driver)
     pod = driver.pods("background")[0]
     container = next(
         item
         for item in pod["spec"]["containers"]
         if item["image"] == f"{REPOSITORY}:{driver.sha}"
     )
+    if driver.sha == SOURCE861_RUNTIME:
+        diagnose_source861(driver, pod["metadata"]["name"], container["name"])
+        return
+    if diagnose_batch44_logs(driver.sha) == "application_group_absent":
+        diagnose_logging_metadata(driver)
     if driver.sha == BATCH47_RUNTIME:
         diagnose_batch47_comparison(driver, pod["metadata"]["name"], container["name"])
         return
