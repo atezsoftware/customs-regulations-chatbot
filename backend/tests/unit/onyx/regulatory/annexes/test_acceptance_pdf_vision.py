@@ -22,17 +22,31 @@ def test_pdf_fixture_is_mixed_and_pinned() -> None:
 
 @pytest.mark.parametrize(
     "outcome",
-    ["correct", "wrong_value", "unsupported", "transport_failure", "invalid_json"],
+    [
+        "correct",
+        "wrong_value",
+        "unsupported",
+        "transport_failure",
+        "invalid_json",
+        "rate_limit",
+        "rate_limit_exhausted",
+        "rate_limit_budget",
+        "duplicate_http",
+        "auxiliary_http",
+    ],
 )
-def test_real_pdf_helpers_use_three_counted_calls_and_preserve_receipt(
+def test_real_pdf_helpers_count_attempts_and_preserve_receipt(
     monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     import httpx
 
     from onyx.llm.factory import get_llm
+    from onyx.regulatory import structured_llm
     from onyx.regulatory.amendments.annexes import acceptance_pdf_vision as probe
 
+    monkeypatch.setattr(structured_llm.time, "sleep", lambda _seconds: None)
+    stage_calls: dict[str, int] = {}
     calls: list[dict[str, object]] = []
 
     def send(
@@ -42,13 +56,27 @@ def test_real_pdf_helpers_use_three_counted_calls_and_preserve_receipt(
         calls.append(body)
         assert body.get("stream", False) is False
         assert "image_url" in str(body["messages"])
+        stage_calls[report.probe_stage] = stage_calls.get(report.probe_stage, 0) + 1
+        if outcome == "duplicate_http":
+            return httpx.Client.send(_client, request)
+        if outcome in {"rate_limit", "rate_limit_exhausted", "rate_limit_budget"} and (
+            outcome != "rate_limit" or stage_calls[report.probe_stage] == 1
+        ):
+            return httpx.Response(
+                429,
+                request=request,
+                headers={
+                    "Retry-After": "90" if outcome == "rate_limit_budget" else "0"
+                },
+                json={"error": {"message": "fixture capacity"}},
+            )
         if outcome == "transport_failure":
             return httpx.Response(
                 500, request=request, json={"error": {"message": "DO_NOT_LOG_secret"}}
             )
-        if len(calls) == 1:
+        if report.probe_stage == "source":
             result = {} if outcome == "invalid_json" else vision_response()
-        elif len(calls) == 2:
+        elif report.probe_stage == "draft":
             text = probe.OLD_TEXT.replace("5%", "17%").replace(
                 "11%", "13%" if outcome == "wrong_value" else "11%"
             )
@@ -99,26 +127,39 @@ def test_real_pdf_helpers_use_three_counted_calls_and_preserve_receipt(
         temperature=0,
         timeout=60,
     )
+    if outcome == "auxiliary_http":
+        from onyx.regulatory.amendments import pdf_vision
+
+        def unexpected_http(*_args: object, **_kwargs: object) -> None:
+            with httpx.Client() as client:
+                client.post("https://fixture.invalid/auxiliary")
+
+        monkeypatch.setattr(pdf_vision, "prepare_pdf_source", unexpected_http)
     report = probe.PdfVisionProbeReport()
     retained: list[probe.PdfVisionProbeReport] = []
     probe.run_probe(
         llm, report, lambda value: retained.append(value.model_copy(deep=True))
     )
-    assert report.status == ("passed" if outcome == "correct" else "failed"), (
-        report.model_dump_json()
-    )
+    assert report.status == (
+        "passed" if outcome in {"correct", "rate_limit"} else "failed"
+    ), report.model_dump_json()
     expected = (
         1
-        if outcome in {"transport_failure", "invalid_json"}
+        if outcome
+        in {"invalid_json", "rate_limit_budget", "duplicate_http", "transport_failure"}
         else 2
         if outcome == "wrong_value"
         else 3
     )
+    if outcome == "rate_limit":
+        expected = 6
+    elif outcome == "auxiliary_http":
+        expected = 0
     assert report.attempt_count == report.http_request_count == len(calls) == expected
     assert "DO_NOT_LOG_secret" not in report.model_dump_json()
     if outcome == "invalid_json":
         assert "ValidationError" in (report.failure or "")
-    if outcome == "correct":
+    if outcome in {"correct", "rate_limit"}:
         assert (
             report.native_value_absent
             and report.image_evidence
@@ -128,6 +169,12 @@ def test_real_pdf_helpers_use_three_counted_calls_and_preserve_receipt(
             report.draft_sha256 and report.receipt_sha256 and report.transcript_sha256
         )
         assert report.page_count == 1 and report.fixture_verified
+        assert (
+            probe.report_from_output((report.model_dump_json() + "\n").encode())[
+                "status"
+            ]
+            == "passed"
+        )
     assert retained[-1].status == report.status
 
 

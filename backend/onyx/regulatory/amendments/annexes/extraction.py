@@ -35,6 +35,7 @@ from onyx.utils.process_isolation import run_in_isolated_process
 class _SourceRetryOptions(TypedDict, total=False):
     max_attempts: int
     provider_max_attempts: int
+    deadline: float
 
 
 def _table_elements(
@@ -520,7 +521,11 @@ def extract_annex_structure(
                 remaining = int(vision_deadline - time.monotonic())
                 if remaining <= 0:
                     raise TimeoutError("pdf_vision_preparation_deadline")
-                bounded_options = {"max_attempts": 1, "provider_max_attempts": 1}
+                bounded_options = {
+                    "max_attempts": 1,
+                    "provider_max_attempts": 3,
+                    "deadline": vision_deadline,
+                }
             response = generate_structured(
                 vision_llm,
                 flow=LLMFlow.REGULATORY_ANNEX_EXTRACTION,

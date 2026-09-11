@@ -553,7 +553,8 @@ def verify_pdf_draft(
         response_model=PdfGroundingVerdict,
         timeout_override=45,
         max_attempts=1,
-        provider_max_attempts=1,
+        provider_max_attempts=3,
+        deadline=time.monotonic() + 45,
     )
     if not verdict.supported or verdict.ambiguous:
         raise DraftIntegrityError(

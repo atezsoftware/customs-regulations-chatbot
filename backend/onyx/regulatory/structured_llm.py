@@ -9,8 +9,10 @@ single provider's structured-output guarantees.
 """
 
 import json
+import math
 import random
 import time
+from collections.abc import Mapping
 from typing import Any, NotRequired, TypedDict, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -36,6 +38,7 @@ from onyx.llm.utils import llm_response_to_string
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 from onyx.utils.logger import setup_logger
+from onyx.utils.retry_after import parse_retry_after_seconds
 
 logger = setup_logger()
 
@@ -169,6 +172,59 @@ def _validation_error_summary(error: ValidationError, limit: int = 5) -> str:
     return "; ".join(summaries)
 
 
+def is_retryable_provider_error(error: BaseException) -> bool:
+    from litellm.exceptions import (
+        APIConnectionError,
+        InternalServerError,
+        RateLimitError,
+        ServiceUnavailableError,
+    )
+    from litellm.exceptions import Timeout as LiteLLMTimeout
+
+    return isinstance(
+        error,
+        (
+            LLMRateLimitError,
+            LLMTimeoutError,
+            RateLimitError,
+            LiteLLMTimeout,
+            APIConnectionError,
+            ServiceUnavailableError,
+            InternalServerError,
+        ),
+    )
+
+
+def _retry_after_seconds(error: BaseException) -> float | None:
+    pending = [error]
+    seen: set[int] = set()
+    delays: list[float] = []
+    while pending and len(seen) < 8:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for owner in (current, getattr(current, "response", None)):
+            headers = getattr(owner, "headers", None)
+            if not isinstance(headers, Mapping):
+                continue
+            for key, value in headers.items():
+                if (
+                    isinstance(key, str)
+                    and key.casefold() == "retry-after"
+                    and isinstance(value, str)
+                ):
+                    delay = parse_retry_after_seconds(value)
+                    if delay is not None:
+                        delays.append(delay)
+        pending.extend(
+            item
+            for item in (current.__cause__, current.__context__, *current.args[:1])
+            if isinstance(item, BaseException) and id(item) not in seen
+        )
+    return max(delays) if delays else None
+
+
 def generate_structured(
     llm: LLM,
     *,
@@ -182,35 +238,21 @@ def generate_structured(
     reasoning_effort: ReasoningEffort | None = None,
     max_attempts: int = 2,
     provider_max_attempts: int = 3,
+    deadline: float | None = None,
 ) -> ResponseModel:
     """Call the LLM and parse+validate its response as `response_model`.
 
     By default, retries once and feeds back the validation error if the first
     response isn't valid JSON matching the schema. Optional invocation limits
-    are forwarded only when supplied, preserving existing callers' behavior.
+    are forwarded only when supplied. An optional absolute monotonic deadline
+    bounds calls and retry waits across both provider and validation attempts.
     """
+    if deadline is not None and not math.isfinite(deadline):
+        raise ValueError("deadline must be finite")
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
     if provider_max_attempts < 1:
         raise ValueError("provider_max_attempts must be at least 1")
-
-    from litellm.exceptions import (
-        APIConnectionError,
-        InternalServerError,
-        RateLimitError,
-        ServiceUnavailableError,
-    )
-    from litellm.exceptions import Timeout as LiteLLMTimeout
-
-    transient_provider_errors = (
-        LLMRateLimitError,
-        LLMTimeoutError,
-        RateLimitError,
-        LiteLLMTimeout,
-        APIConnectionError,
-        ServiceUnavailableError,
-        InternalServerError,
-    )
 
     validation_schema_json = response_model.model_json_schema()
     provider_schema_json = _portable_structured_output_schema(validation_schema_json)
@@ -250,14 +292,27 @@ def generate_structured(
     for attempt in range(max_attempts):
         response: ModelResponse | None = None
         for provider_attempt in range(provider_max_attempts):
+            if deadline is not None:
+                remaining = int(deadline - time.monotonic())
+                if remaining <= 0:
+                    raise TimeoutError("structured LLM deadline exhausted")
+                invoke_options["timeout_override"] = (
+                    min(timeout_override, remaining)
+                    if timeout_override is not None
+                    else remaining
+                )
             try:
                 with llm_generation_span(
                     llm=llm, flow=flow, input_messages=messages
                 ) as span:
                     response = llm.invoke(messages, **invoke_options)
                     record_llm_response(span, response)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("structured LLM deadline exhausted")
                 break
-            except transient_provider_errors as error:
+            except Exception as error:
+                if not is_retryable_provider_error(error):
+                    raise
                 if provider_attempt >= provider_max_attempts - 1:
                     raise
                 scheduled_delay_s = min(
@@ -269,6 +324,19 @@ def generate_structured(
                     max(0.0, scheduled_delay_s - jitter_s),
                     scheduled_delay_s + jitter_s,
                 )
+                provider_delay = _retry_after_seconds(error)
+                if provider_delay is not None:
+                    retry_delay_s = provider_delay
+                    if (
+                        deadline is None
+                        and retry_delay_s > LLM_FIRST_CHUNK_RETRY_MAX_DELAY_S
+                    ):
+                        raise
+                if (
+                    deadline is not None
+                    and retry_delay_s >= deadline - time.monotonic()
+                ):
+                    raise
                 logger.warning(
                     "generate_structured: retrying transient provider error for %s "
                     "after %s on attempt %d/%d in %.1f seconds",
@@ -278,13 +346,21 @@ def generate_structured(
                     provider_max_attempts,
                     retry_delay_s,
                 )
+                if (
+                    deadline is not None
+                    and retry_delay_s >= deadline - time.monotonic()
+                ):
+                    raise
                 time.sleep(retry_delay_s)
 
         if response is None:
             raise RuntimeError("structured LLM invocation produced no response")
         content = llm_response_to_string(response)
         try:
-            return _validate_json_object(content, response_model)
+            result = _validate_json_object(content, response_model)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("structured LLM deadline exhausted")
+            return result
         except ValidationError as e:
             last_error = e
             finish_reason = response.choice.finish_reason

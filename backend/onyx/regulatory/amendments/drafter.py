@@ -1,6 +1,7 @@
 """LLM drafting of the amended chunk content and its effective dates."""
 
 import json
+import time
 import unicodedata
 from typing import Any
 
@@ -142,7 +143,8 @@ def draft_combined_chunk(
             image_parts=pdf_evidence.image_parts,
             timeout_override=45,
             max_attempts=1,
-            provider_max_attempts=1,
+            provider_max_attempts=3,
+            deadline=time.monotonic() + 45,
         )
     return generate_structured(
         llm,

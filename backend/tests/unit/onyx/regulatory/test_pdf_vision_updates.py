@@ -120,8 +120,9 @@ def test_pdf_source_uses_real_rendered_pixels_and_preserves_table(
         display_name="update.pdf",
         text="native paragraph" if native_text else "",
     )
+    deadline = time.monotonic() + 180
     result = pdf_vision.prepare_pdf_source(
-        asset, store=store, llm=model, deadline=time.monotonic() + 180
+        asset, store=store, llm=model, deadline=deadline
     )
     assert result.content == content and result.sha256 == asset.sha256
     assert result.native_text == asset.text
@@ -135,7 +136,8 @@ def test_pdf_source_uses_real_rendered_pixels_and_preserves_table(
     call = generate.call_args.kwargs
     image_url = call["image_parts"][0].image_url.url
     assert base64.b64decode(image_url.split(",", 1)[1]).startswith(b"\x89PNG")
-    assert call["max_attempts"] == 1 and call["provider_max_attempts"] == 1
+    assert call["max_attempts"] == 1 and call["provider_max_attempts"] == 3
+    assert call["deadline"] == deadline
     assert call["timeout_override"] <= 45
 
 

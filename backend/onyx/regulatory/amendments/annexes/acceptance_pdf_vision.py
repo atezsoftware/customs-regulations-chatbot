@@ -38,8 +38,8 @@ class PdfVisionProbeReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["running", "passed", "failed"] = "running"
     probe_stage: Literal["setup", "source", "draft", "grounding", "complete"] = "setup"
-    attempt_count: int = Field(default=0, ge=0, le=3)
-    http_request_count: int = Field(default=0, ge=0, le=3)
+    attempt_count: int = Field(default=0, ge=0, le=9)
+    http_request_count: int = Field(default=0, ge=0, le=9)
     attempt_count_complete: bool = True
     fixture_verified: bool = False
     fixture_sha256: dict[str, str] = Field(
@@ -134,32 +134,56 @@ def run_probe(
     from onyx.regulatory.amendments.annexes.models import AcquisitionResult
     from onyx.regulatory.amendments.annexes.sources import acquire_source_package
     from onyx.regulatory.amendments.models import AmendmentInstruction
+    from onyx.regulatory.structured_llm import is_retryable_provider_error
 
     original_completion, original_send = litellm.completion, httpx.Client.send
     completed: set[str] = set()
-    sent: set[str] = set()
+    attempts: dict[str, int] = {}
+    sent: dict[str, int] = {}
+    retry_allowed: set[str] = set()
+    active: str | None = None
 
     def counted_completion(*args: Any, **kwargs: Any) -> Any:
+        nonlocal active
         stage = report.probe_stage
         if (
             stage not in {"source", "draft", "grounding"}
+            or active is not None
             or stage in completed
+            or attempts.get(stage, 0) >= 3
+            or (attempts.get(stage, 0) and stage not in retry_allowed)
             or kwargs.get("mock_response")
         ):
             raise ValueError("pdf_probe_completion_retry_refused")
-        completed.add(stage)
+        attempts[stage] = attempts.get(stage, 0) + 1
+        retry_allowed.discard(stage)
+        active = stage
         report.attempt_count += 1
         emit(report)
         kwargs.update(num_retries=0, max_retries=0)
-        return original_completion(*args, **kwargs)
+        try:
+            result = original_completion(*args, **kwargs)
+            if sent.get(stage, 0) != attempts[stage]:
+                raise ValueError("pdf_probe_http_attempt_required")
+            completed.add(stage)
+            return result
+        except Exception as error:
+            if (
+                is_retryable_provider_error(error)
+                and sent.get(stage, 0) == attempts[stage]
+            ):
+                retry_allowed.add(stage)
+            raise
+        finally:
+            active = None
 
     def counted_send(
         client: httpx.Client, request: httpx.Request, **kwargs: Any
     ) -> httpx.Response:
         stage = report.probe_stage
-        if stage not in completed or stage in sent:
+        if active != stage or sent.get(stage, 0) >= attempts.get(stage, 0):
             raise ValueError("pdf_probe_http_retry_refused")
-        sent.add(stage)
+        sent[stage] = sent.get(stage, 0) + 1
         report.http_request_count += 1
         emit(report)
         return original_send(client, request, **kwargs)
@@ -308,8 +332,8 @@ def run_probe(
                 receipt.model_dump_json().encode()
             ).hexdigest()
             report.grounding_verified = True
-        if completed != {"source", "draft", "grounding"} or sent != completed:
-            raise ValueError("pdf_probe_three_actual_calls_required")
+        if completed != {"source", "draft", "grounding"} or sent != attempts:
+            raise ValueError("pdf_probe_three_successful_stages_required")
         report.probe_stage = "complete"
         report.status = "passed"
     except Exception as error:
@@ -376,8 +400,8 @@ def report_from_output(output: bytes, failure: str | None = None) -> dict[str, o
             invalid = True
     if report.status == "passed" and (
         report.probe_stage != "complete"
-        or report.attempt_count != 3
-        or report.http_request_count != 3
+        or not 3 <= report.attempt_count <= 9
+        or report.http_request_count != report.attempt_count
         or not all(
             (
                 report.fixture_verified,

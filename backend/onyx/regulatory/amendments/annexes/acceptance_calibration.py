@@ -5,6 +5,7 @@ import importlib
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from functools import partial
 from io import BytesIO
@@ -49,8 +50,8 @@ class CalibrationCase(BaseModel):
         Literal["case_failed", "completion_retry_refused", "http_retry_refused"] | None
     ) = None
     failure_detail: str | None = Field(default=None, max_length=4000)
-    attempt_count: int = Field(default=0, ge=0, le=1)
-    http_request_count: int = Field(default=0, ge=0, le=1)
+    attempt_count: int = Field(default=0, ge=0, le=3)
+    http_request_count: int = Field(default=0, ge=0, le=3)
 
 
 class CalibrationReport(BaseModel):
@@ -58,7 +59,7 @@ class CalibrationReport(BaseModel):
     status: Literal["passed", "failed"] = "failed"
     planned_cases: Literal[4] = 4
     cases: list[CalibrationCase] = Field(default_factory=list, max_length=4)
-    attempt_count: int = Field(default=0, ge=0, le=4)
+    attempt_count: int = Field(default=0, ge=0, le=12)
     attempt_count_complete: bool = True
     fixture_sha256: dict[str, str] = Field(default_factory=lambda: dict(FIXTURE_HASHES))
     module_sha256: dict[str, str] = Field(default_factory=dict)
@@ -104,6 +105,7 @@ def run_cases(
         AnnexElementCorrection,
         AnnexReviewEvidence,
     )
+    from onyx.regulatory.structured_llm import is_retryable_provider_error
 
     fixtures = load_native_fixtures()
     report.fixture_verified = True
@@ -172,27 +174,50 @@ def run_cases(
                     reason="Özgün dosyanın ilgili konumundaki değere göre düzeltme önerisi.",
                 )
 
+                active = False
+                retry_allowed = False
+                deadline = time.monotonic() + 60
+
                 def counted_completion(*args: Any, **kwargs: Any) -> Any:
-                    if case.attempt_count:
+                    nonlocal active, retry_allowed
+                    if (
+                        active
+                        or case.attempt_count >= 3
+                        or (case.attempt_count and not retry_allowed)
+                    ):
                         case.failure = "completion_retry_refused"
                         raise ValueError("completion_retry_refused")
                     if kwargs.get("mock_response"):
                         raise ValueError("actual_provider_required")
                     kwargs.update(num_retries=0, max_retries=0)
-                    case.attempt_count = 1
+                    case.attempt_count += 1
                     report.attempt_count += 1
+                    retry_allowed = False
+                    active = True
                     emit(report)
-                    return original_completion(*args, **kwargs)
+                    try:
+                        result = original_completion(*args, **kwargs)
+                        if case.http_request_count != case.attempt_count:
+                            raise ValueError("calibration_http_attempt_required")
+                        return result
+                    except Exception as error:
+                        retry_allowed = (
+                            is_retryable_provider_error(error)
+                            and case.http_request_count == case.attempt_count
+                        )
+                        raise
+                    finally:
+                        active = False
 
                 def counted_send(
                     client: httpx.Client, request: httpx.Request, **kwargs: Any
                 ) -> httpx.Response:
-                    if not case.attempt_count:
+                    if not active:
                         raise ValueError("calibration_auxiliary_http_refused")
-                    if case.http_request_count:
+                    if case.http_request_count >= case.attempt_count:
                         case.failure = "http_retry_refused"
                         raise ValueError("http_retry_refused")
-                    case.http_request_count = 1
+                    case.http_request_count += 1
                     emit(report)
                     return original_send(client, request, **kwargs)
 
@@ -209,7 +234,8 @@ def run_cases(
                         partial(
                             corrections.generate_structured,
                             max_attempts=1,
-                            provider_max_attempts=1,
+                            provider_max_attempts=3,
+                            deadline=deadline,
                         ),
                     ),
                     patch.object(
@@ -229,8 +255,8 @@ def run_cases(
                 case.status = (
                     "passed"
                     if receipt.supported is expected
-                    and case.attempt_count == 1
-                    and case.http_request_count == 1
+                    and 1 <= case.attempt_count <= 3
+                    and case.http_request_count == case.attempt_count
                     else "failed"
                 )
             except Exception as error:

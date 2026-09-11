@@ -27,15 +27,27 @@ def test_archived_native_fixtures_are_exact() -> None:
     }
 
 
-@pytest.mark.parametrize("outcome", ["correct", "wrong_positive", "transport_failure"])
-def test_four_actual_reconciliation_paths_keep_verdicts_without_retry(
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "correct",
+        "wrong_positive",
+        "transport_failure",
+        "rate_limit",
+        "rate_limit_exhausted",
+        "rate_limit_budget",
+    ],
+)
+def test_four_reconciliation_paths_keep_verdicts_with_bounded_retries(
     monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     import httpx
 
     from onyx.llm.factory import get_llm
+    from onyx.regulatory import structured_llm
 
+    monkeypatch.setattr(structured_llm.time, "sleep", lambda _seconds: None)
     calls: list[dict[str, object]] = []
 
     def send(
@@ -47,13 +59,24 @@ def test_four_actual_reconciliation_paths_keep_verdicts_without_retry(
         messages = str(body["messages"])
         assert "Derived transcription under correction" in messages
         assert "Original native source" in messages
+        if outcome in {"rate_limit", "rate_limit_exhausted", "rate_limit_budget"} and (
+            outcome != "rate_limit" or report.cases[-1].attempt_count == 1
+        ):
+            return httpx.Response(
+                429,
+                request=request,
+                headers={
+                    "Retry-After": "90" if outcome == "rate_limit_budget" else "0"
+                },
+                json={"error": {"message": "fixture capacity"}},
+            )
         if outcome == "transport_failure":
             return httpx.Response(
                 500,
                 request=request,
                 json={"error": {"message": "SENSITIVE_PROVIDER_ERROR"}},
             )
-        supported = len(calls) in (1, 3) and outcome != "wrong_positive"
+        supported = report.cases[-1].expected_supported and outcome != "wrong_positive"
         return httpx.Response(
             200,
             request=request,
@@ -95,15 +118,23 @@ def test_four_actual_reconciliation_paths_keep_verdicts_without_retry(
     calibration.run_cases(
         llm, report, lambda value: reports.append(value.model_copy(deep=True))
     )
-    assert len(calls) == report.attempt_count == 4
-    assert all(case.http_request_count == 1 for case in report.cases)
+    per_case = (
+        2 if outcome == "rate_limit" else 3 if outcome == "rate_limit_exhausted" else 1
+    )
+    assert len(calls) == report.attempt_count == 4 * per_case
+    assert all(
+        case.http_request_count == case.attempt_count == per_case
+        for case in report.cases
+    )
     assert [case.proposed_value for case in report.cases] == ["7%", "9%", "7%", "9%"]
     assert [case.original_value for case in report.cases] == ["7%"] * 4
-    assert report.status == ("passed" if outcome == "correct" else "failed"), [
+    assert report.status == (
+        "passed" if outcome in {"correct", "rate_limit"} else "failed"
+    ), [
         (case.supported, case.status, case.failure, case.rationale)
         for case in report.cases
     ]
-    if outcome == "transport_failure":
+    if outcome in {"transport_failure", "rate_limit_exhausted", "rate_limit_budget"}:
         assert all(case.failure for case in report.cases)
         for case in report.cases:
             assert case.failure_detail is not None

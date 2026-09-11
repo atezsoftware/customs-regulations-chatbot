@@ -44,6 +44,7 @@ def _generate(
     reasoning_effort: ReasoningEffort | None = None,
     max_attempts: int = 2,
     provider_max_attempts: int = 3,
+    deadline: float | None = None,
 ) -> _TinyResult:
     with (
         patch(
@@ -63,6 +64,7 @@ def _generate(
             reasoning_effort=reasoning_effort,
             max_attempts=max_attempts,
             provider_max_attempts=provider_max_attempts,
+            deadline=deadline,
         )
 
 
@@ -303,3 +305,175 @@ def test_structured_image_parts_survive_validation_retry() -> None:
     for call in llm.invoke.call_args_list:
         assert call.args[0][1].content[1] == part
         assert call.args[0][1].content[0].text == "Evidence"
+
+
+@pytest.mark.parametrize("header", ["7", "0", "invalid"])
+def test_wrapped_retry_after_and_monotonic_deadline(
+    monkeypatch: pytest.MonkeyPatch, header: str
+) -> None:
+    import httpx
+    from litellm.exceptions import RateLimitError
+
+    from onyx.regulatory import structured_llm as module
+
+    clock = [100.0]
+    sleeps: list[float] = []
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    monkeypatch.setattr(module.random, "uniform", lambda _low, _high: 2.0)
+    wrapped = LLMRateLimitError("fixture")
+    wrapped.__context__ = RateLimitError(
+        "fixture",
+        llm_provider="openrouter",
+        model="fixture",
+        response=httpx.Response(429, headers={"Retry-After": header}),
+    )
+    llm = MagicMock()
+
+    def invoke(*_args: object, **_kwargs: object) -> ModelResponse:
+        clock[0] += 1
+        if llm.invoke.call_count == 1:
+            raise wrapped
+        return _response('{"value":"ok"}')
+
+    llm.invoke.side_effect = invoke
+    result = _generate(llm, max_attempts=1, deadline=120.0)
+    assert result.value == "ok"
+    delay = 7.0 if header == "7" else 0.0 if header == "0" else 2.0
+    assert sleeps == [delay]
+    assert [call.kwargs["timeout_override"] for call in llm.invoke.call_args_list] == [
+        20,
+        int(19 - delay),
+    ]
+
+
+def test_retry_after_that_cannot_fit_is_never_shortened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    from litellm.exceptions import RateLimitError
+
+    from onyx.regulatory import structured_llm as module
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
+    sleep = MagicMock()
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    error = RateLimitError(
+        "fixture",
+        llm_provider="openrouter",
+        model="fixture",
+        headers={"rEtRy-AfTeR": "30"},
+        response=httpx.Response(429),
+    )
+    llm = MagicMock()
+    llm.invoke.side_effect = error
+    with pytest.raises(RateLimitError):
+        _generate(llm, max_attempts=1, deadline=110.0)
+    llm.invoke.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_deadline_rejects_expired_and_late_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory import structured_llm as module
+
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    llm = MagicMock()
+    with pytest.raises(TimeoutError):
+        _generate(llm, deadline=100.0)
+    llm.invoke.assert_not_called()
+
+    def late(*_args: object, **_kwargs: object) -> ModelResponse:
+        clock[0] = 106.0
+        return _response('{"value":"late"}')
+
+    llm.invoke.side_effect = late
+    with pytest.raises(TimeoutError):
+        _generate(llm, deadline=105.0)
+
+
+def test_retry_after_date_and_bounded_cycle_use_existing_parser() -> None:
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    import httpx
+    from litellm.exceptions import RateLimitError
+
+    from onyx.regulatory import structured_llm as module
+
+    header = format_datetime(
+        datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True
+    )
+    error = RateLimitError(
+        "fixture",
+        llm_provider="vertex_ai",
+        model="fixture",
+        response=httpx.Response(429, headers={"Retry-After": header}),
+    )
+    wrapper = LLMRateLimitError(error)
+    error.__context__ = wrapper
+    delay = module._retry_after_seconds(wrapper)
+    assert delay is not None and 28 <= delay <= 30
+
+
+@pytest.mark.parametrize("retry_header, attempts", [("100000", 1), ("0", 3)])
+def test_provider_delay_ceiling_and_attempt_cap_without_deadline(
+    monkeypatch: pytest.MonkeyPatch, retry_header: str, attempts: int
+) -> None:
+    import httpx
+    from litellm.exceptions import RateLimitError
+
+    from onyx.regulatory import structured_llm as module
+
+    sleep = MagicMock()
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    error = RateLimitError(
+        "fixture",
+        llm_provider="vertex_ai",
+        model="fixture",
+        response=httpx.Response(429, headers={"Retry-After": retry_header}),
+    )
+    llm = MagicMock()
+    llm.invoke.side_effect = error
+    with pytest.raises(RateLimitError):
+        _generate(llm, max_attempts=1)
+    assert llm.invoke.call_count == attempts
+    assert sleep.call_count == attempts - 1
+
+
+def test_nonretryable_provider_failure_never_repeats() -> None:
+    llm = MagicMock()
+    llm.invoke.side_effect = ValueError("fixture invalid request")
+    with (
+        patch("onyx.regulatory.structured_llm.time.sleep") as sleep,
+        pytest.raises(ValueError),
+    ):
+        _generate(llm)
+    llm.invoke.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_validation_must_also_finish_within_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory import structured_llm as module
+
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+
+    def validate(_content: str, _model: type[BaseModel]) -> _TinyResult:
+        clock[0] = 106.0
+        return _TinyResult(value="late")
+
+    monkeypatch.setattr(module, "_validate_json_object", validate)
+    llm = MagicMock()
+    llm.invoke.return_value = _response('{"value":"ok"}')
+    with pytest.raises(TimeoutError):
+        _generate(llm, deadline=105.0)
