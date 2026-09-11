@@ -20,6 +20,7 @@ def safe_failure_detail(stage: str, error: BaseException) -> str:
         "configuration",
         "native",
         "calibration",
+        "pdf_vision",
         "canary",
         "token",
         "capabilities",
@@ -36,6 +37,7 @@ def safe_failure_detail(stage: str, error: BaseException) -> str:
     types = {
         "UnicodeDecodeError",
         "ValueError",
+        "ValidationError",
         "RuntimeError",
         "TypeError",
         "TimeoutError",
@@ -220,6 +222,20 @@ def main() -> None:
             calibration = run_native_calibration()
             report["calibration"] = calibration
             status = "passed" if calibration.get("status") == "passed" else "failed"
+            if status == "passed":
+                stage = "pdf_vision"
+                from onyx.regulatory.amendments.annexes.acceptance_pdf_vision import (
+                    run_pdf_vision_probe,
+                )
+
+                pdf_probe = run_pdf_vision_probe()
+                report["pdf_vision_probe"] = pdf_probe
+                if pdf_probe.get("status") != "passed":
+                    status = "failed"
+                    report["failure_stage"] = stage
+                    report["exception_type"] = (
+                        pdf_probe.get("exception_type") or "Exception"
+                    )
         else:
             stage = "canary"
             from onyx.db.engine.sql_engine import SqlEngine
@@ -239,6 +255,7 @@ def main() -> None:
             in {
                 "UnicodeDecodeError",
                 "ValueError",
+                "ValidationError",
                 "RuntimeError",
                 "TypeError",
                 "TimeoutError",
