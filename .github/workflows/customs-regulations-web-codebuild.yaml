@@ -32,8 +32,10 @@ on:
       - release/v1
     paths:
       - "web/**"
+      - "backend/**"
       - ".dockerignore"
       - ".github/workflows/customs-regulations-web-codebuild.yaml"
+      - ".github/workflows/customs-regulations-backend-lite-codebuild.yaml"
 
 jobs:
   build-and-deploy:

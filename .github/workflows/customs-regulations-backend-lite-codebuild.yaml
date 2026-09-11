@@ -35,8 +35,10 @@ on:
       - release/v1
     paths:
       - "backend/**"
+      - "web/**"
       - ".dockerignore"
       - ".github/workflows/customs-regulations-backend-lite-codebuild.yaml"
+      - ".github/workflows/customs-regulations-web-codebuild.yaml"
 
 concurrency:
   group: backend-lite-${{ github.ref == 'refs/heads/develop' && 'dev' || github.run_id }}
