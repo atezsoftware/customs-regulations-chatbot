@@ -48,6 +48,7 @@ class CalibrationCase(BaseModel):
     failure: (
         Literal["case_failed", "completion_retry_refused", "http_retry_refused"] | None
     ) = None
+    failure_detail: str | None = Field(default=None, max_length=4000)
     attempt_count: int = Field(default=0, ge=0, le=1)
     http_request_count: int = Field(default=0, ge=0, le=1)
 
@@ -65,6 +66,7 @@ class CalibrationReport(BaseModel):
     database_read_only: bool = False
     fixture_verified: bool = False
     failure: str | None = None
+    failure_detail: str | None = Field(default=None, max_length=4000)
 
 
 def load_native_fixtures() -> dict[str, bytes]:
@@ -231,7 +233,12 @@ def run_cases(
                     and case.http_request_count == 1
                     else "failed"
                 )
-            except Exception:
+            except Exception as error:
+                from onyx.regulatory.amendments.annexes.dev_acceptance import (
+                    safe_failure_detail,
+                )
+
+                case.failure_detail = safe_failure_detail("calibration", error)
                 case.status = "failed"
                 case.failure = case.failure or "case_failed"
             emit(report)
@@ -287,7 +294,12 @@ def _child() -> None:
             if llm is None:
                 raise ValueError("configured_vision_required")
             run_cases(llm, report, emit)
-    except Exception:
+    except Exception as error:
+        from onyx.regulatory.amendments.annexes.dev_acceptance import (
+            safe_failure_detail,
+        )
+
+        report.failure_detail = safe_failure_detail("calibration", error)
         report.status = "failed"
         report.failure = "calibration_setup_failed"
         emit(report)

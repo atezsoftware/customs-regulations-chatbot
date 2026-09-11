@@ -114,6 +114,7 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
         "rationale",
         "input_sha256",
         "failure",
+        "failure_detail",
         "attempt_count",
         "http_request_count",
         "attempt_count_complete",

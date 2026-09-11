@@ -14,6 +14,11 @@ from typing import NoReturn
 
 def safe_failure_detail(stage: str, error: BaseException) -> str:
     """Retain bounded code locations, never messages, source lines or frame locals."""
+    from typing import get_args
+
+    from pydantic import ValidationError
+    from pydantic_core import ErrorType
+
     stages = {
         "scope",
         "startup",
@@ -86,9 +91,43 @@ def safe_failure_detail(stage: str, error: BaseException) -> str:
         exceptions.append(
             {"type": name if name in types else "Exception", "frames": frames}
         )
+        if isinstance(current, ValidationError):
+            # Schema names only: extra-key locations and custom error codes can be inputs.
+            fields = {
+                "supported",
+                "rationale",
+                "input_sha256",
+                "model_snapshot",
+                "model_provider",
+                "model_name",
+            }
+            validation_errors = [
+                {
+                    "loc": [
+                        part
+                        if isinstance(part, str) and part in fields
+                        else part
+                        if type(part) is int and 0 <= part <= 1000
+                        else "unknown"
+                        for part in item["loc"][:3]
+                    ],
+                    "type": item["type"]
+                    if item["type"] in get_args(ErrorType)
+                    else "unknown",
+                }
+                for item in current.errors(
+                    include_url=False, include_context=False, include_input=False
+                )[:3]
+            ]
+            exceptions[-1]["validation_errors"] = validation_errors
         current = current.__cause__ or (
             None if current.__suppress_context__ else current.__context__
         )
+    # Keep optional schema diagnostics inside the established transport bound.
+    for item in reversed(exceptions):
+        if len(json.dumps(exceptions)) <= 3900:
+            break
+        item.pop("validation_errors", None)
     return json.dumps(
         {"stage": stage if stage in stages else "unknown", "exceptions": exceptions},
         separators=(",", ":"),
@@ -222,20 +261,30 @@ def main() -> None:
             calibration = run_native_calibration()
             report["calibration"] = calibration
             status = "passed" if calibration.get("status") == "passed" else "failed"
-            if status == "passed":
-                stage = "pdf_vision"
-                from onyx.regulatory.amendments.annexes.acceptance_pdf_vision import (
-                    run_pdf_vision_probe,
-                )
+            if status == "failed":
+                report["failure_stage"] = stage
+            stage = "pdf_vision"
+            from onyx.regulatory.amendments.annexes.acceptance_pdf_vision import (
+                run_pdf_vision_probe,
+            )
 
+            try:
                 pdf_probe = run_pdf_vision_probe()
-                report["pdf_vision_probe"] = pdf_probe
-                if pdf_probe.get("status") != "passed":
-                    status = "failed"
+            except Exception as error:
+                if status == "passed":
+                    raise
+                pdf_probe = {
+                    "status": "failed",
+                    "failure": safe_failure_detail(stage, error),
+                }
+            report["pdf_vision_probe"] = pdf_probe
+            if pdf_probe.get("status") != "passed":
+                if status == "passed":
                     report["failure_stage"] = stage
                     report["exception_type"] = (
                         pdf_probe.get("exception_type") or "Exception"
                     )
+                status = "failed"
         else:
             stage = "canary"
             from onyx.db.engine.sql_engine import SqlEngine

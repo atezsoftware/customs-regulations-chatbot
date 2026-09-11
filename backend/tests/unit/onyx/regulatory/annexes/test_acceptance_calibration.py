@@ -105,6 +105,9 @@ def test_four_actual_reconciliation_paths_keep_verdicts_without_retry(
     ]
     if outcome == "transport_failure":
         assert all(case.failure for case in report.cases)
+        for case in report.cases:
+            assert case.failure_detail is not None
+            assert json.loads(case.failure_detail)["stage"] == "calibration"
         assert "SENSITIVE_PROVIDER_ERROR" not in report.model_dump_json()
         return
     assert len([case for case in report.cases if case.rationale]) == 4
@@ -255,3 +258,61 @@ def test_native_fixture_tampering_refuses_before_model(
     )
     with pytest.raises(ValueError, match="fixed_fixture_hash_mismatch"):
         calibration.load_native_fixtures()
+
+
+def test_child_setup_failure_has_safe_detail() -> None:
+    import os
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from onyx.regulatory.amendments.annexes.acceptance_calibration import _child; _child()",
+        ],
+        env={**os.environ, "POSTGRES_DB": "not-dev"},
+        capture_output=True,
+        timeout=20,
+        check=True,
+    )
+    report = calibration.report_from_output(result.stdout, failure=None)
+    assert report["failure"] == "calibration_setup_failed"
+    assert isinstance(report["failure_detail"], str)
+    detail = json.loads(report["failure_detail"])
+    assert detail["exceptions"][0]["type"] == "ValueError"
+    assert detail["exceptions"][0]["frames"][-1]["function"] == "_child"
+    assert "not-dev" not in result.stdout.decode()
+
+
+def test_case_and_setup_failure_details_survive_runner(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts import regulatory_annex_dev_cutover as cutover
+
+    from onyx.regulatory.amendments.annexes.dev_acceptance import safe_failure_detail
+
+    detail = safe_failure_detail("calibration", ValueError("DO_NOT_LOG"))
+    calibration_report = calibration.CalibrationReport(
+        failure_detail=detail,
+        cases=[
+            calibration.CalibrationCase(
+                format="docx",
+                proposed_value="9%",
+                expected_supported=False,
+                status="failed",
+                failure_detail=detail,
+            )
+        ],
+    )
+    report = {
+        "phase": "preflight",
+        "release_sha_metadata": "a" * 40,
+        "status": "failed",
+        "calibration": calibration_report.model_dump(mode="json"),
+    }
+    with pytest.raises(cutover.CutoverRefusal):
+        cutover.emit_acceptance_report(json.dumps(report), "preflight", "a" * 40)
+    retained = json.loads(capsys.readouterr().out)
+    assert retained == report
+    assert "DO_NOT_LOG" not in json.dumps(retained)

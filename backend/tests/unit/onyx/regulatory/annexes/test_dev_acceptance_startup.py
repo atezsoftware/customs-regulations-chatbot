@@ -181,8 +181,9 @@ def test_failure_detail_limits_cause_depth_and_excludes_external_frames() -> Non
 
 
 @pytest.mark.usefixtures("isolated_probe")
-def test_failed_calibration_is_not_overwritten_or_followed_by_pdf_calls(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("pdf_status", ["passed", "failed", "raises"])
+def test_failed_calibration_preserves_primary_failure_and_runs_pdf(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], pdf_status: str
 ) -> None:
     from onyx.regulatory.amendments.annexes import (
         acceptance_calibration,
@@ -195,14 +196,27 @@ def test_failed_calibration_is_not_overwritten_or_followed_by_pdf_calls(
         "run_native_calibration",
         lambda: {"status": "failed", "attempt_count": 4},
     )
-    pdf = Mock()
+    pdf = Mock(
+        return_value={"status": pdf_status, "failure": "own_pdf_detail"},
+        side_effect=RuntimeError("DO_NOT_LOG") if pdf_status == "raises" else None,
+    )
     monkeypatch.setattr(acceptance_pdf_vision, "run_pdf_vision_probe", pdf)
     monkeypatch.setattr(sys, "argv", ["dev_acceptance", "preflight"])
     with pytest.raises(SystemExit):
         dev_acceptance.main()
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == report["calibration"]["status"] == "failed"
-    pdf.assert_not_called()
+    pdf.assert_called_once_with()
+    assert report["failure_stage"] == "calibration"
+    if pdf_status == "raises":
+        assert report["pdf_vision_probe"]["status"] == "failed"
+        assert (
+            json.loads(report["pdf_vision_probe"]["failure"])["exceptions"][0]["type"]
+            == "RuntimeError"
+        )
+        assert "DO_NOT_LOG" not in json.dumps(report)
+    else:
+        assert report["pdf_vision_probe"] == pdf.return_value
 
 
 @pytest.mark.usefixtures("isolated_probe")
@@ -229,3 +243,40 @@ def test_pdf_failed_report_keeps_safe_phase_and_passed_calibration(
     assert report["calibration"]["status"] == "passed"
     assert report["status"] == "failed" and report["failure_stage"] == "pdf_vision"
     assert report["exception_type"] == "ValidationError"
+
+
+def test_validation_detail_retains_only_known_schema_paths_and_builtin_types() -> None:
+    from pydantic import ValidationError
+    from pydantic_core import PydanticCustomError
+
+    from onyx.regulatory.amendments.annexes.dev_acceptance import safe_failure_detail
+
+    error = ValidationError.from_exception_data(
+        "DO_NOT_LOG_TITLE",
+        [
+            {
+                "type": "bool_parsing",
+                "loc": ("supported",),
+                "input": "DO_NOT_LOG_VALUE",
+            },
+            {
+                "type": "missing",
+                "loc": ("model_snapshot", "model_provider"),
+                "input": {},
+            },
+            {
+                "type": PydanticCustomError("DO_NOT_LOG_TYPE", "DO_NOT_LOG_MESSAGE"),
+                "loc": ("DO_NOT_LOG_KEY",),
+                "input": "DO_NOT_LOG_INPUT",
+            },
+        ],
+    )
+    detail = safe_failure_detail("calibration", error)
+    errors = json.loads(detail)["exceptions"][0]["validation_errors"]
+    assert errors == [
+        {"loc": ["supported"], "type": "bool_parsing"},
+        {"loc": ["model_snapshot", "model_provider"], "type": "missing"},
+        {"loc": ["unknown"], "type": "unknown"},
+    ]
+    assert "DO_NOT_LOG" not in detail
+    assert len(detail) <= 4000
