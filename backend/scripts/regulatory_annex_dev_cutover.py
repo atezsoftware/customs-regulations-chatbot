@@ -2889,6 +2889,257 @@ print(json.dumps(report, sort_keys=True))
     print(json.dumps(report, sort_keys=True), flush=True)
 
 
+MARKDOWN_A8_RUNTIME = "a8a1406d4d4d359298247949bb0e3190f3069598"
+
+
+def markdown_worker_health() -> dict[str, object]:
+    import subprocess
+
+    names = (
+        "celery_worker_user_file_processing",
+        "celery_worker_regulatory_indexing",
+        "celery_beat_regulatory_indexing",
+    )
+    try:
+        result = subprocess.run(
+            ["supervisorctl", "status", *names],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if len(result.stdout) > 4096:
+            return {"worker_health_status": "unavailable"}
+        states = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if (
+                len(parts) < 2
+                or parts[0] not in names
+                or parts[0] in states
+                or parts[1]
+                not in {
+                    "STOPPED",
+                    "STARTING",
+                    "RUNNING",
+                    "BACKOFF",
+                    "STOPPING",
+                    "EXITED",
+                    "FATAL",
+                    "UNKNOWN",
+                }
+            ):
+                return {"worker_health_status": "unavailable"}
+            states[parts[0]] = parts[1]
+        if set(states) != set(names):
+            return {"worker_health_status": "unavailable"}
+        return {
+            "worker_health_status": "read",
+            "workers": [
+                {"process_name": name, "process_state": states[name]} for name in names
+            ],
+        }
+    except (OSError, subprocess.TimeoutExpired):
+        return {"worker_health_status": "unavailable"}
+
+
+def validate_markdown_progress_report(report: Any) -> None:
+    bools = {
+        "database_read_only",
+        "configuration_verified",
+        "current_batch_indexing",
+        "current_deferred_indexing",
+        "current_vector_disabled",
+        "owner_present",
+        "gate_closed",
+        "writer_manifest_present",
+        "receipt_present",
+        "receipt_valid",
+        "file_present",
+        "has_error_code",
+    }
+    counts = {
+        "canonical_count",
+        "temporal_count",
+        "temporal_retired_count",
+        "job_count",
+        "attempt_count",
+    }
+    hashes = {
+        "receipt_raw_sha256",
+        "receipt_canonical_sha256",
+        "receipt_generation_sha256",
+    }
+    dates = {
+        "first_canonical_at",
+        "last_canonical_at",
+        "old_chat_created_at",
+        "old_chat_updated_at",
+        "new_chat_created_at",
+        "new_chat_updated_at",
+        "first_published_at",
+        "last_published_at",
+        "next_retry_at",
+    }
+    enums = {
+        "stage": {"markdown_a8"},
+        "status": {"read", "failed", "scope_refused"},
+        "scope_failure": {
+            "env",
+            "run_missing",
+            "run_ownership",
+            "private_scope",
+            "publication_scope",
+            "chat_ownership",
+            "file_ownership",
+            "evidence_limit",
+        },
+        "failure_type": {"ValueError", "RuntimeError", "TimeoutError", "Exception"},
+        "file_status": {
+            "PROCESSING",
+            "INDEXING",
+            "CHUNKED",
+            "COMPLETED",
+            "SKIPPED",
+            "FAILED",
+            "CANCELED",
+            "DELETING",
+        },
+        "job_status": {
+            "QUEUED",
+            "RUNNING",
+            "RETRY_WAIT",
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLING",
+            "CANCELLED",
+        },
+        "job_stage": {
+            "PREPARING",
+            "CONTEXT_SUBMIT",
+            "CONTEXT_WAIT",
+            "CONTEXT_APPLY",
+            "EMBEDDING",
+            "INDEX_WRITE",
+            "VERIFY",
+            "PUBLISH",
+        },
+        "worker_health_status": {"read", "unavailable"},
+        "process_name": {
+            "celery_worker_user_file_processing",
+            "celery_worker_regulatory_indexing",
+            "celery_beat_regulatory_indexing",
+        },
+        "process_state": {
+            "STOPPED",
+            "STARTING",
+            "RUNNING",
+            "BACKOFF",
+            "STOPPING",
+            "EXITED",
+            "FATAL",
+            "UNKNOWN",
+        },
+    }
+    if (
+        not isinstance(report, dict)
+        or report.get("stage") != "markdown_a8"
+        or report.get("database_read_only") is not True
+        or report.get("status") not in enums["status"]
+    ):
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    pending = [report]
+    while pending:
+        item = pending.pop()
+        for key, value in item.items():
+            valid = False
+            if key in bools:
+                valid = value is None or type(value) is bool
+            elif key in counts:
+                valid = type(value) is int and 0 <= value <= 2147483647
+            elif key in hashes:
+                valid = (
+                    value is None
+                    or isinstance(value, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+                )
+            elif key in dates:
+                valid = (
+                    value is None
+                    or isinstance(value, str)
+                    and re.fullmatch(
+                        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?\+00:00",
+                        value,
+                    )
+                    is not None
+                )
+            elif key in enums:
+                valid = value is None or isinstance(value, str) and value in enums[key]
+            elif key in {"jobs", "workers"}:
+                valid = (
+                    isinstance(value, list)
+                    and len(value) <= 64
+                    and all(
+                        isinstance(row, dict) and not ({"jobs", "workers"} & set(row))
+                        for row in value
+                    )
+                )
+                if valid:
+                    pending.extend(value)
+            if not valid:
+                raise CutoverRefusal("fixed_diagnostic_report_required")
+
+
+def diagnose_markdown_progress(driver: Driver, pod: str, container: str) -> None:
+    if driver.sha != MARKDOWN_A8_RUNTIME:
+        raise CutoverRefusal("fixed_markdown_runtime_required")
+    program = "import contextlib, io, json, logging, signal\nlogging.disable(logging.CRITICAL)\ndef expired(*args):\n    raise TimeoutError()\nsignal.signal(signal.SIGALRM, expired)\nsignal.alarm(60)\n"
+    program += (
+        Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("onyx/db/regulatory_markdown_progress_diagnostic.py")
+        .read_text()
+    )
+    program += "\n" + inspect.getsource(markdown_worker_health)
+    program += """
+report = {"stage": "markdown_a8", "status": "failed", "database_read_only": True}
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        report.update(read_markdown_progress())
+        if report.get("status") == "read":
+            report.update(markdown_worker_health())
+    except Exception as error:
+        name = type(error).__name__
+        report.update(status="failed", failure_type=name if name in {"ValueError", "RuntimeError", "TimeoutError"} else "Exception")
+print(json.dumps(report, sort_keys=True))
+"""
+    output = driver.command(
+        [
+            "kubectl",
+            "--namespace",
+            NAMESPACE,
+            "exec",
+            pod,
+            "-c",
+            container,
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            '. /vault/secrets/config; export PGOPTIONS="-c default_transaction_read_only=on"; exec python -c "$1"',
+            "markdown-a8-diagnostic",
+            program,
+        ],
+        timeout=80,
+    )
+    if len(output.encode()) > 24000:
+        raise CutoverRefusal("fixed_diagnostic_report_required")
+    report = json.loads(output)
+    validate_markdown_progress_report(report)
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
 def diagnose_release(driver: Driver, runner_sha: str) -> None:
     driver.validate_target()
     state = driver.get("configmap", STATE)["data"]
@@ -2909,6 +3160,9 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         for item in pod["spec"]["containers"]
         if item["image"] == f"{REPOSITORY}:{driver.sha}"
     )
+    if driver.sha == MARKDOWN_A8_RUNTIME:
+        diagnose_markdown_progress(driver, pod["metadata"]["name"], container["name"])
+        return
     if driver.sha == CHAT50792_RUNTIME:
         diagnose_chat50792(driver, pod["metadata"]["name"], container["name"])
         return
