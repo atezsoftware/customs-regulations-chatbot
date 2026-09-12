@@ -430,7 +430,12 @@ def test_generic_failure_requires_original_hash_and_vertex_before_preparation(
                                 {
                                     "kind": "text",
                                     "text": "Fictional rule",
-                                    "box": [0.1, 0.1, 0.8, 0.2],
+                                    "box": {
+                                        "left": 0.1,
+                                        "top": 0.1,
+                                        "right": 0.8,
+                                        "bottom": 0.2,
+                                    },
                                     "status": "readable",
                                     "issues": [],
                                 }

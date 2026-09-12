@@ -238,6 +238,58 @@ class AnnexVisionResult(BaseModel):
     elements: list[AnnexVisionElement] = Field(max_length=2000)
 
 
+class AnnexVisionBox(BaseModel):
+    """Named coordinates retain their cardinality in portable provider schemas."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    left: float = Field(ge=0, le=1, allow_inf_nan=False)
+    top: float = Field(ge=0, le=1, allow_inf_nan=False)
+    right: float = Field(ge=0, le=1, allow_inf_nan=False)
+    bottom: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_order(self) -> "AnnexVisionBox":
+        if self.left >= self.right or self.top >= self.bottom:
+            raise ValueError(
+                "invalid_vision_coordinates: left < right and top < bottom required"
+            )
+        return self
+
+    def as_tuple(self) -> tuple[float, float, float, float]:
+        return self.left, self.top, self.right, self.bottom
+
+
+class AnnexVisionWireElement(BaseModel):
+    """Transient response fields; legacy vision evidence keeps its tuple boxes."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["text", "table_cell", "footnote", "image_region"]
+    text: str = Field(max_length=20000)
+    box: AnnexVisionBox
+    status: Literal["readable", "uncertain", "unreadable"]
+    issues: list[
+        Literal[
+            "low_readability",
+            "missing_evidence",
+            "ambiguous_structure",
+            "uncertain_value",
+            "unsupported_visual",
+        ]
+    ] = Field(default_factory=list, max_length=20)
+    table_role: Literal["column_header", "data", "unknown"] = "unknown"
+
+    @model_validator(mode="after")
+    def validate_table_role(self) -> "AnnexVisionWireElement":
+        if self.table_role != "unknown" and self.kind != "table_cell":
+            raise ValueError("table_role requires a table_cell")
+        return self
+
+
+class AnnexVisionWireResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    elements: list[AnnexVisionWireElement] = Field(max_length=2000)
+
+
 class AnnexOriginalEvidence(BaseModel):
     canonical_chunk_ids: list[str] = Field(default_factory=list)
     file_id: str

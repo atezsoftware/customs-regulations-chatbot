@@ -33,6 +33,10 @@ def test_pdf_fixture_is_mixed_and_pinned() -> None:
         "rate_limit_budget",
         "duplicate_http",
         "auxiliary_http",
+        "coordinate_correction",
+        "coordinate_transport_retries",
+        "coordinate_exhaustion",
+        "source_replay",
     ],
 )
 def test_real_pdf_helpers_count_attempts_and_preserve_receipt(
@@ -57,6 +61,7 @@ def test_real_pdf_helpers_count_attempts_and_preserve_receipt(
         assert body.get("stream", False) is False
         assert "image_url" in str(body["messages"])
         stage_calls[report.probe_stage] = stage_calls.get(report.probe_stage, 0) + 1
+        stage_attempt = stage_calls[report.probe_stage]
         if outcome == "duplicate_http":
             return httpx.Client.send(_client, request)
         if outcome in {"rate_limit", "rate_limit_exhausted", "rate_limit_budget"} and (
@@ -70,12 +75,37 @@ def test_real_pdf_helpers_count_attempts_and_preserve_receipt(
                 },
                 json={"error": {"message": "fixture capacity"}},
             )
+        if (
+            outcome in {"coordinate_transport_retries", "coordinate_exhaustion"}
+            and stage_attempt % 3 != 0
+        ):
+            return httpx.Response(
+                429,
+                request=request,
+                headers={"Retry-After": "0"},
+                json={"error": {"message": "fixture capacity"}},
+            )
         if outcome == "transport_failure":
             return httpx.Response(
                 500, request=request, json={"error": {"message": "DO_NOT_LOG_secret"}}
             )
         if report.probe_stage == "source":
             result = {} if outcome == "invalid_json" else vision_response()
+            if (
+                outcome == "coordinate_exhaustion"
+                or (outcome == "coordinate_correction" and stage_attempt == 1)
+                or (outcome == "coordinate_transport_retries" and stage_attempt == 3)
+            ):
+                result = {
+                    "elements": [
+                        {
+                            "kind": "text",
+                            "text": "Malformed region",
+                            "box": [0, 0, 1, 1, 0.5],
+                            "status": "readable",
+                        }
+                    ]
+                }
         elif report.probe_stage == "draft":
             text = probe.OLD_TEXT.replace("5%", "17%").replace(
                 "11%", "13%" if outcome == "wrong_value" else "11%"
@@ -135,31 +165,65 @@ def test_real_pdf_helpers_count_attempts_and_preserve_receipt(
                 client.post("https://fixture.invalid/auxiliary")
 
         monkeypatch.setattr(pdf_vision, "prepare_pdf_source", unexpected_http)
+    elif outcome == "source_replay":
+        from onyx.file_store.file_store import FileStore
+        from onyx.llm.interfaces import LLM
+        from onyx.regulatory.amendments import pdf_vision
+        from onyx.regulatory.amendments.annexes.models import AcquiredAsset
+
+        original_prepare = pdf_vision.prepare_pdf_source
+
+        def repeated_source(
+            asset: AcquiredAsset, *, store: FileStore, llm: LLM | None, deadline: float
+        ) -> AcquiredAsset:
+            original_prepare(asset, store=store, llm=llm, deadline=deadline)
+            return original_prepare(asset, store=store, llm=llm, deadline=deadline)
+
+        monkeypatch.setattr(pdf_vision, "prepare_pdf_source", repeated_source)
     report = probe.PdfVisionProbeReport()
     retained: list[probe.PdfVisionProbeReport] = []
     probe.run_probe(
         llm, report, lambda value: retained.append(value.model_copy(deep=True))
     )
     assert report.status == (
-        "passed" if outcome in {"correct", "rate_limit"} else "failed"
+        "passed"
+        if outcome
+        in {
+            "correct",
+            "rate_limit",
+            "coordinate_correction",
+            "coordinate_transport_retries",
+        }
+        else "failed"
     ), report.model_dump_json()
     expected = (
         1
         if outcome
-        in {"invalid_json", "rate_limit_budget", "duplicate_http", "transport_failure"}
+        in {"source_replay", "rate_limit_budget", "duplicate_http", "transport_failure"}
         else 2
-        if outcome == "wrong_value"
+        if outcome in {"wrong_value", "invalid_json"}
         else 3
     )
     if outcome == "rate_limit":
         expected = 6
     elif outcome == "auxiliary_http":
         expected = 0
+    elif outcome == "coordinate_correction":
+        expected = 4
+    elif outcome == "coordinate_transport_retries":
+        expected = 12
+    elif outcome == "coordinate_exhaustion":
+        expected = 6
     assert report.attempt_count == report.http_request_count == len(calls) == expected
     assert "DO_NOT_LOG_secret" not in report.model_dump_json()
     if outcome == "invalid_json":
         assert "ValidationError" in (report.failure or "")
-    if outcome in {"correct", "rate_limit"}:
+    if outcome in {
+        "correct",
+        "rate_limit",
+        "coordinate_correction",
+        "coordinate_transport_retries",
+    }:
         assert (
             report.native_value_absent
             and report.image_evidence
@@ -175,6 +239,15 @@ def test_real_pdf_helpers_count_attempts_and_preserve_receipt(
             ]
             == "passed"
         )
+        if outcome == "coordinate_correction":
+            original_messages, corrected_messages = (
+                calls[0]["messages"],
+                calls[1]["messages"],
+            )
+            assert isinstance(original_messages, list) and isinstance(
+                corrected_messages, list
+            )
+            assert original_messages[:2] == corrected_messages[:2]
     assert retained[-1].status == report.status
 
 
@@ -183,7 +256,7 @@ def vision_response() -> dict[str, object]:
         {
             "kind": "text",
             "text": "MADDE 3 - Bugday orani asagidaki tabloda gosterilen deger olarak degistirilmistir. Diger oranlar degismemistir.",
-            "box": [0.08, 0.08, 0.92, 0.28],
+            "box": {"left": 0.08, "top": 0.08, "right": 0.92, "bottom": 0.28},
             "status": "readable",
             "issues": [],
         }
@@ -196,12 +269,12 @@ def vision_response() -> dict[str, object]:
                 {
                     "kind": "table_cell",
                     "text": text,
-                    "box": [
-                        0.1 + column * 0.42,
-                        0.40 + row * 0.12,
-                        0.46 + column * 0.42,
-                        0.49 + row * 0.12,
-                    ],
+                    "box": {
+                        "left": 0.1 + column * 0.42,
+                        "top": 0.40 + row * 0.12,
+                        "right": 0.46 + column * 0.42,
+                        "bottom": 0.49 + row * 0.12,
+                    },
                     "table_role": "column_header" if row == 0 else "data",
                     "status": "readable",
                     "issues": [],

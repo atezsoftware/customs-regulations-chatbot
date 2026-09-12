@@ -12,7 +12,10 @@ from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-from onyx.regulatory.amendments.annexes.models import AcquiredAsset, AnnexVisionResult
+from onyx.regulatory.amendments.annexes.models import (
+    AcquiredAsset,
+    AnnexVisionWireResult,
+)
 
 
 def pdf_fixture(*, native_text: bool) -> bytes:
@@ -51,26 +54,26 @@ def pdf_fixture(*, native_text: bool) -> bytes:
     return result.getvalue()
 
 
-def vision_result() -> AnnexVisionResult:
+def vision_result() -> AnnexVisionWireResult:
     def cell(
         text: str, box: tuple[float, float, float, float], role: str
     ) -> dict[str, object]:
         return {
             "kind": "table_cell",
             "text": text,
-            "box": box,
+            "box": {"left": box[0], "top": box[1], "right": box[2], "bottom": box[3]},
             "table_role": role,
             "status": "readable",
             "issues": [],
         }
 
-    return AnnexVisionResult.model_validate(
+    return AnnexVisionWireResult.model_validate(
         {
             "elements": [
                 {
                     "kind": "text",
                     "text": "MADDE 3 - Oran tablosu degistirilmistir.",
-                    "box": [0.04, 0.04, 0.95, 0.2],
+                    "box": {"left": 0.04, "top": 0.04, "right": 0.95, "bottom": 0.2},
                     "status": "readable",
                     "issues": [],
                 },
@@ -81,7 +84,7 @@ def vision_result() -> AnnexVisionResult:
                 {
                     "kind": "footnote",
                     "text": "Not: yalniz test",
-                    "box": [0.04, 0.7, 0.9, 0.8],
+                    "box": {"left": 0.04, "top": 0.7, "right": 0.9, "bottom": 0.8},
                     "status": "readable",
                     "issues": [],
                 },
@@ -136,7 +139,7 @@ def test_pdf_source_uses_real_rendered_pixels_and_preserves_table(
     call = generate.call_args.kwargs
     image_url = call["image_parts"][0].image_url.url
     assert base64.b64decode(image_url.split(",", 1)[1]).startswith(b"\x89PNG")
-    assert call["max_attempts"] == 1 and call["provider_max_attempts"] == 3
+    assert "max_attempts" not in call and call["provider_max_attempts"] == 3
     assert call["deadline"] == deadline
     assert call["timeout_override"] <= 45
 
@@ -182,7 +185,7 @@ def frozen_case(monkeypatch: pytest.MonkeyPatch):
             text=item.text,
             table_role=item.table_role,
             extraction_method="vision",
-            locator=AnnexLocator(page=1, normalized_box=item.box),
+            locator=AnnexLocator(page=1, normalized_box=item.box.as_tuple()),
         )
         for item in vision_result().elements
     ]

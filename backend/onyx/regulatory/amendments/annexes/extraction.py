@@ -22,7 +22,7 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexLocator,
     AnnexModelSnapshot,
     AnnexRenderedPage,
-    AnnexVisionResult,
+    AnnexVisionWireResult,
     ExtractedAnnexElement,
 )
 from onyx.regulatory.amendments.annexes.rendering import render_annex_pages
@@ -33,7 +33,6 @@ from onyx.utils.process_isolation import run_in_isolated_process
 
 
 class _SourceRetryOptions(TypedDict, total=False):
-    max_attempts: int
     provider_max_attempts: int
     deadline: float
 
@@ -522,7 +521,6 @@ def extract_annex_structure(
                 if remaining <= 0:
                     raise TimeoutError("pdf_vision_preparation_deadline")
                 bounded_options = {
-                    "max_attempts": 1,
                     "provider_max_attempts": 3,
                     "deadline": vision_deadline,
                 }
@@ -540,7 +538,7 @@ def extract_annex_structure(
                         )
                     )
                 ],
-                response_model=AnnexVisionResult,
+                response_model=AnnexVisionWireResult,
                 timeout_override=min(45, int(remaining))
                 if vision_deadline is not None
                 else 60,
@@ -556,9 +554,8 @@ def extract_annex_structure(
             for native in page.text_elements:
                 native.aggregate = True
             for item in response.elements:
-                left, top, right, bottom = item.box
-                if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
-                    raise ValueError("invalid_vision_coordinates")
+                box = item.box.as_tuple()
+                left, top, right, bottom = box
                 result.elements.append(
                     ExtractedAnnexElement(
                         kind=item.kind,
@@ -576,7 +573,7 @@ def extract_annex_structure(
                                 right * page.width,
                                 bottom * page.height,
                             ),
-                            normalized_box=item.box,
+                            normalized_box=box,
                             original_width=page.width,
                             original_height=page.height,
                             coordinate_system="top_left_points"

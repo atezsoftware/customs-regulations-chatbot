@@ -8,18 +8,19 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 from unittest.mock import patch
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 if TYPE_CHECKING:
     from onyx.file_store.file_store import FileStore
     from onyx.llm.interfaces import LLM
+    from onyx.llm.model_response import ModelResponse
+    from onyx.llm.models import LanguageModelInput
 
 FIXTURE_SHA = "644179953512c4c5730d23b5a22204a24ded67a873f3d358662ee520c90122c5"
 FIXTURE_NAME = "ordinary-mixed-pdf-vision.pdf"
@@ -32,14 +33,16 @@ MODULES = (
     "onyx.regulatory.amendments.annexes.extraction",
 )
 MAX_REPORT_BYTES = 32_000
+MAX_SOURCE_ATTEMPTS = 6  # Two schema responses, each with three transport attempts.
+MAX_PROBE_ATTEMPTS = MAX_SOURCE_ATTEMPTS + 3 + 3
 
 
 class PdfVisionProbeReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["running", "passed", "failed"] = "running"
     probe_stage: Literal["setup", "source", "draft", "grounding", "complete"] = "setup"
-    attempt_count: int = Field(default=0, ge=0, le=9)
-    http_request_count: int = Field(default=0, ge=0, le=9)
+    attempt_count: int = Field(default=0, ge=0, le=MAX_PROBE_ATTEMPTS)
+    http_request_count: int = Field(default=0, ge=0, le=MAX_PROBE_ATTEMPTS)
     attempt_count_complete: bool = True
     fixture_verified: bool = False
     fixture_sha256: dict[str, str] = Field(
@@ -129,12 +132,19 @@ def run_probe(
     import httpx
     import litellm
 
+    from onyx.llm.utils import llm_response_to_string
     from onyx.regulatory.amendments import drafter, pdf_vision
     from onyx.regulatory.amendments.annexes.dev_acceptance import refuse_fetch
-    from onyx.regulatory.amendments.annexes.models import AcquisitionResult
+    from onyx.regulatory.amendments.annexes.models import (
+        AcquisitionResult,
+        AnnexVisionWireResult,
+    )
     from onyx.regulatory.amendments.annexes.sources import acquire_source_package
     from onyx.regulatory.amendments.models import AmendmentInstruction
-    from onyx.regulatory.structured_llm import is_retryable_provider_error
+    from onyx.regulatory.structured_llm import (
+        _validate_json_object,
+        is_retryable_provider_error,
+    )
 
     original_completion, original_send = litellm.completion, httpx.Client.send
     completed: set[str] = set()
@@ -142,20 +152,56 @@ def run_probe(
     sent: dict[str, int] = {}
     retry_allowed: set[str] = set()
     active: str | None = None
+    original_invoke = llm.invoke
+    source_responses = 0
+    source_transport_attempts = 0
+    source_messages: "LanguageModelInput | None" = None
+
+    def observed_invoke(
+        messages: "LanguageModelInput", **kwargs: Any
+    ) -> "ModelResponse":
+        nonlocal source_responses, source_transport_attempts, source_messages
+        if report.probe_stage == "source":
+            if not isinstance(messages, list) or len(messages) < 2:
+                raise ValueError("pdf_probe_source_messages_required")
+            if source_messages is None:
+                source_messages = [
+                    message.model_copy(deep=True) for message in messages[:2]
+                ]
+            elif messages[:2] != source_messages:
+                raise ValueError("pdf_probe_source_evidence_changed")
+        result = original_invoke(messages, use_streaming=False, **kwargs)
+        if report.probe_stage == "source":
+            source_responses += 1
+            try:
+                # Match production's prose-tolerant validation before permitting correction.
+                _validate_json_object(
+                    llm_response_to_string(result), AnnexVisionWireResult
+                )
+            except ValidationError:
+                if source_responses < 2:
+                    completed.discard("source")
+                    retry_allowed.add("source")
+                    source_transport_attempts = 0
+        return result
 
     def counted_completion(*args: Any, **kwargs: Any) -> Any:
-        nonlocal active
+        nonlocal active, source_transport_attempts
         stage = report.probe_stage
         if (
             stage not in {"source", "draft", "grounding"}
             or active is not None
             or stage in completed
-            or attempts.get(stage, 0) >= 3
+            or attempts.get(stage, 0)
+            >= (MAX_SOURCE_ATTEMPTS if stage == "source" else 3)
+            or (stage == "source" and source_transport_attempts >= 3)
             or (attempts.get(stage, 0) and stage not in retry_allowed)
             or kwargs.get("mock_response")
         ):
             raise ValueError("pdf_probe_completion_retry_refused")
         attempts[stage] = attempts.get(stage, 0) + 1
+        if stage == "source":
+            source_transport_attempts += 1
         retry_allowed.discard(stage)
         active = stage
         report.attempt_count += 1
@@ -228,7 +274,7 @@ def run_probe(
         with (
             patch.object(httpx.Client, "send", counted_send),
             patch.object(litellm, "completion", counted_completion),
-            patch.object(llm, "invoke", partial(llm.invoke, use_streaming=False)),
+            patch.object(llm, "invoke", observed_invoke),
         ):
             report.probe_stage = "source"
             emit(report)
@@ -400,7 +446,7 @@ def report_from_output(output: bytes, failure: str | None = None) -> dict[str, o
             invalid = True
     if report.status == "passed" and (
         report.probe_stage != "complete"
-        or not 3 <= report.attempt_count <= 9
+        or not 3 <= report.attempt_count <= MAX_PROBE_ATTEMPTS
         or report.http_request_count != report.attempt_count
         or not all(
             (

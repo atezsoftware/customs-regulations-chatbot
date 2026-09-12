@@ -137,20 +137,20 @@ def test_vision_rejects_row_plus_cells_and_retries_with_atomic_cells(
     row = {
         "kind": "table_row",
         "text": "A | 5%",
-        "box": [0, 0, 1, 1],
+        "box": {"left": 0, "top": 0, "right": 1, "bottom": 1},
         "status": "readable",
     }
     cells = [
         {
             "kind": "table_cell",
             "text": "A",
-            "box": [0, 0, 0.5, 1],
+            "box": {"left": 0, "top": 0, "right": 0.5, "bottom": 1},
             "status": "readable",
         },
         {
             "kind": "table_cell",
             "text": "5%",
-            "box": [0.5, 0, 1, 1],
+            "box": {"left": 0.5, "top": 0, "right": 1, "bottom": 1},
             "status": "readable",
         },
     ]
@@ -168,7 +168,7 @@ def test_vision_rejects_row_plus_cells_and_retries_with_atomic_cells(
     if not corrected:
         with pytest.raises(
             ValueError,
-            match="LLM failed to produce valid AnnexVisionResult after 2 attempts",
+            match="LLM failed to produce valid AnnexVisionWireResult after 2 attempts",
         ):
             extract_annex_structure(stream.getvalue(), "image/png", vision_llm=llm)
         return
@@ -222,7 +222,7 @@ def test_image_vision_extracts_real_pixels_and_retains_uncertainty() -> None:
         created="2026-01-01",
         choice=Choice(
             message=Message(
-                content='{"elements":[{"kind":"image_region","text":"unclear","box":[0.1,0.2,0.8,0.9],"status":"uncertain","issues":["low_readability"]}]}'
+                content='{"elements":[{"kind":"image_region","text":"unclear","box":{"left":0.1,"top":0.2,"right":0.8,"bottom":0.9},"status":"uncertain","issues":["low_readability"]}]}'
             )
         ),
     )
@@ -365,7 +365,7 @@ def test_oriented_jpeg_uses_explicit_preview_coordinates() -> None:
         created="2026-01-01",
         choice=Choice(
             message=Message(
-                content='{"elements":[{"kind":"image_region","text":"region","box":[0,0,1,1],"status":"readable","issues":[]}]}'
+                content='{"elements":[{"kind":"image_region","text":"region","box":{"left":0,"top":0,"right":1,"bottom":1},"status":"readable","issues":[]}]}'
             )
         ),
     )
@@ -443,7 +443,12 @@ def test_explicit_vision_table_roles_keep_original_text_and_coordinates() -> Non
             {
                 "kind": "table_cell",
                 "text": text,
-                "box": [0, row * 0.3, 1, (row + 1) * 0.3],
+                "box": {
+                    "left": 0,
+                    "top": row * 0.3,
+                    "right": 1,
+                    "bottom": (row + 1) * 0.3,
+                },
                 "status": "readable",
                 "issues": [],
                 "table_role": role,
