@@ -19,6 +19,7 @@ def load_markdown_progress(
 
     from onyx.db.models import (
         AmendmentBatch,
+        ChatMessage,
         ChatSession,
         DocumentSet,
         KVStore,
@@ -84,6 +85,7 @@ def load_markdown_progress(
     ):
         return {**result, "scope_failure": "file_ownership"}
     chat_times: dict[str, object] = {}
+    message_count = 0
     for label, chat_id, day in (
         ("old_chat", UUID("0d6e8e7b-0c11-4c53-8669-aeb079c4daa2"), "2026-09-09"),
         ("new_chat", UUID("c94409a8-f6bd-4ef4-aaf5-3af0dc71968a"), "2026-09-10"),
@@ -102,6 +104,35 @@ def load_markdown_progress(
             or chat.description != run.name + " / dated " + day
         ):
             return {**result, "scope_failure": "chat_ownership"}
+        messages = (
+            list(
+                session.execute(
+                    select(
+                        ChatMessage.id,
+                        ChatMessage.message_type,
+                        ChatMessage.time_sent,
+                        ChatMessage.processing_duration_seconds,
+                    )
+                    .where(ChatMessage.chat_session_id == chat_id)
+                    .order_by(ChatMessage.id)
+                    .limit(65)
+                ).all()
+            )
+            if chat is not None
+            else []
+        )
+        message_count += len(messages)
+        if message_count > 64:
+            return {**result, "scope_failure": "evidence_limit"}
+        chat_times[label + "_messages"] = [
+            {
+                "message_id": message.id,
+                "message_type": message.message_type.value,
+                "time_sent": message.time_sent.isoformat(),
+                "pre_answer_processing_seconds": message.processing_duration_seconds,
+            }
+            for message in messages
+        ]
         chat_times[label + "_created_at"] = (
             chat.time_created.isoformat() if chat else None
         )

@@ -77,6 +77,7 @@ def fixture() -> tuple[Mock, dict[type, Any]]:
     session = Mock()
     session.get.side_effect = lambda model, _key: rows[model]
     session.scalars.side_effect = [[], [], []]
+    session.execute.return_value.all.return_value = []
     return session, rows
 
 
@@ -259,6 +260,12 @@ def test_worker_health_only_returns_fixed_process_states() -> None:
         cast(list[dict[str, object]], result["workers"])[1]["process_state"] == "FATAL"
     )
     assert run.call_args.kwargs["timeout"] == 5
+    assert run.call_args.args[0][:4] == [
+        "supervisorctl",
+        "-c",
+        "/etc/supervisor/conf.d/supervisord.conf",
+        "status",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -310,7 +317,8 @@ def test_exact_embedded_program_refuses_wrong_environment_without_db() -> None:
     assert result["scope_failure"] == "env"
 
 
-def test_owned_chat_timestamps_only() -> None:
+@pytest.mark.parametrize("per_chat_count", [1, 33])
+def test_owned_chat_timestamps_only(per_chat_count: int) -> None:
     session, rows = fixture()
     run = CanaryRun.model_validate(rows[KVStore].value)
     stamp = datetime(2026, 9, 12, 20, 28, tzinfo=timezone.utc)
@@ -329,12 +337,50 @@ def test_owned_chat_timestamps_only() -> None:
         return original(model, key)
 
     session.get.side_effect = get
+    from onyx.configs.constants import MessageType
+
+    session.execute.return_value.all.return_value = [
+        SimpleNamespace(
+            id=123,
+            message_type=MessageType.ASSISTANT,
+            time_sent=stamp,
+            processing_duration_seconds=2.5,
+            message="PRIVATE BODY",
+        )
+    ] * per_chat_count
     result = diagnostic.load_markdown_progress(
         cast(Session, session), expected_scope_key="scope"
     )
+    if per_chat_count > 32:
+        assert result["status"] == "scope_refused"
+        assert result["scope_failure"] == "evidence_limit"
+        assert "old_chat_messages" not in result
+        return
     assert (
         result["old_chat_created_at"]
         == result["new_chat_updated_at"]
         == stamp.isoformat()
     )
     assert "description" not in result
+
+    messages = cast(list[dict[str, object]], result["old_chat_messages"])
+    assert messages == [
+        {
+            "message_id": 123,
+            "message_type": "assistant",
+            "time_sent": stamp.isoformat(),
+            "pre_answer_processing_seconds": 2.5,
+        }
+    ]
+    assert "PRIVATE" not in json.dumps(result)
+    from scripts import regulatory_annex_dev_cutover as runner
+
+    runner.validate_markdown_progress_report(
+        {"stage": "markdown_a8", "database_read_only": True, **result}
+    )
+    for call in session.execute.call_args_list:
+        query = str(call.args[0])
+        assert (
+            "chat_message.message," not in query and "chat_message.error" not in query
+        )
+        assert "chat_message.chat_session_id =" in query

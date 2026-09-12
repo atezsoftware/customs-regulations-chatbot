@@ -2902,7 +2902,13 @@ def markdown_worker_health() -> dict[str, object]:
     )
     try:
         result = subprocess.run(
-            ["supervisorctl", "status", *names],
+            [
+                "supervisorctl",
+                "-c",
+                "/etc/supervisor/conf.d/supervisord.conf",
+                "status",
+                *names,
+            ],
             capture_output=True,
             text=True,
             timeout=5,
@@ -2944,6 +2950,8 @@ def markdown_worker_health() -> dict[str, object]:
 
 
 def validate_markdown_progress_report(report: Any) -> None:
+    import math
+
     bools = {
         "database_read_only",
         "configuration_verified",
@@ -2964,6 +2972,7 @@ def validate_markdown_progress_report(report: Any) -> None:
         "temporal_retired_count",
         "job_count",
         "attempt_count",
+        "message_id",
     }
     hashes = {
         "receipt_raw_sha256",
@@ -2971,6 +2980,7 @@ def validate_markdown_progress_report(report: Any) -> None:
         "receipt_generation_sha256",
     }
     dates = {
+        "time_sent",
         "first_canonical_at",
         "last_canonical_at",
         "old_chat_created_at",
@@ -2982,6 +2992,13 @@ def validate_markdown_progress_report(report: Any) -> None:
         "next_retry_at",
     }
     enums = {
+        "message_type": {
+            "system",
+            "user",
+            "assistant",
+            "tool_call_response",
+            "user_reminder",
+        },
         "stage": {"markdown_a8"},
         "status": {"read", "failed", "scope_refused"},
         "scope_failure": {
@@ -3055,6 +3072,13 @@ def validate_markdown_progress_report(report: Any) -> None:
             valid = False
             if key in bools:
                 valid = value is None or type(value) is bool
+            elif key == "pre_answer_processing_seconds":
+                valid = (
+                    value is None
+                    or type(value) in {int, float}
+                    and math.isfinite(value)
+                    and 0 <= value <= 86400
+                )
             elif key in counts:
                 valid = type(value) is int and 0 <= value <= 2147483647
             elif key in hashes:
@@ -3075,12 +3099,21 @@ def validate_markdown_progress_report(report: Any) -> None:
                 )
             elif key in enums:
                 valid = value is None or isinstance(value, str) and value in enums[key]
-            elif key in {"jobs", "workers"}:
+            elif key in {"jobs", "workers", "old_chat_messages", "new_chat_messages"}:
                 valid = (
                     isinstance(value, list)
                     and len(value) <= 64
                     and all(
-                        isinstance(row, dict) and not ({"jobs", "workers"} & set(row))
+                        isinstance(row, dict)
+                        and not (
+                            {
+                                "jobs",
+                                "workers",
+                                "old_chat_messages",
+                                "new_chat_messages",
+                            }
+                            & set(row)
+                        )
                         for row in value
                     )
                 )
