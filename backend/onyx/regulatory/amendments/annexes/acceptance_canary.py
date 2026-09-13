@@ -5,8 +5,10 @@ import json
 import re
 import signal
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import httpx
@@ -40,6 +42,90 @@ MADDE 1 - Yonetmeligin EK-1 Oran Tablosu, devam sayfasi ve dipnotuyla birlikte,
 ekli kaynakta yer alan iki sayfalik yeni tablo ile degistirilmistir.
 MADDE 2 - Bu temsili degisiklik 10/09/2026 tarihinde yururluge girer.
 Yalniz yazilim testi icindir; hukuki bir kaynak degildir."""
+
+CanaryStage = Literal[
+    "baseline",
+    "source_review",
+    "approval",
+    "historical_chat",
+    "current_chat",
+    "markdown",
+]
+
+
+@contextmanager
+def record_canary_stage(
+    run: CanaryRun, stage: CanaryStage, deadline: float | None = None
+) -> Iterator[None]:
+    """Retain bounded progress before cleanup can remove the live file/job rows."""
+    started = time.monotonic()
+    prefix = "stage_" + stage
+
+    def milliseconds(seconds: float) -> int:
+        return max(0, min(86400000, int(seconds * 1000)))
+
+    if deadline is not None:
+        run.evidence[prefix + "_remaining_start_ms"] = milliseconds(deadline - started)
+    failed = True
+    try:
+        yield
+        failed = False
+    finally:
+        finished = time.monotonic()
+        run.evidence[prefix + "_elapsed_ms"] = milliseconds(finished - started)
+        if deadline is not None:
+            run.evidence[prefix + "_remaining_end_ms"] = milliseconds(
+                deadline - finished
+            )
+        try:
+            save_canary(run)
+        except Exception:
+            run.evidence["progress_save_failed"] = True
+            if not failed:
+                raise
+
+
+def capture_markdown_snapshot(run: CanaryRun, snapshot: dict[str, Any]) -> None:
+    from onyx.db.enums import (
+        RegulatoryIndexingJobStatus,
+        RegulatoryIndexingStage,
+        UserFileStatus,
+    )
+
+    status = snapshot.get("status")
+    run.evidence["markdown_last_status"] = (
+        status
+        if isinstance(status, str) and status in {item.value for item in UserFileStatus}
+        else "UNKNOWN"
+    )
+    for key in list(run.evidence):
+        if key.startswith("markdown_job_"):
+            del run.evidence[key]
+    progress = snapshot.get("regulatory_indexing_progress")
+    run.evidence["markdown_job_present"] = isinstance(progress, dict)
+    if not isinstance(progress, dict):
+        return
+    for key, enum in (
+        ("status", RegulatoryIndexingJobStatus),
+        ("stage", RegulatoryIndexingStage),
+    ):
+        value = progress.get(key)
+        run.evidence["markdown_job_" + key] = (
+            value
+            if isinstance(value, str) and value in {item.value for item in enum}
+            else "UNKNOWN"
+        )
+    for key in (
+        "attempt_count",
+        "total_items",
+        "completed_items",
+        "context_ready_items",
+        "embedded_items",
+        "failed_items",
+    ):
+        value = progress.get(key)
+        if type(value) is int and 0 <= value <= 2147483647:
+            run.evidence["markdown_job_" + key] = value
 
 
 def bootstrap_original(run: CanaryRun) -> None:
@@ -611,22 +697,40 @@ def require_markdown_chat_evidence(
 
 
 def markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> None:
+    with record_canary_stage(run, "markdown", deadline):
+        _markdown_canary(client, run, deadline)
+
+
+def _markdown_canary(client: httpx.Client, run: CanaryRun, deadline: float) -> None:
+    run.evidence.update(
+        markdown_upload_accepted=False,
+        markdown_index_post_attempted=False,
+        markdown_index_post_accepted=False,
+        markdown_poll_count=0,
+    )
     marker = "ANNEXCANARY" + run.run_id.hex
     file = upload_canary_markdown(client, run)
     identifier = UUID(file["id"])
+    run.evidence["markdown_upload_accepted"] = True
     index_requested = False
+    poll_count = 0
     while time.monotonic() < deadline:
         files = request_json(
             client, "GET", f"/manage/admin/document-set/{run.document_set_id}/files"
         )
         current = next(item for item in files if item["id"] == str(identifier))
+        poll_count += 1
+        run.evidence["markdown_poll_count"] = min(poll_count, 10000)
+        capture_markdown_snapshot(run, current)
         if current["status"] == "CHUNKED" and not index_requested:
+            run.evidence["markdown_index_post_attempted"] = True
             request_json(
                 client,
                 "POST",
                 f"/manage/admin/document-set/{run.document_set_id}/files/{identifier}/index",
             )
             index_requested = True
+            run.evidence["markdown_index_post_accepted"] = True
         elif current["status"] == "COMPLETED":
             break
         elif current["status"] in {"FAILED", "CANCELED"}:
@@ -688,16 +792,21 @@ def run_canary(release_sha: str) -> dict[str, Any]:
             operation = "capabilities"
             request_json(client, "GET", "/regulatory/amendments/capabilities")
             operation = "baseline"
-            bootstrap_original(run)
+            with record_canary_stage(run, "baseline"):
+                bootstrap_original(run)
             deadline = time.monotonic() + 600
             operation = "source_review"
-            review = prepare_review(client, run, deadline)
+            with record_canary_stage(run, "source_review", deadline):
+                review = prepare_review(client, run, deadline)
             operation = "approval"
-            approve_review(client, run, review, deadline)
+            with record_canary_stage(run, "approval", deadline):
+                approve_review(client, run, review, deadline)
             operation = "historical_chat"
-            chat_canary(client, run, as_of="2026-09-09", rate="5%")
+            with record_canary_stage(run, "historical_chat", deadline):
+                chat_canary(client, run, as_of="2026-09-09", rate="5%")
             operation = "current_chat"
-            chat_canary(client, run, as_of="2026-09-10", rate="7%")
+            with record_canary_stage(run, "current_chat", deadline):
+                chat_canary(client, run, as_of="2026-09-10", rate="7%")
             operation = "markdown"
             markdown_canary(client, run, deadline)
     except Exception as exc:

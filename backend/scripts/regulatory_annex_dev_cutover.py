@@ -68,6 +68,70 @@ def release(driver: "Driver") -> None:
 
 def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
     """Retain only the fixed probe evidence, including a failed calibration verdict."""
+    timing_keys = {
+        f"stage_{stage}_{metric}"
+        for stage in (
+            "baseline",
+            "source_review",
+            "approval",
+            "historical_chat",
+            "current_chat",
+            "markdown",
+        )
+        for metric in ("elapsed_ms", "remaining_start_ms", "remaining_end_ms")
+    }
+    progress_counts = {
+        "markdown_job_" + key
+        for key in (
+            "attempt_count",
+            "total_items",
+            "completed_items",
+            "context_ready_items",
+            "embedded_items",
+            "failed_items",
+        )
+    }
+    progress_bools = {
+        "markdown_upload_accepted",
+        "markdown_index_post_attempted",
+        "markdown_index_post_accepted",
+        "markdown_job_present",
+        "progress_save_failed",
+    }
+    progress_enums = {
+        "markdown_last_status": {
+            "UNKNOWN",
+            "PROCESSING",
+            "INDEXING",
+            "CHUNKED",
+            "COMPLETED",
+            "SKIPPED",
+            "FAILED",
+            "CANCELED",
+            "DELETING",
+        },
+        "markdown_job_status": {
+            "UNKNOWN",
+            "QUEUED",
+            "RUNNING",
+            "RETRY_WAIT",
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLING",
+            "CANCELLED",
+        },
+        "markdown_job_stage": {
+            "UNKNOWN",
+            "PREPARING",
+            "CONTEXT_SUBMIT",
+            "CONTEXT_WAIT",
+            "CONTEXT_APPLY",
+            "EMBEDDING",
+            "INDEX_WRITE",
+            "VERIFY",
+            "PUBLISH",
+        },
+    }
     keys = {
         "phase",
         "status",
@@ -189,10 +253,33 @@ def emit_acceptance_report(stdout: str, phase: str, sha: str) -> None:
         "chat_2026-09-09",
         "chat_2026-09-10",
     }
+    keys.update(
+        timing_keys
+        | progress_counts
+        | progress_bools
+        | progress_enums.keys()
+        | {"markdown_poll_count"}
+    )
 
     def sanitize(value: Any, parent: str = "", depth: int = 0) -> Any:
         if depth > 8:
             raise CutoverRefusal("acceptance_report_depth_exceeded")
+        if parent in timing_keys | progress_counts | {"markdown_poll_count"}:
+            maximum = (
+                86400000
+                if parent in timing_keys
+                else 10000
+                if parent == "markdown_poll_count"
+                else 2147483647
+            )
+            if type(value) is not int or not 0 <= value <= maximum:
+                raise CutoverRefusal("acceptance_progress_value_refused")
+        if parent in progress_bools and type(value) is not bool:
+            raise CutoverRefusal("acceptance_progress_value_refused")
+        if parent in progress_enums and (
+            not isinstance(value, str) or value not in progress_enums[parent]
+        ):
+            raise CutoverRefusal("acceptance_progress_value_refused")
         if parent == "source_package_status" and value not in ("failed", "blocked"):
             raise CutoverRefusal("acceptance_source_package_status_refused")
         if parent == "failure_stage" and (
