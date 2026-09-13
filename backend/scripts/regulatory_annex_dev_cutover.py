@@ -3650,7 +3650,7 @@ def validate_markdown_worker_report(report: Any) -> None:
 
 def diagnose_markdown_worker(
     driver: Driver, pod: str, container: str, *, role: str = "background"
-) -> None:
+) -> dict[str, Any]:
     if driver.sha != MARKDOWN_WORKER_RUNTIME or role not in {"api", "background"}:
         raise CutoverRefusal("fixed_worker_runtime_required")
     program = "import contextlib, io, json, logging, os, signal\nfrom typing import Any\nlogging.disable(logging.CRITICAL)\ndef expired(*args):\n    raise TimeoutError()\nsignal.signal(signal.SIGALRM, expired)\nsignal.alarm(60)\n"
@@ -3712,6 +3712,71 @@ print(json.dumps(report, sort_keys=True))
     report = json.loads(output)
     validate_markdown_worker_report(report)
     print(json.dumps(report, sort_keys=True), flush=True)
+    return report
+
+
+def diagnose_shared_queue_log(driver: Driver) -> None:
+    """Read only DEV-owned operational events from the observed competing consumer."""
+    if driver.sha != MARKDOWN_WORKER_RUNTIME:
+        raise CutoverRefusal("fixed_worker_runtime_required")
+    prefix = ["kubectl", "--namespace", "customs-regulations-test"]
+    pods = json.loads(
+        driver.command(
+            prefix
+            + [
+                "get",
+                "pods",
+                "-l",
+                "app=test-v1-customs-regulations-background",
+                "-o",
+                "json",
+                "--request-timeout=10s",
+            ],
+            timeout=15,
+        )
+    )["items"]
+    if len(pods) != 1:
+        raise CutoverRefusal("one_observed_consumer_pod_required")
+    pod = pods[0]
+    containers = [
+        item
+        for item in pod["spec"]["containers"]
+        if item["image"].startswith(
+            "255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-backend-lite-test-v1:"
+        )
+    ]
+    if len(containers) != 1:
+        raise CutoverRefusal("one_observed_consumer_container_required")
+    # -S prevents site startup hooks; this child imports only the standard library.
+    source = (
+        Path(__file__).with_name("regulatory_shared_queue_log_probe.py").read_text()
+    )
+    output = driver.command(
+        prefix
+        + [
+            "exec",
+            pod["metadata"]["name"],
+            "-c",
+            containers[0]["name"],
+            "--",
+            "python",
+            "-S",
+            "-c",
+            source,
+        ],
+        timeout=40,
+    )
+    if len(output.encode()) > 8192:
+        raise CutoverRefusal("owned_receipt_bound_required")
+    report = json.loads(output)
+    if report.get("stage") != "shared_queue_receipt" or report.get("status") != "read":
+        raise CutoverRefusal("owned_receipt_read_required")
+    if (
+        report.get("hostname_verified") is not True
+        or report.get("database_accessed") is not False
+    ):
+        raise CutoverRefusal("observed_consumer_read_only_required")
+    print(json.dumps(report, sort_keys=True), flush=True)
 
 
 def diagnose_release(driver: Driver, runner_sha: str) -> None:
@@ -3735,7 +3800,9 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         if item["image"] == f"{REPOSITORY}:{driver.sha}"
     )
     if driver.sha == MARKDOWN_WORKER_RUNTIME:
-        diagnose_markdown_worker(driver, pod["metadata"]["name"], container["name"])
+        worker_report = diagnose_markdown_worker(
+            driver, pod["metadata"]["name"], container["name"]
+        )
         for api_pod in driver.pods("api"):
             api_container = next(
                 item
@@ -3745,6 +3812,11 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
             diagnose_markdown_worker(
                 driver, api_pod["metadata"]["name"], api_container["name"], role="api"
             )
+        if (
+            "user_file_processing@test-v1-customs-regulations-background-deployment-57788b682n78h"
+            in worker_report.get("queue_consumer_names", "").split(",")
+        ):
+            diagnose_shared_queue_log(driver)
         return
     if driver.sha == MARKDOWN_A8_RUNTIME:
         diagnose_markdown_progress(driver, pod["metadata"]["name"], container["name"])
