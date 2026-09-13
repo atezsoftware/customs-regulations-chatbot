@@ -41,6 +41,17 @@ def test_unrelated_task_does_not_supply_owned_evidence() -> None:
     assert result["owned_task_frames"] == ""
 
 
+def test_discard_receipt_does_not_assert_expiry_cause() -> None:
+    result = cutover.summarize_markdown_task_log(
+        "Discarding revoked task: process_single_user_file[719599a4-cddb-402c-ac52-3c3534581d46]"
+    )
+    assert result["owned_task_revoked_or_expired"] is True
+    assert "owned_task_expired" not in result
+    cutover.validate_markdown_worker_report(
+        {**result, "stage": "markdown_worker", "database_read_only": True}
+    )
+
+
 def test_receipt_discovers_consumers_without_hostname_assumption(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

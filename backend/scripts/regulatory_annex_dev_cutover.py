@@ -3386,7 +3386,7 @@ def summarize_markdown_task_log(content: str) -> dict[str, str | bool]:
     events = {
         "received": f"Task process_single_user_file[{task}] received",
         "succeeded": f"Task process_single_user_file[{task}] succeeded",
-        "expired": f"Discarding revoked task: process_single_user_file[{task}]",
+        "revoked_or_expired": f"Discarding revoked task: process_single_user_file[{task}]",
         "started": f"process_user_file_impl - Starting id={file}",
         "file_missing": f"process_user_file_impl - UserFile not found id={file}",
         "lock_held": f"process_user_file_impl - Lock held, skipping user_file_id={file}",
@@ -3566,7 +3566,7 @@ def validate_markdown_worker_report(report: Any) -> None:
         for name in (
             "received",
             "succeeded",
-            "expired",
+            "revoked_or_expired",
             "started",
             "file_missing",
             "lock_held",
