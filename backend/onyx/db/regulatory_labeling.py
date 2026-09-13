@@ -36,6 +36,7 @@ from onyx.db.models import (
     RegulatoryLabelingItem,
     RegulatoryLabelingRun,
     RegulatoryLabelingShard,
+    RegulatoryLabelSettings,
     RegulatoryLabelTaxonomy,
     User,
     UserFile,
@@ -64,7 +65,7 @@ from onyx.regulatory.labeling.domain import (
     LabelingChunkView,
     bounded_document_context,
 )
-from onyx.regulatory.labeling.provider import TaxonomyDefinition
+from onyx.regulatory.labeling.provider import LabelDefinition, TaxonomyDefinition
 
 _ACTIVE_RUN_STATUSES = ("queued", "running")
 _TERMINAL_ITEM_STATUSES = ("completed", "failed", "stale", "cancelled")
@@ -447,8 +448,8 @@ def list_taxonomies(session: Session) -> list[RegulatoryLabelTaxonomy]:
     )
 
 
-def get_or_create_bundled_taxonomy(
-    session: Session, *, taxonomy: TaxonomyDefinition
+def get_or_create_taxonomy(
+    session: Session, *, taxonomy: TaxonomyDefinition, created_by_id: UUID | None
 ) -> RegulatoryLabelTaxonomy:
     session.execute(
         pg_insert(RegulatoryLabelTaxonomy)
@@ -458,7 +459,7 @@ def get_or_create_bundled_taxonomy(
             version_hash=taxonomy.version_hash,
             definition=taxonomy.model_dump(mode="json"),
             label_count=len(taxonomy.labels),
-            created_by_id=None,
+            created_by_id=created_by_id,
         )
         .on_conflict_do_nothing(index_elements=[RegulatoryLabelTaxonomy.version_hash])
     )
@@ -471,6 +472,46 @@ def get_or_create_bundled_taxonomy(
 
 def get_taxonomy(session: Session, taxonomy_id: UUID) -> RegulatoryLabelTaxonomy | None:
     return session.get(RegulatoryLabelTaxonomy, taxonomy_id)
+
+
+def get_label_settings(session: Session) -> RegulatoryLabelSettings:
+    return session.scalars(
+        select(RegulatoryLabelSettings)
+        .options(selectinload(RegulatoryLabelSettings.taxonomy))
+        .where(RegulatoryLabelSettings.id == 1)
+        .execution_options(populate_existing=True)
+    ).one()
+
+
+def update_label_settings(
+    session: Session,
+    *,
+    labels: Sequence[LabelDefinition],
+    expected_revision: int,
+    updated_by_id: UUID,
+) -> RegulatoryLabelSettings:
+    settings = session.scalars(
+        select(RegulatoryLabelSettings)
+        .options(selectinload(RegulatoryLabelSettings.taxonomy))
+        .where(RegulatoryLabelSettings.id == 1)
+        .with_for_update(of=RegulatoryLabelSettings)
+        .execution_options(populate_existing=True)
+    ).one()
+    if settings.revision != expected_revision:
+        raise LabelingStateConflictError(
+            "Label settings changed while you were editing. Reload the latest labels before saving."
+        )
+    definition = TaxonomyDefinition(name=settings.taxonomy.name, labels=list(labels))
+    if definition.version_hash == settings.taxonomy.version_hash:
+        return settings
+    settings.taxonomy = get_or_create_taxonomy(
+        session, taxonomy=definition, created_by_id=updated_by_id
+    )
+    settings.revision += 1
+    settings.updated_by_id = updated_by_id
+    settings.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    session.flush()
+    return settings
 
 
 def get_labeling_counts(
@@ -562,6 +603,7 @@ def create_labeling_run(
     requested_by_id: UUID | None,
     idempotency_key: UUID,
     retry_of_id: UUID | None = None,
+    uses_current_labels: bool = False,
 ) -> tuple[RegulatoryLabelingRun, bool]:
     document_set = session.scalar(
         select(DocumentSet).where(DocumentSet.id == document_set_id).with_for_update()
@@ -577,12 +619,14 @@ def create_labeling_run(
         )
     )
     if existing is not None:
-        expected = (taxonomy.id, model_configuration_id)
-        actual = (
-            existing.taxonomy_id,
-            existing.provider_binding.get("model_configuration_id"),
-        )
-        if actual != expected:
+        same_taxonomy = (
+            uses_current_labels and existing.uses_current_labels
+        ) or existing.taxonomy_id == taxonomy.id
+        if (
+            not same_taxonomy
+            or existing.provider_binding.get("model_configuration_id")
+            != model_configuration_id
+        ):
             raise LabelingStateConflictError(
                 "The idempotency key was already used with different parameters"
             )
@@ -630,6 +674,7 @@ def create_labeling_run(
         requested_by_id=requested_by_id,
         retry_of_id=retry_of_id,
         idempotency_key=idempotency_key,
+        uses_current_labels=uses_current_labels,
         model=model,
         provider_binding=provider_binding,
         file_ids=[str(file_id) for file_id in file_ids],

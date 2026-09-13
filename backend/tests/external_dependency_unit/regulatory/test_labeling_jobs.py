@@ -767,6 +767,29 @@ def _start_body(data: LabelingData) -> dict[str, str | int]:
     }
 
 
+@pytest.fixture
+def restore_label_settings(labeling_data: LabelingData) -> Generator[None, None, None]:
+    with Session(labeling_data.database.engine) as session:
+        original = repository.get_label_settings(session)
+        original_labels = TaxonomyDefinition.model_validate(
+            original.taxonomy.definition
+        ).labels
+        original_taxonomy_id = original.taxonomy_id
+    try:
+        yield
+    finally:
+        with Session(labeling_data.database.engine) as session:
+            current = repository.get_label_settings(session)
+            if current.taxonomy_id != original_taxonomy_id:
+                repository.update_label_settings(
+                    session,
+                    labels=original_labels,
+                    expected_revision=current.revision,
+                    updated_by_id=labeling_data.user_id,
+                )
+                session.commit()
+
+
 def test_api_setup_and_start_expose_only_safe_persisted_state(
     labeling_data: LabelingData, labeling_client: TestClient
 ) -> None:
@@ -798,18 +821,167 @@ def test_api_setup_and_start_expose_only_safe_persisted_state(
     assert page.json()["total"] == 2
 
 
+@pytest.mark.usefixtures("restore_label_settings")
+def test_api_label_settings_save_drive_setup_and_new_batch_prompts(
+    labeling_data: LabelingData,
+    labeling_client: TestClient,
+) -> None:
+    path = _api_path(labeling_data, "label-settings")
+    original = labeling_client.get(path)
+    assert original.status_code == 200, original.text
+    original_body = original.json()
+    labels = [
+        {
+            "id": "editable-customs-value",
+            "name": "Düzenlenebilir gümrük kıymeti",
+            "description": "Gümrük kıymetini düzenleyen hükümler.",
+        },
+        {
+            "id": "editable-origin",
+            "name": "Düzenlenebilir menşe",
+            "description": "Menşe ispatını düzenleyen hükümler.",
+        },
+    ]
+    saved = labeling_client.put(
+        path,
+        json={"expected_revision": original_body["revision"], "labels": labels},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["revision"] == original_body["revision"] + 1
+    assert saved.json()["taxonomy_id"] != original_body["taxonomy_id"]
+    assert saved.json()["labels"] == labels
+    assert labeling_client.get(path).json() == saved.json()
+    assert (
+        labeling_client.get(_api_path(labeling_data, "setup")).json()[
+            "default_label_count"
+        ]
+        == 2
+    )
+
+    body = _start_body(labeling_data)
+    del body["taxonomy_id"]
+    started = labeling_client.post(_api_path(labeling_data, "runs"), json=body)
+    assert started.status_code == 200, started.text
+    lease, shard_id = _prepare(labeling_data, UUID(started.json()["id"]))
+    with Session(labeling_data.database.engine) as session:
+        items = repository.load_shard_requests(session, lease, shard_id)
+        assert items
+        for item in items:
+            assert item.request_payload is not None
+            request = VertexBatchRequest.model_validate(item.request_payload)
+            assert json.loads(request.prompt)["taxonomy"]["labels"] == labels
+
+
+@pytest.mark.usefixtures("restore_label_settings")
+def test_api_label_settings_reject_stale_revision_without_losing_saved_edit(
+    labeling_data: LabelingData,
+    labeling_client: TestClient,
+) -> None:
+    path = _api_path(labeling_data, "label-settings")
+    original = labeling_client.get(path).json()
+    first_labels = [{"id": "winner", "name": "Kazanan", "description": "İlk kayıt."}]
+    saved = labeling_client.put(
+        path,
+        json={"expected_revision": original["revision"], "labels": first_labels},
+    )
+    assert saved.status_code == 200, saved.text
+    stale = labeling_client.put(
+        path,
+        json={
+            "expected_revision": original["revision"],
+            "labels": [
+                {"id": "loser", "name": "Kaybeden", "description": "Eski kayıt."}
+            ],
+        },
+    )
+    assert stale.status_code == 409, stale.text
+    assert labeling_client.get(path).json() == saved.json()
+
+
+@pytest.mark.usefixtures("restore_label_settings")
+def test_api_implicit_replay_keeps_the_original_labels_after_settings_change(
+    labeling_data: LabelingData,
+    labeling_client: TestClient,
+) -> None:
+    settings_path = _api_path(labeling_data, "label-settings")
+    original_settings = labeling_client.get(settings_path).json()
+    body = _start_body(labeling_data)
+    del body["taxonomy_id"]
+    runs_path = _api_path(labeling_data, "runs")
+    started = labeling_client.post(runs_path, json=body)
+    assert started.status_code == 200, started.text
+    original_taxonomy_id = started.json()["taxonomy_id"]
+
+    saved = labeling_client.put(
+        settings_path,
+        json={
+            "expected_revision": original_settings["revision"],
+            "labels": [
+                {
+                    "id": "future-only",
+                    "name": "Yalnız gelecek işler",
+                    "description": "Bu değişiklik yalnız yeni işleri etkiler.",
+                }
+            ],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["taxonomy_id"] != original_taxonomy_id
+    replayed = labeling_client.post(runs_path, json=body)
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["id"] == started.json()["id"]
+    assert replayed.json()["taxonomy_id"] == original_taxonomy_id
+    lease, shard_id = _prepare(labeling_data, UUID(started.json()["id"]))
+    with Session(labeling_data.database.engine) as session:
+        items = repository.load_shard_requests(session, lease, shard_id)
+        assert items
+        for item in items:
+            assert item.request_payload is not None
+            request = VertexBatchRequest.model_validate(item.request_payload)
+            assert (
+                json.loads(request.prompt)["taxonomy"]["labels"]
+                == (original_settings["labels"])
+            )
+
+
+def test_api_label_settings_validate_bounds_and_unknown_fields(
+    labeling_data: LabelingData,
+    labeling_client: TestClient,
+) -> None:
+    path = _api_path(labeling_data, "label-settings")
+    revision = labeling_client.get(path).json()["revision"]
+    label = {"id": "one", "name": "Bir", "description": "Bir etiket."}
+    for body in (
+        {"expected_revision": 0, "labels": [label]},
+        {"expected_revision": revision, "labels": []},
+        {"expected_revision": revision, "labels": [label], "extra": True},
+        {
+            "expected_revision": revision,
+            "labels": [
+                {
+                    "id": f"label-{index}",
+                    "name": f"Etiket {index}",
+                    "description": "Tanım.",
+                }
+                for index in range(1025)
+            ],
+        },
+    ):
+        response = labeling_client.put(path, json=body)
+        assert response.status_code == 422, response.text
+
+
 @pytest.mark.parametrize("explicit_null", [False, True])
 def test_api_default_labels_need_no_upload_and_reach_the_batch_prompt(
     labeling_data: LabelingData, labeling_client: TestClient, explicit_null: bool
 ) -> None:
     with Session(labeling_data.database.engine) as session:
-        session.execute(delete(RegulatoryLabelTaxonomy))
-        session.commit()
+        settings = repository.get_label_settings(session)
+        default_taxonomy_id = settings.taxonomy_id
+        definition = settings.taxonomy.definition
     setup = labeling_client.get(_api_path(labeling_data, "setup"))
     assert setup.status_code == 200, setup.text
     assert setup.json()["default_label_count"] == 255
-    with Session(labeling_data.database.engine) as session:
-        assert repository.list_taxonomies(session) == []
     body: dict[str, str | int | None] = {**_start_body(labeling_data)}
     if explicit_null:
         body["taxonomy_id"] = None
@@ -830,17 +1002,11 @@ def test_api_default_labels_need_no_upload_and_reach_the_batch_prompt(
         path, json={**body, "taxonomy_id": str(labeling_data.taxonomy_id)}
     )
     assert changed.status_code == 409, changed.text
-    definition = json.loads(
-        (
-            Path(__file__).resolve().parents[4]
-            / "deployment/labeling/tariff-regulatory-intelligence-v2.1.json"
-        ).read_text()
-    )
     with Session(labeling_data.database.engine) as session:
-        rows = repository.list_taxonomies(session)
-        assert len(rows) == 1
-        assert rows[0].created_by_id is None
-        assert rows[0].definition == definition
+        settings = repository.get_label_settings(session)
+        assert settings.taxonomy_id == default_taxonomy_id
+        assert settings.taxonomy.created_by_id is None
+        assert settings.taxonomy.definition == definition
     lease, shard_id = _prepare(labeling_data, UUID(first.json()["id"]))
     with Session(labeling_data.database.engine) as session:
         items = repository.load_shard_requests(session, lease, shard_id)
@@ -855,8 +1021,7 @@ def test_api_concurrent_default_starts_share_one_definition_and_run(
     labeling_data: LabelingData, labeling_client: TestClient
 ) -> None:
     with Session(labeling_data.database.engine) as session:
-        session.execute(delete(RegulatoryLabelTaxonomy))
-        session.commit()
+        taxonomy_ids_before = {row.id for row in repository.list_taxonomies(session)}
     body = _start_body(labeling_data)
     del body["taxonomy_id"]
     barrier = Barrier(2)
@@ -871,7 +1036,9 @@ def test_api_concurrent_default_starts_share_one_definition_and_run(
         results = list(executor.map(lambda _: start(), range(2)))
     assert results[0] == results[1]
     with Session(labeling_data.database.engine) as session:
-        assert len(repository.list_taxonomies(session)) == 1
+        assert {row.id for row in repository.list_taxonomies(session)} == (
+            taxonomy_ids_before
+        )
         assert len(repository.list_runs(session, labeling_data.document_set_id)) == 1
 
 
@@ -932,11 +1099,24 @@ def test_api_enforces_admin_permission_and_editable_document_set(
         user.role = UserRole.BASIC
         user.effective_permissions = [Permission.READ_DOCUMENT_SETS.value]
         session.commit()
-    for method, suffix in [("GET", "setup"), ("POST", "runs"), ("GET", "runs")]:
+    for method, suffix, body in [
+        ("GET", "setup", None),
+        ("GET", "label-settings", None),
+        (
+            "PUT",
+            "label-settings",
+            {
+                "expected_revision": 1,
+                "labels": [{"id": "one", "name": "One", "description": "One label."}],
+            },
+        ),
+        ("POST", "runs", _start_body(labeling_data)),
+        ("GET", "runs", None),
+    ]:
         response = labeling_client.request(
             method,
             _api_path(labeling_data, suffix),
-            json=_start_body(labeling_data) if method == "POST" else None,
+            json=body,
         )
         assert response.status_code == 403, response.text
     with Session(labeling_data.database.engine) as session:
@@ -950,6 +1130,26 @@ def test_api_enforces_admin_permission_and_editable_document_set(
         )
     )
     assert forbidden.status_code == 404, forbidden.text
+    for method, body in [
+        ("GET", None),
+        (
+            "PUT",
+            {
+                "expected_revision": 1,
+                "labels": [{"id": "one", "name": "One", "description": "One label."}],
+            },
+        ),
+    ]:
+        forbidden = labeling_client.request(
+            method,
+            _api_path(
+                labeling_data,
+                "label-settings",
+                document_set_id=labeling_data.other_document_set_id,
+            ),
+            json=body,
+        )
+        assert forbidden.status_code == 404, forbidden.text
 
 
 @pytest.mark.parametrize(

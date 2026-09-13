@@ -13,6 +13,9 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     build_vertex_jsonl,
 )
 from onyx.regulatory.labeling.provider import (
+    LabelAssignment,
+    LabelDefinition,
+    LabelingOutcome,
     TaxonomyDefinition,
     build_labeling_request,
     parse_labeling_batch_output,
@@ -101,6 +104,42 @@ def test_duplicate_and_empty_taxonomy_cannot_start_labeling() -> None:
     with pytest.raises(ValidationError):
         TaxonomyDefinition.model_validate(
             {"name": "duplicate", "labels": [label, label]}
+        )
+
+
+def test_taxonomy_and_outcome_share_the_1024_label_limit() -> None:
+    labels = [
+        LabelDefinition(id=f"label-{index}", name=f"Label {index}", description="Rule")
+        for index in range(1024)
+    ]
+    taxonomy = TaxonomyDefinition(name="Large vocabulary", labels=labels)
+    outcome = LabelingOutcome(
+        labels=[
+            LabelAssignment(label_id=label.id, evidence_quote="evidence")
+            for label in taxonomy.labels
+        ],
+        abstained=False,
+    )
+
+    assert len(taxonomy.labels) == 1024
+    assert len(outcome.labels) == 1024
+    with pytest.raises(ValidationError):
+        TaxonomyDefinition(
+            name="Too large",
+            labels=[
+                *labels,
+                LabelDefinition(
+                    id="label-overflow", name="Overflow", description="Rule"
+                ),
+            ],
+        )
+    with pytest.raises(ValidationError):
+        LabelingOutcome(
+            labels=[
+                *outcome.labels,
+                LabelAssignment(label_id="label-overflow", evidence_quote="evidence"),
+            ],
+            abstained=False,
         )
 
 

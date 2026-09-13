@@ -5,21 +5,21 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from onyx.regulatory.labeling.provider import LabelDefinition
+from onyx.regulatory.labeling.provider import MAX_LABELS, LabelDefinition
 
 
 class TaxonomyCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     name: str = Field(min_length=1, max_length=200)
-    labels: list[LabelDefinition] = Field(min_length=1, max_length=256)
+    labels: list[LabelDefinition] = Field(min_length=1, max_length=MAX_LABELS)
 
 
 class TaxonomySummary(BaseModel):
     id: str
     name: str
     version_hash: str
-    label_count: int
+    label_count: int = Field(ge=1, le=MAX_LABELS)
     created_at: datetime.datetime
 
 
@@ -36,12 +36,26 @@ class LabelingCounts(BaseModel):
 
 class LabelingSetup(BaseModel):
     model: str
-    default_label_count: int
+    default_label_count: int = Field(ge=1, le=MAX_LABELS)
     taxonomies: list[TaxonomySummary]
     providers: list[LabelingProviderSummary]
     counts: LabelingCounts
     active_run_id: str | None
     warnings: list[str]
+
+
+class LabelSettingsSnapshot(BaseModel):
+    revision: int
+    taxonomy_id: str
+    labels: list[LabelDefinition] = Field(min_length=1, max_length=MAX_LABELS)
+    updated_at: datetime.datetime
+
+
+class LabelSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1)
+    labels: list[LabelDefinition] = Field(min_length=1, max_length=MAX_LABELS)
 
 
 class LabelingRunCreate(BaseModel):
@@ -77,7 +91,7 @@ class LabelingItemSnapshot(BaseModel):
     chunk_id: str
     file_id: str
     status: str
-    labels: list[str]
+    labels: list[str] = Field(max_length=MAX_LABELS)
     error: str | None
 
 

@@ -5701,7 +5701,7 @@ class RegulatoryChunk(Base):
 
 
 class RegulatoryLabelTaxonomy(Base):
-    """Immutable label vocabulary uploaded by an administrator."""
+    """Immutable label definitions retained for labeling jobs."""
 
     __tablename__ = "regulatory_label_taxonomy"
 
@@ -5724,6 +5724,36 @@ class RegulatoryLabelTaxonomy(Base):
     __table_args__ = (
         CheckConstraint(
             "label_count > 0", name="regulatory_label_taxonomy_label_count_check"
+        ),
+    )
+
+
+class RegulatoryLabelSettings(Base):
+    """Current label definitions shared by document sets in a tenant."""
+
+    __tablename__ = "regulatory_label_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    taxonomy_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_label_taxonomy.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_by_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    taxonomy: Mapped[RegulatoryLabelTaxonomy] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("id = 1", name="regulatory_label_settings_singleton"),
+        CheckConstraint(
+            "revision > 0", name="regulatory_label_settings_revision_positive"
         ),
     )
 
@@ -5758,6 +5788,9 @@ class RegulatoryLabelingRun(Base):
         nullable=True,
     )
     idempotency_key: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    uses_current_labels: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     provider_binding: Mapped[dict[str, object]] = mapped_column(PGJSONB, nullable=False)
     file_ids: Mapped[list[str]] = mapped_column(PGJSONB, nullable=False)

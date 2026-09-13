@@ -1,4 +1,4 @@
-"""Bundled label definitions used when starting document-set labeling."""
+"""Initial label seed retained for migrations and catalog validation."""
 
 from importlib.resources import files
 

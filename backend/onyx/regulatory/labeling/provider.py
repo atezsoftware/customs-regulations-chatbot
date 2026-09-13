@@ -22,6 +22,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 PROMPT_VERSION = REGULATORY_LABELING_PROMPT_VERSION
+MAX_LABELS = 1024
 MAX_TAXONOMY_BYTES = 256 * 1024
 MAX_REQUEST_BYTES = 768 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -39,7 +40,7 @@ class TaxonomyDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
     name: str = Field(min_length=1, max_length=200)
-    labels: list[LabelDefinition] = Field(min_length=1, max_length=256)
+    labels: list[LabelDefinition] = Field(min_length=1, max_length=MAX_LABELS)
 
     @model_validator(mode="after")
     def validate_vocabulary(self) -> TaxonomyDefinition:
@@ -71,7 +72,7 @@ class LabelAssignment(BaseModel):
 class LabelingOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    labels: list[LabelAssignment] = Field(max_length=256)
+    labels: list[LabelAssignment] = Field(max_length=MAX_LABELS)
     abstained: bool
 
 

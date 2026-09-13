@@ -15,7 +15,61 @@ branch_labels = None
 depends_on = None
 
 
-def upgrade() -> None:
+def _taxonomy_already_exists() -> bool:
+    connection = op.get_bind()
+    inspector = sa.inspect(connection)
+    schema = connection.scalar(sa.text("SELECT current_schema()"))
+    table = "regulatory_label_taxonomy"
+    if not inspector.has_table(table, schema=schema):
+        return False
+    columns = {
+        column["name"]: (
+            column["type"].compile(dialect=connection.dialect),
+            column["nullable"],
+        )
+        for column in inspector.get_columns(table, schema=schema)
+    }
+    expected_columns = {
+        "id": ("UUID", False),
+        "name": ("VARCHAR(200)", False),
+        "version_hash": ("VARCHAR(64)", False),
+        "definition": ("JSONB", False),
+        "label_count": ("INTEGER", False),
+        "created_by_id": ("UUID", True),
+        "created_at": ("TIMESTAMP WITH TIME ZONE", False),
+    }
+    foreign_keys = inspector.get_foreign_keys(table, schema=schema)
+    checks = {
+        "".join(check["sqltext"].split()).replace("(", "").replace(")", "")
+        for check in inspector.get_check_constraints(table, schema=schema)
+    }
+    unique_columns = {
+        tuple(constraint["column_names"])
+        for constraint in inspector.get_unique_constraints(table, schema=schema)
+    }
+    defaults = {
+        column["name"]: column.get("default")
+        for column in inspector.get_columns(table, schema=schema)
+    }
+    if (
+        columns != expected_columns
+        or inspector.get_pk_constraint(table, schema=schema)["constrained_columns"]
+        != ["id"]
+        or unique_columns != {("version_hash",)}
+        or checks != {"label_count>0"}
+        or defaults["created_at"] != "now()"
+        or len(foreign_keys) != 1
+        or foreign_keys[0]["constrained_columns"] != ["created_by_id"]
+        or foreign_keys[0]["referred_table"] != "user"
+        or foreign_keys[0]["referred_columns"] != ["id"]
+        or foreign_keys[0]["referred_schema"] not in (None, schema)
+        or foreign_keys[0].get("options", {}).get("ondelete") != "SET NULL"
+    ):
+        raise RuntimeError("Existing regulatory_label_taxonomy has incompatible schema")
+    return True
+
+
+def _create_taxonomy() -> None:
     op.create_table(
         "regulatory_label_taxonomy",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
@@ -37,6 +91,11 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("version_hash"),
     )
+
+
+def upgrade() -> None:
+    if not _taxonomy_already_exists():
+        _create_taxonomy()
     op.create_table(
         "regulatory_labeling_run",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),

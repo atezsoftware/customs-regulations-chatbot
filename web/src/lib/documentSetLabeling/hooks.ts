@@ -5,9 +5,18 @@ import {
   getLabelingRun,
   getLabelingRunItems,
   getLabelingSetup,
+  getLabelSettings,
   labelingBaseUrl,
   listLabelingRuns,
 } from "@/lib/documentSetLabeling/svc";
+
+export function useLabelSettings(documentSetId: number) {
+  return useSWR(
+    `${labelingBaseUrl(documentSetId)}/label-settings`,
+    () => getLabelSettings(documentSetId),
+    { shouldRetryOnError: false }
+  );
+}
 
 export function isActiveLabelingRun(run: LabelingRun): boolean {
   return run.status === "queued" || run.status === "running";

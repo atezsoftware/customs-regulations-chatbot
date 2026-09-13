@@ -225,6 +225,65 @@ test("does not reuse a pending key created for a custom taxonomy request", async
   expect(body.idempotency_key).not.toBe("83775c4e-0726-4a36-88ad-ec33e612f5cb");
 });
 
+test("opens Label Settings beside Start and refreshes the saved label count", async () => {
+  const user = setupUser();
+  let setupRequests = 0;
+  let currentSettings = {
+    revision: 1,
+    taxonomy_id: "taxonomy-v1",
+    labels: [{ id: "CUS.VALUE", name: "Value", description: "Valuation." }],
+    updated_at: "2026-09-13T10:00:00Z",
+  };
+  jest.spyOn(global, "fetch").mockImplementation(async (input, init) => {
+    const url = String(input);
+    if (url === `${baseUrl}/setup`) {
+      setupRequests += 1;
+      return jsonResponse({
+        ...readySetup,
+        default_label_count: setupRequests === 1 ? 255 : 256,
+      });
+    }
+    if (url === `${baseUrl}/runs`) return jsonResponse([]);
+    if (url === `${baseUrl}/label-settings` && init?.method === "PUT") {
+      currentSettings = {
+        revision: 2,
+        taxonomy_id: "taxonomy-v2",
+        labels: [
+          { id: "CUS.VALUE", name: "Value", description: "Valuation." },
+          { id: "NEW", name: "New", description: "New definition." },
+        ],
+        updated_at: "2026-09-13T11:00:00Z",
+      };
+      return jsonResponse(currentSettings);
+    }
+    if (url === `${baseUrl}/label-settings`)
+      return jsonResponse(currentSettings);
+    throw new Error(`Unexpected request: ${url}`);
+  });
+
+  render(<LabelingWorkspace documentSetId={7} />);
+  await user.click(
+    await screen.findByRole("button", { name: "Label Settings" })
+  );
+  await screen.findByLabelText("Label description");
+  await user.click(screen.getByRole("button", { name: "Add label" }));
+  await user.type(screen.getByLabelText("Label ID"), "NEW");
+  await user.type(screen.getByLabelText("Label name"), "New");
+  await user.type(
+    screen.getByLabelText("Label description"),
+    "New definition."
+  );
+  await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await screen.findByText("256 labels ready")).toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "Label Settings" }));
+  expect(
+    await screen.findByRole("button", { name: /NEW.*New/ })
+  ).toBeInTheDocument();
+});
+
 test("polls active runs every five seconds and shows provider waiting without a fake percentage", async () => {
   jest.useFakeTimers();
   const runningRun = buildRun();

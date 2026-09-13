@@ -4,7 +4,7 @@ Kaynak: `TARIFF_REGULATORY_INTELLIGENCE_Full_Scope_Data_Model.pdf`, sürüm 2.1,
 
 Bu dosya yalnızca etiket kodlarını, adlarını ve açıklamalarını çıkarır. PDF’deki mimari, chunk oluşturma, saklama, cardinality ve retrieval kararları uygulama gereksinimi olarak alınmamıştır.
 
-Bu 255 etiket ve açıklaması backend ile birlikte gelir. Document set ekranında **Start Labeling** seçildiğinde tamamı LLM promptuna otomatik eklenir; kullanıcının dosya yüklemesi veya etiket listesi seçmesi gerekmez. [JSON kopyası](tariff-regulatory-intelligence-v2.1.json) inceleme ve dışa aktarım içindir. Çalışma zamanı tanımları `backend/onyx/regulatory/labeling/data/` altında bulunur; iki kopyanın eşitliği test edilir.
+Bu 255 etiket ve açıklaması başlangıçta migration ile DB'ye kaydedilir. Document set ekranında **Label Settings** ile ekleme ve düzenleme yapılabilir. **Start Labeling**, DB'deki güncel tanımları LLM promptuna aktarır. Bu katalog ve [JSON kopyası](tariff-regulatory-intelligence-v2.1.json) ilk v2.1 tanımlarının referansıdır; sonradan DB'de yapılan düzenlemeleri yansıtmaz. `backend/onyx/regulatory/labeling/data/` altındaki kopya geçmiş migration için sabit tutulur; iki başlangıç kopyasının eşitliği test edilir.
 
 ## Sayım
 

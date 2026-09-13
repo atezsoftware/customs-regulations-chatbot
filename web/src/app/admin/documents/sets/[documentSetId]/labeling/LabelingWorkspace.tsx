@@ -15,10 +15,12 @@ import { Content, PageLoader } from "@opal/layouts";
 import {
   SvgPlayCircle,
   SvgRefreshCw,
+  SvgSettings,
   SvgStopCircle,
   SvgTag,
 } from "@opal/icons";
 
+import LabelSettingsModal from "@/app/admin/documents/sets/[documentSetId]/labeling/LabelSettingsModal";
 import InputSelect from "@/refresh-components/inputs/InputSelect";
 import type {
   LabelingRun,
@@ -119,6 +121,7 @@ export default function LabelingWorkspace({
   const [providerId, setProviderId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [itemOffset, setItemOffset] = useState(0);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -353,7 +356,14 @@ export default function LabelingWorkspace({
             </Field>
           </div>
 
-          <div className="flex justify-end">
+          <div className="flex justify-end gap-2">
+            <Button
+              icon={SvgSettings}
+              prominence="secondary"
+              onClick={() => setSettingsOpen(true)}
+            >
+              Label Settings
+            </Button>
             <Button
               icon={SvgPlayCircle}
               prominence="primary"
@@ -370,6 +380,14 @@ export default function LabelingWorkspace({
           </div>
         </div>
       </Card>
+
+      {settingsOpen && (
+        <LabelSettingsModal
+          documentSetId={documentSetId}
+          onClose={() => setSettingsOpen(false)}
+          onSaved={() => void mutateSetup()}
+        />
+      )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[18rem_minmax(0,1fr)]">
         <Card border="solid" padding="md">

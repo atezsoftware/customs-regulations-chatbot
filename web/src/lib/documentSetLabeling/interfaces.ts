@@ -36,6 +36,18 @@ export interface TaxonomyInput {
   labels: TaxonomyLabelInput[];
 }
 
+export interface LabelSettingsSnapshot {
+  revision: number;
+  taxonomy_id: string;
+  labels: TaxonomyLabelInput[];
+  updated_at: string;
+}
+
+export interface LabelSettingsUpdate {
+  expected_revision: number;
+  labels: TaxonomyLabelInput[];
+}
+
 export type LabelingRunStatus =
   | "queued"
   | "running"

@@ -3,6 +3,8 @@ import type {
   LabelingRunItemsPage,
   LabelingSetup,
   LabelingTaxonomySummary,
+  LabelSettingsSnapshot,
+  LabelSettingsUpdate,
   TaxonomyInput,
 } from "@/lib/documentSetLabeling/interfaces";
 
@@ -48,6 +50,14 @@ function postJson<T>(url: string, body?: unknown): Promise<T> {
   });
 }
 
+function putJson<T>(url: string, body: unknown): Promise<T> {
+  return requestJson<T>(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 export function getLabelingSetup(
   documentSetId: number
 ): Promise<LabelingSetup> {
@@ -83,6 +93,19 @@ export function createLabelingTaxonomy(
   taxonomy: TaxonomyInput
 ): Promise<LabelingTaxonomySummary> {
   return postJson(`${labelingBaseUrl(documentSetId)}/taxonomies`, taxonomy);
+}
+
+export function getLabelSettings(
+  documentSetId: number
+): Promise<LabelSettingsSnapshot> {
+  return requestJson(`${labelingBaseUrl(documentSetId)}/label-settings`);
+}
+
+export function updateLabelSettings(
+  documentSetId: number,
+  update: LabelSettingsUpdate
+): Promise<LabelSettingsSnapshot> {
+  return putJson(`${labelingBaseUrl(documentSetId)}/label-settings`, update);
 }
 
 export function startLabelingRun(

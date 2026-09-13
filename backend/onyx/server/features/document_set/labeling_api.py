@@ -15,7 +15,7 @@ from onyx.db.labeling_configuration import (
     get_labeling_provider_options,
     resolve_labeling_provider_binding,
 )
-from onyx.db.models import RegulatoryLabelingRun, User
+from onyx.db.models import RegulatoryLabelingRun, RegulatoryLabelSettings, User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.regulatory.labeling.api_models import (
@@ -24,10 +24,11 @@ from onyx.regulatory.labeling.api_models import (
     LabelingRunCreate,
     LabelingRunSnapshot,
     LabelingSetup,
+    LabelSettingsSnapshot,
+    LabelSettingsUpdate,
     TaxonomyCreate,
     TaxonomySummary,
 )
-from onyx.regulatory.labeling.defaults import load_default_taxonomy
 from onyx.regulatory.labeling.provider import DEFAULT_MODEL, TaxonomyDefinition
 from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import get_current_tenant_id
@@ -73,6 +74,18 @@ def _wake(run_id: UUID, tenant_id: str) -> None:
         )
 
 
+def _label_settings_snapshot(
+    settings: RegulatoryLabelSettings,
+) -> LabelSettingsSnapshot:
+    taxonomy = TaxonomyDefinition.model_validate(settings.taxonomy.definition)
+    return LabelSettingsSnapshot(
+        revision=settings.revision,
+        taxonomy_id=str(settings.taxonomy_id),
+        labels=taxonomy.labels,
+        updated_at=settings.updated_at,
+    )
+
+
 @router.get("/setup")
 def labeling_setup(
     document_set_id: int,
@@ -82,6 +95,7 @@ def labeling_setup(
     _check_access(db_session, document_set_id, user)
     counts, warnings = repository.get_labeling_counts(db_session, document_set_id)
     providers = get_labeling_provider_options(db_session, user=user)
+    label_settings = repository.get_label_settings(db_session)
     if not providers:
         warnings.append(
             "Configure an accessible Google provider with an enabled model before starting labeling."
@@ -89,7 +103,7 @@ def labeling_setup(
     active_run = repository.get_active_run_id(db_session, document_set_id)
     return LabelingSetup(
         model=DEFAULT_MODEL,
-        default_label_count=len(load_default_taxonomy().labels),
+        default_label_count=label_settings.taxonomy.label_count,
         taxonomies=[
             repository.taxonomy_summary(row)
             for row in repository.list_taxonomies(db_session)
@@ -99,6 +113,48 @@ def labeling_setup(
         warnings=warnings,
         active_run_id=str(active_run) if active_run is not None else None,
     )
+
+
+@router.get("/label-settings")
+def get_label_settings(
+    document_set_id: int,
+    user: User = Depends(labeling_admin),
+    db_session: Session = Depends(get_session),
+) -> LabelSettingsSnapshot:
+    _check_access(db_session, document_set_id, user)
+    return _label_settings_snapshot(repository.get_label_settings(db_session))
+
+
+@router.put("/label-settings")
+def update_label_settings(
+    document_set_id: int,
+    body: LabelSettingsUpdate,
+    user: User = Depends(labeling_admin),
+    db_session: Session = Depends(get_session),
+) -> LabelSettingsSnapshot:
+    _check_access(db_session, document_set_id, user)
+    try:
+        settings = repository.update_label_settings(
+            db_session,
+            labels=body.labels,
+            expected_revision=body.expected_revision,
+            updated_by_id=user.id,
+        )
+        result = _label_settings_snapshot(settings)
+        db_session.commit()
+    except repository.LabelingStateConflictError as error:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(error)) from None
+    except ValueError as error:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(error)) from None
+    except IntegrityError:
+        db_session.rollback()
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT,
+            "Label settings changed concurrently; reload the latest labels",
+        ) from None
+    return result
 
 
 @router.post("/taxonomies")
@@ -140,7 +196,6 @@ def _start_run(
     *,
     retry_of_id: UUID | None = None,
 ) -> LabelingRunSnapshot:
-    bundled_taxonomy = load_default_taxonomy() if body.taxonomy_id is None else None
     existing = repository.get_run_by_idempotency(
         session, document_set_id, body.idempotency_key
     )
@@ -148,11 +203,15 @@ def _start_run(
         original_configuration_id = existing.provider_binding.get(
             "model_configuration_id"
         )
-        same_taxonomy = (
-            existing.taxonomy.version_hash == bundled_taxonomy.version_hash
-            if bundled_taxonomy is not None
-            else existing.taxonomy_id == body.taxonomy_id
-        )
+        if body.taxonomy_id is not None:
+            same_taxonomy = existing.taxonomy_id == body.taxonomy_id
+        elif existing.uses_current_labels:
+            same_taxonomy = True
+        else:
+            same_taxonomy = (
+                existing.taxonomy_id
+                == repository.get_label_settings(session).taxonomy_id
+            )
         if (
             not same_taxonomy
             or original_configuration_id != body.model_configuration_id
@@ -165,19 +224,14 @@ def _start_run(
     taxonomy = (
         repository.get_taxonomy(session, body.taxonomy_id)
         if body.taxonomy_id is not None
-        else None
+        else (repository.get_label_settings(session).taxonomy)
     )
-    if taxonomy is None and bundled_taxonomy is None:
+    if taxonomy is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Label taxonomy not found")
     try:
         binding = resolve_labeling_provider_binding(
             session, body.model_configuration_id, user=user
         )
-        if bundled_taxonomy is not None:
-            taxonomy = repository.get_or_create_bundled_taxonomy(
-                session, taxonomy=bundled_taxonomy
-            )
-        assert taxonomy is not None
         run, _created = repository.create_labeling_run(
             session,
             document_set_id=document_set_id,
@@ -188,6 +242,7 @@ def _start_run(
             requested_by_id=user.id,
             idempotency_key=body.idempotency_key,
             retry_of_id=retry_of_id,
+            uses_current_labels=body.taxonomy_id is None,
         )
         result = repository.run_snapshot(run)
         session.commit()

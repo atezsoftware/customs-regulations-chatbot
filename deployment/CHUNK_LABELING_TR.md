@@ -1,13 +1,18 @@
 # Document set üzerinden chunk etiketleme
 
-Bu altyapı, dosyalardan zaten üretilmiş atomik `RegulatoryChunk` kayıtlarını etiketler. Yeni chunk üretmez. TARIFF v2.1 belgesinden çıkarılan 255 etiket ve açıklaması backend ile birlikte gelir ve LLM promptuna otomatik eklenir. Kullanıcının JSON yüklemesi veya etiket listesi seçmesi gerekmez. Kodlar ve açıklamalar [etiket kataloğunda](labeling/TARIFF_LABELS_TR.md) bulunur.
+Bu altyapı, dosyalardan zaten üretilmiş atomik `RegulatoryChunk` kayıtlarını etiketler. TARIFF v2.1 belgesinden çıkarılan ilk 255 etiket migration ile PostgreSQL'e kaydedilir. Sonraki ekleme ve düzenlemeler **Label Settings** ekranından yapılır; yeni işin LLM promptu DB'deki güncel etiketleri ve açıklamalarını kullanır. Başlangıç kodları ve açıklamalar [etiket kataloğunda](labeling/TARIFF_LABELS_TR.md) bulunur.
 
 ## Kullanım
 
 1. **Admin → Documents → Document Sets** bölümünden ilgili seti açın.
 2. **Labeling** ekranına geçin. Dosya ve mevcut chunk sayıları kapsamı gösterir.
-3. Ekran, hazır etiket sayısını gösterir. Tek erişilebilir Google sağlayıcısı varsa otomatik seçilir; birden çok varsa kullanılacak sağlayıcıyı seçin. Sağlayıcı kimlik bilgilerini belirler; etiketleme modeli `gemini-3.8-flash` kullanılır.
-4. **Start Labeling** ile işi başlatın. Backend etiketlerin kodlarını, adlarını ve açıklamalarını çalışma için sabitler; Batch promptu bunların tamamını içerir. Sayfayı kapatmak işi durdurmaz. Aynı ekrana dönerek geçmiş işleri ve ilerlemeyi görebilirsiniz.
+3. **Start Labeling** yanındaki **Label Settings** çarkından etiketleri arayın, adlarını ve açıklamalarını düzenleyin, yeni etiket ekleyin veya kaldırın. **Save** değişiklikleri DB'ye kaydeder. Bu ayarlar aynı tenant içindeki tüm document setler için ortaktır ve yeni işleri etkiler.
+4. Ekran, güncel etiket sayısını gösterir. Tek erişilebilir Google sağlayıcısı varsa otomatik seçilir; birden çok varsa kullanılacak sağlayıcıyı seçin. Sağlayıcı kimlik bilgilerini belirler; etiketleme modeli `gemini-3.8-flash` kullanılır.
+5. **Start Labeling** ile işi başlatın. Backend DB'deki etiketlerin kodlarını, adlarını ve açıklamalarını çalışma için sabitler; Batch promptu bunların tamamını içerir. Sayfayı kapatmak işi durdurmaz. Aynı ekrana dönerek geçmiş işleri ve ilerlemeyi görebilirsiniz.
+
+Etiket kimlikleri benzersiz ve kalıcıdır; mevcut etiketlerin adları ve açıklamaları değiştirilebilir. En az 1, en çok 1024 etiket ve toplam 256 KiB tanım sınırı uygulanır. Bir başka yönetici aynı sırada kaydetmişse eski ekranın kaydı reddedilir; güncel tanımlar yeniden yüklenmelidir. Böylece değişiklikler sessizce ezilmez.
+
+Kaydetme, yeni bir değişmez tanım sürümü oluşturup aktif ayarı buna bağlar. Devam eden işler ve **Retry full run**, kendi kayıtlı tanımlarıyla devam eder. Ayarlar değiştikten sonra daha önce kabul edilmiş bir başlangıç isteğinin ağ tekrarı aynı işi döndürür.
 
 Erişilebilir bir sağlayıcı ve etiketlenebilir canonical chunk olmadan iş başlatılamaz. Bekleme süresi Google Batch kuyruğuna bağlıdır; ekranda iş aşaması ve tamamlanan/hatalı/eskiyen chunk sayıları gösterilir.
 
@@ -81,13 +86,17 @@ Bu değişiklik etiketleri Elasticsearch filtrelerine, sıralamaya veya retrieva
 
 ## Kurulum ve işletim
 
-Migration: `c8b7a6d5e4f3`, önceki sürüm `1325beb9ce60`. Mevcut veri üzerinde chunk üretimi veya etiket backfill'i yapmaz; etiketleme tablolarını ekler. Dağıtılan backend sürümüyle, `backend/` dizininde `uv run alembic upgrade head` uygulanmalıdır. Çok kiracılı dağıtımda mevcut tenant migration prosedürü de izlenmelidir.
+Migration'lar: `c8b7a6d5e4f3` etiketleme tablolarını, `8d19d521d9fa` güncel etiket ayarını ve ilk 255 tanımı ekler. Etiket ayarı migration'ı yalnızca `regulatory_label_settings`, `regulatory_label_taxonomy` ve `regulatory_labeling_run` tablolarını ilgilendirir; mevcut chunk, embedding ve indeks verilerini değiştirmez. Dağıtılan backend sürümüyle, `backend/` dizininde `uv run alembic upgrade head` uygulanmalıdır. Çok kiracılı dağıtımda mevcut tenant migration prosedürü de izlenmelidir.
+
+`backend/onyx/regulatory/labeling/data/tariff-regulatory-intelligence-v2.1.json` geçmiş migration'ın sabit başlangıç verisidir; değiştirilmemeli veya silinmemelidir. Migration içindeki hash kontrolü bunu doğrular. Runtime başlangıç ve ayar okuma işlemleri PostgreSQL'i kullanır; dosya değiştirerek kullanıcı düzenlemeleri ezilmez.
+
+13 Eylül 2026'da `customs-regulations-test/public` üzerinde yalnızca `regulatory_label_taxonomy` ve `regulatory_label_settings` tabloları oluşturulup 255 başlangıç etiketi kaydedildi; kod, ad ve açıklamalar birebir doğrulandı. Mevcut `alembic_version` (`f4a9c2d7e1b3`) ilerletilmedi ve bekleyen genel migration'lar çalıştırılmadı. İş tabloları ve yeni API/web sürümünün dağıtımı bu başlangıç kaydından ayrıdır. İlgili iki migration, önceden oluşturulmuş bu tabloların yapısını doğrular ve mevcut etiket düzenlemelerini korur; uyumsuz bir tabloyu sessizce kabul etmez. Bu işlemde mevcut chunklar, embeddingler ve Elasticsearch verileri değiştirilmedi.
 
 Yeni API ve web sürümünün yanında `regulatory_indexing` kuyruğunu tüketen worker ile ilgili Beat süreci yenilenmelidir. Production-lite supervisor adları `celery_worker_regulatory_indexing` ve `celery_beat_regulatory_indexing` şeklindedir. Genel Beat için özel `BEAT_TASK_ALLOWLIST` kullanılıyorsa `regulatory_labeling_recover_stale` görevi listeye eklenmelidir. Varsayılan tam ve production-lite zamanlamalarında kurtarma görevi zaten tanımlıdır.
 
 Kuyruğa gönderim PostgreSQL kaydından sonra yapılır. Broker bağlantısı başarısız olsa bile periyodik kurtarma işi devam ettirebilir. Worker kodu otomatik yeniden yüklenmez; yalnız web/API yenilemek yeterli değildir.
 
-Sonuçlar PostgreSQL'de şu tablolarda tutulur: `regulatory_label_taxonomy`, `regulatory_labeling_run`, `regulatory_labeling_shard`, `regulatory_labeling_item`, `regulatory_derived_label_projection`. Etiket kanıtı canonical item üzerindeki `assignments` alanındadır; birleşik chunk kanıt bağı `provenance` alanındadır. Kimlik bilgileri bu tablolara kopyalanmaz.
+Sonuçlar PostgreSQL'de şu tablolarda tutulur: `regulatory_label_taxonomy`, `regulatory_labeling_run`, `regulatory_labeling_shard`, `regulatory_labeling_item`, `regulatory_derived_label_projection`. Güncel tanım sürümünü, düzenleme revision'ını, zamanı ve düzenleyeni `regulatory_label_settings` tutar. Etiket kanıtı canonical item üzerindeki `assignments` alanındadır; birleşik chunk kanıt bağı `provenance` alanındadır. Kimlik bilgileri bu tablolara kopyalanmaz.
 
 ## Doğrulama yaklaşımı
 
