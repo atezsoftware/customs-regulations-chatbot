@@ -7,7 +7,7 @@ Bu altyapı, dosyalardan zaten üretilmiş atomik `RegulatoryChunk` kayıtların
 1. **Admin → Documents → Document Sets** bölümünden ilgili seti açın.
 2. **Labeling** ekranına geçin. Dosya ve mevcut chunk sayıları kapsamı gösterir.
 3. **Start Labeling** yanındaki **Label Settings** çarkından etiketleri arayın, adlarını ve açıklamalarını düzenleyin, yeni etiket ekleyin veya kaldırın. **Save** değişiklikleri DB'ye kaydeder. Bu ayarlar aynı tenant içindeki tüm document setler için ortaktır ve yeni işleri etkiler.
-4. Ekran, güncel etiket sayısını gösterir. Tek erişilebilir Google sağlayıcısı varsa otomatik seçilir; birden çok varsa kullanılacak sağlayıcıyı seçin. Sağlayıcı kimlik bilgilerini belirler; etiketleme modeli `gemini-3.8-flash` kullanılır.
+4. Ekran, güncel etiket sayısını gösterir. Tek erişilebilir Gemini sağlayıcısı varsa otomatik seçilir; birden çok varsa kullanılacak sağlayıcıyı seçin. Sağlayıcı kimlik bilgilerini belirler; etiketleme modeli `gemini-3.8-flash` kullanılır.
 5. **Start Labeling** ile işi başlatın. Backend DB'deki etiketlerin kodlarını, adlarını ve açıklamalarını çalışma için sabitler; Batch promptu bunların tamamını içerir. Sayfayı kapatmak işi durdurmaz. Aynı ekrana dönerek geçmiş işleri ve ilerlemeyi görebilirsiniz.
 
 Etiket kimlikleri benzersiz ve kalıcıdır; mevcut etiketlerin adları ve açıklamaları değiştirilebilir. En az 1, en çok 1024 etiket ve toplam 256 KiB tanım sınırı uygulanır. Bir başka yönetici aynı sırada kaydetmişse eski ekranın kaydı reddedilir; güncel tanımlar yeniden yüklenmelidir. Böylece değişiklikler sessizce ezilmez.
@@ -22,7 +22,7 @@ Erişilebilir bir sağlayıcı ve etiketlenebilir canonical chunk olmadan iş ba
 
 ### Kaynak ve sonuç ayrı tutulur
 
-Etiket sonuçları kaynak chunk kayıtlarından ayrı saklanır. Hangi sözlük, model, prompt ve kaynak sürümüyle üretildikleri izlenebilir. Başlangıç kapsamı ve sınıflandırma girdileri sabitlenir. Canonical sonuç kaydedilmeden önce kaynak ve bağlam sürümü denetlenir; birleşik chunka aktarılırken ilgili kaynaklar tekrar kontrol edilir.
+Etiket sonuçları kaynak chunk kayıtlarından ayrı saklanır. Hangi etiket tanımı sürümü, model, prompt ve kaynak sürümüyle üretildikleri izlenebilir. Başlangıç kapsamı ve sınıflandırma girdileri sabitlenir. Canonical sonuç kaydedilmeden önce kaynak ve bağlam sürümü denetlenir; birleşik chunka aktarılırken ilgili kaynaklar tekrar kontrol edilir.
 
 Bir çalışma geçmişte yakalanmış girdilerin sonucudur. `completed`, dosyaların daha sonra değişmediği anlamına gelmez; önceki bir sayfanın kaydı tamamlandıktan sonra kaynak değişebilir. Sonraki arama/yayınlama adaptörü, kullanacağı etiketin kaynak hash'ini güncel chunkla yeniden karşılaştırmalıdır. Bu yüzden sonuçlar doğrudan değişken kaynak metadata'sına yazılmaz.
 
@@ -31,7 +31,7 @@ LLM yalnızca atomik chunkları sınıflandırır. Birleşik chunkların etiketl
 ```mermaid
 flowchart LR
     S[Seçilen document set] --> C[Mevcut canonical chunklar]
-    T[Sürümlenmiş etiket sözlüğü] --> B[Gemini 3.8 Flash Batch]
+    T[Sürümlenmiş etiket tanımları] --> B[Gemini 3.8 Flash Inline Batch]
     C --> B
     X[Contextual retrieval ve komşu metin] --> B
     B --> V[Şema, kanıt ve kaynak sürümü kontrolü]
@@ -56,29 +56,29 @@ Başlangıç isteğinin kimliği tarayıcıda da korunur. Ağ kopması, HTTP zam
 
 Belirsizlik verilen sürede çözülemezse sistem otomatik olarak ikinci bir ücretli gönderim yapmaz. Böyle bir işte **Retry full run** kullanmadan önce shard kaydındaki `submission_key` ile Google Batch kayıtları incelenmelidir; ilk iş sağlayıcı tarafında oluşmuş olabilir.
 
-Ağ çağrıları boyunca veritabanı işlemi açık tutulmaz. Batch girişleri istek sayısı ve byte boyutuyla sınırlanır; etiketleme çıktı indirmesinde ayrıca 64 MiB sınırı vardır. Birleşik chunklara dağıtım da 128 hedeflik sayfalarda kaydedilir. Tamamlanan sayfalar kalıcıdır; worker yeniden başladığında yalnızca bekleyen dağıtımlar ele alınır.
+Ağ çağrıları boyunca veritabanı işlemi açık tutulmaz. Batch girişleri istek sayısı ve byte boyutuyla sınırlanır; doğrudan dönen inline sonuç gövdesinde ayrıca 64 MiB sınırı vardır. Birleşik chunklara dağıtım da 128 hedeflik sayfalarda kaydedilir. Tamamlanan sayfalar kalıcıdır; worker yeniden başladığında yalnızca bekleyen dağıtımlar ele alınır.
 
-Varsayılanlar: hazırlama sayfası 128 canonical chunk; Batch başına en çok 64 istek / 8 MiB; aynı iş için en çok 4 açık Batch; 30 saniyelik sağlayıcı sorgulama aralığı; 300 saniyelik worker sahipliği. HTTP istekleri 20 saniyeyle, tek uzaktaki işi arama adımı 180 saniyelik toplam süre bütçesiyle sınırlandırılır. Sağlayıcıya bir istek başladıktan sonra bu süreye en fazla o HTTP isteğinin kalan süresi eklenebilir.
+Varsayılanlar: hazırlama sayfası 128 canonical chunk; Batch başına en çok 64 istek / 8 MiB JSONL eşdeğeri; gerçek inline gönderim gövdesi 20 MB altında; aynı iş için en çok 4 açık Batch; 30 saniyelik sağlayıcı sorgulama aralığı; 300 saniyelik worker sahipliği. HTTP istekleri 20 saniyeyle, tek uzaktaki işi arama adımı 180 saniyelik toplam süre bütçesiyle sınırlandırılır. Sağlayıcıya bir istek başladıktan sonra bu süreye en fazla o HTTP isteğinin kalan süresi eklenebilir.
 
 Belirsiz gönderimin görünür hale gelmesi için 10 dakikalık pencere tanınır. Worker daha uzun bir kesintiden dönse bile hata kararı vermeden önce bir kez süre sınırlı arama yapar; böylece sağlayıcıda tamamlanmış bir iş bulunabilir.
 
 ### Sonuç doğrulama
 
 - Google çıktıları sırasına göre değil, istek anahtarıyla eşleştirilir. Tekrarlanan veya beklenmeyen anahtarlar kabul edilmez.
-- Sonuç JSON şemasına uymalıdır. Etiket kimliği seçilen sözlükte bulunmalıdır.
+- Sonuç JSON şemasına uymalıdır. Etiket kimliği çalışma için sabitlenen etiket tanımlarında bulunmalıdır.
 - Her etiketin kanıt alıntısı hedef canonical metinde birebir bulunmalıdır. Çevre bağlamdan alınan bir alıntı yeterli değildir.
 - Kesilmiş model çıktısı başarılı sayılmaz. Modelin düşünce alanları sonuç metnine katılmaz.
 - Model hiçbir etiket uygun değilse boş sonuç verebilir; yetersiz kanıt için ayrıca çekimser kalabilir. Bunlar sağlayıcı hatasından ayrıdır.
 
-`canonical-labeling-v2` promptu, seçilen sözlükteki tüm kodları, adları ve açıklamaları alır. Farklı etiket ailelerini kendi tanımlarına göre değerlendirir; kod öneki, kelime benzerliği veya yalnızca çevre bağlamdan etiket çıkarmaz. Sözlük açıklamalarında ya da kaynak metinde geçen talimatları komut olarak izlemez.
+`canonical-labeling-v2` promptu, çalışma için sabitlenen tüm etiket kodlarını, adlarını ve açıklamalarını alır. Farklı etiket ailelerini kendi tanımlarına göre değerlendirir; kod öneki, kelime benzerliği veya yalnızca çevre bağlamdan etiket çıkarmaz. Etiket açıklamalarında ya da kaynak metinde geçen talimatları komut olarak izlemez.
 
 Bu kontroller yapısal doğruluğu ve kaynak bağını sağlar. Etiketlerin anlamsal isabeti, alan uzmanının hazırladığı bir örnek kümesiyle ölçülmelidir.
 
 ### Yetki ve kimlik bilgileri
 
-Document set yönetim yetkisi ve mevcut LLM sağlayıcı erişim kuralları uygulanır. Başka bir persona ile sınırlandırılmış sağlayıcı, bu ekranda kullanılmaz. İş kayıtlarında ve API yanıtlarında Google anahtarı tutulmaz.
+Document set yönetim yetkisi ve mevcut LLM sağlayıcı erişim kuralları uygulanır. Başka bir persona ile sınırlandırılmış sağlayıcı, bu ekranda kullanılmaz. Etiketleme için ayrı bir sağlayıcı kaydı açılmaz; mevcut Gemini bağlantısına özel bir **Gemini Batch API key** kaydedilir. Bu anahtar şifreli sağlayıcı alanında tutulur, iş kayıtlarına kopyalanmaz ve API yanıtlarında geri verilmez.
 
-Service account kullanımında proje ve hesap kimliği iş başlangıcındaki bağa göre denetlenir; aynı hesabın anahtarını döndürmek mümkündür. Workload identity kullanımında proje/konfigürasyon sabitlenir, gerçek principal çalışma ortamının ADC/IAM yapılandırmasından çözülür. Bu modda çalışan ortamın kimliği operasyon ekibinin sorumluluğundadır.
+Anahtar eksikse sağlayıcı **Labeling** ekranında hazır gösterilmez ve iş başlamadan önce istek reddedilir. Anahtar, **Admin → Language Models** bölümünde mevcut Gemini bağlantısı düzenlenerek eklenir veya döndürülür. Anahtarın parmak izi çalışma başlangıcında sabitlenir; anahtar döndürüldüğünde mevcut çalışma sessizce yeni anahtara geçmez, sonraki çalışma yeni anahtarı kullanır. Başlangıç ön kontrolü modelin `batchGenerateContent` desteğini ve Batch listeleme erişimini salt okunur çağrılarla doğrular. Etiketleme çağrıları bu anahtarla Gemini Developer API'ye gider; mevcut Vertex service account ayarı bağlantının diğer kullanımları için korunur.
 
 ## Arama kapsamı
 
@@ -86,11 +86,13 @@ Bu değişiklik etiketleri Elasticsearch filtrelerine, sıralamaya veya retrieva
 
 ## Kurulum ve işletim
 
-Migration'lar: `c8b7a6d5e4f3` etiketleme tablolarını, `8d19d521d9fa` güncel etiket ayarını ve ilk 255 tanımı ekler. Etiket ayarı migration'ı yalnızca `regulatory_label_settings`, `regulatory_label_taxonomy` ve `regulatory_labeling_run` tablolarını ilgilendirir; mevcut chunk, embedding ve indeks verilerini değiştirmez. Dağıtılan backend sürümüyle, `backend/` dizininde `uv run alembic upgrade head` uygulanmalıdır. Çok kiracılı dağıtımda mevcut tenant migration prosedürü de izlenmelidir.
+Migration'lar: `c8b7a6d5e4f3` etiketleme tablolarını, `8d19d521d9fa` güncel etiket ayarını ve ilk 255 tanımı, `9f3a7c2e5d18` ise mevcut LLM sağlayıcı tablosuna nullable ve şifreli Gemini Batch API key alanını ekler. Etiket ayarı migration'ı yalnızca `regulatory_label_settings`, `regulatory_label_taxonomy` ve `regulatory_labeling_run` tablolarını ilgilendirir; Batch anahtarı migration'ı mevcut bağlantılara anahtar değeri yazmaz. Bu migration'lar mevcut chunk, embedding ve indeks verilerini değiştirmez. Dağıtılan backend sürümüyle, `backend/` dizininde `uv run alembic upgrade head` uygulanmalıdır. Çok kiracılı dağıtımda mevcut tenant migration prosedürü de izlenmelidir.
 
 `backend/onyx/regulatory/labeling/data/tariff-regulatory-intelligence-v2.1.json` geçmiş migration'ın sabit başlangıç verisidir; değiştirilmemeli veya silinmemelidir. Migration içindeki hash kontrolü bunu doğrular. Runtime başlangıç ve ayar okuma işlemleri PostgreSQL'i kullanır; dosya değiştirerek kullanıcı düzenlemeleri ezilmez.
 
 13 Eylül 2026'da `customs-regulations-test/public` üzerinde yalnızca `regulatory_label_taxonomy` ve `regulatory_label_settings` tabloları oluşturulup 255 başlangıç etiketi kaydedildi; kod, ad ve açıklamalar birebir doğrulandı. Mevcut `alembic_version` (`f4a9c2d7e1b3`) ilerletilmedi ve bekleyen genel migration'lar çalıştırılmadı. İş tabloları ve yeni API/web sürümünün dağıtımı bu başlangıç kaydından ayrıdır. İlgili iki migration, önceden oluşturulmuş bu tabloların yapısını doğrular ve mevcut etiket düzenlemelerini korur; uyumsuz bir tabloyu sessizce kabul etmez. Bu işlemde mevcut chunklar, embeddingler ve Elasticsearch verileri değiştirilmedi.
+
+Bu sürümün dağıtım hedefi yalnızca DEV ortamıdır (`customs-regulations-dev`). Yukarıdaki `customs-regulations-test/public` kaydı geçmişte yapılan sınırlı başlangıç işlemini belgeler; DEV migration ve uygulama dağıtımından farklıdır. Production bu dağıtım adımının hedefi değildir.
 
 Yeni API ve web sürümünün yanında `regulatory_indexing` kuyruğunu tüketen worker ile ilgili Beat süreci yenilenmelidir. Production-lite supervisor adları `celery_worker_regulatory_indexing` ve `celery_beat_regulatory_indexing` şeklindedir. Genel Beat için özel `BEAT_TASK_ALLOWLIST` kullanılıyorsa `regulatory_labeling_recover_stale` görevi listeye eklenmelidir. Varsayılan tam ve production-lite zamanlamalarında kurtarma görevi zaten tanımlıdır.
 
@@ -106,6 +108,6 @@ Provider sözleşmesi ve mevcut contextual Batch davranışının korunması uni
 
 ## Google API tercihi
 
-Etiketleme, Gemini **Files Batch / generateContent** API üzerinden yürür. Gemini 3.8 için kaldırılmış sampling parametreleri gönderilmez; yapılandırılmış JSON çıktısı ve `medium` düşünme seviyesi kullanılır. Normal senkron LLM çağrısına sessiz geçiş yoktur.
+Etiketleme, Gemini Developer API'nin **inline Batch / generateContent** akışı üzerinden yürür. Her shard'ın istekleri Batch oluşturma gövdesinde doğrudan gönderilir; GCS bucket, Files API yüklemesi veya sonuç dosyası kullanılmaz. İş tamamlandığında sonuçlar aynı Batch kaynağından doğrudan alınır ve kalıcı istek hash'leriyle eşleştirilir. Gemini 3.8 için kaldırılmış sampling parametreleri gönderilmez; yapılandırılmış JSON çıktısı ve `medium` düşünme seviyesi kullanılır. Normal senkron LLM çağrısına sessiz geçiş yoktur.
 
 Kaynaklar: [Gemini Batch API](https://ai.google.dev/gemini-api/docs/batch-api), [Gemini 3.8 Flash geçiş notları](https://ai.google.dev/gemini-api/docs/generate-content/latest-model).
