@@ -3260,6 +3260,218 @@ print(json.dumps(report, sort_keys=True))
     print(json.dumps(report, sort_keys=True), flush=True)
 
 
+MARKDOWN_WORKER_RUNTIME = "c3d077dde1cd10c8f9c4a25288fad9fa84f62e9a"
+
+
+def summarize_markdown_worker(
+    node: str, supervisor_pid: int | None, replies: dict[str, Any]
+) -> dict[str, str | bool | int]:
+    """Only current local worker contract flags and counts may leave the pod."""
+    result: dict[str, str | bool | int] = {
+        "stage": "markdown_worker",
+        "status": "read",
+        "supervisor_running": supervisor_pid is not None,
+    }
+    values: dict[str, Any] = {}
+    for name in ("registered", "active_queues", "stats", "active", "reserved"):
+        reply = replies.get(name)
+        value = reply.get(node) if isinstance(reply, dict) else None
+        available = isinstance(value, dict if name == "stats" else list)
+        result[name + "_response"] = available
+        if not available:
+            result["status"] = "unavailable"
+            value = {} if name == "stats" else []
+        assert isinstance(value, (dict, list))
+        if len(value) > (10000 if name == "registered" else 1000):
+            raise ValueError("worker_reply_bound_exceeded")
+        values[name] = value
+    registered = {
+        item.split(" ", 1)[0] for item in values["registered"] if isinstance(item, str)
+    }
+    result["process_registered"] = "process_single_user_file" in registered
+    result["index_registered"] = "index_single_user_file" in registered
+    queues = {
+        item["name"]
+        for item in values["active_queues"]
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    result["queues_match"] = queues == {
+        "user_file_processing",
+        "user_file_project_sync",
+        "user_file_delete",
+        "user_file_port",
+    }
+    result["queue_count"] = len(queues)
+    stats = values["stats"]
+    pid = stats.get("pid")
+    result["stats_pid_matches"] = type(pid) is int and pid > 0 and pid == supervisor_pid
+    pool = stats.get("pool")
+    concurrency = pool.get("max-concurrency") if isinstance(pool, dict) else None
+    if type(concurrency) is int and 0 < concurrency <= 1000:
+        result["concurrency_available"] = True
+        result["concurrency"] = concurrency
+    else:
+        result["concurrency_available"] = False
+        result["concurrency"] = 0
+    for kind in ("active", "reserved"):
+        rows = values[kind]
+        result[kind + "_count"] = len(rows)
+        for label, task in (
+            ("index", "index_single_user_file"),
+            ("process", "process_single_user_file"),
+        ):
+            result[kind + "_" + label + "_count"] = sum(
+                isinstance(row, dict) and row.get("name") == task for row in rows
+            )
+        result[kind + "_other_count"] = sum(
+            not isinstance(row, dict)
+            or row.get("name")
+            not in {"index_single_user_file", "process_single_user_file"}
+            for row in rows
+        )
+    return result
+
+
+def read_markdown_worker() -> dict[str, str | bool | int]:
+    import re
+    import socket
+    import subprocess
+
+    from onyx.background.celery.versioned_apps.client import app
+    from onyx.configs.app_configs import CELERY_PRIMARY_WORKER_REQUIRED
+
+    pid = None
+    try:
+        status = subprocess.run(
+            [
+                "supervisorctl",
+                "-c",
+                "/etc/supervisor/conf.d/supervisord.conf",
+                "status",
+                "celery_worker_user_file_processing",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if len(status.stdout) <= 4096:
+            match = re.fullmatch(
+                r"celery_worker_user_file_processing\s+RUNNING\s+pid ([1-9][0-9]*),[^\n]*\n?",
+                status.stdout,
+            )
+            if match:
+                pid = int(match[1])
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    node = "user_file_processing@" + socket.gethostname()
+    inspector = app.control.inspect(timeout=3, destination=[node])
+    replies = {
+        "registered": inspector.registered(),
+        "active_queues": inspector.active_queues(),
+        "stats": inspector.stats(),
+        "active": inspector.active(),
+        "reserved": inspector.reserved(),
+    }
+    result = summarize_markdown_worker(node, pid, replies)
+    result["current_primary_worker_required"] = CELERY_PRIMARY_WORKER_REQUIRED
+    return result
+
+
+def validate_markdown_worker_report(report: Any) -> None:
+    booleans = {
+        "database_read_only",
+        "configuration_verified",
+        "supervisor_running",
+        "process_registered",
+        "index_registered",
+        "queues_match",
+        "stats_pid_matches",
+        "concurrency_available",
+        "current_primary_worker_required",
+    }
+    booleans.update(
+        name + "_response"
+        for name in ("registered", "active_queues", "stats", "active", "reserved")
+    )
+    counts = {"queue_count", "concurrency"} | {
+        kind + suffix
+        for kind in ("active", "reserved")
+        for suffix in ("_count", "_index_count", "_process_count", "_other_count")
+    }
+    enums = {
+        "stage": {"markdown_worker"},
+        "status": {"read", "unavailable", "failed"},
+        "failure_type": {"ValueError", "RuntimeError", "TimeoutError", "Exception"},
+    }
+    if (
+        not isinstance(report, dict)
+        or report.get("stage") != "markdown_worker"
+        or report.get("database_read_only") is not True
+    ):
+        raise CutoverRefusal("fixed_worker_report_required")
+    for key, value in report.items():
+        valid = (
+            (key in booleans and type(value) is bool)
+            or (key in counts and type(value) is int and 0 <= value <= 10000)
+            or (key in enums and isinstance(value, str) and value in enums[key])
+        )
+        if not valid:
+            raise CutoverRefusal("fixed_worker_report_required")
+
+
+def diagnose_markdown_worker(driver: Driver, pod: str, container: str) -> None:
+    if driver.sha != MARKDOWN_WORKER_RUNTIME:
+        raise CutoverRefusal("fixed_worker_runtime_required")
+    program = "import contextlib, io, json, logging, os, signal\nfrom typing import Any\nlogging.disable(logging.CRITICAL)\ndef expired(*args):\n    raise TimeoutError()\nsignal.signal(signal.SIGALRM, expired)\nsignal.alarm(60)\n"
+    program += (
+        inspect.getsource(summarize_markdown_worker)
+        + "\n"
+        + inspect.getsource(read_markdown_worker)
+    )
+    program += """
+report = {"stage": "markdown_worker", "status": "failed", "database_read_only": True}
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        if os.environ.get("POSTGRES_DB") != "customs-regulations-dev" or os.environ.get("REGULATORY_ANNEX_ENVIRONMENT") != "dev" or os.environ.get("PGOPTIONS") != "-c default_transaction_read_only=on":
+            raise ValueError()
+        from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
+        set_is_ee_based_on_env_variable()
+        from onyx.db.regulatory_annex_dev_cutover import configured_indices
+        configured_indices()
+        report["configuration_verified"] = True
+        report.update(read_markdown_worker())
+    except Exception as error:
+        name = type(error).__name__
+        report.update(status="failed", failure_type=name if name in {"ValueError", "RuntimeError", "TimeoutError"} else "Exception")
+print(json.dumps(report, sort_keys=True))
+"""
+    output = driver.command(
+        [
+            "kubectl",
+            "--namespace",
+            NAMESPACE,
+            "exec",
+            pod,
+            "-c",
+            container,
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            '. /vault/secrets/config; export PGOPTIONS="-c default_transaction_read_only=on"; exec python -c "$1"',
+            "markdown-worker-diagnostic",
+            program,
+        ],
+        timeout=80,
+    )
+    if len(output.encode()) > 8000:
+        raise CutoverRefusal("fixed_worker_report_required")
+    report = json.loads(output)
+    validate_markdown_worker_report(report)
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
 def diagnose_release(driver: Driver, runner_sha: str) -> None:
     driver.validate_target()
     state = driver.get("configmap", STATE)["data"]
@@ -3280,6 +3492,9 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         for item in pod["spec"]["containers"]
         if item["image"] == f"{REPOSITORY}:{driver.sha}"
     )
+    if driver.sha == MARKDOWN_WORKER_RUNTIME:
+        diagnose_markdown_worker(driver, pod["metadata"]["name"], container["name"])
+        return
     if driver.sha == MARKDOWN_A8_RUNTIME:
         diagnose_markdown_progress(driver, pod["metadata"]["name"], container["name"])
         return
