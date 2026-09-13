@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -83,3 +86,26 @@ def test_tariff_ids_across_families_retain_the_existing_evidence_output_shape() 
         set(assignment.model_dump()) == {"label_id", "evidence_quote"}
         for assignment in outcome.labels
     )
+
+
+def test_bundled_labels_are_available_outside_the_repository_working_directory(
+    tmp_path: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from onyx.regulatory.labeling.defaults import load_default_taxonomy; "
+            "print(load_default_taxonomy().model_dump_json())",
+        ],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[4]),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == json.loads(TAXONOMY_PATH.read_text())

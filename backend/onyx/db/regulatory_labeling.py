@@ -20,6 +20,7 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, load_only, selectinload
 from sqlalchemy.sql import Select
@@ -444,6 +445,28 @@ def list_taxonomies(session: Session) -> list[RegulatoryLabelTaxonomy]:
             .limit(100)
         ).all()
     )
+
+
+def get_or_create_bundled_taxonomy(
+    session: Session, *, taxonomy: TaxonomyDefinition
+) -> RegulatoryLabelTaxonomy:
+    session.execute(
+        pg_insert(RegulatoryLabelTaxonomy)
+        .values(
+            id=uuid4(),
+            name=taxonomy.name,
+            version_hash=taxonomy.version_hash,
+            definition=taxonomy.model_dump(mode="json"),
+            label_count=len(taxonomy.labels),
+            created_by_id=None,
+        )
+        .on_conflict_do_nothing(index_elements=[RegulatoryLabelTaxonomy.version_hash])
+    )
+    return session.scalars(
+        select(RegulatoryLabelTaxonomy).where(
+            RegulatoryLabelTaxonomy.version_hash == taxonomy.version_hash
+        )
+    ).one()
 
 
 def get_taxonomy(session: Session, taxonomy_id: UUID) -> RegulatoryLabelTaxonomy | None:

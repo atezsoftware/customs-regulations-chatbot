@@ -36,6 +36,7 @@ class LabelingCounts(BaseModel):
 
 class LabelingSetup(BaseModel):
     model: str
+    default_label_count: int
     taxonomies: list[TaxonomySummary]
     providers: list[LabelingProviderSummary]
     counts: LabelingCounts
@@ -46,7 +47,7 @@ class LabelingSetup(BaseModel):
 class LabelingRunCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    taxonomy_id: UUID
+    taxonomy_id: UUID | None = None
     model_configuration_id: int
     idempotency_key: UUID
 

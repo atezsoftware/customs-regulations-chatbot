@@ -19,13 +19,11 @@ import {
   SvgTag,
 } from "@opal/icons";
 
-import InputFile from "@/refresh-components/inputs/InputFile";
 import InputSelect from "@/refresh-components/inputs/InputSelect";
 import type {
   LabelingRun,
   LabelingRunItemsPage,
   LabelingRunStatus,
-  TaxonomyInput,
 } from "@/lib/documentSetLabeling/interfaces";
 import {
   isActiveLabelingRun,
@@ -36,14 +34,12 @@ import {
 } from "@/lib/documentSetLabeling/hooks";
 import {
   cancelLabelingRun,
-  createLabelingTaxonomy,
   LabelingApiError,
   retryLabelingRun,
   startLabelingRun,
 } from "@/lib/documentSetLabeling/svc";
 
 const ITEM_PAGE_SIZE = 25;
-const TAXONOMY_MAX_SIZE_KB = 256;
 
 interface LabelingWorkspaceProps {
   documentSetId: number;
@@ -51,8 +47,8 @@ interface LabelingWorkspaceProps {
 
 interface PendingStart {
   key: string;
-  taxonomyId: string;
   providerId: number;
+  usesBundledTaxonomy: true;
 }
 
 function displayName(value: string): string {
@@ -69,66 +65,6 @@ function statusColor(status: LabelingRunStatus) {
   return "blue" as const;
 }
 
-function parseTaxonomyJson(raw: string): TaxonomyInput {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error("The selected file is not valid JSON.");
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("The taxonomy must be a JSON object.");
-  }
-  const candidate = parsed as Record<string, unknown>;
-  const unknownRootField = Object.keys(candidate).find(
-    (field) => field !== "name" && field !== "labels"
-  );
-  if (unknownRootField) {
-    throw new Error(`Unknown taxonomy field: ${unknownRootField}.`);
-  }
-  if (typeof candidate.name !== "string" || !candidate.name.trim()) {
-    throw new Error("The taxonomy must have a non-empty name.");
-  }
-  if (!Array.isArray(candidate.labels) || candidate.labels.length === 0) {
-    throw new Error("The taxonomy must contain at least one label.");
-  }
-  const labels = candidate.labels.map((label, index) => {
-    if (!label || typeof label !== "object" || Array.isArray(label)) {
-      throw new Error(`Label ${index + 1} must be an object.`);
-    }
-    const item = label as Record<string, unknown>;
-    const unknownLabelField = Object.keys(item).find(
-      (field) => field !== "id" && field !== "name" && field !== "description"
-    );
-    if (unknownLabelField) {
-      throw new Error(
-        `Unknown field in label ${index + 1}: ${unknownLabelField}.`
-      );
-    }
-    if (
-      typeof item.id !== "string" ||
-      !item.id.trim() ||
-      typeof item.name !== "string" ||
-      !item.name.trim() ||
-      typeof item.description !== "string" ||
-      !item.description.trim()
-    ) {
-      throw new Error(
-        `Label ${index + 1} needs non-empty id, name, and description fields.`
-      );
-    }
-    return {
-      id: item.id.trim(),
-      name: item.name.trim(),
-      description: item.description.trim(),
-    };
-  });
-  if (new Set(labels.map((label) => label.id)).size !== labels.length) {
-    throw new Error("Every label id must be unique.");
-  }
-  return { name: candidate.name.trim(), labels };
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "The request failed.";
 }
@@ -139,7 +75,6 @@ function startStorageKey(documentSetId: number): string {
 
 function getPendingStart(
   documentSetId: number,
-  taxonomyId: string,
   providerId: number
 ): PendingStart {
   const storageKey = startStorageKey(documentSetId);
@@ -148,8 +83,9 @@ function getPendingStart(
     try {
       const pending = JSON.parse(stored) as PendingStart;
       if (
-        pending.taxonomyId === taxonomyId &&
-        pending.providerId === providerId
+        typeof pending.key === "string" &&
+        pending.providerId === providerId &&
+        pending.usesBundledTaxonomy === true
       )
         return pending;
     } catch {
@@ -158,8 +94,8 @@ function getPendingStart(
   }
   const pending = {
     key: window.crypto.randomUUID(),
-    taxonomyId,
     providerId,
+    usesBundledTaxonomy: true as const,
   };
   window.localStorage.setItem(storageKey, JSON.stringify(pending));
   return pending;
@@ -180,15 +116,9 @@ export default function LabelingWorkspace({
     isLoading: runsLoading,
     mutate: mutateRuns,
   } = useLabelingRuns(documentSetId);
-  const [taxonomyId, setTaxonomyId] = useState("");
   const [providerId, setProviderId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [itemOffset, setItemOffset] = useState(0);
-  const [taxonomyDraft, setTaxonomyDraft] = useState<TaxonomyInput | null>(
-    null
-  );
-  const [taxonomyInputKey, setTaxonomyInputKey] = useState(0);
-  const [taxonomyError, setTaxonomyError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -200,11 +130,9 @@ export default function LabelingWorkspace({
     );
 
   useEffect(() => {
-    if (!taxonomyId && setup?.taxonomies.length === 1)
-      setTaxonomyId(setup.taxonomies[0]!.id);
     if (!providerId && setup?.providers.length === 1)
       setProviderId(String(setup.providers[0]!.id));
-  }, [providerId, setup, taxonomyId]);
+  }, [providerId, setup]);
 
   useEffect(() => {
     if (selectedRunId || runs.length === 0) return;
@@ -238,18 +166,11 @@ export default function LabelingWorkspace({
 
   const readiness = useMemo(
     () => ({
-      taxonomy: Boolean(taxonomyId),
       provider: Boolean(providerId),
       chunks: Boolean(setup?.counts.canonical_chunks),
       idle: !runsError && !hasActiveRun,
     }),
-    [
-      providerId,
-      hasActiveRun,
-      runsError,
-      setup?.counts.canonical_chunks,
-      taxonomyId,
-    ]
+    [providerId, hasActiveRun, runsError, setup?.counts.canonical_chunks]
   );
   const canStart = Object.values(readiness).every(Boolean) && !isSubmitting;
 
@@ -284,14 +205,9 @@ export default function LabelingWorkspace({
     setActionError(null);
     setNotice(null);
     const numericProviderId = Number(providerId);
-    const pending = getPendingStart(
-      documentSetId,
-      taxonomyId,
-      numericProviderId
-    );
+    const pending = getPendingStart(documentSetId, numericProviderId);
     try {
       const run = await startLabelingRun(documentSetId, {
-        taxonomy_id: taxonomyId,
         model_configuration_id: numericProviderId,
         idempotency_key: pending.key,
       });
@@ -314,27 +230,6 @@ export default function LabelingWorkspace({
           ? error.message
           : "The start request could not be confirmed. Retry to safely check the same request."
       );
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
-  async function handleUploadTaxonomy() {
-    if (!taxonomyDraft) return;
-    setIsSubmitting(true);
-    setActionError(null);
-    try {
-      const taxonomy = await createLabelingTaxonomy(
-        documentSetId,
-        taxonomyDraft
-      );
-      setTaxonomyId(taxonomy.id);
-      setTaxonomyDraft(null);
-      setTaxonomyInputKey((key) => key + 1);
-      setNotice("Taxonomy uploaded");
-      void mutateSetup();
-    } catch (error) {
-      setActionError(errorMessage(error));
     } finally {
       setIsSubmitting(false);
     }
@@ -399,17 +294,13 @@ export default function LabelingWorkspace({
             variant="section"
             icon={SvgTag}
             title="Labeling setup"
-            description="Choose an immutable taxonomy version and a configured Google provider."
+            description="Label names and descriptions are sent to Gemini automatically."
           />
           <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
             <ReadinessItem
-              ready={readiness.taxonomy}
-              readyText={`${setup.taxonomies.length} taxonomy version${setup.taxonomies.length === 1 ? "" : "s"}`}
-              blockedText={
-                setup.taxonomies.length
-                  ? "Select a taxonomy version"
-                  : "No taxonomy uploaded"
-              }
+              ready={setup.default_label_count > 0}
+              readyText={`${setup.default_label_count} labels ready`}
+              blockedText="Label definitions unavailable"
             />
             <ReadinessItem
               ready={readiness.provider}
@@ -430,30 +321,7 @@ export default function LabelingWorkspace({
             {`${setup.counts.files} files · ${setup.counts.canonical_chunks} canonical chunks · ${setup.counts.derived_chunks} derived chunks`}
           </Text>
 
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-            <Field label="Taxonomy version">
-              <InputSelect
-                value={taxonomyId}
-                onValueChange={setTaxonomyId}
-                disabled={!setup.taxonomies.length}
-              >
-                <InputSelect.Trigger
-                  aria-label="Taxonomy version"
-                  placeholder="Upload a taxonomy first"
-                />
-                <InputSelect.Content>
-                  {setup.taxonomies.map((taxonomy) => (
-                    <InputSelect.Item
-                      key={taxonomy.id}
-                      value={taxonomy.id}
-                      description={`${taxonomy.label_count} labels · ${taxonomy.version_hash.slice(0, 12)}`}
-                    >
-                      {taxonomy.name}
-                    </InputSelect.Item>
-                  ))}
-                </InputSelect.Content>
-              </InputSelect>
-            </Field>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <Field label="Google provider">
               <InputSelect
                 value={providerId}
@@ -498,63 +366,6 @@ export default function LabelingWorkspace({
               onClick={() => void handleStart()}
             >
               Start Labeling
-            </Button>
-          </div>
-        </div>
-      </Card>
-
-      <Card border="solid" padding="md">
-        <div className="flex flex-col gap-3">
-          <Content
-            sizePreset="main-ui"
-            variant="section"
-            icon={SvgTag}
-            title="Upload taxonomy"
-            description='JSON schema: { "name": "Version name", "labels": [{ "id": "stable-id", "name": "Label", "description": "When it applies" }] }'
-          />
-          <InputFile
-            key={taxonomyInputKey}
-            aria-label="Taxonomy JSON file"
-            accept="application/json,.json"
-            maxSizeKb={TAXONOMY_MAX_SIZE_KB}
-            placeholder="Attach or paste a taxonomy JSON file"
-            error={Boolean(taxonomyError)}
-            setValue={(value) => {
-              if (!value) setTaxonomyDraft(null);
-            }}
-            onFileSizeExceeded={() => {
-              setTaxonomyDraft(null);
-              setTaxonomyError(
-                `Taxonomy files must be ${TAXONOMY_MAX_SIZE_KB} KB or smaller.`
-              );
-            }}
-            onValueSet={(value) => {
-              try {
-                setTaxonomyDraft(parseTaxonomyJson(value));
-                setTaxonomyError(null);
-              } catch (error) {
-                setTaxonomyDraft(null);
-                setTaxonomyError(errorMessage(error));
-              }
-            }}
-          />
-          {taxonomyError && (
-            <Text font="secondary-body" color="status-error-05">
-              {taxonomyError}
-            </Text>
-          )}
-          {taxonomyDraft && (
-            <Text font="secondary-body" color="text-03">
-              {`${taxonomyDraft.name} · ${taxonomyDraft.labels.length} labels`}
-            </Text>
-          )}
-          <div className="flex justify-end">
-            <Button
-              prominence="secondary"
-              disabled={!taxonomyDraft || isSubmitting}
-              onClick={() => void handleUploadTaxonomy()}
-            >
-              Upload taxonomy
             </Button>
           </div>
         </div>

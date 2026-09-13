@@ -16,6 +16,7 @@ const baseUrl = "/api/manage/admin/document-set/7/labeling";
 
 const readySetup: LabelingSetup = {
   model: "gemini-3.8-flash",
+  default_label_count: 255,
   taxonomies: [
     {
       id: "taxonomy-v1",
@@ -90,7 +91,7 @@ afterEach(() => {
   window.localStorage.clear();
 });
 
-test("keeps Start Labeling unavailable until a taxonomy, provider, and canonical chunks exist", async () => {
+test("shows bundled labels and keeps Start Labeling unavailable until a provider and canonical chunks exist", async () => {
   installFetchRouter({
     setup: {
       ...readySetup,
@@ -102,9 +103,15 @@ test("keeps Start Labeling unavailable until a taxonomy, provider, and canonical
 
   render(<LabelingWorkspace documentSetId={7} />);
 
-  expect(await screen.findByText("No taxonomy uploaded")).toBeInTheDocument();
+  expect(await screen.findByText("255 labels ready")).toBeInTheDocument();
   expect(screen.getByText("No Google provider configured")).toBeInTheDocument();
   expect(screen.getByText("No canonical chunks ready")).toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Upload taxonomy" })
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("combobox", { name: "Taxonomy version" })
+  ).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Start Labeling" })).toBeDisabled();
 });
 
@@ -169,7 +176,6 @@ test.each(["network", 502, 503, 408] as const)(
     const firstBody = JSON.parse(String(startCalls[0]?.[1]?.body));
     const secondBody = JSON.parse(String(startCalls[1]?.[1]?.body));
     expect(firstBody).toEqual({
-      taxonomy_id: "taxonomy-v1",
       model_configuration_id: 41,
       idempotency_key: expect.stringMatching(
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -178,6 +184,46 @@ test.each(["network", 502, 503, 408] as const)(
     expect(secondBody).toEqual(firstBody);
   }
 );
+
+test("does not reuse a pending key created for a custom taxonomy request", async () => {
+  const user = setupUser();
+  window.localStorage.setItem(
+    "document-set-labeling:7:pending-start",
+    JSON.stringify({
+      key: "83775c4e-0726-4a36-88ad-ec33e612f5cb",
+      taxonomyId: "taxonomy-v1",
+      providerId: 41,
+    })
+  );
+  const fetchSpy = jest
+    .spyOn(global, "fetch")
+    .mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === `${baseUrl}/setup`) return jsonResponse(readySetup);
+      if (url === `${baseUrl}/runs` && init?.method === "POST")
+        return jsonResponse(buildRun({ status: "queued" }));
+      if (url === `${baseUrl}/runs`) return jsonResponse([]);
+      throw new Error(`Unexpected request: ${url}`);
+    });
+
+  render(<LabelingWorkspace documentSetId={7} />);
+  const startButton = await screen.findByRole("button", {
+    name: "Start Labeling",
+  });
+  await waitFor(() => expect(startButton).toBeEnabled());
+  await user.click(startButton);
+
+  const startCall = fetchSpy.mock.calls.find(
+    ([input, init]) =>
+      String(input) === `${baseUrl}/runs` && init?.method === "POST"
+  );
+  const body = JSON.parse(String(startCall?.[1]?.body));
+  expect(body).toEqual({
+    model_configuration_id: 41,
+    idempotency_key: expect.any(String),
+  });
+  expect(body.idempotency_key).not.toBe("83775c4e-0726-4a36-88ad-ec33e612f5cb");
+});
 
 test("polls active runs every five seconds and shows provider waiting without a fake percentage", async () => {
   jest.useFakeTimers();
@@ -338,102 +384,6 @@ test("shows unresolved derived chunks on a completed-with-errors run", async () 
   expect(screen.getAllByText("Completed With Errors").length).toBeGreaterThan(
     0
   );
-});
-
-test("validates taxonomy JSON before uploading an immutable version", async () => {
-  const user = setupUser();
-  let setupRequests = 0;
-  const fetchSpy = jest
-    .spyOn(global, "fetch")
-    .mockImplementation(async (input, init) => {
-      const url = String(input);
-      if (url === `${baseUrl}/setup`) {
-        setupRequests += 1;
-        return jsonResponse(
-          setupRequests === 1 ? { ...readySetup, taxonomies: [] } : readySetup
-        );
-      }
-      if (url === `${baseUrl}/runs`) return jsonResponse([]);
-      if (url === `${baseUrl}/taxonomies` && init?.method === "POST")
-        return jsonResponse(readySetup.taxonomies[0]);
-      throw new Error(`Unexpected request: ${url}`);
-    });
-  const { container } = render(<LabelingWorkspace documentSetId={7} />);
-  await screen.findByText("No taxonomy uploaded");
-  const fileInput =
-    container.querySelector<HTMLInputElement>('input[type="file"]');
-  expect(fileInput).not.toBeNull();
-
-  await user.upload(
-    fileInput!,
-    new File([JSON.stringify({ name: "Broken", labels: [] })], "broken.json", {
-      type: "application/json",
-    })
-  );
-  expect(
-    await screen.findByText(/must contain at least one label/i)
-  ).toBeInTheDocument();
-
-  await user.upload(
-    fileInput!,
-    new File(
-      [
-        JSON.stringify({
-          name: "Unexpected fields",
-          labels: [
-            {
-              id: "import-duty",
-              name: "Import duty",
-              description: "Duty rules",
-              scope: "imports",
-            },
-          ],
-        }),
-      ],
-      "unexpected-field.json",
-      { type: "application/json" }
-    )
-  );
-  expect(await screen.findByText(/unknown field.*scope/i)).toBeInTheDocument();
-  expect(fetchSpy).not.toHaveBeenCalledWith(
-    `${baseUrl}/taxonomies`,
-    expect.objectContaining({ method: "POST" })
-  );
-
-  await user.upload(
-    fileInput!,
-    new File(
-      [
-        JSON.stringify({
-          name: "Customs scope v1",
-          labels: [
-            {
-              id: "import-duty",
-              name: "Import duty",
-              description: "Duty rules",
-            },
-          ],
-        }),
-      ],
-      "taxonomy.json",
-      { type: "application/json" }
-    )
-  );
-  await user.click(
-    await screen.findByRole("button", { name: "Upload taxonomy" })
-  );
-
-  expect(await screen.findByText("Taxonomy uploaded")).toBeInTheDocument();
-  const uploadCall = fetchSpy.mock.calls.find(
-    ([input, init]) =>
-      String(input) === `${baseUrl}/taxonomies` && init?.method === "POST"
-  );
-  expect(JSON.parse(String(uploadCall?.[1]?.body))).toEqual({
-    name: "Customs scope v1",
-    labels: [
-      { id: "import-duty", name: "Import duty", description: "Duty rules" },
-    ],
-  });
 });
 
 test("does not expose setup details when labeling is forbidden or unavailable", async () => {

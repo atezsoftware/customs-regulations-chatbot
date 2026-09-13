@@ -13,6 +13,7 @@ export interface LabelingProvider {
 
 export interface LabelingSetup {
   model: string;
+  default_label_count: number;
   taxonomies: LabelingTaxonomySummary[];
   providers: LabelingProvider[];
   counts: {

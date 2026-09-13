@@ -88,7 +88,6 @@ export function createLabelingTaxonomy(
 export function startLabelingRun(
   documentSetId: number,
   body: {
-    taxonomy_id: string;
     model_configuration_id: number;
     idempotency_key: string;
   }

@@ -1,18 +1,17 @@
 # Document set üzerinden chunk etiketleme
 
-Bu altyapı, dosyalardan zaten üretilmiş atomik `RegulatoryChunk` kayıtlarını etiketler. Yeni chunk üretmez. Etiket sözlüğü yönetim ekranından yüklenir. TARIFF v2.1 belgesinden çıkarılan 255 etiketin kodları, adları ve açıklamaları [etiket kataloğunda](labeling/TARIFF_LABELS_TR.md), yüklenebilir sözlük ise [JSON dosyasında](labeling/tariff-regulatory-intelligence-v2.1.json) bulunur.
+Bu altyapı, dosyalardan zaten üretilmiş atomik `RegulatoryChunk` kayıtlarını etiketler. Yeni chunk üretmez. TARIFF v2.1 belgesinden çıkarılan 255 etiket ve açıklaması backend ile birlikte gelir ve LLM promptuna otomatik eklenir. Kullanıcının JSON yüklemesi veya etiket listesi seçmesi gerekmez. Kodlar ve açıklamalar [etiket kataloğunda](labeling/TARIFF_LABELS_TR.md) bulunur.
 
 ## Kullanım
 
 1. **Admin → Documents → Document Sets** bölümünden ilgili seti açın.
 2. **Labeling** ekranına geçin. Dosya ve mevcut chunk sayıları kapsamı gösterir.
-3. [Hazır TARIFF sözlüğünü](labeling/tariff-regulatory-intelligence-v2.1.json) veya kendi etiket sözlüğünüzü JSON dosyası olarak yükleyin. Kök nesnede `name` ve `labels` alanları; her etiket için benzersiz `id`, `name` ve açıklama/kapsamı belirten `description` alanları gerekir. Sözlük sürümü sonradan değiştirilmez; değişiklik yeni sürüm olarak yüklenir.
-4. Sözlük sürümünü ve kullanılacak mevcut Google sağlayıcısını seçin. Sağlayıcı seçimi kimlik bilgilerini belirler; etiketleme modeli sabit olarak `gemini-3.8-flash` kullanılır. Mevcut contextual retrieval model ayarı değiştirilmez.
-5. **Start Labeling** ile işi başlatın. Sayfayı kapatmak işi durdurmaz. Aynı ekrana dönerek geçmiş işleri ve ilerlemeyi görebilirsiniz.
+3. Ekran, hazır etiket sayısını gösterir. Tek erişilebilir Google sağlayıcısı varsa otomatik seçilir; birden çok varsa kullanılacak sağlayıcıyı seçin. Sağlayıcı kimlik bilgilerini belirler; etiketleme modeli `gemini-3.8-flash` kullanılır.
+4. **Start Labeling** ile işi başlatın. Backend etiketlerin kodlarını, adlarını ve açıklamalarını çalışma için sabitler; Batch promptu bunların tamamını içerir. Sayfayı kapatmak işi durdurmaz. Aynı ekrana dönerek geçmiş işleri ve ilerlemeyi görebilirsiniz.
 
-Sözlük, erişilebilir bir sağlayıcı ve etiketlenebilir canonical chunk olmadan iş başlatılamaz. Bekleme süresi Google Batch kuyruğuna bağlıdır; ekranda sahte zaman tahmini yerine iş aşaması ve tamamlanan/hatalı/eskiyen chunk sayıları gösterilir.
+Erişilebilir bir sağlayıcı ve etiketlenebilir canonical chunk olmadan iş başlatılamaz. Bekleme süresi Google Batch kuyruğuna bağlıdır; ekranda iş aşaması ve tamamlanan/hatalı/eskiyen chunk sayıları gösterilir.
 
-**Retry full run**, güncel document set kapsamından aynı sözlükle yeni bir çalışma oluşturur; başarılı chunklar da bu yeni çalışmaya dahildir. Aynı yeniden deneme isteğinin ağ nedeniyle tekrarlanması ikinci bir çalışma oluşturmaz. Yeni sözlük veya farklı sağlayıcı için normal başlangıç akışını kullanın.
+**Retry full run**, güncel document set kapsamından önceki çalışmanın etiket tanımlarıyla yeni bir çalışma oluşturur; başarılı chunklar da bu yeni çalışmaya dahildir. Aynı yeniden deneme isteğinin ağ nedeniyle tekrarlanması ikinci bir çalışma oluşturmaz. Güncel etiket tanımları veya farklı sağlayıcı için normal başlangıç akışını kullanın.
 
 ## Tasarım kararları
 
@@ -94,7 +93,7 @@ Sonuçlar PostgreSQL'de şu tablolarda tutulur: `regulatory_label_taxonomy`, `re
 
 Provider sözleşmesi ve mevcut contextual Batch davranışının korunması unit testlerle kontrol edilir. İş yaşam döngüsü, API yetkileri, eşzamanlı başlangıç, kayıp gönderim yanıtı, worker kapanması, iptal ve kaynak değişimi senaryoları gerçek PostgreSQL üzerinde kontrollü bir Batch sağlayıcısıyla çalıştırılır. Migration ayrı test şemalarında ileri/geri uygulanır; uygulamanın mevcut veritabanı bu testler için kullanılmaz. Arayüz testleri başlangıç koşulları, ilerleme sorgulama, sayfalama ve hatalı ağ yanıtlarından sonra aynı başlangıç kimliğinin korunmasını kapsar.
 
-TARIFF sözlüğünün 255 etiketiyle mevcut yükleme, Batch isteği ve kanıtlı çıktı sözleşmelerinin uyumu ayrıca test edilir. Bu doğrulama gerçek Google hesabında ücretli sınıflandırma veya etiketlerin alan doğruluğu ölçümü değildir. Küçük bir değerlendirme kümesiyle etiket kalitesi ve gerçek sağlayıcı çağrısı ayrıca doğrulanmalıdır.
+255 etiketin dosya yüklemeden bir işe bağlanması, açıklamaların Batch promptuna aktarılması, eşzamanlı başlangıçların tek tanım sürümünü kullanması ve ağ tekrarlarının ikinci iş oluşturmaması test edilir. Bu doğrulama gerçek Google hesabında ücretli sınıflandırma veya etiketlerin alan doğruluğu ölçümü değildir. Küçük bir değerlendirme kümesiyle etiket kalitesi ve gerçek sağlayıcı çağrısı ayrıca doğrulanmalıdır.
 
 ## Google API tercihi
 

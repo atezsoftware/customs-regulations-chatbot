@@ -798,10 +798,89 @@ def test_api_setup_and_start_expose_only_safe_persisted_state(
     assert page.json()["total"] == 2
 
 
+@pytest.mark.parametrize("explicit_null", [False, True])
+def test_api_default_labels_need_no_upload_and_reach_the_batch_prompt(
+    labeling_data: LabelingData, labeling_client: TestClient, explicit_null: bool
+) -> None:
+    with Session(labeling_data.database.engine) as session:
+        session.execute(delete(RegulatoryLabelTaxonomy))
+        session.commit()
+    setup = labeling_client.get(_api_path(labeling_data, "setup"))
+    assert setup.status_code == 200, setup.text
+    assert setup.json()["default_label_count"] == 255
+    with Session(labeling_data.database.engine) as session:
+        assert repository.list_taxonomies(session) == []
+    body: dict[str, str | int | None] = {**_start_body(labeling_data)}
+    if explicit_null:
+        body["taxonomy_id"] = None
+    else:
+        del body["taxonomy_id"]
+    path = _api_path(labeling_data, "runs")
+    first = labeling_client.post(path, json=body)
+    assert first.status_code == 200, first.text
+    repeated = labeling_client.post(path, json=body)
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["id"] == first.json()["id"]
+    explicit = labeling_client.post(
+        path, json={**body, "taxonomy_id": first.json()["taxonomy_id"]}
+    )
+    assert explicit.status_code == 200, explicit.text
+    assert explicit.json()["id"] == first.json()["id"]
+    changed = labeling_client.post(
+        path, json={**body, "taxonomy_id": str(labeling_data.taxonomy_id)}
+    )
+    assert changed.status_code == 409, changed.text
+    definition = json.loads(
+        (
+            Path(__file__).resolve().parents[4]
+            / "deployment/labeling/tariff-regulatory-intelligence-v2.1.json"
+        ).read_text()
+    )
+    with Session(labeling_data.database.engine) as session:
+        rows = repository.list_taxonomies(session)
+        assert len(rows) == 1
+        assert rows[0].created_by_id is None
+        assert rows[0].definition == definition
+    lease, shard_id = _prepare(labeling_data, UUID(first.json()["id"]))
+    with Session(labeling_data.database.engine) as session:
+        items = repository.load_shard_requests(session, lease, shard_id)
+        assert len(items) == 2
+        for item in items:
+            assert item.request_payload is not None
+            request = VertexBatchRequest.model_validate(item.request_payload)
+            assert json.loads(request.prompt)["taxonomy"] == definition
+
+
+def test_api_concurrent_default_starts_share_one_definition_and_run(
+    labeling_data: LabelingData, labeling_client: TestClient
+) -> None:
+    with Session(labeling_data.database.engine) as session:
+        session.execute(delete(RegulatoryLabelTaxonomy))
+        session.commit()
+    body = _start_body(labeling_data)
+    del body["taxonomy_id"]
+    barrier = Barrier(2)
+
+    def start() -> str:
+        barrier.wait(timeout=5)
+        response = labeling_client.post(_api_path(labeling_data, "runs"), json=body)
+        assert response.status_code == 200, response.text
+        return str(response.json()["id"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: start(), range(2)))
+    assert results[0] == results[1]
+    with Session(labeling_data.database.engine) as session:
+        assert len(repository.list_taxonomies(session)) == 1
+        assert len(repository.list_runs(session, labeling_data.document_set_id)) == 1
+
+
+@pytest.mark.parametrize("use_default_labels", [False, True])
 def test_api_start_survives_broker_failure_and_replays_after_provider_removal(
     labeling_data: LabelingData,
     labeling_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    use_default_labels: bool,
 ) -> None:
     from onyx.background.celery.tasks.regulatory_labeling import tasks
 
@@ -817,6 +896,8 @@ def test_api_start_survives_broker_failure_and_replays_after_provider_removal(
     monkeypatch.setattr(tasks, "enqueue_labeling_run", failed_delivery)
     monkeypatch.setattr(labeling_api, "_wake", _ORIGINAL_WAKE)
     body = _start_body(labeling_data)
+    if use_default_labels:
+        del body["taxonomy_id"]
     path = _api_path(labeling_data, "runs")
     created = labeling_client.post(path, json=body)
     assert created.status_code == 200, created.text
@@ -898,6 +979,8 @@ def test_api_run_id_cannot_cross_document_sets(
 def test_api_taxonomy_rejects_duplicate_and_unknown_fields_without_new_rows(
     labeling_data: LabelingData, labeling_client: TestClient
 ) -> None:
+    with Session(labeling_data.database.engine) as session:
+        before = {row.id for row in repository.list_taxonomies(session)}
     label = {"id": "one", "name": "One", "description": "One label"}
     duplicate = labeling_client.post(
         _api_path(labeling_data, "taxonomies"),
@@ -914,7 +997,7 @@ def test_api_taxonomy_rejects_duplicate_and_unknown_fields_without_new_rows(
     )
     assert extra.status_code == 422, extra.text
     with Session(labeling_data.database.engine) as session:
-        assert len(repository.list_taxonomies(session)) == 1
+        assert {row.id for row in repository.list_taxonomies(session)} == before
 
 
 def test_api_retry_is_idempotent_and_reauthorizes_provider(

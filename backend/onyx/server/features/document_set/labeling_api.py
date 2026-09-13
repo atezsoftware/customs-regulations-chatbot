@@ -27,6 +27,7 @@ from onyx.regulatory.labeling.api_models import (
     TaxonomyCreate,
     TaxonomySummary,
 )
+from onyx.regulatory.labeling.defaults import load_default_taxonomy
 from onyx.regulatory.labeling.provider import DEFAULT_MODEL, TaxonomyDefinition
 from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import get_current_tenant_id
@@ -88,6 +89,7 @@ def labeling_setup(
     active_run = repository.get_active_run_id(db_session, document_set_id)
     return LabelingSetup(
         model=DEFAULT_MODEL,
+        default_label_count=len(load_default_taxonomy().labels),
         taxonomies=[
             repository.taxonomy_summary(row)
             for row in repository.list_taxonomies(db_session)
@@ -138,6 +140,7 @@ def _start_run(
     *,
     retry_of_id: UUID | None = None,
 ) -> LabelingRunSnapshot:
+    bundled_taxonomy = load_default_taxonomy() if body.taxonomy_id is None else None
     existing = repository.get_run_by_idempotency(
         session, document_set_id, body.idempotency_key
     )
@@ -145,8 +148,13 @@ def _start_run(
         original_configuration_id = existing.provider_binding.get(
             "model_configuration_id"
         )
+        same_taxonomy = (
+            existing.taxonomy.version_hash == bundled_taxonomy.version_hash
+            if bundled_taxonomy is not None
+            else existing.taxonomy_id == body.taxonomy_id
+        )
         if (
-            existing.taxonomy_id != body.taxonomy_id
+            not same_taxonomy
             or original_configuration_id != body.model_configuration_id
         ):
             raise OnyxError(
@@ -154,13 +162,22 @@ def _start_run(
                 "The idempotency key was already used with different parameters",
             )
         return repository.run_snapshot(existing)
-    taxonomy = repository.get_taxonomy(session, body.taxonomy_id)
-    if taxonomy is None:
+    taxonomy = (
+        repository.get_taxonomy(session, body.taxonomy_id)
+        if body.taxonomy_id is not None
+        else None
+    )
+    if taxonomy is None and bundled_taxonomy is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Label taxonomy not found")
     try:
         binding = resolve_labeling_provider_binding(
             session, body.model_configuration_id, user=user
         )
+        if bundled_taxonomy is not None:
+            taxonomy = repository.get_or_create_bundled_taxonomy(
+                session, taxonomy=bundled_taxonomy
+            )
+        assert taxonomy is not None
         run, _created = repository.create_labeling_run(
             session,
             document_set_id=document_set_id,
