@@ -7,7 +7,14 @@ from hashlib import sha256
 from typing import NoReturn, Protocol, cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    computed_field,
+    model_validator,
+)
 
 _SAFETY_FINISH_REASONS = frozenset(
     {
@@ -87,11 +94,32 @@ class VertexBatchRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     prompt: str = Field(min_length=1)
+    generation_config: dict[str, JsonValue] | None = None
+    system_instruction: str | None = None
+
+    def to_generate_content_request(self) -> dict[str, object]:
+        payload = _request_payload(self.prompt)
+        if self.generation_config is not None:
+            payload["generationConfig"] = self.generation_config
+        if self.system_instruction is not None:
+            payload["systemInstruction"] = {
+                "parts": [{"text": self.system_instruction}]
+            }
+        return payload
 
     @computed_field
     @property
     def request_hash(self) -> str:
-        return _canonical_request_hash(self.prompt)
+        if self.generation_config is None and self.system_instruction is None:
+            return _canonical_request_hash(self.prompt)
+        return sha256(
+            json.dumps(
+                self.to_generate_content_request(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
 
 
 class VertexBatchResult(BaseModel):
@@ -201,7 +229,7 @@ def _vertex_jsonl_line(request: VertexBatchRequest) -> str:
         json.dumps(
             {
                 "key": request.request_hash,
-                "request": _request_payload(request.prompt),
+                "request": request.to_generate_content_request(),
             },
             ensure_ascii=False,
             separators=(",", ":"),

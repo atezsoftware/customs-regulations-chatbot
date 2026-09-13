@@ -783,6 +783,7 @@ scheduler:
   tasks:
     - regulatory_amendment_recover_stale
     - regulatory_indexing_recover_stale
+    - regulatory_labeling_recover_stale
     - monitor_celery_queues
   readiness_file: /tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt
   liveness_file: /tmp/onyx_k8s_regulatoryindexingbeat_liveness.txt
@@ -794,6 +795,7 @@ scheduler:
     monitor_celery_queues: 10
     regulatory_amendment_recover_stale: 60
     regulatory_indexing_recover_stale: 60
+    regulatory_labeling_recover_stale: 60
   claim_ttl_semantics: stale_key_retention_not_same_slot_takeover
 user_file_recovery_scheduler:
   name: celery_beat

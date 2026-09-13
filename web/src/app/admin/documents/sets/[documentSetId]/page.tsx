@@ -5,8 +5,8 @@ import { ErrorCallout } from "@/components/ErrorCallout";
 import { refreshDocumentSets, useDocumentSets } from "../hooks";
 import { useConnectorStatus, useUserGroups } from "@/lib/hooks";
 import { PageLoader, SettingsLayouts } from "@opal/layouts";
-import { Tabs } from "@opal/components";
-import { SvgFiles, SvgSettings } from "@opal/icons";
+import { Button, Tabs } from "@opal/components";
+import { SvgFiles, SvgSettings, SvgTag } from "@opal/icons";
 import { ADMIN_ROUTES } from "@/lib/admin-routes";
 import CardSection from "@/components/admin/CardSection";
 import { DocumentSetCreationForm } from "../DocumentSetCreationForm";
@@ -123,6 +123,7 @@ function Main({ documentSetId }: { documentSetId: number }) {
 export default function Page(props: {
   params: Promise<{ documentSetId: string }>;
 }) {
+  const { isAdmin } = useUser();
   const params = use(props.params);
   const documentSetId = parseInt(params.documentSetId);
 
@@ -133,6 +134,17 @@ export default function Page(props: {
         title="Document Set"
         divider
         backButton
+        rightChildren={
+          isAdmin ? (
+            <Button
+              href={`/admin/documents/sets/${documentSetId}/labeling`}
+              icon={SvgTag}
+              prominence="secondary"
+            >
+              Chunk labeling
+            </Button>
+          ) : undefined
+        }
       />
       <SettingsLayouts.Body>
         <Main documentSetId={documentSetId} />

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import NoReturn, Protocol, cast
@@ -41,7 +42,7 @@ _GENERATIVE_LANGUAGE_SCOPE = (
 )
 _GEMINI_OAUTH_SCOPES = (_CLOUD_PLATFORM_SCOPE, _GENERATIVE_LANGUAGE_SCOPE)
 _GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com"
-_SUBMISSION_KEY_PATTERN = re.compile(r"regulatory-context-([0-9a-f]{64})")
+_SUBMISSION_KEY_PATTERN = re.compile(r"regulatory-(context|labeling)-([0-9a-f]{64})")
 _MAX_BATCH_LIST_PAGES = 100
 
 
@@ -49,7 +50,8 @@ def gemini_input_file_name(submission_key: str) -> str:
     match = _SUBMISSION_KEY_PATTERN.fullmatch(submission_key)
     if match is None:
         raise VertexBatchContractError("Gemini submission key is invalid")
-    return f"files/regctx-{match.group(1)[:32]}"
+    prefix = "regctx" if match.group(1) == "context" else "reglbl"
+    return f"files/{prefix}-{match.group(2)[:32]}"
 
 
 class _HTTPResponse(Protocol):
@@ -105,6 +107,8 @@ def _credential_identity(credentials: Credentials) -> str:
 
 
 def _job_status(raw_state: object) -> VertexBatchJobStatus:
+    if not isinstance(raw_state, str):
+        raise VertexBatchContractError("Gemini batch job returned an invalid state")
     if raw_state in {
         "JOB_STATE_UNSPECIFIED",
         "JOB_STATE_QUEUED",
@@ -172,12 +176,27 @@ class GoogleGeminiFilesBatchGateway(VertexBatchGateway):
             _credentials_from_service_account_json
         ),
         session_factory: Callable[[], _HTTPSession] | None = None,
+        flow: LLMFlow = LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
+        max_result_bytes: int | None = None,
+        max_reconciliation_seconds: float | None = None,
     ) -> None:
         if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
             raise VertexBatchContractError(
                 "Gemini request timeout must be positive and finite"
             )
         self._config = config
+        self._flow = flow
+        if max_result_bytes is not None and max_result_bytes < 1:
+            raise VertexBatchContractError("Gemini result byte limit must be positive")
+        self._max_result_bytes = max_result_bytes
+        if max_reconciliation_seconds is not None and (
+            not math.isfinite(max_reconciliation_seconds)
+            or max_reconciliation_seconds <= 0
+        ):
+            raise VertexBatchContractError(
+                "Gemini reconciliation deadline must be positive and finite"
+            )
+        self._max_reconciliation_seconds = max_reconciliation_seconds
         self._credential_json_provider = credential_json_provider
         self._request_timeout_seconds = request_timeout_seconds
         self._credentials_factory = credentials_factory
@@ -335,7 +354,7 @@ class GoogleGeminiFilesBatchGateway(VertexBatchGateway):
             )
             try:
                 with traced_llm_call(
-                    flow=LLMFlow.REGULATORY_CONTEXTUAL_BATCH,
+                    flow=self._flow,
                     model=self._config.model_name,
                     provider="gemini_developer",
                     extra_config={"request_count": str(len(requests))},
@@ -377,10 +396,15 @@ class GoogleGeminiFilesBatchGateway(VertexBatchGateway):
                         IndexingGatewayIndeterminateSubmissionError(submission_key)
                     )
                 raise
-            return _batch_state(
-                self._response_json(response),
-                fallback_input_uri=input_file_name,
-            )
+            try:
+                return _batch_state(
+                    self._response_json(response),
+                    fallback_input_uri=input_file_name,
+                )
+            except VertexBatchContractError:
+                _raise_secret_safe(
+                    IndexingGatewayIndeterminateSubmissionError(submission_key)
+                )
 
     def get(self, remote_job_name: str) -> VertexBatchState:
         if re.fullmatch(r"batches/[A-Za-z0-9_-]+", remote_job_name) is None:
@@ -396,11 +420,18 @@ class GoogleGeminiFilesBatchGateway(VertexBatchGateway):
 
     def reconcile_submission(self, submission_key: str) -> VertexBatchState | None:
         gemini_input_file_name(submission_key)
+        deadline = (
+            time.monotonic() + self._max_reconciliation_seconds
+            if self._max_reconciliation_seconds is not None
+            else None
+        )
         matches: list[object] = []
         page_token: str | None = None
         seen_page_tokens: set[str] = set()
         with self._session() as (session, headers, _credentials):
             for _page_number in range(_MAX_BATCH_LIST_PAGES):
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise IndexingGatewayTimeoutError()
                 params: dict[str, object] = {"pageSize": 100}
                 if page_token is not None:
                     params["pageToken"] = page_token
@@ -457,15 +488,46 @@ class GoogleGeminiFilesBatchGateway(VertexBatchGateway):
                     f"{_GEMINI_API_BASE_URL}/download/v1beta/{output_uri}:download",
                     headers=headers,
                     params={"alt": "media"},
+                    **({"stream": True} if self._max_result_bytes is not None else {}),
                 )
                 try:
-                    output = response.content.decode("utf-8")
+                    if self._max_result_bytes is None:
+                        output_bytes = response.content
+                    else:
+                        iterator = getattr(response, "iter_content", None)
+                        chunks = (
+                            cast(Callable[..., Iterator[bytes]], iterator)(
+                                chunk_size=65536
+                            )
+                            if callable(iterator)
+                            else iter([response.content])
+                        )
+                        buffer = bytearray()
+                        for chunk in chunks:
+                            if len(buffer) + len(chunk) > self._max_result_bytes:
+                                raise VertexBatchContractError(
+                                    "Gemini result exceeds its size limit"
+                                )
+                            buffer.extend(chunk)
+                        output_bytes = bytes(buffer)
+                    output = output_bytes.decode("utf-8")
+                except http_requests.Timeout:
+                    _raise_secret_safe(IndexingGatewayTimeoutError())
+                except (
+                    http_requests.ConnectionError,
+                    http_requests.exceptions.ChunkedEncodingError,
+                ):
+                    _raise_secret_safe(IndexingGatewayConnectionError())
                 except UnicodeDecodeError:
                     _raise_secret_safe(
                         VertexBatchContractError(
                             "Gemini output file is not valid UTF-8"
                         )
                     )
+                finally:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
                 yield from output.splitlines(keepends=True)
 
         return iter_lines()

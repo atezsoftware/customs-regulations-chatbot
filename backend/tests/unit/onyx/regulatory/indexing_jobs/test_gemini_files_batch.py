@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any, cast
 
 import pytest
@@ -17,6 +17,7 @@ from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
     IndexingGatewayHTTPError,
     IndexingGatewayIndeterminateSubmissionError,
+    IndexingGatewayTimeoutError,
     VertexAuthenticationMode,
     VertexBatchConfig,
 )
@@ -211,6 +212,133 @@ def test_submit_raises_secret_safe_indeterminate_error_after_ambiguous_create() 
     assert caught.value.submission_key == _SUBMISSION_KEY
     assert "provider-secret-payload" not in str(caught.value)
     assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("metadata", [{}, {"state": {}}, {"state": []}])
+def test_submit_treats_malformed_success_as_indeterminate_not_safe_to_repeat(
+    metadata: dict[str, object],
+) -> None:
+    session = _FakeSession(
+        [
+            _FakeResponse(
+                200, headers={"x-goog-upload-url": "https://upload.example/session-1"}
+            ),
+            _FakeResponse(200, payload={"file": {"name": "files/input-1"}}),
+            _FakeResponse(200, payload={"name": "batches/job", "metadata": metadata}),
+        ]
+    )
+    with pytest.raises(IndexingGatewayIndeterminateSubmissionError):
+        _gateway(session).submit(
+            [VertexBatchRequest(prompt="first prompt")],
+            submission_key=_SUBMISSION_KEY,
+            max_jsonl_bytes=4096,
+        )
+    assert len(session.calls) == 3
+
+
+def test_labeling_submission_uses_separate_input_file_namespace() -> None:
+    assert (
+        gemini_input_file_name("regulatory-labeling-" + "a" * 64)
+        == "files/reglbl-" + "a" * 32
+    )
+    assert (
+        len(
+            gemini_input_file_name("regulatory-labeling-" + "a" * 64).removeprefix(
+                "files/"
+            )
+        )
+        <= 40
+    )
+    assert gemini_input_file_name(_SUBMISSION_KEY) == "files/regctx-" + "a" * 32
+
+
+def test_bounded_labeling_download_stops_before_reading_oversized_file() -> None:
+    class StreamingResponse(_FakeResponse):
+        closed = False
+        chunks_read = 0
+
+        def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+            del chunk_size
+            for _ in range(100):
+                self.chunks_read += 1
+                yield b"x" * 8
+
+        def close(self) -> None:
+            self.closed = True
+
+    response = StreamingResponse(200)
+    session = _FakeSession([response])
+    gateway = GoogleGeminiFilesBatchGateway(
+        config=_config(),
+        credential_json_provider=lambda: "{}",
+        credentials_factory=lambda _raw: _FakeCredentials(),
+        session_factory=cast(Any, lambda: session),
+        max_result_bytes=10,
+    )
+    with pytest.raises(ValueError, match="size limit"):
+        list(gateway.read_results("files/output-1"))
+    assert response.chunks_read == 2
+    assert response.closed
+    assert session.calls[0][2]["stream"] is True
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (
+            requests.ConnectionError("sensitive stream detail"),
+            IndexingGatewayConnectionError,
+        ),
+        (requests.Timeout("sensitive stream detail"), IndexingGatewayTimeoutError),
+        (
+            requests.exceptions.ChunkedEncodingError("sensitive stream detail"),
+            IndexingGatewayConnectionError,
+        ),
+    ],
+)
+def test_stream_failure_is_secret_safe_and_retryable(
+    error: Exception, expected: type[Exception]
+) -> None:
+    class BrokenResponse(_FakeResponse):
+        def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+            del chunk_size
+            yield b"prefix"
+            raise error
+
+    gateway = GoogleGeminiFilesBatchGateway(
+        config=_config(),
+        credential_json_provider=lambda: "{}",
+        credentials_factory=lambda _raw: _FakeCredentials(),
+        session_factory=cast(Any, lambda: _FakeSession([BrokenResponse(200)])),
+        max_result_bytes=100,
+    )
+    with pytest.raises(expected) as caught:
+        list(gateway.read_results("files/output-1"))
+    assert "sensitive stream detail" not in str(caught.value)
+    assert caught.value.__context__ is None
+
+
+def test_reconciliation_deadline_bounds_worker_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter([100.0, 100.0, 281.0])
+    monkeypatch.setattr(
+        "onyx.regulatory.indexing_jobs.gemini_files_batch.time.monotonic",
+        lambda: next(ticks),
+    )
+    session = _FakeSession(
+        [_FakeResponse(200, payload={"operations": [], "nextPageToken": "next"})]
+    )
+    gateway = GoogleGeminiFilesBatchGateway(
+        config=_config(),
+        credential_json_provider=lambda: "{}",
+        credentials_factory=lambda _raw: _FakeCredentials(),
+        session_factory=cast(Any, lambda: session),
+        max_reconciliation_seconds=180,
+    )
+    with pytest.raises(IndexingGatewayTimeoutError):
+        gateway.reconcile_submission(_SUBMISSION_KEY)
+    assert len(session.calls) == 1
 
 
 def test_submit_deletes_uploaded_input_after_definite_create_rejection() -> None:

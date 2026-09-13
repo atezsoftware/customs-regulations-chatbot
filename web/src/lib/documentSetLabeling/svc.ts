@@ -1,0 +1,111 @@
+import type {
+  LabelingRun,
+  LabelingRunItemsPage,
+  LabelingSetup,
+  LabelingTaxonomySummary,
+  TaxonomyInput,
+} from "@/lib/documentSetLabeling/interfaces";
+
+export class LabelingApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+    this.name = "LabelingApiError";
+  }
+}
+
+export function labelingBaseUrl(documentSetId: number): string {
+  return `/api/manage/admin/document-set/${documentSetId}/labeling`;
+}
+
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = init ? await fetch(url, init) : await fetch(url);
+  if (!response.ok) {
+    let detail: unknown;
+    try {
+      detail = (await response.json())?.detail;
+    } catch {
+      detail = undefined;
+    }
+    throw new LabelingApiError(
+      typeof detail === "string"
+        ? detail
+        : `Request failed (${response.status})`,
+      response.status
+    );
+  }
+  return response.json();
+}
+
+function postJson<T>(url: string, body?: unknown): Promise<T> {
+  return requestJson<T>(url, {
+    method: "POST",
+    headers:
+      body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
+export function getLabelingSetup(
+  documentSetId: number
+): Promise<LabelingSetup> {
+  return requestJson(`${labelingBaseUrl(documentSetId)}/setup`);
+}
+
+export function listLabelingRuns(
+  documentSetId: number
+): Promise<LabelingRun[]> {
+  return requestJson(`${labelingBaseUrl(documentSetId)}/runs`);
+}
+
+export function getLabelingRun(
+  documentSetId: number,
+  runId: string
+): Promise<LabelingRun> {
+  return requestJson(`${labelingBaseUrl(documentSetId)}/runs/${runId}`);
+}
+
+export function getLabelingRunItems(
+  documentSetId: number,
+  runId: string,
+  offset: number,
+  limit: number
+): Promise<LabelingRunItemsPage> {
+  return requestJson(
+    `${labelingBaseUrl(documentSetId)}/runs/${runId}/items?offset=${offset}&limit=${limit}`
+  );
+}
+
+export function createLabelingTaxonomy(
+  documentSetId: number,
+  taxonomy: TaxonomyInput
+): Promise<LabelingTaxonomySummary> {
+  return postJson(`${labelingBaseUrl(documentSetId)}/taxonomies`, taxonomy);
+}
+
+export function startLabelingRun(
+  documentSetId: number,
+  body: {
+    taxonomy_id: string;
+    model_configuration_id: number;
+    idempotency_key: string;
+  }
+): Promise<LabelingRun> {
+  return postJson(`${labelingBaseUrl(documentSetId)}/runs`, body);
+}
+
+export function cancelLabelingRun(
+  documentSetId: number,
+  runId: string
+): Promise<LabelingRun> {
+  return postJson(`${labelingBaseUrl(documentSetId)}/runs/${runId}/cancel`);
+}
+
+export function retryLabelingRun(
+  documentSetId: number,
+  runId: string
+): Promise<LabelingRun> {
+  return postJson(`${labelingBaseUrl(documentSetId)}/runs/${runId}/retry`);
+}

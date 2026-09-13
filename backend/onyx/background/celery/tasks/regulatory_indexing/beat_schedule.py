@@ -48,6 +48,16 @@ PRODUCTION_LITE_TASK_TEMPLATES: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "recover-stale-regulatory-labeling",
+        "task": OnyxCeleryTask.REGULATORY_LABELING_RECOVER_STALE,
+        "schedule": timedelta(minutes=1),
+        "options": {
+            "priority": OnyxCeleryPriority.LOW,
+            "expires": 5 * 60,
+            "queue": OnyxCeleryQueues.REGULATORY_INDEXING,
+        },
+    },
+    {
         "name": "monitor-celery-queues",
         "task": OnyxCeleryTask.MONITOR_CELERY_QUEUES,
         "schedule": timedelta(seconds=10),

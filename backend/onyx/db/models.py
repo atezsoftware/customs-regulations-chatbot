@@ -5700,6 +5700,379 @@ class RegulatoryChunk(Base):
     )
 
 
+class RegulatoryLabelTaxonomy(Base):
+    """Immutable label vocabulary uploaded by an administrator."""
+
+    __tablename__ = "regulatory_label_taxonomy"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    version_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    definition: Mapped[dict[str, object]] = mapped_column(PGJSONB, nullable=False)
+    label_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "label_count > 0", name="regulatory_label_taxonomy_label_count_check"
+        ),
+    )
+
+
+class RegulatoryLabelingRun(Base):
+    """Durable, fenced labeling snapshot for one document set."""
+
+    __tablename__ = "regulatory_labeling_run"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="CASCADE"), nullable=False
+    )
+    taxonomy_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_label_taxonomy.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    model_configuration_id: Mapped[int | None] = mapped_column(
+        ForeignKey("model_configuration.id", ondelete="SET NULL"), nullable=True
+    )
+    requested_by_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    retry_of_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_labeling_run.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    idempotency_key: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    provider_binding: Mapped[dict[str, object]] = mapped_column(PGJSONB, nullable=False)
+    file_ids: Mapped[list[str]] = mapped_column(PGJSONB, nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="queued", server_default="queued"
+    )
+    stage: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="preparing", server_default="preparing"
+    )
+    total_chunks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    completed_chunks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    failed_chunks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    stale_chunks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    derived_chunks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    unresolved_derived_chunks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    error: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    lease_token: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True
+    )
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_retry_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    finished_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    taxonomy: Mapped["RegulatoryLabelTaxonomy"] = relationship(
+        "RegulatoryLabelTaxonomy"
+    )
+    items: Mapped[list["RegulatoryLabelingItem"]] = relationship(
+        "RegulatoryLabelingItem",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    shards: Mapped[list["RegulatoryLabelingShard"]] = relationship(
+        "RegulatoryLabelingShard",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_set_id",
+            "idempotency_key",
+            name="uq_regulatory_labeling_run_idempotency",
+        ),
+        Index(
+            "uq_regulatory_labeling_run_active_document_set",
+            "document_set_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+        Index(
+            "ix_regulatory_labeling_run_recovery",
+            "status",
+            "next_retry_at",
+            "lease_expires_at",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'completed', "
+            "'completed_with_errors', 'failed', 'cancelled')",
+            name="regulatory_labeling_run_status_check",
+        ),
+        CheckConstraint(
+            "stage IN ('preparing', 'submitting', 'waiting', 'applying', "
+            "'projecting', 'finished')",
+            name="regulatory_labeling_run_stage_check",
+        ),
+        CheckConstraint(
+            "total_chunks >= 0 AND completed_chunks >= 0 AND failed_chunks >= 0 "
+            "AND stale_chunks >= 0 AND derived_chunks >= 0 "
+            "AND unresolved_derived_chunks >= 0",
+            name="regulatory_labeling_run_counts_check",
+        ),
+        CheckConstraint(
+            "lease_generation >= 0",
+            name="regulatory_labeling_run_lease_generation_check",
+        ),
+    )
+
+
+class RegulatoryLabelingShard(Base):
+    """One bounded provider batch with an independently recoverable identity."""
+
+    __tablename__ = "regulatory_labeling_shard"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_labeling_run.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    item_ids: Mapped[list[str]] = mapped_column(PGJSONB, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="prepared", server_default="prepared"
+    )
+    submission_key: Mapped[str] = mapped_column(
+        String(128), nullable=False, unique=True
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    failure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    remote_job_name: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    input_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    output_uri: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    reconcile_until: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_retry_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    run: Mapped["RegulatoryLabelingRun"] = relationship(
+        "RegulatoryLabelingRun", back_populates="shards"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "ordinal", name="uq_regulatory_labeling_shard_run_ordinal"
+        ),
+        Index(
+            "ix_regulatory_labeling_shard_due",
+            "run_id",
+            "status",
+            "next_retry_at",
+        ),
+        CheckConstraint(
+            "status IN ('prepared', 'submitting', 'reconcile_required', "
+            "'submitted', 'succeeded', 'failed', 'cancelled')",
+            name="regulatory_labeling_shard_status_check",
+        ),
+        CheckConstraint(
+            "ordinal >= 0 AND attempt_count >= 0 AND failure_count >= 0",
+            name="regulatory_labeling_shard_counts_check",
+        ),
+    )
+
+
+class RegulatoryLabelingItem(Base):
+    """Frozen source and result for one existing atomic RegulatoryChunk."""
+
+    __tablename__ = "regulatory_labeling_item"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_labeling_run.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    regulatory_chunk_id: Mapped[str] = mapped_column(Text, nullable=False)
+    user_file_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    canonical_text_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    context_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    text_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    source_snapshot: Mapped[dict[str, object]] = mapped_column(PGJSONB, nullable=False)
+    context_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_payload: Mapped[dict[str, object] | None] = mapped_column(
+        PGJSONB, nullable=True
+    )
+    shard_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_labeling_shard.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", server_default="pending"
+    )
+    labels: Mapped[list[str]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    assignments: Mapped[list[dict[str, object]]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    error: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    run: Mapped["RegulatoryLabelingRun"] = relationship(
+        "RegulatoryLabelingRun", back_populates="items"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "regulatory_chunk_id",
+            name="uq_regulatory_labeling_item_run_chunk",
+        ),
+        Index("ix_regulatory_labeling_item_run_status", "run_id", "status"),
+        Index(
+            "ix_regulatory_labeling_item_unprepared_position",
+            "run_id",
+            "user_file_id",
+            text("((source_snapshot ->> 'position')::integer)"),
+            "id",
+            postgresql_where=text("status = 'pending' AND request_hash IS NULL"),
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'submitted', 'completed', 'failed', "
+            "'stale', 'cancelled')",
+            name="regulatory_labeling_item_status_check",
+        ),
+    )
+
+
+class RegulatoryDerivedLabelProjection(Base):
+    """Materialized union of canonical labels for one existing derived chunk."""
+
+    __tablename__ = "regulatory_derived_label_projection"
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("regulatory_labeling_run.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    regulatory_chunk_id: Mapped[str] = mapped_column(Text, nullable=False)
+    user_file_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    derived_text_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    text_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    source_snapshot: Mapped[dict[str, object]] = mapped_column(PGJSONB, nullable=False)
+    labels: Mapped[list[str]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    provenance: Mapped[dict[str, object]] = mapped_column(
+        PGJSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    resolution: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", server_default="pending"
+    )
+    unresolved_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "regulatory_chunk_id",
+            name="uq_regulatory_derived_label_projection_run_chunk",
+        ),
+        Index(
+            "ix_regulatory_derived_label_projection_pending",
+            "run_id",
+            "user_file_id",
+            "regulatory_chunk_id",
+            postgresql_where=text("resolution = 'pending'"),
+        ),
+        CheckConstraint(
+            "resolution IN ('pending', 'lineage', 'legacy_containment', 'unresolved')",
+            name="regulatory_derived_label_projection_resolution_check",
+        ),
+    )
+
+
 class RegulatoryIndexingJob(Base):
     """Durable orchestration state for one regulatory file revision."""
 

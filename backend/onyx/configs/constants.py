@@ -711,6 +711,8 @@ class OnyxCeleryTask:
     REGULATORY_AMENDMENT_RECOVER_STALE = "regulatory_amendment_recover_stale"
     REGULATORY_INDEXING_RUN_STEP = "regulatory_indexing_run_step"
     REGULATORY_INDEXING_RECOVER_STALE = "regulatory_indexing_recover_stale"
+    REGULATORY_LABELING_RUN_STEP = "regulatory_labeling_run_step"
+    REGULATORY_LABELING_RECOVER_STALE = "regulatory_labeling_recover_stale"
 
     CHECK_FOR_DOCUMENTS_FOR_ELASTICSEARCH_MIGRATION_TASK = (
         "check_for_documents_for_elasticsearch_migration_task"

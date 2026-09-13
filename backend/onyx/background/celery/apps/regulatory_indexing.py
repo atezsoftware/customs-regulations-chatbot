@@ -124,6 +124,7 @@ celery_app.autodiscover_tasks(
         [
             "onyx.background.celery.tasks.user_file_processing",
             "onyx.background.celery.tasks.regulatory_indexing",
+            "onyx.background.celery.tasks.regulatory_labeling",
         ]
     )
 )

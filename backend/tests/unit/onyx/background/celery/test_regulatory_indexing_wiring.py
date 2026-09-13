@@ -158,6 +158,7 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
     assert {template["task"] for template in templates} == {
         "regulatory_amendment_recover_stale",
         "regulatory_indexing_recover_stale",
+        "regulatory_labeling_recover_stale",
         "recover_annex_publications",
         "monitor_celery_queues",
     }
@@ -173,6 +174,7 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
     schedules = {template["task"]: template["schedule"] for template in templates}
     assert schedules["regulatory_indexing_recover_stale"] == timedelta(minutes=1)
     assert schedules["regulatory_amendment_recover_stale"] == timedelta(minutes=1)
+    assert schedules["regulatory_labeling_recover_stale"] == timedelta(minutes=1)
     assert schedules["monitor_celery_queues"] == timedelta(seconds=10)
     assert all(template["options"]["expires"] > 0 for template in templates)
     assert not any("check-for-indexing" in template["name"] for template in templates)
@@ -215,7 +217,7 @@ def test_production_lite_scheduler_expands_every_task_with_each_tenant_id(
         ["public", "tenant-a"]
     )
 
-    assert len(schedule) == (8 if annex_enabled else 6)
+    assert len(schedule) == (10 if annex_enabled else 8)
     assert ("recover-annex-publications-public" in schedule) is annex_enabled
     assert {entry["kwargs"]["tenant_id"] for entry in schedule.values()} == {
         "public",
@@ -257,6 +259,7 @@ def test_production_lite_scheduler_rebuilds_schedule_across_restart(
         "recover-annex-publications-public",
         "recover-stale-regulatory-amendments-public",
         "recover-stale-regulatory-indexing-public",
+        "recover-stale-regulatory-labeling-public",
         "monitor-celery-queues-public",
     }
     if not annex_enabled:
@@ -321,6 +324,7 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
         "monitor_celery_queues": 10,
         "regulatory_amendment_recover_stale": 60,
         "regulatory_indexing_recover_stale": 60,
+        "regulatory_labeling_recover_stale": 60,
         "recover_annex_publications": 60,
     }
     if not annex_enabled:
@@ -331,6 +335,7 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
             "monitor-celery-queues",
             "recover-stale-regulatory-amendments",
             "recover-stale-regulatory-indexing",
+            "recover-stale-regulatory-labeling",
             "recover-annex-publications",
         )
         for tenant in tenants
@@ -403,7 +408,7 @@ def test_two_scheduler_ticks_isolate_both_entries_per_tenant_slot_and_advance(
         assert Counter(publications) == Counter(
             {publication: 1 for publication in expected_publications}
         )
-        assert len(claim_store.claims) == (8 if annex_enabled else 6)
+        assert len(claim_store.claims) == len(expected_publications)
         assert {claim[0] for claim in claim_store.claims} == set(tenants)
         for tenant_id, claim_key, ttl in claim_store.claims:
             tenant_entry_names = {
@@ -576,6 +581,7 @@ def test_scheduler_recovers_a_corrupt_pod_local_schedule(
             "recover-annex-publications-public",
             "recover-stale-regulatory-amendments-public",
             "recover-stale-regulatory-indexing-public",
+            "recover-stale-regulatory-labeling-public",
             "monitor-celery-queues-public",
         }
         if not annex_enabled:
@@ -1311,6 +1317,7 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         "tasks": [
             "regulatory_amendment_recover_stale",
             "regulatory_indexing_recover_stale",
+            "regulatory_labeling_recover_stale",
             "monitor_celery_queues",
         ],
         "readiness_file": "/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt",
@@ -1323,6 +1330,7 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
             "monitor_celery_queues": 10,
             "regulatory_amendment_recover_stale": 60,
             "regulatory_indexing_recover_stale": 60,
+            "regulatory_labeling_recover_stale": 60,
         },
         "claim_ttl_semantics": "stale_key_retention_not_same_slot_takeover",
     }

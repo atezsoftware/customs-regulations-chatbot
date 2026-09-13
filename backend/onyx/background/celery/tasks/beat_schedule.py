@@ -62,6 +62,16 @@ beat_task_templates: list[dict] = [
         },
     },
     {
+        "name": "recover-stale-regulatory-labeling",
+        "task": OnyxCeleryTask.REGULATORY_LABELING_RECOVER_STALE,
+        "schedule": timedelta(minutes=1),
+        "options": {
+            "priority": OnyxCeleryPriority.LOW,
+            "expires": 5 * 60,
+            "queue": OnyxCeleryQueues.REGULATORY_INDEXING,
+        },
+    },
+    {
         "name": "check-for-user-file-processing",
         "task": OnyxCeleryTask.CHECK_FOR_USER_FILE_PROCESSING,
         "schedule": timedelta(seconds=20),
