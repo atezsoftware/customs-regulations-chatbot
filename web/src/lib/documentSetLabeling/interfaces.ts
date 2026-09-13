@@ -23,6 +23,7 @@ export interface LabelingSetup {
   };
   active_run_id: string | null;
   warnings: string[];
+  configuration_errors?: string[];
 }
 
 export interface TaxonomyLabelInput {

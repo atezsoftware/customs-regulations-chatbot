@@ -732,6 +732,18 @@ store/environment, not in source control. Defaults below match the Compose overl
 If the API gate fails, the wrapper leaves `background` stopped. Preserve its output, then use the
 same fixed overlay order only for read-only diagnostics; do not retry with ad hoc Compose files.
 
+### DEV native Vertex labeling storage
+
+Native Vertex labeling requires a GCS URI for batch input and output. Set the optional
+GitHub Actions variable `REGULATORY_LABELING_VERTEX_GCS_URI_DEV` to that URI after the bucket and
+access have been verified. The DEV backend workflow passes it as `REGULATORY_LABELING_VERTEX_GCS_URI`
+to both API and background Helm environment parameters, including same-image annex activation and
+fallback deployment. An unset or empty variable renders an empty value on both apps and disables
+native labeling starts. This setting does not create a bucket, grant access, enable indexing, or
+change annex activation gates. `annex-verify` remains read-only.
+Batch input, correlation manifests, and output remain under the dedicated labeling prefix after a
+run finishes; configure the bucket's retention/lifecycle policy before enabling real jobs.
+
 ## 6. Health and smoke checks
 
 First verify the same reviewed topology through the authoritative status command:

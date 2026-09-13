@@ -172,8 +172,15 @@ export default function LabelingWorkspace({
       provider: Boolean(providerId),
       chunks: Boolean(setup?.counts.canonical_chunks),
       idle: !runsError && !hasActiveRun,
+      configuration: !setup?.configuration_errors?.length,
     }),
-    [providerId, hasActiveRun, runsError, setup?.counts.canonical_chunks]
+    [
+      providerId,
+      hasActiveRun,
+      runsError,
+      setup?.counts.canonical_chunks,
+      setup?.configuration_errors,
+    ]
   );
   const canStart = Object.values(readiness).every(Boolean) && !isSubmitting;
 
@@ -274,6 +281,14 @@ export default function LabelingWorkspace({
           titleMaxLines={undefined}
         />
       ))}
+      {setup.configuration_errors?.map((configurationError) => (
+        <MessageCard
+          key={configurationError}
+          variant="error"
+          title={configurationError}
+          titleMaxLines={undefined}
+        />
+      ))}
       {actionError && (
         <MessageCard
           variant="error"
@@ -307,11 +322,11 @@ export default function LabelingWorkspace({
             />
             <ReadinessItem
               ready={readiness.provider}
-              readyText={`${setup.providers.length} Google provider${setup.providers.length === 1 ? "" : "s"}`}
+              readyText={`${setup.providers.length} Gemini connection${setup.providers.length === 1 ? "" : "s"}`}
               blockedText={
                 setup.providers.length
-                  ? "Select a Google provider"
-                  : "No Google provider configured"
+                  ? "Select a Gemini connection"
+                  : "No Gemini connection configured"
               }
             />
             <ReadinessItem
@@ -325,18 +340,18 @@ export default function LabelingWorkspace({
           </Text>
 
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-            <Field label="Google provider">
+            <Field label="Gemini connection">
               <InputSelect
                 value={providerId}
                 onValueChange={setProviderId}
                 disabled={!setup.providers.length}
               >
                 <InputSelect.Trigger
-                  aria-label="Google provider"
+                  aria-label="Gemini connection"
                   placeholder={
                     setup.providers.length
-                      ? "Select a Google provider"
-                      : "Configure a provider first"
+                      ? "Select a Gemini connection"
+                      : "Configure a Gemini connection first"
                   }
                 />
                 <InputSelect.Content>

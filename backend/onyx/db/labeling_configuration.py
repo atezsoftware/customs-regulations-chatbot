@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from hashlib import sha256
-from typing import TypedDict
+from typing import Literal, TypedDict
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session, joinedload, load_only
 
@@ -37,6 +40,7 @@ from onyx.regulatory.indexing_jobs.models import (
     VertexAuthenticationMode,
     VertexBatchConfig,
 )
+from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchGateway
 from onyx.regulatory.labeling.provider import DEFAULT_MODEL
 from onyx.tracing.flows import LLMFlow
 
@@ -44,6 +48,58 @@ from onyx.tracing.flows import LLMFlow
 class LabelingProviderOption(TypedDict):
     id: int
     name: str
+
+
+LabelingProviderTransport = Literal["gemini_files_v1", "vertex_gcs_v1"]
+
+_FILES_TRANSPORT: LabelingProviderTransport = "gemini_files_v1"
+_VERTEX_TRANSPORT: LabelingProviderTransport = "vertex_gcs_v1"
+_VERTEX_GCS_URI_ENV = "REGULATORY_LABELING_VERTEX_GCS_URI"
+_GCS_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*[a-z0-9]$")
+_INVALID_STAGING_URI_ERROR = (
+    "Gemini Batch storage requires a gs://bucket/prefix Cloud Storage location."
+)
+
+
+def _normalize_vertex_staging_uri(value: str) -> str:
+    uri = value.strip().rstrip("/")
+    try:
+        parsed = urlsplit(uri)
+    except ValueError:
+        raise ValueError(_INVALID_STAGING_URI_ERROR) from None
+    prefix = parsed.path.removeprefix("/")
+    path_segments = prefix.split("/")
+    if (
+        parsed.scheme != "gs"
+        or not 3 <= len(parsed.netloc) <= 222
+        or _GCS_BUCKET_PATTERN.fullmatch(parsed.netloc) is None
+        or parsed.query
+        or parsed.fragment
+        or not prefix
+        or any(segment in {"", ".", ".."} for segment in path_segments)
+        or any(character.isspace() for character in uri)
+        or "\\" in uri
+    ):
+        raise ValueError(_INVALID_STAGING_URI_ERROR)
+    return f"gs://{parsed.netloc}/{prefix}"
+
+
+def _configured_vertex_staging_uri() -> str:
+    value = os.environ.get(_VERTEX_GCS_URI_ENV, "")
+    if not value.strip():
+        raise ValueError(
+            "Gemini Batch storage is not configured. Configure its Cloud Storage "
+            "location before starting labeling."
+        )
+    return _normalize_vertex_staging_uri(value)
+
+
+def get_labeling_configuration_errors() -> list[str]:
+    try:
+        _configured_vertex_staging_uri()
+    except ValueError as error:
+        return [str(error)]
+    return []
 
 
 class LabelingProviderBinding(BaseModel):
@@ -58,17 +114,39 @@ class LabelingProviderBinding(BaseModel):
     authentication_mode: VertexAuthenticationMode
     credential_identity: str
     model: str = DEFAULT_MODEL
+    transport: LabelingProviderTransport = _FILES_TRANSPORT
+    staging_uri: str | None = None
+
+    @model_validator(mode="after")
+    def validate_transport_configuration(self) -> "LabelingProviderBinding":
+        if self.transport == _FILES_TRANSPORT:
+            if self.staging_uri is not None:
+                raise ValueError("The Gemini Files transport cannot use GCS staging")
+            return self
+        if self.staging_uri is None:
+            raise ValueError("The Vertex transport requires a GCS staging URI")
+        normalized = _normalize_vertex_staging_uri(self.staging_uri)
+        if normalized != self.staging_uri:
+            raise ValueError("The Vertex GCS staging URI must be normalized")
+        return self
 
     @property
     def fingerprint(self) -> str:
+        payload = self.model_dump(mode="json")
+        if self.transport == _FILES_TRANSPORT and self.staging_uri is None:
+            payload.pop("transport")
+            payload.pop("staging_uri")
         return sha256(
-            json.dumps(
-                self.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-            ).encode()
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
 
 
-def _binding(model: ModelConfiguration) -> LabelingProviderBinding:
+def _binding(
+    model: ModelConfiguration,
+    *,
+    transport: LabelingProviderTransport = _FILES_TRANSPORT,
+    staging_uri: str | None = None,
+) -> LabelingProviderBinding:
     provider = model.llm_provider
     if provider.provider != LlmProviderNames.VERTEX_AI or not model.is_visible:
         raise ValueError("Select an enabled Google model configuration for labeling")
@@ -108,6 +186,8 @@ def _binding(model: ModelConfiguration) -> LabelingProviderBinding:
         location=custom.get(VERTEX_LOCATION_KWARG, "global").strip() or "global",
         authentication_mode=authentication_mode,
         credential_identity=identity.strip(),
+        transport=transport,
+        staging_uri=staging_uri,
     )
 
 
@@ -167,7 +247,11 @@ def resolve_labeling_provider_binding(
     *,
     user: User | None = None,
 ) -> LabelingProviderBinding:
-    return _binding(_authorized_model(db_session, model_configuration_id, user))
+    return _binding(
+        _authorized_model(db_session, model_configuration_id, user),
+        transport=_VERTEX_TRANSPORT,
+        staging_uri=_configured_vertex_staging_uri(),
+    )
 
 
 def get_labeling_provider_options(
@@ -210,7 +294,7 @@ def get_labeling_provider_options(
             _binding(model)
         except ValueError:
             continue
-        options.append({"id": model.id, "name": provider.name or "Google"})
+        options.append({"id": model.id, "name": provider.name or "Gemini"})
     return options
 
 
@@ -220,10 +304,21 @@ def resolve_labeling_gateway(
     *,
     user: User | None = None,
     expected_binding: LabelingProviderBinding | None = None,
-) -> GoogleGeminiFilesBatchGateway:
+) -> VertexBatchGateway:
     """Resolve credentials while the session is open; perform no network I/O here."""
     model = _authorized_model(db_session, model_configuration_id, user)
-    binding = _binding(model)
+    transport = (
+        expected_binding.transport
+        if expected_binding is not None
+        else _VERTEX_TRANSPORT
+    )
+    binding = _binding(
+        model,
+        transport=transport,
+        staging_uri=(
+            _configured_vertex_staging_uri() if transport == _VERTEX_TRANSPORT else None
+        ),
+    )
     if (
         expected_binding is not None
         and binding.fingerprint != expected_binding.fingerprint
@@ -232,16 +327,30 @@ def resolve_labeling_gateway(
     raw_credentials = (model.llm_provider.custom_config or {}).get(
         VERTEX_CREDENTIALS_FILE_KWARG
     )
-    return GoogleGeminiFilesBatchGateway(
-        config=VertexBatchConfig(
-            model_configuration_id=model.id,
-            model_name=DEFAULT_MODEL,
-            project=binding.project,
-            location=binding.location,
-            authentication_mode=binding.authentication_mode,
-        ),
+    config = VertexBatchConfig(
+        model_configuration_id=model.id,
+        model_name=DEFAULT_MODEL,
+        project=binding.project,
+        location=binding.location,
+        authentication_mode=binding.authentication_mode,
+    )
+    if transport == _FILES_TRANSPORT:
+        return GoogleGeminiFilesBatchGateway(
+            config=config,
+            credential_json_provider=lambda: raw_credentials,
+            flow=LLMFlow.REGULATORY_LABELING_BATCH,
+            max_result_bytes=64 * 1024 * 1024,
+            request_timeout_seconds=20,
+            max_reconciliation_seconds=180,
+        )
+
+    from onyx.regulatory.labeling.vertex_batch import LabelingVertexBatchGateway
+
+    assert binding.staging_uri is not None
+    return LabelingVertexBatchGateway(
+        config=config,
+        staging_uri=binding.staging_uri,
         credential_json_provider=lambda: raw_credentials,
-        flow=LLMFlow.REGULATORY_LABELING_BATCH,
         max_result_bytes=64 * 1024 * 1024,
         request_timeout_seconds=20,
         max_reconciliation_seconds=180,

@@ -42,6 +42,7 @@ class LabelingSetup(BaseModel):
     counts: LabelingCounts
     active_run_id: str | None
     warnings: list[str]
+    configuration_errors: list[str] = Field(default_factory=list)
 
 
 class LabelSettingsSnapshot(BaseModel):

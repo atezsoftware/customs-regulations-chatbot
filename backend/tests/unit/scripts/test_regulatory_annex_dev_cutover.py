@@ -2606,6 +2606,93 @@ def test_redis_deployment_values_override_both_apps(
         ] == [{"name": "REDIS_DEPLOYMENT_DATABASES", "value": "4,5,6"}]
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "gcs_uri", [None, "", "gs://labeling-test-bucket/native-batch"]
+)
+def test_labeling_vertex_storage_values_match_both_apps_and_replace_stale_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    gcs_uri: str | None,
+) -> None:
+    import yaml
+
+    name = "REGULATORY_LABELING_VERTEX_GCS_URI"
+    monkeypatch.chdir(tmp_path)
+    if gcs_uri is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, gcs_uri)
+    directory = tmp_path / "devops/dev/customs-regulations"
+    directory.mkdir(parents=True)
+    for app in cutover.APPS:
+        parameters = (
+            [{"name": name, "value": "gs://stale-test-bucket/old-prefix"}]
+            if app == "api"
+            else []
+        )
+        (directory / f"customs-regulations-{app}-values.yaml").write_text(
+            yaml.safe_dump({"app": {"environment": {"parameters": parameters}}})
+        )
+
+    cutover.render_values(enabled)
+    cutover.render_values(enabled)
+
+    for app in cutover.APPS:
+        data = yaml.safe_load(
+            (directory / f"customs-regulations-{app}-values.yaml").read_text()
+        )
+        parameters = data["app"]["environment"]["parameters"]
+        assert [entry for entry in parameters if entry["name"] == name] == [
+            {"name": name, "value": gcs_uri or ""}
+        ]
+        assert (
+            next(
+                entry["value"]
+                for entry in parameters
+                if entry["name"] == "REGULATORY_ANNEX_UPDATES_ENABLED"
+            )
+            == str(enabled).lower()
+        )
+
+
+def test_labeling_vertex_storage_refuses_duplicate_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml
+
+    name = "REGULATORY_LABELING_VERTEX_GCS_URI"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(name, "gs://labeling-test-bucket/native-batch")
+    directory = tmp_path / "devops/dev/customs-regulations"
+    directory.mkdir(parents=True)
+    paths = []
+    for app in cutover.APPS:
+        path = directory / f"customs-regulations-{app}-values.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "app": {
+                        "environment": {
+                            "parameters": [
+                                {"name": name, "value": "gs://first-test-bucket/path"},
+                                {"name": name, "value": "gs://second-test-bucket/path"},
+                            ]
+                        }
+                    }
+                }
+            )
+        )
+        paths.append(path)
+    original = [path.read_text() for path in paths]
+
+    with pytest.raises(cutover.CutoverRefusal, match="duplicate_environment_parameter"):
+        cutover.render_values()
+
+    assert [path.read_text() for path in paths] == original
+
+
 def test_redis_failure_keeps_only_fixed_safe_code(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

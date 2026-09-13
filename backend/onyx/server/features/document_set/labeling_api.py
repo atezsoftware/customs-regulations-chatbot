@@ -12,6 +12,7 @@ from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.labeling_configuration import (
+    get_labeling_configuration_errors,
     get_labeling_provider_options,
     resolve_labeling_provider_binding,
 )
@@ -98,7 +99,7 @@ def labeling_setup(
     label_settings = repository.get_label_settings(db_session)
     if not providers:
         warnings.append(
-            "Configure an accessible Google provider with an enabled model before starting labeling."
+            "Configure an accessible Gemini connection with an enabled model before starting labeling."
         )
     active_run = repository.get_active_run_id(db_session, document_set_id)
     return LabelingSetup(
@@ -111,6 +112,7 @@ def labeling_setup(
         providers=[LabelingProviderSummary(**option) for option in providers],
         counts=counts,
         warnings=warnings,
+        configuration_errors=get_labeling_configuration_errors(),
         active_run_id=str(active_run) if active_run is not None else None,
     )
 

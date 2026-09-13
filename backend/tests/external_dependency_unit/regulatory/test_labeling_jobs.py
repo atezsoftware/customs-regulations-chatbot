@@ -56,7 +56,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchRequest,
     VertexBatchState,
 )
-from onyx.regulatory.labeling import orchestrator
+from onyx.regulatory.labeling import orchestrator, vertex_batch
 from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
     build_labeling_request,
@@ -132,7 +132,11 @@ def labeling_database() -> Generator[LabelingDatabase, None, None]:
 @pytest.fixture
 def labeling_data(
     labeling_database: LabelingDatabase,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Generator[LabelingData, None, None]:
+    monkeypatch.setenv(
+        "REGULATORY_LABELING_VERTEX_GCS_URI", "gs://labeling-test-bucket/jobs"
+    )
     token = CURRENT_TENANT_ID_CONTEXTVAR.set(labeling_database.schema)
     with Session(labeling_database.engine) as session:
         user = User(
@@ -821,6 +825,23 @@ def test_api_setup_and_start_expose_only_safe_persisted_state(
     assert page.json()["total"] == 2
 
 
+def test_api_missing_batch_storage_blocks_start_without_creating_run(
+    labeling_data: LabelingData,
+    labeling_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("REGULATORY_LABELING_VERTEX_GCS_URI", raising=False)
+    setup = labeling_client.get(_api_path(labeling_data, "setup"))
+    assert setup.status_code == 200
+    assert setup.json()["providers"]
+    assert setup.json()["configuration_errors"]
+    response = labeling_client.post(
+        _api_path(labeling_data, "runs"), json=_start_body(labeling_data)
+    )
+    assert response.status_code == 400
+    assert labeling_client.get(_api_path(labeling_data, "runs")).json() == []
+
+
 @pytest.mark.usefixtures("restore_label_settings")
 def test_api_label_settings_save_drive_setup_and_new_batch_prompts(
     labeling_data: LabelingData,
@@ -1344,6 +1365,7 @@ def fake_batch(
     monkeypatch.setattr(
         labeling_configuration, "GoogleGeminiFilesBatchGateway", gateway_factory
     )
+    monkeypatch.setattr(vertex_batch, "LabelingVertexBatchGateway", gateway_factory)
     return gateway
 
 

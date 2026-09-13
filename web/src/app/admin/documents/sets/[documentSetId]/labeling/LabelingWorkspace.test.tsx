@@ -104,7 +104,9 @@ test("shows bundled labels and keeps Start Labeling unavailable until a provider
   render(<LabelingWorkspace documentSetId={7} />);
 
   expect(await screen.findByText("255 labels ready")).toBeInTheDocument();
-  expect(screen.getByText("No Google provider configured")).toBeInTheDocument();
+  expect(
+    screen.getByText("No Gemini connection configured")
+  ).toBeInTheDocument();
   expect(screen.getByText("No canonical chunks ready")).toBeInTheDocument();
   expect(
     screen.queryByRole("button", { name: "Upload taxonomy" })
@@ -129,8 +131,20 @@ test("prompts for a provider selection when multiple providers are available", a
   render(<LabelingWorkspace documentSetId={7} />);
 
   expect(
-    await screen.findByRole("combobox", { name: "Google provider" })
-  ).toHaveTextContent("Select a Google provider");
+    await screen.findByRole("combobox", { name: "Gemini connection" })
+  ).toHaveTextContent("Select a Gemini connection");
+});
+
+test("shows batch configuration errors and prevents starting while preserving label settings", async () => {
+  const configurationError = "Vertex batch storage is not configured.";
+  installFetchRouter({
+    setup: { ...readySetup, configuration_errors: [configurationError] },
+  });
+  render(<LabelingWorkspace documentSetId={7} />);
+
+  expect(await screen.findByText(configurationError)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Start Labeling" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Label Settings" })).toBeEnabled();
 });
 
 test("allows a new run when history confirms the setup's active run has finished", async () => {
