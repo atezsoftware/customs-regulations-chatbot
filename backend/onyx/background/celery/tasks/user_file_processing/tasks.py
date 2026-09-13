@@ -62,9 +62,14 @@ from onyx.db.search_settings import (
     get_active_search_settings,
 )
 from onyx.db.user_file import (
+    UserFileIndexRequestSuperseded,
     fetch_user_files_with_access_relationships,
+    finish_user_file_index_request,
     finish_user_file_projection_repair,
+    get_user_file_index_request_status,
     mark_user_file_reconcile_pending,
+    recover_user_file_index_requests,
+    start_user_file_index_request,
     start_user_file_projection_repair,
 )
 from onyx.document_index.factory import get_all_document_indices
@@ -330,6 +335,25 @@ def check_user_file_processing(self: Task, *, tenant_id: str) -> None:
             return None
 
         with get_session_with_current_tenant() as db_session:
+            index_deliveries = recover_user_file_index_requests(
+                db_session,
+                stale_before=datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(seconds=CELERY_USER_FILE_PROCESSING_TASK_EXPIRES),
+            )
+        for file_id, attempt_id in index_deliveries:
+            self.app.send_task(
+                OnyxCeleryTask.INDEX_SINGLE_USER_FILE,
+                kwargs={
+                    "user_file_id": str(file_id),
+                    "tenant_id": tenant_id,
+                    "index_request_attempt_id": str(attempt_id),
+                },
+                queue=OnyxCeleryQueues.USER_FILE_PROCESSING,
+                priority=OnyxCeleryPriority.HIGH,
+                expires=CELERY_USER_FILE_PROCESSING_TASK_EXPIRES,
+            )
+
+        with get_session_with_current_tenant() as db_session:
             user_file_ids = (
                 db_session.execute(
                     select(UserFile.id).where(
@@ -488,14 +512,72 @@ def _chunk_user_file_without_indexing(
     )
 
 
+def _index_requested_user_file(
+    user_file_id: str, tenant_id: str, attempt_id: str
+) -> None:
+    from onyx.regulatory.writer_publication import republish_user_file
+
+    file_id = _as_uuid(user_file_id)
+    token = _as_uuid(attempt_id)
+    from onyx.db.regulatory_publication import (
+        PublicationLeaseConflict,
+        PublicationOwnershipLost,
+    )
+
+    with get_session_with_current_tenant() as session:
+        if not start_user_file_index_request(session, file_id, token):
+            return
+        status = get_user_file_index_request_status(session, file_id)
+    try:
+        if status == UserFileStatus.CHUNKED:
+            if app_configs.REGULATORY_BATCH_INDEXING_ENABLED:
+                with get_session_with_current_tenant() as session:
+                    job_id = prepare_regulatory_indexing_job_from_chunks(
+                        file_id, tenant_id, session, index_request_attempt_id=token
+                    )
+                _enqueue_durable_regulatory_indexing(
+                    job_id=job_id, tenant_id=tenant_id, user_file_id=user_file_id
+                )
+            else:
+                count = republish_user_file(
+                    file_id,
+                    tenant_id,
+                    include_chunked=True,
+                    index_request_attempt_id=token,
+                )
+                if not count:
+                    raise ValueError("index request has no eligible canonical chunks")
+        elif status not in {UserFileStatus.COMPLETED, UserFileStatus.INDEXING}:
+            raise ValueError("index request file is no longer eligible")
+    except UserFileIndexRequestSuperseded:
+        return
+    except (PublicationLeaseConflict, PublicationOwnershipLost):
+        with get_session_with_current_tenant() as session:
+            finish_user_file_index_request(session, file_id, token, retry=True)
+        return
+    except Exception as exc:
+        with get_session_with_current_tenant() as session:
+            finish_user_file_index_request(
+                session, file_id, token, failure_code=f"index:{type(exc).__name__}"
+            )
+        raise
+    with get_session_with_current_tenant() as session:
+        finish_user_file_index_request(session, file_id, token)
+
+
 def index_user_file_impl(
     *,
     user_file_id: str,
     tenant_id: str,
     reproject_completed: bool = False,
     projection_repair_attempt_id: str | None = None,
+    index_request_attempt_id: str | None = None,
 ) -> None:
     """Phase two: project already-written chunk rows into the search index."""
+
+    if index_request_attempt_id is not None:
+        _index_requested_user_file(user_file_id, tenant_id, index_request_attempt_id)
+        return
 
     repair_phase = "validation"
     try:
@@ -890,12 +972,14 @@ def index_single_user_file(
     tenant_id: str,
     reproject_completed: bool = False,
     projection_repair_attempt_id: str | None = None,
+    index_request_attempt_id: str | None = None,
 ) -> None:
     index_user_file_impl(
         user_file_id=user_file_id,
         tenant_id=tenant_id,
         reproject_completed=reproject_completed,
         projection_repair_attempt_id=projection_repair_attempt_id,
+        index_request_attempt_id=index_request_attempt_id,
     )
 
 

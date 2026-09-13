@@ -6,6 +6,7 @@ from onyx.configs.app_configs import (
     CELERY_RESULT_EXPIRES,
     REDIS_DB_NUMBER_CELERY,
     REDIS_DB_NUMBER_CELERY_RESULT_BACKEND,
+    REDIS_DEPLOYMENT_DATABASES,
     REDIS_HEALTH_CHECK_INTERVAL,
     REDIS_HOST,
     REDIS_PASSWORD,
@@ -133,12 +134,17 @@ task_acks_late = True
 # region Task result backend settings
 # It's possible we don't even need celery's result backend, in which case all of the optimization below
 # might be irrelevant
-result_backend_transport_options: dict = {}
+result_backend_transport_options: dict[str, object] = {}
 if USE_SENTINEL:
     result_backend = f"{_SENTINEL_NODES}/{REDIS_DB_NUMBER_CELERY_RESULT_BACKEND}"
-    result_backend_transport_options = _SENTINEL_TRANSPORT_OPTIONS
+    result_backend_transport_options = dict(_SENTINEL_TRANSPORT_OPTIONS)
 else:
     result_backend = f"{REDIS_SCHEME}://{CELERY_PASSWORD_PART}{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB_NUMBER_CELERY_RESULT_BACKEND}{SSL_QUERY_PARAMS}"
+if REDIS_DEPLOYMENT_DATABASES is not None:
+    # Redis Pub/Sub channels are shared across logical databases.
+    result_backend_transport_options["global_keyprefix"] = (
+        f"onyx:redis-db:{REDIS_DB_NUMBER_CELERY_RESULT_BACKEND}:"
+    )
 result_expires = CELERY_RESULT_EXPIRES  # 86400 seconds is the default
 # endregion
 

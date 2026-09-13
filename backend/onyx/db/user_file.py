@@ -2,7 +2,7 @@ import datetime
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
@@ -12,10 +12,12 @@ from onyx.db.models import (
     Persona,
     Project__UserFile,
     RegulatoryChunk,
+    RegulatoryFilePublication,
     User,
     UserFile,
     UserFileProjectionRepair,
 )
+from onyx.document_index.publication_models import FileOwnership
 
 _PROJECTION_REPAIR_PENDING_STALE_AFTER = datetime.timedelta(minutes=2)
 _PROJECTION_REPAIR_RUNNING_STALE_AFTER = datetime.timedelta(hours=2)
@@ -26,6 +28,7 @@ def claim_user_file_projection_repair(
     user_file_id: UUID,
     *,
     now: datetime.datetime | None = None,
+    initial_index: bool = False,
 ) -> UUID | None:
     """Create one durable repair attempt, replacing only a stale/terminal one."""
 
@@ -33,11 +36,18 @@ def claim_user_file_projection_repair(
     user_file = db_session.scalar(
         select(UserFile).where(UserFile.id == user_file_id).with_for_update()
     )
-    if user_file is None or user_file.status is not UserFileStatus.COMPLETED:
+    required_status = (
+        UserFileStatus.CHUNKED if initial_index else UserFileStatus.COMPLETED
+    )
+    if user_file is None or user_file.status is not required_status:
         return None
 
-    repair = db_session.get(UserFileProjectionRepair, user_file_id)
+    repair = db_session.get(
+        UserFileProjectionRepair, user_file_id, with_for_update=True
+    )
     if repair is not None:
+        if initial_index and repair.status is UserFileProjectionRepairStatus.RUNNING:
+            return None
         stale_after = (
             _PROJECTION_REPAIR_PENDING_STALE_AFTER
             if repair.status is UserFileProjectionRepairStatus.PENDING
@@ -66,6 +76,7 @@ def claim_user_file_projection_repair(
         repair.status = UserFileProjectionRepairStatus.PENDING
         repair.updated_at = now
         repair.failure_code = None
+    repair.initial_index = initial_index
     db_session.add(repair)
     return attempt_id
 
@@ -566,3 +577,157 @@ def fetch_user_file_metadata_sync_candidates(db_session: Session) -> list[UUID]:
             )
         )
     ]
+
+
+class UserFileIndexRequestSuperseded(ValueError):
+    """The delivery token no longer owns the explicit index request."""
+
+
+def recover_user_file_index_requests(
+    db_session: Session, *, stale_before: datetime.datetime, limit: int = 100
+) -> list[tuple[UUID, UUID]]:
+    """Recover expired hints/claims without overtaking a live publication lease."""
+    from onyx.db.regulatory_publication import lock_publication_acquisition
+
+    active = (
+        UserFileProjectionRepairStatus.PENDING,
+        UserFileProjectionRepairStatus.RUNNING,
+    )
+    candidates = db_session.scalars(
+        select(UserFileProjectionRepair.user_file_id)
+        .outerjoin(
+            RegulatoryFilePublication,
+            RegulatoryFilePublication.user_file_id
+            == UserFileProjectionRepair.user_file_id,
+        )
+        .where(
+            or_(
+                RegulatoryFilePublication.lease_expires_at.is_(None),
+                RegulatoryFilePublication.lease_expires_at <= func.clock_timestamp(),
+            ),
+            UserFileProjectionRepair.initial_index.is_(True),
+            UserFileProjectionRepair.status.in_(active),
+            UserFileProjectionRepair.updated_at <= stale_before,
+        )
+        .order_by(UserFileProjectionRepair.updated_at)
+        .limit(limit)
+    ).all()
+    deliveries = []
+    for file_id in candidates:
+        if not lock_publication_acquisition(db_session, file_id, blocking=False):
+            continue
+        # Match publication/deletion lock order. Never retain these locks over I/O.
+        publication = db_session.scalar(
+            select(RegulatoryFilePublication)
+            .where(RegulatoryFilePublication.user_file_id == file_id)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        now = db_session.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime.datetime)
+        if publication is not None and publication.lease_expires_at > now:
+            continue
+        if publication is None and db_session.scalar(
+            select(exists().where(RegulatoryFilePublication.user_file_id == file_id))
+        ):
+            continue
+        repair = db_session.scalar(
+            select(UserFileProjectionRepair)
+            .where(
+                UserFileProjectionRepair.user_file_id == file_id,
+                UserFileProjectionRepair.initial_index.is_(True),
+                UserFileProjectionRepair.status.in_(active),
+                UserFileProjectionRepair.updated_at <= stale_before,
+            )
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        if repair is None:
+            continue
+        repair.attempt_id = uuid4()
+        repair.status = UserFileProjectionRepairStatus.PENDING
+        repair.updated_at = now
+        deliveries.append((file_id, repair.attempt_id))
+    db_session.commit()
+    return deliveries
+
+
+def start_user_file_index_request(
+    db_session: Session, user_file_id: UUID, attempt_id: UUID
+) -> bool:
+    claimed = db_session.scalar(
+        update(UserFileProjectionRepair)
+        .where(
+            UserFileProjectionRepair.user_file_id == user_file_id,
+            UserFileProjectionRepair.attempt_id == attempt_id,
+            UserFileProjectionRepair.initial_index.is_(True),
+            UserFileProjectionRepair.status == UserFileProjectionRepairStatus.PENDING,
+        )
+        .values(status=UserFileProjectionRepairStatus.RUNNING, updated_at=func.now())
+        .returning(UserFileProjectionRepair.user_file_id)
+    )
+    db_session.commit()
+    return claimed is not None
+
+
+def validate_user_file_index_request(owner: FileOwnership, attempt_id: UUID) -> None:
+    """Validate after lease acquisition, before recovery/provider/index side effects."""
+    from onyx.db.engine.sql_engine import get_session_with_tenant
+    from onyx.db.regulatory_publication import PublicationStore
+
+    with get_session_with_tenant(tenant_id=owner.scope.tenant_id) as session:
+        PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
+        repair = session.get(UserFileProjectionRepair, owner.user_file_id)
+        if (
+            repair is None
+            or not repair.initial_index
+            or repair.attempt_id != attempt_id
+            or repair.status is not UserFileProjectionRepairStatus.RUNNING
+        ):
+            raise UserFileIndexRequestSuperseded(
+                "index request delivery was superseded"
+            )
+
+
+def get_user_file_index_request_status(
+    db_session: Session, user_file_id: UUID
+) -> UserFileStatus | None:
+    return db_session.scalar(select(UserFile.status).where(UserFile.id == user_file_id))
+
+
+def finish_user_file_index_request(
+    db_session: Session,
+    user_file_id: UUID,
+    attempt_id: UUID,
+    *,
+    failure_code: str | None = None,
+    retry: bool = False,
+) -> bool:
+    # File-before-intent agrees with FK cascading deletion and request creation.
+    file = db_session.get(UserFile, user_file_id, with_for_update=True)
+    repair = db_session.scalar(
+        select(UserFileProjectionRepair)
+        .where(
+            UserFileProjectionRepair.user_file_id == user_file_id,
+            UserFileProjectionRepair.attempt_id == attempt_id,
+            UserFileProjectionRepair.initial_index.is_(True),
+            UserFileProjectionRepair.status == UserFileProjectionRepairStatus.RUNNING,
+        )
+        .with_for_update()
+    )
+    if file is None or repair is None:
+        db_session.rollback()
+        return False
+    repair.status = (
+        UserFileProjectionRepairStatus.PENDING
+        if retry
+        else UserFileProjectionRepairStatus.FAILED
+        if failure_code
+        else UserFileProjectionRepairStatus.SUCCEEDED
+    )
+    repair.failure_code = failure_code[:128] if failure_code else None
+    repair.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    if failure_code and not retry and file.status is UserFileStatus.CHUNKED:
+        file.status = UserFileStatus.FAILED
+    db_session.commit()
+    return True

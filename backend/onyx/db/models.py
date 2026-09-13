@@ -5607,7 +5607,18 @@ class UserFileProjectionRepair(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    initial_index: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_user_file_index_request_pending",
+            "updated_at",
+            postgresql_where=text("initial_index AND status = 'PENDING'"),
+        ),
+    )
 
 
 class RegulatoryChunk(Base):

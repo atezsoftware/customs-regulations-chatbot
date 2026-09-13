@@ -952,6 +952,27 @@ REDIS_DB_NUMBER_CELERY_RESULT_BACKEND = int(
 )
 REDIS_DB_NUMBER_CELERY = int(os.environ.get("REDIS_DB_NUMBER_CELERY", 15))  # broker
 
+# One deployment setting takes precedence over separately managed legacy values.
+# Order: application/coordination, Celery broker, Celery results.
+REDIS_DEPLOYMENT_DATABASES = os.environ.get("REDIS_DEPLOYMENT_DATABASES")
+if REDIS_DEPLOYMENT_DATABASES is not None:
+    _deployment_databases = REDIS_DEPLOYMENT_DATABASES.split(",")
+    if len(_deployment_databases) != 3 or any(
+        not value.strip().isascii() or not value.strip().isdigit()
+        for value in _deployment_databases
+    ):
+        raise ValueError(
+            "REDIS_DEPLOYMENT_DATABASES requires three distinct non-negative database numbers"
+        )
+    _application_db, _broker_db, _result_db = map(int, _deployment_databases)
+    if len({_application_db, _broker_db, _result_db}) != 3:
+        raise ValueError(
+            "REDIS_DEPLOYMENT_DATABASES requires three distinct non-negative database numbers"
+        )
+    REDIS_DB_NUMBER = _application_db
+    REDIS_DB_NUMBER_CELERY = _broker_db
+    REDIS_DB_NUMBER_CELERY_RESULT_BACKEND = _result_db
+
 # will propagate to both our redis client as well as celery's redis client
 REDIS_HEALTH_CHECK_INTERVAL = int(os.environ.get("REDIS_HEALTH_CHECK_INTERVAL", 60))
 

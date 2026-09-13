@@ -151,6 +151,7 @@ def _create_owned_regulatory_indexing_job(
     tenant_id: str,
     snapshot: RegulatoryIndexingConfigSnapshot,
     now: datetime.datetime,
+    index_request_attempt_id: UUID | None = None,
 ) -> RegulatoryIndexingJob:
     from uuid import uuid4
 
@@ -169,6 +170,10 @@ def _create_owned_regulatory_indexing_job(
     )
     owner = authority.acquire(user_file_id, owner_id=uuid4(), ttl=LEASE_TTL)
     try:
+        if index_request_attempt_id is not None:
+            from onyx.db.user_file import validate_user_file_index_request
+
+            validate_user_file_index_request(owner, index_request_attempt_id)
         return create_or_get_regulatory_indexing_job(
             db_session,
             user_file_id=user_file_id,
@@ -241,6 +246,8 @@ def prepare_regulatory_indexing_job_from_chunks(
     user_file_id: UUID,
     tenant_id: str,
     db_session: Session,
+    *,
+    index_request_attempt_id: UUID | None = None,
 ) -> UUID:
     """Create a durable job that reuses the production CHUNKED source of truth."""
 
@@ -277,6 +284,7 @@ def prepare_regulatory_indexing_job_from_chunks(
         tenant_id=tenant_id,
         snapshot=snapshot,
         now=now,
+        index_request_attempt_id=index_request_attempt_id,
     )
     if job.content_hash != content_hash:
         raise RuntimeError(

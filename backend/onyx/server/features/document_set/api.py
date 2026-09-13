@@ -32,7 +32,7 @@ from onyx.db.document_set import delete_document_set as db_delete_document_set
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission, UserFileStatus
 from onyx.db.models import DocumentSet as DocumentSetDBModel
-from onyx.db.models import User
+from onyx.db.models import User, UserFile
 from onyx.db.projects import upload_files_to_user_files_with_indexing
 from onyx.db.regulatory_chunks import get_chunk_counts_for_files
 from onyx.db.regulatory_indexing_jobs import (
@@ -64,8 +64,11 @@ from onyx.server.features.projects.models import (
 from onyx.server.features.projects.user_file_sync import (
     trigger_user_file_metadata_sync,
 )
+from onyx.utils.logger import setup_logger
 from onyx.utils.variable_functionality import fetch_ee_implementation_or_noop
 from shared_configs.contextvars import get_current_tenant_id
+
+logger = setup_logger()
 
 router = APIRouter(prefix="/manage")
 
@@ -280,11 +283,14 @@ def _enqueue_user_file_indexing(
     *,
     reproject_completed: bool = False,
     projection_repair_attempt_id: UUID | None = None,
+    index_request_attempt_id: UUID | None = None,
 ) -> None:
     kwargs: dict[str, str | bool] = {
         "user_file_id": str(user_file_id),
         "tenant_id": tenant_id,
     }
+    if index_request_attempt_id is not None:
+        kwargs["index_request_attempt_id"] = str(index_request_attempt_id)
     if reproject_completed:
         kwargs["reproject_completed"] = True
     if projection_repair_attempt_id is not None:
@@ -296,6 +302,28 @@ def _enqueue_user_file_indexing(
         priority=OnyxCeleryPriority.HIGH,
         expires=CELERY_USER_FILE_PROCESSING_TASK_EXPIRES,
     )
+
+
+def _request_user_file_indexing(
+    user_files: list[UserFile], db_session: Session, tenant_id: str
+) -> None:
+    deliveries = []
+    for user_file in sorted(user_files, key=lambda file: file.id):
+        attempt_id = claim_user_file_projection_repair(
+            db_session, user_file.id, initial_index=True
+        )
+        if attempt_id is not None:
+            deliveries.append((user_file.id, attempt_id))
+    db_session.commit()
+    for file_id, attempt_id in deliveries:
+        try:
+            _enqueue_user_file_indexing(
+                file_id, tenant_id, index_request_attempt_id=attempt_id
+            )
+        except Exception:
+            logger.exception(
+                "Index request delivery failed; durable recovery will retry"
+            )
 
 
 @router.post("/admin/document-set/{document_set_id}/files/{file_id}/index")
@@ -318,7 +346,7 @@ def index_document_set_file(
             f"Only chunked files can be indexed; this one is {user_file.status.value}",
         )
 
-    _enqueue_user_file_indexing(user_file.id, tenant_id)
+    _request_user_file_indexing([user_file], db_session, tenant_id)
     return UserFileSnapshot.from_model(user_file)
 
 
@@ -429,8 +457,7 @@ def index_document_set_chunked_files(
         for user_file in fetch_user_files_for_document_set(db_session, document_set_id)
         if user_file.status == UserFileStatus.CHUNKED
     ]
-    for user_file in chunked_files:
-        _enqueue_user_file_indexing(user_file.id, tenant_id)
+    _request_user_file_indexing(chunked_files, db_session, tenant_id)
 
     return IndexChunkedFilesResponse(queued=len(chunked_files))
 

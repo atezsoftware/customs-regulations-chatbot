@@ -41,9 +41,16 @@ def validate_scope(environment: str, ref: str, sha: str) -> None:
 def prepare(driver: "Driver") -> None:
     driver.validate_target()
     if driver.continue_protected_release():
+        if driver.redis_isolation("reserve"):
+            driver.record_started()
+            driver.stop_api()
+            driver.drain_background()
+            driver.stop_background()
+            driver.assert_no_writers()
         driver.record_installing()
         return
     driver.inventory()
+    driver.redis_isolation("reserve")
     driver.create_probe()
     driver.inspect_indices()
     driver.record_started()
@@ -413,6 +420,21 @@ class Driver:
                 raise CutoverRefusal("fixed_acceptance_phase_required")
             emit_acceptance_report(result.stdout, acceptance_phase, self.sha)
         if result.returncode:
+            if (
+                args[:4] == ["kubectl", "--namespace", NAMESPACE, "exec"]
+                and args[-3:-2] == ['. /vault/secrets/config; exec python - "$1"']
+                and args[-2:]
+                in (
+                    ["redis-isolation", "reserve"],
+                    ["redis-isolation", "verify"],
+                    ["redis-isolation", "worker"],
+                )
+            ):
+                for line in result.stdout.splitlines():
+                    if re.fullmatch(
+                        r"NOT_READY redis_isolation [A-Za-z_][A-Za-z0-9_]{0,99}", line
+                    ):
+                        print(line, flush=True)
             # kubectl/provider errors can contain credentials or source text.
             print(f"command_failed:{args[0]}:{operation}", flush=True)
             raise CutoverRefusal(f"command_failed:{args[0]}:{operation}")
@@ -445,6 +467,7 @@ class Driver:
         data = previous["data"]
         if data["phase"] != "released":
             raise CutoverRefusal("unfinished_cutover_requires_reviewed_recovery")
+        current_writer_nodes: set[str] = set()
         for app in APPS:
             pods = self.pods(app)
             if (
@@ -458,10 +481,14 @@ class Driver:
                 for item in pods[0]["spec"]["containers"]
             ):
                 raise CutoverRefusal("unrecognized_writer_image")
+            node = pods[0]["spec"].get("nodeName")
+            if not isinstance(node, str) or not node:
+                raise CutoverRefusal("current_writer_node_required")
+            current_writer_nodes.add(node)
         self.indices = json.loads(data["indices"])
         self.scope = json.loads(data["scope"])
         self.container = data["container"]
-        self.writer_nodes = set(json.loads(data["writer_nodes"]))
+        self.writer_nodes = current_writer_nodes
         return True
 
     def inventory(self, *, require_scope: bool = True) -> None:
@@ -720,9 +747,88 @@ class Driver:
             json.dumps({"indices": self.indices, "scope": self.scope}),
         )
 
-    def verify_runtime(self, *, readiness: bool = True) -> None:
+    def redis_isolation(self, mode: str, *, app: str = "background") -> bool:
+        if (
+            mode not in {"reserve", "verify", "worker"}
+            or app not in APPS
+            or (mode != "verify" and app != "background")
+        ):
+            raise CutoverRefusal("fixed_redis_isolation_operation_required")
+        pods = self.pods(app)
+        if (
+            len(pods) != 1
+            or not self.ready(pods[0])
+            or pods[0]["metadata"].get("deletionTimestamp")
+        ):
+            raise CutoverRefusal("single_ready_redis_isolation_pod_required")
+        pod = pods[0]
+        containers = [
+            item
+            for item in pod["spec"]["containers"]
+            if item["image"].startswith(REPOSITORY + ":")
+        ]
+        if len(containers) != 1 or (
+            mode != "reserve" and containers[0]["image"] != f"{REPOSITORY}:{self.sha}"
+        ):
+            raise CutoverRefusal("exact_redis_isolation_container_required")
+        script = Path(__file__).with_name("regulatory_redis_isolation.py").read_text()
+        output = self.command(
+            [
+                "kubectl",
+                "--namespace",
+                NAMESPACE,
+                "exec",
+                "-i",
+                pod["metadata"]["name"],
+                "-c",
+                containers[0]["name"],
+                "--",
+                "sh",
+                "-eu",
+                "-c",
+                '. /vault/secrets/config; exec python - "$1"',
+                "redis-isolation",
+                mode,
+            ],
+            script,
+            timeout=60,
+        )
+        if len(output.encode()) > 256 or len(output.splitlines()) != 1:
+            raise CutoverRefusal("fixed_redis_isolation_report_required")
+        try:
+            report = json.loads(output)
+        except (ValueError, TypeError):
+            raise CutoverRefusal("fixed_redis_isolation_report_required") from None
+        expected = {
+            "reserve": "reserved",
+            "verify": "verified",
+            "worker": "worker_verified",
+        }[mode]
+        if (
+            not isinstance(report, dict)
+            or set(report) != {"redis_isolation", "migration_required"}
+            or report["redis_isolation"] != expected
+            or type(report["migration_required"]) is not bool
+            or (mode != "reserve" and report["migration_required"])
+        ):
+            raise CutoverRefusal("fixed_redis_isolation_report_required")
+        print(json.dumps(report, sort_keys=True), flush=True)
+        return report["migration_required"]
+
+    def verify_runtime(
+        self,
+        *,
+        readiness: bool = True,
+        redis_isolation: bool = True,
+        redis_worker: bool = True,
+    ) -> None:
         for app in APPS:
             self.verify_app(app, readiness=readiness)
+        if redis_isolation:
+            for app in APPS:
+                self.redis_isolation("verify", app=app)
+            if redis_worker:
+                self.redis_isolation("worker")
 
     def verify_app(self, app: str, *, readiness: bool = True) -> None:
         if app not in APPS:
@@ -870,6 +976,7 @@ def render_values(enabled: bool = False) -> None:
         environment["enabled"] = True
         parameters = environment.setdefault("parameters", [])
         updates = {
+            "REDIS_DEPLOYMENT_DATABASES": "4,5,6",
             "REGULATORY_ANNEX_WORKER_ENABLED": "true",
             "REGULATORY_ANNEX_ENVIRONMENT": "dev",
             "REGULATORY_ANNEX_UPDATES_ENABLED": str(enabled).lower(),
@@ -3861,7 +3968,7 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
     if state["sha"] != driver.sha or state["phase"] != "released":
         raise CutoverRefusal("successful_matching_cutover_required")
     require_release_runs(driver.sha)
-    driver.verify_runtime(readiness=False)
+    driver.verify_runtime(readiness=False, redis_isolation=False)
     verify_frontend(driver)
     print(
         json.dumps(
@@ -4020,6 +4127,7 @@ def deploy_same_image(driver: Driver, enabled: bool) -> None:
         if enabled and app == "background":
             print("ACTIVATION_STAGE background_readiness", flush=True)
             driver.verify_app("background")
+            driver.redis_isolation("worker")
 
 
 def verify_or_activate(driver: Driver, activate: bool) -> None:
@@ -4035,7 +4143,7 @@ def verify_or_activate(driver: Driver, activate: bool) -> None:
         try:
             deploy_same_image(driver, True)
             print("ACTIVATION_STAGE final_runtime", flush=True)
-            driver.verify_runtime()
+            driver.verify_runtime(redis_worker=False)
             verify_frontend(driver)
             print("ACTIVATION_STAGE canary", flush=True)
             acceptance(driver, "canary")

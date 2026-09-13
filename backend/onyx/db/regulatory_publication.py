@@ -4,9 +4,12 @@ Each ordinary operation owns a short transaction. Finalize joins the caller's
 canonical activation transaction. Lock order: file authority, canonical rows,
 then observation clock; never hold the clock over network/model/index work.
 All writers must use this authority before acquiring canonical/UserFile locks.
+Acquisition/recovery first take the shared transaction acquisition lock, including
+when the authority row has not yet been created.
 """
 
 from datetime import datetime, timedelta
+from hashlib import sha256
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -30,6 +33,29 @@ from onyx.document_index.publication_models import (
     publication_digest,
 )
 from onyx.regulatory.amendments.annexes.config import ANNEX_DATABASE_IDENTITY
+
+
+def lock_publication_acquisition(
+    session: Session, user_file_id: UUID, *, blocking: bool = True
+) -> bool:
+    """Serialize acquisition/recovery even before the first authority row exists."""
+    key = int.from_bytes(
+        sha256(f"file-publication-acquisition:{user_file_id}".encode()).digest()[:8],
+        byteorder="big",
+        signed=True,
+    )
+    if blocking:
+        session.execute(select(func.pg_advisory_xact_lock(key)))
+        return True
+    return bool(session.scalar(select(func.pg_try_advisory_xact_lock(key))))
+
+
+class PublicationLeaseConflict(ValueError):
+    """Another live writer owns this file; delivery can retry later."""
+
+
+class PublicationOwnershipLost(ValueError):
+    """This writer must stop; its expired or superseded work is recoverable."""
 
 
 class PublicationStore:
@@ -76,7 +102,7 @@ class PublicationStore:
             or now is None
             or row.lease_expires_at <= now
         ):
-            raise ValueError("publication ownership lost or expired")
+            raise PublicationOwnershipLost("publication ownership lost or expired")
         return row
 
     def _ownership(self, row: RegulatoryFilePublication) -> FileOwnership:
@@ -95,6 +121,7 @@ class PublicationStore:
             raise ValueError("lease duration must be positive and at most one hour")
         with get_session_with_tenant(tenant_id=self.scope.tenant_id) as session:
             self._check_session(session)
+            lock_publication_acquisition(session, user_file_id)
             if session.get(UserFile, user_file_id) is None:
                 raise ValueError("publication file scope missing")
             now = session.scalar(select(func.clock_timestamp()))
@@ -124,7 +151,9 @@ class PublicationStore:
                 raise ValueError("publication file environment scope mismatch")
             if row.lease_expires_at > now:
                 if row.owner_id != owner_id:
-                    raise ValueError("publication ownership already leased")
+                    raise PublicationLeaseConflict(
+                        "publication ownership already leased"
+                    )
                 return self._ownership(row)
             row.owner_id = owner_id
             row.fencing_token += 1

@@ -36,6 +36,7 @@ def test_cutover_orders_barrier_before_deployment_and_release() -> None:
         "validate_target",
         "continue_protected_release",
         "inventory",
+        "redis_isolation",
         "create_probe",
         "inspect_indices",
         "record_started",
@@ -924,7 +925,9 @@ def test_diagnose_checks_released_runtime_and_executes_only_fixed_wrapper(
     ):
         cutover.diagnose_release(driver, "b" * 40)
     runs.assert_called_once_with(driver.sha)
-    driver.verify_runtime.assert_called_once_with(readiness=False)
+    driver.verify_runtime.assert_called_once_with(
+        readiness=False, redis_isolation=False
+    )
     frontend.assert_called_once_with(driver)
     call = driver.command.call_args
     assert call.kwargs["timeout"] == 180
@@ -1082,6 +1085,7 @@ def test_runtime_waits_for_all_old_pods_then_checks_worker() -> None:
             ],
         ),
         patch.object(driver, "worker_readiness_probe", return_value=True) as command,
+        patch.object(driver, "redis_isolation"),
         patch("time.sleep") as sleep,
     ):
         driver.verify_runtime()
@@ -1437,20 +1441,26 @@ def test_activation_consumer_ready_before_api_creation(
     with patch.object(cutover, "render_values"):
         cutover.deploy_same_image(driver, enabled)
     events = [
-        call for call in driver.method_calls if call[0] in {"command", "verify_app"}
+        call
+        for call in driver.method_calls
+        if call[0] in {"command", "verify_app", "redis_isolation"}
     ]
     assert events[0].args[0][3] == f"customs-regulations-{order[0]}-dev"
     if enabled:
         assert events[1][0] == "verify_app" and events[1].args == ("background",)
-        assert events[2].args[0][3] == "customs-regulations-api-dev"
+        assert events[2][0] == "redis_isolation" and events[2].args == ("worker",)
+        assert events[3].args[0][3] == "customs-regulations-api-dev"
     else:
         assert events[1].args[0][3] == "customs-regulations-background-dev"
 
 
-def test_failed_consumer_admission_never_enables_api() -> None:
+@pytest.mark.parametrize("failure_method", ["verify_app", "redis_isolation"])
+def test_failed_consumer_admission_never_enables_api(failure_method: str) -> None:
     driver = Mock(spec=cutover.Driver)
     driver.sha = "a" * 40
-    driver.verify_app.side_effect = cutover.CutoverRefusal("worker_readiness_timeout")
+    getattr(driver, failure_method).side_effect = cutover.CutoverRefusal(
+        "worker_readiness_timeout"
+    )
     with patch.object(cutover, "render_values"), pytest.raises(cutover.CutoverRefusal):
         cutover.deploy_same_image(driver, True)
     assert driver.command.call_count == 1
@@ -2466,3 +2476,256 @@ def test_source_package_failure_survives_canary_transport(
         cutover.CutoverRefusal, match="acceptance_source_package_status_refused"
     ):
         cutover.emit_acceptance_report(json.dumps(report), "canary", "a" * 40)
+
+
+@pytest.mark.parametrize("migration", [False, True])
+def test_protected_redis_migration_quiesces_without_rebarrier(migration: bool) -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.continue_protected_release.return_value = True
+    driver.redis_isolation.return_value = migration
+    cutover.prepare(driver)
+    expected = ["validate_target", "continue_protected_release", "redis_isolation"]
+    if migration:
+        expected += [
+            "record_started",
+            "stop_api",
+            "drain_background",
+            "stop_background",
+            "assert_no_writers",
+        ]
+    assert [call[0] for call in driver.method_calls] == expected + ["record_installing"]
+    driver.redis_isolation.assert_called_once_with("reserve")
+    driver.block_indices.assert_not_called()
+
+
+def test_redis_reservation_refusal_prevents_any_stop() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.continue_protected_release.return_value = True
+    driver.redis_isolation.side_effect = cutover.CutoverRefusal("occupied")
+    with pytest.raises(cutover.CutoverRefusal):
+        cutover.prepare(driver)
+    driver.stop_api.assert_not_called()
+    driver.drain_background.assert_not_called()
+    driver.record_installing.assert_not_called()
+
+
+def test_redis_helper_injection_is_fixed_and_parses_exact_receipt() -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(driver, "pods", return_value=[runtime_pod()]),
+        patch.object(Path, "read_text", return_value="# fixed helper") as source,
+        patch.object(
+            driver,
+            "command",
+            return_value='{"redis_isolation":"reserved","migration_required":true}',
+        ) as command,
+    ):
+        assert driver.redis_isolation("reserve") is True
+    source.assert_called_once()
+    assert command.call_args.args[1] == "# fixed helper"
+    args = command.call_args.args[0]
+    assert args[-3:] == [
+        '. /vault/secrets/config; exec python - "$1"',
+        "redis-isolation",
+        "reserve",
+    ]
+    assert "-i" in args
+    assert command.call_args.kwargs["timeout"] == 60
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        '{"redis_isolation":"verified","migration_required":true}',
+        '{"redis_isolation":"verified","migration_required":false,"extra":"secret"}',
+        '{"redis_isolation":"reserved","migration_required":false}',
+    ],
+)
+def test_redis_verification_refuses_wrong_receipt(receipt: str) -> None:
+    driver = cutover.Driver("a" * 40)
+    with (
+        patch.object(driver, "pods", return_value=[runtime_pod()]),
+        patch.object(Path, "read_text", return_value="helper"),
+        patch.object(driver, "command", return_value=receipt),
+        pytest.raises(cutover.CutoverRefusal),
+    ):
+        driver.redis_isolation("verify", app="api")
+
+
+def test_runtime_redis_checks_after_settled_apps_only_once() -> None:
+    driver = cutover.Driver("a" * 40)
+    events = Mock()
+    with (
+        patch.object(driver, "verify_app", events.verify_app),
+        patch.object(driver, "redis_isolation", events.redis_isolation),
+    ):
+        driver.verify_runtime()
+    assert [(call[0], call.args, call.kwargs) for call in events.method_calls] == [
+        ("verify_app", ("api",), {"readiness": True}),
+        ("verify_app", ("background",), {"readiness": True}),
+        ("redis_isolation", ("verify",), {"app": "api"}),
+        ("redis_isolation", ("verify",), {"app": "background"}),
+        ("redis_isolation", ("worker",), {}),
+    ]
+
+
+def test_redis_deployment_values_override_both_apps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    directory = tmp_path / "devops/dev/customs-regulations"
+    directory.mkdir(parents=True)
+    for app in cutover.APPS:
+        (directory / f"customs-regulations-{app}-values.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "app": {
+                        "environment": {
+                            "parameters": [
+                                {
+                                    "name": "REDIS_DEPLOYMENT_DATABASES",
+                                    "value": "0,15,14",
+                                }
+                            ]
+                        }
+                    }
+                }
+            )
+        )
+    cutover.render_values()
+    for app in cutover.APPS:
+        data = yaml.safe_load(
+            (directory / f"customs-regulations-{app}-values.yaml").read_text()
+        )
+        assert [
+            entry
+            for entry in data["app"]["environment"]["parameters"]
+            if entry["name"] == "REDIS_DEPLOYMENT_DATABASES"
+        ] == [{"name": "REDIS_DEPLOYMENT_DATABASES", "value": "4,5,6"}]
+
+
+def test_redis_failure_keeps_only_fixed_safe_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    driver = cutover.Driver("a" * 40)
+    args = [
+        "kubectl",
+        "--namespace",
+        cutover.NAMESPACE,
+        "exec",
+        "pod",
+        "--",
+        "sh",
+        "-c",
+        '. /vault/secrets/config; exec python - "$1"',
+        "redis-isolation",
+        "verify",
+    ]
+    with (
+        patch.object(
+            cutover.subprocess,
+            "run",
+            return_value=Mock(
+                returncode=1,
+                stdout="NOT_READY redis_isolation OwnerMismatch\nsecret body\nNOT_READY redis_isolation secret credential\n",
+                stderr="secret credential",
+            ),
+        ),
+        pytest.raises(cutover.CutoverRefusal),
+    ):
+        driver.command(args, "fixed-helper", timeout=60)
+    output = capsys.readouterr().out
+    assert "NOT_READY redis_isolation OwnerMismatch" in output
+    assert "secret" not in output
+
+
+def test_activation_does_not_repeat_already_verified_background_worker() -> None:
+    driver = Mock(spec=cutover.Driver)
+    driver.sha = "a" * 40
+    driver.get.return_value = {"data": {"sha": driver.sha, "phase": "released"}}
+    with (
+        patch.object(cutover, "require_release_runs"),
+        patch.object(cutover, "verify_frontend"),
+        patch.object(cutover, "acceptance"),
+        patch.object(cutover, "deploy_same_image"),
+    ):
+        cutover.verify_or_activate(driver, True)
+    assert driver.verify_runtime.call_args_list[-1].kwargs == {"redis_worker": False}
+
+
+def test_failed_migration_drain_keeps_new_transition_for_failure_handler() -> None:
+    import json
+
+    driver = cutover.Driver("a" * 40)
+    persisted: dict[str, Any] = {"data": {"sha": "b" * 40, "phase": "released"}}
+
+    def kubectl(*args: str, stdin: str | None = None) -> str:
+        assert args == ("apply", "-f", "-") and stdin is not None
+        persisted.clear()
+        persisted.update(json.loads(stdin))
+        return ""
+
+    with (
+        patch.object(driver, "validate_target"),
+        patch.object(driver, "continue_protected_release", return_value=True),
+        patch.object(driver, "redis_isolation", return_value=True),
+        patch.object(driver, "kubectl", side_effect=kubectl),
+        patch.object(driver, "get", side_effect=lambda *_args: persisted),
+        patch.object(driver, "stop_api") as stop,
+        patch.object(
+            driver, "drain_background", side_effect=RuntimeError("drain failed")
+        ) as drain,
+        patch.object(driver, "stop_background") as background,
+        patch.object(driver, "record_installing") as install,
+    ):
+        with pytest.raises(RuntimeError, match="drain failed"):
+            cutover.prepare(driver)
+        assert persisted["data"]["sha"] == driver.sha
+        assert persisted["data"]["phase"] == "quiescing"
+        install.assert_not_called()
+        background.assert_not_called()
+        drain.side_effect = None
+        driver.failure()
+        assert stop.call_count == 2
+        background.assert_called_once()
+
+
+@pytest.mark.parametrize("missing_node", [False, True])
+def test_protected_release_captures_current_pod_nodes(missing_node: bool) -> None:
+    import json
+
+    driver = cutover.Driver("a" * 40)
+    state = {
+        "metadata": {"name": cutover.STATE},
+        "data": {
+            "sha": "b" * 40,
+            "phase": "released",
+            "indices": '{"index":"uuid"}',
+            "scope": '{"ownership":"retained"}',
+            "container": "main",
+            "writer_nodes": json.dumps(["terminated-original-node"]),
+        },
+    }
+    pods = [runtime_pod(sha="b" * 40), runtime_pod(sha="b" * 40)]
+    pods[0]["spec"]["nodeName"] = "current-api-node"
+    if not missing_node:
+        pods[1]["spec"]["nodeName"] = "current-background-node"
+    with (
+        patch.object(driver, "get", return_value={"items": [state]}),
+        patch.object(driver, "pods", side_effect=[[pod] for pod in pods]),
+    ):
+        if missing_node:
+            with pytest.raises(
+                cutover.CutoverRefusal, match="current_writer_node_required"
+            ):
+                driver.continue_protected_release()
+        else:
+            assert driver.continue_protected_release() is True
+            assert driver.writer_nodes == {
+                "current-api-node",
+                "current-background-node",
+            }
+            assert driver.indices == {"index": "uuid"}
+            assert driver.scope == {"ownership": "retained"}

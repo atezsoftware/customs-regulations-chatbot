@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from elasticsearch import Elasticsearch
 
-from onyx.db.regulatory_publication import PublicationStore
+from onyx.db.regulatory_publication import PublicationOwnershipLost, PublicationStore
 from onyx.db.regulatory_writer_publication import (
     finalize_writer_publication,
     pending_writer_manifest,
@@ -77,7 +77,7 @@ def execute_writer_publication(
                 }
             for ordinal in reservations.ordinals:
                 if lost.is_set():
-                    raise ValueError("writer publication heartbeat lost")
+                    raise PublicationOwnershipLost("writer publication heartbeat lost")
                 authority.reservations(owner)
                 if ordinal in projections:
                     adapter.upsert(reservations, projections[ordinal])
@@ -85,7 +85,7 @@ def execute_writer_publication(
                     adapter.tombstone(reservations, ordinal)
             proofs.append(adapter.verify(reservations, tuple(projections.values())))
         if lost.is_set():
-            raise ValueError("writer publication heartbeat lost")
+            raise PublicationOwnershipLost("writer publication heartbeat lost")
     # The heartbeat has joined before authority/canonical activation locks.
     if activate:
         if manifest.kind in {"durable", "cancellation"}:
@@ -461,6 +461,7 @@ def republish_user_file(
     target_search_settings_id: int | None = None,
     adopt_original: bool = False,
     before_stage: Callable[[], bool] | None = None,
+    index_request_attempt_id: "UUID | None" = None,
 ) -> int:
     from uuid import uuid4
 
@@ -481,6 +482,10 @@ def republish_user_file(
     )
     owner = authority.acquire(user_file_id, owner_id=uuid4(), ttl=LEASE_TTL)
     try:
+        if index_request_attempt_id is not None:
+            from onyx.db.user_file import validate_user_file_index_request
+
+            validate_user_file_index_request(owner, index_request_attempt_id)
         owner = recover_owned_writer_before_next(owner)
         with publication_heartbeat(owner) as lost:
             inputs = load_owned_writer_inputs(owner)
@@ -541,7 +546,9 @@ def republish_user_file(
                 }
             )
             if lost.is_set():
-                raise ValueError("reindex publication ownership heartbeat lost")
+                raise PublicationOwnershipLost(
+                    "reindex publication ownership heartbeat lost"
+                )
             if before_stage is not None and not before_stage():
                 return 0
         with ElasticsearchClient() as transport:

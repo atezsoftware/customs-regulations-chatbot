@@ -11,6 +11,7 @@ redis_retry_on_timeout = shared_config.redis_retry_on_timeout
 redis_backend_health_check_interval = shared_config.redis_backend_health_check_interval
 
 result_backend = shared_config.result_backend
+result_backend_transport_options = shared_config.result_backend_transport_options
 result_expires = shared_config.result_expires  # 86400 seconds is the default
 
 task_default_priority = shared_config.task_default_priority
