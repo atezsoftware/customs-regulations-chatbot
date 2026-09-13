@@ -1,12 +1,12 @@
 # Document set üzerinden chunk etiketleme
 
-Bu altyapı, dosyalardan zaten üretilmiş atomik `RegulatoryChunk` kayıtlarını etiketler. Yeni chunk üretmez. Etiket sözlüğü yönetim ekranından yüklenir; bu depoda gerçek etiketler veya varsayılan bir üretim sözlüğü bulunmaz.
+Bu altyapı, dosyalardan zaten üretilmiş atomik `RegulatoryChunk` kayıtlarını etiketler. Yeni chunk üretmez. Etiket sözlüğü yönetim ekranından yüklenir. TARIFF v2.1 belgesinden çıkarılan 255 etiketin kodları, adları ve açıklamaları [etiket kataloğunda](labeling/TARIFF_LABELS_TR.md), yüklenebilir sözlük ise [JSON dosyasında](labeling/tariff-regulatory-intelligence-v2.1.json) bulunur.
 
 ## Kullanım
 
 1. **Admin → Documents → Document Sets** bölümünden ilgili seti açın.
 2. **Labeling** ekranına geçin. Dosya ve mevcut chunk sayıları kapsamı gösterir.
-3. Etiket sözlüğünü JSON dosyası olarak yükleyin. Kök nesnede `name` ve `labels` alanları; her etiket için benzersiz `id`, `name` ve açıklama/kapsamı belirten `description` alanları gerekir. Sözlük sürümü sonradan değiştirilmez; değişiklik yeni sürüm olarak yüklenir.
+3. [Hazır TARIFF sözlüğünü](labeling/tariff-regulatory-intelligence-v2.1.json) veya kendi etiket sözlüğünüzü JSON dosyası olarak yükleyin. Kök nesnede `name` ve `labels` alanları; her etiket için benzersiz `id`, `name` ve açıklama/kapsamı belirten `description` alanları gerekir. Sözlük sürümü sonradan değiştirilmez; değişiklik yeni sürüm olarak yüklenir.
 4. Sözlük sürümünü ve kullanılacak mevcut Google sağlayıcısını seçin. Sağlayıcı seçimi kimlik bilgilerini belirler; etiketleme modeli sabit olarak `gemini-3.8-flash` kullanılır. Mevcut contextual retrieval model ayarı değiştirilmez.
 5. **Start Labeling** ile işi başlatın. Sayfayı kapatmak işi durdurmaz. Aynı ekrana dönerek geçmiş işleri ve ilerlemeyi görebilirsiniz.
 
@@ -66,7 +66,9 @@ Belirsiz gönderimin görünür hale gelmesi için 10 dakikalık pencere tanın�
 - Kesilmiş model çıktısı başarılı sayılmaz. Modelin düşünce alanları sonuç metnine katılmaz.
 - Model hiçbir etiket uygun değilse boş sonuç verebilir; yetersiz kanıt için ayrıca çekimser kalabilir. Bunlar sağlayıcı hatasından ayrıdır.
 
-Bu kontroller yapısal doğruluğu ve kaynak bağını sağlar. Etiketlerin anlamsal isabeti, nihai sözlük geldikten sonra alan uzmanının hazırladığı bir örnek kümesiyle ölçülmelidir.
+`canonical-labeling-v2` promptu, seçilen sözlükteki tüm kodları, adları ve açıklamaları alır. Farklı etiket ailelerini kendi tanımlarına göre değerlendirir; kod öneki, kelime benzerliği veya yalnızca çevre bağlamdan etiket çıkarmaz. Sözlük açıklamalarında ya da kaynak metinde geçen talimatları komut olarak izlemez.
+
+Bu kontroller yapısal doğruluğu ve kaynak bağını sağlar. Etiketlerin anlamsal isabeti, alan uzmanının hazırladığı bir örnek kümesiyle ölçülmelidir.
 
 ### Yetki ve kimlik bilgileri
 
@@ -92,7 +94,7 @@ Sonuçlar PostgreSQL'de şu tablolarda tutulur: `regulatory_label_taxonomy`, `re
 
 Provider sözleşmesi ve mevcut contextual Batch davranışının korunması unit testlerle kontrol edilir. İş yaşam döngüsü, API yetkileri, eşzamanlı başlangıç, kayıp gönderim yanıtı, worker kapanması, iptal ve kaynak değişimi senaryoları gerçek PostgreSQL üzerinde kontrollü bir Batch sağlayıcısıyla çalıştırılır. Migration ayrı test şemalarında ileri/geri uygulanır; uygulamanın mevcut veritabanı bu testler için kullanılmaz. Arayüz testleri başlangıç koşulları, ilerleme sorgulama, sayfalama ve hatalı ağ yanıtlarından sonra aynı başlangıç kimliğinin korunmasını kapsar.
 
-Bu doğrulama gerçek Google hesabında ücretli sınıflandırma veya etiketlerin alan doğruluğu ölçümü değildir. Nihai sözlük geldikten sonra küçük bir değerlendirme kümesiyle etiket kalitesi ve gerçek sağlayıcı çağrısı ayrıca doğrulanmalıdır.
+TARIFF sözlüğünün 255 etiketiyle mevcut yükleme, Batch isteği ve kanıtlı çıktı sözleşmelerinin uyumu ayrıca test edilir. Bu doğrulama gerçek Google hesabında ücretli sınıflandırma veya etiketlerin alan doğruluğu ölçümü değildir. Küçük bir değerlendirme kümesiyle etiket kalitesi ve gerçek sağlayıcı çağrısı ayrıca doğrulanmalıdır.
 
 ## Google API tercihi
 
