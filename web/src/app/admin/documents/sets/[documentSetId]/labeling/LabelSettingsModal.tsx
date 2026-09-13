@@ -24,7 +24,7 @@ const MAX_LABELS = 1024;
 const MAX_LABEL_ID_LENGTH = 100;
 const MAX_NAME_LENGTH = 200;
 const MAX_DESCRIPTION_LENGTH = 8000;
-const LABEL_ID_PATTERN = /^[\p{L}\p{N}_.:-]+$/u;
+const LABEL_ID_PATTERN = new RegExp("^[\\p{L}\\p{N}_.:-]+$", "u");
 
 interface DraftLabel extends TaxonomyLabelInput {
   key: string;
@@ -63,7 +63,8 @@ function validateLabels(labels: TaxonomyLabelInput[]): string | null {
     return `No more than ${MAX_LABELS} labels are allowed.`;
 
   const seenIds = new Set<string>();
-  for (const [index, label] of labels.entries()) {
+  for (let index = 0; index < labels.length; index += 1) {
+    const label = labels[index]!;
     const number = index + 1;
     if (label.id.length > MAX_LABEL_ID_LENGTH)
       return `Label ${number} IDs must be ${MAX_LABEL_ID_LENGTH} characters or fewer.`;
