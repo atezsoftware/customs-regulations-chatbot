@@ -3547,6 +3547,7 @@ def read_markdown_delivery() -> dict[str, str | bool | int]:
 def read_redis_allocation() -> dict[str, str | bool | int]:
     """Server metadata and connection-only SELECT probes; no application key reads."""
     import re
+    from typing import Any, cast
 
     from redis import Redis
     from redis.exceptions import ResponseError
@@ -3561,9 +3562,15 @@ def read_redis_allocation() -> dict[str, str | bool | int]:
         single_connection_client=True,
     )
     try:
-        server = client.info("server")
-        keyspace = client.info("keyspace")
-        clients = client.client_list()
+        server = cast(dict[str, Any], client.info("server"))
+        keyspace = cast(dict[str, Any], client.info("keyspace"))
+        clients = cast(list[dict[str, str]], client.client_list())
+        if (
+            not isinstance(server, dict)
+            or not isinstance(keyspace, dict)
+            or not isinstance(clients, list)
+        ):
+            raise ValueError("redis_metadata_shape_required")
         if len(keyspace) > 1024 or len(clients) > 10000:
             raise ValueError("redis_metadata_bound_exceeded")
         occupied = sorted(
