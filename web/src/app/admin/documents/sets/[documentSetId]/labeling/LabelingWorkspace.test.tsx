@@ -137,7 +137,7 @@ test("prompts for a provider selection when multiple providers are available", a
 
 test("shows batch configuration errors and prevents starting while preserving label settings", async () => {
   const configurationError =
-    "Add a Gemini Batch API key to this connection in Language Models before starting labeling.";
+    "Gemini Batch storage is not configured. Configure its Cloud Storage location before starting labeling.";
   installFetchRouter({
     setup: {
       ...readySetup,

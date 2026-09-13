@@ -58,7 +58,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchState,
     VertexReadOnlyAccessProbe,
 )
-from onyx.regulatory.labeling import gemini_inline_batch, orchestrator
+from onyx.regulatory.labeling import gemini_inline_batch, orchestrator, vertex_batch
 from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
     build_labeling_request,
@@ -134,7 +134,11 @@ def labeling_database() -> Generator[LabelingDatabase, None, None]:
 @pytest.fixture
 def labeling_data(
     labeling_database: LabelingDatabase,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Generator[LabelingData, None, None]:
+    monkeypatch.setenv(
+        "REGULATORY_LABELING_VERTEX_GCS_URI", "gs://labeling-test-bucket/staging"
+    )
     token = CURRENT_TENANT_ID_CONTEXTVAR.set(labeling_database.schema)
     with Session(labeling_database.engine) as session:
         user = User(
@@ -208,7 +212,6 @@ def labeling_data(
             )
         provider = LLMProvider(
             name=f"labeling-provider-{uuid4().hex}",
-            gemini_batch_api_key="batch-test-key-not-a-real-credential",
             provider=LlmProviderNames.VERTEX_AI,
             is_public=True,
             custom_config={
@@ -752,7 +755,7 @@ def labeling_client(
     )
     monkeypatch.setattr(labeling_api, "_wake", lambda *_args: None)
     monkeypatch.setattr(
-        gemini_inline_batch.LabelingGeminiInlineBatchGateway,
+        vertex_batch.LabelingVertexBatchGateway,
         "probe_gemini_read_access",
         lambda _self: VertexReadOnlyAccessProbe(credential_identity="test"),
     )
@@ -833,20 +836,15 @@ def test_api_setup_and_start_expose_only_safe_persisted_state(
     assert page.json()["total"] == 2
 
 
-def test_api_missing_batch_key_blocks_start_without_creating_run(
+def test_api_missing_staging_blocks_start_without_creating_run(
     labeling_data: LabelingData,
     labeling_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with Session(labeling_data.database.engine) as session:
-        provider = session.get(LLMProvider, labeling_data.provider_id)
-        assert provider is not None
-        provider.gemini_batch_api_key = None
-        session.commit()
+    monkeypatch.delenv("REGULATORY_LABELING_VERTEX_GCS_URI")
     setup = labeling_client.get(_api_path(labeling_data, "setup"))
     assert setup.status_code == 200
-    assert setup.json()["providers"][0]["configuration_error"] == (
-        labeling_configuration.MISSING_BATCH_API_KEY
-    )
+    assert "Cloud Storage" in setup.json()["providers"][0]["configuration_error"]
     response = labeling_client.post(
         _api_path(labeling_data, "runs"), json=_start_body(labeling_data)
     )
@@ -854,38 +852,35 @@ def test_api_missing_batch_key_blocks_start_without_creating_run(
     assert labeling_client.get(_api_path(labeling_data, "runs")).json() == []
 
 
-@pytest.mark.parametrize("reason", ["SERVICE_DISABLED", "PERMISSION_DENIED"])
+@pytest.mark.parametrize("status_code", [401, 403, 429])
 def test_api_failed_access_probe_does_not_create_a_run(
     labeling_data: LabelingData,
     labeling_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
-    reason: str,
+    status_code: int,
 ) -> None:
     def denied(_self: object) -> VertexReadOnlyAccessProbe:
-        raise gemini_inline_batch.GeminiInlineBatchAccessError(403, reason)
+        raise IndexingGatewayHTTPError(status_code)
 
     monkeypatch.setattr(
-        gemini_inline_batch.LabelingGeminiInlineBatchGateway,
+        vertex_batch.LabelingVertexBatchGateway,
         "probe_gemini_read_access",
         denied,
     )
     response = labeling_client.post(
         _api_path(labeling_data, "runs"), json=_start_body(labeling_data)
     )
-    assert response.status_code == 400, response.text
-    assert "batch-test-key-not-a-real-credential" not in response.text
-    assert ("Enable the Gemini Developer API" in response.text) == (
-        reason == "SERVICE_DISABLED"
-    )
+    assert response.status_code == (502 if status_code == 429 else 400), response.text
+    assert "fake-test-key" not in response.text
     assert labeling_client.get(_api_path(labeling_data, "runs")).json() == []
 
 
-@pytest.mark.parametrize("rotate_key", [False, True])
+@pytest.mark.parametrize("change_staging", [False, True])
 def test_api_probe_releases_transaction_and_rechecks_binding(
     labeling_data: LabelingData,
     labeling_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
-    rotate_key: bool,
+    change_staging: bool,
 ) -> None:
     sessions: list[Session] = []
     calls = 0
@@ -910,26 +905,25 @@ def test_api_probe_releases_transaction_and_rechecks_binding(
         nonlocal calls
         calls += 1
         assert not sessions[-1].in_transaction()
-        if rotate_key:
-            with Session(labeling_data.database.engine) as session:
-                provider = session.get(LLMProvider, labeling_data.provider_id)
-                assert provider is not None
-                provider.gemini_batch_api_key = "rotated-test-key"  # ty: ignore[invalid-assignment]
-                session.commit()
+        if change_staging:
+            monkeypatch.setenv(
+                "REGULATORY_LABELING_VERTEX_GCS_URI",
+                "gs://other-labeling-bucket/staging",
+            )
         return VertexReadOnlyAccessProbe(credential_identity="test")
 
     monkeypatch.setattr(labeling_api, "resolve_labeling_gateway", resolve)
     monkeypatch.setattr(
-        gemini_inline_batch.LabelingGeminiInlineBatchGateway,
+        vertex_batch.LabelingVertexBatchGateway,
         "probe_gemini_read_access",
         probe,
     )
     body = _start_body(labeling_data)
     response = labeling_client.post(_api_path(labeling_data, "runs"), json=body)
-    assert response.status_code == (409 if rotate_key else 200), response.text
+    assert response.status_code == (409 if change_staging else 200), response.text
     runs = labeling_client.get(_api_path(labeling_data, "runs")).json()
-    assert len(runs) == (0 if rotate_key else 1)
-    if not rotate_key:
+    assert len(runs) == (0 if change_staging else 1)
+    if not change_staging:
         replay = labeling_client.post(_api_path(labeling_data, "runs"), json=body)
         assert replay.status_code == 200
         assert replay.json()["id"] == response.json()["id"]
@@ -1462,6 +1456,7 @@ def fake_batch(
     monkeypatch.setattr(
         gemini_inline_batch, "LabelingGeminiInlineBatchGateway", gateway_factory
     )
+    monkeypatch.setattr(vertex_batch, "LabelingVertexBatchGateway", gateway_factory)
     return gateway
 
 

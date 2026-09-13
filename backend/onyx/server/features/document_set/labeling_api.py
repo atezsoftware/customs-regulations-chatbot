@@ -12,6 +12,7 @@ from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.labeling_configuration import (
+    LabelingBatchGateway,
     get_labeling_provider_options,
     resolve_labeling_gateway,
     resolve_labeling_provider_binding,
@@ -19,7 +20,10 @@ from onyx.db.labeling_configuration import (
 from onyx.db.models import RegulatoryLabelingRun, RegulatoryLabelSettings, User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
-from onyx.regulatory.indexing_jobs.models import IndexingGatewayError
+from onyx.regulatory.indexing_jobs.models import (
+    IndexingGatewayError,
+    IndexingGatewayHTTPError,
+)
 from onyx.regulatory.labeling.api_models import (
     LabelingItemsPage,
     LabelingProviderSummary,
@@ -39,6 +43,33 @@ from shared_configs.contextvars import get_current_tenant_id
 router = APIRouter(prefix="/manage/admin/document-set/{document_set_id}/labeling")
 labeling_admin = require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)
 logger = setup_logger()
+
+
+def _probe_labeling_gateway(gateway: LabelingBatchGateway) -> None:
+    try:
+        gateway.probe_gemini_read_access()
+    except GeminiInlineBatchAccessError as error:
+        detail = (
+            "Enable the Gemini Developer API for the Batch key's project before starting labeling."
+            if error.reason_code == "SERVICE_DISABLED"
+            else "Gemini Batch access could not be verified. Check this connection's Batch API key and project access in Language Models."
+        )
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, detail) from None
+    except IndexingGatewayHTTPError as error:
+        if error.status_code in {400, 401, 403, 404}:
+            raise OnyxError(
+                OnyxErrorCode.INVALID_INPUT,
+                "Gemini Vertex Batch access could not be verified. Check this connection's service account, project, location, and Cloud Storage access in Language Models.",
+            ) from None
+        raise OnyxError(
+            OnyxErrorCode.BAD_GATEWAY,
+            "Gemini Batch access could not be checked. Try again shortly.",
+        ) from None
+    except IndexingGatewayError:
+        raise OnyxError(
+            OnyxErrorCode.BAD_GATEWAY,
+            "Gemini Batch access could not be checked. Try again shortly.",
+        ) from None
 
 
 def _check_access(session: Session, document_set_id: int, user: User) -> None:
@@ -240,20 +271,7 @@ def _start_run(
         )
         taxonomy_id = taxonomy.id
         session.commit()
-        try:
-            gateway.probe_gemini_read_access()
-        except GeminiInlineBatchAccessError as error:
-            detail = (
-                "Enable the Gemini Developer API for the Batch key's project before starting labeling."
-                if error.reason_code == "SERVICE_DISABLED"
-                else "Gemini Batch access could not be verified. Check this connection's Batch API key and project access in Language Models."
-            )
-            raise OnyxError(OnyxErrorCode.INVALID_INPUT, detail) from None
-        except IndexingGatewayError:
-            raise OnyxError(
-                OnyxErrorCode.BAD_GATEWAY,
-                "Gemini Batch access could not be checked. Try again shortly.",
-            ) from None
+        _probe_labeling_gateway(gateway)
         _check_access(session, document_set_id, user)
         current_binding = resolve_labeling_provider_binding(
             session, body.model_configuration_id, user=user

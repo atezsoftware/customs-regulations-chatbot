@@ -734,21 +734,26 @@ same fixed overlay order only for read-only diagnostics; do not retry with ad ho
 
 ### Gemini labeling Batch access
 
-Labeling sends bounded inline batches to the Gemini Developer API and retrieves completed
-responses directly from the batch endpoint. It requires no Cloud Storage bucket, file upload,
-or storage environment variable. Each shard is limited to 64 requests and an 8 MiB request budget;
-the gateway also enforces the API's total inline-body limit of under 20 MB.
+New labeling jobs use native Vertex Batch with the existing Gemini connection's service-account
+JSON or workload identity. No separate API key is required. Each shard is limited to 64 requests
+and 8 MiB of JSONL; workers automatically upload requests, poll the job, and download its results.
 
-In Language Models, edit the existing Gemini connection and set its **Gemini Batch API key**.
-This dedicated credential is encrypted in PostgreSQL and is separate from the connection's Vertex
-service-account JSON or workload identity used by chat. Leaving the field blank preserves a saved
-key; the explicit remove action clears it. API responses expose only whether a key is saved.
-The key's project must have Gemini Developer API access to the selected model and batch operations.
+Set the same `REGULATORY_LABELING_VERTEX_GCS_URI=gs://bucket/prefix` on API and background workers.
+The DEV workflow reads the repository variable `REGULATORY_LABELING_VERTEX_GCS_URI_DEV`.
+Use a private destination dedicated to labeling. The application identity needs object create,
+read, and list access; Google's Vertex service agent needs input read and output write access.
 Start Labeling performs read-only access checks before creating a job, outside a database transaction.
+Read-only checks cannot guarantee that a new paid Batch submission will succeed.
 
-Each run records the selected provider identity, model, immutable label snapshot, and a fingerprint
-of the Batch credential. Changing the credential prevents an existing worker from silently using a
-different connection. Historical Files-based runs retain their original transport binding.
+Input, correlation manifests, and results are confined to `labeling/<submission_hash>/` beneath
+the configured prefix. Successful collection persists results in PostgreSQL; it does not immediately
+delete GCS objects. Configure bounded retention on the dedicated bucket/prefix without changing
+existing document or embedding storage policies.
+
+Each run records the selected provider identity, model, immutable label snapshot, and staging
+destination. Changing the binding prevents an existing worker from silently using a different
+connection. Historical Files and inline runs retain their original transport and fingerprint.
+Keep the already-deployed `9f3a7c2e5d18` migration in history; native jobs do not use its optional key.
 Label results are stored separately; labeling does not rewrite chunks, embeddings, or search indexes.
 
 ## 6. Health and smoke checks

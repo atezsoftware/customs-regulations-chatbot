@@ -31,7 +31,7 @@ LLM yalnızca atomik chunkları sınıflandırır. Birleşik chunkların etiketl
 ```mermaid
 flowchart LR
     S[Seçilen document set] --> C[Mevcut canonical chunklar]
-    T[Sürümlenmiş etiket tanımları] --> B[Gemini 3.8 Flash Inline Batch]
+    T[Sürümlenmiş etiket tanımları] --> B[Gemini 3.8 Flash Vertex Batch]
     C --> B
     X[Contextual retrieval ve komşu metin] --> B
     B --> V[Şema, kanıt ve kaynak sürümü kontrolü]
@@ -56,9 +56,9 @@ Başlangıç isteğinin kimliği tarayıcıda da korunur. Ağ kopması, HTTP zam
 
 Belirsizlik verilen sürede çözülemezse sistem otomatik olarak ikinci bir ücretli gönderim yapmaz. Böyle bir işte **Retry full run** kullanmadan önce shard kaydındaki `submission_key` ile Google Batch kayıtları incelenmelidir; ilk iş sağlayıcı tarafında oluşmuş olabilir.
 
-Ağ çağrıları boyunca veritabanı işlemi açık tutulmaz. Batch girişleri istek sayısı ve byte boyutuyla sınırlanır; doğrudan dönen inline sonuç gövdesinde ayrıca 64 MiB sınırı vardır. Birleşik chunklara dağıtım da 128 hedeflik sayfalarda kaydedilir. Tamamlanan sayfalar kalıcıdır; worker yeniden başladığında yalnızca bekleyen dağıtımlar ele alınır.
+Ağ çağrıları boyunca veritabanı işlemi açık tutulmaz. Batch girişleri istek sayısı ve byte boyutuyla sınırlanır; indirilen sonuçlarda ayrıca toplam 64 MiB sınırı vardır. Birleşik chunklara dağıtım da 128 hedeflik sayfalarda kaydedilir. Tamamlanan sayfalar kalıcıdır; worker yeniden başladığında yalnızca bekleyen dağıtımlar ele alınır.
 
-Varsayılanlar: hazırlama sayfası 128 canonical chunk; Batch başına en çok 64 istek / 8 MiB JSONL eşdeğeri; gerçek inline gönderim gövdesi 20 MB altında; aynı iş için en çok 4 açık Batch; 30 saniyelik sağlayıcı sorgulama aralığı; 300 saniyelik worker sahipliği. HTTP istekleri 20 saniyeyle, tek uzaktaki işi arama adımı 180 saniyelik toplam süre bütçesiyle sınırlandırılır. Sağlayıcıya bir istek başladıktan sonra bu süreye en fazla o HTTP isteğinin kalan süresi eklenebilir.
+Varsayılanlar: hazırlama sayfası 128 canonical chunk; Batch başına en çok 64 istek / 8 MiB JSONL; aynı iş için en çok 4 açık Batch; 30 saniyelik sağlayıcı sorgulama aralığı; 300 saniyelik worker sahipliği. Vertex RPC ve GCS isteklerine 20 saniyelik timeout verilir. Kimlik doğrulama yenilemesi ve GCS istemcisinin tekrar deneme bütçesi bundan ayrıdır; bu değer bütün worker adımının toplam süre garantisi değildir.
 
 Belirsiz gönderimin görünür hale gelmesi için 10 dakikalık pencere tanınır. Worker daha uzun bir kesintiden dönse bile hata kararı vermeden önce bir kez süre sınırlı arama yapar; böylece sağlayıcıda tamamlanmış bir iş bulunabilir.
 
@@ -76,9 +76,9 @@ Bu kontroller yapısal doğruluğu ve kaynak bağını sağlar. Etiketlerin anla
 
 ### Yetki ve kimlik bilgileri
 
-Document set yönetim yetkisi ve mevcut LLM sağlayıcı erişim kuralları uygulanır. Başka bir persona ile sınırlandırılmış sağlayıcı, bu ekranda kullanılmaz. Etiketleme için ayrı bir sağlayıcı kaydı açılmaz; mevcut Gemini bağlantısına özel bir **Gemini Batch API key** kaydedilir. Bu anahtar şifreli sağlayıcı alanında tutulur, iş kayıtlarına kopyalanmaz ve API yanıtlarında geri verilmez.
+Document set yönetim yetkisi ve mevcut LLM sağlayıcı erişim kuralları uygulanır. Başka bir persona ile sınırlandırılmış sağlayıcı, bu ekranda kullanılmaz. Etiketleme mevcut Gemini bağlantısındaki Vertex service account veya workload identity kimliğini kullanır; ayrı API anahtarı gerekmez. Kimlik bilgileri iş kayıtlarına kopyalanmaz ve API yanıtlarında geri verilmez.
 
-Anahtar eksikse sağlayıcı **Labeling** ekranında hazır gösterilmez ve iş başlamadan önce istek reddedilir. Anahtar, **Admin → Language Models** bölümünde mevcut Gemini bağlantısı düzenlenerek eklenir veya döndürülür. Anahtarın parmak izi çalışma başlangıcında sabitlenir; anahtar döndürüldüğünde mevcut çalışma sessizce yeni anahtara geçmez, sonraki çalışma yeni anahtarı kullanır. Başlangıç ön kontrolü modelin `batchGenerateContent` desteğini ve Batch listeleme erişimini salt okunur çağrılarla doğrular. Etiketleme çağrıları bu anahtarla Gemini Developer API'ye gider; mevcut Vertex service account ayarı bağlantının diğer kullanımları için korunur.
+Sağlayıcı kimliği, proje, konum ve Batch dosya alanı çalışma başlangıcında sabitlenir. Bağlantı değiştiğinde mevcut çalışma sessizce başka bağlantıya geçmez. Başlangıç ön kontrolü Google erişimini veritabanı işleminin dışında kontrol eder; ardından kullanıcı yetkileri ve bağlantı tekrar doğrulanır. Eski Files ve inline işleri kendi kayıtlı taşıma yöntemlerini korur.
 
 ## Arama kapsamı
 
@@ -108,6 +108,33 @@ Provider sözleşmesi ve mevcut contextual Batch davranışının korunması uni
 
 ## Google API tercihi
 
-Etiketleme, Gemini Developer API'nin **inline Batch / generateContent** akışı üzerinden yürür. Her shard'ın istekleri Batch oluşturma gövdesinde doğrudan gönderilir; GCS bucket, Files API yüklemesi veya sonuç dosyası kullanılmaz. İş tamamlandığında sonuçlar aynı Batch kaynağından doğrudan alınır ve kalıcı istek hash'leriyle eşleştirilir. Gemini 3.8 için kaldırılmış sampling parametreleri gönderilmez; yapılandırılmış JSON çıktısı ve `medium` düşünme seviyesi kullanılır. Normal senkron LLM çağrısına sessiz geçiş yoktur.
+Yeni etiketleme işleri Vertex'in **BatchPredictionJob** akışını kullanır. Uygulama bu akışın Cloud Storage üzerinden JSONL giriş ve sonuç dosyası yöntemini uygular. Kullanıcı dosya yüklemez veya sonuç indirme komutu çalıştırmaz: worker JSONL girdisini gönderir, işi takip eder ve sonuçları otomatik indirip PostgreSQL'e kaydeder. Tam prompt, sistem talimatı ve JSON şeması her istekte korunur. Gemini 3.8 için kaldırılmış sampling parametreleri gönderilmez; yapılandırılmış JSON çıktısı ve `medium` düşünme seviyesi kullanılır. Normal senkron LLM çağrısına sessiz geçiş yoktur.
 
-Kaynaklar: [Gemini Batch API](https://ai.google.dev/gemini-api/docs/batch-api), [Gemini 3.8 Flash geçiş notları](https://ai.google.dev/gemini-api/docs/generate-content/latest-model).
+API ve worker aynı `REGULATORY_LABELING_VERTEX_GCS_URI=gs://bucket/prefix` değerini kullanmalıdır. DEV iş akışı bu değeri `REGULATORY_LABELING_VERTEX_GCS_URI_DEV` repository variable üzerinden alır. Yalnızca etiketleme için ayrılmış özel bir alan kullanılmalıdır. İstek, korelasyon manifesti ve sonuçlar bu alanın `labeling/<submission_hash>/` altına yazılır; gateway bunun dışındaki nesneleri sonuç olarak kabul etmez.
+
+Uygulama servis hesabının bu alanda nesne oluşturma, okuma ve listeleme; Vertex'in Google tarafından yönetilen service agent'ının giriş okuma ve çıktı yazma yetkisi olmalıdır. Sonuçlar PostgreSQL'e kalıcı olarak aktarılsa da mevcut worker GCS nesnelerini anında silmez. Geçici dosyaların saklama süresi, yalnızca bu işe ayrılmış bucket veya prefix için tanımlanan yaşam döngüsü kuralıyla yönetilmelidir; mevcut belge/embedding alanlarının politikaları değiştirilmemelidir.
+
+Kaynaklar: [Vertex Batch ve Cloud Storage](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/multimodal/batch-prediction-from-cloud-storage), [Google kimlik doğrulama](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/gcp-auth), [Gemini 3.8 Flash geçiş notları](https://ai.google.dev/gemini-api/docs/generate-content/latest-model).
+
+## DEV ortamında bucket hazır olduğunda
+
+Altyapı ekibi özel GCS alanını ve uygulama servis hesabı ile Vertex service agent erişimlerini hazırladıktan sonra, verilen `gs://bucket/prefix` yolu `REGULATORY_LABELING_VERTEX_GCS_URI_DEV` repository variable değerine yazılır. Bu değer bir API anahtarı değildir. Kodda bucket adı veya yeni servis hesabı tanımlanmaz.
+
+```sh
+gh variable set REGULATORY_LABELING_VERTEX_GCS_URI_DEV \
+  --repo atezsoftware/customs-regulations-chatbot \
+  --body 'gs://BUCKET/PREFIX'
+```
+
+Değişkeni kaydetmek çalışan podları güncellemez. Standart DEV iş akışının `annex-activate` eylemi, son başarılı backend ve web deploylarının tam commit SHA'sıyla çalıştırılır. Aynı imaj kullanılarak API ve background ayarları birlikte uygulanır; yeni kod build'i gerekmez. Başka bir SHA veya elle capability/gate değişikliği kullanılmaz.
+
+```sh
+gh workflow run customs-regulations-backend-lite-codebuild.yaml \
+  --repo atezsoftware/customs-regulations-chatbot --ref develop \
+  -f environment=dev -f action=annex-activate \
+  -f image_tag=FULL_DEPLOYED_COMMIT_SHA
+```
+
+Aktivasyon başarılı olduktan sonra Labeling ekranı yenilenir. Storage yapılandırma hatasının kaybolması yalnızca yapılandırmanın yüklendiğini gösterir. **Start Labeling** model, Batch listeleme ve GCS listeleme erişimlerini kontrol eder; gerçek oluşturma/yazma yetkisi ve sonuç toplama ancak küçük, ayrılmış bir document set üzerindeki uçtan uca Batch denemesiyle doğrulanır. Büyük belge seti bağlantı testi olarak kullanılmaz.
+
+Bu adımda normal indekslemenin Batch bayrağı, embedding ayarları ve mevcut indeksler değiştirilmez. Bucket yolu olmadan sürüm açılabilir ve etiketler düzenlenebilir; yeni etiketleme işi açıklayıcı yapılandırma hatasıyla engellenir. İzinler ve bucket yolu sağlanmadan canlı Vertex Batch başarısı doğrulanmış sayılmaz.

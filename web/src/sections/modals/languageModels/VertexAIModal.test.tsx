@@ -69,67 +69,54 @@ const provider: LLMProviderView = {
 describe("Refreshing the provider named Gemini", () => {
   afterEach(() => jest.restoreAllMocks());
 
-  it.each(["unchanged", "replace", "remove"] as const)(
-    "keeps the Batch credential separate from Vertex chat when %s",
-    async (action) => {
-      const user = setupUser({
-        pointerEventsCheck: PointerEventsCheckLevel.Never,
-      });
-      const fetchSpy = jest.spyOn(global, "fetch").mockResolvedValue({
-        ok: true,
-        json: async () => provider,
-      } as Response);
-      render(
-        <VertexAIModal
-          existingLlmProvider={{ ...provider, has_gemini_batch_api_key: true }}
-          onSuccess={jest.fn()}
-        />
-      );
-      const batchKey = screen.getByLabelText("Gemini Batch API key");
-      expect(batchKey).toHaveAttribute("type", "password");
-      expect(batchKey).toHaveValue("");
-      if (action === "replace") {
-        await user.type(batchKey, "batch-test-key-not-a-real-credential");
-      } else if (action === "remove") {
-        await user.click(
-          screen.getByRole("button", { name: "Remove saved Batch key" })
-        );
-      } else {
-        const region = screen.getByPlaceholderText("global");
-        await user.clear(region);
-        await user.type(region, "us-central1");
-      }
-      await user.click(screen.getByRole("button", { name: "Update" }));
-      await waitFor(() =>
-        expect(fetchSpy).toHaveBeenCalledWith(
-          "/api/admin/llm/provider",
-          expect.objectContaining({ method: "PUT" })
-        )
-      );
-      const save = fetchSpy.mock.calls.find(
-        ([url]) => url === "/api/admin/llm/provider"
-      );
-      const body = JSON.parse(save![1]!.body as string);
-      expect(body.custom_config).toEqual(
-        action === "unchanged"
-          ? { ...provider.custom_config, vertex_location: "us-central1" }
-          : provider.custom_config
-      );
-      expect(body).not.toHaveProperty("api_key");
-      expect(body.api_key_changed).toBe(false);
-      expect(body).not.toHaveProperty("remove_gemini_batch_api_key");
-      if (action === "unchanged") {
-        expect(body).not.toHaveProperty("gemini_batch_api_key");
-      } else {
-        expect(body.gemini_batch_api_key).toBe(
-          action === "remove" ? "" : "batch-test-key-not-a-real-credential"
-        );
-      }
-      expect(
-        fetchSpy.mock.calls.some(([url]) => url === "/api/admin/llm/test")
-      ).toBe(false);
-    }
-  );
+  it("uses the existing Vertex credentials without exposing a separate Batch key", async () => {
+    const user = setupUser({
+      pointerEventsCheck: PointerEventsCheckLevel.Never,
+    });
+    const fetchSpy = jest.spyOn(global, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => provider,
+    } as Response);
+    render(
+      <VertexAIModal
+        existingLlmProvider={{ ...provider, has_gemini_batch_api_key: true }}
+        onSuccess={jest.fn()}
+      />
+    );
+
+    expect(
+      screen.queryByLabelText("Gemini Batch API key")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Remove saved Batch key" })
+    ).not.toBeInTheDocument();
+
+    const region = screen.getByPlaceholderText("global");
+    await user.clear(region);
+    await user.type(region, "us-central1");
+    await user.click(screen.getByRole("button", { name: "Update" }));
+    await waitFor(() =>
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/admin/llm/provider",
+        expect.objectContaining({ method: "PUT" })
+      )
+    );
+    const save = fetchSpy.mock.calls.find(
+      ([url]) => url === "/api/admin/llm/provider"
+    );
+    const body = JSON.parse(save![1]!.body as string);
+    expect(body.custom_config).toEqual({
+      ...provider.custom_config,
+      vertex_location: "us-central1",
+    });
+    expect(body).not.toHaveProperty("api_key");
+    expect(body.api_key_changed).toBe(false);
+    expect(body).not.toHaveProperty("remove_gemini_batch_api_key");
+    expect(body).not.toHaveProperty("gemini_batch_api_key");
+    expect(
+      fetchSpy.mock.calls.some(([url]) => url === "/api/admin/llm/test")
+    ).toBe(false);
+  });
 
   it("uses the saved dynamic catalog when opening an existing provider", () => {
     render(<VertexAIModal existingLlmProvider={provider} />);
