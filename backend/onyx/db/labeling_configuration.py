@@ -13,7 +13,14 @@ from onyx.db.llm import (
     can_user_access_llm_provider,
     fetch_user_group_ids,
 )
-from onyx.db.models import LLMProvider, ModelConfiguration, Persona, User, UserGroup
+from onyx.db.models import (
+    ImageGenerationConfig,
+    LLMProvider,
+    ModelConfiguration,
+    Persona,
+    User,
+    UserGroup,
+)
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.well_known_providers.constants import (
     VERTEX_AUTH_METHOD_KWARG,
@@ -128,22 +135,29 @@ def _authorized_model(
 
 def _model_statement() -> Select[tuple[ModelConfiguration]]:
     provider = joinedload(ModelConfiguration.llm_provider)
-    return select(ModelConfiguration).options(
-        load_only(
-            ModelConfiguration.id,
-            ModelConfiguration.llm_provider_id,
-            ModelConfiguration.name,
-            ModelConfiguration.is_visible,
-        ),
-        provider.load_only(
-            LLMProvider.id,
-            LLMProvider.name,
-            LLMProvider.provider,
-            LLMProvider.is_public,
-            LLMProvider.custom_config,
-        ),
-        provider.selectinload(LLMProvider.groups).load_only(UserGroup.id),
-        provider.selectinload(LLMProvider.personas).load_only(Persona.id),
+    image_generation_provider_ids = select(ModelConfiguration.llm_provider_id).join(
+        ImageGenerationConfig
+    )
+    return (
+        select(ModelConfiguration)
+        .where(~ModelConfiguration.llm_provider_id.in_(image_generation_provider_ids))
+        .options(
+            load_only(
+                ModelConfiguration.id,
+                ModelConfiguration.llm_provider_id,
+                ModelConfiguration.name,
+                ModelConfiguration.is_visible,
+            ),
+            provider.load_only(
+                LLMProvider.id,
+                LLMProvider.name,
+                LLMProvider.provider,
+                LLMProvider.is_public,
+                LLMProvider.custom_config,
+            ),
+            provider.selectinload(LLMProvider.groups).load_only(UserGroup.id),
+            provider.selectinload(LLMProvider.personas).load_only(Persona.id),
+        )
     )
 
 

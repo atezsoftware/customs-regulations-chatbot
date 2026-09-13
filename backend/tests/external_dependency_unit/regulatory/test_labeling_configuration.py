@@ -18,6 +18,7 @@ from onyx.db.labeling_configuration import (
     resolve_labeling_provider_binding,
 )
 from onyx.db.models import (
+    ImageGenerationConfig,
     LLMProvider,
     LLMProvider__Persona,
     LLMProvider__UserGroup,
@@ -218,6 +219,40 @@ def test_one_option_per_provider_prefers_labeling_model_without_exposing_credent
     serialized = json.dumps(options) + binding.model_dump_json()
     for secret in (_PRIVATE_KEY, "test-key-identifier", "private_key", "token_uri"):
         assert secret not in serialized
+
+
+def test_image_generation_provider_is_excluded_by_association_not_name(
+    labeling_session: Session,
+) -> None:
+    user = make_user(labeling_session, role=UserRole.ADMIN)
+    image_model = _model(labeling_session, name="gemini-3.8-flash")
+    labeling_session.add(
+        ImageGenerationConfig(
+            image_provider_id=f"image-{uuid4().hex}",
+            model_configuration_id=image_model.id,
+            is_default=False,
+        )
+    )
+    ordinary_model = _model(labeling_session, name="gemini-3.8-flash")
+    ordinary_model.llm_provider.name = "Google Image analysis"
+    labeling_session.flush()
+
+    option_ids = {
+        option["id"]
+        for option in get_labeling_provider_options(labeling_session, user=user)
+    }
+    assert image_model.id not in option_ids
+    assert ordinary_model.id in option_ids
+    assert (
+        resolve_labeling_provider_binding(
+            labeling_session, ordinary_model.id, user=user
+        ).provider_id
+        == ordinary_model.llm_provider_id
+    )
+    with pytest.raises(ValueError, match="unavailable"):
+        resolve_labeling_provider_binding(labeling_session, image_model.id, user=user)
+    with pytest.raises(ValueError, match="unavailable"):
+        resolve_labeling_gateway(labeling_session, image_model.id, user=user)
 
 
 def test_labeling_uses_fixed_model_and_current_key_after_same_principal_rotation(
