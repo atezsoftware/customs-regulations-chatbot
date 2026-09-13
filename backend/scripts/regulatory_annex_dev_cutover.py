@@ -3378,6 +3378,133 @@ def read_markdown_worker() -> dict[str, str | bool | int]:
     return result
 
 
+def summarize_markdown_task_log(content: str) -> dict[str, str | bool]:
+    import re
+
+    task = "719599a4-cddb-402c-ac52-3c3534581d46"
+    file = "32ab4fc6-f7cd-4d51-a34f-1c808760908f"
+    events = {
+        "received": f"Task process_single_user_file[{task}] received",
+        "succeeded": f"Task process_single_user_file[{task}] succeeded",
+        "expired": f"Discarding revoked task: process_single_user_file[{task}]",
+        "started": f"process_user_file_impl - Starting id={file}",
+        "file_missing": f"process_user_file_impl - UserFile not found id={file}",
+        "lock_held": f"process_user_file_impl - Lock held, skipping user_file_id={file}",
+        "failed": f"process_user_file_impl - Error processing file id={file}",
+    }
+    lines = re.sub(r"\x1b\[[0-9;]*m", "", content).splitlines()
+    result: dict[str, str | bool] = {
+        "owned_task_" + key: any(value in line for line in lines)
+        for key, value in events.items()
+    }
+    frames: list[str] = []
+    for position, line in enumerate(lines):
+        if events["failed"] not in line:
+            continue
+        for following in lines[position + 1 : position + 101]:
+            if following.startswith("Traceback "):
+                continue
+            if following and not following.startswith(" "):
+                break
+            match = re.fullmatch(
+                r'  File "[^"\n]*?((?:onyx|shared_configs|ee/onyx)/[A-Za-z0-9_./-]+\.py)", line ([1-9][0-9]*), in ([A-Za-z0-9_<>]+)',
+                following,
+            )
+            if match and ".." not in match[1].split("/"):
+                frames.append(":".join(match.groups()))
+    result["owned_task_frames"] = ";".join(frames[:30])
+    return result
+
+
+def read_markdown_task_receipt() -> dict[str, str | bool | int]:
+    import os
+    import re
+    import socket
+    from datetime import datetime
+
+    from onyx.background.celery.versioned_apps.client import app
+
+    result: dict[str, str | bool | int] = {
+        "owned_task_log_available": False,
+        "owned_task_log_truncated": False,
+        "owned_task_log_files": 0,
+        "owned_task_log_bytes": 0,
+    }
+    timestamps: list[datetime] = []
+    frames: list[str] = []
+    path = "/var/log/onyx/celery_worker_user_file_processing.log"
+    for number in range(11):
+        try:
+            with open(path + ("." + str(number) if number else ""), "rb") as log:
+                size = os.fstat(log.fileno()).st_size
+                content = log.read(16777216).decode("utf-8", errors="replace")
+            result["owned_task_log_available"] = True
+            result["owned_task_log_truncated"] = (
+                bool(result["owned_task_log_truncated"]) or size > 16777216
+            )
+            result["owned_task_log_files"] = number + 1
+            previous_bytes = result["owned_task_log_bytes"]
+            assert type(previous_bytes) is int
+            result["owned_task_log_bytes"] = previous_bytes + min(size, 16777216)
+            snapshot = summarize_markdown_task_log(content)
+            for key, value in snapshot.items():
+                if isinstance(value, bool):
+                    result[key] = bool(result.get(key)) or value
+                elif value:
+                    frames.append(value)
+            matches = list(
+                re.finditer(
+                    r"[0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} [AP]M",
+                    content,
+                )
+            )
+            for match in matches[:1] + matches[-1:]:
+                timestamps.append(datetime.strptime(match[0], "%m/%d/%Y %I:%M:%S %p"))
+        except FileNotFoundError:
+            break
+    result["owned_task_frames"] = ";".join(";".join(frames).split(";")[:30])
+    if timestamps:
+        result["owned_log_first_timestamp"] = min(timestamps).isoformat()
+        result["owned_log_last_timestamp"] = max(timestamps).isoformat()
+    # Use actual queue membership; consumer node names are not an ownership boundary.
+    inspector = app.control.inspect(timeout=3)
+    replies = inspector.active_queues() or {}
+    if len(replies) > 64:
+        raise ValueError("consumer_reply_bound_exceeded")
+    nodes = sorted(
+        node
+        for node, queues in replies.items()
+        if isinstance(node, str)
+        and re.fullmatch(r"[A-Za-z0-9_@.:-]{1,256}", node)
+        and isinstance(queues, list)
+        and any(
+            isinstance(queue, dict) and queue.get("name") == "user_file_processing"
+            for queue in queues
+        )
+    )
+    local = "user_file_processing@" + socket.gethostname()
+    result["normal_worker_responses"] = len(replies)
+    result["normal_worker_other_consumers"] = sum(node != local for node in nodes)
+    result["queue_consumer_names"] = ",".join(nodes)
+    task = "719599a4-cddb-402c-ac52-3c3534581d46"
+    queried = inspector.query_task(task) or {}
+    if len(queried) > 64:
+        raise ValueError("task_reply_bound_exceeded")
+    receivers = []
+    for node, tasks in queried.items():
+        entry = tasks.get(task) if isinstance(tasks, dict) else None
+        if (
+            isinstance(node, str)
+            and re.fullmatch(r"[A-Za-z0-9_@.:-]{1,256}", node)
+            and isinstance(entry, (list, tuple))
+            and len(entry) == 2
+            and entry[0] in {"active", "reserved", "ready"}
+        ):
+            receivers.append(node + ":" + entry[0])
+    result["owned_task_receivers"] = ",".join(sorted(receivers))
+    return result
+
+
 def read_markdown_delivery() -> dict[str, str | bool | int]:
     import hashlib
     import json
@@ -3431,12 +3558,32 @@ def validate_markdown_worker_report(report: Any) -> None:
         "current_vector_disabled",
         "current_defer_indexing",
         "current_batch_indexing",
+        "owned_task_log_available",
+        "owned_task_log_truncated",
     }
+    booleans.update(
+        "owned_task_" + name
+        for name in (
+            "received",
+            "succeeded",
+            "expired",
+            "started",
+            "file_missing",
+            "lock_held",
+            "failed",
+        )
+    )
     booleans.update(
         name + "_response"
         for name in ("registered", "active_queues", "stats", "active", "reserved")
     )
-    counts = {"queue_count", "concurrency"} | {
+    counts = {
+        "queue_count",
+        "concurrency",
+        "owned_task_log_files",
+        "normal_worker_responses",
+        "normal_worker_other_consumers",
+    } | {
         kind + suffix
         for kind in ("active", "reserved")
         for suffix in ("_count", "_index_count", "_process_count", "_other_count")
@@ -3456,6 +3603,34 @@ def validate_markdown_worker_report(report: Any) -> None:
     for key, value in report.items():
         valid = (
             (key in booleans and type(value) is bool)
+            or (
+                key == "owned_task_frames"
+                and isinstance(value, str)
+                and len(value) <= 8192
+                and re.fullmatch(
+                    r"(?:[A-Za-z0-9_./<>-]+:[0-9]+:[A-Za-z0-9_<>]+;?)*", value
+                )
+                is not None
+            )
+            or (
+                key in {"queue_consumer_names", "owned_task_receivers"}
+                and isinstance(value, str)
+                and len(value) <= 8192
+                and re.fullmatch(r"[A-Za-z0-9_@.,:-]*", value) is not None
+            )
+            or (
+                key in {"owned_log_first_timestamp", "owned_log_last_timestamp"}
+                and isinstance(value, str)
+                and re.fullmatch(
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}", value
+                )
+                is not None
+            )
+            or (
+                key == "owned_task_log_bytes"
+                and type(value) is int
+                and 0 <= value <= 184549376
+            )
             or (key in counts and type(value) is int and 0 <= value <= 10000)
             or (
                 key == "processing_queue_depth"
@@ -3485,6 +3660,10 @@ def diagnose_markdown_worker(
         + inspect.getsource(read_markdown_worker)
         + "\n"
         + inspect.getsource(read_markdown_delivery)
+        + "\n"
+        + inspect.getsource(summarize_markdown_task_log)
+        + "\n"
+        + inspect.getsource(read_markdown_task_receipt)
     )
     program += "\nrole = " + repr(role) + "\n"
     program += """
@@ -3503,6 +3682,7 @@ with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.St
         report["status"] = "read"
         if role == "background":
             report.update(read_markdown_worker())
+            report.update(read_markdown_task_receipt())
     except Exception as error:
         name = type(error).__name__
         report.update(status="failed", failure_type=name if name in {"ValueError", "RuntimeError", "TimeoutError"} else "Exception")
