@@ -115,6 +115,24 @@ test("shows bundled labels and keeps Start Labeling unavailable until a provider
   expect(screen.getByRole("button", { name: "Start Labeling" })).toBeDisabled();
 });
 
+test("prompts for a provider selection when multiple providers are available", async () => {
+  installFetchRouter({
+    setup: {
+      ...readySetup,
+      providers: [
+        ...readySetup.providers,
+        { id: 42, name: "Google workload identity" },
+      ],
+    },
+  });
+
+  render(<LabelingWorkspace documentSetId={7} />);
+
+  expect(
+    await screen.findByRole("combobox", { name: "Google provider" })
+  ).toHaveTextContent("Select a Google provider");
+});
+
 test("allows a new run when history confirms the setup's active run has finished", async () => {
   const run = buildRun({ status: "completed", stage: "finished" });
   installFetchRouter({

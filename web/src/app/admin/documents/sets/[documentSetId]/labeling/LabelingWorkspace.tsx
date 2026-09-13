@@ -333,7 +333,11 @@ export default function LabelingWorkspace({
               >
                 <InputSelect.Trigger
                   aria-label="Google provider"
-                  placeholder="Configure a provider first"
+                  placeholder={
+                    setup.providers.length
+                      ? "Select a Google provider"
+                      : "Configure a provider first"
+                  }
                 />
                 <InputSelect.Content>
                   {setup.providers.map((provider) => (
