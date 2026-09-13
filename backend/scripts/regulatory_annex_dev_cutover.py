@@ -3378,6 +3378,45 @@ def read_markdown_worker() -> dict[str, str | bool | int]:
     return result
 
 
+def read_markdown_delivery() -> dict[str, str | bool | int]:
+    import hashlib
+    import json
+
+    from onyx.background.celery.celery_redis import (
+        celery_get_broker_client,
+        celery_get_queue_length,
+    )
+    from onyx.background.celery.versioned_apps.client import app
+    from onyx.configs import app_configs
+
+    with app.connection_for_write() as connection:
+        identity = {
+            "host": connection.hostname,
+            "port": connection.port,
+            "database": connection.virtual_host,
+            "transport": connection.transport_cls,
+            "priority_steps": app.conf.broker_transport_options.get("priority_steps"),
+            "separator": app.conf.broker_transport_options.get("sep"),
+            "key_prefix": app.conf.broker_transport_options.get("global_keyprefix"),
+        }
+    broker = celery_get_broker_client(app)
+    try:
+        depth = celery_get_queue_length("user_file_processing", broker)
+    finally:
+        broker.close()
+    if type(depth) is not int or not 0 <= depth <= 1000000:
+        raise ValueError("queue_depth_bound_exceeded")
+    return {
+        "broker_target_sha256": hashlib.sha256(
+            json.dumps(identity, sort_keys=True).encode()
+        ).hexdigest(),
+        "processing_queue_depth": depth,
+        "current_vector_disabled": app_configs.DISABLE_VECTOR_DB,
+        "current_defer_indexing": app_configs.DEFER_USER_FILE_INDEXING,
+        "current_batch_indexing": app_configs.REGULATORY_BATCH_INDEXING_ENABLED,
+    }
+
+
 def validate_markdown_worker_report(report: Any) -> None:
     booleans = {
         "database_read_only",
@@ -3389,6 +3428,9 @@ def validate_markdown_worker_report(report: Any) -> None:
         "stats_pid_matches",
         "concurrency_available",
         "current_primary_worker_required",
+        "current_vector_disabled",
+        "current_defer_indexing",
+        "current_batch_indexing",
     }
     booleans.update(
         name + "_response"
@@ -3401,6 +3443,7 @@ def validate_markdown_worker_report(report: Any) -> None:
     }
     enums = {
         "stage": {"markdown_worker"},
+        "role": {"api", "background"},
         "status": {"read", "unavailable", "failed"},
         "failure_type": {"ValueError", "RuntimeError", "TimeoutError", "Exception"},
     }
@@ -3414,21 +3457,36 @@ def validate_markdown_worker_report(report: Any) -> None:
         valid = (
             (key in booleans and type(value) is bool)
             or (key in counts and type(value) is int and 0 <= value <= 10000)
+            or (
+                key == "processing_queue_depth"
+                and type(value) is int
+                and 0 <= value <= 1000000
+            )
+            or (
+                key == "broker_target_sha256"
+                and isinstance(value, str)
+                and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            )
             or (key in enums and isinstance(value, str) and value in enums[key])
         )
         if not valid:
             raise CutoverRefusal("fixed_worker_report_required")
 
 
-def diagnose_markdown_worker(driver: Driver, pod: str, container: str) -> None:
-    if driver.sha != MARKDOWN_WORKER_RUNTIME:
+def diagnose_markdown_worker(
+    driver: Driver, pod: str, container: str, *, role: str = "background"
+) -> None:
+    if driver.sha != MARKDOWN_WORKER_RUNTIME or role not in {"api", "background"}:
         raise CutoverRefusal("fixed_worker_runtime_required")
     program = "import contextlib, io, json, logging, os, signal\nfrom typing import Any\nlogging.disable(logging.CRITICAL)\ndef expired(*args):\n    raise TimeoutError()\nsignal.signal(signal.SIGALRM, expired)\nsignal.alarm(60)\n"
     program += (
         inspect.getsource(summarize_markdown_worker)
         + "\n"
         + inspect.getsource(read_markdown_worker)
+        + "\n"
+        + inspect.getsource(read_markdown_delivery)
     )
+    program += "\nrole = " + repr(role) + "\n"
     program += """
 report = {"stage": "markdown_worker", "status": "failed", "database_read_only": True}
 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -3440,7 +3498,11 @@ with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.St
         from onyx.db.regulatory_annex_dev_cutover import configured_indices
         configured_indices()
         report["configuration_verified"] = True
-        report.update(read_markdown_worker())
+        report.update(read_markdown_delivery())
+        report["role"] = role
+        report["status"] = "read"
+        if role == "background":
+            report.update(read_markdown_worker())
     except Exception as error:
         name = type(error).__name__
         report.update(status="failed", failure_type=name if name in {"ValueError", "RuntimeError", "TimeoutError"} else "Exception")
@@ -3494,6 +3556,15 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
     )
     if driver.sha == MARKDOWN_WORKER_RUNTIME:
         diagnose_markdown_worker(driver, pod["metadata"]["name"], container["name"])
+        for api_pod in driver.pods("api"):
+            api_container = next(
+                item
+                for item in api_pod["spec"]["containers"]
+                if item["image"] == f"{REPOSITORY}:{driver.sha}"
+            )
+            diagnose_markdown_worker(
+                driver, api_pod["metadata"]["name"], api_container["name"], role="api"
+            )
         return
     if driver.sha == MARKDOWN_A8_RUNTIME:
         diagnose_markdown_progress(driver, pod["metadata"]["name"], container["name"])
