@@ -3544,6 +3544,59 @@ def read_markdown_delivery() -> dict[str, str | bool | int]:
     }
 
 
+def read_redis_allocation() -> dict[str, str | bool | int]:
+    """Server metadata and connection-only SELECT probes; no application key reads."""
+    import re
+
+    from redis import Redis
+    from redis.exceptions import ResponseError
+
+    from onyx.background.celery.versioned_apps.client import app
+    from onyx.configs import app_configs
+
+    client = Redis.from_url(
+        app.conf.broker_url,
+        socket_timeout=2,
+        socket_connect_timeout=2,
+        single_connection_client=True,
+    )
+    try:
+        server = client.info("server")
+        keyspace = client.info("keyspace")
+        clients = client.client_list()
+        if len(keyspace) > 1024 or len(clients) > 10000:
+            raise ValueError("redis_metadata_bound_exceeded")
+        occupied = sorted(
+            int(name[2:]) for name in keyspace if re.fullmatch(r"db[0-9]{1,5}", name)
+        )
+        active = sorted(
+            {
+                int(row["db"])
+                for row in clients
+                if re.fullmatch(r"[0-9]{1,5}", str(row.get("db", "")))
+            }
+        )
+        supported = []
+        for database in range(16):
+            try:
+                client.execute_command("SELECT", database)
+                supported.append(database)
+            except ResponseError:
+                continue
+        return {
+            "redis_application_database": app_configs.REDIS_DB_NUMBER,
+            "redis_broker_database": app_configs.REDIS_DB_NUMBER_CELERY,
+            "redis_result_database": app_configs.REDIS_DB_NUMBER_CELERY_RESULT_BACKEND,
+            "redis_cluster_mode": server.get("redis_mode") == "cluster",
+            "redis_keyspace_databases": ",".join(map(str, occupied)),
+            "redis_client_databases": ",".join(map(str, active)),
+            "redis_supported_databases": ",".join(map(str, supported)),
+        }
+    finally:
+        client.close()
+        client.connection_pool.disconnect()
+
+
 def validate_markdown_worker_report(report: Any) -> None:
     booleans = {
         "database_read_only",
@@ -3560,6 +3613,7 @@ def validate_markdown_worker_report(report: Any) -> None:
         "current_batch_indexing",
         "owned_task_log_available",
         "owned_task_log_truncated",
+        "redis_cluster_mode",
     }
     booleans.update(
         "owned_task_" + name
@@ -3583,6 +3637,9 @@ def validate_markdown_worker_report(report: Any) -> None:
         "owned_task_log_files",
         "normal_worker_responses",
         "normal_worker_other_consumers",
+        "redis_application_database",
+        "redis_broker_database",
+        "redis_result_database",
     } | {
         kind + suffix
         for kind in ("active", "reserved")
@@ -3603,6 +3660,17 @@ def validate_markdown_worker_report(report: Any) -> None:
     for key, value in report.items():
         valid = (
             (key in booleans and type(value) is bool)
+            or (
+                key
+                in {
+                    "redis_keyspace_databases",
+                    "redis_client_databases",
+                    "redis_supported_databases",
+                }
+                and isinstance(value, str)
+                and len(value) <= 1024
+                and re.fullmatch(r"(?:[0-9]{1,5}(?:,[0-9]{1,5})*)?", value) is not None
+            )
             or (
                 key == "owned_task_frames"
                 and isinstance(value, str)
@@ -3664,6 +3732,8 @@ def diagnose_markdown_worker(
         + inspect.getsource(summarize_markdown_task_log)
         + "\n"
         + inspect.getsource(read_markdown_task_receipt)
+        + "\n"
+        + inspect.getsource(read_redis_allocation)
     )
     program += "\nrole = " + repr(role) + "\n"
     program += """
@@ -3681,8 +3751,7 @@ with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.St
         report["role"] = role
         report["status"] = "read"
         if role == "background":
-            report.update(read_markdown_worker())
-            report.update(read_markdown_task_receipt())
+            report.update(read_redis_allocation())
     except Exception as error:
         name = type(error).__name__
         report.update(status="failed", failure_type=name if name in {"ValueError", "RuntimeError", "TimeoutError"} else "Exception")
@@ -3800,9 +3869,7 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
         if item["image"] == f"{REPOSITORY}:{driver.sha}"
     )
     if driver.sha == MARKDOWN_WORKER_RUNTIME:
-        worker_report = diagnose_markdown_worker(
-            driver, pod["metadata"]["name"], container["name"]
-        )
+        diagnose_markdown_worker(driver, pod["metadata"]["name"], container["name"])
         for api_pod in driver.pods("api"):
             api_container = next(
                 item
@@ -3812,11 +3879,6 @@ def diagnose_release(driver: Driver, runner_sha: str) -> None:
             diagnose_markdown_worker(
                 driver, api_pod["metadata"]["name"], api_container["name"], role="api"
             )
-        if (
-            "user_file_processing@test-v1-customs-regulations-background-deployment-57788b682n78h"
-            in worker_report.get("queue_consumer_names", "").split(",")
-        ):
-            diagnose_shared_queue_log(driver)
         return
     if driver.sha == MARKDOWN_A8_RUNTIME:
         diagnose_markdown_progress(driver, pod["metadata"]["name"], container["name"])
