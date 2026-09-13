@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
-import re
 from hashlib import sha256
-from typing import Literal, TypedDict
-from urllib.parse import urlsplit
+from typing import Literal, Protocol, TypedDict
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session, joinedload, load_only
 
@@ -15,6 +12,7 @@ from onyx.auth.schemas import UserRole
 from onyx.db.llm import (
     can_user_access_llm_provider,
     fetch_user_group_ids,
+    get_gemini_batch_api_key,
 )
 from onyx.db.models import (
     ImageGenerationConfig,
@@ -40,7 +38,10 @@ from onyx.regulatory.indexing_jobs.models import (
     VertexAuthenticationMode,
     VertexBatchConfig,
 )
-from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchGateway
+from onyx.regulatory.indexing_jobs.vertex_batch import (
+    VertexBatchGateway,
+    VertexReadOnlyAccessProbe,
+)
 from onyx.regulatory.labeling.provider import DEFAULT_MODEL
 from onyx.tracing.flows import LLMFlow
 
@@ -48,62 +49,22 @@ from onyx.tracing.flows import LLMFlow
 class LabelingProviderOption(TypedDict):
     id: int
     name: str
+    configuration_error: str | None
 
 
-LabelingProviderTransport = Literal["gemini_files_v1", "vertex_gcs_v1"]
+class LabelingBatchGateway(VertexBatchGateway, Protocol):
+    def probe_gemini_read_access(self) -> VertexReadOnlyAccessProbe: ...
+
+
+LabelingProviderTransport = Literal["gemini_files_v1", "gemini_inline_api_key_v1"]
 
 _FILES_TRANSPORT: LabelingProviderTransport = "gemini_files_v1"
-_VERTEX_TRANSPORT: LabelingProviderTransport = "vertex_gcs_v1"
-_VERTEX_GCS_URI_ENV = "REGULATORY_LABELING_VERTEX_GCS_URI"
-_GCS_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*[a-z0-9]$")
-_INVALID_STAGING_URI_ERROR = (
-    "Gemini Batch storage requires a gs://bucket/prefix Cloud Storage location."
-)
-
-
-def _normalize_vertex_staging_uri(value: str) -> str:
-    uri = value.strip().rstrip("/")
-    try:
-        parsed = urlsplit(uri)
-    except ValueError:
-        raise ValueError(_INVALID_STAGING_URI_ERROR) from None
-    prefix = parsed.path.removeprefix("/")
-    path_segments = prefix.split("/")
-    if (
-        parsed.scheme != "gs"
-        or not 3 <= len(parsed.netloc) <= 222
-        or _GCS_BUCKET_PATTERN.fullmatch(parsed.netloc) is None
-        or parsed.query
-        or parsed.fragment
-        or not prefix
-        or any(segment in {"", ".", ".."} for segment in path_segments)
-        or any(character.isspace() for character in uri)
-        or "\\" in uri
-    ):
-        raise ValueError(_INVALID_STAGING_URI_ERROR)
-    return f"gs://{parsed.netloc}/{prefix}"
-
-
-def _configured_vertex_staging_uri() -> str:
-    value = os.environ.get(_VERTEX_GCS_URI_ENV, "")
-    if not value.strip():
-        raise ValueError(
-            "Gemini Batch storage is not configured. Configure its Cloud Storage "
-            "location before starting labeling."
-        )
-    return _normalize_vertex_staging_uri(value)
-
-
-def get_labeling_configuration_errors() -> list[str]:
-    try:
-        _configured_vertex_staging_uri()
-    except ValueError as error:
-        return [str(error)]
-    return []
+_INLINE_TRANSPORT: LabelingProviderTransport = "gemini_inline_api_key_v1"
+MISSING_BATCH_API_KEY = "Add a Gemini Batch API key to this connection in Language Models before starting labeling."
 
 
 class LabelingProviderBinding(BaseModel):
-    """Non-secret provider identity; rotating a key for the same principal is safe."""
+    """Frozen provider identity and, for inline jobs, the Batch credential hash."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -115,27 +76,26 @@ class LabelingProviderBinding(BaseModel):
     credential_identity: str
     model: str = DEFAULT_MODEL
     transport: LabelingProviderTransport = _FILES_TRANSPORT
-    staging_uri: str | None = None
+    api_key_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_transport_configuration(self) -> "LabelingProviderBinding":
         if self.transport == _FILES_TRANSPORT:
-            if self.staging_uri is not None:
-                raise ValueError("The Gemini Files transport cannot use GCS staging")
+            if self.api_key_hash is not None:
+                raise ValueError(
+                    "The legacy Files transport cannot use a Batch API key"
+                )
             return self
-        if self.staging_uri is None:
-            raise ValueError("The Vertex transport requires a GCS staging URI")
-        normalized = _normalize_vertex_staging_uri(self.staging_uri)
-        if normalized != self.staging_uri:
-            raise ValueError("The Vertex GCS staging URI must be normalized")
+        if self.api_key_hash is None:
+            raise ValueError("The inline Batch transport requires a credential hash")
         return self
 
     @property
     def fingerprint(self) -> str:
         payload = self.model_dump(mode="json")
-        if self.transport == _FILES_TRANSPORT and self.staging_uri is None:
+        if self.transport == _FILES_TRANSPORT:
             payload.pop("transport")
-            payload.pop("staging_uri")
+            payload.pop("api_key_hash")
         return sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -145,7 +105,7 @@ def _binding(
     model: ModelConfiguration,
     *,
     transport: LabelingProviderTransport = _FILES_TRANSPORT,
-    staging_uri: str | None = None,
+    api_key_hash: str | None = None,
 ) -> LabelingProviderBinding:
     provider = model.llm_provider
     if provider.provider != LlmProviderNames.VERTEX_AI or not model.is_visible:
@@ -187,7 +147,25 @@ def _binding(
         authentication_mode=authentication_mode,
         credential_identity=identity.strip(),
         transport=transport,
-        staging_uri=staging_uri,
+        api_key_hash=api_key_hash,
+    )
+
+
+def _inline_binding(
+    model: ModelConfiguration, user: User | None
+) -> tuple[LabelingProviderBinding, str]:
+    api_key = get_gemini_batch_api_key(
+        model.llm_provider, user_id=str(user.id) if user is not None else None
+    )
+    if not api_key:
+        raise ValueError(MISSING_BATCH_API_KEY)
+    return (
+        _binding(
+            model,
+            transport=_INLINE_TRANSPORT,
+            api_key_hash=sha256(api_key.encode()).hexdigest(),
+        ),
+        api_key,
     )
 
 
@@ -197,7 +175,7 @@ def _authorized_model(
     user: User | None,
 ) -> ModelConfiguration:
     model = db_session.scalar(
-        _model_statement()
+        _model_statement(include_batch_key=True)
         .where(ModelConfiguration.id == model_configuration_id)
         .execution_options(populate_existing=True)
     )
@@ -213,12 +191,14 @@ def _authorized_model(
     return model
 
 
-def _model_statement() -> Select[tuple[ModelConfiguration]]:
+def _model_statement(
+    *, include_batch_key: bool = False
+) -> Select[tuple[ModelConfiguration]]:
     provider = joinedload(ModelConfiguration.llm_provider)
     image_generation_provider_ids = select(ModelConfiguration.llm_provider_id).join(
         ImageGenerationConfig
     )
-    return (
+    statement = (
         select(ModelConfiguration)
         .where(~ModelConfiguration.llm_provider_id.in_(image_generation_provider_ids))
         .options(
@@ -239,6 +219,11 @@ def _model_statement() -> Select[tuple[ModelConfiguration]]:
             provider.selectinload(LLMProvider.personas).load_only(Persona.id),
         )
     )
+    if include_batch_key:
+        statement = statement.options(
+            provider.undefer(LLMProvider.gemini_batch_api_key)
+        )
+    return statement
 
 
 def resolve_labeling_provider_binding(
@@ -247,11 +232,9 @@ def resolve_labeling_provider_binding(
     *,
     user: User | None = None,
 ) -> LabelingProviderBinding:
-    return _binding(
-        _authorized_model(db_session, model_configuration_id, user),
-        transport=_VERTEX_TRANSPORT,
-        staging_uri=_configured_vertex_staging_uri(),
-    )
+    return _inline_binding(
+        _authorized_model(db_session, model_configuration_id, user), user
+    )[0]
 
 
 def get_labeling_provider_options(
@@ -280,6 +263,14 @@ def get_labeling_provider_options(
         .execution_options(populate_existing=True)
     )
     user_group_ids = fetch_user_group_ids(db_session, user)
+    configured_provider_ids = set(
+        db_session.scalars(
+            select(LLMProvider.id).where(
+                LLMProvider.provider == LlmProviderNames.VERTEX_AI,
+                LLMProvider.gemini_batch_api_key.is_not(None),
+            )
+        )
+    )
     options: list[LabelingProviderOption] = []
     for model in models:
         provider = model.llm_provider
@@ -294,7 +285,15 @@ def get_labeling_provider_options(
             _binding(model)
         except ValueError:
             continue
-        options.append({"id": model.id, "name": provider.name or "Gemini"})
+        options.append(
+            {
+                "id": model.id,
+                "name": provider.name or "Gemini",
+                "configuration_error": None
+                if provider.id in configured_provider_ids
+                else MISSING_BATCH_API_KEY,
+            }
+        )
     return options
 
 
@@ -304,20 +303,18 @@ def resolve_labeling_gateway(
     *,
     user: User | None = None,
     expected_binding: LabelingProviderBinding | None = None,
-) -> VertexBatchGateway:
+) -> LabelingBatchGateway:
     """Resolve credentials while the session is open; perform no network I/O here."""
     model = _authorized_model(db_session, model_configuration_id, user)
     transport = (
         expected_binding.transport
         if expected_binding is not None
-        else _VERTEX_TRANSPORT
+        else _INLINE_TRANSPORT
     )
-    binding = _binding(
-        model,
-        transport=transport,
-        staging_uri=(
-            _configured_vertex_staging_uri() if transport == _VERTEX_TRANSPORT else None
-        ),
+    binding, api_key = (
+        _inline_binding(model, user)
+        if transport == _INLINE_TRANSPORT
+        else (_binding(model), None)
     )
     if (
         expected_binding is not None
@@ -344,13 +341,14 @@ def resolve_labeling_gateway(
             max_reconciliation_seconds=180,
         )
 
-    from onyx.regulatory.labeling.vertex_batch import LabelingVertexBatchGateway
+    from onyx.regulatory.labeling.gemini_inline_batch import (
+        LabelingGeminiInlineBatchGateway,
+    )
 
-    assert binding.staging_uri is not None
-    return LabelingVertexBatchGateway(
+    assert api_key is not None
+    return LabelingGeminiInlineBatchGateway(
         config=config,
-        staging_uri=binding.staging_uri,
-        credential_json_provider=lambda: raw_credentials,
+        api_key_provider=lambda: api_key,
         max_result_bytes=64 * 1024 * 1024,
         request_timeout_seconds=20,
         max_reconciliation_seconds=180,

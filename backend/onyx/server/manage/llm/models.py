@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from onyx.db.enums import LLMModelFlowType
 from onyx.llm.constants import DYNAMIC_LLM_PROVIDERS
@@ -118,6 +118,9 @@ class LLMProviderUpsertRequest(LLMProvider):
     id: int | None = None
     api_key_changed: bool = False
     custom_config_changed: bool = False
+    gemini_batch_api_key: SecretStr | None = Field(
+        default=None, exclude=True, repr=False
+    )
     model_configurations: list["ModelConfigurationUpsertRequest"] = []
 
     @field_validator("provider", mode="before")
@@ -131,6 +134,7 @@ class LLMProviderView(LLMProvider):
     """Stripped down representation of LLMProvider for display / limited access info only"""
 
     id: int
+    has_gemini_batch_api_key: bool = False
     model_configurations: list["ModelConfigurationView"]
 
     @classmethod
@@ -174,6 +178,9 @@ class LLMProviderView(LLMProvider):
 
         return cls(
             id=llm_provider_model.id,
+            has_gemini_batch_api_key=(
+                llm_provider_model.gemini_batch_api_key is not None
+            ),
             name=llm_provider_model.name,
             provider=provider,
             api_key=api_key,

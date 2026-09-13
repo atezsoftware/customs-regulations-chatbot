@@ -48,8 +48,6 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    env:
-      REGULATORY_LABELING_VERTEX_GCS_URI: ${{ vars.REGULATORY_LABELING_VERTEX_GCS_URI_DEV }}
     permissions:
       id-token: write
       issues: write

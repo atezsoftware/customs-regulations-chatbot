@@ -167,19 +167,32 @@ export default function LabelingWorkspace({
     selectedRunIsActive
   );
 
+  const selectedProvider = setup?.providers.find(
+    (provider) => String(provider.id) === providerId
+  );
+  const configurationErrors = useMemo(
+    () => [
+      ...(setup?.configuration_errors ?? []),
+      ...(selectedProvider?.configuration_error
+        ? [selectedProvider.configuration_error]
+        : []),
+    ],
+    [setup?.configuration_errors, selectedProvider?.configuration_error]
+  );
+
   const readiness = useMemo(
     () => ({
-      provider: Boolean(providerId),
+      provider: Boolean(selectedProvider),
       chunks: Boolean(setup?.counts.canonical_chunks),
       idle: !runsError && !hasActiveRun,
-      configuration: !setup?.configuration_errors?.length,
+      configuration: configurationErrors.length === 0,
     }),
     [
-      providerId,
+      selectedProvider,
       hasActiveRun,
       runsError,
       setup?.counts.canonical_chunks,
-      setup?.configuration_errors,
+      configurationErrors,
     ]
   );
   const canStart = Object.values(readiness).every(Boolean) && !isSubmitting;
@@ -281,7 +294,7 @@ export default function LabelingWorkspace({
           titleMaxLines={undefined}
         />
       ))}
-      {setup.configuration_errors?.map((configurationError) => (
+      {configurationErrors.map((configurationError) => (
         <MessageCard
           key={configurationError}
           variant="error"

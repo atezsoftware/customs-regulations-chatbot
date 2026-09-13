@@ -129,7 +129,13 @@ export async function submitProvider<T extends BaseLLMFormValues>({
 }: SubmitProviderParams<T>): Promise<void> {
   setSubmitting(true);
 
-  const { test_model_name, api_key, name: rawName, ...rest } = values;
+  const {
+    test_model_name,
+    api_key,
+    gemini_batch_api_key,
+    name: rawName,
+    ...rest
+  } = values;
   const testModelName =
     test_model_name ||
     values.model_configurations.find((m) => m.is_visible)?.name ||
@@ -208,6 +214,7 @@ export async function submitProvider<T extends BaseLLMFormValues>({
       body: JSON.stringify({
         provider: providerName,
         ...finalValues,
+        ...(gemini_batch_api_key !== undefined ? { gemini_batch_api_key } : {}),
         id: existingLlmProvider?.id,
       }),
     }

@@ -16,6 +16,7 @@ from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayError,
     IndexingGatewayIndeterminateSubmissionError,
 )
+from onyx.regulatory.indexing_jobs.retry import classify_indexing_error
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchGateway,
     VertexBatchJobStatus,
@@ -58,6 +59,15 @@ class LabelingStepResult:
     outcome: LabelingStepOutcome
     expected_generation: int | None = None
     countdown_seconds: float = 0
+
+
+def _provider_error_is_terminal(
+    error: IndexingGatewayError, failure_count: int
+) -> bool:
+    return (
+        not classify_indexing_error(error).retryable
+        or failure_count + 1 >= LABELING_MAX_PROVIDER_FAILURES
+    )
 
 
 def _next(
@@ -237,7 +247,10 @@ def _cancel(
                 reconcile_until is not None
                 and datetime.datetime.now(datetime.timezone.utc) < reconcile_until
             )
-            if failure_count + 1 < LABELING_MAX_PROVIDER_FAILURES and within_deadline:
+            if (
+                not _provider_error_is_terminal(error, failure_count)
+                and within_deadline
+            ):
                 with get_session_with_current_tenant() as session:
                     repository.record_shard_state(
                         session,
@@ -289,7 +302,7 @@ def _cancel(
             with get_session_with_current_tenant() as session:
                 current = repository.load_claimed_shard(session, lease, shard_id)
                 failures = current.failure_count
-                if failures + 1 < LABELING_MAX_PROVIDER_FAILURES:
+                if not _provider_error_is_terminal(error, failures):
                     repository.record_shard_state(
                         session,
                         lease,
@@ -372,7 +385,7 @@ def _submit_or_reconcile(
                         result_session, lease, shard_id
                     )
                     failures = current.failure_count
-                    terminal = failures + 1 >= LABELING_MAX_PROVIDER_FAILURES
+                    terminal = _provider_error_is_terminal(error, failures)
                     repository.record_shard_state(
                         result_session,
                         lease,
@@ -431,7 +444,7 @@ def _submit_or_reconcile(
             shard = repository.load_claimed_shard(session, lease, shard_id)
             failures = shard.failure_count
             terminal = (
-                failures + 1 >= LABELING_MAX_PROVIDER_FAILURES
+                _provider_error_is_terminal(error, failures)
                 or reconcile_until is None
                 or datetime.datetime.now(datetime.timezone.utc) >= reconcile_until
             )
@@ -508,7 +521,7 @@ def _poll_or_apply(
         with get_session_with_current_tenant() as session:
             shard = repository.load_claimed_shard(session, lease, shard_id)
             failures = shard.failure_count
-            terminal = failures + 1 >= LABELING_MAX_PROVIDER_FAILURES
+            terminal = _provider_error_is_terminal(error, failures)
             repository.record_shard_state(
                 session,
                 lease,
@@ -582,7 +595,7 @@ def _poll_or_apply(
     except IndexingGatewayError as error:
         with get_session_with_current_tenant() as session:
             shard = repository.load_claimed_shard(session, lease, shard_id)
-            terminal = shard.failure_count + 1 >= LABELING_MAX_PROVIDER_FAILURES
+            terminal = _provider_error_is_terminal(error, shard.failure_count)
             repository.record_shard_state(
                 session,
                 lease,

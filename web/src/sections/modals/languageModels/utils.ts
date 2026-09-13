@@ -116,6 +116,7 @@ export function buildValidationSchema(
 export interface BaseLLMFormValues {
   name?: string;
   api_key?: string;
+  gemini_batch_api_key?: string;
   api_base?: string;
   /** Model name used for the test request — automatically derived. */
   test_model_name?: string;

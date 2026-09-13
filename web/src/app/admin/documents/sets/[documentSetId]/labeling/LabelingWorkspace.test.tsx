@@ -136,9 +136,16 @@ test("prompts for a provider selection when multiple providers are available", a
 });
 
 test("shows batch configuration errors and prevents starting while preserving label settings", async () => {
-  const configurationError = "Vertex batch storage is not configured.";
+  const configurationError =
+    "Add a Gemini Batch API key to this connection in Language Models before starting labeling.";
   installFetchRouter({
-    setup: { ...readySetup, configuration_errors: [configurationError] },
+    setup: {
+      ...readySetup,
+      providers: readySetup.providers.map((provider) => ({
+        ...provider,
+        configuration_error: configurationError,
+      })),
+    },
   });
   render(<LabelingWorkspace documentSetId={7} />);
 

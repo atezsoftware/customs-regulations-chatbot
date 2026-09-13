@@ -732,17 +732,24 @@ store/environment, not in source control. Defaults below match the Compose overl
 If the API gate fails, the wrapper leaves `background` stopped. Preserve its output, then use the
 same fixed overlay order only for read-only diagnostics; do not retry with ad hoc Compose files.
 
-### DEV native Vertex labeling storage
+### Gemini labeling Batch access
 
-Native Vertex labeling requires a GCS URI for batch input and output. Set the optional
-GitHub Actions variable `REGULATORY_LABELING_VERTEX_GCS_URI_DEV` to that URI after the bucket and
-access have been verified. The DEV backend workflow passes it as `REGULATORY_LABELING_VERTEX_GCS_URI`
-to both API and background Helm environment parameters, including same-image annex activation and
-fallback deployment. An unset or empty variable renders an empty value on both apps and disables
-native labeling starts. This setting does not create a bucket, grant access, enable indexing, or
-change annex activation gates. `annex-verify` remains read-only.
-Batch input, correlation manifests, and output remain under the dedicated labeling prefix after a
-run finishes; configure the bucket's retention/lifecycle policy before enabling real jobs.
+Labeling sends bounded inline batches to the Gemini Developer API and retrieves completed
+responses directly from the batch endpoint. It requires no Cloud Storage bucket, file upload,
+or storage environment variable. Each shard is limited to 64 requests and an 8 MiB request budget;
+the gateway also enforces the API's total inline-body limit of under 20 MB.
+
+In Language Models, edit the existing Gemini connection and set its **Gemini Batch API key**.
+This dedicated credential is encrypted in PostgreSQL and is separate from the connection's Vertex
+service-account JSON or workload identity used by chat. Leaving the field blank preserves a saved
+key; the explicit remove action clears it. API responses expose only whether a key is saved.
+The key's project must have Gemini Developer API access to the selected model and batch operations.
+Start Labeling performs read-only access checks before creating a job, outside a database transaction.
+
+Each run records the selected provider identity, model, immutable label snapshot, and a fingerprint
+of the Batch credential. Changing the credential prevents an existing worker from silently using a
+different connection. Historical Files-based runs retain their original transport binding.
+Label results are stored separately; labeling does not rewrite chunks, embeddings, or search indexes.
 
 ## 6. Health and smoke checks
 

@@ -12,13 +12,14 @@ from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.labeling_configuration import (
-    get_labeling_configuration_errors,
     get_labeling_provider_options,
+    resolve_labeling_gateway,
     resolve_labeling_provider_binding,
 )
 from onyx.db.models import RegulatoryLabelingRun, RegulatoryLabelSettings, User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
+from onyx.regulatory.indexing_jobs.models import IndexingGatewayError
 from onyx.regulatory.labeling.api_models import (
     LabelingItemsPage,
     LabelingProviderSummary,
@@ -30,6 +31,7 @@ from onyx.regulatory.labeling.api_models import (
     TaxonomyCreate,
     TaxonomySummary,
 )
+from onyx.regulatory.labeling.gemini_inline_batch import GeminiInlineBatchAccessError
 from onyx.regulatory.labeling.provider import DEFAULT_MODEL, TaxonomyDefinition
 from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import get_current_tenant_id
@@ -112,7 +114,6 @@ def labeling_setup(
         providers=[LabelingProviderSummary(**option) for option in providers],
         counts=counts,
         warnings=warnings,
-        configuration_errors=get_labeling_configuration_errors(),
         active_run_id=str(active_run) if active_run is not None else None,
     )
 
@@ -234,6 +235,36 @@ def _start_run(
         binding = resolve_labeling_provider_binding(
             session, body.model_configuration_id, user=user
         )
+        gateway = resolve_labeling_gateway(
+            session, body.model_configuration_id, user=user, expected_binding=binding
+        )
+        taxonomy_id = taxonomy.id
+        session.commit()
+        try:
+            gateway.probe_gemini_read_access()
+        except GeminiInlineBatchAccessError as error:
+            detail = (
+                "Enable the Gemini Developer API for the Batch key's project before starting labeling."
+                if error.reason_code == "SERVICE_DISABLED"
+                else "Gemini Batch access could not be verified. Check this connection's Batch API key and project access in Language Models."
+            )
+            raise OnyxError(OnyxErrorCode.INVALID_INPUT, detail) from None
+        except IndexingGatewayError:
+            raise OnyxError(
+                OnyxErrorCode.BAD_GATEWAY,
+                "Gemini Batch access could not be checked. Try again shortly.",
+            ) from None
+        _check_access(session, document_set_id, user)
+        current_binding = resolve_labeling_provider_binding(
+            session, body.model_configuration_id, user=user
+        )
+        if current_binding.fingerprint != binding.fingerprint:
+            raise repository.LabelingStateConflictError(
+                "The Gemini Batch connection changed while access was checked; start again."
+            )
+        taxonomy = repository.get_taxonomy(session, taxonomy_id)
+        if taxonomy is None:
+            raise ValueError("The selected label snapshot is no longer available")
         run, _created = repository.create_labeling_run(
             session,
             document_set_id=document_set_id,

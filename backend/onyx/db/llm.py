@@ -39,6 +39,26 @@ from shared_configs.enums import EmbeddingProvider
 logger = setup_logger()
 
 
+def get_gemini_batch_api_key(
+    provider: LLMProviderModel,
+    *,
+    user_id: str | None = None,
+) -> str | None:
+    """Return the dedicated Gemini Batch key after recording credential use."""
+    if provider.gemini_batch_api_key is None:
+        return None
+
+    from onyx.utils.credential_audit import emit_credential_access
+
+    emit_credential_access(
+        credential_type="gemini_batch_api_key",
+        provider=provider.provider,
+        row_id=provider.id,
+        user_id=user_id,
+    )
+    return provider.gemini_batch_api_key.get_value(apply_mask=False).strip() or None
+
+
 def update_group_llm_provider_relationships__no_commit(
     llm_provider_id: int,
     group_ids: list[int] | None,
@@ -255,6 +275,17 @@ def upsert_llm_provider(
     # in the input data, so absent and null are distinguishable.
     if "name" in llm_provider_upsert_request.model_fields_set:
         existing_llm_provider.name = llm_provider_upsert_request.name
+    batch_key_was_provided = (
+        "gemini_batch_api_key" in llm_provider_upsert_request.model_fields_set
+    )
+    normalized_batch_key: str | None = None
+    if batch_key_was_provided:
+        submitted_batch_key = llm_provider_upsert_request.gemini_batch_api_key
+        normalized_batch_key = (
+            submitted_batch_key.get_secret_value().strip()
+            if submitted_batch_key is not None
+            else ""
+        ) or None
     existing_llm_provider.provider = llm_provider_upsert_request.provider
     # EncryptedString accepts str for writes, returns SensitiveValue for reads
     existing_llm_provider.api_key = (  # ty: ignore[invalid-assignment]
@@ -356,13 +387,18 @@ def upsert_llm_provider(
         persona_ids=llm_provider_upsert_request.personas,
     )
 
-    db_session.flush()
-    db_session.refresh(existing_llm_provider)
-
     try:
+        if batch_key_was_provided:
+            existing_llm_provider.gemini_batch_api_key = (  # ty: ignore[invalid-assignment]
+                normalized_batch_key
+            )
+        db_session.flush()
+        db_session.refresh(existing_llm_provider)
         db_session.commit()
     except Exception as e:
         db_session.rollback()
+        if batch_key_was_provided:
+            raise ValueError("Failed to save LLM provider") from None
         raise ValueError(f"Failed to save LLM provider: {str(e)}") from e
 
     full_llm_provider = LLMProviderView.from_model(existing_llm_provider)

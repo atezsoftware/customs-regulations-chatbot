@@ -47,12 +47,8 @@ from tests.external_dependency_unit.craft.db_helpers import make_user
 
 _PRIVATE_KEY = "labeling-test-private-key-not-a-real-credential"
 _ROTATED_KEY = "labeling-test-rotated-key-not-a-real-credential"
-_STAGING_URI = "gs://labeling-test-bucket/regulatory-labeling"
-
-
-@pytest.fixture(autouse=True)
-def configured_vertex_staging(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("REGULATORY_LABELING_VERTEX_GCS_URI", _STAGING_URI)
+_BATCH_API_KEY = "labeling-test-batch-api-key-not-a-real-credential"
+_ROTATED_BATCH_API_KEY = "labeling-test-rotated-batch-api-key"
 
 
 @pytest.fixture
@@ -96,6 +92,7 @@ def _model(
     visible: bool = True,
     provider_type: str = LlmProviderNames.VERTEX_AI,
     name: str = "gemini-2.5-flash",
+    batch_api_key: str | None = _BATCH_API_KEY,
 ) -> ModelConfiguration:
     provider = LLMProvider(
         name=f"Labeling test {uuid4().hex}",
@@ -107,6 +104,7 @@ def _model(
             VERTEX_LOCATION_KWARG: "global",
         },
     )
+    provider.gemini_batch_api_key = batch_api_key  # ty: ignore[invalid-assignment]
     model = ModelConfiguration(llm_provider=provider, name=name, is_visible=visible)
     session.add(model)
     session.flush()
@@ -218,7 +216,11 @@ def test_one_option_per_provider_prefers_labeling_model_without_exposing_credent
         if option["id"] in {contextual_model.id, labeling_model.id}
     ]
     assert owned_options == [
-        {"id": labeling_model.id, "name": contextual_model.llm_provider.name}
+        {
+            "id": labeling_model.id,
+            "name": contextual_model.llm_provider.name,
+            "configuration_error": None,
+        }
     ]
     binding = resolve_labeling_provider_binding(
         labeling_session, labeling_model.id, user=user
@@ -228,7 +230,7 @@ def test_one_option_per_provider_prefers_labeling_model_without_exposing_credent
         assert secret not in serialized
 
 
-def test_new_binding_freezes_native_vertex_transport_and_staging_uri(
+def test_new_binding_freezes_inline_transport_and_batch_key_hash(
     labeling_session: Session,
 ) -> None:
     user = make_user(labeling_session, role=UserRole.BASIC)
@@ -236,8 +238,8 @@ def test_new_binding_freezes_native_vertex_transport_and_staging_uri(
 
     binding = resolve_labeling_provider_binding(labeling_session, model.id, user=user)
 
-    assert binding.transport == "vertex_gcs_v1"
-    assert binding.staging_uri == _STAGING_URI
+    assert binding.transport == "gemini_inline_api_key_v1"
+    assert binding.api_key_hash == sha256(_BATCH_API_KEY.encode()).hexdigest()
 
 
 def test_legacy_binding_defaults_to_files_transport_and_preserves_fingerprint() -> None:
@@ -257,61 +259,40 @@ def test_legacy_binding_defaults_to_files_transport_and_preserves_fingerprint() 
     binding = labeling_configuration.LabelingProviderBinding.model_validate(payload)
 
     assert binding.transport == "gemini_files_v1"
-    assert binding.staging_uri is None
+    assert binding.api_key_hash is None
     assert binding.fingerprint == expected_fingerprint
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        "https://example.com/path",
-        "gs://bucket",
-        "gs://bucket/../escape",
-        "gs://[invalid/path",
-    ],
-)
-def test_invalid_vertex_staging_configuration_is_reported(
-    monkeypatch: pytest.MonkeyPatch, value: str
+def test_missing_batch_key_is_reported_without_decrypting_during_catalog(
+    labeling_session: Session,
 ) -> None:
-    monkeypatch.setenv("REGULATORY_LABELING_VERTEX_GCS_URI", value)
+    user = make_user(labeling_session, role=UserRole.BASIC)
+    model = _model(labeling_session, name="gemini-3.8-flash", batch_api_key=None)
 
-    errors = labeling_configuration.get_labeling_configuration_errors()
+    with patch.object(
+        labeling_configuration, "get_gemini_batch_api_key"
+    ) as get_batch_key:
+        options = get_labeling_provider_options(labeling_session, user=user)
 
-    assert len(errors) == 1
-    assert "Gemini Batch storage requires a gs://bucket/prefix" in errors[0]
+    get_batch_key.assert_not_called()
+    option = next(option for option in options if option["id"] == model.id)
+    assert option["configuration_error"] == labeling_configuration.MISSING_BATCH_API_KEY
+    with pytest.raises(ValueError, match="Add a Gemini Batch API key"):
+        resolve_labeling_provider_binding(labeling_session, model.id, user=user)
+    with pytest.raises(ValueError, match="Add a Gemini Batch API key"):
+        resolve_labeling_gateway(labeling_session, model.id, user=user)
 
 
-def test_missing_vertex_staging_blocks_new_binding_but_not_catalog(
-    labeling_session: Session, monkeypatch: pytest.MonkeyPatch
+def test_configured_batch_key_clears_catalog_configuration_error(
+    labeling_session: Session,
 ) -> None:
-    monkeypatch.delenv("REGULATORY_LABELING_VERTEX_GCS_URI", raising=False)
     user = make_user(labeling_session, role=UserRole.BASIC)
     model = _model(labeling_session, name="gemini-3.8-flash")
 
     options = get_labeling_provider_options(labeling_session, user=user)
 
-    assert model.id in {option["id"] for option in options}
-    assert labeling_configuration.get_labeling_configuration_errors()
-    with pytest.raises(ValueError, match="Gemini Batch storage is not configured"):
-        resolve_labeling_provider_binding(labeling_session, model.id, user=user)
-    with pytest.raises(ValueError, match="Gemini Batch storage is not configured"):
-        resolve_labeling_gateway(labeling_session, model.id, user=user)
-
-
-def test_vertex_staging_is_normalized_and_frozen_in_binding(
-    labeling_session: Session, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv(
-        "REGULATORY_LABELING_VERTEX_GCS_URI",
-        "  gs://labeling-test-bucket/regulatory-labeling/  ",
-    )
-    user = make_user(labeling_session, role=UserRole.BASIC)
-    model = _model(labeling_session, name="gemini-3.8-flash")
-
-    binding = resolve_labeling_provider_binding(labeling_session, model.id, user=user)
-
-    assert binding.staging_uri == _STAGING_URI
-    assert labeling_configuration.get_labeling_configuration_errors() == []
+    option = next(option for option in options if option["id"] == model.id)
+    assert option["configuration_error"] is None
 
 
 def test_unnamed_provider_uses_gemini_display_name(
@@ -377,7 +358,7 @@ def test_labeling_uses_fixed_model_and_current_key_after_same_principal_rotation
     current = resolve_labeling_provider_binding(labeling_session, model.id, user=user)
     assert current.fingerprint == binding.fingerprint
     with patch(
-        "onyx.regulatory.labeling.vertex_batch.LabelingVertexBatchGateway",
+        "onyx.regulatory.labeling.gemini_inline_batch.LabelingGeminiInlineBatchGateway",
         autospec=True,
     ) as gateway_constructor:
         resolve_labeling_gateway(
@@ -389,27 +370,24 @@ def test_labeling_uses_fixed_model_and_current_key_after_same_principal_rotation
     assert config.model_name == "gemini-3.8-flash"
     assert config.project == "labeling-project"
     assert config.authentication_mode == VertexAuthenticationMode.SERVICE_ACCOUNT_JSON
-    assert arguments["staging_uri"] == _STAGING_URI
-    credential_provider = cast(
-        Callable[[], str | None], arguments["credential_json_provider"]
-    )
-    assert credential_provider() == rotated_credentials
+    api_key_provider = cast(Callable[[], str], arguments["api_key_provider"])
+    assert api_key_provider() == _BATCH_API_KEY
     assert _ROTATED_KEY not in current.model_dump_json()
 
 
-def test_legacy_binding_resumes_with_files_gateway(
-    labeling_session: Session, monkeypatch: pytest.MonkeyPatch
+def test_legacy_binding_resumes_with_files_gateway_without_batch_key(
+    labeling_session: Session,
 ) -> None:
     user = make_user(labeling_session, role=UserRole.BASIC)
-    model = _model(labeling_session, name="gemini-3.8-flash")
-    current = resolve_labeling_provider_binding(labeling_session, model.id, user=user)
-    legacy_payload = current.model_dump(
-        mode="json", exclude={"transport", "staging_uri"}
+    model = _model(labeling_session, name="gemini-3.8-flash", batch_api_key=None)
+    legacy_binding = labeling_configuration.LabelingProviderBinding(
+        model_configuration_id=model.id,
+        provider_id=model.llm_provider_id,
+        project="labeling-project",
+        location="global",
+        authentication_mode=VertexAuthenticationMode.SERVICE_ACCOUNT_JSON,
+        credential_identity="labeler@labeling-project.iam.gserviceaccount.com",
     )
-    legacy_binding = labeling_configuration.LabelingProviderBinding.model_validate(
-        legacy_payload
-    )
-    monkeypatch.delenv("REGULATORY_LABELING_VERTEX_GCS_URI", raising=False)
 
     with patch.object(
         labeling_configuration, "GoogleGeminiFilesBatchGateway", autospec=True
@@ -426,16 +404,16 @@ def test_legacy_binding_resumes_with_files_gateway(
     assert arguments["config"].model_name == "gemini-3.8-flash"
 
 
-def test_native_binding_rejects_staging_uri_drift_before_gateway_creation(
-    labeling_session: Session, monkeypatch: pytest.MonkeyPatch
+def test_inline_binding_rejects_batch_key_rotation_before_gateway_creation(
+    labeling_session: Session,
 ) -> None:
     user = make_user(labeling_session, role=UserRole.BASIC)
     model = _model(labeling_session, name="gemini-3.8-flash")
     binding = resolve_labeling_provider_binding(labeling_session, model.id, user=user)
-    monkeypatch.setenv(
-        "REGULATORY_LABELING_VERTEX_GCS_URI",
-        "gs://other-labeling-bucket/regulatory-labeling",
+    model.llm_provider.gemini_batch_api_key = (  # ty: ignore[invalid-assignment]
+        _ROTATED_BATCH_API_KEY
     )
+    labeling_session.flush()
 
     with pytest.raises(ValueError, match="binding changed"):
         resolve_labeling_gateway(
@@ -535,9 +513,11 @@ def test_labeling_resolution_does_not_load_unneeded_models_or_scale_query_count(
     event.listen(labeling_session, "loaded_as_persistent", record_load)
     try:
         if operation == "catalog":
-            assert {"id": selected_id, "name": selected_name} in (
-                get_labeling_provider_options(labeling_session, user=user)
-            )
+            assert {
+                "id": selected_id,
+                "name": selected_name,
+                "configuration_error": None,
+            } in (get_labeling_provider_options(labeling_session, user=user))
         else:
             binding = resolve_labeling_provider_binding(
                 labeling_session, selected_id, user=user

@@ -26,6 +26,7 @@ class TaxonomySummary(BaseModel):
 class LabelingProviderSummary(BaseModel):
     id: int
     name: str
+    configuration_error: str | None = None
 
 
 class LabelingCounts(BaseModel):

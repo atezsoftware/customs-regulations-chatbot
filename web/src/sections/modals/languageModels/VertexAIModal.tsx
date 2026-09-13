@@ -8,7 +8,7 @@ import { FileUploadFormField } from "@/components/Field";
 import InputTypeInField from "@/refresh-components/form/InputTypeInField";
 import InputSelectField from "@/refresh-components/form/InputSelectField";
 import InputSelect from "@/refresh-components/inputs/InputSelect";
-import { Card, MessageCard } from "@opal/components";
+import { Button, Card, MessageCard } from "@opal/components";
 import { Section } from "@/layouts/general-layouts";
 import { InputDivider, InputPadder, InputVertical, toast } from "@opal/layouts";
 import {
@@ -46,6 +46,8 @@ const FIELD_VERTEX_LOCATION = "custom_config.vertex_location";
 const FIELD_VERTEX_PROJECT = "custom_config.vertex_project";
 
 interface VertexAIModalValues extends BaseLLMFormValues {
+  gemini_batch_api_key: string;
+  remove_gemini_batch_api_key: boolean;
   custom_config: {
     vertex_auth_method: string;
     vertex_credentials: string;
@@ -182,8 +184,8 @@ function VertexAIModalInternals({
         <InputPadder>
           <InputVertical
             withLabel={FIELD_VERTEX_CREDENTIALS}
-            title="API Key"
-            subDescription="Attach your API key JSON from Google Cloud to access your models."
+            title="Service Account JSON"
+            subDescription="Attach your Google Cloud service account JSON to access Vertex AI models."
           >
             <FileUploadFormField name={FIELD_VERTEX_CREDENTIALS} label="" />
           </InputVertical>
@@ -211,6 +213,47 @@ function VertexAIModalInternals({
             </InputVertical>
           </Card>
         </>
+      )}
+
+      {!isOnboarding && (
+        <InputPadder>
+          <InputVertical
+            withLabel="gemini_batch_api_key"
+            title="Gemini Batch API key"
+            subDescription="Used for background chunk labeling through the Gemini Developer API. Saved securely; leave blank to keep the current key."
+          >
+            <InputTypeInField
+              name="gemini_batch_api_key"
+              aria-label="Gemini Batch API key"
+              type="password"
+              autoComplete="new-password"
+              placeholder={
+                existingLlmProvider?.has_gemini_batch_api_key
+                  ? "A Batch key is saved"
+                  : "Enter a Gemini Developer API key"
+              }
+              onChange={() =>
+                formikProps.setFieldValue("remove_gemini_batch_api_key", false)
+              }
+            />
+            {existingLlmProvider?.has_gemini_batch_api_key && (
+              <Button
+                prominence="tertiary"
+                onClick={() => {
+                  formikProps.setFieldValue("gemini_batch_api_key", "");
+                  formikProps.setFieldValue(
+                    "remove_gemini_batch_api_key",
+                    !formikProps.values.remove_gemini_batch_api_key
+                  );
+                }}
+              >
+                {formikProps.values.remove_gemini_batch_api_key
+                  ? "Keep saved Batch key"
+                  : "Remove saved Batch key"}
+              </Button>
+            )}
+          </InputVertical>
+        </InputPadder>
       )}
 
       {!isOnboarding && (
@@ -256,6 +299,8 @@ export default function VertexAIModal({
       LLMProviderName.VERTEX_AI,
       existingLlmProvider
     ),
+    gemini_batch_api_key: "",
+    remove_gemini_batch_api_key: false,
     custom_config: {
       vertex_auth_method:
         (existingLlmProvider?.custom_config?.vertex_auth_method as string) ??
@@ -300,6 +345,14 @@ export default function VertexAIModal({
       initialValues={initialValues}
       validationSchema={validationSchema}
       onSubmit={async (values, { setSubmitting, setStatus }) => {
+        const {
+          gemini_batch_api_key,
+          remove_gemini_batch_api_key,
+          ...connectionValues
+        } = values;
+        const batchKey = remove_gemini_batch_api_key
+          ? ""
+          : gemini_batch_api_key.trim() || undefined;
         const filteredCustomConfig = Object.fromEntries(
           Object.entries(values.custom_config || {}).filter(
             ([key, v]) => key === "vertex_auth_method" || v !== ""
@@ -307,7 +360,8 @@ export default function VertexAIModal({
         );
 
         const submitValues = {
-          ...values,
+          ...connectionValues,
+          ...(batchKey !== undefined ? { gemini_batch_api_key: batchKey } : {}),
           custom_config:
             Object.keys(filteredCustomConfig).length > 0
               ? filteredCustomConfig

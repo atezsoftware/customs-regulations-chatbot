@@ -9,6 +9,7 @@ export interface LabelingTaxonomySummary {
 export interface LabelingProvider {
   id: number;
   name: string;
+  configuration_error?: string | null;
 }
 
 export interface LabelingSetup {

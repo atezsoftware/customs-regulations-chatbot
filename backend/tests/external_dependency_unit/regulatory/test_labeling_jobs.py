@@ -49,14 +49,16 @@ from onyx.llm.well_known_providers.constants import (
 )
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayConnectionError,
+    IndexingGatewayHTTPError,
     IndexingGatewayIndeterminateSubmissionError,
 )
 from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchJobStatus,
     VertexBatchRequest,
     VertexBatchState,
+    VertexReadOnlyAccessProbe,
 )
-from onyx.regulatory.labeling import orchestrator, vertex_batch
+from onyx.regulatory.labeling import gemini_inline_batch, orchestrator
 from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
     build_labeling_request,
@@ -132,11 +134,7 @@ def labeling_database() -> Generator[LabelingDatabase, None, None]:
 @pytest.fixture
 def labeling_data(
     labeling_database: LabelingDatabase,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> Generator[LabelingData, None, None]:
-    monkeypatch.setenv(
-        "REGULATORY_LABELING_VERTEX_GCS_URI", "gs://labeling-test-bucket/jobs"
-    )
     token = CURRENT_TENANT_ID_CONTEXTVAR.set(labeling_database.schema)
     with Session(labeling_database.engine) as session:
         user = User(
@@ -210,6 +208,7 @@ def labeling_data(
             )
         provider = LLMProvider(
             name=f"labeling-provider-{uuid4().hex}",
+            gemini_batch_api_key="batch-test-key-not-a-real-credential",
             provider=LlmProviderNames.VERTEX_AI,
             is_public=True,
             custom_config={
@@ -752,6 +751,11 @@ def labeling_client(
         labeling_data.database.schema
     )
     monkeypatch.setattr(labeling_api, "_wake", lambda *_args: None)
+    monkeypatch.setattr(
+        gemini_inline_batch.LabelingGeminiInlineBatchGateway,
+        "probe_gemini_read_access",
+        lambda _self: VertexReadOnlyAccessProbe(credential_identity="test"),
+    )
     with TestClient(app) as client:
         yield client
 
@@ -803,7 +807,11 @@ def test_api_setup_and_start_expose_only_safe_persisted_state(
     assert setup["model"] == "gemini-3.8-flash"
     assert setup["counts"] == {"files": 1, "canonical_chunks": 2, "derived_chunks": 2}
     assert setup["providers"] == [
-        {"id": labeling_data.model_id, "name": setup["providers"][0]["name"]}
+        {
+            "id": labeling_data.model_id,
+            "name": setup["providers"][0]["name"],
+            "configuration_error": None,
+        }
     ]
     assert setup["taxonomies"][0]["id"] == str(labeling_data.taxonomy_id)
     assert setup["active_run_id"] is None
@@ -825,21 +833,107 @@ def test_api_setup_and_start_expose_only_safe_persisted_state(
     assert page.json()["total"] == 2
 
 
-def test_api_missing_batch_storage_blocks_start_without_creating_run(
+def test_api_missing_batch_key_blocks_start_without_creating_run(
     labeling_data: LabelingData,
     labeling_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("REGULATORY_LABELING_VERTEX_GCS_URI", raising=False)
+    with Session(labeling_data.database.engine) as session:
+        provider = session.get(LLMProvider, labeling_data.provider_id)
+        assert provider is not None
+        provider.gemini_batch_api_key = None
+        session.commit()
     setup = labeling_client.get(_api_path(labeling_data, "setup"))
     assert setup.status_code == 200
-    assert setup.json()["providers"]
-    assert setup.json()["configuration_errors"]
+    assert setup.json()["providers"][0]["configuration_error"] == (
+        labeling_configuration.MISSING_BATCH_API_KEY
+    )
     response = labeling_client.post(
         _api_path(labeling_data, "runs"), json=_start_body(labeling_data)
     )
     assert response.status_code == 400
     assert labeling_client.get(_api_path(labeling_data, "runs")).json() == []
+
+
+@pytest.mark.parametrize("reason", ["SERVICE_DISABLED", "PERMISSION_DENIED"])
+def test_api_failed_access_probe_does_not_create_a_run(
+    labeling_data: LabelingData,
+    labeling_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    def denied(_self: object) -> VertexReadOnlyAccessProbe:
+        raise gemini_inline_batch.GeminiInlineBatchAccessError(403, reason)
+
+    monkeypatch.setattr(
+        gemini_inline_batch.LabelingGeminiInlineBatchGateway,
+        "probe_gemini_read_access",
+        denied,
+    )
+    response = labeling_client.post(
+        _api_path(labeling_data, "runs"), json=_start_body(labeling_data)
+    )
+    assert response.status_code == 400, response.text
+    assert "batch-test-key-not-a-real-credential" not in response.text
+    assert ("Enable the Gemini Developer API" in response.text) == (
+        reason == "SERVICE_DISABLED"
+    )
+    assert labeling_client.get(_api_path(labeling_data, "runs")).json() == []
+
+
+@pytest.mark.parametrize("rotate_key", [False, True])
+def test_api_probe_releases_transaction_and_rechecks_binding(
+    labeling_data: LabelingData,
+    labeling_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    rotate_key: bool,
+) -> None:
+    sessions: list[Session] = []
+    calls = 0
+    original_resolver = labeling_api.resolve_labeling_gateway
+
+    def resolve(
+        session: Session,
+        model_configuration_id: int,
+        *,
+        user: User | None,
+        expected_binding: labeling_configuration.LabelingProviderBinding | None = None,
+    ) -> labeling_configuration.LabelingBatchGateway:
+        sessions.append(session)
+        return original_resolver(
+            session,
+            model_configuration_id,
+            user=user,
+            expected_binding=expected_binding,
+        )
+
+    def probe(_self: object) -> VertexReadOnlyAccessProbe:
+        nonlocal calls
+        calls += 1
+        assert not sessions[-1].in_transaction()
+        if rotate_key:
+            with Session(labeling_data.database.engine) as session:
+                provider = session.get(LLMProvider, labeling_data.provider_id)
+                assert provider is not None
+                provider.gemini_batch_api_key = "rotated-test-key"  # ty: ignore[invalid-assignment]
+                session.commit()
+        return VertexReadOnlyAccessProbe(credential_identity="test")
+
+    monkeypatch.setattr(labeling_api, "resolve_labeling_gateway", resolve)
+    monkeypatch.setattr(
+        gemini_inline_batch.LabelingGeminiInlineBatchGateway,
+        "probe_gemini_read_access",
+        probe,
+    )
+    body = _start_body(labeling_data)
+    response = labeling_client.post(_api_path(labeling_data, "runs"), json=body)
+    assert response.status_code == (409 if rotate_key else 200), response.text
+    runs = labeling_client.get(_api_path(labeling_data, "runs")).json()
+    assert len(runs) == (0 if rotate_key else 1)
+    if not rotate_key:
+        replay = labeling_client.post(_api_path(labeling_data, "runs"), json=body)
+        assert replay.status_code == 200
+        assert replay.json()["id"] == response.json()["id"]
+    assert calls == 1
 
 
 @pytest.mark.usefixtures("restore_label_settings")
@@ -1365,7 +1459,9 @@ def fake_batch(
     monkeypatch.setattr(
         labeling_configuration, "GoogleGeminiFilesBatchGateway", gateway_factory
     )
-    monkeypatch.setattr(vertex_batch, "LabelingVertexBatchGateway", gateway_factory)
+    monkeypatch.setattr(
+        gemini_inline_batch, "LabelingGeminiInlineBatchGateway", gateway_factory
+    )
     return gateway
 
 
@@ -1924,3 +2020,37 @@ def test_projection_page_checkpoint_survives_crash_and_fences_previous_worker(
         run = session.get(RegulatoryLabelingRun, run_id)
         assert run is not None and run.status == "completed_with_errors"
         assert run.completed_chunks == 2 and run.unresolved_derived_chunks == 1
+
+
+@pytest.mark.parametrize(
+    "status_code,expected_status", [(403, "failed"), (429, "prepared")]
+)
+def test_worker_submission_retries_only_transient_provider_errors(
+    labeling_data: LabelingData,
+    fake_batch: RecordingBatch,
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    expected_status: str,
+) -> None:
+    calls = 0
+
+    def reject(*_args: object, **_kwargs: object) -> VertexBatchState:
+        nonlocal calls
+        calls += 1
+        raise IndexingGatewayHTTPError(status_code)
+
+    monkeypatch.setattr(fake_batch, "submit", reject)
+    run_id, _ = _start(labeling_data)
+    _step(labeling_data, run_id)
+    _step(labeling_data, run_id)
+    with Session(labeling_data.database.engine) as session:
+        shard = session.scalar(
+            select(RegulatoryLabelingShard).where(
+                RegulatoryLabelingShard.run_id == run_id
+            )
+        )
+        assert shard is not None
+        assert shard.status == expected_status
+        assert shard.failure_count == 1
+    _step(labeling_data, run_id)
+    assert calls == (1 if status_code == 403 else 2)

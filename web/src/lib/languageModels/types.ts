@@ -84,6 +84,7 @@ export interface LLMProviderView {
   name: string | null;
   provider: string;
   api_key: string | null;
+  has_gemini_batch_api_key?: boolean;
   api_base: string | null;
   api_version: string | null;
   custom_config: { [key: string]: string } | null;

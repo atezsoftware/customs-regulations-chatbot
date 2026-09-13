@@ -1534,8 +1534,6 @@ configMap:
   MIN_THREADS_ML_MODELS: ""
   # Indexing Configs
   NUM_INDEXING_WORKERS: ""
-  # Gemini labeling Batch storage (gs://bucket/prefix); blank blocks new jobs.
-  REGULATORY_LABELING_VERTEX_GCS_URI: ""
   # OpenRouter asynchronous regulatory embedding Batch contract. Keep
   # MAX_INPUTS below the provider's 50,000-input hard ceiling.
   REGULATORY_INDEXING_OPENROUTER_BATCH_URL: "https://openrouter.ai/api/beta/batches"
