@@ -50,6 +50,13 @@ class RegulatoryChunkSnapshot(BaseModel):
         )
 
 
+class RegulatoryChunkPage(BaseModel):
+    items: list[RegulatoryChunkSnapshot]
+    total: int
+    offset: int
+    limit: int
+
+
 class RegulatoryChunkUpdateRequest(BaseModel):
     """Partial chunk edit. Omitted fields stay unchanged; validity dates may
     be explicitly nulled to clear them."""

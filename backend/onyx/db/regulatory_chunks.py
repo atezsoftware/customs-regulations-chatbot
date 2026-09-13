@@ -2595,6 +2595,34 @@ def get_next_chunk_position(db_session: Session, user_file_id: UUID) -> int:
     return 0 if max_position is None else max_position + 1
 
 
+def get_chunks_for_file_page_snapshot(
+    db_session: Session,
+    user_file_id: UUID,
+    *,
+    offset: int,
+    limit: int,
+) -> tuple[list[RegulatoryChunk], int]:
+    """Bound inspection reads; the caller validates access and publication state."""
+    if offset < 0 or not 1 <= limit <= 100:
+        raise ValueError("Chunk pages require a nonnegative offset and limit 1–100")
+    file_filter = RegulatoryChunk.user_file_id == user_file_id
+    total = (
+        db_session.scalar(select(func.count(RegulatoryChunk.id)).where(file_filter))
+        or 0
+    )
+    chunks = list(
+        db_session.scalars(
+            select(RegulatoryChunk)
+            .where(file_filter)
+            .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
+            .offset(offset)
+            .limit(limit)
+            .execution_options(populate_existing=True)
+        )
+    )
+    return chunks, total
+
+
 def has_regulatory_chunks_for_file(db_session: Session, user_file_id: UUID) -> bool:
     """Return whether PostgreSQL owns the canonical chunks for this user file."""
 

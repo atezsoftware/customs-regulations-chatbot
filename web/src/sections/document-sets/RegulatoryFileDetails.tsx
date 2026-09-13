@@ -1,12 +1,10 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { Button, InputTextArea, Modal, Tag, Text } from "@opal/components";
 import { toast } from "@opal/layouts";
-import { SvgEdit,
-  SvgFileText,
-} from "@opal/icons";
+import { SvgEdit, SvgFileText } from "@opal/icons";
 import { cn } from "@opal/utils";
 
 import InputDatePicker from "@/refresh-components/inputs/InputDatePicker";
@@ -23,6 +21,8 @@ import {
   renameUserFile,
 } from "@/lib/regulatory/svc";
 import type { ProjectFile } from "@/lib/projects/types";
+
+const CHUNKS_PER_PAGE = 25;
 
 function parseIsoDate(value: string | null): Date | null {
   if (!value) return null;
@@ -239,17 +239,44 @@ interface RegulatoryFileDetailsProps {
   onFileRenamed: (name: string) => void;
 }
 
+interface EditingChunkState {
+  fileId: string;
+  chunk: RegulatoryChunk;
+}
+
 export default function RegulatoryFileDetails({
   file,
   onFileRenamed,
 }: RegulatoryFileDetailsProps) {
-  const { chunks, error, isLoading, refreshChunks } = useFileChunks(file.id);
-  const [editingChunk, setEditingChunk] = useState<RegulatoryChunk | null>(
+  const [chunkPage, setChunkPage] = useState({ fileId: file.id, offset: 0 });
+  const chunkOffset = chunkPage.fileId === file.id ? chunkPage.offset : 0;
+  const { chunks, total, error, isLoading, refreshChunks } = useFileChunks(
+    file.id,
+    chunkOffset,
+    CHUNKS_PER_PAGE
+  );
+  const [editingChunk, setEditingChunk] = useState<EditingChunkState | null>(
     null
   );
+  const currentEditingChunk =
+    editingChunk?.fileId === file.id ? editingChunk.chunk : null;
   const [expandedJson, setExpandedJson] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState(false);
   const [newFileName, setNewFileName] = useState(file.name);
+
+  useEffect(() => {
+    if (isLoading || error || chunkOffset === 0 || chunkOffset < total) return;
+    const lastOffset =
+      total === 0
+        ? 0
+        : Math.floor((total - 1) / CHUNKS_PER_PAGE) * CHUNKS_PER_PAGE;
+    setChunkPage({ fileId: file.id, offset: lastOffset });
+  }, [chunkOffset, error, file.id, isLoading, total]);
+
+  const setChunkOffset = useCallback(
+    (offset: number) => setChunkPage({ fileId: file.id, offset }),
+    [file.id]
+  );
 
   const toggleJson = useCallback((chunkId: string) => {
     setExpandedJson((currentExpandedChunks) => {
@@ -318,7 +345,7 @@ export default function RegulatoryFileDetails({
         )}
         {!isLoading && (
           <Text font="secondary-body" color="text-03">
-            {`${chunks.length} chunks`}
+            {`${total} chunks`}
           </Text>
         )}
         <Button
@@ -384,7 +411,8 @@ export default function RegulatoryFileDetails({
                   icon={SvgEdit}
                   size="sm"
                   tooltip="Edit chunk"
-                  onClick={() => setEditingChunk(chunk)}
+                  aria-label={`Edit chunk ${chunk.position}`}
+                  onClick={() => setEditingChunk({ fileId: file.id, chunk })}
                 />
               </div>
             </div>
@@ -408,9 +436,33 @@ export default function RegulatoryFileDetails({
         ))
       )}
 
-      {editingChunk && (
+      {!isLoading && !error && total > 0 && (
+        <div className="flex items-center justify-between gap-2">
+          <Button
+            prominence="tertiary"
+            disabled={chunkOffset === 0}
+            onClick={() =>
+              setChunkOffset(Math.max(0, chunkOffset - CHUNKS_PER_PAGE))
+            }
+          >
+            Previous
+          </Button>
+          <Text font="secondary-body" color="text-03">
+            {`${chunkOffset + 1}–${Math.min(chunkOffset + chunks.length, total)} of ${total}`}
+          </Text>
+          <Button
+            prominence="tertiary"
+            disabled={chunkOffset + CHUNKS_PER_PAGE >= total}
+            onClick={() => setChunkOffset(chunkOffset + CHUNKS_PER_PAGE)}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+
+      {currentEditingChunk && (
         <ChunkEditModal
-          chunk={editingChunk}
+          chunk={currentEditingChunk}
           onClose={() => setEditingChunk(null)}
           onSaved={() => void refreshChunks()}
         />

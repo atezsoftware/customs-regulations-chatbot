@@ -8,6 +8,7 @@ import {
   retryAmendmentBatch,
 } from "@/lib/regulatory/amendments";
 import { listBenchmarkCitationOptions } from "@/lib/regulatory/benchmark";
+import { fetchChunkPageForFile } from "@/lib/regulatory/svc";
 
 function jsonResponse(body: unknown): Response {
   return {
@@ -60,6 +61,18 @@ describe("regulatory document set API contracts", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/regulatory/benchmark/document-sets/17/citation-options",
       undefined
+    );
+  });
+
+  it("loads one bounded page of chunks for a file", async () => {
+    const page = { items: [], total: 51, offset: 25, limit: 25 };
+    fetchMock.mockResolvedValueOnce(jsonResponse(page));
+
+    await expect(fetchChunkPageForFile("file/id", 25, 25)).resolves.toEqual(
+      page
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/regulatory/files/file%2Fid/chunks/page?offset=25&limit=25"
     );
   });
 

@@ -1,6 +1,7 @@
 import type { ProjectFile } from "@/lib/projects/types";
 import type {
   RegulatoryChunk,
+  RegulatoryChunkPage,
   RegulatoryChunkUpdate,
 } from "@/lib/regulatory/interfaces";
 
@@ -14,6 +15,20 @@ export async function fetchChunksForFile(
   const response = await fetch(`/api/regulatory/files/${userFileId}/chunks`);
   if (!response.ok) {
     handleRequestError("Fetch chunks", response);
+  }
+  return response.json();
+}
+
+export async function fetchChunkPageForFile(
+  userFileId: string,
+  offset: number,
+  limit: number
+): Promise<RegulatoryChunkPage> {
+  const response = await fetch(
+    `/api/regulatory/files/${encodeURIComponent(userFileId)}/chunks/page?offset=${offset}&limit=${limit}`
+  );
+  if (!response.ok) {
+    handleRequestError("Fetch chunk page", response);
   }
   return response.json();
 }

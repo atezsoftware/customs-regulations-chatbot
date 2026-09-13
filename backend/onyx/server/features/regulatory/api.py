@@ -12,7 +12,7 @@ from datetime import date
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
@@ -65,6 +65,7 @@ from onyx.db.regulatory_chunks import (
     get_chunk_by_id,
     get_chunk_snapshot_by_id,
     get_chunks_for_file,
+    get_chunks_for_file_page_snapshot,
     is_hierarchical_aggregate_chunk,
 )
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -97,6 +98,7 @@ from onyx.server.features.regulatory.models import (
     AnnexReviewSnapshot,
     ApproveAmendmentProposalRequest,
     CreateAmendmentSourcePackageRequest,
+    RegulatoryChunkPage,
     RegulatoryChunkSnapshot,
     RegulatoryChunkUpdateRequest,
     RegulatoryFileValidityUpdateRequest,
@@ -142,6 +144,34 @@ def list_chunks_for_file(
     _get_owned_user_file(db_session, user_file_id, user)
     chunks = get_chunks_for_file(db_session, user_file_id)
     result = [RegulatoryChunkSnapshot.from_model(chunk) for chunk in chunks]
+    require_publication_files(observation, (user_file_id,))
+    return result
+
+
+@router.get("/files/{user_file_id}/chunks/page", tags=PUBLIC_API_TAGS)
+def list_chunk_page_for_file(
+    user_file_id: UUID,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=25, ge=1, le=100),
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> RegulatoryChunkPage:
+    from onyx.regulatory.publication_reads import (
+        observe_publication_read,
+        require_publication_files,
+    )
+
+    observation = observe_publication_read()
+    _get_owned_user_file(db_session, user_file_id, user)
+    chunks, total = get_chunks_for_file_page_snapshot(
+        db_session, user_file_id, offset=offset, limit=limit
+    )
+    result = RegulatoryChunkPage(
+        items=[RegulatoryChunkSnapshot.from_model(chunk) for chunk in chunks],
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
     require_publication_files(observation, (user_file_id,))
     return result
 

@@ -146,16 +146,23 @@ def _atomic_sql_expression() -> ColumnElement[bool]:
         (source_value.is_(None), 0),
         else_=1,
     )
-    return or_(
-        variant == ATOMIC_CHUNK_VARIANT,
-        and_(
-            variant.is_(None),
+    return type_cast(
+        ColumnElement[bool],
+        func.coalesce(
             or_(
-                RegulatoryChunk.chunk_type.is_(None),
-                RegulatoryChunk.chunk_type != HIERARCHICAL_AGGREGATE_CHUNK_VARIANT,
+                variant == ATOMIC_CHUNK_VARIANT,
+                and_(
+                    variant.is_(None),
+                    or_(
+                        RegulatoryChunk.chunk_type.is_(None),
+                        RegulatoryChunk.chunk_type
+                        != HIERARCHICAL_AGGREGATE_CHUNK_VARIANT,
+                    ),
+                    binding.is_(None),
+                    source_count == 0,
+                ),
             ),
-            binding.is_(None),
-            source_count == 0,
+            False,
         ),
     )
 
@@ -526,13 +533,11 @@ def get_labeling_counts(
         )
         or 0
     )
-    canonical_count, derived_count, covered_file_count = session.execute(
+    counts_by_file = (
         select(
-            func.count().filter(atomic_expression),
-            func.count().filter(~atomic_expression),
-            func.count(func.distinct(RegulatoryChunk.user_file_id)).filter(
-                atomic_expression
-            ),
+            RegulatoryChunk.user_file_id.label("user_file_id"),
+            func.count().filter(atomic_expression).label("canonical_count"),
+            func.count().filter(~atomic_expression).label("derived_count"),
         )
         .join(
             DocumentSet__UserFile,
@@ -541,6 +546,15 @@ def get_labeling_counts(
         .where(
             DocumentSet__UserFile.document_set_id == document_set_id,
             RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value,
+        )
+        .group_by(RegulatoryChunk.user_file_id)
+        .subquery()
+    )
+    canonical_count, derived_count, covered_file_count = session.execute(
+        select(
+            func.coalesce(func.sum(counts_by_file.c.canonical_count), 0),
+            func.coalesce(func.sum(counts_by_file.c.derived_count), 0),
+            func.count().filter(counts_by_file.c.canonical_count > 0),
         )
     ).one()
     unsupported = max(0, file_count - covered_file_count)

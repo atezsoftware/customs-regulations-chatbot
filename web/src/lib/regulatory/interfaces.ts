@@ -16,6 +16,13 @@ export interface RegulatoryChunk {
   updated_at: string;
 }
 
+export interface RegulatoryChunkPage {
+  items: RegulatoryChunk[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
 export interface RegulatoryChunkUpdate {
   text?: string;
   heading_path?: string[];

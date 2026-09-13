@@ -5,14 +5,15 @@ from hashlib import sha256
 from typing import TypedDict
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy.orm import Session
+from sqlalchemy import Select, select
+from sqlalchemy.orm import Session, joinedload, load_only
 
+from onyx.auth.schemas import UserRole
 from onyx.db.llm import (
-    fetch_accessible_llm_provider_by_id,
-    fetch_all_accessible_llm_providers,
-    fetch_model_configuration_by_id,
+    can_user_access_llm_provider,
+    fetch_user_group_ids,
 )
-from onyx.db.models import ModelConfiguration, User
+from onyx.db.models import LLMProvider, ModelConfiguration, Persona, User, UserGroup
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.well_known_providers.constants import (
     VERTEX_AUTH_METHOD_KWARG,
@@ -108,20 +109,42 @@ def _authorized_model(
     model_configuration_id: int,
     user: User | None,
 ) -> ModelConfiguration:
-    model = fetch_model_configuration_by_id(db_session, model_configuration_id)
+    model = db_session.scalar(
+        _model_statement()
+        .where(ModelConfiguration.id == model_configuration_id)
+        .execution_options(populate_existing=True)
+    )
     if model is None:
         raise ValueError("The labeling model configuration is unavailable")
-    if (
-        user is not None
-        and fetch_accessible_llm_provider_by_id(
-            db_session,
-            user,
-            model.llm_provider_id,
-        )
-        is None
+    if user is not None and not can_user_access_llm_provider(
+        model.llm_provider,
+        fetch_user_group_ids(db_session, user),
+        persona=None,
+        is_admin=user.role == UserRole.ADMIN,
     ):
         raise ValueError("The labeling provider is unavailable to this user")
     return model
+
+
+def _model_statement() -> Select[tuple[ModelConfiguration]]:
+    provider = joinedload(ModelConfiguration.llm_provider)
+    return select(ModelConfiguration).options(
+        load_only(
+            ModelConfiguration.id,
+            ModelConfiguration.llm_provider_id,
+            ModelConfiguration.name,
+            ModelConfiguration.is_visible,
+        ),
+        provider.load_only(
+            LLMProvider.id,
+            LLMProvider.name,
+            LLMProvider.provider,
+            LLMProvider.is_public,
+            LLMProvider.custom_config,
+        ),
+        provider.selectinload(LLMProvider.groups).load_only(UserGroup.id),
+        provider.selectinload(LLMProvider.personas).load_only(Persona.id),
+    )
 
 
 def resolve_labeling_provider_binding(
@@ -138,23 +161,42 @@ def get_labeling_provider_options(
     *,
     user: User,
 ) -> list[LabelingProviderOption]:
-    options: list[LabelingProviderOption] = []
-    for provider in fetch_all_accessible_llm_providers(db_session, user):
-        if provider.provider != LlmProviderNames.VERTEX_AI:
-            continue
-        models = sorted(
-            provider.model_configurations,
-            key=lambda model: (model.name != DEFAULT_MODEL, model.id or 0),
+    preferred_models = (
+        select(ModelConfiguration.id)
+        .join(ModelConfiguration.llm_provider)
+        .where(
+            LLMProvider.provider == LlmProviderNames.VERTEX_AI,
+            ModelConfiguration.is_visible.is_(True),
         )
-        for model in models:
-            if not model.is_visible or model.id is None:
-                continue
-            try:
-                resolve_labeling_provider_binding(db_session, model.id, user=user)
-            except ValueError:
-                continue
-            options.append({"id": model.id, "name": provider.name or "Google"})
-            break
+        .distinct(ModelConfiguration.llm_provider_id)
+        .order_by(
+            ModelConfiguration.llm_provider_id,
+            ModelConfiguration.name != DEFAULT_MODEL,
+            ModelConfiguration.id,
+        )
+    )
+    models = db_session.scalars(
+        _model_statement()
+        .where(ModelConfiguration.id.in_(preferred_models))
+        .order_by(ModelConfiguration.llm_provider_id)
+        .execution_options(populate_existing=True)
+    )
+    user_group_ids = fetch_user_group_ids(db_session, user)
+    options: list[LabelingProviderOption] = []
+    for model in models:
+        provider = model.llm_provider
+        if not can_user_access_llm_provider(
+            provider,
+            user_group_ids,
+            persona=None,
+            is_admin=user.role == UserRole.ADMIN,
+        ):
+            continue
+        try:
+            _binding(model)
+        except ValueError:
+            continue
+        options.append({"id": model.id, "name": provider.name or "Google"})
     return options
 
 

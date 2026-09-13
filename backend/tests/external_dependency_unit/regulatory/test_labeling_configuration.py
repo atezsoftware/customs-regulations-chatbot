@@ -2,12 +2,13 @@
 
 import json
 from collections.abc import Callable, Generator
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Engine
+from sqlalchemy import Connection, Engine, event
+from sqlalchemy.engine import ExecutionContext
 from sqlalchemy.orm import Session
 
 from onyx.db import labeling_configuration
@@ -293,3 +294,72 @@ def test_resume_rechecks_revoked_provider_access_even_with_matching_binding(
         resolve_labeling_gateway(
             labeling_session, model.id, user=user, expected_binding=binding
         )
+
+
+@pytest.mark.parametrize("operation", ["catalog", "binding"])
+def test_labeling_resolution_does_not_load_unneeded_models_or_scale_query_count(
+    labeling_session: Session, operation: str
+) -> None:
+    user = make_user(labeling_session, role=UserRole.BASIC)
+    selected = _model(labeling_session, name="gemini-3.8-flash")
+    unrelated = _model(
+        labeling_session, provider_type=LlmProviderNames.OPENAI, name="gpt-5-mini"
+    )
+    extra_models = [
+        ModelConfiguration(
+            llm_provider=provider,
+            name=f"labeling-perf-{visible}-{index}",
+            is_visible=visible,
+        )
+        for provider, visible in (
+            (selected.llm_provider, True),
+            (selected.llm_provider, False),
+            (unrelated.llm_provider, True),
+        )
+        for index in range(40)
+    ]
+    labeling_session.add_all(extra_models)
+    labeling_session.flush()
+    selected_id = selected.id
+    selected_name = selected.llm_provider.name
+    unneeded_ids = {model.id for model in extra_models} | {unrelated.id}
+    labeling_session.expunge_all()
+    statements: list[str] = []
+    loaded_model_ids: set[int] = set()
+
+    def record_query(
+        _connection: Connection,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: ExecutionContext,
+        _executemany: bool,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    def record_load(_session: Session, instance: object) -> None:
+        if isinstance(instance, ModelConfiguration):
+            loaded_model_ids.add(instance.id)
+
+    bind = labeling_session.get_bind()
+    event.listen(bind, "before_cursor_execute", record_query)
+    event.listen(labeling_session, "loaded_as_persistent", record_load)
+    try:
+        if operation == "catalog":
+            assert {"id": selected_id, "name": selected_name} in (
+                get_labeling_provider_options(labeling_session, user=user)
+            )
+        else:
+            binding = resolve_labeling_provider_binding(
+                labeling_session, selected_id, user=user
+            )
+            assert binding.model_configuration_id == selected_id
+    finally:
+        event.remove(bind, "before_cursor_execute", record_query)
+        event.remove(labeling_session, "loaded_as_persistent", record_load)
+
+    assert selected_id in loaded_model_ids
+    assert not loaded_model_ids.intersection(unneeded_ids)
+    assert len(statements) <= 8
+    assert not any("llm_model_flow" in statement for statement in statements)
