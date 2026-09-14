@@ -275,7 +275,7 @@ function TableRun({ cells }: { cells: IndexedElement[] }) {
       <details className="mt-1">
         <summary className="cursor-pointer">
           <Text font="secondary-body" color="text-03">
-            Cell evidence ({cells.length})
+            {`Cell evidence (${cells.length})`}
           </Text>
         </summary>
         <div className="mt-1 flex flex-col gap-1">
