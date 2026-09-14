@@ -144,9 +144,21 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
 
     if not instruction_payloads:
         # No database session is held while the provider performs segmentation.
+        # An empty result is a legitimate terminal outcome, not a failure: the
+        # segmenter is instructed to return no instructions whenever the pasted
+        # text, together with its surrounding context, does not express update
+        # intent (e.g. an unrelated notice, or a full replacement document with
+        # no "this is the new version of X" framing). The batch still needs a
+        # checkpoint and a normal analyzed/finalized lifecycle so the admin
+        # sees "no update instructions detected" instead of a crash they can
+        # never resolve by retrying the identical text.
         segmentation = segment_amendment_text(llm, raw_text)
         if not segmentation.instructions:
-            raise RuntimeError("Amendment segmentation returned no instructions")
+            logger.info(
+                "Amendment batch=%s segmentation found no update instructions; "
+                "marking analyzed with nothing to review",
+                batch_id,
+            )
         instruction_payloads = [
             instruction.model_dump() for instruction in segmentation.instructions
         ]

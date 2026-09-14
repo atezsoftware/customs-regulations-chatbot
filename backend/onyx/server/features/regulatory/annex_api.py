@@ -393,7 +393,10 @@ def get_source_text(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> AnnexSourceTextSnapshot:
-    from onyx.regulatory.amendments.annexes.analysis import read_original_source_text
+    from onyx.regulatory.amendments.annexes.analysis import (
+        read_original_source_text,
+        read_source_graph,
+    )
 
     if (
         not config.REGULATORY_ANNEX_UPDATES_ENABLED
@@ -415,9 +418,22 @@ def get_source_text(
         )
         if package.created_by != user.id:
             raise ValueError("source package owner mismatch")
-        text, digest = read_original_source_text(
-            get_default_file_store(), list_source_assets(db_session, package.id)
+        store = get_default_file_store()
+        assets = list_source_assets(db_session, package.id)
+        # A source without a frozen manifest (e.g. a plain pasted-text package)
+        # has no link graph to mark attachments with; fall back to the plain
+        # join rather than failing the whole preview.
+        links = (
+            read_source_graph(
+                store,
+                manifest_file_id=package.manifest_file_id,
+                manifest_sha256=package.manifest_sha256,
+                assets=assets,
+            )
+            if package.manifest_file_id and package.manifest_sha256
+            else None
         )
+        text, digest = read_original_source_text(store, assets, links=links)
     except ValueError as exc:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
     return AnnexSourceTextSnapshot(

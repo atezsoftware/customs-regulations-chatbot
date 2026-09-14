@@ -993,9 +993,74 @@ def validate_new_evidence_remapping(
         raise ValueError("NEW evidence mapping differs from reviewed package/view")
 
 
+# A draft's `original_source_text_version` pins which join algorithm produced
+# its frozen `original_source_text_sha256`, so upgrading this constant can
+# never retroactively change a hash a live review is still checked against —
+# see `AnnexChangeDraft.original_source_text_version`.
+CURRENT_SOURCE_TEXT_VERSION: Literal[1, 2] = 2
+
+
+def _annex_section_heading(
+    asset: "RegulatorySourceAsset", links: list[SourceLink]
+) -> str | None:
+    """Mark `asset` as the resolved target of a discovered link, if it is one.
+
+    Reuses `_source_occurrence_label` so a link whose own anchor text names
+    its annex (e.g. "Ek-3'ü görüntülemek için tıklayınız") gets that exact
+    label; a generic anchor (e.g. "Ekleri için tıklayınız") still gets a
+    clear attachment boundary, just without a specific annex number — no
+    number is invented. Only a cross-asset link counts as an attachment; an
+    internal anchor that resolves back to the page it came from isn't a
+    separate section.
+    """
+    link = next(
+        (
+            candidate
+            for candidate in links
+            if candidate.target_asset_hash == asset.sha256
+            and candidate.target_asset_hash != candidate.parent_asset_hash
+        ),
+        None,
+    )
+    if link is None:
+        return None
+    label = link.label.strip() or "linked attachment"
+    try:
+        annex_label = _source_occurrence_label(link.label)
+    except ValueError:
+        annex_label = None
+    heading = f"Annex {annex_label}" if annex_label else "Attachment"
+    display_name = asset.display_name or "attachment"
+    return f'## {heading} — resolved from "{label}": {display_name}'
+
+
 def read_original_source_text(
-    store: FileStore, assets: list["RegulatorySourceAsset"]
+    store: FileStore,
+    assets: list["RegulatorySourceAsset"],
+    *,
+    links: list[SourceLink] | None = None,
+    version: Literal[1, 2] = CURRENT_SOURCE_TEXT_VERSION,
 ) -> tuple[str, str]:
+    """Assemble one immutable source's per-asset text into one reviewable string.
+
+    Version 1 is a bare join in asset order — the original behavior, kept so
+    a draft frozen before version 2 shipped keeps verifying against its
+    original hash forever. Version 2 threads the already-discovered link
+    graph through so a resolved attachment (e.g. a page whose only reference
+    to it was an "Ekleri için tıklayınız" anchor) is marked as its own
+    section instead of silently concatenated after the anchor's own literal
+    text, for both the segmenter/drafter's input and the admin's pre-analysis
+    review text.
+    """
+    headings_by_hash = (
+        {}
+        if version == 1 or links is None
+        else {
+            asset.sha256: heading
+            for asset in assets
+            if (heading := _annex_section_heading(asset, links)) is not None
+        }
+    )
     parts: list[str] = []
     for asset in assets:
         if asset.text_file_id is None:
@@ -1007,7 +1072,9 @@ def read_original_source_text(
             or hashlib.sha256(content).hexdigest() != asset.text_sha256
         ):
             raise ValueError("original extracted source text integrity changed")
-        parts.append(content.decode("utf-8"))
+        asset_text = content.decode("utf-8")
+        heading = headings_by_hash.get(asset.sha256)
+        parts.append(f"{heading}\n\n{asset_text}" if heading else asset_text)
     text = "\n\n".join(parts)
     if len(text) > 2_000_000:
         raise ValueError("original extracted source text limit")

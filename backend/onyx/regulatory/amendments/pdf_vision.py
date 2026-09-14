@@ -63,7 +63,16 @@ def page_elements(
     ]
 
 
-def pdf_transcript(extraction: AnnexExtraction, *, version: Literal[1, 2] = 2) -> str:
+def pdf_transcript(extraction: AnnexExtraction, *, version: Literal[1, 2, 3] = 3) -> str:
+    """Render one frozen extraction as reviewable text.
+
+    Version 3 emits real GFM markdown tables (a header row followed by a
+    ``---`` separator row) so a table renders as a table wherever the result
+    is shown as markdown, instead of plain ``cell | cell`` lines. Versions 1
+    and 2 are frozen forever at their original row-assembly and formatting
+    rules so an existing transcript keeps verifying against the exact hash it
+    was saved with — see `PdfVisionReference.transcript_version`.
+    """
     if (
         extraction.issues
         or not extraction.page_count
@@ -87,7 +96,7 @@ def pdf_transcript(extraction: AnnexExtraction, *, version: Literal[1, 2] = 2) -
                 else (0, 0)
             )
         )
-        if version == 2:
+        if version in (2, 3):
             table_boxes = [
                 item.locator.normalized_box
                 for item in elements
@@ -106,8 +115,13 @@ def pdf_transcript(extraction: AnnexExtraction, *, version: Literal[1, 2] = 2) -
                 continue
         lines: list[str] = []
         row: list[ExtractedAnnexElement] = []
+        # Tracks whether the row about to flush continues the table it's
+        # already inside, so the markdown header separator is emitted exactly
+        # once per contiguous run of table rows, right after the first one.
+        table_run_open = False
 
         def flush_row() -> None:
+            nonlocal table_run_open
             if row:
                 row.sort(
                     key=lambda item: (
@@ -116,7 +130,14 @@ def pdf_transcript(extraction: AnnexExtraction, *, version: Literal[1, 2] = 2) -
                         else 0
                     )
                 )
-                lines.append(" | ".join(item.text for item in row))
+                cells = [item.text for item in row]
+                if version == 3:
+                    lines.append("| " + " | ".join(cells) + " |")
+                    if not table_run_open:
+                        lines.append("| " + " | ".join(["---"] * len(cells)) + " |")
+                        table_run_open = True
+                else:
+                    lines.append(" | ".join(cells))
                 row.clear()
 
         for item in elements:
@@ -124,6 +145,7 @@ def pdf_transcript(extraction: AnnexExtraction, *, version: Literal[1, 2] = 2) -
             assert box is not None
             if item.kind != "table_cell":
                 flush_row()
+                table_run_open = False
                 if item.text.strip():
                     lines.append(item.text)
                 continue
@@ -132,6 +154,8 @@ def pdf_transcript(extraction: AnnexExtraction, *, version: Literal[1, 2] = 2) -
                 assert previous is not None
                 overlap = min(box[3], previous[3]) - max(box[1], previous[1])
                 if overlap <= 0:
+                    # A new row of the same table, not a new table: keep the
+                    # header separator that already opened this run.
                     flush_row()
                 elif version == 1:
                     # Frozen derivatives must retain their original row assembly.
@@ -176,7 +200,7 @@ def prepare_pdf_source(
                 file_id=identifier,
                 sha256=hashlib.sha256(data).hexdigest(),
                 transcript_sha256=digest(text),
-                transcript_version=2,
+                transcript_version=3,
             ),
         }
     )
