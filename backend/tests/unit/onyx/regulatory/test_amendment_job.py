@@ -495,14 +495,25 @@ def test_segmentation_runs_without_an_open_database_session(
     job.run_amendment_batch(batch_id=11, lease_generation=1)
 
 
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        "belirsiz metin",
+        "KAFE MENÜ\nFiltre kahve 100 TL",
+        "Hatıra fotoğrafı: 2026 yaz tatili",
+    ],
+)
 def test_empty_segmentation_fails_instead_of_checkpointing_ambiguous_empty_list(
     monkeypatch: pytest.MonkeyPatch,
+    raw_text: str,
 ) -> None:
+    from onyx.llm.model_response import Choice, Message, ModelResponse
+
     batch = SimpleNamespace(
         id=12,
         document_set_id=7,
         created_by=_CREATOR_ID,
-        raw_text="belirsiz metin",
+        raw_text=raw_text,
         user_file_ids=["00000000-0000-0000-0000-000000000123"],
         reference_date=None,
         segmented_instructions=[],
@@ -515,20 +526,70 @@ def test_empty_segmentation_fails_instead_of_checkpointing_ambiguous_empty_list(
 
     monkeypatch.setattr(job, "_session", _session)
     monkeypatch.setattr(job, "get_batch", lambda *_args: batch)
-    _patch_empty_retriever(monkeypatch)
-    monkeypatch.setattr(
-        job,
-        "segment_amendment_text",
-        MagicMock(return_value=SimpleNamespace(reference_date=None, instructions=[])),
+    retriever = _patch_empty_retriever(monkeypatch)
+    model = MagicMock()
+    model.config.model_provider = "fixture"
+    model.config.model_name = "fixture"
+    model.invoke.return_value = ModelResponse(
+        id="empty-segmentation",
+        created="2026-09-14",
+        choice=Choice(
+            message=Message(content='{"reference_date":null,"instructions":[]}')
+        ),
     )
     persist = MagicMock()
     monkeypatch.setattr(job, "persist_segmentation_checkpoint", persist)
-    monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=model))
+    draft = MagicMock()
+    proposals = MagicMock()
+    monkeypatch.setattr(job, "draft_instruction_group_proposal", draft)
+    monkeypatch.setattr(job, "persist_proposal_checkpoint", proposals)
 
     with pytest.raises(RuntimeError, match="no instructions"):
         job.run_amendment_batch(batch_id=12, lease_generation=1)
 
     persist.assert_not_called()
+    retriever.search.assert_not_called()
+    draft.assert_not_called()
+    proposals.assert_not_called()
+
+
+def test_contextual_replacement_table_is_accepted_without_formal_legal_phrase() -> None:
+    import json
+
+    from onyx.llm.model_response import Choice, Message, ModelResponse
+    from onyx.regulatory.amendments.segmenter import segment_amendment_text
+
+    context = "Tablonun yeni hali bu:\nÜrün | Oran\nBuğday | %17"
+    model = MagicMock()
+    model.config.model_provider = "fixture"
+    model.config.model_name = "fixture"
+    model.invoke.return_value = ModelResponse(
+        id="replacement-table",
+        created="2026-09-14",
+        choice=Choice(
+            message=Message(
+                content=json.dumps(
+                    {
+                        "reference_date": None,
+                        "instructions": [
+                            {
+                                "instruction_text": context,
+                                "search_query": "Buğday için mevcut oran tablosu nedir?",
+                                "recovery_query": "buğday oran tablosu",
+                            }
+                        ],
+                    }
+                )
+            )
+        ),
+    )
+    result = segment_amendment_text(model, context)
+    assert len(result.instructions) == 1
+    assert result.instructions[0].instruction_text == context
+    assert result.instructions[0].article_reference is None
+    assert result.instructions[0].target_source is None
+    assert result.reference_date is None
 
 
 def test_match_and_draft_llm_calls_run_outside_database_sessions(

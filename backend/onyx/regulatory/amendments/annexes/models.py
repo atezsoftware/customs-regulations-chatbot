@@ -10,6 +10,9 @@ from onyx.document_index.publication_models import (
     PublicationIndexSnapshot,
     PublicationScope,
 )
+from onyx.regulatory.amendments.annexes.table_geometry import (
+    require_disjoint_table_cells,
+)
 from onyx.regulatory.amendments.models import DateResolution
 
 SourcePackageStatus = Literal["processing", "ready", "partial", "blocked", "failed"]
@@ -39,6 +42,9 @@ class PdfVisionReference(BaseModel):
     file_id: str
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     transcript_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    transcript_version: Literal[1, 2] = Field(
+        default=1, exclude_if=lambda version: version == 1
+    )
 
 
 class AcquiredAsset(BaseModel):
@@ -51,6 +57,9 @@ class AcquiredAsset(BaseModel):
     original_url: str | None = None
     final_url: str | None = None
     text: str = ""
+    page_count: int | None = Field(
+        default=None, ge=1, le=500, exclude_if=lambda value: value is None
+    )
     native_text: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -79,6 +88,7 @@ class SourceInspection(BaseModel):
     mime_type: str
     text: str = ""
     links: list[DiscoveredLink] = Field(default_factory=list)
+    page_count: int | None = Field(default=None, ge=1, le=500)
 
 
 class AnnexModelSnapshot(BaseModel):
@@ -288,6 +298,13 @@ class AnnexVisionWireElement(BaseModel):
 class AnnexVisionWireResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     elements: list[AnnexVisionWireElement] = Field(max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_table_cell_geometry(self) -> "AnnexVisionWireResult":
+        require_disjoint_table_cells(
+            [item.box.as_tuple() for item in self.elements if item.kind == "table_cell"]
+        )
+        return self
 
 
 class AnnexOriginalEvidence(BaseModel):

@@ -1,5 +1,6 @@
 """Bounded native rendering; only called in a disposable process."""
 
+from collections.abc import Sequence
 from contextlib import closing
 from io import BytesIO
 
@@ -14,7 +15,9 @@ MAX_RENDER_PIXELS = 64_000_000
 MAX_RENDER_BYTES = 100 * 1024 * 1024
 
 
-def render_annex_pages(content: bytes, mime_type: str) -> list[AnnexRenderedPage]:
+def render_annex_pages(
+    content: bytes, mime_type: str, *, page_numbers: Sequence[int] | None = None
+) -> list[AnnexRenderedPage]:
     apply_source_process_limits()
     from PIL import Image
 
@@ -36,7 +39,19 @@ def render_annex_pages(content: bytes, mime_type: str) -> list[AnnexRenderedPage
         with pdfium.PdfDocument(content) as document:
             if len(document) > 500:
                 raise ValueError("annex_page_limit")
-            for index in range(len(document)):
+            selected = (
+                tuple(page_numbers)
+                if page_numbers is not None
+                else tuple(range(1, len(document) + 1))
+            )
+            if (
+                not selected
+                or len(set(selected)) != len(selected)
+                or any(number < 1 or number > len(document) for number in selected)
+            ):
+                raise ValueError("annex_page_selection_invalid")
+            for page_number in selected:
+                index = page_number - 1
                 with closing(document[index]) as page:
                     width, height = page.get_size()
                     if width * height * 4 + pixels > MAX_RENDER_PIXELS:

@@ -50,6 +50,7 @@ class _StructuredInvokeOptions(TypedDict):
     timeout_override: NotRequired[int]
     max_tokens: NotRequired[int]
     reasoning_effort: NotRequired[ReasoningEffort]
+    use_streaming: NotRequired[bool]
 
 
 _JSON_ONLY_REMINDER = (
@@ -239,6 +240,7 @@ def generate_structured(
     max_attempts: int = 2,
     provider_max_attempts: int = 3,
     deadline: float | None = None,
+    use_streaming: bool | None = None,
 ) -> ResponseModel:
     """Call the LLM and parse+validate its response as `response_model`.
 
@@ -287,6 +289,8 @@ def generate_structured(
         invoke_options["max_tokens"] = max_tokens
     if reasoning_effort is not None:
         invoke_options["reasoning_effort"] = reasoning_effort
+    if use_streaming is not None:
+        invoke_options["use_streaming"] = use_streaming
 
     last_error: ValidationError | None = None
     for attempt in range(max_attempts):

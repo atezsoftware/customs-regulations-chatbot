@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import math
 import time
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
@@ -9,6 +10,7 @@ from uuid import UUID
 from onyx.configs.constants import FileOrigin
 from onyx.db.amendment_sources import (
     claim_source_package,
+    extend_source_package_lease,
     finish_source_package,
     list_source_assets,
     mark_source_package_failed,
@@ -17,6 +19,10 @@ from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import RegulatorySourceAsset
 from onyx.file_store.file_store import FileStore, get_default_file_store
 from onyx.regulatory.amendments.annexes.models import SourceLink
+from onyx.regulatory.amendments.annexes.source_limits import (
+    SOURCE_PACKAGE_LEASE_MARGIN_SECONDS,
+    source_preparation_seconds,
+)
 from onyx.regulatory.amendments.annexes.sources import (
     MAX_ASSET_BYTES,
     MAX_PACKAGE_SECONDS,
@@ -60,7 +66,8 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
             package.manifest_sha256 if previous_manifest_id else None
         )
         existing_assets = list_source_assets(session, package_id)
-    deadline = time.monotonic() + MAX_PACKAGE_SECONDS
+    started = time.monotonic()
+    acquisition_deadline = started + MAX_PACKAGE_SECONDS
     try:
         store = get_default_file_store()
         url = spec.get("url") or spec.get("base_url")
@@ -139,7 +146,7 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                     cached.asset.mime_type,
                     cached.final_url,
                 )
-            return download_source(address, deadline=deadline)
+            return download_source(address, deadline=acquisition_deadline)
 
         result = acquire_source_package(
             url=url,
@@ -148,6 +155,44 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
             display_name=spec.get("display_name", "source"),
             fetch=fetch,
         )
+        pending_pdfs = [
+            asset
+            for asset in result.assets
+            if asset.mime_type == "application/pdf"
+            and asset.sha256 not in previous_pdf_assets
+            and not legacy_pdf_assets
+        ]
+        pending_images = [
+            asset
+            for asset in result.assets
+            if asset.mime_type.startswith("image/")
+            and not (
+                (existing := existing_by_hash.get(asset.sha256))
+                and existing.text_file_id
+                and existing.text_sha256
+            )
+        ]
+        if any(asset.sha256 in existing_by_hash for asset in pending_images):
+            raise ValueError("image_source_requires_new_preparation")
+        if any(asset.page_count is None for asset in pending_pdfs):
+            raise ValueError("pdf_page_count_missing")
+        if any(asset.page_count is None for asset in pending_images):
+            raise ValueError("image_page_count_missing")
+        deadline = started + source_preparation_seconds(
+            sum(asset.page_count or 0 for asset in [*pending_pdfs, *pending_images])
+        )
+        if time.monotonic() >= deadline:
+            raise TimeoutError("source_preparation_deadline")
+        with get_session_with_current_tenant() as session:
+            if not extend_source_package_lease(
+                session,
+                package_id=package_id,
+                environment=environment,
+                lease_token=token,
+                lease_seconds=math.ceil(deadline - time.monotonic())
+                + SOURCE_PACKAGE_LEASE_MARGIN_SECONDS,
+            ):
+                raise RuntimeError("source_preparation_lease_lost")
         if legacy_pdf_assets:
             # A retry completes the frozen package; it never partially upgrades its PDFs.
             result.assets = [
@@ -174,6 +219,8 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 vision = get_default_llm_with_vision()
             prepared = []
             for asset in result.assets:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("source_preparation_deadline")
                 if asset.mime_type != "application/pdf":
                     prepared.append(asset)
                 elif asset.sha256 in previous_pdf_assets:
@@ -189,8 +236,40 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                         )
                     )
             result.assets = prepared
+        if any(asset.mime_type.startswith("image/") for asset in result.assets):
+            from onyx.llm.factory import get_default_llm_with_vision
+            from onyx.regulatory.amendments.annexes.source_images import (
+                prepare_image_source,
+                reuse_image_source,
+            )
+
+            image_model = get_default_llm_with_vision() if pending_images else None
+            prepared_images = []
+            for asset in result.assets:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("source_preparation_deadline")
+                if not asset.mime_type.startswith("image/"):
+                    prepared_images.append(asset)
+                    continue
+                existing = existing_by_hash.get(asset.sha256)
+                if existing and existing.text_file_id and existing.text_sha256:
+                    prepared_images.append(
+                        reuse_image_source(
+                            asset,
+                            store=store,
+                            text_file_id=existing.text_file_id,
+                            text_sha256=existing.text_sha256,
+                        )
+                    )
+                else:
+                    prepared_images.append(
+                        prepare_image_source(asset, llm=image_model, deadline=deadline)
+                    )
+            result.assets = prepared_images
         stored_assets: list[RegulatorySourceAsset] = []
         for asset in result.assets:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("source_preparation_deadline")
             if asset.sha256 in existing_by_hash:
                 continue
             file_id = store.save_file(
@@ -226,6 +305,8 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                     final_url=asset.final_url,
                 )
             )
+        if time.monotonic() >= deadline:
+            raise TimeoutError("source_preparation_deadline")
         manifest = result.model_dump_json().encode()
         manifest_id = store.save_file(
             io.BytesIO(manifest),
@@ -234,7 +315,9 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
             file_type="application/json",
         )
         with get_session_with_current_tenant() as session:
-            finish_source_package(
+            if time.monotonic() >= deadline:
+                raise TimeoutError("source_preparation_deadline")
+            if not finish_source_package(
                 session,
                 package_id=package_id,
                 environment=environment,
@@ -243,7 +326,8 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 assets=stored_assets,
                 manifest_file_id=manifest_id,
                 manifest_sha256=hashlib.sha256(manifest).hexdigest(),
-            )
+            ):
+                raise RuntimeError("source_preparation_lease_lost")
     except Exception as error:
         with get_session_with_current_tenant() as session:
             mark_source_package_failed(

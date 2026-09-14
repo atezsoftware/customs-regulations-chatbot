@@ -7,7 +7,7 @@ import re
 import time
 from collections.abc import Sequence
 from io import BytesIO
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -24,6 +24,10 @@ from onyx.regulatory.amendments.annexes.models import (
     PdfVisionReference,
 )
 from onyx.regulatory.amendments.annexes.rendering import render_annex_pages
+from onyx.regulatory.amendments.annexes.table_geometry import (
+    has_ambiguous_table_rows,
+    require_disjoint_table_cells,
+)
 from onyx.regulatory.amendments.draft_integrity import DraftIntegrityError
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.structured_llm import generate_structured
@@ -59,7 +63,7 @@ def page_elements(
     ]
 
 
-def pdf_transcript(extraction: AnnexExtraction) -> str:
+def pdf_transcript(extraction: AnnexExtraction, *, version: Literal[1, 2] = 2) -> str:
     if (
         extraction.issues
         or not extraction.page_count
@@ -83,6 +87,23 @@ def pdf_transcript(extraction: AnnexExtraction) -> str:
                 else (0, 0)
             )
         )
+        if version == 2:
+            table_boxes = [
+                item.locator.normalized_box
+                for item in elements
+                if item.kind == "table_cell" and item.locator.normalized_box is not None
+            ]
+            require_disjoint_table_cells(table_boxes)
+            if has_ambiguous_table_rows(table_boxes):
+                # Row-spanning form fields remain separate grounded regions.
+                output.append(
+                    "\n".join(
+                        item.text
+                        for item in elements
+                        if item.kind == "table_cell" or item.text.strip()
+                    )
+                )
+                continue
         lines: list[str] = []
         row: list[ExtractedAnnexElement] = []
 
@@ -112,15 +133,17 @@ def pdf_transcript(extraction: AnnexExtraction) -> str:
                 overlap = min(box[3], previous[3]) - max(box[1], previous[1])
                 if overlap <= 0:
                     flush_row()
-                elif overlap < 0.5 * min(box[3] - box[1], previous[3] - previous[1]):
-                    raise ValueError("pdf_table_row_ambiguous")
-                elif any(
-                    min(box[2], cell.locator.normalized_box[2])
-                    > max(box[0], cell.locator.normalized_box[0])
-                    for cell in row
-                    if cell.locator.normalized_box
-                ):
-                    raise ValueError("pdf_table_cells_overlap")
+                elif version == 1:
+                    # Frozen derivatives must retain their original row assembly.
+                    if overlap < 0.5 * min(box[3] - box[1], previous[3] - previous[1]):
+                        raise ValueError("pdf_table_row_ambiguous")
+                    if any(
+                        min(box[2], cell.locator.normalized_box[2])
+                        > max(box[0], cell.locator.normalized_box[0])
+                        for cell in row
+                        if cell.locator.normalized_box
+                    ):
+                        raise ValueError("pdf_table_cells_overlap")
             row.append(item)
         flush_row()
         output.append("\n".join(lines))
@@ -153,6 +176,7 @@ def prepare_pdf_source(
                 file_id=identifier,
                 sha256=hashlib.sha256(data).hexdigest(),
                 transcript_sha256=digest(text),
+                transcript_version=2,
             ),
         }
     )
@@ -168,7 +192,7 @@ def load_pdf_extraction(
     extraction = AnnexExtraction.model_validate_json(
         read_verified(store, reference.file_id, reference.sha256)
     )
-    text = pdf_transcript(extraction)
+    text = pdf_transcript(extraction, version=reference.transcript_version)
     if (
         saved.get("sha256") != source_sha256
         or saved.get("mime_type") != "application/pdf"
@@ -214,7 +238,7 @@ def reuse_pdf_source(
     return asset.model_copy(
         update={
             "native_text": saved.get("native_text"),
-            "text": pdf_transcript(extraction),
+            "text": saved["text"],
             "pdf_vision": PdfVisionReference.model_validate(saved["pdf_vision"]),
         }
     )

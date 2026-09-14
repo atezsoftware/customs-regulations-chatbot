@@ -4,6 +4,7 @@ import base64
 import hashlib
 import time
 from collections import Counter
+from collections.abc import Iterable, Iterator, Sequence
 from io import BytesIO
 from typing import TypedDict
 from uuid import UUID
@@ -35,6 +36,7 @@ from onyx.utils.process_isolation import run_in_isolated_process
 class _SourceRetryOptions(TypedDict, total=False):
     provider_max_attempts: int
     deadline: float
+    use_streaming: bool
 
 
 def _table_elements(
@@ -434,6 +436,14 @@ def _xlsx_elements(content: bytes) -> list[ExtractedAnnexElement]:
     return elements
 
 
+def _require_structure_budget(elements: Sequence[ExtractedAnnexElement]) -> None:
+    if (
+        len(elements) > 20000
+        or sum(len(element.text) for element in elements) > 2_000_000
+    ):
+        raise ValueError("annex_structure_limit")
+
+
 def _native_structure(
     content: bytes, mime_type: str
 ) -> tuple[list[ExtractedAnnexElement], list[AnnexRenderedPage]]:
@@ -453,12 +463,37 @@ def _native_structure(
         return [], render_annex_pages(content, mime_type)
     else:
         elements = [ExtractedAnnexElement(kind="text", text=content.decode("utf-8"))]
-    if (
-        len(elements) > 20000
-        or sum(len(element.text) for element in elements) > 2_000_000
-    ):
-        raise ValueError("annex_structure_limit")
+    _require_structure_budget(elements)
     return elements, []
+
+
+def _source_pdf_page_count(content: bytes) -> int:
+    from onyx.regulatory.amendments.annexes.source_parser import (
+        apply_source_process_limits,
+    )
+
+    apply_source_process_limits()
+    count = inspect_source(content, "application/pdf").page_count
+    if count is None or count < 1:
+        raise ValueError("pdf_page_count_missing")
+    return count
+
+
+def _source_pdf_pages(
+    content: bytes, page_count: int, deadline: float
+) -> Iterator[AnnexRenderedPage]:
+    for start in range(1, page_count + 1, 4):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("pdf_vision_preparation_deadline")
+        pages = run_in_isolated_process(
+            render_annex_pages,
+            content,
+            "application/pdf",
+            page_numbers=tuple(range(start, min(start + 4, page_count + 1))),
+            timeout=min(30, remaining),
+        )
+        yield from pages
 
 
 def extract_annex_structure(
@@ -467,15 +502,26 @@ def extract_annex_structure(
     *,
     vision_llm: LLM | None = None,
     vision_deadline: float | None = None,
+    source_text_only: bool = False,
 ) -> AnnexExtraction:
     remaining = (
         vision_deadline - time.monotonic() if vision_deadline is not None else 30
     )
     if remaining <= 0:
         raise TimeoutError("pdf_vision_preparation_deadline")
-    elements, pages = run_in_isolated_process(
-        _native_structure, content, mime_type, timeout=min(30, remaining)
-    )
+    pages: Iterable[AnnexRenderedPage]
+    if mime_type == "application/pdf" and vision_deadline is not None:
+        page_count = run_in_isolated_process(
+            _source_pdf_page_count, content, timeout=min(30, remaining)
+        )
+        elements = []
+        pages = _source_pdf_pages(content, page_count, vision_deadline)
+    else:
+        elements, rendered_pages = run_in_isolated_process(
+            _native_structure, content, mime_type, timeout=min(30, remaining)
+        )
+        page_count = len(rendered_pages)
+        pages = rendered_pages
     result = AnnexExtraction(
         source_sha256=hashlib.sha256(content).hexdigest(),
         mime_type=mime_type,
@@ -484,7 +530,7 @@ def extract_annex_structure(
             for element in elements
         ],
     )
-    if pages:
+    if page_count:
         if vision_llm is not None:
             result.model_snapshot = AnnexModelSnapshot(
                 model_provider=vision_llm.config.model_provider,
@@ -492,17 +538,17 @@ def extract_annex_structure(
             )
         else:
             result.issues.append("vision_model_unavailable")
-        result.page_count = len(pages)
+        result.page_count = page_count
         original_image_input = (
-            mime_type in ("image/png", "image/jpeg", "image/webp")
-            and len(pages) == 1
-            and pages[0].original_orientation == 1
+            mime_type in ("image/png", "image/jpeg", "image/webp") and page_count == 1
         )
         for page in pages:
-            evidence_kind = "original" if original_image_input else "rendered_preview"
-            image_mime = mime_type if original_image_input else "image/png"
-            image_bytes = content if original_image_input else page.png
+            use_original = original_image_input and page.original_orientation == 1
+            evidence_kind = "original" if use_original else "rendered_preview"
+            image_mime = mime_type if use_original else "image/png"
+            image_bytes = content if use_original else page.png
             result.elements.extend(page.text_elements)
+            _require_structure_budget(result.elements)
             if vision_llm is None:
                 result.elements.append(
                     ExtractedAnnexElement(
@@ -514,6 +560,7 @@ def extract_annex_structure(
                         issues=["vision_model_unavailable"],
                     )
                 )
+                _require_structure_budget(result.elements)
                 continue
             bounded_options: _SourceRetryOptions = {}
             if vision_deadline is not None:
@@ -523,11 +570,21 @@ def extract_annex_structure(
                 bounded_options = {
                     "provider_max_attempts": 3,
                     "deadline": vision_deadline,
+                    "use_streaming": False,
                 }
             response = generate_structured(
                 vision_llm,
                 flow=LLMFlow.REGULATORY_ANNEX_EXTRACTION,
-                system_prompt=ANNEX_STRUCTURE_PROMPT,
+                system_prompt=ANNEX_STRUCTURE_PROMPT
+                + (
+                    "\nFor this source image, transcribe only document text, numbers, "
+                    "and table cells actually visible in the image. Never describe the scene, "
+                    "infer legal instructions, invent an amendment, or infer missing words. "
+                    "Do not emit image_region elements. If no legible document text is "
+                    "visible, return an empty elements array. Unclear text must remain uncertain."
+                    if source_text_only
+                    else ""
+                ),
                 user_prompt=f"Page {page.page}. Native text (evidence): "
                 + "\n".join(element.text for element in page.text_elements),
                 image_parts=[
@@ -582,11 +639,8 @@ def extract_annex_structure(
                         ),
                     )
                 )
-    if (
-        len(result.elements) > 20000
-        or sum(len(element.text) for element in result.elements) > 2_000_000
-    ):
-        raise ValueError("annex_structure_limit")
+            _require_structure_budget(result.elements)
+    _require_structure_budget(result.elements)
     counts = Counter(
         element.semantic_key for element in result.elements if element.semantic_key
     )

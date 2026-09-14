@@ -170,7 +170,8 @@ def run_probe(
                 ]
             elif messages[:2] != source_messages:
                 raise ValueError("pdf_probe_source_evidence_changed")
-        result = original_invoke(messages, use_streaming=False, **kwargs)
+        kwargs["use_streaming"] = False
+        result = original_invoke(messages, **kwargs)
         if report.probe_stage == "source":
             source_responses += 1
             try:

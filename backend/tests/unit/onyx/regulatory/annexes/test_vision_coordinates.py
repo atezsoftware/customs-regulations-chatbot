@@ -40,14 +40,16 @@ def response(box: object) -> ModelResponse:
 
 @pytest.fixture
 def llm(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    monkeypatch.setattr(
-        extraction,
-        "run_in_isolated_process",
-        lambda *_args, **_kwargs: (
-            [],
-            [AnnexRenderedPage(page=1, width=200, height=100, png=b"fixture pixels")],
-        ),
-    )
+    pages = [AnnexRenderedPage(page=1, width=200, height=100, png=b"fixture pixels")]
+
+    def isolate(function: object, *_args: object, **_kwargs: object) -> object:
+        if function is extraction._source_pdf_page_count:
+            return 1
+        if function is extraction.render_annex_pages:
+            return pages
+        return [], pages
+
+    monkeypatch.setattr(extraction, "run_in_isolated_process", isolate)
     model = MagicMock()
     model.config.model_name = "fixture"
     model.config.model_provider = "fixture"

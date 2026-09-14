@@ -45,6 +45,7 @@ def _generate(
     max_attempts: int = 2,
     provider_max_attempts: int = 3,
     deadline: float | None = None,
+    use_streaming: bool | None = None,
 ) -> _TinyResult:
     with (
         patch(
@@ -65,6 +66,7 @@ def _generate(
             max_attempts=max_attempts,
             provider_max_attempts=provider_max_attempts,
             deadline=deadline,
+            use_streaming=use_streaming,
         )
 
 
@@ -98,6 +100,15 @@ def test_generate_structured_omits_unsupplied_optional_invoke_limits() -> None:
     assert "timeout_override" not in invoke_kwargs
     assert "max_tokens" not in invoke_kwargs
     assert "reasoning_effort" not in invoke_kwargs
+    assert "use_streaming" not in invoke_kwargs
+
+
+def test_generate_structured_can_disable_streaming_for_bounded_source_calls() -> None:
+    llm = MagicMock()
+    llm.invoke.return_value = _response('{"value":"ok"}')
+
+    assert _generate(llm, use_streaming=False).value == "ok"
+    assert llm.invoke.call_args.kwargs["use_streaming"] is False
 
 
 def test_generate_structured_retries_validation_failure() -> None:

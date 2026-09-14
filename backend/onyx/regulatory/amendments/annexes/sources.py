@@ -31,6 +31,7 @@ from onyx.regulatory.amendments.annexes.models import (
     SourceIssue,
     SourceLink,
 )
+from onyx.regulatory.amendments.annexes.source_limits import SOURCE_ACQUISITION_SECONDS
 from onyx.regulatory.amendments.source_extraction import (
     amendment_source_http_options,
 )
@@ -41,7 +42,7 @@ MAX_ASSET_BYTES = 25 * 1024 * 1024
 MAX_PACKAGE_BYTES = 100 * 1024 * 1024
 MAX_ANNEX_ASSETS = 20
 MAX_LINK_DEPTH = 2
-MAX_PACKAGE_SECONDS = 180
+MAX_PACKAGE_SECONDS = SOURCE_ACQUISITION_SECONDS
 MAX_TEXT_CHARS = 2_000_000
 MAX_RELATIONSHIPS = 500
 _ANNEX = re.compile(
@@ -398,7 +399,10 @@ def _inspect_pdf(content: bytes) -> SourceInspection:
                 )
             )
     return SourceInspection(
-        mime_type="application/pdf", text="\n\n".join(texts), links=links
+        mime_type="application/pdf",
+        text="\n\n".join(texts),
+        links=links,
+        page_count=len(reader.pages),
     )
 
 
@@ -514,6 +518,12 @@ def inspect_source(content: bytes, declared: str | None) -> SourceInspection:
         result = _inspect_html(content, mime)
     elif mime in (_DOCX_MIME, _XLSX_MIME):
         result = _inspect_office(content, mime)
+    elif mime.startswith("image/"):
+        with Image.open(io.BytesIO(content)) as image:
+            frames = getattr(image, "n_frames", 1)
+            if frames > 500:
+                raise SourceAcquisitionError("page_limit")
+            result = SourceInspection(mime_type=mime, page_count=frames)
     else:
         result = SourceInspection(
             mime_type=mime, text=content.decode("utf-8") if mime == "text/plain" else ""
@@ -628,6 +638,7 @@ def acquire_source_package(
                     original_url=address,
                     final_url=final_url,
                     text=inspection.text,
+                    page_count=inspection.page_count,
                 )
                 by_hash[digest] = asset
                 result.assets.append(asset)

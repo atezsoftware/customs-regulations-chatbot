@@ -11,6 +11,10 @@ from sqlalchemy.orm import Session
 
 from onyx.db.models import AmendmentBatch, AmendmentSourcePackage, RegulatorySourceAsset
 from onyx.regulatory.amendments.annexes.models import AcquisitionResult
+from onyx.regulatory.amendments.annexes.source_limits import (
+    MAX_SOURCE_PREPARATION_SECONDS,
+    SOURCE_PACKAGE_LEASE_MARGIN_SECONDS,
+)
 
 
 def create_source_package(
@@ -129,6 +133,37 @@ def claim_source_package(
     return (claimed, token) if claimed is not None else None
 
 
+def extend_source_package_lease(
+    db_session: Session,
+    *,
+    package_id: UUID,
+    environment: str,
+    lease_token: UUID,
+    lease_seconds: int,
+) -> bool:
+    if (
+        not 0
+        < lease_seconds
+        <= (MAX_SOURCE_PREPARATION_SECONDS + SOURCE_PACKAGE_LEASE_MARGIN_SECONDS)
+    ):
+        raise ValueError("Invalid source preparation lease duration")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    extended = db_session.scalar(
+        update(AmendmentSourcePackage)
+        .where(
+            AmendmentSourcePackage.id == package_id,
+            AmendmentSourcePackage.environment == environment,
+            AmendmentSourcePackage.status == "processing",
+            AmendmentSourcePackage.lease_token == lease_token,
+            AmendmentSourcePackage.lease_expires_at > now,
+        )
+        .values(lease_expires_at=now + datetime.timedelta(seconds=lease_seconds))
+        .returning(AmendmentSourcePackage.id)
+    )
+    db_session.commit()
+    return extended is not None
+
+
 def retry_source_package(
     db_session: Session, *, package_id: UUID, document_set_id: int, environment: str
 ) -> AmendmentSourcePackage:
@@ -227,7 +262,16 @@ def mark_source_package_failed(
         if lease_token
         else statement.where(AmendmentSourcePackage.lease_token.is_(None))
     )
-    issue: dict[str, Any] = {"code": "acquisition_failed", "retryable": True}
+    if isinstance(failure, TimeoutError):
+        code, retryable = "source_preparation_timeout", True
+    elif (
+        isinstance(failure, ValueError)
+        and str(failure) == "image_source_requires_new_preparation"
+    ):
+        code, retryable = "image_source_requires_new_preparation", False
+    else:
+        code, retryable = "acquisition_failed", True
+    issue: dict[str, Any] = {"code": code, "retryable": retryable}
     if failure is not None:
         from onyx.regulatory.failure_details import safe_failure_detail
 

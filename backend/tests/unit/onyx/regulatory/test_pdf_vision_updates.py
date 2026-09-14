@@ -417,6 +417,7 @@ def test_source_worker_freezes_vision_text_for_existing_readback(
             "text": "native-only paragraph",
             "native_text": None,
             "pdf_vision": None,
+            "page_count": 1,
         }
     )
     monkeypatch.setattr(
@@ -445,6 +446,114 @@ def test_source_worker_freezes_vision_text_for_existing_readback(
         == finish.call_args.kwargs["manifest_sha256"]
     )
     assert b"pdf_vision" in manifest
+
+
+@pytest.mark.parametrize("page_seconds", [30, 111])
+def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
+    monkeypatch: pytest.MonkeyPatch, page_seconds: int
+) -> None:
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from onyx.llm import factory
+    from onyx.llm.model_response import Choice, Message, ModelResponse
+    from onyx.regulatory.amendments.annexes import extraction, job
+    from onyx.regulatory.amendments.annexes.models import (
+        AcquisitionResult,
+        AnnexExtraction,
+        AnnexRenderedPage,
+    )
+
+    now = [100.0]
+    monkeypatch.setattr(job.time, "monotonic", lambda: now[0])
+    package = SimpleNamespace(
+        input_spec={"url": "https://example.gov/update.htm"},
+        input_file_id=None,
+        manifest_file_id=None,
+    )
+    monkeypatch.setattr(
+        job, "claim_source_package", MagicMock(return_value=(package, uuid4()))
+    )
+    monkeypatch.setattr(job, "list_source_assets", MagicMock(return_value=[]))
+    monkeypatch.setattr(job, "get_session_with_current_tenant", MagicMock())
+    content = b"twelve image-only PDF pages"
+    original = AcquiredAsset(
+        sha256=hashlib.sha256(content).hexdigest(),
+        content=content,
+        mime_type="application/pdf",
+        display_name="linked.pdf",
+        text="Resmi Gazete",
+        page_count=12,
+    )
+    monkeypatch.setattr(
+        job,
+        "acquire_source_package",
+        lambda **_kwargs: AcquisitionResult(status="ready", assets=[original]),
+    )
+
+    def isolate(function: object, *_args: object, **kwargs: object) -> object:
+        if function is extraction._source_pdf_page_count:
+            return 12
+        if function is extraction.render_annex_pages:
+            return [
+                AnnexRenderedPage(page=number, width=200, height=300, png=b"pixels")
+                for number in cast(tuple[int, ...], kwargs["page_numbers"])
+            ]
+        raise AssertionError("Unexpected isolated source operation")
+
+    monkeypatch.setattr(extraction, "run_in_isolated_process", isolate)
+    model = MagicMock()
+    model.config.model_provider = "fixture"
+    model.config.model_name = "vision"
+
+    def invoke(*_args: object, **_kwargs: object) -> ModelResponse:
+        now[0] += page_seconds
+        return ModelResponse(
+            id="fixture",
+            created="2026-09-14",
+            choice=Choice(message=Message(content=vision_result().model_dump_json())),
+        )
+
+    model.invoke.side_effect = invoke
+    monkeypatch.setattr(factory, "get_default_llm_with_vision", lambda: model)
+    blobs: dict[str, bytes] = {}
+    store = MagicMock()
+
+    def save(stream: BytesIO, **_kwargs: object) -> str:
+        key = str(len(blobs))
+        blobs[key] = stream.read()
+        return key
+
+    store.save_file.side_effect = save
+    monkeypatch.setattr(job, "get_default_file_store", lambda: store)
+    finish, failed = MagicMock(), MagicMock()
+    monkeypatch.setattr(job, "finish_source_package", finish)
+    monkeypatch.setattr(job, "mark_source_package_failed", failed)
+    monkeypatch.setattr(
+        job, "extend_source_package_lease", MagicMock(return_value=True), raising=False
+    )
+    if page_seconds == 111:
+        with pytest.raises(TimeoutError, match="deadline"):
+            job.run_source_package(package_id=uuid4(), environment="local-test")
+        assert model.invoke.call_count == 12
+        assert not blobs
+        finish.assert_not_called()
+        assert isinstance(failed.call_args.kwargs["failure"], TimeoutError)
+        return
+
+    job.run_source_package(package_id=uuid4(), environment="local-test")
+    frozen = finish.call_args.kwargs["result"].assets[0]
+    assert frozen.native_text == "Resmi Gazete"
+    assert frozen.pdf_vision is not None
+    prepared = AnnexExtraction.model_validate_json(blobs[frozen.pdf_vision.file_id])
+    assert prepared.page_count == 12
+    assert {element.locator.page for element in prepared.elements} == set(range(1, 13))
+    assert frozen.text.count("Bugday | 17%") == 12
+    assert model.invoke.call_count == 12
+    assert all(
+        call.kwargs["use_streaming"] is False for call in model.invoke.call_args_list
+    )
+    failed.assert_not_called()
 
 
 def test_source_derivative_reuse_does_not_invoke_vision(

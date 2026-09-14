@@ -267,6 +267,153 @@ def test_retry_refreshes_locked_state_before_clearing_worker_lease(
         )
 
 
+@pytest.mark.parametrize("page_count", [12, 50])
+def test_source_lease_protects_long_pdf_preparation_from_duplicate_claims(
+    source_session: Session, monkeypatch: pytest.MonkeyPatch, page_count: int
+) -> None:
+    import datetime
+    from types import SimpleNamespace
+
+    from onyx.db import amendment_sources
+    from onyx.regulatory.amendments.annexes.source_limits import (
+        source_preparation_seconds,
+    )
+
+    document_set = DocumentSet(
+        name=f"annex-{uuid4()}", description="annex test", is_up_to_date=True
+    )
+    source_session.add(document_set)
+    source_session.flush()
+    package, _ = amendment_sources.create_source_package(
+        source_session,
+        document_set_id=document_set.id,
+        environment="local-test",
+        idempotency_key=str(uuid4()),
+        request_hash="a" * 64,
+        input_spec={"url": "https://example.gov/update.htm"},
+        created_by=None,
+    )
+    started = datetime.datetime.now(datetime.timezone.utc)
+    claimed = amendment_sources.claim_source_package(
+        source_session, package_id=package.id, environment="local-test"
+    )
+    assert claimed is not None
+    assert amendment_sources.extend_source_package_lease(
+        source_session,
+        package_id=package.id,
+        environment="local-test",
+        lease_token=claimed[1],
+        lease_seconds=source_preparation_seconds(page_count) + 300,
+    )
+    fake_datetime = SimpleNamespace(
+        datetime=SimpleNamespace(
+            now=lambda _tz: started + datetime.timedelta(minutes=20)
+        ),
+        timezone=datetime.timezone,
+        timedelta=datetime.timedelta,
+    )
+    monkeypatch.setattr(amendment_sources, "datetime", fake_datetime)
+    assert (
+        amendment_sources.claim_source_package(
+            source_session, package_id=package.id, environment="local-test"
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="still running"):
+        amendment_sources.retry_source_package(
+            source_session,
+            package_id=package.id,
+            document_set_id=document_set.id,
+            environment="local-test",
+        )
+    fake_datetime.datetime.now = lambda _tz: started + datetime.timedelta(minutes=30)
+    subsequent = amendment_sources.claim_source_package(
+        source_session, package_id=package.id, environment="local-test"
+    )
+    assert (subsequent is None) is (page_count == 50)
+
+
+@pytest.mark.parametrize("ownership", ["wrong_token", "expired", "finished"])
+def test_source_lease_extension_rejects_lost_ownership(
+    source_session: Session, ownership: str
+) -> None:
+    import datetime
+
+    from onyx.db import amendment_sources
+
+    document_set = DocumentSet(
+        name=f"annex-{uuid4()}", description="annex test", is_up_to_date=True
+    )
+    source_session.add(document_set)
+    source_session.flush()
+    package, _ = amendment_sources.create_source_package(
+        source_session,
+        document_set_id=document_set.id,
+        environment="local-test",
+        idempotency_key=str(uuid4()),
+        request_hash="a" * 64,
+        input_spec={"url": "https://example.gov/update.htm"},
+        created_by=None,
+    )
+    claimed = amendment_sources.claim_source_package(
+        source_session, package_id=package.id, environment="local-test"
+    )
+    assert claimed is not None
+    if ownership == "expired":
+        package.lease_expires_at = datetime.datetime.now(
+            datetime.timezone.utc
+        ) - datetime.timedelta(seconds=1)
+    elif ownership == "finished":
+        package.status = "failed"
+    source_session.commit()
+    previous_expiry = package.lease_expires_at
+    assert not amendment_sources.extend_source_package_lease(
+        source_session,
+        package_id=package.id,
+        environment="local-test",
+        lease_token=uuid4() if ownership == "wrong_token" else claimed[1],
+        lease_seconds=1500,
+    )
+    source_session.refresh(package)
+    assert package.lease_expires_at == previous_expiry
+
+
+def test_source_preparation_timeout_has_a_specific_safe_failure_code(
+    source_session: Session,
+) -> None:
+    from onyx.db.amendment_sources import (
+        create_source_package,
+        mark_source_package_failed,
+    )
+
+    document_set = DocumentSet(
+        name=f"annex-{uuid4()}", description="annex test", is_up_to_date=True
+    )
+    source_session.add(document_set)
+    source_session.flush()
+    package, _ = create_source_package(
+        source_session,
+        document_set_id=document_set.id,
+        environment="local-test",
+        idempotency_key=str(uuid4()),
+        request_hash="a" * 64,
+        input_spec={"url": "https://example.gov/update.htm"},
+        created_by=None,
+    )
+    mark_source_package_failed(
+        source_session,
+        package_id=package.id,
+        environment="local-test",
+        failure=TimeoutError("private payload must not appear"),
+    )
+    source_session.refresh(package)
+    assert package.status == "failed"
+    assert package.issues[0]["code"] == "source_preparation_timeout"
+    assert package.issues[0]["retryable"] is True
+    assert "TimeoutError" in package.issues[0]["failure_detail"]
+    assert "private payload" not in package.issues[0]["failure_detail"]
+
+
 def test_retry_retains_distinct_url_occurrences_and_retries_unresolved_child(
     source_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -282,7 +429,9 @@ def test_retry_retains_distinct_url_occurrences_and_retries_unresolved_child(
         retry_source_package,
     )
     from onyx.file_store.file_store import get_default_file_store
+    from onyx.regulatory.amendments import pdf_vision
     from onyx.regulatory.amendments.annexes import job
+    from onyx.regulatory.amendments.annexes.models import AcquiredAsset
     from onyx.regulatory.amendments.annexes.sources import (
         DownloadedSource,
         SourceAcquisitionError,
@@ -293,6 +442,11 @@ def test_retry_retains_distinct_url_occurrences_and_retries_unresolved_child(
         yield source_session
 
     monkeypatch.setattr(job, "get_session_with_current_tenant", session_context)
+
+    def prepare_fixture(asset: AcquiredAsset, **_kwargs: object) -> AcquiredAsset:
+        return asset.model_copy(update={"text": "Frozen PDF fixture"})
+
+    monkeypatch.setattr(pdf_vision, "prepare_pdf_source", prepare_fixture)
     document_set = DocumentSet(
         name=f"annex-{uuid4()}", description="annex test", is_up_to_date=True
     )

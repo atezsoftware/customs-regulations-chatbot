@@ -123,6 +123,16 @@ function sourceRequestIdentity() {
   return `annex-source-${globalThis.crypto.randomUUID()}`;
 }
 
+function sourceIssueMessage(code: string) {
+  if (code === "source_preparation_timeout") {
+    return "Source preparation timed out while reading the document or its attachments. Retry source preparation.";
+  }
+  if (code === "image_source_requires_new_preparation") {
+    return "This image source was saved without extracted text. Click Prepare source to create a new package.";
+  }
+  return code.replaceAll("_", " ");
+}
+
 function analysisProgressLabel(batch: AmendmentBatch) {
   if (batch.stage === "segmenting") return "Segmenting amendment…";
   if (batch.stage === "finalizing") return "Finalizing analysis…";
@@ -783,6 +793,9 @@ export default function AmendmentsPage() {
     string | null
   >(null);
   const sourceRequestTokenRef = useRef<string | null>(null);
+  const sourceDraftRef = useRef<{ identity: string; text: string } | null>(
+    null
+  );
   const sourceFileInputRef = useRef<HTMLInputElement>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [retrying, setRetrying] = useState(false);
@@ -1047,6 +1060,12 @@ export default function AmendmentsPage() {
   const canAnalyze = Boolean(rawText.trim()) && hasCurrentSourceExtraction;
   const sourcePackageId = sourcePackage?.id ?? null;
   const sourcePackageStatus = sourcePackage?.status ?? null;
+  const sourcePreparationBusy =
+    retryingSourcePackage ||
+    (annexEnabled &&
+      sourcePackageStatus === "processing" &&
+      currentSourceIdentity !== null &&
+      currentSourceIdentity === sourcePackageIdentity);
 
   useEffect(() => {
     if (
@@ -1076,8 +1095,17 @@ export default function AmendmentsPage() {
           if (!isCurrentRequest()) return;
           setSourcePackagePollError(null);
           if (sourceText.original_text.trim()) {
-            setRawText(sourceText.original_text);
+            const draft = sourceDraftRef.current;
+            setRawText(
+              [
+                sourceText.original_text,
+                draft?.identity === expectedIdentity ? draft.text : "",
+              ]
+                .filter((text) => text.trim())
+                .join("\n\n")
+            );
           }
+          sourceDraftRef.current = null;
           setExtractedSourceIdentity(expectedIdentity);
           toast.success("Frozen source package is ready for analysis.");
           return;
@@ -1130,6 +1158,7 @@ export default function AmendmentsPage() {
 
   const handleSourceModeChange = useCallback((mode: AmendmentSourceMode) => {
     sourceRequestTokenRef.current = null;
+    sourceDraftRef.current = null;
     setSourceMode(mode);
     setSourceFile(null);
     if (sourceFileInputRef.current) {
@@ -1140,11 +1169,13 @@ export default function AmendmentsPage() {
     setSourcePackage(null);
     setSourcePackageIdentity(null);
     setExtracting(false);
+    setAnalyzing(false);
     setRetryingSourcePackage(false);
     setSourcePackagePollError(null);
   }, []);
 
   const handleExtract = useCallback(async () => {
+    if (sourcePreparationBusy) return;
     const identity = sourceIdentity(sourceMode, sourceUrl, sourceFile, rawText);
     if (!identity) {
       toast.error(
@@ -1210,11 +1241,13 @@ export default function AmendmentsPage() {
     selectedDocumentSetId,
     sourceFile,
     sourceMode,
+    sourcePreparationBusy,
     sourceUrl,
   ]);
 
   const handleAnalyze = useCallback(async () => {
-    if (!selectedDocumentSetId || !rawText.trim()) return;
+    if (!selectedDocumentSetId || !rawText.trim() || sourcePreparationBusy)
+      return;
     let sourcePreparationToken: string | null = null;
     setAnalyzing(true);
     try {
@@ -1287,6 +1320,7 @@ export default function AmendmentsPage() {
     sourceFile,
     sourceMode,
     sourcePackage?.id,
+    sourcePreparationBusy,
     sourceUrl,
   ]);
 
@@ -1362,6 +1396,7 @@ export default function AmendmentsPage() {
               value={selectedDocumentSetId ?? ""}
               onValueChange={(value) => {
                 sourceRequestTokenRef.current = null;
+                sourceDraftRef.current = null;
                 setSelectedDocumentSetId(value);
                 setSelectedBatchId(null);
                 setSourcePackage(null);
@@ -1448,6 +1483,7 @@ export default function AmendmentsPage() {
                       value={sourceUrl}
                       onChange={(event) => {
                         sourceRequestTokenRef.current = null;
+                        sourceDraftRef.current = null;
                         setSourceUrl(event.target.value);
                         setRawText("");
                         setExtractedSourceIdentity(null);
@@ -1462,7 +1498,9 @@ export default function AmendmentsPage() {
                     <Button
                       type="button"
                       onClick={() => void handleExtract()}
-                      disabled={extracting || !sourceUrl.trim()}
+                      disabled={
+                        extracting || sourcePreparationBusy || !sourceUrl.trim()
+                      }
                     >
                       {extracting
                         ? annexEnabled
@@ -1499,6 +1537,7 @@ export default function AmendmentsPage() {
                       }
                       onChange={(event) => {
                         sourceRequestTokenRef.current = null;
+                        sourceDraftRef.current = null;
                         setSourceFile(event.target.files?.[0] ?? null);
                         setRawText("");
                         setExtractedSourceIdentity(null);
@@ -1524,7 +1563,9 @@ export default function AmendmentsPage() {
                     <Button
                       type="button"
                       onClick={() => void handleExtract()}
-                      disabled={extracting || !sourceFile}
+                      disabled={
+                        extracting || sourcePreparationBusy || !sourceFile
+                      }
                     >
                       {extracting
                         ? annexEnabled
@@ -1557,7 +1598,7 @@ export default function AmendmentsPage() {
                         font="secondary-body"
                         color="status-error-05"
                       >
-                        {`${issue.code.replaceAll("_", " ")}${issue.locator ? ` · ${issue.locator}` : ""}`}
+                        {`${sourceIssueMessage(issue.code)}${issue.locator ? ` · ${issue.locator}` : ""}`}
                       </Text>
                     ))}
                     {sourcePackagePollError && (
@@ -1598,7 +1639,20 @@ export default function AmendmentsPage() {
                   aria-label="Amendment text"
                   value={rawText}
                   onChange={(event) => {
-                    sourceRequestTokenRef.current = null;
+                    if (!annexEnabled || sourceMode === "text") {
+                      sourceRequestTokenRef.current = null;
+                    }
+                    if (
+                      annexEnabled &&
+                      sourceMode !== "text" &&
+                      currentSourceIdentity !== null &&
+                      currentSourceIdentity !== extractedSourceIdentity
+                    ) {
+                      sourceDraftRef.current = {
+                        identity: currentSourceIdentity,
+                        text: event.target.value,
+                      };
+                    }
                     setRawText(event.target.value);
                     if (annexEnabled && sourceMode === "text") {
                       setSourcePackage(null);
@@ -1618,6 +1672,7 @@ export default function AmendmentsPage() {
                     onClick={() => void handleAnalyze()}
                     disabled={
                       analyzing ||
+                      sourcePreparationBusy ||
                       !rawText.trim() ||
                       (!canAnalyze && !(annexEnabled && sourceMode === "text"))
                     }

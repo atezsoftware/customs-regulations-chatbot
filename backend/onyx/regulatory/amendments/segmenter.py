@@ -12,7 +12,9 @@ from onyx.tracing.flows import LLMFlow
 # ruff: noqa: E501 start
 _SYSTEM_PROMPT = """You are an expert at analyzing Turkish regulatory amendment texts (Resmi Gazete değişiklik/protokol metinleri).
 
-You will be given a pasted amendment/update text. Your job:
+The input may be amendment text, a concise update request, a replacement table/document, or text extracted from an unrelated photograph. Interpret the supplied context: "tablonun yeni hali", "this is the updated table", a replacement document/version, or equivalent surrounding instructions establish update intent even without formal legislative amendment language or an article number. Preserve the supplied table/content and its stated update context; do not invent a missing target, an old value, or an additional change. Return `instructions: []` and `reference_date: null` only when neither the content nor its supplied context expresses an update. Unrelated photograph descriptions, signs, menus, object labels, or ordinary passages without update context are not update requests. Never invent an update merely because this workflow is called amendment analysis.
+
+When the content or its supplied context establishes update intent, your job:
 
 1. Split the text into atomic amendment instructions, each affecting exactly ONE independently retrievable legal rule or provision.
    Common patterns in Turkish regulatory amendments:
@@ -20,7 +22,7 @@ You will be given a pasted amendment/update text. Your job:
    - "... aşağıdaki fıkra/bent eklenmiştir." (the following paragraph/clause is added)
    - "... yürürlükten kaldırılmıştır." (repealed)
    Put the exact text needed to fully understand each change (the instruction sentence plus any new article text) into `instruction_text`.
-   The input may instead be a concise natural-language summary in any language. Such a summary is still an amendment request. Split coordinated changes into separate instructions whenever they concern different operative rules, even when no article number is given. Do not leave multiple independently searchable changes in one instruction.
+   The input may instead be a concise natural-language summary or a table/document supplied as the new version, in any language. Such contextual update requests do not require a formal amendment sentence. Split coordinated changes into separate instructions whenever they concern different operative rules, even when no article number is given. Do not leave multiple independently searchable changes in one instruction.
    CRITICAL: Never keep a changed numerical threshold/cap and a distinct exception, fallback, or alternative procedure that applies beyond that threshold in the same instruction. Emit one instruction for the threshold and another for the beyond-threshold procedure. Each instruction must be answerable by one focused search question and target one existing chunk.
 
 2. CRITICAL — only treat an instruction as adding a brand-new article/provision if the text EXPLICITLY says so (e.g. "... eklenmiştir", "yeni bir madde olarak", "MADDE N eklenmiştir"). If the text is merely amending, replacing, or clarifying an existing article, it is NOT a new article — leave `article_reference` pointing at the existing article being changed. Never infer a new-article addition from ambiguous or silent phrasing.
