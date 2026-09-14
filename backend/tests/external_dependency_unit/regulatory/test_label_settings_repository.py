@@ -8,21 +8,27 @@ from uuid import uuid4
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import inspect, select, text
+from sqlalchemy import inspect, select, text, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from onyx.db import regulatory_labeling as repository
 from onyx.db.labeling_configuration import resolve_labeling_provider_binding
 from onyx.db.models import (
     RegulatoryChunk,
+    RegulatoryDerivedLabelProjection,
+    RegulatoryLabelingItem,
     RegulatoryLabelingRun,
+    RegulatoryLabelingShard,
     RegulatoryLabelSettings,
     RegulatoryLabelTaxonomy,
     User,
+    UserFile,
 )
 from onyx.regulatory.labeling.provider import LabelDefinition, TaxonomyDefinition
 from tests.external_dependency_unit.regulatory.test_labeling_jobs import (
     LabelingData,
+    _prepare,
     _start,
 )
 from tests.external_dependency_unit.regulatory.test_labeling_jobs import (
@@ -38,9 +44,9 @@ def test_settings_are_seeded_in_db_and_concurrent_edits_do_not_overwrite(
 ) -> None:
     with Session(labeling_data.database.engine) as session:
         settings = repository.get_label_settings(session)
-        assert settings.revision == 1
+        assert settings.revision == 2
         original_id = settings.taxonomy_id
-        assert settings.taxonomy.label_count == 255
+        assert settings.taxonomy.label_count == 165
         original = TaxonomyDefinition.model_validate(settings.taxonomy.definition)
     barrier = Barrier(2)
 
@@ -55,7 +61,7 @@ def test_settings_are_seeded_in_db_and_concurrent_edits_do_not_overwrite(
                             id="editable", name="Editable", description=description
                         )
                     ],
-                    expected_revision=1,
+                    expected_revision=2,
                     updated_by_id=labeling_data.user_id,
                 )
                 session.commit()
@@ -70,7 +76,7 @@ def test_settings_are_seeded_in_db_and_concurrent_edits_do_not_overwrite(
     winner = next(result for result in results if result != "conflict")
     with Session(labeling_data.database.engine) as session:
         current = repository.get_label_settings(session)
-        assert current.revision == 2
+        assert current.revision == 3
         assert current.updated_by_id == labeling_data.user_id
         assert (
             TaxonomyDefinition.model_validate(current.taxonomy.definition)
@@ -289,5 +295,189 @@ def test_label_migration_rejects_incompatible_preexisting_table(
                 pytest.raises(RuntimeError, match="schema|incompatible|column"),
             ):
                 migration.upgrade()
+        finally:
+            transaction.rollback()
+
+
+_LEGACY_DEFAULT_HASH = (
+    "5a89e4d393c2974a900e15bb57914814633e70ce65b0f5f39f02b7d24b7b50bd"
+)
+_CHUNK_DEFAULT_HASH = "6ff25f4865bcd1107dd7f7dc51120476f05339327498d5d9a2b422b130193193"
+_SCOPE_MIGRATION = "b27e6a4c1d90_scope_default_chunk_labels.py"
+
+
+def test_scope_migration_updates_only_untouched_default_and_preserves_history(
+    labeling_data: LabelingData,
+) -> None:
+    with Session(labeling_data.database.engine) as session:
+        legacy = session.scalar(
+            select(RegulatoryLabelTaxonomy).where(
+                RegulatoryLabelTaxonomy.version_hash == _LEGACY_DEFAULT_HASH
+            )
+        )
+        assert legacy is not None
+        legacy_id = legacy.id
+    run_id, _ = _start(labeling_data._replace(taxonomy_id=legacy_id))
+    _prepare(labeling_data, run_id)
+    migration = _migration(_SCOPE_MIGRATION)
+    with labeling_data.database.engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            connection.execute(
+                text(f'SET LOCAL search_path TO "{labeling_data.database.schema}"')
+            )
+            connection.execute(
+                update(RegulatoryLabelSettings)
+                .where(RegulatoryLabelSettings.id == 1)
+                .values(
+                    taxonomy_id=legacy_id,
+                    revision=1,
+                    updated_by_id=None,
+                    updated_at=text("'2000-01-01T00:00:00Z'::timestamptz"),
+                )
+            )
+            preserved_tables = (
+                RegulatoryChunk.__table__,
+                UserFile.__table__,
+                RegulatoryLabelingRun.__table__,
+                RegulatoryLabelingItem.__table__,
+                RegulatoryLabelingShard.__table__,
+                RegulatoryDerivedLabelProjection.__table__,
+            )
+            before = {
+                table: [
+                    dict(row)
+                    for row in connection.execute(
+                        select(table).order_by(table.c.id)
+                    ).mappings()
+                ]
+                for table in preserved_tables
+            }
+            legacy_query = select(RegulatoryLabelTaxonomy.__table__).where(
+                RegulatoryLabelTaxonomy.id == legacy_id
+            )
+            legacy_before = dict(connection.execute(legacy_query).mappings().one())
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+            current = (
+                connection.execute(select(RegulatoryLabelSettings.__table__))
+                .mappings()
+                .one()
+            )
+            assert current["revision"] == 2
+            assert current["updated_by_id"] is None
+            assert current["updated_at"].year > 2000
+            scoped = (
+                connection.execute(
+                    select(RegulatoryLabelTaxonomy.__table__).where(
+                        RegulatoryLabelTaxonomy.id == current["taxonomy_id"]
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert scoped["version_hash"] == _CHUNK_DEFAULT_HASH
+            assert scoped["label_count"] == 165
+            assert len(scoped["definition"]["labels"]) == 165
+            assert all(
+                label["id"].startswith(("SUB.", "EFF.", "ANX.", "SEC."))
+                for label in scoped["definition"]["labels"]
+            )
+            assert current["taxonomy_id"] != legacy_id
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+                migration.downgrade()
+            assert dict(
+                connection.execute(select(RegulatoryLabelSettings.__table__))
+                .mappings()
+                .one()
+            ) == dict(current)
+            assert (
+                dict(connection.execute(legacy_query).mappings().one()) == legacy_before
+            )
+            for table in preserved_tables:
+                assert [
+                    dict(row)
+                    for row in connection.execute(
+                        select(table).order_by(table.c.id)
+                    ).mappings()
+                ] == before[table]
+        finally:
+            transaction.rollback()
+
+
+@pytest.mark.parametrize(
+    "current_kind", ["custom", "edited_legacy", "attributed_legacy", "scoped"]
+)
+def test_scope_migration_preserves_current_or_edited_settings(
+    labeling_data: LabelingData, current_kind: str
+) -> None:
+    migration = _migration(_SCOPE_MIGRATION)
+    with labeling_data.database.engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            connection.execute(
+                text(f'SET LOCAL search_path TO "{labeling_data.database.schema}"')
+            )
+            if current_kind == "scoped":
+                seed_path = (
+                    Path(__file__).resolve().parents[3]
+                    / "onyx/regulatory/labeling/data/tariff-regulatory-intelligence-chunk-labels-v1.json"
+                )
+                scoped = TaxonomyDefinition.model_validate_json(seed_path.read_text())
+                connection.execute(
+                    insert(RegulatoryLabelTaxonomy)
+                    .values(
+                        id=uuid4(),
+                        name=scoped.name,
+                        version_hash=scoped.version_hash,
+                        definition=scoped.model_dump(),
+                        label_count=len(scoped.labels),
+                    )
+                    .on_conflict_do_nothing(index_elements=["version_hash"])
+                )
+            taxonomy_id = (
+                labeling_data.taxonomy_id
+                if current_kind == "custom"
+                else connection.execute(
+                    select(RegulatoryLabelTaxonomy.id).where(
+                        RegulatoryLabelTaxonomy.version_hash
+                        == (
+                            _CHUNK_DEFAULT_HASH
+                            if current_kind == "scoped"
+                            else _LEGACY_DEFAULT_HASH
+                        )
+                    )
+                ).scalar_one()
+            )
+            connection.execute(
+                update(RegulatoryLabelSettings)
+                .where(RegulatoryLabelSettings.id == 1)
+                .values(
+                    taxonomy_id=taxonomy_id,
+                    revision=2 if current_kind == "edited_legacy" else 1,
+                    updated_by_id=(
+                        labeling_data.user_id
+                        if current_kind == "attributed_legacy"
+                        else None
+                    ),
+                )
+            )
+            settings_query = select(RegulatoryLabelSettings.__table__)
+            taxonomy_query = select(RegulatoryLabelTaxonomy.__table__).order_by(
+                RegulatoryLabelTaxonomy.id
+            )
+            before = dict(connection.execute(settings_query).mappings().one())
+            taxonomies_before = [
+                dict(row) for row in connection.execute(taxonomy_query).mappings()
+            ]
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+                migration.downgrade()
+                migration.upgrade()
+            assert dict(connection.execute(settings_query).mappings().one()) == before
+            assert [
+                dict(row) for row in connection.execute(taxonomy_query).mappings()
+            ] == taxonomies_before
         finally:
             transaction.rollback()

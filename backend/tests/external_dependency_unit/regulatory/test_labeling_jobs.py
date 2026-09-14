@@ -1090,7 +1090,7 @@ def test_api_default_labels_need_no_upload_and_reach_the_batch_prompt(
         definition = settings.taxonomy.definition
     setup = labeling_client.get(_api_path(labeling_data, "setup"))
     assert setup.status_code == 200, setup.text
-    assert setup.json()["default_label_count"] == 255
+    assert setup.json()["default_label_count"] == 165
     body: dict[str, str | int | None] = {**_start_body(labeling_data)}
     if explicit_null:
         body["taxonomy_id"] = None

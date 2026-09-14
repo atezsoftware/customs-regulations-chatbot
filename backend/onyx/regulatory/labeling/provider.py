@@ -98,7 +98,7 @@ def build_labeling_request(
         "properties": {
             "labels": {
                 "type": "array",
-                "maxItems": len(taxonomy.labels),
+                # Validate cardinality locally to avoid expanding Gemini's grammar.
                 "items": {
                     "type": "object",
                     "additionalProperties": False,

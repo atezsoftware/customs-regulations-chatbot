@@ -1,66 +1,18 @@
-# TARIFF Regulatory Intelligence etiket sözlüğü
+# TARIFF chunk etiketleri
 
-Kaynak: `TARIFF_REGULATORY_INTELLIGENCE_Full_Scope_Data_Model.pdf`, sürüm 2.1, 30 Ağustos 2026; etiket tabloları s.13-23. Belgenin 51 sayfası tarandı; örnekler ve eklerde yeni etiket bulunmadı.
+Kapsam: Kullanıcının paylaştığı TARIFF Regulatory Intelligence v2.1 metnindeki **2.4.5–2.4.8** bölümleri. Güncel başlangıç listesinde yalnızca aşağıdaki 165 etiket bulunur; önceki kapsamdan gelen diğer 90 tanım yeni işlere dahil edilmez.
 
-Bu dosya yalnızca etiket kodlarını, adlarını ve açıklamalarını çıkarır. PDF’deki mimari, chunk oluşturma, saklama, cardinality ve retrieval kararları uygulama gereksinimi olarak alınmamıştır.
+| Grup | Adet |
+| --- | ---: |
+| Konu (`SUB`) | 90 |
+| Hüküm ve etki (`EFF`) | 33 |
+| Ek türü (`ANX`) | 30 |
+| Sektör (`SEC`) | 12 |
+| **Toplam** | **165** |
 
-Bu 255 etiket ve açıklaması başlangıçta migration ile DB'ye kaydedilir. Document set ekranında **Label Settings** ile ekleme ve düzenleme yapılabilir. **Start Labeling**, DB'deki güncel tanımları LLM promptuna aktarır. Bu katalog ve [JSON kopyası](tariff-regulatory-intelligence-v2.1.json) ilk v2.1 tanımlarının referansıdır; sonradan DB'de yapılan düzenlemeleri yansıtmaz. `backend/onyx/regulatory/labeling/data/` altındaki kopya geçmiş migration için sabit tutulur; iki başlangıç kopyasının eşitliği test edilir.
+Kodlar, Türkçe adlar, tanımlar ve konu üst kodları kaynakla karşılaştırıldı; yalnızca PDF satır bölünmeleri birleştirildi. Belgedeki diğer mimari ve sınıflandırma kararları uygulama talimatı olarak alınmaz. Bir chunka birden fazla etiket atanabilir.
 
-## Sayım
-
-| Grup | Sayı | Kaynak sayfalar |
-| --- | ---: | --- |
-| Hukuk alanı | 26 | 13-14 |
-| Konu (üst gruplar dahil) | 90 | 14-18 |
-| Hüküm ve etki türü | 33 | 18-19 |
-| Ek türü | 30 | 19-20 |
-| Sektör | 12 | 20-21 |
-| Relevance alanı | 24 | 22-23 |
-| Uygulanabilirlik: ticaret akışı | 7 | 23 |
-| Uygulanabilirlik: gümrük rejimi | 11 | 23 |
-| Uygulanabilirlik: aktör | 14 | 23 |
-| Uygulanabilirlik: sistem | 8 | 23 |
-| **Toplam** | **255** | |
-
-## Aktarım notları
-
-- Ana 215 etikette PDF’deki kodlar ve Türkçe adlar korundu. Açıklama sütunları kaynak dilinde alındı; PDF satır sonlarında bölünmüş kod ve kelimeler birleştirildi.
-- Uygulanabilirlikte PDF yalnızca 40 kod değeri verir. Bu değerlerin Türkçe görünen adları ve kısa boyut açıklamaları aktarım için eklendi; kaynakta ayrı tanım metinleri bulunmaz. Sistem kısaltmaları genişletilmedi.
-- `export` gibi farklı boyutlarda tekrarlanan değerlerin çakışmaması için yalnızca uygulanabilirlik etiketlerinin ID’lerine boyut eklendi: `trade_flow.export`, `customs_regime.export`. Kaynak değer değişmedi.
-- `geography` için PDF kapalı bir liste vermiyor; yalnızca ISO ülke/yönetilen bölge kodunu işaret ediyor. Ülke etiketi üretilmedi.
-- `core`, `substantial`, `partial`, `limited` (s.21,47) relevance düzeyleridir, içerik etiketleri değildir. Mevcut job çıktı şemasına düzey alanı eklenmedi.
-- Kaynak kimliği/türü/durumu, ilişki türleri, retrieval profilleri ve örnek sayısal ID’ler içerik etiketi olarak sözlüğe eklenmedi.
-
-## Hukuk alanı (26)
-
-| Kod | Türkçe ad | Açıklama | Üst konu | Sayfa |
-| --- | --- | --- | --- | ---: |
-| `customs_law` | Gümrük hukuku | Customs procedures, declarations, tariff, origin, valuation, debt, control and customs regimes. | - | 13 |
-| `international_trade_law` | Uluslararası ticaret hukuku | Import, export, trade policy, preferential trade and cross-border restrictions. | - | 13 |
-| `tax_law` | Vergi hukuku | VAT, excise, duties, tax procedure and fiscal liabilities. | - | 13 |
-| `administrative_law` | İdare hukuku | Administrative powers, procedures, organisation and public administration. | - | 13 |
-| `administrative_enforcement_law` | İdari yaptırım hukuku | Administrative fines, regulatory violations, licence sanctions and non-criminal enforcement. | - | 13 |
-| `criminal_law` | Ceza hukuku | Criminal offences, smuggling, seizure, confiscation and criminal penalties. | - | 13 |
-| `civil_and_obligations_law` | Medeni hukuk ve borçlar hukuku | Persons, property, contracts, delivery, liability and private-law obligations. | - | 13 |
-| `commercial_and_company_law` | Ticaret ve şirketler hukuku | Commercial enterprise, companies, negotiable instruments and commercial records. | - | 13 |
-| `transport_law` | Taşıma hukuku | Road, maritime, aviation and rail transport, including carrier obligations. | - | 13 |
-| `environmental_law` | Çevre hukuku | Waste, emissions, hazardous substances, environmental permits and nature protection. | - | 13 |
-| `product_compliance_law` | Ürün uygunluğu ve teknik düzenlemeler hukuku | Product safety, standards, conformity assessment and market surveillance. | - | 13 |
-| `strategic_trade_control_law` | Stratejik ticaret kontrolü hukuku | Weapons, defence goods, dual-use goods and controlled technology. | - | 13 |
-| `sanctions_law` | Yaptırımlar hukuku | Embargoes, asset freezes and country-, person- or entity-based restrictive measures. | - | 13 |
-| `labour_and_occupational_safety_law` | İş ve iş sağlığı güvenliği hukuku | Employment relationships, collective rights and occupational health and safety. | - | 13 |
-| `financial_and_currency_law` | Finans ve kambiyo hukuku | Foreign exchange, currency controls, banking, interest, funds and precious metals. | - | 13 |
-| `public_finance_and_receivables_law` | Kamu maliyesi ve kamu alacakları hukuku | Public accounting, collection of public debts, restructuring, interest and public guarantees. | - | 13 |
-| `public_procurement_law` | Kamu ihale hukuku | Public purchasing, tenders, direct procurement, contracting and contractor processes. | - | 13 |
-| `state_aid_and_investment_incentives_law` | Devlet yardımları ve yatırım teşvikleri hukuku | Investment certificates, project-based aid, support funds and export incentives. | - | 13 |
-| `public_employment_law` | Kamu personeli hukuku | Civil servants, appointments, leave, discipline and public-sector employment. | - | 13 |
-| `judicial_procedure_and_enforcement_law` | Yargılama, icra ve takip hukuku | Litigation, administrative courts, enforcement, bankruptcy, service and judicial assistance. | - | 13 |
-| `information_and_digital_law` | Bilgi ve dijital hukuk | Access to information, electronic signatures, electronic notification, data and communications. | - | 14 |
-| `public_property_and_real_estate_law` | Kamu malları ve taşınmaz hukuku | Treasury property, public movables, easements, occupation permits and public assets. | - | 14 |
-| `constitutional_and_human_rights_law` | Anayasa ve insan hakları hukuku | Constitutional review, equality, fundamental rights and rights-based public-law rules. | - | 14 |
-| `public_international_and_treaty_law` | Uluslararası kamu hukuku ve antlaşmalar hukuku | Treaties, diplomatic status, international organisations and international obligations. | - | 14 |
-| `associations_and_foundations_law` | Dernekler ve vakıflar hukuku | Membership, donations, records, governance and nonprofit legal administration. | - | 14 |
-| `regulated_professions_law` | Düzenlenmiş meslekler hukuku | Licensing, competence, fees, discipline and responsibility of regulated professionals. | - | 14 |
+**Label Settings**, DB'deki güncel ad ve açıklamaları düzenler. **Start Labeling**, bu güncel listenin sabit bir kopyasını prompta yükler; yalnızca bu kopyadaki kodlar kabul edilir. [Güncel JSON referansı](tariff-regulatory-intelligence-chunk-labels-v1.json) kullanıcı yüklemesi gerektirmez. Önceki v2.1 JSON dosyası yalnızca yayımlanmış migration'ın değişmez kaynağı olarak saklanır; mevcut işlerin etiket sürümleri değiştirilmez.
 
 ## Konu (90)
 
@@ -246,92 +198,3 @@ Bu 255 etiket ve açıklaması başlangıçta migration ile DB'ye kaydedilir. Do
 | `SEC.CULTURAL` | Kültür varlığı | Sanat, arkeoloji ve kültür varlığı. | - | 21 |
 | `SEC.DEFENCE` | Savunma, silah ve çift kullanım | Silah, mühimmat, askeri malzeme ve çift kullanım. | - | 21 |
 | `SEC.TELECOM` | Elektronik ve telekom cihazları | Telsiz, haberleşme, elektronik cihaz ve bileşen. | - | 21 |
-
-## Relevance alanı (24)
-
-| Kod | Türkçe ad | Açıklama | Üst konu | Sayfa |
-| --- | --- | --- | --- | ---: |
-| `cross_border_regulatory` | Sınır-ötesi düzenleyici | Customs, import/export, trade policy, origin, transport, border control and cross-border enforcement. | - | 22 |
-| `accounting` | Muhasebe | Books, records, tax accounting, costing, reporting and documentary accounting obligations. | - | 22 |
-| `finance` | Finans | Payments, collection, foreign exchange, funds, credit, guarantees, interest and financial effects. | - | 22 |
-| `tax_and_public_revenue` | Vergi ve kamu gelirleri | Taxes, fees, duties, VAT/excise, assessment, collection and public receivables. | - | 22 |
-| `supply_chain_and_logistics` | Tedarik zinciri ve lojistik | Transit, transport, carriers, ports, warehousing, storage, containers and border operations. | - | 22 |
-| `environmental_compliance` | Çevresel uyum | Waste, emissions, ozone, permits, hazardous materials and nature-protection compliance. | - | 22 |
-| `product_compliance` | Ürün uygunluğu | Product safety, technical rules, CE/TSE, TAREKS, conformity assessment and surveillance. | - | 22 |
-| `strategic_trade_control` | Stratejik ticaret kontrolü | Defence goods, weapons, ammunition, dual-use goods and controlled technology. | - | 22 |
-| `sanctions_and_restrictive_measures` | Yaptırımlar ve kısıtlayıcı tedbirler | Embargoes, UN sanctions, asset freezes, travel bans and listed-party measures. | - | 22 |
-| `employment_compliance` | İstihdam ve işyeri uyumu | Employment rights, contracts, collective rights and occupational health and safety. | - | 22 |
-| `public_sector_governance` | Kamu yönetimi ve personel | Public organisation, powers, personnel, appointments, discipline, audit and internal processes. | - | 22 |
-| `public_procurement` | Kamu ihalesi ve sözleşmeleri | Public purchasing, tenders, direct procurement, public contracts and contractor processes. | - | 22 |
-| `investment_and_incentives` | Yatırım ve teşvikler | Investment certificates, project aid, state support, funds and export support. | - | 22 |
-| `disputes_and_enforcement` | Uyuşmazlık ve yaptırım süreçleri | Appeals, litigation, settlement, enforcement, bankruptcy, fines, seizure and confiscation. | - | 22 |
-| `digital_and_data` | Dijital, veri ve elektronik işlemler | Electronic signatures, e-notification, e-documents, single-window systems, data and cyber processes. | - | 22 |
-| `public_assets_and_property` | Kamu varlıkları ve taşınmazlar | Treasury land, public movables, easements, allocation and public-asset management. | - | 22 |
-| `agri_food_veterinary` | Tarım, gıda ve veterinerlik | Agriculture, plant/animal health, food safety, veterinary controls, fisheries, tobacco and alcohol products. | - | 22 |
-| `health_and_life_sciences` | Sağlık ve yaşam bilimleri | Medicines, medical devices, pharmacy, healthcare and biological or chemical health controls. | - | 22 |
-| `energy_and_natural_resources` | Enerji ve doğal kaynaklar | Electricity, gas, petroleum, fuels, LPG, mining, coal and energy markets. | - | 22 |
-| `nonprofit_and_associations` | Dernek, vakıf ve kâr amacı gütmeyenler | Associations, foundations, donations, membership and nonprofit records or operations. | - | 22 |
-| `market_conduct_and_consumer` | Piyasa davranışı ve tüketici | Consumer protection, competition, advertising, prices, labels and unfair commercial practices. | - | 22 |
-| `intellectual_property_and_brand_protection` | Fikri mülkiyet ve marka koruması | Trade marks, patents, copyright, geographical indications and counterfeit-goods protection. | - | 22 |
-| `regulated_professional_services` | Düzenlenmiş mesleki hizmetler | Customs brokerage, YGM, legal, accounting and other licensed professional services. | - | 23 |
-| `international_and_treaty_compliance` | Uluslararası anlaşma ve yükümlülükler | Treaties, bilateral arrangements, NATO/diplomatic status and international obligations. | - | 23 |
-
-## Ticaret akışı (7)
-
-| Kod | Türkçe ad | Açıklama | Üst konu | Sayfa |
-| --- | --- | --- | --- | ---: |
-| `trade_flow.import` | İthalat | Uygulanabilirlik boyutu: trade_flow (Ticaret akışı). Kaynak değer: import. Bu boyuttaki İthalat kapsamını ifade eder. | - | 23 |
-| `trade_flow.export` | İhracat | Uygulanabilirlik boyutu: trade_flow (Ticaret akışı). Kaynak değer: export. Bu boyuttaki İhracat kapsamını ifade eder. | - | 23 |
-| `trade_flow.transit` | Transit | Uygulanabilirlik boyutu: trade_flow (Ticaret akışı). Kaynak değer: transit. Bu boyuttaki Transit kapsamını ifade eder. | - | 23 |
-| `trade_flow.entry` | Giriş | Uygulanabilirlik boyutu: trade_flow (Ticaret akışı). Kaynak değer: entry. Bu boyuttaki Giriş kapsamını ifade eder. | - | 23 |
-| `trade_flow.exit` | Çıkış | Uygulanabilirlik boyutu: trade_flow (Ticaret akışı). Kaynak değer: exit. Bu boyuttaki Çıkış kapsamını ifade eder. | - | 23 |
-| `trade_flow.domestic` | Yurt içi | Uygulanabilirlik boyutu: trade_flow (Ticaret akışı). Kaynak değer: domestic. Bu boyuttaki Yurt içi kapsamını ifade eder. | - | 23 |
-| `trade_flow.re_export` | Yeniden ihracat | Uygulanabilirlik boyutu: trade_flow (Ticaret akışı). Kaynak değer: re_export. Bu boyuttaki Yeniden ihracat kapsamını ifade eder. | - | 23 |
-
-## Gümrük rejimi (11)
-
-| Kod | Türkçe ad | Açıklama | Üst konu | Sayfa |
-| --- | --- | --- | --- | ---: |
-| `customs_regime.free_circulation` | Serbest dolaşıma giriş | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: free_circulation. Bu boyuttaki Serbest dolaşıma giriş kapsamını ifade eder. | - | 23 |
-| `customs_regime.export` | İhracat | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: export. Bu boyuttaki İhracat kapsamını ifade eder. | - | 23 |
-| `customs_regime.national_transit` | Ulusal transit | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: national_transit. Bu boyuttaki Ulusal transit kapsamını ifade eder. | - | 23 |
-| `customs_regime.common_transit` | Ortak transit | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: common_transit. Bu boyuttaki Ortak transit kapsamını ifade eder. | - | 23 |
-| `customs_regime.tir` | TIR | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: tir. Bu boyuttaki TIR kapsamını ifade eder. | - | 23 |
-| `customs_regime.warehouse` | Antrepo | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: warehouse. Bu boyuttaki Antrepo kapsamını ifade eder. | - | 23 |
-| `customs_regime.inward_processing` | Dahilde işleme | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: inward_processing. Bu boyuttaki Dahilde işleme kapsamını ifade eder. | - | 23 |
-| `customs_regime.outward_processing` | Hariçte işleme | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: outward_processing. Bu boyuttaki Hariçte işleme kapsamını ifade eder. | - | 23 |
-| `customs_regime.temporary_admission` | Geçici ithalat | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: temporary_admission. Bu boyuttaki Geçici ithalat kapsamını ifade eder. | - | 23 |
-| `customs_regime.end_use` | Nihai kullanım | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: end_use. Bu boyuttaki Nihai kullanım kapsamını ifade eder. | - | 23 |
-| `customs_regime.free_zone` | Serbest bölge | Uygulanabilirlik boyutu: customs_regime (Gümrük rejimi). Kaynak değer: free_zone. Bu boyuttaki Serbest bölge kapsamını ifade eder. | - | 23 |
-
-## Aktör (14)
-
-| Kod | Türkçe ad | Açıklama | Üst konu | Sayfa |
-| --- | --- | --- | --- | ---: |
-| `actor.importer` | İthalatçı | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: importer. Bu boyuttaki İthalatçı kapsamını ifade eder. | - | 23 |
-| `actor.exporter` | İhracatçı | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: exporter. Bu boyuttaki İhracatçı kapsamını ifade eder. | - | 23 |
-| `actor.declarant` | Beyan sahibi | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: declarant. Bu boyuttaki Beyan sahibi kapsamını ifade eder. | - | 23 |
-| `actor.representative` | Temsilci | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: representative. Bu boyuttaki Temsilci kapsamını ifade eder. | - | 23 |
-| `actor.customs_broker` | Gümrük müşaviri | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: customs_broker. Bu boyuttaki Gümrük müşaviri kapsamını ifade eder. | - | 23 |
-| `actor.YGM` | YGM | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: YGM. Bu boyuttaki YGM kapsamını ifade eder. | - | 23 |
-| `actor.carrier` | Taşıyıcı | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: carrier. Bu boyuttaki Taşıyıcı kapsamını ifade eder. | - | 23 |
-| `actor.warehouse_operator` | Antrepo işletmecisi | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: warehouse_operator. Bu boyuttaki Antrepo işletmecisi kapsamını ifade eder. | - | 23 |
-| `actor.AEO` | AEO | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: AEO. Bu boyuttaki AEO kapsamını ifade eder. | - | 23 |
-| `actor.manufacturer` | Üretici | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: manufacturer. Bu boyuttaki Üretici kapsamını ifade eder. | - | 23 |
-| `actor.passenger` | Yolcu | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: passenger. Bu boyuttaki Yolcu kapsamını ifade eder. | - | 23 |
-| `actor.postal_operator` | Posta işletmecisi | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: postal_operator. Bu boyuttaki Posta işletmecisi kapsamını ifade eder. | - | 23 |
-| `actor.bank` | Banka | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: bank. Bu boyuttaki Banka kapsamını ifade eder. | - | 23 |
-| `actor.authority` | Yetkili makam | Uygulanabilirlik boyutu: actor (Aktör). Kaynak değer: authority. Bu boyuttaki Yetkili makam kapsamını ifade eder. | - | 23 |
-
-## Sistem (8)
-
-| Kod | Türkçe ad | Açıklama | Üst konu | Sayfa |
-| --- | --- | --- | --- | ---: |
-| `system.BILGE` | BILGE | Uygulanabilirlik boyutu: system (Sistem). Kaynak değer: BILGE. Bu boyuttaki BILGE kapsamını ifade eder. | - | 23 |
-| `system.NCTS` | NCTS | Uygulanabilirlik boyutu: system (Sistem). Kaynak değer: NCTS. Bu boyuttaki NCTS kapsamını ifade eder. | - | 23 |
-| `system.TPS` | TPS | Uygulanabilirlik boyutu: system (Sistem). Kaynak değer: TPS. Bu boyuttaki TPS kapsamını ifade eder. | - | 23 |
-| `system.TAREKS` | TAREKS | Uygulanabilirlik boyutu: system (Sistem). Kaynak değer: TAREKS. Bu boyuttaki TAREKS kapsamını ifade eder. | - | 23 |
-| `system.SEBIS` | SEBIS | Uygulanabilirlik boyutu: system (Sistem). Kaynak değer: SEBIS. Bu boyuttaki SEBIS kapsamını ifade eder. | - | 23 |
-| `system.ETGB` | ETGB | Uygulanabilirlik boyutu: system (Sistem). Kaynak değer: ETGB. Bu boyuttaki ETGB kapsamını ifade eder. | - | 23 |
-| `system.KTS` | KTS | Uygulanabilirlik boyutu: system (Sistem). Kaynak değer: KTS. Bu boyuttaki KTS kapsamını ifade eder. | - | 23 |
-| `system.TIR_TRACKING` | TIR_TRACKING | Uygulanabilirlik boyutu: system (Sistem). Kaynak değer: TIR_TRACKING. Bu boyuttaki TIR_TRACKING kapsamını ifade eder. | - | 23 |

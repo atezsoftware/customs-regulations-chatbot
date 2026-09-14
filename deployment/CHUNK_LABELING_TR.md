@@ -1,6 +1,6 @@
 # Document set üzerinden chunk etiketleme
 
-Bu altyapı, dosyalardan zaten üretilmiş atomik `RegulatoryChunk` kayıtlarını etiketler. TARIFF v2.1 belgesinden çıkarılan ilk 255 etiket migration ile PostgreSQL'e kaydedilir. Sonraki ekleme ve düzenlemeler **Label Settings** ekranından yapılır; yeni işin LLM promptu DB'deki güncel etiketleri ve açıklamalarını kullanır. Başlangıç kodları ve açıklamalar [etiket kataloğunda](labeling/TARIFF_LABELS_TR.md) bulunur.
+Bu altyapı, dosyalardan zaten üretilmiş atomik `RegulatoryChunk` kayıtlarını etiketler. Güncel başlangıç kapsamı, kullanıcının paylaştığı TARIFF v2.1 bölümleri 2.4.5–2.4.8'deki 165 etikettir: 90 konu (`SUB`), 33 hüküm ve etki (`EFF`), 30 ek türü (`ANX`) ve 12 sektör (`SEC`). Bu tanımlar migration ile PostgreSQL'e kaydedilir. Sonraki ekleme ve düzenlemeler **Label Settings** ekranından yapılır; yeni işin LLM promptu DB'deki güncel etiketleri ve açıklamalarını kullanır. Başlangıç kodları ve açıklamalar [etiket kataloğunda](labeling/TARIFF_LABELS_TR.md) bulunur.
 
 ## Kullanım
 
@@ -70,7 +70,9 @@ Belirsiz gönderimin görünür hale gelmesi için 10 dakikalık pencere tanın�
 - Kesilmiş model çıktısı başarılı sayılmaz. Modelin düşünce alanları sonuç metnine katılmaz.
 - Model hiçbir etiket uygun değilse boş sonuç verebilir; yetersiz kanıt için ayrıca çekimser kalabilir. Bunlar sağlayıcı hatasından ayrıdır.
 
-`canonical-labeling-v2` promptu, çalışma için sabitlenen tüm etiket kodlarını, adlarını ve açıklamalarını alır. Farklı etiket ailelerini kendi tanımlarına göre değerlendirir; kod öneki, kelime benzerliği veya yalnızca çevre bağlamdan etiket çıkarmaz. Etiket açıklamalarında ya da kaynak metinde geçen talimatları komut olarak izlemez.
+`canonical-labeling-v3` promptu, çalışma için sabitlenen tüm etiket kodlarını, adlarını ve açıklamalarını alır. Her etiketi kendi tanımına göre değerlendirir ve aynı chunka kanıtı bulunan birden fazla etiketi atayabilir. Listede olmayan kategori eklemez; kod öneki, etiket ailesi, kelime benzerliği veya yalnızca çevre bağlamdan etiket çıkarmaz. Etiket açıklamalarında ya da kaynak metinde geçen talimatları komut olarak izlemez.
+
+Google'a gönderilen JSON şeması izin verilen etiket kodlarını `enum` ile sınırlar. Dizi için ayrıca `maxItems` gönderilmez: büyük kod listesiyle birleşen dizi uzunluğu kısıtı, Google'ın şema derleyicisinin sınırını aşabilir. En çok 1024 sonuç, geçerli ve benzersiz kodlar ile birebir kaynak kanıtı uygulamada doğrulanmaya devam eder. Bu değişiklik çoklu etiketlemeyi veya düzenlenebilir etiket sayısını 165 ile sınırlamaz. [Google'ın yapılandırılmış çıktı sınırları](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/multimodal/control-generated-output#considerations)
 
 Bu kontroller yapısal doğruluğu ve kaynak bağını sağlar. Etiketlerin anlamsal isabeti, alan uzmanının hazırladığı bir örnek kümesiyle ölçülmelidir.
 
@@ -86,9 +88,11 @@ Bu değişiklik etiketleri Elasticsearch filtrelerine, sıralamaya veya retrieva
 
 ## Kurulum ve işletim
 
-Migration'lar: `c8b7a6d5e4f3` etiketleme tablolarını, `8d19d521d9fa` güncel etiket ayarını ve ilk 255 tanımı, `9f3a7c2e5d18` ise mevcut LLM sağlayıcı tablosuna nullable ve şifreli Gemini Batch API key alanını ekler. Etiket ayarı migration'ı yalnızca `regulatory_label_settings`, `regulatory_label_taxonomy` ve `regulatory_labeling_run` tablolarını ilgilendirir; Batch anahtarı migration'ı mevcut bağlantılara anahtar değeri yazmaz. Bu migration'lar mevcut chunk, embedding ve indeks verilerini değiştirmez. Dağıtılan backend sürümüyle, `backend/` dizininde `uv run alembic upgrade head` uygulanmalıdır. Çok kiracılı dağıtımda mevcut tenant migration prosedürü de izlenmelidir.
+Migration'lar: `c8b7a6d5e4f3` etiketleme tablolarını, `8d19d521d9fa` güncel etiket ayarını ve tarihsel ilk 255 tanımı, `9f3a7c2e5d18` ise mevcut LLM sağlayıcı tablosuna nullable ve şifreli Gemini Batch API key alanını ekler. `b27e6a4c1d90`, `9f3a7c2e5d18` sonrasında gelir. Aktif ayar hâlâ hiç düzenlenmemiş ilk 255 tanıma bağlıysa güncel 165 etiketi ayrı bir değişmez tanım sürümü olarak ekleyip ayarı bu sürüme geçirir; kullanıcı tarafından düzenlenmiş ayarlar ve geçmiş işlerin tanım sürümleri korunur.
 
-`backend/onyx/regulatory/labeling/data/tariff-regulatory-intelligence-v2.1.json` geçmiş migration'ın sabit başlangıç verisidir; değiştirilmemeli veya silinmemelidir. Migration içindeki hash kontrolü bunu doğrular. Runtime başlangıç ve ayar okuma işlemleri PostgreSQL'i kullanır; dosya değiştirerek kullanıcı düzenlemeleri ezilmez.
+Etiket ayarı migration'ları etiket tanımı, ayarı ve iş tablolarıyla sınırlıdır; Batch anahtarı migration'ı mevcut bağlantılara anahtar değeri yazmaz. Bu migration'lar mevcut chunk, embedding ve indeks verilerini değiştirmez. Dağıtılan backend sürümüyle, `backend/` dizininde `uv run alembic upgrade head` uygulanmalıdır. Çok kiracılı dağıtımda mevcut tenant migration prosedürü de izlenmelidir.
+
+`backend/onyx/regulatory/labeling/data/tariff-regulatory-intelligence-v2.1.json`, tarihsel 255 tanımı ekleyen migration'ın sabit başlangıç verisidir. Güncel 165 tanımın sabit kaynağı `backend/onyx/regulatory/labeling/data/tariff-regulatory-intelligence-chunk-labels-v1.json` dosyasıdır; [aynı içeriğin referans kopyası](labeling/tariff-regulatory-intelligence-chunk-labels-v1.json) da bulunur. Bu migration varlıkları değiştirilmemeli veya silinmemelidir; hash kontrolleri içeriklerini doğrular. Runtime başlangıç ve ayar okuma işlemleri PostgreSQL'i kullanır; dosya değiştirerek kullanıcı düzenlemeleri ezilmez.
 
 13 Eylül 2026'da `customs-regulations-test/public` üzerinde yalnızca `regulatory_label_taxonomy` ve `regulatory_label_settings` tabloları oluşturulup 255 başlangıç etiketi kaydedildi; kod, ad ve açıklamalar birebir doğrulandı. Mevcut `alembic_version` (`f4a9c2d7e1b3`) ilerletilmedi ve bekleyen genel migration'lar çalıştırılmadı. İş tabloları ve yeni API/web sürümünün dağıtımı bu başlangıç kaydından ayrıdır. İlgili iki migration, önceden oluşturulmuş bu tabloların yapısını doğrular ve mevcut etiket düzenlemelerini korur; uyumsuz bir tabloyu sessizce kabul etmez. Bu işlemde mevcut chunklar, embeddingler ve Elasticsearch verileri değiştirilmedi.
 
@@ -104,7 +108,7 @@ Sonuçlar PostgreSQL'de şu tablolarda tutulur: `regulatory_label_taxonomy`, `re
 
 Provider sözleşmesi ve mevcut contextual Batch davranışının korunması unit testlerle kontrol edilir. İş yaşam döngüsü, API yetkileri, eşzamanlı başlangıç, kayıp gönderim yanıtı, worker kapanması, iptal ve kaynak değişimi senaryoları gerçek PostgreSQL üzerinde kontrollü bir Batch sağlayıcısıyla çalıştırılır. Migration ayrı test şemalarında ileri/geri uygulanır; uygulamanın mevcut veritabanı bu testler için kullanılmaz. Arayüz testleri başlangıç koşulları, ilerleme sorgulama, sayfalama ve hatalı ağ yanıtlarından sonra aynı başlangıç kimliğinin korunmasını kapsar.
 
-255 etiketin dosya yüklemeden bir işe bağlanması, açıklamaların Batch promptuna aktarılması, eşzamanlı başlangıçların tek tanım sürümünü kullanması ve ağ tekrarlarının ikinci iş oluşturmaması test edilir. Bu doğrulama gerçek Google hesabında ücretli sınıflandırma veya etiketlerin alan doğruluğu ölçümü değildir. Küçük bir değerlendirme kümesiyle etiket kalitesi ve gerçek sağlayıcı çağrısı ayrıca doğrulanmalıdır.
+Güncel 165 etiketin dosya yüklemeden bir işe bağlanması, dört gruptaki kodların eksiksizliği, açıklamaların Batch promptuna aktarılması, eşzamanlı başlangıçların tek tanım sürümünü kullanması ve ağ tekrarlarının ikinci iş oluşturmaması test edilir. Kullanıcı düzenlemeleri ile eski tanım ve işlerin kapsam düzeltmesinde korunması ayrıca denetlenir. Düzenlenebilir etiket sayısının büyümesi ve sonuç sınırları için 255 ve 1024 tanımlı örnekler de kullanılır. Bu doğrulama gerçek Google hesabında ücretli sınıflandırma veya etiketlerin alan doğruluğu ölçümü değildir. Küçük bir değerlendirme kümesiyle etiket kalitesi ve gerçek sağlayıcı çağrısı ayrıca doğrulanmalıdır.
 
 ## Google API tercihi
 
