@@ -642,6 +642,19 @@ export default function AnnexChangeReview({
       )}
 
       <ReviewSection title="Frozen original evidence">
+        {payload.old_evidence_kind === "canonical_text" && (
+          <div
+            role="status"
+            className="rounded-08 border border-status-warning-02 bg-status-warning-01 p-2"
+          >
+            <Text as="p" font="main-ui-body" color="text-05">
+              OLD has no retained original document (this file was indexed
+              from markdown/plain text), so it was compared using its
+              already-indexed canonical text instead of a visually
+              re-verified original.
+            </Text>
+          </div>
+        )}
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           <ExtractionPanel title="OLD" extraction={payload.old_extraction} />
           <ExtractionPanel title="NEW" extraction={payload.new_extraction} />

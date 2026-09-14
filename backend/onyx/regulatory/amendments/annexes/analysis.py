@@ -340,26 +340,50 @@ def prepare_annex_group(
             for element in baseline.elements
             if element.canonical_chunk_id
         ]
-        old_originals = choose_original_evidence(
-            baseline.originals, canonical_chunk_ids=canonical_ids
-        )
-        old_views = [
-            select_annex_evidence_view(
-                extraction=_extract_cached(store, original, cache, vision_llm),
-                original=original,
-                annex_label=group.annex_label,
-                canonical_labels=[group.annex_label],
-                canonical_chunk_ids=original.canonical_chunk_ids,
+        if baseline.visual_evidence_available:
+            old_originals = choose_original_evidence(
+                baseline.originals, canonical_chunk_ids=canonical_ids
             )
-            for original in old_originals
-        ]
-        old = (
-            old_views[0]
-            if len(old_views) == 1
-            else combine_annex_evidence_views(
-                old_views, canonical_chunk_ids=canonical_ids
+            old_views = [
+                select_annex_evidence_view(
+                    extraction=_extract_cached(store, original, cache, vision_llm),
+                    original=original,
+                    annex_label=group.annex_label,
+                    canonical_labels=[group.annex_label],
+                    canonical_chunk_ids=original.canonical_chunk_ids,
+                )
+                for original in old_originals
+            ]
+            old = (
+                old_views[0]
+                if len(old_views) == 1
+                else combine_annex_evidence_views(
+                    old_views, canonical_chunk_ids=canonical_ids
+                )
             )
-        )
+            old_evidence_kind = "visual"
+        else:
+            # No retained original backs this baseline (e.g. the file was
+            # imported as markdown/plain text, so there is nothing to
+            # visually re-verify). Fall back to the already-indexed
+            # canonical text as the OLD side — the same AnnexExtraction
+            # shape prepare_legacy_baseline persists for the current
+            # revision. It carries no evidence_view (nothing was "selected
+            # from" a larger original), so validate_baseline_evidence_view
+            # and validate_evidence_view both skip their view-specific
+            # checks below, and compare_annexes compares it as native text
+            # against the new side's real visual evidence — never treated
+            # as equally strong, and always labeled as such to the reviewer
+            # via draft.old_evidence_kind.
+            old = AnnexExtraction(
+                source_sha256=hashlib.sha256(
+                    baseline.canonical_text.encode()
+                ).hexdigest(),
+                mime_type="text/markdown",
+                elements=baseline.elements,
+            )
+            old_originals = []
+            old_evidence_kind = "canonical_text"
         baseline_issues = validate_baseline_evidence_view(baseline, old)
         if baseline_issues:
             raise ValueError(",".join(baseline_issues))
@@ -422,6 +446,7 @@ def prepare_annex_group(
         draft = draft.model_copy(
             update={
                 "old_extraction": old,
+                "old_evidence_kind": old_evidence_kind,
                 "new_extraction": new,
                 "raw_new_extraction": new,
                 "comparison": comparison,

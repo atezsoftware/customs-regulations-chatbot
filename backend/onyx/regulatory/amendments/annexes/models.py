@@ -757,6 +757,12 @@ class AnnexChangeDraft(BaseModel):
     # defaults to 1, so live re-verification recomputes the original source
     # text with the same join algorithm it was frozen with — never today's.
     original_source_text_version: Literal[1, 2] = 1
+    # "canonical_text" means the OLD side has no retained original document
+    # (e.g. this file was imported as markdown/plain text) and was compared
+    # using its already-indexed canonical text instead of a visually
+    # re-verified original. The reviewer sees this distinction explicitly —
+    # it is never silently treated as equally strong evidence.
+    old_evidence_kind: Literal["visual", "canonical_text"] = "visual"
     source_graph_sha256: str | None = None
     source_graph: list[SourceLink] = Field(default_factory=list)
     submitted_source_text: str | None = None

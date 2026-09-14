@@ -52,6 +52,53 @@ def test_approved_canonical_overlay_controls_patch_despite_old_raw_pixels(
         assert result.patches[0].old_text == "7%" and result.patches[0].new_text == "5%"
 
 
+def test_canonical_text_old_against_visual_new_is_not_an_evidence_mismatch() -> None:
+    """A markdown-only baseline (no retained original) compared against a
+    freshly acquired visual NEW is the intended fallback, not the
+    inconsistency `original_visual_evidence_unavailable` exists to catch.
+    """
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    old, new = extraction("7%", visual=False), extraction("7%", visual=True)
+    comparison = compare_annexes(old=old, new=new)
+    canonical_only_baseline = baseline("7%").model_copy(
+        update={"visual_evidence_available": False}
+    )
+    result = prepare_annex_patch(
+        baseline=canonical_only_baseline,
+        old=old,
+        new=new,
+        comparison=comparison,
+        effective_date=date(2026, 9, 10),
+        package_complete=True,
+    )
+    assert "original_visual_evidence_unavailable" not in result.issues
+
+
+def test_visual_old_still_requires_baseline_to_confirm_it() -> None:
+    """Guard the original intent: if OLD itself claims visual evidence, the
+    baseline backing it must confirm that evidence actually exists.
+    """
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
+
+    old, new = extraction("7%", visual=True), extraction("7%", visual=True)
+    comparison = compare_annexes(old=old, new=new)
+    result = prepare_annex_patch(
+        baseline=baseline("7%").model_copy(
+            update={"visual_evidence_available": False}
+        ),
+        old=old,
+        new=new,
+        comparison=comparison,
+        effective_date=date(2026, 9, 10),
+        package_complete=True,
+    )
+    assert not result.ready
+    assert "original_visual_evidence_unavailable" in result.issues
+
+
 def test_changed_unmapped_visual_region_cannot_authorize_arbitrary_chunk() -> None:
     from onyx.regulatory.amendments.annexes.comparison import compare_annexes
     from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch

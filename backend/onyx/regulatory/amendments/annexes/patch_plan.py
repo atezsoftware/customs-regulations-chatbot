@@ -271,10 +271,13 @@ def prepare_annex_patch(
         old
     ) or comparison.new_snapshot_sha256 != annex_snapshot_hash(new):
         issues.append("comparison_snapshot_changed")
-    if (
-        any(has_visual_original(item) for item in (old, new))
-        and not baseline.visual_evidence_available
-    ):
+    if has_visual_original(old) and not baseline.visual_evidence_available:
+        # OLD's own evidence chain must match what the baseline claims to
+        # back it. NEW's visual evidence comes from the freshly acquired
+        # amendment source, an independent chain baseline never speaks to —
+        # a canonical-text-only OLD (baseline.visual_evidence_available is
+        # False by design here, not by error) compared against a visual NEW
+        # is the intended fallback, not an inconsistency to block.
         issues.append("original_visual_evidence_unavailable")
     if issues:
         return AnnexPatchPlan(
