@@ -221,7 +221,7 @@ function groupTableCellsIntoRows(cells: IndexedElement[]): IndexedElement[][] {
       if (bucket) bucket.push(cell);
       else byRow.set(row, [cell]);
     }
-    return [...byRow.entries()]
+    return Array.from(byRow.entries())
       .sort(([left], [right]) => left - right)
       .map(([, row]) =>
         [...row].sort(
