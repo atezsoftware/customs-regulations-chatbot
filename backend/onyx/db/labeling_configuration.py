@@ -440,7 +440,7 @@ def resolve_labeling_gateway(
         config=config,
         staging_uri=binding.staging_uri,
         credential_json_provider=lambda: raw_credentials,
-        max_result_bytes=64 * 1024 * 1024,
+        max_result_bytes=8 * 1024**3,
         request_timeout_seconds=20,
         max_reconciliation_seconds=180,
     )

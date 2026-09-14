@@ -2,24 +2,31 @@ from __future__ import annotations
 
 import datetime
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from time import monotonic
 from typing import Any
 from typing import cast as type_cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
     Integer,
+    String,
+    Uuid,
     and_,
     case,
     cast,
+    column,
+    delete,
     func,
     insert,
     literal,
     or_,
     select,
     update,
+    values,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, load_only, selectinload
@@ -54,6 +61,10 @@ from onyx.regulatory.contextual import (
     validity_window_contains,
     visible_regulatory_snapshot_for_target,
 )
+from onyx.regulatory.indexing_jobs.vertex_batch import (
+    VertexBatchRequest,
+    vertex_jsonl_line_size,
+)
 from onyx.regulatory.labeling.api_models import (
     LabelingCounts,
     LabelingItemSnapshot,
@@ -64,6 +75,7 @@ from onyx.regulatory.labeling.api_models import (
 from onyx.regulatory.labeling.domain import (
     LabelingChunkView,
     bounded_document_context,
+    labeling_submission_key_from_hashes,
 )
 from onyx.regulatory.labeling.provider import LabelDefinition, TaxonomyDefinition
 
@@ -944,6 +956,47 @@ def load_claimed_shard(
     return shard
 
 
+def renew_run_lease(
+    session: Session, lease: RunLease, *, lease_seconds: int = 300
+) -> None:
+    if lease_seconds < 1:
+        raise ValueError("The lease duration must be positive")
+    now = _utcnow()
+    renewed = type_cast(
+        CursorResult[Any],
+        session.execute(
+            update(RegulatoryLabelingRun)
+            .where(
+                RegulatoryLabelingRun.id == lease.run_id,
+                RegulatoryLabelingRun.lease_generation == lease.generation,
+                RegulatoryLabelingRun.lease_token == lease.token,
+                RegulatoryLabelingRun.lease_expires_at > now,
+                RegulatoryLabelingRun.cancel_requested.is_(False),
+                RegulatoryLabelingRun.status.in_(_ACTIVE_RUN_STATUSES),
+            )
+            .values(
+                lease_expires_at=func.greatest(
+                    RegulatoryLabelingRun.lease_expires_at,
+                    now + datetime.timedelta(seconds=lease_seconds),
+                ),
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    if renewed.rowcount != 1:
+        cancelled = session.scalar(
+            select(RegulatoryLabelingRun.cancel_requested).where(
+                RegulatoryLabelingRun.id == lease.run_id,
+                RegulatoryLabelingRun.lease_generation == lease.generation,
+                RegulatoryLabelingRun.lease_token == lease.token,
+            )
+        )
+        if cancelled:
+            raise LabelingCancellationRequested("The labeling run was cancelled")
+        raise LabelingStateConflictError("The labeling run lease expired or changed")
+
+
 def release_run(
     session: Session,
     lease: RunLease,
@@ -1043,7 +1096,7 @@ def prepare_next_item_page(
 ) -> list[RegulatoryLabelingItem]:
     """Freeze bounded contexts for one page without loading the whole corpus."""
 
-    _lease_run(session, lease)
+    run = _lease_run(session, lease)
     position = cast(
         RegulatoryLabelingItem.source_snapshot["position"].as_string(), Integer
     )
@@ -1089,6 +1142,7 @@ def prepare_next_item_page(
             ).all()
         )
         if len(nearby) > _CONTEXT_CANDIDATE_LIMIT:
+            run.failed_chunks += len(file_targets)
             for target in file_targets:
                 target.status = "failed"
                 target.error = "The canonical context window is too ambiguous"
@@ -1193,50 +1247,103 @@ def store_prepared_shards(
     if run.stage != "preparing":
         raise LabelingStateConflictError("The labeling run is no longer preparing")
     request_by_id = {request.item_id: request for request in requests}
-    for item_id, error in failed_items.items():
-        session.execute(
-            update(RegulatoryLabelingItem)
-            .where(
-                RegulatoryLabelingItem.run_id == run.id,
-                RegulatoryLabelingItem.id == item_id,
-                RegulatoryLabelingItem.status == "pending",
-            )
-            .values(status="failed", error=error[:4000], updated_at=_utcnow())
+    assigned_ids = [item_id for shard in shards for item_id in shard.item_ids]
+    if (
+        len(request_by_id) != len(requests)
+        or len(set(assigned_ids)) != len(assigned_ids)
+        or set(assigned_ids) != set(request_by_id)
+        or set(request_by_id) & set(failed_items)
+    ):
+        raise ValueError(
+            "Prepared requests require distinct, complete shard membership"
         )
+    prepared_rows: list[tuple[UUID, str, dict[str, Any], UUID]] = []
     for shard in shards:
-        shard_row = RegulatoryLabelingShard(
-            run_id=run.id,
-            ordinal=shard.ordinal,
-            item_ids=[str(item_id) for item_id in shard.item_ids],
-            submission_key=shard.submission_key,
+        if not shard.item_ids:
+            raise ValueError("Prepared shards must contain requests")
+        shard_id = uuid4()
+        session.add(
+            RegulatoryLabelingShard(
+                id=shard_id,
+                run_id=run.id,
+                ordinal=shard.ordinal,
+                item_ids=[str(item_id) for item_id in shard.item_ids],
+                submission_key=shard.submission_key,
+            )
         )
-        session.add(shard_row)
-        session.flush()
         for item_id in shard.item_ids:
             request = request_by_id[item_id]
+            prepared_rows.append(
+                (item_id, request.request_hash, request.request_payload, shard_id)
+            )
+    session.flush()
+    for offset in range(0, len(prepared_rows), 128):
+        page = prepared_rows[offset : offset + 128]
+        prepared = values(
+            column("item_id", Uuid),
+            column("request_hash", String),
+            column("request_payload", JSONB),
+            column("shard_id", Uuid),
+            name="prepared",
+        ).data(page)
+        changed = type_cast(
+            CursorResult[Any],
             session.execute(
                 update(RegulatoryLabelingItem)
                 .where(
                     RegulatoryLabelingItem.run_id == run.id,
-                    RegulatoryLabelingItem.id == item_id,
+                    RegulatoryLabelingItem.id == prepared.c.item_id,
                     RegulatoryLabelingItem.status == "pending",
+                    RegulatoryLabelingItem.request_hash.is_(None),
+                    RegulatoryLabelingItem.shard_id.is_(None),
                 )
                 .values(
-                    request_hash=request.request_hash,
-                    request_payload=request.request_payload,
-                    shard_id=shard_row.id,
+                    request_hash=prepared.c.request_hash,
+                    request_payload=prepared.c.request_payload,
+                    shard_id=prepared.c.shard_id,
                     updated_at=_utcnow(),
                 )
-            )
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        if changed.rowcount != len(page):
+            raise LabelingStateConflictError("The prepared item ownership changed")
+    failures = [(item_id, error[:4000]) for item_id, error in failed_items.items()]
+    for offset in range(0, len(failures), 128):
+        page_failures = failures[offset : offset + 128]
+        failed = values(
+            column("item_id", Uuid), column("error", String), name="failed"
+        ).data(page_failures)
+        changed = type_cast(
+            CursorResult[Any],
+            session.execute(
+                update(RegulatoryLabelingItem)
+                .where(
+                    RegulatoryLabelingItem.run_id == run.id,
+                    RegulatoryLabelingItem.id == failed.c.item_id,
+                    RegulatoryLabelingItem.status == "pending",
+                    RegulatoryLabelingItem.request_hash.is_(None),
+                    RegulatoryLabelingItem.shard_id.is_(None),
+                )
+                .values(status="failed", error=failed.c.error, updated_at=_utcnow())
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        if changed.rowcount != len(page_failures):
+            raise LabelingStateConflictError("The failed item ownership changed")
+        run.failed_chunks += changed.rowcount
     remaining = session.scalar(
-        select(func.count()).where(
-            RegulatoryLabelingItem.run_id == run.id,
-            RegulatoryLabelingItem.status == "pending",
-            RegulatoryLabelingItem.request_hash.is_(None),
+        select(
+            select(RegulatoryLabelingItem.id)
+            .where(
+                RegulatoryLabelingItem.run_id == run.id,
+                RegulatoryLabelingItem.status == "pending",
+                RegulatoryLabelingItem.request_hash.is_(None),
+            )
+            .exists()
         )
     )
     run.stage = "preparing" if remaining else "submitting"
-    _refresh_counts(session, run)
     session.flush()
     return run.stage
 
@@ -1326,6 +1433,288 @@ def load_shard_requests(
     )
 
 
+def _never_attempted_shard(shard: RegulatoryLabelingShard) -> bool:
+    return (
+        shard.status == "prepared"
+        and shard.attempt_count == 0
+        and shard.failure_count == 0
+        and shard.remote_job_name is None
+        and shard.input_uri is None
+        and shard.output_uri is None
+        and shard.reconcile_until is None
+    )
+
+
+def _coalescing_request_metadata(
+    session: Session,
+    *,
+    run_id: UUID,
+    shard: RegulatoryLabelingShard,
+    max_items: int,
+    max_jsonl_bytes: int,
+    heartbeat: Callable[[], None],
+) -> tuple[list[UUID], list[str], int] | None:
+    item_ids: list[UUID] = []
+    hashes: list[str] = []
+    used_bytes = 0
+    rows = session.execute(
+        select(
+            RegulatoryLabelingItem.id,
+            RegulatoryLabelingItem.status,
+            RegulatoryLabelingItem.request_hash,
+            RegulatoryLabelingItem.request_payload,
+        )
+        .where(
+            RegulatoryLabelingItem.run_id == run_id,
+            RegulatoryLabelingItem.shard_id == shard.id,
+        )
+        .order_by(RegulatoryLabelingItem.id)
+        .execution_options(yield_per=64)
+    )
+    try:
+        for item_id, status, request_hash, payload in rows:
+            if len(item_ids) >= max_items:
+                return None
+            if status != "pending" or request_hash is None or payload is None:
+                raise LabelingStateConflictError("The prepared request is unavailable")
+            request = VertexBatchRequest.model_validate(payload)
+            if request.request_hash != request_hash:
+                raise LabelingStateConflictError("The frozen labeling request changed")
+            used_bytes += vertex_jsonl_line_size(request)
+            heartbeat()
+            if used_bytes > max_jsonl_bytes:
+                return None
+            item_ids.append(item_id)
+            hashes.append(request_hash)
+    finally:
+        rows.close()
+    if (
+        not item_ids
+        or len(item_ids) != len(shard.item_ids)
+        or {str(item_id) for item_id in item_ids} != set(shard.item_ids)
+    ):
+        raise LabelingStateConflictError("The prepared shard membership changed")
+    return item_ids, hashes, used_bytes
+
+
+def coalesce_prepared_shards(
+    session: Session,
+    lease: RunLease,
+    *,
+    tenant_id: str,
+    anchor_shard_id: UUID,
+    max_items: int,
+    max_jsonl_bytes: int,
+) -> RegulatoryLabelingShard:
+    """Merge only unpublished plans while retaining their frozen request identity."""
+    if not tenant_id.strip() or max_items < 1 or max_jsonl_bytes < 1:
+        raise ValueError("Coalescing requires a tenant and positive batch limits")
+    renew_run_lease(session, lease)
+    last_renewed = monotonic()
+
+    def heartbeat() -> None:
+        nonlocal last_renewed
+        if monotonic() - last_renewed >= 30:
+            renew_run_lease(session, lease)
+            last_renewed = monotonic()
+
+    run = _lease_run(session, lease)
+    if run.cancel_requested:
+        raise LabelingCancellationRequested("The labeling run was cancelled")
+    anchor = load_claimed_shard(session, lease, anchor_shard_id)
+    if anchor.status != "prepared":
+        raise LabelingStateConflictError("The labeling shard is not prepared")
+    if not _never_attempted_shard(anchor):
+        return anchor
+    anchor_data = _coalescing_request_metadata(
+        session,
+        run_id=run.id,
+        shard=anchor,
+        max_items=max_items,
+        max_jsonl_bytes=max_jsonl_bytes,
+        heartbeat=heartbeat,
+    )
+    if anchor_data is None:
+        raise ValueError("The prepared shard exceeds the provider batch limits")
+    item_ids, hashes, used_bytes = anchor_data
+    donor_ids: list[UUID] = []
+    donor_item_counts: dict[UUID, int] = {}
+    after_ordinal = anchor.ordinal
+    full = False
+    while not full and len(item_ids) < max_items and used_bytes < max_jsonl_bytes:
+        candidates = session.execute(
+            select(RegulatoryLabelingShard.id, RegulatoryLabelingShard.ordinal)
+            .where(
+                RegulatoryLabelingShard.run_id == run.id,
+                RegulatoryLabelingShard.ordinal > after_ordinal,
+                RegulatoryLabelingShard.status == "prepared",
+                RegulatoryLabelingShard.attempt_count == 0,
+                RegulatoryLabelingShard.failure_count == 0,
+                RegulatoryLabelingShard.remote_job_name.is_(None),
+                RegulatoryLabelingShard.input_uri.is_(None),
+                RegulatoryLabelingShard.output_uri.is_(None),
+                RegulatoryLabelingShard.reconcile_until.is_(None),
+            )
+            .order_by(RegulatoryLabelingShard.ordinal)
+            .limit(64)
+        ).all()
+        if not candidates:
+            break
+        for donor_id, ordinal in candidates:
+            heartbeat()
+            donor = load_claimed_shard(session, lease, donor_id)
+            if not _never_attempted_shard(donor):
+                raise LabelingStateConflictError(
+                    "The donor shard was already attempted"
+                )
+            donor_data = _coalescing_request_metadata(
+                session,
+                run_id=run.id,
+                shard=donor,
+                max_items=max_items - len(item_ids),
+                max_jsonl_bytes=max_jsonl_bytes - used_bytes,
+                heartbeat=heartbeat,
+            )
+            if donor_data is None:
+                full = True
+                break
+            donor_items, donor_hashes, donor_bytes = donor_data
+            item_ids.extend(donor_items)
+            hashes.extend(donor_hashes)
+            used_bytes += donor_bytes
+            donor_ids.append(donor_id)
+            donor_item_counts[donor_id] = len(donor_items)
+            after_ordinal = ordinal
+            if len(item_ids) >= max_items or used_bytes >= max_jsonl_bytes:
+                full = True
+                break
+    renew_run_lease(session, lease)
+    if not donor_ids:
+        return anchor
+    submission_key = labeling_submission_key_from_hashes(
+        hashes, tenant_id=tenant_id, run_id=run.id, ordinal=anchor.ordinal
+    )
+    for offset in range(0, len(donor_ids), 128):
+        heartbeat()
+        page = donor_ids[offset : offset + 128]
+        moved = type_cast(
+            CursorResult[Any],
+            session.execute(
+                update(RegulatoryLabelingItem)
+                .where(
+                    RegulatoryLabelingItem.run_id == run.id,
+                    RegulatoryLabelingItem.shard_id.in_(page),
+                    RegulatoryLabelingItem.status == "pending",
+                )
+                .values(shard_id=anchor.id, updated_at=_utcnow())
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        if moved.rowcount != sum(donor_item_counts[donor_id] for donor_id in page):
+            raise LabelingStateConflictError("The donor shard membership changed")
+        session.execute(
+            delete(RegulatoryLabelingShard).where(
+                RegulatoryLabelingShard.run_id == run.id,
+                RegulatoryLabelingShard.id.in_(page),
+            )
+        )
+    anchor.item_ids = [str(item_id) for item_id in item_ids]
+    anchor.submission_key = submission_key
+    session.flush()
+    return anchor
+
+
+def _result_item_query() -> Select[tuple[RegulatoryLabelingItem]]:
+    return select(RegulatoryLabelingItem).options(
+        load_only(
+            RegulatoryLabelingItem.id,
+            RegulatoryLabelingItem.run_id,
+            RegulatoryLabelingItem.regulatory_chunk_id,
+            RegulatoryLabelingItem.user_file_id,
+            RegulatoryLabelingItem.canonical_text_sha256,
+            RegulatoryLabelingItem.text_snapshot,
+            RegulatoryLabelingItem.source_snapshot,
+            RegulatoryLabelingItem.request_hash,
+            RegulatoryLabelingItem.status,
+            RegulatoryLabelingItem.labels,
+            RegulatoryLabelingItem.assignments,
+            RegulatoryLabelingItem.error,
+        )
+    )
+
+
+def _check_shard_membership(session: Session, lease: RunLease, shard_id: UUID) -> None:
+    _lease_run(session, lease)
+    if (
+        session.scalar(
+            select(RegulatoryLabelingShard.id).where(
+                RegulatoryLabelingShard.id == shard_id,
+                RegulatoryLabelingShard.run_id == lease.run_id,
+            )
+        )
+        is None
+    ):
+        raise LabelingStateConflictError("The labeling shard is outside the run")
+
+
+def load_shard_result_items(
+    session: Session,
+    lease: RunLease,
+    shard_id: UUID,
+    *,
+    after_id: UUID | None = None,
+    limit: int = 128,
+) -> list[RegulatoryLabelingItem]:
+    """Read one result page without duplicated request or generated-context data."""
+    if not 1 <= limit <= 128:
+        raise ValueError("Result pages require a limit from 1 to 128")
+    _check_shard_membership(session, lease, shard_id)
+    statement = (
+        _result_item_query()
+        .where(
+            RegulatoryLabelingItem.run_id == lease.run_id,
+            RegulatoryLabelingItem.shard_id == shard_id,
+        )
+        .order_by(RegulatoryLabelingItem.id)
+        .limit(limit)
+    )
+    if after_id is not None:
+        statement = statement.where(RegulatoryLabelingItem.id > after_id)
+    return list(session.scalars(statement))
+
+
+def load_shard_request_page(
+    session: Session,
+    lease: RunLease,
+    shard_id: UUID,
+    *,
+    after_id: UUID | None = None,
+    limit: int = 128,
+) -> list[RegulatoryLabelingItem]:
+    if not 1 <= limit <= 128:
+        raise ValueError("Request pages require a limit from 1 to 128")
+    _check_shard_membership(session, lease, shard_id)
+    statement = (
+        select(RegulatoryLabelingItem)
+        .options(
+            load_only(
+                RegulatoryLabelingItem.id,
+                RegulatoryLabelingItem.request_hash,
+                RegulatoryLabelingItem.request_payload,
+            )
+        )
+        .where(
+            RegulatoryLabelingItem.run_id == lease.run_id,
+            RegulatoryLabelingItem.shard_id == shard_id,
+        )
+        .order_by(RegulatoryLabelingItem.id)
+        .limit(limit)
+    )
+    if after_id is not None:
+        statement = statement.where(RegulatoryLabelingItem.id > after_id)
+    return list(session.scalars(statement))
+
+
 def next_cancellable_shard(
     session: Session, lease: RunLease
 ) -> RegulatoryLabelingShard | None:
@@ -1358,8 +1747,14 @@ def mark_shard_submitting(
     shard.attempt_count += 1
     shard.reconcile_until = _utcnow() + datetime.timedelta(seconds=reconcile_seconds)
     shard.next_retry_at = None
-    for item in load_shard_requests(session, lease, shard_id):
-        item.status = "submitted"
+    session.execute(
+        update(RegulatoryLabelingItem)
+        .where(
+            RegulatoryLabelingItem.run_id == lease.run_id,
+            RegulatoryLabelingItem.shard_id == shard_id,
+        )
+        .values(status="submitted")
+    )
     session.flush()
     return shard
 
@@ -1376,11 +1771,23 @@ def record_shard_state(
     retry_after_seconds: float | None = None,
     error: str | None = None,
     increment_failure: bool = False,
+    reconcile_seconds: int | None = None,
 ) -> None:
+    if reconcile_seconds is not None and (
+        reconcile_seconds < 1 or status != "reconcile_required"
+    ):
+        raise ValueError(
+            "A reconciliation window requires a positive duration and reconciliation status"
+        )
     _lease_run(session, lease)
     shard = session.get(RegulatoryLabelingShard, shard_id)
     if shard is None or shard.run_id != lease.run_id:
         raise LabelingStateConflictError("The labeling shard is outside the run")
+    if reconcile_seconds is not None and shard.status == "submitting":
+        # Upload duration must not consume the window for resolving an unknown create.
+        shard.reconcile_until = _utcnow() + datetime.timedelta(
+            seconds=reconcile_seconds
+        )
     shard.status = status
     shard.remote_job_name = remote_job_name or shard.remote_job_name
     shard.input_uri = input_uri or shard.input_uri
@@ -1552,20 +1959,16 @@ def _item_snapshot_is_current(
     ) == item.source_snapshot.get("advisory_sha256")
 
 
-def apply_shard_results(
+def _apply_frozen_window_results(
     session: Session,
-    lease: RunLease,
+    run: RegulatoryLabelingRun,
     *,
-    shard_id: UUID,
+    items: Sequence[RegulatoryLabelingItem],
+    file_id: UUID,
+    lower: int,
+    upper: int,
     outcomes: Mapping[str, tuple[list[str], list[dict[str, object]]] | str],
 ) -> None:
-    run = _lease_run(session, lease)
-    if run.cancel_requested:
-        raise LabelingCancellationRequested("The labeling run was cancelled")
-    shard = session.get(RegulatoryLabelingShard, shard_id)
-    if shard is None or shard.run_id != run.id:
-        raise LabelingStateConflictError("The labeling shard is outside the run")
-    items = load_shard_requests(session, lease, shard_id)
     required_ids = {
         member_id
         for item in items
@@ -1591,37 +1994,29 @@ def apply_shard_results(
             )
         ).all()
     }
-    current_file_rows: dict[UUID, list[RegulatoryChunk]] = {}
-    current_boundary_ids: dict[UUID, frozenset[str]] = {}
-    current_windows_complete: dict[UUID, bool] = {}
-    for file_id in {item.user_file_id for item in items}:
-        file_items = [item for item in items if item.user_file_id == file_id]
-        windows = [
-            _snapshot_context_window(item.source_snapshot) for item in file_items
-        ]
-        rows, boundaries, complete = _current_file_context_candidates(
-            session,
-            document_set_id=run.document_set_id,
-            user_file_id=file_id,
-            lower=min(lower for lower, _upper in windows),
-            upper=max(upper for _lower, upper in windows),
-        )
-        current_file_rows[file_id] = rows
-        current_boundary_ids[file_id] = boundaries
-        current_windows_complete[file_id] = complete
+    rows, boundaries, complete = _current_file_context_candidates(
+        session,
+        document_set_id=run.document_set_id,
+        user_file_id=file_id,
+        lower=lower,
+        upper=upper,
+    )
+    current_file_rows = {file_id: rows}
+    current_boundary_ids = {file_id: boundaries}
+    current_windows_complete = {file_id: complete}
     current_by_id = {row.id: row for rows in current_file_rows.values() for row in rows}
     advisories = _latest_context_advisories(
         session, [item.regulatory_chunk_id for item in items]
     )
+    advisory_hashes = {
+        chunk_id: context_hash(value) for chunk_id, value in advisories.items()
+    }
     for item in items:
         outcome = outcomes.get(item.request_hash or "")
         if outcome is None:
             item.status = "failed"
             item.error = "The provider output omitted this request"
             continue
-        advisory_hashes = {
-            chunk_id: context_hash(value) for chunk_id, value in advisories.items()
-        }
         if not _item_snapshot_is_current(
             item,
             snapshot_items=snapshot_items,
@@ -1643,9 +2038,102 @@ def apply_shard_results(
         item.assignments = assignments
         item.status = "completed"
         item.error = None
+
+
+def apply_shard_result_page(
+    session: Session,
+    lease: RunLease,
+    *,
+    shard_id: UUID,
+    item_ids: Sequence[UUID],
+    outcomes: Mapping[str, tuple[list[str], list[dict[str, object]]] | str],
+) -> int:
+    """Apply a validated output page; committed terminal items are replay-safe."""
+    if not 1 <= len(item_ids) <= 128 or len(set(item_ids)) != len(item_ids):
+        raise ValueError("Result application requires 1 to 128 distinct item IDs")
+    renew_run_lease(session, lease)
+    run = _lease_run(session, lease)
+    if run.cancel_requested:
+        raise LabelingCancellationRequested("The labeling run was cancelled")
+    _check_shard_membership(session, lease, shard_id)
+    items = list(
+        session.scalars(
+            _result_item_query().where(
+                RegulatoryLabelingItem.run_id == lease.run_id,
+                RegulatoryLabelingItem.shard_id == shard_id,
+                RegulatoryLabelingItem.id.in_(item_ids),
+            )
+        )
+    )
+    if len(items) != len(item_ids):
+        raise LabelingStateConflictError("The result items are outside the shard")
+    windows: dict[tuple[UUID, int, int], list[RegulatoryLabelingItem]] = defaultdict(
+        list
+    )
+    for item in items:
+        if item.status in _TERMINAL_ITEM_STATUSES:
+            continue
+        lower, upper = _snapshot_context_window(item.source_snapshot)
+        windows[(item.user_file_id, lower, upper)].append(item)
+    handled = 0
+    for (file_id, lower, upper), window_items in windows.items():
+        _apply_frozen_window_results(
+            session,
+            run,
+            items=window_items,
+            file_id=file_id,
+            lower=lower,
+            upper=upper,
+            outcomes=outcomes,
+        )
+        run.completed_chunks += sum(item.status == "completed" for item in window_items)
+        run.failed_chunks += sum(item.status == "failed" for item in window_items)
+        run.stale_chunks += sum(item.status == "stale" for item in window_items)
+        handled += len(window_items)
+    session.flush()
+    return handled
+
+
+def finalize_shard_results(session: Session, lease: RunLease, shard_id: UUID) -> None:
+    renew_run_lease(session, lease)
+    run = _lease_run(session, lease)
+    if run.cancel_requested:
+        raise LabelingCancellationRequested("The labeling run was cancelled")
+    shard = load_claimed_shard(session, lease, shard_id)
+    unfinished = session.scalar(
+        select(RegulatoryLabelingItem.id)
+        .where(
+            RegulatoryLabelingItem.run_id == lease.run_id,
+            RegulatoryLabelingItem.shard_id == shard_id,
+            RegulatoryLabelingItem.status.not_in(_TERMINAL_ITEM_STATUSES),
+        )
+        .limit(1)
+    )
+    if unfinished is not None:
+        raise LabelingStateConflictError("The shard has unfinished result items")
     shard.status = "succeeded"
     shard.error = None
     _refresh_counts(session, run)
+
+
+def apply_shard_results(
+    session: Session,
+    lease: RunLease,
+    *,
+    shard_id: UUID,
+    outcomes: Mapping[str, tuple[list[str], list[dict[str, object]]] | str],
+) -> None:
+    after_id: UUID | None = None
+    while items := load_shard_result_items(session, lease, shard_id, after_id=after_id):
+        apply_shard_result_page(
+            session,
+            lease,
+            shard_id=shard_id,
+            item_ids=[item.id for item in items],
+            outcomes=outcomes,
+        )
+        after_id = items[-1].id
+    finalize_shard_results(session, lease, shard_id)
 
 
 def all_shards_terminal(session: Session, lease: RunLease) -> bool:

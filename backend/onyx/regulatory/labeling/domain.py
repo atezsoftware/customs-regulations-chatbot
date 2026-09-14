@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import TypeVar
+from uuid import UUID
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,3 +154,33 @@ def resolve_derived_sources(
     if not resolved:
         return DerivedSourceResolution((), "unresolved", "no_legacy_containment")
     return DerivedSourceResolution(resolved, "legacy_containment")
+
+
+def labeling_submission_key_from_hashes(
+    request_hashes: Sequence[str], *, tenant_id: str, run_id: UUID, ordinal: int
+) -> str:
+    """Retain the provider submission identity without retaining full prompts."""
+    if (
+        not request_hashes
+        or not tenant_id.strip()
+        or ordinal < 0
+        or len(set(request_hashes)) != len(request_hashes)
+        or any(
+            len(value) != 64 or any(c not in "0123456789abcdef" for c in value)
+            for value in request_hashes
+        )
+    ):
+        raise ValueError("The labeling submission identity is invalid")
+    identity = json.dumps(
+        {
+            "job_id": str(run_id),
+            "output_prefix": f"regulatory-labeling/{run_id}/{ordinal}",
+            "request_hashes": sorted(request_hashes),
+            "submission_attempt": 1,
+            "tenant_id": tenant_id,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"regulatory-labeling-{sha256(identity.encode()).hexdigest()}"

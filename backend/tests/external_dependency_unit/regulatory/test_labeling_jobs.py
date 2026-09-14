@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -1360,6 +1360,24 @@ class RecordingBatch:
         self.reconcile_visible = True
         self.get_calls = 0
 
+    def submit_stream(
+        self,
+        requests: Iterable[VertexBatchRequest],
+        *,
+        submission_key: str,
+        max_jsonl_bytes: int,
+        on_progress: Callable[[], None],
+    ) -> VertexBatchState:
+        materialized = []
+        for request in requests:
+            on_progress()
+            materialized.append(request)
+        return self.submit(
+            materialized,
+            submission_key=submission_key,
+            max_jsonl_bytes=max_jsonl_bytes,
+        )
+
     def submit(
         self,
         requests: Sequence[VertexBatchRequest],
@@ -1608,6 +1626,232 @@ def test_worker_reauthorizes_before_submitting_frozen_run(
         assert run.completed_chunks == 0
 
 
+def test_worker_combines_preparation_pages_into_one_google_batch(
+    labeling_data: LabelingData,
+    fake_batch: RecordingBatch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(orchestrator, "LABELING_PREPARATION_PAGE", 1)
+    monkeypatch.setattr(orchestrator, "LABELING_SHARD_ITEMS", 1)
+    run_id, _ = _start(labeling_data)
+    _step(labeling_data, run_id)
+    _step(labeling_data, run_id)
+    assert fake_batch.submit_calls == 0
+    _finish(labeling_data, run_id)
+    assert fake_batch.submit_calls == 1
+    assert len(next(iter(fake_batch.requests.values()))) == 2
+    with Session(labeling_data.database.engine) as session:
+        run = session.get(RegulatoryLabelingRun, run_id)
+        assert run is not None and run.completed_chunks == 2
+        assert len(run.shards) == 1
+
+
+def test_worker_cancellation_during_stream_preparation_never_waits_for_google(
+    labeling_data: LabelingData,
+    fake_batch: RecordingBatch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, _ = _start(labeling_data)
+    _step(labeling_data, run_id)
+
+    def cancelled_stream(
+        _requests: Iterable[VertexBatchRequest],
+        *,
+        on_progress: Callable[[], None],
+        **_kwargs: object,
+    ) -> VertexBatchState:
+        with Session(labeling_data.database.engine) as session:
+            repository.request_cancellation(
+                session, run_id=run_id, document_set_id=labeling_data.document_set_id
+            )
+            session.commit()
+        on_progress()
+        raise AssertionError("Cancelled stream must stop before provider creation")
+
+    monkeypatch.setattr(fake_batch, "submit_stream", cancelled_stream)
+    _step(labeling_data, run_id)
+    _step(labeling_data, run_id)
+    with Session(labeling_data.database.engine) as session:
+        run = session.get(RegulatoryLabelingRun, run_id)
+        assert run is not None and run.status == "cancelled"
+    assert fake_batch.submit_calls == fake_batch.reconcile_calls == 0
+
+
+def test_worker_recovery_grants_visibility_time_after_a_long_submission(
+    labeling_data: LabelingData, fake_batch: RecordingBatch
+) -> None:
+    run_id, _ = _start(labeling_data)
+    _step(labeling_data, run_id)
+    fake_batch.submit_mode = "crash"
+    with pytest.raises(SystemExit):
+        _step(labeling_data, run_id)
+    with Session(labeling_data.database.engine) as session:
+        shard = session.scalar(
+            select(RegulatoryLabelingShard).where(
+                RegulatoryLabelingShard.run_id == run_id
+            )
+        )
+        assert shard is not None
+        shard.reconcile_until = datetime.datetime.now(
+            datetime.timezone.utc
+        ) - datetime.timedelta(minutes=1)
+        session.commit()
+    fake_batch.reconcile_visible = False
+    _step(labeling_data, run_id, expire_lease=True)
+    with Session(labeling_data.database.engine) as session:
+        run = session.get(RegulatoryLabelingRun, run_id)
+        assert run is not None and run.shards[0].status == "reconcile_required"
+        assert run.shards[0].reconcile_until is not None
+        assert run.shards[0].reconcile_until > datetime.datetime.now(
+            datetime.timezone.utc
+        )
+    fake_batch.reconcile_visible = True
+    _finish(labeling_data, run_id)
+    assert fake_batch.submit_calls == 1
+
+
+def test_worker_rechecks_cancellation_after_coalescing_with_cached_sessions(
+    labeling_data: LabelingData,
+    fake_batch: RecordingBatch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @contextmanager
+    def session_factory() -> Iterator[Session]:
+        with Session(labeling_data.database.engine, expire_on_commit=False) as session:
+            yield session
+
+    monkeypatch.setattr(
+        orchestrator, "get_session_with_current_tenant", session_factory
+    )
+    run_id, _ = _start(labeling_data)
+    _step(labeling_data, run_id)
+    original_mark = repository.mark_shard_submitting
+
+    def cancel_before_mark(
+        session: Session,
+        lease: repository.RunLease,
+        *,
+        shard_id: UUID,
+        reconcile_seconds: int,
+    ) -> RegulatoryLabelingShard:
+        with Session(labeling_data.database.engine) as cancellation_session:
+            repository.request_cancellation(
+                cancellation_session,
+                run_id=run_id,
+                document_set_id=labeling_data.document_set_id,
+            )
+            cancellation_session.commit()
+        return original_mark(
+            session, lease, shard_id=shard_id, reconcile_seconds=reconcile_seconds
+        )
+
+    monkeypatch.setattr(repository, "mark_shard_submitting", cancel_before_mark)
+    _finish(labeling_data, run_id)
+    with Session(labeling_data.database.engine) as session:
+        run = session.get(RegulatoryLabelingRun, run_id)
+        assert run is not None and run.status == "cancelled"
+        assert all(shard.attempt_count == 0 for shard in run.shards)
+    assert fake_batch.submit_calls == fake_batch.reconcile_calls == 0
+
+
+@pytest.mark.parametrize("crash_after_page", [False, True])
+def test_worker_applies_large_output_without_loading_all_request_payloads(
+    labeling_data: LabelingData,
+    fake_batch: RecordingBatch,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_after_page: bool,
+) -> None:
+    with Session(labeling_data.database.engine) as session:
+        for position in range(4, 134):
+            session.add(
+                RegulatoryChunk(
+                    id=str(uuid4()),
+                    user_file_id=labeling_data.file_id,
+                    text=f"Certificate of origin rule {position} must be followed.",
+                    position=position,
+                    projection_ordinal=position,
+                    chunk_metadata={"chunk_variant": "atomic"},
+                    source="indexed",
+                    status="active",
+                )
+            )
+        session.commit()
+
+    def forbid_unbounded_read(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("A large batch must use bounded request/result pages")
+
+    monkeypatch.setattr(repository, "load_shard_requests", forbid_unbounded_read)
+    run_id, _ = _start(labeling_data)
+    if crash_after_page:
+        original_apply = repository.apply_shard_result_page
+        applied_pages = 0
+
+        def interrupted_apply(
+            session: Session,
+            lease: repository.RunLease,
+            *,
+            shard_id: UUID,
+            item_ids: Sequence[UUID],
+            outcomes: Mapping[str, tuple[list[str], list[dict[str, object]]] | str],
+        ) -> int:
+            nonlocal applied_pages
+            if applied_pages == 1:
+                raise SystemExit("Worker stopped after a committed result page")
+            applied_pages += 1
+            return original_apply(
+                session, lease, shard_id=shard_id, item_ids=item_ids, outcomes=outcomes
+            )
+
+        monkeypatch.setattr(repository, "apply_shard_result_page", interrupted_apply)
+        _step(labeling_data, run_id)
+        _step(labeling_data, run_id)
+        _step(labeling_data, run_id)
+        with pytest.raises(SystemExit):
+            _step(labeling_data, run_id)
+        monkeypatch.setattr(repository, "apply_shard_result_page", original_apply)
+        _step(labeling_data, run_id, expire_lease=True)
+    _finish(labeling_data, run_id)
+    assert fake_batch.submit_calls == 1
+    with Session(labeling_data.database.engine) as session:
+        run = session.get(RegulatoryLabelingRun, run_id)
+        assert run is not None
+        assert run.completed_chunks == 132, run.error
+        assert run.failed_chunks == run.stale_chunks == 0
+
+
+@pytest.mark.parametrize("late_error", ["duplicate", "foreign", "malformed"])
+def test_worker_rejects_late_output_contract_errors_before_applying_labels(
+    labeling_data: LabelingData,
+    fake_batch: RecordingBatch,
+    monkeypatch: pytest.MonkeyPatch,
+    late_error: str,
+) -> None:
+    original_read = fake_batch.read_results
+
+    def corrupt_output(output_uri: str) -> Iterator[str]:
+        lines = list(original_read(output_uri))
+        yield from lines
+        if late_error == "duplicate":
+            yield lines[-1]
+        elif late_error == "foreign":
+            foreign = json.loads(lines[-1])
+            foreign["key"] = "f" * 64
+            yield json.dumps(foreign)
+        else:
+            yield "invalid JSON"
+
+    monkeypatch.setattr(fake_batch, "read_results", corrupt_output)
+    run_id, _ = _start(labeling_data)
+    _finish(labeling_data, run_id)
+    with Session(labeling_data.database.engine) as session:
+        run = session.get(RegulatoryLabelingRun, run_id)
+        assert run is not None
+        assert run.completed_chunks == 0
+        assert run.failed_chunks == 2
+        assert all(not item.labels for item in run.items)
+    assert fake_batch.submit_calls == 1
+
+
 def test_worker_preparation_pages_and_in_flight_limit_are_durable(
     labeling_data: LabelingData,
     fake_batch: RecordingBatch,
@@ -1615,6 +1859,7 @@ def test_worker_preparation_pages_and_in_flight_limit_are_durable(
 ) -> None:
     monkeypatch.setattr(orchestrator, "LABELING_PREPARATION_PAGE", 1)
     monkeypatch.setattr(orchestrator, "LABELING_SHARD_ITEMS", 1)
+    monkeypatch.setattr(orchestrator, "LABELING_VERTEX_BATCH_ITEMS", 1)
     monkeypatch.setattr(orchestrator, "LABELING_MAX_IN_FLIGHT", 1)
     fake_batch.complete_jobs = False
     run_id, _ = _start(labeling_data)

@@ -4,7 +4,7 @@ import json
 import math
 import re
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from hashlib import sha256
 from typing import cast
 
@@ -37,9 +37,35 @@ _HEX_HASH = re.compile(r"[0-9a-f]{64}")
 _MAX_RESULT_BLOBS = 1024
 _BLOB_PAGE_SIZE = 100
 _DELETE_BATCH_SIZE = 100
-_MAX_MANIFEST_BYTES = 1024 * 1024
-_MAX_MANIFEST_REQUESTS = 1024
+_MAX_MANIFEST_BYTES = 64 * 1024 * 1024
+_MAX_MANIFEST_REQUESTS = 200_000
+_MAX_INPUT_BYTES = 1_000_000_000
 _MAX_RESULT_LINE_BYTES = 1024 * 1024
+_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+class _ProgressFile:
+    def __init__(
+        self,
+        stream: tempfile.SpooledTemporaryFile[bytes],
+        on_progress: Callable[[], None],
+    ) -> None:
+        self._stream = stream
+        self._on_progress = on_progress
+
+    def read(self, size: int = -1) -> bytes:
+        self._on_progress()
+        data = self._stream.read(size)
+        self._on_progress()
+        return data
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        self._on_progress()
+        return self._stream.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._stream.tell()
 
 
 def _jsonl_line(request: VertexBatchRequest) -> bytes:
@@ -114,21 +140,7 @@ def _correlation_hash(request: object) -> str:
     ).hexdigest()
 
 
-def _manifest_bytes(
-    submission_key: str, requests: Sequence[VertexBatchRequest]
-) -> bytes:
-    if len(requests) > _MAX_MANIFEST_REQUESTS:
-        raise VertexBatchContractError(
-            "Vertex labeling batch contains too many requests"
-        )
-    correlations: dict[str, str] = {}
-    for request in requests:
-        correlation_hash = _correlation_hash(request.to_generate_content_request())
-        if correlation_hash in correlations:
-            raise VertexBatchContractError(
-                "Vertex labeling batch has ambiguous request correlation"
-            )
-        correlations[correlation_hash] = request.request_hash
+def _manifest_bytes(submission_key: str, correlations: Mapping[str, str]) -> bytes:
     payload = {
         "version": 1,
         "submission_key": submission_key,
@@ -158,7 +170,7 @@ class LabelingVertexBatchGateway(GoogleVertexBatchGateway):
         staging_uri: str,
         credential_json_provider: Callable[[], str | None],
         request_timeout_seconds: float = 20,
-        max_result_bytes: int = 64 * 1024 * 1024,
+        max_result_bytes: int = 8 * 1024**3,
         max_reconciliation_seconds: float = 180,
     ) -> None:
         bucket, prefix = _parse_gcs_uri(staging_uri)
@@ -392,69 +404,115 @@ class LabelingVertexBatchGateway(GoogleVertexBatchGateway):
         submission_key: str,
         max_jsonl_bytes: int,
     ) -> VertexBatchState:
+        return self.submit_stream(
+            requests,
+            submission_key=submission_key,
+            max_jsonl_bytes=max_jsonl_bytes,
+            on_progress=lambda: None,
+        )
+
+    def submit_stream(
+        self,
+        requests: Iterable[VertexBatchRequest],
+        *,
+        submission_key: str,
+        max_jsonl_bytes: int,
+        on_progress: Callable[[], None],
+    ) -> VertexBatchState:
         from google.genai import types as genai_types
 
         match = _SUBMISSION_KEY.fullmatch(submission_key)
         if match is None:
             raise VertexBatchContractError("Vertex labeling submission key is invalid")
-        if max_jsonl_bytes < 1 or not requests:
+        if max_jsonl_bytes < 1:
             raise VertexBatchContractError("Vertex labeling batch input is invalid")
-        if len({request.request_hash for request in requests}) != len(requests):
-            raise VertexBatchContractError(
-                "Vertex batch contains a duplicate request hash"
-            )
-        manifest = _manifest_bytes(submission_key, requests)
-        used_bytes = 0
-        for request in requests:
-            used_bytes += len(_jsonl_line(request))
-            if used_bytes > max_jsonl_bytes:
-                raise VertexBatchContractError(
-                    "Vertex batch exceeds the configured JSONL byte limit"
-                )
-
+        byte_limit = min(max_jsonl_bytes, _MAX_INPUT_BYTES)
         submission_hash = match.group(1)
         batch_prefix = f"{self._gcs_uri.rstrip('/')}/labeling/{submission_hash}"
         input_uri = f"{batch_prefix}/input.jsonl"
         output_uri = f"{batch_prefix}/output"
         bucket_name, input_name = _parse_gcs_uri(input_uri)
         manifest_name = f"{input_name.rsplit('/', 1)[0]}/manifest.json"
-        with _translate_gateway_errors():
-            credentials = self._credentials()
-            with self._managed_storage_client(credentials) as storage_client:
-                with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as payload:
-                    for request in requests:
-                        payload.write(_jsonl_line(request))
-                    storage_client.bucket(bucket_name).blob(
-                        input_name
-                    ).upload_from_file(
-                        payload,
+        with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as payload:
+            correlations: dict[str, str] = {}
+            request_hashes: set[str] = set()
+            used_bytes = 0
+            request_count = 0
+            for request in requests:
+                on_progress()
+                request_count += 1
+                if request_count > _MAX_MANIFEST_REQUESTS:
+                    raise VertexBatchContractError(
+                        "Vertex labeling batch contains too many requests"
+                    )
+                if request.request_hash in request_hashes:
+                    raise VertexBatchContractError(
+                        "Vertex batch contains a duplicate request hash"
+                    )
+                correlation_hash = _correlation_hash(
+                    request.to_generate_content_request()
+                )
+                if correlation_hash in correlations:
+                    raise VertexBatchContractError(
+                        "Vertex labeling batch has ambiguous request correlation"
+                    )
+                line = _jsonl_line(request)
+                used_bytes += len(line)
+                if used_bytes > byte_limit:
+                    raise VertexBatchContractError(
+                        "Vertex batch exceeds the configured JSONL byte limit"
+                    )
+                payload.write(line)
+                correlations[correlation_hash] = request.request_hash
+                request_hashes.add(request.request_hash)
+            if not request_count:
+                raise VertexBatchContractError("Vertex labeling batch input is invalid")
+            manifest = _manifest_bytes(submission_key, correlations)
+            del correlations, request_hashes
+            with _translate_gateway_errors():
+                on_progress()
+                credentials = self._credentials()
+                with self._managed_storage_client(credentials) as storage_client:
+                    input_blob = storage_client.bucket(bucket_name).blob(input_name)
+                    input_blob.chunk_size = _UPLOAD_CHUNK_BYTES
+                    input_blob.upload_from_file(
+                        _ProgressFile(payload, on_progress),
                         content_type="application/jsonl",
                         rewind=True,
                         timeout=self._request_timeout_seconds,
                     )
-                storage_client.bucket(bucket_name).blob(
-                    manifest_name
-                ).upload_from_string(
-                    manifest,
-                    content_type="application/json",
-                    timeout=self._request_timeout_seconds,
-                )
-            with self._managed_genai_client(credentials) as client:
-                with _translate_create_errors(submission_key):
-                    with traced_llm_call(
-                        flow=LLMFlow.REGULATORY_LABELING_BATCH,
-                        model=self._config.model_name,
-                        provider="vertex_ai",
-                        extra_config={"request_count": str(len(requests))},
-                    ):
-                        job = client.batches.create(
+                    on_progress()
+                    storage_client.bucket(bucket_name).blob(
+                        manifest_name
+                    ).upload_from_string(
+                        manifest,
+                        content_type="application/json",
+                        timeout=self._request_timeout_seconds,
+                    )
+                    on_progress()
+                with self._managed_genai_client(credentials) as client:
+                    on_progress()
+                    with _translate_create_errors(submission_key):
+                        with traced_llm_call(
+                            flow=LLMFlow.REGULATORY_LABELING_BATCH,
                             model=self._config.model_name,
-                            src=input_uri,
-                            config=genai_types.CreateBatchJobConfig(
-                                display_name=submission_key,
-                                dest=output_uri,
-                            ),
-                        )
+                            provider="vertex_ai",
+                            extra_config={"request_count": str(request_count)},
+                        ):
+                            job = client.batches.create(
+                                model=self._config.model_name,
+                                src=input_uri,
+                                config=genai_types.CreateBatchJobConfig(
+                                    display_name=submission_key,
+                                    dest=output_uri,
+                                ),
+                            )
+                try:
+                    on_progress()
+                except Exception:
+                    raise IndexingGatewayIndeterminateSubmissionError(
+                        submission_key
+                    ) from None
         try:
             state = _batch_state(
                 job, input_uri=input_uri, fallback_output_uri=output_uri
@@ -593,7 +651,9 @@ class LabelingVertexBatchGateway(GoogleVertexBatchGateway):
                     seen_hashes: set[str] = set()
                     for blob in jsonl_blobs:
                         with blob.open(
-                            "rb", timeout=self._request_timeout_seconds
+                            "rb",
+                            timeout=self._request_timeout_seconds,
+                            chunk_size=_DOWNLOAD_CHUNK_BYTES,
                         ) as stream:
                             while True:
                                 remaining = self._max_result_bytes - used_bytes

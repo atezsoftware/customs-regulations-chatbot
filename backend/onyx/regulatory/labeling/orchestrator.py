@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import datetime
+import time
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from onyx.db import regulatory_labeling as repository
@@ -12,6 +15,7 @@ from onyx.db.labeling_configuration import (
     resolve_labeling_gateway,
 )
 from onyx.db.models import RegulatoryLabelingItem
+from onyx.db.regulatory_labeling_results import LabelingResultSpool
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayError,
     IndexingGatewayIndeterminateSubmissionError,
@@ -21,6 +25,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     VertexBatchGateway,
     VertexBatchJobStatus,
     VertexBatchRequest,
+    VertexBatchState,
     vertex_batch_submission_key,
     vertex_jsonl_line_size,
 )
@@ -28,7 +33,6 @@ from onyx.regulatory.labeling.domain import shard_by_count_and_bytes
 from onyx.regulatory.labeling.provider import (
     TaxonomyDefinition,
     build_labeling_request,
-    parse_labeling_batch_output,
     validate_labeling_response,
 )
 from onyx.utils.logger import setup_logger
@@ -39,11 +43,74 @@ LABELING_LEASE_SECONDS = 300
 LABELING_PREPARATION_PAGE = 128
 LABELING_SHARD_ITEMS = 64
 LABELING_SHARD_BYTES = 8 * 1024 * 1024
+LABELING_VERTEX_BATCH_ITEMS = 200_000
+LABELING_VERTEX_BATCH_BYTES = 1_000_000_000
+LABELING_HEARTBEAT_SECONDS = 30
 LABELING_MAX_IN_FLIGHT = 4
 LABELING_PROJECTION_PAGE = 128
 LABELING_RECONCILE_SECONDS = 10 * 60
 LABELING_POLL_SECONDS = 30
 LABELING_MAX_PROVIDER_FAILURES = 5
+
+
+@runtime_checkable
+class StreamingLabelingGateway(Protocol):
+    def submit_stream(
+        self,
+        requests: Iterable[VertexBatchRequest],
+        *,
+        submission_key: str,
+        max_jsonl_bytes: int,
+        on_progress: Callable[[], None],
+    ) -> VertexBatchState: ...
+
+
+def _lease_heartbeat(lease: repository.RunLease) -> Callable[[], None]:
+    last_renewed = 0.0
+
+    def heartbeat() -> None:
+        nonlocal last_renewed
+        now = time.monotonic()
+        if now - last_renewed < LABELING_HEARTBEAT_SECONDS:
+            return
+        with get_session_with_current_tenant() as session:
+            run = repository.load_claimed_run(session, lease)
+            if run.cancel_requested:
+                raise repository.LabelingCancellationRequested(
+                    "The labeling run was cancelled"
+                )
+            repository.renew_run_lease(
+                session, lease, lease_seconds=LABELING_LEASE_SECONDS
+            )
+            session.commit()
+        last_renewed = now
+
+    return heartbeat
+
+
+def _stream_shard_requests(
+    lease: repository.RunLease,
+    shard_id: UUID,
+    heartbeat: Callable[[], None],
+) -> Iterator[VertexBatchRequest]:
+    after_id: UUID | None = None
+    while True:
+        heartbeat()
+        with get_session_with_current_tenant() as session:
+            items = repository.load_shard_request_page(
+                session, lease, shard_id, after_id=after_id
+            )
+            requests = []
+            for item in items:
+                request = VertexBatchRequest.model_validate(item.request_payload)
+                if request.request_hash != item.request_hash:
+                    raise ValueError("The frozen labeling request changed")
+                requests.append(request)
+            if items:
+                after_id = items[-1].id
+        if not requests:
+            return
+        yield from requests
 
 
 class LabelingStepOutcome(StrEnum):
@@ -225,6 +292,14 @@ def _cancel(
             return LabelingStepResult(
                 run_id=lease.run_id, outcome=LabelingStepOutcome.TERMINAL
             )
+        if shard.status == "submitting":
+            repository.record_shard_state(
+                session,
+                lease,
+                shard_id=shard.id,
+                status="reconcile_required",
+                reconcile_seconds=LABELING_RECONCILE_SECONDS,
+            )
         shard_id = shard.id
         remote_job_name = shard.remote_job_name
         submission_key = shard.submission_key
@@ -337,31 +412,75 @@ def _submit_or_reconcile(
     lease: repository.RunLease,
     shard_id: UUID,
     gateway: VertexBatchGateway,
+    tenant_id: str,
 ) -> LabelingStepResult:
     with get_session_with_current_tenant() as session:
-        repository.load_claimed_run(session, lease)
+        run = repository.load_claimed_run(session, lease)
+        native = (
+            LabelingProviderBinding.model_validate(run.provider_binding).transport
+            == "vertex_gcs_v1"
+        )
         shard = repository.load_claimed_shard(session, lease, shard_id)
         if shard.status == "prepared":
+            if native:
+                if not isinstance(gateway, StreamingLabelingGateway):
+                    raise ValueError("Native labeling requires streaming Batch support")
+                shard = repository.coalesce_prepared_shards(
+                    session,
+                    lease,
+                    tenant_id=tenant_id,
+                    anchor_shard_id=shard_id,
+                    max_items=LABELING_VERTEX_BATCH_ITEMS,
+                    max_jsonl_bytes=LABELING_VERTEX_BATCH_BYTES,
+                )
+                session.commit()
+                session.expire_all()
             shard = repository.mark_shard_submitting(
                 session,
                 lease,
-                shard_id=shard.id,
+                shard_id=shard_id,
                 reconcile_seconds=LABELING_RECONCILE_SECONDS,
             )
-            items = repository.load_shard_requests(session, lease, shard.id)
-            requests = [
-                VertexBatchRequest.model_validate(item.request_payload)
-                for item in items
-                if item.request_payload is not None
-            ]
+            requests = []
+            if not native:
+                items = repository.load_shard_requests(session, lease, shard.id)
+                requests = [
+                    VertexBatchRequest.model_validate(item.request_payload)
+                    for item in items
+                    if item.request_payload is not None
+                ]
             submission_key = shard.submission_key
             session.commit()
             try:
-                state = gateway.submit(
-                    requests,
-                    submission_key=submission_key,
-                    max_jsonl_bytes=LABELING_SHARD_BYTES,
-                )
+                if native and isinstance(gateway, StreamingLabelingGateway):
+                    heartbeat = _lease_heartbeat(lease)
+                    state = gateway.submit_stream(
+                        _stream_shard_requests(lease, shard_id, heartbeat),
+                        submission_key=submission_key,
+                        max_jsonl_bytes=LABELING_VERTEX_BATCH_BYTES,
+                        on_progress=heartbeat,
+                    )
+                else:
+                    state = gateway.submit(
+                        requests,
+                        submission_key=submission_key,
+                        max_jsonl_bytes=LABELING_SHARD_BYTES,
+                    )
+            except repository.LabelingCancellationRequested:
+                if not native:
+                    raise
+                # Native transport wraps every post-create callback failure as uncertain.
+                with get_session_with_current_tenant() as result_session:
+                    repository.record_shard_state(
+                        result_session,
+                        lease,
+                        shard_id=shard_id,
+                        status="cancelled",
+                        error="Cancelled before provider job creation",
+                    )
+                    repository.release_run(result_session, lease)
+                    result_session.commit()
+                return _next(lease)
             except IndexingGatewayIndeterminateSubmissionError:
                 with get_session_with_current_tenant() as result_session:
                     repository.record_shard_state(
@@ -369,6 +488,7 @@ def _submit_or_reconcile(
                         lease,
                         shard_id=shard_id,
                         status="reconcile_required",
+                        reconcile_seconds=LABELING_RECONCILE_SECONDS,
                         retry_after_seconds=LABELING_POLL_SECONDS,
                         error="Provider submission must be reconciled",
                     )
@@ -409,6 +529,7 @@ def _submit_or_reconcile(
                         lease,
                         shard_id=shard_id,
                         status="reconcile_required",
+                        reconcile_seconds=LABELING_RECONCILE_SECONDS,
                         retry_after_seconds=LABELING_POLL_SECONDS,
                         error="Provider submission outcome is uncertain",
                     )
@@ -433,6 +554,14 @@ def _submit_or_reconcile(
                 result_session.commit()
             return _next(lease)
 
+        if shard.status == "submitting":
+            repository.record_shard_state(
+                session,
+                lease,
+                shard_id=shard_id,
+                status="reconcile_required",
+                reconcile_seconds=LABELING_RECONCILE_SECONDS,
+            )
         submission_key = shard.submission_key
         reconcile_until = shard.reconcile_until
         session.commit()
@@ -574,24 +703,8 @@ def _poll_or_apply(
             session.commit()
         return _next(lease)
 
-    with get_session_with_current_tenant() as session:
-        run = repository.load_claimed_run(session, lease)
-        repository.set_claimed_run_stage(session, lease, "applying")
-        taxonomy = TaxonomyDefinition.model_validate(run.taxonomy.definition)
-        items = repository.load_shard_requests(session, lease, shard_id)
-        item_data = {
-            item.request_hash: (item.text_snapshot, item.id)
-            for item in items
-            if item.request_hash is not None
-        }
-        session.commit()
-    outcomes: dict[str, tuple[list[str], list[dict[str, object]]] | str] = {}
     try:
-        parsed = parse_labeling_batch_output(
-            gateway.read_results(state.output_uri),
-            item_data,
-            require_complete=False,
-        )
+        _read_and_apply_results(lease, shard_id, gateway, state.output_uri)
     except IndexingGatewayError as error:
         with get_session_with_current_tenant() as session:
             shard = repository.load_claimed_shard(session, lease, shard_id)
@@ -608,46 +721,104 @@ def _poll_or_apply(
             repository.release_run(session, lease, stage="waiting")
             session.commit()
         return _next(lease)
-    except ValueError as error:
-        parsed = {}
-        for request_hash in item_data:
-            outcomes[request_hash] = str(error)
-    else:
-        for request_hash, result in parsed.items():
-            if result.error is not None or result.context is None:
-                outcomes[request_hash] = (
-                    f"Provider result was rejected: {result.error or 'empty'}"
-                )
-                continue
-            text, _item_id = item_data[request_hash]
-            try:
-                outcome = validate_labeling_response(
-                    result.context, text=text, taxonomy=taxonomy
-                )
-            except ValueError as error:
-                outcomes[request_hash] = str(error)
-                continue
-            if outcome.abstained:
-                outcomes[request_hash] = "Model abstained: insufficient evidence"
-                continue
-            assignments = [assignment.model_dump() for assignment in outcome.labels]
-            outcomes[request_hash] = (
-                [assignment.label_id for assignment in outcome.labels],
-                assignments,
-            )
     with get_session_with_current_tenant() as session:
-        repository.apply_shard_results(
-            session,
-            lease,
-            shard_id=shard_id,
-            outcomes=outcomes,
-        )
+        repository.finalize_shard_results(session, lease, shard_id)
         repository.release_run(session, lease, stage="waiting")
         session.commit()
     return _next(lease)
 
 
-def _process_provider(lease: repository.RunLease) -> LabelingStepResult:
+def _result_pages(
+    lease: repository.RunLease,
+    shard_id: UUID,
+    heartbeat: Callable[[], None],
+) -> Iterator[list[RegulatoryLabelingItem]]:
+    after_id: UUID | None = None
+    while True:
+        heartbeat()
+        with get_session_with_current_tenant() as session:
+            items = repository.load_shard_result_items(
+                session, lease, shard_id, after_id=after_id
+            )
+        if not items:
+            return
+        after_id = items[-1].id
+        yield items
+
+
+def _read_and_apply_results(
+    lease: repository.RunLease,
+    shard_id: UUID,
+    gateway: VertexBatchGateway,
+    output_uri: str,
+) -> None:
+    heartbeat = _lease_heartbeat(lease)
+    heartbeat()
+    with get_session_with_current_tenant() as session:
+        run = repository.load_claimed_run(session, lease)
+        repository.set_claimed_run_stage(session, lease, "applying")
+        taxonomy = TaxonomyDefinition.model_validate(run.taxonomy.definition)
+        session.commit()
+    with LabelingResultSpool() as spool:
+        for items in _result_pages(lease, shard_id, heartbeat):
+            spool.add_expected(
+                item.request_hash for item in items if item.request_hash is not None
+            )
+        batch_error: str | None = None
+        try:
+            spool.stage(gateway.read_results(output_uri), on_progress=heartbeat)
+        except ValueError as error:
+            batch_error = str(error)
+        # Validate the complete output contract before committing any assignments.
+        for items in _result_pages(lease, shard_id, heartbeat):
+            hashes = [
+                item.request_hash for item in items if item.request_hash is not None
+            ]
+            parsed = spool.get_many(hashes) if batch_error is None else {}
+            outcomes: dict[str, tuple[list[str], list[dict[str, object]]] | str] = {}
+            for item in items:
+                request_hash = item.request_hash
+                if request_hash is None:
+                    continue
+                if batch_error is not None:
+                    outcomes[request_hash] = batch_error
+                    continue
+                result = parsed.get(request_hash)
+                if result is None:
+                    continue
+                if result.error is not None or result.context is None:
+                    outcomes[request_hash] = (
+                        f"Provider result was rejected: {result.error or 'empty'}"
+                    )
+                    continue
+                try:
+                    outcome = validate_labeling_response(
+                        result.context, text=item.text_snapshot, taxonomy=taxonomy
+                    )
+                except ValueError as error:
+                    outcomes[request_hash] = str(error)
+                    continue
+                if outcome.abstained:
+                    outcomes[request_hash] = "Model abstained: insufficient evidence"
+                    continue
+                assignments = [assignment.model_dump() for assignment in outcome.labels]
+                outcomes[request_hash] = (
+                    [assignment.label_id for assignment in outcome.labels],
+                    assignments,
+                )
+            heartbeat()
+            with get_session_with_current_tenant() as session:
+                repository.apply_shard_result_page(
+                    session,
+                    lease,
+                    shard_id=shard_id,
+                    item_ids=[item.id for item in items],
+                    outcomes=outcomes,
+                )
+                session.commit()
+
+
+def _process_provider(lease: repository.RunLease, tenant_id: str) -> LabelingStepResult:
     with get_session_with_current_tenant() as session:
         run = repository.load_claimed_run(session, lease)
         cancel_requested = run.cancel_requested
@@ -681,7 +852,7 @@ def _process_provider(lease: repository.RunLease) -> LabelingStepResult:
         status = shard.status
         session.commit()
     if status in ("prepared", "submitting", "reconcile_required"):
-        return _submit_or_reconcile(lease, shard_id, gateway)
+        return _submit_or_reconcile(lease, shard_id, gateway, tenant_id)
     return _poll_or_apply(lease, shard_id, gateway)
 
 
@@ -733,7 +904,7 @@ def run_labeling_step(
         if stage == "preparing":
             return _prepare(lease, tenant_id)
         if stage in ("submitting", "waiting", "applying"):
-            return _process_provider(lease)
+            return _process_provider(lease, tenant_id)
         if stage == "projecting":
             return _project_and_finish(lease)
         _release(

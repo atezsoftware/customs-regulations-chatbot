@@ -77,6 +77,7 @@ class _FakeBlob:
         self.content = content
         self.uploaded = ""
         self.size: int | None = len(content.encode())
+        self.chunk_size: int | None = None
 
     def upload_from_file(
         self,
@@ -88,6 +89,7 @@ class _FakeBlob:
     ) -> None:
         assert content_type == "application/jsonl"
         assert timeout == 20
+        assert self.chunk_size == 8 * 1024 * 1024
         if rewind:
             cast(Any, file_obj).seek(0)
         raw = cast(Any, file_obj).read()
@@ -96,7 +98,7 @@ class _FakeBlob:
 
     def open(self, mode: str, **kwargs: object) -> BytesIO:
         assert mode == "rb"
-        assert kwargs == {"timeout": 20}
+        assert kwargs == {"timeout": 20, "chunk_size": 4 * 1024 * 1024}
         return BytesIO(self.content.encode())
 
     def upload_from_string(
@@ -109,7 +111,7 @@ class _FakeBlob:
 
     def download_as_bytes(self, *, start: int, end: int, timeout: float) -> bytes:
         assert start == 0
-        assert end == 1024 * 1024
+        assert end == 64 * 1024 * 1024
         assert timeout == 20
         data = (self.uploaded or self.content).encode()
         return data[start : end + 1]
@@ -152,6 +154,7 @@ class _FakeStorageClient:
 class _FakeBatches:
     def __init__(self) -> None:
         self.created: dict[str, Any] | None = None
+        self.create_count = 0
         self.create_error: Exception | None = None
         self.list_results: list[object] = []
         self.list_config: object | None = None
@@ -161,6 +164,7 @@ class _FakeBatches:
         self.get_result: object | None = None
 
     def create(self, **kwargs: Any) -> object:
+        self.create_count += 1
         self.created = kwargs
         if self.create_error is not None:
             raise self.create_error
@@ -397,6 +401,183 @@ def test_submit_rejects_invalid_or_oversized_input_before_cloud_access(
             max_jsonl_bytes=1024 * 1024,
         )
 
+    with pytest.raises(VertexBatchContractError, match="too many requests"):
+        gateway.submit_stream(
+            (VertexBatchRequest(prompt=f"Chunk {index}") for index in range(200001)),
+            submission_key=_SUBMISSION_KEY,
+            max_jsonl_bytes=128 * 1024 * 1024,
+            on_progress=lambda: None,
+        )
+
+
+@pytest.mark.parametrize("request_count", [2048, 200000])
+def test_large_batch_submits_once_and_correlates_last_manifest_entry(
+    monkeypatch: pytest.MonkeyPatch, request_count: int
+) -> None:
+    gateway = _gateway()
+    storage_client = _FakeStorageClient()
+    batches = _FakeBatches()
+    _install_clients(monkeypatch, gateway, storage_client, batches)
+    requests = (
+        VertexBatchRequest(prompt=f"Chunk {index}") for index in range(request_count)
+    )
+    last_request = VertexBatchRequest(prompt=f"Chunk {request_count - 1}")
+
+    progress_calls = 0
+
+    def on_progress() -> None:
+        nonlocal progress_calls
+        progress_calls += 1
+
+    state = gateway.submit_stream(
+        requests,
+        submission_key=_SUBMISSION_KEY,
+        max_jsonl_bytes=128 * 1024 * 1024,
+        on_progress=on_progress,
+    )
+
+    assert batches.create_count == 1
+    assert progress_calls > request_count
+    root = f"tenant-a/labeling-stage/labeling/{'a' * 64}"
+    uploaded = storage_client.bucket_value.blobs[f"{root}/input.jsonl"]
+    assert len(uploaded.uploaded.splitlines()) == request_count
+    manifest = storage_client.bucket_value.blobs[f"{root}/manifest.json"]
+    assert len(json.loads(manifest.uploaded)["requests"]) == request_count
+    assert len(manifest.uploaded.encode()) <= 64 * 1024 * 1024
+    output_name = f"{root}/output/part.jsonl"
+    storage_client.bucket_value.blobs[output_name] = _FakeBlob(
+        output_name, _vertex_output_line(last_request, model=None)
+    )
+    assert state.output_uri is not None
+
+    rows = list(gateway.read_results(state.output_uri))
+
+    assert len(rows) == 1
+    assert json.loads(rows[0])["key"] == last_request.request_hash
+
+
+def test_result_manifest_rejects_more_than_200000_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway()
+    storage_client = _FakeStorageClient()
+    _install_clients(monkeypatch, gateway, storage_client, _FakeBatches())
+    _install_manifest(
+        storage_client,
+        [VertexBatchRequest(prompt=f"Chunk {index}") for index in range(200001)],
+    )
+
+    with pytest.raises(VertexBatchContractError, match="manifest"):
+        list(gateway.read_results(f"{_STAGING_URI}/labeling/{'a' * 64}/output"))
+
+
+def test_submit_enforces_google_byte_limit_before_writing_or_cloud_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OversizedLine(bytes):
+        def __len__(self) -> int:
+            return 1_000_000_001
+
+    gateway = _gateway()
+    monkeypatch.setattr(
+        gateway, "_credentials", lambda: pytest.fail("oversized input reached cloud")
+    )
+    monkeypatch.setattr(
+        "onyx.regulatory.labeling.vertex_batch._jsonl_line",
+        lambda _request: OversizedLine(b"oversized"),
+    )
+
+    with pytest.raises(VertexBatchContractError, match="byte limit"):
+        gateway.submit(
+            [_request()],
+            submission_key=_SUBMISSION_KEY,
+            max_jsonl_bytes=2_000_000_000,
+        )
+
+
+def test_submit_rejects_empty_one_pass_input_before_cloud_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway()
+    monkeypatch.setattr(
+        gateway, "_credentials", lambda: pytest.fail("empty input reached cloud")
+    )
+
+    with pytest.raises(VertexBatchContractError, match="input is invalid"):
+        gateway.submit_stream(
+            iter(()),
+            submission_key=_SUBMISSION_KEY,
+            max_jsonl_bytes=1_000_000_000,
+            on_progress=lambda: None,
+        )
+
+
+def test_heartbeat_failure_after_create_remains_indeterminate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway()
+    storage_client = _FakeStorageClient()
+    batches = _FakeBatches()
+    _install_clients(monkeypatch, gateway, storage_client, batches)
+
+    def on_progress() -> None:
+        if batches.create_count:
+            raise RuntimeError("lease lost after remote create")
+
+    with pytest.raises(IndexingGatewayIndeterminateSubmissionError) as captured:
+        gateway.submit_stream(
+            iter([_request()]),
+            submission_key=_SUBMISSION_KEY,
+            max_jsonl_bytes=1_000_000_000,
+            on_progress=on_progress,
+        )
+
+    assert batches.create_count == 1
+    assert captured.value.submission_key == _SUBMISSION_KEY
+
+
+def test_upload_reads_and_seeks_report_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway()
+    storage_client = _FakeStorageClient()
+    batches = _FakeBatches()
+    _install_clients(monkeypatch, gateway, storage_client, batches)
+    progress_calls = 0
+
+    def on_progress() -> None:
+        nonlocal progress_calls
+        progress_calls += 1
+
+    original_upload = _FakeBlob.upload_from_file
+
+    def observed_upload(
+        blob: _FakeBlob,
+        file_obj: object,
+        *,
+        content_type: str,
+        rewind: bool,
+        timeout: float,
+    ) -> None:
+        before = progress_calls
+        original_upload(
+            blob,
+            file_obj,
+            content_type=content_type,
+            rewind=rewind,
+            timeout=timeout,
+        )
+        assert progress_calls >= before + 2
+
+    monkeypatch.setattr(_FakeBlob, "upload_from_file", observed_upload)
+
+    gateway.submit_stream(
+        iter([_request()]),
+        submission_key=_SUBMISSION_KEY,
+        max_jsonl_bytes=1_000_000_000,
+        on_progress=on_progress,
+    )
+
 
 def test_indeterminate_create_is_reconcilable_and_reconciliation_is_exact(
     monkeypatch: pytest.MonkeyPatch,
@@ -413,6 +594,7 @@ def test_indeterminate_create_is_reconcilable_and_reconciliation_is_exact(
             submission_key=_SUBMISSION_KEY,
             max_jsonl_bytes=1024 * 1024,
         )
+
     assert captured.value.submission_key == _SUBMISSION_KEY
     assert "secret response" not in str(captured.value)
 
@@ -580,6 +762,34 @@ def test_result_stream_rejects_wrong_model_and_total_byte_overflow(
     storage_client.bucket_value.blobs[path].size = None
     with pytest.raises(VertexBatchContractError, match="size limit"):
         list(gateway.read_results(f"gs://regulatory-batch/{output_prefix}"))
+
+
+@pytest.mark.parametrize("reported_bytes", [2 * 1024**3, 8 * 1024**3 + 1])
+def test_default_result_limit_accepts_large_echoes_but_remains_bounded(
+    monkeypatch: pytest.MonkeyPatch, reported_bytes: int
+) -> None:
+    gateway = LabelingVertexBatchGateway(
+        config=_config(),
+        staging_uri=_STAGING_URI,
+        credential_json_provider=lambda: None,
+    )
+    storage_client = _FakeStorageClient()
+    _install_clients(monkeypatch, gateway, storage_client, _FakeBatches())
+    request = _request()
+    _install_manifest(storage_client, [request])
+    output_prefix = f"tenant-a/labeling-stage/labeling/{'a' * 64}/output"
+    output_name = f"{output_prefix}/part.jsonl"
+    blob = _FakeBlob(output_name, _vertex_output_line(request, model=None))
+    blob.size = reported_bytes
+    storage_client.bucket_value.blobs[output_name] = blob
+
+    results = gateway.read_results(f"gs://regulatory-batch/{output_prefix}")
+
+    if reported_bytes > 8 * 1024**3:
+        with pytest.raises(VertexBatchContractError, match="size limit"):
+            list(results)
+    else:
+        assert json.loads(list(results)[0])["key"] == request.request_hash
 
 
 def test_result_and_cleanup_paths_are_confined_to_one_labeling_submission(
