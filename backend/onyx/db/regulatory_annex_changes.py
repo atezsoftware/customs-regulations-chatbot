@@ -328,7 +328,9 @@ def validate_prepared_annex_change(
             graph != draft.source_graph
             or context_hash([item.model_dump(mode="json") for item in graph])
             != draft.source_graph_sha256
-            or read_original_source_text(store, assets)[1]
+            or read_original_source_text(
+                store, assets, links=graph, version=draft.original_source_text_version
+            )[1]
             != draft.original_source_text_sha256
         ):
             raise ValueError("prepared source graph or original text changed")

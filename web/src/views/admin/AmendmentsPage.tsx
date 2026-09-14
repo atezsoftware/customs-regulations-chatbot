@@ -1733,6 +1733,16 @@ export default function AmendmentsPage() {
                     </div>
                   )}
 
+                  {selectedBatch.status === "analyzed" &&
+                    selectedBatch.instruction_count === 0 && (
+                      <Text font="main-ui-body" color="text-03" as="p">
+                        No update instructions were detected in this text. Paste
+                        an amendment/update, or add context (e.g. "this is the
+                        new version of X") if the pasted content is a
+                        replacement without formal amendment language.
+                      </Text>
+                    )}
+
                   {unmatched.length > 0 && (
                     <div className="rounded-lg border border-border-02 p-3">
                       <Text font="main-ui-action" color="text-04">

@@ -27,6 +27,7 @@ from onyx.regulatory.amendments.annexes.context_dependencies import (
     context_hash,
 )
 from onyx.regulatory.amendments.annexes.evidence import (
+    CURRENT_SOURCE_TEXT_VERSION,
     build_new_evidence_remapping,
     choose_original_evidence,
     combine_annex_evidence_views,
@@ -328,9 +329,10 @@ def prepare_annex_group(
                 "source_graph_sha256": context_hash(
                     [link.model_dump(mode="json") for link in links]
                 ),
-                "original_source_text_sha256": read_original_source_text(store, assets)[
-                    1
-                ],
+                "original_source_text_sha256": read_original_source_text(
+                    store, assets, links=links
+                )[1],
+                "original_source_text_version": CURRENT_SOURCE_TEXT_VERSION,
             }
         )
         canonical_ids = [
@@ -720,7 +722,12 @@ def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
     )
     if actual != draft.preparation_configuration:
         raise ValueError("prepared runtime/model/index configuration changed")
-    _, original_text_hash = read_original_source_text(get_default_file_store(), assets)
+    _, original_text_hash = read_original_source_text(
+        get_default_file_store(),
+        assets,
+        links=graph,
+        version=draft.original_source_text_version,
+    )
     if original_text_hash != draft.original_source_text_sha256:
         raise ValueError("original extracted source text changed")
 

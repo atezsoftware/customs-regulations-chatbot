@@ -503,10 +503,18 @@ def test_segmentation_runs_without_an_open_database_session(
         "Hatıra fotoğrafı: 2026 yaz tatili",
     ],
 )
-def test_empty_segmentation_fails_instead_of_checkpointing_ambiguous_empty_list(
+def test_empty_segmentation_checkpoints_and_finishes_analyzed_without_review(
     monkeypatch: pytest.MonkeyPatch,
     raw_text: str,
 ) -> None:
+    """No update instructions is a legitimate terminal outcome, not a crash.
+
+    The segmenter is explicitly instructed to return an empty instruction
+    list for content (or context) that doesn't express update intent —
+    ambiguous text, a menu, a photo caption. The batch must still reach
+    `analyzed` with nothing to review, not raise, so retrying the identical
+    text isn't offered as if it could ever produce a different result.
+    """
     from onyx.llm.model_response import Choice, Message, ModelResponse
 
     batch = SimpleNamespace(
@@ -537,21 +545,25 @@ def test_empty_segmentation_fails_instead_of_checkpointing_ambiguous_empty_list(
             message=Message(content='{"reference_date":null,"instructions":[]}')
         ),
     )
-    persist = MagicMock()
+    persist = MagicMock(return_value=True)
     monkeypatch.setattr(job, "persist_segmentation_checkpoint", persist)
     monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=model))
     draft = MagicMock()
     proposals = MagicMock()
     monkeypatch.setattr(job, "draft_instruction_group_proposal", draft)
     monkeypatch.setattr(job, "persist_proposal_checkpoint", proposals)
+    mark_analyzed = MagicMock(return_value=True)
+    monkeypatch.setattr(job, "mark_batch_analyzed", mark_analyzed)
 
-    with pytest.raises(RuntimeError, match="no instructions"):
-        job.run_amendment_batch(batch_id=12, lease_generation=1)
+    job.run_amendment_batch(batch_id=12, lease_generation=1)
 
-    persist.assert_not_called()
+    assert persist.call_args.kwargs["instructions"] == []
     retriever.search.assert_not_called()
     draft.assert_not_called()
     proposals.assert_not_called()
+    mark_analyzed.assert_called_once()
+    assert mark_analyzed.call_args.kwargs["batch_id"] == 12
+    assert mark_analyzed.call_args.kwargs["lease_generation"] == 1
 
 
 def test_contextual_replacement_table_is_accepted_without_formal_legal_phrase() -> None:

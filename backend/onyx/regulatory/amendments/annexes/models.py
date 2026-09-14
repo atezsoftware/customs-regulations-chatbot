@@ -42,7 +42,7 @@ class PdfVisionReference(BaseModel):
     file_id: str
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     transcript_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    transcript_version: Literal[1, 2] = Field(
+    transcript_version: Literal[1, 2, 3] = Field(
         default=1, exclude_if=lambda version: version == 1
     )
 
@@ -753,6 +753,10 @@ class AnnexChangeDraft(BaseModel):
     source_text_sha256: str | None = None
     source_manifest_sha256: str | None = None
     original_source_text_sha256: str | None = None
+    # A draft frozen before version 2 shipped has no explicit value here and
+    # defaults to 1, so live re-verification recomputes the original source
+    # text with the same join algorithm it was frozen with — never today's.
+    original_source_text_version: Literal[1, 2] = 1
     source_graph_sha256: str | None = None
     source_graph: list[SourceLink] = Field(default_factory=list)
     submitted_source_text: str | None = None

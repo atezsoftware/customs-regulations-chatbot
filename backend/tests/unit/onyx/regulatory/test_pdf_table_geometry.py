@@ -87,6 +87,25 @@ def test_regular_grid_keeps_pipe_rows_and_touching_borders() -> None:
                 ]
             )
         )
+        == "| Name | Rate |\n| --- | --- |\n| Fixture | 17% |"
+    )
+
+
+def test_regular_grid_keeps_legacy_pipe_rows_at_version_two() -> None:
+    # Frozen version-2 transcripts must never gain the version-3 markdown
+    # header separator retroactively.
+    assert (
+        pdf_transcript(
+            page(
+                [
+                    cell("Name", (0.1, 0.1, 0.4, 0.3)),
+                    cell("Rate", (0.4, 0.1, 0.9, 0.3)),
+                    cell("Fixture", (0.1, 0.3, 0.4, 0.5)),
+                    cell("17%", (0.4, 0.3, 0.9, 0.5)),
+                ]
+            ),
+            version=2,
+        )
         == "Name | Rate\nFixture | 17%"
     )
 
@@ -266,4 +285,4 @@ def test_new_pdf_derivatives_explicitly_select_current_transcript_version(
         deadline=pdf_vision.time.monotonic() + 60,
     )
     assert prepared.pdf_vision is not None
-    assert prepared.pdf_vision.model_dump(mode="json")["transcript_version"] == 2
+    assert prepared.pdf_vision.model_dump(mode="json")["transcript_version"] == 3

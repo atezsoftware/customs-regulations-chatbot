@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import {
   Button,
+  CompactMarkdown,
   InputTextArea,
   InputTypeIn,
   Tag,
@@ -13,6 +14,7 @@ import { toast } from "@opal/layouts";
 import {
   type AnnexElementCorrection,
   type AnnexExtraction,
+  type AnnexExtractionElement,
   type AnnexLocator,
   type AnnexReview,
   approveAnnexReview,
@@ -154,6 +156,164 @@ function ReviewSection({
   );
 }
 
+interface IndexedElement {
+  element: AnnexExtractionElement;
+  position: number;
+}
+
+interface ExtractionPageGroup {
+  page: number | null;
+  items: IndexedElement[];
+}
+
+/** Split elements into contiguous per-page runs, preserving reading order. */
+function groupElementsByPage(
+  elements: AnnexExtractionElement[]
+): ExtractionPageGroup[] {
+  const groups: ExtractionPageGroup[] = [];
+  elements.forEach((element, position) => {
+    const page = element.locator.page;
+    const current = groups[groups.length - 1];
+    if (!current || current.page !== page) {
+      groups.push({ page, items: [{ element, position }] });
+    } else {
+      current.items.push({ element, position });
+    }
+  });
+  return groups;
+}
+
+type DisplayRun =
+  | { kind: "table"; cells: IndexedElement[] }
+  | { kind: "single"; item: IndexedElement };
+
+/** Split one page's elements into table runs and standalone elements. */
+function splitIntoRuns(items: IndexedElement[]): DisplayRun[] {
+  const runs: DisplayRun[] = [];
+  for (const item of items) {
+    const last = runs[runs.length - 1];
+    if (item.element.kind === "table_cell") {
+      if (last?.kind === "table") {
+        last.cells.push(item);
+      } else {
+        runs.push({ kind: "table", cells: [item] });
+      }
+    } else {
+      runs.push({ kind: "single", item });
+    }
+  }
+  return runs;
+}
+
+/**
+ * Group a table run's cells into rows for display. XLSX cells already carry
+ * an explicit row/column from the sheet; PDF-vision cells don't, so rows are
+ * inferred from vertical box overlap as a best-effort presentational aid —
+ * per-cell locators stay visible underneath, so an imperfect split never
+ * hides or misattributes evidence.
+ */
+function groupTableCellsIntoRows(cells: IndexedElement[]): IndexedElement[][] {
+  if (cells.every(({ element }) => element.locator.row !== null)) {
+    const byRow = new Map<number, IndexedElement[]>();
+    for (const cell of cells) {
+      const row = cell.element.locator.row as number;
+      const bucket = byRow.get(row);
+      if (bucket) bucket.push(cell);
+      else byRow.set(row, [cell]);
+    }
+    return [...byRow.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, row]) =>
+        [...row].sort(
+          (left, right) =>
+            (left.element.locator.column ?? 0) -
+            (right.element.locator.column ?? 0)
+        )
+      );
+  }
+  const rows: IndexedElement[][] = [];
+  for (const cell of cells) {
+    const box = cell.element.locator.normalized_box;
+    const previousRow = rows[rows.length - 1];
+    const previousBox = previousRow?.[0]?.element.locator.normalized_box;
+    const overlaps =
+      box && previousBox
+        ? Math.min(box[3], previousBox[3]) - Math.max(box[1], previousBox[1]) > 0
+        : false;
+    if (previousRow && overlaps) previousRow.push(cell);
+    else rows.push([cell]);
+  }
+  return rows.map((row) =>
+    [...row].sort(
+      (left, right) =>
+        (left.element.locator.normalized_box?.[0] ?? 0) -
+        (right.element.locator.normalized_box?.[0] ?? 0)
+    )
+  );
+}
+
+function tableRowMarkdown(cells: IndexedElement[]): string {
+  return `| ${cells
+    .map(({ element }) => (element.text || "—").replaceAll("|", "\\|").replaceAll("\n", " "))
+    .join(" | ")} |`;
+}
+
+function TableRun({ cells }: { cells: IndexedElement[] }) {
+  const rows = useMemo(() => groupTableCellsIntoRows(cells), [cells]);
+  const columnCount = Math.max(...rows.map((row) => row.length), 1);
+  const source = useMemo(() => {
+    if (rows.length === 0) return "";
+    const separator = `| ${Array(columnCount).fill("---").join(" | ")} |`;
+    return [tableRowMarkdown(rows[0] ?? []), separator, ...rows.slice(1).map(tableRowMarkdown)].join(
+      "\n"
+    );
+  }, [rows, columnCount]);
+
+  return (
+    <div className="rounded-08 bg-background-tint-01 p-2">
+      <CompactMarkdown>{source}</CompactMarkdown>
+      <details className="mt-1">
+        <summary className="cursor-pointer">
+          <Text font="secondary-body" color="text-03">
+            Cell evidence ({cells.length})
+          </Text>
+        </summary>
+        <div className="mt-1 flex flex-col gap-1">
+          {cells.map(({ element, position }) => (
+            <Text key={position} as="p" font="secondary-body" color="text-03">
+              {`${position}: ${element.kind} · ${element.extraction_method} · ${locatorLabel(element.locator)}`}
+            </Text>
+          ))}
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function ExtractionElementBlock({ item }: { item: IndexedElement }) {
+  const { element, position } = item;
+  return (
+    <div className="rounded-08 bg-background-tint-01 p-2">
+      <Text as="p" font="main-ui-body" color="text-05">
+        {element.text || "(visual element)"}
+      </Text>
+      <Text as="p" font="secondary-body" color="text-03">
+        {`${position}: ${element.kind} · ${element.extraction_method} · ${locatorLabel(element.locator)}`}
+      </Text>
+      {element.formula && (
+        <Text as="p" font="secondary-body" color="text-03">
+          {`Formula: ${element.formula}`}
+        </Text>
+      )}
+    </div>
+  );
+}
+
+// Small documents stay fully expanded; larger ones default to their first
+// couple of pages so opening a 77-page annex doesn't dump hundreds of
+// element blocks at once.
+const DEFAULT_EXPANDED_PAGE_GROUPS = 2;
+
 function ExtractionPanel({
   title,
   extraction,
@@ -161,6 +321,11 @@ function ExtractionPanel({
   title: string;
   extraction: AnnexExtraction | null;
 }) {
+  const pageGroups = useMemo(
+    () => (extraction ? groupElementsByPage(extraction.elements) : []),
+    [extraction]
+  );
+
   if (!extraction) {
     return (
       <div className="min-w-0 flex-1 rounded-08 border border-border-01 p-3">
@@ -179,7 +344,9 @@ function ExtractionPanel({
         <Tag title={extraction.mime_type} truncate />
       </div>
       <Text as="p" font="secondary-body" color="text-03">
-        {`Frozen extraction ${shorten(extraction.source_sha256)} · ${extraction.elements.length} elements`}
+        {`Frozen extraction ${shorten(extraction.source_sha256)} · ${extraction.elements.length} elements${
+          pageGroups.length > 1 ? ` · ${pageGroups.length} pages` : ""
+        }`}
       </Text>
       {extraction.evidence_view?.pages.map((page) => (
         <Text
@@ -202,24 +369,38 @@ function ExtractionPanel({
         </Text>
       ))}
       <div className="mt-2 flex flex-col gap-2">
-        {extraction.elements.map((element, position) => (
-          <div
-            key={`${position}-${element.semantic_key ?? element.text}`}
-            className="rounded-08 bg-background-tint-01 p-2"
-          >
-            <Text as="p" font="main-ui-body" color="text-05">
-              {element.text || "(visual element)"}
-            </Text>
-            <Text as="p" font="secondary-body" color="text-03">
-              {`${element.kind} · ${element.extraction_method} · ${locatorLabel(element.locator)}`}
-            </Text>
-            {element.formula && (
-              <Text as="p" font="secondary-body" color="text-03">
-                {`Formula: ${element.formula}`}
-              </Text>
-            )}
-          </div>
-        ))}
+        {pageGroups.map((group, groupIndex) => {
+          const runs = splitIntoRuns(group.items);
+          const body = (
+            <div className="mt-2 flex flex-col gap-2">
+              {runs.map((run, runIndex) =>
+                run.kind === "table" ? (
+                  <TableRun key={runIndex} cells={run.cells} />
+                ) : (
+                  <ExtractionElementBlock key={runIndex} item={run.item} />
+                )
+              )}
+            </div>
+          );
+          // A single unpaged group (DOCX, plain text) needs no page wrapper.
+          if (pageGroups.length === 1 && group.page === null) {
+            return <div key={groupIndex}>{body}</div>;
+          }
+          return (
+            <details
+              key={groupIndex}
+              open={groupIndex < DEFAULT_EXPANDED_PAGE_GROUPS}
+              className="rounded-08 border border-border-01"
+            >
+              <summary className="cursor-pointer p-2">
+                <Text font="main-ui-action" color="text-04">
+                  {`${group.page !== null ? `Page ${group.page}` : "Unpaged"} — ${group.items.length} elements`}
+                </Text>
+              </summary>
+              <div className="px-2 pb-2">{body}</div>
+            </details>
+          );
+        })}
       </div>
     </div>
   );
