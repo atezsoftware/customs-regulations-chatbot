@@ -1,7 +1,8 @@
 """Scoped immutable context inputs and independently effective retrieval versions."""
 
 import datetime
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import or_, select
@@ -709,3 +710,56 @@ def get_indexed_temporal_projection(
             "temporal binding encoder receipt is not accepted by query configuration"
         )
     return binding
+
+
+def resolve_preparation_context_call(
+    *,
+    user_file_id: UUID,
+    call: ContextGenerationCall,
+    generate: Callable[[], str],
+) -> ContextGenerationCall:
+    """Cache exact generation receipts without activating projections or vectors."""
+    from onyx.db.engine.sql_engine import get_session_with_current_tenant
+
+    def validated(payload: dict[str, Any]) -> ContextGenerationCall:
+        stored = ContextGenerationCall.model_validate(payload)
+        if stored.model_copy(update={"output": ""}) != call.model_copy(
+            update={"output": ""}
+        ):
+            raise ValueError("context generation cache input proof changed")
+        if not stored.output.strip():
+            raise ValueError("context generation cache has no output")
+        return stored
+
+    with get_session_with_current_tenant() as session:
+        cached = session.scalar(
+            select(RegulatoryContextGeneration.payload).where(
+                RegulatoryContextGeneration.user_file_id == user_file_id,
+                RegulatoryContextGeneration.request_sha256 == call.request_sha256,
+            )
+        )
+    if cached is not None:
+        return validated(cached)
+    generated = call.model_copy(update={"output": generate()})
+    validated(generated.model_dump(mode="json"))
+    with get_session_with_current_tenant() as session:
+        session.execute(
+            insert(RegulatoryContextGeneration)
+            .values(
+                id=uuid4(),
+                user_file_id=user_file_id,
+                request_sha256=call.request_sha256,
+                payload=generated.model_dump(mode="json"),
+            )
+            .on_conflict_do_nothing(constraint="uq_context_generation_file_hash")
+        )
+        stored = session.scalar(
+            select(RegulatoryContextGeneration.payload).where(
+                RegulatoryContextGeneration.user_file_id == user_file_id,
+                RegulatoryContextGeneration.request_sha256 == call.request_sha256,
+            )
+        )
+        assert stored is not None
+        result = validated(stored)
+        session.commit()
+        return result

@@ -149,16 +149,21 @@ def test_active_structural_descendants_require_an_exact_heading_prefix() -> None
             id="paragraph-3",
             user_file_id=user_file_id,
             position=136,
+            chunk_type="paragraph",
             heading_path=parent_path,
             chunk_metadata={"article_no": "20"},
         ),
     )
     child = SimpleNamespace(
         id="clause-a",
+        chunk_type="clause",
+        chunk_metadata={"article_no": "20", "paragraph_no": "3"},
         heading_path=[*parent_path, "a) Birinci yöntem"],
     )
     peer = SimpleNamespace(
         id="paragraph-4",
+        chunk_type="paragraph",
+        chunk_metadata={"article_no": "20", "paragraph_no": "4"},
         heading_path=["MADDE 20", "(4) Başka hüküm"],
     )
     scalars = MagicMock()

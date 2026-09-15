@@ -497,3 +497,26 @@ test("shows precise blocked and provider-reconciliation states", () => {
     screen.queryByRole("button", { name: "Retry publication" })
   ).not.toBeInTheDocument();
 });
+
+test("shows durable preparation progress and prevents duplicate review actions", () => {
+  const review = reviewFixture({
+    status: "blocked",
+    preparation: {
+      status: "running",
+      stage: "replacement_context",
+      completed_chunks: 12,
+      total_chunks: 469,
+      error_message: null,
+      result_review_id: null,
+    },
+  });
+  render(<AnnexChangeReview review={review} onUpdated={jest.fn()} />);
+  expect(screen.getByText("Preparing review")).toBeInTheDocument();
+  expect(
+    screen.getByText("replacement context · 12/469 chunks")
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Retry review" })).toBeDisabled();
+  expect(
+    screen.queryByRole("button", { name: "Approve group" })
+  ).not.toBeInTheDocument();
+});

@@ -116,6 +116,11 @@ def prepare_publication_review(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         or draft.impact is None
     ):
         raise ValueError("logical annex context must precede publication preparation")
+    from onyx.regulatory.amendments.annexes.preparation_progress import (
+        report_preparation_progress,
+    )
+
+    report_preparation_progress("publication_inputs")
     draft = resolve_after_window_authority(draft)
     assert (
         draft.user_file_id is not None

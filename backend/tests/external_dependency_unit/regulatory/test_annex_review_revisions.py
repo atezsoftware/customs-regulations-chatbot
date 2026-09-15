@@ -841,11 +841,18 @@ def test_group_api_enforces_owner_and_returns_exact_frozen_bytes(
         and response.content == b'<h1>EK-1</h1><p id="rate">new</p>'
     )
     revalidate = MagicMock(side_effect=AssertionError("retry must not reprepare"))
-    monkeypatch.setattr(annex_api, "revalidate_annex_review", revalidate)
+    monkeypatch.setattr(
+        "onyx.regulatory.amendments.annexes.corrections.revalidate_annex_review",
+        revalidate,
+    )
+    from onyx.server.features.regulatory.models import AnnexReviewSnapshot
+
     identity = (
         live_review.review.id,
         live_review.review.review_sha256,
-        live_review.review.review_payload,
+        AnnexReviewSnapshot.model_validate(live_review.review).model_dump(mode="json")[
+            "review_payload"
+        ],
     )
     for status in ("pending", "rejected", "failed", "blocked"):
         live_review.review.status = status

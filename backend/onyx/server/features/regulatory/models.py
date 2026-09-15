@@ -2,7 +2,7 @@ import datetime
 from typing import Any, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_TEXT_CHARS
 from onyx.db.models import AnnexChangeSet, RegulatoryChunk
@@ -178,6 +178,16 @@ class AmendmentProposalSnapshot(BaseModel):
         )
 
 
+class AnnexReviewPreparationSnapshot(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    status: Literal["queued", "running", "completed", "failed"]
+    stage: str
+    completed_chunks: int
+    total_chunks: int
+    error_message: str | None
+    result_review_id: UUID | None
+
+
 class AnnexReviewSnapshot(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
@@ -197,6 +207,20 @@ class AnnexReviewSnapshot(BaseModel):
     review_sha256: str
     publication_generation: int
     review_payload: AnnexChangeDraft
+    preparation: AnnexReviewPreparationSnapshot | None = None
+
+    @field_serializer("review_payload")
+    def serialize_review_payload(self, payload: AnnexChangeDraft) -> dict[str, Any]:
+        # Prompts and full-file projection receipts stay in the immutable DB review.
+        return payload.model_dump(
+            mode="json",
+            exclude={
+                "baseline_scope": True,
+                "baseline_context": True,
+                "impact": {"prepared": True},
+            },
+        )
+
     error_message: str | None
     created_at: datetime.datetime
 

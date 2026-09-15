@@ -582,6 +582,7 @@ def require_current_annex_review(
     change_set_id: UUID,
     expected_review_sha256: str,
     environment: str,
+    allow_preparation: bool = False,
 ) -> AnnexChangeSet:
     review = session.get(AnnexChangeSet, change_set_id)
     if review is None or review.environment != environment:
@@ -606,6 +607,12 @@ def require_current_annex_review(
         or review.review_sha256 != expected_review_sha256
     ):
         raise ValueError("stale review revision or hash")
+    if (
+        not allow_preparation
+        and review.preparation is not None
+        and review.preparation.status in ("queued", "running")
+    ):
+        raise ValueError("review preparation is still running")
     return review
 
 
@@ -616,13 +623,31 @@ def revise_annex_review(
     expected_review_sha256: str,
     draft: AnnexChangeDraft,
     environment: str,
+    preparation_generation: int | None = None,
 ) -> AnnexChangeSet:
     previous = require_current_annex_review(
         session,
         change_set_id=change_set_id,
         expected_review_sha256=expected_review_sha256,
         environment=environment,
+        allow_preparation=preparation_generation is not None,
     )
+    preparation = previous.preparation
+    if preparation_generation is not None:
+        from onyx.db.models import AnnexReviewPreparation
+
+        preparation = session.scalar(
+            select(AnnexReviewPreparation)
+            .where(AnnexReviewPreparation.review_id == previous.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    if preparation_generation is not None and (
+        preparation is None
+        or preparation.status != "running"
+        or preparation.generation != preparation_generation
+    ):
+        raise ValueError("review preparation lease lost")
     if previous.status not in ("pending", "blocked", "rejected", "failed"):
         raise ValueError("review state does not allow edits")
     if previous.publication_generation:
@@ -678,6 +703,12 @@ def revise_annex_review(
     session.add(review)
     session.flush()
     _add_review_associations(session, change=review, draft=draft)
+    if preparation_generation is not None:
+        assert preparation is not None
+        preparation.status = "completed"
+        preparation.stage = "finished"
+        preparation.result_review_id = review.id
+        preparation.checkpoint = None
     session.commit()
     return review
 

@@ -117,4 +117,12 @@ def recover_annex_publications(
             expires=3600,
             retry=False,
         )
-    return len(deliveries)
+    from onyx.background.celery.tasks.regulatory_amendments.annex_preparation import (
+        recover_review_preparations,
+    )
+
+    return len(deliveries) + recover_review_preparations(
+        tenant_id=tenant_id,
+        environment=environment,
+        database_identity=database_identity,
+    )

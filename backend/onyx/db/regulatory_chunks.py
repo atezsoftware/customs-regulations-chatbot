@@ -2750,7 +2750,13 @@ def get_current_chunks_by_ids(
 def has_active_structural_descendants(
     db_session: Session, chunk: RegulatoryChunk
 ) -> bool:
-    """Return whether an active atomic row is structurally nested under ``chunk``."""
+    return bool(load_active_structural_descendants(db_session, chunk))
+
+
+def load_active_structural_descendants(
+    db_session: Session, chunk: RegulatoryChunk
+) -> list[RegulatoryChunk]:
+    """Load the complete active canonical scope structurally nested under ``chunk``."""
 
     article_no = chunk.chunk_metadata.get("article_no")
     conditions = [
@@ -2769,34 +2775,56 @@ def has_active_structural_descendants(
     parent_path = list(chunk.heading_path)
     parent_paragraph_no = chunk.chunk_metadata.get("paragraph_no")
     parent_clause_label = chunk.chunk_metadata.get("clause_label")
+    descendants: list[RegulatoryChunk] = []
     for row in rows:
+        if is_hierarchical_aggregate_chunk(row):
+            continue
+        if chunk.chunk_type in {"paragraph", "clause", "subclause"}:
+            paragraph = row.chunk_metadata.get("paragraph_no")
+            if (
+                parent_paragraph_no is not None
+                and paragraph is not None
+                and str(parent_paragraph_no) != str(paragraph)
+            ):
+                break
+        if chunk.chunk_type in {"clause", "subclause"}:
+            clause = row.chunk_metadata.get("clause_label")
+            if (
+                parent_clause_label is not None
+                and clause is not None
+                and str(parent_clause_label) != str(clause)
+            ):
+                break
         row_path = list(row.heading_path)
         if (
-            len(row_path) > len(parent_path)
+            parent_path
+            and len(row_path) > len(parent_path)
             and row_path[: len(parent_path)] == parent_path
         ):
-            return True
+            descendants.append(row)
+            continue
         if chunk.chunk_type == "paragraph":
             if row.chunk_type == "paragraph":
-                return False
+                break
             row_paragraph_no = row.chunk_metadata.get("paragraph_no")
             if (
                 parent_paragraph_no is not None
                 and row_paragraph_no is not None
                 and str(row_paragraph_no) != str(parent_paragraph_no)
             ):
-                return False
+                break
             if row.chunk_type in {"clause", "subclause"} and (
                 parent_paragraph_no is None
                 or row_paragraph_no is None
                 or str(row_paragraph_no) == str(parent_paragraph_no)
             ):
-                return True
+                descendants.append(row)
+            continue
         if chunk.chunk_type == "clause":
             if row.chunk_type == "paragraph":
-                return False
+                break
             if row.chunk_type == "clause":
-                return False
+                break
             row_paragraph_no = row.chunk_metadata.get("paragraph_no")
             row_clause_label = row.chunk_metadata.get("clause_label")
             if (
@@ -2812,8 +2840,9 @@ def has_active_structural_descendants(
                     or str(row_clause_label) == str(parent_clause_label)
                 )
             ):
-                return True
-    return False
+                descendants.append(row)
+            continue
+    return descendants
 
 
 def get_active_chunks_by_structural_reference(

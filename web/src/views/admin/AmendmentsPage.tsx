@@ -463,6 +463,15 @@ function ProposalCard({
   const currentChunk = isNewChunk
     ? null
     : { ...emptyCurrentChunkSnapshot, ...proposal.old_chunk_snapshot };
+  const descendantSnapshots = proposal.old_chunk_snapshot.descendant_snapshots;
+  if (currentChunk && Array.isArray(descendantSnapshots)) {
+    currentChunk.text = [
+      currentChunk.text,
+      ...descendantSnapshots.map((item: Record<string, unknown>) =>
+        String(item.text ?? "")
+      ),
+    ].join("\n\n");
+  }
   const afterChunk: Record<string, unknown> = {
     id: "Generated on approval",
     user_file_id: draft.user_file_id,
@@ -915,8 +924,10 @@ export default function AmendmentsPage() {
   const activeAnnexReviewKey = useMemo(
     () =>
       annexReviews
-        .filter((review) =>
-          ["approving", "preparing", "publishing"].includes(review.status)
+        .filter(
+          (review) =>
+            ["approving", "preparing", "publishing"].includes(review.status) ||
+            ["queued", "running"].includes(review.preparation?.status ?? "")
         )
         .map((review) => `${review.id}:${review.status}`)
         .sort()
@@ -938,8 +949,12 @@ export default function AmendmentsPage() {
         setAnnexReviews(reviews);
         delayMs = 1500;
         if (
-          reviews.some((review) =>
-            ["approving", "preparing", "publishing"].includes(review.status)
+          reviews.some(
+            (review) =>
+              ["approving", "preparing", "publishing"].includes(
+                review.status
+              ) ||
+              ["queued", "running"].includes(review.preparation?.status ?? "")
           )
         ) {
           timeoutId = setTimeout(() => void pollReviews(), delayMs);
@@ -1363,7 +1378,6 @@ export default function AmendmentsPage() {
       setBatches((current) =>
         current.map((item) => (item.id === batch.id ? batch : item))
       );
-      setProposals([]);
       setUnmatched([]);
       setPollRevision((revision) => revision + 1);
       toast.success("Analysis queued again from its last checkpoint.");
@@ -1748,6 +1762,15 @@ export default function AmendmentsPage() {
                       <Text font="main-ui-action" color="text-04">
                         Instructions requiring attention
                       </Text>
+                      {selectedBatch?.status === "analyzed" && (
+                        <Button
+                          prominence="secondary"
+                          disabled={retrying}
+                          onClick={() => void handleRetry()}
+                        >
+                          Retry unresolved instructions
+                        </Button>
+                      )}
                       {unmatched.map((instr, i) => (
                         <div key={i} className="whitespace-pre-wrap">
                           <Text font="main-ui-body" color="text-03" as="p">

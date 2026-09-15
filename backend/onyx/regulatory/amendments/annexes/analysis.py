@@ -558,6 +558,10 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
     from onyx.configs.app_configs import REGULATORY_BATCH_INDEXING_ENABLED
     from onyx.db.regulatory_annex_publication import load_annex_context_settings
     from onyx.indexing.embedder import DefaultIndexingEmbedder
+    from onyx.regulatory.amendments.annexes.preparation_progress import (
+        report_preparation_progress,
+        save_preparation_checkpoint,
+    )
     from onyx.regulatory.indexing_jobs.configuration import (
         resolve_regulatory_indexing_snapshot,
     )
@@ -594,13 +598,29 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
     configuration["transport"] = (
         context_hash(snapshot.model_dump(mode="json")) if snapshot else "normal"
     )
+    draft = draft.model_copy(
+        update={
+            "preparation_configuration": {
+                **draft.preparation_configuration,
+                **configuration,
+            },
+            "indexing_configuration": snapshot.model_dump(mode="json")
+            if snapshot
+            else None,
+        }
+    )
+    save_preparation_checkpoint(draft)
+    assert draft.effective_date is not None and draft.patch_plan is not None
+    effective_date = draft.effective_date
+    metadata_only = draft.patch_plan.metadata_only
     old_rows = canonical_snapshot_rows(draft.baseline_scope)
     candidate = prepare_staged_candidate_rows(
         baseline_scope=draft.baseline_scope,
         items=draft.items,
-        effective_date=draft.effective_date,
+        effective_date=effective_date,
         evidence_remapping=draft.new_evidence_remapping,
     )
+    report_preparation_progress("original_context", total=len(old_rows))
     before = prepare_publication_context_view(
         rows=old_rows,
         file=file,
@@ -608,9 +628,12 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         snapshot=snapshot,
         embedder=embedder,
         context_llm=context_llm,
-        reference_date=draft.effective_date,
+        reference_date=effective_date,
         cached=draft.baseline_context,
     )
+    draft = draft.model_copy(update={"baseline_context": before})
+    save_preparation_checkpoint(draft)
+    report_preparation_progress("replacement_context", total=len(candidate))
     after = prepare_publication_context_view(
         rows=candidate,
         file=file,
@@ -618,7 +641,7 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         snapshot=snapshot,
         embedder=embedder,
         context_llm=context_llm,
-        reference_date=draft.effective_date,
+        reference_date=effective_date,
         cached=before,
     )
     impact = compare_context_views(
@@ -627,7 +650,7 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         direct_canonical_changes=[
             chunk.id for item in draft.items for chunk in item.new_chunks
         ],
-        metadata_only=draft.patch_plan.metadata_only,
+        metadata_only=metadata_only,
         canonical_predecessors=staged_canonical_predecessors(draft.items),
     )
     prepared = draft.model_copy(
@@ -644,6 +667,7 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         }
     )
 
+    save_preparation_checkpoint(prepared)
     if draft.date_resolution is not None:
         from onyx.regulatory.amendments.annexes.publication_preparation import (
             prepare_publication_review,
@@ -862,6 +886,11 @@ def prepare_publication_context_view(
                 context_llm.invoke(messages, timeout_override=60, max_tokens=256)
             )
 
+    from onyx.db.regulatory_context_projections import resolve_preparation_context_call
+    from onyx.regulatory.amendments.annexes.preparation_progress import (
+        report_context_progress,
+    )
+
     return prepare_durable_context_view(
         job=job,
         rows=rows,
@@ -869,6 +898,13 @@ def prepare_publication_context_view(
         contextual_tokenizer=tokenizer,
         embedding_model=embedder.embedding_model,
         generate=generate,
+        resolve_call=lambda call, invoke: resolve_preparation_context_call(
+            user_file_id=file.id,
+            call=call,
+            generate=invoke,
+        ),
+        progress=report_context_progress,
+        max_workers=4,
         cached=cached,
         as_of_date=reference_date,
     )

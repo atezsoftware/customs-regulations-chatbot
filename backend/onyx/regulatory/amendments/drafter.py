@@ -33,6 +33,8 @@ For `dates`:
 - `effective_end_date`: ONLY set this if the instruction ITSELF explicitly states this new provision is also temporary/time-limited (e.g. "31.12.2027 tarihine kadar geçerlidir"). Otherwise null — never invent a default end date; null means "valid indefinitely", which is the correct default.
 - `rationale`: briefly explain how you derived these dates (or why you left them null).
 
+If the old chunk includes descendants, these are the current nested provisions, in document order. A full replacement of the parent replaces this entire scope; include every new clause in the replacement text. For a partial edit, keep the parent-only text and do not duplicate descendants.
+
 Use ONLY information explicitly present in the given texts. Never invent or assume anything not stated."""
 # ruff: noqa: E501 end
 
@@ -44,6 +46,10 @@ def _chunk_to_review_dict(chunk: dict[str, Any]) -> dict[str, Any]:
         "chunk_type": chunk.get("chunk_type"),
         "heading_path": chunk.get("heading_path"),
         "metadata": chunk.get("chunk_metadata") or chunk.get("metadata"),
+        "descendants": [
+            _chunk_to_review_dict(item)
+            for item in chunk.get("descendant_snapshots", [])
+        ],
     }
 
 

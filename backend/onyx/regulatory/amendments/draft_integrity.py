@@ -165,3 +165,15 @@ def reconcile_existing_heading_path(
     else:
         path.append(terminal)
     return path
+
+
+def validate_complete_scope_replacement(instruction_texts: Sequence[str]) -> None:
+    bodies = [
+        body
+        for text in instruction_texts
+        if (body := explicit_replacement_body(text)) is not None
+    ]
+    if not bodies or any(_OMISSION_RE.search(body) for body in bodies):
+        raise DraftIntegrityError(
+            "The complete replacement text is required to replace a provision and its descendants."
+        )

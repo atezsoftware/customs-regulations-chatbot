@@ -17,11 +17,12 @@ from onyx.db.models import RegulatoryChunk
 from onyx.db.regulatory_chunks import (
     get_chunk_snapshot_by_id,
     get_next_chunk_position,
-    has_active_structural_descendants,
+    load_active_structural_descendants,
 )
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.candidate_finder import find_candidates
 from onyx.regulatory.amendments.draft_integrity import (
+    explicit_replacement_body,
     reconcile_existing_heading_path,
     reject_unsupported_descendant_replacement,
     validate_explicit_replacements,
@@ -141,19 +142,25 @@ def load_instruction_draft_context(
         }
         target_position = get_next_chunk_position(db_session, target_user_file_id)
 
+    descendants = (
+        load_active_structural_descendants(db_session, old_chunk)
+        if old_chunk is not None
+        else []
+    )
+    snapshot = _chunk_to_review_dict(old_chunk) if old_chunk else {}
+    if descendants:
+        snapshot["descendant_snapshots"] = [
+            _chunk_to_review_dict(row) for row in descendants
+        ]
     return InstructionDraftContext(
         match=match,
-        old_chunk_snapshot=_chunk_to_review_dict(old_chunk) if old_chunk else {},
+        old_chunk_snapshot=snapshot,
         target_user_file_id=target_user_file_id,
         target_position=target_position,
         sibling_reference=sibling_reference,
         base_metadata=dict(old_chunk.chunk_metadata) if old_chunk else {},
         base_heading_path=list(old_chunk.heading_path) if old_chunk else [],
-        has_active_descendants=(
-            has_active_structural_descendants(db_session, old_chunk)
-            if old_chunk is not None
-            else False
-        ),
+        has_active_descendants=bool(descendants),
     )
 
 
@@ -301,10 +308,22 @@ def draft_instruction_group_proposal(
         raise ValueError(
             "Grouped amendment drafting requires one match per instruction"
         )
-    reject_unsupported_descendant_replacement(
-        instructions,
-        has_active_descendants=context.has_active_descendants,
+    full_replacement = any(
+        explicit_replacement_body(item.instruction_text) for item in instructions
     )
+    descendants = context.old_chunk_snapshot.get("descendant_snapshots") or []
+    if context.has_active_descendants and full_replacement and not descendants:
+        reject_unsupported_descendant_replacement(
+            instructions, has_active_descendants=True
+        )
+    if descendants and full_replacement:
+        from onyx.regulatory.amendments.draft_integrity import (
+            validate_complete_scope_replacement,
+        )
+
+        validate_complete_scope_replacement(
+            [item.instruction_text for item in instructions]
+        )
     old_chunk_ids = {match.old_chunk_id for match in matches}
     if len(old_chunk_ids) != 1:
         raise ValueError("Grouped amendment instructions must share one target chunk")

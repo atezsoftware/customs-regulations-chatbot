@@ -3,6 +3,8 @@ from __future__ import annotations
 import datetime
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, cast
@@ -852,6 +854,12 @@ def prepare_durable_context_view(
     cached: PreparedContextView | None = None,
     as_of_date: datetime.date | None = None,
     changed_ids: list[str] | None = None,
+    resolve_call: Callable[
+        [ContextGenerationCall, Callable[[], str]], ContextGenerationCall
+    ]
+    | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    max_workers: int = 1,
 ) -> PreparedContextView:
     """Freeze the existing durable transport's exact inputs and configuration.
 
@@ -936,7 +944,57 @@ def prepare_durable_context_view(
     calls: dict[str, ContextGenerationCall] = {}
     snapshots: dict[str, ContextSourceSnapshot] = {}
     projections: list[FrozenContextProjection] = []
-    for row in ordered:
+    if not 1 <= max_workers <= 4:
+        raise ValueError("context preparation concurrency must be between one and four")
+
+    def resolve(request: VertexBatchRequest) -> ContextGenerationCall:
+        request_hash = context_hash([request.request_hash, config_hash])
+        template = ContextGenerationCall(
+            request_sha256=request_hash,
+            stage="durable_chunk",
+            prompt_json=request.model_dump_json(),
+            config_sha256=config_hash,
+            output="",
+            source_text=request.prompt,
+            token_budget=_contextual_safe_input_limit(job),
+            tokenizer=f"{type(contextual_tokenizer).__module__}.{type(contextual_tokenizer).__qualname__}",
+            generation_path="durable",
+        )
+        prior = cached_calls.get(request_hash)
+        if prior is not None:
+            if prior.model_copy(update={"output": ""}) != template:
+                raise ContextualMappingError("cached context request proof changed")
+            return prior
+        return (
+            resolve_call(template, lambda: generate(request))
+            if resolve_call
+            else template.model_copy(update={"output": generate(request)})
+        )
+
+    def resolve_in_context(
+        context: Context, request: VertexBatchRequest
+    ) -> ContextGenerationCall:
+        return context.run(resolve, request)
+
+    def resolved_rows() -> Iterator[
+        tuple[RegulatoryChunk, ContextGenerationCall | None]
+    ]:
+        # Only a bounded window of prompts and provider calls exists at a time.
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for offset in range(0, len(ordered), max_workers):
+                window = ordered[offset : offset + max_workers]
+                pending = [
+                    executor.submit(
+                        resolve_in_context, copy_context(), factory.request(row)
+                    )
+                    if factory.reserve(row)
+                    else None
+                    for row in window
+                ]
+                for row, future in zip(window, pending, strict=True):
+                    yield row, future.result() if future is not None else None
+
+    for completed, (row, call) in enumerate(resolved_rows(), 1):
         source_snapshot = factory.source_snapshot(row)
         snapshot_hash = source_snapshot.sha256
         snapshots[snapshot_hash] = source_snapshot
@@ -946,39 +1004,27 @@ def prepare_durable_context_view(
         )
         request_hashes: list[str] = []
         output = ""
-        if factory.reserve(row):
-            request = factory.request(row)
-            request_hash = context_hash([request.request_hash, config_hash])
-            prior = cached_calls.get(request_hash)
-            raw_output = prior.output if prior is not None else generate(request)
-            if not raw_output.strip():
+        if call is not None:
+            if not call.output.strip():
                 raise ContextualMappingError("context_generation_incomplete")
             output, _ = fit_context_fields_to_embedding_budget(
                 title_prefix="",
                 content=row.text,
                 metadata_suffix="",
-                doc_summary=raw_output,
+                doc_summary=call.output,
                 chunk_context="",
                 tokenizer=embedding_tokenizer,
                 embedding_token_limit=DOC_EMBEDDING_CONTEXT_SIZE,
             )
             if not output:
                 raise ContextualMappingError("context_generation_incomplete")
-            calls[request_hash] = ContextGenerationCall(
-                request_sha256=request_hash,
-                stage="durable_chunk",
-                prompt_json=request.model_dump_json(),
-                config_sha256=config_hash,
-                output=raw_output,
-                source_text=request.prompt,
-                token_budget=_contextual_safe_input_limit(job),
-                tokenizer=f"{type(contextual_tokenizer).__module__}.{type(contextual_tokenizer).__qualname__}",
-                generation_path="durable",
-            )
-            request_hashes.append(request_hash)
+            calls[call.request_sha256] = call
+            request_hashes.append(call.request_sha256)
             item.status = RegulatoryIndexingItemStatus.CONTEXT_READY.value
             context_metadata: dict[str, object] = {"contextual_text": output}
             item.context = context_metadata
+        if progress is not None:
+            progress(completed, len(ordered))
         text = contextualized_embedding_text(row, item)
         texts = [text]
         if batch_config is None:

@@ -951,3 +951,75 @@ def test_expired_durable_view_prepares_retirement_without_encoder_or_generation(
     impact = compare_context_views(old=before, new=after, direct_canonical_changes=[])
     assert impact.ready and impact.retire_history == [row.id]
     assert not impact.embedding_changes and not impact.contextual_candidates
+
+
+def test_durable_review_context_has_bounded_parallelism_and_exact_cache_reuse() -> None:
+    from contextvars import ContextVar
+    from threading import Barrier
+    from unittest.mock import patch
+
+    from onyx.regulatory.indexing_jobs.contextual import (
+        ContextualRequestFactory,
+        prepare_durable_context_view,
+    )
+    from tests.unit.onyx.regulatory.indexing_jobs.test_contextual import _row
+
+    job, _, tokenizer = _durable_fixture()
+    rows = [
+        _row(
+            job,
+            row_id=str(index),
+            position=index,
+            text=f"Legal clause {index}",
+            heading_path=["EK-1"],
+        )
+        for index in range(8)
+    ]
+    for row in rows:
+        row.chunk_metadata = {}
+    barrier = Barrier(4, timeout=5)
+    tenant = ContextVar("test_review_context_tenant", default="wrong")
+    token = tenant.set("scoped-tenant")
+
+    def generate(_request: object) -> str:
+        assert tenant.get() == "scoped-tenant"
+        barrier.wait()
+        return "Verified context"
+
+    progress: list[tuple[int, int]] = []
+    try:
+        with (
+            patch.object(ContextualRequestFactory, "reserve", return_value=256),
+            patch(
+                "onyx.regulatory.indexing_jobs.contextual._contextual_safe_input_limit",
+                return_value=1200,
+            ),
+        ):
+            prepared = prepare_durable_context_view(
+                job=job,
+                rows=rows,
+                embedding_tokenizer=tokenizer,
+                contextual_tokenizer=tokenizer,
+                generate=generate,
+                embedding_model=_durable_embedding_model(),
+                max_workers=4,
+                progress=lambda completed, total: progress.append((completed, total)),
+            )
+            unused = MagicMock(
+                side_effect=AssertionError("completed prompts must not be regenerated")
+            )
+            replay = prepare_durable_context_view(
+                job=job,
+                rows=rows,
+                embedding_tokenizer=tokenizer,
+                contextual_tokenizer=tokenizer,
+                generate=unused,
+                embedding_model=_durable_embedding_model(),
+                max_workers=4,
+                cached=prepared,
+            )
+            assert prepared == replay
+            unused.assert_not_called()
+    finally:
+        tenant.reset(token)
+    assert progress == [(index, 8) for index in range(1, 9)]

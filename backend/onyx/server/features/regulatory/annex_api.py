@@ -27,8 +27,6 @@ from onyx.db.regulatory_annex_changes import (
     list_annex_review_revisions,
     queue_annex_publication,
     reject_annex_review,
-    require_current_annex_review,
-    revise_annex_review,
 )
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
@@ -36,7 +34,6 @@ from onyx.file_store.file_store import get_default_file_store
 from onyx.regulatory.amendments.annexes import config
 from onyx.regulatory.amendments.annexes.corrections import (
     read_frozen_evidence,
-    revalidate_annex_review,
 )
 from onyx.regulatory.amendments.annexes.models import AnnexChangeDraft
 from onyx.server.features.regulatory.models import (
@@ -178,8 +175,8 @@ def get_evidence(
     )
 
 
-@router.post("/batches/{batch_id}/annex-groups/{review_id}/edit")
-@router.post("/batches/{batch_id}/annex-groups/{review_id}/revalidate")
+@router.post("/batches/{batch_id}/annex-groups/{review_id}/edit", status_code=202)
+@router.post("/batches/{batch_id}/annex-groups/{review_id}/revalidate", status_code=202)
 def edit_group(
     batch_id: int,
     review_id: UUID,
@@ -187,42 +184,34 @@ def edit_group(
     user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> AnnexReviewSnapshot:
-    from onyx.llm.factory import get_default_llm, get_default_llm_with_vision
+    from onyx.background.celery.tasks.regulatory_amendments.annex_preparation import (
+        enqueue_review_preparation,
+    )
+    from onyx.db.regulatory_annex_preparation import queue_review_preparation
 
     _authorized_review(db_session, batch_id, review_id, user)
     try:
-        review = require_current_annex_review(
+        review = queue_review_preparation(
             db_session,
-            change_set_id=review_id,
+            review_id=review_id,
             expected_review_sha256=request.expected_review_sha256,
-            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
-        )
-        if (
-            review.status not in ("pending", "blocked", "rejected", "failed")
-            or review.publication_generation
-        ):
-            raise ValueError("review state does not allow edits")
-        draft = AnnexChangeDraft.model_validate(review.review_payload)
-        db_session.rollback()  # No database lock spans provider/context preparation.
-        draft = revalidate_annex_review(
-            draft=draft,
-            corrections=request.corrections
-            if request.corrections is not None
-            else draft.corrections,
+            corrections=request.corrections,
             corrected_by=user.id,
-            llm=get_default_llm(),
-            vision_llm=get_default_llm_with_vision(),
-        )
-        updated = revise_annex_review(
-            db_session,
-            change_set_id=review_id,
-            expected_review_sha256=request.expected_review_sha256,
-            draft=draft,
+            tenant_id=get_current_tenant_id(),
             environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
         )
-        return AnnexReviewSnapshot.model_validate(updated)
     except ValueError as exc:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    try:
+        enqueue_review_preparation(
+            review_id=review.id, tenant_id=get_current_tenant_id()
+        )
+    except Exception:
+        logger.exception(
+            "Annex review preparation dispatch deferred review=%s", review.id
+        )
+    return AnnexReviewSnapshot.model_validate(review)
 
 
 def _queue_review(
@@ -311,6 +300,24 @@ def retry_group(
         review.status in ("pending", "blocked", "rejected", "failed")
         and not review.publication_generation
     ):
+        draft = AnnexChangeDraft.model_validate(review.review_payload)
+        if (
+            draft.issues
+            or draft.publication is None
+            or (
+                review.preparation is not None
+                and review.preparation.status in ("queued", "running", "failed")
+            )
+        ):
+            return edit_group(
+                batch_id=batch_id,
+                review_id=review_id,
+                request=AnnexReviewEditRequest(
+                    expected_review_sha256=request.expected_review_sha256
+                ),
+                user=user,
+                db_session=db_session,
+            )
         from onyx.db.regulatory_annex_changes import resume_unpublished_annex_review
         from onyx.regulatory.amendments.annexes.analysis import (
             validate_live_review_configuration,

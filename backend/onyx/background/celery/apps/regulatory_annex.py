@@ -124,4 +124,5 @@ celery_app.conf.imports = (
     "onyx.background.celery.tasks.regulatory_amendments.sources",
     "onyx.background.celery.tasks.regulatory_amendments.tasks",
     "onyx.background.celery.tasks.regulatory_amendments.annex_publication",
+    "onyx.background.celery.tasks.regulatory_amendments.annex_preparation",
 )

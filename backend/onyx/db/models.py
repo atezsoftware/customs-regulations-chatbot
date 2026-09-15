@@ -8883,6 +8883,9 @@ class AnnexChangeSet(Base):
     status: Mapped[str] = mapped_column(Text, default="pending")
     review_sha256: Mapped[str] = mapped_column(Text)
     review_payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB)
+    preparation: Mapped["AnnexReviewPreparation | None"] = relationship(
+        foreign_keys="AnnexReviewPreparation.review_id", lazy="selectin"
+    )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     decided_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("user.id"), nullable=True
@@ -8912,6 +8915,45 @@ class AnnexChangeSet(Base):
         ),
         Index(
             "ix_annex_change_pending_publication",
+            "environment",
+            "status",
+            "heartbeat_at",
+        ),
+    )
+
+
+class AnnexReviewPreparation(Base):
+    """Resumable preparation of a new review; grants no publication authority."""
+
+    __tablename__ = "annex_review_preparation"
+    review_id: Mapped[UUID] = mapped_column(
+        ForeignKey("annex_change_set.id", ondelete="CASCADE"), primary_key=True
+    )
+    expected_review_sha256: Mapped[str] = mapped_column(Text)
+    request_sha256: Mapped[str] = mapped_column(Text)
+    corrections: Mapped[list[dict[str, Any]]] = mapped_column(PGJSONB)
+    corrected_by: Mapped[UUID] = mapped_column(ForeignKey("user.id"))
+    tenant_id: Mapped[str] = mapped_column(Text)
+    environment: Mapped[str] = mapped_column(Text)
+    database_identity: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    stage: Mapped[str] = mapped_column(Text)
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    heartbeat_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    checkpoint: Mapped[dict[str, Any] | None] = mapped_column(PGJSONB, nullable=True)
+    completed_chunks: Mapped[int] = mapped_column(Integer, default=0)
+    total_chunks: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_review_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("annex_change_set.id", ondelete="SET NULL"), nullable=True
+    )
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued', 'running', 'completed', 'failed')",
+            name="annex_review_preparation_status_check",
+        ),
+        Index(
+            "ix_annex_review_preparation_recovery",
             "environment",
             "status",
             "heartbeat_at",

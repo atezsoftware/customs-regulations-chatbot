@@ -102,6 +102,9 @@ function correctionsEqual(
 }
 
 function retryResultMessage(review: AnnexReview) {
+  if (["queued", "running"].includes(review.preparation?.status ?? "")) {
+    return "Review preparation is running in the background. You can leave this page.";
+  }
   if (review.status === "blocked") {
     return "Blocking checks remain; the review was not resumed.";
   }
@@ -469,7 +472,11 @@ export default function AnnexChangeReview({
   onEdit,
 }: AnnexChangeReviewProps) {
   const payload = review.review_payload;
-  const [working, setWorking] = useState(false);
+  const [submitting, setWorking] = useState(false);
+  const preparingReview = ["queued", "running"].includes(
+    review.preparation?.status ?? ""
+  );
+  const working = submitting || preparingReview;
   const [corrections, setCorrections] = useState<AnnexElementCorrection[]>(
     payload.corrections
   );
@@ -490,6 +497,7 @@ export default function AnnexChangeReview({
     [corrections]
   );
   const canEdit =
+    !preparingReview &&
     review.publication_generation === 0 &&
     ["pending", "blocked", "rejected", "failed"].includes(review.status) &&
     editableElements.length > 0;
@@ -501,6 +509,7 @@ export default function AnnexChangeReview({
   );
   const correctionsDirty = !correctionsEqual(corrections, payload.corrections);
   const frozenReviewReadyToApprove =
+    !preparingReview &&
     review.status === "pending" &&
     payload.issues.length === 0 &&
     payload.impact?.ready === true &&
@@ -562,7 +571,9 @@ export default function AnnexChangeReview({
           </Text>
         </div>
         <Tag
-          title={STATUS_LABELS[review.status]}
+          title={
+            preparingReview ? "Preparing review" : STATUS_LABELS[review.status]
+          }
           error={review.status === "blocked" || review.status === "failed"}
         />
       </div>
@@ -603,10 +614,22 @@ export default function AnnexChangeReview({
 
       <div role="status" className="rounded-08 border border-border-01 p-2">
         <Text as="p" font="main-ui-body" color="text-05">
-          {STATUS_DESCRIPTIONS[review.status]}
+          {preparingReview
+            ? "The revised annex evidence and affected chunk contexts are being prepared in the background."
+            : STATUS_DESCRIPTIONS[review.status]}
         </Text>
       </div>
 
+      {review.preparation && (
+        <div role="status">
+          <Text as="p" font="secondary-body" color="text-03">
+            {review.preparation.error_message ??
+              (preparingReview
+                ? `${review.preparation.stage.replaceAll("_", " ")}${review.preparation.total_chunks > 0 ? ` · ${review.preparation.completed_chunks}/${review.preparation.total_chunks} chunks` : ""}`
+                : "")}
+          </Text>
+        </div>
+      )}
       {review.error_message && (
         <div
           role="alert"
@@ -948,7 +971,7 @@ export default function AnnexChangeReview({
                               review.review_sha256,
                               corrections
                             ),
-                      "A new immutable review revision was created."
+                      retryResultMessage
                     )
                   }
                 >

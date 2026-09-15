@@ -52,6 +52,7 @@ from onyx.db.regulatory_amendments import (
     queue_amendment_proposal_approval,
     reject_proposal,
     reset_amendment_proposal_approval,
+    reset_batch_attention_for_retry,
     reset_failed_batch_for_retry,
     retry_amendment_proposal_projection,
 )
@@ -725,9 +726,11 @@ def retry_amendment_analysis(
     _get_editable_document_set(db_session, batch.document_set_id, user)
     retried = reset_failed_batch_for_retry(db_session, batch_id=batch_id)
     if retried is None:
+        retried = reset_batch_attention_for_retry(db_session, batch_id=batch_id)
+    if retried is None:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
-            "Only failed amendment batches can be retried.",
+            "Only failed batches or completed batches with unresolved instructions can be retried.",
         )
     try:
         enqueue_amendment_batch(batch_id=batch_id, tenant_id=tenant_id)

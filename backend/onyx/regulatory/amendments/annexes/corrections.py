@@ -314,7 +314,16 @@ def revalidate_annex_review(
             llm=llm,
             vision_llm=vision_llm,
         )
-        return prepared.model_copy(update={"date_resolution": draft.date_resolution})
+        prepared = prepared.model_copy(
+            update={"date_resolution": draft.date_resolution}
+        )
+        if prepared.impact is not None and not prepared.issues:
+            from onyx.regulatory.amendments.annexes.publication_preparation import (
+                prepare_publication_review,
+            )
+
+            prepared = prepare_publication_review(prepared)
+        return prepared
     user_file_id, source_package_id, baseline, old_extraction = (
         draft.user_file_id,
         draft.source_package_id,

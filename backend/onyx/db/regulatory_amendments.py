@@ -31,6 +31,7 @@ from onyx.db.models import (
 from onyx.db.regulatory_chunks import (
     has_active_structural_descendants,
     is_hierarchical_aggregate_chunk,
+    load_active_structural_descendants,
     make_regulatory_chunk_id,
     supersede_hierarchical_aggregates_referencing_chunk,
 )
@@ -1084,6 +1085,7 @@ def approve_amendment_proposal(
         raise ValueError("effective_end_date must be after effective_start_date")
 
     old_chunk: RegulatoryChunk | None = None
+    replaced_descendants: list[RegulatoryChunk] = []
     if proposal.old_chunk_id:
         old_chunk = db_session.scalar(
             select(RegulatoryChunk)
@@ -1108,12 +1110,45 @@ def approve_amendment_proposal(
         )
         instruction_texts = _proposal_instruction_texts(proposal)
         if any(explicit_replacement_body(text) for text in instruction_texts):
-            reject_unsupported_descendant_replacement_texts(
-                instruction_texts,
-                has_active_descendants=has_active_structural_descendants(
-                    db_session, old_chunk
-                ),
+            from onyx.regulatory.amendments.draft_integrity import (
+                validate_complete_scope_replacement,
             )
+
+            snapshots = proposal.old_chunk_snapshot.get("descendant_snapshots") or []
+            if snapshots:
+                validate_complete_scope_replacement(instruction_texts)
+                live = load_active_structural_descendants(db_session, old_chunk)
+                if {row.id for row in live} != {item["id"] for item in snapshots}:
+                    raise ValueError(
+                        "Descendant scope changed after review; reanalyze before approval."
+                    )
+                locked = list(
+                    db_session.scalars(
+                        select(RegulatoryChunk)
+                        .where(RegulatoryChunk.id.in_([row.id for row in live]))
+                        .order_by(RegulatoryChunk.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                )
+                by_id = {item["id"]: item for item in snapshots}
+                for row in locked:
+                    _ensure_old_chunk_matches_review_snapshot(row, by_id[row.id])
+                    if (
+                        row.validity_start_date is not None
+                        and row.validity_start_date >= start_date
+                    ):
+                        raise ValueError(
+                            "Replacement date does not follow the existing descendant's start date."
+                        )
+                replaced_descendants = locked
+            else:
+                reject_unsupported_descendant_replacement_texts(
+                    instruction_texts,
+                    has_active_descendants=has_active_structural_descendants(
+                        db_session, old_chunk
+                    ),
+                )
 
     new_chunk_metadata = dict(draft.get("metadata") or {})
     # Model-authored references do not grant access to source images or elements.
@@ -1180,6 +1215,18 @@ def approve_amendment_proposal(
         old_chunk.superseded_by_chunk_id = new_chunk.id
         db_session.add(old_chunk)
 
+    for descendant in replaced_descendants:
+        supersede_hierarchical_aggregates_referencing_chunk(
+            db_session,
+            user_file_id=user_file_id,
+            source_chunk_id=descendant.id,
+            superseded_at=start_date,
+        )
+        descendant.status = RegulatoryChunkStatus.SUPERSEDED.value
+        descendant.validity_end_date = start_date
+        descendant.superseded_by_chunk_id = new_chunk.id
+        db_session.add(descendant)
+
     proposal.new_chunk_draft = draft
     proposal.status = AmendmentProposalStatus.APPROVING.value
     proposal.applied_new_chunk_id = new_chunk.id
@@ -1191,3 +1238,69 @@ def approve_amendment_proposal(
     db_session.flush()
 
     return ApprovalResult(proposal=proposal, new_chunk=new_chunk, old_chunk=old_chunk)
+
+
+def reset_batch_attention_for_retry(
+    db_session: Session, *, batch_id: int
+) -> AmendmentBatch | None:
+    """Reopen only unmatched instructions, preserving every existing proposal/review."""
+    from onyx.db.models import AnnexChangeSet
+
+    batch = _get_batch_for_update(db_session, batch_id)
+    if (
+        batch is None
+        or batch.status != AmendmentBatchStatus.ANALYZED.value
+        or not batch.unmatched_instructions
+        or batch.superseded_by_batch_id is not None
+    ):
+        db_session.rollback()
+        return None
+    protected = {
+        index
+        for indices in db_session.scalars(
+            select(AmendmentProposal.instruction_indices).where(
+                AmendmentProposal.batch_id == batch_id
+            )
+        )
+        for index in indices
+    }
+    protected.update(
+        db_session.scalars(
+            select(AmendmentProposal.instruction_index).where(
+                AmendmentProposal.batch_id == batch_id
+            )
+        )
+    )
+    protected.update(
+        index
+        for indices in db_session.scalars(
+            select(AnnexChangeSet.instruction_indices).where(
+                AnnexChangeSet.batch_id == batch_id
+            )
+        )
+        for index in indices
+    )
+    reopened: set[int] = set()
+    for attention in batch.unmatched_instructions:
+        matches = [
+            index
+            for index, instruction in enumerate(batch.segmented_instructions or [])
+            if (body := instruction.get("instruction_text"))
+            and (attention == body or attention.startswith(body + "\n\n"))
+        ]
+        if len(matches) != 1 or matches[0] in protected:
+            db_session.rollback()
+            return None
+        reopened.add(matches[0])
+    remaining = _processed_instruction_indices(batch) - reopened
+    batch.processed_instruction_indices = sorted(remaining)
+    batch.processed_instruction_count = len(remaining)
+    batch.unmatched_instructions = []
+    batch.status = AmendmentBatchStatus.QUEUED.value
+    batch.stage = AmendmentBatchStage.PROCESSING.value
+    batch.lease_generation += 1
+    batch.error_message = None
+    batch.heartbeat_at = None
+    batch.completed_at = None
+    db_session.commit()
+    return batch

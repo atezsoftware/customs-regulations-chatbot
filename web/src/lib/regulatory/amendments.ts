@@ -314,7 +314,7 @@ export interface AnnexReviewPayload {
     rationale: string;
     input_sha256: string | null;
   } | null;
-  baseline_scope: AnnexCanonicalSnapshot[];
+  baseline_scope?: AnnexCanonicalSnapshot[];
   comparison: {
     changes: AnnexDifference[];
     issues: string[];
@@ -389,6 +389,14 @@ export interface AnnexReview {
   status: AnnexReviewStatus;
   review_sha256: string;
   publication_generation: number;
+  preparation?: {
+    status: "queued" | "running" | "completed" | "failed";
+    stage: string;
+    completed_chunks: number;
+    total_chunks: number;
+    error_message: string | null;
+    result_review_id: string | null;
+  } | null;
   review_payload: AnnexReviewPayload;
   error_message: string | null;
   created_at: string;
