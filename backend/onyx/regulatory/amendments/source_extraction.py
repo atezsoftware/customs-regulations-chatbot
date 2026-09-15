@@ -1,6 +1,8 @@
 """Normalize one amendment HTML, PDF, or DOCX source into reviewable text."""
 
 import atexit
+import base64
+import binascii
 import io
 import os
 import re
@@ -9,16 +11,19 @@ import zipfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING, Literal, cast
+from urllib.parse import urljoin, urlsplit
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from docx import Document
 from docx.opc.exceptions import OpcError
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from requests.utils import DEFAULT_CA_BUNDLE_PATH
+
+if TYPE_CHECKING:
+    from onyx.llm.interfaces import LLM
 
 from onyx.configs.app_configs import (
     MAX_AMENDMENT_SOURCE_BYTES,
@@ -43,6 +48,15 @@ _MAX_AMENDMENT_DOCX_EXPANDED_BYTES = 50 * 1024 * 1024
 _MAX_AMENDMENT_DOCX_XML_BYTES = 10 * 1024 * 1024
 _DOCX_HEADING_STYLE_PATTERN = re.compile(r"Heading ([1-9])")
 _NON_CONTENT_TAGS = ("script", "style", "template", "noscript", "nav", "footer")
+_DECORATIVE_IMAGE_PATTERN = re.compile(
+    r"(logo|icon|favicon|sprite|pixel|spacer|badge|avatar)", re.IGNORECASE
+)
+_MIN_DESCRIBED_IMAGE_DIMENSION_PX = 40
+_MAX_DESCRIBED_IMAGES = 6
+_MAX_IMAGE_DOWNLOAD_BYTES = 15 * 1024 * 1024
+_MAX_DESCRIBED_PDF_LINKS = 3
+_MAX_DESCRIBED_PDF_PAGES = 5
+_PDF_LINK_PATTERN = re.compile(r"\.pdf(?:[?#]|$)", re.IGNORECASE)
 _AMENDMENT_SOURCE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -116,14 +130,226 @@ def _normalize_text(text: str) -> str:
     return normalized
 
 
-def extract_amendment_html(content: bytes, content_type: str | None) -> str:
-    """Extract readable main/body text while discarding common page chrome."""
+def _is_decorative_image(img: Tag) -> bool:
+    """Skip logos/icons/tracking pixels — not the scanned/charted content
+    amendments actually embed."""
+    src = str(img.get("src") or "")
+    alt = str(img.get("alt") or "")
+    if _DECORATIVE_IMAGE_PATTERN.search(src) or _DECORATIVE_IMAGE_PATTERN.search(alt):
+        return True
+    for attr in ("width", "height"):
+        raw_value = img.get(attr)
+        if raw_value is None:
+            continue
+        digits = re.sub(r"[^0-9]", "", str(raw_value))
+        if digits and int(digits) < _MIN_DESCRIBED_IMAGE_DIMENSION_PX:
+            return True
+    return False
+
+
+def _download_embedded_asset_bytes(url: str, *, max_bytes: int) -> bytes | None:
+    """Best-effort bounded download for an <img>/<a> target discovered inline
+    in an amendment source page. Never raises — callers treat None as
+    "skip this one", not as a reason to fail the surrounding extraction."""
+    if url.startswith("data:"):
+        _, _, encoded = url.partition(",")
+        if ";base64" not in url or not encoded:
+            return None
+        try:
+            return base64.b64decode(encoded)
+        except (binascii.Error, ValueError):
+            return None
+    try:
+        options = amendment_source_http_options(url)
+        response = ssrf_safe_get(
+            url,
+            headers=options.headers,
+            timeout=_URL_TIMEOUT_SECONDS,
+            stream=True,
+            verify=options.verify,
+        )
+        response.raise_for_status()
+        payload = bytearray()
+        for chunk in response.iter_content(_DOWNLOAD_CHUNK_SIZE):
+            if not chunk:
+                continue
+            payload.extend(chunk)
+            if len(payload) > max_bytes:
+                return None
+        return bytes(payload) if payload else None
+    except Exception:
+        return None
+
+
+def _describe_pdf_bytes(content: bytes, *, llm: "LLM", label: str) -> str | None:
+    """Text layer when there is one (verbatim — the most faithful reading of
+    "add it in exactly, fully"); otherwise render pages and describe each via
+    vision. Returns None on any failure — best-effort, same as images."""
+    try:
+        extracted_text = extract_file_text(io.BytesIO(content), label, extension=".pdf")
+    except Exception:
+        extracted_text = ""
+    if (
+        extracted_text.strip()
+        and len(extracted_text.strip()) >= MIN_AMENDMENT_PDF_TEXT_CHARS
+    ):
+        return extracted_text.strip()
+
+    from onyx.file_processing.image_summarization import (
+        summarize_image_with_error_handling,
+    )
+    from onyx.regulatory.amendments.annexes.rendering import render_annex_pages
+    from onyx.utils.process_isolation import run_in_isolated_process
+
+    try:
+        rendered_pages = run_in_isolated_process(
+            render_annex_pages, content, "application/pdf", timeout=30
+        )
+    except Exception:
+        return None
+
+    page_descriptions: list[str] = []
+    for page in rendered_pages[:_MAX_DESCRIBED_PDF_PAGES]:
+        description = summarize_image_with_error_handling(
+            llm,
+            page.png,
+            f"{label} (sayfa {page.page})",
+        )
+        if description:
+            page_descriptions.append(f"Sayfa {page.page}: {description}")
+    if not page_descriptions:
+        return None
+    return "\n\n".join(page_descriptions)
+
+
+def _describe_linked_pdfs(root: Tag, base_url: str, *, llm: "LLM") -> str:
+    """Best-effort: fetch and describe PDF attachments linked from the page
+    (not just images) so a scanned/annex PDF's content reaches analysis
+    alongside the page's own prose instead of silently vanishing."""
+    seen_urls: set[str] = set()
+    candidates: list[str] = []
+    for link in root.find_all("a"):
+        href = link.get("href")
+        if not href or not _PDF_LINK_PATTERN.search(str(href)):
+            continue
+        resolved = urljoin(base_url, str(href))
+        if resolved in seen_urls:
+            continue
+        seen_urls.add(resolved)
+        candidates.append(resolved)
+        if len(candidates) >= _MAX_DESCRIBED_PDF_LINKS:
+            break
+    if not candidates:
+        return ""
+
+    descriptions: list[str] = []
+    for url in candidates:
+        content = _download_embedded_asset_bytes(
+            url, max_bytes=MAX_AMENDMENT_SOURCE_BYTES
+        )
+        if not content or not has_pdf_signature(content):
+            continue
+        label = title_from_url(url) or url
+        description = _describe_pdf_bytes(content, llm=llm, label=label)
+        if description:
+            descriptions.append(f"[Ekli PDF: {label}]\n{description}")
+
+    if not descriptions:
+        return ""
+    return "--- Ekli PDF içerikleri ---\n\n" + "\n\n".join(descriptions)
+
+
+def _describe_embedded_images(root: Tag, base_url: str, *, llm: "LLM") -> str:
+    """Best-effort: describe qualifying <img> elements via a vision LLM so
+    charts/scanned content embedded in the source page reach the same
+    analysis text the segmenter reads, not just the surrounding prose."""
+    images = [
+        img
+        for img in root.find_all("img")
+        if img.get("src") and not _is_decorative_image(img)
+    ][:_MAX_DESCRIBED_IMAGES]
+    if not images:
+        return ""
+
+    from onyx.file_processing.image_summarization import (
+        summarize_image_with_error_handling,
+    )
+
+    descriptions: list[str] = []
+    for img in images:
+        src = urljoin(base_url, str(img.get("src")))
+        image_bytes = _download_embedded_asset_bytes(
+            src, max_bytes=_MAX_IMAGE_DOWNLOAD_BYTES
+        )
+        if not image_bytes:
+            continue
+        label = str(img.get("alt") or "").strip() or src
+        description = summarize_image_with_error_handling(llm, image_bytes, label)
+        if description:
+            descriptions.append(f"[Gömülü görsel: {label}]\n{description}")
+
+    if not descriptions:
+        return ""
+    return "--- Gömülü görsel açıklamaları ---\n\n" + "\n\n".join(descriptions)
+
+
+def _describe_embedded_media(root: Tag, base_url: str) -> str:
+    """Describe both inline <img> elements and linked PDF attachments so
+    everything an amendment page embeds — not just its surrounding prose —
+    reaches the same text the segmenter analyzes.
+
+    Best-effort throughout: any failure (no vision provider configured,
+    download error, render error, unsupported format) silently contributes
+    nothing rather than failing the underlying text extraction.
+    """
+    has_images = any(
+        img.get("src") and not _is_decorative_image(img) for img in root.find_all("img")
+    )
+    has_pdf_links = any(
+        link.get("href") and _PDF_LINK_PATTERN.search(str(link.get("href")))
+        for link in root.find_all("a")
+    )
+    if not has_images and not has_pdf_links:
+        return ""
+
+    from onyx.llm.factory import get_default_llm_with_vision
+
+    llm = get_default_llm_with_vision()
+    if llm is None:
+        return ""
+
+    blocks = [
+        block
+        for block in (
+            _describe_embedded_images(root, base_url, llm=llm),
+            _describe_linked_pdfs(root, base_url, llm=llm),
+        )
+        if block
+    ]
+    return "\n\n".join(blocks)
+
+
+def extract_amendment_html(
+    content: bytes, content_type: str | None, *, base_url: str | None = None
+) -> str:
+    """Extract readable main/body text while discarding common page chrome.
+
+    When ``base_url`` is supplied, non-decorative <img> elements and linked
+    PDF attachments are also described (best-effort, via a vision LLM) and
+    appended, so an amendment page's embedded charts/scans/attachments reach
+    analysis alongside its prose instead of silently vanishing.
+    """
     soup = BeautifulSoup(decode_html_bytes(content, content_type), "html.parser")
     for tag in soup.find_all(_NON_CONTENT_TAGS):
         tag.decompose()
 
-    root = soup.find("main") or soup.find("article") or soup.body or soup
-    return _normalize_text(root.get_text("\n\n", strip=True))
+    root = cast(Tag, soup.find("main") or soup.find("article") or soup.body or soup)
+    text = root.get_text("\n\n", strip=True)
+    if base_url is not None:
+        media_descriptions = _describe_embedded_media(root, base_url)
+        if media_descriptions:
+            text = f"{text}\n\n{media_descriptions}"
+    return _normalize_text(text)
 
 
 def extract_amendment_pdf(content: bytes, file_name: str) -> str:
@@ -299,7 +525,7 @@ def fetch_and_extract_amendment_url(url: str) -> AmendmentSourceExtraction:
             "The URL must point to an HTML page or PDF document."
         )
     return AmendmentSourceExtraction(
-        text=extract_amendment_html(content, content_type),
+        text=extract_amendment_html(content, content_type, base_url=final_url),
         source_type="html",
         display_name=display_name,
     )

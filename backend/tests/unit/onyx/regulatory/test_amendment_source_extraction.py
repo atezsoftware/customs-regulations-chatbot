@@ -4,6 +4,7 @@ import sys
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from docx import Document
@@ -119,6 +120,133 @@ def test_extract_amendment_html_honors_declared_turkish_charset() -> None:
     result = extract_amendment_html(content, "text/html")
 
     assert result == "16 Kasım TEBLİĞ"
+
+
+def test_extract_amendment_html_ignores_images_without_base_url() -> None:
+    result = extract_amendment_html(
+        b"<html><main><p>MADDE 1- Yeni metin.</p>"
+        b'<img src="chart.png" alt="Tarife tablosu"></main></html>',
+        "text/html",
+    )
+
+    assert result == "MADDE 1- Yeni metin."
+
+
+def test_extract_amendment_html_describes_embedded_image_when_base_url_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
+    )
+    monkeypatch.setattr(
+        source_extraction,
+        "_download_embedded_asset_bytes",
+        lambda *_args, **_kwargs: b"fake-image-bytes",
+    )
+    monkeypatch.setattr(
+        "onyx.file_processing.image_summarization.summarize_image_with_error_handling",
+        lambda *_args, **_kwargs: "Tarife tablosunu gösteren bir grafik.",
+    )
+
+    result = extract_amendment_html(
+        b"<html><main><p>MADDE 1- Yeni metin.</p>"
+        b'<img src="chart.png" alt="Tarife tablosu"></main></html>',
+        "text/html",
+        base_url="https://example.gov/update",
+    )
+
+    assert "MADDE 1- Yeni metin." in result
+    assert "Gömülü görsel" in result
+    assert "Tarife tablosunu gösteren bir grafik." in result
+
+
+def test_extract_amendment_html_skips_decorative_images(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        "onyx.llm.factory.get_default_llm_with_vision",
+        lambda: calls.append("called") or object(),
+    )
+
+    result = extract_amendment_html(
+        b"<html><main><p>MADDE 1- Yeni metin.</p>"
+        b'<img src="site-logo.png" alt="logo"></main></html>',
+        "text/html",
+        base_url="https://example.gov/update",
+    )
+
+    assert result == "MADDE 1- Yeni metin."
+    assert calls == []
+
+
+def test_extract_amendment_html_describes_linked_pdf_text_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
+    )
+    monkeypatch.setattr(
+        source_extraction,
+        "_download_embedded_asset_bytes",
+        lambda *_args, **_kwargs: b"%PDF-1.7 fake pdf bytes",
+    )
+    monkeypatch.setattr(
+        source_extraction,
+        "extract_file_text",
+        lambda *_args, **_kwargs: "EK-1: Yeni tarife listesi burada yer alır." * 3,
+    )
+    render_calls = []
+    monkeypatch.setattr(
+        "onyx.utils.process_isolation.run_in_isolated_process",
+        lambda *args, **kwargs: render_calls.append((args, kwargs)),
+    )
+
+    result = extract_amendment_html(
+        b"<html><main><p>MADDE 1- Yeni metin.</p>"
+        b'<a href="ek1.pdf">Ekleri icin tiklayiniz</a></main></html>',
+        "text/html",
+        base_url="https://example.gov/update",
+    )
+
+    assert "Ekli PDF" in result
+    assert "EK-1: Yeni tarife listesi burada yer alır." in result
+    assert render_calls == []
+
+
+def test_extract_amendment_html_describes_linked_pdf_via_vision_without_text_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
+    )
+    monkeypatch.setattr(
+        source_extraction,
+        "_download_embedded_asset_bytes",
+        lambda *_args, **_kwargs: b"%PDF-1.7 fake scanned pdf",
+    )
+    monkeypatch.setattr(
+        source_extraction, "extract_file_text", lambda *_args, **_kwargs: ""
+    )
+    monkeypatch.setattr(
+        "onyx.utils.process_isolation.run_in_isolated_process",
+        lambda *_args, **_kwargs: [SimpleNamespace(page=1, png=b"fake-page-png")],
+    )
+    monkeypatch.setattr(
+        "onyx.file_processing.image_summarization.summarize_image_with_error_handling",
+        lambda *_args, **_kwargs: "Taranmış ek: yeni gümrük tarife tablosu.",
+    )
+
+    result = extract_amendment_html(
+        b"<html><main><p>MADDE 1- Yeni metin.</p>"
+        b'<a href="ek1.pdf">Ekleri icin tiklayiniz</a></main></html>',
+        "text/html",
+        base_url="https://example.gov/update",
+    )
+
+    assert "Ekli PDF" in result
+    assert "Sayfa 1" in result
+    assert "Taranmış ek: yeni gümrük tarife tablosu." in result
 
 
 def test_extract_amendment_pdf_rejects_empty_text(
