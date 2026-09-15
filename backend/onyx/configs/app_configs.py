@@ -1676,9 +1676,11 @@ MAX_FILE_SIZE_BYTES = int(
 # One-off amendment sources are synchronously extracted and then sent to the
 # default LLM. Keep their network and prompt footprint bounded independently
 # from normal user-file ingestion.
-REGULATORY_ANNEX_UPDATES_ENABLED = (
-    os.environ.get("REGULATORY_ANNEX_UPDATES_ENABLED", "false").lower() == "true"
-)
+#
+# Always on: this used to depend on an environment variable that a separate
+# infra repo's Helm values file controlled, which meant the feature could be
+# silently disabled by state nobody here could see or wanted to touch.
+REGULATORY_ANNEX_UPDATES_ENABLED = True
 REGULATORY_ANNEX_ENVIRONMENT = (
     os.environ.get("REGULATORY_ANNEX_ENVIRONMENT") or POSTGRES_DB
 )

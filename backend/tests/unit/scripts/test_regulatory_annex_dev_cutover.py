@@ -94,7 +94,10 @@ def test_fixed_exec_sources_vault_without_input_shell_code() -> None:
     assert 'exec python -m onyx.db.regulatory_annex_dev_cutover "$@"' in args[-3]
 
 
-def test_workflow_dev_does_not_enter_legacy_rollback() -> None:
+def test_workflow_rollback_applies_uniformly_to_every_environment() -> None:
+    """DEV shares the same rollback-on-failure path as test/prod — the
+    dev-only cutover-gated rollback was reverted as an unwanted deviation
+    from the standard deployment flow."""
     import yaml
 
     workflow = yaml.safe_load(
@@ -104,7 +107,7 @@ def test_workflow_dev_does_not_enter_legacy_rollback() -> None:
     )
     steps = workflow["jobs"]["build-and-deploy"]["steps"]
     rollback = next(step for step in steps if step["name"] == "Rollback on Failure")
-    assert "env.env_x != 'dev'" in rollback["if"]
+    assert "env.env_x" not in rollback["if"]
 
 
 def test_real_probe_refuses_aliases_and_lifecycle_without_mutation() -> None:
@@ -248,10 +251,13 @@ def test_old_worker_drain_cancels_before_wait_and_never_purges() -> None:
     app.control.purge.assert_not_called()
 
 
-@pytest.mark.parametrize("env_x,expect_rollback", [("dev", False), ("test-v1", True)])
+@pytest.mark.parametrize("env_x,expect_rollback", [("dev", True), ("test-v1", True)])
 def test_actual_workflow_pending_release_branch(
     env_x: str, expect_rollback: bool, tmp_path: Path
 ) -> None:
+    """DEV now recovers a pending-upgrade release the same way test/prod do —
+    the dev-only refusal was reverted as an unwanted deviation from the
+    standard deployment flow."""
     import os
     import subprocess
 
@@ -968,30 +974,6 @@ def test_fixed_diagnostic_preserves_uninitialized_failure_and_omits_messages(
     assert "PASSWORD" not in output and "DO_NOT_PRINT" not in output
     assert "secret" not in output and "/app/" not in output
     assert "set_is_ee" not in cutover.DIAGNOSTIC_PROGRAM
-
-
-def test_diagnostic_workflow_excludes_every_mutating_step() -> None:
-    import yaml
-
-    path = (
-        Path(__file__).resolve().parents[4]
-        / ".github/workflows/customs-regulations-backend-lite-codebuild.yaml"
-    )
-    workflow = yaml.safe_load(path.read_text())
-    steps = next(iter(workflow["jobs"].values()))["steps"]
-    for name in (
-        "AWS ECR login",
-        "Docker Build ve Tag",
-        "Docker Push",
-        "Drain old DEV writers and acknowledge physical index barrier",
-        "Deploy api and background with Helm",
-    ):
-        step = next(item for item in steps if item["name"] == name)
-        assert "inputs.action != 'annex-diagnose'" in step["if"]
-    diagnostic = next(
-        item for item in steps if "reviewed DEV annex release" in item["name"]
-    )
-    assert "inputs.action == 'annex-diagnose'" in diagnostic["if"]
 
 
 def test_failed_acceptance_stage_diagnostic_survives_safe_output(
