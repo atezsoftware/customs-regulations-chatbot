@@ -40,6 +40,7 @@ function reviewFixture(overrides: Partial<AnnexReview> = {}): AnnexReview {
       original_source_text_sha256: "d".repeat(64),
       submitted_source_text: "EK-1 ekteki şekilde değiştirilmiştir.",
       raw_new_extraction: null,
+      old_evidence_kind: "visual",
       old_extraction: {
         evidence_view: {
           sha256: "old-view",

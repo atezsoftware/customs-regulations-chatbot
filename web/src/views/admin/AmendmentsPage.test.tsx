@@ -677,6 +677,7 @@ test("renders a grouped blocked review from the real analysis response shape", a
       original_source_text_sha256: null,
       submitted_source_text: "EK-1 ekteki şekilde değiştirilmiştir.",
       raw_new_extraction: null,
+      old_evidence_kind: "visual",
       old_extraction: null,
       new_extraction: null,
       corrections: [],

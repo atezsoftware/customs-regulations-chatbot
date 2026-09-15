@@ -131,3 +131,10 @@ export function retryLabelingRun(
 ): Promise<LabelingRun> {
   return postJson(`${labelingBaseUrl(documentSetId)}/runs/${runId}/retry`);
 }
+
+export function resumeLabelingRun(
+  documentSetId: number,
+  runId: string
+): Promise<LabelingRun> {
+  return postJson(`${labelingBaseUrl(documentSetId)}/runs/${runId}/resume`);
+}

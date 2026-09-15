@@ -12,6 +12,7 @@ from onyx.db import regulatory_labeling as repository
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.labeling_configuration import (
     LabelingProviderBinding,
+    LabelingStorageConfigurationError,
     resolve_labeling_gateway,
 )
 from onyx.db.models import RegulatoryLabelingItem
@@ -922,6 +923,14 @@ def run_labeling_step(
         return _cancel(lease, gateway)
     except repository.LabelingStateConflictError:
         return LabelingStepResult(run_id=run_id, outcome=LabelingStepOutcome.SKIPPED)
+    except LabelingStorageConfigurationError as error:
+        try:
+            _release(lease, retry_after_seconds=60, error=str(error))
+        except repository.LabelingStateConflictError:
+            return LabelingStepResult(
+                run_id=run_id, outcome=LabelingStepOutcome.SKIPPED
+            )
+        return _next(lease, countdown_seconds=60)
     except Exception as error:
         logger.exception("Durable regulatory labeling step failed")
         try:

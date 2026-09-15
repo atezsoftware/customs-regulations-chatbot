@@ -92,7 +92,9 @@ def test_combined_draft_prompt_contains_each_instruction_and_returns_one_proposa
     assert "period row" in (proposal.match_rationale or "")
 
 
-def _article_20_context() -> pipeline.InstructionDraftContext:
+def _article_20_context(
+    *, has_active_descendants: bool = False
+) -> pipeline.InstructionDraftContext:
     heading_path = [
         "GÜMRÜK GENEL TEBLİĞİ (TIR İşlemleri) (Seri No: 1)",
         "ÜÇÜNCÜ BÖLÜM",
@@ -120,6 +122,7 @@ def _article_20_context() -> pipeline.InstructionDraftContext:
         sibling_reference=None,
         base_metadata=metadata,
         base_heading_path=heading_path,
+        has_active_descendants=has_active_descendants,
     )
 
 
@@ -191,39 +194,29 @@ def test_existing_chunk_type_and_heading_follow_the_amended_text() -> None:
     assert proposal.new_chunk_draft["metadata"]["heading_path"] == expected_heading
 
 
-def test_full_replacement_of_parent_with_active_descendants_drafts_only_that_chunk(
+def test_incomplete_full_replacement_of_parent_with_descendants_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A paragraph-level replacement must not be blocked by separately chunked
-    child clauses (a), b) rows) — only the matched parent chunk is drafted;
-    siblings/descendants are left untouched."""
-
-    body = "(3) Yediden fazla idare için: a) Birinci yöntem... b) İkinci yöntem..."
     instruction = AmendmentInstruction(
         instruction_text=(
             "20 nci maddenin üçüncü fıkrası aşağıdaki şekilde değiştirilmiştir. "
-            f"“{body}”"
+            "“(3) Yediden fazla idare için: a) Birinci yöntem... b) İkinci yöntem...”"
         )
     )
-    generated = DraftResult(
-        new_chunk=ChunkFieldsDraft(text=f"**MADDE 20 -** {body}"),
-        dates=DateResolution(rationale="publication date"),
-    )
-    generate_structured = MagicMock(return_value=generated)
+    generate_structured = MagicMock()
     monkeypatch.setattr(drafter, "generate_structured", generate_structured)
 
-    proposal = pipeline.draft_instruction_group_proposal(
-        MagicMock(),
-        instruction_indices=[0],
-        instructions=[instruction],
-        matches=[_article_20_context().match],
-        reference_date="2026-07-04",
-        context=_article_20_context(),
-    )
+    with pytest.raises(DraftIntegrityError, match="descendant chunks"):
+        pipeline.draft_instruction_group_proposal(
+            MagicMock(),
+            instruction_indices=[0],
+            instructions=[instruction],
+            matches=[_article_20_context(has_active_descendants=True).match],
+            reference_date="2026-07-04",
+            context=_article_20_context(has_active_descendants=True),
+        )
 
-    generate_structured.assert_called_once()
-    assert proposal.old_chunk_id == "article-20-v2"
-    assert body in proposal.new_chunk_draft["text"]
+    generate_structured.assert_not_called()
 
 
 @pytest.mark.parametrize(

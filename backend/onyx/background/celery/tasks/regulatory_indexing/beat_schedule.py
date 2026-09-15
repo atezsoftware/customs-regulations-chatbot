@@ -14,6 +14,20 @@ from onyx.regulatory.amendments.annexes import config as annex_config
 # must not dispatch connector ingestion or generic document-indexing work.
 PRODUCTION_LITE_TASK_TEMPLATES: tuple[dict[str, Any], ...] = (
     {
+        "name": "recover-amendment-sources",
+        "task": "recover_amendment_sources",
+        "schedule": timedelta(minutes=1),
+        "kwargs": {
+            "environment": annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+            "database_identity": annex_config.ANNEX_DATABASE_IDENTITY,
+        },
+        "options": {
+            "priority": OnyxCeleryPriority.LOW,
+            "expires": 60,
+            "queue": annex_config.publication_queue_name(),
+        },
+    },
+    {
         "name": "recover-annex-publications",
         "task": "recover_annex_publications",
         "schedule": timedelta(minutes=1),

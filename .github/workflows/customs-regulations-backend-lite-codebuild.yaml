@@ -171,6 +171,15 @@ jobs:
         run: |
           aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
+      - name: Render required DEV runtime configuration
+        if: env.env_x == 'dev'
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/regulatory-runtime-values
+          /tmp/regulatory-runtime-values/bin/pip install --quiet PyYAML==6.0.2
+          PYTHONPATH=backend /tmp/regulatory-runtime-values/bin/python -c \
+            'from scripts.regulatory_annex_dev_cutover import render_values; render_values(enabled=True)'
+
       - name: Capture pre-deploy worker diagnostics
         if: env.env_x != 'dev'
         run: |
@@ -497,6 +506,27 @@ jobs:
           verify_regulatory_indexing_beat
           capture_background_memory_evidence
         continue-on-error: true
+
+      - name: Verify DEV annex consumer and labeling configuration
+        if: env.env_x == 'dev' && steps.helm_deploy.outcome == 'success'
+        run: |
+          set -euo pipefail
+          for app_name in api background; do
+            selector="app=${env_x}-customs-regulations-${app_name}"
+            pods=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json)
+            pod_names=$(jq -r --arg tag "${IMAGE_TAG}" '.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]?; (.image | endswith(":" + $tag)))) | .metadata.name' <<<"$pods")
+            test -n "$pod_names"
+            while IFS= read -r pod; do
+              container=$(jq -r --arg pod "$pod" --arg tag "${IMAGE_TAG}" '.items[] | select(.metadata.name == $pod) | .spec.containers[] | select(.image | endswith(":" + $tag)) | .name' <<<"$pods")
+              kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+                sh -ec '. /vault/secrets/config; exec python -c "$1"' runtime-check \
+                'import os; from onyx.db.labeling_configuration import _configured_vertex_staging_uri; assert os.environ.get("REGULATORY_ANNEX_ENVIRONMENT") == "dev"; assert os.environ.get("REDIS_DEPLOYMENT_DATABASES") == "4,5,6"; _configured_vertex_staging_uri(); print("READY DEV runtime configuration")'
+              if [[ "$app_name" == "background" ]]; then
+                kubectl exec "$pod" --namespace "${namespace}" -c "$container" -- \
+                  sh -ec '. /vault/secrets/config; exec python -m onyx.background.celery.regulatory_annex_readiness'
+              fi
+            done <<<"$pod_names"
+          done
 
       - name: Check Deployment Status
         if: steps.helm_deploy.outcome == 'failure' || steps.helm_deploy.conclusion == 'failure'

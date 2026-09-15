@@ -618,6 +618,70 @@ def get_run_for_delivery(
     return session.get(RegulatoryLabelingRun, run_id)
 
 
+def resume_labeling_run(
+    session: Session,
+    *,
+    document_set_id: int,
+    run_id: UUID,
+    provider_binding: dict[str, object],
+) -> RegulatoryLabelingRun:
+    """Resume frozen work, fencing old deliveries without touching item outcomes."""
+    session.scalar(
+        select(DocumentSet).where(DocumentSet.id == document_set_id).with_for_update()
+    )
+    run = session.scalar(
+        select(RegulatoryLabelingRun)
+        .where(
+            RegulatoryLabelingRun.id == run_id,
+            RegulatoryLabelingRun.document_set_id == document_set_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if run is None:
+        raise LabelingStateConflictError("Labeling run not found")
+    if run.provider_binding != provider_binding:
+        raise LabelingStateConflictError("The frozen labeling connection changed")
+    if run.cancel_requested:
+        raise LabelingStateConflictError("A cancelled run cannot be resumed")
+    if run.status in _ACTIVE_RUN_STATUSES:
+        return run
+    if run.status != "failed":
+        raise LabelingStateConflictError("Only a failed run can be resumed")
+    if get_active_run_id(session, document_set_id) is not None:
+        raise LabelingStateConflictError("Another labeling run is already active")
+    unprepared = session.scalar(
+        select(RegulatoryLabelingItem.id)
+        .where(
+            RegulatoryLabelingItem.run_id == run_id,
+            RegulatoryLabelingItem.status == "pending",
+            RegulatoryLabelingItem.shard_id.is_(None),
+        )
+        .limit(1)
+    )
+    unfinished_shard = session.scalar(
+        select(RegulatoryLabelingShard.id)
+        .where(
+            RegulatoryLabelingShard.run_id == run_id,
+            RegulatoryLabelingShard.status.not_in(("succeeded", "failed", "cancelled")),
+        )
+        .limit(1)
+    )
+    run.stage = (
+        "preparing" if unprepared else "waiting" if unfinished_shard else "projecting"
+    )
+    run.status = "queued"
+    run.lease_generation += 1
+    run.lease_token = None
+    run.lease_expires_at = None
+    run.next_retry_at = None
+    run.finished_at = None
+    run.error = None
+    run.updated_at = _utcnow()
+    session.flush()
+    return run
+
+
 def create_labeling_run(
     session: Session,
     *,

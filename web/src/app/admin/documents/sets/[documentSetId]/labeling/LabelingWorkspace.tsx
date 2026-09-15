@@ -38,6 +38,7 @@ import {
   cancelLabelingRun,
   LabelingApiError,
   retryLabelingRun,
+  resumeLabelingRun,
   startLabelingRun,
 } from "@/lib/documentSetLabeling/svc";
 
@@ -265,11 +266,17 @@ export default function LabelingWorkspace({
       const updated =
         action === "cancel"
           ? await cancelLabelingRun(documentSetId, run.id)
-          : await retryLabelingRun(documentSetId, run.id);
+          : run.status === "failed" && !run.cancel_requested
+            ? await resumeLabelingRun(documentSetId, run.id)
+            : await retryLabelingRun(documentSetId, run.id);
       setSelectedRunId(updated.id);
       setItemOffset(0);
       setNotice(
-        action === "cancel" ? "Cancellation requested" : "New full run queued"
+        action === "cancel"
+          ? "Cancellation requested"
+          : updated.id === run.id
+            ? "Run resumed; completed chunks and submitted batches are preserved"
+            : "New full run queued"
       );
       void mutateRuns();
     } catch (error) {
@@ -574,7 +581,9 @@ function RunDetails({
                 tooltip="Creates a new full run from a fresh snapshot."
                 onClick={() => onRetry(run)}
               >
-                Retry full run
+                {run.status === "failed" && !run.cancel_requested
+                  ? "Resume labeling"
+                  : "Retry full run"}
               </Button>
             )}
           </div>

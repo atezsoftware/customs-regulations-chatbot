@@ -78,6 +78,10 @@ _INVALID_STAGING_URI_ERROR = (
 MISSING_BATCH_API_KEY = "Add a Gemini Batch API key to this connection in Language Models before starting labeling."
 
 
+class LabelingStorageConfigurationError(ValueError):
+    """Deployment configuration can be restored without replacing a batch run."""
+
+
 def _normalize_vertex_staging_uri(value: str) -> str:
     uri = value.strip().rstrip("/")
     try:
@@ -104,8 +108,11 @@ def _normalize_vertex_staging_uri(value: str) -> str:
 def _configured_vertex_staging_uri() -> str:
     value = os.environ.get(_VERTEX_GCS_URI_ENV, "")
     if not value.strip():
-        raise ValueError(_MISSING_STAGING_URI_ERROR)
-    return _normalize_vertex_staging_uri(value)
+        raise LabelingStorageConfigurationError(_MISSING_STAGING_URI_ERROR)
+    try:
+        return _normalize_vertex_staging_uri(value)
+    except ValueError as error:
+        raise LabelingStorageConfigurationError(str(error)) from None
 
 
 def _vertex_configuration_error() -> str | None:

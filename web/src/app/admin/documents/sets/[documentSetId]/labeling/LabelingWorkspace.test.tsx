@@ -385,7 +385,7 @@ test("retries a failed run as a new full run", async () => {
     stage: "finished",
   });
   const replacementRun = buildRun({
-    id: "retry-run",
+    id: failedRun.id,
     status: "queued",
     stage: "preparing",
   });
@@ -399,7 +399,7 @@ test("retries a failed run as a new full run", async () => {
         return jsonResponse(failedRun);
       if (url.includes("/items?")) return jsonResponse({ items: [], total: 0 });
       if (
-        url === `${baseUrl}/runs/${failedRun.id}/retry` &&
+        url === `${baseUrl}/runs/${failedRun.id}/resume` &&
         init?.method === "POST"
       )
         return jsonResponse(replacementRun);
@@ -408,14 +408,18 @@ test("retries a failed run as a new full run", async () => {
 
   render(<LabelingWorkspace documentSetId={7} />);
   await user.click(
-    await screen.findByRole("button", { name: "Retry full run" })
+    await screen.findByRole("button", { name: "Resume labeling" })
   );
 
   expect(fetchSpy).toHaveBeenCalledWith(
-    `${baseUrl}/runs/${failedRun.id}/retry`,
+    `${baseUrl}/runs/${failedRun.id}/resume`,
     expect.objectContaining({ method: "POST" })
   );
-  expect(await screen.findByText("New full run queued")).toBeInTheDocument();
+  expect(
+    await screen.findByText(
+      "Run resumed; completed chunks and submitted batches are preserved"
+    )
+  ).toBeInTheDocument();
 });
 
 test("pages through chunk outcomes and keeps item errors visible", async () => {

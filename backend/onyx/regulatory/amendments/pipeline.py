@@ -17,11 +17,13 @@ from onyx.db.models import RegulatoryChunk
 from onyx.db.regulatory_chunks import (
     get_chunk_snapshot_by_id,
     get_next_chunk_position,
+    has_active_structural_descendants,
 )
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.candidate_finder import find_candidates
 from onyx.regulatory.amendments.draft_integrity import (
     reconcile_existing_heading_path,
+    reject_unsupported_descendant_replacement,
     validate_explicit_replacements,
 )
 from onyx.regulatory.amendments.drafter import draft_combined_chunk, draft_new_chunk
@@ -81,6 +83,7 @@ class InstructionDraftContext:
     sibling_reference: dict[str, Any] | None
     base_metadata: dict[str, Any]
     base_heading_path: list[str]
+    has_active_descendants: bool = False
 
 
 def confirm_instruction_match(
@@ -146,6 +149,11 @@ def load_instruction_draft_context(
         sibling_reference=sibling_reference,
         base_metadata=dict(old_chunk.chunk_metadata) if old_chunk else {},
         base_heading_path=list(old_chunk.heading_path) if old_chunk else [],
+        has_active_descendants=(
+            has_active_structural_descendants(db_session, old_chunk)
+            if old_chunk is not None
+            else False
+        ),
     )
 
 
@@ -293,6 +301,10 @@ def draft_instruction_group_proposal(
         raise ValueError(
             "Grouped amendment drafting requires one match per instruction"
         )
+    reject_unsupported_descendant_replacement(
+        instructions,
+        has_active_descendants=context.has_active_descendants,
+    )
     old_chunk_ids = {match.old_chunk_id for match in matches}
     if len(old_chunk_ids) != 1:
         raise ValueError("Grouped amendment instructions must share one target chunk")

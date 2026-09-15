@@ -2556,6 +2556,9 @@ def test_redis_deployment_values_override_both_apps(
 ) -> None:
     import yaml
 
+    monkeypatch.setenv(
+        "REGULATORY_LABELING_VERTEX_GCS_URI", "gs://labeling-test-bucket/staging"
+    )
     monkeypatch.chdir(tmp_path)
     directory = tmp_path / "devops/dev/customs-regulations"
     directory.mkdir(parents=True)
@@ -2588,6 +2591,35 @@ def test_redis_deployment_values_override_both_apps(
         ] == [{"name": "REDIS_DEPLOYMENT_DATABASES", "value": "4,5,6"}]
 
 
+def test_standard_dev_deploy_renders_configuration_and_probes_actual_worker() -> None:
+    import yaml
+
+    root = Path(__file__).resolve().parents[4]
+    workflow = yaml.safe_load(
+        (
+            root / ".github/workflows/customs-regulations-backend-lite-codebuild.yaml"
+        ).read_text()
+    )
+    steps = workflow["jobs"]["build-and-deploy"]["steps"]
+    render = next(
+        step
+        for step in steps
+        if step["name"] == "Render required DEV runtime configuration"
+    )
+    deploy = next(step for step in steps if step.get("id") == "helm_deploy")
+    verify = next(
+        step
+        for step in steps
+        if step["name"] == "Verify DEV annex consumer and labeling configuration"
+    )
+    assert render["if"] == "env.env_x == 'dev'"
+    assert "render_values(enabled=True)" in render["run"]
+    assert steps.index(render) < steps.index(deploy) < steps.index(verify)
+    assert "regulatory_annex_readiness" in verify["run"]
+    assert "_configured_vertex_staging_uri" in verify["run"]
+    assert ". /vault/secrets/config" in verify["run"]
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize(
     "gcs_uri", [None, "", "gs://labeling-test-bucket/native-batch"]
@@ -2618,6 +2650,12 @@ def test_labeling_vertex_storage_values_match_both_apps_and_replace_stale_values
             yaml.safe_dump({"app": {"environment": {"parameters": parameters}}})
         )
 
+    if not gcs_uri:
+        originals = {path: path.read_text() for path in directory.iterdir()}
+        with pytest.raises(cutover.CutoverRefusal, match="GCS_location_required"):
+            cutover.render_values(enabled)
+        assert all(path.read_text() == original for path, original in originals.items())
+        return
     cutover.render_values(enabled)
     cutover.render_values(enabled)
 

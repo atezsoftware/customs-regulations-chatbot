@@ -189,6 +189,34 @@ def retry_source_package(
     return package
 
 
+def source_packages_for_redelivery(
+    db_session: Session, *, environment: str, limit: int = 10
+) -> list[UUID]:
+    """Reserve bounded redeliveries; active leases and completed evidence stay intact."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    packages = list(
+        db_session.scalars(
+            select(AmendmentSourcePackage)
+            .where(
+                AmendmentSourcePackage.environment == environment,
+                AmendmentSourcePackage.status == "processing",
+                AmendmentSourcePackage.updated_at < now - datetime.timedelta(minutes=5),
+                or_(
+                    AmendmentSourcePackage.lease_expires_at.is_(None),
+                    AmendmentSourcePackage.lease_expires_at < now,
+                ),
+            )
+            .order_by(AmendmentSourcePackage.updated_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+    )
+    for package in packages:
+        package.updated_at = now
+    db_session.flush()
+    return [package.id for package in packages]
+
+
 def finish_source_package(
     db_session: Session,
     *,

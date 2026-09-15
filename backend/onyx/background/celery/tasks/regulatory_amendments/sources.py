@@ -3,12 +3,16 @@ from uuid import UUID
 from celery import shared_task
 
 from onyx.configs.constants import OnyxCeleryPriority
+from onyx.db.amendment_sources import source_packages_for_redelivery
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.regulatory.amendments.annexes import config
 from onyx.regulatory.amendments.annexes.job import run_source_package
+from onyx.utils.logger import setup_logger
 from shared_configs.configs import MULTI_TENANT, POSTGRES_DEFAULT_SCHEMA
 from shared_configs.contextvars import get_current_tenant_id
 
 _TASK_NAME = "acquire_amendment_sources"
+logger = setup_logger()
 
 
 def enqueue_source_package(*, package_id: UUID, tenant_id: str) -> None:
@@ -29,9 +33,8 @@ def enqueue_source_package(*, package_id: UUID, tenant_id: str) -> None:
     )
 
 
-@shared_task(name=_TASK_NAME, ignore_result=True)
-def acquire_amendment_sources(
-    *, package_id: str, tenant_id: str, environment: str, database_identity: str
+def _validate_scope(
+    *, tenant_id: str, environment: str, database_identity: str
 ) -> None:
     if (
         environment != config.REGULATORY_ANNEX_ENVIRONMENT
@@ -41,6 +44,39 @@ def acquire_amendment_sources(
         or (not MULTI_TENANT and tenant_id != POSTGRES_DEFAULT_SCHEMA)
     ):
         raise ValueError("Source acquisition worker scope mismatch")
+
+
+@shared_task(name="recover_amendment_sources", ignore_result=True)
+def recover_amendment_sources(
+    *, tenant_id: str, environment: str, database_identity: str
+) -> None:
+    _validate_scope(
+        tenant_id=tenant_id,
+        environment=environment,
+        database_identity=database_identity,
+    )
+    with get_session_with_current_tenant() as session:
+        package_ids = source_packages_for_redelivery(session, environment=environment)
+        session.commit()
+    for package_id in package_ids:
+        try:
+            enqueue_source_package(package_id=package_id, tenant_id=tenant_id)
+        except Exception:
+            logger.warning(
+                "Source package redelivery failed; recovery will retry",
+                extra={"package_id": str(package_id)},
+            )
+
+
+@shared_task(name=_TASK_NAME, ignore_result=True)
+def acquire_amendment_sources(
+    *, package_id: str, tenant_id: str, environment: str, database_identity: str
+) -> None:
+    _validate_scope(
+        tenant_id=tenant_id,
+        environment=environment,
+        database_identity=database_identity,
+    )
     if not config.REGULATORY_ANNEX_UPDATES_ENABLED:
         raise ValueError("Annex updates are disabled")
     run_source_package(package_id=UUID(package_id), environment=environment)

@@ -10,6 +10,7 @@ _FULL_REPLACEMENT_RE = re.compile(
     r"aşağıdaki\s+şekilde\s+değiştirilmiştir\s*[.:]?",
     flags=re.IGNORECASE,
 )
+_OMISSION_RE = re.compile(r"\.{3,}|…")
 _MARKDOWN_RE = re.compile(r"(?:\*\*|__|`|<[^>]+>)")
 
 
@@ -64,6 +65,44 @@ def validate_explicit_replacement_texts(
                 "The generated draft does not contain the explicit replacement "
                 "body from the amendment instruction."
             )
+
+
+def reject_unsupported_descendant_replacement(
+    instructions: Sequence[AmendmentInstruction], *, has_active_descendants: bool
+) -> None:
+    """Refuse a one-row replacement when the target owns canonical children."""
+
+    if not has_active_descendants:
+        return
+    reject_unsupported_descendant_replacement_texts(
+        [instruction.instruction_text for instruction in instructions],
+        has_active_descendants=has_active_descendants,
+    )
+
+
+def reject_unsupported_descendant_replacement_texts(
+    instruction_texts: Sequence[str], *, has_active_descendants: bool
+) -> None:
+    """Apply the descendant guard to instructions persisted in the database."""
+
+    if not has_active_descendants:
+        return
+    bodies = [
+        body
+        for instruction_text in instruction_texts
+        if (body := explicit_replacement_body(instruction_text)) is not None
+    ]
+    if not bodies:
+        return
+    detail = (
+        " and contains omission markers"
+        if any(_OMISSION_RE.search(body) for body in bodies)
+        else ""
+    )
+    raise DraftIntegrityError(
+        "The replacement targets a provision with active descendant chunks"
+        f"{detail}; an atomic multi-chunk replacement is required."
+    )
 
 
 def reconcile_existing_heading_path(

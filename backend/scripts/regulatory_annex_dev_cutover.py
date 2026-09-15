@@ -967,6 +967,9 @@ class Driver:
 def render_values(enabled: bool = False) -> None:
     import yaml
 
+    staging_uri = os.environ.get("REGULATORY_LABELING_VERTEX_GCS_URI", "").strip()
+    if not re.fullmatch(r"gs://[a-z0-9][a-z0-9._-]+/[\S]+", staging_uri):
+        raise CutoverRefusal("DEV_labeling_GCS_location_required")
     for app in APPS:
         path = Path(
             f"devops/dev/customs-regulations/customs-regulations-{app}-values.yaml"
@@ -980,9 +983,7 @@ def render_values(enabled: bool = False) -> None:
             "REGULATORY_ANNEX_WORKER_ENABLED": "true",
             "REGULATORY_ANNEX_ENVIRONMENT": "dev",
             "REGULATORY_ANNEX_UPDATES_ENABLED": str(enabled).lower(),
-            "REGULATORY_LABELING_VERTEX_GCS_URI": os.environ.get(
-                "REGULATORY_LABELING_VERTEX_GCS_URI", ""
-            ),
+            "REGULATORY_LABELING_VERTEX_GCS_URI": staging_uri,
         }
         for name, value in updates.items():
             matches = [entry for entry in parameters if entry["name"] == name]

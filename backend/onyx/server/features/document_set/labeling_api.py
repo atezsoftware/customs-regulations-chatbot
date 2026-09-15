@@ -13,6 +13,7 @@ from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.labeling_configuration import (
     LabelingBatchGateway,
+    LabelingProviderBinding,
     get_labeling_provider_options,
     resolve_labeling_gateway,
     resolve_labeling_provider_binding,
@@ -387,6 +388,52 @@ def cancel_labeling(
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Labeling run not found")
     result = repository.run_snapshot(run)
     db_session.commit()
+    _wake(run_id, tenant_id)
+    return result
+
+
+@router.post("/runs/{run_id}/resume")
+def resume_labeling(
+    document_set_id: int,
+    run_id: UUID,
+    user: User = Depends(labeling_admin),
+    db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
+) -> LabelingRunSnapshot:
+    _check_access(db_session, document_set_id, user)
+    previous = _get_run(db_session, document_set_id, run_id)
+    try:
+        binding = LabelingProviderBinding.model_validate(previous.provider_binding)
+        gateway = resolve_labeling_gateway(
+            db_session,
+            binding.model_configuration_id,
+            user=user,
+            expected_binding=binding,
+        )
+        db_session.commit()
+        _probe_labeling_gateway(gateway)
+        _check_access(db_session, document_set_id, user)
+        current = resolve_labeling_provider_binding(
+            db_session, binding.model_configuration_id, user=user
+        )
+        if current.fingerprint != binding.fingerprint:
+            raise repository.LabelingStateConflictError(
+                "The labeling connection changed"
+            )
+        run = repository.resume_labeling_run(
+            db_session,
+            document_set_id=document_set_id,
+            run_id=run_id,
+            provider_binding=binding.model_dump(mode="json"),
+        )
+        result = repository.run_snapshot(run)
+        db_session.commit()
+    except repository.LabelingStateConflictError as error:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(error)) from None
+    except ValueError as error:
+        db_session.rollback()
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(error)) from None
     _wake(run_id, tenant_id)
     return result
 

@@ -18,6 +18,7 @@ def test_runtime_registers_handlers_and_exclusively_consumes_scoped_work() -> No
         "regulatory_amendment_run",
         "publish_annex_change",
         "recover_annex_publications",
+        "recover_amendment_sources",
     } <= celery_app.tasks.keys()
     assert celery_app.conf.worker_concurrency == 1
     assert celery_app.conf.worker_prefetch_multiplier == 1
@@ -95,6 +96,7 @@ def test_readiness_refuses_foreign_worker_stale_pid_missing_handlers_and_concurr
             "regulatory_amendment_run",
             "publish_annex_change",
             "recover_annex_publications",
+            "recover_amendment_sources",
         ]
     }
     validate_worker(worker, 71, queues=queues, stats=stats, registered=registered)

@@ -1263,7 +1263,13 @@ def test_api_enforces_admin_permission_and_editable_document_set(
 
 @pytest.mark.parametrize(
     "suffix,method",
-    [("", "GET"), ("/items", "GET"), ("/cancel", "POST"), ("/retry", "POST")],
+    [
+        ("", "GET"),
+        ("/items", "GET"),
+        ("/cancel", "POST"),
+        ("/retry", "POST"),
+        ("/resume", "POST"),
+    ],
 )
 def test_api_run_id_cannot_cross_document_sets(
     labeling_data: LabelingData, labeling_client: TestClient, suffix: str, method: str
@@ -1346,6 +1352,139 @@ def test_api_retry_is_idempotent_and_reauthorizes_provider(
     assert denied.status_code == 400, denied.text
     with Session(labeling_data.database.engine) as session:
         assert len(repository.list_runs(session, labeling_data.document_set_id)) == 2
+
+
+def test_resume_keeps_completed_items_remote_job_and_fences_old_worker(
+    labeling_data: LabelingData, labeling_client: TestClient
+) -> None:
+    run_id, _ = _start(labeling_data)
+    old_lease, shard_id = _prepare(labeling_data, run_id)
+    with Session(labeling_data.database.engine) as session:
+        items = repository.load_shard_requests(session, old_lease, shard_id)
+        first = items[0]
+        repository.apply_shard_result_page(
+            session,
+            old_lease,
+            shard_id=shard_id,
+            item_ids=[first.id],
+            outcomes=_outcomes(session, old_lease, shard_id),
+        )
+        item_before = (first.id, first.request_hash, first.status, first.labels)
+        repository.release_run(session, old_lease, status="failed", finished=True)
+        session.commit()
+    path = _api_path(labeling_data, f"runs/{run_id}/resume")
+    first_response = labeling_client.post(path)
+    replay = labeling_client.post(path)
+    assert first_response.status_code == replay.status_code == 200, first_response.text
+    assert first_response.json()["id"] == replay.json()["id"] == str(run_id)
+    assert first_response.json()["completed_chunks"] == 1
+    with Session(labeling_data.database.engine) as session:
+        run = repository.get_run_for_delivery(session, run_id)
+        assert run is not None and run.stage == "waiting" and run.finished_at is None
+        assert run.lease_generation == old_lease.generation + 1
+        assert len(repository.list_runs(session, labeling_data.document_set_id)) == 1
+        item = session.get(RegulatoryLabelingItem, item_before[0])
+        assert item is not None
+        assert (item.id, item.request_hash, item.status, item.labels) == item_before
+        shard = session.get(RegulatoryLabelingShard, shard_id)
+        assert shard is not None and shard.remote_job_name == "batches/test"
+        assert shard.status == "submitted" and shard.attempt_count == 1
+        assert (
+            repository.claim_run(
+                session,
+                run_id=run_id,
+                expected_generation=old_lease.generation,
+                lease_seconds=60,
+            )
+            is None
+        )
+        with pytest.raises(repository.LabelingStateConflictError):
+            repository.release_run(session, old_lease, status="failed", finished=True)
+
+
+def test_resume_refuses_changed_provider_and_concurrent_replacement(
+    labeling_data: LabelingData,
+    labeling_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, _ = _start(labeling_data)
+    with Session(labeling_data.database.engine) as session:
+        run = session.get(RegulatoryLabelingRun, run_id)
+        assert run is not None
+        run.status = "failed"
+        session.commit()
+    path = _api_path(labeling_data, f"runs/{run_id}/resume")
+    monkeypatch.setenv(
+        "REGULATORY_LABELING_VERTEX_GCS_URI", "gs://different-bucket/staging"
+    )
+    assert labeling_client.post(path).status_code == 400
+    monkeypatch.setenv(
+        "REGULATORY_LABELING_VERTEX_GCS_URI", "gs://labeling-test-bucket/staging"
+    )
+    replacement, _ = _start(labeling_data)
+    assert labeling_client.post(path).status_code == 409
+    with Session(labeling_data.database.engine) as session:
+        assert (
+            repository.get_active_run_id(session, labeling_data.document_set_id)
+            == replacement
+        )
+
+
+def test_source_recovery_preserves_active_leases_ready_assets_and_environment(
+    labeling_data: LabelingData,
+) -> None:
+    from onyx.db.amendment_sources import (
+        create_source_package,
+        source_packages_for_redelivery,
+    )
+    from onyx.db.models import AmendmentSourcePackage
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ids: list[UUID] = []
+    with Session(labeling_data.database.engine) as session:
+        for status, environment, expiry in [
+            ("processing", "dev", None),
+            ("processing", "dev", now - datetime.timedelta(seconds=1)),
+            ("processing", "dev", now + datetime.timedelta(minutes=20)),
+            ("ready", "dev", None),
+            ("failed", "dev", None),
+            ("processing", "foreign", None),
+        ]:
+            package, _ = create_source_package(
+                session,
+                document_set_id=labeling_data.document_set_id,
+                environment=environment,
+                idempotency_key=str(uuid4()),
+                request_hash="a" * 64,
+                input_spec={"url": "https://example.com/source"},
+                created_by=labeling_data.user_id,
+            )
+            package.status = status
+            package.updated_at = now - datetime.timedelta(minutes=10)
+            package.lease_expires_at = expiry
+            ids.append(package.id)
+        session.commit()
+        first_delivery = source_packages_for_redelivery(
+            session, environment="dev", limit=1
+        )
+        assert len(first_delivery) == 1 and first_delivery[0] in ids[:2]
+        session.commit()
+        second_delivery = source_packages_for_redelivery(session, environment="dev")
+        assert len(second_delivery) == 1
+        assert set(first_delivery + second_delivery) == set(ids[:2])
+        session.commit()
+        assert source_packages_for_redelivery(session, environment="dev") == []
+        active = session.get(AmendmentSourcePackage, ids[2])
+        assert (
+            active is not None
+            and active.lease_expires_at == now + datetime.timedelta(minutes=20)
+        )
+        ready = session.get(AmendmentSourcePackage, ids[3])
+        assert ready is not None and ready.status == "ready"
+        session.execute(
+            delete(AmendmentSourcePackage).where(AmendmentSourcePackage.id.in_(ids))
+        )
+        session.commit()
 
 
 class RecordingBatch:
@@ -1624,6 +1763,38 @@ def test_worker_reauthorizes_before_submitting_frozen_run(
         run = session.get(RegulatoryLabelingRun, run_id)
         assert run is not None and run.status == "failed"
         assert run.completed_chunks == 0
+
+
+def test_missing_storage_waits_then_uses_the_same_submitted_batch(
+    labeling_data: LabelingData,
+    fake_batch: RecordingBatch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, _ = _start(labeling_data)
+    fake_batch.complete_jobs = False
+    for _ in range(5):
+        _step(labeling_data, run_id)
+        if fake_batch.submit_calls:
+            break
+    assert fake_batch.submit_calls == 1
+    monkeypatch.delenv("REGULATORY_LABELING_VERTEX_GCS_URI")
+    result = _step(labeling_data, run_id)
+    assert result.outcome == orchestrator.LabelingStepOutcome.WAIT
+    with Session(labeling_data.database.engine) as session:
+        run = repository.get_run_for_delivery(session, run_id)
+        assert run is not None and run.status == "running"
+        assert run.finished_at is None and run.next_retry_at is not None
+        assert run.error and "storage is not configured" in run.error
+    monkeypatch.setenv(
+        "REGULATORY_LABELING_VERTEX_GCS_URI", "gs://labeling-test-bucket/staging"
+    )
+    fake_batch.complete_jobs = True
+    _finish(labeling_data, run_id)
+    assert fake_batch.submit_calls == 1
+    with Session(labeling_data.database.engine) as session:
+        run = repository.get_run_for_delivery(session, run_id)
+        assert run is not None and run.completed_chunks == 2
+        assert run.error == "1 derived chunk(s) could not be projected safely"
 
 
 def test_worker_combines_preparation_pages_into_one_google_batch(

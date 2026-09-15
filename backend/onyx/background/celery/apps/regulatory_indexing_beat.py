@@ -124,7 +124,8 @@ class RegulatoryIndexingScheduler(PersistentScheduler):
                 from onyx.regulatory.amendments.annexes import config as annex_config
 
                 if (
-                    template["task"] == "recover_annex_publications"
+                    template["task"]
+                    in {"recover_annex_publications", "recover_amendment_sources"}
                     and not annex_config.REGULATORY_ANNEX_WORKER_ENABLED
                 ):
                     continue
