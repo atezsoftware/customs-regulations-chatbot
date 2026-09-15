@@ -68,6 +68,7 @@ def _run_grouping_job(
     batch_values: dict[str, object] = {
         "id": batch_id,
         "document_set_id": 7,
+        "source_package_id": None,
         "created_by": _CREATOR_ID,
         "raw_text": "original",
         "user_file_ids": ["00000000-0000-0000-0000-000000000123"],
@@ -359,6 +360,7 @@ def test_resume_reuses_segmentation_and_skips_completed_instructions(
     batch = SimpleNamespace(
         id=9,
         document_set_id=7,
+        source_package_id=None,
         created_by=_CREATOR_ID,
         raw_text="original",
         user_file_ids=["00000000-0000-0000-0000-000000000123"],
@@ -402,6 +404,7 @@ def test_first_run_persists_segmentation_before_instruction_work(
     batch = SimpleNamespace(
         id=10,
         document_set_id=7,
+        source_package_id=None,
         created_by=_CREATOR_ID,
         raw_text="MADDE 1",
         user_file_ids=["00000000-0000-0000-0000-000000000123"],
@@ -452,6 +455,7 @@ def test_segmentation_runs_without_an_open_database_session(
     batch = SimpleNamespace(
         id=11,
         document_set_id=7,
+        source_package_id=None,
         created_by=_CREATOR_ID,
         raw_text="MADDE 1",
         user_file_ids=["00000000-0000-0000-0000-000000000123"],
@@ -520,6 +524,7 @@ def test_empty_segmentation_checkpoints_and_finishes_analyzed_without_review(
     batch = SimpleNamespace(
         id=12,
         document_set_id=7,
+        source_package_id=None,
         created_by=_CREATOR_ID,
         raw_text=raw_text,
         user_file_ids=["00000000-0000-0000-0000-000000000123"],
@@ -614,6 +619,7 @@ def test_match_and_draft_llm_calls_run_outside_database_sessions(
     batch = SimpleNamespace(
         id=13,
         document_set_id=7,
+        source_package_id=None,
         created_by=_CREATOR_ID,
         raw_text="MADDE 1",
         user_file_ids=["00000000-0000-0000-0000-000000000123"],
