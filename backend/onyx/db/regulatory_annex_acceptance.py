@@ -2,6 +2,7 @@
 
 import datetime
 import hashlib
+import json
 from collections.abc import Mapping
 from typing import Literal, cast
 from uuid import UUID, uuid4
@@ -121,15 +122,62 @@ def verify_dev_configuration() -> dict[str, object]:
     }
 
 
+# Exception types that mean the *testing infrastructure* hiccupped, never
+# that the release itself failed a check. Never includes ValueError,
+# AssertionError, or anything a real defect could raise — a run only
+# qualifies for a fresh attempt when every recorded exception is one of
+# these, so a genuine finding always still requires owned recovery.
+_TRANSIENT_CANARY_FAILURE_TYPES = frozenset(
+    {"ReadTimeout", "ConnectTimeout", "ConnectError", "RemoteProtocolError", "PoolTimeout"}
+)
+
+
+def _canary_failure_is_transient(run: CanaryRun) -> bool:
+    raw = run.evidence.get("failure")
+    if not isinstance(raw, str):
+        return False
+    try:
+        detail = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    exceptions = detail.get("exceptions") if isinstance(detail, dict) else None
+    if not isinstance(exceptions, list) or not exceptions:
+        return False
+    return all(
+        isinstance(exc, dict) and exc.get("type") in _TRANSIENT_CANARY_FAILURE_TYPES
+        for exc in exceptions
+    )
+
+
 def reserve_canary(release_sha: str, *, admin_email: str) -> CanaryRun:
     from onyx.auth.users import is_user_admin
 
     key = "regulatory_annex_acceptance:" + release_sha
     with get_session_with_current_tenant() as session:
         session.execute(text("SELECT pg_advisory_xact_lock(818297340019)"))
-        saved = session.get(KVStore, key)
+        saved = session.get(KVStore, key, with_for_update=True)
         if saved is not None:
-            return CanaryRun.model_validate(saved.value)
+            existing = CanaryRun.model_validate(saved.value)
+            # A fresh attempt for the same SHA is safe only when the
+            # previous one fully cleaned up its own fictional artifacts and
+            # failed on a known network/timeout type — a genuine assertion
+            # or logic failure still requires owned recovery, unchanged.
+            if (
+                existing.phase == "cleaned"
+                and existing.evidence.get("acceptance_passed") is not True
+                and existing.evidence.get("cleanup_complete", True) is not False
+                and _canary_failure_is_transient(existing)
+            ):
+                user = session.scalar(
+                    select(User).where(User.__table__.c.email == admin_email)
+                )
+                if user is None or not user.is_active or not is_user_admin(user):
+                    raise ValueError("exact_active_canary_admin_required")
+                run = CanaryRun(release_sha=release_sha, user_id=user.id)
+                saved.value = run.model_dump(mode="json")
+                session.commit()
+                return run
+            return existing
         user = session.scalar(select(User).where(User.__table__.c.email == admin_email))
         if user is None or not user.is_active or not is_user_admin(user):
             raise ValueError("exact_active_canary_admin_required")
