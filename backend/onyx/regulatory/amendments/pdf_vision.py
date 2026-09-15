@@ -469,6 +469,19 @@ def prepare_pdf_draft_evidence(
                 text,
             )
         ]
+        if not matches:
+            if _TABLE_DEPENDENT.search(instruction.instruction_text):
+                # The instruction itself names a table/çizelge but no page
+                # of the attached PDF corresponds to it — genuinely
+                # unresolved, not merely unrelated.
+                raise DraftIntegrityError(
+                    "PDF instruction image evidence is missing or ambiguous."
+                )
+            # This instruction has no connection to any page of the attached
+            # PDF at all — e.g. it amends the tebliğ's main body text, not
+            # the table/annex this source also happens to carry. Draft it
+            # normally, without requiring PDF grounding.
+            continue
         # Repeated ordinary text on exclusively non-table pages keeps the legacy path.
         if matches and not any(
             item.kind == "table_cell"

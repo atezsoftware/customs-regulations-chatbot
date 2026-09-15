@@ -271,13 +271,22 @@ def test_pdf_draft_evidence_refuses_changed_bytes_and_missing_anchor(
         assert asset.pdf_vision is not None
         blobs[asset.pdf_vision.file_id] += b"changed"
     if mutation == "anchor":
+        # An instruction with no connection to any page of the attached PDF
+        # (e.g. it amends the tebliğ's body text, not this table) is not
+        # ambiguous or tampered evidence — it simply isn't about this PDF at
+        # all, so evidence generation quietly yields nothing rather than
+        # refusing the whole group.
         instruction = instruction.model_copy(
             update={
                 "instruction_text": "other instruction",
                 "article_reference": "MADDE 30",
             }
         )
-    if mutation:
+        assert (
+            pdf_vision.prepare_pdf_draft_evidence(source, [instruction], store)
+            is None
+        )
+    elif mutation:
         with pytest.raises(ValueError):
             pdf_vision.prepare_pdf_draft_evidence(source, [instruction], store)
     else:
