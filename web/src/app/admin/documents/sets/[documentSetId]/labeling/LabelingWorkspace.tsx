@@ -154,7 +154,10 @@ export default function LabelingWorkspace({
   }, [documentSetId, hasActiveRun]);
 
   const selectedSummary = runs.find((run) => run.id === selectedRunId) ?? null;
-  const { data: selectedDetail } = useLabelingRun(documentSetId, selectedRunId);
+  const { data: selectedDetail, mutate: mutateSelectedDetail } = useLabelingRun(
+    documentSetId,
+    selectedRunId
+  );
   const selectedRun =
     selectedDetail?.id === selectedRunId ? selectedDetail : selectedSummary;
   const selectedRunIsActive = selectedRun
@@ -269,6 +272,9 @@ export default function LabelingWorkspace({
           : run.status === "failed" && !run.cancel_requested
             ? await resumeLabelingRun(documentSetId, run.id)
             : await retryLabelingRun(documentSetId, run.id);
+      if (updated.id === selectedRunId) {
+        await mutateSelectedDetail(updated, { revalidate: false });
+      }
       setSelectedRunId(updated.id);
       setItemOffset(0);
       setNotice(
@@ -544,6 +550,7 @@ function RunDetails({
   const canRetry = ["failed", "cancelled", "completed_with_errors"].includes(
     run.status
   );
+  const canResume = run.status === "failed" && !run.cancel_requested;
   return (
     <Card border="solid" padding="md">
       <div className="flex flex-col gap-4">
@@ -578,12 +585,14 @@ function RunDetails({
                 icon={SvgRefreshCw}
                 prominence="secondary"
                 disabled={busy}
-                tooltip="Creates a new full run from a fresh snapshot."
+                tooltip={
+                  canResume
+                    ? "Continues this run, keeping completed chunks and submitted batches."
+                    : "Creates a new full run from a fresh snapshot."
+                }
                 onClick={() => onRetry(run)}
               >
-                {run.status === "failed" && !run.cancel_requested
-                  ? "Resume labeling"
-                  : "Retry full run"}
+                {canResume ? "Resume labeling" : "Retry full run"}
               </Button>
             )}
           </div>

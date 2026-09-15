@@ -377,12 +377,13 @@ test("cancels an active run and reports a server error without hiding the run", 
   expect(screen.getByText("Waiting for Gemini Batch")).toBeInTheDocument();
 });
 
-test("retries a failed run as a new full run", async () => {
+test("resumes the same run and replaces its cached failure immediately", async () => {
   const user = setupUser();
   const failedRun = buildRun({
     id: "failed-run",
     status: "failed",
     stage: "finished",
+    error: "Labeling worker failed: ValueError",
   });
   const replacementRun = buildRun({
     id: failedRun.id,
@@ -420,6 +421,12 @@ test("retries a failed run as a new full run", async () => {
       "Run resumed; completed chunks and submitted batches are preserved"
     )
   ).toBeInTheDocument();
+  expect(
+    await screen.findByRole("button", { name: "Cancel run" })
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByText("Labeling worker failed: ValueError")
+  ).not.toBeInTheDocument();
 });
 
 test("pages through chunk outcomes and keeps item errors visible", async () => {
