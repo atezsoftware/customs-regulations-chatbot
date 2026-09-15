@@ -372,6 +372,43 @@ def _describe_embedded_images(root: Tag, base_url: str, *, llm: "LLM") -> str:
     return "--- Gömülü görsel açıklamaları ---\n\n" + "\n\n".join(descriptions)
 
 
+_PINNED_VISION_MODEL = "gemini-3.8-flash"
+_PINNED_VISION_PROVIDER_TYPE = "vertex_ai"
+
+
+def _get_pinned_vision_llm() -> "LLM | None":
+    """Pinned to a specific vision-capable model rather than resolved via
+    the default-vision-provider lookup: no provider is marked as the
+    default vision provider, and the fallback search has hundreds of
+    vision-capable models to pick from with no guarantee which one it
+    lands on — explicit product direction is to pin exactly one model.
+    """
+    from onyx.db.engine.sql_engine import get_session_with_current_tenant
+    from onyx.db.llm import fetch_existing_llm_providers
+    from onyx.llm.factory import llm_from_provider
+    from onyx.server.manage.llm.models import LLMProviderView
+
+    try:
+        with get_session_with_current_tenant() as db_session:
+            providers = fetch_existing_llm_providers(db_session, flow_type_filter=[])
+            provider = next(
+                (
+                    candidate
+                    for candidate in providers
+                    if candidate.provider == _PINNED_VISION_PROVIDER_TYPE
+                ),
+                None,
+            )
+            if provider is None:
+                return None
+            provider_view = LLMProviderView.from_model(provider)
+        return llm_from_provider(
+            model_name=_PINNED_VISION_MODEL, llm_provider=provider_view
+        )
+    except Exception:
+        return None
+
+
 def _describe_embedded_media(root: Tag, base_url: str) -> str:
     """Describe both inline <img> elements and linked PDF attachments so
     everything an amendment page embeds — not just its surrounding prose —
@@ -391,9 +428,7 @@ def _describe_embedded_media(root: Tag, base_url: str) -> str:
     if not has_images and not has_pdf_links:
         return ""
 
-    from onyx.llm.factory import get_default_llm_with_vision
-
-    llm = get_default_llm_with_vision()
+    llm = _get_pinned_vision_llm()
     if llm is None:
         return ""
 

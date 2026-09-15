@@ -135,9 +135,7 @@ def test_extract_amendment_html_ignores_images_without_base_url() -> None:
 def test_extract_amendment_html_describes_embedded_image_when_base_url_given(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
-    )
+    monkeypatch.setattr(source_extraction, "_get_pinned_vision_llm", lambda: object())
     monkeypatch.setattr(
         source_extraction,
         "_download_embedded_asset_bytes",
@@ -165,7 +163,8 @@ def test_extract_amendment_html_skips_decorative_images(
 ) -> None:
     calls = []
     monkeypatch.setattr(
-        "onyx.llm.factory.get_default_llm_with_vision",
+        source_extraction,
+        "_get_pinned_vision_llm",
         lambda: calls.append("called") or object(),
     )
 
@@ -185,9 +184,7 @@ def test_extract_amendment_html_always_runs_vision_on_linked_pdf_with_text_hint(
 ) -> None:
     """A text layer existing is never trusted alone — vision always reads the
     rendered page, with the extracted text passed along only as a hint."""
-    monkeypatch.setattr(
-        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
-    )
+    monkeypatch.setattr(source_extraction, "_get_pinned_vision_llm", lambda: object())
     monkeypatch.setattr(
         source_extraction,
         "_download_embedded_asset_bytes",
@@ -231,9 +228,7 @@ def test_extract_amendment_html_always_runs_vision_on_linked_pdf_with_text_hint(
 def test_extract_amendment_html_falls_back_to_text_layer_when_render_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
-    )
+    monkeypatch.setattr(source_extraction, "_get_pinned_vision_llm", lambda: object())
     monkeypatch.setattr(
         source_extraction,
         "_download_embedded_asset_bytes",
@@ -266,9 +261,7 @@ def test_extract_amendment_html_falls_back_to_text_layer_when_render_fails(
 def test_extract_amendment_html_drops_garbled_text_layer_when_render_also_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
-    )
+    monkeypatch.setattr(source_extraction, "_get_pinned_vision_llm", lambda: object())
     monkeypatch.setattr(
         source_extraction,
         "_download_embedded_asset_bytes",
@@ -301,9 +294,7 @@ def test_extract_amendment_html_drops_garbled_text_layer_when_render_also_fails(
 def test_extract_amendment_html_describes_linked_pdf_via_vision_without_text_layer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
-    )
+    monkeypatch.setattr(source_extraction, "_get_pinned_vision_llm", lambda: object())
     monkeypatch.setattr(
         source_extraction,
         "_download_embedded_asset_bytes",
