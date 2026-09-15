@@ -211,11 +211,16 @@ _PDF_PAGE_OCR_SYSTEM_PROMPT = (
     "paragraph, table row, and label, in reading order, exactly as written. "
     "This is OCR-style transcription, not a summary and not a paraphrase: "
     "never rewrite, condense, or paraphrase the source wording, and never "
-    "omit substantive content. If a raw text-extraction hint is provided "
-    "below, treat it only as a possible aid — it may be partial, out of "
-    "order, or corrupted by a broken font encoding (garbled symbols instead "
-    "of letters); trust what you actually see in the image over the hint "
-    "whenever they disagree, and still transcribe it verbatim."
+    "omit substantive content that appears on the page. A raw text layer "
+    "extracted from the same PDF page may also be provided below — it is a "
+    "second genuine source of the same page, not a lesser one, but some "
+    "PDFs have a corrupted font encoding that turns their text layer into "
+    "garbled symbols instead of letters on some or all pages. Use both "
+    "sources together: where they agree, or where the text layer is legible "
+    "and the image is not (small print, poor scan quality), rely on it "
+    "directly; where the text layer is garbled, rely on the image instead. "
+    "Your output must be the single, complete, verbatim transcription of "
+    "everything on the page — never drop content present in either source."
 )
 
 _EMBEDDED_IMAGE_OCR_SYSTEM_PROMPT = (
@@ -233,10 +238,13 @@ _EMBEDDED_IMAGE_OCR_SYSTEM_PROMPT = (
 def _describe_pdf_bytes(content: bytes, *, llm: "LLM", label: str) -> str | None:
     """Always read each page via vision — a PDF's text layer can look
     present (enough characters to pass a length check) while actually being
-    garbled under a broken font encoding, so it is never trusted alone.
-    Any text layer that does exist is passed to the LLM as a hint, not
-    returned verbatim on its own. Falls back to the raw text layer only if
-    page rendering itself fails outright. Returns None on total failure —
+    garbled under a broken font encoding, so it is never trusted alone
+    without the LLM cross-checking it against the rendered page image. Any
+    text layer that does exist is given to the LLM as a second genuine
+    source for the same page, to be combined with the image (see
+    _PDF_PAGE_OCR_SYSTEM_PROMPT), not returned verbatim on its own without
+    that cross-check. Falls back to the raw text layer only if page
+    rendering itself fails outright. Returns None on total failure —
     best-effort, same as images."""
     try:
         extracted_text = extract_file_text(io.BytesIO(content), label, extension=".pdf")
@@ -262,9 +270,11 @@ def _describe_pdf_bytes(content: bytes, *, llm: "LLM", label: str) -> str | None
     page_descriptions: list[str] = []
     for page in rendered_pages[:_MAX_DESCRIBED_PDF_PAGES]:
         user_prompt = (
-            f"Transcribe page {page.page} of '{label}' completely and structurally."
+            f"Transcribe page {page.page} of '{label}' completely, verbatim."
             + (
-                f"\n\nRaw text-extraction hint (may be unreliable):\n{text_hint}"
+                f"\n\nThis page's own extracted text layer (a second real "
+                f"source for the same page — see system instructions on how "
+                f"to combine it with the image):\n{text_hint}"
                 if text_hint
                 else ""
             )
