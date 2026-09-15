@@ -79,13 +79,38 @@ def _source_occurrence_label(value: str) -> str | None:
     return normalize_annex_label(reference.group())
 
 
-def _boundary_label(element: ExtractedAnnexElement) -> str | None:
-    if element.extraction_method != "native" or element.kind != "text":
+def _boundary_label(
+    element: ExtractedAnnexElement, *, verified_visual: bool = False
+) -> str | None:
+    if element.kind != "text":
         return None
     text = element.text.strip()
-    if not _STANDALONE_LABEL.fullmatch(text):
+    if element.extraction_method == "native" and _STANDALONE_LABEL.fullmatch(text):
+        return normalize_annex_label(text)
+    if not (
+        verified_visual
+        and element.extraction_method == "vision"
+        and element.status == "readable"
+        and not element.issues
+        and element.locator.page is not None
+        and element.locator.normalized_box is not None
+        and 0 <= element.locator.normalized_box[1] < 0.2
+    ):
         return None
-    return normalize_annex_label(text)
+    # A frozen page heading may include its title and typographic quotation marks.
+    text = text.strip('“”"')
+    match = _STANDALONE_LABEL.match(text)
+    if match is None:
+        return None
+    remainder = text[match.end() :]
+    if remainder and remainder[0] not in " :–—-\n\t":
+        return None
+    title = remainder.strip(" :–—-\n\t")
+    if title != title.upper() or (title and not any(char.isalpha() for char in title)):
+        return None
+    if _source_occurrence_label(text) != normalize_annex_label(match.group()):
+        return None
+    return normalize_annex_label(match.group())
 
 
 def _boundary_top(extraction: AnnexExtraction, position: int) -> float:
@@ -139,12 +164,16 @@ def evidence_view_hash(extraction: AnnexExtraction) -> str:
 
 
 def selected_evidence_pages(extraction: AnnexExtraction) -> list[int]:
+    if extraction.canonical_evidence is not None:
+        return [image.page for image in extraction.canonical_evidence.images]
     if extraction.evidence_view is not None:
         return [page.view_page for page in extraction.evidence_view.pages]
     return list(range(1, (extraction.page_count or 0) + 1))
 
 
 def identical_evidence_scope(old: AnnexExtraction, new: AnnexExtraction) -> bool:
+    if old.canonical_evidence is not None or new.canonical_evidence is not None:
+        return old == new
     if old.source_sha256 != new.source_sha256:
         return False
     if old.evidence_view is None and new.evidence_view is None:
@@ -166,6 +195,7 @@ def select_annex_evidence_view(
     canonical_labels: list[str],
     canonical_chunk_ids: list[str],
     source_labels: list[str] | None = None,
+    verified_visual_source_sha256: str | None = None,
 ) -> AnnexExtraction:
     """Select native, standalone annex boundaries corroborated by relational scope.
 
@@ -175,6 +205,8 @@ def select_annex_evidence_view(
     """
     if extraction.evidence_view is not None:
         raise ValueError("nested evidence scope")
+    if extraction.canonical_evidence is not None:
+        raise ValueError("canonical evidence is not a selectable original")
     if (
         not original.available
         or original.sha256 != extraction.source_sha256
@@ -187,11 +219,56 @@ def select_annex_evidence_view(
         or not canonical_chunk_ids
     ):
         raise ValueError("canonical annex scope is not corroborated")
+    verified_visual = (
+        verified_visual_source_sha256 == original.sha256
+        and extraction.mime_type == "application/pdf"
+        and extraction.model_snapshot is not None
+    )
     boundaries = [
         (position, found)
         for position, element in enumerate(extraction.elements)
-        if (found := _boundary_label(element)) is not None
+        if (found := _boundary_label(element, verified_visual=verified_visual))
+        is not None
     ]
+    if verified_visual:
+        native_boundaries = [
+            (position, found)
+            for position, found in boundaries
+            if extraction.elements[position].extraction_method == "native"
+        ]
+
+        def duplicates_native(position: int, found: str) -> bool:
+            element = extraction.elements[position]
+            box = element.locator.normalized_box
+            if element.extraction_method != "vision" or box is None:
+                return False
+            for native_position, native_label in native_boundaries:
+                native = extraction.elements[native_position]
+                other = native.locator.normalized_box
+                if (
+                    native_label == found
+                    and native.locator.page == element.locator.page
+                    and other is not None
+                    and min(box[2], other[2]) > max(box[0], other[0])
+                    and min(box[3], other[3]) - max(box[1], other[1])
+                    > 0.5 * min(box[3] - box[1], other[3] - other[1])
+                ):
+                    return True
+            return False
+
+        boundaries = [
+            (position, found)
+            for position, found in boundaries
+            if not duplicates_native(position, found)
+        ]
+        boundaries.sort(
+            key=lambda entry: (
+                extraction.elements[entry[0]].locator.page or 0,
+                (extraction.elements[entry[0]].locator.normalized_box or (0, 0, 0, 0))[
+                    1
+                ],
+            )
+        )
     starts = [position for position, found in boundaries if found == label]
     if not starts and extraction.mime_type.endswith("spreadsheetml.sheet"):
         sheets = {
@@ -261,9 +338,11 @@ def select_annex_evidence_view(
     if len(starts) != 1:
         raise ValueError("annex native boundary missing or ambiguous")
     start = starts[0]
-    end = next(
-        (position for position, _ in boundaries if position > start),
-        len(extraction.elements),
+    boundary_index = boundaries.index((start, label))
+    end = (
+        boundaries[boundary_index + 1][0]
+        if boundary_index + 1 < len(boundaries)
+        else len(extraction.elements)
     )
     visual = extraction.mime_type.startswith(("application/pdf", "image/"))
     pages: list[AnnexEvidencePage] = []
@@ -335,7 +414,13 @@ def select_annex_evidence_view(
         selected,
         pages,
         [start, *([end] if end < len(extraction.elements) else [])],
-        "native_boundaries",
+        "verified_visual_boundaries"
+        if verified_visual
+        and any(
+            extraction.elements[position].extraction_method == "vision"
+            for position, _ in boundaries
+        )
+        else "native_boundaries",
     )
 
 
@@ -347,7 +432,12 @@ def _build_selected_view(
     selected: list[int],
     pages: list[AnnexEvidencePage],
     boundaries: list[int],
-    method: Literal["native_boundaries", "bound_whole_original", "native_sheet"],
+    method: Literal[
+        "native_boundaries",
+        "verified_visual_boundaries",
+        "bound_whole_original",
+        "native_sheet",
+    ],
 ) -> AnnexExtraction:
     parent = AnnexEvidenceParent(
         file_id=original.file_id,
@@ -461,6 +551,12 @@ def validate_baseline_evidence_view(
     baseline: AnnexBaseline, extraction: AnnexExtraction
 ) -> list[str]:
     issues = validate_evidence_view(extraction)
+    if extraction.canonical_evidence is not None:
+        from onyx.regulatory.amendments.annexes.canonical_evidence import (
+            validate_canonical_baseline,
+        )
+
+        return [*issues, *validate_canonical_baseline(baseline, extraction)]
     view = extraction.evidence_view
     if view is None:
         return issues
@@ -610,6 +706,23 @@ def freeze_review_pages(
         render_annex_pages, content, original.mime_type, timeout=30
     )
     mappings: dict[int, AnnexEvidencePage] = {}
+    if extraction is not None and extraction.canonical_evidence is not None:
+        bound_images = [
+            image
+            for image in extraction.canonical_evidence.images
+            if image.file_id == original.parent_file_id
+            and image.sha256 == original.parent_sha256
+        ]
+        if len(bound_images) != 1 or len(pages) != 1:
+            raise ValueError("canonical image evidence mapping ambiguous")
+        mappings = {
+            1: AnnexEvidencePage(
+                parent_index=0,
+                original_page=1,
+                view_page=bound_images[0].page,
+                normalized_box=(0, 0, 1, 1),
+            )
+        }
     if extraction is not None and extraction.evidence_view is not None:
         if validate_evidence_view(extraction):
             raise ValueError("invalid evidence view")
@@ -795,6 +908,7 @@ def validate_compared_evidence(
     new_originals: list[AnnexOriginalEvidence],
     comparison: AnnexComparison,
     evidence: list[AnnexReviewEvidence],
+    baseline: AnnexBaseline | None = None,
 ) -> None:
     """Bind every compared parent and image to authorized frozen review bytes."""
     expected_images: list[tuple[object, ...]] = []
@@ -803,7 +917,31 @@ def validate_compared_evidence(
         ("old", old, old_originals),
         ("new", new, new_originals),
     ):
-        if extraction.evidence_view:
+        canonical = (
+            side == "old"
+            and extraction.evidence_view is None
+            and baseline is not None
+            and extraction.mime_type == "text/markdown"
+        )
+        if canonical:
+            from onyx.regulatory.amendments.annexes.canonical_evidence import (
+                validate_canonical_baseline,
+            )
+
+            assert baseline is not None
+            if validate_canonical_baseline(baseline, extraction):
+                raise ValueError(
+                    "compared canonical baseline differs from frozen review"
+                )
+            parents = (
+                [
+                    (image.file_id, image.sha256, image.mime_type)
+                    for image in extraction.canonical_evidence.images
+                ]
+                if extraction.canonical_evidence
+                else []
+            )
+        elif extraction.evidence_view:
             parents = [
                 (parent.file_id, parent.sha256, parent.mime_type)
                 for parent in extraction.evidence_view.parents
@@ -825,7 +963,7 @@ def validate_compared_evidence(
             for original in originals
             if original.available
         }
-        if not parents or not set(parents).issubset(authorized):
+        if (not parents and not canonical) or not set(parents).issubset(authorized):
             raise ValueError("compared parent identity outside authorized originals")
         for parent_id, digest, mime in parents:
             frozen = [
@@ -842,7 +980,7 @@ def validate_compared_evidence(
             ) != (digest, digest, mime):
                 raise ValueError("compared original differs from frozen review bytes")
         manifest = [item for item in comparison.image_manifest if item.side == side]
-        if extraction.mime_type.startswith(("image/", "application/pdf")):
+        if has_visual_evidence(extraction):
             pages = selected_evidence_pages(extraction)
             if not pages or sorted(
                 item.page for item in manifest if item.kind == "comparison_page"
@@ -851,7 +989,17 @@ def validate_compared_evidence(
         elif manifest:
             raise ValueError("nonvisual original has comparison image manifest")
         for item in manifest:
-            if extraction.evidence_view:
+            if extraction.canonical_evidence is not None:
+                images = [
+                    image
+                    for image in extraction.canonical_evidence.images
+                    if image.page == item.page
+                ]
+                if len(images) != 1:
+                    raise ValueError("comparison image outside canonical bindings")
+                parent_id, digest = images[0].file_id, images[0].sha256
+                original_page = 1
+            elif extraction.evidence_view:
                 mappings = [
                     page
                     for page in extraction.evidence_view.pages
@@ -1396,4 +1544,10 @@ def has_visual_original(extraction: AnnexExtraction) -> bool:
         )
         if extraction.evidence_view
         else extraction.mime_type.startswith(("image/", "application/pdf"))
+    )
+
+
+def has_visual_evidence(extraction: AnnexExtraction) -> bool:
+    return has_visual_original(extraction) or bool(
+        extraction.canonical_evidence and extraction.canonical_evidence.images
     )

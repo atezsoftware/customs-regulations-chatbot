@@ -63,6 +63,16 @@ def frozen_comparison_pages(
         if evidence.side != side or evidence.kind != "comparison_page":
             continue
         page = evidence.locator.page
+        if extraction.canonical_evidence is not None:
+            images = [
+                image
+                for image in extraction.canonical_evidence.images
+                if image.file_id == evidence.parent_file_id
+                and image.sha256 == evidence.parent_sha256
+            ]
+            if len(images) != 1 or page != 1:
+                raise ValueError("frozen canonical image mapping changed")
+            page = images[0].page
         if extraction.evidence_view is not None:
             view = extraction.evidence_view
             parent_indices = [

@@ -409,6 +409,7 @@ def validate_prepared_annex_change(
     from onyx.regulatory.amendments.annexes.models import AnnexOriginalEvidence
 
     validate_compared_evidence(
+        baseline=draft.baseline,
         old=draft.old_extraction,
         new=draft.new_extraction,
         old_originals=draft.baseline.originals,

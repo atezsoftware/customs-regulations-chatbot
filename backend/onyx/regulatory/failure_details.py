@@ -36,6 +36,7 @@ def safe_failure_detail(stage: str, error: BaseException) -> str:
         "UnicodeDecodeError",
         "ValueError",
         "ValidationError",
+        "StructuredOutputValidationError",
         "RuntimeError",
         "TypeError",
         "TimeoutError",
@@ -100,6 +101,14 @@ def safe_failure_detail(stage: str, error: BaseException) -> str:
                 "status",
                 "issues",
                 "table_role",
+                "new_chunk",
+                "dates",
+                "effective_start_date",
+                "effective_end_date",
+                "reference_date",
+                "heading_path",
+                "metadata_changes",
+                "chunk_type",
             }
             validation_errors = [
                 {

@@ -238,7 +238,8 @@ function groupTableCellsIntoRows(cells: IndexedElement[]): IndexedElement[][] {
     const previousBox = previousRow?.[0]?.element.locator.normalized_box;
     const overlaps =
       box && previousBox
-        ? Math.min(box[3], previousBox[3]) - Math.max(box[1], previousBox[1]) > 0
+        ? Math.min(box[3], previousBox[3]) - Math.max(box[1], previousBox[1]) >
+          0
         : false;
     if (previousRow && overlaps) previousRow.push(cell);
     else rows.push([cell]);
@@ -254,7 +255,9 @@ function groupTableCellsIntoRows(cells: IndexedElement[]): IndexedElement[][] {
 
 function tableRowMarkdown(cells: IndexedElement[]): string {
   return `| ${cells
-    .map(({ element }) => (element.text || "—").replaceAll("|", "\\|").replaceAll("\n", " "))
+    .map(({ element }) =>
+      (element.text || "—").replaceAll("|", "\\|").replaceAll("\n", " ")
+    )
     .join(" | ")} |`;
 }
 
@@ -264,9 +267,11 @@ function TableRun({ cells }: { cells: IndexedElement[] }) {
   const source = useMemo(() => {
     if (rows.length === 0) return "";
     const separator = `| ${Array(columnCount).fill("---").join(" | ")} |`;
-    return [tableRowMarkdown(rows[0] ?? []), separator, ...rows.slice(1).map(tableRowMarkdown)].join(
-      "\n"
-    );
+    return [
+      tableRowMarkdown(rows[0] ?? []),
+      separator,
+      ...rows.slice(1).map(tableRowMarkdown),
+    ].join("\n");
   }, [rows, columnCount]);
 
   return (
@@ -648,10 +653,9 @@ export default function AnnexChangeReview({
             className="rounded-08 border border-status-warning-02 bg-status-warning-01 p-2"
           >
             <Text as="p" font="main-ui-body" color="text-05">
-              OLD has no retained original document (this file was indexed
-              from markdown/plain text), so it was compared using its
-              already-indexed canonical text instead of a visually
-              re-verified original.
+              OLD uses the current indexed chunks of this annex. Available
+              images linked to those chunks are included as visual evidence. An
+              original PDF is not required.
             </Text>
           </div>
         )}

@@ -37,6 +37,7 @@ from onyx.regulatory.amendments.segmenter import (
 from onyx.regulatory.amendments.structural_target import (
     appendix_replacement_attention_message,
 )
+from onyx.regulatory.structured_llm import StructuredOutputValidationError
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -183,21 +184,23 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             for payload in instruction_payloads
         ]
     )
-    from onyx.regulatory.amendments.annexes.analysis import run_annex_groups
-
-    processed_instruction_indices.update(
-        run_annex_groups(
-            batch_id=batch_id,
-            lease_generation=lease_generation,
-            instructions=instructions,
-            processed_indices=processed_instruction_indices,
-            reference_date=reference_date,
-            llm=llm,
-        )
+    from onyx.regulatory.amendments.annexes.analysis import (
+        group_annex_instructions,
+        run_annex_groups,
     )
+
+    annex_indices = {
+        index
+        for group in group_annex_instructions(instructions)
+        for index in group.instruction_indices
+    }
+    first_output_error: StructuredOutputValidationError | TimeoutError | None = None
     matched_instructions: list[_MatchedInstruction] = []
     for instruction_index, instruction in enumerate(instructions):
-        if instruction_index in processed_instruction_indices:
+        if (
+            instruction_index in processed_instruction_indices
+            or instruction_index in annex_indices
+        ):
             continue
         candidates, match = retrieve_and_confirm_instruction(
             retriever=retriever,
@@ -298,6 +301,17 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 context=context,
                 pdf_source=pdf_source,
             )
+        except (StructuredOutputValidationError, TimeoutError) as error:
+            # Leave these indices unfinished so Retry resumes them, while other
+            # independent groups can still produce durable review proposals.
+            first_output_error = first_output_error or error
+            logger.warning(
+                "Amendment batch=%s drafting group=%s failed: %s",
+                batch_id,
+                instruction_indices,
+                type(error).__name__,
+            )
+            continue
         except DraftIntegrityError as error:
             for item in ordered_group:
                 with _session() as db_session:
@@ -329,6 +343,17 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             lease_generation,
             len(group_candidates),
         )
+
+    run_annex_groups(
+        batch_id=batch_id,
+        lease_generation=lease_generation,
+        instructions=instructions,
+        processed_indices=processed_instruction_indices,
+        reference_date=reference_date,
+        llm=llm,
+    )
+    if first_output_error is not None:
+        raise first_output_error
 
     with _session() as db_session:
         if not mark_batch_analyzed(

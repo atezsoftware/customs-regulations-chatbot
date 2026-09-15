@@ -21,6 +21,9 @@ from onyx.file_store.file_store import FileStore, get_default_file_store
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.annexes import config
 from onyx.regulatory.amendments.annexes.baseline import prepare_legacy_baseline
+from onyx.regulatory.amendments.annexes.canonical_evidence import (
+    canonical_baseline_extraction,
+)
 from onyx.regulatory.amendments.annexes.comparison import compare_annexes
 from onyx.regulatory.amendments.annexes.context_dependencies import (
     compare_context_views,
@@ -29,8 +32,6 @@ from onyx.regulatory.amendments.annexes.context_dependencies import (
 from onyx.regulatory.amendments.annexes.evidence import (
     CURRENT_SOURCE_TEXT_VERSION,
     build_new_evidence_remapping,
-    choose_original_evidence,
-    combine_annex_evidence_views,
     freeze_review_original,
     freeze_review_pages,
     read_original_source_text,
@@ -161,6 +162,7 @@ def _extract_prepared_source(
     *,
     manifest_file_id: str,
     manifest_sha256: str,
+    verified_sources: set[str] | None = None,
 ) -> AnnexExtraction:
     if original.mime_type == "application/pdf":
         from onyx.regulatory.amendments.pdf_vision import load_frozen_pdf_asset
@@ -175,6 +177,8 @@ def _extract_prepared_source(
             source_sha256=original.sha256,
         )
         if frozen is not None:
+            if verified_sources is not None:
+                verified_sources.add(original.sha256)
             return frozen
     return _extract_cached(store, original, cache, vision_llm)
 
@@ -340,55 +344,26 @@ def prepare_annex_group(
             for element in baseline.elements
             if element.canonical_chunk_id
         ]
-        if baseline.visual_evidence_available:
-            old_originals = choose_original_evidence(
-                baseline.originals, canonical_chunk_ids=canonical_ids
-            )
-            old_views = [
-                select_annex_evidence_view(
-                    extraction=_extract_cached(store, original, cache, vision_llm),
-                    original=original,
-                    annex_label=group.annex_label,
-                    canonical_labels=[group.annex_label],
-                    canonical_chunk_ids=original.canonical_chunk_ids,
-                )
-                for original in old_originals
-            ]
-            old = (
-                old_views[0]
-                if len(old_views) == 1
-                else combine_annex_evidence_views(
-                    old_views, canonical_chunk_ids=canonical_ids
-                )
-            )
-            old_evidence_kind = "visual"
-        else:
-            # No retained original backs this baseline (e.g. the file was
-            # imported as markdown/plain text, so there is nothing to
-            # visually re-verify). Fall back to the already-indexed
-            # canonical text as the OLD side — the same AnnexExtraction
-            # shape prepare_legacy_baseline persists for the current
-            # revision. It carries no evidence_view (nothing was "selected
-            # from" a larger original), so validate_baseline_evidence_view
-            # and validate_evidence_view both skip their view-specific
-            # checks below, and compare_annexes compares it as native text
-            # against the new side's real visual evidence — never treated
-            # as equally strong, and always labeled as such to the reviewer
-            # via draft.old_evidence_kind.
-            old = AnnexExtraction(
-                source_sha256=hashlib.sha256(
-                    baseline.canonical_text.encode()
-                ).hexdigest(),
-                mime_type="text/markdown",
-                elements=baseline.elements,
-            )
-            old_originals = []
-            old_evidence_kind = "canonical_text"
+        old = canonical_baseline_extraction(baseline)
+        assert old.canonical_evidence is not None
+        image_ids = {image.file_id for image in old.canonical_evidence.images}
+        old_originals = [
+            original for original in baseline.originals if original.file_id in image_ids
+        ]
+        old_pages, old_evidence = _freeze_side(store, scope, "old", old_originals, old)
+        draft = draft.model_copy(
+            update={
+                "old_extraction": old,
+                "old_evidence_kind": "canonical_text",
+                "evidence": old_evidence,
+            }
+        )
         baseline_issues = validate_baseline_evidence_view(baseline, old)
         if baseline_issues:
             raise ValueError(",".join(baseline_issues))
         selected: list[tuple[AnnexOriginalEvidence, AnnexExtraction]] = []
         selection_errors: list[str] = []
+        verified_sources: set[str] = set()
         for asset in assets:
             original = AnnexOriginalEvidence(
                 file_id=asset.file_id,
@@ -403,6 +378,7 @@ def prepare_annex_group(
                 vision_llm,
                 manifest_file_id=manifest_id,
                 manifest_sha256=manifest_sha256,
+                verified_sources=verified_sources,
             )
             for element in extraction.elements:
                 element.source_asset_id = str(asset.id)
@@ -417,6 +393,9 @@ def prepare_annex_group(
                     canonical_labels=[group.annex_label],
                     canonical_chunk_ids=canonical_ids,
                     source_labels=labels,
+                    verified_visual_source_sha256=asset.sha256
+                    if asset.sha256 in verified_sources
+                    else None,
                 )
                 selected.append((original, view))
             except ValueError as exc:
@@ -424,9 +403,15 @@ def prepare_annex_group(
         if not selected:
             raise ValueError("new_annex_evidence_missing:" + ";".join(selection_errors))
         new_originals, new = select_new_annex_sources(selected, links)
-        old_pages, old_evidence = _freeze_side(store, scope, "old", old_originals, old)
         new_pages, new_evidence = _freeze_side(store, scope, "new", new_originals, new)
         evidence = [*old_evidence, *new_evidence]
+        draft = draft.model_copy(
+            update={
+                "new_extraction": new,
+                "raw_new_extraction": new,
+                "evidence": evidence,
+            }
+        )
         comparison = compare_annexes(
             old=old,
             new=new,
@@ -446,7 +431,7 @@ def prepare_annex_group(
         draft = draft.model_copy(
             update={
                 "old_extraction": old,
-                "old_evidence_kind": old_evidence_kind,
+                "old_evidence_kind": "canonical_text",
                 "new_extraction": new,
                 "raw_new_extraction": new,
                 "comparison": comparison,

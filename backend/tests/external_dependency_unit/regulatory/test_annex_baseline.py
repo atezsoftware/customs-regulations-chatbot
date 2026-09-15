@@ -67,8 +67,10 @@ def _chunk(
     return row
 
 
+@pytest.mark.parametrize("companion_source", ["indexed", "amendment"])
 def test_scoped_complete_legacy_baseline_uses_real_image_companions(
     source_session: Session,
+    companion_source: str,
 ) -> None:
     from onyx.configs.constants import FileOrigin
     from onyx.file_store.postgres_file_store import PostgresBackedFileStore
@@ -112,6 +114,7 @@ def test_scoped_complete_legacy_baseline_uses_real_image_companions(
         for key, value in companion.chunk_metadata.items()
         if key != "appendix_label"
     }
+    companion.source = companion_source
     source_session.flush()
     baseline = prepare_legacy_baseline(
         source_session,
@@ -127,6 +130,93 @@ def test_scoped_complete_legacy_baseline_uses_real_image_companions(
     assert baseline.originals[0].available and baseline.originals[0].sha256
     assert baseline.visual_evidence_available
     assert baseline.canonical_text.startswith("Approved 0")
+    assert "Approved image transcript" not in baseline.canonical_text
+    assert (
+        next(
+            element
+            for element in baseline.elements
+            if element.canonical_chunk_id == companion.id
+        ).canonical_role
+        == "supporting"
+    )
+    from onyx.regulatory.amendments.annexes.canonical_evidence import (
+        canonical_baseline_extraction,
+        validate_canonical_baseline,
+    )
+
+    old = canonical_baseline_extraction(baseline)
+    assert old.elements == baseline.elements
+    assert old.canonical_evidence is not None
+    assert old.canonical_evidence.images[0].file_id == image_id
+    assert old.canonical_evidence.images[0].canonical_chunk_ids == [companion.id]
+    assert not old.issues
+    assert not validate_canonical_baseline(baseline, old)
+    import hashlib
+
+    from onyx.regulatory.amendments.annexes.analysis import _freeze_side
+    from onyx.regulatory.amendments.annexes.comparison import compare_annexes
+    from onyx.regulatory.amendments.annexes.evidence import validate_compared_evidence
+    from onyx.regulatory.amendments.annexes.models import (
+        AnnexExtraction,
+        AnnexOriginalEvidence,
+        AnnexReviewEvidenceScope,
+        ExtractedAnnexElement,
+    )
+
+    new_content = b"New approved text"
+    new_id = store.save_file(
+        BytesIO(new_content), "new.txt", FileOrigin.OTHER, "text/plain"
+    )
+    new_original = AnnexOriginalEvidence(
+        file_id=new_id,
+        sha256=hashlib.sha256(new_content).hexdigest(),
+        mime_type="text/plain",
+        available=True,
+    )
+    assert new_original.sha256 is not None
+    new = AnnexExtraction(
+        source_sha256=new_original.sha256,
+        mime_type="text/plain",
+        elements=[ExtractedAnnexElement(kind="text", text=new_content.decode())],
+    )
+    scope = AnnexReviewEvidenceScope(
+        batch_id=1,
+        document_set_id=document_set.id,
+        user_file_id=file.id,
+        created_by=file.user_id,
+        environment="local-test",
+        old_original_file_ids=[image_id],
+        new_original_file_ids=[new_id],
+    )
+    old_pages, old_evidence = _freeze_side(store, scope, "old", baseline.originals, old)
+    _, new_evidence = _freeze_side(store, scope, "new", [new_original], new)
+    try:
+        assert [page.page for page in old_pages] == [1]
+        comparison = compare_annexes(old=old, new=new, old_pages=old_pages)
+        validate_compared_evidence(
+            old=old,
+            new=new,
+            old_originals=baseline.originals,
+            new_originals=[new_original],
+            comparison=comparison,
+            evidence=[*old_evidence, *new_evidence],
+            baseline=baseline,
+        )
+        tampered = comparison.model_copy(update={"image_manifest": []})
+        with pytest.raises(ValueError, match="manifest"):
+            validate_compared_evidence(
+                old=old,
+                new=new,
+                old_originals=baseline.originals,
+                new_originals=[new_original],
+                comparison=tampered,
+                evidence=[*old_evidence, *new_evidence],
+                baseline=baseline,
+            )
+    finally:
+        for evidence in [*old_evidence, *new_evidence]:
+            store.delete_file(evidence.file_id)
+        store.delete_file(new_id)
     assert (
         baseline.revision_id
         == prepare_legacy_baseline(
@@ -160,6 +250,9 @@ def test_scoped_complete_legacy_baseline_uses_real_image_companions(
     assert missing.baseline_sha256 != baseline.baseline_sha256
     assert missing.canonical_text == baseline.canonical_text
     assert missing.originals[0].issue == "original_unavailable"
+    assert canonical_baseline_extraction(missing).issues == [
+        "canonical_image_unavailable"
+    ]
 
 
 def test_revision_dates_and_row_identity_do_not_follow_latest_approval(

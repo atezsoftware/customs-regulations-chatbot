@@ -186,6 +186,7 @@ class AnnexEvidenceView(BaseModel):
     boundary_positions: list[int]
     selection_method: Literal[
         "native_boundaries",
+        "verified_visual_boundaries",
         "bound_whole_original",
         "native_sheet",
         "ordered_bound_originals",
@@ -196,7 +197,25 @@ class AnnexEvidenceView(BaseModel):
     renderer_version: str = "annex-rendering-v1"
 
 
+class AnnexCanonicalImage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    file_id: str
+    sha256: str
+    mime_type: str
+    canonical_chunk_ids: list[str]
+    page: int = Field(ge=1)
+
+
+class AnnexCanonicalEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    baseline_sha256: str
+    images: list[AnnexCanonicalImage] = Field(default_factory=list)
+
+
 class AnnexExtraction(BaseModel):
+    canonical_evidence: AnnexCanonicalEvidence | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     evidence_view: AnnexEvidenceView | None = None
     page_count: int | None = Field(default=None, ge=1)
     model_config = ConfigDict(extra="forbid")
@@ -308,6 +327,7 @@ class AnnexVisionWireResult(BaseModel):
 
 
 class AnnexOriginalEvidence(BaseModel):
+    linked_from_chunks: bool = Field(default=False, exclude_if=lambda value: not value)
     canonical_chunk_ids: list[str] = Field(default_factory=list)
     file_id: str
     mime_type: str | None = None
@@ -757,11 +777,7 @@ class AnnexChangeDraft(BaseModel):
     # defaults to 1, so live re-verification recomputes the original source
     # text with the same join algorithm it was frozen with — never today's.
     original_source_text_version: Literal[1, 2] = 1
-    # "canonical_text" means the OLD side has no retained original document
-    # (e.g. this file was imported as markdown/plain text) and was compared
-    # using its already-indexed canonical text instead of a visually
-    # re-verified original. The reviewer sees this distinction explicitly —
-    # it is never silently treated as equally strong evidence.
+    # Canonical OLD retains indexed text and explicitly bound supplementary images.
     old_evidence_kind: Literal["visual", "canonical_text"] = "visual"
     source_graph_sha256: str | None = None
     source_graph: list[SourceLink] = Field(default_factory=list)

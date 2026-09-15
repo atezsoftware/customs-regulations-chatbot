@@ -15,6 +15,13 @@ Equal OCR is not proof of equal visual meaning. Conversely, a different number o
 extracted regions is NOT evidence of an insertion or removal: reconcile grouping
 against the simultaneous images. A scan/layout difference alone is not a legal
 change. A missing or unreadable page is incomplete evidence, not a deletion.
+When OLD is indexed canonical chunks, those chunks define the current approved
+text. Supplementary OLD images belong only to their listed canonical chunk IDs;
+they are not missing pages of a required original PDF. Inspect those images, not
+just their OCR captions. Tables use printed cell values and row/column geometry;
+forms retain their field labels and layout; photos, signatures, seals and diagrams
+remain visual evidence. Never turn a caption or a decorative photo into invented
+regulatory wording. An unrelated image supports no amendment by itself.
 For each change, select only integer old_positions and new_positions from the
 eligible OLD/NEW reference candidates. Do not return copied text, locators, or
 coordinates: the server resolves them from the frozen extraction. Never invent a

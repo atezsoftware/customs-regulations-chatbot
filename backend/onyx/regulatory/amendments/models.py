@@ -6,10 +6,12 @@ parsing.
 """
 
 from datetime import date
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+IsoDateString = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")]
 
 
 def _require_iso_date_or_none(value: str | None) -> str | None:
@@ -77,7 +79,7 @@ class AmendmentInstruction(BaseModel):
 class SegmentationResult(BaseModel):
     """Output of splitting a pasted amendment text into atomic instructions."""
 
-    reference_date: str | None = Field(
+    reference_date: IsoDateString | None = Field(
         default=None,
         description="The amendment text's own publication/reference date (YYYY-MM-DD), if stated",
     )
@@ -142,11 +144,11 @@ class DateResolution(BaseModel):
     """Effective dates resolved from natural-language phrasing in the
     amendment text, anchored to the amendment's reference date."""
 
-    effective_start_date: str | None = Field(
+    effective_start_date: IsoDateString | None = Field(
         default=None,
         description="YYYY-MM-DD the amended text starts applying, or null if not stated",
     )
-    effective_end_date: str | None = Field(
+    effective_end_date: IsoDateString | None = Field(
         default=None,
         description=(
             "YYYY-MM-DD the amended text stops applying — only set this if "

@@ -11,7 +11,7 @@ from onyx.llm.interfaces import LLM
 from onyx.llm.models import ImageContentPart, ImageUrlDetail
 from onyx.prompts.regulatory_annex_comparison import ANNEX_COMPARISON_PROMPT
 from onyx.regulatory.amendments.annexes.evidence import (
-    has_visual_original,
+    has_visual_evidence,
     identical_evidence_scope,
     selected_evidence_pages,
     validate_evidence_view,
@@ -294,6 +294,11 @@ def _validate_response(
 
 def _scope_prompt(extraction: AnnexExtraction) -> str:
     view = extraction.evidence_view
+    if extraction.canonical_evidence is not None:
+        return (
+            "Authoritative indexed chunks, with supplementary image bindings: "
+            + extraction.canonical_evidence.model_dump_json()
+        )
     if view is None:
         return "whole original"
     return (
@@ -343,7 +348,7 @@ def compare_annexes(
         issues.append("incomplete_extraction")
     if not old_positions or not new_positions:
         issues.append("empty_extraction")
-    visual = any(has_visual_original(extraction) for extraction in (old, new))
+    visual = any(has_visual_evidence(extraction) for extraction in (old, new))
     method = (
         "identical_asset"
         if identical_evidence_scope(old, new)
@@ -400,14 +405,15 @@ def compare_annexes(
     elif method == "simultaneous_vision":
         for extraction, pages in ((old, before_pages), (new, after_pages)):
             if (
-                has_visual_original(extraction)
+                has_visual_evidence(extraction)
                 and extraction.evidence_view is None
                 and extraction.page_count is None
+                and extraction.canonical_evidence is None
             ):
                 issues.append("page_count_unverified")
             elif [page.page for page in pages] != selected_evidence_pages(extraction):
                 issues.append("page_coverage_mismatch")
-            if has_visual_original(extraction) and not pages:
+            if has_visual_evidence(extraction) and not pages:
                 issues.append("visual_evidence_unavailable")
             if not {
                 extraction.elements[position].locator.page
@@ -571,7 +577,7 @@ def validate_annex_comparison(
     new_positions = _atomic_positions(new, omit_scope_boundaries=multipart)
     if not old_positions or not new_positions:
         issues.append("empty_extraction")
-    visual = any(has_visual_original(extraction) for extraction in (old, new))
+    visual = any(has_visual_evidence(extraction) for extraction in (old, new))
     expected_method = (
         "identical_asset"
         if identical_evidence_scope(old, new)
@@ -587,9 +593,10 @@ def validate_annex_comparison(
             (new, comparison.coverage.new_pages),
         ):
             if (
-                has_visual_original(extraction)
+                has_visual_evidence(extraction)
                 and extraction.evidence_view is None
                 and extraction.page_count is None
+                and extraction.canonical_evidence is None
             ):
                 issues.append("page_count_unverified")
             elif pages != selected_evidence_pages(extraction):

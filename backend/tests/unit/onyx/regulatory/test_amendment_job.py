@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -49,6 +49,7 @@ def _run_grouping_job(
     processed_instruction_indices: list[int] | None = None,
     heartbeat_result: bool = True,
     draft_error: Exception | None = None,
+    draft_failures: dict[int, Exception] | None = None,
 ) -> SimpleNamespace:
     instructions = [
         AmendmentInstruction(
@@ -136,6 +137,8 @@ def _run_grouping_job(
     def draft_group(*_args: object, **kwargs: Any) -> SimpleNamespace:
         assert session_depth == 0
         events.append(("draft", list(kwargs["instruction_indices"])))
+        if draft_failures and kwargs["instruction_indices"][0] in draft_failures:
+            raise draft_failures[kwargs["instruction_indices"][0]]
         if draft_error is not None:
             raise draft_error
         return SimpleNamespace(
@@ -176,6 +179,33 @@ def _run_grouping_job(
         events=events,
         instructions=instructions,
     )
+
+
+def test_schema_failure_preserves_other_groups_and_leaves_failed_indices_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory.structured_llm import StructuredOutputValidationError
+
+    error = StructuredOutputValidationError("invalid draft date")
+    with pytest.raises(StructuredOutputValidationError):
+        _run_grouping_job(
+            monkeypatch,
+            batch_id=31,
+            targets=["failed", "completed", "good"],
+            processed_instruction_indices=[1],
+            processed_instruction_count=1,
+            draft_failures={0: error},
+        )
+    cast(MagicMock, job.persist_proposal_checkpoint).assert_called_once()
+    assert cast(MagicMock, job.persist_proposal_checkpoint).call_args.kwargs[
+        "proposal"
+    ].instruction_indices == [2]
+    assert [
+        call.kwargs["instruction_indices"]
+        for call in cast(MagicMock, job.draft_instruction_group_proposal).call_args_list
+    ] == [[0], [2]]
+    cast(MagicMock, job.persist_unmatched_checkpoint).assert_not_called()
+    cast(MagicMock, job.mark_batch_analyzed).assert_not_called()
 
 
 def test_invalid_generated_draft_becomes_an_attention_item(

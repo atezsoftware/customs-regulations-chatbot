@@ -103,7 +103,9 @@ def prepare_legacy_baseline(
         ):
             if image_file_id not in seen:
                 seen.add(image_file_id)
-                originals.append(verify_legacy_original(store, image_file_id))
+                original = verify_legacy_original(store, image_file_id)
+                original.linked_from_chunks = True
+                originals.append(original)
         elements.append(
             ExtractedAnnexElement(
                 canonical_chunk_id=row.id,
@@ -111,8 +113,7 @@ def prepare_legacy_baseline(
                     "bound_to_regulatory_chunk_id"
                 ),
                 canonical_role="supporting"
-                if row.source == "indexed"
-                and row.chunk_metadata.get("chunk_variant") == "image_companion"
+                if row.chunk_metadata.get("chunk_variant") == "image_companion"
                 else "authoritative",
                 kind="image_region" if image_id else "text",
                 text=row.text,

@@ -45,6 +45,10 @@ logger = setup_logger()
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 
 
+class StructuredOutputValidationError(ValueError):
+    """The provider answered, but exhausted schema-correction attempts."""
+
+
 class _StructuredInvokeOptions(TypedDict):
     structured_response_format: dict
     timeout_override: NotRequired[int]
@@ -405,7 +409,7 @@ def generate_structured(
                 ]
 
     assert last_error is not None
-    raise ValueError(
+    raise StructuredOutputValidationError(
         f"LLM failed to produce valid {response_model.__name__} after "
         f"{max_attempts} attempts: {_validation_error_summary(last_error)}"
     ) from last_error

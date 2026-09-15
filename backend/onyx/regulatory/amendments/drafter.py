@@ -28,6 +28,7 @@ For `new_chunk`:
   IF there is NO old chunk (this is a brand-new article/provision): there is no old metadata to merge onto, so `metadata_changes` is effectively the metadata in full. Derive document_type, document_number, etc. from `sibling_reference` as appropriate. Fill article_no from the instruction if you can (e.g. "Madde 7 eklenmiştir") — citations look at article_no first, heading_path only as a fallback.
 
 For `dates`:
+- Both date fields must be a real calendar date string in exactly YYYY-MM-DD format or JSON null. Never return an empty string, the string "null", a date phrase, or DD/MM/YYYY. Put explanations only in `rationale`. For example, publication date 2026-07-04 with "yayımı tarihinde" gives effective_start_date "2026-07-04" and effective_end_date null unless an end date is explicitly stated.
 - `effective_start_date`: the date (YYYY-MM-DD) this new text takes effect. If the instruction states a concrete date (e.g. "1 Ocak 2027'den itibaren"), use it directly. If it states a relative phrase (e.g. "yayımı tarihinden itibaren") AND you were given a reference/publication date, resolve it against that date. If there is NEITHER a concrete date NOR a usable reference date, DO NOT GUESS — leave this null; the system will then use the approval date as a safe default (matching the Turkish regulatory default of "yürürlüğe giriş, aksi belirtilmedikçe yayım tarihinde" and the best information actually available). NOTE: this date (or the approval-date fallback) is also used as the date the OLD chunk's validity ENDS.
 - `effective_end_date`: ONLY set this if the instruction ITSELF explicitly states this new provision is also temporary/time-limited (e.g. "31.12.2027 tarihine kadar geçerlidir"). Otherwise null — never invent a default end date; null means "valid indefinitely", which is the correct default.
 - `rationale`: briefly explain how you derived these dates (or why you left them null).
@@ -152,6 +153,8 @@ def draft_combined_chunk(
         system_prompt=_SYSTEM_PROMPT,
         user_prompt=prompt,
         response_model=DraftResult,
+        timeout_override=60,
+        deadline=time.monotonic() + 90,
     )
 
 

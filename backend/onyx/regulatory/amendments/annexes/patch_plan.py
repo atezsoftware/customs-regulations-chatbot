@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import date
 
 from onyx.db.regulatory_annexes import normalize_annex_label
+from onyx.regulatory.amendments.annexes.canonical_evidence import render_selected_text
 from onyx.regulatory.amendments.annexes.comparison import (
     annex_snapshot_hash,
     validate_annex_comparison,
@@ -353,7 +354,10 @@ def prepare_annex_patch(
             continue
         matches: list[AnnexCanonicalSpan] = []
         for candidate in canonical:
-            if candidate.canonical_role == "supporting":
+            if (
+                candidate.canonical_role == "supporting"
+                and old.canonical_evidence is None
+            ):
                 continue
             chunk_id = candidate.canonical_chunk_id
             assert chunk_id is not None
@@ -418,6 +422,10 @@ def prepare_annex_patch(
     for old_position, element in enumerate(old.elements):
         if element.aggregate or old_position in changed_old:
             continue
+        if old.canonical_evidence is not None:
+            # Exhaustively reviewed unchanged canonical rows already have exact
+            # DB identities; OCR line wrapping need not create replacement text.
+            continue
         matching_positions = [
             index
             for index, candidate in enumerate(new.elements)
@@ -441,6 +449,12 @@ def prepare_annex_patch(
             issues.append("canonical_correspondence_unresolved")
     patches: list[AnnexCanonicalPatch] = []
     used_chunks: set[str] = set(visual_bound_chunks)
+    if old.canonical_evidence is not None:
+        used_chunks.update(
+            element.canonical_chunk_id
+            for position, element in enumerate(old.elements)
+            if position not in changed_old and element.canonical_chunk_id is not None
+        )
     grouped: dict[str, list[AnnexCanonicalSpan]] = {}
     for old_position in correspondence:
         binding = bindings.get(old_position)
@@ -464,7 +478,11 @@ def prepare_annex_patch(
         for span in reversed(ordered_spans):
             positions = correspondence[span.old_position]
             new_positions.extend(positions)
-            text = "\n".join(new.elements[position].text for position in positions)
+            text = (
+                render_selected_text(new, positions)
+                if old.canonical_evidence is not None
+                else "\n".join(new.elements[position].text for position in positions)
+            )
             replacement = replacement[: span.start] + text + replacement[span.end :]
         new_text = replacement or None
         operation = "remove" if new_text is None else "replace"
@@ -477,6 +495,7 @@ def prepare_annex_patch(
                 continue
         patches.append(
             AnnexCanonicalPatch(
+                canonical_role=current.canonical_role,
                 old_chunk_id=chunk_id,
                 old_text=current.text,
                 new_text=new_text,
@@ -500,7 +519,7 @@ def prepare_annex_patch(
                 )
             )
     insertions: dict[tuple[object, ...], list[int]] = {}
-    for change in comparison.changes:
+    for change_index, change in enumerate(comparison.changes):
         if change.operation != "insert":
             continue
         for reference in change.new:
@@ -511,6 +530,8 @@ def prepare_annex_patch(
                 if element.kind == "table_cell" and locator.row is not None
                 else (reference.position,)
             )
+            if old.canonical_evidence is not None:
+                key = ("canonical_insert", change_index)
             insertions.setdefault(key, []).append(reference.position)
     for positions in insertions.values():
         separator = (
@@ -524,7 +545,9 @@ def prepare_annex_patch(
             AnnexCanonicalPatch(
                 old_chunk_id=None,
                 old_text=None,
-                new_text=separator.join(
+                new_text=render_selected_text(new, sorted(positions))
+                if old.canonical_evidence is not None
+                else separator.join(
                     new.elements[position].text for position in sorted(positions)
                 ),
                 old_positions=[],
@@ -536,6 +559,17 @@ def prepare_annex_patch(
         chunk_id = element.canonical_chunk_id
         assert chunk_id is not None
         if element.canonical_role == "supporting":
+            if old.canonical_evidence is not None:
+                positions = {
+                    index
+                    for index, item in enumerate(old.elements)
+                    if item.canonical_chunk_id == chunk_id
+                }
+                if chunk_id in used_chunks or not positions.intersection(changed_old):
+                    used_chunks.add(chunk_id)
+                else:
+                    issues.append("supporting_caption_disposition_required")
+                continue
             originals = [
                 original
                 for original in baseline.originals

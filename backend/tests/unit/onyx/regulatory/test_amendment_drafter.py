@@ -17,6 +17,24 @@ from onyx.regulatory.amendments.models import (
 )
 
 
+@pytest.mark.parametrize(
+    "value", ["null", "", "yayımı tarihinde", "04/07/2026", "2026-02-30"]
+)
+def test_date_schema_rejects_phrases_and_invalid_calendar_dates(value: str) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        DateResolution(effective_start_date=value, rationale="fixture")
+    schema = DateResolution.model_json_schema()
+    assert schema["properties"]["effective_start_date"]["anyOf"][0]["pattern"]
+    assert (
+        DateResolution(
+            effective_start_date="2026-07-04", rationale="publication"
+        ).effective_end_date
+        is None
+    )
+
+
 def test_combined_draft_prompt_contains_each_instruction_and_returns_one_proposal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

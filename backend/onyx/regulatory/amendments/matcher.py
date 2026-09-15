@@ -1,6 +1,7 @@
 """LLM confirmation of which hybrid-search candidate an amendment instruction targets."""
 
 import json
+import time
 
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
@@ -64,4 +65,6 @@ def confirm_match(
         system_prompt=_SYSTEM_PROMPT,
         user_prompt=prompt,
         response_model=MatchResult,
+        timeout_override=45,
+        deadline=time.monotonic() + 60,
     )

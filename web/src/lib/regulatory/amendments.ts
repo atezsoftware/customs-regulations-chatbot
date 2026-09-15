@@ -302,10 +302,7 @@ export interface AnnexReviewPayload {
   source_text_sha256: string | null;
   source_manifest_sha256: string | null;
   original_source_text_sha256: string | null;
-  // "canonical_text" means OLD has no retained original document (e.g. it
-  // was imported as markdown/plain text) and was compared using its
-  // already-indexed canonical text instead of a visually re-verified
-  // original — never treated as equally strong evidence.
+  // Canonical OLD uses current indexed text plus any explicitly bound images.
   old_evidence_kind: "visual" | "canonical_text";
   submitted_source_text: string | null;
   raw_new_extraction: AnnexExtraction | null;
