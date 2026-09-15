@@ -180,7 +180,55 @@ def test_extract_amendment_html_skips_decorative_images(
     assert calls == []
 
 
-def test_extract_amendment_html_describes_linked_pdf_text_layer(
+def test_extract_amendment_html_always_runs_vision_on_linked_pdf_with_text_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A text layer existing is never trusted alone — vision always reads the
+    rendered page, with the extracted text passed along only as a hint."""
+    monkeypatch.setattr(
+        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
+    )
+    monkeypatch.setattr(
+        source_extraction,
+        "_download_embedded_asset_bytes",
+        lambda *_args, **_kwargs: b"%PDF-1.7 fake pdf bytes",
+    )
+    monkeypatch.setattr(
+        source_extraction,
+        "extract_file_text",
+        lambda *_args, **_kwargs: "EK-1: Yeni tarife listesi burada yer alır." * 3,
+    )
+    monkeypatch.setattr(
+        "onyx.utils.process_isolation.run_in_isolated_process",
+        lambda *_args, **_kwargs: [SimpleNamespace(page=1, png=b"fake-page-png")],
+    )
+    seen_prompts = []
+
+    def fake_summarize(
+        _llm: object, _image_data: bytes, _context_name: str, **kwargs: object
+    ) -> str:
+        seen_prompts.append(kwargs.get("user_prompt_template"))
+        return "Sayfa görselinden okunan gerçek tarife listesi."
+
+    monkeypatch.setattr(
+        "onyx.file_processing.image_summarization.summarize_image_with_error_handling",
+        fake_summarize,
+    )
+
+    result = extract_amendment_html(
+        b"<html><main><p>MADDE 1- Yeni metin.</p>"
+        b'<a href="ek1.pdf">Ekleri icin tiklayiniz</a></main></html>',
+        "text/html",
+        base_url="https://example.gov/update",
+    )
+
+    assert "Ekli PDF" in result
+    assert "Sayfa görselinden okunan gerçek tarife listesi." in result
+    assert "EK-1: Yeni tarife listesi burada yer alır." not in result
+    assert seen_prompts and "EK-1: Yeni tarife listesi" in (seen_prompts[0] or "")
+
+
+def test_extract_amendment_html_falls_back_to_text_layer_when_render_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -196,10 +244,12 @@ def test_extract_amendment_html_describes_linked_pdf_text_layer(
         "extract_file_text",
         lambda *_args, **_kwargs: "EK-1: Yeni tarife listesi burada yer alır." * 3,
     )
-    render_calls = []
+
+    def fail_render(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("render backend unavailable")
+
     monkeypatch.setattr(
-        "onyx.utils.process_isolation.run_in_isolated_process",
-        lambda *args, **kwargs: render_calls.append((args, kwargs)),
+        "onyx.utils.process_isolation.run_in_isolated_process", fail_render
     )
 
     result = extract_amendment_html(
@@ -211,7 +261,41 @@ def test_extract_amendment_html_describes_linked_pdf_text_layer(
 
     assert "Ekli PDF" in result
     assert "EK-1: Yeni tarife listesi burada yer alır." in result
-    assert render_calls == []
+
+
+def test_extract_amendment_html_drops_garbled_text_layer_when_render_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "onyx.llm.factory.get_default_llm_with_vision", lambda: object()
+    )
+    monkeypatch.setattr(
+        source_extraction,
+        "_download_embedded_asset_bytes",
+        lambda *_args, **_kwargs: b"%PDF-1.7 fake pdf bytes",
+    )
+    monkeypatch.setattr(
+        source_extraction,
+        "extract_file_text",
+        lambda *_args, **_kwargs: "-)(+*,06:8 1GHMGKR*PMQR:>R'R )KLPMQR%QLH" * 5,
+    )
+
+    def fail_render(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("render backend unavailable")
+
+    monkeypatch.setattr(
+        "onyx.utils.process_isolation.run_in_isolated_process", fail_render
+    )
+
+    result = extract_amendment_html(
+        b"<html><main><p>MADDE 1- Yeni metin.</p>"
+        b'<a href="ek1.pdf">Ekleri icin tiklayiniz</a></main></html>',
+        "text/html",
+        base_url="https://example.gov/update",
+    )
+
+    assert "Ekli PDF" not in result
+    assert "1GHMGKR" not in result
 
 
 def test_extract_amendment_html_describes_linked_pdf_via_vision_without_text_layer(

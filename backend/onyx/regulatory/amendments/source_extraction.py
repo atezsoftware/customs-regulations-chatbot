@@ -130,6 +130,29 @@ def _normalize_text(text: str) -> str:
     return normalized
 
 
+_LOWERCASE_LETTER_RE = re.compile(r"[a-zığüşöç]")
+_MIN_LOWERCASE_LETTER_RATIO = 0.15
+
+
+def has_readable_prose(text: str) -> bool:
+    """Reject a PDF "text layer" that is present but not actually text.
+
+    Some PDFs carry a text layer whose font has no (or a corrupt) ToUnicode
+    CMap: extraction succeeds and returns plenty of characters, but they
+    decode to unrelated glyphs instead of the source language — e.g.
+    "-)(+*,06:8" instead of Turkish prose. A character-count check alone
+    accepts this garbage. Real Turkish/Latin prose is predominantly
+    lowercase letters; font-remapped garbage is typically all-caps/symbols
+    with almost none — so count lowercase letters in the text as-is,
+    never case-normalized first (that would erase the signal).
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lowercase_letters = len(_LOWERCASE_LETTER_RE.findall(stripped))
+    return (lowercase_letters / len(stripped)) >= _MIN_LOWERCASE_LETTER_RATIO
+
+
 def _is_decorative_image(img: Tag) -> bool:
     """Skip logos/icons/tracking pixels — not the scanned/charted content
     amendments actually embed."""
@@ -181,19 +204,44 @@ def _download_embedded_asset_bytes(url: str, *, max_bytes: int) -> bytes | None:
         return None
 
 
+_PDF_PAGE_OCR_SYSTEM_PROMPT = (
+    "You transcribe scanned/rendered pages of Turkish customs regulation "
+    "documents for legal analysis. Read the page image directly and "
+    "reproduce its content VERBATIM, word-for-word — every article, "
+    "paragraph, table row, and label, in reading order, exactly as written. "
+    "This is OCR-style transcription, not a summary and not a paraphrase: "
+    "never rewrite, condense, or paraphrase the source wording, and never "
+    "omit substantive content. If a raw text-extraction hint is provided "
+    "below, treat it only as a possible aid — it may be partial, out of "
+    "order, or corrupted by a broken font encoding (garbled symbols instead "
+    "of letters); trust what you actually see in the image over the hint "
+    "whenever they disagree, and still transcribe it verbatim."
+)
+
+_EMBEDDED_IMAGE_OCR_SYSTEM_PROMPT = (
+    "You transcribe images embedded in Turkish customs regulation source "
+    "pages (charts, tables, scanned notices) for legal analysis. If the "
+    "image contains text, tables, or figures, reproduce their content "
+    "VERBATIM, word-for-word, in reading order — this is OCR-style "
+    "transcription, not a summary and not a paraphrase; never rewrite, "
+    "condense, or omit substantive content. Only if the image is purely "
+    "decorative/photographic with no textual or tabular content, give a "
+    "brief factual description instead."
+)
+
+
 def _describe_pdf_bytes(content: bytes, *, llm: "LLM", label: str) -> str | None:
-    """Text layer when there is one (verbatim — the most faithful reading of
-    "add it in exactly, fully"); otherwise render pages and describe each via
-    vision. Returns None on any failure — best-effort, same as images."""
+    """Always read each page via vision — a PDF's text layer can look
+    present (enough characters to pass a length check) while actually being
+    garbled under a broken font encoding, so it is never trusted alone.
+    Any text layer that does exist is passed to the LLM as a hint, not
+    returned verbatim on its own. Falls back to the raw text layer only if
+    page rendering itself fails outright. Returns None on total failure —
+    best-effort, same as images."""
     try:
         extracted_text = extract_file_text(io.BytesIO(content), label, extension=".pdf")
     except Exception:
         extracted_text = ""
-    if (
-        extracted_text.strip()
-        and len(extracted_text.strip()) >= MIN_AMENDMENT_PDF_TEXT_CHARS
-    ):
-        return extracted_text.strip()
 
     from onyx.file_processing.image_summarization import (
         summarize_image_with_error_handling,
@@ -206,18 +254,33 @@ def _describe_pdf_bytes(content: bytes, *, llm: "LLM", label: str) -> str | None
             render_annex_pages, content, "application/pdf", timeout=30
         )
     except Exception:
+        if extracted_text.strip() and has_readable_prose(extracted_text):
+            return extracted_text.strip()
         return None
 
+    text_hint = extracted_text.strip()[:6000]
     page_descriptions: list[str] = []
     for page in rendered_pages[:_MAX_DESCRIBED_PDF_PAGES]:
+        user_prompt = (
+            f"Transcribe page {page.page} of '{label}' completely and structurally."
+            + (
+                f"\n\nRaw text-extraction hint (may be unreliable):\n{text_hint}"
+                if text_hint
+                else ""
+            )
+        )
         description = summarize_image_with_error_handling(
             llm,
             page.png,
             f"{label} (sayfa {page.page})",
+            system_prompt=_PDF_PAGE_OCR_SYSTEM_PROMPT,
+            user_prompt_template=user_prompt,
         )
         if description:
             page_descriptions.append(f"Sayfa {page.page}: {description}")
     if not page_descriptions:
+        if extracted_text.strip() and has_readable_prose(extracted_text):
+            return extracted_text.strip()
         return None
     return "\n\n".join(page_descriptions)
 
@@ -284,7 +347,13 @@ def _describe_embedded_images(root: Tag, base_url: str, *, llm: "LLM") -> str:
         if not image_bytes:
             continue
         label = str(img.get("alt") or "").strip() or src
-        description = summarize_image_with_error_handling(llm, image_bytes, label)
+        description = summarize_image_with_error_handling(
+            llm,
+            image_bytes,
+            label,
+            system_prompt=_EMBEDDED_IMAGE_OCR_SYSTEM_PROMPT,
+            user_prompt_template=f"Transcribe the content of this embedded image ('{label}') verbatim.",
+        )
         if description:
             descriptions.append(f"[Gömülü görsel: {label}]\n{description}")
 
