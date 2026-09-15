@@ -175,6 +175,7 @@ function groupElementsByPage(
 ): ExtractionPageGroup[] {
   const groups: ExtractionPageGroup[] = [];
   elements.forEach((element, position) => {
+    if (element.aggregate) return;
     const page = element.locator.page;
     const current = groups[groups.length - 1];
     if (!current || current.page !== page) {
@@ -305,9 +306,16 @@ function ExtractionElementBlock({ item }: { item: IndexedElement }) {
       <Text as="p" font="main-ui-body" color="text-05">
         {element.text || "(visual element)"}
       </Text>
-      <Text as="p" font="secondary-body" color="text-03">
-        {`${position}: ${element.kind} · ${element.extraction_method} · ${locatorLabel(element.locator)}`}
-      </Text>
+      <details>
+        <summary className="cursor-pointer">
+          <Text font="secondary-body" color="text-03">
+            Source details
+          </Text>
+        </summary>
+        <Text as="p" font="secondary-body" color="text-03">
+          {`${position}: ${element.kind} · ${element.extraction_method} · ${locatorLabel(element.locator)}`}
+        </Text>
+      </details>
       {element.formula && (
         <Text as="p" font="secondary-body" color="text-03">
           {`Formula: ${element.formula}`}
@@ -352,30 +360,56 @@ function ExtractionPanel({
         <Tag title={extraction.mime_type} truncate />
       </div>
       <Text as="p" font="secondary-body" color="text-03">
-        {`Frozen extraction ${shorten(extraction.source_sha256)} · ${extraction.elements.length} elements${
+        {`${pageGroups.reduce((count, group) => count + group.items.length, 0)} content elements${
           pageGroups.length > 1 ? ` · ${pageGroups.length} pages` : ""
         }`}
       </Text>
-      {extraction.evidence_view?.pages.map((page) => (
-        <Text
-          key={`${page.parent_index}-${page.view_page}`}
-          as="p"
-          font="secondary-body"
-          color="text-03"
-        >
-          {`Original page ${page.original_page} → review page ${page.view_page}`}
+      <details>
+        <summary className="cursor-pointer">
+          <Text font="secondary-body" color="text-03">
+            Extraction details
+          </Text>
+        </summary>
+        <Text as="p" font="secondary-body" color="text-03">
+          {`Frozen extraction ${shorten(extraction.source_sha256)} · ${extraction.elements.length} source elements`}
         </Text>
-      ))}
-      {extraction.evidence_view?.element_mappings.map((mapping) => (
-        <Text
-          key={`${mapping.parent_index}-${mapping.original_position}-${mapping.view_position}`}
-          as="p"
-          font="secondary-body"
-          color="text-03"
-        >
-          {`Original element ${mapping.original_position} → review element ${mapping.view_position} · ${locatorLabel(mapping.original_locator)}`}
-        </Text>
-      ))}
+        {extraction.evidence_view?.pages.map((page) => (
+          <Text
+            key={`${page.parent_index}-${page.view_page}`}
+            as="p"
+            font="secondary-body"
+            color="text-03"
+          >
+            {`Original page ${page.original_page} → review page ${page.view_page}`}
+          </Text>
+        ))}
+        {extraction.evidence_view?.element_mappings.map((mapping) => (
+          <Text
+            key={`${mapping.parent_index}-${mapping.original_position}-${mapping.view_position}`}
+            as="p"
+            font="secondary-body"
+            color="text-03"
+          >
+            {`Original element ${mapping.original_position} → review element ${mapping.view_position} · ${locatorLabel(mapping.original_locator)}`}
+          </Text>
+        ))}
+        {extraction.elements.some((element) => element.aggregate) && (
+          <div className="flex flex-col gap-2">
+            <Text as="p" font="secondary-body" color="text-03">
+              Supplementary extraction retained for audit; excluded from the
+              content above.
+            </Text>
+            {extraction.elements.map((element, position) =>
+              element.aggregate ? (
+                <ExtractionElementBlock
+                  key={position}
+                  item={{ element, position }}
+                />
+              ) : null
+            )}
+          </div>
+        )}
+      </details>
       <div className="mt-2 flex flex-col gap-2">
         {pageGroups.map((group, groupIndex) => {
           const runs = splitIntoRuns(group.items);
@@ -671,16 +705,9 @@ export default function AnnexChangeReview({
 
       <ReviewSection title="Frozen original evidence">
         {payload.old_evidence_kind === "canonical_text" && (
-          <div
-            role="status"
-            className="rounded-08 border border-status-warning-02 bg-status-warning-01 p-2"
-          >
-            <Text as="p" font="main-ui-body" color="text-05">
-              OLD uses the current indexed chunks of this annex. Available
-              images linked to those chunks are included as visual evidence. An
-              original PDF is not required.
-            </Text>
-          </div>
+          <Text as="p" font="secondary-body" color="text-03">
+            Original content: existing document chunks and linked images.
+          </Text>
         )}
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           <ExtractionPanel title="OLD" extraction={payload.old_extraction} />
@@ -852,16 +879,18 @@ export default function AnnexChangeReview({
         payload.corrections.length > 0 ||
         payload.correction_reconciliation) && (
         <ReviewSection title="Evidence-backed correction">
-          {editableElements.map((element, position) => (
-            <Text
-              key={`raw-${position}`}
-              as="p"
-              font="secondary-body"
-              color="text-03"
-            >
-              {`Raw extraction ${position}: ${element.text}`}
-            </Text>
-          ))}
+          {editableElements.map((element, position) =>
+            element.aggregate ? null : (
+              <Text
+                key={`raw-${position}`}
+                as="p"
+                font="secondary-body"
+                color="text-03"
+              >
+                {`Raw extraction ${position}: ${element.text}`}
+              </Text>
+            )
+          )}
           {payload.corrections.map((correction) => (
             <div
               key={`applied-${correction.position}`}
@@ -887,6 +916,7 @@ export default function AnnexChangeReview({
                 revalidates the complete group against frozen evidence.
               </Text>
               {editableElements.map((element, position) => {
+                if (element.aggregate) return null;
                 const correction = correctionByPosition.get(position);
                 return (
                   <div key={position} className="flex flex-col gap-2">

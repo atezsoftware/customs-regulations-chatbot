@@ -264,11 +264,14 @@ function reviewFixture(overrides: Partial<AnnexReview> = {}): AnnexReview {
   };
 }
 
-test("renders frozen evidence, separated impact, and final publication windows", () => {
+test("renders frozen evidence, separated impact, and final publication windows", async () => {
+  const user = setupUser();
   render(<AnnexChangeReview review={reviewFixture()} onUpdated={jest.fn()} />);
 
   expect(screen.getByText("Old rate: 10%")).toBeVisible();
   expect(screen.getAllByText("New rate: 12%")[0]).toBeVisible();
+  expect(screen.getByText(/Original page 2 → review page 1/)).not.toBeVisible();
+  await user.click(screen.getAllByText("Extraction details")[0]!);
   expect(screen.getByText(/Original page 2 → review page 1/)).toBeVisible();
   expect(screen.getByText("Direct legal changes")).toBeVisible();
   expect(screen.getByText("Context reevaluation candidates")).toBeVisible();
@@ -282,6 +285,33 @@ test("renders frozen evidence, separated impact, and final publication windows",
     "/api/regulatory/amendments/batches/42/annex-groups/review-1/evidence/evidence-old"
   );
   expect(screen.queryByText("artifact-internal")).not.toBeInTheDocument();
+});
+
+test("keeps supplementary PDF extraction out of the content view without losing evidence", async () => {
+  const user = setupUser();
+  const review = reviewFixture();
+  const extraction = review.review_payload.new_extraction!;
+  const original = extraction.elements[0]!;
+  extraction.elements.unshift({
+    ...original,
+    aggregate: true,
+    text: "1GHMGKR*PMQR:>R'R",
+  });
+  const frozen = JSON.stringify(extraction);
+
+  render(<AnnexChangeReview review={review} onUpdated={jest.fn()} />);
+
+  expect(screen.getByText("1GHMGKR*PMQR:>R'R")).not.toBeVisible();
+  expect(screen.getAllByText(original.text)[0]).toBeVisible();
+  expect(
+    screen.queryByRole("textbox", { name: "Correct NEW element 0" })
+  ).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("textbox", { name: "Correct NEW element 1" })
+  ).toBeVisible();
+  await user.click(screen.getAllByText("Extraction details")[1]!);
+  expect(screen.getByText("1GHMGKR*PMQR:>R'R")).toBeVisible();
+  expect(JSON.stringify(extraction)).toBe(frozen);
 });
 
 test("submits a corrected NEW element as a full immutable revalidation", async () => {
