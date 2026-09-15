@@ -1,5 +1,4 @@
 import hashlib
-import os
 
 from onyx.background.celery.queue_names import database_scoped_queue_name
 from onyx.configs.app_configs import POSTGRES_DB, POSTGRES_HOST, POSTGRES_PORT
@@ -10,9 +9,11 @@ from onyx.configs.app_configs import (
     REGULATORY_ANNEX_UPDATES_ENABLED as REGULATORY_ANNEX_UPDATES_ENABLED,
 )
 
-REGULATORY_ANNEX_WORKER_ENABLED = (
-    os.environ.get("REGULATORY_ANNEX_WORKER_ENABLED", "false").lower() == "true"
-)
+# Always on: this used to depend on an environment variable that a separate
+# infra repo's Helm values file controlled (mirroring supervisord-lite.conf's
+# celery_worker_regulatory_annex autostart), which meant task routing here
+# could silently disagree with whether that worker was actually running.
+REGULATORY_ANNEX_WORKER_ENABLED = True
 
 ANNEX_DATABASE_IDENTITY = f"{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 

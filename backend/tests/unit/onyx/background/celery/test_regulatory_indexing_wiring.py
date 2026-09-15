@@ -1363,15 +1363,10 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         for section in parser.sections()
         if section.startswith("program:")
     }
-    # The existing production topology excludes the explicitly opt-in DEV lane.
-    assert (
-        parser.get("program:celery_worker_regulatory_annex", "autostart")
-        == "%(ENV_REGULATORY_ANNEX_WORKER_ENABLED)s"
-    )
-    assert (
-        'ENV REGULATORY_ANNEX_WORKER_ENABLED="false"'
-        in (_BACKEND_ROOT / "Dockerfile.runtime-lite").read_text()
-    )
+    # Always started now — the opt-in-per-environment gate depended on an
+    # external repo's Helm values to flip an env var, which silently left
+    # the worker never started once nothing rendered that value anymore.
+    assert parser.get("program:celery_worker_regulatory_annex", "autostart") == "true"
     supervisor_programs.remove("celery_worker_regulatory_annex")
     assert supervisor_programs == {
         *workers,
