@@ -1681,9 +1681,17 @@ MAX_FILE_SIZE_BYTES = int(
 # infra repo's Helm values file controlled, which meant the feature could be
 # silently disabled by state nobody here could see or wanted to touch.
 REGULATORY_ANNEX_UPDATES_ENABLED = True
-REGULATORY_ANNEX_ENVIRONMENT = (
-    os.environ.get("REGULATORY_ANNEX_ENVIRONMENT") or POSTGRES_DB
-)
+# This scopes the annex worker queue names (see
+# regulatory/amendments/annexes/config.py) — it must resolve to the same
+# short value ("dev"/"test"/"prod") on every pod, producer and consumer
+# alike, or enqueued source-package jobs land on a queue nothing is
+# listening to and sit stuck forever. It used to be rendered explicitly by
+# the now-removed DEV cutover workflow step; strip the shared
+# "customs-regulations-" prefix from POSTGRES_DB instead so every pod
+# derives the identical value with no dependency on that external step.
+REGULATORY_ANNEX_ENVIRONMENT = os.environ.get(
+    "REGULATORY_ANNEX_ENVIRONMENT"
+) or POSTGRES_DB.removeprefix("customs-regulations-")
 
 MAX_AMENDMENT_SOURCE_BYTES = _non_negative_int_env(
     "MAX_AMENDMENT_SOURCE_BYTES", 25 * 1024 * 1024
