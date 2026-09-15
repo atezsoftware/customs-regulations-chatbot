@@ -154,10 +154,14 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         # never resolve by retrying the identical text.
         segmentation = segment_amendment_text(llm, raw_text)
         if not segmentation.instructions:
-            logger.info(
+            logger.warning(
                 "Amendment batch=%s segmentation found no update instructions; "
-                "marking analyzed with nothing to review",
+                "marking analyzed with nothing to review. This is expected for "
+                "genuinely non-amendment text, but silently drops the batch if "
+                "the segmenter misjudged real amendment text — check raw_text "
+                "if that's suspected. raw_text_prefix=%r",
                 batch_id,
+                raw_text[:200],
             )
         instruction_payloads = [
             instruction.model_dump() for instruction in segmentation.instructions

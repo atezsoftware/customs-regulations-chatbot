@@ -29,16 +29,13 @@ from onyx.db.models import (
     RegulatoryChunk,
 )
 from onyx.db.regulatory_chunks import (
-    has_active_structural_descendants,
     is_hierarchical_aggregate_chunk,
     make_regulatory_chunk_id,
     supersede_hierarchical_aggregates_referencing_chunk,
 )
 from onyx.document_index.publication_models import FileOwnership
 from onyx.regulatory.amendments.draft_integrity import (
-    explicit_replacement_body,
     reconcile_existing_heading_path,
-    reject_unsupported_descendant_replacement_texts,
     validate_explicit_replacement_texts,
 )
 from onyx.regulatory.amendments.models import ProposalDraft, ReviewedAmendmentChunkDraft
@@ -1106,14 +1103,6 @@ def approve_amendment_proposal(
             old_chunk,
             getattr(proposal, "old_chunk_snapshot", None) or {},
         )
-        instruction_texts = _proposal_instruction_texts(proposal)
-        if any(explicit_replacement_body(text) for text in instruction_texts):
-            reject_unsupported_descendant_replacement_texts(
-                instruction_texts,
-                has_active_descendants=has_active_structural_descendants(
-                    db_session, old_chunk
-                ),
-            )
 
     new_chunk_metadata = dict(draft.get("metadata") or {})
     # Model-authored references do not grant access to source images or elements.

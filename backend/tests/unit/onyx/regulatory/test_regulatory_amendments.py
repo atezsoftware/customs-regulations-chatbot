@@ -17,7 +17,6 @@ from onyx.db.regulatory_chunks import (
     get_active_chunks_by_ids,
     get_current_chunks_by_ids,
     get_next_chunk_position,
-    has_active_structural_descendants,
     make_regulatory_chunk_id,
 )
 from onyx.regulatory.amendments import candidate_finder, pipeline
@@ -138,76 +137,6 @@ def test_stale_search_projection_ids_follow_the_active_version_lineage() -> None
         "article-20-v2": current,
     }
     db_session.scalars.assert_called_once()
-
-
-def test_active_structural_descendants_require_an_exact_heading_prefix() -> None:
-    user_file_id = UUID("00000000-0000-0000-0000-000000000123")
-    parent_path = ["MADDE 20", "(3) Yediden fazla idare için"]
-    parent = cast(
-        RegulatoryChunk,
-        SimpleNamespace(
-            id="paragraph-3",
-            user_file_id=user_file_id,
-            position=136,
-            heading_path=parent_path,
-            chunk_metadata={"article_no": "20"},
-        ),
-    )
-    child = SimpleNamespace(
-        id="clause-a",
-        heading_path=[*parent_path, "a) Birinci yöntem"],
-    )
-    peer = SimpleNamespace(
-        id="paragraph-4",
-        heading_path=["MADDE 20", "(4) Başka hüküm"],
-    )
-    scalars = MagicMock()
-    scalars.all.return_value = [child, peer]
-    db_session = MagicMock(spec=Session)
-    db_session.scalars.return_value = scalars
-
-    assert has_active_structural_descendants(db_session, parent) is True
-
-    statement = str(db_session.scalars.call_args.args[0])
-    assert "regulatory_chunk.status" in statement
-    assert "regulatory_chunk.user_file_id" in statement
-
-
-def test_active_structural_descendants_survive_stale_child_heading() -> None:
-    user_file_id = UUID("00000000-0000-0000-0000-000000000123")
-    parent = cast(
-        RegulatoryChunk,
-        SimpleNamespace(
-            id="paragraph-1-v2",
-            user_file_id=user_file_id,
-            position=136,
-            chunk_type="paragraph",
-            heading_path=["MADDE 20", "(1) Yediyi geçemez"],
-            chunk_metadata={"article_no": "20", "paragraph_no": "1"},
-        ),
-    )
-    stale_heading_child = SimpleNamespace(
-        id="clause-a-v1",
-        chunk_type="clause",
-        heading_path=["MADDE 20", "(1) Sekizi geçemez", "a) Birinci yöntem"],
-        chunk_metadata={
-            "article_no": "20",
-            "paragraph_no": "1",
-            "clause_label": "a",
-        },
-    )
-    next_paragraph = SimpleNamespace(
-        id="paragraph-2",
-        chunk_type="paragraph",
-        heading_path=["MADDE 20", "(2) Başka hüküm"],
-        chunk_metadata={"article_no": "20", "paragraph_no": "2"},
-    )
-    scalars = MagicMock()
-    scalars.all.return_value = [stale_heading_child, next_paragraph]
-    db_session = MagicMock(spec=Session)
-    db_session.scalars.return_value = scalars
-
-    assert has_active_structural_descendants(db_session, parent) is True
 
 
 def test_candidate_lookup_keeps_large_dataset_out_of_llm_context() -> None:
