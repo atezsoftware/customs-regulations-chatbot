@@ -6,6 +6,7 @@ import re
 import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from hashlib import sha256
+from io import BufferedReader
 from typing import cast
 
 from google.cloud import storage
@@ -650,11 +651,16 @@ class LabelingVertexBatchGateway(GoogleVertexBatchGateway):
                     used_bytes = 0
                     seen_hashes: set[str] = set()
                     for blob in jsonl_blobs:
-                        with blob.open(
-                            "rb",
-                            timeout=self._request_timeout_seconds,
-                            chunk_size=_DOWNLOAD_CHUNK_BYTES,
-                        ) as stream:
+                        # BlobReader inherits a byte-at-a-time readline; buffer it
+                        # before scanning large JSONL records returned by Vertex.
+                        with (
+                            blob.open(
+                                "rb",
+                                timeout=self._request_timeout_seconds,
+                                chunk_size=_DOWNLOAD_CHUNK_BYTES,
+                            ) as raw_stream,
+                            BufferedReader(raw_stream, buffer_size=64 * 1024) as stream,
+                        ):
                             while True:
                                 remaining = self._max_result_bytes - used_bytes
                                 read_limit = min(_MAX_RESULT_LINE_BYTES, remaining) + 1

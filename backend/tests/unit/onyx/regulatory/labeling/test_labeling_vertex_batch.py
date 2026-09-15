@@ -12,6 +12,8 @@ from typing import Any, cast
 import pytest
 import requests
 from google.auth.credentials import Credentials
+from google.cloud.storage import Blob
+from google.cloud.storage.fileio import BlobReader
 
 from onyx.regulatory.indexing_jobs.models import (
     IndexingGatewayIndeterminateSubmissionError,
@@ -700,6 +702,45 @@ def test_results_are_bounded_and_correlated_from_full_echoed_requests(
             "timeout": 20,
         }
     ]
+
+
+def test_native_blob_reader_processes_large_lines_with_bounded_block_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway()
+    storage_client = _FakeStorageClient()
+    _install_clients(monkeypatch, gateway, storage_client, _FakeBatches())
+    requests = [_request("a" * 80_000), _request("b" * 80_000)]
+    output_prefix = f"tenant-a/labeling-stage/labeling/{'a' * 64}/output"
+    path = f"{output_prefix}/part.jsonl"
+    payload = "".join(
+        _vertex_output_line(request, model=None) for request in requests
+    ).encode()
+    blob = _FakeBlob(path, payload.decode())
+    storage_client.bucket_value.blobs[path] = blob
+    _install_manifest(storage_client, requests)
+    read_sizes: list[int] = []
+
+    class CountingBlobReader(BlobReader):
+        def read(self, size: int | None = -1) -> bytes:
+            assert size is not None
+            read_sizes.append(size)
+            assert 0 < size <= 64 * 1024
+            return super().read(size)
+
+    def download_range(*, start: int, end: int, **_kwargs: object) -> bytes:
+        return payload[start : end + 1]
+
+    monkeypatch.setattr(blob, "download_as_bytes", download_range)
+    reader = CountingBlobReader(cast(Blob, blob), chunk_size=4 * 1024 * 1024)
+    monkeypatch.setattr(blob, "open", lambda *_args, **_kwargs: reader)
+    parsed = parse_labeling_batch_output(
+        gateway.read_results(f"gs://regulatory-batch/{output_prefix}"),
+        {request.request_hash for request in requests},
+    )
+    assert len(parsed) == 2 and all(result.error is None for result in parsed.values())
+    assert reader.closed
+    assert 0 < len(read_sizes) < 10
 
 
 def test_tampered_or_duplicate_result_echo_fails_closed(
