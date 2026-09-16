@@ -216,7 +216,7 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 and asset.sha256 not in previous_pdf_assets
                 for asset in result.assets
             ):
-                vision = get_default_llm_with_vision()
+                vision = get_default_llm_with_vision(temperature=0)
             prepared = []
             for asset in result.assets:
                 if time.monotonic() >= deadline:

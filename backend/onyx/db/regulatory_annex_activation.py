@@ -186,6 +186,17 @@ def _activate_sources(
     prepared: AnnexPublicationPreparation,
     now: datetime,
 ) -> None:
+    if draft.selection_parent_id is not None:
+        _activate_selected_sources(
+            session,
+            delivery,
+            draft,
+            now=now,
+            user_file_id=prepared.user_file_id,
+            effective_start=prepared.legal.effective_start,
+            effective_end=prepared.legal.effective_end,
+        )
+        return
     if (
         draft.baseline is None
         or draft.baseline.revision_id is None
@@ -321,6 +332,170 @@ def _activate_sources(
     session.flush()
 
 
+def _activate_selected_sources(
+    session: Session,
+    delivery: AnnexPublicationDelivery,
+    draft: AnnexChangeDraft,
+    *,
+    now: datetime,
+    user_file_id: UUID,
+    effective_start: date,
+    effective_end: date | None,
+) -> None:
+    """Compose approved elements with the previous revision, excluding pending drafts."""
+    if (
+        draft.selection_source_revision_id is None
+        or draft.new_extraction is None
+        or draft.new_evidence_remapping is None
+    ):
+        raise ValueError("selected source revision missing")
+    previous = session.get(RegulatoryAnnexRevision, draft.selection_source_revision_id)
+    if previous is None or previous.baseline_sha256 != draft.selection_source_sha256:
+        raise ValueError("selected source baseline changed")
+    annex = session.get(RegulatoryAnnex, previous.annex_id)
+    if annex is None or annex.user_file_id != user_file_id:
+        raise ValueError("selected source scope changed")
+    if effective_end is not None:
+        raise ValueError(
+            "temporary partial source review must be approved as a complete unit"
+        )
+    end = previous.effective_end
+    if (
+        previous.effective_start is not None
+        and previous.effective_start > effective_start
+        or end is not None
+        and end <= effective_start
+    ):
+        raise ValueError("selected source interval changed")
+    old_ids = {identifier for item in draft.items for identifier in item.old_chunk_ids}
+    old_elements = list(
+        session.scalars(
+            select(RegulatoryAnnexRevisionElement)
+            .where(RegulatoryAnnexRevisionElement.revision_id == previous.id)
+            .order_by(RegulatoryAnnexRevisionElement.position)
+        )
+    )
+    old_links = list(
+        session.scalars(
+            select(RegulatoryAnnexElementChunk).where(
+                RegulatoryAnnexElementChunk.revision_id == previous.id
+            )
+        )
+    )
+    removed_elements = {
+        link.element_id for link in old_links if link.chunk_id in old_ids
+    }
+    links_by_element: dict[UUID, list[str]] = {}
+    for link in old_links:
+        links_by_element.setdefault(link.element_id, []).append(link.chunk_id)
+    if any(
+        set(links_by_element[element_id]) - old_ids for element_id in removed_elements
+    ):
+        raise ValueError(
+            "source element shared with an unselected chunk; select the complete group"
+        )
+    # Ordering is anchored in the previous source; unrelated elements keep their payloads.
+    entries: list[tuple[int, int, UUID, dict[str, JsonValue], list[str]]] = [
+        (
+            element.position,
+            0,
+            element.element_id,
+            element.payload,
+            links_by_element.get(element.element_id, []),
+        )
+        for element in old_elements
+        if element.element_id not in removed_elements
+    ]
+    mapping = {entry.position: entry for entry in draft.new_evidence_remapping.elements}
+    selected_elements: set[UUID] = set()
+    for item in draft.items:
+        anchor_positions = [
+            element.position
+            for element in old_elements
+            if set(links_by_element.get(element.element_id, []))
+            & set(item.old_chunk_ids)
+        ]
+        if not anchor_positions and item.insertion_after_chunk_id:
+            anchor_positions = [
+                element.position
+                for element in old_elements
+                if item.insertion_after_chunk_id
+                in links_by_element.get(element.element_id, [])
+            ]
+        if not anchor_positions:
+            raise ValueError("selected source insertion boundary missing")
+        anchor = min(anchor_positions)
+        for offset, position in enumerate(item.new_positions, 1):
+            entry = mapping[position]
+            if entry.element_id in selected_elements:
+                continue
+            selected_elements.add(entry.element_id)
+            identity = session.get(RegulatoryAnnexElement, entry.element_id)
+            if identity is None:
+                session.add(
+                    RegulatoryAnnexElement(id=entry.element_id, annex_id=annex.id)
+                )
+            elif identity.annex_id != annex.id:
+                raise ValueError("selected source element outside annex")
+            chunk_ids = [
+                row.id
+                for selected in draft.items
+                for row in selected.new_chunks
+                if str(entry.element_id) in _element_ids(row.metadata)
+            ]
+            entries.append(
+                (
+                    anchor,
+                    offset,
+                    entry.element_id,
+                    draft.new_extraction.elements[position].model_dump(mode="json"),
+                    chunk_ids,
+                )
+            )
+    if len({entry[2] for entry in entries}) != len(entries):
+        raise ValueError("selected source elements overlap; select a connected unit")
+    # Same-day approvals are successive source revisions, not zero-length legal windows.
+    if previous.effective_start != effective_start:
+        previous.effective_end = effective_start
+    identifier = uuid5(delivery.change_set_id, "selected-annex-source-revision")
+    revision = RegulatoryAnnexRevision(
+        id=identifier,
+        annex_id=annex.id,
+        predecessor_revision_id=previous.id,
+        baseline_sha256=context_hash([delivery.review_sha256, "selected-source"]),
+        snapshot={
+            "review_id": str(delivery.change_set_id),
+            "selected_item_ids": [str(i) for i in draft.selection_item_ids],
+            "parent_review_id": str(draft.selection_parent_id),
+        },
+        effective_start=effective_start,
+        effective_end=end,
+        approved_at=now,
+    )
+    session.add(revision)
+    session.flush()
+    for position, (_anchor, _offset, element_id, payload, chunk_ids) in enumerate(
+        sorted(entries, key=lambda entry: (entry[0], entry[1]))
+    ):
+        session.add(
+            RegulatoryAnnexRevisionElement(
+                revision_id=identifier,
+                element_id=element_id,
+                position=position,
+                payload=payload,
+            )
+        )
+        session.flush()
+        for chunk_id in chunk_ids:
+            session.add(
+                RegulatoryAnnexElementChunk(
+                    revision_id=identifier, element_id=element_id, chunk_id=chunk_id
+                )
+            )
+    annex.latest_approved_revision_id = identifier
+    session.flush()
+
+
 def activate_publication(
     owner: FileOwnership,
     delivery: AnnexPublicationDelivery,
@@ -353,8 +528,13 @@ def activate_publication(
                 for op in operations.operations
                 if op.index_uuid == proof.index.index_uuid and op.binding
             ]
+            retained_ordinals = [
+                op.ordinal
+                for op in operations.operations
+                if op.index_uuid == proof.index.index_uuid and op.retained is not None
+            ]
             if proof.reservations != reservations or proof.live_ordinals != tuple(
-                sorted(item.ordinal for item in expected)
+                sorted([item.ordinal for item in expected] + retained_ordinals)
             ):
                 raise ValueError("activation verification scope differs from manifest")
         now = datetime.now(timezone.utc)
@@ -372,6 +552,46 @@ def activate_publication(
             if item.binding
         }
         bindings = [op.binding for op in operations.operations if op.binding]
+        retained_ordinals_by_index = {
+            (op.index_uuid, op.ordinal): op.retained
+            for op in operations.operations
+            if op.retained is not None
+        }
+        for previous in prior.values():
+            retained = retained_ordinals_by_index.get(
+                (previous.index.index_uuid, previous.projection.ordinal)
+            )
+            if retained is None:
+                continue
+            source = json.loads(retained.source_json)
+            from onyx.regulatory.amendments.annexes.publication_representations import (
+                _as_date,
+            )
+
+            end = _as_date(source.get("validity_end_date"))
+            if end != previous.effective_end:
+                updated = previous.model_copy(
+                    update={
+                        "effective_end": end,
+                        "projection": previous.projection.model_copy(
+                            update={
+                                "source_json": json.dumps(
+                                    {
+                                        k: v
+                                        for k, v in source.items()
+                                        if not k.startswith("publication_")
+                                    }
+                                )
+                            }
+                        ),
+                    }
+                )
+                close_preapproved_temporal_binding(
+                    session,
+                    previous=previous,
+                    updated=updated,
+                    user_file_id=prepared.user_file_id,
+                )
         # Close reviewed old windows first, then register dependencies before consumers.
         for binding in bindings:
             existing = prior.get(binding.id)
@@ -383,6 +603,11 @@ def activate_publication(
                     user_file_id=prepared.user_file_id,
                 )
         for identifier, previous in prior.items():
+            if (
+                previous.index.index_uuid,
+                previous.projection.ordinal,
+            ) in retained_ordinals_by_index:
+                continue
             if identifier not in {binding.id for binding in bindings}:
                 retire_preapproved_temporal_binding(
                     session,

@@ -2854,6 +2854,7 @@ def get_active_chunks_by_structural_reference(
     appendix_label: str | None,
     source_name_hint: str | None,
     source_name_tokens: Sequence[str] = (),
+    paragraph_no: str | None = None,
     limit: int = 32,
 ) -> list[RegulatoryChunkStructuralMatch]:
     """Load bounded exact structural targets inside a captured batch scope."""
@@ -2880,6 +2881,13 @@ def get_active_chunks_by_structural_reference(
         conditions.append(
             func.lower(func.trim(RegulatoryChunk.chunk_metadata["clause_label"].astext))
             == clause_label.casefold()
+        )
+    elif paragraph_no is not None:
+        # A clause carries its own label and no paragraph number, so the two
+        # narrowings are alternatives rather than a conjunction.
+        conditions.append(
+            func.trim(RegulatoryChunk.chunk_metadata["paragraph_no"].astext)
+            == paragraph_no
         )
     if appendix_label is not None:
         normalized_appendix_label = "".join(

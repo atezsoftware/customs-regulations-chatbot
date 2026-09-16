@@ -756,6 +756,24 @@ class AnnexAfterWindowAuthority(BaseModel):
 
 
 class AnnexChangeDraft(BaseModel):
+    impact_strategy: Literal["legacy_full_file", "source_dependencies_v1"] = Field(
+        default="legacy_full_file", exclude_if=lambda value: value == "legacy_full_file"
+    )
+    dependency_impact: "AnnexDependencyImpact | None" = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    selection_parent_id: UUID | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    selection_item_ids: list[UUID] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    selection_source_revision_id: UUID | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    selection_source_sha256: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     after_window_authority: AnnexAfterWindowAuthority | None = None
     publication: "AnnexPublicationReview | None" = None
     batch_id: int | None = None
@@ -905,6 +923,12 @@ class AnnexPublicationPreparation(BaseModel):
     views: dict[str, PreparedContextView]
     reserved_ordinals: list[int]
     retired_ordinals: dict[str, list[int]]
+    retained: list["AnnexRetainedProjection"] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    position_views: list["AnnexPositionView"] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
 
 
 class AnnexPublicationImpactCounts(BaseModel):
@@ -916,6 +940,9 @@ class AnnexPublicationImpactCounts(BaseModel):
     historical_projections: int
     retired_projections: int
     total_projections: int
+    preserved_vectors: int = Field(default=0, exclude_if=lambda value: value == 0)
+    metadata_updates: int = Field(default=0, exclude_if=lambda value: value == 0)
+    unresolved_dependencies: int = Field(default=0, exclude_if=lambda value: value == 0)
 
 
 class AnnexPublicationReview(BaseModel):
@@ -938,6 +965,36 @@ class AnnexProjectionAccess(BaseModel):
     project_ids: list[int]
     persona_ids: list[int]
     document_sets: list[str]
+
+
+class AnnexDependencyImpact(BaseModel):
+    """Source-only impact proof; never inferred from freshly generated context."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    changed_old_ids: list[str]
+    changed_new_ids: list[str]
+    affected_ids: list[str]
+    unchanged_ids: list[str]
+    unresolved: dict[str, list[str]]
+    reasons: dict[str, list[str]]
+
+
+class AnnexRetainedProjection(BaseModel):
+    """Keep an existing physical vector without claiming its encoder provenance."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    evidence: IndexedProjectionEvidence
+    validity_end: date | None = None
+    close_interval: bool = False
+
+
+class AnnexPositionView(BaseModel):
+    """Semantic order is versioned independently of permanent physical ordinals."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    effective_start: date | None
+    effective_end: date | None
+    positions: dict[str, int]
 
 
 from onyx.access.models import DocumentAccess  # noqa: E402

@@ -7,11 +7,46 @@ from dataclasses import dataclass
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.heading_path import (
-    extract_single_regulatory_provision_reference,
+    extract_regulatory_provision_references,
 )
 
 _CLAUSE_REFERENCE_RE = re.compile(
     r"\((?P<label>[a-zçğıöşü])\)\s*bend",
+    flags=re.IGNORECASE,
+)
+# A Turkish amendment instruction always opens with its own article number
+# ("MADDE 10-"), then names the target ("11 inci maddesinin"). Extracting a
+# reference from the whole sentence therefore sees two numbers and can neither
+# choose nor safely refuse; the opening designator is dropped first so the
+# remaining references describe the amended source only.
+_INSTRUCTION_HEADER_RE = re.compile(
+    r"^\s*(?:(?:geçici|gecici|mükerrer|mukerrer)\s+)?madde\s*\d+[a-zçğıöşü]*\s*"
+    r"[-–—.)]\s*",
+    flags=re.IGNORECASE,
+)
+_PARAGRAPH_ORDINALS = {
+    "birinci": "1",
+    "ikinci": "2",
+    "üçüncü": "3",
+    "ucuncu": "3",
+    "dördüncü": "4",
+    "dorduncu": "4",
+    "beşinci": "5",
+    "besinci": "5",
+    "altıncı": "6",
+    "altinci": "6",
+    "yedinci": "7",
+    "sekizinci": "8",
+    "dokuzuncu": "9",
+    "onuncu": "10",
+}
+_PARAGRAPH_ORDINAL_ALTERNATION: str = "|".join(
+    sorted(_PARAGRAPH_ORDINALS, key=lambda name: (-len(name), name))
+)
+_PARAGRAPH_REFERENCE_RE = re.compile(
+    rf"(?:(?P<ordinal>{_PARAGRAPH_ORDINAL_ALTERNATION})"
+    r"|(?P<number>\d{1,3})\s*(?:inci|ıncı|incı|uncu|üncü|uncü|nci|ncı|ncu|ncü)?)"
+    r"\s+f[ıi]kra",
     flags=re.IGNORECASE,
 )
 _APPENDIX_REFERENCE_RE = re.compile(
@@ -46,6 +81,7 @@ class AmendmentStructuralTarget:
     article_no: str | None = None
     clause_label: str | None = None
     appendix_label: str | None = None
+    paragraph_no: str | None = None
 
 
 def normalize_appendix_label(value: str) -> str:
@@ -87,29 +123,82 @@ def source_identity_distinguishing_tokens(
     )
 
 
+def amended_body(instruction_text: str) -> str:
+    """Drop the instruction's own ``MADDE N-`` designator from its text."""
+
+    return _INSTRUCTION_HEADER_RE.sub("", instruction_text, count=1)
+
+
+def _target_paragraph_no(instruction_body: str) -> str | None:
+    """Return the single amended paragraph number, if the text names one."""
+
+    numbers = {
+        _PARAGRAPH_ORDINALS[match.group("ordinal").casefold()]
+        if match.group("ordinal")
+        else match.group("number").lstrip("0")
+        for match in _PARAGRAPH_REFERENCE_RE.finditer(instruction_body)
+    }
+    numbers.discard("")
+    if len(numbers) != 1:
+        return None
+    return next(iter(numbers))
+
+
 def parse_amendment_structural_target(
     instruction: AmendmentInstruction,
 ) -> AmendmentStructuralTarget | None:
+    """Resolve the amended provision, ignoring the instruction's own number.
+
+    The first reference in the amended body is used when several remain: Turkish
+    amendment drafting cites the target (or the neighbour a new unit follows)
+    before quoting any replacement text, so a later number belongs to the new
+    body rather than to the provision being changed.
+    """
+
+    instruction_body = amended_body(instruction.instruction_text)
     combined_reference = "\n".join(
-        value
-        for value in (instruction.article_reference, instruction.instruction_text)
-        if value
+        value for value in (instruction.article_reference, instruction_body) if value
     )
-    article_reference = extract_single_regulatory_provision_reference(
-        combined_reference
-    )
-    clause_match = _CLAUSE_REFERENCE_RE.search(instruction.instruction_text)
-    appendix_match = _APPENDIX_REFERENCE_RE.search(instruction.instruction_text)
+    references = extract_regulatory_provision_references(combined_reference)
+    clause_match = _CLAUSE_REFERENCE_RE.search(instruction_body)
+    appendix_match = _APPENDIX_REFERENCE_RE.search(instruction_body)
     target = AmendmentStructuralTarget(
-        article_no=(article_reference.article_no if article_reference else None),
+        article_no=(references[0].article_no if references else None),
         clause_label=(clause_match.group("label").casefold() if clause_match else None),
         appendix_label=(
             f"EK-{appendix_match.group('label').upper()}" if appendix_match else None
         ),
+        paragraph_no=_target_paragraph_no(instruction_body),
     )
     if target.article_no is None and target.appendix_label is None:
         return None
     return target
+
+
+def canonical_structural_query_anchor(
+    target: AmendmentStructuralTarget | None,
+) -> str | None:
+    """Render the target as the forward ``madde N`` form retrieval indexes.
+
+    ``extract_legal_exact_fields`` — which feeds the exact provision boost — only
+    recognizes the forward designator. An instruction spells its target as
+    ``11 inci maddesinin``, so passing the raw sentence through boosts the
+    instruction's own article instead. Rendering the resolved target keeps that
+    boost pointed at the amended provision.
+    """
+
+    if target is None:
+        return None
+    if target.article_no is not None:
+        anchor = f"madde {target.article_no}"
+        if target.paragraph_no is not None:
+            anchor = f"{anchor} ({target.paragraph_no}) fıkra"
+        if target.clause_label is not None:
+            anchor = f"{anchor} ({target.clause_label}) bent"
+        return anchor
+    if target.appendix_label is not None:
+        return target.appendix_label
+    return None
 
 
 def _candidate_matches_appendix(candidate: CandidateChunk, appendix_label: str) -> bool:

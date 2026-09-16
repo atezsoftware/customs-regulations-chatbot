@@ -30,6 +30,7 @@ type EditAction = (
 ) => Promise<AnnexReview>;
 
 interface AnnexChangeReviewProps {
+  decisionsLocked?: boolean;
   review: AnnexReview;
   onUpdated: (review: AnnexReview) => void;
   onApprove?: ReviewAction;
@@ -504,13 +505,14 @@ export default function AnnexChangeReview({
   onReject,
   onRetry,
   onEdit,
+  decisionsLocked = false,
 }: AnnexChangeReviewProps) {
   const payload = review.review_payload;
   const [submitting, setWorking] = useState(false);
   const preparingReview = ["queued", "running"].includes(
     review.preparation?.status ?? ""
   );
-  const working = submitting || preparingReview;
+  const working = submitting || preparingReview || decisionsLocked;
   const [corrections, setCorrections] = useState<AnnexElementCorrection[]>(
     payload.corrections
   );
@@ -531,6 +533,7 @@ export default function AnnexChangeReview({
     [corrections]
   );
   const canEdit =
+    !decisionsLocked &&
     !preparingReview &&
     review.publication_generation === 0 &&
     ["pending", "blocked", "rejected", "failed"].includes(review.status) &&
@@ -543,6 +546,7 @@ export default function AnnexChangeReview({
   );
   const correctionsDirty = !correctionsEqual(corrections, payload.corrections);
   const frozenReviewReadyToApprove =
+    payload.impact_strategy === "source_dependencies_v1" &&
     !preparingReview &&
     review.status === "pending" &&
     payload.issues.length === 0 &&

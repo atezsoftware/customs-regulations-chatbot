@@ -156,6 +156,18 @@ def read_publication_preparation(
         raise ValueError("duplicate frozen projection ordinal")
     for index in result.indexes:
         live = {plan.ordinal for plan in result.projections if plan.index == index}
+        retained = [
+            json.loads(item.evidence.source_json)["chunk_index"]
+            for item in result.retained
+            if item.evidence.index.matches_temporal_index(index)
+        ]
+        if (
+            len(retained) != len(set(retained))
+            or set(retained) & live
+            or not set(retained).issubset(result.reserved_ordinals)
+        ):
+            raise ValueError("invalid frozen retained inventory")
+        live.update(retained)
         if (
             set(result.retired_ordinals.get(index.index_uuid, []))
             != set(result.reserved_ordinals) - live

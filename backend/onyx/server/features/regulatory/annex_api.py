@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
@@ -40,9 +40,12 @@ from onyx.server.features.regulatory.models import (
     AmendmentBatchSnapshot,
     AmendmentSourceTextRevisionRequest,
     AnnexCapabilities,
+    AnnexChunkReviewItem,
+    AnnexChunkReviewPage,
     AnnexReviewDecisionRequest,
     AnnexReviewEditRequest,
     AnnexReviewSnapshot,
+    AnnexSelectionRequest,
     AnnexSourceTextSnapshot,
 )
 from onyx.utils.logger import setup_logger
@@ -123,7 +126,138 @@ def get_group(
 ) -> AnnexReviewSnapshot:
     return AnnexReviewSnapshot.model_validate(
         _authorized_review(db_session, batch_id, review_id, user)
+    ).model_copy(update={"include_evidence": True})
+
+
+@router.get("/batches/{batch_id}/annex-groups/{review_id}/chunks")
+def get_chunk_reviews(
+    batch_id: int,
+    review_id: UUID,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=10, ge=1, le=50),
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> AnnexChunkReviewPage:
+    from onyx.db.regulatory_annex_selection import chunk_review_page
+    from onyx.regulatory.amendments.annexes.models import AnnexChangeItemDraft
+
+    review = _authorized_review(db_session, batch_id, review_id, user)
+    total, records, selections = chunk_review_page(
+        db_session, review, offset=offset, limit=limit
     )
+    draft = AnnexChangeDraft.model_validate(review.review_payload)
+    old = {row.id: row for row in draft.baseline_scope}
+    decisions = {
+        identifier: child
+        for child in selections
+        for identifier in AnnexChangeDraft.model_validate(
+            child.review_payload
+        ).selection_item_ids
+    }
+    items = []
+    for unit in records:
+        record = unit[0]
+        parts = [AnnexChangeItemDraft.model_validate(member.payload) for member in unit]
+        item = AnnexChangeItemDraft(
+            operation=parts[0].operation
+            if len(parts) == 1
+            else "split"
+            if sum(len(p.new_chunks) for p in parts) > 1
+            else "replace",
+            old_chunk_ids=[
+                identifier for part in parts for identifier in part.old_chunk_ids
+            ],
+            new_chunks=[chunk for part in parts for chunk in part.new_chunks],
+            old_positions=sorted(
+                {position for part in parts for position in part.old_positions}
+            ),
+            new_positions=sorted(
+                {position for part in parts for position in part.new_positions}
+            ),
+        )
+
+        def images(side: str) -> list[UUID]:
+            chunks = (
+                [old[identifier] for identifier in item.old_chunk_ids]
+                if side == "old"
+                else item.new_chunks
+            )
+            file_ids: set[str] = set()
+            for chunk in chunks:
+                image = chunk.metadata.get("image_file_id")
+                if isinstance(image, str):
+                    file_ids.add(image)
+                images = chunk.metadata.get("image_file_ids")
+                if isinstance(images, list):
+                    file_ids.update(value for value in images if isinstance(value, str))
+            return [
+                e.id
+                for e in draft.evidence
+                if e.side == side
+                and e.mime_type in ("image/png", "image/jpeg", "image/webp")
+                and e.file_id in file_ids
+            ]
+
+        items.append(
+            AnnexChunkReviewItem(
+                id=record.id,
+                position=offset + len(items),
+                operation=item.operation,
+                old_chunks=[old[identifier] for identifier in item.old_chunk_ids],
+                new_chunks=item.new_chunks,
+                selection=AnnexReviewSnapshot.model_validate(decisions[record.id])
+                if record.id in decisions
+                else None,
+                old_image_evidence_ids=images("old"),
+                new_image_evidence_ids=images("new"),
+            )
+        )
+    return AnnexChunkReviewPage(
+        items=items,
+        total=total,
+        offset=offset,
+        limit=limit,
+        selection_count=len(selections),
+    )
+
+
+@router.post("/batches/{batch_id}/annex-groups/{review_id}/selections", status_code=202)
+def prepare_chunk_selection(
+    batch_id: int,
+    review_id: UUID,
+    request: AnnexSelectionRequest,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> AnnexReviewSnapshot:
+    from onyx.background.celery.tasks.regulatory_amendments.annex_preparation import (
+        enqueue_review_preparation,
+    )
+    from onyx.db.regulatory_annex_selection import create_selection
+
+    _authorized_review(db_session, batch_id, review_id, user)
+    try:
+        review = create_selection(
+            db_session,
+            parent_id=review_id,
+            expected_sha256=request.expected_review_sha256,
+            item_ids=request.item_ids,
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            user_id=user.id,
+            tenant_id=get_current_tenant_id(),
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
+        )
+    except ValueError as exc:
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(exc)) from exc
+    if review.preparation and review.preparation.status == "queued":
+        try:
+            enqueue_review_preparation(
+                review_id=review.id, tenant_id=get_current_tenant_id()
+            )
+        except Exception:
+            logger.exception(
+                "Selection preparation remains in durable queue review=%s", review.id
+            )
+    return AnnexReviewSnapshot.model_validate(review)
 
 
 @router.get("/batches/{batch_id}/annex-groups/{review_id}/revisions")
@@ -241,6 +375,13 @@ def _queue_review(
             database_identity=config.ANNEX_DATABASE_IDENTITY,
         )
         draft = AnnexChangeDraft.model_validate(review.review_payload)
+        if (
+            review.publication_generation == 0
+            and draft.impact_strategy != "source_dependencies_v1"
+        ):
+            raise ValueError(
+                "Prepare the selected chunks before approving; this review contains an older full-file plan"
+            )
         if recovery:
             validate_live_review_runtime(draft)
         else:
@@ -302,7 +443,8 @@ def retry_group(
     ):
         draft = AnnexChangeDraft.model_validate(review.review_payload)
         if (
-            draft.issues
+            draft.selection_parent_id is not None
+            or draft.issues
             or draft.publication is None
             or (
                 review.preparation is not None

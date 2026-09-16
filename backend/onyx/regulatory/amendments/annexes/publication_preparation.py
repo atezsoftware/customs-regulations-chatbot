@@ -98,6 +98,12 @@ def _target_configuration(
 
 def prepare_publication_review(draft: AnnexChangeDraft) -> AnnexChangeDraft:
     """Acquire/freeze the complete real indexed delta before a human can approve."""
+    if draft.impact_strategy == "source_dependencies_v1":
+        from onyx.regulatory.amendments.annexes.selective_publication import (
+            prepare_selective_publication,
+        )
+
+        return prepare_selective_publication(draft)
     from onyx.configs.constants import FileOrigin
     from onyx.regulatory.amendments.annexes.analysis import (
         prepare_publication_context_view,

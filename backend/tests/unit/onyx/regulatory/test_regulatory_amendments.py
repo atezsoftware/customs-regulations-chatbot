@@ -977,7 +977,7 @@ def test_analyze_amendment_marks_match_id_outside_candidates_unmatched(
             old_chunk_id="foreign", confidence=0.9, rationale="wrong chunk"
         ),
     )
-    monkeypatch.setattr(pipeline, "get_chunk_by_id", lambda *_args: None)
+    monkeypatch.setattr(pipeline, "get_chunk_snapshot_by_id", lambda *_args: None)
     monkeypatch.setattr(pipeline, "get_next_chunk_position", lambda *_args: 0)
     monkeypatch.setattr(
         pipeline,
@@ -1100,7 +1100,7 @@ def test_matcher_null_for_explicit_new_article_is_allowed(
 def test_disappeared_matched_chunk_is_not_converted_to_new_provision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(pipeline, "get_chunk_by_id", lambda *_args: None)
+    monkeypatch.setattr(pipeline, "get_chunk_snapshot_by_id", lambda *_args: None)
     get_next_position = MagicMock()
     monkeypatch.setattr(pipeline, "get_next_chunk_position", get_next_position)
 

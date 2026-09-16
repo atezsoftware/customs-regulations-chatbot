@@ -94,19 +94,27 @@ def vision_result() -> AnnexVisionWireResult:
 
 
 @pytest.mark.parametrize("native_text", [True, False])
-def test_pdf_source_uses_real_rendered_pixels_and_preserves_table(
+def test_pdf_source_sends_original_pdf_once_and_preserves_table(
     monkeypatch: pytest.MonkeyPatch, native_text: bool
 ) -> None:
     from onyx.regulatory.amendments import pdf_vision
-    from onyx.regulatory.amendments.annexes import extraction
+    from onyx.regulatory.amendments.annexes import pdf_document
 
     content = pdf_fixture(native_text=native_text)
     assert "17%" not in (PdfReader(BytesIO(content)).pages[0].extract_text() or "")
     model = MagicMock()
     model.config.model_provider = "fixture"
     model.config.model_name = "vision"
-    generate = MagicMock(return_value=vision_result())
-    monkeypatch.setattr(extraction, "generate_structured", generate)
+    generate = MagicMock(
+        return_value=pdf_document.PdfVisionDocument(
+            pages=[
+                pdf_document.PdfVisionPage(
+                    page=1, complete=True, elements=vision_result().elements
+                )
+            ]
+        )
+    )
+    monkeypatch.setattr(pdf_document, "generate_structured", generate)
     blobs: dict[str, bytes] = {}
     store = MagicMock()
 
@@ -137,11 +145,12 @@ def test_pdf_source_uses_real_rendered_pixels_and_preserves_table(
         == result.pdf_vision.sha256
     )
     call = generate.call_args.kwargs
-    image_url = call["image_parts"][0].image_url.url
-    assert base64.b64decode(image_url.split(",", 1)[1]).startswith(b"\x89PNG")
-    assert "max_attempts" not in call and call["provider_max_attempts"] == 3
-    assert call["deadline"] == deadline
-    assert call["timeout_override"] <= 45
+    file_data = call["file_parts"][0].file.file_data
+    assert base64.b64decode(file_data.split(",", 1)[1]) == content
+    assert call["max_attempts"] == call["provider_max_attempts"] == 1
+    assert call["deadline"] <= deadline
+    assert call["timeout_override"] <= 68
+    assert generate.call_count == 1
 
 
 def test_source_pdf_refuses_missing_model_or_expired_budget() -> None:
@@ -283,8 +292,7 @@ def test_pdf_draft_evidence_refuses_changed_bytes_and_missing_anchor(
             }
         )
         assert (
-            pdf_vision.prepare_pdf_draft_evidence(source, [instruction], store)
-            is None
+            pdf_vision.prepare_pdf_draft_evidence(source, [instruction], store) is None
         )
     elif mutation:
         with pytest.raises(ValueError):
@@ -420,7 +428,9 @@ def test_source_worker_freezes_vision_text_for_existing_readback(
     monkeypatch.setattr(job, "list_source_assets", MagicMock(return_value=[]))
     monkeypatch.setattr(job, "get_session_with_current_tenant", MagicMock())
     monkeypatch.setattr(job, "get_default_file_store", lambda: store)
-    monkeypatch.setattr(factory, "get_default_llm_with_vision", lambda: MagicMock())
+    monkeypatch.setattr(
+        factory, "get_default_llm_with_vision", lambda **_kwargs: MagicMock()
+    )
     native = asset.model_copy(
         update={
             "text": "native-only paragraph",
@@ -457,7 +467,7 @@ def test_source_worker_freezes_vision_text_for_existing_readback(
     assert b"pdf_vision" in manifest
 
 
-@pytest.mark.parametrize("page_seconds", [30, 111])
+@pytest.mark.parametrize("page_seconds", [30, 170])
 def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
     monkeypatch: pytest.MonkeyPatch, page_seconds: int
 ) -> None:
@@ -466,11 +476,10 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
 
     from onyx.llm import factory
     from onyx.llm.model_response import Choice, Message, ModelResponse
-    from onyx.regulatory.amendments.annexes import extraction, job
+    from onyx.regulatory.amendments.annexes import job, pdf_document
     from onyx.regulatory.amendments.annexes.models import (
         AcquisitionResult,
         AnnexExtraction,
-        AnnexRenderedPage,
     )
 
     now = [100.0]
@@ -500,31 +509,46 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
         lambda **_kwargs: AcquisitionResult(status="ready", assets=[original]),
     )
 
-    def isolate(function: object, *_args: object, **kwargs: object) -> object:
-        if function is extraction._source_pdf_page_count:
-            return 12
-        if function is extraction.render_annex_pages:
-            return [
-                AnnexRenderedPage(page=number, width=200, height=300, png=b"pixels")
-                for number in cast(tuple[int, ...], kwargs["page_numbers"])
-            ]
-        raise AssertionError("Unexpected isolated source operation")
-
-    monkeypatch.setattr(extraction, "run_in_isolated_process", isolate)
+    monkeypatch.setattr(
+        pdf_document,
+        "run_in_isolated_process",
+        lambda *_args, **_kwargs: [(200, 300)] * 12,
+    )
     model = MagicMock()
     model.config.model_provider = "fixture"
     model.config.model_name = "vision"
 
+    # Pages are transcribed in contiguous groups, so the model is asked for one
+    # bounded range at a time and answers with exactly that range.
+    next_page = [1]
+
     def invoke(*_args: object, **_kwargs: object) -> ModelResponse:
         now[0] += page_seconds
+        first = next_page[0]
+        last = min(first + pdf_document._PAGE_GROUP_SIZE - 1, 12)
+        next_page[0] = last + 1
         return ModelResponse(
             id="fixture",
             created="2026-09-14",
-            choice=Choice(message=Message(content=vision_result().model_dump_json())),
+            choice=Choice(
+                message=Message(
+                    content=pdf_document.PdfVisionDocument(
+                        pages=[
+                            pdf_document.PdfVisionPage(
+                                page=page,
+                                complete=True,
+                                elements=vision_result().elements,
+                            )
+                            for page in range(first, last + 1)
+                        ]
+                    ).model_dump_json()
+                )
+            ),
         )
 
     model.invoke.side_effect = invoke
-    monkeypatch.setattr(factory, "get_default_llm_with_vision", lambda: model)
+    vision_factory = MagicMock(return_value=model)
+    monkeypatch.setattr(factory, "get_default_llm_with_vision", vision_factory)
     blobs: dict[str, bytes] = {}
     store = MagicMock()
 
@@ -541,10 +565,10 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
     monkeypatch.setattr(
         job, "extend_source_package_lease", MagicMock(return_value=True), raising=False
     )
-    if page_seconds == 111:
+    if page_seconds == 170:
         with pytest.raises(TimeoutError, match="deadline"):
             job.run_source_package(package_id=uuid4(), environment="local-test")
-        assert model.invoke.call_count == 12
+        assert model.invoke.call_count == 1
         assert not blobs
         finish.assert_not_called()
         assert isinstance(failed.call_args.kwargs["failure"], TimeoutError)
@@ -552,13 +576,14 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
 
     job.run_source_package(package_id=uuid4(), environment="local-test")
     frozen = finish.call_args.kwargs["result"].assets[0]
+    vision_factory.assert_called_once_with(temperature=0)
     assert frozen.native_text == "Resmi Gazete"
     assert frozen.pdf_vision is not None
     prepared = AnnexExtraction.model_validate_json(blobs[frozen.pdf_vision.file_id])
     assert prepared.page_count == 12
     assert {element.locator.page for element in prepared.elements} == set(range(1, 13))
     assert frozen.text.count("Bugday | 17%") == 12
-    assert model.invoke.call_count == 12
+    assert model.invoke.call_count == 3
     assert all(
         call.kwargs["use_streaming"] is False for call in model.invoke.call_args_list
     )
@@ -973,3 +998,52 @@ def test_legacy_partial_pdf_retry_keeps_entire_package_text_contract(
     )
     vision.assert_not_called()
     download.assert_not_called()
+
+
+def test_one_incomplete_page_group_is_retried_without_losing_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped page must cost one retry of its group, not the whole document."""
+
+    from onyx.regulatory.amendments.annexes import pdf_document
+
+    monkeypatch.setattr(
+        pdf_document,
+        "run_in_isolated_process",
+        lambda *_args, **_kwargs: [(200, 300)] * 6,
+    )
+    requested: list[tuple[int, int]] = []
+
+    def generate(*_args: object, **kwargs: object) -> pdf_document.PdfVisionDocument:
+        prompt = cast(str, kwargs["user_prompt"])
+        first, last = (1, 4) if "pages 1 through 4" in prompt else (5, 6)
+        requested.append((first, last))
+        # The first attempt at the opening group silently drops its last page.
+        pages = range(
+            first,
+            last
+            if (first, last) == (1, 4) and requested.count((1, 4)) == 1
+            else last + 1,
+        )
+        return pdf_document.PdfVisionDocument(
+            pages=[
+                pdf_document.PdfVisionPage(
+                    page=page, complete=True, elements=vision_result().elements
+                )
+                for page in pages
+            ]
+        )
+
+    monkeypatch.setattr(pdf_document, "generate_structured", generate)
+    model = MagicMock()
+    model.config.model_provider = "fixture"
+    model.config.model_name = "vision"
+
+    extraction = pdf_document.extract_pdf_document(
+        b"six page pdf", llm=model, deadline=time.monotonic() + 600
+    )
+
+    assert extraction.page_count == 6
+    assert {element.locator.page for element in extraction.elements} == set(range(1, 7))
+    # Two groups, with exactly one extra attempt spent on the group that failed.
+    assert requested == [(1, 4), (1, 4), (5, 6)]

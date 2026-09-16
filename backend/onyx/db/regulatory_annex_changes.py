@@ -69,7 +69,10 @@ def list_annex_changes(session: Session, batch_id: int) -> list[AnnexChangeSet]:
     revisions = list(
         session.scalars(
             select(AnnexChangeSet)
-            .where(AnnexChangeSet.batch_id == batch_id)
+            .where(
+                AnnexChangeSet.batch_id == batch_id,
+                AnnexChangeSet.review_payload["selection_parent_id"].astext.is_(None),
+            )
             .order_by(
                 AnnexChangeSet.instruction_index, AnnexChangeSet.review_revision.desc()
             )
@@ -453,14 +456,33 @@ def validate_prepared_annex_change(
         validate_staged_items,
     )
 
-    validate_staged_items(
-        plan=actual_plan,
-        baseline_scope=draft.baseline_scope,
-        items=draft.items,
-        comparison=draft.comparison,
-        insertion_after_chunk_id=draft.insertion_after_chunk_id,
-        evidence_remapping=draft.new_evidence_remapping,
-    )
+    if draft.selection_parent_id is not None:
+        from onyx.db.regulatory_annex_selection import validate_selection
+
+        validate_selection(session, draft)
+    else:
+        validate_staged_items(
+            plan=actual_plan,
+            baseline_scope=draft.baseline_scope,
+            items=draft.items,
+            comparison=draft.comparison,
+            insertion_after_chunk_id=draft.insertion_after_chunk_id,
+            evidence_remapping=draft.new_evidence_remapping,
+        )
+    if draft.impact_strategy == "source_dependencies_v1":
+        if (
+            draft.dependency_impact is None
+            or draft.dependency_impact.unresolved
+            or not draft.impact.ready
+            or draft.publication is None
+        ):
+            raise ValueError("selective dependency proof is incomplete")
+        from onyx.regulatory.amendments.annexes.publication_preparation import (
+            validate_frozen_publication_review,
+        )
+
+        validate_frozen_publication_review(draft)
+        return
     from onyx.regulatory.amendments.annexes.context_dependencies import (
         compare_context_views,
         validate_complete_context_view,
@@ -632,6 +654,9 @@ def revise_annex_review(
         environment=environment,
         allow_preparation=preparation_generation is not None,
     )
+    from onyx.db.regulatory_annex_selection import require_unpartitioned_review
+
+    require_unpartitioned_review(session, previous)
     preparation = previous.preparation
     if preparation_generation is not None:
         from onyx.db.models import AnnexReviewPreparation
@@ -763,22 +788,31 @@ def resolve_annex_instruction_file(
     from onyx.db.regulatory_annexes import load_legacy_annex_chunks
     from onyx.regulatory.amendments.structural_target import source_identity_matches
 
-    matches: list[UUID] = []
-    for identifier in batch.user_file_ids:
-        file_id = UUID(identifier)
-        file = require_annex_file_scope(session, batch.document_set_id, file_id)
-        if not all(
-            source_identity_matches(source, file.name) for source in target_sources
-        ):
-            continue
-        if load_legacy_annex_chunks(
-            session,
-            document_set_id=batch.document_set_id,
-            user_file_id=file_id,
-            annex_label=annex_label,
-            as_of_date=effective_date,
-        ):
-            matches.append(file_id)
+    def resolve(require_every_source: bool) -> list[UUID]:
+        matches: list[UUID] = []
+        for identifier in batch.user_file_ids:
+            file_id = UUID(identifier)
+            file = require_annex_file_scope(session, batch.document_set_id, file_id)
+            verdicts = [
+                source_identity_matches(source, file.name) for source in target_sources
+            ]
+            if not (all(verdicts) if require_every_source else any(verdicts)):
+                continue
+            if load_legacy_annex_chunks(
+                session,
+                document_set_id=batch.document_set_id,
+                user_file_id=file_id,
+                annex_label=annex_label,
+                as_of_date=effective_date,
+            ):
+                matches.append(file_id)
+        return matches
+
+    matches = resolve(require_every_source=True)
+    if not matches and len(target_sources) > 1:
+        # Grouped instructions can name the same instrument in different words;
+        # one spelling the file name does not carry must not hide the annex.
+        matches = resolve(require_every_source=False)
     if len(matches) != 1:
         raise ValueError(
             "annex_file_missing" if not matches else "annex_file_ambiguous"
@@ -828,6 +862,9 @@ def queue_annex_publication(
         expected_review_sha256=expected_review_sha256,
         environment=environment,
     )
+    from onyx.db.regulatory_annex_selection import require_unpartitioned_review
+
+    require_unpartitioned_review(session, review)
     if review.status in ("approving", "preparing", "publishing"):
         intent = session.scalar(
             select(AnnexPublicationIntent).where(
@@ -898,6 +935,9 @@ def reject_annex_review(
         expected_review_sha256=expected_review_sha256,
         environment=environment,
     )
+    from onyx.db.regulatory_annex_selection import require_unpartitioned_review
+
+    require_unpartitioned_review(session, review)
     if (
         review.status not in ("pending", "blocked", "rejected")
         or review.publication_generation

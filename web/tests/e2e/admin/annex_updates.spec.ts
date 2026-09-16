@@ -47,7 +47,7 @@ test("opens both actual dated annex chat citations @annex", async ({
     }[];
   } = JSON.parse(readFileSync(fixturePath!, "utf8"));
   const chat = new ChatPage(page);
-  for (const [index, rate] of ["5%", "7%"].entries()) {
+  for (const [index, rate] of Array.from(["5%", "7%"].entries())) {
     await chat.openSavedCitation(
       fixture.chat_ids[index]!,
       rate,

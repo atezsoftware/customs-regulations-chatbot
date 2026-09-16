@@ -2,7 +2,10 @@
 
 import json
 
-from onyx.document_index.publication_models import FrozenPublicationProjection
+from onyx.document_index.publication_models import (
+    FrozenPublicationProjection,
+    RetainedPublicationProjection,
+)
 from onyx.regulatory.amendments.annexes.models import (
     AnnexPublicationPreparation,
     AnnexTemporalProjection,
@@ -20,6 +23,22 @@ def build_operations(
     from onyx.db.regulatory_annex_execution import embedding_checkpoint
 
     operations = []
+    from onyx.regulatory.amendments.annexes.publication_representations import _epoch
+
+    for retained in prepared.retained:
+        source = json.loads(retained.evidence.source_json)
+        if retained.close_interval:
+            source["validity_end_date"] = _epoch(retained.validity_end)
+        operations.append(
+            AnnexPublicationOperation(
+                index_uuid=retained.evidence.index.index_uuid,
+                ordinal=source["chunk_index"],
+                kind="retain",
+                retained=RetainedPublicationProjection(
+                    evidence=retained.evidence, source_json=json.dumps(source)
+                ),
+            )
+        )
     for plan in prepared.projections:
         source = json.loads(plan.source_template_json)
         if plan.reuse_from is not None:

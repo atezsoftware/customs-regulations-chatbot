@@ -172,7 +172,10 @@ def source_history_snapshot(
         or draft.effective_date is None
     ):
         raise ValueError("annex source history baseline missing")
-    baseline = session.get(RegulatoryAnnexRevision, UUID(draft.baseline.revision_id))
+    baseline = session.get(
+        RegulatoryAnnexRevision,
+        draft.selection_source_revision_id or UUID(draft.baseline.revision_id),
+    )
     if baseline is None:
         raise ValueError("annex source history baseline missing")
     annex = session.scalar(
@@ -186,7 +189,8 @@ def source_history_snapshot(
     if (
         effective is None
         or effective.id != baseline.id
-        or baseline.baseline_sha256 != draft.baseline.baseline_sha256
+        or baseline.baseline_sha256
+        != (draft.selection_source_sha256 or draft.baseline.baseline_sha256)
     ):
         raise ValueError("annex source history changed")
     revisions = list(

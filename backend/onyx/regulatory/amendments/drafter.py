@@ -6,9 +6,13 @@ import unicodedata
 from typing import Any
 
 from onyx.llm.interfaces import LLM
+from onyx.regulatory.amendments.draft_integrity import explicit_replacement_body
 from onyx.regulatory.amendments.models import (
     AmendmentInstruction,
     DraftResult,
+)
+from onyx.regulatory.amendments.new_provision_policy import (
+    added_subordinate_unit_kind,
 )
 from onyx.regulatory.amendments.pdf_vision import PdfDraftEvidence
 from onyx.regulatory.structured_llm import generate_structured
@@ -34,6 +38,14 @@ For `dates`:
 - `rationale`: briefly explain how you derived these dates (or why you left them null).
 
 If the old chunk includes descendants, these are the current nested provisions, in document order. A full replacement of the parent replaces this entire scope; include every new clause in the replacement text. For a partial edit, keep the parent-only text and do not duplicate descendants.
+
+When an instruction states the replacement wording explicitly ("... aşağıdaki şekilde değiştirilmiştir." followed by the quoted new provision), that quoted wording is authoritative and must appear in `text` character for character. Copy it; never re-word, re-order, summarize, abbreviate with "...", or merge it into your own phrasing. You may add surrounding text the instruction does not replace, but the quoted body itself must survive verbatim.
+
+Some instructions add a NEW paragraph (fıkra) or clause (bent) INSIDE an existing article instead of replacing anything. There is then no old chunk, and `sibling_reference` is a chunk of that same article. In that case the chunk you produce is the added unit alone — not a new article, and not a rewrite of the article:
+- `text`: only the new paragraph/clause, written with its own marker exactly as the instruction gives it (e.g. "(6) ..." or "d) ...").
+- `chunk_type`: "paragraph" for a fıkra, "clause" for a bent.
+- `metadata_changes`: carry article_no, article_title, document_type and document_number from `sibling_reference`, and set paragraph_no (for a fıkra) or clause_label (for a bent) to the marker the instruction assigns. Never invent a new article_no.
+- `heading_path`: base it on `sibling_reference`'s heading_path, keeping the same article heading and replacing only the terminal unit line.
 
 Use ONLY information explicitly present in the given texts. Never invent or assume anything not stated."""
 # ruff: noqa: E501 end
@@ -108,6 +120,27 @@ def draft_combined_chunk(
         if sibling_reference is not None
         else "(none)"
     )
+    # Stating these deterministically removes the two failure modes the
+    # downstream guards reject outright: a paraphrased replacement body, and an
+    # added paragraph or clause drafted as if it were a brand-new article.
+    requirements: list[str] = []
+    for display_index, instruction in enumerate(instructions, start=1):
+        body = explicit_replacement_body(instruction.instruction_text)
+        if body:
+            requirements.append(
+                f"Instruction {display_index} states its replacement wording "
+                f"explicitly. This exact text must appear verbatim in "
+                f"new_chunk.text:\n{body}"
+            )
+        unit_kind = added_subordinate_unit_kind(instruction.instruction_text)
+        if unit_kind is not None and old_chunk is None:
+            requirements.append(
+                f"Instruction {display_index} adds a new "
+                f"{'clause (bent)' if unit_kind == 'clause' else 'paragraph (fıkra)'} "
+                "inside an existing article. Draft only that unit, with "
+                f'chunk_type "{unit_kind}", and keep the article identity from '
+                "sibling_reference."
+            )
     instruction_sections = []
     for display_index, instruction in enumerate(instructions, start=1):
         own_date_phrase = (
@@ -135,6 +168,8 @@ def draft_combined_chunk(
         f"chunk, for heading_path/metadata convention):\n{sibling_json}\n\n"
         "Return one full replacement chunk containing every listed change."
     )
+    if requirements:
+        prompt += "\n\nBinding requirements:\n\n" + "\n\n".join(requirements)
     if pdf_evidence is not None:
         prompt += (
             "\nOriginal PDF page images are attached. Apply the amendment using these images and the old chunk; derived transcription is supporting evidence only. If multiple tables fit, do not guess.\n"

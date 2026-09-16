@@ -245,6 +245,8 @@ def execute_publication(delivery: AnnexPublicationDelivery) -> str:
                     adapter = adapters[operation.index_uuid]
                     if operation.kind == "tombstone":
                         adapter.tombstone(reservations, operation.ordinal)
+                    elif operation.kind == "retain" and operation.retained is not None:
+                        adapter.retain(reservations, operation.retained)
                     elif operation.binding is not None:
                         adapter.upsert(reservations, operation.binding.projection)
                     else:
@@ -257,7 +259,16 @@ def execute_publication(delivery: AnnexPublicationDelivery) -> str:
                         and operation.binding
                     )
                     proofs.append(
-                        adapters[index.index_uuid].verify(reservations, projections)
+                        adapters[index.index_uuid].verify(
+                            reservations,
+                            projections,
+                            tuple(
+                                op.retained
+                                for op in operations.operations
+                                if op.index_uuid == index.index_uuid
+                                and op.retained is not None
+                            ),
+                        )
                     )
             if lost.is_set():
                 raise ValueError("publication ownership heartbeat lost")

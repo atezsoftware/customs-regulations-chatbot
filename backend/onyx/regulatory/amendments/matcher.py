@@ -12,14 +12,19 @@ from onyx.tracing.flows import LLMFlow
 # ruff: noqa: E501 start
 _SYSTEM_PROMPT = """You are an expert at matching Turkish regulatory amendment instructions to the existing text they amend.
 
-You will be given one amendment instruction and a list of candidate existing text chunks. The candidates were found via fuzzy text/heading matching and exact article-number matching — heading_path is only a best-effort reconstruction from document formatting, so it can be unreliable. Read each candidate's actual TEXT carefully; do not rely on the heading or the scores alone.
+Your purpose is to find what is changing. An amendment instruction describes a change to a provision that already exists in the corpus; your job is to identify that provision so the change can be applied to it. Locating the affected provision is the goal — not judging how well the instruction is written.
+
+Instructions are frequently imperfect. They may be paraphrased, abbreviated, summarized by a user, carried through OCR with broken characters, missing an article number, missing the source name, or written in a different register than the indexed text. A well-built retrieval system still resolves these, because the identity of a provision is carried by several independent signals at once — its structural position (article/paragraph/clause number), its subject matter, the wording it quotes, and its source instrument. Use every signal available and reason about which provision they converge on. Never decline a match merely because the instruction's phrasing differs from the candidate's phrasing; differing phrasing is the normal case, since the instruction usually describes the NEW text while the candidate holds the OLD text.
+
+You will be given one amendment instruction and a list of candidate existing text chunks. Candidates come from several independent retrieval lanes. A candidate with `structured_match: true` was found by an exact structural lookup of the article/paragraph/clause the instruction names — that is the strongest available signal, so weigh it heavily even when its wording looks unrelated to the instruction. `heading_path` is only a best-effort reconstruction from document formatting and can be unreliable; read each candidate's actual TEXT.
 
 Your task: decide which candidate (if any) this instruction amends.
 
-- If exactly one candidate is clearly the existing article/provision this instruction changes, set `old_chunk_id` to that candidate's id.
-- CRITICAL — only set `old_chunk_id` to null if the instruction EXPLICITLY adds a brand-new article/provision (e.g. "... eklenmiştir", "yeni madde"). If the instruction is amending, replacing, clarifying, or repealing something and a matching candidate exists, you MUST select it — never treat an ordinary amendment as a new addition just because the wording differs from the candidate.
+- If one candidate is the existing provision this instruction changes, set `old_chunk_id` to that candidate's id. Prefer the most specific correct unit: if the instruction amends one paragraph or clause, choose that paragraph or clause rather than the whole article.
+- Set `old_chunk_id` to null ONLY when the instruction adds text that does not exist yet — a brand-new article, or a new paragraph/clause added inside an existing article ("aşağıdaki fıkra eklenmiştir", "aşağıdaki bent eklenmiş ve diğer bentler buna göre teselsül ettirilmiştir"). For an added paragraph or clause, still return null: the unit being added has no existing chunk, even though its article does.
+- If the instruction amends, replaces, clarifies, or repeals something and a matching candidate exists, you MUST select it. Never treat an ordinary amendment as an addition just because the wording differs.
 - Set `confidence` to a 0.0-1.0 score.
-- Set `rationale` to a brief explanation.
+- Set `rationale` to a brief explanation naming the signals you relied on.
 
 Only ever use an id from the given candidates. Never invent an id."""
 # ruff: noqa: E501 end
@@ -35,11 +40,8 @@ def _format_candidates(candidates: list[CandidateChunk]) -> str:
                     "source_name": candidate.source_name,
                     "text": candidate.text,
                     "metadata": candidate.metadata,
-                    "scores": {
-                        "text_similarity": round(candidate.text_trgm_score, 3),
-                        "heading_similarity": round(candidate.heading_trgm_score, 3),
-                        "structured_match": candidate.structured_match,
-                    },
+                    "structured_match": candidate.structured_match,
+                    "source_name_similarity": round(candidate.source_score, 3),
                 },
                 ensure_ascii=False,
             )

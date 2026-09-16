@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from uuid import UUID, uuid4
 
 from sqlalchemy import or_, select
@@ -87,6 +88,32 @@ def get_or_create_annex(
     ).one()
 
 
+def _opening_annex_label(text: str) -> str | None:
+    """Return the annex label when this chunk opens one, else None."""
+
+    heading = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    # An annex heading stands alone; a sentence that merely cites one does not.
+    if not heading or len(heading) > 40:
+        return None
+    try:
+        candidate = normalize_annex_label(heading)
+    except ValueError:
+        return None
+    return candidate if ":" in candidate else None
+
+
+def _annex_label_spans(rows: list[RegulatoryChunk]) -> dict[str, str]:
+    current: str | None = None
+    spans: dict[str, str] = {}
+    for row in rows:
+        opened = _opening_annex_label(row.text)
+        if opened is not None:
+            current = opened
+        if current is not None:
+            spans[row.id] = current
+    return spans
+
+
 def load_legacy_annex_chunks(
     session: Session,
     *,
@@ -116,7 +143,7 @@ def load_legacy_annex_chunks(
         )
     )
 
-    def matches(row: RegulatoryChunk) -> bool:
+    def labelled(row: RegulatoryChunk) -> bool:
         metadata_label = row.chunk_metadata.get("appendix_label")
         if isinstance(metadata_label, str) and metadata_label.strip():
             try:
@@ -133,13 +160,24 @@ def load_legacy_annex_chunks(
                 continue
         return False
 
-    atomic = [
-        row
-        for row in rows
-        if not is_hierarchical_aggregate_chunk(row)
-        and not row.chunk_metadata.get("bound_to_regulatory_chunk_id")
-        and matches(row)
-    ]
+    def structural(row: RegulatoryChunk) -> bool:
+        return not is_hierarchical_aggregate_chunk(row) and not row.chunk_metadata.get(
+            "bound_to_regulatory_chunk_id"
+        )
+
+    matches: Callable[[RegulatoryChunk], bool] = labelled
+    atomic = [row for row in rows if structural(row) and labelled(row)]
+    if not atomic:
+        # A file chunked before annex labelling carries the annex only in its own
+        # text. Annexes are sequential trailing sections, so the heading that
+        # opens one owns every chunk up to the heading that opens the next.
+        spans = _annex_label_spans(rows)
+
+        def in_span(row: RegulatoryChunk) -> bool:
+            return spans.get(row.id) == label
+
+        matches = in_span
+        atomic = [row for row in rows if structural(row) and in_span(row)]
     ids = {row.id for row in atomic}
     roots = set(canonical_chunk_lineage_keys(session, atomic).values())
     for row in rows:
@@ -156,7 +194,18 @@ def load_legacy_annex_chunks(
             raise ValueError(
                 "legacy annex scope has unresolved image-companion binding"
             )
-    return [row for row in rows if row.id in ids]
+    from onyx.db.regulatory_annex_publication import (
+        effective_positions,
+        load_file_position_views,
+    )
+
+    positions = effective_positions(
+        load_file_position_views(session, user_file_id), as_of_date
+    )
+    return sorted(
+        (row for row in rows if row.id in ids),
+        key=lambda row: (positions.get(row.id, row.position), row.id),
+    )
 
 
 def get_revision_elements(

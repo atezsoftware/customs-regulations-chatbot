@@ -280,6 +280,9 @@ export interface AnnexPublicationReview {
     context_consumers: number;
     embeddings: number;
     exact_vector_reuses: number;
+    preserved_vectors?: number;
+    metadata_updates?: number;
+    unresolved_dependencies?: number;
     historical_projections: number;
     retired_projections: number;
     total_projections: number;
@@ -289,6 +292,8 @@ export interface AnnexPublicationReview {
 }
 
 export interface AnnexReviewPayload {
+  impact_strategy?: "legacy_full_file" | "source_dependencies_v1";
+  selection_parent_id?: string | null;
   instruction_indices: number[];
   instruction_texts: string[];
   annex_label: string;
@@ -382,6 +387,11 @@ export type AnnexReviewStatus =
   | "failed";
 
 export interface AnnexReview {
+  dependency_summary?: {
+    unresolved: number;
+    affected: number;
+    reasons: string[];
+  };
   id: string;
   logical_group_id: string;
   review_revision: number;
@@ -400,6 +410,25 @@ export interface AnnexReview {
   review_payload: AnnexReviewPayload;
   error_message: string | null;
   created_at: string;
+}
+
+export interface AnnexChunkReviewItem {
+  id: string;
+  position: number;
+  operation: string;
+  old_chunks: AnnexCanonicalSnapshot[];
+  new_chunks: AnnexCanonicalSnapshot[];
+  old_image_evidence_ids: string[];
+  new_image_evidence_ids: string[];
+  selection: AnnexReview | null;
+}
+
+export interface AnnexChunkReviewPage {
+  selection_count?: number;
+  items: AnnexChunkReviewItem[];
+  total: number;
+  offset: number;
+  limit: number;
 }
 
 export interface AnnexSourceText {
@@ -516,6 +545,41 @@ export async function getAmendmentSourceText(
   return requestJson(
     "Get original amendment source text",
     `/api/regulatory/amendments/source-packages/${packageId}/text?document_set_id=${documentSetId}`
+  );
+}
+
+export function getAnnexReview(review: AnnexReview): Promise<AnnexReview> {
+  return requestJson(
+    "Get annex review",
+    `/api/regulatory/amendments/batches/${review.batch_id}/annex-groups/${review.id}`
+  );
+}
+
+export function getAnnexChunkPage(
+  review: AnnexReview,
+  offset: number
+): Promise<AnnexChunkReviewPage> {
+  return requestJson(
+    "Get chunk changes",
+    `/api/regulatory/amendments/batches/${review.batch_id}/annex-groups/${review.id}/chunks?offset=${offset}&limit=10`
+  );
+}
+
+export function prepareAnnexSelection(
+  review: AnnexReview,
+  itemIds: string[]
+): Promise<AnnexReview> {
+  return requestJson(
+    "Prepare selected chunks",
+    `/api/regulatory/amendments/batches/${review.batch_id}/annex-groups/${review.id}/selections`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_review_sha256: review.review_sha256,
+        item_ids: itemIds,
+      }),
+    }
   );
 }
 

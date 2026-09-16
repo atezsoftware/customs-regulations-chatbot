@@ -636,6 +636,17 @@ class LitellmLLM(LLM):
         #########################
         # Optional kwargs - should only be passed to LiteLLM under certain conditions
         optional_kwargs: dict[str, Any] = {}
+        messages = _prompt_to_dicts(prompt)
+        native_pdf_input = any(
+            part.get("type") == "file"
+            and str(part.get("file", {}).get("file_data", "")).startswith(
+                "data:application/pdf;base64,"
+            )
+            for message in messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if isinstance(part, dict)
+        )
 
         # Model name
         is_openai_compatible_proxy = self._api_surface in OPENAI_COMPATIBLE_SURFACES
@@ -702,7 +713,15 @@ class LitellmLLM(LLM):
             _anthropic_omits_sampling_params(name) for name in model_identity_names
         )
         if not omits_sampling_params:
-            optional_kwargs["temperature"] = 1 if is_reasoning else self._temperature
+            optional_kwargs["temperature"] = (
+                self._temperature
+                if native_pdf_input
+                else 1
+                if is_reasoning
+                else self._temperature
+            )
+        elif native_pdf_input and self._temperature == 0:
+            raise ValueError("pdf_model_does_not_support_temperature_zero")
 
         if stream and not is_vertex_model_rejecting_output_config:
             optional_kwargs["stream_options"] = {"include_usage": True}
@@ -867,7 +886,19 @@ class LitellmLLM(LLM):
             if "api_key" not in passthrough_kwargs:
                 passthrough_kwargs["api_key"] = self._api_key or None
 
-            messages = _prompt_to_dicts(prompt)
+            if native_pdf_input and self._model_provider == LlmProviderNames.OPENROUTER:
+                passthrough_kwargs = copy.deepcopy(passthrough_kwargs)
+                extra_body = passthrough_kwargs.setdefault("extra_body", {})
+                # OCR fallback can discard PDF images; native support is required.
+                plugins = [
+                    plugin
+                    for plugin in extra_body.get("plugins", [])
+                    if plugin.get("id") != "file-parser"
+                ]
+                extra_body["plugins"] = [
+                    *plugins,
+                    {"id": "file-parser", "pdf": {"engine": "native"}},
+                ]
 
             # Bedrock's Converse API requires toolConfig when messages
             # contain toolUse/toolResult content blocks. When no tools are
@@ -937,7 +968,9 @@ class LitellmLLM(LLM):
             attempts = [optional_kwargs]
             for strip_keys in (_REASONING_KWARG_KEYS, _BEST_EFFORT_KWARG_KEYS):
                 stripped = {
-                    k: v for k, v in optional_kwargs.items() if k not in strip_keys
+                    k: v
+                    for k, v in optional_kwargs.items()
+                    if k not in strip_keys or (native_pdf_input and k == "temperature")
                 }
                 if len(stripped) < len(attempts[-1]):
                     attempts.append(stripped)

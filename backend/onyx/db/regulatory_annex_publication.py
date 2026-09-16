@@ -1,5 +1,6 @@
 """Short scoped database reads for final annex publication preparation."""
 
+from datetime import date
 from uuid import UUID
 
 from sqlalchemy import select
@@ -8,8 +9,10 @@ from sqlalchemy.orm import Session
 from onyx.db.models import RegulatoryTemporalProjection, SearchSettings, UserFile
 from onyx.regulatory.amendments.annexes.models import (
     AnnexChangeDraft,
+    AnnexPositionView,
     AnnexProjectionAccess,
     AnnexTemporalProjection,
+    PreparedContextView,
 )
 
 
@@ -94,6 +97,66 @@ def load_file_temporal_bindings(
         validate_temporal_canonical_revision(session, row)
         bindings.append(AnnexTemporalProjection.model_validate(row.payload))
     return bindings
+
+
+def load_binding_context_sources(
+    session: Session, user_file_id: UUID, bindings: list[AnnexTemporalProjection]
+) -> "PreparedContextView":
+    from onyx.db.models import RegulatoryContextSnapshot
+    from onyx.regulatory.amendments.annexes.models import (
+        ContextSourceSnapshot,
+        PreparedContextView,
+    )
+
+    projections = [
+        binding.context for binding in bindings if binding.context is not None
+    ]
+    hashes = {projection.source_snapshot_sha256 for projection in projections}
+    snapshots = [
+        ContextSourceSnapshot.model_validate(row.payload)
+        for row in session.scalars(
+            select(RegulatoryContextSnapshot).where(
+                RegulatoryContextSnapshot.user_file_id == user_file_id,
+                RegulatoryContextSnapshot.sha256.in_(hashes),
+            )
+        )
+    ]
+    return PreparedContextView(projections=projections, snapshots=snapshots)
+
+
+def load_file_position_views(
+    session: Session, user_file_id: UUID
+) -> list[AnnexPositionView]:
+    from onyx.db.models import AnnexChangeSet, AnnexPublicationManifest
+
+    payloads = session.scalars(
+        select(AnnexPublicationManifest.payload)
+        .join(
+            AnnexChangeSet, AnnexChangeSet.id == AnnexPublicationManifest.change_set_id
+        )
+        .where(
+            AnnexChangeSet.user_file_id == user_file_id,
+            AnnexPublicationManifest.approved_at.is_not(None),
+        )
+        .order_by(
+            AnnexPublicationManifest.approved_at, AnnexPublicationManifest.change_set_id
+        )
+    )
+    return [
+        AnnexPositionView.model_validate(view)
+        for payload in payloads
+        for view in payload.get("position_views", [])
+    ]
+
+
+def effective_positions(views: list[AnnexPositionView], when: date) -> dict[str, int]:
+    positions: dict[str, int] = {}
+    for view in views:
+        if (view.effective_start is None or view.effective_start <= when) and (
+            view.effective_end is None or when < view.effective_end
+        ):
+            positions.update(view.positions)
+    return positions
 
 
 def publication_input_scope_hash(

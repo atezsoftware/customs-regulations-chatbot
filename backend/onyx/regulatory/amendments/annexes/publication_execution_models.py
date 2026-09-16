@@ -5,6 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from onyx.document_index.publication_models import RetainedPublicationProjection
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
 
 
@@ -25,8 +26,11 @@ class AnnexPublicationOperation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     index_uuid: str
     ordinal: int
-    kind: Literal["upsert", "tombstone"]
+    kind: Literal["upsert", "tombstone", "retain"]
     binding: AnnexTemporalProjection | None = None
+    retained: RetainedPublicationProjection | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AnnexPublicationOperations(BaseModel):

@@ -713,7 +713,7 @@ test("renders a grouped blocked review from the real analysis response shape", a
     await screen.findByRole("button", { name: "Batch #42 (analyzed)" })
   );
 
-  expect(await screen.findByText("Annex review groups")).toBeVisible();
+  expect(await screen.findByText("Annex chunk changes")).toBeVisible();
   expect(screen.getByText("Source package missing")).toBeVisible();
   expect(
     screen.queryByRole("button", { name: "Approve group" })
@@ -777,7 +777,6 @@ const sourceUploadCases = [
 
 test.each([
   "URL",
-  "Text",
   ...sourceUploadCases.map((source) => source.mode),
 ] as const)(
   "prevents duplicate %s preparation until the selected source changes",
@@ -818,11 +817,6 @@ test.each([
         screen.getByLabelText("Amendment source URL"),
         "https://www.resmigazete.gov.tr/eskiler/2026/07/20260704-17.htm"
       );
-    } else if (mode === "Text") {
-      await user.type(
-        screen.getByLabelText("Amendment text"),
-        "MADDE 1- Ek değişti."
-      );
     } else {
       const source = sourceUploadCases.find((source) => source.mode === mode);
       if (!source) throw new Error("Missing source upload fixture");
@@ -840,7 +834,7 @@ test.each([
     expect(prepareButton).toBeDisabled();
     await user.click(prepareButton);
     expect(
-      mode === "URL" || mode === "Text"
+      mode === "URL"
         ? mockedCreateAmendmentSourcePackage
         : mockedUploadAmendmentSourcePackage
     ).toHaveBeenCalledTimes(1);
@@ -850,8 +844,6 @@ test.each([
         screen.getByLabelText("Amendment source URL"),
         "?revision=2"
       );
-    } else if (mode === "Text") {
-      await user.type(screen.getByLabelText("Amendment text"), " Yeni kaynak.");
     } else {
       const source = sourceUploadCases.find((source) => source.mode === mode);
       if (!source) throw new Error("Missing source upload fixture");
@@ -871,7 +863,7 @@ test.each([
   }
 );
 
-test.each(["URL", "PDF", "Text"] as const)(
+test.each(["URL", "PDF"] as const)(
   "explains a %s source timeout and retries the same package",
   async (mode) => {
     mockedGetAnnexCapabilities.mockResolvedValue({
@@ -917,11 +909,6 @@ test.each(["URL", "PDF", "Text"] as const)(
         screen.getByLabelText("Amendment source URL"),
         "https://www.resmigazete.gov.tr/eskiler/2026/07/20260704-17.htm"
       );
-    } else if (mode === "Text") {
-      await user.type(
-        screen.getByLabelText("Amendment text"),
-        "MADDE 1- Ek tablo güncellenmiştir."
-      );
     } else {
       await user.upload(
         screen.getByLabelText("Amendment source PDF"),
@@ -930,9 +917,7 @@ test.each(["URL", "PDF", "Text"] as const)(
     }
     await user.click(screen.getByRole("button", { name: "Prepare source" }));
     await screen.findByText("Source package processing");
-    if (mode !== "Text") {
-      await user.type(screen.getByLabelText("Amendment text"), "bu yeni hali");
-    }
+    await user.type(screen.getByLabelText("Amendment text"), "bu yeni hali");
     await act(async () =>
       resolvePreparation({
         ...processingPackage,
@@ -946,9 +931,7 @@ test.each(["URL", "PDF", "Text"] as const)(
         /timed out while reading the document or its attachments/i
       )
     ).toBeVisible();
-    if (mode !== "Text") {
-      expect(screen.getByRole("button", { name: "Analyze" })).toBeDisabled();
-    }
+    expect(screen.getByRole("button", { name: "Analyze" })).toBeDisabled();
     mockedGetAmendmentSourcePackage.mockResolvedValue({
       ...processingPackage,
       status: "ready",
@@ -975,8 +958,7 @@ test.each(["URL", "PDF", "Text"] as const)(
         : mockedCreateAmendmentSourcePackage
     ).toHaveBeenCalledTimes(1);
     const expectedText =
-      "MADDE 1- Ek tablo güncellenmiştir." +
-      (mode === "Text" ? "" : "\n\nbu yeni hali");
+      "MADDE 1- Ek tablo güncellenmiştir.\n\nbu yeni hali";
     await waitFor(() =>
       expect(screen.getByLabelText("Amendment text")).toHaveValue(expectedText)
     );
@@ -990,7 +972,7 @@ test.each(["URL", "PDF", "Text"] as const)(
   }
 );
 
-test("changing modes during text preparation leaves the next source usable", async () => {
+test("analyzes pasted text directly and still prepares a switched-to URL", async () => {
   mockedGetAnnexCapabilities.mockResolvedValue({
     enabled: true,
     grouped_review: true,
@@ -998,31 +980,18 @@ test("changing modes during text preparation leaves the next source usable", asy
     asynchronous_source_preparation: true,
     publication_requires_verified_index: true,
   });
-  const processingPackage: AmendmentSourcePackage = {
-    id: "text-preparation",
+  mockedCreateAmendmentSourcePackage.mockResolvedValue({
+    id: "url-preparation",
     document_set_id: 7,
-    status: "processing",
-    asset_count: 0,
-    total_bytes: 0,
+    status: "ready",
+    asset_count: 1,
+    total_bytes: 10,
     issues: [],
-    manifest_sha256: null,
+    manifest_sha256: "a".repeat(64),
     assets: [],
     created_at: "2026-09-14T12:00:00Z",
     updated_at: "2026-09-14T12:00:00Z",
-  };
-  let resolveText: (value: AmendmentSourcePackage) => void = () => {};
-  mockedCreateAmendmentSourcePackage
-    .mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveText = resolve;
-        })
-    )
-    .mockResolvedValueOnce({
-      ...processingPackage,
-      id: "url-preparation",
-      status: "ready",
-    });
+  });
   mockedGetAmendmentSourceText.mockResolvedValue({
     package_id: "url-preparation",
     manifest_sha256: "a".repeat(64),
@@ -1038,23 +1007,26 @@ test("changing modes during text preparation leaves the next source usable", asy
   await user.keyboard("{Enter}");
   await user.type(
     screen.getByLabelText("Amendment text"),
-    "Pending pasted source"
+    "MADDE 1- Ek değişti."
   );
-  await user.click(screen.getByRole("button", { name: "Prepare source" }));
-  await screen.findByRole("button", { name: "Analyzing…" });
+
+  // Pasted text is already the amendment text; nothing has to be frozen first.
+  const analyzeButton = screen.getByRole("button", { name: "Analyze" });
+  expect(analyzeButton).toBeEnabled();
+  await user.click(analyzeButton);
+  expect(mockedCreateAmendmentSourcePackage).not.toHaveBeenCalled();
+  expect(mockedAnalyzeAmendment).toHaveBeenCalledWith(7, "MADDE 1- Ek değişti.");
+
+  // A URL source still has to be downloaded and frozen before analysis.
   await user.click(screen.getByRole("button", { name: "URL" }));
   await user.type(
     screen.getByLabelText("Amendment source URL"),
     "https://example.gov/update.htm"
   );
+  expect(screen.getByRole("button", { name: "Prepare source" })).toBeEnabled();
   await user.click(screen.getByRole("button", { name: "Prepare source" }));
   await screen.findByDisplayValue("Ready URL source text");
-  await act(async () => resolveText(processingPackage));
-
-  expect(screen.getByRole("button", { name: "Analyze" })).toBeEnabled();
-  expect(
-    screen.queryByText("Source package processing")
-  ).not.toBeInTheDocument();
+  expect(mockedCreateAmendmentSourcePackage).toHaveBeenCalledTimes(1);
 });
 
 test("places extracted PDF text in the editable amendment text area", async () => {

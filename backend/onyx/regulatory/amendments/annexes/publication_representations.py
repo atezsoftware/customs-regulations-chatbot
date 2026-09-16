@@ -66,6 +66,7 @@ def temporal_candidate_rows(
     legal: AnnexLegalPublicationTimeline,
     when: date,
     bindings: list[AnnexTemporalProjection] | None = None,
+    positions: dict[str, int] | None = None,
 ) -> list["RegulatoryChunk"]:
     """Derive dated representations without rewriting baseline legal metadata."""
     rows = canonical_snapshot_rows(legal.canonical_rows)
@@ -80,7 +81,23 @@ def temporal_candidate_rows(
             and (binding.effective_start is None or binding.effective_start <= when)
             and (binding.effective_end is None or when < binding.effective_end)
         ]
-        if len(matches) > 1:
+        if (
+            len(
+                {
+                    context_hash(
+                        [
+                            binding.canonical_base_sha256,
+                            binding.derived_role,
+                            binding.representation_text,
+                            binding.representation_metadata,
+                            binding.semantic_position,
+                        ]
+                    )
+                    for binding in matches
+                }
+            )
+            > 1
+        ):
             raise ValueError("dated canonical source representation is ambiguous")
         if matches:
             binding = matches[0]
@@ -95,6 +112,23 @@ def temporal_candidate_rows(
             row.text = binding.representation_text
             row.chunk_metadata = dict(binding.representation_metadata)
             row.position = binding.semantic_position
+    if draft.impact_strategy == "source_dependencies_v1":
+        from onyx.regulatory.amendments.annexes.selective_impact import (
+            recover_source_membership,
+        )
+
+        recovered = recover_source_membership(draft.baseline_scope)
+        for row in rows:
+            if row.id in recovered and not row.chunk_metadata.get(
+                "source_regulatory_chunk_ids"
+            ):
+                row.chunk_metadata = {
+                    **row.chunk_metadata,
+                    "source_regulatory_chunk_ids": recovered[row.id],
+                }
+    for row in rows:
+        if positions and row.id in positions:
+            row.position = positions[row.id]
     for item in draft.items:
         if item.old_chunk_ids:
             anchor = by_id[item.old_chunk_ids[0]]
@@ -147,18 +181,65 @@ def temporal_candidate_rows(
             and draft.new_evidence_remapping
             and draft.baseline
         ):
-            positions = [
+            element_positions = [
                 position
                 for position, element in enumerate(draft.baseline.elements)
                 if element.canonical_chunk_id == row.id
             ]
+            if draft.comparison and draft.comparison.schema_version == 2:
+                if draft.new_extraction is None:
+                    raise ValueError("source-only extraction missing")
+                resolved = []
+                for position in element_positions:
+                    old_element = draft.baseline.elements[position]
+                    matches = [
+                        index
+                        for index in draft.comparison.coverage.new_positions
+                        if (
+                            draft.new_extraction.elements[index].kind,
+                            draft.new_extraction.elements[index].text,
+                        )
+                        == (old_element.kind, old_element.text)
+                    ]
+                    if len(matches) != 1:
+                        raise ValueError("source-only correspondence is ambiguous")
+                    resolved.append(matches[0])
+                element_positions = resolved
             row.chunk_metadata = remap_new_chunk_evidence(
-                row.chunk_metadata, positions, draft.new_evidence_remapping
+                row.chunk_metadata, element_positions, draft.new_evidence_remapping
             )
+    insertions: dict[str, list[str]] = {}
+    if draft.impact_strategy == "source_dependencies_v1" and during:
+        for item in draft.items:
+            if not item.old_chunk_ids and item.insertion_after_chunk_id:
+                insertions.setdefault(item.insertion_after_chunk_id, []).extend(
+                    chunk.id for chunk in item.new_chunks if chunk.id in effective_ids
+                )
     for row in effective:
         metadata = dict(row.chunk_metadata)
         sources = metadata.get("source_regulatory_chunk_ids")
         if isinstance(sources, list):
+            expanded = []
+            for source in sources:
+                if not isinstance(source, str):
+                    continue
+                expanded.append(source)
+                for identifier in insertions.get(source, []):
+                    root = metadata.get("hierarchy_root_path")
+                    target = by_id[identifier]
+                    replaces_anchor = any(
+                        source in item.old_chunk_ids for item in draft.items
+                    )
+                    if not replaces_anchor and (
+                        not isinstance(root, list)
+                        or not root
+                        or target.heading_path[: len(root)] != root
+                    ):
+                        raise ValueError(
+                            "inserted aggregate boundary requires explicit source membership"
+                        )
+                    expanded.append(identifier)
+            sources = expanded
             metadata["source_regulatory_chunk_ids"] = list(
                 dict.fromkeys(
                     target

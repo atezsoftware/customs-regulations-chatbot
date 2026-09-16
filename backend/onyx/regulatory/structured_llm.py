@@ -27,6 +27,7 @@ from onyx.llm.model_response import ModelResponse
 from onyx.llm.models import (
     AssistantMessage,
     ChatCompletionMessage,
+    FileContentPart,
     ImageContentPart,
     ReasoningEffort,
     SystemMessage,
@@ -238,6 +239,7 @@ def generate_structured(
     user_prompt: str,
     response_model: type[ResponseModel],
     image_parts: list[ImageContentPart] | None = None,
+    file_parts: list[FileContentPart] | None = None,
     timeout_override: int | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
@@ -269,8 +271,12 @@ def generate_structured(
     messages: list[ChatCompletionMessage] = [
         SystemMessage(content=full_system_prompt),
         UserMessage(
-            content=[TextContentPart(text=user_prompt), *image_parts]
-            if image_parts
+            content=[
+                TextContentPart(text=user_prompt),
+                *(image_parts or []),
+                *(file_parts or []),
+            ]
+            if image_parts or file_parts
             else user_prompt
         ),
     ]
@@ -364,6 +370,8 @@ def generate_structured(
         if response is None:
             raise RuntimeError("structured LLM invocation produced no response")
         content = llm_response_to_string(response)
+        if file_parts and _response_hit_output_limit(response.choice.finish_reason):
+            raise StructuredOutputValidationError("pdf_output_truncated")
         try:
             result = _validate_json_object(content, response_model)
             if deadline is not None and time.monotonic() >= deadline:

@@ -26,7 +26,6 @@ from onyx.regulatory.amendments.annexes.canonical_evidence import (
 )
 from onyx.regulatory.amendments.annexes.comparison import compare_annexes
 from onyx.regulatory.amendments.annexes.context_dependencies import (
-    compare_context_views,
     context_hash,
 )
 from onyx.regulatory.amendments.annexes.evidence import (
@@ -52,10 +51,7 @@ from onyx.regulatory.amendments.annexes.models import (
 )
 from onyx.regulatory.amendments.annexes.patch_plan import prepare_annex_patch
 from onyx.regulatory.amendments.annexes.staging import (
-    canonical_snapshot_rows,
-    prepare_staged_candidate_rows,
     stage_canonical_items,
-    staged_canonical_predecessors,
 )
 from onyx.regulatory.amendments.models import AmendmentInstruction, DateResolution
 from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
@@ -557,9 +553,7 @@ def run_annex_groups(
 def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
     from onyx.configs.app_configs import REGULATORY_BATCH_INDEXING_ENABLED
     from onyx.db.regulatory_annex_publication import load_annex_context_settings
-    from onyx.indexing.embedder import DefaultIndexingEmbedder
     from onyx.regulatory.amendments.annexes.preparation_progress import (
-        report_preparation_progress,
         save_preparation_checkpoint,
     )
     from onyx.regulatory.indexing_jobs.configuration import (
@@ -573,12 +567,15 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
     ):
         raise ValueError("context preparation scope missing")
     with get_session_with_current_tenant() as session:
+        if draft.selection_parent_id is not None:
+            from onyx.db.regulatory_annex_selection import rebase_selection
+
+            draft = rebase_selection(session, draft)
+        assert draft.user_file_id is not None
         batch = get_batch(session, draft_batch_id(draft))
         if batch is None:
             raise ValueError("batch missing")
-        file = require_annex_file_scope(
-            session, batch.document_set_id, draft.user_file_id
-        )
+        require_annex_file_scope(session, batch.document_set_id, draft.user_file_id)
         settings = load_annex_context_settings(session)
         snapshot = (
             resolve_regulatory_indexing_snapshot(session)
@@ -588,7 +585,6 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         configuration = capture_preparation_configuration(
             session, user_file_id=draft.user_file_id
         )
-    embedder = DefaultIndexingEmbedder.from_db_search_settings(search_settings=settings)
     context_llm = resolve_review_context_llm(settings, snapshot)
     configuration["context_model"] = (
         context_hash(context_llm.config.model_dump(mode="json"))
@@ -610,71 +606,13 @@ def prepare_review_context(draft: AnnexChangeDraft) -> AnnexChangeDraft:
         }
     )
     save_preparation_checkpoint(draft)
-    assert draft.effective_date is not None and draft.patch_plan is not None
-    effective_date = draft.effective_date
-    metadata_only = draft.patch_plan.metadata_only
-    old_rows = canonical_snapshot_rows(draft.baseline_scope)
-    candidate = prepare_staged_candidate_rows(
-        baseline_scope=draft.baseline_scope,
-        items=draft.items,
-        effective_date=effective_date,
-        evidence_remapping=draft.new_evidence_remapping,
-    )
-    report_preparation_progress("original_context", total=len(old_rows))
-    before = prepare_publication_context_view(
-        rows=old_rows,
-        file=file,
-        settings=settings,
-        snapshot=snapshot,
-        embedder=embedder,
-        context_llm=context_llm,
-        reference_date=effective_date,
-        cached=draft.baseline_context,
-    )
-    draft = draft.model_copy(update={"baseline_context": before})
-    save_preparation_checkpoint(draft)
-    report_preparation_progress("replacement_context", total=len(candidate))
-    after = prepare_publication_context_view(
-        rows=candidate,
-        file=file,
-        settings=settings,
-        snapshot=snapshot,
-        embedder=embedder,
-        context_llm=context_llm,
-        reference_date=effective_date,
-        cached=before,
-    )
-    impact = compare_context_views(
-        old=before,
-        new=after,
-        direct_canonical_changes=[
-            chunk.id for item in draft.items for chunk in item.new_chunks
-        ],
-        metadata_only=metadata_only,
-        canonical_predecessors=staged_canonical_predecessors(draft.items),
-    )
-    prepared = draft.model_copy(
-        update={
-            "baseline_context": before,
-            "impact": impact,
-            "preparation_configuration": {
-                **draft.preparation_configuration,
-                **configuration,
-            },
-            "indexing_configuration": snapshot.model_dump(mode="json")
-            if snapshot
-            else None,
-        }
+    from onyx.regulatory.amendments.annexes.selective_publication import (
+        prepare_selective_publication,
     )
 
-    save_preparation_checkpoint(prepared)
-    if draft.date_resolution is not None:
-        from onyx.regulatory.amendments.annexes.publication_preparation import (
-            prepare_publication_review,
-        )
-
-        return prepare_publication_review(prepared)
-    return prepared
+    return prepare_selective_publication(
+        draft.model_copy(update={"impact_strategy": "source_dependencies_v1"})
+    )
 
 
 def draft_batch_id(draft: AnnexChangeDraft) -> int:
@@ -834,6 +772,7 @@ def prepare_publication_context_view(
     context_llm: "LLM | None",
     reference_date: date,
     cached: "PreparedContextView | None",
+    target_ids: set[str] | None = None,
 ) -> "PreparedContextView":
     from onyx.regulatory.projection import prepare_normal_context_view
 
@@ -846,6 +785,7 @@ def prepare_publication_context_view(
             llm=context_llm,
             as_of_date=reference_date,
             cached=cached,
+            target_ids=target_ids,
         )
     from onyx.db.models import RegulatoryIndexingJob
     from onyx.llm.constants import LlmProviderNames
@@ -907,4 +847,5 @@ def prepare_publication_context_view(
         max_workers=4,
         cached=cached,
         as_of_date=reference_date,
+        target_ids=target_ids,
     )

@@ -37,6 +37,7 @@ from onyx.regulatory.amendments.models import (
     ProposalDraft,
 )
 from onyx.regulatory.amendments.new_provision_policy import (
+    added_subordinate_unit_kind,
     explicitly_adds_top_level_provision,
 )
 from onyx.regulatory.amendments.pdf_vision import PdfBatchSource
@@ -101,12 +102,14 @@ def confirm_instruction_match(
             match.old_chunk_id,
         )
         return None
-    if match.old_chunk_id is None and not explicitly_adds_top_level_provision(
-        instruction.instruction_text
+    if (
+        match.old_chunk_id is None
+        and not explicitly_adds_top_level_provision(instruction.instruction_text)
+        and added_subordinate_unit_kind(instruction.instruction_text) is None
     ):
         logger.warning(
             "Amendment matcher declined all candidates for an instruction that "
-            "does not explicitly add a top-level provision; marking unmatched"
+            "adds no provision of its own; marking unmatched"
         )
         return None
     return match
@@ -133,7 +136,19 @@ def load_instruction_draft_context(
         target_user_file_id = old_chunk.user_file_id
         target_position = old_chunk.position
     else:
-        best_candidate = candidates[0]
+        if not candidates:
+            logger.warning(
+                "Amendment addition has no candidate to anchor its file and "
+                "position; marking instruction unmatched"
+            )
+            return None
+        # An exact structural match names the amended article outright, so it
+        # anchors a new unit far more reliably than the best ranked search hit,
+        # which may sit in a neighbouring provision.
+        best_candidate = next(
+            (candidate for candidate in candidates if candidate.structured_match),
+            candidates[0],
+        )
         target_user_file_id = UUID(best_candidate.user_file_id)
         sibling_reference = {
             "text": best_candidate.text,

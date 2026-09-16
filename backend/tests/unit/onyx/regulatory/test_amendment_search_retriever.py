@@ -271,3 +271,89 @@ def _candidate_for_wrong_source() -> CandidateChunk:
         metadata={"article_no": "3", "clause_label": "u"},
         structured_match=True,
     )
+
+
+def test_instruction_is_searched_from_several_independent_angles() -> None:
+    """One query built from the raw instruction only finds the new wording."""
+
+    search_tool = MagicMock()
+    search_tool.run.return_value = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[], citation_mapping={}, displayed_docs=None
+        ),
+        llm_facing_response="",
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: search_tool,
+        canonical_candidate_loader=lambda _chunk_ids: {},
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "MADDE 4- Aynı Tebliğin 5 inci maddesinin üçüncü fıkrasında yer "
+            "alan “2, 3, 4, 5 ve 6 numaralı belgeler” ibaresi “2, 3, 4, 5, 6 "
+            "ve 7 numaralı belgeler” şeklinde değiştirilmiştir."
+        ),
+        target_source="Karayolu Dışında Kullanılan Hareketli Makinaların İthalat Denetimi Tebliği",
+        search_query="TAREKS başvurusunda hangi belgeler yüklenir?",
+    )
+
+    retriever.search(instruction)
+
+    lanes = [call.kwargs for call in search_tool.run.call_args_list]
+    modes = {lane["search_mode"] for lane in lanes}
+    queries = [lane["queries"][0] for lane in lanes]
+    assert len(lanes) >= 3
+    assert {"keyword", "full_text", "hybrid"} <= modes
+    # The structural lane must name the amended article, never the amending one.
+    assert any("madde 5" in query and "madde 4" not in query for query in queries)
+    # The replaced wording is searched as its own literal anchor.
+    assert any("2, 3, 4, 5 ve 6 numaralı belgeler" == query for query in queries)
+    assert instruction.search_query in queries
+
+
+def test_target_reached_by_only_one_lane_survives_fusion() -> None:
+    """A provision no other lane ranks must not be lost when lanes are merged."""
+
+    only_hit = _search_doc(file_id=None, chunk_id="article-11-paragraph-3")
+    responses = [
+        ToolResponse(
+            rich_response=SearchDocsResponse(
+                search_docs=[], citation_mapping={}, displayed_docs=None
+            ),
+            llm_facing_response="",
+        ),
+        ToolResponse(
+            rich_response=SearchDocsResponse(
+                search_docs=[only_hit], citation_mapping={}, displayed_docs=None
+            ),
+            llm_facing_response="",
+        ),
+    ]
+    search_tool = MagicMock()
+    search_tool.run.side_effect = lambda *_args, **_kwargs: responses.pop(0)
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: search_tool,
+        canonical_candidate_loader=lambda chunk_ids: {
+            chunk_id: CandidateChunk(
+                chunk_id=chunk_id,
+                user_file_id=str(_FILE_ID),
+                text="(3) Firmalardan ilave bilgi ve belge istenebilir.",
+                metadata={"article_no": "11", "paragraph_no": "3"},
+            )
+            for chunk_id in chunk_ids
+        },
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "MADDE 10- Aynı Tebliğin 11 inci maddesinin üçüncü fıkrası "
+            "yürürlükten kaldırılmıştır."
+        ),
+    )
+
+    candidates = retriever.search(instruction)
+
+    assert [candidate.chunk_id for candidate in candidates] == [
+        "article-11-paragraph-3"
+    ]

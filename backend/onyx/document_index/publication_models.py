@@ -324,3 +324,43 @@ class IndexedProjectionEvidence(PublicationModel):
     source_json: str
     frozen_projection: FrozenPublicationProjection | None
     payload_sha256: str | None
+
+
+class RetainedPublicationProjection(PublicationModel):
+    """Same-index preservation, independent of unknown legacy encoder inputs."""
+
+    evidence: IndexedProjectionEvidence
+    source_json: str
+
+    @model_validator(mode="after")
+    def validate_retention(self) -> Self:
+        before = json.loads(self.evidence.source_json)
+        after = json.loads(self.source_json)
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise ValueError("retained source must be an object")
+        if {k: v for k, v in before.items() if k != "validity_end_date"} != {
+            k: v for k, v in after.items() if k != "validity_end_date"
+        }:
+            raise ValueError("retention changes existing content or vector")
+        start, old_end, end = (
+            before.get("validity_start_date"),
+            before.get("validity_end_date"),
+            after.get("validity_end_date"),
+        )
+        if end != old_end and (
+            type(end) is not int
+            or start is not None
+            and end <= start
+            or old_end is not None
+            and end > old_end
+        ):
+            raise ValueError("retention can only shorten an existing interval")
+        source = SerializedPublicationSource.model_validate(
+            {k: v for k, v in after.items() if not k.startswith("publication_")}
+        )
+        if len(source.content_vector) != self.evidence.index.vector_dimension or (
+            source.title_vector is not None
+            and len(source.title_vector) != self.evidence.index.vector_dimension
+        ):
+            raise ValueError("retained vector dimension mismatch")
+        return self

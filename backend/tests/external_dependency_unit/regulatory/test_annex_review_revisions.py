@@ -629,17 +629,29 @@ def live_review(
     assert groups[0].status == "pending", groups[0].review_payload["issues"]
     draft = AnnexChangeDraft.model_validate(groups[0].review_payload)
     assert draft.instruction_indices == [0, 1]
-    assert (
-        draft.baseline_context is not None
-        and len(draft.baseline_context.projections) == 2
-    )
-    assert draft.impact is not None and len(draft.impact.prepared.projections) == (
-        3 if multipart else 2
-    )
+    assert draft.baseline_context is not None
+    assert draft.impact is not None
+    assert draft.impact_strategy == "source_dependencies_v1"
+    expected_consumers = {
+        chunk.id for item in draft.items for chunk in item.new_chunks
+    } | set(draft.source_only_canonical_ids)
+    if mode == "temporary":
+        from onyx.regulatory.amendments.annexes.publication_preparation import (
+            validate_frozen_publication_review,
+        )
+
+        expected_consumers.update(
+            validate_frozen_publication_review(draft).legal.restoration_predecessors
+        )
+    if mode == "historical-derived-verified":
+        expected_consumers.add(outside.id)
+    assert {
+        p.canonical_chunk_id for p in draft.impact.prepared.projections
+    } == expected_consumers
     if not source_only:
-        assert draft.items[0].new_chunks[0].metadata["source_asset_ids"] == [
-            str(asset.id)
-        ]
+        assert next(
+            chunk for item in draft.items for chunk in item.new_chunks
+        ).metadata["source_asset_ids"] == [str(asset.id)]
     assert batch.processed_instruction_count == 2 and batch.status == "analyzed"
     assert capture_canonical_scope(source_session, file.id) == before
     retriever.search.assert_not_called()
@@ -828,6 +840,13 @@ def test_group_api_enforces_owner_and_returns_exact_frozen_bytes(
     response = client.get(path)
     assert response.status_code == 200
     assert len(response.json()) == 1 and response.json()[0]["review_revision"] == 1
+    assert response.json()[0]["review_payload"]["items"] == []
+    assert response.json()[0]["review_payload"]["new_extraction"] is None
+    chunk_path = f"{path}/{live_review.review.id}/chunks"
+    page = client.get(chunk_path, params={"limit": 1})
+    assert page.status_code == 200 and page.json()["total"] == 1
+    assert len(page.json()["items"]) == 1 and page.json()["items"][0]["old_chunks"]
+    assert client.get(chunk_path, params={"limit": 51}).status_code == 422
     draft = AnnexChangeDraft.model_validate(live_review.review.review_payload)
     evidence = next(
         item
@@ -902,6 +921,7 @@ def test_group_api_enforces_owner_and_returns_exact_frozen_bytes(
     owner.id = uuid4()
     assert client.get(path).status_code == 404
     assert client.get(evidence_path).status_code == 404
+    assert client.get(chunk_path).status_code == 404
     owner.effective_permissions = []
     assert client.get(path).status_code == 403
 
@@ -958,7 +978,7 @@ def test_unreconciled_correction_remains_blocked_with_raw_evidence_preserved(
     assert live_review.review.review_payload == draft.model_dump(mode="json")
 
 
-def test_revalidation_creates_new_ready_revision_with_new_ids_and_whole_context(
+def test_revalidation_creates_new_ready_revision_with_new_ids_and_selective_context(
     live_review: LiveReview, source_session: Session
 ) -> None:
     from onyx.db.regulatory_annex_changes import (
@@ -984,10 +1004,15 @@ def test_revalidation_creates_new_ready_revision_with_new_ids_and_whole_context(
         environment="local-test",
     )
     assert review.status == "pending" and review.review_revision == 2
-    assert revised.items[0].new_chunks[0].id != draft.items[0].new_chunks[0].id
+    assert {chunk.id for item in revised.items for chunk in item.new_chunks}.isdisjoint(
+        {chunk.id for item in draft.items for chunk in item.new_chunks}
+    )
     assert revised.baseline_context == draft.baseline_context
     assert revised.evidence == draft.evidence
-    assert revised.impact is not None and len(revised.impact.prepared.projections) == 2
+    assert revised.impact is not None
+    assert {p.canonical_chunk_id for p in revised.impact.prepared.projections} == {
+        chunk.id for item in revised.items for chunk in item.new_chunks
+    }
     with pytest.raises(ValueError, match="stale"):
         require_current_annex_review(
             source_session,
@@ -1092,7 +1117,14 @@ def test_live_preparation_uses_actual_durable_transport(
         evidence_remapping=prepared.new_evidence_remapping,
     )
     validate_complete_context_view(
-        rows=rows, view=prepared.impact.prepared, as_of_date=prepared.effective_date
+        rows=[
+            row
+            for row in rows
+            if row.id
+            in {p.canonical_chunk_id for p in prepared.impact.prepared.projections}
+        ],
+        view=prepared.impact.prepared,
+        as_of_date=prepared.effective_date,
     )
 
 
@@ -1105,10 +1137,36 @@ def test_source_only_change_keeps_legal_identity_and_stages_new_source(
     draft = AnnexChangeDraft.model_validate(live_review.review.review_payload)
     assert live_review.review.status == "pending"
     assert draft.items == [] and draft.source_only_canonical_ids
+    from onyx.regulatory.amendments.annexes.comparison import (
+        _native_changes,
+        validate_annex_comparison,
+    )
+
+    assert draft.comparison is not None and draft.comparison.schema_version == 2
+    assert draft.old_extraction is not None and draft.new_extraction is not None
+    legacy = draft.comparison.model_copy(
+        update={
+            "schema_version": 1,
+            "changes": _native_changes(draft.old_extraction, draft.new_extraction),
+            "coverage": draft.comparison.coverage.model_copy(
+                update={
+                    "old_positions": list(range(len(draft.old_extraction.elements))),
+                    "new_positions": list(range(len(draft.new_extraction.elements))),
+                }
+            ),
+        }
+    )
+    assert legacy.changes
+    assert (
+        validate_annex_comparison(
+            legacy, old=draft.old_extraction, new=draft.new_extraction
+        )
+        == []
+    )
     assert draft.impact is not None and draft.baseline_context is not None
-    assert {row.canonical_chunk_id for row in draft.impact.prepared.projections} == {
-        row.canonical_chunk_id for row in draft.baseline_context.projections
-    }
+    assert {row.canonical_chunk_id for row in draft.impact.prepared.projections} == set(
+        draft.source_only_canonical_ids
+    )
     assert draft.new_evidence_remapping is not None
     assert {item.parent_sha256 for item in draft.evidence if item.side == "new"} != {
         item.parent_sha256 for item in draft.evidence if item.side == "old"
@@ -1151,7 +1209,7 @@ def test_live_batch_combines_complete_native_new_parts(live_review: LiveReview) 
         len({item.source_asset_id for item in draft.new_evidence_remapping.elements})
         == 2
     )
-    assert len(draft.items) == 2
+    assert sum(len(item.new_chunks) for item in draft.items) == 2
 
 
 @pytest.mark.parametrize(
@@ -1187,7 +1245,7 @@ def test_live_single_chunk_text_annex_keeps_legacy_route(
         segmented_instructions=[{"instruction_text": instruction}],
     )
     source_session.add(batch)
-    source_session.flush()
+    source_session.commit()
     retrieve = MagicMock(return_value=([], None))
     monkeypatch.setattr(job, "retrieve_and_confirm_instruction", retrieve)
     job.run_amendment_batch(batch_id=batch.id, lease_generation=1)

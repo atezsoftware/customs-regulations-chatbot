@@ -504,6 +504,14 @@ def extract_annex_structure(
     vision_deadline: float | None = None,
     source_text_only: bool = False,
 ) -> AnnexExtraction:
+    if (
+        mime_type == "application/pdf"
+        and vision_llm is not None
+        and vision_deadline is not None
+    ):
+        from onyx.regulatory.amendments.annexes.pdf_document import extract_pdf_document
+
+        return extract_pdf_document(content, llm=vision_llm, deadline=vision_deadline)
     remaining = (
         vision_deadline - time.monotonic() if vision_deadline is not None else 30
     )

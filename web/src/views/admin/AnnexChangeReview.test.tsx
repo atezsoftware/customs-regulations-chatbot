@@ -30,6 +30,7 @@ function reviewFixture(overrides: Partial<AnnexReview> = {}): AnnexReview {
     error_message: null,
     created_at: "2026-09-10T00:00:00Z",
     review_payload: {
+      impact_strategy: "source_dependencies_v1",
       instruction_indices: [0, 1],
       instruction_texts: ["Replace EK-1.", "Keep the temporary window."],
       annex_label: "EK-1",

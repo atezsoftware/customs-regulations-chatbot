@@ -109,7 +109,17 @@ class ImageContentPart(BaseModel):
     image_url: ImageUrlDetail
 
 
-ContentPart = TextContentPart | ImageContentPart
+class FileDetail(BaseModel):
+    filename: str
+    file_data: str
+
+
+class FileContentPart(BaseModel):
+    type: Literal["file"] = "file"
+    file: FileDetail
+
+
+ContentPart = TextContentPart | ImageContentPart | FileContentPart
 
 
 # Tool call structures

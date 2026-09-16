@@ -8909,6 +8909,20 @@ class AnnexChangeSet(Base):
         UniqueConstraint(
             "logical_group_id", "review_revision", name="uq_annex_review_revision"
         ),
+        Index(
+            "ix_annex_initial_instruction",
+            "batch_id",
+            "instruction_index",
+            unique=True,
+            postgresql_where=text(
+                "review_revision = 1 AND review_payload->>'selection_parent_id' IS NULL"
+            ),
+        ),
+        Index(
+            "ix_annex_selection_parent",
+            text("(review_payload->>'selection_parent_id')"),
+            postgresql_where=text("review_payload->>'selection_parent_id' IS NOT NULL"),
+        ),
         CheckConstraint(
             "status IN ('pending', 'blocked', 'approving', 'preparing', 'publishing', 'approved', 'rejected', 'failed')",
             name="annex_change_status_check",

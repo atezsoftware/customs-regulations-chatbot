@@ -3,6 +3,7 @@
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -184,16 +185,30 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             for payload in instruction_payloads
         ]
     )
+    from onyx.db.regulatory_annex_changes import legacy_text_annex_is_complete
+    from onyx.regulatory.amendments.annexes import config as annex_config
     from onyx.regulatory.amendments.annexes.analysis import (
         group_annex_instructions,
         run_annex_groups,
     )
 
-    annex_indices = {
-        index
-        for group in group_annex_instructions(instructions)
-        for index in group.instruction_indices
-    }
+    annex_indices: set[int] = set()
+    groups = group_annex_instructions(instructions)
+    if annex_config.REGULATORY_ANNEX_UPDATES_ENABLED and groups:
+        with _session() as db_session:
+            batch = get_batch(db_session, batch_id)
+            if batch is None:
+                raise RuntimeError(f"Amendment batch {batch_id} no longer exists")
+            for group in groups:
+                if not legacy_text_annex_is_complete(
+                    db_session,
+                    batch=batch,
+                    group=group,
+                    reference_date=date.fromisoformat(reference_date)
+                    if reference_date
+                    else date.today(),
+                ):
+                    annex_indices.update(group.instruction_indices)
     first_output_error: StructuredOutputValidationError | TimeoutError | None = None
     matched_instructions: list[_MatchedInstruction] = []
     for instruction_index, instruction in enumerate(instructions):

@@ -66,17 +66,44 @@ def _atomic_positions(
     ]
 
 
-def _native_changes(
-    old: AnnexExtraction, new: AnnexExtraction
-) -> list[AnnexDifference]:
+def _comparison_positions(
+    old: AnnexExtraction, new: AnnexExtraction, *, canonical_alignment: bool
+) -> tuple[list[int], list[int]]:
     multipart = any(
         extraction.evidence_view is not None
         and len(extraction.evidence_view.parents) > 1
         for extraction in (old, new)
     )
-    old_positions, new_positions = (
-        _atomic_positions(old, omit_scope_boundaries=multipart),
-        _atomic_positions(new, omit_scope_boundaries=multipart),
+    sides: list[list[int]] = []
+    for extraction, other in ((old, new), (new, old)):
+        positions = _atomic_positions(extraction, omit_scope_boundaries=multipart)
+        if (
+            canonical_alignment
+            and other.canonical_evidence is not None
+            and extraction.evidence_view is not None
+        ):
+            # A source's annex delimiter is not a new content chunk when the indexed
+            # representation carries that heading only in its path.
+            other_text = {element.text for element in other.elements}
+            positions = [
+                position
+                for position in positions
+                if not (
+                    extraction.evidence_view.selected_positions[position]
+                    in extraction.evidence_view.boundary_positions
+                    and extraction.elements[position].extraction_method == "native"
+                    and extraction.elements[position].text not in other_text
+                )
+            ]
+        sides.append(positions)
+    return sides[0], sides[1]
+
+
+def _native_changes(
+    old: AnnexExtraction, new: AnnexExtraction, *, canonical_alignment: bool = False
+) -> list[AnnexDifference]:
+    old_positions, new_positions = _comparison_positions(
+        old, new, canonical_alignment=canonical_alignment
     )
 
     # Unique structural keys anchor changed cells; exact content can anchor moves.
@@ -86,8 +113,12 @@ def _native_changes(
         return {
             index: (
                 element.kind,
-                "semantic" if element.semantic_key else "text",
-                element.semantic_key or element.text,
+                "semantic"
+                if element.semantic_key and not canonical_alignment
+                else "text",
+                element.semantic_key
+                if element.semantic_key and not canonical_alignment
+                else element.text,
             )
             for index in positions
             for element in [extraction.elements[index]]
@@ -325,14 +356,11 @@ def compare_annexes(
     Patch preparation separately verifies canonical baseline, dates and mappings.
     """
     before_pages, after_pages = old_pages or [], new_pages or []
-    multipart = any(
-        extraction.evidence_view is not None
-        and len(extraction.evidence_view.parents) > 1
-        for extraction in (old, new)
-    )
-    old_positions, new_positions = (
-        _atomic_positions(old, omit_scope_boundaries=multipart),
-        _atomic_positions(new, omit_scope_boundaries=multipart),
+    canonical_alignment = bool(old.canonical_evidence) != bool(
+        new.canonical_evidence
+    ) and not any(has_visual_evidence(extraction) for extraction in (old, new))
+    old_positions, new_positions = _comparison_positions(
+        old, new, canonical_alignment=canonical_alignment
     )
     issues = [
         *old.issues,
@@ -399,7 +427,7 @@ def compare_annexes(
     model_snapshot = None
     if method == "native_structure" and not issues:
         try:
-            changes = _native_changes(old, new)
+            changes = _native_changes(old, new, canonical_alignment=canonical_alignment)
         except ValueError as error:
             issues.append(str(error))
     elif method == "simultaneous_vision":
@@ -535,6 +563,7 @@ def compare_annexes(
                     )
                     changes.extend(response.changes)
     return AnnexComparison(
+        schema_version=2 if canonical_alignment else 1,
         old_source_sha256=old.source_sha256,
         new_source_sha256=new.source_sha256,
         old_snapshot_sha256=annex_snapshot_hash(old),
@@ -568,13 +597,11 @@ def validate_annex_comparison(
         for element in extraction.elements
     ):
         issues.append("incomplete_extraction")
-    multipart = any(
-        extraction.evidence_view is not None
-        and len(extraction.evidence_view.parents) > 1
-        for extraction in (old, new)
+    if comparison.schema_version not in (1, 2):
+        issues.append("unsupported_comparison_version")
+    old_positions, new_positions = _comparison_positions(
+        old, new, canonical_alignment=comparison.schema_version == 2
     )
-    old_positions = _atomic_positions(old, omit_scope_boundaries=multipart)
-    new_positions = _atomic_positions(new, omit_scope_boundaries=multipart)
     if not old_positions or not new_positions:
         issues.append("empty_extraction")
     visual = any(has_visual_evidence(extraction) for extraction in (old, new))

@@ -24,6 +24,7 @@ from onyx.document_index.publication_models import (
     IndexedProjectionEvidence,
     PublicationIndexSnapshot,
     PublicationVerification,
+    RetainedPublicationProjection,
     publication_digest,
 )
 
@@ -73,6 +74,38 @@ if (ctx._source.publication_token == params.token) {
     ctx._source = params.source;
 }
 """
+)
+
+_RETAIN = (
+    _SCOPE
+    + """
+if (ctx._source.publication_floor != params.token) {
+    throw new IllegalArgumentException('stale or unsealed preservation');
+}
+def actual = new HashMap(ctx._source);
+for (def key : params.controls) { actual.remove(key); }
+if (!actual.equals(params.previous) && !actual.equals(params.updated)) {
+    throw new IllegalArgumentException('retained source changed');
+}
+if (ctx._source.publication_token == params.token &&
+    ctx._source.publication_operation != params.operation) {
+    throw new IllegalArgumentException('different equal-token preservation');
+}
+if (params.updated.containsKey('validity_end_date')) {
+    ctx._source.validity_end_date = params.updated.validity_end_date;
+}
+ctx._source.publication_token = params.token;
+ctx._source.publication_payload = params.payload;
+ctx._source.publication_operation = params.operation;
+"""
+)
+
+_RETENTION_CONTROLS = (
+    "publication_floor",
+    "publication_token",
+    "publication_payload",
+    "publication_operation",
+    "publication_scope",
 )
 
 
@@ -307,9 +340,21 @@ class FencedPublicationIndex:
         self,
         reservations: FileReservations,
         projections: tuple[FrozenPublicationProjection, ...],
+        retained: tuple[RetainedPublicationProjection, ...] = (),
     ) -> PublicationVerification:
         self._check_index()
         live = {projection.ordinal: projection for projection in projections}
+        preserved = {
+            json.loads(item.source_json)["chunk_index"]: item for item in retained
+        }
+        if (
+            len(preserved) != len(retained)
+            or set(preserved) & set(live)
+            or not set(preserved).issubset(reservations.ordinals)
+        ):
+            raise DocumentChunkVerificationError(
+                "duplicate or unreserved retained identity"
+            )
         if len(live) != len(projections) or not set(live).issubset(
             reservations.ordinals
         ):
@@ -352,7 +397,11 @@ class FencedPublicationIndex:
             )
         manifest: list[JsonValue] = []
         for ordinal in reservations.ordinals:
-            expected = self._source(reservations, live.get(ordinal), ordinal)
+            expected = (
+                self._retained_source(reservations, preserved[ordinal])
+                if ordinal in preserved
+                else self._source(reservations, live.get(ordinal), ordinal)
+            )
             actual = dict(sources[self._id(reservations, ordinal)])
             operation = actual.pop("publication_operation", None)
             if not operation or actual != expected:
@@ -363,12 +412,66 @@ class FencedPublicationIndex:
         return PublicationVerification(
             reservations=reservations,
             index=self.snapshot,
-            live_ordinals=tuple(sorted(live)),
+            live_ordinals=tuple(sorted(set(live) | set(preserved))),
             canonical_chunk_ids=frozenset(
                 json.loads(item.source_json)["regulatory_chunk_id"]
-                for item in projections
+                for item in (*projections, *retained)
             ),
             manifest_sha256=publication_digest(manifest),
+        )
+
+    def _retained_source(
+        self, reservations: FileReservations, retained: RetainedPublicationProjection
+    ) -> dict[str, JsonValue]:
+        if not self.snapshot.matches_temporal_index(retained.evidence.index):
+            raise ValueError("retention crosses physical index")
+        source = cast(dict[str, JsonValue], json.loads(retained.source_json))
+        ordinal = source["chunk_index"]
+        if not isinstance(ordinal, int):
+            raise ValueError("retained ordinal missing")
+        params = self._params(reservations, ordinal)
+        if (
+            source.get("document_id") != params["file"]
+            or source.get("tenant_id") != params["tenant"]
+        ):
+            raise ValueError("retained tenant/file mismatch")
+        for key in _RETENTION_CONTROLS:
+            source.pop(key, None)
+        source.update(
+            publication_scope=params["scope"],
+            publication_floor=params["token"],
+            publication_token=params["token"],
+        )
+        source["publication_payload"] = publication_digest(source)
+        return source
+
+    def retain(
+        self, reservations: FileReservations, retained: RetainedPublicationProjection
+    ) -> None:
+        """CAS preserves vectors and existing evidence; never manufactures provenance."""
+        self._check_index()
+        source = self._retained_source(reservations, retained)
+        ordinal = cast(int, source["chunk_index"])
+        previous = {
+            k: v
+            for k, v in json.loads(retained.evidence.source_json).items()
+            if k not in _RETENTION_CONTROLS
+        }
+        updated = {k: v for k, v in source.items() if k not in _RETENTION_CONTROLS}
+        operation = publication_digest({"retained": source})
+        params = self._params(reservations, ordinal)
+        params.update(
+            previous=previous,
+            updated=updated,
+            controls=list(_RETENTION_CONTROLS),
+            operation=operation,
+            payload=source["publication_payload"],
+        )
+        self.client.update(
+            index=self.snapshot.index_name,
+            id=self._id(reservations, ordinal),
+            script={"lang": "painless", "source": _RETAIN, "params": params},
+            retry_on_conflict=3,
         )
 
     def read_evidence(

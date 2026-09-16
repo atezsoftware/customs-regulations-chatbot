@@ -854,6 +854,7 @@ def prepare_durable_context_view(
     cached: PreparedContextView | None = None,
     as_of_date: datetime.date | None = None,
     changed_ids: list[str] | None = None,
+    target_ids: set[str] | None = None,
     resolve_call: Callable[
         [ContextGenerationCall, Callable[[], str]], ContextGenerationCall
     ]
@@ -872,6 +873,8 @@ def prepare_durable_context_view(
     if changed_ids:
         rows = rebuild_context_aggregates(list(rows), changed_ids=changed_ids)
     ordered = effective_context_rows(list(rows), as_of_date)
+    if target_ids is not None:
+        ordered = [row for row in ordered if row.id in target_ids]
     if not ordered:
         return PreparedContextView()
     snapshot = job.config_snapshot

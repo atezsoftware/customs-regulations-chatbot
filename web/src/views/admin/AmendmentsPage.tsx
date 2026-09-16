@@ -39,7 +39,8 @@ import {
   retryProposalIndexing,
   uploadAmendmentSourcePackage,
 } from "@/lib/regulatory/amendments";
-import AnnexChangeReview from "@/views/admin/AnnexChangeReview";
+import AnnexChunkReview from "@/views/admin/AnnexChunkReview";
+import { ChunkContent } from "@/sections/cards/ChunkChangeCard";
 
 type AmendmentSourceMode =
   | "text"
@@ -298,6 +299,8 @@ function FieldTable({
               <div role="cell" className="min-w-0">
                 {renderValue ? (
                   renderValue(key, fields[key])
+                ) : key === "text" && typeof fields[key] === "string" ? (
+                  <ChunkContent text={fields[key]} />
                 ) : (
                   <ReadOnlyFieldValue value={fields[key]} />
                 )}
@@ -1065,12 +1068,15 @@ export default function AmendmentsPage() {
     sourceFile,
     rawText
   );
-  const hasCurrentSourceExtraction = annexEnabled
-    ? sourcePackage?.status === "ready" &&
-      currentSourceIdentity !== null &&
-      currentSourceIdentity === sourcePackageIdentity
-    : sourceMode === "text" ||
-      (currentSourceIdentity !== null &&
+  // Pasted text is already the amendment text: there is nothing to download,
+  // transcribe, or freeze before analysis can read it.
+  const hasCurrentSourceExtraction =
+    sourceMode === "text" ||
+    (annexEnabled
+      ? sourcePackage?.status === "ready" &&
+        currentSourceIdentity !== null &&
+        currentSourceIdentity === sourcePackageIdentity
+      : currentSourceIdentity !== null &&
         currentSourceIdentity === extractedSourceIdentity);
   const canAnalyze = Boolean(rawText.trim()) && hasCurrentSourceExtraction;
   const sourcePackageId = sourcePackage?.id ?? null;
@@ -1263,44 +1269,17 @@ export default function AmendmentsPage() {
   const handleAnalyze = useCallback(async () => {
     if (!selectedDocumentSetId || !rawText.trim() || sourcePreparationBusy)
       return;
-    let sourcePreparationToken: string | null = null;
     setAnalyzing(true);
     try {
-      if (
-        annexEnabled &&
-        sourceMode === "text" &&
-        !hasCurrentSourceExtraction
-      ) {
-        const identity = sourceIdentity(
-          sourceMode,
-          sourceUrl,
-          sourceFile,
-          rawText
-        );
-        sourcePreparationToken = sourceRequestIdentity();
-        sourceRequestTokenRef.current = sourcePreparationToken;
-        setSourcePackagePollError(null);
-        const prepared = await createAmendmentSourcePackage(
-          Number(selectedDocumentSetId),
-          sourcePreparationToken,
-          { text: rawText }
-        );
-        if (sourceRequestTokenRef.current !== sourcePreparationToken) return;
-        setSourcePackageIdentity(identity);
-        setSourcePackage(prepared);
-        toast.info(
-          "Source preparation started. Analyze again when the frozen package is ready."
-        );
-        return;
-      }
       if (!canAnalyze) return;
-      const result = annexEnabled
-        ? await analyzeAmendment(
-            Number(selectedDocumentSetId),
-            rawText,
-            sourcePackage?.id
-          )
-        : await analyzeAmendment(Number(selectedDocumentSetId), rawText);
+      const result =
+        annexEnabled && sourceMode !== "text"
+          ? await analyzeAmendment(
+              Number(selectedDocumentSetId),
+              rawText,
+              sourcePackage?.id
+            )
+          : await analyzeAmendment(Number(selectedDocumentSetId), rawText);
       toast.success("Analysis queued. Progress will update automatically.");
       setRawText("");
       setBatches((current) => [
@@ -1312,31 +1291,18 @@ export default function AmendmentsPage() {
       setAnnexReviews([]);
       setUnmatched([]);
     } catch (e) {
-      if (
-        sourcePreparationToken === null ||
-        sourceRequestTokenRef.current === sourcePreparationToken
-      ) {
-        toast.error(e instanceof Error ? e.message : "Analysis failed.");
-      }
+      toast.error(e instanceof Error ? e.message : "Analysis failed.");
     } finally {
-      if (
-        sourcePreparationToken === null ||
-        sourceRequestTokenRef.current === sourcePreparationToken
-      ) {
-        setAnalyzing(false);
-      }
+      setAnalyzing(false);
     }
   }, [
     annexEnabled,
     canAnalyze,
-    hasCurrentSourceExtraction,
     rawText,
     selectedDocumentSetId,
-    sourceFile,
     sourceMode,
     sourcePackage?.id,
     sourcePreparationBusy,
-    sourceUrl,
   ]);
 
   const handleSourcePackageRetry = useCallback(async () => {
@@ -1688,16 +1654,10 @@ export default function AmendmentsPage() {
                       analyzing ||
                       sourcePreparationBusy ||
                       !rawText.trim() ||
-                      (!canAnalyze && !(annexEnabled && sourceMode === "text"))
+                      !canAnalyze
                     }
                   >
-                    {analyzing
-                      ? "Analyzing…"
-                      : annexEnabled &&
-                          sourceMode === "text" &&
-                          !hasCurrentSourceExtraction
-                        ? "Prepare source"
-                        : "Analyze"}
+                    {analyzing ? "Analyzing…" : "Analyze"}
                   </Button>
                 </div>
               </div>
@@ -1784,15 +1744,14 @@ export default function AmendmentsPage() {
                   {annexEnabled && annexReviews.length > 0 && (
                     <div className="flex flex-col gap-3">
                       <Text as="h2" font="heading-h3" color="text-05">
-                        Annex review groups
+                        Annex chunk changes
                       </Text>
                       <Text as="p" font="secondary-body" color="text-03">
-                        Each annex and all of its linked instructions are
-                        reviewed, edited, approved, rejected, or retried as one
-                        immutable unit.
+                        Compare changed chunks and prepare the changes you want
+                        to approve.
                       </Text>
                       {annexReviews.map((review) => (
-                        <AnnexChangeReview
+                        <AnnexChunkReview
                           key={review.id}
                           review={review}
                           onUpdated={updateAnnexReview}

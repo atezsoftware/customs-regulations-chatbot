@@ -27,6 +27,7 @@ def queue_review_preparation(
     tenant_id: str,
     environment: str,
     database_identity: str,
+    initial_checkpoint: AnnexChangeDraft | None = None,
 ) -> AnnexChangeSet:
     from onyx.db.regulatory_annex_changes import require_current_annex_review
 
@@ -42,6 +43,9 @@ def queue_review_preparation(
         or review.publication_generation
     ):
         raise ValueError("review state does not allow edits")
+    from onyx.db.regulatory_annex_selection import require_unpartitioned_review
+
+    require_unpartitioned_review(session, review)
     draft = AnnexChangeDraft.model_validate(review.review_payload)
     payload = [
         item.model_dump(mode="json")
@@ -97,11 +101,16 @@ def queue_review_preparation(
     if (
         job.checkpoint is None
         and payload == [item.model_dump(mode="json") for item in draft.corrections]
-        and not draft.issues
-        and draft.impact is not None
-        and draft.impact.ready
+        and (
+            draft.selection_parent_id is not None
+            or (not draft.issues and draft.impact is not None and draft.impact.ready)
+        )
     ):
         job.checkpoint = draft.model_dump(mode="json")
+    if initial_checkpoint is not None:
+        if initial_checkpoint.model_dump(mode="json") != review.review_payload:
+            raise ValueError("initial selection checkpoint differs from review")
+        job.checkpoint = initial_checkpoint.model_dump(mode="json")
     session.commit()
     session.refresh(review)
     return review

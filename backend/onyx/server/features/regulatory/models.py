@@ -2,11 +2,19 @@ import datetime
 from typing import Any, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_serializer,
+    model_validator,
+)
 
 from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_TEXT_CHARS
 from onyx.db.models import AnnexChangeSet, RegulatoryChunk
 from onyx.regulatory.amendments.annexes.models import (
+    AnnexCanonicalSnapshot,
     AnnexChangeDraft,
     AnnexElementCorrection,
 )
@@ -190,6 +198,7 @@ class AnnexReviewPreparationSnapshot(BaseModel):
 
 class AnnexReviewSnapshot(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+    include_evidence: bool = Field(default=False, exclude=True)
     id: UUID
     logical_group_id: UUID
     review_revision: int
@@ -209,15 +218,72 @@ class AnnexReviewSnapshot(BaseModel):
     review_payload: AnnexChangeDraft
     preparation: AnnexReviewPreparationSnapshot | None = None
 
+    @computed_field
+    @property
+    def dependency_summary(self) -> dict[str, Any]:
+        impact = self.review_payload.dependency_impact
+        return {
+            "unresolved": len(impact.unresolved) if impact else 0,
+            "affected": len(impact.affected_ids) if impact else 0,
+            "reasons": sorted(
+                {reason for reasons in impact.unresolved.values() for reason in reasons}
+            )[:5]
+            if impact
+            else [],
+        }
+
     @field_serializer("review_payload")
     def serialize_review_payload(self, payload: AnnexChangeDraft) -> dict[str, Any]:
         # Prompts and full-file projection receipts stay in the immutable DB review.
+        if not self.include_evidence:
+            if payload.impact is not None:
+                payload = payload.model_copy(
+                    update={
+                        "impact": payload.impact.model_copy(
+                            update={
+                                "direct_canonical_changes": [],
+                                "contextual_candidates": [],
+                                "embedding_changes": [],
+                                "context_only": [],
+                                "metadata_only": [],
+                                "retire_history": [],
+                                "unchanged": [],
+                                "reasons": {},
+                            }
+                        )
+                    }
+                )
+            if payload.publication is not None:
+                payload = payload.model_copy(
+                    update={
+                        "publication": payload.publication.model_copy(
+                            update={"projection_ids": []}
+                        )
+                    }
+                )
+            payload = payload.model_copy(
+                update={
+                    "items": [],
+                    "evidence": [],
+                    "old_extraction": None,
+                    "new_extraction": None,
+                    "raw_new_extraction": None,
+                    "comparison": None,
+                    "patch_plan": None,
+                    "submitted_source_text": None,
+                    "baseline": None,
+                    "source_graph": [],
+                    "new_evidence_remapping": None,
+                    "instruction_texts": [],
+                }
+            )
         return payload.model_dump(
             mode="json",
             exclude={
                 "baseline_scope": True,
                 "baseline_context": True,
                 "impact": {"prepared": True},
+                "dependency_impact": True,
             },
         )
 
@@ -228,6 +294,29 @@ class AnnexReviewSnapshot(BaseModel):
 class AnnexReviewDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_review_sha256: str = Field(min_length=64, max_length=64)
+
+
+class AnnexSelectionRequest(AnnexReviewDecisionRequest):
+    item_ids: list[UUID] = Field(min_length=1, max_length=1000)
+
+
+class AnnexChunkReviewItem(BaseModel):
+    id: UUID
+    position: int
+    operation: str
+    old_chunks: list[AnnexCanonicalSnapshot]
+    new_chunks: list[AnnexCanonicalSnapshot]
+    selection: AnnexReviewSnapshot | None = None
+    old_image_evidence_ids: list[UUID] = Field(default_factory=list)
+    new_image_evidence_ids: list[UUID] = Field(default_factory=list)
+
+
+class AnnexChunkReviewPage(BaseModel):
+    selection_count: int = 0
+    items: list[AnnexChunkReviewItem]
+    total: int
+    offset: int
+    limit: int
 
 
 class AnnexReviewEditRequest(AnnexReviewDecisionRequest):

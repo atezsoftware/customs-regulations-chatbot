@@ -102,9 +102,6 @@ def prepare_annex_review(
         PreparationObserver,
         observe_preparation,
     )
-    from onyx.regulatory.amendments.annexes.publication_preparation import (
-        prepare_publication_review,
-    )
     from shared_configs.contextvars import get_current_tenant_id
 
     if (
@@ -166,11 +163,7 @@ def prepare_annex_review(
                 )
                 # A saved comparison is reusable only under its frozen live configuration.
                 validate_live_review_runtime(draft)
-                draft = (
-                    prepare_publication_review(draft)
-                    if draft.impact is not None
-                    else prepare_review_context(draft)
-                )
+                draft = prepare_review_context(draft)
             else:
                 draft = revalidate_annex_review(
                     draft=original,

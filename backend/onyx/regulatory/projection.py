@@ -358,6 +358,7 @@ def prepare_normal_context_view(
     cached: PreparedContextView | None = None,
     as_of_date: datetime.date | None = None,
     changed_ids: list[str] | None = None,
+    target_ids: set[str] | None = None,
 ) -> PreparedContextView:
     """Prepare every potential consumer using the same normal projection path.
 
@@ -372,6 +373,8 @@ def prepare_normal_context_view(
         rows = rebuild_context_aggregates(rows, changed_ids=changed_ids)
     all_rows = _rows_in_structural_order(rows)
     ordered = effective_context_rows(all_rows, as_of_date)
+    if target_ids is not None:
+        ordered = [row for row in ordered if row.id in target_ids]
     if not ordered:
         return PreparedContextView()
     recorder = ContextGenerationRecorder(cached_calls=cached.calls if cached else [])
