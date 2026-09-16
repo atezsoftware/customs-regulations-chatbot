@@ -1,8 +1,7 @@
 """Retrieve amendment targets through Onyx's production SearchTool pipeline."""
 
-import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from difflib import SequenceMatcher
 from uuid import UUID
 
@@ -31,9 +30,6 @@ from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.structural_target import (
-    AmendmentStructuralTarget,
-    amended_body,
-    canonical_structural_query_anchor,
     parse_amendment_structural_target,
     source_identity_distinguishing_tokens,
     source_identity_matches,
@@ -42,82 +38,17 @@ from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS, SEARCH_TOOL_ID
 from onyx.tools.models import ChatMinimalTextMessage, SearchToolOverrideKwargs
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
-from onyx.tools.tool_implementations.search.search_utils import (
-    weighted_reciprocal_rank_fusion,
-)
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
 _MAX_AMENDMENT_CANDIDATES = 12
+_MAX_SEARCH_CANDIDATES = 8
 _MAX_STRUCTURAL_CANDIDATES = 6
-_MAX_LANE_HITS = 8
-# An amendment quotes the wording it replaces; that literal is the strongest
-# retrieval anchor available when the rest of the sentence describes new text.
-_QUOTED_SOURCE_WORDING_RE = re.compile(
-    r"[\"“]([^\"”]{3,160})[\"”]\s*"
-    r"(?:ibaresi|ibareleri|ifadesi|ifadeleri|kelimesi|hükmü|gtip|gt[ıi]p)",
-    re.IGNORECASE,
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _RetrievalLane:
-    """One independent retrieval attempt for a single amendment instruction."""
-
-    query: str
-    search_mode: str
-    weight: float
 
 
 def _bounded_query(value: str) -> str:
     return " ".join(value.split())[:REGULATORY_MAX_SEARCH_QUERY_CHARS].strip()
-
-
-def _instruction_lanes(
-    instruction: AmendmentInstruction,
-    target: AmendmentStructuralTarget | None,
-) -> list[_RetrievalLane]:
-    """Describe the amended provision from several independent angles.
-
-    A single query built from the raw instruction is dominated by the *new*
-    wording, which by definition is absent from the indexed corpus. Splitting
-    the instruction into a structural anchor, the quoted wording it replaces,
-    and the planned semantic question gives each signal its own ranked list, so
-    a target that only one of them can reach still surfaces.
-    """
-
-    source = " ".join((instruction.target_source or "").split())
-    lanes: list[_RetrievalLane] = []
-    seen: set[str] = set()
-
-    def add(query: str, *, search_mode: str, weight: float) -> None:
-        bounded = _bounded_query(query)
-        if not bounded or bounded.casefold() in seen:
-            return
-        seen.add(bounded.casefold())
-        lanes.append(
-            _RetrievalLane(query=bounded, search_mode=search_mode, weight=weight)
-        )
-
-    anchor = canonical_structural_query_anchor(target)
-    if anchor:
-        add(
-            f"{source} {anchor}" if source else anchor,
-            search_mode="keyword",
-            weight=1.6,
-        )
-    for quoted in list(
-        dict.fromkeys(_QUOTED_SOURCE_WORDING_RE.findall(instruction.instruction_text))
-    )[:2]:
-        add(quoted, search_mode="full_text", weight=1.4)
-    planned = (instruction.search_query or "").strip()
-    add(
-        planned or amended_body(instruction.instruction_text),
-        search_mode="hybrid",
-        weight=1.0,
-    )
-    return lanes
 
 
 SearchToolFactory = Callable[[], SearchTool]
@@ -143,14 +74,14 @@ class AmendmentSearchRetriever:
             str(user_file_id) for user_file_id in allowed_user_file_ids
         }
 
-    def _run_lane(
+    def _run_query(
         self,
         instruction: AmendmentInstruction,
-        lane: _RetrievalLane,
+        query: str,
         *,
         skip_query_expansion: bool,
     ) -> list[CandidateChunk]:
-        """Execute one lane and return its in-scope candidates in rank order."""
+        """Run one focused query and return its in-scope candidates in rank order."""
 
         source_anchors = (
             [instruction.target_source.strip()]
@@ -161,27 +92,24 @@ class AmendmentSearchRetriever:
             placement=Placement(turn_index=0),
             override_kwargs=SearchToolOverrideKwargs(
                 starting_citation_num=1,
-                original_query=lane.query,
+                original_query=query,
                 message_history=[
                     ChatMinimalTextMessage(
-                        message=lane.query,
+                        message=query,
                         message_type=MessageType.USER,
                     )
                 ],
                 skip_query_expansion=skip_query_expansion,
-                num_hits=_MAX_LANE_HITS,
-                max_llm_chunks=_MAX_LANE_HITS,
+                num_hits=_MAX_SEARCH_CANDIDATES,
+                max_llm_chunks=_MAX_SEARCH_CANDIDATES,
             ),
-            queries=[lane.query],
-            search_mode=lane.search_mode,
+            queries=[query],
+            search_mode="hybrid",
             source_anchors=source_anchors,
         )
         rich_response = response.rich_response
         if not isinstance(rich_response, SearchDocsResponse):
-            logger.warning(
-                "Amendment SearchTool lane returned no document response mode=%s",
-                lane.search_mode,
-            )
+            logger.warning("Amendment SearchTool returned no document response")
             return []
         ranked_docs: Sequence[SearchDoc] = (
             rich_response.displayed_docs or rich_response.search_docs
@@ -217,71 +145,27 @@ class AmendmentSearchRetriever:
         *,
         recovery: bool = False,
     ) -> list[CandidateChunk]:
-        """Fuse several independent lanes into one bounded candidate list."""
+        """Search once, then add the provision the instruction names outright."""
 
-        target = parse_amendment_structural_target(instruction)
+        initial_query = _bounded_query(
+            instruction.search_query or instruction.instruction_text
+        )
         if recovery:
-            recovery_query = _bounded_query(instruction.recovery_query or "")
-            planned = _bounded_query(
-                instruction.search_query or instruction.instruction_text
-            )
-            if not recovery_query or recovery_query.casefold() == planned.casefold():
+            query = _bounded_query(instruction.recovery_query or "")
+            if not query or query.casefold() == initial_query.casefold():
                 return []
-            lanes = [
-                _RetrievalLane(query=recovery_query, search_mode="hybrid", weight=1.0)
-            ]
         else:
-            lanes = _instruction_lanes(instruction, target)
-        if not lanes:
+            query = initial_query
+        if not query:
             return []
 
-        ranked_lanes: list[list[CandidateChunk]] = []
-        weights: list[float] = []
-        merged: dict[str, CandidateChunk] = {}
+        ranked = self._run_query(instruction, query, skip_query_expansion=recovery)
 
-        def run(lane: _RetrievalLane) -> None:
-            lane_candidates = self._run_lane(
-                instruction, lane, skip_query_expansion=recovery
-            )
-            logger.info(
-                "Amendment lane mode=%s hits=%s query=%r",
-                lane.search_mode,
-                len(lane_candidates),
-                lane.query[:120],
-            )
-            if not lane_candidates:
-                return
-            for candidate in lane_candidates:
-                merged.setdefault(candidate.chunk_id, candidate)
-            ranked_lanes.append(lane_candidates)
-            weights.append(lane.weight)
-
-        for lane in lanes:
-            run(lane)
-        if not merged and not recovery:
-            # Whatever the target-shaped lanes could not reach, the plain
-            # instruction query reached before them. Falling back to it keeps
-            # this retrieval a strict superset of the single-query behaviour it
-            # replaced, so a lane that finds nothing can never cost a match.
-            fallback = _bounded_query(
-                instruction.search_query or instruction.instruction_text
-            )
-            if fallback:
-                run(_RetrievalLane(query=fallback, search_mode="hybrid", weight=1.0))
-
-        fused = (
-            weighted_reciprocal_rank_fusion(
-                ranked_lanes, weights, lambda candidate: candidate.chunk_id
-            )
-            if ranked_lanes
-            else []
-        )
-        # The exact structural target is authoritative even when no lexical or
-        # semantic lane reached it, which is the norm for an instruction whose
-        # body is entirely new text, so it leads rather than trails the ranked
-        # hits. Expansion still requires an instrument-specific source identity:
-        # without one, "article 3" names a provision in every instrument the
-        # batch covers.
+        # An amendment describes the text it introduces, not the text it
+        # replaces, so the provision it names by article/paragraph/clause is
+        # regularly unreachable by wording alone. Expansion still requires an
+        # instrument-specific source identity: without one, "article 3" names a
+        # provision in every instrument the batch covers.
         structural_source_tokens = source_identity_distinguishing_tokens(
             instruction.target_source
         )
@@ -294,15 +178,12 @@ class AmendmentSearchRetriever:
             else []
         )
 
-        # One bounded list: the confirming model reads every candidate in full,
-        # so an unbounded merge buys recall with a prompt that cannot be read
-        # inside its deadline — which loses every match, not just the weak ones.
+        # The confirming model reads every candidate in full, so the merged list
+        # stays bounded: a prompt it cannot read inside its deadline loses every
+        # match, not just the weak ones.
         candidates: list[CandidateChunk] = []
         seen_candidate_ids: set[str] = set()
-        for candidate in [
-            *structural,
-            *(merged[candidate.chunk_id] for candidate in fused),
-        ]:
+        for candidate in [*ranked, *structural]:
             if (
                 candidate.chunk_id in seen_candidate_ids
                 or candidate.user_file_id not in self._allowed_user_file_ids
@@ -314,12 +195,12 @@ class AmendmentSearchRetriever:
                 break
 
         logger.info(
-            "Amendment retrieval phase=%s lanes=%s structural=%s target=%s candidates=%s",
+            "Amendment retrieval phase=%s ranked=%s structural=%s candidates=%s query=%r",
             "recovery" if recovery else "initial",
-            len(ranked_lanes),
+            len(ranked),
             len(structural),
-            target,
             len(candidates),
+            query[:120],
         )
         return candidates
 

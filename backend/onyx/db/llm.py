@@ -1,6 +1,6 @@
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Session, load_only, selectinload
+from sqlalchemy.orm import Session, joinedload, load_only, selectinload
 
 from onyx.auth.schemas import UserRole
 from onyx.db.enums import LLMModelFlowType
@@ -1536,3 +1536,21 @@ def add_model_to_flow(
     )
 
     db_session.commit()
+
+
+def fetch_vertex_model_configuration(
+    db_session: Session, model_name: str
+) -> ModelConfiguration | None:
+    """Return one visible Vertex AI model configuration by exact model name."""
+
+    return db_session.scalars(
+        select(ModelConfiguration)
+        .join(ModelConfiguration.llm_provider)
+        .where(
+            LLMProviderModel.provider == LlmProviderNames.VERTEX_AI,
+            ModelConfiguration.name == model_name,
+            ModelConfiguration.is_visible.is_(True),
+        )
+        .options(joinedload(ModelConfiguration.llm_provider))
+        .order_by(ModelConfiguration.llm_provider_id, ModelConfiguration.id)
+    ).first()

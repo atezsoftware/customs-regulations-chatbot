@@ -639,7 +639,8 @@ def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
         require_ready_source_package,
     )
     from onyx.db.regulatory_annex_publication import load_annex_context_settings
-    from onyx.llm.factory import get_default_llm, get_default_llm_with_vision
+    from onyx.llm.factory import get_default_llm_with_vision
+    from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
     from onyx.regulatory.indexing_jobs.configuration import (
         resolve_regulatory_indexing_snapshot,
     )
@@ -688,7 +689,7 @@ def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
     context_llm = resolve_review_context_llm(settings, snapshot)
     vision_llm = get_default_llm_with_vision()
     actual["analysis_model"] = context_hash(
-        get_default_llm().config.model_dump(mode="json")
+        get_amendment_analysis_llm().config.model_dump(mode="json")
     )
     actual["vision_model"] = (
         context_hash(vision_llm.config.model_dump(mode="json"))

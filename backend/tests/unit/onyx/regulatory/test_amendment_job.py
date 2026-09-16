@@ -169,7 +169,7 @@ def _run_grouping_job(
     monkeypatch.setattr(job, "persist_proposal_checkpoint", persisted)
     monkeypatch.setattr(job, "persist_unmatched_checkpoint", unmatched)
     monkeypatch.setattr(job, "mark_batch_analyzed", MagicMock(return_value=True))
-    monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(job, "get_amendment_analysis_llm", MagicMock(return_value=MagicMock()))
     job.run_amendment_batch(batch_id=batch_id, lease_generation=2)
     return SimpleNamespace(
         draft=draft_group_mock,
@@ -415,7 +415,7 @@ def test_resume_reuses_segmentation_and_skips_completed_instructions(
     persist_unmatched = MagicMock(return_value=True)
     monkeypatch.setattr(job, "persist_unmatched_checkpoint", persist_unmatched)
     monkeypatch.setattr(job, "mark_batch_analyzed", MagicMock(return_value=True))
-    monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(job, "get_amendment_analysis_llm", MagicMock(return_value=MagicMock()))
 
     job.run_amendment_batch(batch_id=9, lease_generation=3)
 
@@ -472,7 +472,7 @@ def test_first_run_persists_segmentation_before_instruction_work(
         job, "persist_unmatched_checkpoint", MagicMock(return_value=True)
     )
     monkeypatch.setattr(job, "mark_batch_analyzed", MagicMock(return_value=True))
-    monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(job, "get_amendment_analysis_llm", MagicMock(return_value=MagicMock()))
 
     job.run_amendment_batch(batch_id=10, lease_generation=1)
 
@@ -524,7 +524,7 @@ def test_segmentation_runs_without_an_open_database_session(
         job, "persist_unmatched_checkpoint", MagicMock(return_value=True)
     )
     monkeypatch.setattr(job, "mark_batch_analyzed", MagicMock(return_value=True))
-    monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(job, "get_amendment_analysis_llm", MagicMock(return_value=MagicMock()))
 
     job.run_amendment_batch(batch_id=11, lease_generation=1)
 
@@ -582,7 +582,7 @@ def test_empty_segmentation_checkpoints_and_finishes_analyzed_without_review(
     )
     persist = MagicMock(return_value=True)
     monkeypatch.setattr(job, "persist_segmentation_checkpoint", persist)
-    monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=model))
+    monkeypatch.setattr(job, "get_amendment_analysis_llm", MagicMock(return_value=model))
     draft = MagicMock()
     proposals = MagicMock()
     monkeypatch.setattr(job, "draft_instruction_group_proposal", draft)
@@ -716,7 +716,7 @@ def test_match_and_draft_llm_calls_run_outside_database_sessions(
         job, "persist_proposal_checkpoint", MagicMock(return_value=True)
     )
     monkeypatch.setattr(job, "mark_batch_analyzed", MagicMock(return_value=True))
-    monkeypatch.setattr(job, "get_default_llm", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(job, "get_amendment_analysis_llm", MagicMock(return_value=MagicMock()))
 
     job.run_amendment_batch(batch_id=13, lease_generation=1)
 

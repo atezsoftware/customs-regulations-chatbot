@@ -17,8 +17,8 @@ from onyx.db.regulatory_amendments import (
     persist_unmatched_checkpoint,
     touch_batch_heartbeat,
 )
-from onyx.llm.factory import get_default_llm
 from onyx.llm.interfaces import LLM
+from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
 from onyx.regulatory.amendments.draft_integrity import DraftIntegrityError
 from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
 from onyx.regulatory.amendments.pipeline import (
@@ -106,7 +106,7 @@ def retrieve_and_confirm_instruction(
 
 
 def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
-    llm = get_default_llm()
+    llm = get_amendment_analysis_llm()
 
     from onyx.db.amendment_pdf_evidence import load_batch_pdf_source
 
