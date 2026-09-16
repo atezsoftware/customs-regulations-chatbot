@@ -12,22 +12,32 @@ from onyx.tracing.flows import LLMFlow
 # ruff: noqa: E501 start
 _SYSTEM_PROMPT = """You are an expert at matching Turkish regulatory amendment instructions to the existing text they amend.
 
-Your purpose is to find what is changing. An amendment instruction describes a change to a provision that already exists in the corpus; your job is to identify that provision so the change can be applied to it. Locating the affected provision is the goal — not judging how well the instruction is written.
+Your purpose is to find what is changing: identify the existing provision an instruction affects so the change can be applied to it.
 
-Instructions are frequently imperfect. They may be paraphrased, abbreviated, summarized by a user, carried through OCR with broken characters, missing an article number, missing the source name, or written in a different register than the indexed text. A well-built retrieval system still resolves these, because the identity of a provision is carried by several independent signals at once — its structural position (article/paragraph/clause number), its subject matter, the wording it quotes, and its source instrument. Use every signal available and reason about which provision they converge on. Never decline a match merely because the instruction's phrasing differs from the candidate's phrasing; differing phrasing is the normal case, since the instruction usually describes the NEW text while the candidate holds the OLD text.
+Instructions are routinely imperfect — paraphrased, abbreviated, summarized by a user, damaged by OCR, missing an article number or the source name. Resolve them anyway: a provision's identity is carried by several independent signals at once (structural position, subject matter, quoted wording, source instrument). Differing phrasing is the normal case, never a reason to decline: the instruction describes the NEW text while the candidate holds the OLD text.
 
-You will be given one amendment instruction and a list of candidate existing text chunks. Candidates come from several independent retrieval lanes. A candidate with `structured_match: true` was found by an exact structural lookup of the article/paragraph/clause the instruction names — that is the strongest available signal, so weigh it heavily even when its wording looks unrelated to the instruction. `heading_path` is only a best-effort reconstruction from document formatting and can be unreliable; read each candidate's actual TEXT.
+You will be given one amendment instruction and candidate existing chunks from several retrieval lanes. A candidate with `structured_match: true` was found by an exact structural lookup of the article/paragraph/clause the instruction names — the strongest signal available, so weigh it heavily even when its wording looks unrelated. `heading_path` is a best-effort reconstruction from document formatting and can be unreliable; read each candidate's actual TEXT.
 
 Your task: decide which candidate (if any) this instruction amends.
 
-- If one candidate is the existing provision this instruction changes, set `old_chunk_id` to that candidate's id. Prefer the most specific correct unit: if the instruction amends one paragraph or clause, choose that paragraph or clause rather than the whole article.
-- Set `old_chunk_id` to null ONLY when the instruction adds text that does not exist yet — a brand-new article, or a new paragraph/clause added inside an existing article ("aşağıdaki fıkra eklenmiştir", "aşağıdaki bent eklenmiş ve diğer bentler buna göre teselsül ettirilmiştir"). For an added paragraph or clause, still return null: the unit being added has no existing chunk, even though its article does.
-- If the instruction amends, replaces, clarifies, or repeals something and a matching candidate exists, you MUST select it. Never treat an ordinary amendment as an addition just because the wording differs.
-- Set `confidence` to a 0.0-1.0 score.
-- Set `rationale` to a brief explanation naming the signals you relied on.
+- If a candidate is the existing provision this instruction changes, set `old_chunk_id` to its id. Prefer the most specific correct unit: for an amendment to one paragraph or clause, choose that paragraph or clause rather than the whole article.
+- CRITICAL — set `old_chunk_id` to null ONLY when the instruction adds text that does not exist yet: a brand-new article, or a new paragraph/clause added inside an existing article ("aşağıdaki fıkra eklenmiştir", "aşağıdaki bent eklenmiş ve diğer bentler buna göre teselsül ettirilmiştir"). If the instruction amends, replaces, clarifies, or repeals something and a matching candidate exists, you MUST select it.
+- Set `confidence` to a 0.0-1.0 score and `rationale` to a brief explanation naming the signals you used.
 
 Only ever use an id from the given candidates. Never invent an id."""
 # ruff: noqa: E501 end
+
+
+# An annex table chunk can run to tens of thousands of characters. Identity is
+# decided from the opening of a candidate plus its structural metadata, so a
+# generous bound keeps one oversized candidate from crowding out every other one.
+_MAX_CANDIDATE_TEXT_CHARS = 6000
+
+
+def _bounded_candidate_text(text: str) -> str:
+    if len(text) <= _MAX_CANDIDATE_TEXT_CHARS:
+        return text
+    return f"{text[:_MAX_CANDIDATE_TEXT_CHARS]}\n[truncated for matching]"
 
 
 def _format_candidates(candidates: list[CandidateChunk]) -> str:
@@ -38,7 +48,7 @@ def _format_candidates(candidates: list[CandidateChunk]) -> str:
                 {
                     "id": candidate.chunk_id,
                     "source_name": candidate.source_name,
-                    "text": candidate.text,
+                    "text": _bounded_candidate_text(candidate.text),
                     "metadata": candidate.metadata,
                     "structured_match": candidate.structured_match,
                     "source_name_similarity": round(candidate.source_score, 3),
@@ -67,6 +77,6 @@ def confirm_match(
         system_prompt=_SYSTEM_PROMPT,
         user_prompt=prompt,
         response_model=MatchResult,
-        timeout_override=45,
-        deadline=time.monotonic() + 60,
+        timeout_override=60,
+        deadline=time.monotonic() + 90,
     )

@@ -482,6 +482,17 @@ def run_annex_groups(
     groups = group_annex_instructions(instructions)
     if not groups:
         return set()
+    with get_session_with_current_tenant() as scope_session:
+        scoped_batch = get_batch(scope_session, batch_id)
+        if scoped_batch is None:
+            raise ValueError("batch missing")
+        # This review exists to compare a frozen original document against the
+        # indexed annex. An amendment that states its change in text references
+        # no such document, and the indexed chunks already hold the annex, so
+        # those instructions belong to ordinary analysis rather than to a review
+        # that can only ever block for a document that does not exist.
+        if scoped_batch.source_package_id is None:
+            return set()
     vision_llm = get_default_llm_with_vision()
     cache: dict[str, AnnexExtraction] = {}
     covered: set[int] = set()

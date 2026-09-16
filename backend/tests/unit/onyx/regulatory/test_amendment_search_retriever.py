@@ -189,9 +189,10 @@ def test_explicit_clause_candidate_is_kept_when_search_tool_omits_it() -> None:
 
     candidates = retriever.search(instruction)
 
+    # The exact structural match leads; the ranked search hit follows.
     assert [candidate.chunk_id for candidate in candidates] == [
-        "article-3-intro",
         "article-3-clause-u",
+        "article-3-intro",
     ]
 
 
@@ -357,3 +358,108 @@ def test_target_reached_by_only_one_lane_survives_fusion() -> None:
     assert [candidate.chunk_id for candidate in candidates] == [
         "article-11-paragraph-3"
     ]
+
+
+def test_candidate_list_stays_bounded_for_the_confirming_model() -> None:
+    """The matcher reads every candidate, so the merged list must stay small."""
+
+    from onyx.regulatory.amendments.search_retriever import (
+        _MAX_AMENDMENT_CANDIDATES,
+    )
+
+    search_docs = [
+        _search_doc(file_id=None, chunk_id=f"ranked-{index}") for index in range(8)
+    ]
+    search_tool = MagicMock()
+    search_tool.run.return_value = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=search_docs, citation_mapping={}, displayed_docs=None
+        ),
+        llm_facing_response="",
+    )
+    structural = [
+        CandidateChunk(
+            chunk_id=f"structural-{index}",
+            user_file_id=str(_FILE_ID),
+            text="Madde 3 alt birimi.",
+            source_name="Karayolu Dışında Kullanılan Hareketli Makinaların Tebliği",
+            metadata={"article_no": "3"},
+            structured_match=True,
+        )
+        for index in range(20)
+    ]
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: search_tool,
+        canonical_candidate_loader=lambda chunk_ids: {
+            chunk_id: CandidateChunk(
+                chunk_id=chunk_id,
+                user_file_id=str(_FILE_ID),
+                text="Aday metni.",
+                metadata={},
+            )
+            for chunk_id in chunk_ids
+        },
+        structural_candidate_loader=lambda _instruction: structural,
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "MADDE 2- Aynı Tebliğin 3 üncü maddesinin birinci fıkrasının (d) "
+            "bendi aşağıdaki şekilde değiştirilmiştir."
+        ),
+        target_source="Karayolu Dışında Kullanılan Hareketli Makinaların Tebliği",
+    )
+
+    candidates = retriever.search(instruction)
+
+    assert len(candidates) <= _MAX_AMENDMENT_CANDIDATES
+    assert len({candidate.chunk_id for candidate in candidates}) == len(candidates)
+    # Structural matches lead, so they survive the bound.
+    assert candidates[0].structured_match is True
+
+
+def test_plain_instruction_query_is_tried_when_every_lane_is_empty() -> None:
+    """Retrieval must remain a superset of the single-query behaviour."""
+
+    hit = _search_doc(file_id=None, chunk_id="article-5-paragraph-3")
+    empty = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[], citation_mapping={}, displayed_docs=None
+        ),
+        llm_facing_response="",
+    )
+    found = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[hit], citation_mapping={}, displayed_docs=None
+        ),
+        llm_facing_response="",
+    )
+    search_tool = MagicMock()
+    # Every target-shaped lane comes back empty; only the plain query hits.
+    search_tool.run.side_effect = lambda *_args, **kwargs: (
+        found if kwargs["queries"][0] == "TAREKS başvuru belgeleri" else empty
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: search_tool,
+        canonical_candidate_loader=lambda chunk_ids: {
+            chunk_id: CandidateChunk(
+                chunk_id=chunk_id,
+                user_file_id=str(_FILE_ID),
+                text="(3) Başvuruya ilişkin belgeler yüklenir.",
+                metadata={"article_no": "5", "paragraph_no": "3"},
+            )
+            for chunk_id in chunk_ids
+        },
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "MADDE 4- Aynı Tebliğin 5 inci maddesinin üçüncü fıkrasında yer "
+            "alan “2, 3, 4, 5 ve 6 numaralı belgeler” ibaresi değiştirilmiştir."
+        ),
+        search_query="TAREKS başvuru belgeleri",
+    )
+
+    candidates = retriever.search(instruction)
+
+    assert [candidate.chunk_id for candidate in candidates] == ["article-5-paragraph-3"]

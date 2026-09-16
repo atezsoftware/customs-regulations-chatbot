@@ -49,8 +49,9 @@ from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
-_MAX_AMENDMENT_CANDIDATES = 16
-_MAX_LANE_HITS = 10
+_MAX_AMENDMENT_CANDIDATES = 12
+_MAX_STRUCTURAL_CANDIDATES = 6
+_MAX_LANE_HITS = 8
 # An amendment quotes the wording it replaces; that literal is the strongest
 # retrieval anchor available when the rest of the sentence describes new text.
 _QUOTED_SOURCE_WORDING_RE = re.compile(
@@ -237,16 +238,36 @@ class AmendmentSearchRetriever:
         ranked_lanes: list[list[CandidateChunk]] = []
         weights: list[float] = []
         merged: dict[str, CandidateChunk] = {}
-        for lane in lanes:
+
+        def run(lane: _RetrievalLane) -> None:
             lane_candidates = self._run_lane(
                 instruction, lane, skip_query_expansion=recovery
             )
+            logger.info(
+                "Amendment lane mode=%s hits=%s query=%r",
+                lane.search_mode,
+                len(lane_candidates),
+                lane.query[:120],
+            )
             if not lane_candidates:
-                continue
+                return
             for candidate in lane_candidates:
                 merged.setdefault(candidate.chunk_id, candidate)
             ranked_lanes.append(lane_candidates)
             weights.append(lane.weight)
+
+        for lane in lanes:
+            run(lane)
+        if not merged and not recovery:
+            # Whatever the target-shaped lanes could not reach, the plain
+            # instruction query reached before them. Falling back to it keeps
+            # this retrieval a strict superset of the single-query behaviour it
+            # replaced, so a lane that finds nothing can never cost a match.
+            fallback = _bounded_query(
+                instruction.search_query or instruction.instruction_text
+            )
+            if fallback:
+                run(_RetrievalLane(query=fallback, search_mode="hybrid", weight=1.0))
 
         fused = (
             weighted_reciprocal_rank_fusion(
@@ -255,33 +276,48 @@ class AmendmentSearchRetriever:
             if ranked_lanes
             else []
         )
-        candidates = [merged[candidate.chunk_id] for candidate in fused][
-            :_MAX_AMENDMENT_CANDIDATES
-        ]
-        seen_candidate_ids = {candidate.chunk_id for candidate in candidates}
-
         # The exact structural target is authoritative even when no lexical or
         # semantic lane reached it, which is the norm for an instruction whose
-        # body is entirely new text. Expansion still requires an instrument-
-        # specific source identity: without one, "article 3" names a provision
-        # in every instrument the batch covers.
+        # body is entirely new text, so it leads rather than trails the ranked
+        # hits. Expansion still requires an instrument-specific source identity:
+        # without one, "article 3" names a provision in every instrument the
+        # batch covers.
         structural_source_tokens = source_identity_distinguishing_tokens(
             instruction.target_source
         )
-        if self._structural_candidate_loader is not None and structural_source_tokens:
-            for candidate in self._structural_candidate_loader(instruction):
-                if (
-                    candidate.chunk_id in seen_candidate_ids
-                    or candidate.user_file_id not in self._allowed_user_file_ids
-                ):
-                    continue
-                candidates.append(candidate)
-                seen_candidate_ids.add(candidate.chunk_id)
+        structural = (
+            list(self._structural_candidate_loader(instruction))[
+                :_MAX_STRUCTURAL_CANDIDATES
+            ]
+            if self._structural_candidate_loader is not None
+            and structural_source_tokens
+            else []
+        )
+
+        # One bounded list: the confirming model reads every candidate in full,
+        # so an unbounded merge buys recall with a prompt that cannot be read
+        # inside its deadline — which loses every match, not just the weak ones.
+        candidates: list[CandidateChunk] = []
+        seen_candidate_ids: set[str] = set()
+        for candidate in [
+            *structural,
+            *(merged[candidate.chunk_id] for candidate in fused),
+        ]:
+            if (
+                candidate.chunk_id in seen_candidate_ids
+                or candidate.user_file_id not in self._allowed_user_file_ids
+            ):
+                continue
+            candidates.append(candidate)
+            seen_candidate_ids.add(candidate.chunk_id)
+            if len(candidates) == _MAX_AMENDMENT_CANDIDATES:
+                break
 
         logger.info(
-            "Amendment retrieval phase=%s lanes=%s target=%s candidates=%s",
+            "Amendment retrieval phase=%s lanes=%s structural=%s target=%s candidates=%s",
             "recovery" if recovery else "initial",
             len(ranked_lanes),
+            len(structural),
             target,
             len(candidates),
         )
@@ -424,7 +460,7 @@ def build_amendment_search_retriever(
                     source_name_hint=instruction.target_source,
                     source_name_tokens=source_tokens,
                     paragraph_no=paragraph_no,
-                    limit=32 if target.appendix_label is not None else 16,
+                    limit=32 if target.appendix_label is not None else 8,
                 ):
                     if match.chunk.id in seen_chunk_ids:
                         continue

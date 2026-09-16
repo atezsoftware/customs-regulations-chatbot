@@ -199,16 +199,22 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             batch = get_batch(db_session, batch_id)
             if batch is None:
                 raise RuntimeError(f"Amendment batch {batch_id} no longer exists")
-            for group in groups:
-                if not legacy_text_annex_is_complete(
-                    db_session,
-                    batch=batch,
-                    group=group,
-                    reference_date=date.fromisoformat(reference_date)
-                    if reference_date
-                    else date.today(),
-                ):
-                    annex_indices.update(group.instruction_indices)
+            # The annex review compares a frozen original document against the
+            # indexed annex. Without one there is nothing to freeze, and the
+            # indexed chunks already carry the annex text, so the instruction is
+            # an ordinary amendment against those chunks rather than a blocked
+            # review waiting for a document the amendment never referenced.
+            if batch.source_package_id is not None:
+                for group in groups:
+                    if not legacy_text_annex_is_complete(
+                        db_session,
+                        batch=batch,
+                        group=group,
+                        reference_date=date.fromisoformat(reference_date)
+                        if reference_date
+                        else date.today(),
+                    ):
+                        annex_indices.update(group.instruction_indices)
     first_output_error: StructuredOutputValidationError | TimeoutError | None = None
     matched_instructions: list[_MatchedInstruction] = []
     for instruction_index, instruction in enumerate(instructions):
