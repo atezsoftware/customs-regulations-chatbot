@@ -315,8 +315,7 @@ def test_non_annex_pipeline_receives_images_and_requires_grounding(
     monkeypatch: pytest.MonkeyPatch, supported: bool, ambiguous: bool
 ) -> None:
     from onyx.file_store import file_store
-    from onyx.llm import factory
-    from onyx.regulatory.amendments import drafter, pdf_vision, pipeline
+    from onyx.regulatory.amendments import analysis_llm, drafter, pdf_vision, pipeline
     from onyx.regulatory.amendments.models import (
         AmendmentInstruction,
         ChunkFieldsDraft,
@@ -348,7 +347,9 @@ def test_non_annex_pipeline_receives_images_and_requires_grounding(
         base_heading_path=["MADDE 3"],
     )
     vision = MagicMock()
-    monkeypatch.setattr(factory, "get_default_llm_with_vision", lambda: vision)
+    monkeypatch.setattr(
+        analysis_llm, "get_amendment_analysis_llm", lambda **_kwargs: vision
+    )
     monkeypatch.setattr(file_store, "get_default_file_store", lambda: store)
     draft = DraftResult(
         new_chunk=ChunkFieldsDraft(text="MADDE 3\nBugday | 17%", chunk_type="article"),
@@ -412,7 +413,7 @@ def test_source_worker_freezes_vision_text_for_existing_readback(
     from types import SimpleNamespace
     from uuid import uuid4
 
-    from onyx.llm import factory
+    from onyx.regulatory.amendments import analysis_llm
     from onyx.regulatory.amendments.annexes import evidence, job
     from onyx.regulatory.amendments.annexes.models import AcquisitionResult
 
@@ -429,7 +430,7 @@ def test_source_worker_freezes_vision_text_for_existing_readback(
     monkeypatch.setattr(job, "get_session_with_current_tenant", MagicMock())
     monkeypatch.setattr(job, "get_default_file_store", lambda: store)
     monkeypatch.setattr(
-        factory, "get_default_llm_with_vision", lambda **_kwargs: MagicMock()
+        analysis_llm, "get_amendment_analysis_llm", lambda **_kwargs: MagicMock()
     )
     native = asset.model_copy(
         update={
@@ -474,8 +475,8 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
     from types import SimpleNamespace
     from uuid import uuid4
 
-    from onyx.llm import factory
     from onyx.llm.model_response import Choice, Message, ModelResponse
+    from onyx.regulatory.amendments import analysis_llm
     from onyx.regulatory.amendments.annexes import job, pdf_document
     from onyx.regulatory.amendments.annexes.models import (
         AcquisitionResult,
@@ -548,7 +549,11 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
 
     model.invoke.side_effect = invoke
     vision_factory = MagicMock(return_value=model)
-    monkeypatch.setattr(factory, "get_default_llm_with_vision", vision_factory)
+    monkeypatch.setattr(
+        analysis_llm,
+        "get_amendment_analysis_llm",
+        lambda **kwargs: vision_factory(**kwargs),
+    )
     blobs: dict[str, bytes] = {}
     store = MagicMock()
 
@@ -920,7 +925,7 @@ def test_legacy_partial_pdf_retry_keeps_entire_package_text_contract(
     from types import SimpleNamespace
     from uuid import uuid4
 
-    from onyx.llm import factory
+    from onyx.regulatory.amendments import analysis_llm
     from onyx.regulatory.amendments.annexes import job
     from onyx.regulatory.amendments.annexes.models import AcquisitionResult
 
@@ -954,7 +959,9 @@ def test_legacy_partial_pdf_retry_keeps_entire_package_text_contract(
     monkeypatch.setattr(job, "get_session_with_current_tenant", MagicMock())
     monkeypatch.setattr(job, "get_default_file_store", lambda: store)
     vision = MagicMock(side_effect=AssertionError("legacy retry must not use vision"))
-    monkeypatch.setattr(factory, "get_default_llm_with_vision", vision)
+    monkeypatch.setattr(
+        analysis_llm, "get_amendment_analysis_llm", lambda **kwargs: vision(**kwargs)
+    )
     download = MagicMock(side_effect=AssertionError("cached PDF must not download"))
     monkeypatch.setattr(job, "download_source", download)
     new_bytes = b"new linked PDF fixture"

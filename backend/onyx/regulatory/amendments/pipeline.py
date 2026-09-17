@@ -346,7 +346,9 @@ def draft_instruction_group_proposal(
     evidence = None
     if pdf_source is not None:
         from onyx.file_store.file_store import get_default_file_store
-        from onyx.llm.factory import get_default_llm_with_vision
+        from onyx.regulatory.amendments.analysis_llm import (
+            get_amendment_analysis_llm,
+        )
         from onyx.regulatory.amendments.pdf_vision import prepare_pdf_draft_evidence
 
         evidence = prepare_pdf_draft_evidence(
@@ -360,10 +362,9 @@ def draft_instruction_group_proposal(
                 or context.match.old_chunk_id != context.old_chunk_snapshot.get("id")
             ):
                 raise ValueError("pdf_draft_target_scope_mismatch")
-            vision = get_default_llm_with_vision()
-            if vision is None:
-                raise ValueError("pdf_vision_model_required")
-            llm = vision
+            # The pinned analysis model reads the original pages itself, so
+            # no separate vision provider is selected for this pipeline.
+            llm = get_amendment_analysis_llm()
     draft = draft_combined_chunk(
         llm,
         instructions=instructions,

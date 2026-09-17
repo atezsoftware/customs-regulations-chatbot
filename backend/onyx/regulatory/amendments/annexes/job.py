@@ -204,7 +204,9 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 for asset in result.assets
             ]
         elif any(asset.mime_type == "application/pdf" for asset in result.assets):
-            from onyx.llm.factory import get_default_llm_with_vision
+            from onyx.regulatory.amendments.analysis_llm import (
+                get_amendment_analysis_llm,
+            )
             from onyx.regulatory.amendments.pdf_vision import (
                 prepare_pdf_source,
                 reuse_pdf_source,
@@ -216,7 +218,7 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                 and asset.sha256 not in previous_pdf_assets
                 for asset in result.assets
             ):
-                vision = get_default_llm_with_vision(temperature=0)
+                vision = get_amendment_analysis_llm(temperature=0)
             prepared = []
             for asset in result.assets:
                 if time.monotonic() >= deadline:
@@ -237,13 +239,15 @@ def run_source_package(*, package_id: UUID, environment: str) -> None:
                     )
             result.assets = prepared
         if any(asset.mime_type.startswith("image/") for asset in result.assets):
-            from onyx.llm.factory import get_default_llm_with_vision
+            from onyx.regulatory.amendments.analysis_llm import (
+                get_amendment_analysis_llm,
+            )
             from onyx.regulatory.amendments.annexes.source_images import (
                 prepare_image_source,
                 reuse_image_source,
             )
 
-            image_model = get_default_llm_with_vision() if pending_images else None
+            image_model = get_amendment_analysis_llm() if pending_images else None
             prepared_images = []
             for asset in result.assets:
                 if time.monotonic() >= deadline:

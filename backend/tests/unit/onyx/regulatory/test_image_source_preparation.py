@@ -17,7 +17,7 @@ from onyx.regulatory.amendments.annexes.models import AnnexVisionWireResult
 def test_image_source_preparation_requires_visible_text_and_reuses_verified_text(
     monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    from onyx.llm import factory
+    from onyx.regulatory.amendments import analysis_llm
 
     output = BytesIO()
     Image.new("RGB", (120, 160), "white").save(output, format="PNG")
@@ -68,7 +68,11 @@ def test_image_source_preparation_requires_visible_text_and_reuses_verified_text
     model.config.model_provider = "fixture"
     model.config.model_name = "vision"
     model_factory = MagicMock(return_value=model)
-    monkeypatch.setattr(factory, "get_default_llm_with_vision", model_factory)
+    monkeypatch.setattr(
+        analysis_llm,
+        "get_amendment_analysis_llm",
+        lambda **kwargs: model_factory(**kwargs),
+    )
 
     def visual_response(*_args: object, **kwargs: object) -> AnnexVisionWireResult:
         assert "Never describe the scene" in str(kwargs["system_prompt"])

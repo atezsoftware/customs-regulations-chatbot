@@ -475,7 +475,7 @@ def run_annex_groups(
     reference_date: str | None,
     llm: LLM,
 ) -> set[int]:
-    from onyx.llm.factory import get_default_llm_with_vision
+    from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
 
     if not config.REGULATORY_ANNEX_UPDATES_ENABLED:
         return set()
@@ -493,7 +493,7 @@ def run_annex_groups(
         # that can only ever block for a document that does not exist.
         if scoped_batch.source_package_id is None:
             return set()
-    vision_llm = get_default_llm_with_vision()
+    vision_llm = get_amendment_analysis_llm()
     cache: dict[str, AnnexExtraction] = {}
     covered: set[int] = set()
     for group in groups:
@@ -639,7 +639,6 @@ def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
         require_ready_source_package,
     )
     from onyx.db.regulatory_annex_publication import load_annex_context_settings
-    from onyx.llm.factory import get_default_llm_with_vision
     from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
     from onyx.regulatory.indexing_jobs.configuration import (
         resolve_regulatory_indexing_snapshot,
@@ -687,7 +686,7 @@ def validate_live_review_runtime(draft: AnnexChangeDraft) -> None:
     ):
         raise ValueError("source graph changed")
     context_llm = resolve_review_context_llm(settings, snapshot)
-    vision_llm = get_default_llm_with_vision()
+    vision_llm = get_amendment_analysis_llm()
     actual["analysis_model"] = context_hash(
         get_amendment_analysis_llm().config.model_dump(mode="json")
     )
