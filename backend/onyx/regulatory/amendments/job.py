@@ -19,6 +19,10 @@ from onyx.db.regulatory_amendments import (
     touch_batch_heartbeat,
 )
 from onyx.llm.interfaces import LLM
+from onyx.regulatory.amendments.amendment_context import (
+    AmendmentContext,
+    build_amendment_context,
+)
 from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
 from onyx.regulatory.amendments.draft_integrity import DraftIntegrityError
 from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
@@ -119,6 +123,7 @@ def retrieve_and_confirm_instruction(
     retriever: AmendmentSearchRetriever,
     llm: LLM,
     instruction: AmendmentInstruction,
+    amendment_context: AmendmentContext | None = None,
     trace: "_InstructionTrace | None" = None,
 ) -> tuple[list[CandidateChunk], MatchResult | None]:
     """Search, confirm, then make at most one focused recovery attempt."""
@@ -138,6 +143,7 @@ def retrieve_and_confirm_instruction(
             llm,
             instruction=instruction,
             candidates=candidates,
+            amendment_context=amendment_context,
         )
         if match is not None:
             return candidates, match
@@ -158,6 +164,7 @@ def retrieve_and_confirm_instruction(
         llm,
         instruction=instruction,
         candidates=candidates,
+        amendment_context=amendment_context,
     )
     trace.declined = match is None
     return candidates, match
@@ -261,6 +268,15 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             for payload in instruction_payloads
         ]
     )
+    # Every instruction is matched and drafted alone, so without this it never
+    # sees the article stating when the amendment enters into force, nor the
+    # ones defining the terms it uses.
+    amendment_context = build_amendment_context(raw_text)
+    log(
+        "amendment_context_built",
+        background_chars=len(amendment_context.background) if amendment_context else 0,
+        commencement=list(amendment_context.commencement) if amendment_context else [],
+    )
     from onyx.db.regulatory_annex_changes import legacy_text_annex_is_complete
     from onyx.regulatory.amendments.annexes import config as annex_config
     from onyx.regulatory.amendments.annexes.analysis import (
@@ -325,6 +341,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 retriever=retriever,
                 llm=llm,
                 instruction=instruction,
+                amendment_context=amendment_context,
                 trace=trace,
             )
         except (StructuredOutputValidationError, TimeoutError) as error:
@@ -465,6 +482,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 reference_date=reference_date,
                 context=context,
                 pdf_source=pdf_source,
+                amendment_context=amendment_context,
             )
         except (StructuredOutputValidationError, TimeoutError) as error:
             log(

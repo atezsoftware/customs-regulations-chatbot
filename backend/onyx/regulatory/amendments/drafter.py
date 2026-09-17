@@ -6,6 +6,7 @@ import unicodedata
 from typing import Any
 
 from onyx.llm.interfaces import LLM
+from onyx.regulatory.amendments.amendment_context import AmendmentContext
 from onyx.regulatory.amendments.draft_integrity import explicit_replacement_body
 from onyx.regulatory.amendments.models import (
     AmendmentInstruction,
@@ -46,6 +47,10 @@ Some instructions add a NEW paragraph (fıkra) or clause (bent) INSIDE an existi
 - `chunk_type`: "paragraph" for a fıkra, "clause" for a bent.
 - `metadata_changes`: carry article_no, article_title, document_type and document_number from `sibling_reference`, and set paragraph_no (for a fıkra) or clause_label (for a bent) to the marker the instruction assigns. Never invent a new article_no.
 - `heading_path`: base it on `sibling_reference`'s heading_path, keeping the same article heading and replacing only the terminal unit line.
+
+You may also be given the full text of the amendment these instructions were taken from. Read it to interpret them — which source is being amended, what a term defined in another article means, and above all when the amendment enters into force, which is normally stated once in its own closing article and governs every instruction that does not carry a date of its own. That article is the answer for `effective_start_date` whenever the listed instruction is silent; resolve its relative phrase against the reference/publication date exactly as you would the instruction's own.
+
+The full text is context, not work. `new_chunk` must contain the listed instruction(s) applied and nothing else: never carry over a change that another article of the amendment makes, however clearly you can see it there.
 
 Use ONLY information explicitly present in the given texts. Never invent or assume anything not stated."""
 # ruff: noqa: E501 end
@@ -102,6 +107,7 @@ def draft_combined_chunk(
     sibling_reference: dict[str, Any] | None,
     reference_date: str | None,
     pdf_evidence: PdfDraftEvidence | None = None,
+    amendment_context: AmendmentContext | None = None,
 ) -> DraftResult:
     if not instructions:
         raise ValueError(
@@ -168,6 +174,8 @@ def draft_combined_chunk(
         f"chunk, for heading_path/metadata convention):\n{sibling_json}\n\n"
         "Return one full replacement chunk containing every listed change."
     )
+    if amendment_context is not None:
+        prompt += f"\n\n{amendment_context.prompt_section()}"
     if requirements:
         prompt += "\n\nBinding requirements:\n\n" + "\n\n".join(requirements)
     if pdf_evidence is not None:
@@ -206,6 +214,7 @@ def draft_new_chunk(
     old_chunk: dict[str, Any] | None,
     sibling_reference: dict[str, Any] | None,
     reference_date: str | None,
+    amendment_context: AmendmentContext | None = None,
 ) -> DraftResult:
     return draft_combined_chunk(
         llm,
@@ -213,4 +222,5 @@ def draft_new_chunk(
         old_chunk=old_chunk,
         sibling_reference=sibling_reference,
         reference_date=reference_date,
+        amendment_context=amendment_context,
     )

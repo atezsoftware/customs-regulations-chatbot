@@ -20,6 +20,10 @@ from onyx.db.regulatory_chunks import (
     load_active_structural_descendants,
 )
 from onyx.llm.interfaces import LLM
+from onyx.regulatory.amendments.amendment_context import (
+    AmendmentContext,
+    build_amendment_context,
+)
 from onyx.regulatory.amendments.candidate_finder import find_candidates
 from onyx.regulatory.amendments.draft_integrity import (
     explicit_replacement_body,
@@ -93,8 +97,14 @@ def confirm_instruction_match(
     *,
     instruction: AmendmentInstruction,
     candidates: list[CandidateChunk],
+    amendment_context: AmendmentContext | None = None,
 ) -> MatchResult | None:
-    match = confirm_match(llm, instruction=instruction, candidates=candidates)
+    match = confirm_match(
+        llm,
+        instruction=instruction,
+        candidates=candidates,
+        amendment_context=amendment_context,
+    )
     candidate_ids = {candidate.chunk_id for candidate in candidates}
     if match.old_chunk_id is not None and match.old_chunk_id not in candidate_ids:
         logger.warning(
@@ -186,6 +196,7 @@ def draft_instruction_proposal(
     instruction: AmendmentInstruction,
     reference_date: str | None,
     context: InstructionDraftContext,
+    amendment_context: AmendmentContext | None = None,
 ) -> ProposalDraft:
     draft = draft_new_chunk(
         llm,
@@ -193,6 +204,7 @@ def draft_instruction_proposal(
         old_chunk=context.old_chunk_snapshot or None,
         sibling_reference=context.sibling_reference,
         reference_date=reference_date,
+        amendment_context=amendment_context,
     )
     return _build_proposal_draft(
         instruction_indices=[instruction_index],
@@ -314,6 +326,7 @@ def draft_instruction_group_proposal(
     reference_date: str | None,
     context: InstructionDraftContext,
     pdf_source: PdfBatchSource | None = None,
+    amendment_context: AmendmentContext | None = None,
 ) -> ProposalDraft:
     if not instructions or len(instruction_indices) != len(instructions):
         raise ValueError(
@@ -372,6 +385,7 @@ def draft_instruction_group_proposal(
         sibling_reference=context.sibling_reference,
         reference_date=reference_date,
         pdf_evidence=evidence,
+        amendment_context=amendment_context,
     )
     proposal = _build_proposal_draft(
         instruction_indices=instruction_indices,
@@ -409,6 +423,7 @@ def analyze_instruction(
     instruction: AmendmentInstruction,
     reference_date: str | None,
     source_scope_cache: dict[str, list[UUID]] | None = None,
+    amendment_context: AmendmentContext | None = None,
 ) -> ProposalDraft | None:
     candidates = find_candidates(
         db_session,
@@ -420,7 +435,10 @@ def analyze_instruction(
         return None
 
     match = confirm_instruction_match(
-        llm, instruction=instruction, candidates=candidates
+        llm,
+        instruction=instruction,
+        candidates=candidates,
+        amendment_context=amendment_context,
     )
     if match is None:
         return None
@@ -435,6 +453,7 @@ def analyze_instruction(
         instruction=instruction,
         reference_date=reference_date,
         context=context,
+        amendment_context=amendment_context,
     )
 
 
@@ -446,6 +465,7 @@ def analyze_amendment(
     raw_text: str,
 ) -> AnalysisResult:
     segmentation = segment_amendment_text(llm, raw_text)
+    amendment_context = build_amendment_context(raw_text)
 
     proposals: list[ProposalDraft] = []
     unmatched: list[AmendmentInstruction] = []
@@ -460,6 +480,7 @@ def analyze_amendment(
             instruction=instruction,
             reference_date=segmentation.reference_date,
             source_scope_cache=source_scope_cache,
+            amendment_context=amendment_context,
         )
         if proposal is None:
             unmatched.append(instruction)

@@ -4,6 +4,7 @@ import json
 import time
 
 from onyx.llm.interfaces import LLM
+from onyx.regulatory.amendments.amendment_context import AmendmentContext
 from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.structured_llm import generate_structured
@@ -23,6 +24,8 @@ Your task: decide which candidate (if any) this instruction amends.
 - If a candidate is the existing provision this instruction changes, set `old_chunk_id` to its id. Prefer the most specific correct unit: for an amendment to one paragraph or clause, choose that paragraph or clause rather than the whole article.
 - CRITICAL — set `old_chunk_id` to null ONLY when the instruction adds text that does not exist yet: a brand-new article, or a new paragraph/clause added inside an existing article ("aşağıdaki fıkra eklenmiştir", "aşağıdaki bent eklenmiş ve diğer bentler buna göre teselsül ettirilmiştir"). If the instruction amends, replaces, clarifies, or repeals something and a matching candidate exists, you MUST select it.
 - Set `confidence` to a 0.0-1.0 score and `rationale` to a brief explanation naming the signals you used.
+
+You may also be given the full text of the amendment the instruction was taken from. Read it to understand the instruction — which source "Aynı Tebliğ" names, what a term defined in another article means, which article a cross-reference points at. It is context only: decide the target of the ONE instruction you were given, never of another article you read there.
 
 Only ever use an id from the given candidates. Never invent an id."""
 # ruff: noqa: E501 end
@@ -64,6 +67,7 @@ def confirm_match(
     *,
     instruction: AmendmentInstruction,
     candidates: list[CandidateChunk],
+    amendment_context: AmendmentContext | None = None,
 ) -> MatchResult:
     prompt = (
         f"Amendment instruction:\n{instruction.instruction_text}\n\n"
@@ -71,6 +75,8 @@ def confirm_match(
         f"Target source: {instruction.target_source or '(not stated)'}\n\n"
         f"Candidate chunks:\n{_format_candidates(candidates)}"
     )
+    if amendment_context is not None:
+        prompt += f"\n\n{amendment_context.prompt_section()}"
     return generate_structured(
         llm,
         flow=LLMFlow.AMENDMENT_MATCH_CONFIRMATION,

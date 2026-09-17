@@ -63,7 +63,9 @@ def page_elements(
     ]
 
 
-def pdf_transcript(extraction: AnnexExtraction, *, version: Literal[1, 2, 3] = 3) -> str:
+def pdf_transcript(
+    extraction: AnnexExtraction, *, version: Literal[1, 2, 3] = 3
+) -> str:
     """Render one frozen extraction as reviewable text.
 
     Version 3 emits real GFM markdown tables (a header row followed by a

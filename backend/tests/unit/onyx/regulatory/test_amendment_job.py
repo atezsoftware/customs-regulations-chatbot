@@ -112,6 +112,7 @@ def _run_grouping_job(
         retriever: object,
         llm: object,
         instruction: AmendmentInstruction,
+        amendment_context: object = None,
         trace: object = None,
     ) -> tuple[list[CandidateChunk], MatchResult]:
         del retriever, llm, trace
