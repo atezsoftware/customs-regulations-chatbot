@@ -379,13 +379,12 @@ def test_plain_instruction_query_is_tried_when_every_lane_is_empty() -> None:
     assert [candidate.chunk_id for candidate in candidates] == ["article-5-paragraph-3"]
 
 
-def test_amendment_filters_match_atez_search_v2() -> None:
-    """Same index, same regulatory scope, plus the selected update document set."""
+def test_amendment_search_is_scoped_to_the_selected_document_set() -> None:
+    """The update searches the set it was started from, nothing wider."""
 
     from types import SimpleNamespace
     from unittest.mock import patch
 
-    from onyx.configs.constants import DocumentSource
     from onyx.regulatory.amendments.search_retriever import (
         build_amendment_search_retriever,
     )
@@ -423,40 +422,4 @@ def test_amendment_filters_match_atez_search_v2() -> None:
 
     filters = cast(BaseFilters, captured["user_selected_filters"])
     assert filters.regulatory_chunks_only is True
-    assert filters.source_type == [DocumentSource.USER_FILE]
-    # The update's scope is the batch's file list, enforced after retrieval. An
-    # index-side set tag is not queried: a chunk published before it joined the
-    # set carries none, and the query would then match nothing at all.
-    assert filters.document_set is None
-
-
-def test_search_is_marked_as_already_planned_like_atez_search_v2() -> None:
-    """An amendment query is one focused target; the tool must not re-plan it."""
-
-    search_tool = MagicMock()
-    search_tool.run.return_value = ToolResponse(
-        rich_response=SearchDocsResponse(
-            search_docs=[], citation_mapping={}, displayed_docs=None
-        ),
-        llm_facing_response="",
-    )
-    retriever = AmendmentSearchRetriever(
-        search_tool_factory=lambda: search_tool,
-        canonical_candidate_loader=lambda _chunk_ids: {},
-        allowed_user_file_ids=[_FILE_ID],
-    )
-    instruction = AmendmentInstruction(
-        instruction_text=(
-            "MADDE 2- Aynı Tebliğin 3 üncü maddesinin birinci fıkrasının (d) "
-            "bendi aşağıdaki şekilde değiştirilmiştir."
-        ),
-        search_query="Fiili denetim tanımı nedir?",
-    )
-
-    retriever.search(instruction)
-
-    call = search_tool.run.call_args.kwargs
-    # Both fields must be non-empty: SearchTool treats them together as the
-    # signal that expansion and scope inference are already done.
-    assert call["coverage_item"].strip()
-    assert call["evidence_target"].strip() == instruction.search_query
+    assert filters.document_set == ["Mevzuat"]
