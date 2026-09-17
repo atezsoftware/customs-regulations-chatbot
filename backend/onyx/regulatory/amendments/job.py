@@ -320,12 +320,39 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             article_reference=instruction.article_reference,
         )
         trace = _InstructionTrace()
-        candidates, match = retrieve_and_confirm_instruction(
-            retriever=retriever,
-            llm=llm,
-            instruction=instruction,
-            trace=trace,
-        )
+        try:
+            candidates, match = retrieve_and_confirm_instruction(
+                retriever=retriever,
+                llm=llm,
+                instruction=instruction,
+                trace=trace,
+            )
+        except (StructuredOutputValidationError, TimeoutError) as error:
+            # Leave this index unfinished so Retry resumes it, and keep going:
+            # one instruction the confirming model could not answer must not
+            # decide the outcome of every other instruction in the batch.
+            first_output_error = first_output_error or error
+            log(
+                "instruction_failed",
+                index=instruction_index,
+                error=type(error).__name__,
+                searches=trace.searched,
+                candidates=trace.candidates,
+                detail=str(error)[:300],
+            )
+            continue
+        except Exception as error:
+            # Still fatal, but no longer silent: the batch's own record names
+            # what stopped it instead of only saying that it stopped.
+            log(
+                "instruction_error",
+                index=instruction_index,
+                error=type(error).__name__,
+                searches=trace.searched,
+                candidates=trace.candidates,
+                detail=str(error)[:300],
+            )
+            raise
 
         log(
             "instruction_finished",
