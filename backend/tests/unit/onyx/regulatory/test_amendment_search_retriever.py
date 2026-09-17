@@ -424,7 +424,10 @@ def test_amendment_filters_match_atez_search_v2() -> None:
     filters = cast(BaseFilters, captured["user_selected_filters"])
     assert filters.regulatory_chunks_only is True
     assert filters.source_type == [DocumentSource.USER_FILE]
-    assert filters.document_set == ["Mevzuat"]
+    # The update's scope is the batch's file list, enforced after retrieval. An
+    # index-side set tag is not queried: a chunk published before it joined the
+    # set carries none, and the query would then match nothing at all.
+    assert filters.document_set is None
 
 
 def test_search_is_marked_as_already_planned_like_atez_search_v2() -> None:

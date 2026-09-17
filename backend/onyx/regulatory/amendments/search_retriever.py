@@ -68,6 +68,8 @@ class AmendmentSearchRetriever:
         allowed_user_file_ids: Sequence[UUID],
     ) -> None:
         self._search_tool_factory = search_tool_factory
+        self.last_query_stats: dict[str, object] = {}
+        self.query_stats: list[dict[str, object]] = []
         self._canonical_candidate_loader = canonical_candidate_loader
         self._structural_candidate_loader = structural_candidate_loader
         self._allowed_user_file_ids = {
@@ -81,7 +83,13 @@ class AmendmentSearchRetriever:
         *,
         skip_query_expansion: bool,
     ) -> list[CandidateChunk]:
-        """Run one focused query and return its in-scope candidates in rank order."""
+        """Run one focused query and return its in-scope candidates in rank order.
+
+        Each stage that can empty the result set is counted separately: an index
+        that returned nothing, rows without a canonical id, ids that no longer
+        resolve, and rows outside the batch are four different faults that look
+        identical from a candidate count alone.
+        """
 
         source_anchors = (
             [instruction.target_source.strip()]
@@ -135,16 +143,34 @@ class AmendmentSearchRetriever:
             docs_by_chunk_id[chunk_id] = search_doc
         canonical_candidates = self._canonical_candidate_loader(list(docs_by_chunk_id))
         candidates: list[CandidateChunk] = []
+        out_of_scope = 0
         for chunk_id, search_doc in docs_by_chunk_id.items():
             candidate = canonical_candidates.get(chunk_id)
-            if (
-                candidate is None
-                or candidate.user_file_id not in self._allowed_user_file_ids
-            ):
+            if candidate is None:
+                continue
+            if candidate.user_file_id not in self._allowed_user_file_ids:
+                out_of_scope += 1
                 continue
             candidates.append(
                 replace(candidate, source_name=search_doc.semantic_identifier)
             )
+        logger.info(
+            "Amendment query docs=%s with_chunk_id=%s resolved=%s "
+            "out_of_scope=%s kept=%s query=%r",
+            len(ranked_docs),
+            len(docs_by_chunk_id),
+            len(canonical_candidates),
+            out_of_scope,
+            len(candidates),
+            query[:120],
+        )
+        self.last_query_stats = {
+            "docs": len(ranked_docs),
+            "with_chunk_id": len(docs_by_chunk_id),
+            "resolved": len(canonical_candidates),
+            "out_of_scope": out_of_scope,
+            "kept": len(candidates),
+        }
         return candidates
 
     def search(
@@ -168,6 +194,7 @@ class AmendmentSearchRetriever:
             return []
 
         ranked = self._run_query(instruction, query, skip_query_expansion=recovery)
+        self.query_stats = [dict(self.last_query_stats)]
 
         # An amendment describes the text it introduces, not the text it
         # replaces, so the provision it names by article/paragraph/clause is
@@ -252,8 +279,11 @@ def build_amendment_search_retriever(
         attached_document_ids=[],
         hierarchy_node_ids=[],
     )
+    # Exactly what Atez Search V2 queries the same index with. The update's
+    # scope is the batch's own file list, which is the selected Document Set,
+    # and every candidate is checked against it after retrieval — so an index
+    # side set tag that is missing or stale cannot hide a chunk.
     filters = BaseFilters(
-        document_set=[document_set.name],
         source_type=[DocumentSource.USER_FILE],
         regulatory_chunks_only=True,
     )

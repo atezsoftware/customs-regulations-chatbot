@@ -2,7 +2,7 @@
 
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from uuid import UUID
 
@@ -86,6 +86,7 @@ class _InstructionTrace:
     confirmations: int = 0
     declined: bool = False
     note: str | None = None
+    queries: list[dict[str, object]] = field(default_factory=list)
 
     def describe(self) -> str:
         if self.note:
@@ -120,6 +121,7 @@ def retrieve_and_confirm_instruction(
     candidates = retriever.search(instruction=instruction, recovery=False)
     trace.searched += 1
     trace.candidates = len(candidates)
+    trace.queries.extend(retriever.query_stats)
     appendix_note = appendix_replacement_attention_message(instruction, candidates)
     if appendix_note is not None:
         trace.note = "This annex target needs its replacement body supplied."
@@ -137,6 +139,7 @@ def retrieve_and_confirm_instruction(
 
     recovered = retriever.search(instruction=instruction, recovery=True)
     trace.searched += 1
+    trace.queries.extend(retriever.query_stats)
     if not recovered:
         return candidates, None
     candidates = _merge_candidates(candidates, recovered)
@@ -325,6 +328,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             candidates=trace.candidates,
             confirmations=trace.confirmations,
             declined=trace.declined,
+            queries=trace.queries,
             matched_chunk_id=match.old_chunk_id if match else None,
             outcome="matched" if match else "unmatched",
             detail=trace.describe() if match is None else None,
