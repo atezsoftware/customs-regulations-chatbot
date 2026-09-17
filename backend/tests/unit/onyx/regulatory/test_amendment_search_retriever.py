@@ -379,8 +379,8 @@ def test_plain_instruction_query_is_tried_when_every_lane_is_empty() -> None:
     assert [candidate.chunk_id for candidate in candidates] == ["article-5-paragraph-3"]
 
 
-def test_amendment_search_is_scoped_to_the_selected_document_set() -> None:
-    """The update searches the set it was started from, nothing wider."""
+def test_amendment_search_does_not_filter_on_the_document_set_tag() -> None:
+    """Scope comes from the batch file list, not from a stored index tag."""
 
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -422,4 +422,6 @@ def test_amendment_search_is_scoped_to_the_selected_document_set() -> None:
 
     filters = cast(BaseFilters, captured["user_selected_filters"])
     assert filters.regulatory_chunks_only is True
-    assert filters.document_set == ["Mevzuat"]
+    # A stale index-side set tag must not be able to hide a chunk; scope is
+    # enforced against the batch's file list after retrieval instead.
+    assert filters.document_set is None

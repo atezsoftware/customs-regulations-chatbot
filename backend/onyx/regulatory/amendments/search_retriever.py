@@ -271,10 +271,14 @@ def build_amendment_search_retriever(
         attached_document_ids=[],
         hierarchy_node_ids=[],
     )
-    # The scope the update has always searched. Every candidate is additionally
-    # checked against the batch's file list after retrieval.
+    # What Atez Search V2 queries this index with. The Document Set tag is not
+    # queried: it is written from the membership a file had when it was last
+    # published, so a file republished through another writer can carry a stale
+    # tag and vanish from a set-filtered query while staying fully searchable.
+    # The update's scope is the batch's own file list — which is this Document
+    # Set — and every candidate is checked against it after retrieval, where no
+    # publication path can weaken it.
     filters = BaseFilters(
-        document_set=[document_set.name],
         regulatory_chunks_only=True,
     )
 
