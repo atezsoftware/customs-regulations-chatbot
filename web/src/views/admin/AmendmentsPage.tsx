@@ -17,6 +17,7 @@ import {
   type AmendmentSourcePackage,
   type AnnexCapabilities,
   type AnnexReview,
+  type AmendmentAnalysisLogEntry,
   type AmendmentBatch,
   type AmendmentProposal,
   RegulatoryRequestError,
@@ -818,6 +819,7 @@ export default function AmendmentsPage() {
   const [proposals, setProposals] = useState<AmendmentProposal[]>([]);
   const [annexReviews, setAnnexReviews] = useState<AnnexReview[]>([]);
   const [unmatched, setUnmatched] = useState<string[]>([]);
+  const [analysisLog, setAnalysisLog] = useState<AmendmentAnalysisLogEntry[]>([]);
 
   const annexEnabled =
     annexCapabilities?.enabled === true &&
@@ -864,6 +866,7 @@ export default function AmendmentsPage() {
       setProposals([]);
       setAnnexReviews([]);
       setUnmatched([]);
+      setAnalysisLog([]);
       return;
     }
 
@@ -890,6 +893,7 @@ export default function AmendmentsPage() {
         setProposals(result.proposals);
         setAnnexReviews(result.annex_groups ?? []);
         setUnmatched(result.unmatched_instructions);
+        setAnalysisLog(result.analysis_log ?? []);
 
         if (
           result.batch.status === "queued" ||
@@ -1290,6 +1294,7 @@ export default function AmendmentsPage() {
       setProposals([]);
       setAnnexReviews([]);
       setUnmatched([]);
+      setAnalysisLog([]);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Analysis failed.");
     } finally {
@@ -1345,6 +1350,7 @@ export default function AmendmentsPage() {
         current.map((item) => (item.id === batch.id ? batch : item))
       );
       setUnmatched([]);
+      setAnalysisLog([]);
       setPollRevision((revision) => revision + 1);
       toast.success("Analysis queued again from its last checkpoint.");
     } catch (e) {
@@ -1716,6 +1722,33 @@ export default function AmendmentsPage() {
                         replacement without formal amendment language.
                       </Text>
                     )}
+
+                  {analysisLog.length > 0 && (
+                    <details className="rounded-lg border border-border-02 p-3">
+                      <summary className="cursor-pointer">
+                        <Text font="main-ui-action" color="text-04">
+                          {`Analysis log (${analysisLog.length} steps)`}
+                        </Text>
+                      </summary>
+                      <div className="mt-2 flex max-h-96 flex-col gap-1 overflow-auto">
+                        {analysisLog.map((entry, index) => {
+                          const { at, step, ...fields } = entry;
+                          const detail = Object.entries(fields)
+                            .filter(([, value]) => value !== null)
+                            .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+                            .join(" ");
+                          return (
+                            <div
+                              key={`${at}-${index}`}
+                              className="whitespace-pre-wrap break-words font-mono text-xs text-text-03"
+                            >
+                              {`${at} ${step} ${detail}`.trim()}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </details>
+                  )}
 
                   {unmatched.length > 0 && (
                     <div className="rounded-lg border border-border-02 p-3">

@@ -112,8 +112,9 @@ def _run_grouping_job(
         retriever: object,
         llm: object,
         instruction: AmendmentInstruction,
+        trace: object = None,
     ) -> tuple[list[CandidateChunk], MatchResult]:
-        del retriever, llm
+        del retriever, llm, trace
         assert session_depth == 0
         instruction_index = index_by_text[instruction.instruction_text]
         events.append(("match", instruction_index))

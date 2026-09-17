@@ -6499,6 +6499,11 @@ class AmendmentBatch(Base):
     unmatched_instructions: Mapped[list[str]] = mapped_column(
         PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
     )
+    # Every step this batch took, in order, so the admin screen can show what
+    # actually happened instead of only the instructions that came out unmatched.
+    analysis_log: Mapped[list[dict[str, Any]]] = mapped_column(
+        PGJSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     reference_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(
         Text, nullable=False, default=AmendmentBatchStatus.QUEUED.value

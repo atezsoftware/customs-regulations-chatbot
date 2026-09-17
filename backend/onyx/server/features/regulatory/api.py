@@ -706,6 +706,7 @@ def get_amendment_analysis(
             for proposal in proposals
         ],
         unmatched_instructions=list(batch.unmatched_instructions),
+        analysis_log=list(batch.analysis_log),
     )
 
 

@@ -302,7 +302,10 @@ def litellm_thinks_model_supports_image_input(
     try:
         model_obj = find_model_obj(get_model_map(), model_provider, model_name)
         if not model_obj:
-            logger.warning(
+            # Listing providers checks every configured model, so a catalogue
+            # miss is routine bookkeeping rather than a fault worth warning
+            # about on every admin page load.
+            logger.debug(
                 "No litellm entry found for %s/%s, this model may or may not support image input.",
                 model_provider,
                 model_name,

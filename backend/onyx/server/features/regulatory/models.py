@@ -410,6 +410,9 @@ class AnalyzeAmendmentResponse(BaseModel):
     batch: AmendmentBatchSnapshot
     proposals: list[AmendmentProposalSnapshot]
     unmatched_instructions: list[str]
+    # Ordered record of what the analysis actually did, shown on the Updates
+    # screen so a run can be diagnosed without server log access.
+    analysis_log: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CreateAmendmentSourcePackageRequest(BaseModel):

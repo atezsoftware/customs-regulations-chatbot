@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.regulatory_amendments import (
+    append_batch_log,
     get_batch,
     mark_batch_analyzed,
     persist_proposal_checkpoint,
@@ -71,18 +72,60 @@ def _merge_candidates(
     return merged
 
 
+@dataclass
+class _InstructionTrace:
+    """What actually happened while resolving one instruction.
+
+    An unresolved instruction is otherwise indistinguishable from one that was
+    never searched at all, which makes the difference between "retrieval found
+    nothing" and "the model declined" invisible to whoever has to fix it.
+    """
+
+    searched: int = 0
+    candidates: int = 0
+    confirmations: int = 0
+    declined: bool = False
+    note: str | None = None
+
+    def describe(self) -> str:
+        if self.note:
+            return self.note
+        if self.searched == 0:
+            return "No search was run for this instruction."
+        if self.candidates == 0:
+            return (
+                f"{self.searched} search(es) returned no candidate chunk in this "
+                "Document Set, so no comparison was possible."
+            )
+        if self.confirmations == 0:
+            return f"{self.candidates} candidate(s) found but none was confirmed."
+        if self.declined:
+            return (
+                f"{self.candidates} candidate(s) found; the model declined all of "
+                "them after " + f"{self.confirmations} check(s)."
+            )
+        return f"{self.candidates} candidate(s) found; no match was recorded."
+
+
 def retrieve_and_confirm_instruction(
     *,
     retriever: AmendmentSearchRetriever,
     llm: LLM,
     instruction: AmendmentInstruction,
+    trace: "_InstructionTrace | None" = None,
 ) -> tuple[list[CandidateChunk], MatchResult | None]:
     """Search, confirm, then make at most one focused recovery attempt."""
 
+    trace = trace if trace is not None else _InstructionTrace()
     candidates = retriever.search(instruction=instruction, recovery=False)
-    if appendix_replacement_attention_message(instruction, candidates) is not None:
+    trace.searched += 1
+    trace.candidates = len(candidates)
+    appendix_note = appendix_replacement_attention_message(instruction, candidates)
+    if appendix_note is not None:
+        trace.note = "This annex target needs its replacement body supplied."
         return candidates, None
     if candidates:
+        trace.confirmations += 1
         match = confirm_instruction_match(
             llm,
             instruction=instruction,
@@ -90,23 +133,41 @@ def retrieve_and_confirm_instruction(
         )
         if match is not None:
             return candidates, match
+        trace.declined = True
 
     recovered = retriever.search(instruction=instruction, recovery=True)
+    trace.searched += 1
     if not recovered:
         return candidates, None
     candidates = _merge_candidates(candidates, recovered)
+    trace.candidates = len(candidates)
     if appendix_replacement_attention_message(instruction, candidates) is not None:
+        trace.note = "This annex target needs its replacement body supplied."
         return candidates, None
+    trace.confirmations += 1
     match = confirm_instruction_match(
         llm,
         instruction=instruction,
         candidates=candidates,
     )
+    trace.declined = match is None
     return candidates, match
 
 
 def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
+    def log(step: str, **fields: object) -> None:
+        with _session() as log_session:
+            append_batch_log(
+                log_session, batch_id=batch_id, entries=[{"step": step, **fields}]
+            )
+
+    log("batch_started", lease_generation=lease_generation)
     llm = get_amendment_analysis_llm()
+    log(
+        "analysis_model_resolved",
+        provider=llm.config.model_provider,
+        model=llm.config.model_name,
+    )
 
     from onyx.db.amendment_pdf_evidence import load_batch_pdf_source
 
@@ -154,7 +215,13 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         # checkpoint and a normal analyzed/finalized lifecycle so the admin
         # sees "no update instructions detected" instead of a crash they can
         # never resolve by retrying the identical text.
+        log("segmentation_started", raw_text_chars=len(raw_text))
         segmentation = segment_amendment_text(llm, raw_text)
+        log(
+            "segmentation_finished",
+            instructions=len(segmentation.instructions),
+            reference_date=segmentation.reference_date,
+        )
         if not segmentation.instructions:
             logger.warning(
                 "Amendment batch=%s segmentation found no update instructions; "
@@ -215,24 +282,57 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                         else date.today(),
                     ):
                         annex_indices.update(group.instruction_indices)
+    log(
+        "instruction_loop_started",
+        instructions=len(instructions),
+        already_processed=sorted(processed_instruction_indices),
+        annex_handled=sorted(annex_indices),
+        annex_groups=len(groups),
+    )
     first_output_error: StructuredOutputValidationError | TimeoutError | None = None
     matched_instructions: list[_MatchedInstruction] = []
     for instruction_index, instruction in enumerate(instructions):
-        if (
-            instruction_index in processed_instruction_indices
-            or instruction_index in annex_indices
-        ):
+        if instruction_index in processed_instruction_indices:
+            log(
+                "instruction_skipped",
+                index=instruction_index,
+                reason="already processed",
+            )
             continue
+        if instruction_index in annex_indices:
+            log("instruction_skipped", index=instruction_index, reason="annex review")
+            continue
+        log(
+            "instruction_started",
+            index=instruction_index,
+            text=instruction.instruction_text[:300],
+            search_query=instruction.search_query,
+            target_source=instruction.target_source,
+            article_reference=instruction.article_reference,
+        )
+        trace = _InstructionTrace()
         candidates, match = retrieve_and_confirm_instruction(
             retriever=retriever,
             llm=llm,
             instruction=instruction,
+            trace=trace,
         )
 
+        log(
+            "instruction_finished",
+            index=instruction_index,
+            searches=trace.searched,
+            candidates=trace.candidates,
+            confirmations=trace.confirmations,
+            declined=trace.declined,
+            matched_chunk_id=match.old_chunk_id if match else None,
+            outcome="matched" if match else "unmatched",
+            detail=trace.describe() if match is None else None,
+        )
         if match is None:
             unresolved_text = (
                 appendix_replacement_attention_message(instruction, candidates)
-                or instruction.instruction_text
+                or f"{instruction.instruction_text}\n\nAttention: {trace.describe()}"
             )
             with _session() as db_session:
                 persisted = persist_unmatched_checkpoint(
@@ -298,7 +398,14 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 candidates=group_candidates,
                 match=ordered_group[0].match,
             )
+        log(
+            "draft_group_started",
+            indices=instruction_indices,
+            candidates=len(group_candidates),
+            old_chunk_id=ordered_group[0].match.old_chunk_id,
+        )
         if context is None:
+            log("draft_group_context_missing", indices=instruction_indices)
             for item in ordered_group:
                 with _session() as db_session:
                     persisted = persist_unmatched_checkpoint(
@@ -323,6 +430,11 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 pdf_source=pdf_source,
             )
         except (StructuredOutputValidationError, TimeoutError) as error:
+            log(
+                "draft_group_failed",
+                indices=instruction_indices,
+                error=type(error).__name__,
+            )
             # Leave these indices unfinished so Retry resumes them, while other
             # independent groups can still produce durable review proposals.
             first_output_error = first_output_error or error
@@ -334,6 +446,11 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             )
             continue
         except DraftIntegrityError as error:
+            log(
+                "draft_group_rejected",
+                indices=instruction_indices,
+                error=str(error)[:300],
+            )
             for item in ordered_group:
                 with _session() as db_session:
                     persisted = persist_unmatched_checkpoint(
@@ -365,6 +482,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             len(group_candidates),
         )
 
+    log("proposals_finished", groups=len(ordered_groups))
     run_annex_groups(
         batch_id=batch_id,
         lease_generation=lease_generation,
@@ -374,9 +492,11 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         llm=llm,
     )
     if first_output_error is not None:
+        log("batch_failed", error=type(first_output_error).__name__)
         raise first_output_error
 
     with _session() as db_session:
+        log("batch_analyzed")
         if not mark_batch_analyzed(
             db_session,
             batch_id=batch_id,

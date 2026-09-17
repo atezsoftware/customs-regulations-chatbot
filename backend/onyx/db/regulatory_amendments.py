@@ -44,6 +44,7 @@ from onyx.regulatory.amendments.draft_integrity import (
 )
 from onyx.regulatory.amendments.models import ProposalDraft, ReviewedAmendmentChunkDraft
 from onyx.regulatory.chunker import ATOMIC_CHUNK_VARIANT
+from onyx.utils.logger import setup_logger
 
 _MAX_ERROR_MESSAGE_LENGTH = 4000
 _AMENDMENT_PROJECTION_ORDINAL_BASE = 1_000_000_000
@@ -1304,3 +1305,38 @@ def reset_batch_attention_for_retry(
     batch.completed_at = None
     db_session.commit()
     return batch
+
+
+AMENDMENT_LOG_LIMIT = 2000
+
+
+def append_batch_log(
+    db_session: Session, *, batch_id: int, entries: list[dict[str, object]]
+) -> None:
+    """Append ordered analysis steps for the admin screen, never failing the run.
+
+    Diagnostics must not be able to break the work they describe, so a failure
+    to record is rolled back and dropped rather than raised.
+    """
+
+    if not entries:
+        return
+    try:
+        batch = db_session.get(AmendmentBatch, batch_id)
+        if batch is None:
+            db_session.rollback()
+            return
+        stamped = [
+            {
+                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                **entry,
+            }
+            for entry in entries
+        ]
+        batch.analysis_log = [*batch.analysis_log, *stamped][-AMENDMENT_LOG_LIMIT:]
+        db_session.commit()
+    except Exception:
+        db_session.rollback()
+        setup_logger().exception(
+            "Failed to record amendment analysis log for %s", batch_id
+        )

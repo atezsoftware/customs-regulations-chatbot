@@ -47,11 +47,18 @@ export interface AmendmentProposal {
   duplicate_target: boolean;
 }
 
+export interface AmendmentAnalysisLogEntry {
+  at: string;
+  step: string;
+  [field: string]: unknown;
+}
+
 export interface AnalyzeAmendmentResponse {
   annex_groups?: AnnexReview[];
   batch: AmendmentBatch;
   proposals: AmendmentProposal[];
   unmatched_instructions: string[];
+  analysis_log?: AmendmentAnalysisLogEntry[];
 }
 
 export interface AmendmentSourceExtraction {
