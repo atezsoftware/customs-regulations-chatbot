@@ -15,6 +15,9 @@ from onyx.context.search.models import (
     SearchDoc,
     SearchDocsResponse,
 )
+from onyx.context.search.retrieval.search_runner import (
+    regulatory_embedding_unavailable,
+)
 from onyx.db.document_set import get_document_set_by_id
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.regulatory_chunks import (
@@ -158,6 +161,7 @@ class AmendmentSearchRetriever:
         )
         self.last_query_stats = {
             "docs": len(ranked_docs),
+            "lexical_only": regulatory_embedding_unavailable(),
             "with_chunk_id": len(docs_by_chunk_id),
             "resolved": len(canonical_candidates),
             "out_of_scope": out_of_scope,

@@ -82,6 +82,21 @@ def _get_regulatory_query_embedding(
         raise
 
 
+def regulatory_embedding_unavailable() -> bool:
+    """True while regulatory retrieval is degraded to lexical-only search.
+
+    The fall back to keyword retrieval keeps a chat answerable when the
+    embedding provider is briefly unreachable, but it is a silent loss of
+    recall: a long natural-language query that hybrid retrieval answers easily
+    can match nothing lexically. A caller that treats an empty result as a
+    finding — rather than as a failed search — needs to be able to tell the two
+    apart.
+    """
+
+    with _regulatory_embedding_circuit_lock:
+        return time.monotonic() < _regulatory_embedding_circuit_open_until
+
+
 _VECTOR_DIMENSION_MISMATCH_MARKERS = (
     "query vector has a different dimension",
     "than the index vectors",

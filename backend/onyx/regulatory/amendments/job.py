@@ -93,6 +93,12 @@ class _InstructionTrace:
             return self.note
         if self.searched == 0:
             return "No search was run for this instruction."
+        if any(query.get("lexical_only") for query in self.queries):
+            return (
+                "The embedding service was unreachable, so retrieval ran without "
+                "its semantic half and matched nothing. This is a failed search, "
+                "not a missing provision."
+            )
         if self.candidates == 0:
             return (
                 f"{self.searched} search(es) returned no candidate chunk in this "
