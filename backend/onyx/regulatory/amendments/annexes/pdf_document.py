@@ -18,7 +18,10 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexVisionWireResult,
     ExtractedAnnexElement,
 )
-from onyx.regulatory.structured_llm import generate_structured
+from onyx.regulatory.structured_llm import (
+    generate_structured,
+    is_retryable_provider_error,
+)
 from onyx.tracing.flows import LLMFlow
 from onyx.utils.process_isolation import run_in_isolated_process
 
@@ -54,6 +57,27 @@ class PdfVisionDocument(BaseModel):
 # inside its budget and confines a retry to the pages that actually failed.
 _PAGE_GROUP_SIZE = 4
 _MAX_GROUP_ATTEMPTS = 3
+# Below this an attempt cannot finish a page group at all, so a nearly spent
+# group budget is better used on one last real attempt than on three futile ones.
+_MIN_ATTEMPT_SECONDS = 45
+
+
+def _is_transient_provider_failure(error: BaseException) -> bool:
+    """Read the cause chain, not just the exception the provider layer raised.
+
+    A read timeout reaches this module wrapped by the LLM layer, so matching on
+    the outermost type alone classifies the most common transient failure of a
+    multimodal call as permanent.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if is_retryable_provider_error(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _pdf_page_sizes(content: bytes) -> list[tuple[float, float]]:
@@ -108,10 +132,16 @@ def _transcribe_page_group(
         else f"pages {first_page} through {last_page}"
     )
     last_error: Exception | None = None
-    for _attempt in range(_MAX_GROUP_ATTEMPTS):
+    for attempt in range(_MAX_GROUP_ATTEMPTS):
         remaining = int(deadline - time.monotonic())
         if remaining < 1:
             raise TimeoutError("pdf_vision_preparation_deadline")
+        # A provider that stops responding costs the caller its full timeout,
+        # so an attempt allowed to wait out the whole group budget leaves the
+        # retries below with nothing to run in. Give each attempt its share.
+        attempt_timeout = max(
+            _MIN_ATTEMPT_SECONDS, remaining // (_MAX_GROUP_ATTEMPTS - attempt)
+        )
         try:
             response = generate_structured(
                 llm,
@@ -133,7 +163,7 @@ def _transcribe_page_group(
                     )
                 ],
                 response_model=PdfVisionDocument,
-                timeout_override=remaining,
+                timeout_override=attempt_timeout,
                 max_tokens=min(65_536, max(12_000, 3_000 * len(expected))),
                 reasoning_effort=ReasoningEffort.OFF,
                 max_attempts=1,
@@ -142,6 +172,15 @@ def _transcribe_page_group(
                 use_streaming=False,
             )
         except (ValueError, TimeoutError) as error:
+            last_error = error
+            continue
+        except Exception as error:
+            # A read timeout or a refused connection is the ordinary failure of
+            # a long multimodal call and is exactly what these attempts exist
+            # for. Letting it past this loop fails the whole source package on
+            # the first blip, with every remaining attempt unused.
+            if not _is_transient_provider_failure(error):
+                raise
             last_error = error
             continue
         if [page.page for page in response.pages] == expected:
