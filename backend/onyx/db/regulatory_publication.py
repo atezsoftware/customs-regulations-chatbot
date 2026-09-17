@@ -370,6 +370,24 @@ class PublicationStore:
     def unavailable(
         self, observation: ReadObservation, candidate_files: tuple[UUID, ...]
     ) -> frozenset[UUID]:
+        """Files this snapshot must not serve.
+
+        Two things make a file unsafe to read: it is mid-publication, or it has
+        moved past the snapshot this read is pinned to. Owning the publication
+        is a third, separate question, and answering it here hides content for
+        the wrong reason: the scope key folds in how a process dialled the
+        database, so an API server and a worker on one deployment can derive
+        different keys for the rows describing the very publication they are
+        both reading, and every file then looks foreign and disappears.
+
+        Ownership is still enforced wherever a file is acquired or finalized,
+        which is where writing under another scope actually matters. Epochs are
+        only comparable inside the scope that issued them, so a foreign row's
+        epoch is not tested against this observation — but a closed gate is
+        honoured whoever closed it, because the file is being rewritten
+        underneath this read either way.
+        """
+
         if observation.scope != self.scope:
             raise ValueError("read observation scope mismatch")
         with get_session_with_tenant(tenant_id=self.scope.tenant_id) as session:
@@ -382,9 +400,11 @@ class PublicationStore:
             return frozenset(
                 row.user_file_id
                 for row in rows
-                if row.scope_key != self.scope_key
-                or row.gate_closed
-                or row.epoch > observation.committed_epoch
+                if row.gate_closed
+                or (
+                    row.scope_key == self.scope_key
+                    and row.epoch > observation.committed_epoch
+                )
             )
 
     def lock_public_read(
