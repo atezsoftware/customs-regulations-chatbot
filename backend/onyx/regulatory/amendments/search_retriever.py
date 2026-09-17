@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from onyx.chat.emitter import NullEmitter
-from onyx.configs.constants import MessageType
+from onyx.configs.constants import DocumentSource, MessageType
 from onyx.context.search.models import (
     BaseFilters,
     PersonaSearchInfo,
@@ -106,6 +106,14 @@ class AmendmentSearchRetriever:
             queries=[query],
             search_mode="hybrid",
             source_anchors=source_anchors,
+            # Atez Search V2 marks its plan-driven searches with these two
+            # fields, which is what tells SearchTool the query is already
+            # planned. Without them the tool adds its own expansion and scope
+            # decision on top of a query that is already a single focused
+            # target, and that inferred scope can exclude the very files the
+            # batch is amending.
+            coverage_item=_bounded_query(instruction.instruction_text),
+            evidence_target=query,
         )
         rich_response = response.rich_response
         if not isinstance(rich_response, SearchDocsResponse):
@@ -246,6 +254,7 @@ def build_amendment_search_retriever(
     )
     filters = BaseFilters(
         document_set=[document_set.name],
+        source_type=[DocumentSource.USER_FILE],
         regulatory_chunks_only=True,
     )
 

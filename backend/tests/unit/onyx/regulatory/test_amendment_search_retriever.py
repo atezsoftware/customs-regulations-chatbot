@@ -1,8 +1,9 @@
+from typing import cast
 from unittest.mock import MagicMock
 from uuid import UUID
 
 from onyx.configs.constants import DocumentSource
-from onyx.context.search.models import SearchDoc, SearchDocsResponse
+from onyx.context.search.models import BaseFilters, SearchDoc, SearchDocsResponse
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.search_retriever import AmendmentSearchRetriever
@@ -376,3 +377,83 @@ def test_plain_instruction_query_is_tried_when_every_lane_is_empty() -> None:
     candidates = retriever.search(instruction)
 
     assert [candidate.chunk_id for candidate in candidates] == ["article-5-paragraph-3"]
+
+
+def test_amendment_filters_match_atez_search_v2() -> None:
+    """Same index, same regulatory scope, plus the selected update document set."""
+
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from onyx.configs.constants import DocumentSource
+    from onyx.regulatory.amendments.search_retriever import (
+        build_amendment_search_retriever,
+    )
+
+    document_set = MagicMock()
+    document_set.name = "Mevzuat"
+    captured: dict[str, object] = {}
+
+    class _CapturingSearchTool:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    module = "onyx.regulatory.amendments.search_retriever"
+    with (
+        patch(f"{module}.fetch_user_by_id", return_value=MagicMock()),
+        patch(f"{module}.get_document_set_by_id", return_value=document_set),
+        patch(f"{module}.get_current_search_settings", return_value=MagicMock()),
+        patch(f"{module}.get_default_document_index", return_value=MagicMock()),
+        patch(
+            f"{module}.get_tools",
+            return_value=[SimpleNamespace(id=1, in_code_tool_id="search")],
+        ),
+        patch(f"{module}.SearchTool", _CapturingSearchTool),
+        patch(f"{module}.SEARCH_TOOL_ID", "search"),
+    ):
+        retriever = build_amendment_search_retriever(
+            MagicMock(),
+            document_set_id=7,
+            created_by=_FILE_ID,
+            user_file_ids=[_FILE_ID],
+            llm=MagicMock(),
+        )
+        # The tool is built lazily, once per query.
+        retriever._search_tool_factory()
+
+    filters = cast(BaseFilters, captured["user_selected_filters"])
+    assert filters.regulatory_chunks_only is True
+    assert filters.source_type == [DocumentSource.USER_FILE]
+    assert filters.document_set == ["Mevzuat"]
+
+
+def test_search_is_marked_as_already_planned_like_atez_search_v2() -> None:
+    """An amendment query is one focused target; the tool must not re-plan it."""
+
+    search_tool = MagicMock()
+    search_tool.run.return_value = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[], citation_mapping={}, displayed_docs=None
+        ),
+        llm_facing_response="",
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: search_tool,
+        canonical_candidate_loader=lambda _chunk_ids: {},
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "MADDE 2- Aynı Tebliğin 3 üncü maddesinin birinci fıkrasının (d) "
+            "bendi aşağıdaki şekilde değiştirilmiştir."
+        ),
+        search_query="Fiili denetim tanımı nedir?",
+    )
+
+    retriever.search(instruction)
+
+    call = search_tool.run.call_args.kwargs
+    # Both fields must be non-empty: SearchTool treats them together as the
+    # signal that expansion and scope inference are already done.
+    assert call["coverage_item"].strip()
+    assert call["evidence_target"].strip() == instruction.search_query
