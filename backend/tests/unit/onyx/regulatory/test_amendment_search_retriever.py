@@ -7,11 +7,24 @@ from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import BaseFilters, SearchDoc, SearchDocsResponse
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.ranker import CandidateChunk
-from onyx.regulatory.amendments.search_retriever import AmendmentSearchRetriever
+from onyx.regulatory.amendments.search_retriever import (
+    AmendmentSearchRetriever,
+    _structural_lookup_scopes,
+)
+from onyx.regulatory.amendments.structural_target import AmendmentStructuralTarget
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS
 from onyx.tools.models import ToolResponse
 
 _FILE_ID = UUID("00000000-0000-0000-0000-000000000123")
+
+
+def test_appendix_target_runs_one_whole_appendix_structural_lookup() -> None:
+    assert _structural_lookup_scopes(
+        AmendmentStructuralTarget(appendix_label="EK-2")
+    ) == ((None, None),)
+    assert _structural_lookup_scopes(AmendmentStructuralTarget(article_no="3")) == (
+        (None, None),
+    )
 
 
 def _search_doc(*, file_id: str | None, chunk_id: str) -> SearchDoc:

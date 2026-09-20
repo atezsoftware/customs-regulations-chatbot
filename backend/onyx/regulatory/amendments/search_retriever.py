@@ -33,6 +33,7 @@ from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.structural_target import (
+    AmendmentStructuralTarget,
     parse_amendment_structural_target,
     source_identity_distinguishing_tokens,
     source_identity_matches,
@@ -57,6 +58,15 @@ def _bounded_query(value: str) -> str:
 SearchToolFactory = Callable[[], SearchTool]
 CanonicalCandidateLoader = Callable[[Sequence[str]], Mapping[str, CandidateChunk]]
 StructuralCandidateLoader = Callable[[AmendmentInstruction], Sequence[CandidateChunk]]
+
+
+def _structural_lookup_scopes(
+    target: AmendmentStructuralTarget,
+) -> tuple[tuple[str | None, str | None], ...]:
+    if target.appendix_label is not None:
+        return ((None, None),)
+    narrow = (target.clause_label, target.paragraph_no)
+    return (narrow,) if narrow == (None, None) else (narrow, (None, None))
 
 
 class AmendmentSearchRetriever:
@@ -366,18 +376,10 @@ def build_amendment_search_retriever(
         with get_session_with_current_tenant() as structural_session:
             matches: list[RegulatoryChunkStructuralMatch] = []
             seen_chunk_ids: set[str] = set()
-            # The narrow reference identifies the amended unit; the article-level
-            # pass supplies its siblings, which is the only way an instruction
-            # that adds a new paragraph or clause can be positioned at all.
-            for clause_label, paragraph_no in (
-                (target.clause_label, target.paragraph_no),
-                (None, None),
-            ):
-                if target.article_no is None and (clause_label, paragraph_no) == (
-                    None,
-                    None,
-                ):
-                    continue
+            # An appendix is one structural scope. For articles, the narrow
+            # target identifies the amended unit and the article-level pass
+            # supplies siblings needed to position inserted paragraphs/clauses.
+            for clause_label, paragraph_no in _structural_lookup_scopes(target):
                 for match in get_active_chunks_by_structural_reference(
                     structural_session,
                     user_file_ids=user_file_ids,
