@@ -54,6 +54,15 @@ def pdf_fixture(*, native_text: bool) -> bytes:
     return result.getvalue()
 
 
+def vision_text() -> str:
+    return (
+        "MADDE 3 - Oran tablosu degistirilmistir.\n"
+        "Urun | Oran\n"
+        "Bugday | 17%\n"
+        "Not: yalniz test"
+    )
+
+
 def vision_result() -> AnnexVisionWireResult:
     def cell(
         text: str, box: tuple[float, float, float, float], role: str
@@ -75,7 +84,6 @@ def vision_result() -> AnnexVisionWireResult:
                     "text": "MADDE 3 - Oran tablosu degistirilmistir.",
                     "box": {"left": 0.04, "top": 0.04, "right": 0.95, "bottom": 0.2},
                     "status": "readable",
-                    "issues": [],
                 },
                 cell("Urun", (0.04, 0.3, 0.4, 0.4), "column_header"),
                 cell("Oran", (0.5, 0.3, 0.9, 0.4), "column_header"),
@@ -86,7 +94,6 @@ def vision_result() -> AnnexVisionWireResult:
                     "text": "Not: yalniz test",
                     "box": {"left": 0.04, "top": 0.7, "right": 0.9, "bottom": 0.8},
                     "status": "readable",
-                    "issues": [],
                 },
             ]
         }
@@ -108,9 +115,7 @@ def test_pdf_source_sends_original_pdf_once_and_preserves_table(
     generate = MagicMock(
         return_value=pdf_document.PdfVisionDocument(
             pages=[
-                pdf_document.PdfVisionPage(
-                    page=1, complete=True, elements=vision_result().elements
-                )
+                pdf_document.PdfVisionPage(page=1, complete=True, text=vision_text())
             ]
         )
     )
@@ -147,7 +152,8 @@ def test_pdf_source_sends_original_pdf_once_and_preserves_table(
     call = generate.call_args.kwargs
     file_data = call["file_parts"][0].file.file_data
     assert base64.b64decode(file_data.split(",", 1)[1]) == content
-    assert call["max_attempts"] == call["provider_max_attempts"] == 1
+    assert call["max_attempts"] == 2
+    assert call["provider_max_attempts"] == 1
     assert call["deadline"] <= deadline
     assert 90 <= call["timeout_override"] <= 180
     assert generate.call_count == 1
@@ -537,7 +543,7 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
                             pdf_document.PdfVisionPage(
                                 page=page,
                                 complete=True,
-                                elements=vision_result().elements,
+                                text=vision_text(),
                             )
                             for page in range(first, last + 1)
                         ]
@@ -1036,9 +1042,7 @@ def test_one_incomplete_page_group_is_retried_without_losing_the_others(
         )
         return pdf_document.PdfVisionDocument(
             pages=[
-                pdf_document.PdfVisionPage(
-                    page=page, complete=True, elements=vision_result().elements
-                )
+                pdf_document.PdfVisionPage(page=page, complete=True, text=vision_text())
                 for page in pages
             ]
         )

@@ -2914,9 +2914,13 @@ def get_active_chunks_by_structural_reference(
         )
     )
     for source_name_token in source_name_tokens:
+        # Document numbers are commonly zero-padded in filenames (2026/2 ->
+        # 2026-02). Treat the numeric token as the same identity instead of
+        # eliminating the exact structural target before ranking.
+        token_pattern = _source_name_token_pattern(source_name_token)
         conditions.append(
             normalized_source_name.op("~")(
-                rf"(^|[^[:alnum:]]){re.escape(source_name_token.casefold())}"
+                rf"(^|[^[:alnum:]]){token_pattern}"
                 r"([^[:alnum:]]|$)"
             )
         )
@@ -2946,6 +2950,10 @@ def get_active_chunks_by_structural_reference(
         RegulatoryChunkStructuralMatch(chunk=row[0], source_name=str(row[1]))
         for row in rows
     ]
+
+
+def _source_name_token_pattern(token: str) -> str:
+    return rf"0*{int(token)}" if token.isdigit() else re.escape(token.casefold())
 
 
 def is_hierarchical_aggregate_chunk(chunk: RegulatoryChunk) -> bool:

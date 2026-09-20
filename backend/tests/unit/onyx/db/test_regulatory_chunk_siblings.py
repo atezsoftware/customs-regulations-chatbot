@@ -13,6 +13,7 @@ from onyx.db.regulatory_chunks import (
     RegulatoryChunkSiblingCandidate,
     RegulatoryNavigationSeed,
     RegulatoryProvisionHeadingCandidate,
+    _source_name_token_pattern,
     get_regulatory_provision_heading_source,
     get_visible_regulatory_chunk_ids,
     is_regulatory_navigation_candidate_visible,
@@ -26,6 +27,11 @@ from onyx.regulatory.heading_path import RegulatoryProvisionReference
 
 FILE_A = UUID("00000000-0000-0000-0000-000000000001")
 FILE_B = UUID("00000000-0000-0000-0000-000000000002")
+
+
+def test_structural_source_number_matches_zero_padded_filename_token() -> None:
+    assert _source_name_token_pattern("2") == "0*2"
+    assert _source_name_token_pattern("Karayolu") == "karayolu"
 
 
 @pytest.fixture(autouse=True)

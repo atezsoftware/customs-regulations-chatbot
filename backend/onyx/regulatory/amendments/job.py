@@ -331,7 +331,6 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         annex_handled=sorted(annex_indices),
         annex_groups=len(groups),
     )
-    first_output_error: StructuredOutputValidationError | TimeoutError | None = None
     matched_instructions: list[_MatchedInstruction] = []
     for instruction_index, instruction in enumerate(instructions):
         if instruction_index in processed_instruction_indices:
@@ -362,10 +361,6 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 trace=trace,
             )
         except (StructuredOutputValidationError, TimeoutError) as error:
-            # Leave this index unfinished so Retry resumes it, and keep going:
-            # one instruction the confirming model could not answer must not
-            # decide the outcome of every other instruction in the batch.
-            first_output_error = first_output_error or error
             log(
                 "instruction_failed",
                 index=instruction_index,
@@ -374,6 +369,19 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 candidates=trace.candidates,
                 detail=str(error)[:300],
             )
+            with _session() as db_session:
+                persisted = persist_unmatched_checkpoint(
+                    db_session,
+                    batch_id=batch_id,
+                    lease_generation=lease_generation,
+                    instruction_index=instruction_index,
+                    instruction_text=(
+                        f"{instruction.instruction_text}\n\nAttention: Model output "
+                        f"could not be validated ({type(error).__name__})."
+                    ),
+                )
+            if not persisted:
+                raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
             continue
         except Exception as error:
             # Still fatal, but no longer silent: the batch's own record names
@@ -596,15 +604,26 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 error=type(error).__name__,
                 detail=str(error)[:300],
             )
-            # Leave these indices unfinished so Retry resumes them, while other
-            # independent groups can still produce durable review proposals.
-            first_output_error = first_output_error or error
             logger.warning(
                 "Amendment batch=%s drafting group=%s failed: %s",
                 batch_id,
                 instruction_indices,
                 type(error).__name__,
             )
+            for item in ordered_group:
+                with _session() as db_session:
+                    persisted = persist_unmatched_checkpoint(
+                        db_session,
+                        batch_id=batch_id,
+                        lease_generation=lease_generation,
+                        instruction_index=item.instruction_index,
+                        instruction_text=(
+                            f"{item.instruction.instruction_text}\n\nAttention: Draft "
+                            f"output could not be validated ({type(error).__name__})."
+                        ),
+                    )
+                if not persisted:
+                    raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
             continue
         except DraftIntegrityError as error:
             log(
@@ -652,10 +671,6 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         reference_date=reference_date,
         llm=llm,
     )
-    if first_output_error is not None:
-        log("batch_failed", error=type(first_output_error).__name__)
-        raise first_output_error
-
     with _session() as db_session:
         log("batch_analyzed")
         if not mark_batch_analyzed(

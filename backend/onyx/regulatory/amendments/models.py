@@ -29,7 +29,7 @@ def _normalize_iso_date(value: Any) -> Any:
     normalized = value.strip()
     if normalized.casefold() in {"", "null", "none"}:
         return None
-    iso_prefix = re.fullmatch(
+    iso_prefix = re.search(
         r"(?P<year>[0-9]{4})-(?P<month>[0-9]{1,2})-(?P<day>[0-9]{1,2})"
         r"(?:[T ](?:[0-9]{2}):[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:Z|[+-][0-9]{2}:[0-9]{2})?)?",
         normalized,
@@ -42,9 +42,9 @@ def _normalize_iso_date(value: Any) -> Any:
         try:
             return date.fromisoformat(candidate).isoformat()
         except ValueError:
-            return normalized
-    day_first = re.fullmatch(
-        r"(?P<day>[0-9]{1,2})[./](?P<month>[0-9]{1,2})[./](?P<year>[0-9]{4})",
+            return None
+    day_first = re.search(
+        r"(?P<day>[0-9]{1,2})[./-](?P<month>[0-9]{1,2})[./-](?P<year>[0-9]{4})",
         normalized,
     )
     if day_first is not None:
@@ -55,8 +55,11 @@ def _normalize_iso_date(value: Any) -> Any:
                 int(day_first.group("day")),
             ).isoformat()
         except ValueError:
-            return normalized
-    return normalized
+            return None
+    # A model may put its explanation in the date field despite the schema.
+    # Keeping an unparseable phrase would fail the entire instruction group;
+    # null is the safe contract and lets the rationale retain the explanation.
+    return None
 
 
 IsoDateString = Annotated[
@@ -138,6 +141,9 @@ class SegmentationResult(BaseModel):
     )
     instructions: list[AmendmentInstruction]
 
+    _normalize_reference_date = field_validator("reference_date", mode="before")(
+        _normalize_iso_date
+    )
     _validate_reference_date = field_validator("reference_date")(
         _require_iso_date_or_none
     )
@@ -212,6 +218,9 @@ class DateResolution(BaseModel):
         description="Brief explanation of how these dates were derived from the text"
     )
 
+    _normalize_dates = field_validator(
+        "effective_start_date", "effective_end_date", mode="before"
+    )(_normalize_iso_date)
     _validate_dates = field_validator("effective_start_date", "effective_end_date")(
         _require_iso_date_or_none
     )

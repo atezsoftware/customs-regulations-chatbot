@@ -53,20 +53,7 @@ def test_fifty_page_source_reads_every_page_without_rendering_entire_pdf(
                     {
                         "page": page,
                         "complete": True,
-                        "elements": [
-                            {
-                                "kind": "text",
-                                "text": f"Page {page}",
-                                "box": {
-                                    "left": 0.1,
-                                    "top": 0.1,
-                                    "right": 0.9,
-                                    "bottom": 0.2,
-                                },
-                                "status": "readable",
-                                "issues": [],
-                            }
-                        ],
+                        "text": f"Page {page}",
                     }
                     for page in range(first_page, last_page + 1)
                 ]
@@ -105,20 +92,7 @@ def test_source_stops_reading_more_pages_when_structure_budget_is_exhausted(
                     {
                         "page": page,
                         "complete": True,
-                        "elements": [
-                            {
-                                "kind": "text",
-                                "text": "x" * 10000,
-                                "box": {
-                                    "left": 0.1,
-                                    "top": 0.1,
-                                    "right": 0.9,
-                                    "bottom": 0.2,
-                                },
-                                "status": "readable",
-                            }
-                            for _ in range(60)
-                        ],
+                        "text": "x" * 200000,
                     }
                     for page in range(first_page, last_page + 1)
                 ]
@@ -137,4 +111,4 @@ def test_source_stops_reading_more_pages_when_structure_budget_is_exhausted(
             vision_llm=model,
             vision_deadline=time.monotonic() + 7200,
         )
-    assert generate.call_count == 2
+    assert generate.call_count == 4

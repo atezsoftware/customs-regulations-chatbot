@@ -115,7 +115,7 @@ def _run_grouping_job(
         amendment_context: object = None,
         trace: object = None,
     ) -> tuple[list[CandidateChunk], MatchResult]:
-        del retriever, llm, trace
+        del retriever, llm, amendment_context, trace
         assert session_depth == 0
         instruction_index = index_by_text[instruction.instruction_text]
         events.append(("match", instruction_index))
@@ -185,21 +185,20 @@ def _run_grouping_job(
     )
 
 
-def test_schema_failure_preserves_other_groups_and_leaves_failed_indices_retryable(
+def test_schema_failure_preserves_other_groups_as_an_attention_item(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from onyx.regulatory.structured_llm import StructuredOutputValidationError
 
     error = StructuredOutputValidationError("invalid draft date")
-    with pytest.raises(StructuredOutputValidationError):
-        _run_grouping_job(
-            monkeypatch,
-            batch_id=31,
-            targets=["failed", "completed", "good"],
-            processed_instruction_indices=[1],
-            processed_instruction_count=1,
-            draft_failures={0: error},
-        )
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=31,
+        targets=["failed", "completed", "good"],
+        processed_instruction_indices=[1],
+        processed_instruction_count=1,
+        draft_failures={0: error},
+    )
     cast(MagicMock, job.persist_proposal_checkpoint).assert_called_once()
     assert cast(MagicMock, job.persist_proposal_checkpoint).call_args.kwargs[
         "proposal"
@@ -208,8 +207,12 @@ def test_schema_failure_preserves_other_groups_and_leaves_failed_indices_retryab
         call.kwargs["instruction_indices"]
         for call in cast(MagicMock, job.draft_instruction_group_proposal).call_args_list
     ] == [[0], [2]]
-    cast(MagicMock, job.persist_unmatched_checkpoint).assert_not_called()
-    cast(MagicMock, job.mark_batch_analyzed).assert_not_called()
+    result.unmatched.assert_called_once()
+    assert (
+        "Draft output could not be validated"
+        in result.unmatched.call_args.kwargs["instruction_text"]
+    )
+    cast(MagicMock, job.mark_batch_analyzed).assert_called_once()
 
 
 def test_invalid_generated_draft_becomes_an_attention_item(
