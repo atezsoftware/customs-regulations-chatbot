@@ -11,6 +11,7 @@ from onyx.regulatory.amendments.draft_integrity import explicit_replacement_body
 from onyx.regulatory.amendments.models import (
     AmendmentInstruction,
     DraftResult,
+    MultiChunkDraftResult,
 )
 from onyx.regulatory.amendments.new_provision_policy import (
     added_subordinate_unit_kind,
@@ -54,6 +55,8 @@ The full text is context, not work. `new_chunk` must contain the listed instruct
 
 Use ONLY information explicitly present in the given texts. Never invent or assume anything not stated."""
 # ruff: noqa: E501 end
+
+_MULTI_CHUNK_SYSTEM_PROMPT = """You are an expert at applying Turkish regulatory amendments to a canonical multi-chunk scope. Return one change item for every existing canonical chunk whose full text changes, and no item for an unchanged chunk. Apply all instructions in their stated order. Preserve every unchanged word, table cell, heading, footnote, identifier and punctuation mark. Copy explicit replacement wording verbatim. Renumber following units only when an instruction expressly requires teselsül. Never invent missing replacement content, rows, links or identifiers. old_chunk_id and instruction_indexes must come from the supplied input. Dates must be real YYYY-MM-DD values or null; never put a natural-language date phrase in a date field."""
 
 
 def _chunk_to_review_dict(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -223,4 +226,60 @@ def draft_new_chunk(
         sibling_reference=sibling_reference,
         reference_date=reference_date,
         amendment_context=amendment_context,
+    )
+
+
+def draft_multi_chunk_scope(
+    llm: LLM,
+    *,
+    instructions: list[AmendmentInstruction],
+    old_chunks: list[dict[str, Any]],
+    reference_date: str | None,
+    amendment_context: AmendmentContext | None = None,
+) -> MultiChunkDraftResult:
+    """Draft every changed chunk in one structurally connected scope.
+
+    The model may select a strict subset of ``old_chunks``. Chunk identities are
+    validated by the caller; the model cannot introduce a target outside the
+    frozen candidate scope.
+    """
+
+    if not instructions or len(old_chunks) < 2:
+        raise ValueError("Multi-chunk drafting requires instructions and a scope")
+    instruction_text = "\n\n".join(
+        f"[{index}] {instruction.instruction_text}"
+        for index, instruction in enumerate(instructions)
+    )
+    old_scope = json.dumps(
+        [_chunk_to_review_dict(chunk) for chunk in old_chunks],
+        ensure_ascii=False,
+        indent=2,
+    )
+    prompt = (
+        "Apply the numbered Turkish regulatory amendment instructions to the "
+        "frozen canonical scope below. Return every existing chunk whose full "
+        "text must change. A table row can cross chunk boundaries; preserve all "
+        "unchanged rows, columns, headings, footnotes and punctuation. For an "
+        "insertion, deletion or teselsül instruction, update every affected "
+        "chunk and renumber only when the instruction expressly requires it. "
+        "Never return an unchanged chunk. old_chunk_id must be copied exactly "
+        "from the supplied scope. instruction_indexes are zero-based indexes "
+        "from this instruction list and must name every instruction applied to "
+        "that chunk. metadata_changes remains a patch.\n\n"
+        f"Instructions:\n{instruction_text}\n\n"
+        f"Reference/publication date: {reference_date or '(not stated)'}\n\n"
+        f"Canonical scope:\n{old_scope}"
+    )
+    if amendment_context is not None:
+        prompt += f"\n\n{amendment_context.prompt_section()}"
+    return generate_structured(
+        llm,
+        flow=LLMFlow.AMENDMENT_DRAFTING,
+        system_prompt=_MULTI_CHUNK_SYSTEM_PROMPT,
+        user_prompt=prompt,
+        response_model=MultiChunkDraftResult,
+        timeout_override=90,
+        max_attempts=2,
+        provider_max_attempts=1,
+        deadline=time.monotonic() + 120,
     )

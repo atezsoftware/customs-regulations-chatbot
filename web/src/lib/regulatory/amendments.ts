@@ -33,11 +33,13 @@ export interface AmendmentProposal {
   old_chunk_id: string | null;
   old_chunk_snapshot: Record<string, unknown>;
   new_chunk_draft: Record<string, unknown>;
+  chunk_changes?: AmendmentProposalChunkChange[];
   match_confidence: number | null;
   match_rationale: string | null;
   date_rationale: string | null;
   status: "pending" | "approving" | "approval_failed" | "approved" | "rejected";
   applied_new_chunk_id: string | null;
+  applied_new_chunk_ids?: string[];
   approval_indexing_job_id?: string | null;
   approval_error?: string | null;
   decided_by: string | null;
@@ -45,6 +47,17 @@ export interface AmendmentProposal {
   created_at: string;
   updated_at: string;
   duplicate_target: boolean;
+}
+
+export interface AmendmentProposalChunkChange {
+  old_chunk_id: string | null;
+  old_chunk_snapshot: Record<string, unknown>;
+  new_chunk_draft: Record<string, unknown>;
+  instruction_indices: number[];
+  instruction_texts: string[];
+  match_confidence: number | null;
+  match_rationale: string | null;
+  date_rationale: string | null;
 }
 
 export interface AmendmentAnalysisLogEntry {
@@ -829,14 +842,18 @@ export async function listAmendmentProposals(
 
 export async function approveProposal(
   proposalId: number,
-  newChunkDraft: Record<string, unknown>
+  newChunkDraft: Record<string, unknown>,
+  chunkChanges?: AmendmentProposalChunkChange[]
 ): Promise<AmendmentProposal> {
   const response = await fetch(
     `/api/regulatory/amendments/proposals/${proposalId}/approve`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ new_chunk_draft: newChunkDraft }),
+      body: JSON.stringify({
+        new_chunk_draft: newChunkDraft,
+        chunk_changes: chunkChanges,
+      }),
     }
   );
   if (!response.ok) {

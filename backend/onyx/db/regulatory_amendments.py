@@ -240,6 +240,9 @@ def persist_proposal_checkpoint(
             old_chunk_id=proposal.old_chunk_id,
             old_chunk_snapshot=proposal.old_chunk_snapshot,
             new_chunk_draft=proposal.new_chunk_draft,
+            chunk_changes=[
+                change.model_dump(mode="json") for change in proposal.chunk_changes
+            ],
             match_confidence=proposal.match_confidence,
             match_rationale=proposal.match_rationale,
             date_rationale=proposal.date_rationale,
@@ -592,6 +595,7 @@ def queue_amendment_proposal_approval(
     *,
     decided_by: UUID | None,
     reviewed_new_chunk_draft: dict[str, Any] | None = None,
+    reviewed_chunk_changes: list[dict[str, Any]] | None = None,
 ) -> AmendmentProposal:
     """Validate and durably claim a proposal before dispatching its projection."""
 
@@ -600,20 +604,42 @@ def queue_amendment_proposal_approval(
         raise ValueError(
             f"Amendment proposal {proposal.id} is already {proposal.status}."
         )
-    effective_draft = reviewed_new_chunk_draft or proposal.new_chunk_draft
-    reviewed_draft = _validated_reviewed_chunk_draft(
-        proposal.new_chunk_draft,
-        effective_draft,
-        old_chunk_snapshot=getattr(proposal, "old_chunk_snapshot", None) or {},
-    )
-    validate_explicit_replacement_texts(
-        _proposal_instruction_texts(proposal),
-        reviewed_draft["text"],
-    )
+    stored_changes = _stored_proposal_chunk_changes(proposal)
+    submitted_changes = reviewed_chunk_changes
+    if submitted_changes is not None and len(submitted_changes) != len(stored_changes):
+        raise ValueError("Reviewed change count differs from the analyzed proposal")
+    reviewed_changes: list[dict[str, Any]] = []
+    for index, stored_change in enumerate(stored_changes):
+        submitted = submitted_changes[index] if submitted_changes is not None else None
+        if submitted is not None and submitted.get("old_chunk_id") != stored_change.get(
+            "old_chunk_id"
+        ):
+            raise ValueError("Reviewed chunk target cannot be changed")
+        effective_draft = (
+            submitted.get("new_chunk_draft")
+            if submitted is not None
+            else reviewed_new_chunk_draft
+            if index == 0 and reviewed_new_chunk_draft is not None
+            else stored_change["new_chunk_draft"]
+        )
+        if not isinstance(effective_draft, dict):
+            raise ValueError("Reviewed chunk draft is missing")
+        reviewed_draft = _validated_reviewed_chunk_draft(
+            stored_change["new_chunk_draft"],
+            effective_draft,
+            old_chunk_snapshot=stored_change.get("old_chunk_snapshot") or {},
+        )
+        validate_explicit_replacement_texts(
+            list(stored_change.get("instruction_texts") or []),
+            reviewed_draft["text"],
+        )
+        reviewed_changes.append({**stored_change, "new_chunk_draft": reviewed_draft})
+    reviewed_draft = reviewed_changes[0]["new_chunk_draft"]
     from onyx.db.amendment_pdf_evidence import validate_pdf_proposal_authority
 
     validate_pdf_proposal_authority(db_session, proposal, reviewed_draft)
     proposal.new_chunk_draft = reviewed_draft
+    proposal.chunk_changes = reviewed_changes if len(reviewed_changes) > 1 else []
     proposal.status = AmendmentProposalStatus.APPROVING.value
     proposal.decided_by = decided_by
     proposal.decided_at = None
@@ -847,10 +873,14 @@ class ApprovalResult:
         proposal: AmendmentProposal,
         new_chunk: RegulatoryChunk,
         old_chunk: RegulatoryChunk | None,
+        new_chunks: list[RegulatoryChunk] | None = None,
+        old_chunks: list[RegulatoryChunk | None] | None = None,
     ) -> None:
         self.proposal = proposal
         self.new_chunk = new_chunk
         self.old_chunk = old_chunk
+        self.new_chunks = new_chunks or [new_chunk]
+        self.old_chunks = old_chunks or [old_chunk]
 
 
 def _validated_reviewed_chunk_draft(
@@ -942,6 +972,29 @@ def _proposal_instruction_texts(proposal: AmendmentProposal) -> list[str]:
     )
 
 
+def _stored_proposal_chunk_changes(
+    proposal: AmendmentProposal,
+) -> list[dict[str, Any]]:
+    stored = list(getattr(proposal, "chunk_changes", None) or [])
+    if stored:
+        return [dict(change) for change in stored]
+    return [
+        {
+            "old_chunk_id": proposal.old_chunk_id,
+            "old_chunk_snapshot": dict(proposal.old_chunk_snapshot),
+            "new_chunk_draft": dict(proposal.new_chunk_draft),
+            "instruction_indices": list(
+                getattr(proposal, "instruction_indices", None)
+                or [proposal.instruction_index]
+            ),
+            "instruction_texts": _proposal_instruction_texts(proposal),
+            "match_confidence": proposal.match_confidence,
+            "match_rationale": proposal.match_rationale,
+            "date_rationale": proposal.date_rationale,
+        }
+    ]
+
+
 def _review_snapshot_value(chunk: RegulatoryChunk, key: str) -> Any:
     """Return the live value for one field persisted in a review snapshot."""
     if key == "user_file_id":
@@ -984,6 +1037,163 @@ def _ensure_old_chunk_matches_review_snapshot(
                 f"Old chunk {chunk.id} changed after analysis; "
                 "refresh or reanalyze before approval."
             )
+
+
+def _approve_multi_chunk_proposal(
+    db_session: Session,
+    proposal: AmendmentProposal,
+    *,
+    publication_owner: FileOwnership | None,
+) -> ApprovalResult:
+    """Apply every reviewed before/after pair in one database transaction."""
+
+    from onyx.db.regulatory_publication import PublicationStore
+
+    if publication_owner is None:
+        raise ValueError("Multi-chunk approval requires publication ownership")
+    changes = _stored_proposal_chunk_changes(proposal)
+    target_ids = [
+        str(change["old_chunk_id"])
+        for change in changes
+        if change.get("old_chunk_id") is not None
+    ]
+    if len(target_ids) != len(changes) or len(set(target_ids)) != len(target_ids):
+        raise ValueError("Multi-chunk proposal targets must be unique existing chunks")
+    locked = list(
+        db_session.scalars(
+            select(RegulatoryChunk)
+            .where(RegulatoryChunk.id.in_(sorted(target_ids)))
+            .order_by(RegulatoryChunk.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    by_id = {chunk.id: chunk for chunk in locked}
+    if set(by_id) != set(target_ids):
+        raise ValueError("One or more reviewed chunks no longer exist")
+
+    from onyx.db.regulatory_annexes import copy_annex_chunk_links
+    from onyx.regulatory.chunk_evidence import RegulatoryChunkEvidence
+
+    new_chunks: list[RegulatoryChunk] = []
+    old_chunks: list[RegulatoryChunk | None] = []
+    today = datetime.date.today()
+    for index, change in enumerate(changes):
+        old_chunk = by_id[str(change["old_chunk_id"])]
+        snapshot = dict(change.get("old_chunk_snapshot") or {})
+        if snapshot.get("id") != old_chunk.id:
+            raise ValueError("Reviewed multi-chunk target identity changed")
+        if old_chunk.status != RegulatoryChunkStatus.ACTIVE.value:
+            raise ValueError(
+                f"Old chunk {old_chunk.id} is already {old_chunk.status}; cannot approve."
+            )
+        if is_hierarchical_aggregate_chunk(old_chunk):
+            raise ValueError("Derived aggregate chunks cannot be amended directly.")
+        _ensure_old_chunk_matches_review_snapshot(old_chunk, snapshot)
+        if has_active_structural_descendants(db_session, old_chunk):
+            raise ValueError(
+                "A multi-chunk target gained active descendants; reanalyze before approval."
+            )
+        draft = _validated_reviewed_chunk_draft(
+            change["new_chunk_draft"],
+            change["new_chunk_draft"],
+            old_chunk_snapshot=snapshot,
+        )
+        validate_explicit_replacement_texts(
+            list(change.get("instruction_texts") or []), draft["text"]
+        )
+        user_file_id = UUID(draft["user_file_id"])
+        if user_file_id != publication_owner.user_file_id:
+            raise ValueError("Atomic multi-chunk change escaped its source file")
+        start_date = (
+            datetime.date.fromisoformat(draft["effective_start_date"])
+            if draft.get("effective_start_date")
+            else today
+        )
+        end_date = (
+            datetime.date.fromisoformat(draft["effective_end_date"])
+            if draft.get("effective_end_date")
+            else None
+        )
+        if end_date is not None and end_date <= start_date:
+            raise ValueError("effective_end_date must be after effective_start_date")
+        if (
+            old_chunk.validity_start_date is not None
+            and old_chunk.validity_start_date >= start_date
+        ):
+            raise ValueError(
+                "Replacement date must follow the existing chunk start date"
+            )
+
+        metadata = dict(draft.get("metadata") or {})
+        for key in RegulatoryChunkEvidence.model_fields:
+            metadata.pop(key, None)
+            if key in old_chunk.chunk_metadata:
+                metadata[key] = old_chunk.chunk_metadata[key]
+        metadata.setdefault("chunk_variant", ATOMIC_CHUNK_VARIANT)
+        metadata.setdefault("source_chunk_orders", [])
+        metadata.setdefault("source_regulatory_chunk_ids", [])
+        new_chunk_id = make_regulatory_chunk_id(
+            user_file_id,
+            draft["position"],
+            draft["text"],
+            version_key=f"amendment:{proposal.id}:{index}",
+        )
+        projection_ordinal = PublicationStore(
+            publication_owner.scope
+        ).allocate_in_session(
+            db_session, publication_owner, "canonical:" + new_chunk_id
+        )
+        new_chunk = RegulatoryChunk(
+            id=new_chunk_id,
+            user_file_id=user_file_id,
+            text=draft["text"],
+            position=draft["position"],
+            chunk_type=draft.get("chunk_type"),
+            heading_path=draft.get("heading_path") or [],
+            chunk_metadata=metadata,
+            status=RegulatoryChunkStatus.ACTIVE.value,
+            source=RegulatoryChunkSource.AMENDMENT.value,
+            projection_ordinal=projection_ordinal,
+            validity_start_date=start_date,
+            validity_end_date=end_date,
+            supersedes_chunk_id=old_chunk.id,
+        )
+        db_session.add(new_chunk)
+        db_session.flush()
+        copy_annex_chunk_links(
+            db_session, old_chunk_id=old_chunk.id, new_chunk_id=new_chunk.id
+        )
+        supersede_hierarchical_aggregates_referencing_chunk(
+            db_session,
+            user_file_id=user_file_id,
+            source_chunk_id=old_chunk.id,
+            superseded_at=start_date,
+        )
+        old_chunk.status = RegulatoryChunkStatus.SUPERSEDED.value
+        old_chunk.validity_end_date = start_date
+        old_chunk.superseded_by_chunk_id = new_chunk.id
+        db_session.add(old_chunk)
+        change["new_chunk_draft"] = draft
+        new_chunks.append(new_chunk)
+        old_chunks.append(old_chunk)
+
+    proposal.chunk_changes = changes
+    proposal.new_chunk_draft = dict(changes[0]["new_chunk_draft"])
+    proposal.status = AmendmentProposalStatus.APPROVING.value
+    proposal.applied_new_chunk_id = new_chunks[0].id
+    proposal.applied_new_chunk_ids = [chunk.id for chunk in new_chunks]
+    proposal.approval_error = None
+    proposal.decided_at = None
+    db_session.add(proposal)
+    db_session.flush()
+    return ApprovalResult(
+        proposal=proposal,
+        new_chunk=new_chunks[0],
+        old_chunk=old_chunks[0],
+        new_chunks=new_chunks,
+        old_chunks=old_chunks,
+    )
 
 
 def approve_amendment_proposal(
@@ -1031,6 +1241,32 @@ def approve_amendment_proposal(
         raise ValueError(
             f"Amendment proposal {proposal.id} is not queued for approval "
             f"(status: {proposal.status})."
+        )
+
+    if len(getattr(proposal, "chunk_changes", None) or []) > 1:
+        applied_ids = list(getattr(proposal, "applied_new_chunk_ids", None) or [])
+        if applied_ids:
+            existing = [
+                db_session.get(RegulatoryChunk, chunk_id) for chunk_id in applied_ids
+            ]
+            if any(chunk is None for chunk in existing):
+                raise ValueError("An applied multi-chunk result no longer exists")
+            new_chunks = [chunk for chunk in existing if chunk is not None]
+            old_chunks = [
+                db_session.get(RegulatoryChunk, chunk.supersedes_chunk_id)
+                if chunk.supersedes_chunk_id
+                else None
+                for chunk in new_chunks
+            ]
+            return ApprovalResult(
+                proposal=proposal,
+                new_chunk=new_chunks[0],
+                old_chunk=old_chunks[0],
+                new_chunks=new_chunks,
+                old_chunks=old_chunks,
+            )
+        return _approve_multi_chunk_proposal(
+            db_session, proposal, publication_owner=publication_owner
         )
 
     applied_new_chunk_id = getattr(proposal, "applied_new_chunk_id", None)

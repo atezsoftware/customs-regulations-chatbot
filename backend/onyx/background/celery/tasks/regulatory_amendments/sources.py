@@ -3,7 +3,10 @@ from uuid import UUID
 from celery import shared_task
 
 from onyx.configs.constants import OnyxCeleryPriority
-from onyx.db.amendment_sources import source_packages_for_redelivery
+from onyx.db.amendment_sources import (
+    mark_source_package_failed,
+    source_packages_for_redelivery,
+)
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.regulatory.amendments.annexes import config
 from onyx.regulatory.amendments.annexes.job import run_source_package
@@ -72,11 +75,33 @@ def recover_amendment_sources(
 def acquire_amendment_sources(
     *, package_id: str, tenant_id: str, environment: str, database_identity: str
 ) -> None:
-    _validate_scope(
-        tenant_id=tenant_id,
-        environment=environment,
-        database_identity=database_identity,
-    )
-    if not config.REGULATORY_ANNEX_UPDATES_ENABLED:
-        raise ValueError("Annex updates are disabled")
-    run_source_package(package_id=UUID(package_id), environment=environment)
+    identifier = UUID(package_id)
+    try:
+        _validate_scope(
+            tenant_id=tenant_id,
+            environment=environment,
+            database_identity=database_identity,
+        )
+        if not config.REGULATORY_ANNEX_UPDATES_ENABLED:
+            raise ValueError("Annex updates are disabled")
+        run_source_package(package_id=identifier, environment=environment)
+    except Exception as error:
+        # Validation happens before the worker can claim a lease. Without a
+        # terminal transition the UI polls `processing` forever and recovery
+        # redelivers the same permanently invalid task.
+        from shared_configs.contextvars import get_current_tenant_id
+
+        if (
+            tenant_id
+            and tenant_id == get_current_tenant_id()
+            and (MULTI_TENANT or tenant_id == POSTGRES_DEFAULT_SCHEMA)
+        ):
+            with get_session_with_current_tenant() as session:
+                mark_source_package_failed(
+                    session,
+                    package_id=identifier,
+                    environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+                    failure=error,
+                )
+        logger.exception("Source package %s failed before completion", package_id)
+        raise

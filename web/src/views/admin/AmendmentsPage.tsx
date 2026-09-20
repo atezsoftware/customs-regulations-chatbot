@@ -12,6 +12,8 @@ import {
 } from "@opal/components";
 import { SettingsLayouts, toast } from "@opal/layouts";
 import SvgHistory from "@opal/icons/history";
+import SvgChevronLeft from "@opal/icons/chevron-left";
+import SvgChevronRight from "@opal/icons/chevron-right";
 import { useDocumentSets } from "@/lib/hooks/useDocumentSets";
 import {
   type AmendmentSourcePackage,
@@ -20,6 +22,7 @@ import {
   type AmendmentAnalysisLogEntry,
   type AmendmentBatch,
   type AmendmentProposal,
+  type AmendmentProposalChunkChange,
   RegulatoryRequestError,
   analyzeAmendment,
   approveProposal,
@@ -410,22 +413,65 @@ function ProposalCard({
   reviewEnabled: boolean;
 }) {
   const [deciding, setDeciding] = useState(false);
-  const [draft, setDraft] = useState<Record<string, unknown>>(() =>
-    cloneDraft(proposal.new_chunk_draft)
+  const proposalChanges = useMemo<AmendmentProposalChunkChange[]>(
+    () => {
+      const storedChanges = proposal.chunk_changes ?? [];
+      return storedChanges.length > 1
+        ? storedChanges
+        : [
+            {
+              old_chunk_id: proposal.old_chunk_id,
+              old_chunk_snapshot: proposal.old_chunk_snapshot,
+              new_chunk_draft: proposal.new_chunk_draft,
+              instruction_indices: proposal.instruction_indices,
+              instruction_texts: proposal.instruction_texts,
+              match_confidence: proposal.match_confidence,
+              match_rationale: proposal.match_rationale,
+              date_rationale: proposal.date_rationale,
+            },
+          ];
+    },
+    [proposal]
   );
-  const validationError = useMemo(() => draftValidationError(draft), [draft]);
+  const [activeChangeIndex, setActiveChangeIndex] = useState(0);
+  const [drafts, setDrafts] = useState<Record<string, unknown>[]>(() =>
+    proposalChanges.map((change) => cloneDraft(change.new_chunk_draft))
+  );
+  const draft = drafts[activeChangeIndex] ?? {};
+  const activeChange = proposalChanges[activeChangeIndex] ?? proposalChanges[0];
+  const validationError = useMemo(
+    () => {
+      const invalid = drafts
+        .map((item, index) => ({ index, error: draftValidationError(item) }))
+        .find((item) => item.error !== null);
+      return invalid
+        ? `Chunk ${invalid.index + 1}: ${invalid.error}`
+        : null;
+    },
+    [drafts]
+  );
 
   useEffect(() => {
     if (proposal.status !== "pending") {
-      setDraft(cloneDraft(proposal.new_chunk_draft));
+      setDrafts(
+        proposalChanges.map((change) => cloneDraft(change.new_chunk_draft))
+      );
+      setActiveChangeIndex(0);
     }
-  }, [proposal.status, proposal.updated_at, proposal.new_chunk_draft]);
+  }, [proposal.status, proposal.updated_at, proposalChanges]);
 
   const handleApprove = useCallback(async () => {
     if (validationError !== null) return;
     setDeciding(true);
     try {
-      const queuedProposal = await approveProposal(proposal.id, draft);
+      const reviewedChanges = proposalChanges.map((change, index) => ({
+        ...change,
+        new_chunk_draft: drafts[index],
+      }));
+      const queuedProposal =
+        proposalChanges.length > 1
+          ? await approveProposal(proposal.id, drafts[0], reviewedChanges)
+          : await approveProposal(proposal.id, drafts[0]);
       onUpdated(queuedProposal);
       toast.info("Approval queued. Indexing will continue in the background.");
     } catch (e) {
@@ -433,7 +479,7 @@ function ProposalCard({
     } finally {
       setDeciding(false);
     }
-  }, [proposal.id, draft, validationError, onUpdated]);
+  }, [proposal.id, drafts, proposalChanges, validationError, onUpdated]);
 
   const handleReject = useCallback(async () => {
     setDeciding(true);
@@ -461,13 +507,13 @@ function ProposalCard({
     }
   }, [proposal.id, onUpdated]);
 
-  const isNewChunk = Object.keys(proposal.old_chunk_snapshot).length === 0;
+  const isNewChunk = Object.keys(activeChange.old_chunk_snapshot).length === 0;
   const isConsolidated = proposal.instruction_texts.length > 1;
   const effectiveStart = draft.effective_start_date;
   const currentChunk = isNewChunk
     ? null
-    : { ...emptyCurrentChunkSnapshot, ...proposal.old_chunk_snapshot };
-  const descendantSnapshots = proposal.old_chunk_snapshot.descendant_snapshots;
+    : { ...emptyCurrentChunkSnapshot, ...activeChange.old_chunk_snapshot };
+  const descendantSnapshots = activeChange.old_chunk_snapshot.descendant_snapshots;
   if (currentChunk && Array.isArray(descendantSnapshots)) {
     currentChunk.text = [
       currentChunk.text,
@@ -488,7 +534,7 @@ function ProposalCard({
     validity_end_date: draft.effective_end_date,
     status: "active",
     source: "amendment",
-    supersedes_chunk_id: proposal.old_chunk_id,
+    supersedes_chunk_id: activeChange.old_chunk_id,
     superseded_by_chunk_id: null,
     created_at: "Generated on approval",
     updated_at: "Generated on approval",
@@ -496,7 +542,11 @@ function ProposalCard({
   const readOnly = proposal.status !== "pending";
 
   const updateDraftField = (key: string, value: unknown) => {
-    setDraft((current) => ({ ...current, [key]: value }));
+    setDrafts((current) =>
+      current.map((item, index) =>
+        index === activeChangeIndex ? { ...item, [key]: value } : item
+      )
+    );
   };
 
   const renderAfterValue = (key: string, value: unknown) => {
@@ -670,6 +720,41 @@ function ProposalCard({
         </div>
       </div>
 
+      {proposalChanges.length > 1 && (
+        <div
+          className="flex items-center gap-2"
+          role="navigation"
+          aria-label="Changed chunks"
+        >
+          <Button
+            icon={SvgChevronLeft}
+            prominence="tertiary"
+            size="sm"
+            aria-label="Previous changed chunk"
+            onClick={() =>
+              setActiveChangeIndex((current) => Math.max(0, current - 1))
+            }
+            disabled={activeChangeIndex === 0}
+          />
+          <Text font="secondary-action" color="text-03">
+            {`Chunk ${activeChangeIndex + 1} / ${proposalChanges.length}`}
+          </Text>
+          <Button
+            icon={SvgChevronRight}
+            prominence="tertiary"
+            size="sm"
+            aria-label="Next changed chunk"
+            onClick={() =>
+              setActiveChangeIndex((current) =>
+                Math.min(proposalChanges.length - 1, current + 1)
+              )
+            }
+            disabled={activeChangeIndex === proposalChanges.length - 1}
+          />
+          <Tag title="Approved together" />
+        </div>
+      )}
+
       {proposal.match_rationale && (
         <Text font="secondary-body" color="text-03">
           {`Match: ${proposal.match_rationale}${
@@ -773,7 +858,9 @@ function ProposalCard({
             onClick={() => void handleApprove()}
             disabled={deciding || !reviewEnabled || validationError !== null}
           >
-            Approve
+            {proposalChanges.length > 1
+              ? `Approve all ${proposalChanges.length} chunks`
+              : "Approve"}
           </Button>
         </div>
       )}

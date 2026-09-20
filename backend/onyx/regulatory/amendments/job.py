@@ -29,6 +29,7 @@ from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
 from onyx.regulatory.amendments.pipeline import (
     confirm_instruction_match,
     draft_instruction_group_proposal,
+    draft_multi_chunk_group_proposal,
     load_instruction_draft_context,
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
@@ -42,6 +43,8 @@ from onyx.regulatory.amendments.segmenter import (
 )
 from onyx.regulatory.amendments.structural_target import (
     appendix_replacement_attention_message,
+    normalize_appendix_label,
+    parse_amendment_structural_target,
 )
 from onyx.regulatory.structured_llm import StructuredOutputValidationError
 from onyx.utils.logger import setup_logger
@@ -428,8 +431,17 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
     groups: dict[tuple[str, str | int], list[_MatchedInstruction]] = {}
     for matched_instruction in matched_instructions:
         old_chunk_id = matched_instruction.match.old_chunk_id
+        structural_target = parse_amendment_structural_target(
+            matched_instruction.instruction
+        )
         group_key: tuple[str, str | int] = (
-            ("existing", old_chunk_id)
+            (
+                "appendix",
+                normalize_appendix_label(structural_target.appendix_label),
+            )
+            if structural_target is not None
+            and structural_target.appendix_label is not None
+            else ("existing", old_chunk_id)
             if old_chunk_id is not None
             else ("new", matched_instruction.instruction_index)
         )
@@ -446,19 +458,87 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         for item in ordered_group:
             group_candidates = _merge_candidates(group_candidates, item.candidates)
 
+        appendix_target = parse_amendment_structural_target(
+            ordered_group[0].instruction
+        )
+        appendix_candidate_ids = (
+            [
+                candidate.chunk_id
+                for candidate in group_candidates
+                if isinstance(candidate.metadata.get("appendix_label"), str)
+                and appendix_target is not None
+                and appendix_target.appendix_label is not None
+                and normalize_appendix_label(str(candidate.metadata["appendix_label"]))
+                == normalize_appendix_label(appendix_target.appendix_label)
+            ]
+            if appendix_target is not None
+            and appendix_target.appendix_label is not None
+            else []
+        )
+        appendix_candidate_ids = list(dict.fromkeys(appendix_candidate_ids))
+        contexts = []
         with _session() as db_session:
-            context = load_instruction_draft_context(
+            representative = next(
+                (
+                    item.match
+                    for item in ordered_group
+                    if item.match.old_chunk_id is not None
+                ),
+                ordered_group[0].match,
+            )
+            representative_context = load_instruction_draft_context(
                 db_session,
                 candidates=group_candidates,
-                match=ordered_group[0].match,
+                match=representative,
             )
+            if (
+                representative_context is not None
+                and appendix_target is not None
+                and appendix_target.appendix_label is not None
+                and representative.old_chunk_id is not None
+            ):
+                from onyx.db.regulatory_annexes import load_legacy_annex_chunks
+
+                appendix_rows = load_legacy_annex_chunks(
+                    db_session,
+                    document_set_id=document_set_id,
+                    user_file_id=representative_context.target_user_file_id,
+                    annex_label=appendix_target.appendix_label,
+                    as_of_date=(
+                        date.fromisoformat(reference_date)
+                        if reference_date
+                        else date.today()
+                    ),
+                )
+                # Image companions are evidence for their bound canonical chunk,
+                # not independent legal units to supersede.
+                appendix_candidate_ids = [
+                    row.id
+                    for row in appendix_rows
+                    if not row.chunk_metadata.get("bound_to_regulatory_chunk_id")
+                ]
+            if len(appendix_candidate_ids) > 1:
+                for candidate_id in appendix_candidate_ids:
+                    context = load_instruction_draft_context(
+                        db_session,
+                        candidates=group_candidates,
+                        match=MatchResult(
+                            old_chunk_id=candidate_id,
+                            confidence=representative.confidence,
+                            rationale=("Canonical member of the same appendix scope"),
+                        ),
+                    )
+                    if context is not None:
+                        contexts.append(context)
+            elif representative_context is not None:
+                contexts.append(representative_context)
         log(
             "draft_group_started",
             indices=instruction_indices,
             candidates=len(group_candidates),
             old_chunk_id=ordered_group[0].match.old_chunk_id,
         )
-        if context is None:
+        if not contexts:
             log("draft_group_context_missing", indices=instruction_indices)
             for item in ordered_group:
                 with _session() as db_session:
@@ -474,21 +554,33 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             continue
 
         try:
-            proposal = draft_instruction_group_proposal(
-                llm,
-                instruction_indices=instruction_indices,
-                instructions=[item.instruction for item in ordered_group],
-                matches=[item.match for item in ordered_group],
-                reference_date=reference_date,
-                context=context,
-                pdf_source=pdf_source,
-                amendment_context=amendment_context,
-            )
+            if len(contexts) > 1:
+                proposal = draft_multi_chunk_group_proposal(
+                    llm,
+                    instruction_indices=instruction_indices,
+                    instructions=[item.instruction for item in ordered_group],
+                    matches=[item.match for item in ordered_group],
+                    contexts=contexts,
+                    reference_date=reference_date,
+                    amendment_context=amendment_context,
+                )
+            else:
+                proposal = draft_instruction_group_proposal(
+                    llm,
+                    instruction_indices=instruction_indices,
+                    instructions=[item.instruction for item in ordered_group],
+                    matches=[item.match for item in ordered_group],
+                    reference_date=reference_date,
+                    context=contexts[0],
+                    pdf_source=pdf_source,
+                    amendment_context=amendment_context,
+                )
         except (StructuredOutputValidationError, TimeoutError) as error:
             log(
                 "draft_group_failed",
                 indices=instruction_indices,
                 error=type(error).__name__,
+                detail=str(error)[:300],
             )
             # Leave these indices unfinished so Retry resumes them, while other
             # independent groups can still produce durable review proposals.

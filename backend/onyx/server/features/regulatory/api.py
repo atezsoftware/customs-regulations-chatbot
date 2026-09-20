@@ -768,6 +768,12 @@ def approve_proposal(
         )
 
     try:
+        reviewed_changes = approval_request.chunk_changes if approval_request else None
+        review_kwargs = (
+            {"reviewed_chunk_changes": reviewed_changes}
+            if reviewed_changes is not None
+            else {}
+        )
         proposal = queue_amendment_proposal_approval(
             db_session,
             proposal,
@@ -775,6 +781,7 @@ def approve_proposal(
             reviewed_new_chunk_draft=(
                 approval_request.new_chunk_draft if approval_request else None
             ),
+            **review_kwargs,
         )
     except ValueError as e:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e)) from e

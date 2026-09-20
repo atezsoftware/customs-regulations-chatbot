@@ -2,6 +2,7 @@
 
 import importlib.util
 from datetime import timedelta
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -155,3 +156,37 @@ def test_source_worker_refuses_foreign_single_tenant_before_loading(
             environment=config.REGULATORY_ANNEX_ENVIRONMENT,
             database_identity=config.ANNEX_DATABASE_IDENTITY,
         )
+
+
+def test_source_worker_marks_preflight_failure_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from uuid import uuid4
+
+    from onyx.background.celery.tasks.regulatory_amendments import sources
+    from onyx.regulatory.amendments.annexes import config
+
+    package_id = uuid4()
+    session = MagicMock()
+    session_factory = MagicMock()
+    session_factory.return_value.__enter__.return_value = session
+    mark_failed = MagicMock()
+    monkeypatch.setattr(sources, "get_current_tenant_id", lambda: "public")
+    monkeypatch.setattr(sources, "get_session_with_current_tenant", session_factory)
+    monkeypatch.setattr(sources, "mark_source_package_failed", mark_failed)
+    monkeypatch.setattr(config, "REGULATORY_ANNEX_UPDATES_ENABLED", False)
+
+    with pytest.raises(ValueError, match="disabled"):
+        sources.acquire_amendment_sources.run(
+            package_id=str(package_id),
+            tenant_id="public",
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            database_identity=config.ANNEX_DATABASE_IDENTITY,
+        )
+
+    mark_failed.assert_called_once()
+    assert mark_failed.call_args.kwargs["package_id"] == package_id
+    assert (
+        mark_failed.call_args.kwargs["environment"]
+        == config.REGULATORY_ANNEX_ENVIRONMENT
+    )

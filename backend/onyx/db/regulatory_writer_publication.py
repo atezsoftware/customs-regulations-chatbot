@@ -963,7 +963,7 @@ def finish_owned_deletion(
 
 def amendment_writer_target(
     proposal_id: int, tenant_id: str
-) -> tuple[UUID, str] | None:
+) -> tuple[UUID, list[str]] | None:
     from onyx.db.models import AmendmentProposal
     from onyx.db.regulatory_chunks import make_regulatory_chunk_id
 
@@ -971,14 +971,36 @@ def amendment_writer_target(
         proposal = session.get(AmendmentProposal, proposal_id)
         if proposal is None or proposal.status != "approving":
             return None
+        changes = list(getattr(proposal, "chunk_changes", None) or [])
+        if len(changes) > 1:
+            file_ids = {
+                UUID(change["new_chunk_draft"]["user_file_id"]) for change in changes
+            }
+            if len(file_ids) != 1:
+                raise ValueError("Atomic amendment spans multiple source files")
+            file_id = next(iter(file_ids))
+            applied = list(getattr(proposal, "applied_new_chunk_ids", None) or [])
+            canonical_ids = applied or [
+                make_regulatory_chunk_id(
+                    file_id,
+                    change["new_chunk_draft"]["position"],
+                    change["new_chunk_draft"]["text"],
+                    version_key=f"amendment:{proposal.id}:{index}",
+                )
+                for index, change in enumerate(changes)
+            ]
+            return file_id, canonical_ids
         draft = proposal.new_chunk_draft
         file_id = UUID(draft["user_file_id"])
-        return file_id, proposal.applied_new_chunk_id or make_regulatory_chunk_id(
-            file_id,
-            draft["position"],
-            draft["text"],
-            version_key=f"amendment:{proposal.id}",
-        )
+        return file_id, [
+            proposal.applied_new_chunk_id
+            or make_regulatory_chunk_id(
+                file_id,
+                draft["position"],
+                draft["text"],
+                version_key=f"amendment:{proposal.id}",
+            )
+        ]
 
 
 def _amendment_review_digest(proposal: "AmendmentProposal") -> str:
@@ -986,6 +1008,7 @@ def _amendment_review_digest(proposal: "AmendmentProposal") -> str:
         {
             "id": proposal.id,
             "new_chunk_draft": proposal.new_chunk_draft,
+            "chunk_changes": list(getattr(proposal, "chunk_changes", None) or []),
             "old_chunk_id": proposal.old_chunk_id,
             "old_chunk_snapshot": proposal.old_chunk_snapshot,
             "instruction_text": proposal.instruction_text,
@@ -1008,7 +1031,7 @@ def preview_owned_amendment(
             raise ValueError("amendment proposal disappeared")
         reviewed = _amendment_review_digest(proposal)
         result = approve_amendment_proposal(session, proposal, publication_owner=owner)
-        if result.new_chunk.user_file_id != owner.user_file_id:
+        if any(chunk.user_file_id != owner.user_file_id for chunk in result.new_chunks):
             raise ValueError("amendment escaped publication file scope")
         after = capture_canonical_scope(session, owner.user_file_id)
         session.rollback()

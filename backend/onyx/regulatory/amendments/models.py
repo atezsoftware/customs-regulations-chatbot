@@ -206,6 +206,41 @@ class DraftResult(BaseModel):
     dates: DateResolution
 
 
+class MultiChunkFieldsDraft(BaseModel):
+    """One changed member of a structurally connected canonical scope."""
+
+    old_chunk_id: str
+    instruction_indexes: list[int] = Field(min_length=1)
+    new_chunk: ChunkFieldsDraft
+
+
+class MultiChunkDraftResult(BaseModel):
+    """All canonical replacements required by one atomic instruction group."""
+
+    changes: list[MultiChunkFieldsDraft] = Field(min_length=1)
+    dates: DateResolution
+
+    @model_validator(mode="after")
+    def _require_unique_targets(self) -> "MultiChunkDraftResult":
+        targets = [change.old_chunk_id for change in self.changes]
+        if len(targets) != len(set(targets)):
+            raise ValueError("Multi-chunk draft contains duplicate target chunks")
+        return self
+
+
+class ProposalChunkChange(BaseModel):
+    """One editable before/after pair inside an atomic proposal."""
+
+    old_chunk_id: str | None
+    old_chunk_snapshot: dict[str, Any]
+    new_chunk_draft: dict[str, Any]
+    instruction_indices: list[int]
+    instruction_texts: list[str]
+    match_confidence: float | None = None
+    match_rationale: str | None = None
+    date_rationale: str | None = None
+
+
 class ProposalDraft(BaseModel):
     """One fully-assembled amendment proposal, ready to persist for review."""
 
@@ -216,6 +251,7 @@ class ProposalDraft(BaseModel):
     old_chunk_id: str | None
     old_chunk_snapshot: dict[str, Any]
     new_chunk_draft: dict[str, Any]
+    chunk_changes: list[ProposalChunkChange] = Field(default_factory=list)
     match_confidence: float | None = None
     match_rationale: str | None = None
     date_rationale: str | None = None

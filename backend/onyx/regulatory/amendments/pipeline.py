@@ -31,13 +31,18 @@ from onyx.regulatory.amendments.draft_integrity import (
     reject_unsupported_descendant_replacement,
     validate_explicit_replacements,
 )
-from onyx.regulatory.amendments.drafter import draft_combined_chunk, draft_new_chunk
+from onyx.regulatory.amendments.drafter import (
+    draft_combined_chunk,
+    draft_multi_chunk_scope,
+    draft_new_chunk,
+)
 from onyx.regulatory.amendments.matcher import confirm_match
 from onyx.regulatory.amendments.models import (
     AmendmentInstruction,
     AnalysisResult,
     DraftResult,
     MatchResult,
+    ProposalChunkChange,
     ProposalDraft,
 )
 from onyx.regulatory.amendments.new_provision_policy import (
@@ -412,6 +417,104 @@ def draft_instruction_group_proposal(
             PDF_EVIDENCE_KEY: receipt.model_dump(mode="json"),
         }
     return proposal
+
+
+def draft_multi_chunk_group_proposal(
+    llm: LLM,
+    *,
+    instruction_indices: list[int],
+    instructions: list[AmendmentInstruction],
+    matches: list[MatchResult],
+    contexts: list[InstructionDraftContext],
+    reference_date: str | None,
+    amendment_context: AmendmentContext | None = None,
+) -> ProposalDraft:
+    """Create one atomically reviewed proposal spanning multiple old chunks."""
+
+    if len(instruction_indices) != len(instructions) or len(matches) != len(
+        instructions
+    ):
+        raise ValueError("Multi-chunk group has inconsistent instruction coverage")
+    context_by_id = {
+        context.match.old_chunk_id: context
+        for context in contexts
+        if context.match.old_chunk_id is not None
+    }
+    if len(context_by_id) < 2:
+        raise ValueError("Multi-chunk group requires at least two existing chunks")
+    file_ids = {context.target_user_file_id for context in context_by_id.values()}
+    if len(file_ids) != 1:
+        raise ValueError("Atomic multi-chunk changes must stay within one source file")
+
+    result = draft_multi_chunk_scope(
+        llm,
+        instructions=instructions,
+        old_chunks=[context.old_chunk_snapshot for context in contexts],
+        reference_date=reference_date,
+        amendment_context=amendment_context,
+    )
+    changed_ids = [change.old_chunk_id for change in result.changes]
+    if any(chunk_id not in context_by_id for chunk_id in changed_ids):
+        raise ValueError("Multi-chunk draft escaped its frozen candidate scope")
+
+    covered_instruction_indexes: set[int] = set()
+    changes: list[ProposalChunkChange] = []
+    built_proposals: list[ProposalDraft] = []
+    for change in result.changes:
+        local_indexes = sorted(set(change.instruction_indexes))
+        if any(index < 0 or index >= len(instructions) for index in local_indexes):
+            raise ValueError("Multi-chunk draft returned an invalid instruction index")
+        covered_instruction_indexes.update(local_indexes)
+        local_instructions = [instructions[index] for index in local_indexes]
+        local_global_indices = [instruction_indices[index] for index in local_indexes]
+        context = context_by_id[change.old_chunk_id]
+        local_matches = [
+            MatchResult(
+                old_chunk_id=change.old_chunk_id,
+                confidence=matches[index].confidence,
+                rationale=matches[index].rationale,
+            )
+            for index in local_indexes
+        ]
+        built = _build_proposal_draft(
+            instruction_indices=local_global_indices,
+            instructions=local_instructions,
+            matches=local_matches,
+            context=context,
+            draft=DraftResult(new_chunk=change.new_chunk, dates=result.dates),
+        )
+        built_proposals.append(built)
+        changes.append(
+            ProposalChunkChange(
+                old_chunk_id=built.old_chunk_id,
+                old_chunk_snapshot=built.old_chunk_snapshot,
+                new_chunk_draft=built.new_chunk_draft,
+                instruction_indices=built.instruction_indices,
+                instruction_texts=built.instruction_texts,
+                match_confidence=built.match_confidence,
+                match_rationale=built.match_rationale,
+                date_rationale=built.date_rationale,
+            )
+        )
+    if covered_instruction_indexes != set(range(len(instructions))):
+        raise ValueError("Multi-chunk draft did not apply every instruction")
+
+    primary = built_proposals[0]
+    return ProposalDraft(
+        instruction_index=instruction_indices[0],
+        instruction_text=instructions[0].instruction_text,
+        instruction_indices=instruction_indices,
+        instruction_texts=[
+            instruction.instruction_text for instruction in instructions
+        ],
+        old_chunk_id=primary.old_chunk_id,
+        old_chunk_snapshot=primary.old_chunk_snapshot,
+        new_chunk_draft=primary.new_chunk_draft,
+        chunk_changes=changes,
+        match_confidence=min(match.confidence for match in matches),
+        match_rationale="Atomic multi-chunk structural amendment",
+        date_rationale=result.dates.rationale,
+    )
 
 
 def analyze_instruction(

@@ -111,6 +111,7 @@ class AnalyzeAmendmentRequest(BaseModel):
 
 class ApproveAmendmentProposalRequest(BaseModel):
     new_chunk_draft: dict[str, Any]
+    chunk_changes: list[dict[str, Any]] | None = None
 
 
 class AmendmentSourceUrlRequest(BaseModel):
@@ -133,11 +134,13 @@ class AmendmentProposalSnapshot(BaseModel):
     old_chunk_id: str | None
     old_chunk_snapshot: dict[str, Any]
     new_chunk_draft: dict[str, Any]
+    chunk_changes: list[dict[str, Any]]
     match_confidence: float | None
     match_rationale: str | None
     date_rationale: str | None
     status: str
     applied_new_chunk_id: str | None
+    applied_new_chunk_ids: list[str]
     approval_indexing_job_id: str | None
     approval_error: str | None
     decided_by: str | None
@@ -167,11 +170,18 @@ class AmendmentProposalSnapshot(BaseModel):
             old_chunk_id=proposal.old_chunk_id,
             old_chunk_snapshot=dict(proposal.old_chunk_snapshot),
             new_chunk_draft=dict(proposal.new_chunk_draft),
+            chunk_changes=[
+                dict(change)
+                for change in (getattr(proposal, "chunk_changes", None) or [])
+            ],
             match_confidence=proposal.match_confidence,
             match_rationale=proposal.match_rationale,
             date_rationale=proposal.date_rationale,
             status=proposal.status,
             applied_new_chunk_id=proposal.applied_new_chunk_id,
+            applied_new_chunk_ids=list(
+                getattr(proposal, "applied_new_chunk_ids", None) or []
+            ),
             approval_indexing_job_id=(
                 str(proposal.approval_indexing_job_id)
                 if getattr(proposal, "approval_indexing_job_id", None)

@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import io
 import time
 from contextlib import closing
 from typing import Literal
@@ -55,7 +56,7 @@ class PdfVisionDocument(BaseModel):
 # budget or silently drops a page, and either one fails the whole document with
 # no partial progress. Transcribing a few pages per request keeps every request
 # inside its budget and confines a retry to the pages that actually failed.
-_PAGE_GROUP_SIZE = 4
+_PAGE_GROUP_SIZE = 3
 _MAX_GROUP_ATTEMPTS = 3
 # Below this an attempt cannot finish a page group at all, so a nearly spent
 # group budget is better used on one last real attempt than on three futile ones.
@@ -96,6 +97,27 @@ def _pdf_page_sizes(content: bytes) -> list[tuple[float, float]]:
             with closing(document[index]) as page:
                 sizes.append(page.get_size())
         return sizes
+
+
+def _slice_pdf_pages(content: bytes, first_page: int, last_page: int) -> bytes:
+    """Return a real PDF containing one requested contiguous physical range."""
+
+    from onyx.regulatory.amendments.annexes.source_parser import (
+        apply_source_process_limits,
+    )
+
+    apply_source_process_limits()
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(io.BytesIO(content), strict=True)
+    if first_page < 1 or last_page > len(reader.pages) or first_page > last_page:
+        raise ValueError("pdf_page_range_invalid")
+    writer = PdfWriter()
+    for page_index in range(first_page - 1, last_page):
+        writer.add_page(reader.pages[page_index])
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
 
 
 _SYSTEM_INSTRUCTION = (
@@ -202,12 +224,23 @@ def extract_pdf_document(
     for start_page in range(1, len(sizes) + 1, _PAGE_GROUP_SIZE):
         last_page = min(start_page + _PAGE_GROUP_SIZE - 1, len(sizes))
         group_size = last_page - start_page + 1
+        group_content = (
+            content
+            if len(sizes) <= _PAGE_GROUP_SIZE
+            else run_in_isolated_process(
+                _slice_pdf_pages,
+                content,
+                start_page,
+                last_page,
+                timeout=min(30, max(1, deadline - time.monotonic())),
+            )
+        )
         group_deadline = min(
             deadline, time.monotonic() + min(600, 45 + 20 * group_size)
         )
         pages.extend(
             _transcribe_page_group(
-                content,
+                group_content,
                 llm=llm,
                 first_page=start_page,
                 last_page=last_page,

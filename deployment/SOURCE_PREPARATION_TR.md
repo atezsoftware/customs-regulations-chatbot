@@ -10,7 +10,7 @@ URL, doğrudan dosya yükleme ve yapıştırılan metin aynı paket hazırlama a
 
 Bu bir azami çalışma süresidir; işlem erken biterse bekletilmez. 12 sayfa için üst sınır 22 dakika, 50 sayfa için 79 dakikadır. Daha önce doğrulanıp kaydedilmiş PDF çıktıları tekrar modele gönderilmez.
 
-Sayfa sayısı, kaynak dosyasından izole parser ile elde edilir. PDF görüntüleri dörder sayfalık gruplar halinde hazırlanır; mevcut grup bellek ve boyut sınırları korunur. Sayfalar sırayla okunur, orijinal sayfa numaraları ve görsel kanıt kontrolleri korunur. Kaynak PDF çağrıları nonstreaming çalışır; her çağrı ve toplam hazırlık için süre kontrolleri uygulanır. Diğer LLM akışlarının varsayılan davranışı değişmez.
+Sayfa sayısı, kaynak dosyasından izole parser ile elde edilir. En çok üç sayfalık PDF tek çağrıda işlenir; daha uzun PDF'ler gerçek, ardışık ve en çok üç sayfalık alt PDF'lere bölünerek gruplar halinde modele gönderilir. Sayfalar sırayla okunur, orijinal sayfa numaraları ve görsel kanıt kontrolleri korunur. Kaynak PDF çağrıları nonstreaming çalışır; her çağrı ve toplam hazırlık için süre kontrolleri uygulanır. Diğer LLM akışlarının varsayılan davranışı değişmez.
 
 Normal tablo hücreleri satır düzeninde aktarılır. Birleşik veya uzun form hücrelerinde satır ilişkisi belirsizse, hücreler görsel konumlarına göre ayrı ayrı aktarılır. Gerçek iki boyutlu hücre çakışması doğrulama hatasıdır ve mevcut model düzeltme denemesini tetikler; yalnız yatay aralığın aynı olması çakışma sayılmaz.
 

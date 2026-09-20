@@ -900,7 +900,7 @@ def approve_owned_amendment(
     target = amendment_writer_target(proposal_id, tenant_id)
     if target is None:
         return 0
-    file_id, canonical_id = target
+    file_id, canonical_ids = target
     authority = PublicationStore(
         PublicationScope(
             tenant_id=tenant_id,
@@ -920,7 +920,8 @@ def approve_owned_amendment(
             current_search_settings_id
         ]:
             raise ValueError("current amendment search settings changed")
-        authority.allocate(owner, "canonical:" + canonical_id)
+        for canonical_id in canonical_ids:
+            authority.allocate(owner, "canonical:" + canonical_id)
         after, reviewed = preview_owned_amendment(owner, proposal_id)
         with publication_heartbeat(owner) as lost:
             with ElasticsearchClient() as transport:

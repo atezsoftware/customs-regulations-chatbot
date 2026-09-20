@@ -246,15 +246,10 @@ def appendix_replacement_attention_message(
     if _has_inline_appendix_replacement_body(
         instruction.instruction_text, target.appendix_label
     ):
-        if len(matching_candidates) == 1:
-            return None
-        return (
-            f"{instruction.instruction_text}\n\n"
-            f"Target found: {target.appendix_label} "
-            f"({len(matching_candidates)} {chunk_word}). This appendix spans "
-            "multiple canonical chunks, so an atomic multi-chunk replacement is "
-            "required; no partial proposal was generated."
-        )
+        # The number of physical search chunks says nothing about the legal
+        # scope of a row/cell edit. Multi-chunk drafting resolves and reviews
+        # the complete scope atomically downstream.
+        return None
     return (
         f"{instruction.instruction_text}\n\n"
         f"Target found: {target.appendix_label} "

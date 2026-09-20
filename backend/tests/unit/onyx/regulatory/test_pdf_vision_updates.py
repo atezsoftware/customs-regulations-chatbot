@@ -510,11 +510,10 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
         lambda **_kwargs: AcquisitionResult(status="ready", assets=[original]),
     )
 
-    monkeypatch.setattr(
-        pdf_document,
-        "run_in_isolated_process",
-        lambda *_args, **_kwargs: [(200, 300)] * 12,
-    )
+    def isolated(fn: object, *_args: object, **_kwargs: object) -> object:
+        return [(200, 300)] * 12 if fn is pdf_document._pdf_page_sizes else content
+
+    monkeypatch.setattr(pdf_document, "run_in_isolated_process", isolated)
     model = MagicMock()
     model.config.model_provider = "fixture"
     model.config.model_name = "vision"
@@ -588,7 +587,7 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
     assert prepared.page_count == 12
     assert {element.locator.page for element in prepared.elements} == set(range(1, 13))
     assert frozen.text.count("Bugday | 17%") == 12
-    assert model.invoke.call_count == 3
+    assert model.invoke.call_count == 4
     assert all(
         call.kwargs["use_streaming"] is False for call in model.invoke.call_args_list
     )
@@ -1014,22 +1013,25 @@ def test_one_incomplete_page_group_is_retried_without_losing_the_others(
 
     from onyx.regulatory.amendments.annexes import pdf_document
 
-    monkeypatch.setattr(
-        pdf_document,
-        "run_in_isolated_process",
-        lambda *_args, **_kwargs: [(200, 300)] * 6,
-    )
+    def isolated(fn: object, *_args: object, **_kwargs: object) -> object:
+        return (
+            [(200, 300)] * 6
+            if fn is pdf_document._pdf_page_sizes
+            else b"three page group"
+        )
+
+    monkeypatch.setattr(pdf_document, "run_in_isolated_process", isolated)
     requested: list[tuple[int, int]] = []
 
     def generate(*_args: object, **kwargs: object) -> pdf_document.PdfVisionDocument:
         prompt = cast(str, kwargs["user_prompt"])
-        first, last = (1, 4) if "pages 1 through 4" in prompt else (5, 6)
+        first, last = (1, 3) if "pages 1 through 3" in prompt else (4, 6)
         requested.append((first, last))
         # The first attempt at the opening group silently drops its last page.
         pages = range(
             first,
             last
-            if (first, last) == (1, 4) and requested.count((1, 4)) == 1
+            if (first, last) == (1, 3) and requested.count((1, 3)) == 1
             else last + 1,
         )
         return pdf_document.PdfVisionDocument(
@@ -1053,4 +1055,4 @@ def test_one_incomplete_page_group_is_retried_without_losing_the_others(
     assert extraction.page_count == 6
     assert {element.locator.page for element in extraction.elements} == set(range(1, 7))
     # Two groups, with exactly one extra attempt spent on the group that failed.
-    assert requested == [(1, 4), (1, 4), (5, 6)]
+    assert requested == [(1, 3), (1, 3), (4, 6)]

@@ -13,7 +13,9 @@ from onyx.regulatory.amendments.new_provision_policy import (
     added_subordinate_unit_kind,
     explicitly_adds_top_level_provision,
 )
+from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.structural_target import (
+    appendix_replacement_attention_message,
     canonical_structural_query_anchor,
     parse_amendment_structural_target,
 )
@@ -115,6 +117,44 @@ def test_query_anchor_uses_the_forward_designator_retrieval_indexes() -> None:
     assert anchor is not None
     assert anchor.startswith("madde 11")
     assert "madde 10" not in anchor
+
+
+def test_surgical_appendix_change_is_not_rejected_for_physical_chunk_count() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text=(
+            "MADDE 18- Aynı Tebliğin Ek-2’sinde yer alan listenin 3 üncü "
+            "sırasının MADDE ADI sütununda yer alan “Gantri vinçler” ibaresi "
+            "“Portal ve yarı portal gantri vinçler” şeklinde değiştirilmiştir."
+        )
+    )
+    candidates = [
+        CandidateChunk(
+            chunk_id=f"chunk-{index}",
+            user_file_id="00000000-0000-0000-0000-000000000001",
+            text=f"EK-2 bölüm {index}",
+            metadata={"appendix_label": "EK-2"},
+        )
+        for index in (1, 2)
+    ]
+
+    assert appendix_replacement_attention_message(instruction, candidates) is None
+
+
+def test_missing_full_appendix_body_still_blocks_partial_replacement() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 18- Aynı Tebliğin Ek-2’si ekteki şekilde değiştirilmiştir."
+    )
+    candidate = CandidateChunk(
+        chunk_id="chunk-1",
+        user_file_id="00000000-0000-0000-0000-000000000001",
+        text="EK-2",
+        metadata={"appendix_label": "EK-2"},
+    )
+
+    message = appendix_replacement_attention_message(instruction, [candidate])
+
+    assert message is not None
+    assert "No replacement appendix content" in message
 
 
 @pytest.mark.parametrize(

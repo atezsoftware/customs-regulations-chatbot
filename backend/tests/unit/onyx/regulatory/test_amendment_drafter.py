@@ -14,6 +14,8 @@ from onyx.regulatory.amendments.models import (
     DateResolution,
     DraftResult,
     MatchResult,
+    MultiChunkDraftResult,
+    MultiChunkFieldsDraft,
 )
 
 
@@ -108,6 +110,86 @@ def test_combined_draft_prompt_contains_each_instruction_and_returns_one_proposa
     assert proposal.match_confidence == 0.73
     assert "amount row" in (proposal.match_rationale or "")
     assert "period row" in (proposal.match_rationale or "")
+
+
+def test_multi_chunk_scope_becomes_one_atomic_editable_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instructions = [
+        AmendmentInstruction(instruction_text="EK-2 sıra 3 adı değiştirilmiştir."),
+        AmendmentInstruction(instruction_text="EK-2 sıra 8 GTİP değiştirilmiştir."),
+    ]
+    matches = [
+        MatchResult(old_chunk_id="first", confidence=0.9, rationale="row 3"),
+        MatchResult(old_chunk_id="second", confidence=0.8, rationale="row 8"),
+    ]
+
+    def context(chunk_id: str, position: int) -> pipeline.InstructionDraftContext:
+        snapshot = {
+            "id": chunk_id,
+            "user_file_id": "00000000-0000-0000-0000-000000000123",
+            "position": position,
+            "text": f"old {chunk_id}",
+            "chunk_type": "table",
+            "heading_path": ["EK-2"],
+            "metadata": {"appendix_label": "EK-2"},
+        }
+        return pipeline.InstructionDraftContext(
+            match=MatchResult(
+                old_chunk_id=chunk_id, confidence=0.9, rationale="appendix scope"
+            ),
+            old_chunk_snapshot=snapshot,
+            target_user_file_id=UUID("00000000-0000-0000-0000-000000000123"),
+            target_position=position,
+            sibling_reference=None,
+            base_metadata={"appendix_label": "EK-2"},
+            base_heading_path=["EK-2"],
+        )
+
+    generated = MultiChunkDraftResult(
+        changes=[
+            MultiChunkFieldsDraft(
+                old_chunk_id="first",
+                instruction_indexes=[0],
+                new_chunk=ChunkFieldsDraft(text="new first", chunk_type="table"),
+            ),
+            MultiChunkFieldsDraft(
+                old_chunk_id="second",
+                instruction_indexes=[1],
+                new_chunk=ChunkFieldsDraft(text="new second", chunk_type="table"),
+            ),
+        ],
+        dates=DateResolution(
+            effective_start_date="2026-09-20", rationale="publication"
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline, "draft_multi_chunk_scope", MagicMock(return_value=generated)
+    )
+
+    proposal = pipeline.draft_multi_chunk_group_proposal(
+        MagicMock(),
+        instruction_indices=[17, 18],
+        instructions=instructions,
+        matches=matches,
+        contexts=[context("first", 1), context("second", 2)],
+        reference_date="2026-09-20",
+    )
+
+    assert proposal.instruction_indices == [17, 18]
+    assert [change.old_chunk_id for change in proposal.chunk_changes] == [
+        "first",
+        "second",
+    ]
+    assert [change.new_chunk_draft["text"] for change in proposal.chunk_changes] == [
+        "new first",
+        "new second",
+    ]
+    assert proposal.instruction_index == 17
+    assert proposal.instruction_texts == [
+        instruction.instruction_text for instruction in instructions
+    ]
+    assert proposal.match_confidence == 0.8
 
 
 def _article_20_context(
