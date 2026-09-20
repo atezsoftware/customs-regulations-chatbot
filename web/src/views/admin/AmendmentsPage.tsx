@@ -466,12 +466,16 @@ function ProposalCard({
     try {
       const reviewedChanges = proposalChanges.map((change, index) => ({
         ...change,
-        new_chunk_draft: drafts[index],
+        new_chunk_draft: drafts[index] ?? change.new_chunk_draft,
       }));
+      const primaryDraft = drafts[0];
+      if (primaryDraft === undefined) {
+        throw new Error("Proposal has no editable chunk draft.");
+      }
       const queuedProposal =
         proposalChanges.length > 1
-          ? await approveProposal(proposal.id, drafts[0], reviewedChanges)
-          : await approveProposal(proposal.id, drafts[0]);
+          ? await approveProposal(proposal.id, primaryDraft, reviewedChanges)
+          : await approveProposal(proposal.id, primaryDraft);
       onUpdated(queuedProposal);
       toast.info("Approval queued. Indexing will continue in the background.");
     } catch (e) {
