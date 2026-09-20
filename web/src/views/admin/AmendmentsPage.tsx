@@ -413,32 +413,32 @@ function ProposalCard({
   reviewEnabled: boolean;
 }) {
   const [deciding, setDeciding] = useState(false);
+  const fallbackChange = useMemo<AmendmentProposalChunkChange>(
+    () => ({
+      old_chunk_id: proposal.old_chunk_id,
+      old_chunk_snapshot: proposal.old_chunk_snapshot,
+      new_chunk_draft: proposal.new_chunk_draft,
+      instruction_indices: proposal.instruction_indices,
+      instruction_texts: proposal.instruction_texts,
+      match_confidence: proposal.match_confidence,
+      match_rationale: proposal.match_rationale,
+      date_rationale: proposal.date_rationale,
+    }),
+    [proposal]
+  );
   const proposalChanges = useMemo<AmendmentProposalChunkChange[]>(
     () => {
       const storedChanges = proposal.chunk_changes ?? [];
-      return storedChanges.length > 1
-        ? storedChanges
-        : [
-            {
-              old_chunk_id: proposal.old_chunk_id,
-              old_chunk_snapshot: proposal.old_chunk_snapshot,
-              new_chunk_draft: proposal.new_chunk_draft,
-              instruction_indices: proposal.instruction_indices,
-              instruction_texts: proposal.instruction_texts,
-              match_confidence: proposal.match_confidence,
-              match_rationale: proposal.match_rationale,
-              date_rationale: proposal.date_rationale,
-            },
-          ];
+      return storedChanges.length > 1 ? storedChanges : [fallbackChange];
     },
-    [proposal]
+    [fallbackChange, proposal.chunk_changes]
   );
   const [activeChangeIndex, setActiveChangeIndex] = useState(0);
   const [drafts, setDrafts] = useState<Record<string, unknown>[]>(() =>
     proposalChanges.map((change) => cloneDraft(change.new_chunk_draft))
   );
   const draft = drafts[activeChangeIndex] ?? {};
-  const activeChange = proposalChanges[activeChangeIndex] ?? proposalChanges[0];
+  const activeChange = proposalChanges[activeChangeIndex] ?? fallbackChange;
   const validationError = useMemo(
     () => {
       const invalid = drafts
