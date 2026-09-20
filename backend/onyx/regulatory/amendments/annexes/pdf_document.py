@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import io
+import math
 import time
 from contextlib import closing
 from typing import Literal
@@ -60,7 +61,18 @@ _PAGE_GROUP_SIZE = 3
 _MAX_GROUP_ATTEMPTS = 3
 # Below this an attempt cannot finish a page group at all, so a nearly spent
 # group budget is better used on one last real attempt than on three futile ones.
-_MIN_ATTEMPT_SECONDS = 45
+_MIN_ATTEMPT_SECONDS = 90
+_MAX_STRUCTURE_ELEMENTS = 20_000
+_MAX_STRUCTURE_TEXT_CHARS = 2_000_000
+
+
+def _require_document_budget(pages: list[PdfVisionPage]) -> None:
+    elements = [element for page in pages for element in page.elements]
+    if (
+        len(elements) > _MAX_STRUCTURE_ELEMENTS
+        or sum(len(element.text) for element in elements) > _MAX_STRUCTURE_TEXT_CHARS
+    ):
+        raise ValueError("annex_structure_limit")
 
 
 def _is_transient_provider_failure(error: BaseException) -> bool:
@@ -223,7 +235,6 @@ def extract_pdf_document(
     pages: list[PdfVisionPage] = []
     for start_page in range(1, len(sizes) + 1, _PAGE_GROUP_SIZE):
         last_page = min(start_page + _PAGE_GROUP_SIZE - 1, len(sizes))
-        group_size = last_page - start_page + 1
         group_content = (
             content
             if len(sizes) <= _PAGE_GROUP_SIZE
@@ -235,9 +246,16 @@ def extract_pdf_document(
                 timeout=min(30, max(1, deadline - time.monotonic())),
             )
         )
-        group_deadline = min(
-            deadline, time.monotonic() + min(600, 45 + 20 * group_size)
-        )
+        # Share the package's remaining wall-time across the remaining groups.
+        # The old 45+20s/page cap gave a three-page native PDF only 105 seconds
+        # in total, split into ~45-second provider calls. DEV repeatedly proved
+        # that the provider needs longer before returning its first byte.
+        groups_left = math.ceil((len(sizes) - start_page + 1) / _PAGE_GROUP_SIZE)
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining <= 0:
+            raise TimeoutError("pdf_vision_preparation_deadline")
+        group_deadline = min(deadline, now + remaining / groups_left)
         pages.extend(
             _transcribe_page_group(
                 group_content,
@@ -247,6 +265,7 @@ def extract_pdf_document(
                 deadline=group_deadline,
             )
         )
+        _require_document_budget(pages)
     response = PdfVisionDocument(pages=pages)
     if len(response.pages) != len(sizes):
         raise ValueError("pdf_page_coverage_mismatch")

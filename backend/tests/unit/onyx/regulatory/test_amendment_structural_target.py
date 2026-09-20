@@ -17,6 +17,7 @@ from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.structural_target import (
     appendix_replacement_attention_message,
     canonical_structural_query_anchor,
+    deterministic_structural_candidate,
     parse_amendment_structural_target,
 )
 
@@ -104,6 +105,46 @@ def test_annex_instruction_resolves_to_its_appendix() -> None:
     assert target is not None
     assert target.appendix_label == "EK-2"
     assert canonical_structural_query_anchor(target) == "EK-2"
+
+
+def test_exact_paragraph_repeal_does_not_depend_on_llm_confirmation() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text=_REPEAL_PARAGRAPH,
+        target_source=(
+            "Karayolu Dışında Kullanılan Hareketli Makinaların İthalat Denetimi "
+            "Tebliği (Ürün Güvenliği ve Denetimi: 2026/2)"
+        ),
+    )
+    exact = CandidateChunk(
+        chunk_id="article-11-paragraph-3",
+        user_file_id="00000000-0000-0000-0000-000000000001",
+        text="(3) Mevcut metin.",
+        source_name=(
+            "2026-02_ugd_karayolu_disinda_kullanilan_hareketli_makinalarin_"
+            "ithalat_denetimi_tebligi.md"
+        ),
+        metadata={"article_no": "11", "paragraph_no": "3"},
+        structured_match=True,
+    )
+
+    assert deterministic_structural_candidate(instruction, [exact]) == exact
+
+
+def test_annex_row_addition_anchors_to_existing_canonical_scope() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text=_ADD_ANNEX_ROW,
+        target_source="Karayolu Dışında Kullanılan Hareketli Makinalar Tebliği",
+    )
+    exact = CandidateChunk(
+        chunk_id="ek-2-part-1",
+        user_file_id="00000000-0000-0000-0000-000000000001",
+        text="EK-2 mevcut liste",
+        source_name="karayolu_disinda_kullanilan_hareketli_makinalar_tebligi.md",
+        metadata={"appendix_label": "EK-2"},
+        structured_match=True,
+    )
+
+    assert deterministic_structural_candidate(instruction, [exact]) == exact
 
 
 def test_query_anchor_uses_the_forward_designator_retrieval_indexes() -> None:

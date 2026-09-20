@@ -99,6 +99,7 @@ export interface AmendmentSourceIssue {
   code: string;
   locator?: string | null;
   retryable?: boolean;
+  failure_detail?: string | null;
 }
 
 export interface AmendmentSourceAsset {

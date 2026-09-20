@@ -426,30 +426,22 @@ function ProposalCard({
     }),
     [proposal]
   );
-  const proposalChanges = useMemo<AmendmentProposalChunkChange[]>(
-    () => {
-      const storedChanges = proposal.chunk_changes ?? [];
-      return storedChanges.length > 1 ? storedChanges : [fallbackChange];
-    },
-    [fallbackChange, proposal.chunk_changes]
-  );
+  const proposalChanges = useMemo<AmendmentProposalChunkChange[]>(() => {
+    const storedChanges = proposal.chunk_changes ?? [];
+    return storedChanges.length > 1 ? storedChanges : [fallbackChange];
+  }, [fallbackChange, proposal.chunk_changes]);
   const [activeChangeIndex, setActiveChangeIndex] = useState(0);
   const [drafts, setDrafts] = useState<Record<string, unknown>[]>(() =>
     proposalChanges.map((change) => cloneDraft(change.new_chunk_draft))
   );
   const draft = drafts[activeChangeIndex] ?? {};
   const activeChange = proposalChanges[activeChangeIndex] ?? fallbackChange;
-  const validationError = useMemo(
-    () => {
-      const invalid = drafts
-        .map((item, index) => ({ index, error: draftValidationError(item) }))
-        .find((item) => item.error !== null);
-      return invalid
-        ? `Chunk ${invalid.index + 1}: ${invalid.error}`
-        : null;
-    },
-    [drafts]
-  );
+  const validationError = useMemo(() => {
+    const invalid = drafts
+      .map((item, index) => ({ index, error: draftValidationError(item) }))
+      .find((item) => item.error !== null);
+    return invalid ? `Chunk ${invalid.index + 1}: ${invalid.error}` : null;
+  }, [drafts]);
 
   useEffect(() => {
     if (proposal.status !== "pending") {
@@ -517,7 +509,8 @@ function ProposalCard({
   const currentChunk = isNewChunk
     ? null
     : { ...emptyCurrentChunkSnapshot, ...activeChange.old_chunk_snapshot };
-  const descendantSnapshots = activeChange.old_chunk_snapshot.descendant_snapshots;
+  const descendantSnapshots =
+    activeChange.old_chunk_snapshot.descendant_snapshots;
   if (currentChunk && Array.isArray(descendantSnapshots)) {
     currentChunk.text = [
       currentChunk.text,
@@ -910,7 +903,9 @@ export default function AmendmentsPage() {
   const [proposals, setProposals] = useState<AmendmentProposal[]>([]);
   const [annexReviews, setAnnexReviews] = useState<AnnexReview[]>([]);
   const [unmatched, setUnmatched] = useState<string[]>([]);
-  const [analysisLog, setAnalysisLog] = useState<AmendmentAnalysisLogEntry[]>([]);
+  const [analysisLog, setAnalysisLog] = useState<AmendmentAnalysisLogEntry[]>(
+    []
+  );
 
   const annexEnabled =
     annexCapabilities?.enabled === true &&
@@ -1669,14 +1664,23 @@ export default function AmendmentsPage() {
                       </Text>
                     )}
                     {sourcePackage.issues.map((issue) => (
-                      <Text
+                      <div
                         key={`${issue.code}-${issue.locator ?? ""}`}
-                        as="p"
-                        font="secondary-body"
-                        color="status-error-05"
+                        className="flex flex-col gap-1"
                       >
-                        {`${sourceIssueMessage(issue.code)}${issue.locator ? ` · ${issue.locator}` : ""}`}
-                      </Text>
+                        <Text
+                          as="p"
+                          font="secondary-body"
+                          color="status-error-05"
+                        >
+                          {`${sourceIssueMessage(issue.code)}${issue.locator ? ` · ${issue.locator}` : ""}`}
+                        </Text>
+                        {issue.failure_detail && (
+                          <Text as="p" font="secondary-body" color="text-03">
+                            {issue.failure_detail}
+                          </Text>
+                        )}
+                      </div>
                     ))}
                     {sourcePackagePollError && (
                       <Text as="p" font="main-ui-body" color="status-error-05">
@@ -1826,7 +1830,10 @@ export default function AmendmentsPage() {
                           const { at, step, ...fields } = entry;
                           const detail = Object.entries(fields)
                             .filter(([, value]) => value !== null)
-                            .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+                            .map(
+                              ([key, value]) =>
+                                `${key}=${JSON.stringify(value)}`
+                            )
                             .join(" ");
                           return (
                             <div

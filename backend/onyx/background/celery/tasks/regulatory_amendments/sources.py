@@ -76,12 +76,14 @@ def acquire_amendment_sources(
     *, package_id: str, tenant_id: str, environment: str, database_identity: str
 ) -> None:
     identifier = UUID(package_id)
+    scope_validated = False
     try:
         _validate_scope(
             tenant_id=tenant_id,
             environment=environment,
             database_identity=database_identity,
         )
+        scope_validated = True
         if not config.REGULATORY_ANNEX_UPDATES_ENABLED:
             raise ValueError("Annex updates are disabled")
         run_source_package(package_id=identifier, environment=environment)
@@ -92,7 +94,8 @@ def acquire_amendment_sources(
         from shared_configs.contextvars import get_current_tenant_id
 
         if (
-            tenant_id
+            scope_validated
+            and tenant_id
             and tenant_id == get_current_tenant_id()
             and (MULTI_TENANT or tenant_id == POSTGRES_DEFAULT_SCHEMA)
         ):

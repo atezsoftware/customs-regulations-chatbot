@@ -149,7 +149,7 @@ def test_pdf_source_sends_original_pdf_once_and_preserves_table(
     assert base64.b64decode(file_data.split(",", 1)[1]) == content
     assert call["max_attempts"] == call["provider_max_attempts"] == 1
     assert call["deadline"] <= deadline
-    assert call["timeout_override"] <= 68
+    assert 90 <= call["timeout_override"] <= 180
     assert generate.call_count == 1
 
 
@@ -468,7 +468,7 @@ def test_source_worker_freezes_vision_text_for_existing_readback(
     assert b"pdf_vision" in manifest
 
 
-@pytest.mark.parametrize("page_seconds", [30, 170])
+@pytest.mark.parametrize("page_seconds", [30, 350])
 def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
     monkeypatch: pytest.MonkeyPatch, page_seconds: int
 ) -> None:
@@ -569,7 +569,7 @@ def test_source_worker_prepares_twelve_visual_pages_with_a_total_deadline(
     monkeypatch.setattr(
         job, "extend_source_package_lease", MagicMock(return_value=True), raising=False
     )
-    if page_seconds == 170:
+    if page_seconds == 350:
         with pytest.raises(TimeoutError, match="deadline"):
             job.run_source_package(package_id=uuid4(), environment="local-test")
         assert model.invoke.call_count == 1

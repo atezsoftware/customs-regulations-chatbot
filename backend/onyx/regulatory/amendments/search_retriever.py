@@ -213,15 +213,24 @@ class AmendmentSearchRetriever:
         # stays bounded: a prompt it cannot read inside its deadline loses every
         # match, not just the weak ones.
         candidates: list[CandidateChunk] = []
-        seen_candidate_ids: set[str] = set()
+        candidate_indexes: dict[str, int] = {}
         for candidate in [*ranked, *structural]:
-            if (
-                candidate.chunk_id in seen_candidate_ids
-                or candidate.user_file_id not in self._allowed_user_file_ids
-            ):
+            if candidate.user_file_id not in self._allowed_user_file_ids:
+                continue
+            existing_index = candidate_indexes.get(candidate.chunk_id)
+            if existing_index is not None:
+                existing = candidates[existing_index]
+                if candidate.structured_match and not existing.structured_match:
+                    candidates[existing_index] = replace(
+                        existing,
+                        structured_match=True,
+                        source_score=max(existing.source_score, candidate.source_score),
+                        source_name=candidate.source_name or existing.source_name,
+                        metadata={**existing.metadata, **candidate.metadata},
+                    )
                 continue
             candidates.append(candidate)
-            seen_candidate_ids.add(candidate.chunk_id)
+            candidate_indexes[candidate.chunk_id] = len(candidates) - 1
             if len(candidates) == _MAX_AMENDMENT_CANDIDATES:
                 break
 

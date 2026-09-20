@@ -5,13 +5,66 @@ Every LLM output here is schema-validated via
 parsing.
 """
 
+import re
 from datetime import date
 from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    WithJsonSchema,
+    field_validator,
+    model_validator,
+)
 
-IsoDateString = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")]
+
+def _normalize_iso_date(value: Any) -> Any:
+    """Canonicalize unambiguous date strings returned by structured models."""
+
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip()
+    if normalized.casefold() in {"", "null", "none"}:
+        return None
+    iso_prefix = re.fullmatch(
+        r"(?P<year>[0-9]{4})-(?P<month>[0-9]{1,2})-(?P<day>[0-9]{1,2})"
+        r"(?:[T ](?:[0-9]{2}):[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:Z|[+-][0-9]{2}:[0-9]{2})?)?",
+        normalized,
+    )
+    if iso_prefix is not None:
+        candidate = (
+            f"{iso_prefix.group('year')}-{int(iso_prefix.group('month')):02d}-"
+            f"{int(iso_prefix.group('day')):02d}"
+        )
+        try:
+            return date.fromisoformat(candidate).isoformat()
+        except ValueError:
+            return normalized
+    day_first = re.fullmatch(
+        r"(?P<day>[0-9]{1,2})[./](?P<month>[0-9]{1,2})[./](?P<year>[0-9]{4})",
+        normalized,
+    )
+    if day_first is not None:
+        try:
+            return date(
+                int(day_first.group("year")),
+                int(day_first.group("month")),
+                int(day_first.group("day")),
+            ).isoformat()
+        except ValueError:
+            return normalized
+    return normalized
+
+
+IsoDateString = Annotated[
+    str,
+    BeforeValidator(_normalize_iso_date, json_schema_input_type=str),
+    Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"),
+    WithJsonSchema({"type": "string", "pattern": r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}),
+]
 
 
 def _require_iso_date_or_none(value: str | None) -> str | None:

@@ -43,6 +43,7 @@ from onyx.regulatory.amendments.segmenter import (
 )
 from onyx.regulatory.amendments.structural_target import (
     appendix_replacement_attention_message,
+    deterministic_structural_candidate,
     normalize_appendix_label,
     parse_amendment_structural_target,
 )
@@ -141,6 +142,19 @@ def retrieve_and_confirm_instruction(
         trace.note = "This annex target needs its replacement body supplied."
         return candidates, None
     if candidates:
+        structural_candidate = deterministic_structural_candidate(
+            instruction, candidates
+        )
+        if structural_candidate is not None:
+            trace.confirmations += 1
+            return candidates, MatchResult(
+                old_chunk_id=structural_candidate.chunk_id,
+                confidence=1.0,
+                rationale=(
+                    "Exact canonical source and structural metadata match the "
+                    "named amendment target."
+                ),
+            )
         trace.confirmations += 1
         match = confirm_instruction_match(
             llm,

@@ -70,6 +70,10 @@ _SOURCE_GENERIC_TOKENS = frozenset(
         "seri",
         "tebligi",
         "teblig",
+        "urun",
+        "guvenligi",
+        "denetimi",
+        "ve",
         "yonetmeligi",
         "yonetmelik",
     }
@@ -95,11 +99,19 @@ def normalize_appendix_label(value: str) -> str:
 
 def _source_identity_tokens(value: str) -> set[str]:
     decoded = re.sub(r"_?x[12]", " ", value, flags=re.IGNORECASE)
-    folded = unicodedata.normalize("NFKD", decoded.casefold())
+    folded = unicodedata.normalize(
+        "NFKD",
+        decoded.casefold().translate(
+            str.maketrans({"ı": "i", "ş": "s", "ç": "c", "ğ": "g", "ö": "o", "ü": "u"})
+        ),
+    )
     ascii_value = "".join(
         character for character in folded if not unicodedata.combining(character)
     )
-    return set(re.findall(r"[a-z0-9]+", ascii_value))
+    return {
+        str(int(token)) if token.isdigit() else token
+        for token in re.findall(r"[a-z0-9]+", ascii_value)
+    }
 
 
 def source_identity_matches(target_source: str | None, source_name: str) -> bool:
@@ -207,6 +219,60 @@ def _candidate_matches_appendix(candidate: CandidateChunk, appendix_label: str) 
         normalize_appendix_label(candidate_label)
         == normalize_appendix_label(appendix_label)
     )
+
+
+def deterministic_structural_candidate(
+    instruction: AmendmentInstruction, candidates: list[CandidateChunk]
+) -> CandidateChunk | None:
+    """Resolve a uniquely named canonical target without asking the matcher.
+
+    Search wording is weak evidence for amendments because it usually describes
+    the new text. Exact source, article and subunit metadata is stronger. Annex
+    edits use any exact annex member only as a representative; drafting later
+    loads and replaces the complete canonical annex scope atomically.
+    """
+
+    target = parse_amendment_structural_target(instruction)
+    if target is None:
+        return None
+    exact = [
+        candidate
+        for candidate in candidates
+        if bool(getattr(candidate, "structured_match", False))
+        and source_identity_matches(
+            instruction.target_source, str(getattr(candidate, "source_name", ""))
+        )
+    ]
+    if target.appendix_label is not None:
+        appendix = [
+            candidate
+            for candidate in exact
+            if _candidate_matches_appendix(candidate, target.appendix_label)
+        ]
+        return appendix[0] if appendix else None
+
+    def matches_named_unit(candidate: CandidateChunk) -> bool:
+        metadata = candidate.metadata
+        if (
+            str(metadata.get("article_no") or "").casefold()
+            != str(target.article_no or "").casefold()
+        ):
+            return False
+        if (
+            target.paragraph_no is not None
+            and str(metadata.get("paragraph_no") or "") != target.paragraph_no
+        ):
+            return False
+        if (
+            target.clause_label is not None
+            and str(metadata.get("clause_label") or "").casefold()
+            != target.clause_label.casefold()
+        ):
+            return False
+        return True
+
+    named = [candidate for candidate in exact if matches_named_unit(candidate)]
+    return named[0] if len(named) == 1 else None
 
 
 def _has_inline_appendix_replacement_body(

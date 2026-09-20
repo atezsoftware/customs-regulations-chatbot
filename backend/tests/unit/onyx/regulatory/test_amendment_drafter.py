@@ -19,9 +19,7 @@ from onyx.regulatory.amendments.models import (
 )
 
 
-@pytest.mark.parametrize(
-    "value", ["null", "", "yayımı tarihinde", "04/07/2026", "2026-02-30"]
-)
+@pytest.mark.parametrize("value", ["yayımı tarihinde", "2026-02-30"])
 def test_date_schema_rejects_phrases_and_invalid_calendar_dates(value: str) -> None:
     from pydantic import ValidationError
 
@@ -34,6 +32,26 @@ def test_date_schema_rejects_phrases_and_invalid_calendar_dates(value: str) -> N
             effective_start_date="2026-07-04", rationale="publication"
         ).effective_end_date
         is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-9-20", "2026-09-20"),
+        ("2026-09-20T00:00:00Z", "2026-09-20"),
+        ("20.09.2026", "2026-09-20"),
+        ("20/09/2026", "2026-09-20"),
+    ],
+)
+def test_date_schema_normalizes_unambiguous_model_formats(
+    value: str, expected: str
+) -> None:
+    assert (
+        DateResolution(
+            effective_start_date=value, rationale="fixture"
+        ).effective_start_date
+        == expected
     )
 
 

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import cast
 from unittest.mock import MagicMock
 from uuid import UUID
@@ -330,6 +331,50 @@ def test_candidate_list_stays_bounded_for_the_confirming_model() -> None:
     assert len({candidate.chunk_id for candidate in candidates}) == len(candidates)
     # The named provision still reaches the model inside the bound.
     assert any(candidate.structured_match for candidate in candidates)
+
+
+def test_ranked_duplicate_keeps_exact_structural_identity() -> None:
+    hit = _search_doc(file_id=None, chunk_id="article-11-paragraph-3")
+    search_tool = MagicMock()
+    search_tool.run.return_value = ToolResponse(
+        rich_response=SearchDocsResponse(
+            search_docs=[hit], citation_mapping={}, displayed_docs=None
+        ),
+        llm_facing_response="",
+    )
+    ranked = CandidateChunk(
+        chunk_id="article-11-paragraph-3",
+        user_file_id=str(_FILE_ID),
+        text="(3) Mevcut metin.",
+        metadata={"article_no": "11", "paragraph_no": "3"},
+    )
+    structural = replace(
+        ranked,
+        source_name="Karayolu Dışında Kullanılan Hareketli Makinalar Tebliği",
+        structured_match=True,
+        source_score=1.0,
+    )
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=lambda: search_tool,
+        canonical_candidate_loader=lambda _chunk_ids: {ranked.chunk_id: ranked},
+        structural_candidate_loader=lambda _instruction: [structural],
+        allowed_user_file_ids=[_FILE_ID],
+    )
+
+    candidates = retriever.search(
+        AmendmentInstruction(
+            instruction_text=(
+                "MADDE 10- Aynı Tebliğin 11 inci maddesinin üçüncü fıkrası "
+                "yürürlükten kaldırılmıştır."
+            ),
+            target_source="Karayolu Dışında Kullanılan Hareketli Makinalar Tebliği",
+            search_query="Madde 11 üçüncü fıkra",
+        )
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].structured_match is True
+    assert candidates[0].source_score == 1.0
 
 
 def test_plain_instruction_query_is_tried_when_every_lane_is_empty() -> None:
