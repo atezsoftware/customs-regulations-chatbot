@@ -11,7 +11,6 @@ from onyx.db.regulatory_amendments import get_batch
 from onyx.db.regulatory_annex_changes import (
     capture_canonical_scope,
     capture_preparation_configuration,
-    legacy_text_annex_is_complete,
     load_review_evidence_scope,
     persist_annex_checkpoint,
     resolve_annex_instruction_file,
@@ -120,7 +119,23 @@ def group_annex_instructions(
             and instruction.target_source not in group.target_sources
         ):
             group.target_sources.append(instruction.target_source)
-    return list(groups.values())
+    result: list[AnnexInstructionGroup] = []
+    for group in groups.values():
+        bases = [
+            instructions[index].annex_change_basis
+            for index in group.instruction_indices
+        ]
+        needs_comparison = (
+            True
+            if "replacement_document" in bases
+            else False
+            if all(basis == "explicit_amendment" for basis in bases)
+            else None
+        )
+        result.append(
+            group.model_copy(update={"requires_document_comparison": needs_comparison})
+        )
+    return result
 
 
 def _verified_bytes(store: FileStore, original: AnnexOriginalEvidence) -> bytes:
@@ -470,7 +485,7 @@ def run_annex_groups(
     *,
     batch_id: int,
     lease_generation: int,
-    instructions: list[AmendmentInstruction],
+    groups: list[AnnexInstructionGroup],
     processed_indices: set[int],
     reference_date: str | None,
     llm: LLM,
@@ -479,7 +494,6 @@ def run_annex_groups(
 
     if not config.REGULATORY_ANNEX_UPDATES_ENABLED:
         return set()
-    groups = group_annex_instructions(instructions)
     if not groups:
         return set()
     with get_session_with_current_tenant() as scope_session:
@@ -507,15 +521,6 @@ def run_annex_groups(
             batch = get_batch(session, batch_id)
             if batch is None:
                 raise ValueError("batch missing")
-            if legacy_text_annex_is_complete(
-                session,
-                batch=batch,
-                group=group,
-                reference_date=date.fromisoformat(reference_date)
-                if reference_date
-                else date.today(),
-            ):
-                continue
             covered.update(indices)
             source_text = batch.raw_text
         resolved = resolve_group_effective_date(

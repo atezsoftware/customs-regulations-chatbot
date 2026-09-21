@@ -292,6 +292,30 @@ def _has_inline_appendix_replacement_body(
     return len(re.findall(r"[^\W_]+", remainder, flags=re.UNICODE)) >= 4
 
 
+def has_explicit_legacy_annex_edit(instruction_text: str) -> bool:
+    """Recognize self-contained edits in checkpoints predating semantic routing.
+
+    Unknown new-version wording stays in document comparison rather than being
+    treated as permission to synthesize a replacement from the old annex.
+    """
+    if _ATTACHED_REPLACEMENT_RE.search(instruction_text):
+        return False
+    if re.search(r"yürürlükten\s+kaldırılmıştır", instruction_text, re.IGNORECASE):
+        return True
+    if re.search(
+        r"(?:ibare\w*|gtip\w*|gtıp\w*).*değiştirilmiştir",
+        instruction_text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        return len(re.findall(r"[“\"][^”\"]+[”\"]", instruction_text)) >= 2
+    supplied = re.search(
+        r"aşağıdaki.*?(?:eklenmiştir|ilave\s+edilmiştir)[.!:]?\s*(.+)",
+        instruction_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return supplied is not None and bool(re.search(r"\w", supplied.group(1)))
+
+
 def appendix_replacement_attention_message(
     instruction: AmendmentInstruction,
     candidates: list[CandidateChunk],

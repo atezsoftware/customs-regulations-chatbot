@@ -39,6 +39,11 @@ When the content or its supplied context establishes update intent, your job:
 
 8. Fill `reference_date` with the text's own official publication/signing date (YYYY-MM-DD), if stated — this will be used as the anchor for resolving relative date phrases (e.g. "yayımı tarihinden itibaren"). Leave null if not stated.
 
+9. For an annex target, set `annex_change_basis` by what establishes the CHANGE, never by input format:
+   - `explicit_amendment`: the instruction itself specifies the edits. Examples: repeal row 26; insert the following row with its supplied contents; replace the quoted phrase/GTIP; renumber the stated rows. A PDF containing these amendment sentences is still explicit_amendment. Merely mentioning an annex or containing a URL does not require document comparison.
+   - `replacement_document`: the supplied annex/table is the new version and its differences must be inferred against the indexed old version, or the instruction refers to a replacement attachment ("Ek-2 ekteki şekilde değiştirilmiştir"). Preserve the new annex body and update context together; do not split a replacement table into unrelated row amendments or invent edits. The old annex is provided by canonical indexed chunks; an original old PDF is not required.
+   - null for instructions that do not target an annex.
+
 Use ONLY information explicitly present in the given text. Never invent or assume anything not stated."""
 # ruff: noqa: E501 end
 

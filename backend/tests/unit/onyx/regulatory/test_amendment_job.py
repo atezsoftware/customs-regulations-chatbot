@@ -50,8 +50,10 @@ def _run_grouping_job(
     heartbeat_result: bool = True,
     draft_error: Exception | None = None,
     draft_failures: dict[int, Exception] | None = None,
+    instructions_override: list[AmendmentInstruction] | None = None,
+    source_package_id: UUID | None = None,
 ) -> SimpleNamespace:
-    instructions = [
+    instructions = instructions_override or [
         AmendmentInstruction(
             instruction_text=f"Instruction {index}",
             raw_date_phrase=(raw_date_phrases or [None] * len(targets))[index],
@@ -69,7 +71,7 @@ def _run_grouping_job(
     batch_values: dict[str, object] = {
         "id": batch_id,
         "document_set_id": 7,
-        "source_package_id": None,
+        "source_package_id": source_package_id,
         "created_by": _CREATOR_ID,
         "raw_text": "original",
         "user_file_ids": ["00000000-0000-0000-0000-000000000123"],
@@ -134,7 +136,11 @@ def _run_grouping_job(
                 (match.old_chunk_id, [candidate.chunk_id for candidate in candidates]),
             )
         )
-        return SimpleNamespace(match=match, candidates=candidates)
+        return SimpleNamespace(
+            match=match,
+            candidates=candidates,
+            target_user_file_id=UUID("00000000-0000-0000-0000-000000000123"),
+        )
 
     def draft_group(*_args: object, **kwargs: Any) -> SimpleNamespace:
         assert session_depth == 0
@@ -167,6 +173,7 @@ def _run_grouping_job(
     monkeypatch.setattr(
         job, "draft_instruction_group_proposal", draft_group_mock, raising=False
     )
+    monkeypatch.setattr(job, "draft_multi_chunk_group_proposal", draft_group_mock)
     monkeypatch.setattr(job, "touch_batch_heartbeat", heartbeat, raising=False)
     monkeypatch.setattr(job, "persist_proposal_checkpoint", persisted)
     monkeypatch.setattr(job, "persist_unmatched_checkpoint", unmatched)
@@ -183,6 +190,67 @@ def _run_grouping_job(
         events=events,
         instructions=instructions,
     )
+
+
+def test_pdf_explicit_annex_edits_produce_one_proposal_and_no_document_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.db import (
+        amendment_pdf_evidence,
+        regulatory_annex_changes,
+        regulatory_annexes,
+    )
+    from onyx.db.models import RegulatoryChunk
+    from onyx.regulatory.amendments.annexes import analysis, config
+
+    file_id = UUID("00000000-0000-0000-0000-000000000123")
+    rows = [
+        RegulatoryChunk(
+            id=f"annex-{i}",
+            user_file_id=file_id,
+            text=f"Row {i}",
+            chunk_type="table",
+            chunk_metadata={"appendix_label": "EK 2"},
+        )
+        for i in range(14)
+    ]
+    monkeypatch.setattr(config, "REGULATORY_ANNEX_UPDATES_ENABLED", True)
+    monkeypatch.setattr(
+        amendment_pdf_evidence, "load_batch_pdf_source", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        regulatory_annex_changes,
+        "resolve_annex_instruction_file",
+        lambda *_args, **_kwargs: file_id,
+    )
+    monkeypatch.setattr(
+        regulatory_annexes, "load_legacy_annex_chunks", lambda *_args, **_kwargs: rows
+    )
+    reviews: list[object] = []
+
+    def record_reviews(**kwargs: Any) -> set[int]:
+        reviews.extend(kwargs["groups"])
+        return set()
+
+    monkeypatch.setattr(analysis, "run_annex_groups", record_reviews)
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=96,
+        targets=["annex-0", "annex-0"],
+        source_package_id=UUID("00000000-0000-0000-0000-000000000999"),
+        instructions_override=[
+            AmendmentInstruction(instruction_text=text, article_reference="Ek-2")
+            for text in [
+                "MADDE 16- Aynı Tebliğin Ek-2’sinde yer alan listenin 26 ncı sırası yürürlükten kaldırılmıştır.",
+                "MADDE 17- Aynı Tebliğin Ek-2’sinde yer alan listeye aşağıdaki sıra eklenmiştir.\n26. 8429.11.00.00.00 Paletli olanlar Makina, Emisyon, Gürültü",
+            ]
+        ],
+    )
+    assert reviews == []
+    assert ("draft", [0, 1]) in result.events
+    assert len(result.persist.call_args_list) == 1
+    assert result.persist.call_args.kwargs["proposal"].instruction_indices == [0, 1]
+    assert len(result.draft.call_args.kwargs["contexts"]) == 14
 
 
 def test_schema_failure_preserves_other_groups_as_an_attention_item(

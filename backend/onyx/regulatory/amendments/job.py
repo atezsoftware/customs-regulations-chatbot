@@ -294,7 +294,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         background_chars=len(amendment_context.background) if amendment_context else 0,
         commencement=list(amendment_context.commencement) if amendment_context else [],
     )
-    from onyx.db.regulatory_annex_changes import legacy_text_annex_is_complete
+    from onyx.db.regulatory_annex_changes import can_draft_annex_from_instructions
     from onyx.regulatory.amendments.annexes import config as annex_config
     from onyx.regulatory.amendments.annexes.analysis import (
         group_annex_instructions,
@@ -303,19 +303,17 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
 
     annex_indices: set[int] = set()
     groups = group_annex_instructions(instructions)
+    review_groups = []
     if annex_config.REGULATORY_ANNEX_UPDATES_ENABLED and groups:
         with _session() as db_session:
             batch = get_batch(db_session, batch_id)
             if batch is None:
                 raise RuntimeError(f"Amendment batch {batch_id} no longer exists")
-            # The annex review compares a frozen original document against the
-            # indexed annex. Without one there is nothing to freeze, and the
-            # indexed chunks already carry the annex text, so the instruction is
-            # an ordinary amendment against those chunks rather than a blocked
-            # review waiting for a document the amendment never referenced.
+            # A package supplies evidence, not the operation type. Explicit
+            # edits use indexed chunks; only replacement evidence needs review.
             if batch.source_package_id is not None:
                 for group in groups:
-                    if not legacy_text_annex_is_complete(
+                    if not can_draft_annex_from_instructions(
                         db_session,
                         batch=batch,
                         group=group,
@@ -324,6 +322,16 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                         else date.today(),
                     ):
                         annex_indices.update(group.instruction_indices)
+                        review_groups.append(group)
+    for group in groups:
+        log(
+            "annex_route_selected",
+            indices=group.instruction_indices,
+            annex_label=group.annex_label,
+            route="document_comparison"
+            if group in review_groups
+            else "chunk_amendment",
+        )
     log(
         "instruction_loop_started",
         instructions=len(instructions),
@@ -666,7 +674,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
     run_annex_groups(
         batch_id=batch_id,
         lease_generation=lease_generation,
-        instructions=instructions,
+        groups=review_groups,
         processed_indices=processed_instruction_indices,
         reference_date=reference_date,
         llm=llm,

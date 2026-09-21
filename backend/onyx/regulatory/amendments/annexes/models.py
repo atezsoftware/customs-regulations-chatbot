@@ -721,6 +721,7 @@ class AnnexInstructionGroup(BaseModel):
     instruction_indices: list[int]
     instruction_texts: list[str]
     target_sources: list[str]
+    requires_document_comparison: bool | None = None
 
 
 class AnnexElementCorrection(BaseModel):

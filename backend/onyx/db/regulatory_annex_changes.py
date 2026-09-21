@@ -23,6 +23,7 @@ from onyx.db.models import (
     AnnexChangeSet,
     AnnexPublicationIntent,
     RegulatoryChunk,
+    UserFile,
 )
 from onyx.db.regulatory_annexes import require_annex_file_scope
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
@@ -788,16 +789,25 @@ def resolve_annex_instruction_file(
     from onyx.db.regulatory_annexes import load_legacy_annex_chunks
     from onyx.regulatory.amendments.structural_target import source_identity_matches
 
+    # Batch scopes can contain thousands of files. Read identities together;
+    # validate document-set membership before inspecting a matching annex.
+    identities = list(
+        session.execute(
+            select(UserFile.id, UserFile.name).where(
+                UserFile.id.in_([UUID(value) for value in batch.user_file_ids])
+            )
+        )
+    )
+
     def resolve(require_every_source: bool) -> list[UUID]:
         matches: list[UUID] = []
-        for identifier in batch.user_file_ids:
-            file_id = UUID(identifier)
-            file = require_annex_file_scope(session, batch.document_set_id, file_id)
+        for file_id, name in identities:
             verdicts = [
-                source_identity_matches(source, file.name) for source in target_sources
+                source_identity_matches(source, name) for source in target_sources
             ]
             if not (all(verdicts) if require_every_source else any(verdicts)):
                 continue
+            require_annex_file_scope(session, batch.document_set_id, file_id)
             if load_legacy_annex_chunks(
                 session,
                 document_set_id=batch.document_set_id,
@@ -1092,25 +1102,28 @@ def list_pending_annex_publication_intents(
     )
 
 
-def legacy_text_annex_is_complete(
+def can_draft_annex_from_instructions(
     session: Session,
     *,
     batch: AmendmentBatch,
     group: "AnnexInstructionGroup",
     reference_date: datetime.date,
 ) -> bool:
-    import re
+    """Route self-contained edits against the full indexed annex, for any input format."""
 
     from onyx.db.regulatory_annexes import load_legacy_annex_chunks
     from onyx.regulatory.amendments.models import AmendmentInstruction
     from onyx.regulatory.amendments.ranker import CandidateChunk
     from onyx.regulatory.amendments.structural_target import (
         appendix_replacement_attention_message,
+        has_explicit_legacy_annex_edit,
         parse_amendment_structural_target,
     )
 
-    if batch.source_package_id is not None or any(
-        re.search(r"https?://", text) for text in group.instruction_texts
+    if group.requires_document_comparison is not None:
+        return not group.requires_document_comparison
+    if not all(
+        has_explicit_legacy_annex_edit(text) for text in group.instruction_texts
     ):
         return False
     try:
@@ -1130,12 +1143,19 @@ def legacy_text_annex_is_complete(
         )
     except ValueError:
         return False
-    if len(rows) != 1:
+    if not rows:
         return False
-    row = rows[0]
-    if row.chunk_type == "image" or any(
-        row.chunk_metadata.get(key)
-        for key in ("image_file_id", "image_file_ids", "bound_to_regulatory_chunk_id")
+    if any(
+        row.chunk_type == "image"
+        or any(
+            row.chunk_metadata.get(key)
+            for key in (
+                "image_file_id",
+                "image_file_ids",
+                "bound_to_regulatory_chunk_id",
+            )
+        )
+        for row in rows
     ):
         return False
     for text in group.instruction_texts:
@@ -1143,13 +1163,19 @@ def legacy_text_annex_is_complete(
         target = parse_amendment_structural_target(instruction)
         if target is None or target.appendix_label is None:
             return False
-        candidate = CandidateChunk(
-            chunk_id=row.id,
-            user_file_id=str(file_id),
-            text=row.text,
-            metadata={**row.chunk_metadata, "appendix_label": target.appendix_label},
-        )
-        if appendix_replacement_attention_message(instruction, [candidate]) is not None:
+        candidates = [
+            CandidateChunk(
+                chunk_id=row.id,
+                user_file_id=str(file_id),
+                text=row.text,
+                metadata={
+                    **row.chunk_metadata,
+                    "appendix_label": target.appendix_label,
+                },
+            )
+            for row in rows
+        ]
+        if appendix_replacement_attention_message(instruction, candidates) is not None:
             return False
     return True
 

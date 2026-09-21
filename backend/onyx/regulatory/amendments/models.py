@@ -7,7 +7,7 @@ parsing.
 
 import re
 from datetime import date
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import (
@@ -97,6 +97,18 @@ class AmendmentInstruction(BaseModel):
 
     instruction_text: str = Field(
         description="The exact text of this single amendment instruction"
+    )
+    annex_change_basis: Literal["explicit_amendment", "replacement_document"] | None = (
+        Field(
+            default=None,
+            description=(
+                "For annex targets: explicit_amendment when the instruction states the "
+                "actual edits (including inserted text or repeal); replacement_document "
+                "when changes must be inferred by comparing a supplied new annex with "
+                "the existing indexed chunks. Independent of PDF/URL/text input format. "
+                "Null for non-annex instructions or unknown legacy checkpoints."
+            ),
+        )
     )
     article_reference: str | None = Field(
         default=None,
