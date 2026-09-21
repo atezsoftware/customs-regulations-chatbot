@@ -1,8 +1,9 @@
 """LLM segmentation of a pasted amendment text into atomic instructions."""
 
 import re
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction, SegmentationResult
@@ -22,6 +23,7 @@ When the content or its supplied context establishes update intent, your job:
    - "... aşağıdaki fıkra/bent eklenmiştir." (the following paragraph/clause is added)
    - "... yürürlükten kaldırılmıştır." (repealed)
    Put the exact text needed to fully understand each change (the instruction sentence plus any new article text) into `instruction_text`.
+   Cover EVERY operative amendment in the input, including later instructions referring to "Aynı Tebliğin". Preserve each source amendment's "MADDE N-" heading in instruction_text (repeat it for atomic edits split from the same source article). Do not stop after the first named source. Commencement/execution clauses supply context and do not need their own change proposals.
    The input may instead be a concise natural-language summary or a table/document supplied as the new version, in any language. Such contextual update requests do not require a formal amendment sentence. Split coordinated changes into separate instructions whenever they concern different operative rules, even when no article number is given. Do not leave multiple independently searchable changes in one instruction.
    CRITICAL: Never keep a changed numerical threshold/cap and a distinct exception, fallback, or alternative procedure that applies beyond that threshold in the same instruction. Emit one instruction for the threshold and another for the beyond-threshold procedure. Each instruction must be answerable by one focused search question and target one existing chunk.
 
@@ -57,6 +59,14 @@ _NAMED_SOURCE_RE = re.compile(
 )
 _SAME_SOURCE_RE = re.compile(
     r"\b(?:aynı|ayni)\s+(?:tebliğ|teblig|yönetmelik|yonetmelik|kanun|karar)",
+    re.IGNORECASE,
+)
+_ARTICLE_HEADING_RE = re.compile(
+    r"^[ \t]*MADDE[ \t]+([0-9]+)[ \t]*[-–—]([^\n]*)", re.MULTILINE | re.IGNORECASE
+)
+_EXPLICIT_EDIT_RE = re.compile(
+    r"(?:değiştirilmiştir|eklenmiştir|ilave edilmiştir|yürürlükten kaldırılmıştır|"
+    r"çıkarılmıştır|yeniden düzenlenmiştir)",
     re.IGNORECASE,
 )
 
@@ -99,12 +109,44 @@ def propagate_target_sources(
 
 
 def segment_amendment_text(llm: LLM, raw_text: str) -> SegmentationResult:
+    headings = list(_ARTICLE_HEADING_RE.finditer(raw_text))
+    required_articles: set[str] = {
+        match.group(1)
+        for index, match in enumerate(headings)
+        if _EXPLICIT_EDIT_RE.search(
+            " ".join(
+                raw_text[
+                    match.start() : headings[index + 1].start()
+                    if index + 1 < len(headings)
+                    else len(raw_text)
+                ].split()
+            )
+        )
+    }
+
+    class _CoverageValidatedSegmentationResult(_RetrievalPlannedSegmentationResult):
+        @model_validator(mode="after")
+        def require_explicit_amendments(self) -> Self:
+            covered_articles: set[str] = {
+                match.group(1)
+                for instruction in self.instructions
+                for match in _ARTICLE_HEADING_RE.finditer(instruction.instruction_text)
+            }
+            missing = required_articles - covered_articles
+            if missing:
+                raise ValueError(
+                    "Missing operative amendment articles: "
+                    + ", ".join(sorted(missing, key=lambda value: int(value)))
+                    + ". Return all changes, retaining their source MADDE N- headings."
+                )
+            return self
+
     result = generate_structured(
         llm,
         flow=LLMFlow.AMENDMENT_SEGMENTATION,
         system_prompt=_SYSTEM_PROMPT,
         user_prompt=raw_text,
-        response_model=_RetrievalPlannedSegmentationResult,
+        response_model=_CoverageValidatedSegmentationResult,
     )
     return SegmentationResult(
         reference_date=result.reference_date,
