@@ -1,0 +1,42 @@
+name: DEV amendment approval diagnostics
+on:
+  workflow_dispatch:
+  push:
+    branches: [develop]
+    paths: [.github/workflows/dev-amendment-diagnostics.yaml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 5
+    steps:
+      - name: Read DEV worker failure traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          pods=$(kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json)
+          while IFS=$'\t' read -r pod container; do
+            kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- python -c '
+          import json,re
+          from pathlib import Path
+          lines=Path("/var/log/onyx/celery_worker_regulatory_benchmark.log").read_text(errors="replace").splitlines()[-20000:]
+          failures=[]
+          for i,line in enumerate(lines):
+              if not re.search(r"Amendment proposal \d+ approval failed",line):
+                  continue
+              trace=[]
+              for part in lines[i+1:i+120]:
+                  if re.search(r"Amendment proposal \d+ approval failed",part):
+                      break
+                  if re.search(r"api.key|password|secret|authorization|bearer",part,re.I):
+                      continue
+                  if re.match(r"\s*File \"",part) or re.match(r"^[\w.]+(?:Error|Exception):",part):
+                      trace.append(part[:500])
+                  if trace and re.match(r"^[\w.]+(?:Error|Exception):",part):
+                      break
+              failures.append({"event":line[:220],"trace":trace})
+          print(json.dumps(failures[-10:],ensure_ascii=False,indent=2))
+          '
+          done < <(jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name as $pod | .spec.containers[] | select(.image | contains("customs-regulations-backend-lite")) | [$pod,.name] | @tsv' <<<"$pods")
