@@ -67,6 +67,11 @@ _EDIT_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 _QUOTED_TEXT_RE = re.compile(r'"[^"]*"|“[^”]*”', re.DOTALL)
+_QUOTED_APPENDIX_TARGET_RE = re.compile(
+    r'[“"]((?:ek|annex|appendix)[\s:–—-]*(?:\d+[a-z]?|[ivxlcdm]+|[a-z])'
+    r'(?:[/.-][0-9a-z]+)*)[”"](?=\s+(?:başlıklı|numaralı|sayılı|ek\w*))',
+    re.IGNORECASE,
+)
 _ATTACHED_REPLACEMENT_RE = re.compile(
     r"ekteki\s+şekilde\s+değiştirilmiştir\s*[.!:]?",
     flags=re.IGNORECASE,
@@ -151,9 +156,17 @@ def named_law_number(source_name: str) -> str | None:
     ).replace("_", " ")
     if not re.search(r"\bkanun", title):
         return None
-    if re.search(r"\b(?:yonetmelik|teblig|degisiklik|uygulanmas|iliskin)", title):
-        return None
     match = re.search(r"\b(\d{3,5})\s+sayili\b", title)
+    if match is not None:
+        own_title = re.sub(
+            r"\.(?:md|txt|pdf|docx|html?)$", "", title[match.end() :]
+        ).strip()
+        # A title may itself amend other laws. Its final instrument type, not
+        # the word 'amendment', distinguishes it from a regulation citing a law.
+        if not re.search(r"\bkanun(?:u)?(?:\s*\(.*\))?\s*$", own_title):
+            return None
+        if re.match(r"kanun(?:da|unda|a|una)\b", own_title):
+            return None
     if match is None:
         match = re.search(r"\bkanun\s+(?:no|numarasi)\s*[:.]?\s*(\d{3,5})\b", title)
     return str(int(match.group(1))) if match else None
@@ -183,6 +196,7 @@ def unquoted_text(text: str) -> str:
 def amendment_operation_text(instruction_text: str) -> str:
     """Read the edit command without references inside its supplied new body."""
     body = amended_body(instruction_text)
+    body = _QUOTED_APPENDIX_TARGET_RE.sub(r"\1", body)
     # Strip quoted phrases before locating the verb so a quoted edit is not
     # mistaken for the command being performed.
     unquoted = unquoted_text(body)

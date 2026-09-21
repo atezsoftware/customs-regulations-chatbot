@@ -1047,3 +1047,27 @@ def test_missing_source_attention_is_preserved_without_model_call() -> None:
     assert candidates == [] and match is None
     assert "7082" in trace.describe()
     assert retriever.search.call_count == 1
+
+
+def test_quoted_annex_designator_loads_complete_canonical_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.db import regulatory_annexes
+
+    rows = [SimpleNamespace(id=chunk_id, chunk_metadata={}) for chunk_id in ["a", "b"]]
+    load = MagicMock(return_value=rows)
+    monkeypatch.setattr(regulatory_annexes, "load_legacy_annex_chunks", load)
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=105,
+        targets=["a"],
+        instructions_override=[
+            AmendmentInstruction(
+                instruction_text='Tebliğin “EK-3” başlıklı ekinde "eski" ibaresi "yeni" olarak değiştirilmiştir.',
+                article_reference="EK-3",
+                annex_change_basis="explicit_amendment",
+            )
+        ],
+    )
+    load.assert_called_once()
+    assert len(result.draft.call_args.kwargs["contexts"]) == 2

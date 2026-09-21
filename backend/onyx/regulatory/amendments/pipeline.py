@@ -53,6 +53,10 @@ from onyx.regulatory.amendments.new_provision_policy import (
 from onyx.regulatory.amendments.pdf_vision import PdfBatchSource
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.segmenter import segment_amendment_text
+from onyx.regulatory.amendments.structural_target import (
+    article_identity,
+    parse_amendment_structural_target,
+)
 from onyx.regulatory.amendments.target_scope import validated_addition_anchor
 from onyx.utils.logger import setup_logger
 
@@ -98,6 +102,7 @@ class InstructionDraftContext:
     base_heading_path: list[str]
     has_active_descendants: bool = False
     target_evidence: str | None = None
+    expected_new_article_no: str | None = None
 
 
 def confirm_instruction_match(
@@ -167,6 +172,7 @@ def load_instruction_draft_context(
             return None
 
     sibling_reference: dict[str, Any] | None = None
+    expected_new_article_no: str | None = None
     if old_chunk is not None:
         target_user_file_id = old_chunk.user_file_id
         target_position = old_chunk.position
@@ -192,16 +198,26 @@ def load_instruction_draft_context(
         sibling_heading = list(sibling_metadata.get("heading_path") or [])
         if best_candidate.resolved_article_no is not None:
             sibling_metadata["article_no"] = best_candidate.resolved_article_no
-            sibling_heading = [
-                *sibling_heading[:1],
-                f"MADDE {best_candidate.resolved_article_no}",
-            ]
+            identity_parts = best_candidate.resolved_article_no.rsplit(" ", 1)
+            article_heading = (
+                f"{identity_parts[0]} MADDE {identity_parts[1]}"
+                if len(identity_parts) == 2
+                else f"MADDE {identity_parts[0]}"
+            )
+            sibling_heading = [*sibling_heading[:1], article_heading]
         sibling_reference = {
             "text": best_candidate.text,
             "metadata": sibling_metadata,
             "heading_path": sibling_heading,
             "target_evidence": best_candidate.scope_evidence,
         }
+        target = (
+            parse_amendment_structural_target(instruction)
+            if instruction is not None
+            else None
+        )
+        expected_new_article_no = target.article_no if target is not None else None
+        sibling_reference["expected_new_article_no"] = expected_new_article_no
         target_position = get_next_chunk_position(db_session, target_user_file_id)
 
     descendants = (
@@ -223,6 +239,7 @@ def load_instruction_draft_context(
         base_metadata=dict(old_chunk.chunk_metadata) if old_chunk else {},
         base_heading_path=list(old_chunk.heading_path) if old_chunk else [],
         has_active_descendants=bool(descendants),
+        expected_new_article_no=expected_new_article_no,
         target_evidence=next(
             (
                 candidate.scope_evidence
@@ -301,6 +318,31 @@ def _build_proposal_draft(
         if context.old_chunk_snapshot
         else list(draft.new_chunk.heading_path or [])
     )
+    if not context.old_chunk_snapshot:
+        expected_article = context.expected_new_article_no
+        if (
+            expected_article is None
+            and context.sibling_reference
+            and added_subordinate_unit_kind(instructions[0].instruction_text)
+        ):
+            expected_article = context.sibling_reference.get("metadata", {}).get(
+                "article_no"
+            )
+        if expected_article is not None:
+            heading_identities = [
+                identity
+                for heading in heading_path
+                if (identity := article_identity(heading)) is not None
+            ]
+            if (
+                merged_metadata.get("article_no") != expected_article
+                or not heading_identities
+                or heading_identities[-1] != expected_article
+            ):
+                raise DraftIntegrityError(
+                    f"New provision identity must remain {expected_article} in metadata and heading_path."
+                )
+
     if context.old_chunk_snapshot:
         heading_path = reconcile_existing_heading_path(
             heading_path,

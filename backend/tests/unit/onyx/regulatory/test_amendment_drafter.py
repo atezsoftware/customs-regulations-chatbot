@@ -428,3 +428,104 @@ def test_multichunk_conflicting_dates_stop_before_model(
             reference_date="2026-09-22",
         )
     generate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("metadata_article", "heading", "valid"),
+    [
+        ("EK 3", "EK MADDE 3", True),
+        ("3", "EK MADDE 3", False),
+        ("EK 3", "MADDE 3", False),
+    ],
+)
+def test_verified_new_unit_identity_survives_generation(
+    metadata_article: str, heading: str, valid: bool
+) -> None:
+    context = pipeline.InstructionDraftContext(
+        match=MatchResult(
+            old_chunk_id=None, confidence=1.0, rationale="verified parent"
+        ),
+        old_chunk_snapshot={},
+        target_user_file_id=UUID("00000000-0000-0000-0000-000000000123"),
+        target_position=10,
+        sibling_reference={
+            "metadata": {"article_no": "EK 3"},
+            "heading_path": ["EK MADDE 3"],
+        },
+        base_metadata={},
+        base_heading_path=[],
+    )
+    instruction = AmendmentInstruction(
+        instruction_text="3713 sayılı Kanunun ek 3 üncü maddesine aşağıdaki fıkra eklenmiştir. “Yeni metin.”"
+    )
+    draft = DraftResult(
+        new_chunk=ChunkFieldsDraft(
+            text="Yeni metin.",
+            chunk_type="paragraph",
+            heading_path=[heading],
+            metadata_changes={"article_no": metadata_article},
+        ),
+        dates=DateResolution(rationale="date"),
+    )
+    if valid:
+        proposal = pipeline._build_proposal_draft(
+            instruction_indices=[0],
+            instructions=[instruction],
+            matches=[context.match],
+            context=context,
+            draft=draft,
+        )
+        assert proposal.new_chunk_draft["metadata"]["article_no"] == "EK 3"
+    else:
+        with pytest.raises(DraftIntegrityError, match="identity"):
+            pipeline._build_proposal_draft(
+                instruction_indices=[0],
+                instructions=[instruction],
+                matches=[context.match],
+                context=context,
+                draft=draft,
+            )
+
+
+@pytest.mark.parametrize("article_no", ["20", "GEÇİCİ 20"])
+def test_new_temporary_article_preserves_expected_namespace(article_no: str) -> None:
+    context = pipeline.InstructionDraftContext(
+        match=MatchResult(old_chunk_id=None, confidence=1, rationale="new"),
+        old_chunk_snapshot={},
+        target_user_file_id=UUID("00000000-0000-0000-0000-000000000123"),
+        target_position=11,
+        sibling_reference=None,
+        base_metadata={},
+        base_heading_path=[],
+        expected_new_article_no="GEÇİCİ 20",
+    )
+    instruction = AmendmentInstruction(
+        instruction_text="3713 sayılı Kanuna aşağıdaki geçici madde eklenmiştir. “GEÇİCİ MADDE 20- Yeni metin.”"
+    )
+    draft = DraftResult(
+        new_chunk=ChunkFieldsDraft(
+            text="GEÇİCİ MADDE 20- Yeni metin.",
+            chunk_type="article",
+            heading_path=["GEÇİCİ MADDE 20"],
+            metadata_changes={"article_no": article_no},
+        ),
+        dates=DateResolution(rationale="date"),
+    )
+    if article_no == "20":
+        with pytest.raises(DraftIntegrityError, match="identity"):
+            pipeline._build_proposal_draft(
+                instruction_indices=[0],
+                instructions=[instruction],
+                matches=[context.match],
+                context=context,
+                draft=draft,
+            )
+    else:
+        result = pipeline._build_proposal_draft(
+            instruction_indices=[0],
+            instructions=[instruction],
+            matches=[context.match],
+            context=context,
+            draft=draft,
+        )
+        assert result.new_chunk_draft["metadata"]["article_no"] == article_no

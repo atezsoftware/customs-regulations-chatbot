@@ -601,6 +601,32 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             indices=instruction_indices,
             candidates=len(group_candidates),
             old_chunk_id=ordered_group[0].match.old_chunk_id,
+            canonical_scope=[
+                {
+                    "file_id": str(getattr(context, "target_user_file_id", "")),
+                    "chunk_id": (getattr(context, "old_chunk_snapshot", {}) or {}).get(
+                        "id"
+                    ),
+                    "target_evidence": getattr(context, "target_evidence", None),
+                    "expected_new_article_no": getattr(
+                        context, "expected_new_article_no", None
+                    ),
+                }
+                for context in contexts
+            ],
+            operations=[
+                {
+                    "instruction_index": item.instruction_index,
+                    "kind": (
+                        added_subordinate_unit_kind(item.instruction.instruction_text)
+                        or "article"
+                    )
+                    if item.match.old_chunk_id is None
+                    else "replace_existing",
+                    "target": str(parse_amendment_structural_target(item.instruction)),
+                }
+                for item in ordered_group
+            ],
         )
         if not contexts:
             log("draft_group_context_missing", indices=instruction_indices)

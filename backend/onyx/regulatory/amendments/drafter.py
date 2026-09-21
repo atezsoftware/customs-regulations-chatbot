@@ -69,6 +69,7 @@ def _chunk_to_review_dict(chunk: dict[str, Any]) -> dict[str, Any]:
         "heading_path": chunk.get("heading_path"),
         "metadata": chunk.get("chunk_metadata") or chunk.get("metadata"),
         "target_evidence": chunk.get("target_evidence"),
+        "expected_new_article_no": chunk.get("expected_new_article_no"),
         "descendants": [
             _chunk_to_review_dict(item)
             for item in chunk.get("descendant_snapshots", [])
@@ -140,6 +141,16 @@ def draft_combined_chunk(
     # downstream guards reject outright: a paraphrased replacement body, and an
     # added paragraph or clause drafted as if it were a brand-new article.
     requirements: list[str] = []
+    if (
+        old_chunk is None
+        and sibling_reference
+        and sibling_reference.get("expected_new_article_no")
+    ):
+        requirements.append(
+            f"Verified new provision identity: {sibling_reference['expected_new_article_no']}. "
+            "metadata_changes.article_no must use this exact value, including EK/GEÇİCİ/MÜKERRER when present. "
+            "heading_path must identify the same article (e.g. EK MADDE 3 or GEÇİCİ MADDE 20)."
+        )
     for display_index, instruction in enumerate(instructions, start=1):
         body = explicit_replacement_body(instruction.instruction_text)
         if body:

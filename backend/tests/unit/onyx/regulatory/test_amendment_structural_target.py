@@ -303,3 +303,16 @@ def test_related_instrument_is_not_the_named_law(source: str) -> None:
     from onyx.regulatory.amendments.structural_target import source_identity_matches
 
     assert not source_identity_matches("3713 sayılı Terörle Mücadele Kanunu", source)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "4646 Sayılı Doğal Gaz Piyasası Kanunu (Elektrik Piyasası Kanununda Değişiklik Yapılması ve Doğal Gaz Piyasası Hakkında Kanun)",
+        "6552 sayılı İş Kanunu ile Bazı Kanun ve Kanun Hükmünde Kararnamelerde Değişiklik Yapılması ile Bazı Alacakların Yeniden Yapılandırılmasına Dair Kanun",
+    ],
+)
+def test_actual_law_identity_survives_amendment_words_in_its_title(title: str) -> None:
+    from onyx.regulatory.amendments.structural_target import named_law_number
+
+    assert named_law_number(title) == title[:4]
