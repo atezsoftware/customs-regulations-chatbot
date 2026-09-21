@@ -223,6 +223,45 @@ def test_activation_retains_ownership_while_transaction_holds_row_lock(
         authority.reservations(owner)
 
 
+def test_ownership_checks_do_not_reload_frozen_vector_payload(owned_file: UUID) -> None:
+    from sqlalchemy import event
+
+    from onyx.db.engine.sql_engine import get_sqlalchemy_engine
+    from onyx.db.models import RegulatoryFilePublication
+
+    authority = store()
+    owner = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=30))
+    payload = {"frozen_vectors": [0.1] * 1024}
+    with get_session_with_tenant(tenant_id="public") as session:
+        authority.lock_owned_snapshot(session, owner)
+        row = session.get(RegulatoryFilePublication, owned_file)
+        assert row is not None
+        row.writer_manifest = payload
+        session.commit()
+    statements: list[str] = []
+
+    def capture(
+        _connection: object, _cursor: object, statement: str, *_args: object
+    ) -> None:
+        statements.append(statement)
+
+    engine = get_sqlalchemy_engine()
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        authority.reservations(owner)
+        authority.heartbeat(owner, ttl=timedelta(seconds=30))
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert not any(
+        "regulatory_file_publication.writer_manifest," in sql for sql in statements
+    )
+    # A publication caller can still load the exact frozen payload under the lock.
+    with get_session_with_tenant(tenant_id="public") as session:
+        authority.lock_owned_snapshot(session, owner)
+        row = session.get(RegulatoryFilePublication, owned_file)
+        assert row is not None and row.writer_manifest == payload
+
+
 @pytest.mark.parametrize("boundary", ["commit", "rollback", "savepoint"])
 def test_activation_lock_authority_cannot_survive_transaction_boundary(
     owned_file: UUID, boundary: str

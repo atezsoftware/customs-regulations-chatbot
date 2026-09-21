@@ -14,7 +14,7 @@ from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from onyx.db.engine.sql_engine import get_session_with_tenant
 from onyx.db.models import (
@@ -89,6 +89,8 @@ class PublicationStore:
             raise ValueError("publication ownership scope mismatch")
         row = session.scalar(
             select(RegulatoryFilePublication)
+            # Heartbeats and per-ordinal checks need authority, not frozen vectors.
+            .options(defer(RegulatoryFilePublication.writer_manifest))
             .where(RegulatoryFilePublication.user_file_id == owner.user_file_id)
             .with_for_update()
             .execution_options(populate_existing=True)
