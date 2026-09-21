@@ -16,6 +16,7 @@ jobs:
         run: |
           set -euo pipefail
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -o json | jq '[.items[] | select(.metadata.name | test("customs-regulations-(api|background)")) | {name:.metadata.name,phase:.status.phase,terminating:.metadata.deletionTimestamp,containers:[.status.containerStatuses[]? | {name,ready,restartCount,state}],image:[.spec.containers[].image]}]'
           pods=$(kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json)
           while IFS=$'\t' read -r pod container; do
             kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- python -c '
@@ -32,9 +33,9 @@ jobs:
                       break
                   if re.search(r"api.key|password|secret|authorization|bearer",part,re.I):
                       continue
-                  if re.match(r"\s*File \"",part) or re.match(r"^[\w.]+(?:Error|Exception):",part):
+                  if re.match(r"\s*File \"",part) or re.match(r"^[\w.]+(?:Error|Exception|Lost|Conflict):",part):
                       trace.append(part[:500])
-                  if trace and re.match(r"^[\w.]+(?:Error|Exception):",part):
+                  if trace and re.match(r"^[\w.]+(?:Error|Exception|Lost|Conflict):",part):
                       break
               failures.append({"event":line[:220],"trace":trace})
           print(json.dumps(failures[-10:],ensure_ascii=False,indent=2))
