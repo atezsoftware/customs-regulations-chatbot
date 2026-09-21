@@ -192,6 +192,59 @@ def test_expiry_never_opens_gate_and_old_owner_loses_access(owned_file: UUID) ->
         authority.owned_chunks(owner)
 
 
+def test_activation_retains_ownership_while_transaction_holds_row_lock(
+    owned_file: UUID,
+) -> None:
+    from sqlalchemy import text
+
+    authority = store()
+    owner = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=1))
+    authority.close_gate(owner)
+    with get_session_with_tenant(tenant_id="public") as session:
+        initial = authority.lock_owned_snapshot(session, owner)
+        session.execute(text("SELECT pg_sleep(1.1)"))
+        # A competing acquisition must remain blocked until activation commits.
+        with ThreadPoolExecutor(1) as executor:
+            competing = executor.submit(
+                authority.acquire,
+                owned_file,
+                owner_id=uuid4(),
+                ttl=timedelta(seconds=30),
+            )
+            try:
+                with pytest.raises(TimeoutError):
+                    competing.result(timeout=0.1)
+                assert authority.lock_owned_snapshot(session, owner) == initial
+            finally:
+                session.rollback()
+            replacement = competing.result(timeout=5)
+    assert replacement.fencing_token > owner.fencing_token
+    with pytest.raises(ValueError, match="ownership"):
+        authority.reservations(owner)
+
+
+@pytest.mark.parametrize("boundary", ["commit", "rollback", "savepoint"])
+def test_activation_lock_authority_cannot_survive_transaction_boundary(
+    owned_file: UUID, boundary: str
+) -> None:
+    from sqlalchemy import text
+
+    authority = store()
+    owner = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=1))
+    with get_session_with_tenant(tenant_id="public") as session:
+        nested = session.begin_nested() if boundary == "savepoint" else None
+        authority.lock_owned_snapshot(session, owner)
+        session.execute(text("SELECT pg_sleep(1.1)"))
+        if nested is not None:
+            nested.rollback()
+        elif boundary == "commit":
+            session.commit()
+        else:
+            session.rollback()
+        with pytest.raises(ValueError, match="ownership"):
+            authority.lock_owned_snapshot(session, owner)
+
+
 def test_committed_observation_does_not_skip_uncommitted_lower_epoch(
     owned_file: UUID,
 ) -> None:

@@ -94,15 +94,30 @@ class PublicationStore:
             .execution_options(populate_existing=True)
         )
         now = session.scalar(select(func.clock_timestamp()))
+        transaction = (session.get_transaction(), session.get_nested_transaction())
+        lock_identity = (
+            *transaction,
+            self.scope_key,
+            owner.owner_id,
+            owner.fencing_token,
+        )
+        held_locks = session.info.setdefault("publication_transaction_locks", {})
         if (
             row is None
             or row.scope_key != self.scope_key
             or row.owner_id != owner.owner_id
             or row.fencing_token != owner.fencing_token
             or now is None
-            or row.lease_expires_at <= now
+            or (
+                row.lease_expires_at <= now
+                and held_locks.get(owner.user_file_id) != lock_identity
+            )
         ):
             raise PublicationOwnershipLost("publication ownership lost or expired")
+        # A valid lease becomes exclusive transaction ownership under FOR UPDATE.
+        # Heartbeats/takeovers cannot acquire this row until commit or rollback;
+        # savepoint rollback must also invalidate authority acquired inside it.
+        held_locks[owner.user_file_id] = lock_identity
         return row
 
     def _ownership(self, row: RegulatoryFilePublication) -> FileOwnership:
