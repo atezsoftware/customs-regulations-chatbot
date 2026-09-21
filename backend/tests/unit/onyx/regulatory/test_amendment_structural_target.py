@@ -55,6 +55,9 @@ _ADD_ANNEX_ROW = (
     ("instruction_text", "article_no", "paragraph_no", "clause_label"),
     [
         (_REPLACE_PARAGRAPH, "1", "2", None),
+        (_REPLACE_PARAGRAPH.replace("ikinci", "İkinci"), "1", "2", None),
+        (_REPLACE_PARAGRAPH.replace("ikinci", "İKİNCİ"), "1", "2", None),
+        (_REPLACE_PARAGRAPH.replace("ikinci", "IKINCI"), "1", "2", None),
         (_REPLACE_CLAUSE, "3", "1", "d"),
         (_ADD_CLAUSE, "3", "1", "ç"),
         (_ADD_PARAGRAPH, "7", None, None),

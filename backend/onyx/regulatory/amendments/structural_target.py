@@ -145,7 +145,9 @@ def _target_paragraph_no(instruction_body: str) -> str | None:
     """Return the single amended paragraph number, if the text names one."""
 
     numbers = {
-        _PARAGRAPH_ORDINALS[match.group("ordinal").casefold()]
+        _PARAGRAPH_ORDINALS[
+            match.group("ordinal").casefold().replace("\u0307", "").replace("ı", "i")
+        ]
         if match.group("ordinal")
         else match.group("number").lstrip("0")
         for match in _PARAGRAPH_REFERENCE_RE.finditer(instruction_body)
