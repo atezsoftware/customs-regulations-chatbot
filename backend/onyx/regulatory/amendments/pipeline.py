@@ -134,6 +134,16 @@ def confirm_instruction_match(
         return None
     if match.outcome == "new_provision" and match.old_chunk_id is not None:
         return None
+    if match.old_chunk_id is not None and (
+        explicitly_adds_top_level_provision(instruction.instruction_text)
+        or added_subordinate_unit_kind(instruction.instruction_text)
+    ):
+        if decisions:
+            decisions[-1]["rationale"] = (
+                "The instruction adds a new provision, but the model selected "
+                "an existing chunk to replace. Parent context is not a replacement target."
+            )
+        return None
     candidate_ids = {candidate.chunk_id for candidate in candidates}
     if match.old_chunk_id is not None and match.old_chunk_id not in candidate_ids:
         logger.warning(

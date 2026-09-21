@@ -545,3 +545,25 @@ def test_structural_targets_survive_eight_unrelated_search_hits(
     )
     assert len(result) <= 12
     assert {item.chunk_id for item in exact} <= {item.chunk_id for item in result}
+
+
+def test_new_unit_does_not_pick_one_of_multiple_verified_source_versions() -> None:
+    search = MagicMock()
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=search,
+        canonical_candidate_loader=lambda _ids: {},
+        source_file_loader=lambda _instruction: [
+            str(_FILE_ID),
+            "00000000-0000-0000-0000-000000000222",
+        ],
+        allowed_user_file_ids=[_FILE_ID, UUID("00000000-0000-0000-0000-000000000222")],
+    )
+    found = retriever.search(
+        AmendmentInstruction(
+            instruction_text="3713 sayılı Kanuna aşağıdaki geçici madde eklenmiştir. “GEÇİCİ MADDE 20- Metin.”",
+            target_source="3713 sayılı Kanun",
+        )
+    )
+    assert found == []
+    assert "multiple" in (retriever.last_attention or "").lower()
+    search.assert_not_called()

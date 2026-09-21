@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+import pytest
+
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.target_scope import (
@@ -105,3 +107,26 @@ def test_legacy_scope_stops_at_nonconsolidated_supplement() -> None:
     assert [row.chunk_id for row in article_scope_candidates(rows, "GEÇİCİ 19")] == [
         "heading"
     ]
+
+
+def test_new_paragraph_match_cannot_replace_existing_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from onyx.regulatory.amendments import pipeline
+    from onyx.regulatory.amendments.models import MatchResult
+
+    instruction = AmendmentInstruction(
+        instruction_text="3713 sayılı Kanunun ek 3 üncü maddesine aşağıdaki fıkra eklenmiştir. “Yeni metin.”"
+    )
+    match = MatchResult(old_chunk_id="parent", confidence=1, rationale="parent found")
+    monkeypatch.setattr(pipeline, "confirm_match", lambda *_args, **_kwargs: match)
+    assert (
+        pipeline.confirm_instruction_match(
+            MagicMock(),
+            instruction=instruction,
+            candidates=[candidate("parent", "EK MADDE 3- Mevcut", article_no="EK 3")],
+        )
+        is None
+    )

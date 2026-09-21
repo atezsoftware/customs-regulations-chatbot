@@ -36,6 +36,7 @@ from onyx.document_index.factory import get_default_document_index
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.new_provision_policy import (
+    added_subordinate_unit_kind,
     explicitly_adds_top_level_provision,
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
@@ -222,6 +223,21 @@ class AmendmentSearchRetriever:
                 f"Target source '{instruction.target_source}' could not be verified "
                 "in this batch's Document Set. References in other documents "
                 "cannot replace the source itself."
+            )
+            return []
+
+        if (
+            source_files is not None
+            and len(set(source_files)) > 1
+            and (
+                explicitly_adds_top_level_provision(instruction.instruction_text)
+                or added_subordinate_unit_kind(instruction.instruction_text)
+            )
+        ):
+            self.query_stats = []
+            self.last_attention = (
+                "Multiple target source files or versions were verified. "
+                "A new provision requires one unambiguous source; narrow the Document Set."
             )
             return []
 
