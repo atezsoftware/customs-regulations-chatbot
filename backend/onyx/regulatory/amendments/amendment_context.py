@@ -12,6 +12,8 @@ instruction, without letting it become something the instruction applies.
 import re
 from dataclasses import dataclass
 
+from onyx.regulatory.amendments.structural_target import unquoted_text
+
 # An amendment's own commencement article speaks about the amendment itself
 # ("Bu Tebliğ ... yürürlüğe girer"), which is what separates it from a quoted
 # replacement body that happens to describe some other text's entry into force.
@@ -48,7 +50,11 @@ def _bounded(text: str, limit: int) -> str:
 def commencement_provisions(raw_text: str) -> list[str]:
     """Articles of this amendment that state when it takes effect."""
 
-    blocks = [block for block in _ARTICLE_BOUNDARY_RE.split(raw_text) if block.strip()]
+    blocks = [
+        block
+        for block in _ARTICLE_BOUNDARY_RE.split(unquoted_text(raw_text))
+        if block.strip()
+    ]
     if not blocks:
         blocks = [raw_text]
     found: list[str] = []

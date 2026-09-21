@@ -17,6 +17,9 @@ class CandidateChunk:
     heading_trgm_score: float = 0.0
     structured_match: bool = False
     source_score: float = 0.0
+    source_verified: bool = False
+    resolved_article_no: str | None = None
+    scope_evidence: str | None = None
 
     @property
     def combined_score(self) -> float:

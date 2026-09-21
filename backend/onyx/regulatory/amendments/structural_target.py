@@ -53,6 +53,20 @@ _APPENDIX_REFERENCE_RE = re.compile(
     r"(?<![\w])ek\s*[-–—:.]?\s*(?P<label>\d+[a-z]?)\b",
     flags=re.IGNORECASE,
 )
+_QUALIFIED_ARTICLE_RE = re.compile(
+    r"(?<!\w)(?P<kind>ek|geçici|gecici|mükerrer|mukerrer)\s+"
+    r"(?:madde\s+(?P<forward>\d+[a-z]?)\b|"
+    r"(?P<reverse>\d+[a-z]?)\s*(?:[.'’]?\s*"
+    r"(?:inci|ıncı|uncu|üncü|nci|ncı|ncu|ncü))?\s+madd\w*)",
+    re.IGNORECASE,
+)
+_EDIT_VERB_RE = re.compile(
+    r"\b(?:değiştirilmiş|degistirilmis|eklenmiş|eklenmis|"
+    r"ilave\s+edilmiş|ilave\s+edilmis|kaldırılmış|kaldirilmis|"
+    r"çıkarılmış|cikarilmis)(?:tir|tır|tur|tür|ti)?\b",
+    re.IGNORECASE,
+)
+_QUOTED_TEXT_RE = re.compile(r'"[^"]*"|“[^”]*”', re.DOTALL)
 _ATTACHED_REPLACEMENT_RE = re.compile(
     r"ekteki\s+şekilde\s+değiştirilmiştir\s*[.!:]?",
     flags=re.IGNORECASE,
@@ -119,10 +133,30 @@ def source_identity_matches(target_source: str | None, source_name: str) -> bool
 
     if not target_source:
         return True
+    law_number = named_law_number(target_source)
+    source_number = named_law_number(source_name)
+    if law_number is not None:
+        return law_number == source_number
     distinguishing_tokens = set(source_identity_distinguishing_tokens(target_source))
     if not distinguishing_tokens:
         return True
     return distinguishing_tokens <= _source_identity_tokens(source_name)
+
+
+def named_law_number(source_name: str) -> str | None:
+    """Identify a law title, not a law cited inside another document's name."""
+    folded = unicodedata.normalize("NFKD", source_name.casefold().replace("ı", "i"))
+    title = "".join(
+        character for character in folded if not unicodedata.combining(character)
+    ).replace("_", " ")
+    if not re.search(r"\bkanun", title):
+        return None
+    if re.search(r"\b(?:yonetmelik|teblig|degisiklik|uygulanmas|iliskin)", title):
+        return None
+    match = re.search(r"\b(\d{3,5})\s+sayili\b", title)
+    if match is None:
+        match = re.search(r"\bkanun\s+(?:no|numarasi)\s*[:.]?\s*(\d{3,5})\b", title)
+    return str(int(match.group(1))) if match else None
 
 
 def source_identity_distinguishing_tokens(
@@ -139,6 +173,44 @@ def amended_body(instruction_text: str) -> str:
     """Drop the instruction's own ``MADDE N-`` designator from its text."""
 
     return _INSTRUCTION_HEADER_RE.sub("", instruction_text, count=1)
+
+
+def unquoted_text(text: str) -> str:
+    """Remove quoted content while retaining surrounding article boundaries."""
+    return _QUOTED_TEXT_RE.sub(lambda match: "\n" * match.group().count("\n"), text)
+
+
+def amendment_operation_text(instruction_text: str) -> str:
+    """Read the edit command without references inside its supplied new body."""
+    body = amended_body(instruction_text)
+    # Strip quoted phrases before locating the verb so a quoted edit is not
+    # mistaken for the command being performed.
+    unquoted = unquoted_text(body)
+    command = _EDIT_VERB_RE.search(unquoted)
+    return unquoted[: command.end()] if command is not None else unquoted
+
+
+def article_identity(reference: str) -> str | None:
+    """Preserve the normal/additional/temporary/repeated article namespace."""
+    references = extract_regulatory_provision_references(reference)
+    if not references:
+        return None
+    number = references[0].article_no
+    qualified = _QUALIFIED_ARTICLE_RE.search(reference)
+    if (
+        qualified
+        and (qualified.group("forward") or qualified.group("reverse")).upper() == number
+    ):
+        kind = qualified.group("kind").casefold().replace("\u0307", "")
+        prefix = (
+            "EK"
+            if kind == "ek"
+            else "GEÇİCİ"
+            if kind in {"geçici", "gecici"}
+            else "MÜKERRER"
+        )
+        return f"{prefix} {number}"
+    return number
 
 
 def _target_paragraph_no(instruction_body: str) -> str | None:
@@ -158,6 +230,11 @@ def _target_paragraph_no(instruction_body: str) -> str | None:
     return next(iter(numbers))
 
 
+def appendix_reference_text(text: str) -> str:
+    """Remove additional-article references before detecting document annexes."""
+    return _QUALIFIED_ARTICLE_RE.sub("", text)
+
+
 def parse_amendment_structural_target(
     instruction: AmendmentInstruction,
 ) -> AmendmentStructuralTarget | None:
@@ -169,15 +246,28 @@ def parse_amendment_structural_target(
     body rather than to the provision being changed.
     """
 
-    instruction_body = amended_body(instruction.instruction_text)
-    combined_reference = "\n".join(
-        value for value in (instruction.article_reference, instruction_body) if value
+    instruction_body = amendment_operation_text(instruction.instruction_text)
+    article_no = article_identity(instruction_body) or article_identity(
+        instruction.article_reference or ""
     )
-    references = extract_regulatory_provision_references(combined_reference)
+    if article_no is None and re.search(
+        r"aşağıdaki\s+(?:(?:yeni|geçici|ek|mükerrer)\s+)*madde.*eklenmiş",
+        instruction_body,
+        re.IGNORECASE,
+    ):
+        heading = re.search(
+            r'(?:^|\n)\s*["“]*(?:(?:GEÇİCİ|EK|MÜKERRER)\s+)?MADDE\s+\d+[a-z]?',
+            amended_body(instruction.instruction_text),
+            re.IGNORECASE,
+        )
+        if heading:
+            article_no = article_identity(heading.group())
     clause_match = _CLAUSE_REFERENCE_RE.search(instruction_body)
-    appendix_match = _APPENDIX_REFERENCE_RE.search(instruction_body)
+    appendix_match = _APPENDIX_REFERENCE_RE.search(
+        appendix_reference_text(instruction_body)
+    )
     target = AmendmentStructuralTarget(
-        article_no=(references[0].article_no if references else None),
+        article_no=article_no,
         clause_label=(clause_match.group("label").casefold() if clause_match else None),
         appendix_label=(
             f"EK-{appendix_match.group('label').upper()}" if appendix_match else None

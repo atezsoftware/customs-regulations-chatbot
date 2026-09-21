@@ -200,3 +200,26 @@ def test_supplied_new_annex_is_compared_even_when_its_text_is_inline(
         group=group,
         reference_date=date(2027, 1, 1),
     )
+
+
+def test_qualified_articles_and_quoted_annex_references_are_not_annex_groups() -> None:
+    from onyx.regulatory.amendments.annexes.analysis import group_annex_instructions
+    from onyx.regulatory.amendments.models import AmendmentInstruction
+
+    instructions = [
+        AmendmentInstruction(
+            instruction_text="Kanunun ek 3 üncü maddesi değiştirilmiştir.",
+            article_reference="Ek 3 üncü madde",
+        ),
+        AmendmentInstruction(
+            instruction_text="Kanuna aşağıdaki geçici madde eklenmiştir.\n“GEÇİCİ MADDE 20- EK-3 kapsamındakiler.”",
+            article_reference="Geçici Madde 20",
+        ),
+        AmendmentInstruction(
+            instruction_text="Tebliğin EK-IV/A eki değiştirilmiştir.",
+            article_reference="EK-IV/A",
+        ),
+    ]
+    groups = group_annex_instructions(instructions)
+    assert len(groups) == 1
+    assert groups[0].instruction_indices == [2]

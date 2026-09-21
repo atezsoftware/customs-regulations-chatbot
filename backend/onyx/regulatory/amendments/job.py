@@ -2,7 +2,7 @@
 
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from uuid import UUID
 
@@ -25,7 +25,12 @@ from onyx.regulatory.amendments.amendment_context import (
 )
 from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
 from onyx.regulatory.amendments.draft_integrity import DraftIntegrityError
+from onyx.regulatory.amendments.drafter import AmendmentDateConflict
 from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
+from onyx.regulatory.amendments.new_provision_policy import (
+    added_subordinate_unit_kind,
+    explicitly_adds_top_level_provision,
+)
 from onyx.regulatory.amendments.pipeline import (
     confirm_instruction_match,
     draft_instruction_group_proposal,
@@ -70,14 +75,22 @@ def _session() -> Generator[Session, None, None]:
 def _merge_candidates(
     initial: list[CandidateChunk], recovered: list[CandidateChunk]
 ) -> list[CandidateChunk]:
-    merged: list[CandidateChunk] = []
-    seen_ids: set[str] = set()
+    merged: dict[str, CandidateChunk] = {}
     for candidate in [*initial, *recovered]:
-        if candidate.chunk_id in seen_ids:
-            continue
-        seen_ids.add(candidate.chunk_id)
-        merged.append(candidate)
-    return merged
+        previous = merged.get(candidate.chunk_id)
+        if previous is None:
+            merged[candidate.chunk_id] = candidate
+        else:
+            merged[candidate.chunk_id] = replace(
+                previous,
+                structured_match=previous.structured_match
+                or candidate.structured_match,
+                source_verified=previous.source_verified or candidate.source_verified,
+                resolved_article_no=candidate.resolved_article_no
+                or previous.resolved_article_no,
+                scope_evidence=candidate.scope_evidence or previous.scope_evidence,
+            )
+    return list(merged.values())
 
 
 @dataclass
@@ -95,6 +108,7 @@ class _InstructionTrace:
     declined: bool = False
     note: str | None = None
     queries: list[dict[str, object]] = field(default_factory=list)
+    decisions: list[dict[str, object]] = field(default_factory=list)
 
     def describe(self) -> str:
         if self.note:
@@ -117,7 +131,13 @@ class _InstructionTrace:
         if self.declined:
             return (
                 f"{self.candidates} candidate(s) found; the model declined all of "
-                "them after " + f"{self.confirmations} check(s)."
+                "them after "
+                + f"{self.confirmations} check(s)."
+                + (
+                    f" Reason: {self.decisions[-1].get('rationale', '')}"
+                    if self.decisions
+                    else ""
+                )
             )
         return f"{self.candidates} candidate(s) found; no match was recorded."
 
@@ -137,13 +157,21 @@ def retrieve_and_confirm_instruction(
     trace.searched += 1
     trace.candidates = len(candidates)
     trace.queries.extend(retriever.query_stats)
+    if isinstance(retriever.last_attention, str):
+        trace.note = retriever.last_attention
+        return candidates, None
     appendix_note = appendix_replacement_attention_message(instruction, candidates)
     if appendix_note is not None:
         trace.note = "This annex target needs its replacement body supplied."
         return candidates, None
     if candidates:
-        structural_candidate = deterministic_structural_candidate(
-            instruction, candidates
+        structural_candidate = (
+            deterministic_structural_candidate(instruction, candidates)
+            if not (
+                explicitly_adds_top_level_provision(instruction.instruction_text)
+                or added_subordinate_unit_kind(instruction.instruction_text)
+            )
+            else None
         )
         if structural_candidate is not None:
             trace.confirmations += 1
@@ -161,6 +189,7 @@ def retrieve_and_confirm_instruction(
             instruction=instruction,
             candidates=candidates,
             amendment_context=amendment_context,
+            decisions=trace.decisions,
         )
         if match is not None:
             return candidates, match
@@ -182,6 +211,7 @@ def retrieve_and_confirm_instruction(
         instruction=instruction,
         candidates=candidates,
         amendment_context=amendment_context,
+        decisions=trace.decisions,
     )
     trace.declined = match is None
     return candidates, match
@@ -412,6 +442,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             confirmations=trace.confirmations,
             declined=trace.declined,
             queries=trace.queries,
+            decisions=trace.decisions,
             matched_chunk_id=match.old_chunk_id if match else None,
             outcome="matched" if match else "unmatched",
             detail=trace.describe() if match is None else None,
@@ -467,9 +498,10 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         group_key: tuple[str, str | int] = (
             (
                 "appendix",
-                normalize_appendix_label(structural_target.appendix_label),
+                f"{next((candidate.user_file_id for candidate in matched_instruction.candidates if candidate.chunk_id == old_chunk_id), old_chunk_id)}:{normalize_appendix_label(structural_target.appendix_label)}",
             )
-            if structural_target is not None
+            if old_chunk_id is not None
+            and structural_target is not None
             and structural_target.appendix_label is not None
             else ("existing", old_chunk_id)
             if old_chunk_id is not None
@@ -520,6 +552,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 db_session,
                 candidates=group_candidates,
                 match=representative,
+                instruction=ordered_group[0].instruction,
             )
             if (
                 representative_context is not None
@@ -552,6 +585,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     context = load_instruction_draft_context(
                         db_session,
                         candidates=group_candidates,
+                        instruction=ordered_group[0].instruction,
                         match=MatchResult(
                             old_chunk_id=candidate_id,
                             confidence=representative.confidence,
@@ -577,7 +611,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                         batch_id=batch_id,
                         lease_generation=lease_generation,
                         instruction_index=item.instruction_index,
-                        instruction_text=item.instruction.instruction_text,
+                        instruction_text=f"{item.instruction.instruction_text}\n\nAttention: The target source or parent provision could not be verified unambiguously.",
                     )
                 if not persisted:
                     raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
@@ -633,7 +667,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 if not persisted:
                     raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
             continue
-        except DraftIntegrityError as error:
+        except (DraftIntegrityError, AmendmentDateConflict) as error:
             log(
                 "draft_group_rejected",
                 indices=instruction_indices,

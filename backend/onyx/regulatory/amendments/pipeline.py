@@ -26,6 +26,7 @@ from onyx.regulatory.amendments.amendment_context import (
 )
 from onyx.regulatory.amendments.candidate_finder import find_candidates
 from onyx.regulatory.amendments.draft_integrity import (
+    DraftIntegrityError,
     explicit_replacement_body,
     reconcile_existing_heading_path,
     reject_unsupported_descendant_replacement,
@@ -52,6 +53,7 @@ from onyx.regulatory.amendments.new_provision_policy import (
 from onyx.regulatory.amendments.pdf_vision import PdfBatchSource
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.segmenter import segment_amendment_text
+from onyx.regulatory.amendments.target_scope import validated_addition_anchor
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -95,6 +97,7 @@ class InstructionDraftContext:
     base_metadata: dict[str, Any]
     base_heading_path: list[str]
     has_active_descendants: bool = False
+    target_evidence: str | None = None
 
 
 def confirm_instruction_match(
@@ -103,6 +106,7 @@ def confirm_instruction_match(
     instruction: AmendmentInstruction,
     candidates: list[CandidateChunk],
     amendment_context: AmendmentContext | None = None,
+    decisions: list[dict[str, object]] | None = None,
 ) -> MatchResult | None:
     match = confirm_match(
         llm,
@@ -110,6 +114,21 @@ def confirm_instruction_match(
         candidates=candidates,
         amendment_context=amendment_context,
     )
+    if decisions is not None:
+        decisions.append(
+            {
+                "outcome": match.outcome,
+                "old_chunk_id": match.old_chunk_id,
+                "rationale": match.rationale,
+                "candidate_ids": [candidate.chunk_id for candidate in candidates],
+            }
+        )
+    if match.outcome == "not_found":
+        return None
+    if match.outcome == "matched" and match.old_chunk_id is None:
+        return None
+    if match.outcome == "new_provision" and match.old_chunk_id is not None:
+        return None
     candidate_ids = {candidate.chunk_id for candidate in candidates}
     if match.old_chunk_id is not None and match.old_chunk_id not in candidate_ids:
         logger.warning(
@@ -135,6 +154,7 @@ def load_instruction_draft_context(
     *,
     candidates: list[CandidateChunk],
     match: MatchResult,
+    instruction: AmendmentInstruction | None = None,
 ) -> InstructionDraftContext | None:
     old_chunk: RegulatoryChunk | None = None
     if match.old_chunk_id:
@@ -157,18 +177,30 @@ def load_instruction_draft_context(
                 "position; marking instruction unmatched"
             )
             return None
-        # An exact structural match names the amended article outright, so it
-        # anchors a new unit far more reliably than the best ranked search hit,
-        # which may sit in a neighbouring provision.
-        best_candidate = next(
-            (candidate for candidate in candidates if candidate.structured_match),
-            candidates[0],
+        best_candidate = (
+            validated_addition_anchor(instruction, candidates)
+            if instruction is not None
+            else None
         )
+        if best_candidate is None:
+            logger.warning(
+                "New amendment provision has no unambiguous source and parent anchor"
+            )
+            return None
         target_user_file_id = UUID(best_candidate.user_file_id)
+        sibling_metadata = dict(best_candidate.metadata)
+        sibling_heading = list(sibling_metadata.get("heading_path") or [])
+        if best_candidate.resolved_article_no is not None:
+            sibling_metadata["article_no"] = best_candidate.resolved_article_no
+            sibling_heading = [
+                *sibling_heading[:1],
+                f"MADDE {best_candidate.resolved_article_no}",
+            ]
         sibling_reference = {
             "text": best_candidate.text,
-            "metadata": best_candidate.metadata,
-            "heading_path": best_candidate.metadata.get("heading_path"),
+            "metadata": sibling_metadata,
+            "heading_path": sibling_heading,
+            "target_evidence": best_candidate.scope_evidence,
         }
         target_position = get_next_chunk_position(db_session, target_user_file_id)
 
@@ -191,6 +223,14 @@ def load_instruction_draft_context(
         base_metadata=dict(old_chunk.chunk_metadata) if old_chunk else {},
         base_heading_path=list(old_chunk.heading_path) if old_chunk else [],
         has_active_descendants=bool(descendants),
+        target_evidence=next(
+            (
+                candidate.scope_evidence
+                for candidate in candidates
+                if candidate.chunk_id == match.old_chunk_id
+            ),
+            None,
+        ),
     )
 
 
@@ -206,7 +246,12 @@ def draft_instruction_proposal(
     draft = draft_new_chunk(
         llm,
         instruction=instruction,
-        old_chunk=context.old_chunk_snapshot or None,
+        old_chunk={
+            **context.old_chunk_snapshot,
+            "target_evidence": context.target_evidence,
+        }
+        if context.old_chunk_snapshot
+        else None,
         sibling_reference=context.sibling_reference,
         reference_date=reference_date,
         amendment_context=amendment_context,
@@ -317,7 +362,8 @@ def _build_proposal_draft(
         old_chunk_snapshot=context.old_chunk_snapshot,
         new_chunk_draft=new_chunk_draft,
         match_confidence=min(match.confidence for match in matches),
-        match_rationale=combined_match_rationale,
+        match_rationale=combined_match_rationale
+        + (f"\n{context.target_evidence}" if context.target_evidence else ""),
         date_rationale=draft.dates.rationale,
     )
 
@@ -359,7 +405,9 @@ def draft_instruction_group_proposal(
         )
     old_chunk_ids = {match.old_chunk_id for match in matches}
     if len(old_chunk_ids) != 1:
-        raise ValueError("Grouped amendment instructions must share one target chunk")
+        raise DraftIntegrityError(
+            "Grouped amendment instructions must share one target chunk"
+        )
 
     evidence = None
     if pdf_source is not None:
@@ -386,7 +434,12 @@ def draft_instruction_group_proposal(
     draft = draft_combined_chunk(
         llm,
         instructions=instructions,
-        old_chunk=context.old_chunk_snapshot or None,
+        old_chunk={
+            **context.old_chunk_snapshot,
+            "target_evidence": context.target_evidence,
+        }
+        if context.old_chunk_snapshot
+        else None,
         sibling_reference=context.sibling_reference,
         reference_date=reference_date,
         pdf_evidence=evidence,
@@ -546,7 +599,7 @@ def analyze_instruction(
     if match is None:
         return None
     context = load_instruction_draft_context(
-        db_session, candidates=candidates, match=match
+        db_session, candidates=candidates, match=match, instruction=instruction
     )
     if context is None:
         return None

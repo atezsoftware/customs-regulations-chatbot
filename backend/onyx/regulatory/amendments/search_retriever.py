@@ -20,6 +20,10 @@ from onyx.context.search.retrieval.search_runner import (
 )
 from onyx.db.document_set import get_document_set_by_id
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.regulatory_amendment_targets import (
+    load_amendment_source_chunks,
+    load_amendment_source_identities,
+)
 from onyx.db.regulatory_chunks import (
     RegulatoryChunkStructuralMatch,
     get_active_chunks_by_structural_reference,
@@ -31,13 +35,18 @@ from onyx.db.users import fetch_user_by_id
 from onyx.document_index.factory import get_default_document_index
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction
+from onyx.regulatory.amendments.new_provision_policy import (
+    explicitly_adds_top_level_provision,
+)
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.structural_target import (
     AmendmentStructuralTarget,
+    named_law_number,
     parse_amendment_structural_target,
     source_identity_distinguishing_tokens,
     source_identity_matches,
 )
+from onyx.regulatory.amendments.target_scope import article_scope_candidates
 from onyx.server.query_and_chat.placement import Placement
 from onyx.tools.constants import REGULATORY_MAX_SEARCH_QUERY_CHARS, SEARCH_TOOL_ID
 from onyx.tools.models import ChatMinimalTextMessage, SearchToolOverrideKwargs
@@ -58,6 +67,7 @@ def _bounded_query(value: str) -> str:
 SearchToolFactory = Callable[[], SearchTool]
 CanonicalCandidateLoader = Callable[[Sequence[str]], Mapping[str, CandidateChunk]]
 StructuralCandidateLoader = Callable[[AmendmentInstruction], Sequence[CandidateChunk]]
+SourceFileLoader = Callable[[AmendmentInstruction], Sequence[str] | None]
 
 
 def _structural_lookup_scopes(
@@ -78,6 +88,7 @@ class AmendmentSearchRetriever:
         search_tool_factory: SearchToolFactory,
         canonical_candidate_loader: CanonicalCandidateLoader,
         structural_candidate_loader: StructuralCandidateLoader | None = None,
+        source_file_loader: SourceFileLoader | None = None,
         allowed_user_file_ids: Sequence[UUID],
     ) -> None:
         self._search_tool_factory = search_tool_factory
@@ -85,6 +96,8 @@ class AmendmentSearchRetriever:
         self.query_stats: list[dict[str, object]] = []
         self._canonical_candidate_loader = canonical_candidate_loader
         self._structural_candidate_loader = structural_candidate_loader
+        self._source_file_loader = source_file_loader
+        self.last_attention: str | None = None
         self._allowed_user_file_ids = {
             str(user_file_id) for user_file_id in allowed_user_file_ids
         }
@@ -199,6 +212,19 @@ class AmendmentSearchRetriever:
         if not query:
             return []
 
+        self.last_attention = None
+        source_files = (
+            self._source_file_loader(instruction) if self._source_file_loader else None
+        )
+        if source_files is not None and not source_files:
+            self.query_stats = []
+            self.last_attention = (
+                f"Target source '{instruction.target_source}' could not be verified "
+                "in this batch's Document Set. References in other documents "
+                "cannot replace the source itself."
+            )
+            return []
+
         ranked = self._run_query(instruction, query, skip_query_expansion=recovery)
         self.query_stats = [dict(self.last_query_stats)]
 
@@ -224,25 +250,42 @@ class AmendmentSearchRetriever:
         # match, not just the weak ones.
         candidates: list[CandidateChunk] = []
         candidate_indexes: dict[str, int] = {}
-        for candidate in [*ranked, *structural]:
+        for candidate in [
+            *[
+                item
+                for item in structural
+                if item.structured_match or item.scope_evidence
+            ],
+            *ranked,
+            *structural,
+        ]:
             if candidate.user_file_id not in self._allowed_user_file_ids:
+                continue
+            if source_files is not None and candidate.user_file_id not in source_files:
                 continue
             existing_index = candidate_indexes.get(candidate.chunk_id)
             if existing_index is not None:
                 existing = candidates[existing_index]
-                if candidate.structured_match and not existing.structured_match:
+                if candidate.structured_match or candidate.scope_evidence:
                     candidates[existing_index] = replace(
                         existing,
-                        structured_match=True,
+                        structured_match=existing.structured_match
+                        or candidate.structured_match,
+                        resolved_article_no=candidate.resolved_article_no
+                        or existing.resolved_article_no,
+                        scope_evidence=candidate.scope_evidence
+                        or existing.scope_evidence,
                         source_score=max(existing.source_score, candidate.source_score),
                         source_name=candidate.source_name or existing.source_name,
                         metadata={**existing.metadata, **candidate.metadata},
                     )
                 continue
-            candidates.append(candidate)
+            candidates.append(
+                replace(candidate, source_verified=True)
+                if source_files is not None
+                else candidate
+            )
             candidate_indexes[candidate.chunk_id] = len(candidates) - 1
-            if len(candidates) == _MAX_AMENDMENT_CANDIDATES:
-                break
 
         logger.info(
             "Amendment retrieval phase=%s ranked=%s structural=%s candidates=%s query=%r",
@@ -252,7 +295,7 @@ class AmendmentSearchRetriever:
             len(candidates),
             query[:120],
         )
-        return candidates
+        return candidates[:_MAX_AMENDMENT_CANDIDATES]
 
 
 def build_amendment_search_retriever(
@@ -340,6 +383,27 @@ def build_amendment_search_retriever(
                 for chunk_id, row in rows.items()
             }
 
+    source_identities = load_amendment_source_identities(db_session, user_file_ids)
+    source_chunks: dict[str, list[CandidateChunk]] = {}
+
+    def source_file_loader(instruction: AmendmentInstruction) -> Sequence[str] | None:
+        number = named_law_number(instruction.target_source or "")
+        if number is None:
+            return None
+        files = []
+        for source in source_identities:
+            filename_number = named_law_number(source.name)
+            root_number = named_law_number(source.root_heading)
+            if (
+                filename_number is not None
+                and root_number is not None
+                and filename_number != root_number
+            ):
+                continue
+            if (filename_number or root_number) == number:
+                files.append(str(source.user_file_id))
+        return files
+
     def structural_candidate_loader(
         instruction: AmendmentInstruction,
     ) -> Sequence[CandidateChunk]:
@@ -351,7 +415,9 @@ def build_amendment_search_retriever(
         )
         source_tokens = source_identity_distinguishing_tokens(instruction.target_source)
 
-        def as_candidate(match: RegulatoryChunkStructuralMatch) -> CandidateChunk:
+        def as_candidate(
+            match: RegulatoryChunkStructuralMatch, *, exact: bool = False
+        ) -> CandidateChunk:
             return CandidateChunk(
                 chunk_id=match.chunk.id,
                 user_file_id=str(match.chunk.user_file_id),
@@ -361,7 +427,7 @@ def build_amendment_search_retriever(
                     **match.chunk.chunk_metadata,
                     "heading_path": list(match.chunk.heading_path),
                 },
-                structured_match=True,
+                structured_match=exact,
                 source_score=(
                     SequenceMatcher(
                         None,
@@ -373,43 +439,91 @@ def build_amendment_search_retriever(
                 ),
             )
 
+        verified_files = source_file_loader(instruction)
+        scoped_ids = (
+            [UUID(value) for value in verified_files]
+            if verified_files is not None
+            else user_file_ids
+        )
+        candidates: list[CandidateChunk] = []
+        seen_chunk_ids: set[str] = set()
         with get_session_with_current_tenant() as structural_session:
-            matches: list[RegulatoryChunkStructuralMatch] = []
-            seen_chunk_ids: set[str] = set()
-            # An appendix is one structural scope. For articles, the narrow
-            # target identifies the amended unit and the article-level pass
-            # supplies siblings needed to position inserted paragraphs/clauses.
             for clause_label, paragraph_no in _structural_lookup_scopes(target):
                 for match in get_active_chunks_by_structural_reference(
                     structural_session,
-                    user_file_ids=user_file_ids,
+                    user_file_ids=scoped_ids,
                     article_no=target.article_no,
                     clause_label=clause_label,
                     appendix_label=target.appendix_label,
                     source_name_hint=instruction.target_source,
-                    source_name_tokens=source_tokens,
+                    source_name_tokens=()
+                    if verified_files is not None
+                    else source_tokens,
                     paragraph_no=paragraph_no,
                     limit=32 if target.appendix_label is not None else 8,
                 ):
                     if match.chunk.id in seen_chunk_ids:
                         continue
+                    if verified_files is None and not source_identity_matches(
+                        instruction.target_source, match.source_name
+                    ):
+                        continue
                     seen_chunk_ids.add(match.chunk.id)
-                    matches.append(match)
-                if (clause_label, paragraph_no) == (None, None):
-                    break
-            candidates = [
-                as_candidate(match)
-                for match in matches
-                if source_identity_matches(instruction.target_source, match.source_name)
-            ]
-        return sorted(
-            candidates,
-            key=lambda candidate: (-candidate.source_score, candidate.chunk_id),
-        )
+                    candidates.append(
+                        as_candidate(
+                            match,
+                            exact=(clause_label, paragraph_no)
+                            == (target.clause_label, target.paragraph_no),
+                        )
+                    )
+            # Legacy documents can carry stale article metadata. Resolve only
+            # within one verified source, with explicit heading boundaries.
+            if (
+                verified_files is not None
+                and len(verified_files) == 1
+                and target.article_no is not None
+            ):
+                file_id = verified_files[0]
+                if file_id not in source_chunks:
+                    source_chunks[file_id] = [
+                        replace(as_candidate(match), source_verified=True)
+                        for match in load_amendment_source_chunks(
+                            structural_session, UUID(file_id)
+                        )
+                    ]
+                rows = source_chunks[file_id]
+                resolved = article_scope_candidates(rows, target.article_no)
+                resolved_by_id = {
+                    candidate.chunk_id: candidate for candidate in resolved
+                }
+                candidates = [
+                    replace(
+                        candidate,
+                        resolved_article_no=target.article_no,
+                        scope_evidence=resolved_by_id[
+                            candidate.chunk_id
+                        ].scope_evidence,
+                    )
+                    if candidate.chunk_id in resolved_by_id
+                    else candidate
+                    for candidate in candidates
+                ]
+                candidates.extend(
+                    candidate
+                    for candidate in resolved
+                    if candidate.chunk_id not in seen_chunk_ids
+                )
+                if not candidates and explicitly_adds_top_level_provision(
+                    instruction.instruction_text
+                ):
+                    candidates = rows[:1]
+        # Stable order keeps the narrow named unit ahead of article siblings.
+        return candidates
 
     return AmendmentSearchRetriever(
         search_tool_factory=search_tool_factory,
         canonical_candidate_loader=canonical_candidate_loader,
         structural_candidate_loader=structural_candidate_loader,
+        source_file_loader=source_file_loader,
         allowed_user_file_ids=user_file_ids,
     )

@@ -53,6 +53,10 @@ from onyx.regulatory.amendments.annexes.staging import (
     stage_canonical_items,
 )
 from onyx.regulatory.amendments.models import AmendmentInstruction, DateResolution
+from onyx.regulatory.amendments.structural_target import (
+    amendment_operation_text,
+    appendix_reference_text,
+)
 from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
 
 _ANNEX_REFERENCE = re.compile(
@@ -77,7 +81,10 @@ def group_annex_instructions(
             extract_single_regulatory_provision_reference,
         )
 
-        reference = instruction.article_reference or ""
+        operation = appendix_reference_text(
+            amendment_operation_text(instruction.instruction_text)
+        )
+        reference = appendix_reference_text(instruction.article_reference or "")
         reference_labels = list(_ANNEX_REFERENCE.finditer(reference))
         if (
             not reference_labels
@@ -86,7 +93,7 @@ def group_annex_instructions(
             continue
         if not reference_labels and re.search(
             r"(?:maddesin(?:de|in)|fıkrasın(?:da|ın)|bendin(?:de|in)|article\s+\d+)",
-            instruction.instruction_text,
+            operation,
             re.IGNORECASE,
         ):
             continue
@@ -94,8 +101,7 @@ def group_annex_instructions(
             dict.fromkeys(
                 normalize_annex_label(match.group())
                 for match in (
-                    reference_labels
-                    or list(_ANNEX_REFERENCE.finditer(instruction.instruction_text))
+                    reference_labels or list(_ANNEX_REFERENCE.finditer(operation))
                 )
             )
         )

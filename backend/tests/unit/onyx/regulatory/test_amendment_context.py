@@ -54,3 +54,16 @@ def test_the_context_carries_the_whole_amendment_and_its_commencement() -> None:
 
 def test_empty_text_has_no_context_to_share() -> None:
     assert build_amendment_context("   \n  ") is None
+
+
+def test_quoted_temporary_article_is_not_amendment_commencement() -> None:
+    import json
+    from pathlib import Path
+
+    payload = json.loads(
+        (Path(__file__).parent / "fixtures/7594_amendment.json").read_text()
+    )
+    provisions = commencement_provisions(payload["raw_text"])
+    assert len(provisions) == 1
+    assert provisions[0].startswith("MADDE 8-")
+    assert "1/9/2026" in provisions[0]

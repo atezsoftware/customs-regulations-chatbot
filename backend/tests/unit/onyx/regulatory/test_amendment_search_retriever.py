@@ -3,6 +3,8 @@ from typing import cast
 from unittest.mock import MagicMock
 from uuid import UUID
 
+import pytest
+
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import BaseFilters, SearchDoc, SearchDocsResponse
 from onyx.regulatory.amendments.models import AmendmentInstruction
@@ -483,3 +485,63 @@ def test_amendment_search_does_not_filter_on_the_document_set_tag() -> None:
     # A stale index-side set tag must not be able to hide a chunk; scope is
     # enforced against the batch's file list after retrieval instead.
     assert filters.document_set is None
+
+
+def test_missing_named_source_stops_before_search_or_model() -> None:
+    search = MagicMock()
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=search,
+        canonical_candidate_loader=lambda _ids: {},
+        source_file_loader=lambda _instruction: [],
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    result = retriever.search(
+        AmendmentInstruction(
+            instruction_text="7082 sayılı Kanunun 14 üncü maddesine aşağıdaki fıkra eklenmiştir.",
+            target_source="7082 sayılı Kanun",
+        )
+    )
+    assert result == []
+    assert "source" in (retriever.last_attention or "").lower()
+    assert "7082" in (retriever.last_attention or "")
+    search.assert_not_called()
+
+
+def test_structural_targets_survive_eight_unrelated_search_hits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact = [
+        CandidateChunk(
+            chunk_id=f"exact-{i}",
+            user_file_id=str(_FILE_ID),
+            text="target",
+            structured_match=True,
+        )
+        for i in range(6)
+    ]
+    retriever = AmendmentSearchRetriever(
+        search_tool_factory=MagicMock(),
+        canonical_candidate_loader=lambda _ids: {},
+        structural_candidate_loader=lambda _instruction: exact,
+        allowed_user_file_ids=[_FILE_ID],
+    )
+    monkeypatch.setattr(
+        retriever,
+        "_run_query",
+        MagicMock(
+            return_value=[
+                CandidateChunk(
+                    chunk_id=f"broad-{i}", user_file_id=str(_FILE_ID), text="other"
+                )
+                for i in range(8)
+            ]
+        ),
+    )
+    result = retriever.search(
+        AmendmentInstruction(
+            instruction_text="Madde 72 değiştirilmiştir.",
+            target_source="5434 sayılı Kanun",
+        )
+    )
+    assert len(result) <= 12
+    assert {item.chunk_id for item in exact} <= {item.chunk_id for item in result}

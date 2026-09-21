@@ -164,10 +164,12 @@ class SegmentationResult(BaseModel):
 class MatchResult(BaseModel):
     """Which (if any) hybrid-search candidate an instruction amends."""
 
+    outcome: Literal["matched", "new_provision", "not_found"] | None = None
+
     old_chunk_id: str | None = Field(
         description=(
             "id of the matched candidate chunk to amend, or null if this "
-            "instruction adds a new provision with no existing match"
+            "instruction adds a new provision or no supported target was found; distinguish with outcome"
         )
     )
     confidence: float = Field(description="Confidence in this match, 0.0-1.0")

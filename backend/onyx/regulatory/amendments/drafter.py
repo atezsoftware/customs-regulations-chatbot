@@ -25,6 +25,8 @@ _SYSTEM_PROMPT = """You are an expert at drafting amended Turkish regulatory tex
 
 You will be given one or more amendment instructions, (if any) the existing chunk they amend, and the amendment's reference/publication date. Your task is to apply every listed instruction and produce ONE full replacement chunk containing all listed changes, plus its single effective-date window. Never return separate or partial chunk texts.
 
+The optional target_evidence describes a verified source heading when legacy metadata is stale. Use it for legal context without changing unrelated canonical metadata.
+
 For `new_chunk`:
 - `text`: the FULL amended chunk text after applying EVERY listed instruction (not just the changed parts — one complete replacement chunk containing all changes).
 - `chunk_type`: usually stays the same as the old chunk; only change it if the nature of the amendment requires it.
@@ -66,6 +68,7 @@ def _chunk_to_review_dict(chunk: dict[str, Any]) -> dict[str, Any]:
         "chunk_type": chunk.get("chunk_type"),
         "heading_path": chunk.get("heading_path"),
         "metadata": chunk.get("chunk_metadata") or chunk.get("metadata"),
+        "target_evidence": chunk.get("target_evidence"),
         "descendants": [
             _chunk_to_review_dict(item)
             for item in chunk.get("descendant_snapshots", [])
@@ -82,6 +85,10 @@ def _normalized_date_phrase(phrase: str) -> str:
     return " ".join(normalized_case.split())
 
 
+class AmendmentDateConflict(RuntimeError):
+    """One chunk version cannot represent incompatible effective windows."""
+
+
 def _group_date_phrase(instructions: list[AmendmentInstruction]) -> str | None:
     phrases_by_normalized_value: dict[str, str] = {}
     for instruction in instructions:
@@ -95,7 +102,7 @@ def _group_date_phrase(instructions: list[AmendmentInstruction]) -> str | None:
         phrases = ", ".join(
             repr(value) for value in phrases_by_normalized_value.values()
         )
-        raise RuntimeError(
+        raise AmendmentDateConflict(
             "Same-target amendment instructions contain incompatible explicit "
             f"effective-date phrases: {phrases}"
         )
@@ -246,8 +253,9 @@ def draft_multi_chunk_scope(
 
     if not instructions or len(old_chunks) < 2:
         raise ValueError("Multi-chunk drafting requires instructions and a scope")
+    group_date_phrase = _group_date_phrase(instructions)
     instruction_text = "\n\n".join(
-        f"[{index}] {instruction.instruction_text}"
+        f"[{index}] {instruction.instruction_text}\nNatural-language date phrase: {instruction.raw_date_phrase or group_date_phrase or '(none)'}"
         for index, instruction in enumerate(instructions)
     )
     old_scope = json.dumps(

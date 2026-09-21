@@ -3,7 +3,7 @@
 import re
 from typing import Literal
 
-from onyx.regulatory.amendments.structural_target import amended_body
+from onyx.regulatory.amendments.structural_target import amendment_operation_text
 
 # Official drafting routinely conjoins the addition with the renumbering it
 # causes ("eklenmiş ve diğer bentler buna göre teselsül ettirilmiştir"), which
@@ -17,11 +17,11 @@ _SUBORDINATE_ADDITION_RE = re.compile(
 )
 _TOP_LEVEL_ADDITION_PATTERNS = (
     re.compile(
-        rf"(?:geçici\s+|gecici\s+)?madde\s+\d+[a-zçğıöşü]*\b.{{0,160}}?{_ADDITION_VERB}",
+        rf"(?:(?:geçici|gecici|ek|mükerrer|mukerrer)\s+)?madde\s+\d+[a-zçğıöşü]*\b.{{0,160}}?{_ADDITION_VERB}",
         re.IGNORECASE | re.DOTALL,
     ),
     re.compile(
-        rf"aşağıdaki\s+(?:yeni\s+)?(?:geçici\s+|gecici\s+)?madde\b.{{0,200}}?"
+        rf"aşağıdaki\s+(?:yeni\s+)?(?:(?:geçici|gecici|ek|mükerrer|mukerrer)\s+)?madde\b.{{0,200}}?"
         rf"{_ADDITION_VERB}",
         re.IGNORECASE | re.DOTALL,
     ),
@@ -46,7 +46,7 @@ def explicitly_adds_top_level_provision(instruction_text: str) -> bool:
     """
 
     # The instruction's own "MADDE N-" designator is not a provision it adds.
-    normalized = " ".join(amended_body(instruction_text).split())
+    normalized = " ".join(amendment_operation_text(instruction_text).split())
     if _SUBORDINATE_ADDITION_RE.search(normalized):
         return False
     return any(pattern.search(normalized) for pattern in _TOP_LEVEL_ADDITION_PATTERNS)
@@ -61,7 +61,7 @@ def added_subordinate_unit_kind(instruction_text: str) -> SubordinateUnitKind | 
     the new chunk without inventing a top-level provision.
     """
 
-    normalized = " ".join(amended_body(instruction_text).split())
+    normalized = " ".join(amendment_operation_text(instruction_text).split())
     if not _SUBORDINATE_ADDITION_RE.search(normalized):
         return None
     if _ADDED_CLAUSE_RE.search(normalized):

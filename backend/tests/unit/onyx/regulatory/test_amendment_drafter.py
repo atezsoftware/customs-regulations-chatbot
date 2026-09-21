@@ -408,3 +408,23 @@ def test_reconcile_existing_heading_path_for_structural_types(
         )
         == expected
     )
+
+
+def test_multichunk_conflicting_dates_stop_before_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generate = MagicMock()
+    monkeypatch.setattr(drafter, "generate_structured", generate)
+    with pytest.raises(RuntimeError, match="incompatible"):
+        drafter.draft_multi_chunk_scope(
+            MagicMock(),
+            instructions=[
+                AmendmentInstruction(instruction_text="A", raw_date_phrase="1/9/2026"),
+                AmendmentInstruction(
+                    instruction_text="B", raw_date_phrase="yayımı tarihinde"
+                ),
+            ],
+            old_chunks=[{"id": "a"}, {"id": "b"}],
+            reference_date="2026-09-22",
+        )
+    generate.assert_not_called()

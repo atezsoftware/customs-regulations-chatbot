@@ -752,13 +752,13 @@ def test_match_and_draft_llm_calls_run_outside_database_sessions(
         finally:
             session_depth -= 1
 
-    candidate = SimpleNamespace(chunk_id="chunk-1")
+    candidate = _candidate("chunk-1")
     match = MatchResult(old_chunk_id="chunk-1", confidence=0.9, rationale="match")
     context = SimpleNamespace()
     proposal = SimpleNamespace(instruction_index=0)
     matcher_calls = 0
 
-    def search(**_kwargs: object) -> list[SimpleNamespace]:
+    def search(**_kwargs: object) -> list[CandidateChunk]:
         assert session_depth == 0
         return [candidate]
 
@@ -970,3 +970,80 @@ def test_same_target_conflicting_explicit_date_phrases_fail_before_drafting(
         )
 
     generate_structured.assert_not_called()
+
+
+def test_additional_article_replacement_and_new_units_are_separate_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+    from pathlib import Path
+
+    payload = json.loads(
+        (Path(__file__).parent / "fixtures/7594_amendment.json").read_text()
+    )
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=102,
+        targets=["table", None, None],
+        instructions_override=[
+            AmendmentInstruction.model_validate(payload["instructions"][i])
+            for i in [4, 5, 6]
+        ],
+    )
+    assert [
+        call.kwargs["instruction_indices"] for call in result.draft.call_args_list
+    ] == [[0], [1], [2]]
+
+
+def test_annex_groups_do_not_cross_source_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from dataclasses import replace
+
+    original = _candidate
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_candidate",
+        lambda chunk_id: replace(
+            original(chunk_id),
+            user_file_id=(
+                "00000000-0000-0000-0000-000000000124"
+                if chunk_id == "second"
+                else "00000000-0000-0000-0000-000000000123"
+            ),
+        ),
+    )
+    instructions = [
+        AmendmentInstruction(
+            instruction_text=f'MADDE {index + 1}- EK-3 içindeki "eski" ibaresi "yeni" şeklinde değiştirilmiştir.',
+            annex_change_basis="explicit_amendment",
+        )
+        for index in range(2)
+    ]
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=104,
+        targets=["first", "second"],
+        instructions_override=instructions,
+    )
+    assert [
+        call.kwargs["instruction_indices"] for call in result.draft.call_args_list
+    ] == [[0], [1]]
+
+
+def test_missing_source_attention_is_preserved_without_model_call() -> None:
+    retriever = MagicMock()
+    retriever.search.return_value = []
+    retriever.query_stats = []
+    retriever.last_attention = "7082 source is absent from the captured Document Set"
+    trace = job._InstructionTrace()
+    candidates, match = job.retrieve_and_confirm_instruction(
+        retriever=retriever,
+        llm=MagicMock(),
+        instruction=AmendmentInstruction(instruction_text="7082 sayılı Kanun"),
+        trace=trace,
+    )
+    assert candidates == [] and match is None
+    assert "7082" in trace.describe()
+    assert retriever.search.call_count == 1

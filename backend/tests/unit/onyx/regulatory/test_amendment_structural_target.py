@@ -220,3 +220,86 @@ def test_addition_classification_covers_conjoined_official_drafting(
 
     assert explicitly_adds_top_level_provision(instruction_text) is top_level
     assert added_subordinate_unit_kind(instruction_text) == unit_kind
+
+
+@pytest.mark.parametrize(
+    ("index", "article", "paragraph", "clause"),
+    [
+        (1, "EK 77", "3", None),
+        (3, "21", "2", None),
+        (4, "EK 3", "1", None),
+        (5, "EK 3", "3", None),
+        (6, "GEÇİCİ 20", None, None),
+        (7, "GEÇİCİ 18", "3", None),
+        (9, "14", None, None),
+    ],
+)
+def test_7594_operation_target_excludes_references_in_new_wording(
+    index: int,
+    article: str,
+    paragraph: str | None,
+    clause: str | None,
+) -> None:
+    import json
+    from pathlib import Path
+
+    payload = json.loads(
+        (Path(__file__).parent / "fixtures/7594_amendment.json").read_text()
+    )
+    target = parse_amendment_structural_target(
+        AmendmentInstruction.model_validate(payload["instructions"][index])
+    )
+    assert target is not None
+    assert target.article_no == article
+    assert target.appendix_label is None
+    assert target.paragraph_no == paragraph
+    assert target.clause_label == clause
+
+
+def test_numbered_law_filename_is_identity_not_a_cross_reference() -> None:
+    from onyx.regulatory.amendments.structural_target import source_identity_matches
+
+    source = "5434 sayılı Türkiye Cumhuriyeti Emekli Sandığı Kanunu"
+    assert source_identity_matches(source, "Diğer Kanunlar/5434_sayili_kanun.md")
+    assert not source_identity_matches(
+        source, "Diğer Kanunlar/4759_sayili_emekli_sandigi_kanununda_degisiklik.md"
+    )
+
+
+def test_new_article_identity_is_preserved_without_model_reference() -> None:
+    target = parse_amendment_structural_target(
+        AmendmentInstruction(
+            instruction_text="MADDE 5- 3713 sayılı Kanuna aşağıdaki geçici madde eklenmiştir.\n“GEÇİCİ MADDE 20- Ek 3 üncü madde hükümleri uygulanır.”"
+        )
+    )
+    assert target is not None
+    assert target.article_no == "GEÇİCİ 20"
+    assert target.appendix_label is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "12/4/1991 tarihli ve 3713 sayılı Terörle Mücadele Kanunu",
+        "Diğer Kanunlar/03713_sayili_terorle_mucadele_kanunu.md",
+        "Kanun No: 3713",
+    ],
+)
+def test_law_number_comes_from_instrument_identity(source: str) -> None:
+    from onyx.regulatory.amendments.structural_target import named_law_number
+
+    assert named_law_number(source) == "3713"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "3713 sayılı Kanuna İlişkin Yönetmelik",
+        "3713_sayili_kanunda_degisiklik_yapilmasina_dair_kanun.md",
+        "3713 sayılı Kanunu Genel Tebliği",
+    ],
+)
+def test_related_instrument_is_not_the_named_law(source: str) -> None:
+    from onyx.regulatory.amendments.structural_target import source_identity_matches
+
+    assert not source_identity_matches("3713 sayılı Terörle Mücadele Kanunu", source)
