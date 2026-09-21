@@ -7,7 +7,8 @@ PG can open the gate. Never physically delete these records or mix legacy writer
 """
 
 import json
-from typing import cast
+from collections.abc import Callable, Mapping
+from typing import Any, cast
 
 from elasticsearch import ConflictError, Elasticsearch
 from elasticsearch.helpers import scan
@@ -483,11 +484,17 @@ class FencedPublicationIndex:
         path. This method never labels a newly regenerated old input as verified.
         """
         self._check_index()
-        params = self._params(reservations, ordinal, require_gate=False)
+        self._params(reservations, ordinal, require_gate=False)
         result = self.client.get(
             index=self.snapshot.index_name, id=self._id(reservations, ordinal)
         )
         source = dict(result["_source"])
+        return self._evidence_from_source(reservations, ordinal, source)
+
+    def _evidence_from_source(
+        self, reservations: FileReservations, ordinal: int, source: dict[str, Any]
+    ) -> IndexedProjectionEvidence:
+        params = self._params(reservations, ordinal, require_gate=False)
         if (
             source.get("document_id") != params["file"]
             or source.get("chunk_index") != ordinal
@@ -616,9 +623,79 @@ class FencedPublicationIndex:
                         "indexed evidence physical index identity mismatch"
                     )
                 adapter = FencedPublicationIndex(self.client, previous)
-            inventory.append(adapter.read_evidence(reservations, ordinal))
+            inventory.append(
+                adapter._evidence_from_source(reservations, ordinal, dict(source))
+            )
+        self._check_index()
         return tuple(
             sorted(
                 inventory, key=lambda item: json.loads(item.source_json)["chunk_index"]
             )
         )
+
+    def publish_inventory(
+        self,
+        reservations: FileReservations,
+        projections: tuple[FrozenPublicationProjection, ...],
+        *,
+        before_batch: Callable[[], object],
+    ) -> None:
+        """Batch the same create/seal/write scripts; preserve every fencing check.
+
+        The complete reserved inventory is fenced, including retained vectors and
+        abandoned ordinals. Only the caller's frozen projections supply content.
+        Any partial failure leaves the gate closed for an idempotent retry.
+        """
+        live = {projection.ordinal: projection for projection in projections}
+        if len(live) != len(projections) or not set(live).issubset(
+            reservations.ordinals
+        ):
+            raise ValueError("bulk publication requires unique reserved projections")
+        for phase in ("create", "seal", "write"):
+            for offset in range(0, len(reservations.ordinals), 64):
+                before_batch()
+                self._check_index()
+                operations: list[Mapping[str, Any]] = []
+                for ordinal in reservations.ordinals[offset : offset + 64]:
+                    identity = {
+                        "_index": self.snapshot.index_name,
+                        "_id": self._id(reservations, ordinal),
+                    }
+                    if phase == "create":
+                        operations.extend(
+                            [{"create": identity}, self._empty(reservations, ordinal)]
+                        )
+                        continue
+                    params = self._params(reservations, ordinal)
+                    script = _SEAL
+                    if phase == "write":
+                        source = self._source(reservations, live.get(ordinal), ordinal)
+                        operation = publication_digest({"source": source, "base": None})
+                        source["publication_operation"] = operation
+                        params.update(
+                            source=source, operation=operation, base=None, previous=None
+                        )
+                        script = _WRITE
+                    operations.extend(
+                        [
+                            {"update": {**identity, "retry_on_conflict": 3}},
+                            {
+                                "script": {
+                                    "lang": "painless",
+                                    "source": script,
+                                    "params": params,
+                                }
+                            },
+                        ]
+                    )
+                response = self.client.bulk(operations=operations)
+                items = response.get("items", [])
+                if len(items) != len(operations) // 2:
+                    raise ValueError("bulk publication returned incomplete results")
+                for item in items:
+                    outcome = item["create" if phase == "create" else "update"]
+                    status = outcome.get("status", 500)
+                    if not (200 <= status < 300 or phase == "create" and status == 409):
+                        raise ValueError(
+                            f"bulk publication {phase} failed (status {status})"
+                        )

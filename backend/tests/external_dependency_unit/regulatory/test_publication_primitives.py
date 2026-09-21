@@ -669,6 +669,69 @@ def test_finalization_rejects_new_reservations_after_verification(
     assert owned_file in authority.unavailable(authority.observe(), (owned_file,))
 
 
+def test_bulk_publication_preserves_exact_fencing_retry_and_tombstones(
+    owned_file: UUID, es: tuple[Elasticsearch, str]
+) -> None:
+    authority = store()
+    owner = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=30))
+    authority.close_gate(owner)
+    reserved = authority.reservations(owner)
+    adapter = adapter_for(es)
+    projection = frozen_projection(owned_file, 0)
+    adapter.publish_inventory(
+        reserved, (projection,), before_batch=lambda: authority.reservations(owner)
+    )
+    assert adapter.verify(reserved, (projection,)).live_ordinals == (0,)
+    adapter.publish_inventory(
+        reserved, (projection,), before_batch=lambda: authority.reservations(owner)
+    )
+    assert adapter.verify(reserved, (projection,)).live_ordinals == (0,)
+    with pytest.raises(ValueError, match="bulk"):
+        adapter.publish_inventory(
+            reserved,
+            (frozen_projection(owned_file, 0, "unreviewed change"),),
+            before_batch=lambda: authority.reservations(owner),
+        )
+    authority.release(owner)
+    newer = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=30))
+    current = authority.reservations(newer)
+    adapter.publish_inventory(
+        current, (), before_batch=lambda: authority.reservations(newer)
+    )
+    with pytest.raises(ValueError, match="bulk"):
+        adapter.publish_inventory(reserved, (projection,), before_batch=lambda: None)
+    assert adapter.verify(current, ()).live_ordinals == ()
+
+
+def test_inventory_reads_scanned_vectors_without_per_record_gets(
+    owned_file: UUID, es: tuple[Elasticsearch, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import MagicMock
+
+    authority = store()
+    owner = authority.acquire(owned_file, owner_id=uuid4(), ttl=timedelta(seconds=30))
+    authority.close_gate(owner)
+    reserved = authority.reservations(owner)
+    adapter = adapter_for(es)
+    adapter.seal(reserved)
+    projection = frozen_projection(owned_file, 0)
+    adapter.upsert(reserved, projection)
+    adapter.tombstone(reserved, reserved.ordinals[-1])
+    get = MagicMock(side_effect=AssertionError("inventory must use scanned evidence"))
+    monkeypatch.setattr(es[0], "get", get)
+    evidence = adapter.inventory_evidence(reserved)
+    assert len(evidence) == 1
+    frozen = evidence[0].frozen_projection
+    assert frozen is not None
+    assert frozen.context_projection_id == projection.context_projection_id
+    assert frozen.embedding_inputs == projection.embedding_inputs
+    assert json.loads(frozen.source_json) == json.loads(projection.source_json)
+    assert json.loads(frozen.embedding_config_json) == json.loads(
+        projection.embedding_config_json
+    )
+    get.assert_not_called()
+
+
 def test_tenant_file_and_index_identity_cannot_be_adopted_from_other_scope(
     owned_file: UUID, es: tuple[Elasticsearch, str]
 ) -> None:

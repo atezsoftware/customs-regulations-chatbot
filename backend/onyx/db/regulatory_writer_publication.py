@@ -229,6 +229,17 @@ def _validate_history_coverage(
         if manifest.kind == "correction"
         else set()
     )
+    coverage: dict[tuple[str, str], list[tuple[date, date]]] = {}
+    for binding in manifest.bindings:
+        key = (
+            binding.index.index_uuid,
+            json.loads(binding.projection.source_json)["regulatory_chunk_id"],
+        )
+        coverage.setdefault(key, []).append(
+            (binding.effective_start or date.min, binding.effective_end or date.max)
+        )
+    for intervals in coverage.values():
+        intervals.sort()
     for previous in active:
         start, end = (
             previous.effective_start or date.min,
@@ -247,13 +258,7 @@ def _validate_history_coverage(
             end = min(end, legal.validity_end_date or date.max)
             if start >= end:
                 continue
-        intervals = sorted(
-            (binding.effective_start or date.min, binding.effective_end or date.max)
-            for binding in manifest.bindings
-            if binding.index.index_uuid == previous.index_uuid
-            and json.loads(binding.projection.source_json)["regulatory_chunk_id"]
-            == previous.canonical_chunk_id
-        )
+        intervals = coverage.get((previous.index_uuid, previous.canonical_chunk_id), [])
         covered = start
         for lower, upper in intervals:
             if lower <= covered:
@@ -376,6 +381,12 @@ def finalize_writer_publication(
         pending = [
             binding for binding in manifest.bindings if binding.id not in existing_ids
         ]
+        canonical_by_binding = {
+            binding.id: json.loads(binding.projection.source_json)[
+                "regulatory_chunk_id"
+            ]
+            for binding in pending
+        }
         while pending:
             ready = [
                 binding
@@ -383,8 +394,7 @@ def finalize_writer_publication(
                 if not any(
                     other is not binding
                     and other.index.index_uuid == binding.index.index_uuid
-                    and json.loads(other.projection.source_json)["regulatory_chunk_id"]
-                    in binding.dependency_ids
+                    and canonical_by_binding[other.id] in binding.dependency_ids
                     for other in pending
                 )
             ]

@@ -1,6 +1,7 @@
 """Execute a durable legacy writer inventory with permanent actual ES fencing."""
 
 from collections.abc import Callable
+from time import monotonic
 from typing import TYPE_CHECKING
 
 from elasticsearch import Elasticsearch
@@ -17,6 +18,9 @@ from onyx.regulatory.amendments.annexes.publication_execution import (
     publication_heartbeat,
 )
 from onyx.regulatory.writer_publication_models import WriterPublicationManifest
+from onyx.utils.logger import setup_logger
+
+logger = setup_logger()
 
 if TYPE_CHECKING:
     from datetime import date
@@ -40,6 +44,7 @@ def execute_writer_publication(
     activate: bool = True,
     durable_generation: int | None = None,
 ) -> None:
+    started = monotonic()
     authority = PublicationStore(owner.scope)
     if manifest is not None:
         pending = pending_writer_manifest(owner)
@@ -56,7 +61,6 @@ def execute_writer_publication(
         reservations = authority.reservations(owner)
         for index in manifest.indexes:
             adapter = FencedPublicationIndex(client, index)
-            adapter.seal(reservations)
             projections = {
                 binding.projection.ordinal: binding.projection
                 for binding in manifest.bindings
@@ -75,18 +79,29 @@ def execute_writer_publication(
                     )
                     for ordinal, projection in projections.items()
                 }
-            for ordinal in reservations.ordinals:
+
+            def check_owner() -> None:
                 if lost.is_set():
                     raise PublicationOwnershipLost("writer publication heartbeat lost")
                 authority.reservations(owner)
-                if ordinal in projections:
-                    adapter.upsert(reservations, projections[ordinal])
-                else:
-                    adapter.tombstone(reservations, ordinal)
+
+            if manifest.kind == "amendment":
+                adapter.publish_inventory(
+                    reservations, tuple(projections.values()), before_batch=check_owner
+                )
+            else:
+                adapter.seal(reservations)
+                for ordinal in reservations.ordinals:
+                    check_owner()
+                    if ordinal in projections:
+                        adapter.upsert(reservations, projections[ordinal])
+                    else:
+                        adapter.tombstone(reservations, ordinal)
             proofs.append(adapter.verify(reservations, tuple(projections.values())))
         if lost.is_set():
             raise PublicationOwnershipLost("writer publication heartbeat lost")
     # The heartbeat has joined before authority/canonical activation locks.
+    indexed = monotonic()
     if activate:
         if manifest.kind in {"durable", "cancellation"}:
             finalize_writer_publication(
@@ -94,6 +109,15 @@ def execute_writer_publication(
             )
         else:
             finalize_writer_publication(owner, manifest, proofs)
+    logger.info(
+        "writer_publication_finished kind=%s file_id=%s proposal_id=%s index_seconds=%.3f activation_seconds=%.3f bindings=%d",
+        manifest.kind,
+        owner.user_file_id,
+        manifest.amendment_proposal_id,
+        indexed - started,
+        monotonic() - indexed,
+        len(manifest.bindings),
+    )
 
 
 def recover_owned_writer(owner: FileOwnership) -> bool:
@@ -897,6 +921,7 @@ def approve_owned_amendment(
     from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
     from onyx.regulatory.writer_projection import prepare_owned_correction
 
+    started = monotonic()
     target = amendment_writer_target(proposal_id, tenant_id)
     if target is None:
         return 0
@@ -932,6 +957,7 @@ def approve_owned_amendment(
                     after,
                     changed_id=None,
                     target_settings_ids={current_search_settings_id},
+                    selective_amendment=True,
                 ).model_copy(
                     update={
                         "kind": "amendment",
@@ -946,8 +972,22 @@ def approve_owned_amendment(
                 )
             if lost.is_set():
                 raise ValueError("amendment publication ownership heartbeat lost")
+        previous_ids = {binding.id for binding in inputs.bindings}
+        logger.info(
+            "amendment_prepared proposal_id=%s seconds=%.3f retained_bindings=%d new_bindings=%d generated_contexts=%d",
+            proposal_id,
+            monotonic() - started,
+            sum(binding.id in previous_ids for binding in manifest.bindings),
+            sum(binding.id not in previous_ids for binding in manifest.bindings),
+            sum(len(view.projections) for view in manifest.views),
+        )
         with ElasticsearchClient() as transport:
             execute_writer_publication(owner, transport.publication_client(), manifest)
+        logger.info(
+            "amendment_approved proposal_id=%s total_seconds=%.3f",
+            proposal_id,
+            monotonic() - started,
+        )
         return len(after)
     finally:
         try:

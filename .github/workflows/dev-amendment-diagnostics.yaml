@@ -39,5 +39,7 @@ jobs:
                       break
               failures.append({"event":line[:220],"trace":trace})
           print(json.dumps(failures[-10:],ensure_ascii=False,indent=2))
+          timings=[line for line in lines if re.search(r"(?:amendment_context_impact|amendment_prepared|writer_publication_finished|amendment_approved) ",line)]
+          print(json.dumps({"publication_timings":timings[-30:]},ensure_ascii=False,indent=2))
           '
           done < <(jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name as $pod | .spec.containers[] | select(.image | contains("customs-regulations-backend-lite")) | [$pod,.name] | @tsv' <<<"$pods")

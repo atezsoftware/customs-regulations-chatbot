@@ -15,6 +15,11 @@ from onyx.document_index.publication_models import (
     publication_digest,
 )
 from onyx.indexing.embedder import DefaultIndexingEmbedder
+from onyx.regulatory.amendment_projection_impact import (
+    include_context_consumers,
+    merge_windows,
+    structural_windows,
+)
 from onyx.regulatory.amendments.annexes.analysis import resolve_review_context_llm
 from onyx.regulatory.amendments.annexes.context_dependencies import (
     context_hash,
@@ -57,6 +62,7 @@ def prepare_owned_correction(
     *,
     changed_id: str | None,
     target_settings_ids: set[int] | None = None,
+    selective_amendment: bool = False,
 ) -> WriterPublicationManifest:
     """Correct one canonical version, preserving all other legal time windows."""
     authority = PublicationStore(owner.scope)
@@ -152,7 +158,33 @@ def prepare_owned_correction(
             encoder_receipts=tuple(receipts.values()),
         )
         indexes.append(index)
+        llm = resolve_review_context_llm(settings, None)
+        impact_windows = None
+        if selective_amendment:
+            if not prior:
+                raise ValueError(
+                    "Selective amendment requires an existing qualified index baseline"
+                )
+            impact_windows = include_context_consumers(
+                structural_windows(inputs.canonical, after),
+                before=inputs.canonical,
+                after=after,
+                bindings=prior,
+                llm=llm,
+            )
+            affected = merge_windows(
+                [w for ranges in impact_windows.values() for w in ranges]
+            )
+            if not affected:
+                raise ValueError("Amendment has no effective canonical change")
+            lower, upper = affected[0][0], affected[-1][1]
         used: set[int] = set()
+        canonical_by_binding = {
+            binding.id: json.loads(binding.projection.source_json)[
+                "regulatory_chunk_id"
+            ]
+            for binding in context_prior + prior
+        }
         candidates_for_reuse = [
             binding.projection for binding in [*prior, *context_prior]
         ]
@@ -211,7 +243,12 @@ def prepare_owned_correction(
                 previous.effective_end or date.max,
             )
             untouched = [(start, end)]
-            for affected_start, affected_end in affected:
+            previous_windows = (
+                impact_windows.get(canonical_by_binding[previous.id], [])
+                if impact_windows is not None
+                else affected
+            )
+            for affected_start, affected_end in previous_windows:
                 untouched = [
                     (part_start, part_end)
                     for original_start, original_end in untouched
@@ -284,7 +321,6 @@ def prepare_owned_correction(
                 ),
             }
         )
-        llm = resolve_review_context_llm(settings, None)
         for start, end in zip(boundaries, boundaries[1:]):
             if prior and not any(
                 lower <= start and end <= upper for lower, upper in affected
@@ -304,9 +340,7 @@ def prepare_owned_correction(
             matching: dict[str, AnnexTemporalProjection] = {}
             for previous in context_prior:
                 if _contains(previous, when):
-                    canonical_id = json.loads(previous.projection.source_json)[
-                        "regulatory_chunk_id"
-                    ]
+                    canonical_id = canonical_by_binding[previous.id]
                     matching[canonical_id] = previous
                     row = by_id[canonical_id]
                     if row.id not in changed_ids:
@@ -326,6 +360,15 @@ def prepare_owned_correction(
                 llm=llm,
                 cached=inputs.cached,
                 as_of_date=when,
+                target_ids=(
+                    {
+                        identifier
+                        for identifier, ranges in impact_windows.items()
+                        if any(left <= start and end <= right for left, right in ranges)
+                    }
+                    if impact_windows is not None
+                    else None
+                ),
             )
             views.append(view)
             for context in view.projections:
@@ -336,10 +379,7 @@ def prepare_owned_correction(
                         binding
                         for binding in prior
                         if (
-                            json.loads(binding.projection.source_json)[
-                                "regulatory_chunk_id"
-                            ]
-                            == row.id
+                            canonical_by_binding[binding.id] == row.id
                             and _contains(binding, when)
                         )
                     ),
@@ -411,6 +451,7 @@ def prepare_owned_correction(
                     embedding_inputs=tuple(context.embedding_texts),
                     embedding_config_json=json.dumps(context.embedding_config),
                 )
+                candidates_for_reuse.append(projection)
                 base = desired[row.id]
                 if semantic_previous is not None and row.id not in changed_ids:
                     canonical_base = semantic_previous.canonical_base_sha256
