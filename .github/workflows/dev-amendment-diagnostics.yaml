@@ -1,7 +1,11 @@
 name: DEV amendment approval diagnostics
+run-name: DEV amendment ${{ inputs.mode || 'diagnostics' }} ${{ inputs.operation_id || github.run_id }}
 on:
   workflow_dispatch:
     inputs:
+      operation_id:
+        type: string
+        description: Unique operator checkpoint ID for locating this run
       mode:
         type: choice
         default: diagnostics
@@ -43,6 +47,10 @@ jobs:
             --start-time "$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
             --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --period 300 --statistics Minimum Average \
             --query '{Label:Label,Datapoints:Datapoints}'
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json \
+            | jq '[.items[] | select(.metadata.deletionTimestamp == null) | {name:.metadata.name,containers:[.spec.containers[] | {name,resources}]}]'
+          kubectl top pods -n customs-regulations-dev -l app=dev-customs-regulations-background
       - name: Read DEV worker failure traces
         if: inputs.mode == 'diagnostics' || github.event_name == 'push'
         shell: bash
