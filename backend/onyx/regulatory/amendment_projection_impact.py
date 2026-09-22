@@ -242,7 +242,8 @@ def validate_context_decisions(
             not decision.quote.strip() or decision.quote not in contexts[decision.key]
         ):
             raise ValueError(
-                "context impact must quote an actual affected context statement"
+                f"context {decision.key}: context impact must quote an actual affected "
+                "context statement verbatim"
             )
         if decision.affected and changes is not None:
             source = (
@@ -255,7 +256,13 @@ def validate_context_decisions(
                 or not decision.source_quote.strip()
                 or decision.source_quote not in source
             ):
-                raise ValueError("context impact must quote an actual changed source")
+                raise ValueError(
+                    f"context {decision.key}: context impact must quote an actual changed "
+                    "source verbatim; source_id and source_side must select one of "
+                    + json.dumps(
+                        {side: list(rows) for side, rows in changes[decision.key].items()}
+                    )
+                )
     return {d.key for d in decisions if d.affected}
 
 
@@ -387,7 +394,7 @@ def include_context_consumers(
         proofs = source_proofs(batch)
 
         def generate_audit() -> ContextImpactResult:
-            feedback: str | None = None
+            feedback: dict[str, object] | None = None
             for attempt in range(2):
                 response = generate_structured(
                     llm,
@@ -419,7 +426,12 @@ def include_context_consumers(
                 except ValueError as error:
                     if attempt == 1:
                         raise
-                    feedback = str(error)
+                    feedback = {
+                        "error": str(error),
+                        "previous_decisions": response.model_dump(mode="json")[
+                            "decisions"
+                        ],
+                    }
             raise AssertionError("context audit attempts exhausted")
 
         return (

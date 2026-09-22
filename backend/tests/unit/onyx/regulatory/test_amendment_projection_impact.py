@@ -278,7 +278,8 @@ def test_source_usage_traverses_shared_consumers_and_preserves_unrelated_text() 
 
 
 @pytest.mark.parametrize(
-    "fault", [None, "uncertain", "wrong_source", "missing", "transient"]
+    "fault",
+    [None, "uncertain", "wrong_source", "missing", "transient", "repair_source_quote"],
 )
 def test_context_evidence_selects_actual_consumer_and_keeps_generic_summary(
     monkeypatch: pytest.MonkeyPatch,
@@ -340,6 +341,10 @@ def test_context_evidence_selects_actual_consumer_and_keeps_generic_summary(
         nonlocal attempts
         attempts += 1
         data = json.loads(str(kwargs["user_prompt"]))
+        if fault == "repair_source_quote" and attempts == 2:
+            feedback = data["validation_feedback"]
+            assert "context 0" in feedback["error"]
+            assert feedback["previous_decisions"][0]["source_quote"] == "fee is 7 percent"
         decisions = [
             ContextImpactDecision(
                 key=key,
@@ -348,7 +353,9 @@ def test_context_evidence_selects_actual_consumer_and_keeps_generic_summary(
                 reason="The rate changes; the generic scope does not.",
                 source_side="after",
                 source_id="new" if fault != "wrong_source" else "foreign",
-                source_quote="fee is 7%",
+                source_quote="fee is 7 percent"
+                if fault == "repair_source_quote" and attempts == 1
+                else "fee is 7%",
                 uncertain=fault == "uncertain",
             )
             for key, case in data["contexts"].items()
@@ -372,7 +379,7 @@ def test_context_evidence_selects_actual_consumer_and_keeps_generic_summary(
     report = impact.analyze_amendment_impact(
         before=before, after=after, bindings=bindings, llm=llm, audit_cache=resolve
     )
-    if fault and fault != "transient":
+    if fault not in {None, "transient", "repair_source_quote"}:
         assert report.unresolved
         assert report.unchanged_ids == []
     else:
