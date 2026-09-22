@@ -25,10 +25,6 @@ on:
       limit:
         type: string
         default: '100'
-      profile:
-        type: boolean
-        default: false
-        description: Capture function timings and CPU counters for a bounded baseline run
   push:
     branches: [develop]
     paths: [.github/workflows/dev-amendment-diagnostics.yaml]
@@ -109,7 +105,6 @@ jobs:
           FILE_IDS: ${{ inputs.file_ids }}
           AFTER_FILE_ID: ${{ inputs.after_file_id }}
           FILE_LIMIT: ${{ inputs.limit }}
-          BASELINE_PROFILE: ${{ inputs.profile }}
         run: |
           set -euo pipefail
           [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -133,43 +128,17 @@ jobs:
             args+=(--after-file-id "$AFTER_FILE_ID")
           fi
           if [[ "$BASELINE_MODE" == baseline-apply ]]; then args+=(--apply); fi
-          python_args=(/app/scripts/prepare_regulatory_publication_baselines.py)
-          if [[ "$BASELINE_PROFILE" == true ]]; then
-            python_args=(-m cProfile -o "/tmp/baseline-${GITHUB_RUN_ID}.prof" "${python_args[@]}")
-            kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- python -c '
-          from pathlib import Path
-          for name in ("cpu.max", "cpu.stat", "memory.current"):
-              path = Path("/sys/fs/cgroup") / name
-              if path.exists(): print(name, path.read_text())
-          ' > baseline-cpu-before.txt
-          fi
           set +e
           kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; exec python "$@"' baseline-cli "${python_args[@]}" "${args[@]}"
+            sh -ec '. /vault/secrets/config; exec python /app/scripts/prepare_regulatory_publication_baselines.py "$@"' baseline-cli "${args[@]}"
           result=$?
           set -e
           kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- cat "/tmp/baseline-${GITHUB_RUN_ID}.jsonl" > baseline-report.jsonl
-          if [[ "$BASELINE_PROFILE" == true ]]; then
-            kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- python -c '
-          import pstats,sys
-          from pathlib import Path
-          stats = pstats.Stats(sys.argv[1])
-          stats.sort_stats("cumulative").print_stats(70)
-          stats.sort_stats("tottime").print_stats(30)
-          stats.print_callers("publication_digest|validate_observation|load_owned_writer_inputs|stage_writer_publication")
-          for name in ("cpu.max", "cpu.stat", "memory.current"):
-              path = Path("/sys/fs/cgroup") / name
-              if path.exists(): print(name, path.read_text())
-          ' "/tmp/baseline-${GITHUB_RUN_ID}.prof" > baseline-profile.txt
-          fi
           exit "$result"
       - name: Preserve baseline evidence report
         if: always() && inputs.mode != 'diagnostics' && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: baseline-report-${{ github.run_id }}
-          path: |
-            baseline-report.jsonl
-            baseline-profile.txt
-            baseline-cpu-before.txt
+          path: baseline-report.jsonl
           if-no-files-found: ignore
