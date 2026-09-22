@@ -41,8 +41,18 @@ jobs:
           pods=$(kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json)
           while IFS=$'\t' read -r pod container; do
             kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- python -c '
-          import json,re
+          import json,re,subprocess
           from pathlib import Path
+          print(subprocess.run(["supervisorctl","-c","/etc/supervisor/conf.d/supervisord.conf","status"],capture_output=True,text=True).stdout)
+          print(json.dumps({"worker_readiness": {name:Path("/tmp/onyx_k8s_"+name+"_readiness.txt").exists() for name in ("regulatorybenchmark","regulatoryindexing","annex_worker")}}))
+          startup_errors=[]
+          for path in Path("/var/log/onyx").glob("celery_worker_regulatory*.log"):
+              for line in path.read_text(errors="replace").splitlines()[-200:]:
+                  if re.search(r"api.key|password|secret|authorization|bearer",line,re.I):
+                      continue
+                  if re.match(r"\s*File \"",line) or re.match(r"^[\w.]+(?:Error|Exception):",line):
+                      startup_errors.append({"log":path.name,"trace":line[:500]})
+          print(json.dumps({"worker_startup_traces":startup_errors[-30:]},ensure_ascii=False))
           lines=Path("/var/log/onyx/celery_worker_regulatory_benchmark.log").read_text(errors="replace").splitlines()[-20000:]
           failures=[]
           for i,line in enumerate(lines):
