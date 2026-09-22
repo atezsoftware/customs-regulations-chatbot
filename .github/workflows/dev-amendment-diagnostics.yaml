@@ -5,7 +5,7 @@ on:
       mode:
         type: choice
         default: diagnostics
-        options: [diagnostics, baseline-audit, baseline-apply]
+        options: [diagnostics, baseline-audit, baseline-apply, baseline-capacity]
       expected_image_sha:
         type: string
         description: Exact deployed backend commit required for baseline operations
@@ -31,6 +31,18 @@ jobs:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 60
     steps:
+      - name: Read DEV database capacity
+        if: inputs.mode == 'baseline-capacity'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws rds describe-db-instances --region eu-central-1 --db-instance-identifier atez-dev-db-psql \
+            --query 'DBInstances[].{Identifier:DBInstanceIdentifier,Status:DBInstanceStatus,AllocatedGiB:AllocatedStorage,MaximumGiB:MaxAllocatedStorage,StorageType:StorageType}'
+          aws cloudwatch get-metric-statistics --region eu-central-1 --namespace AWS/RDS \
+            --metric-name FreeStorageSpace --dimensions Name=DBInstanceIdentifier,Value=atez-dev-db-psql \
+            --start-time "$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
+            --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --period 300 --statistics Minimum Average \
+            --query '{Label:Label,Datapoints:Datapoints}'
       - name: Read DEV worker failure traces
         if: inputs.mode == 'diagnostics' || github.event_name == 'push'
         shell: bash
