@@ -1,6 +1,26 @@
 name: DEV amendment approval diagnostics
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        default: diagnostics
+        options: [diagnostics, baseline-audit, baseline-apply]
+      expected_image_sha:
+        type: string
+        description: Exact deployed backend commit required for baseline operations
+      expected_index_uuid:
+        type: string
+        description: Exact DEV physical index UUID
+      file_ids:
+        type: string
+        description: Comma-separated file UUIDs; empty uses bounded corpus selection
+      after_file_id:
+        type: string
+        description: Resume corpus selection after this UUID
+      limit:
+        type: string
+        default: '100'
   push:
     branches: [develop]
     paths: [.github/workflows/dev-amendment-diagnostics.yaml]
@@ -9,9 +29,10 @@ permissions:
 jobs:
   inspect:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 5
+    timeout-minutes: 60
     steps:
       - name: Read DEV worker failure traces
+        if: inputs.mode == 'diagnostics' || github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
@@ -43,3 +64,50 @@ jobs:
           print(json.dumps({"publication_timings":timings[-30:]},ensure_ascii=False,indent=2))
           '
           done < <(jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name as $pod | .spec.containers[] | select(.image | contains("customs-regulations-backend-lite")) | [$pod,.name] | @tsv' <<<"$pods")
+
+      - name: Prepare verified DEV publication baselines
+        if: inputs.mode == 'baseline-audit' || inputs.mode == 'baseline-apply'
+        shell: bash
+        env:
+          BASELINE_MODE: ${{ inputs.mode }}
+          EXPECTED_IMAGE_SHA: ${{ inputs.expected_image_sha }}
+          EXPECTED_INDEX_UUID: ${{ inputs.expected_index_uuid }}
+          FILE_IDS: ${{ inputs.file_ids }}
+          AFTER_FILE_ID: ${{ inputs.after_file_id }}
+          FILE_LIMIT: ${{ inputs.limit }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_INDEX_UUID" =~ ^[A-Za-z0-9_-]+$ ]]
+          [[ "$FILE_LIMIT" =~ ^[1-9][0-9]*$ ]] && (( FILE_LIMIT <= 500 ))
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          pods=$(kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json)
+          selected=$(jq -r --arg sha "$EXPECTED_IMAGE_SHA" '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name as $pod | .spec.containers[] | select(.image | endswith(":" + $sha)) | [$pod,.name] | @tsv' <<<"$pods" | head -n 1)
+          [[ -n "$selected" ]]
+          IFS=$'\t' read -r pod container <<<"$selected"
+          args=(--expected-database customs-regulations-dev --expected-index-uuid "$EXPECTED_INDEX_UUID" --limit "$FILE_LIMIT" --output "/tmp/baseline-${GITHUB_RUN_ID}.jsonl")
+          if [[ -n "$FILE_IDS" ]]; then
+            IFS=',' read -ra identifiers <<<"$FILE_IDS"
+            for identifier in "${identifiers[@]}"; do
+              [[ "$identifier" =~ ^[0-9a-f-]{36}$ ]]
+              args+=(--file-id "$identifier")
+            done
+          fi
+          if [[ -n "$AFTER_FILE_ID" ]]; then
+            [[ "$AFTER_FILE_ID" =~ ^[0-9a-f-]{36}$ ]]
+            args+=(--after-file-id "$AFTER_FILE_ID")
+          fi
+          if [[ "$BASELINE_MODE" == baseline-apply ]]; then args+=(--apply); fi
+          set +e
+          kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- python /app/scripts/prepare_regulatory_publication_baselines.py "${args[@]}"
+          result=$?
+          set -e
+          kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- cat "/tmp/baseline-${GITHUB_RUN_ID}.jsonl" > baseline-report.jsonl
+          exit "$result"
+      - name: Preserve baseline evidence report
+        if: always() && inputs.mode != 'diagnostics' && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-report-${{ github.run_id }}
+          path: baseline-report.jsonl
+          if-no-files-found: ignore

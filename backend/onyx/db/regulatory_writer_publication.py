@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from onyx.document_index.interfaces_new import MetadataUpdateRequest
     from onyx.natural_language_processing.utils import BaseTokenizer
     from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
+    from onyx.regulatory.approval_execution_state import ApprovalStage
 
 from dataclasses import dataclass
 
@@ -355,7 +356,6 @@ def finalize_writer_publication(
         session.flush()
         if manifest.amendment_proposal_id is not None:
             from onyx.db.models import AmendmentProposal
-            from onyx.db.regulatory_amendments import approve_amendment_proposal
 
             proposal = session.get(AmendmentProposal, manifest.amendment_proposal_id)
             if (
@@ -364,7 +364,13 @@ def finalize_writer_publication(
                 != manifest.amendment_review_sha256
             ):
                 raise ValueError("amendment human review changed during publication")
-            approve_amendment_proposal(session, proposal, publication_owner=owner)
+            if manifest.amendment_impacts:
+                _approve_with_derived_sources(session, proposal, owner)
+            else:
+                # A frozen legacy publication must replay its original transition.
+                from onyx.db.regulatory_amendments import approve_amendment_proposal
+
+                approve_amendment_proposal(session, proposal, publication_owner=owner)
             if (
                 capture_canonical_scope(session, owner.user_file_id)
                 != manifest.canonical_after
@@ -803,6 +809,13 @@ def persist_owned_initial_chunks(
         )
         if not chunks:
             raise ValueError("initial chunking produced no canonical chunks")
+        from onyx.regulatory.amendments.annexes.selective_impact import (
+            validate_canonical_source_integrity,
+        )
+
+        validate_canonical_source_integrity(
+            capture_canonical_scope(session, owner.user_file_id)
+        )
         file = session.get(UserFile, owner.user_file_id, with_for_update=True)
         if file is None or file.status == UserFileStatus.DELETING:
             raise ValueError("initial chunking file is gone or deleting")
@@ -1028,11 +1041,45 @@ def _amendment_review_digest(proposal: "AmendmentProposal") -> str:
     )
 
 
+def _approve_with_derived_sources(
+    session: Session, proposal: "AmendmentProposal", owner: FileOwnership
+) -> None:
+    from onyx.db.regulatory_amendments import approve_amendment_proposal
+    from onyx.regulatory.amendment_dependents import rebuild_amendment_dependents
+    from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+
+    before = capture_canonical_scope(session, owner.user_file_id)
+    result = approve_amendment_proposal(session, proposal, publication_owner=owner)
+    if any(chunk.user_file_id != owner.user_file_id for chunk in result.new_chunks):
+        raise ValueError("amendment escaped publication file scope")
+    canonical = capture_canonical_scope(session, owner.user_file_id)
+    existing_ids = {row.id for row in canonical}
+    after = rebuild_amendment_dependents(before, canonical)
+    authority = PublicationStore(owner.scope)
+    after = [
+        row.model_copy(
+            update={
+                "projection_ordinal": authority.allocate_in_session(
+                    session, owner, "canonical:" + row.id
+                )
+            }
+        )
+        if row.projection_ordinal == -1
+        else row
+        for row in after
+    ]
+    # Insert successors before linking predecessors' non-deferrable foreign keys.
+    session.add_all(
+        canonical_snapshot_rows([row for row in after if row.id not in existing_ids])
+    )
+    session.flush()
+    _apply_canonical_rows(session, owner.user_file_id, after)
+
+
 def preview_owned_amendment(
     owner: FileOwnership, proposal_id: int
 ) -> tuple[list[AnnexCanonicalSnapshot], str]:
     from onyx.db.models import AmendmentProposal
-    from onyx.db.regulatory_amendments import approve_amendment_proposal
 
     with get_session_with_tenant(tenant_id=owner.scope.tenant_id) as session:
         PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
@@ -1040,36 +1087,110 @@ def preview_owned_amendment(
         if proposal is None:
             raise ValueError("amendment proposal disappeared")
         reviewed = _amendment_review_digest(proposal)
-        result = approve_amendment_proposal(session, proposal, publication_owner=owner)
-        if any(chunk.user_file_id != owner.user_file_id for chunk in result.new_chunks):
-            raise ValueError("amendment escaped publication file scope")
+        _approve_with_derived_sources(session, proposal, owner)
         after = capture_canonical_scope(session, owner.user_file_id)
         session.rollback()
         return after, reviewed
 
 
-def record_owned_amendment_failure(proposal_id: int, tenant_id: str) -> None:
+def record_amendment_execution_stage(
+    owner: FileOwnership, proposal_id: int, stage: "ApprovalStage"
+) -> None:
     from onyx.db.models import AmendmentProposal
-    from onyx.db.regulatory_amendments import reset_amendment_proposal_approval
+    from onyx.regulatory.approval_execution_state import (
+        ApprovalExecutionState,
+        read_execution_state,
+    )
+
+    with get_session_with_tenant(tenant_id=owner.scope.tenant_id) as session:
+        PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
+        proposal = session.get(AmendmentProposal, proposal_id, with_for_update=True)
+        if (
+            proposal is None
+            or proposal.status != "approving"
+            or UUID(proposal.new_chunk_draft["user_file_id"]) != owner.user_file_id
+        ):
+            raise ValueError("approval execution target changed")
+        previous = read_execution_state(proposal.approval_error)
+        attempt = (
+            (previous.attempt if previous else 0) + 1
+            if stage == "baseline"
+            else previous.attempt
+            if previous
+            else 1
+        )
+        proposal.approval_error = ApprovalExecutionState.running(
+            stage, attempt=attempt
+        ).model_dump_json()
+        session.commit()
+
+
+def record_owned_amendment_failure(
+    proposal_id: int,
+    tenant_id: str,
+    error: Exception | None = None,
+    *,
+    owner: FileOwnership | None = None,
+) -> None:
+    from onyx.db.models import AmendmentProposal
+    from onyx.regulatory.approval_execution_state import (
+        ApprovalExecutionState,
+        read_execution_state,
+    )
 
     with get_session_with_tenant(tenant_id=tenant_id) as session:
         proposal = session.get(AmendmentProposal, proposal_id)
         if proposal is None or proposal.status != "approving":
             return
         file_id = UUID(proposal.new_chunk_draft["user_file_id"])
-        publication = session.get(RegulatoryFilePublication, file_id)
+        publication = session.get(
+            RegulatoryFilePublication, file_id, with_for_update=True
+        )
+        proposal = session.get(
+            AmendmentProposal, proposal_id, with_for_update=True, populate_existing=True
+        )
         if (
+            proposal is None
+            or proposal.status != "approving"
+            or UUID(proposal.new_chunk_draft["user_file_id"]) != file_id
+        ):
+            return
+        if publication is not None:
+            if owner is not None and (
+                publication.owner_id != owner.owner_id
+                or publication.fencing_token != owner.fencing_token
+            ):
+                return
+            if (
+                owner is None
+                and publication.lease_expires_at is not None
+                and publication.lease_expires_at > datetime.now(timezone.utc)
+            ):
+                return
+        state = read_execution_state(proposal.approval_error)
+        if state is not None and state.state == "failed" and owner is None:
+            return
+        state = state or ApprovalExecutionState.running("review", attempt=1)
+        retained = (
             publication is not None
             and publication.writer_manifest is not None
-            and publication.writer_manifest.get("amendment_proposal_id") == proposal_id
-        ):
-            proposal.approval_error = (
-                "Indexing interrupted. The frozen publication will resume."
+            and proposal_id
+            in (
+                publication.writer_manifest.get("amendment_proposal_id"),
+                publication.writer_manifest.get("baseline_origin_proposal_id"),
             )
-            session.commit()
-        else:
-            reset_amendment_proposal_approval(session, proposal_id=proposal_id)
-            session.commit()
+        )
+        proposal.approval_error = state.failed(
+            error or RuntimeError("approval interrupted"),
+            manifest_sha256=publication.writer_manifest_sha256
+            if retained and publication
+            else None,
+        ).model_dump_json()
+        if not retained:
+            proposal.status = "pending"
+            proposal.decided_by = None
+            proposal.decided_at = None
+        session.commit()
 
 
 def _validate_durable_writer(

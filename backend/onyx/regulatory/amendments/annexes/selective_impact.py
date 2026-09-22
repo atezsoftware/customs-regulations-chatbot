@@ -160,6 +160,38 @@ def review_units(items: list[AnnexChangeItemDraft]) -> list[list[int]]:
     return sorted(groups.values(), key=lambda group: group[0])
 
 
+def aggregate_membership_is_valid(
+    aggregate: AnnexCanonicalSnapshot, rows: dict[str, AnnexCanonicalSnapshot]
+) -> bool:
+    from onyx.regulatory.chunker import hierarchical_aggregate_text
+
+    members = source_ids(aggregate)
+    root = aggregate.metadata.get("hierarchy_root_path")
+    if (
+        not members
+        or aggregate.id in members
+        or not isinstance(root, list)
+        or not root
+        or not isinstance(root[-1], str)
+    ):
+        return False
+    selected = [rows.get(identifier) for identifier in members]
+    if any(
+        row is None
+        or row.user_file_id != aggregate.user_file_id
+        or row.validity_start_date != aggregate.validity_start_date
+        or row.validity_end_date != aggregate.validity_end_date
+        for row in selected
+    ):
+        return False
+    return (
+        hierarchical_aggregate_text(
+            root[-1], [row.text for row in selected if row is not None]
+        )
+        == aggregate.text
+    )
+
+
 def recover_source_membership(
     rows: list[AnnexCanonicalSnapshot],
 ) -> dict[str, list[str]]:
@@ -167,10 +199,38 @@ def recover_source_membership(
     from onyx.regulatory.chunker import hierarchical_aggregate_text
 
     recovered: dict[str, list[str]] = {}
+    by_id = {row.id: row for row in rows}
+    for image in rows:
+        parent = image.metadata.get("bound_to_regulatory_chunk_id")
+        if not isinstance(parent, str) or parent in by_id:
+            continue
+        candidates = [
+            row
+            for row in rows
+            if row.user_file_id == image.user_file_id
+            and row.validity_start_date == image.validity_start_date
+            and row.validity_end_date == image.validity_end_date
+            and row.heading_path == image.heading_path
+            and image.text
+            in (
+                row.text,
+                row.text
+                + "\n\n[Görsel: "
+                + str(image.metadata.get("image_alt") or "")
+                + "]",
+            )
+            and not row.metadata.get("bound_to_regulatory_chunk_id")
+            and isinstance(split := row.metadata.get("oversized_split"), dict)
+            and split.get("source_chunk_id") == parent
+        ]
+        if len(candidates) == 1:
+            recovered[image.id] = [candidates[0].id]
     for aggregate in rows:
         if aggregate.metadata.get(
             "chunk_variant"
-        ) != "hierarchical_aggregate" or source_ids(aggregate):
+        ) != "hierarchical_aggregate" or aggregate_membership_is_valid(
+            aggregate, by_id
+        ):
             continue
         root = aggregate.metadata.get("hierarchy_root_path")
         if (
@@ -233,3 +293,85 @@ def recover_source_membership(
         if len(matches) == 1:
             recovered[aggregate.id] = matches[0]
     return recovered
+
+
+def recovered_source_row(
+    row: AnnexCanonicalSnapshot, members: list[str]
+) -> AnnexCanonicalSnapshot:
+    metadata = dict(row.metadata)
+    if metadata.get("bound_to_regulatory_chunk_id") is not None:
+        if len(members) != 1:
+            raise ValueError("image source recovery must be unique")
+        metadata["bound_to_regulatory_chunk_id"] = members[0]
+        metadata["source_regulatory_chunk_ids"] = []
+    else:
+        metadata["source_regulatory_chunk_ids"] = members
+    return row.model_copy(update={"metadata": metadata})
+
+
+def validate_canonical_source_integrity(rows: list[AnnexCanonicalSnapshot]) -> None:
+    """Check the final ingest graph after all transformations and ID allocation."""
+    by_id = {row.id: row for row in rows}
+    if len(by_id) != len(rows) or len({row.user_file_id for row in rows}) > 1:
+        raise ValueError("canonical source membership crosses identity scope")
+    pending: dict[str, set[str]] = {}
+    for row in rows:
+        members = source_ids(row)
+        if row.metadata.get(
+            "chunk_variant"
+        ) == "hierarchical_aggregate" and not aggregate_membership_is_valid(row, by_id):
+            raise ValueError(
+                "aggregate source membership does not reconstruct final text: " + row.id
+            )
+        for member in members:
+            if member == row.id or member not in by_id:
+                raise ValueError(
+                    "canonical source membership is dangling or self-referential: "
+                    + row.id
+                )
+        pending[row.id] = set(members)
+    while pending:
+        ready = {
+            identifier
+            for identifier, members in pending.items()
+            if not members.intersection(pending)
+        }
+        if not ready:
+            raise ValueError("canonical source membership is cyclic")
+        for identifier in ready:
+            del pending[identifier]
+
+
+def image_membership_is_valid(
+    image: AnnexCanonicalSnapshot, parent: AnnexCanonicalSnapshot
+) -> bool:
+    if (
+        image.id == parent.id
+        or image.user_file_id != parent.user_file_id
+        or image.validity_start_date != parent.validity_start_date
+        or image.validity_end_date != parent.validity_end_date
+        or parent.metadata.get("chunk_variant")
+        in {"hierarchical_aggregate", "image_companion"}
+        or parent.metadata.get("bound_to_regulatory_chunk_id") is not None
+        or image.heading_path != parent.heading_path
+    ):
+        return False
+    if image.text in (
+        parent.text,
+        parent.text
+        + "\n\n[Görsel: "
+        + str(image.metadata.get("image_alt") or "")
+        + "]",
+    ):
+        return True
+    asset = image.metadata.get("image_file_id")
+    parent_assets = parent.metadata.get("image_file_ids")
+    return (
+        isinstance(asset, str)
+        and bool(asset)
+        and (
+            parent.metadata.get("image_file_id") == asset
+            or isinstance(parent_assets, list)
+            and asset in parent_assets
+        )
+    )

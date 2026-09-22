@@ -80,9 +80,10 @@ def close_preapproved_temporal_binding(
         payload.pop("effective_end")
         payload.pop("index")
         payload["projection"].pop("source_json")
-        payload["projection"]["embedding_config_json"] = json.loads(
-            payload["projection"]["embedding_config_json"]
-        )
+        if "embedding_config_json" in payload["projection"]:
+            payload["projection"]["embedding_config_json"] = json.loads(
+                payload["projection"]["embedding_config_json"]
+            )
     if before_source != after_source or before != after:
         raise ValueError("temporal closing changes immutable representation")
     # The enclosing manifest retains the original full payload and the approved final operation.

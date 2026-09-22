@@ -402,7 +402,7 @@ def test_approval_task_preserves_owned_failure_for_scoped_recovery(
         tasks.regulatory_amendment_approve.run(proposal_id=9, tenant_id="tenant-a")
     assert raised.value is error
     publish.assert_called_once_with(9, "tenant-a", 11)
-    failure.assert_called_once_with(9, "tenant-a")
+    failure.assert_called_once_with(9, "tenant-a", error)
     sessions.return_value.__enter__().commit.assert_not_called()
 
 
@@ -455,7 +455,7 @@ def test_approval_task_rejects_invalid_initial_target_before_ownership() -> None
     assert raised.value is error
     heartbeat.assert_not_called()
     publish.assert_not_called()
-    failure.assert_called_once_with(9, "tenant-a")
+    failure.assert_called_once_with(9, "tenant-a", error)
 
 
 def test_worker_retains_exception_with_current_failure_lease() -> None:

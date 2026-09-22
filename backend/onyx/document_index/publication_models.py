@@ -3,7 +3,7 @@
 import json
 from datetime import datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 if TYPE_CHECKING:
     from onyx.document_index.encoder_authority import EffectiveEncoderAuthority
@@ -311,6 +311,148 @@ class FrozenPublicationProjection(PublicationModel):
         return self
 
 
+OBSERVED_MUTABLE_SOURCE_FIELDS = frozenset(
+    {
+        "chunk_index",
+        "validity_start_date",
+        "validity_end_date",
+        "hidden",
+        "public",
+        "access_control_list",
+        "document_sets",
+        "user_projects",
+        "personas",
+        "global_boost",
+        "created_at",
+    }
+)
+
+
+class ObservedPublicationProjection(PublicationModel):
+    """Versioned same-index evidence; deliberately contains no encoder receipt.
+
+    The observed source is immutable. A publication may change access metadata or
+    copy the identical representation into a narrower interval in the same index.
+    """
+
+    evidence_kind: Literal["observed-v1"] = "observed-v1"
+    ordinal: int = Field(ge=0)
+    context_projection_id: str = Field(min_length=1)
+    source_json: str
+    observed_source_sha256: str = Field(min_length=64, max_length=64)
+    observed_immutable_sha256: str = Field(min_length=64, max_length=64)
+    observed_start: int | None
+    observed_end: int | None
+    observed_index: PublicationIndexSnapshot
+
+    @classmethod
+    def observe(
+        cls,
+        *,
+        source_json: str,
+        observed_index: PublicationIndexSnapshot,
+        context_projection_id: str,
+    ) -> Self:
+        source = publication_source(source_json)
+        parsed = SerializedPublicationSource.model_validate(source)
+        return cls(
+            ordinal=parsed.chunk_index,
+            context_projection_id=context_projection_id,
+            source_json=json.dumps(source),
+            observed_index=observed_index,
+            observed_source_sha256=publication_digest(source),
+            observed_immutable_sha256=publication_digest(
+                {
+                    k: v
+                    for k, v in source.items()
+                    if k not in OBSERVED_MUTABLE_SOURCE_FIELDS
+                }
+            ),
+            observed_start=parsed.validity_start_date,
+            observed_end=parsed.validity_end_date,
+        )
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> Self:
+        after = json.loads(self.source_json)
+        current = SerializedPublicationSource.model_validate(after)
+        if (
+            publication_digest(
+                {
+                    k: v
+                    for k, v in after.items()
+                    if k not in OBSERVED_MUTABLE_SOURCE_FIELDS
+                }
+            )
+            != self.observed_immutable_sha256
+        ):
+            raise ValueError("observation changes existing content or vector")
+        if current.chunk_index != self.ordinal:
+            raise ValueError("observed projection ordinal mismatch")
+        dimension = self.observed_index.vector_dimension
+        if len(current.content_vector) != dimension or (
+            current.title_vector is not None and len(current.title_vector) != dimension
+        ):
+            raise ValueError("observed vector dimension mismatch")
+        for key, lower_bound, old in (
+            ("validity_start_date", True, self.observed_start),
+            ("validity_end_date", False, self.observed_end),
+        ):
+            new = after.get(key)
+            if old is not None and (
+                new is None or (new < old if lower_bound else new > old)
+            ):
+                raise ValueError("observation cannot expand its legal interval")
+        publication_digest(after)
+        return self
+
+    def accepted_by(self, index: PublicationIndexSnapshot) -> bool:
+        return self.observed_index.matches_temporal_index(index)
+
+
+PublicationProjection = FrozenPublicationProjection | ObservedPublicationProjection
+
+
+def accepts_publication_projection(
+    index: PublicationIndexSnapshot, projection: PublicationProjection
+) -> bool:
+    if isinstance(projection, ObservedPublicationProjection):
+        return projection.accepted_by(index)
+    return index.accepts_encoder_configuration(
+        json.loads(projection.embedding_config_json)
+    )
+
+
+def publication_source(source_json: str) -> dict[str, JsonValue]:
+    """Remove transport controls; preserve the exact serializer fields and values."""
+    return {
+        key: value
+        for key, value in json.loads(source_json).items()
+        if not key.startswith("publication_")
+    }
+
+
+def matches_indexed_evidence(
+    projection: PublicationProjection, evidence: "IndexedProjectionEvidence"
+) -> bool:
+    if publication_source(projection.source_json) != publication_source(
+        evidence.source_json
+    ):
+        return False
+    if isinstance(projection, ObservedPublicationProjection):
+        return (
+            projection.accepted_by(evidence.index)
+            and evidence.observed_projection == projection
+        )
+    frozen = evidence.frozen_projection
+    return frozen is not None and (
+        projection.context_projection_id == frozen.context_projection_id
+        and projection.embedding_inputs == frozen.embedding_inputs
+        and json.loads(projection.embedding_config_json)
+        == json.loads(frozen.embedding_config_json)
+    )
+
+
 class PublicationVerification(PublicationModel):
     reservations: FileReservations
     index: PublicationIndexSnapshot
@@ -324,6 +466,9 @@ class IndexedProjectionEvidence(PublicationModel):
     source_json: str
     frozen_projection: FrozenPublicationProjection | None
     payload_sha256: str | None
+    observed_projection: ObservedPublicationProjection | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class RetainedPublicationProjection(PublicationModel):
@@ -364,3 +509,35 @@ class RetainedPublicationProjection(PublicationModel):
         ):
             raise ValueError("retained vector dimension mismatch")
         return self
+
+
+def merge_publication_indexes(
+    indexes: list[PublicationIndexSnapshot],
+) -> PublicationIndexSnapshot:
+    """Combine compatible real receipts without promoting observations into proofs."""
+    if not indexes:
+        raise ValueError("publication index inventory is empty")
+    selected = sorted(
+        indexes,
+        key=lambda index: (
+            index.encoder_authority is None,
+            index.embedding_config_sha256,
+        ),
+    )[0]
+    receipts: dict[str, PublicationEncoderReceipt] = {}
+    for index in indexes:
+        if not selected.matches_temporal_index(index):
+            raise ValueError("publication index identity mismatch")
+        if (
+            index.encoder_authority is not None
+            and selected.effective_authority() != index.effective_authority()
+        ):
+            raise ValueError("publication index encoder authority mismatch")
+        for receipt in index.encoder_receipts:
+            receipts[receipt.configuration_json] = receipt
+    return PublicationIndexSnapshot.model_validate(
+        {
+            **selected.model_dump(mode="json"),
+            "encoder_receipts": tuple(receipts[key] for key in sorted(receipts)),
+        }
+    )

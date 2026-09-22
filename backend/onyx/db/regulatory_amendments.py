@@ -836,31 +836,64 @@ def recover_stale_amendment_proposal_approvals(
             )
             .order_by(AmendmentProposal.updated_at, AmendmentProposal.id)
             .limit(limit)
-            .with_for_update(skip_locked=True)
         ).all()
     )
     resume_ids: list[int] = []
-    for proposal in proposals:
+    for candidate in proposals:
         from onyx.db.models import RegulatoryFilePublication
 
-        retained_writer = db_session.scalar(
-            select(RegulatoryFilePublication.user_file_id)
-            .where(
-                RegulatoryFilePublication.writer_manifest[
-                    "amendment_proposal_id"
-                ].as_integer()
-                == proposal.id
-            )
-            .limit(1)
+        file_id = UUID(candidate.new_chunk_draft["user_file_id"])
+        publication = db_session.get(
+            RegulatoryFilePublication,
+            file_id,
+            with_for_update={"skip_locked": True},
+            populate_existing=True,
         )
-        if proposal.applied_new_chunk_id or retained_writer is not None:
+        if (
+            publication is None
+            and db_session.get(RegulatoryFilePublication, file_id) is not None
+        ):
+            continue
+        if publication is not None and publication.lease_expires_at > recovered_at:
+            continue
+        proposal = db_session.get(
+            AmendmentProposal,
+            candidate.id,
+            with_for_update={"skip_locked": True},
+            populate_existing=True,
+        )
+        if (
+            proposal is None
+            or proposal.status != AmendmentProposalStatus.APPROVING.value
+            or proposal.approval_indexing_job_id is not None
+            or proposal.updated_at >= stale_before
+            or UUID(proposal.new_chunk_draft["user_file_id"]) != file_id
+        ):
+            continue
+        manifest = publication.writer_manifest if publication is not None else None
+        retained_writer = manifest is not None and proposal.id in (
+            manifest.get("amendment_proposal_id"),
+            manifest.get("baseline_origin_proposal_id"),
+        )
+        if proposal.applied_new_chunk_id or retained_writer:
             proposal.updated_at = recovered_at
             resume_ids.append(proposal.id)
             continue
         proposal.status = AmendmentProposalStatus.PENDING.value
         proposal.decided_by = None
         proposal.decided_at = None
-        proposal.approval_error = None
+        from onyx.regulatory.approval_execution_state import (
+            ApprovalExecutionState,
+            read_execution_state,
+        )
+
+        state = read_execution_state(proposal.approval_error)
+        if state is None or state.state != "failed":
+            proposal.approval_error = (
+                (state or ApprovalExecutionState.running("baseline", attempt=1))
+                .failed(RuntimeError("worker interrupted"))
+                .model_dump_json()
+            )
         proposal.updated_at = recovered_at
     db_session.commit()
     return resume_ids

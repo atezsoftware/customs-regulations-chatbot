@@ -17,7 +17,10 @@ from onyx.db.models import (
     UserFile,
 )
 from onyx.db.regulatory_annex_publication import load_file_temporal_bindings
-from onyx.document_index.publication_models import PublicationIndexSnapshot
+from onyx.document_index.publication_models import (
+    PublicationIndexSnapshot,
+    accepts_publication_projection,
+)
 from onyx.regulatory.amendments.annexes.models import AnnexTemporalProjection
 
 
@@ -81,9 +84,7 @@ def load_public_temporal_bindings(
             )
         ):
             continue
-        if not index.accepts_encoder_configuration(
-            json.loads(binding.projection.embedding_config_json)
-        ):
+        if not accepts_publication_projection(index, binding.projection):
             raise ValueError("temporal binding encoder receipt is not accepted")
         selected.append(binding)
     return sorted(
@@ -243,7 +244,6 @@ def resolve_public_query_index(
     from onyx.document_index.encoder_authority import effective_runtime_authority
     from onyx.document_index.publication_models import (
         PublicationEncoderAuthority,
-        publication_digest,
     )
     from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
     from shared_configs.configs import MULTI_TENANT
@@ -267,25 +267,35 @@ def resolve_public_query_index(
             passage_prefix=settings.passage_prefix,
         )
         rows = session.scalars(
-            select(RegulatoryTemporalProjection).where(
+            select(RegulatoryTemporalProjection.payload["index"])
+            .distinct()
+            .where(
                 RegulatoryTemporalProjection.index_uuid == index_uuid,
                 RegulatoryTemporalProjection.retired_at.is_(None),
             )
         )
         accepted: PublicationIndexSnapshot | None = None
         receipts = {}
-        for row in rows:
-            if publication_digest(row.payload) != row.payload_sha256:
-                raise ValueError("temporal binding payload changed")
-            binding = AnnexTemporalProjection.model_validate(row.payload)
-            index = binding.index
+        from onyx.regulatory.publication_baseline import observed_index_snapshot
+
+        observed = observed_index_snapshot(settings, index_uuid)
+        for payload in rows:
+            # Validate full source/binding digests only for returned file hits.
+            # Index authority is small and shared; never load every corpus vector
+            # into memory to resolve a single query's encoder.
+            index = PublicationIndexSnapshot.model_validate(payload)
             if (
                 index.index_name != index_name
                 or index.search_settings_id != settings.id
                 or index.multitenant != MULTI_TENANT
             ):
                 continue
-            if index.effective_authority() != effective_runtime_authority(
+            if index.encoder_authority is None:
+                if index != observed:
+                    raise ValueError(
+                        "qualified query observation configuration changed"
+                    )
+            elif index.effective_authority() != effective_runtime_authority(
                 actual, query_prefix=settings.query_prefix
             ):
                 raise ValueError(
@@ -293,7 +303,8 @@ def resolve_public_query_index(
                 )
             if accepted is not None and not accepted.matches_temporal_index(index):
                 raise ValueError("ambiguous activated query index authority")
-            accepted = index
+            if accepted is None or index.encoder_authority is not None:
+                accepted = index
             receipts.update(
                 {
                     receipt.configuration_json: receipt

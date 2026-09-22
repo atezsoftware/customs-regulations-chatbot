@@ -20,13 +20,17 @@ from onyx.document_index.interfaces_new import (
     TenantState,
 )
 from onyx.document_index.publication_models import (
+    OBSERVED_MUTABLE_SOURCE_FIELDS,
     FileReservations,
     FrozenPublicationProjection,
     IndexedProjectionEvidence,
+    ObservedPublicationProjection,
     PublicationIndexSnapshot,
+    PublicationProjection,
     PublicationVerification,
     RetainedPublicationProjection,
     publication_digest,
+    publication_source,
 )
 
 # Checks run atomically against stored ownership, including metadata-only writes.
@@ -59,6 +63,21 @@ if (ctx._source.publication_token == params.token) {
     }
     ctx.op = 'none';
 } else {
+    if (params.containsKey('observation') && params.observation != null &&
+        ctx._source.publication_tombstone != true) {
+        def original = new HashMap();
+        for (def entry : ctx._source.entrySet()) {
+            if (!entry.getKey().startsWith('publication_') &&
+                !params.observation_mutable.contains(entry.getKey())) {
+                original.put(entry.getKey(), entry.getValue());
+            }
+        }
+        if (!original.equals(params.observation) ||
+            (ctx._source.publication_evidence != null &&
+             ctx._source.publication_evidence.kind != 'observed-v1')) {
+            throw new IllegalArgumentException('observed source changed before publication');
+        }
+    }
     if (params.base != null) {
         if (ctx._source.publication_payload != params.base) {
             throw new IllegalArgumentException('metadata base payload changed');
@@ -208,7 +227,7 @@ class FencedPublicationIndex:
     def _source(
         self,
         reservations: FileReservations,
-        projection: FrozenPublicationProjection | None,
+        projection: PublicationProjection | None,
         ordinal: int,
     ) -> dict[str, JsonValue]:
         params = self._params(reservations, ordinal)
@@ -231,15 +250,28 @@ class FencedPublicationIndex:
                 )
             ):
                 raise ValueError("projection vector dimension/content mismatch")
-            config = cast(JsonValue, json.loads(projection.embedding_config_json))
-            if not self.snapshot.accepts_encoder_configuration(config):
-                raise ValueError("projection model configuration mismatch")
-            payload["publication_evidence"] = {
-                "context_projection_id": projection.context_projection_id,
-                "embedding_inputs": list(projection.embedding_inputs),
-                "embedding_config": config,
-                "index": self.snapshot.model_dump(mode="json"),
-            }
+            if isinstance(projection, ObservedPublicationProjection):
+                if not projection.accepted_by(self.snapshot):
+                    raise ValueError("observation crosses physical index")
+                # Revalidate model_copy results before any transport mutation.
+                ObservedPublicationProjection.model_validate(projection.model_dump())
+                payload["publication_evidence"] = {
+                    "kind": "observed-v1",
+                    "observation": projection.model_dump(
+                        mode="json", exclude={"source_json"}
+                    ),
+                    "index": self.snapshot.model_dump(mode="json"),
+                }
+            else:
+                config = cast(JsonValue, json.loads(projection.embedding_config_json))
+                if not self.snapshot.accepts_encoder_configuration(config):
+                    raise ValueError("projection model configuration mismatch")
+                payload["publication_evidence"] = {
+                    "context_projection_id": projection.context_projection_id,
+                    "embedding_inputs": list(projection.embedding_inputs),
+                    "embedding_config": config,
+                    "index": self.snapshot.model_dump(mode="json"),
+                }
             payload["publication_tombstone"] = False
         payload["publication_scope"] = params["scope"]
         payload["publication_floor"] = params["token"]
@@ -272,6 +304,7 @@ class FencedPublicationIndex:
                 "previous": previous,
             }
         )
+        self._guard_observation(params, source)
         # Intentionally no upsert: an unseen/uninitialized ID cannot become live.
         self.client.update(
             index=self.snapshot.index_name,
@@ -280,8 +313,27 @@ class FencedPublicationIndex:
             retry_on_conflict=3,
         )
 
+    @staticmethod
+    def _guard_observation(
+        params: dict[str, JsonValue], source: dict[str, JsonValue]
+    ) -> None:
+        evidence = source.get("publication_evidence")
+        if isinstance(evidence, dict) and evidence.get("kind") == "observed-v1":
+            observed = ObservedPublicationProjection.model_validate(
+                {
+                    **cast(dict[str, JsonValue], evidence["observation"]),
+                    "source_json": json.dumps(publication_source(json.dumps(source))),
+                }
+            )
+            params["observation"] = {
+                key: value
+                for key, value in publication_source(observed.source_json).items()
+                if key not in OBSERVED_MUTABLE_SOURCE_FIELDS
+            }
+            params["observation_mutable"] = sorted(OBSERVED_MUTABLE_SOURCE_FIELDS)
+
     def upsert(
-        self, reservations: FileReservations, projection: FrozenPublicationProjection
+        self, reservations: FileReservations, projection: PublicationProjection
     ) -> None:
         self._write(
             reservations,
@@ -340,7 +392,7 @@ class FencedPublicationIndex:
     def verify(
         self,
         reservations: FileReservations,
-        projections: tuple[FrozenPublicationProjection, ...],
+        projections: tuple[PublicationProjection, ...],
         retained: tuple[RetainedPublicationProjection, ...] = (),
     ) -> PublicationVerification:
         self._check_index()
@@ -502,48 +554,7 @@ class FencedPublicationIndex:
             or source.get("publication_scope", params["scope"]) != params["scope"]
         ):
             raise ValueError("indexed evidence scope mismatch")
-        frozen = None
-        digest = None
-        evidence = source.get("publication_evidence")
-        if evidence is not None:
-            stored = dict(source)
-            digest = stored.pop("publication_payload", None)
-            stored.pop("publication_operation", None)
-            # Sealing advances the floor while retaining the previous frozen payload.
-            stored["publication_floor"] = stored.get("publication_token")
-            if (
-                publication_digest(stored) != digest
-                or PublicationIndexSnapshot.model_validate(evidence["index"])
-                != self.snapshot
-            ):
-                raise DocumentChunkVerificationError(
-                    "stored embedding evidence identity mismatch"
-                )
-            frozen = FrozenPublicationProjection(
-                ordinal=ordinal,
-                context_projection_id=evidence["context_projection_id"],
-                source_json=json.dumps(
-                    {
-                        key: value
-                        for key, value in source.items()
-                        if not key.startswith("publication_")
-                    }
-                ),
-                embedding_inputs=tuple(evidence["embedding_inputs"]),
-                embedding_config_json=json.dumps(evidence["embedding_config"]),
-            )
-            if not self.snapshot.accepts_encoder_configuration(
-                evidence["embedding_config"]
-            ):
-                raise DocumentChunkVerificationError(
-                    "stored embedding configuration mismatch"
-                )
-        return IndexedProjectionEvidence(
-            index=self.snapshot,
-            source_json=json.dumps(source),
-            frozen_projection=frozen,
-            payload_sha256=digest,
-        )
+        return indexed_evidence_from_source(self.snapshot, source)
 
     def existing_ordinals(self, reservations: FileReservations) -> tuple[int, ...]:
         """Identify legacy physical IDs without inventing embedding provenance."""
@@ -636,7 +647,7 @@ class FencedPublicationIndex:
     def publish_inventory(
         self,
         reservations: FileReservations,
-        projections: tuple[FrozenPublicationProjection, ...],
+        projections: tuple[PublicationProjection, ...],
         *,
         before_batch: Callable[[], object],
     ) -> None:
@@ -675,6 +686,7 @@ class FencedPublicationIndex:
                         params.update(
                             source=source, operation=operation, base=None, previous=None
                         )
+                        self._guard_observation(params, source)
                         script = _WRITE
                     operations.extend(
                         [
@@ -699,3 +711,71 @@ class FencedPublicationIndex:
                         raise ValueError(
                             f"bulk publication {phase} failed (status {status})"
                         )
+
+
+def indexed_evidence_from_source(
+    snapshot: PublicationIndexSnapshot, source: dict[str, Any]
+) -> IndexedProjectionEvidence:
+    """Validate stored content/provenance; callers establish file and tenant scope."""
+    ordinal = source.get("chunk_index")
+    if type(ordinal) is not int:
+        raise ValueError("indexed evidence ordinal missing")
+    frozen = None
+    digest = None
+    evidence = source.get("publication_evidence")
+    if evidence is not None:
+        stored = dict(source)
+        digest = stored.pop("publication_payload", None)
+        stored.pop("publication_operation", None)
+        # Sealing advances the floor while retaining the previous frozen payload.
+        stored["publication_floor"] = stored.get("publication_token")
+        if (
+            publication_digest(stored) != digest
+            or PublicationIndexSnapshot.model_validate(evidence["index"]) != snapshot
+        ):
+            raise DocumentChunkVerificationError(
+                "stored embedding evidence identity mismatch"
+            )
+        if evidence.get("kind") == "observed-v1":
+            observed = ObservedPublicationProjection.model_validate(
+                {
+                    **evidence["observation"],
+                    "source_json": json.dumps(publication_source(json.dumps(source))),
+                }
+            )
+            if not observed.accepted_by(snapshot) or publication_source(
+                observed.source_json
+            ) != publication_source(json.dumps(source)):
+                raise DocumentChunkVerificationError(
+                    "stored observation source mismatch"
+                )
+            return IndexedProjectionEvidence(
+                index=snapshot,
+                source_json=json.dumps(source),
+                frozen_projection=None,
+                payload_sha256=digest,
+                observed_projection=observed,
+            )
+        frozen = FrozenPublicationProjection(
+            ordinal=ordinal,
+            context_projection_id=evidence["context_projection_id"],
+            source_json=json.dumps(
+                {
+                    key: value
+                    for key, value in source.items()
+                    if not key.startswith("publication_")
+                }
+            ),
+            embedding_inputs=tuple(evidence["embedding_inputs"]),
+            embedding_config_json=json.dumps(evidence["embedding_config"]),
+        )
+        if not snapshot.accepts_encoder_configuration(evidence["embedding_config"]):
+            raise DocumentChunkVerificationError(
+                "stored embedding configuration mismatch"
+            )
+    return IndexedProjectionEvidence(
+        index=snapshot,
+        source_json=json.dumps(source),
+        frozen_projection=frozen,
+        payload_sha256=digest,
+    )
