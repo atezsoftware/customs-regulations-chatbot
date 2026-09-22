@@ -227,7 +227,7 @@ def test_legacy_membership_recovery_requires_exact_unique_same_version_sources()
 
 
 @pytest.mark.parametrize("caption", [False, True])
-def test_image_source_recovery_requires_exact_text_and_recorded_split_lineage(
+def test_image_source_recovery_uses_exact_text_and_available_split_lineage(
     caption: bool,
 ) -> None:
     from onyx.regulatory.amendments.annexes.selective_impact import (
@@ -279,12 +279,16 @@ def test_image_source_recovery_requires_exact_text_and_recorded_split_lineage(
         )
         == {}
     )
-    assert (
-        recover_source_membership(
-            [first.model_copy(update={"metadata": {}}), second, image]
-        )
-        == {}
-    )
+    assert recover_source_membership(
+        [first.model_copy(update={"metadata": {}}), second, image]
+    ) == {"image": ["part-1"]}
+    assert recover_source_membership(
+        [
+            first,
+            first.model_copy(update={"id": "unrecorded-copy", "metadata": {}}),
+            image,
+        ]
+    ) == {"image": ["part-1"]}
 
 
 def test_final_ingest_source_integrity_rejects_dangling_and_wrong_aggregate_text() -> (

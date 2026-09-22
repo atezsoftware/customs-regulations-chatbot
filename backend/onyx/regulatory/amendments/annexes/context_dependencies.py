@@ -380,7 +380,10 @@ def rebuild_context_aggregates(
     snapshot. Missing sources, unknown roots and cycles are explicit blockers.
     """
     from onyx.db.models import RegulatoryChunk
-    from onyx.regulatory.chunker import hierarchical_aggregate_text
+    from onyx.regulatory.chunker import (
+        hierarchical_aggregate_root_label,
+        hierarchical_aggregate_text,
+    )
 
     by_id = {row.id: row for row in rows}
     affected = set(canonical_dependency_closure(rows, changed_ids))
@@ -408,7 +411,8 @@ def rebuild_context_aggregates(
             ):
                 raise ValueError("aggregate_provenance_unavailable")
             text = hierarchical_aggregate_text(
-                root_path[-1], [by_id[source].text for source in sources]
+                hierarchical_aggregate_root_label(row.chunk_metadata, row.text),
+                [by_id[source].text for source in sources],
             )
             by_id[identifier] = RegulatoryChunk(
                 id=row.id,

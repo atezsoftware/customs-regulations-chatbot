@@ -569,7 +569,7 @@ def activate_temporal_projection(
                     capture_canonical_scope(session, user_file_id)
                 )
                 if recovered.get(canonical.id) != [target.id]:
-                    raise ValueError("observed image split lineage is unavailable")
+                    raise ValueError("observed image source recovery is unavailable")
                 metadata["bound_to_regulatory_chunk_id"] = target.id
                 metadata["source_regulatory_chunk_ids"] = []
             if metadata != binding.representation_metadata:

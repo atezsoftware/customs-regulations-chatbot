@@ -82,7 +82,10 @@ def observed_baseline_binding(
     if row is None or (
         source.get("document_id") != row.user_file_id
         or source.get("chunk_index") != row.projection_ordinal
-        or source.get("heading_path") != row.heading_path
+        or (
+            source.get("heading_path") != row.heading_path
+            and not (source.get("heading_path") is None and row.heading_path == [])
+        )
         or source.get("validity_start_date") != _epoch(row.validity_start_date)
         or source.get("validity_end_date") != _epoch(row.validity_end_date)
     ):
@@ -107,7 +110,10 @@ def observed_baseline_binding(
     image = metadata.get("bound_to_regulatory_chunk_id") is not None
     members = source_ids(row)
     if aggregate:
-        from onyx.regulatory.chunker import hierarchical_aggregate_text
+        from onyx.regulatory.chunker import (
+            hierarchical_aggregate_root_label,
+            hierarchical_aggregate_text,
+        )
 
         root = metadata.get("hierarchy_root_path")
         if not isinstance(root, list) or not root or not isinstance(root[-1], str):
@@ -117,7 +123,8 @@ def observed_baseline_binding(
         if (
             not members
             or hierarchical_aggregate_text(
-                root[-1], [rows[identifier].text for identifier in members]
+                hierarchical_aggregate_root_label(metadata, row.text),
+                [rows[identifier].text for identifier in members],
             )
             != row.text
         ):

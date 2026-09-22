@@ -163,7 +163,10 @@ def review_units(items: list[AnnexChangeItemDraft]) -> list[list[int]]:
 def aggregate_membership_is_valid(
     aggregate: AnnexCanonicalSnapshot, rows: dict[str, AnnexCanonicalSnapshot]
 ) -> bool:
-    from onyx.regulatory.chunker import hierarchical_aggregate_text
+    from onyx.regulatory.chunker import (
+        hierarchical_aggregate_root_label,
+        hierarchical_aggregate_text,
+    )
 
     members = source_ids(aggregate)
     root = aggregate.metadata.get("hierarchy_root_path")
@@ -186,7 +189,8 @@ def aggregate_membership_is_valid(
         return False
     return (
         hierarchical_aggregate_text(
-            root[-1], [row.text for row in selected if row is not None]
+            hierarchical_aggregate_root_label(aggregate.metadata, aggregate.text),
+            [row.text for row in selected if row is not None],
         )
         == aggregate.text
     )
@@ -196,7 +200,10 @@ def recover_source_membership(
     rows: list[AnnexCanonicalSnapshot],
 ) -> dict[str, list[str]]:
     """Recover only exact, unique membership within the same file and legal version."""
-    from onyx.regulatory.chunker import hierarchical_aggregate_text
+    from onyx.regulatory.chunker import (
+        hierarchical_aggregate_root_label,
+        hierarchical_aggregate_text,
+    )
 
     recovered: dict[str, list[str]] = {}
     by_id = {row.id: row for row in rows}
@@ -207,10 +214,9 @@ def recover_source_membership(
         candidates = [
             row
             for row in rows
-            if row.user_file_id == image.user_file_id
-            and row.validity_start_date == image.validity_start_date
-            and row.validity_end_date == image.validity_end_date
-            and row.heading_path == image.heading_path
+            if row.text.strip()
+            and row.chunk_type not in {"image", "hierarchical_aggregate"}
+            and image_membership_is_valid(image, row)
             and image.text
             in (
                 row.text,
@@ -219,9 +225,15 @@ def recover_source_membership(
                 + str(image.metadata.get("image_alt") or "")
                 + "]",
             )
-            and not row.metadata.get("bound_to_regulatory_chunk_id")
-            and isinstance(split := row.metadata.get("oversized_split"), dict)
+        ]
+        recorded = [
+            row
+            for row in candidates
+            if isinstance(split := row.metadata.get("oversized_split"), dict)
             and split.get("source_chunk_id") == parent
+        ]
+        candidates = recorded or [
+            row for row in candidates if row.metadata.get("oversized_split") is None
         ]
         if len(candidates) == 1:
             recovered[image.id] = [candidates[0].id]
@@ -239,8 +251,10 @@ def recover_source_membership(
             or not all(isinstance(part, str) for part in root)
         ):
             continue
-        root_label = root[-1]
-        assert isinstance(root_label, str)
+        root_label = hierarchical_aggregate_root_label(
+            aggregate.metadata, aggregate.text
+        )
+        root_paths = [root, [*root[:-1], root_label]]
         candidates = sorted(
             (
                 row
@@ -251,7 +265,7 @@ def recover_source_membership(
                 and row.validity_end_date == aggregate.validity_end_date
                 and row.metadata.get("chunk_variant") != "hierarchical_aggregate"
                 and not row.metadata.get("bound_to_regulatory_chunk_id")
-                and row.heading_path[: len(root)] == root
+                and row.heading_path[: len(root)] in root_paths
             ),
             key=lambda row: (row.position, row.id),
         )

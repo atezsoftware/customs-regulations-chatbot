@@ -10,7 +10,10 @@ from onyx.regulatory.amendments.annexes.selective_impact import (
     recovered_source_row,
     source_ids,
 )
-from onyx.regulatory.chunker import hierarchical_aggregate_text
+from onyx.regulatory.chunker import (
+    hierarchical_aggregate_root_label,
+    hierarchical_aggregate_text,
+)
 
 
 def rebuild_amendment_dependents(
@@ -156,7 +159,8 @@ def rebuild_amendment_dependents(
                     ):
                         raise ValueError("aggregate root unavailable")
                     text = hierarchical_aggregate_text(
-                        root[-1], [r.text for r in sources]
+                        hierarchical_aggregate_root_label(metadata, original.text),
+                        [r.text for r in sources],
                     )
                     metadata["source_regulatory_chunk_ids"] = [r.id for r in sources]
                     metadata["source_chunk_orders"] = [

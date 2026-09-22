@@ -177,3 +177,48 @@ def test_temporary_source_absence_restores_derived_consumer_after_window() -> No
         ["b"],
         ["restored", "b"],
     ]
+
+
+def test_changed_aggregate_preserves_its_recorded_article_title_prefix() -> None:
+    boundary = date(2027, 1, 1)
+    first = snapshot("first", None, None).model_copy(
+        update={"text": "original provision"}
+    )
+    second = snapshot("second", None, None).model_copy(
+        update={"text": "retained provision"}
+    )
+    parent = aggregate("parent", [first.id, second.id]).model_copy(
+        update={
+            "text": "EK-1 - Başlık\n\noriginal provision\n\nretained provision",
+            "metadata": {
+                "chunk_variant": "hierarchical_aggregate",
+                "hierarchy_root_path": ["EK-1"],
+                "article_title": "Başlık",
+                "source_regulatory_chunk_ids": [first.id, second.id],
+            },
+        }
+    )
+    replacement = first.model_copy(
+        update={
+            "id": "replacement",
+            "text": "changed provision",
+            "validity_start_date": boundary,
+            "supersedes_chunk_id": first.id,
+        }
+    )
+    result = rebuild_amendment_dependents(
+        [first, second, parent],
+        [
+            first.model_copy(
+                update={
+                    "validity_end_date": boundary,
+                    "superseded_by_chunk_id": replacement.id,
+                }
+            ),
+            replacement,
+            second,
+            parent,
+        ],
+    )
+    updated = next(row for row in result if row.supersedes_chunk_id == parent.id)
+    assert updated.text == "EK-1 - Başlık\n\nchanged provision\n\nretained provision"

@@ -107,7 +107,10 @@ def test_inventory_audit_distinguishes_legacy_ready_and_missing_source() -> None
     assert missing.issues[0].code == "missing_indexed_source"
 
 
-def test_observed_image_retains_own_asset_with_exact_split_parent() -> None:
+@pytest.mark.parametrize("recorded_split", [False, True])
+def test_observed_image_retains_own_asset_with_exact_split_parent(
+    recorded_split: bool,
+) -> None:
     inputs, evidence = baseline_case()
     image = inputs.canonical[0].model_copy(
         update={
@@ -128,7 +131,9 @@ def test_observed_image_retains_own_asset_with_exact_split_parent() -> None:
                     "part": 1,
                     "parts": 2,
                 },
-            },
+            }
+            if recorded_split
+            else {},
         }
     )
     source = json.loads(evidence.source_json)
@@ -141,9 +146,15 @@ def test_observed_image_retains_own_asset_with_exact_split_parent() -> None:
     assert binding.representation_metadata["image_file_id"] == "asset-1"
 
 
-@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize(
+    "split,unrecorded", [(False, False), (True, False), (False, True)]
+)
+@pytest.mark.parametrize("missing_heading", [False, True])
 def test_observed_image_activation_validates_own_citation_asset(
-    split: bool, monkeypatch: pytest.MonkeyPatch
+    split: bool,
+    unrecorded: bool,
+    missing_heading: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from unittest.mock import MagicMock
 
@@ -173,13 +184,19 @@ def test_observed_image_activation_validates_own_citation_asset(
         update={
             "metadata": {
                 "chunk_variant": "image_companion",
-                "bound_to_regulatory_chunk_id": "old-parent" if split else "parent",
+                "bound_to_regulatory_chunk_id": "old-parent"
+                if split or unrecorded
+                else "parent",
                 "image_file_id": "asset-1",
             }
         }
     )
     source = json.loads(evidence.source_json)
     source["image_file_id"] = "asset-1"
+    if missing_heading:
+        parent = parent.model_copy(update={"heading_path": []})
+        image = image.model_copy(update={"heading_path": []})
+        source["heading_path"] = None
     binding = observed_baseline_binding(
         evidence.model_copy(update={"source_json": json.dumps(source)}), [parent, image]
     )
@@ -326,3 +343,119 @@ def test_observed_reader_keeps_exact_historical_citation_ordinal(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("fault", [None, "ambiguous", "contradictory_split"])
+def test_exact_image_source_recovery_requires_unambiguous_evidence(
+    fault: str | None,
+) -> None:
+    inputs, evidence = baseline_case()
+    image = inputs.canonical[0].model_copy(
+        update={
+            "metadata": {
+                "chunk_variant": "image_companion",
+                "bound_to_regulatory_chunk_id": "missing-parent",
+                "image_file_id": "asset",
+                "image_alt": "caption",
+            }
+        }
+    )
+    parent = image.model_copy(
+        update={"id": "parent", "projection_ordinal": 6, "metadata": {}}
+    )
+    rows = [parent, image]
+    if fault == "ambiguous":
+        rows.append(
+            parent.model_copy(update={"id": "duplicate", "projection_ordinal": 7})
+        )
+    if fault == "contradictory_split":
+        rows[0] = parent.model_copy(
+            update={
+                "metadata": {"oversized_split": {"source_chunk_id": "other-parent"}}
+            }
+        )
+    source = json.loads(evidence.source_json)
+    source["image_file_id"] = "asset"
+    actual = evidence.model_copy(update={"source_json": json.dumps(source)})
+    if fault:
+        with pytest.raises(ValueError, match="image membership"):
+            observed_baseline_binding(actual, rows)
+    else:
+        original = [r.model_dump(mode="json") for r in rows]
+        binding = observed_baseline_binding(actual, rows)
+        assert binding.dependency_ids == [parent.id]
+        assert binding.projection.source_json == actual.source_json
+        assert [r.model_dump(mode="json") for r in rows] == original
+
+
+def test_observed_aggregate_accepts_exact_recorded_article_title_without_metadata_changes() -> (
+    None
+):
+    inputs, evidence = baseline_case()
+    root = ["Karar 7238", "MADDE 4"]
+    title = "Ortak Komisyonun Amaçları"
+    first = inputs.canonical[0].model_copy(
+        update={
+            "id": "first",
+            "position": 1,
+            "projection_ordinal": 1,
+            "text": "**Madde 4**\n**Ortak Komisyonun Amaçları**\nKomisyonun amaçları:",
+            "heading_path": root,
+            "metadata": {"chunk_variant": "atomic"},
+        }
+    )
+    second = first.model_copy(
+        update={
+            "id": "second",
+            "position": 2,
+            "projection_ordinal": 2,
+            "text": "a) İşlemleri kolaylaştırmak;",
+            "heading_path": [root[0], root[1] + " - " + title, "a)"],
+        }
+    )
+    aggregate = inputs.canonical[0].model_copy(
+        update={
+            "chunk_type": "hierarchical_aggregate",
+            "heading_path": root,
+            "text": root[-1]
+            + " - "
+            + title
+            + "\n\n"
+            + first.text
+            + "\n\n"
+            + second.text,
+            "metadata": {
+                "chunk_variant": "hierarchical_aggregate",
+                "hierarchy_root_path": root,
+                "article_title": title,
+                "source_regulatory_chunk_ids": [first.id, second.id],
+            },
+        }
+    )
+    source = json.loads(evidence.source_json)
+    source.update(content=aggregate.text, heading_path=root)
+    actual = evidence.model_copy(update={"source_json": json.dumps(source)})
+    rows = [first, second, aggregate]
+    original = [r.model_dump(mode="json") for r in rows]
+    binding = observed_baseline_binding(actual, rows)
+    assert binding.dependency_ids == [first.id, second.id]
+    assert binding.projection.source_json == actual.source_json
+    assert [r.model_dump(mode="json") for r in rows] == original
+
+
+@pytest.mark.parametrize("indexed_heading", [None, [], False, ""])
+def test_empty_canonical_heading_accepts_only_null_or_empty_index_heading(
+    indexed_heading: object,
+) -> None:
+    inputs, evidence = baseline_case()
+    canonical = inputs.canonical[0].model_copy(update={"heading_path": []})
+    source = json.loads(evidence.source_json)
+    source["heading_path"] = indexed_heading
+    actual = evidence.model_copy(update={"source_json": json.dumps(source)})
+    if indexed_heading is None or indexed_heading == []:
+        binding = observed_baseline_binding(actual, [canonical])
+        assert binding.projection.source_json == actual.source_json
+        assert canonical.heading_path == []
+    else:
+        with pytest.raises(ValueError, match="identity, heading"):
+            observed_baseline_binding(actual, [canonical])
