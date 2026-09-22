@@ -109,7 +109,8 @@ jobs:
           fi
           if [[ "$BASELINE_MODE" == baseline-apply ]]; then args+=(--apply); fi
           set +e
-          kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- python /app/scripts/prepare_regulatory_publication_baselines.py "${args[@]}"
+          kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; exec python /app/scripts/prepare_regulatory_publication_baselines.py "$@"' baseline-cli "${args[@]}"
           result=$?
           set -e
           kubectl exec "$pod" -n customs-regulations-dev -c "$container" -- cat "/tmp/baseline-${GITHUB_RUN_ID}.jsonl" > baseline-report.jsonl
