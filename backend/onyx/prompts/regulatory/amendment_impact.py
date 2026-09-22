@@ -11,5 +11,9 @@ source_id, source_side (before or after), and source_quote copied literally from
 changed source's text; explain which fact, condition, exception or scope changed.
 For affected=false explain why the statement remains valid. If the evidence is
 insufficient or ambiguous set uncertain=true, affected=false; never guess unchanged.
-Use only the source IDs and text in the context's change_key. Keep reasons concise.
+Use only the source IDs and text in the context's change_key. Give one short reason
+per decision, at most 200 characters. For affected decisions use the shortest exact
+evidence spans, at most 300 characters each; do not copy whole source paragraphs.
+For unchanged decisions use an empty quote and source_quote, and null source_id and
+source_side. Return every supplied key exactly once in one complete JSON object.
 """

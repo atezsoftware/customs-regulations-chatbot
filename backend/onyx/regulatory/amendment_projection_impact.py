@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from datetime import date
 from time import monotonic
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -31,6 +31,7 @@ from onyx.regulatory.writer_publication_models import (
 )
 from onyx.tracing.flows import LLMFlow
 from onyx.utils.logger import setup_logger
+from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 
 logger = setup_logger()
 Window = tuple[date, date]
@@ -357,18 +358,33 @@ def include_context_consumers(
         }
         for key, (context, start, end) in entries.items()
     }
-    keys = list(contexts)
+    batches: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    characters = 0
+    for key, context in contexts.items():
+        if current and (len(current) >= 8 or characters + len(context) > 24000):
+            batches.append(current)
+            current = {}
+            characters = 0
+        current[key] = context
+        characters += len(context)
+    if current:
+        batches.append(current)
     affected: set[str] = set()
-    deadline = monotonic() + 180
-    for offset in range(0, len(keys), 64):
-        batch = {key: contexts[key] for key in keys[offset : offset + 64]}
-        proofs = {
+
+    def source_proofs(batch: dict[str, str]) -> dict[str, dict[str, dict[str, str]]]:
+        return {
             key: {
                 side: {str(r["id"]): str(r["text"]) for r in rows}
                 for side, rows in changes[str(cases[key]["change_key"])].items()
             }
             for key in batch
         }
+
+    def audit_batch(batch: dict[str, str]) -> ContextImpactResult:
+        # Bound each unit of work without timing out later groups before they start.
+        deadline = monotonic() + 180
+        proofs = source_proofs(batch)
 
         def generate_audit() -> ContextImpactResult:
             feedback: str | None = None
@@ -406,7 +422,7 @@ def include_context_consumers(
                     feedback = str(error)
             raise AssertionError("context audit attempts exhausted")
 
-        response = (
+        return (
             audit_cache(
                 context_hash(
                     [
@@ -426,6 +442,16 @@ def include_context_consumers(
             if audit_cache is not None
             else generate_audit()
         )
+
+    # The shared helper preserves tenant/tracing context and joins every call on failure.
+    responses = cast(
+        list[ContextImpactResult],
+        run_functions_tuples_in_parallel(
+            [(audit_batch, (batch,)) for batch in batches], max_workers=4
+        ),
+    )
+    for batch, response in zip(batches, responses):
+        proofs = source_proofs(batch)
         if evidence is not None:
             for decision in response.decisions:
                 if decision.key not in batch:
@@ -467,10 +493,11 @@ def include_context_consumers(
                 result.get(identifier, []) + [(start, end)]
             )
     logger.info(
-        "amendment_context_impact unique_contexts=%d affected_contexts=%d affected_chunks=%d",
+        "amendment_context_impact unique_contexts=%d affected_contexts=%d affected_chunks=%d audit_groups=%d",
         len(contexts),
         len(affected),
         len(result),
+        len(batches),
     )
     return result
 

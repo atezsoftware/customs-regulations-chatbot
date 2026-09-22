@@ -1,4 +1,4 @@
-"""Read-only source-usage inspection; no leases, preview writes or model calls."""
+"""Source-usage inspection and owned checkpoints for validated context decisions."""
 
 from collections.abc import Callable
 from datetime import date

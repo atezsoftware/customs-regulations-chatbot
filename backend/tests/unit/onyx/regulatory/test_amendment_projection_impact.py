@@ -407,3 +407,119 @@ def test_context_evidence_selects_actual_consumer_and_keeps_generic_summary(
         )
         assert not fresh.unresolved
         assert len(cache) == 2
+
+
+def test_context_audit_handles_bounded_provider_output_and_resumes_completed_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+    from collections import Counter
+    from collections.abc import Callable
+    from contextvars import ContextVar
+    from threading import Lock
+    from unittest.mock import MagicMock
+
+    from onyx.llm.interfaces import LLMConfig
+    from onyx.regulatory import amendment_projection_impact as impact
+    from onyx.regulatory.structured_llm import StructuredOutputValidationError
+    from tests.unit.onyx.regulatory.annexes.test_publication_timeline import snapshot
+
+    old = snapshot("old", None, None).model_copy(update={"text": "Fee is 5%."})
+    consumers = [snapshot(f"consumer-{i}", None, None) for i in range(25)]
+    boundary = date(2027, 1, 1)
+    before = [old, *consumers]
+    after = [
+        old.model_copy(update={"validity_end_date": boundary}),
+        *consumers,
+        snapshot("new", boundary, None).model_copy(
+            update={"text": "Fee is 7%.", "supersedes_chunk_id": "old"}
+        ),
+    ]
+    contexts = {
+        row.id: f"Independent administrative rule {i}."
+        for i, row in enumerate(consumers)
+    }
+    contexts[consumers[-1].id] = "The fee is 5%."
+    bindings = [
+        MagicMock(
+            effective_start=None,
+            effective_end=None,
+            projection=MagicMock(
+                source_json=json.dumps(
+                    {"regulatory_chunk_id": key, "chunk_context": value}
+                )
+            ),
+        )
+        for key, value in contexts.items()
+    ]
+    llm = MagicMock()
+    llm.config = LLMConfig(
+        model_provider="configured",
+        model_name="context",
+        temperature=0,
+        max_input_tokens=10000,
+    )
+    tenant = ContextVar("audit_test_tenant", default="missing")
+    token = tenant.set("owned-tenant")
+    calls: Counter[str] = Counter()
+    cache: dict[str, impact.ContextImpactResult] = {}
+    guard = Lock()
+    blocked = True
+
+    def audit(*_args: object, **kwargs: object) -> impact.ContextImpactResult:
+        assert tenant.get() == "owned-tenant"
+        data = json.loads(str(kwargs["user_prompt"]))["contexts"]
+        # A bounded provider response cannot contain the entire file's decisions.
+        if len(data) > 8:
+            raise StructuredOutputValidationError("json_invalid: EOF in decisions")
+        with guard:
+            calls.update(case["text"] for case in data.values())
+        if blocked and any(case["text"] == "The fee is 5%." for case in data.values()):
+            raise StructuredOutputValidationError("json_invalid: EOF in last group")
+        return impact.ContextImpactResult(
+            decisions=[
+                ContextImpactDecision(
+                    key=key,
+                    affected=case["text"] == "The fee is 5%.",
+                    quote="fee is 5%" if case["text"] == "The fee is 5%." else "",
+                    reason="Fee changes; administrative rules remain valid.",
+                    source_side="after",
+                    source_id="new",
+                    source_quote="Fee is 7%.",
+                )
+                for key, case in data.items()
+            ]
+        )
+
+    def resolve(
+        key: str, generate: Callable[[], impact.ContextImpactResult]
+    ) -> impact.ContextImpactResult:
+        with guard:
+            stored = cache.get(key)
+        if stored is not None:
+            return stored
+        value = generate()
+        with guard:
+            cache[key] = value
+        return value
+
+    monkeypatch.setattr(impact, "generate_structured", audit)
+    try:
+        failed = impact.analyze_amendment_impact(
+            before=before, after=after, bindings=bindings, llm=llm, audit_cache=resolve
+        )
+        assert failed.unresolved and not failed.unchanged_ids
+        assert cache  # Successful groups survive a different group's provider failure.
+        successful_calls = calls[contexts[consumers[0].id]]
+        blocked = False
+        result = impact.analyze_amendment_impact(
+            before=before, after=after, bindings=bindings, llm=llm, audit_cache=resolve
+        )
+        assert not result.unresolved
+        assert set(result.affected_windows) == {"old", "new", consumers[-1].id}
+        assert set(result.unchanged_ids) == {r.id for r in consumers[:-1]}
+        assert len(result.context_evidence) == len(contexts)
+        assert calls[contexts[consumers[0].id]] == successful_calls
+        assert all(calls[value] >= 1 for value in contexts.values())
+    finally:
+        tenant.reset(token)
