@@ -440,9 +440,12 @@ def matches_indexed_evidence(
     ):
         return False
     if isinstance(projection, ObservedPublicationProjection):
+        observed = evidence.observed_projection
         return (
             projection.accepted_by(evidence.index)
-            and evidence.observed_projection == projection
+            and observed is not None
+            and observed.model_dump(exclude={"source_json"})
+            == projection.model_dump(exclude={"source_json"})
         )
     frozen = evidence.frozen_projection
     return frozen is not None and (

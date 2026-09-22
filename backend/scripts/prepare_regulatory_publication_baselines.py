@@ -193,6 +193,7 @@ def main() -> None:
                         if pending != resumed_from:
                             raise ValueError("baseline recovery changed after audit")
                         owner = recover_owned_writer_before_next(owner)
+                        record["applied"] = True
                     finally:
                         authority.release(owner)
                     inputs = baseline_audit_inputs(args.tenant, file_id)
@@ -267,12 +268,12 @@ def main() -> None:
                             raise ValueError(
                                 "baseline recovery source/vector verification failed"
                             )
-                    record["applied"] = True
                 if args.apply and state == "legacy":
                     owner = authority.acquire(file_id, owner_id=uuid4(), ttl=LEASE_TTL)
                     try:
                         owner = recover_owned_writer_before_next(owner)
                         owner = ensure_owned_baseline(owner, client)
+                        record["applied"] = True
                     finally:
                         authority.release(owner)
                     after = baseline_audit_inputs(args.tenant, file_id)
@@ -297,7 +298,7 @@ def main() -> None:
                                 "baseline source/vector preservation verification failed"
                             )
                         checks[index.index_uuid] = verified.model_dump(mode="json")
-                    record.update(applied=True, state="ready", after=checks)
+                    record.update(state="ready", after=checks)
             except Exception as error:
                 # Full trace belongs to protected service logs; never dump request credentials.
                 logger.exception("Publication baseline failed for file %s", file_id)

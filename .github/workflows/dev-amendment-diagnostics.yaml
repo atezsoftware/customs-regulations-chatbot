@@ -44,7 +44,7 @@ jobs:
           import json,re,subprocess
           from pathlib import Path
           print(subprocess.run(["supervisorctl","-c","/etc/supervisor/conf.d/supervisord.conf","status"],capture_output=True,text=True).stdout)
-          print(json.dumps({"worker_readiness": {name:Path("/tmp/onyx_k8s_"+name+"_readiness.txt").exists() for name in ("regulatorybenchmark","regulatoryindexing","annex_worker")}}))
+          print(json.dumps({"worker_readiness": {name:Path("/tmp/onyx_k8s_"+name+"_readiness.txt").exists() for name in ("regulatorybenchmark","regulatoryindexing")}}))
           startup_errors=[]
           for path in Path("/var/log/onyx").glob("celery_worker_regulatory*.log"):
               for line in path.read_text(errors="replace").splitlines()[-200:]:

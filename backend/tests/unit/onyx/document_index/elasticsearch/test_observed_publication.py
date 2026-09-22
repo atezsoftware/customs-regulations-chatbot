@@ -139,6 +139,35 @@ def test_activated_observation_cannot_silently_lose_its_index_proof() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "changed_proof", [None, "context_projection_id", "observed_source_sha256"]
+)
+def test_observation_accepts_reordered_json_only_with_identical_proof(
+    changed_proof: str | None,
+) -> None:
+    from onyx.document_index.publication_models import (
+        IndexedProjectionEvidence,
+        matches_indexed_evidence,
+    )
+
+    projection = observed()
+    source_json = json.dumps(json.loads(projection.source_json), sort_keys=True)
+    assert source_json != projection.source_json
+    payload = projection.model_dump()
+    payload["source_json"] = source_json
+    if changed_proof is not None:
+        payload[changed_proof] = "f" * 64
+    decoded = ObservedPublicationProjection.model_validate(payload)
+    evidence = IndexedProjectionEvidence(
+        index=projection.observed_index,
+        source_json=source_json,
+        frozen_projection=None,
+        payload_sha256=None,
+        observed_projection=decoded,
+    )
+    assert matches_indexed_evidence(projection, evidence) is (changed_proof is None)
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_mixed_index_authority_is_independent_of_binding_order(reverse: bool) -> None:
     from onyx.document_index.publication_models import (

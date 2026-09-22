@@ -19,10 +19,21 @@ from tests.unit.onyx.regulatory.indexing_jobs.owned_publication_test_helpers imp
 from tests.unit.onyx.regulatory.test_publication_baseline import baseline_case
 
 
-@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize(
+    "mode,verification_error",
+    [
+        ("audit", False),
+        ("apply", False),
+        ("resume", False),
+        ("apply", True),
+        ("resume", True),
+    ],
+)
 def test_cli_audits_without_writes_and_resumes_only_frozen_baseline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resume: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, verification_error: bool
 ) -> None:
+    resume = mode == "resume"
+    applies = mode != "audit"
     inputs, evidence = baseline_case()
     owner = OwnedAuthority(inputs.file.id)
     binding = observed_baseline_binding(evidence, inputs.canonical)
@@ -55,7 +66,7 @@ def test_cli_audits_without_writes_and_resumes_only_frozen_baseline(
         pending_manifest=False,
         manifest=None,
     )
-    states = iter([initial, after] if resume else [initial])
+    states = iter([initial, after] if applies else [initial])
     setting = SearchSettings(
         id=11,
         status=IndexModelStatus.PRESENT,
@@ -76,16 +87,19 @@ def test_cli_audits_without_writes_and_resumes_only_frozen_baseline(
     monkeypatch.setattr(cli, "PublicationStore", lambda *_a: authority)
     monkeypatch.setattr(cli, "baseline_audit_settings", lambda *_a: [setting])
     monkeypatch.setattr(cli, "baseline_audit_inputs", lambda *_a: next(states))
-    monkeypatch.setattr(
-        cli,
-        "read_file_inventory",
-        lambda *_a: [
-            evidence.model_copy(update={"observed_projection": binding.projection})
-            if resume
-            else evidence
-        ],
+    after_evidence = evidence.model_copy(
+        update={"observed_projection": binding.projection}
     )
+    if verification_error:
+        source = json.loads(evidence.source_json)
+        source["content"] = "Unexpected indexed content"
+        after_evidence = after_evidence.model_copy(
+            update={"source_json": json.dumps(source)}
+        )
+    inventories = iter([after_evidence] if resume else [evidence, after_evidence])
+    monkeypatch.setattr(cli, "read_file_inventory", lambda *_a: [next(inventories)])
     monkeypatch.setattr(cli, "recover_owned_writer_before_next", lambda _owner: _owner)
+    monkeypatch.setattr(cli, "ensure_owned_baseline", lambda _owner, _client: _owner)
     monkeypatch.setattr(
         "onyx.db.regulatory_writer_publication.pending_writer_manifest",
         lambda _owner: manifest,
@@ -102,13 +116,20 @@ def test_cli_audits_without_writes_and_resumes_only_frozen_baseline(
         "--output",
         str(output),
     ]
-    if resume:
+    if applies:
         args.append("--apply")
     monkeypatch.setattr("sys.argv", args)
-    cli.main()
+    if verification_error:
+        with pytest.raises(SystemExit) as error:
+            cli.main()
+        assert error.value.code == 2
+    else:
+        cli.main()
     report, summary = [json.loads(line) for line in output.read_text().splitlines()]
-    assert report["state"] == ("ready" if resume else "legacy")
-    assert report["applied"] is resume
+    assert report["state"] == (
+        "error" if verification_error else "ready" if applies else "legacy"
+    )
+    assert report["applied"] is applies
     assert summary["summary"] == {report["state"]: 1}
-    if not resume:
+    if not applies:
         authority.acquire.assert_not_called()
