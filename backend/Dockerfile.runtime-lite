@@ -115,6 +115,7 @@ COPY --chown=onyx:onyx ./static /app/static
 COPY --chown=onyx:onyx ./keys /app/keys
 COPY --chown=onyx:onyx ./scripts/regulatory_indexing_readiness.py /app/scripts/regulatory_indexing_readiness.py
 COPY --chown=onyx:onyx ./scripts/supervisord_entrypoint.sh /app/scripts/supervisord_entrypoint.sh
+COPY --chown=onyx:onyx ./scripts/prepare_regulatory_publication_baselines.py /app/scripts/prepare_regulatory_publication_baselines.py
 RUN chmod +x /app/scripts/supervisord_entrypoint.sh
 COPY --chown=onyx:onyx ./assets /app/assets
 
