@@ -53,6 +53,7 @@ def execute_writer_publication(
                 manifest.kind == "cancellation" and pending.kind == "durable"
             ):
                 manifest = complete_writer_index_inventory(owner, client, manifest)
+            del pending
             stage_writer_publication(
                 owner, manifest, durable_generation=durable_generation
             )
@@ -131,6 +132,7 @@ def recover_owned_writer(owner: FileOwnership) -> bool:
         return False
     if pending.kind in {"durable", "cancellation"}:
         raise ValueError("durable publication must resume through its indexing job")
+    del pending
     with ElasticsearchClient() as transport:
         execute_writer_publication(owner, transport.publication_client())
     return True

@@ -1,7 +1,9 @@
 import json
+from typing import cast
 from uuid import uuid4
 
 import pytest
+from pydantic import JsonValue
 
 from onyx.document_index.publication_models import IndexedProjectionEvidence
 from onyx.regulatory.publication_baseline import observed_baseline_binding
@@ -105,6 +107,70 @@ def test_inventory_audit_distinguishes_legacy_ready_and_missing_source() -> None
     missing = audit_baseline_inventory(inputs.canonical, [], [])
     assert missing.state == "unresolved"
     assert missing.issues[0].code == "missing_indexed_source"
+
+
+def test_inventory_audit_keeps_legacy_digests_without_retaining_decoded_vectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import weakref
+
+    from onyx.document_index.publication_models import publication_digest
+    from onyx.regulatory import publication_baseline as baseline
+
+    class TrackedVector(list[float]):
+        pass
+
+    inputs, item = baseline_case()
+    sources = []
+    evidence = []
+    bindings = []
+    canonical = []
+    for ordinal in (5, 1, 12, 2, 9, 3):
+        source = json.loads(item.source_json)
+        source.update(chunk_index=ordinal, regulatory_chunk_id=f"row-{ordinal}")
+        sources.append(source)
+        row = inputs.canonical[0].model_copy(
+            update={"id": f"row-{ordinal}", "projection_ordinal": ordinal}
+        )
+        current = item.model_copy(update={"source_json": json.dumps(source)})
+        binding = observed_baseline_binding(current, [row])
+        canonical.append(row)
+        evidence.append(
+            current.model_copy(update={"observed_projection": binding.projection})
+        )
+        bindings.append(binding)
+    ordered = sorted(sources, key=lambda source: str(source["chunk_index"]))
+    source_digest = publication_digest(ordered)
+    vector_digest = publication_digest(
+        [
+            {
+                "ordinal": s["chunk_index"],
+                "id": s["regulatory_chunk_id"],
+                "content": s["content_vector"],
+                "title": s["title_vector"],
+            }
+            for s in ordered
+        ]
+    )
+    original = baseline.publication_source
+    tracked: list[weakref.ReferenceType[TrackedVector]] = []
+
+    def parse(value: str) -> dict[str, JsonValue]:
+        source = original(value)
+        source["content_vector"] = TrackedVector(
+            cast(list[float], source["content_vector"])
+        )
+        tracked.append(weakref.ref(source["content_vector"]))
+        assert sum(ref() is not None for ref in tracked) <= 3, (
+            "audit retains decoded inventory"
+        )
+        return source
+
+    monkeypatch.setattr(baseline, "publication_source", parse)
+    report = baseline.audit_baseline_inventory(canonical, evidence, bindings)
+    assert report.state == "ready" and report.issues == []
+    assert report.source_sha256 == source_digest
+    assert report.vectors_sha256 == vector_digest
 
 
 @pytest.mark.parametrize("recorded_split", [False, True])

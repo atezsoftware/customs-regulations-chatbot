@@ -30,6 +30,7 @@ from onyx.document_index.publication_models import (
     PublicationVerification,
     RetainedPublicationProjection,
     publication_digest,
+    publication_list_digest,
     publication_source,
 )
 
@@ -432,36 +433,39 @@ class FencedPublicationIndex:
                 }
             }
         expected_ids = {
-            self._id(reservations, ordinal) for ordinal in reservations.ordinals
+            self._id(reservations, ordinal): ordinal
+            for ordinal in reservations.ordinals
         }
-        sources: dict[str, dict[str, JsonValue]] = {}
-        # Stop on an extra hit; storage remains bounded by the frozen inventory.
-        for hit in scan(
-            self.client, index=self.snapshot.index_name, query={"query": query}
-        ):
-            if hit["_id"] not in expected_ids:
-                raise DocumentChunkVerificationError(
-                    "missing/extra reserved file projection"
-                )
-            sources[hit["_id"]] = hit["_source"]
-        if set(sources) != expected_ids:
-            raise DocumentChunkVerificationError(
-                "missing/extra reserved file projection"
-            )
-        manifest: list[JsonValue] = []
-        for ordinal in reservations.ordinals:
-            expected = (
+
+        def expected_source(ordinal: int) -> dict[str, JsonValue]:
+            return (
                 self._retained_source(reservations, preserved[ordinal])
                 if ordinal in preserved
                 else self._source(reservations, live.get(ordinal), ordinal)
             )
-            actual = dict(sources[self._id(reservations, ordinal)])
+
+        seen: set[str] = set()
+        # Keep only identities across pages; full decoded vectors are compared per hit.
+        for hit in scan(
+            self.client, index=self.snapshot.index_name, query={"query": query}, size=64
+        ):
+            identifier = hit["_id"]
+            if identifier not in expected_ids or identifier in seen:
+                raise DocumentChunkVerificationError(
+                    "missing/extra/duplicate reserved file projection"
+                )
+            ordinal = expected_ids[identifier]
+            actual = dict(hit["_source"])
             operation = actual.pop("publication_operation", None)
-            if not operation or actual != expected:
+            if not operation or actual != expected_source(ordinal):
                 raise DocumentChunkVerificationError(
                     f"exact projection/tombstone verification failed for ordinal {ordinal}"
                 )
-            manifest.append(expected)
+            seen.add(identifier)
+        if seen != expected_ids.keys():
+            raise DocumentChunkVerificationError(
+                "missing/extra reserved file projection"
+            )
         return PublicationVerification(
             reservations=reservations,
             index=self.snapshot,
@@ -470,7 +474,9 @@ class FencedPublicationIndex:
                 json.loads(item.source_json)["regulatory_chunk_id"]
                 for item in (*projections, *retained)
             ),
-            manifest_sha256=publication_digest(manifest),
+            manifest_sha256=publication_list_digest(
+                expected_source(ordinal) for ordinal in reservations.ordinals
+            ),
         )
 
     def _retained_source(

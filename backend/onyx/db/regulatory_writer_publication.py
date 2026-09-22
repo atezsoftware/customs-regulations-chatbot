@@ -22,6 +22,7 @@ from onyx.document_index.publication_models import (
     FileOwnership,
     PublicationVerification,
     publication_digest,
+    publication_streaming_digest,
 )
 from onyx.regulatory.writer_publication_models import WriterPublicationManifest
 
@@ -63,7 +64,10 @@ def pending_writer_manifest(owner: FileOwnership) -> WriterPublicationManifest |
             PublicationStore(owner.scope).renew_in_session(session, owner)
             session.commit()
             return None
-        if publication_digest(row.writer_manifest) != row.writer_manifest_sha256:
+        if (
+            publication_streaming_digest(row.writer_manifest)
+            != row.writer_manifest_sha256
+        ):
             raise ValueError("durable writer manifest changed")
         manifest = WriterPublicationManifest.model_validate(row.writer_manifest)
         if manifest.scope != owner.scope or manifest.user_file_id != owner.user_file_id:
@@ -101,7 +105,7 @@ def stage_writer_publication(
                 if (
                     previous.kind != "durable"
                     or previous.durable_job_id != manifest.cancellation_job_id
-                    or publication_digest(row.writer_manifest)
+                    or publication_streaming_digest(row.writer_manifest)
                     != manifest.cancelled_manifest_sha256
                     or row.writer_manifest_sha256 != manifest.cancelled_manifest_sha256
                 ):
@@ -114,7 +118,7 @@ def stage_writer_publication(
         if row.writer_manifest is not None:
             if (
                 row.writer_manifest != payload
-                or row.writer_manifest_sha256 != publication_digest(payload)
+                or row.writer_manifest_sha256 != publication_streaming_digest(payload)
             ):
                 raise ValueError("another durable writer must recover first")
             authority.renew_in_session(session, owner)
@@ -153,7 +157,7 @@ def stage_writer_publication(
             )
         archive_canonical_revisions(session, owner)
         row.writer_manifest = payload
-        row.writer_manifest_sha256 = publication_digest(payload)
+        row.writer_manifest_sha256 = publication_streaming_digest(payload)
         authority.record_event(session, owner)
         from onyx.db.regulatory_physical_indexes import (
             validate_physical_index_snapshots,
@@ -295,7 +299,9 @@ def finalize_writer_publication(
         assert row is not None
         if row.writer_manifest != manifest.model_dump(
             mode="json"
-        ) or row.writer_manifest_sha256 != publication_digest(row.writer_manifest):
+        ) or row.writer_manifest_sha256 != publication_streaming_digest(
+            row.writer_manifest
+        ):
             raise ValueError("writer activation manifest changed")
         if (
             canonical_scope_digest(session, owner.user_file_id)

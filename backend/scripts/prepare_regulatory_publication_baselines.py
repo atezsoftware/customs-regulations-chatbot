@@ -192,6 +192,7 @@ def main() -> None:
                         pending = pending_writer_manifest(owner)
                         if pending != resumed_from:
                             raise ValueError("baseline recovery changed after audit")
+                        del pending
                         owner = recover_owned_writer_before_next(owner)
                         record["applied"] = True
                     finally:

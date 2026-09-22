@@ -2,6 +2,7 @@
 
 import json
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
@@ -228,6 +229,37 @@ def publication_digest(value: JsonValue) -> str:
             allow_nan=False,
         ).encode()
     ).hexdigest()
+
+
+def publication_list_digest(values: Iterable[JsonValue]) -> str:
+    """Hash the identical canonical JSON array without retaining its whole payload."""
+    digest = sha256(b"[")
+    separator = b""
+    for value in values:
+        digest.update(separator)
+        digest.update(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode()
+        )
+        separator = b","
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
+def publication_streaming_digest(value: JsonValue) -> str:
+    """Hash large persisted manifests without whole-document JSON/UTF-8 buffers."""
+    digest = sha256()
+    encoder = json.JSONEncoder(
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+    for part in encoder.iterencode(value):
+        digest.update(part.encode())
+    return digest.hexdigest()
 
 
 class SerializedPublicationSource(PublicationModel):

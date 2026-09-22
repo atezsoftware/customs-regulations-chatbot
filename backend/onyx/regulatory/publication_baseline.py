@@ -16,6 +16,7 @@ from onyx.document_index.publication_models import (
     PublicationIndexSnapshot,
     matches_indexed_evidence,
     publication_digest,
+    publication_list_digest,
     publication_source,
 )
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
@@ -355,19 +356,11 @@ def audit_baseline_inventory(
 ) -> BaselineInventoryAudit:
     """Pure, read-only preflight shared by operators and the normal writer."""
     issues: list[BaselineIssue] = []
-    sources = [publication_source(item.source_json) for item in evidence]
-    indexed_ids = {str(source.get("regulatory_chunk_id")) for source in sources}
+    indexed_ids: set[str] = set()
+    source_order: list[tuple[str, int]] = []
     required = {
         row.id for row in canonical if row.source == "indexed" or row.status == "active"
     }
-    for missing in sorted(required - indexed_ids) if require_complete else []:
-        issues.append(
-            BaselineIssue(
-                code="missing_indexed_source",
-                chunk_id=missing,
-                detail="Canonical source has no indexed representation",
-            )
-        )
     expected = {binding.projection.ordinal: binding for binding in bindings}
     if len(expected) != len(bindings):
         issues.append(
@@ -379,9 +372,12 @@ def audit_baseline_inventory(
     seen: set[int] = set()
     retained = 0
     pending_dependencies: dict[str, set[str]] = {}
-    for item, source in zip(evidence, sources):
+    for position, item in enumerate(evidence):
+        source = publication_source(item.source_json)
         ordinal = source.get("chunk_index")
         identifier = str(source.get("regulatory_chunk_id"))
+        indexed_ids.add(identifier)
+        source_order.append((str(ordinal), position))
         if type(ordinal) is not int or ordinal in seen:
             issues.append(
                 BaselineIssue(
@@ -436,7 +432,17 @@ def audit_baseline_inventory(
                 detail=f"Binding ordinal {ordinal} has no indexed representation",
             )
         )
-    ordered = sorted(sources, key=lambda source: str(source.get("chunk_index")))
+    if require_complete:
+        issues = [
+            BaselineIssue(
+                code="missing_indexed_source",
+                chunk_id=missing,
+                detail="Canonical source has no indexed representation",
+            )
+            for missing in sorted(required - indexed_ids)
+        ] + issues
+    # Preserve the historical lexicographic ordinal order, including equal-key order.
+    ordered = sorted(source_order)
     return BaselineInventoryAudit(
         state="unresolved"
         if issues
@@ -451,17 +457,21 @@ def audit_baseline_inventory(
         indexed_count=len(evidence),
         retained_count=retained,
         binding_count=len(bindings),
-        source_sha256=publication_digest(ordered),
-        vectors_sha256=publication_digest(
-            [
-                {
-                    "ordinal": source.get("chunk_index"),
-                    "id": source.get("regulatory_chunk_id"),
-                    "content": source.get("content_vector"),
-                    "title": source.get("title_vector"),
-                }
-                for source in ordered
-            ]
+        source_sha256=publication_list_digest(
+            publication_source(evidence[position].source_json)
+            for _, position in ordered
+        ),
+        vectors_sha256=publication_list_digest(
+            {
+                "ordinal": source.get("chunk_index"),
+                "id": source.get("regulatory_chunk_id"),
+                "content": source.get("content_vector"),
+                "title": source.get("title_vector"),
+            }
+            for source in (
+                publication_source(evidence[position].source_json)
+                for _, position in ordered
+            )
         ),
         issues=issues,
     )

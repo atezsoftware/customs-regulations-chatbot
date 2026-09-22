@@ -16,7 +16,7 @@ from onyx.db.models import (
 from onyx.db.regulatory_annex_changes import capture_canonical_scope
 from onyx.db.regulatory_annex_publication import load_file_temporal_bindings
 from onyx.db.search_settings import get_active_search_settings_list
-from onyx.document_index.publication_models import publication_digest
+from onyx.document_index.publication_models import publication_streaming_digest
 from onyx.regulatory.amendments.annexes.models import (
     AnnexCanonicalSnapshot,
     AnnexTemporalProjection,
@@ -82,7 +82,7 @@ def baseline_audit_inputs(tenant: str, file_id: UUID) -> BaselineAuditInputs:
         manifest = None
         if publication is not None and publication.writer_manifest is not None:
             if (
-                publication_digest(publication.writer_manifest)
+                publication_streaming_digest(publication.writer_manifest)
                 != publication.writer_manifest_sha256
             ):
                 raise ValueError("baseline recovery manifest changed")
@@ -149,7 +149,7 @@ def baseline_audit_inputs_batch(
             manifest = None
             if publication is not None and publication.writer_manifest is not None:
                 if (
-                    publication_digest(publication.writer_manifest)
+                    publication_streaming_digest(publication.writer_manifest)
                     != publication.writer_manifest_sha256
                 ):
                     raise ValueError("baseline recovery manifest changed")
