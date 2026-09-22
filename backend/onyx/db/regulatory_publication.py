@@ -495,10 +495,9 @@ def archive_canonical_revisions(
 ) -> dict[str, UUID]:
     """Freeze current canonical authority before an owned correction/deletion."""
     from onyx.db.regulatory_annex_changes import capture_canonical_scope
-    from onyx.db.regulatory_canonical_revisions import retain_canonical_revision
+    from onyx.db.regulatory_canonical_revisions import retain_canonical_revisions
 
     PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
-    return {
-        snapshot.id: retain_canonical_revision(session, snapshot)
-        for snapshot in capture_canonical_scope(session, owner.user_file_id)
-    }
+    return retain_canonical_revisions(
+        session, capture_canonical_scope(session, owner.user_file_id)
+    )
