@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -2204,6 +2205,22 @@ def hierarchical_aggregate_text(root_label: str, source_texts: list[str]) -> str
     if root_label.strip() and not root_is_present:
         parts.insert(0, root_label.strip())
     return "\n\n".join(parts)
+
+
+def hierarchical_aggregate_root_label(
+    metadata: Mapping[str, object], existing_text: str
+) -> str:
+    """Preserve a recorded title prefix when the structural path has a bare label."""
+    root = metadata.get("hierarchy_root_path")
+    if not isinstance(root, list) or not root or not isinstance(root[-1], str):
+        raise ValueError("aggregate root unavailable")
+    label = root[-1].strip()
+    title = metadata.get("article_title")
+    if isinstance(title, str) and title.strip():
+        titled = f"{label} - {title.strip()}"
+        if existing_text.startswith(titled + "\n\n"):
+            return titled
+    return label
 
 
 def _finalize_hierarchical_aggregate(

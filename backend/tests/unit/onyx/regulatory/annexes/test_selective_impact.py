@@ -205,6 +205,16 @@ def test_legacy_membership_recovery_requires_exact_unique_same_version_sources()
         }
     )
     assert recover_source_membership([a, b, aggregate]) == {"aggregate": ["a", "b"]}
+    for invalid in (["deleted-a", "deleted-b"], ["a"]):
+        broken = aggregate.model_copy(
+            update={
+                "metadata": {
+                    **aggregate.metadata,
+                    "source_regulatory_chunk_ids": invalid,
+                }
+            }
+        )
+        assert recover_source_membership([a, b, broken]) == {"aggregate": ["a", "b"]}
     assert not recover_source_membership(
         [a, b.model_copy(update={"user_file_id": "other"}), aggregate]
     )
@@ -214,3 +224,97 @@ def test_legacy_membership_recovery_requires_exact_unique_same_version_sources()
     duplicate = a.model_copy(update={"id": "duplicate", "position": 2})
     one = aggregate.model_copy(update={"text": "Root\n\na"})
     assert not recover_source_membership([a, duplicate, one])
+
+
+@pytest.mark.parametrize("caption", [False, True])
+def test_image_source_recovery_uses_exact_text_and_available_split_lineage(
+    caption: bool,
+) -> None:
+    from onyx.regulatory.amendments.annexes.selective_impact import (
+        recover_source_membership,
+    )
+
+    first = snapshot("part-1", None, None).model_copy(
+        update={
+            "text": "first part",
+            "metadata": {
+                "oversized_split": {
+                    "source_chunk_id": "old-parent",
+                    "part": 1,
+                    "parts": 2,
+                }
+            },
+        }
+    )
+    second = first.model_copy(
+        update={
+            "id": "part-2",
+            "text": "second part",
+            "metadata": {
+                "oversized_split": {
+                    "source_chunk_id": "old-parent",
+                    "part": 2,
+                    "parts": 2,
+                },
+            },
+        }
+    )
+    image = first.model_copy(
+        update={
+            "id": "image",
+            "metadata": {
+                "chunk_variant": "image_companion",
+                "bound_to_regulatory_chunk_id": "old-parent",
+                "image_file_id": "asset-1",
+                "image_alt": "stored caption",
+            },
+            "text": first.text + ("\n\n[Görsel: stored caption]" if caption else ""),
+        }
+    )
+    assert recover_source_membership([first, second, image]) == {"image": ["part-1"]}
+    assert recover_source_membership([second, image]) == {}
+    assert (
+        recover_source_membership(
+            [first, second, first.model_copy(update={"id": "duplicate"}), image]
+        )
+        == {}
+    )
+    assert recover_source_membership(
+        [first.model_copy(update={"metadata": {}}), second, image]
+    ) == {"image": ["part-1"]}
+    assert recover_source_membership(
+        [
+            first,
+            first.model_copy(update={"id": "unrecorded-copy", "metadata": {}}),
+            image,
+        ]
+    ) == {"image": ["part-1"]}
+
+
+def test_final_ingest_source_integrity_rejects_dangling_and_wrong_aggregate_text() -> (
+    None
+):
+    from onyx.regulatory.amendments.annexes.selective_impact import (
+        validate_canonical_source_integrity,
+    )
+    from onyx.regulatory.chunker import hierarchical_aggregate_text
+
+    row = snapshot("source", None, None)
+    aggregate = row.model_copy(
+        update={
+            "id": "aggregate",
+            "text": hierarchical_aggregate_text("EK-1", [row.text]),
+            "metadata": {
+                "chunk_variant": "hierarchical_aggregate",
+                "hierarchy_root_path": ["EK-1"],
+                "source_regulatory_chunk_ids": [row.id],
+            },
+        }
+    )
+    validate_canonical_source_integrity([row, aggregate])
+    with pytest.raises(ValueError, match="membership"):
+        validate_canonical_source_integrity(
+            [row, aggregate.model_copy(update={"text": "wrong text"})]
+        )
+    with pytest.raises(ValueError, match="membership"):
+        validate_canonical_source_integrity([aggregate])

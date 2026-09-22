@@ -8,6 +8,7 @@ from onyx.document_index.publication_models import (
     FrozenPublicationProjection,
     IndexedProjectionEvidence,
     PublicationIndexSnapshot,
+    PublicationProjection,
     PublicationScope,
 )
 from onyx.regulatory.amendments.annexes.table_geometry import (
@@ -871,7 +872,7 @@ class AnnexTemporalProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     id: UUID
     index: "PublicationIndexSnapshot"
-    projection: "FrozenPublicationProjection"
+    projection: PublicationProjection
     canonical_base_sha256: str
     derived_role: Literal["canonical", "hierarchical_aggregate", "image_companion"]
     dependency_ids: list[str]

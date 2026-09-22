@@ -42,6 +42,16 @@ export interface AmendmentProposal {
   applied_new_chunk_ids?: string[];
   approval_indexing_job_id?: string | null;
   approval_error?: string | null;
+  approval_execution?: {
+    schema_version: "approval-execution-v1";
+    stage: "baseline" | "review" | "context" | "publication";
+    state: "running" | "failed";
+    code: string | null;
+    retryable: boolean;
+    attempt: number;
+    message: string;
+    manifest_sha256: string | null;
+  } | null;
   decided_by: string | null;
   decided_at: string | null;
   created_at: string;
@@ -462,7 +472,7 @@ export interface AnnexSourceText {
 export class RegulatoryRequestError extends Error {
   constructor(
     message: string,
-    public readonly status: number
+    public readonly status: number,
   ) {
     super(message);
     this.name = "RegulatoryRequestError";
@@ -472,14 +482,14 @@ export class RegulatoryRequestError extends Error {
 const handleRequestError = (action: string, response: Response): never => {
   throw new RegulatoryRequestError(
     `${action} failed (Status: ${response.status})`,
-    response.status
+    response.status,
   );
 };
 
 async function requestJson<T>(
   action: string,
   input: RequestInfo | URL,
-  init?: RequestInit
+  init?: RequestInit,
 ): Promise<T> {
   const response = await fetch(input, init);
   if (!response.ok) {
@@ -502,7 +512,7 @@ export async function getAnnexCapabilities(): Promise<AnnexCapabilities | null> 
 export async function createAmendmentSourcePackage(
   documentSetId: number,
   idempotencyKey: string,
-  source: { text: string } | { url: string }
+  source: { text: string } | { url: string },
 ): Promise<AmendmentSourcePackage> {
   return requestJson(
     "Create amendment source package",
@@ -515,14 +525,14 @@ export async function createAmendmentSourcePackage(
         idempotency_key: idempotencyKey,
         ...source,
       }),
-    }
+    },
   );
 }
 
 export async function uploadAmendmentSourcePackage(
   documentSetId: number,
   idempotencyKey: string,
-  file: File
+  file: File,
 ): Promise<AmendmentSourcePackage> {
   const body = new FormData();
   body.append("document_set_id", String(documentSetId));
@@ -534,61 +544,61 @@ export async function uploadAmendmentSourcePackage(
     {
       method: "POST",
       body,
-    }
+    },
   );
 }
 
 export async function getAmendmentSourcePackage(
   documentSetId: number,
-  packageId: string
+  packageId: string,
 ): Promise<AmendmentSourcePackage> {
   return requestJson(
     "Get amendment source package",
-    `/api/regulatory/amendments/source-packages/${packageId}?document_set_id=${documentSetId}`
+    `/api/regulatory/amendments/source-packages/${packageId}?document_set_id=${documentSetId}`,
   );
 }
 
 export async function retryAmendmentSourcePackage(
   documentSetId: number,
-  packageId: string
+  packageId: string,
 ): Promise<AmendmentSourcePackage> {
   return requestJson(
     "Retry amendment source package",
     `/api/regulatory/amendments/source-packages/${packageId}/retry?document_set_id=${documentSetId}`,
-    { method: "POST" }
+    { method: "POST" },
   );
 }
 
 export async function getAmendmentSourceText(
   documentSetId: number,
-  packageId: string
+  packageId: string,
 ): Promise<AnnexSourceText> {
   return requestJson(
     "Get original amendment source text",
-    `/api/regulatory/amendments/source-packages/${packageId}/text?document_set_id=${documentSetId}`
+    `/api/regulatory/amendments/source-packages/${packageId}/text?document_set_id=${documentSetId}`,
   );
 }
 
 export function getAnnexReview(review: AnnexReview): Promise<AnnexReview> {
   return requestJson(
     "Get annex review",
-    `/api/regulatory/amendments/batches/${review.batch_id}/annex-groups/${review.id}`
+    `/api/regulatory/amendments/batches/${review.batch_id}/annex-groups/${review.id}`,
   );
 }
 
 export function getAnnexChunkPage(
   review: AnnexReview,
-  offset: number
+  offset: number,
 ): Promise<AnnexChunkReviewPage> {
   return requestJson(
     "Get chunk changes",
-    `/api/regulatory/amendments/batches/${review.batch_id}/annex-groups/${review.id}/chunks?offset=${offset}&limit=10`
+    `/api/regulatory/amendments/batches/${review.batch_id}/annex-groups/${review.id}/chunks?offset=${offset}&limit=10`,
   );
 }
 
 export function prepareAnnexSelection(
   review: AnnexReview,
-  itemIds: string[]
+  itemIds: string[],
 ): Promise<AnnexReview> {
   return requestJson(
     "Prepare selected chunks",
@@ -600,26 +610,26 @@ export function prepareAnnexSelection(
         expected_review_sha256: review.review_sha256,
         item_ids: itemIds,
       }),
-    }
+    },
   );
 }
 
 export async function listAnnexReviews(
-  batchId: number
+  batchId: number,
 ): Promise<AnnexReview[]> {
   return requestJson(
     "List annex reviews",
-    `/api/regulatory/amendments/batches/${batchId}/annex-groups`
+    `/api/regulatory/amendments/batches/${batchId}/annex-groups`,
   );
 }
 
 export async function listAnnexReviewRevisions(
   batchId: number,
-  reviewId: string
+  reviewId: string,
 ): Promise<AnnexReview[]> {
   return requestJson(
     "List annex review revisions",
-    `/api/regulatory/amendments/batches/${batchId}/annex-groups/${reviewId}/revisions`
+    `/api/regulatory/amendments/batches/${batchId}/annex-groups/${reviewId}/revisions`,
   );
 }
 
@@ -627,7 +637,7 @@ async function decideAnnexReview(
   action: "approve" | "reject" | "retry",
   batchId: number,
   reviewId: string,
-  expectedReviewSha256: string
+  expectedReviewSha256: string,
 ): Promise<AnnexReview> {
   return requestJson(
     `${action[0]?.toUpperCase()}${action.slice(1)} annex review`,
@@ -636,14 +646,14 @@ async function decideAnnexReview(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ expected_review_sha256: expectedReviewSha256 }),
-    }
+    },
   );
 }
 
 export function approveAnnexReview(
   batchId: number,
   reviewId: string,
-  expectedReviewSha256: string
+  expectedReviewSha256: string,
 ): Promise<AnnexReview> {
   return decideAnnexReview("approve", batchId, reviewId, expectedReviewSha256);
 }
@@ -651,7 +661,7 @@ export function approveAnnexReview(
 export function rejectAnnexReview(
   batchId: number,
   reviewId: string,
-  expectedReviewSha256: string
+  expectedReviewSha256: string,
 ): Promise<AnnexReview> {
   return decideAnnexReview("reject", batchId, reviewId, expectedReviewSha256);
 }
@@ -659,7 +669,7 @@ export function rejectAnnexReview(
 export function retryAnnexReview(
   batchId: number,
   reviewId: string,
-  expectedReviewSha256: string
+  expectedReviewSha256: string,
 ): Promise<AnnexReview> {
   return decideAnnexReview("retry", batchId, reviewId, expectedReviewSha256);
 }
@@ -668,7 +678,7 @@ export async function editAnnexReview(
   batchId: number,
   reviewId: string,
   expectedReviewSha256: string,
-  corrections: AnnexElementCorrection[]
+  corrections: AnnexElementCorrection[],
 ): Promise<AnnexReview> {
   return requestJson(
     "Revalidate annex review",
@@ -680,7 +690,7 @@ export async function editAnnexReview(
         expected_review_sha256: expectedReviewSha256,
         corrections,
       }),
-    }
+    },
   );
 }
 
@@ -688,7 +698,7 @@ export async function createAmendmentSourceTextRevision(
   batchId: number,
   rawText: string,
   expectedSourceTextSha256: string,
-  sourcePackageId?: string | null
+  sourcePackageId?: string | null,
 ): Promise<AmendmentBatch> {
   return requestJson(
     "Create amendment source text revision",
@@ -701,14 +711,14 @@ export async function createAmendmentSourceTextRevision(
         expected_source_text_sha256: expectedSourceTextSha256,
         source_package_id: sourcePackageId ?? null,
       }),
-    }
+    },
   );
 }
 
 export function getAnnexEvidenceUrl(
   batchId: number,
   reviewId: string,
-  evidenceId: string
+  evidenceId: string,
 ): string {
   return `/api/regulatory/amendments/batches/${batchId}/annex-groups/${reviewId}/evidence/${evidenceId}`;
 }
@@ -716,7 +726,7 @@ export function getAnnexEvidenceUrl(
 export async function analyzeAmendment(
   documentSetId: number,
   rawText: string,
-  sourcePackageId?: string
+  sourcePackageId?: string,
 ): Promise<AmendmentBatch> {
   const response = await fetch("/api/regulatory/amendments/analyze", {
     method: "POST",
@@ -730,17 +740,17 @@ export async function analyzeAmendment(
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(
-      body?.detail || `Amendment analysis failed (Status: ${response.status})`
+      body?.detail || `Amendment analysis failed (Status: ${response.status})`,
     );
   }
   return response.json();
 }
 
 export async function getAmendmentAnalysis(
-  batchId: number
+  batchId: number,
 ): Promise<AnalyzeAmendmentResponse> {
   const response = await fetch(
-    `/api/regulatory/amendments/batches/${batchId}/analysis`
+    `/api/regulatory/amendments/batches/${batchId}/analysis`,
   );
   if (!response.ok) {
     handleRequestError("Get amendment analysis", response);
@@ -749,23 +759,23 @@ export async function getAmendmentAnalysis(
 }
 
 export async function retryAmendmentBatch(
-  batchId: number
+  batchId: number,
 ): Promise<AmendmentBatch> {
   const response = await fetch(
     `/api/regulatory/amendments/batches/${batchId}/retry`,
-    { method: "POST" }
+    { method: "POST" },
   );
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(
-      body?.detail || `Retry analysis failed (Status: ${response.status})`
+      body?.detail || `Retry analysis failed (Status: ${response.status})`,
     );
   }
   return response.json();
 }
 
 export async function extractAmendmentUrl(
-  url: string
+  url: string,
 ): Promise<AmendmentSourceExtraction> {
   const response = await fetch("/api/regulatory/amendments/sources/url", {
     method: "POST",
@@ -775,14 +785,14 @@ export async function extractAmendmentUrl(
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(
-      body?.detail || `URL extraction failed (Status: ${response.status})`
+      body?.detail || `URL extraction failed (Status: ${response.status})`,
     );
   }
   return response.json();
 }
 
 export async function extractAmendmentPdf(
-  file: File
+  file: File,
 ): Promise<AmendmentSourceExtraction> {
   const formData = new FormData();
   formData.append("file", file);
@@ -793,14 +803,14 @@ export async function extractAmendmentPdf(
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(
-      body?.detail || `PDF extraction failed (Status: ${response.status})`
+      body?.detail || `PDF extraction failed (Status: ${response.status})`,
     );
   }
   return response.json();
 }
 
 export async function extractAmendmentDocx(
-  file: File
+  file: File,
 ): Promise<AmendmentSourceExtraction> {
   const formData = new FormData();
   formData.append("file", file);
@@ -811,17 +821,17 @@ export async function extractAmendmentDocx(
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(
-      body?.detail || `Word extraction failed (Status: ${response.status})`
+      body?.detail || `Word extraction failed (Status: ${response.status})`,
     );
   }
   return response.json();
 }
 
 export async function listAmendmentBatches(
-  documentSetId: number
+  documentSetId: number,
 ): Promise<AmendmentBatch[]> {
   const response = await fetch(
-    `/api/regulatory/amendments/batches?document_set_id=${documentSetId}`
+    `/api/regulatory/amendments/batches?document_set_id=${documentSetId}`,
   );
   if (!response.ok) {
     handleRequestError("List amendment batches", response);
@@ -830,10 +840,10 @@ export async function listAmendmentBatches(
 }
 
 export async function listAmendmentProposals(
-  batchId: number
+  batchId: number,
 ): Promise<AmendmentProposal[]> {
   const response = await fetch(
-    `/api/regulatory/amendments/batches/${batchId}/proposals`
+    `/api/regulatory/amendments/batches/${batchId}/proposals`,
   );
   if (!response.ok) {
     handleRequestError("List amendment proposals", response);
@@ -844,7 +854,7 @@ export async function listAmendmentProposals(
 export async function approveProposal(
   proposalId: number,
   newChunkDraft: Record<string, unknown>,
-  chunkChanges?: AmendmentProposalChunkChange[]
+  chunkChanges?: AmendmentProposalChunkChange[],
 ): Promise<AmendmentProposal> {
   const response = await fetch(
     `/api/regulatory/amendments/proposals/${proposalId}/approve`,
@@ -855,39 +865,39 @@ export async function approveProposal(
         new_chunk_draft: newChunkDraft,
         chunk_changes: chunkChanges,
       }),
-    }
+    },
   );
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(
-      body?.detail || `Approve failed (Status: ${response.status})`
+      body?.detail || `Approve failed (Status: ${response.status})`,
     );
   }
   return response.json();
 }
 
 export async function retryProposalIndexing(
-  proposalId: number
+  proposalId: number,
 ): Promise<AmendmentProposal> {
   const response = await fetch(
     `/api/regulatory/amendments/proposals/${proposalId}/retry`,
-    { method: "POST" }
+    { method: "POST" },
   );
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(
-      body?.detail || `Retry indexing failed (Status: ${response.status})`
+      body?.detail || `Retry indexing failed (Status: ${response.status})`,
     );
   }
   return response.json();
 }
 
 export async function rejectProposal(
-  proposalId: number
+  proposalId: number,
 ): Promise<AmendmentProposal> {
   const response = await fetch(
     `/api/regulatory/amendments/proposals/${proposalId}/reject`,
-    { method: "POST" }
+    { method: "POST" },
   );
   if (!response.ok) {
     handleRequestError("Reject proposal", response);

@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from elasticsearch import Elasticsearch
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from onyx.db.engine.sql_engine import get_session_with_tenant
 from onyx.db.enums import IndexModelStatus
@@ -16,6 +16,7 @@ from onyx.db.models import (
     AmendmentProposal,
     DocumentSet__UserFile,
     RegulatoryChunk,
+    RegulatoryFilePublication,
     SearchSettings,
 )
 from onyx.db.regulatory_annex_publication import load_file_temporal_bindings
@@ -35,11 +36,62 @@ from tests.unit.onyx.regulatory.annexes.test_context_dependencies import (
 )
 
 
+@pytest.mark.parametrize("aggregate_count,legacy", [(0, False), (2, False), (2, True)])
 def test_selective_approval_preserves_other_binding_and_recovers_atomic_activation(
-    owned_file: UUID, es: tuple[Elasticsearch, str], monkeypatch: pytest.MonkeyPatch
+    owned_file: UUID,
+    es: tuple[Elasticsearch, str],
+    monkeypatch: pytest.MonkeyPatch,
+    aggregate_count: int,
+    legacy: bool,
 ) -> None:
     from onyx.db import search_settings as settings_repository
     from onyx.document_index.elasticsearch.client import ElasticsearchClient
+    from onyx.regulatory.chunker import hierarchical_aggregate_text
+
+    aggregate_ids: list[str] = []
+    with get_session_with_tenant(tenant_id="public") as session:
+        sources = list(
+            session.scalars(
+                select(RegulatoryChunk)
+                .where(RegulatoryChunk.user_file_id == owned_file)
+                .order_by(RegulatoryChunk.position)
+            )
+        )
+        for i in range(aggregate_count):
+            identifier = str(uuid4())
+            aggregate_ids.append(identifier)
+            session.add(
+                RegulatoryChunk(
+                    id=identifier,
+                    user_file_id=owned_file,
+                    position=i + 1,
+                    projection_ordinal=i + 1,
+                    heading_path=["EK-1"],
+                    text=hierarchical_aggregate_text("EK-1", [r.text for r in sources]),
+                    chunk_type="hierarchical_aggregate",
+                    source="indexed",
+                    status="active",
+                    chunk_metadata={
+                        "chunk_variant": "hierarchical_aggregate",
+                        "hierarchy_root_path": ["EK-1"],
+                        "source_regulatory_chunk_ids": [r.id for r in sources],
+                    },
+                )
+            )
+        session.commit()
+
+    from onyx.db.regulatory_amendment_impact import inspect_amendment_source_usage
+
+    with get_session_with_tenant(tenant_id="public") as session:
+        usage = inspect_amendment_source_usage(
+            session,
+            user_file_id=owned_file,
+            source_ids={sources[0].id},
+            as_of_date=date(2026, 1, 1),
+        )
+        assert {c.consumer_id for c in usage.consumers} == set(aggregate_ids)
+        assert session.scalar(text("SHOW transaction_read_only")) == "on"
+        session.rollback()
 
     with get_session_with_tenant(tenant_id="public") as session:
         settings = SearchSettings(
@@ -91,8 +143,21 @@ def test_selective_approval_preserves_other_binding_and_recovers_atomic_activati
     manifest = writer_projection.prepare_owned_correction(
         owner, es[0], inputs, inputs.canonical, changed_id=None
     )
+    assert "amendment_impacts" not in manifest.model_dump(mode="json")
     writer_publication.execute_writer_publication(owner, es[0], manifest)
     authority.release(owner)
+    with get_session_with_tenant(tenant_id="public") as session:
+        indexed_usage = inspect_amendment_source_usage(
+            session,
+            user_file_id=owned_file,
+            source_ids={sources[0].id},
+            as_of_date=date(2026, 1, 1),
+            index_uuid=manifest.indexes[0].index_uuid,
+        )
+        assert indexed_usage.index_uuid == manifest.indexes[0].index_uuid
+        assert indexed_usage.contextual_consumer_count == 0
+        assert {c.consumer_id for c in indexed_usage.consumers} == set(aggregate_ids)
+        session.rollback()
     with get_session_with_tenant(tenant_id="public") as session:
         before = load_file_temporal_bindings(session, owned_file)
         old = session.get_one(RegulatoryChunk, inputs.canonical[0].id)
@@ -138,11 +203,47 @@ def test_selective_approval_preserves_other_binding_and_recovers_atomic_activati
 
     encode.reset_mock()
     monkeypatch.setattr(writer_publication, "finalize_writer_publication", interrupt)
-    with pytest.raises(RuntimeError, match="interrupted before atomic activation"):
-        writer_publication.approve_owned_amendment(proposal_id, "public", setting_id)
-    assert encode.call_count == 1
+    with monkeypatch.context() as previous_release:
+        if legacy:
+            from onyx.db import regulatory_writer_publication as db_writer
+            from onyx.db.regulatory_amendments import approve_amendment_proposal
+
+            previous_release.setattr(
+                db_writer,
+                "_approve_with_derived_sources",
+                lambda session, proposal, owner: approve_amendment_proposal(
+                    session, proposal, publication_owner=owner
+                ),
+            )
+            prepare = writer_projection.prepare_owned_correction
+            previous_release.setattr(
+                writer_projection,
+                "prepare_owned_correction",
+                lambda *args, **kwargs: prepare(*args, **kwargs).model_copy(
+                    update={"amendment_impacts": []}
+                ),
+            )
+        with pytest.raises(RuntimeError, match="interrupted before atomic activation"):
+            writer_publication.approve_owned_amendment(
+                proposal_id, "public", setting_id
+            )
+    # Equal aggregate inputs reuse a vector, even across two different consumers.
+    assert encode.call_count == (2 if aggregate_count and not legacy else 1)
     with get_session_with_tenant(tenant_id="public") as session:
         assert session.get_one(AmendmentProposal, proposal_id).status == "approving"
+        pending = session.get_one(RegulatoryFilePublication, owned_file).writer_manifest
+        assert pending is not None
+        if legacy:
+            assert "amendment_impacts" not in pending
+        else:
+            report = pending["amendment_impacts"][0]
+            assert not report["unresolved"]
+            assert sources[1].id in report["unchanged_ids"]
+            assert {
+                r["consumer_id"]
+                for r in report["dependencies"]
+                if r["source_id"] == sources[0].id
+            } == set(aggregate_ids)
         assert (
             session.get_one(RegulatoryChunk, inputs.canonical[0].id).validity_end_date
             is None
@@ -151,7 +252,7 @@ def test_selective_approval_preserves_other_binding_and_recovers_atomic_activati
         writer_publication, "finalize_writer_publication", real_finalize
     )
     writer_publication.approve_owned_amendment(proposal_id, "public", setting_id)
-    assert encode.call_count == 1
+    assert encode.call_count == (2 if aggregate_count and not legacy else 1)
     with get_session_with_tenant(tenant_id="public") as session:
         assert session.get_one(AmendmentProposal, proposal_id).status == "approved"
         assert session.get_one(
@@ -162,10 +263,41 @@ def test_selective_approval_preserves_other_binding_and_recovers_atomic_activati
             b
             for b in before
             if json.loads(b.projection.source_json)["regulatory_chunk_id"]
-            == inputs.canonical[1].id
+            == sources[1].id
         )
         assert untouched in after
-        assert len(after) == 3
+        assert len(after) == 3 + (1 if legacy else 2) * aggregate_count
+        for identifier in aggregate_ids:
+            old_aggregate = session.get_one(RegulatoryChunk, identifier)
+            assert old_aggregate.validity_end_date == date(2027, 1, 1)
+            successors = list(
+                session.scalars(
+                    select(RegulatoryChunk).where(
+                        RegulatoryChunk.supersedes_chunk_id == identifier
+                    )
+                )
+            )
+            if legacy:
+                assert not successors
+                continue
+            assert len(successors) == 1
+            successor = successors[0]
+            assert "Only approved provision changes" in successor.text
+            assert "existing zero" not in successor.text
+            assert successor.validity_start_date == date(2027, 1, 1)
+            assert successor.chunk_metadata["source_regulatory_chunk_ids"] == [
+                session.get_one(AmendmentProposal, proposal_id).applied_new_chunk_id,
+                sources[1].id,
+            ]
+            binding = next(
+                b
+                for b in after
+                if json.loads(b.projection.source_json)["regulatory_chunk_id"]
+                == successor.id
+            )
+            assert (
+                json.loads(binding.projection.source_json)["content"] == successor.text
+            )
         session.execute(
             delete(AmendmentProposal).where(AmendmentProposal.id == proposal_id)
         )

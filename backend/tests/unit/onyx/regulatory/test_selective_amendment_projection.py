@@ -8,7 +8,10 @@ import pytest
 
 from onyx.db.enums import IndexModelStatus
 from onyx.db.models import SearchSettings
-from onyx.document_index.publication_models import IndexedProjectionEvidence
+from onyx.document_index.publication_models import (
+    IndexedProjectionEvidence,
+    ObservedPublicationProjection,
+)
 from onyx.regulatory import writer_projection
 from tests.unit.onyx.regulatory.annexes.test_context_dependencies import (
     _durable_embedding_model,
@@ -25,11 +28,12 @@ class ProjectionAuthority(OwnedAuthority):
         return object()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize(
     "changed_count,scheduled", [(1, False), (4, False), (11, False), (1, True)]
 )
 def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
-    changed_count: int, scheduled: bool
+    changed_count: int, scheduled: bool, legacy: bool
 ) -> None:
     file_id = uuid4()
     authority = ProjectionAuthority(file_id)
@@ -130,6 +134,28 @@ def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
         original = writer_projection.prepare_owned_correction(
             authority.owner, client, inputs, inputs.canonical, changed_id=None
         )
+        if legacy:
+            from onyx.regulatory.publication_baseline import observed_index_snapshot
+
+            observation = observed_index_snapshot(settings, "physical-test")
+            original = original.model_copy(
+                update={
+                    "bindings": [
+                        b.model_copy(
+                            update={
+                                "index": observation,
+                                "projection": ObservedPublicationProjection.observe(
+                                    context_projection_id=str(b.id),
+                                    source_json=b.projection.source_json,
+                                    observed_index=observation,
+                                ),
+                                "context": None,
+                            }
+                        )
+                        for b in original.bindings
+                    ]
+                }
+            )
         inputs = replace(
             inputs,
             bindings=original.bindings,
@@ -163,7 +189,8 @@ def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
             IndexedProjectionEvidence(
                 index=b.index,
                 source_json=b.projection.source_json,
-                frozen_projection=b.projection,
+                frozen_projection=None if legacy else b.projection,
+                observed_projection=b.projection if legacy else None,
                 payload_sha256=None,
             )
             for b in original.bindings
@@ -216,10 +243,19 @@ def test_amendment_retains_unrelated_bindings_and_only_embeds_successors(
             if json.loads(b.projection.source_json)["regulatory_chunk_id"] == old.id
         )
         assert historical.effective_end == boundary
-        assert (
-            historical.projection.embedding_inputs
-            == original.bindings[10].projection.embedding_inputs
-        )
+        if legacy:
+            assert isinstance(historical.projection, ObservedPublicationProjection)
+            assert (
+                json.loads(historical.projection.source_json)["content_vector"]
+                == json.loads(original.bindings[10].projection.source_json)[
+                    "content_vector"
+                ]
+            )
+        else:
+            assert (
+                historical.projection.embedding_inputs
+                == original.bindings[10].projection.embedding_inputs
+            )
 
         from onyx.db import regulatory_writer_publication as repository
         from onyx.db.models import RegulatoryTemporalProjection

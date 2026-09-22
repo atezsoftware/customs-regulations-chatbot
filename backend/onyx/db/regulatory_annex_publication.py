@@ -77,26 +77,26 @@ def load_annex_publication_inputs(
 def load_file_temporal_bindings(
     session: Session, user_file_id: UUID, *, refresh: bool = False
 ) -> list[AnnexTemporalProjection]:
+    from onyx.db.regulatory_canonical_revisions import (
+        validate_temporal_canonical_revisions,
+    )
     from onyx.document_index.publication_models import publication_digest
 
-    bindings = []
-    for row in session.scalars(
-        select(RegulatoryTemporalProjection)
-        .execution_options(populate_existing=refresh)
-        .where(
-            RegulatoryTemporalProjection.user_file_id == user_file_id,
-            RegulatoryTemporalProjection.retired_at.is_(None),
+    rows = list(
+        session.scalars(
+            select(RegulatoryTemporalProjection)
+            .execution_options(populate_existing=refresh)
+            .where(
+                RegulatoryTemporalProjection.user_file_id == user_file_id,
+                RegulatoryTemporalProjection.retired_at.is_(None),
+            )
         )
-    ):
+    )
+    for row in rows:
         if publication_digest(row.payload) != row.payload_sha256:
             raise ValueError("temporal binding payload changed")
-        from onyx.db.regulatory_canonical_revisions import (
-            validate_temporal_canonical_revision,
-        )
-
-        validate_temporal_canonical_revision(session, row)
-        bindings.append(AnnexTemporalProjection.model_validate(row.payload))
-    return bindings
+    validate_temporal_canonical_revisions(session, rows)
+    return [AnnexTemporalProjection.model_validate(row.payload) for row in rows]
 
 
 def load_binding_context_sources(

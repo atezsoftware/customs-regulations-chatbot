@@ -4,7 +4,6 @@ import json
 from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import copy_context
-from datetime import timedelta
 from threading import Event, Thread
 from uuid import UUID, uuid4
 
@@ -17,7 +16,7 @@ from onyx.db.regulatory_annex_execution import (
     record_embedding,
     stage_manifest,
 )
-from onyx.db.regulatory_publication import PublicationStore
+from onyx.db.regulatory_publication import PUBLICATION_LEASE_TTL, PublicationStore
 from onyx.document_index.elasticsearch.client import ElasticsearchClient
 from onyx.document_index.elasticsearch.publication import FencedPublicationIndex
 from onyx.document_index.publication_models import FileOwnership
@@ -42,7 +41,7 @@ from onyx.regulatory.amendments.annexes.publication_preparation import (
 from onyx.regulatory.indexing_jobs.embedding import _validate_response_vectors
 from onyx.regulatory.indexing_jobs.models import RegulatoryIndexingConfigSnapshot
 
-LEASE_TTL = timedelta(minutes=2)
+LEASE_TTL = PUBLICATION_LEASE_TTL
 HEARTBEAT_SECONDS = 20
 
 

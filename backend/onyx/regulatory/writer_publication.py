@@ -46,18 +46,20 @@ def execute_writer_publication(
 ) -> None:
     started = monotonic()
     authority = PublicationStore(owner.scope)
-    if manifest is not None:
-        pending = pending_writer_manifest(owner)
-        if pending is None or (
-            manifest.kind == "cancellation" and pending.kind == "durable"
-        ):
-            manifest = complete_writer_index_inventory(owner, client, manifest)
-        stage_writer_publication(owner, manifest, durable_generation=durable_generation)
-    manifest = pending_writer_manifest(owner)
-    if manifest is None:
-        raise ValueError("owned writer has no durable publication to execute")
-    proofs = []
     with publication_heartbeat(owner) as lost:
+        if manifest is not None:
+            pending = pending_writer_manifest(owner)
+            if pending is None or (
+                manifest.kind == "cancellation" and pending.kind == "durable"
+            ):
+                manifest = complete_writer_index_inventory(owner, client, manifest)
+            stage_writer_publication(
+                owner, manifest, durable_generation=durable_generation
+            )
+        manifest = pending_writer_manifest(owner)
+        if manifest is None:
+            raise ValueError("owned writer has no durable publication to execute")
+        proofs = []
         reservations = authority.reservations(owner)
         for index in manifest.indexes:
             adapter = FencedPublicationIndex(client, index)
@@ -85,7 +87,7 @@ def execute_writer_publication(
                     raise PublicationOwnershipLost("writer publication heartbeat lost")
                 authority.reservations(owner)
 
-            if manifest.kind == "amendment":
+            if manifest.kind in {"amendment", "baseline"}:
                 adapter.publish_inventory(
                     reservations, tuple(projections.values()), before_batch=check_owner
                 )
@@ -157,7 +159,8 @@ def prepare_owned_metadata(
     )
     from onyx.document_index.publication_models import (
         FrozenPublicationProjection,
-        publication_digest,
+        ObservedPublicationProjection,
+        matches_indexed_evidence,
     )
 
     if request.document_ids != [str(owner.user_file_id)]:
@@ -189,7 +192,14 @@ def prepare_owned_metadata(
         return
     authority = PublicationStore(owner.scope)
     reservations = authority.reservations(owner)
-    indexes = {binding.index.index_uuid: binding.index for binding in before}
+    from onyx.document_index.publication_models import merge_publication_indexes
+
+    indexes = {
+        uuid: merge_publication_indexes(
+            [binding.index for binding in before if binding.index.index_uuid == uuid]
+        )
+        for uuid in {binding.index.index_uuid for binding in before}
+    }
     for index in indexes.values():
         actuals = FencedPublicationIndex(client, index).inventory_evidence(reservations)
         expected = {
@@ -205,44 +215,31 @@ def prepare_owned_metadata(
             )
         for actual in actuals:
             previous = expected[json.loads(actual.source_json)["chunk_index"]]
-            frozen = actual.frozen_projection
-            if frozen is None:
-                raise ValueError("metadata actual source has no frozen encoder receipt")
-            if publication_digest(json.loads(frozen.source_json)) != publication_digest(
-                json.loads(previous.projection.source_json)
-            ):
-                raise ValueError("metadata actual source differs from qualified source")
-            if (
-                frozen.context_projection_id
-                != previous.projection.context_projection_id
-            ):
+            if not matches_indexed_evidence(previous.projection, actual):
                 raise ValueError(
-                    "metadata actual context identity differs from qualified source"
-                )
-            if frozen.embedding_inputs != previous.projection.embedding_inputs:
-                raise ValueError(
-                    "metadata actual encoder inputs differ from qualified source"
-                )
-            if publication_digest(
-                json.loads(frozen.embedding_config_json)
-            ) != publication_digest(
-                json.loads(previous.projection.embedding_config_json)
-            ):
-                raise ValueError(
-                    "metadata actual encoder configuration differs from qualified source"
+                    "metadata actual source differs from qualified evidence"
                 )
     updated = []
     revision_ids = {}
     for previous in before:
         identifier = uuid4()
         source = {**json.loads(previous.projection.source_json), **changes}
-        projection = FrozenPublicationProjection(
-            ordinal=previous.projection.ordinal,
-            context_projection_id=str(identifier),
-            source_json=json.dumps(source),
-            embedding_inputs=previous.projection.embedding_inputs,
-            embedding_config_json=previous.projection.embedding_config_json,
-        )
+        if isinstance(previous.projection, ObservedPublicationProjection):
+            projection = ObservedPublicationProjection.model_validate(
+                {
+                    **previous.projection.model_dump(),
+                    "context_projection_id": str(identifier),
+                    "source_json": json.dumps(source),
+                }
+            )
+        else:
+            projection = FrozenPublicationProjection(
+                ordinal=previous.projection.ordinal,
+                context_projection_id=str(identifier),
+                source_json=json.dumps(source),
+                embedding_inputs=previous.projection.embedding_inputs,
+                embedding_config_json=previous.projection.embedding_config_json,
+            )
         updated.append(
             previous.model_copy(update={"id": identifier, "projection": projection})
         )
@@ -910,10 +907,13 @@ def approve_owned_amendment(
     from uuid import uuid4
 
     from onyx.db.enums import UserFileStatus
+    from onyx.db.regulatory_amendment_impact import resolve_context_impact_audit
     from onyx.db.regulatory_writer_publication import (
         amendment_writer_target,
         load_owned_writer_inputs,
         preview_owned_amendment,
+        record_amendment_execution_stage,
+        record_owned_amendment_failure,
     )
     from onyx.document_index.elasticsearch.client import ElasticsearchClient
     from onyx.document_index.publication_models import PublicationScope
@@ -938,6 +938,13 @@ def approve_owned_amendment(
         owner = recover_owned_writer_before_next(owner)
         if amendment_writer_target(proposal_id, tenant_id) is None:
             return 0
+        record_amendment_execution_stage(owner, proposal_id, "baseline")
+        from onyx.regulatory.publication_baseline import ensure_owned_baseline
+
+        with ElasticsearchClient() as transport:
+            owner = ensure_owned_baseline(
+                owner, transport.publication_client(), origin_proposal_id=proposal_id
+            )
         inputs = load_owned_writer_inputs(owner)
         if inputs.file.status in {UserFileStatus.CANCELED, UserFileStatus.DELETING}:
             raise ValueError("amendment file is canceled or deleting")
@@ -947,7 +954,23 @@ def approve_owned_amendment(
             raise ValueError("current amendment search settings changed")
         for canonical_id in canonical_ids:
             authority.allocate(owner, "canonical:" + canonical_id)
+        record_amendment_execution_stage(owner, proposal_id, "review")
         after, reviewed = preview_owned_amendment(owner, proposal_id)
+        existing_ids = {row.id for row in inputs.canonical}
+        # Preview rolls back derived reservations; keep stable identities durably.
+        after = [
+            row.model_copy(
+                update={
+                    "projection_ordinal": authority.allocate(
+                        owner, "canonical:" + row.id
+                    )
+                }
+            )
+            if row.id not in existing_ids
+            else row
+            for row in after
+        ]
+        record_amendment_execution_stage(owner, proposal_id, "context")
         with publication_heartbeat(owner) as lost:
             with ElasticsearchClient() as transport:
                 manifest = prepare_owned_correction(
@@ -958,6 +981,9 @@ def approve_owned_amendment(
                     changed_id=None,
                     target_settings_ids={current_search_settings_id},
                     selective_amendment=True,
+                    audit_cache=lambda key, generate: resolve_context_impact_audit(
+                        owner, key, generate
+                    ),
                 ).model_copy(
                     update={
                         "kind": "amendment",
@@ -981,6 +1007,7 @@ def approve_owned_amendment(
             sum(binding.id not in previous_ids for binding in manifest.bindings),
             sum(len(view.projections) for view in manifest.views),
         )
+        record_amendment_execution_stage(owner, proposal_id, "publication")
         with ElasticsearchClient() as transport:
             execute_writer_publication(owner, transport.publication_client(), manifest)
         logger.info(
@@ -989,6 +1016,9 @@ def approve_owned_amendment(
             monotonic() - started,
         )
         return len(after)
+    except Exception as error:
+        record_owned_amendment_failure(proposal_id, tenant_id, error, owner=owner)
+        raise
     finally:
         try:
             authority.release(owner)
@@ -1002,12 +1032,9 @@ def complete_writer_index_inventory(
     manifest: WriterPublicationManifest,
 ) -> WriterPublicationManifest:
     """Every takeover seals the file in every active concrete physical index."""
+    import json
+
     from onyx.db.regulatory_writer_publication import owned_writer_index_inventory
-    from onyx.document_index.publication_models import (
-        PublicationIndexSnapshot,
-        publication_digest,
-    )
-    from shared_configs.configs import MULTI_TENANT
 
     inventory = owned_writer_index_inventory(
         owner, [index.search_settings_id for index in manifest.indexes]
@@ -1050,48 +1077,57 @@ def complete_writer_index_inventory(
             for index in indexes.values()
         ):
             raise ValueError("writer's active physical index was replaced")
-        indexes.setdefault(
-            index_uuid,
-            PublicationIndexSnapshot(
-                index_name=setting.index_name,
-                index_uuid=index_uuid,
-                search_settings_id=setting.id,
-                model_provider=setting.provider_type.value
-                if setting.provider_type
-                else "",
-                model_name=setting.model_name,
-                vector_dimension=setting.final_embedding_dim,
-                embedding_config_sha256=publication_digest(
-                    {"reserved_inventory": setting.id}
-                ),
-                multitenant=MULTI_TENANT,
-            ),
-        )
+        from onyx.regulatory.publication_baseline import observed_index_snapshot
+
+        indexes.setdefault(index_uuid, observed_index_snapshot(setting, index_uuid))
     authority = PublicationStore(owner.scope)
     for index_uuid, index in list(indexes.items()):
         existing = FencedPublicationIndex(client, index).existing_ordinals(
             authority.reservations(owner)
         )
         authority.reserve_existing_ordinals(owner, existing)
-        receipts = {
-            receipt.configuration_json: receipt for receipt in index.encoder_receipts
-        }
-        for binding in bindings:
-            if binding.index.index_uuid == index_uuid:
-                if not index.matches_temporal_index(binding.index):
-                    raise ValueError(
-                        "writer physical index selector differs from retained history"
+        if index_uuid not in target_uuids and manifest.kind != "delete":
+            from onyx.db.regulatory_writer_publication import load_owned_writer_inputs
+            from onyx.regulatory.publication_baseline import observed_baseline_binding
+
+            expected_ordinals = {
+                binding.projection.ordinal
+                for binding in bindings
+                if binding.index.index_uuid == index_uuid
+            }
+            actuals = FencedPublicationIndex(client, index).inventory_evidence(
+                authority.reservations(owner)
+            )
+            missing = [
+                item
+                for item in actuals
+                if json.loads(item.source_json)["chunk_index"] not in expected_ordinals
+            ]
+            if missing:
+                inputs = load_owned_writer_inputs(owner)
+                for actual in missing:
+                    if (
+                        actual.frozen_projection is not None
+                        or actual.observed_projection is not None
+                    ):
+                        raise ValueError("secondary index lost its temporal binding")
+                    binding = observed_baseline_binding(actual, inputs.canonical)
+                    bindings.append(binding)
+                    canonical_id = str(
+                        json.loads(actual.source_json)["regulatory_chunk_id"]
                     )
-                receipts.update(
-                    {
-                        receipt.configuration_json: receipt
-                        for receipt in binding.index.encoder_receipts
-                    }
-                )
-        indexes[index_uuid] = PublicationIndexSnapshot.model_validate(
-            index.model_copy(
-                update={"encoder_receipts": tuple(receipts.values())}
-            ).model_dump(mode="json")
+                    revisions[binding.id] = inputs.canonical_revisions[canonical_id]
+        from onyx.document_index.publication_models import merge_publication_indexes
+
+        indexes[index_uuid] = merge_publication_indexes(
+            [
+                index,
+                *(
+                    binding.index
+                    for binding in bindings
+                    if binding.index.index_uuid == index_uuid
+                ),
+            ]
         )
     return WriterPublicationManifest.model_validate(
         manifest.model_copy(

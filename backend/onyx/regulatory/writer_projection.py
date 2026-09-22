@@ -11,14 +11,17 @@ from onyx.db.regulatory_writer_publication import OwnedWriterInputs
 from onyx.document_index.publication_models import (
     FileOwnership,
     FrozenPublicationProjection,
+    ObservedPublicationProjection,
     PublicationIndexSnapshot,
+    PublicationProjection,
+    matches_indexed_evidence,
     publication_digest,
 )
 from onyx.indexing.embedder import DefaultIndexingEmbedder
 from onyx.regulatory.amendment_projection_impact import (
-    include_context_consumers,
+    ContextAuditResolver,
+    analyze_amendment_impact,
     merge_windows,
-    structural_windows,
 )
 from onyx.regulatory.amendments.annexes.analysis import resolve_review_context_llm
 from onyx.regulatory.amendments.annexes.context_dependencies import (
@@ -43,7 +46,10 @@ from onyx.regulatory.amendments.annexes.publication_representations import (
 from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
 from onyx.regulatory.indexing_jobs.embedding import _validate_response_vectors
 from onyx.regulatory.projection import prepare_normal_context_view
-from onyx.regulatory.writer_publication_models import WriterPublicationManifest
+from onyx.regulatory.writer_publication_models import (
+    AmendmentImpactReport,
+    WriterPublicationManifest,
+)
 from shared_configs.configs import MULTI_TENANT
 from shared_configs.enums import EmbedTextType
 
@@ -63,6 +69,7 @@ def prepare_owned_correction(
     changed_id: str | None,
     target_settings_ids: set[int] | None = None,
     selective_amendment: bool = False,
+    audit_cache: ContextAuditResolver | None = None,
 ) -> WriterPublicationManifest:
     """Correct one canonical version, preserving all other legal time windows."""
     authority = PublicationStore(owner.scope)
@@ -90,6 +97,7 @@ def prepare_owned_correction(
     bindings: list[AnnexTemporalProjection] = []
     indexes: list[PublicationIndexSnapshot] = []
     views: list[PreparedContextView] = []
+    impacts: list[AmendmentImpactReport] = []
     revisions: dict[UUID, UUID] = {}
     for settings in sorted(
         [
@@ -165,13 +173,19 @@ def prepare_owned_correction(
                 raise ValueError(
                     "Selective amendment requires an existing qualified index baseline"
                 )
-            impact_windows = include_context_consumers(
-                structural_windows(inputs.canonical, after),
+            impact = analyze_amendment_impact(
                 before=inputs.canonical,
                 after=after,
                 bindings=prior,
                 llm=llm,
-            )
+                audit_cache=audit_cache,
+            ).model_copy(update={"index_uuid": index_uuid})
+            if impact.unresolved:
+                raise ValueError(
+                    "amendment impact unresolved: " + "; ".join(impact.unresolved)
+                )
+            impacts.append(impact)
+            impact_windows = impact.affected_windows
             affected = merge_windows(
                 [w for ranges in impact_windows.values() for w in ranges]
             )
@@ -186,7 +200,9 @@ def prepare_owned_correction(
             for binding in context_prior + prior
         }
         candidates_for_reuse = [
-            binding.projection for binding in [*prior, *context_prior]
+            binding.projection
+            for binding in [*prior, *context_prior]
+            if isinstance(binding.projection, FrozenPublicationProjection)
         ]
         if prior:
             from onyx.document_index.elasticsearch.publication import (
@@ -197,21 +213,12 @@ def prepare_owned_correction(
                 authority.reservations(owner)
             )
             actual_by_ordinal = {
-                item.frozen_projection.ordinal: item.frozen_projection
-                for item in actual
-                if item.frozen_projection is not None
+                json.loads(item.source_json)["chunk_index"]: item for item in actual
             }
             for previous in prior:
-                frozen = actual_by_ordinal.get(previous.projection.ordinal)
-                if (
-                    frozen is None
-                    or publication_digest(json.loads(frozen.source_json))
-                    != publication_digest(json.loads(previous.projection.source_json))
-                    or frozen.embedding_inputs != previous.projection.embedding_inputs
-                    or publication_digest(json.loads(frozen.embedding_config_json))
-                    != publication_digest(
-                        json.loads(previous.projection.embedding_config_json)
-                    )
+                evidence = actual_by_ordinal.get(previous.projection.ordinal)
+                if evidence is None or not matches_indexed_evidence(
+                    previous.projection, evidence
                 ):
                     raise ValueError(
                         "writer qualified baseline no longer matches actual ES evidence"
@@ -277,13 +284,24 @@ def prepare_owned_correction(
                     validity_start_date=_epoch(start_date),
                     validity_end_date=_epoch(end_date),
                 )
-                projection = FrozenPublicationProjection(
-                    ordinal=ordinal,
-                    context_projection_id=str(new_id),
-                    source_json=json.dumps(source),
-                    embedding_inputs=previous.projection.embedding_inputs,
-                    embedding_config_json=previous.projection.embedding_config_json,
-                )
+                projection: PublicationProjection
+                if isinstance(previous.projection, ObservedPublicationProjection):
+                    projection = ObservedPublicationProjection.model_validate(
+                        {
+                            **previous.projection.model_dump(),
+                            "ordinal": ordinal,
+                            "context_projection_id": str(new_id),
+                            "source_json": json.dumps(source),
+                        }
+                    )
+                else:
+                    projection = FrozenPublicationProjection(
+                        ordinal=ordinal,
+                        context_projection_id=str(new_id),
+                        source_json=json.dumps(source),
+                        embedding_inputs=previous.projection.embedding_inputs,
+                        embedding_config_json=previous.projection.embedding_config_json,
+                    )
                 bindings.append(
                     previous.model_copy(
                         update={
@@ -482,24 +500,30 @@ def prepare_owned_correction(
                     semantic_position=row.position,
                 )
 
-                if previous is not None and (
-                    previous.index.index_uuid == index.index_uuid
-                    and previous.projection.ordinal == ordinal
-                    and previous.effective_start == start_date
-                    and previous.effective_end == end_date
-                    and previous.canonical_base_sha256 == canonical_base
-                    and previous.representation_text == rebuilt.representation_text
-                    and previous.representation_metadata
-                    == rebuilt.representation_metadata
-                    and previous.dependency_ids == rebuilt.dependency_ids
-                    and publication_digest(json.loads(previous.projection.source_json))
-                    == publication_digest(source)
-                    and previous.projection.embedding_inputs
-                    == projection.embedding_inputs
-                    and publication_digest(
-                        json.loads(previous.projection.embedding_config_json)
+                if (
+                    previous is not None
+                    and isinstance(previous.projection, FrozenPublicationProjection)
+                    and (
+                        previous.index.index_uuid == index.index_uuid
+                        and previous.projection.ordinal == ordinal
+                        and previous.effective_start == start_date
+                        and previous.effective_end == end_date
+                        and previous.canonical_base_sha256 == canonical_base
+                        and previous.representation_text == rebuilt.representation_text
+                        and previous.representation_metadata
+                        == rebuilt.representation_metadata
+                        and previous.dependency_ids == rebuilt.dependency_ids
+                        and publication_digest(
+                            json.loads(previous.projection.source_json)
+                        )
+                        == publication_digest(source)
+                        and previous.projection.embedding_inputs
+                        == projection.embedding_inputs
+                        and publication_digest(
+                            json.loads(previous.projection.embedding_config_json)
+                        )
+                        == publication_digest(context.embedding_config)
                     )
-                    == publication_digest(context.embedding_config)
                 ):
                     bindings.append(previous)
                 else:
@@ -523,5 +547,6 @@ def prepare_owned_correction(
         ],
         bindings=bindings,
         views=views,
+        amendment_impacts=impacts,
         canonical_revisions=revisions,
     )

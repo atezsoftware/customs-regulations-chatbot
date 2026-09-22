@@ -18,6 +18,10 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexChangeDraft,
     AnnexElementCorrection,
 )
+from onyx.regulatory.approval_execution_state import (
+    ApprovalExecutionState,
+    read_execution_state,
+)
 
 
 class RegulatoryChunkSnapshot(BaseModel):
@@ -143,6 +147,7 @@ class AmendmentProposalSnapshot(BaseModel):
     applied_new_chunk_ids: list[str]
     approval_indexing_job_id: str | None
     approval_error: str | None
+    approval_execution: ApprovalExecutionState | None = None
     decided_by: str | None
     decided_at: datetime.datetime | None
     created_at: datetime.datetime
@@ -160,6 +165,8 @@ class AmendmentProposalSnapshot(BaseModel):
         instruction_texts = list(
             getattr(proposal, "instruction_texts", None) or [proposal.instruction_text]
         )
+        raw_error = getattr(proposal, "approval_error", None)
+        execution = read_execution_state(raw_error)
         return cls(
             id=proposal.id,
             batch_id=proposal.batch_id,
@@ -187,7 +194,10 @@ class AmendmentProposalSnapshot(BaseModel):
                 if getattr(proposal, "approval_indexing_job_id", None)
                 else None
             ),
-            approval_error=getattr(proposal, "approval_error", None),
+            approval_error=(execution.message if execution.state == "failed" else None)
+            if execution
+            else raw_error,
+            approval_execution=execution,
             decided_by=str(proposal.decided_by) if proposal.decided_by else None,
             decided_at=proposal.decided_at,
             created_at=proposal.created_at,

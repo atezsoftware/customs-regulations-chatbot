@@ -2563,6 +2563,13 @@ def replace_indexed_chunks_for_file(
         )
         db_session.add(row)
         rows.append(row)
+    from onyx.regulatory.amendments.annexes.publication_representations import _snapshot
+    from onyx.regulatory.amendments.annexes.selective_impact import (
+        validate_canonical_source_integrity,
+    )
+
+    validate_canonical_source_integrity([_snapshot(row) for row in rows])
+
     return rows
 
 

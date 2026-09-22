@@ -34,6 +34,8 @@ from onyx.document_index.publication_models import (
 )
 from onyx.regulatory.amendments.annexes.config import ANNEX_DATABASE_IDENTITY
 
+PUBLICATION_LEASE_TTL = timedelta(minutes=2)
+
 
 def lock_publication_acquisition(
     session: Session, user_file_id: UUID, *, blocking: bool = True
@@ -194,19 +196,35 @@ class PublicationStore:
                         )
                     )
                 row.next_ordinal = max(row.next_ordinal, chunk.projection_ordinal + 1)
-            result = self._ownership(row)
-            session.commit()
-            return result
-
-    def heartbeat(self, owner: FileOwnership, *, ttl: timedelta) -> FileOwnership:
-        if ttl <= timedelta(0) or ttl > timedelta(hours=1):
-            raise ValueError("invalid lease duration")
-        with get_session_with_tenant(tenant_id=self.scope.tenant_id) as session:
-            row = self._locked(session, owner)
+            # Importing a large sparse inventory can outlive the initial lease.
+            session.flush()
             now = session.scalar(select(func.clock_timestamp()))
             assert isinstance(now, datetime)
             row.lease_expires_at = now + ttl
             result = self._ownership(row)
+            session.commit()
+            return result
+
+    def renew_in_session(
+        self,
+        session: Session,
+        owner: FileOwnership,
+        *,
+        ttl: timedelta = PUBLICATION_LEASE_TTL,
+    ) -> FileOwnership:
+        """Hand off a live lease before releasing validated transaction ownership."""
+        if ttl <= timedelta(0) or ttl > timedelta(hours=1):
+            raise ValueError("invalid lease duration")
+        row = self._locked(session, owner)
+        session.flush()
+        now = session.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
+        row.lease_expires_at = now + ttl
+        return self._ownership(row)
+
+    def heartbeat(self, owner: FileOwnership, *, ttl: timedelta) -> FileOwnership:
+        with get_session_with_tenant(tenant_id=self.scope.tenant_id) as session:
+            result = self.renew_in_session(session, owner, ttl=ttl)
             session.commit()
             return result
 
@@ -495,10 +513,9 @@ def archive_canonical_revisions(
 ) -> dict[str, UUID]:
     """Freeze current canonical authority before an owned correction/deletion."""
     from onyx.db.regulatory_annex_changes import capture_canonical_scope
-    from onyx.db.regulatory_canonical_revisions import retain_canonical_revision
+    from onyx.db.regulatory_canonical_revisions import retain_canonical_revisions
 
     PublicationStore(owner.scope).lock_owned_snapshot(session, owner)
-    return {
-        snapshot.id: retain_canonical_revision(session, snapshot)
-        for snapshot in capture_canonical_scope(session, owner.user_file_id)
-    }
+    return retain_canonical_revisions(
+        session, capture_canonical_scope(session, owner.user_file_id)
+    )

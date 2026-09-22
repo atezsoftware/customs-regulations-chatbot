@@ -54,7 +54,7 @@ def _snapshot(row: "RegulatoryChunk") -> AnnexCanonicalSnapshot:
         position=row.position,
         text=row.text,
         heading_path=row.heading_path,
-        metadata=row.chunk_metadata,
+        metadata=json.loads(json.dumps(row.chunk_metadata)),
         source=row.source,
         validity_start_date=row.validity_start_date,
         validity_end_date=row.validity_end_date,

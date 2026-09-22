@@ -266,9 +266,9 @@ def regulatory_amendment_approve(
             current_id = validate_amendment_projection_search_settings(db_session)
         with _renew_amendment_approval(proposal_id=proposal_id):
             approve_owned_amendment(proposal_id, tenant_id, current_id)
-    except Exception:
+    except Exception as error:
         logger.exception("Amendment proposal %s approval failed", proposal_id)
-        record_owned_amendment_failure(proposal_id, tenant_id)
+        record_owned_amendment_failure(proposal_id, tenant_id, error)
         raise
 
 

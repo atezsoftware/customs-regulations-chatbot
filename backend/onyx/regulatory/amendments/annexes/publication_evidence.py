@@ -12,6 +12,7 @@ from onyx.document_index.publication_models import (
     PublicationEncoderAuthority,
     PublicationEncoderReceipt,
     PublicationIndexSnapshot,
+    matches_indexed_evidence,
 )
 from onyx.file_store.file_store import get_default_file_store
 from onyx.regulatory.amendments.annexes.context_dependencies import (
@@ -251,16 +252,7 @@ def _historical_plan(
         if actual.binding.canonical_base_sha256 != canonical_base_sha256:
             raise ValueError("historical canonical base changed")
         bound = actual.binding.projection
-        if (
-            context_hash(json.loads(bound.source_json)) != context_hash(source)
-            or actual.evidence.frozen_projection is not None
-            and (
-                bound.embedding_inputs
-                != actual.evidence.frozen_projection.embedding_inputs
-                or json.loads(bound.embedding_config_json)
-                != json.loads(actual.evidence.frozen_projection.embedding_config_json)
-            )
-        ):
+        if not matches_indexed_evidence(bound, actual.evidence):
             raise ValueError("dated binding no longer matches actual indexed proof")
     start, end = (
         _as_date(source.get("validity_start_date")),

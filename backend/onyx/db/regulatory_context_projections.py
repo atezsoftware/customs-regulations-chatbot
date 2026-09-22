@@ -16,6 +16,7 @@ from onyx.db.models import (
     RegulatoryContextProjectionCall,
     RegulatoryContextSnapshot,
 )
+from onyx.document_index.publication_models import accepts_publication_projection
 from onyx.regulatory.amendments.annexes.context_dependencies import context_hash
 from onyx.regulatory.amendments.annexes.models import (
     ContextGenerationCall,
@@ -393,9 +394,7 @@ def activate_temporal_projection(
     if (
         source.get("chunk_index") != binding.projection.ordinal
         or len(source["content_vector"]) != binding.index.vector_dimension
-        or not binding.index.accepts_encoder_configuration(
-            json.loads(binding.projection.embedding_config_json)
-        )
+        or not accepts_publication_projection(binding.index, binding.projection)
     ):
         raise ValueError("temporal encoder/source identity mismatch")
     canonical = session.get(RegulatoryChunk, source["regulatory_chunk_id"])
@@ -556,27 +555,50 @@ def activate_temporal_projection(
             or binding.dependency_ids != [target.id]
         ):
             raise ValueError("image companion provenance mismatch")
-        ancestor = target
-        visited: set[str] = set()
-        while ancestor.id != predecessor:
-            if ancestor.id in visited or ancestor.supersedes_chunk_id is None:
-                raise ValueError("image companion target has no reviewed legal lineage")
-            visited.add(ancestor.id)
-            parent = session.get(RegulatoryChunk, ancestor.supersedes_chunk_id)
-            if parent is None or parent.user_file_id != user_file_id:
-                raise ValueError("image companion target lineage leaves file scope")
-            ancestor = parent
-        target = dated_dependency(target)
-        for key in (
-            "image_file_id",
-            "image_file_ids",
-            "source_asset_ids",
-            "annex_element_ids",
-        ):
-            if binding.representation_metadata.get(key) != target.chunk_metadata.get(
-                key
+        from onyx.document_index.publication_models import ObservedPublicationProjection
+
+        if isinstance(binding.projection, ObservedPublicationProjection):
+            from onyx.db.regulatory_annex_changes import capture_canonical_scope
+            from onyx.regulatory.amendments.annexes.selective_impact import (
+                recover_source_membership,
+            )
+
+            metadata = dict(canonical.chunk_metadata)
+            if target.id != predecessor:
+                recovered = recover_source_membership(
+                    capture_canonical_scope(session, user_file_id)
+                )
+                if recovered.get(canonical.id) != [target.id]:
+                    raise ValueError("observed image source recovery is unavailable")
+                metadata["bound_to_regulatory_chunk_id"] = target.id
+                metadata["source_regulatory_chunk_ids"] = []
+            if metadata != binding.representation_metadata:
+                raise ValueError("observed image source metadata changed")
+            dated_dependency(target)
+        else:
+            ancestor = target
+            visited: set[str] = set()
+            while ancestor.id != predecessor:
+                if ancestor.id in visited or ancestor.supersedes_chunk_id is None:
+                    raise ValueError(
+                        "image companion target has no reviewed legal lineage"
+                    )
+                visited.add(ancestor.id)
+                parent = session.get(RegulatoryChunk, ancestor.supersedes_chunk_id)
+                if parent is None or parent.user_file_id != user_file_id:
+                    raise ValueError("image companion target lineage leaves file scope")
+                ancestor = parent
+            target = dated_dependency(target)
+            for key in (
+                "image_file_id",
+                "image_file_ids",
+                "source_asset_ids",
+                "annex_element_ids",
             ):
-                raise ValueError("image companion source evidence mismatch")
+                if binding.representation_metadata.get(
+                    key
+                ) != target.chunk_metadata.get(key):
+                    raise ValueError("image companion source evidence mismatch")
     from onyx.regulatory.chunk_evidence import chunk_evidence
 
     evidence = chunk_evidence(binding.representation_metadata)
@@ -701,11 +723,8 @@ def get_indexed_temporal_projection(
 
     validate_temporal_canonical_revision(session, row)
     binding = AnnexTemporalProjection.model_validate(row.payload)
-    import json
 
-    if not index.accepts_encoder_configuration(
-        json.loads(binding.projection.embedding_config_json)
-    ):
+    if not accepts_publication_projection(index, binding.projection):
         raise ValueError(
             "temporal binding encoder receipt is not accepted by query configuration"
         )
