@@ -9181,7 +9181,13 @@ class RegulatoryTemporalProjection(Base):
             "effective_end",
         ),
         CheckConstraint(
-            "effective_end IS NULL OR effective_start IS NULL OR effective_end > effective_start",
+            "effective_end IS NULL OR effective_start IS NULL OR effective_end > effective_start "
+            "OR (effective_end = effective_start AND COALESCE("
+            "payload #>> '{projection,evidence_kind}' = 'observed-v1' "
+            "AND (payload #>> '{projection,observed_start}')::bigint "
+            "= EXTRACT(EPOCH FROM effective_start::timestamp)::bigint "
+            "AND (payload #>> '{projection,observed_end}')::bigint "
+            "= EXTRACT(EPOCH FROM effective_end::timestamp)::bigint, FALSE))",
             name="temporal_projection_dates_check",
         ),
     )

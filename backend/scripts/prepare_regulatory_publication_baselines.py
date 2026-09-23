@@ -7,6 +7,7 @@ matches the normal workers. No embedding or context provider is called.
 
 import argparse
 import json
+import os
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -106,13 +107,40 @@ def main() -> None:
         "--expected-database", required=True, choices=["customs-regulations-dev"]
     )
     parser.add_argument("--expected-index-uuid", required=True)
-    parser.add_argument("--file-id", type=UUID, action="append")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--file-id", type=UUID, action="append")
+    selection.add_argument(
+        "--file-list", type=Path, help="JSON array of explicit file UUIDs"
+    )
     parser.add_argument("--after-file-id", type=UUID)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--workers", type=int, choices=range(1, 9), default=4)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument(
+        "--stop-file",
+        type=Path,
+        action="append",
+        help="Stop between files when any supplied path exists",
+    )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--progress-file",
+        type=Path,
+        help="Persist file starts for interrupted-run review",
+    )
     args = parser.parse_args()
+    if args.file_list is not None:
+        try:
+            requested = json.loads(args.file_list.read_text())
+            if not isinstance(requested, list) or not requested:
+                raise ValueError("file list must be a nonempty JSON array")
+            if not all(isinstance(value, str) for value in requested):
+                raise ValueError("file list must contain UUID strings")
+            args.file_id = [UUID(value) for value in requested]
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+    if args.file_id and len(set(args.file_id)) != len(args.file_id):
+        parser.error("duplicate file identifiers")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
     if args.apply and not args.file_id and args.limit is None:
@@ -121,6 +149,7 @@ def main() -> None:
     CURRENT_TENANT_ID_CONTEXTVAR.set(args.tenant)
     settings = baseline_audit_settings(args.tenant, args.expected_database)
     counts: Counter[str] = Counter()
+    stopped = False
     with ElasticsearchClient() as transport, args.output.open("a") as report:
         client = transport.publication_client()
         indexes = []
@@ -382,6 +411,17 @@ def main() -> None:
 
         if args.apply or args.file_id:
             for file_id in identifiers:
+                if any(path.exists() for path in args.stop_file or []):
+                    stopped = True
+                    break
+                if args.progress_file is not None:
+                    with args.progress_file.open("a") as progress:
+                        progress.write(
+                            json.dumps({"file_id": str(file_id), "state": "started"})
+                            + "\n"
+                        )
+                        progress.flush()
+                        os.fsync(progress.fileno())
                 record_result(process_file(file_id))
         else:
             groups = [
@@ -398,10 +438,13 @@ def main() -> None:
                     "summary": dict(counts),
                     "database": args.expected_database,
                     "index_uuid": args.expected_index_uuid,
+                    "stopped": stopped,
                 }
             )
             + "\n"
         )
+    if stopped:
+        raise SystemExit(3)
     if counts["unresolved"] or counts["error"] or counts["pending"]:
         raise SystemExit(2)
 

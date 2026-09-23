@@ -72,9 +72,60 @@ def pending_writer_manifest(owner: FileOwnership) -> WriterPublicationManifest |
         manifest = WriterPublicationManifest.model_validate(row.writer_manifest)
         if manifest.scope != owner.scope or manifest.user_file_id != owner.user_file_id:
             raise ValueError("durable writer manifest scope mismatch")
+        _validate_pending_temporal_intervals(session, manifest)
         PublicationStore(owner.scope).renew_in_session(session, owner)
         session.commit()
         return manifest
+
+
+def _validate_pending_temporal_intervals(
+    session: Session, manifest: WriterPublicationManifest
+) -> None:
+    unusual = [
+        binding
+        for binding in manifest.bindings
+        if binding.effective_start is not None
+        and binding.effective_end is not None
+        and binding.effective_end <= binding.effective_start
+    ]
+    if not unusual:
+        return
+    from onyx.db.regulatory_canonical_revisions import get_canonical_revisions
+    from onyx.regulatory.amendments.annexes.publication_representations import (
+        _snapshot,
+        validate_temporal_interval,
+    )
+
+    revisions = get_canonical_revisions(
+        session,
+        [
+            manifest.canonical_revisions[binding.id]
+            for binding in unusual
+            if binding.id in manifest.canonical_revisions
+        ],
+    )
+    for binding in unusual:
+        source = json.loads(binding.projection.source_json)
+        revision_id = manifest.canonical_revisions.get(binding.id)
+        if revision_id is not None:
+            canonical = revisions[revision_id].snapshot
+        else:
+            row = session.get(RegulatoryChunk, source["regulatory_chunk_id"])
+            if row is None:
+                raise ValueError("pending interval canonical authority missing")
+            canonical = _snapshot(row)
+        if (
+            canonical.id != source.get("regulatory_chunk_id")
+            or canonical.user_file_id != str(manifest.user_file_id)
+            or source.get("document_id") != str(manifest.user_file_id)
+        ):
+            raise ValueError("pending interval canonical scope mismatch")
+        validate_temporal_interval(
+            binding,
+            canonical_status=canonical.status,
+            canonical_start=canonical.validity_start_date,
+            canonical_end=canonical.validity_end_date,
+        )
 
 
 def stage_writer_publication(

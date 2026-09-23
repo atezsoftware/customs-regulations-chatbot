@@ -420,6 +420,16 @@ def activate_temporal_projection(
         user_file_id
     ) or binding.projection.context_projection_id != str(binding.id):
         raise ValueError("temporal projection identity mismatch")
+    from onyx.regulatory.amendments.annexes.publication_representations import (
+        validate_temporal_interval,
+    )
+
+    validate_temporal_interval(
+        binding,
+        canonical_status=canonical.status,
+        canonical_start=canonical.validity_start_date,
+        canonical_end=canonical.validity_end_date,
+    )
 
     def dated_dependency(row: RegulatoryChunk) -> RegulatoryChunk:
         from onyx.regulatory.contextual import context_reference_date

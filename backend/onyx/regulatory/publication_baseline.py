@@ -24,7 +24,10 @@ from onyx.regulatory.amendments.annexes.models import (
     AnnexCanonicalSnapshot,
     AnnexTemporalProjection,
 )
-from onyx.regulatory.amendments.annexes.publication_representations import _epoch
+from onyx.regulatory.amendments.annexes.publication_representations import (
+    _epoch,
+    validate_temporal_interval,
+)
 from onyx.regulatory.amendments.annexes.selective_impact import (
     aggregate_membership_is_valid,
     image_membership_is_valid,
@@ -161,7 +164,7 @@ def observed_baseline_binding(
         source_json=json.dumps(source),
         observed_index=evidence.index,
     )
-    return AnnexTemporalProjection(
+    binding = AnnexTemporalProjection(
         id=identifier,
         index=evidence.index,
         projection=projection,
@@ -180,6 +183,13 @@ def observed_baseline_binding(
         effective_end=row.validity_end_date,
         semantic_position=row.position,
     )
+    validate_temporal_interval(
+        binding,
+        canonical_status=row.status,
+        canonical_start=row.validity_start_date,
+        canonical_end=row.validity_end_date,
+    )
+    return binding
 
 
 def prepare_owned_baseline(

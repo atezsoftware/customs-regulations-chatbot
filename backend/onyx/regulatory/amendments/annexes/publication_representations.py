@@ -42,6 +42,38 @@ def _epoch(value: date | None) -> int | None:
     )
 
 
+def validate_temporal_interval(
+    binding: AnnexTemporalProjection,
+    *,
+    canonical_status: str,
+    canonical_start: date | None,
+    canonical_end: date | None,
+) -> None:
+    """An empty interval can retain observed history, never create a legal day."""
+    from onyx.document_index.publication_models import ObservedPublicationProjection
+
+    start, end = binding.effective_start, binding.effective_end
+    if start is None or end is None or end > start:
+        return
+    if end < start:
+        raise ValueError("temporal interval is reversed")
+    projection = binding.projection
+    if (
+        canonical_status != "superseded"
+        or canonical_start != start
+        or canonical_end != end
+        or not isinstance(projection, ObservedPublicationProjection)
+        or projection.observed_start != _epoch(start)
+        or projection.observed_end != _epoch(end)
+    ):
+        raise ValueError("empty interval requires unchanged superseded observation")
+    source = json.loads(projection.source_json)
+    if source.get("validity_start_date") != _epoch(start) or source.get(
+        "validity_end_date"
+    ) != _epoch(end):
+        raise ValueError("empty temporal source interval mismatch")
+
+
 def _snapshot(row: "RegulatoryChunk") -> AnnexCanonicalSnapshot:
     return AnnexCanonicalSnapshot(
         id=row.id,

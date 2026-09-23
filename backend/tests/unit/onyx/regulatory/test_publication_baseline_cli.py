@@ -29,8 +29,13 @@ from tests.unit.onyx.regulatory.test_publication_baseline import baseline_case
         ("resume", True),
     ],
 )
+@pytest.mark.parametrize("file_list", [False, True])
 def test_cli_audits_without_writes_and_resumes_only_frozen_baseline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, verification_error: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    verification_error: bool,
+    file_list: bool,
 ) -> None:
     resume = mode == "resume"
     applies = mode != "audit"
@@ -67,6 +72,17 @@ def test_cli_audits_without_writes_and_resumes_only_frozen_baseline(
         manifest=None,
     )
     states = iter([initial, after] if applies else [initial])
+    bad_file_id = uuid4()
+    progress = tmp_path / "started.jsonl"
+
+    def audit_inputs(_tenant: str, identifier: object) -> BaselineAuditInputs:
+        if file_list:
+            last = json.loads(progress.read_text().splitlines()[-1])
+            assert last["file_id"] == str(identifier) and last["state"] == "started"
+        if identifier == bad_file_id:
+            raise ValueError("Unresolved source evidence")
+        return next(states)
+
     setting = SearchSettings(
         id=11,
         status=IndexModelStatus.PRESENT,
@@ -86,7 +102,7 @@ def test_cli_audits_without_writes_and_resumes_only_frozen_baseline(
     monkeypatch.setattr(cli, "ElasticsearchClient", lambda: transport)
     monkeypatch.setattr(cli, "PublicationStore", lambda *_a: authority)
     monkeypatch.setattr(cli, "baseline_audit_settings", lambda *_a: [setting])
-    monkeypatch.setattr(cli, "baseline_audit_inputs", lambda *_a: next(states))
+    monkeypatch.setattr(cli, "baseline_audit_inputs", audit_inputs)
     after_evidence = evidence.model_copy(
         update={"observed_projection": binding.projection}
     )
@@ -118,18 +134,105 @@ def test_cli_audits_without_writes_and_resumes_only_frozen_baseline(
     ]
     if applies:
         args.append("--apply")
+    if file_list:
+        identifiers = tmp_path / "files.json"
+        identifiers.write_text(json.dumps([str(bad_file_id), str(inputs.file.id)]))
+        offset = args.index("--file-id")
+        args[offset : offset + 2] = ["--file-list", str(identifiers)]
+        args.extend(["--progress-file", str(progress)])
     monkeypatch.setattr("sys.argv", args)
-    if verification_error:
+    if verification_error or file_list:
         with pytest.raises(SystemExit) as error:
             cli.main()
         assert error.value.code == 2
     else:
         cli.main()
-    report, summary = [json.loads(line) for line in output.read_text().splitlines()]
+    reports = [json.loads(line) for line in output.read_text().splitlines()]
+    if file_list:
+        failed = reports.pop(0)
+        assert failed["state"] == "error" and failed["file_id"] == str(bad_file_id)
+    report, summary = reports
     assert report["state"] == (
         "error" if verification_error else "ready" if applies else "legacy"
     )
     assert report["applied"] is applies
-    assert summary["summary"] == {report["state"]: 1}
+    expected_counts = {report["state"]: 1}
+    if file_list:
+        expected_counts["error"] = expected_counts.get("error", 0) + 1
+    assert summary["summary"] == expected_counts
     if not applies:
         authority.acquire.assert_not_called()
+
+
+def test_cli_respects_stop_file_before_processing_another_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop = tmp_path / "STOP"
+    stop.touch()
+    output = tmp_path / "report.jsonl"
+    monkeypatch.setattr(cli.SqlEngine, "init_engine", lambda **_kw: None)
+    monkeypatch.setattr(cli, "ElasticsearchClient", MagicMock())
+    monkeypatch.setattr(cli, "baseline_audit_settings", lambda *_a: [])
+
+    def unexpected_read(*_args: object) -> None:
+        pytest.fail("STOP must prevent the next file's processing")
+
+    monkeypatch.setattr(cli, "baseline_audit_inputs", unexpected_read)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "baseline",
+            "--expected-database",
+            "customs-regulations-dev",
+            "--expected-index-uuid",
+            "physical-uuid",
+            "--file-id",
+            str(uuid4()),
+            "--apply",
+            "--stop-file",
+            str(stop),
+            "--output",
+            str(output),
+            "--stop-file",
+            str(tmp_path / "operator-STOP"),
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 3
+    assert json.loads(output.read_text())["stopped"] is True
+    assert stop.exists()
+
+
+@pytest.mark.parametrize("content", ["[]", "{}", '["not-a-uuid"]', "[4]"])
+def test_invalid_explicit_list_cannot_fall_back_to_the_corpus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+) -> None:
+    identifiers = tmp_path / "ids.json"
+    identifiers.write_text(content)
+
+    def unexpected_connection(**_kwargs: object) -> None:
+        pytest.fail("invalid selection must fail before database access")
+
+    monkeypatch.setattr(cli.SqlEngine, "init_engine", unexpected_connection)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "baseline",
+            "--expected-database",
+            "customs-regulations-dev",
+            "--expected-index-uuid",
+            "physical-uuid",
+            "--file-list",
+            str(identifiers),
+            "--apply",
+            "--output",
+            str(tmp_path / "report.jsonl"),
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
