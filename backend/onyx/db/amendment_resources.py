@@ -4,10 +4,57 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import cast
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from onyx.db.models import AmendmentBatch, KVStore
+from onyx.utils.special_types import JSON_ro
+
+
+def record_analysis_resources(
+    db_session: Session,
+    *,
+    batch_id: int,
+    lease_generation: int,
+    measurements: dict[str, int],
+) -> None:
+    """Retain one numeric snapshot, fenced against a superseded analysis."""
+    db_session.execute(text("SET LOCAL lock_timeout = '200ms'"))
+    db_session.execute(text("SET LOCAL statement_timeout = '500ms'"))
+    batch = db_session.scalar(
+        select(AmendmentBatch.id)
+        .where(
+            AmendmentBatch.id == batch_id,
+            AmendmentBatch.status == "analyzing",
+            AmendmentBatch.lease_generation == lease_generation,
+        )
+        .with_for_update()
+    )
+    if batch is None:
+        db_session.rollback()
+        return
+    key = f"amendment_runtime:{batch_id}"
+    row = db_session.get(KVStore, key)
+    if row is None:
+        row = KVStore(key=key, value={})
+        db_session.add(row)
+    previous: Mapping[str, JSON_ro] = (
+        cast(Mapping[str, JSON_ro], row.value) if isinstance(row.value, Mapping) else {}
+    )
+    if previous.get("lease_generation") != lease_generation:
+        previous = {}
+    previous_peak = previous.get("peak_bytes", 0)
+    row.value = {
+        **previous,
+        **measurements,
+        "peak_bytes": max(
+            previous_peak if isinstance(previous_peak, int) else 0,
+            measurements.get("peak_bytes", 0),
+        ),
+        "lease_generation": lease_generation,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    db_session.commit()
 
 
 def owns_analysis(db_session: Session, *, batch_id: int, lease_generation: int) -> bool:

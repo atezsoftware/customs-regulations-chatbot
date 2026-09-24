@@ -19,6 +19,54 @@ from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
 from onyx.regulatory.amendments.ranker import CandidateChunk
 
 
+def test_runtime_measurements_cannot_be_overwritten_by_old_analysis(
+    checkpoint_session: Session,
+) -> None:
+    from onyx.db.amendment_resources import record_analysis_resources
+    from onyx.db.models import KVStore
+
+    session = checkpoint_session
+    docset = DocumentSet(
+        name=f"telemetry-{uuid4()}", description="test", is_up_to_date=True
+    )
+    session.add(docset)
+    session.flush()
+    batch = AmendmentBatch(
+        document_set_id=docset.id,
+        raw_text="test",
+        status="analyzing",
+        stage="processing",
+        lease_generation=7,
+        user_file_ids=[],
+    )
+    session.add(batch)
+    session.flush()
+    record_analysis_resources(
+        session,
+        batch_id=batch.id,
+        lease_generation=7,
+        measurements={"current_bytes": 123, "active": 2, "peak_bytes": 200},
+    )
+    record_analysis_resources(
+        session,
+        batch_id=batch.id,
+        lease_generation=7,
+        measurements={"current_bytes": 123, "peak_bytes": 150},
+    )
+    record_analysis_resources(
+        session,
+        batch_id=batch.id,
+        lease_generation=6,
+        measurements={"current_bytes": 999, "active": 4},
+    )
+    row = session.get(KVStore, f"amendment_runtime:{batch.id}")
+    assert row is not None
+    assert row.value["current_bytes"] == 123
+    assert row.value["active"] == 2
+    assert row.value["lease_generation"] == 7
+    assert row.value["peak_bytes"] == 200
+
+
 @pytest.fixture
 def checkpoint_session(
     db_session: Session, tenant_context: None

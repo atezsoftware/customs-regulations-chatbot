@@ -6,6 +6,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from dataclasses import dataclass, replace
 from pathlib import Path
+from time import monotonic
 from typing import TypeVar, cast
 
 MIB = 1024 * 1024
@@ -66,27 +67,52 @@ def bounded_map(
     sample: Callable[[], MemorySample | None] = read_memory,
     policy: MemoryPolicy = MemoryPolicy(),
     max_parallel: int = 2,
+    report: Callable[[dict[str, int]], None] | None = None,
 ) -> Iterator[R]:
-    """Warm up serially, then admit at most two calls without a task backlog."""
-    if max_parallel not in (1, 2):
-        raise ValueError("Matching concurrency must be one or two")
+    """Warm up serially, then admit bounded calls using fresh container samples."""
+    if max_parallel not in (1, 2, 3, 4):
+        raise ValueError("Matching concurrency must be between one and four")
     iterator = iter(items)
     pending: dict[Future[R], None] = {}
     queued: deque[T] = deque()
     warmed_up = False
     exhausted = False
-    parallel_blocked = False
     warmup_baseline: int | None = None
     warmup_peak = 0
-    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="amendment-match")
+    peak_bytes = peak_active = 0
+    next_report = 0.0
+    last_active = -1
+    pool = ThreadPoolExecutor(
+        max_workers=max_parallel, thread_name_prefix="amendment-match"
+    )
+
+    def observe(reading: MemorySample) -> None:
+        nonlocal peak_bytes, peak_active, next_report, last_active
+        peak_bytes = max(peak_bytes, reading.current)
+        peak_active = max(peak_active, len(pending))
+        now = monotonic()
+        if report is not None and (now >= next_report or len(pending) != last_active):
+            report(
+                {
+                    "current_bytes": reading.current,
+                    "limit_bytes": reading.limit,
+                    "peak_bytes": peak_bytes,
+                    "active": len(pending),
+                    "peak_active": peak_active,
+                    "max_parallel": max_parallel,
+                    "item_budget_bytes": policy.item_bytes,
+                    "reserve_bytes": policy.reserve_bytes,
+                }
+            )
+            next_report = now + 5
+            last_active = len(pending)
+
     try:
         while not exhausted or pending:
             reading = policy.check(sample())
             if not warmed_up:
                 warmup_peak = max(warmup_peak, reading.current)
-            if parallel_blocked and reading.current < reading.limit // 2:
-                parallel_blocked = False
-            slots = max_parallel if warmed_up and not parallel_blocked else 1
+            slots = max_parallel if warmed_up else 1
             while not exhausted and len(pending) < slots:
                 if not queued:
                     try:
@@ -97,7 +123,6 @@ def bounded_map(
                 if not policy.admit(sample(), active=len(pending)):
                     if not pending:
                         raise ResourcePressure("insufficient_instruction_headroom")
-                    parallel_blocked = True
                     break
                 item = queued.popleft()
                 if warmup_baseline is None:
@@ -106,6 +131,7 @@ def bounded_map(
                     Future[R], pool.submit(copy_context().run, function, item)
                 )
                 pending[future] = None
+            observe(policy.check(sample()))
             if not pending:
                 break
             done, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
@@ -115,9 +141,13 @@ def bounded_map(
                 if not warmed_up and warmup_baseline is not None:
                     growth = max(0, warmup_peak - warmup_baseline)
                     policy = replace(
-                        policy, item_bytes=max(policy.item_bytes, growth * 3 // 2)
+                        policy,
+                        item_bytes=max(
+                            min(policy.item_bytes, 256 * MIB), growth * 3 // 2
+                        ),
                     )
                 warmed_up = True
+        observe(policy.check(sample()))
     finally:
         for future in pending:
             future.cancel()

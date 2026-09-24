@@ -78,6 +78,7 @@ def _run_grouping_job(
     checkpoint_store: dict[int, object] | None = None,
     interrupt_match_at: int | None = None,
     before_work: Callable[[], None] | None = None,
+    instruction_runner: job.InstructionRunner | None = None,
 ) -> SimpleNamespace:
     instructions = instructions_override or [
         AmendmentInstruction(
@@ -227,7 +228,10 @@ def _run_grouping_job(
         raising=False,
     )
     job.run_amendment_batch(
-        batch_id=batch_id, lease_generation=2, before_work=before_work
+        batch_id=batch_id,
+        lease_generation=2,
+        before_work=before_work,
+        instruction_runner=instruction_runner,
     )
     return SimpleNamespace(
         draft=draft_group_mock,
@@ -237,6 +241,36 @@ def _run_grouping_job(
         events=events,
         instructions=instructions,
     )
+
+
+def test_resumed_matches_do_not_count_as_memory_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved: dict[int, object] = {}
+    with pytest.raises(RuntimeError, match="simulated worker interruption"):
+        _run_grouping_job(
+            monkeypatch,
+            batch_id=162,
+            targets=["a", "b", "c"],
+            checkpoint_store=saved,
+            interrupt_match_at=1,
+        )
+    submitted: list[int] = []
+
+    def runner(function: Callable[[int], job.MatchOutcome], items: list[int]):
+        submitted.extend(items)
+        return map(function, items)
+
+    result = _run_grouping_job(
+        monkeypatch,
+        batch_id=162,
+        targets=["a", "b", "c"],
+        checkpoint_store=saved,
+        instruction_runner=runner,
+    )
+    assert submitted == [1, 2]
+    assert ("match", 0) not in result.events
+    assert ("draft", [0]) in result.events
 
 
 def test_pdf_explicit_annex_edits_produce_one_proposal_and_no_document_review(

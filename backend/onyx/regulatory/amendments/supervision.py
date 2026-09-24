@@ -146,14 +146,37 @@ def run_supervised_amendment(
     tenant_id: str,
     parallel: bool,
 ) -> None:
-    from onyx.db.amendment_resources import owns_analysis
+    from onyx.db.amendment_resources import owns_analysis, record_analysis_resources
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
+
+    measurements: dict[str, int] = {}
+
+    def tracked_sample() -> MemorySample | None:
+        reading = read_memory()
+        if reading is not None:
+            measurements.update(
+                current_bytes=reading.current,
+                limit_bytes=reading.limit,
+                peak_bytes=max(measurements.get("peak_bytes", 0), reading.current),
+            )
+        return reading
 
     def owned() -> bool:
         with get_session_with_current_tenant() as session:
-            return owns_analysis(
+            allowed = owns_analysis(
                 session, batch_id=batch_id, lease_generation=lease_generation
             )
+            if allowed and measurements:
+                try:
+                    record_analysis_resources(
+                        session,
+                        batch_id=batch_id,
+                        lease_generation=lease_generation,
+                        measurements=dict(measurements),
+                    )
+                except Exception:
+                    session.rollback()
+            return allowed
 
     supervise(
         [
@@ -166,6 +189,7 @@ def run_supervised_amendment(
             "parallel" if parallel else "serial",
         ],
         owned=owned,
+        sample=tracked_sample,
     )
 
 
@@ -190,7 +214,8 @@ def _child_main() -> None:
 
     from functools import partial
 
-    from onyx.db.engine.sql_engine import SqlEngine
+    from onyx.db.amendment_resources import record_analysis_resources
+    from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
     from onyx.regulatory.amendments.job import run_amendment_batch
     from onyx.regulatory.amendments.memory_budget import bounded_map
     from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
@@ -199,8 +224,24 @@ def _child_main() -> None:
     token = CURRENT_TENANT_ID_CONTEXTVAR.set(tenant_id)
     SqlEngine.reset_engine()
     SqlEngine.set_app_name("amendment_analysis_child")
-    SqlEngine.init_engine(pool_size=3, max_overflow=0, pool_pre_ping=True)
+    # Search lanes can nest settings/publication reads and cost accounting.
+    # Bound the shared pool without starving those reads behind matching lanes.
+    SqlEngine.init_engine(pool_size=12, max_overflow=0, pool_pre_ping=True)
     policy = MemoryPolicy()
+
+    def report(measurements: dict[str, int]) -> None:
+        from onyx.utils.logger import setup_logger
+
+        try:
+            with get_session_with_current_tenant() as session:
+                record_analysis_resources(
+                    session,
+                    batch_id=int(batch_id),
+                    lease_generation=int(generation),
+                    measurements=measurements,
+                )
+        except Exception:
+            setup_logger().warning("Amendment resource snapshot could not be stored")
 
     def check_resources() -> None:
         policy.check(read_memory())
@@ -214,7 +255,7 @@ def _child_main() -> None:
             batch_id=int(batch_id),
             lease_generation=int(generation),
             instruction_runner=partial(
-                bounded_map, max_parallel=2 if mode == "parallel" else 1
+                bounded_map, max_parallel=4 if mode == "parallel" else 1, report=report
             ),
             check_resources=check_resources,
             before_work=before_work,

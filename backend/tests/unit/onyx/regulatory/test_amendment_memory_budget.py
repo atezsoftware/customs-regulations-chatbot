@@ -152,3 +152,61 @@ def test_warmup_peak_can_keep_later_instructions_serial() -> None:
         )
     ) == [0, 1, 2, 3]
     assert peak == 1
+
+
+def test_parallelism_recovers_above_half_container_usage() -> None:
+    current = 750
+    running = peak = 0
+    lock = Lock()
+
+    def work(value: int) -> int:
+        nonlocal current, running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        sleep(0.03)
+        if value == 1:
+            current = 550  # two calls now fit, without dropping below 50%
+        with lock:
+            running -= 1
+        return value
+
+    assert sorted(
+        bounded_map(
+            work,
+            range(8),
+            sample=lambda: MemorySample(current, 1000),
+            policy=MemoryPolicy(reserve_bytes=100, item_bytes=100),
+        )
+    ) == list(range(8))
+    assert peak == 2
+
+
+def test_adaptive_scheduler_can_use_four_slots_after_measured_warmup() -> None:
+    running = peak = 0
+    lock = Lock()
+    readings: list[dict[str, int]] = []
+
+    def work(value: int) -> int:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        sleep(0.03)
+        with lock:
+            running -= 1
+        return value
+
+    assert sorted(
+        bounded_map(
+            work,
+            range(9),
+            sample=lambda: MemorySample(1800 * MIB, 3584 * MIB),
+            max_parallel=4,
+            report=readings.append,
+        )
+    ) == list(range(9))
+    assert peak == 4
+    assert readings[-1]["active"] == 0
+    assert max(row["peak_active"] for row in readings) == 4
+    assert all(row["current_bytes"] == 1800 * MIB for row in readings)

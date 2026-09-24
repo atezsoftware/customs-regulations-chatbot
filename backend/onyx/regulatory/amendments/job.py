@@ -4,6 +4,7 @@ from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date
+from traceback import extract_tb
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -399,24 +400,21 @@ def run_amendment_batch(
     )
     del raw_text, instruction_payloads
     groups: dict[tuple[str, str | int], list[int]] = {}
-
-    def match_one(instruction_index: int) -> MatchOutcome:
+    pending_indices: list[int] = []
+    # Only real retrieval work can calibrate the scheduler's memory budget.
+    for instruction_index in range(len(instructions)):
         if check_resources is not None:
             check_resources()
-        instruction = instructions[instruction_index]
-        instruction_llm = (
-            get_amendment_analysis_llm() if instruction_runner is not None else llm
-        )
         if instruction_index in processed_instruction_indices:
             log(
                 "instruction_skipped",
                 index=instruction_index,
                 reason="already processed",
             )
-            return None
+            continue
         if instruction_index in annex_indices:
             log("instruction_skipped", index=instruction_index, reason="annex review")
-            return None
+            continue
         with _session() as db_session:
             checkpoint = load_match_checkpoint(
                 db_session,
@@ -425,10 +423,19 @@ def run_amendment_batch(
                 input_sha256=input_sha256,
             )
         if checkpoint is not None:
-            restored_group = checkpoint.group_key
+            groups.setdefault(checkpoint.group_key, []).append(instruction_index)
             log("instruction_match_restored", index=instruction_index)
             del checkpoint
-            return instruction_index, restored_group
+            continue
+        pending_indices.append(instruction_index)
+
+    def match_one(instruction_index: int) -> MatchOutcome:
+        if check_resources is not None:
+            check_resources()
+        instruction = instructions[instruction_index]
+        instruction_llm = (
+            get_amendment_analysis_llm() if instruction_runner is not None else llm
+        )
         log(
             "instruction_started",
             index=instruction_index,
@@ -504,6 +511,14 @@ def run_amendment_batch(
                 searches=trace.searched,
                 candidates=trace.candidates,
                 detail=str(error)[:300],
+                frames=[
+                    {
+                        "file": frame.filename,
+                        "line": frame.lineno,
+                        "function": frame.name,
+                    }
+                    for frame in extract_tb(error.__traceback__)[-20:]
+                ],
             )
             raise
 
@@ -574,7 +589,7 @@ def run_amendment_batch(
         # Only checkpoint references survive the next retrieval/model call.
         return outcome
 
-    outcomes = (instruction_runner or map)(match_one, list(range(len(instructions))))
+    outcomes = (instruction_runner or map)(match_one, pending_indices)
     for outcome in outcomes:
         if outcome is not None:
             index, group_key = outcome
