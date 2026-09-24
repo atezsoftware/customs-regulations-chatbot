@@ -10,7 +10,8 @@ from onyx.auth.oauth_token_manager import OAuthTokenManager
 from onyx.chat.emitter import Emitter
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
 from onyx.configs.model_configs import GEN_AI_TEMPERATURE
-from onyx.context.search.models import BaseFilters, PersonaSearchInfo
+from onyx.context.search.models import BaseFilters, IndexFilters, PersonaSearchInfo
+from onyx.context.search.pipeline import _build_index_filters
 from onyx.db.document_set import (
     fetch_user_files_for_document_set,
     filter_document_set_names_by_user_access,
@@ -52,6 +53,9 @@ from onyx.tools.tool_implementations.images.image_generation_tool import (
 )
 from onyx.tools.tool_implementations.mcp.mcp_tool import MCPTool
 from onyx.tools.tool_implementations.memory.memory_tool import MemoryTool
+from onyx.tools.tool_implementations.regulatory_provision.regulatory_provision_tool import (
+    RegulatoryProvisionTool,
+)
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.utils.headers import header_dict_to_header_list
 from onyx.utils.logger import setup_logger
@@ -308,6 +312,35 @@ def _construct_tools_impl(
             auto_detect_filters=config.auto_detect_filters,
         )
 
+    def _build_provision_tool(
+        tool_id: int, config: SearchToolConfig
+    ) -> RegulatoryProvisionTool:
+        # Share the existing scope resolver, not SearchTool.run or its LLM calls.
+        scoped_search = _build_search_tool(tool_id, config)
+        info = scoped_search.persona_search_info
+
+        def filters_provider() -> IndexFilters:
+            with get_session_with_current_tenant_if_none(None) as session:
+                return _build_index_filters(
+                    user_provided_filters=scoped_search.user_selected_filters,
+                    user=user,
+                    project_id_filter=scoped_search.project_id_filter,
+                    persona_id_filter=scoped_search.persona_id_filter,
+                    persona_document_sets=info.document_set_names,
+                    persona_time_cutoff=info.search_start_date,
+                    attached_document_ids=info.attached_document_ids,
+                    hierarchy_node_ids=info.hierarchy_node_ids,
+                    db_session=session,
+                    bypass_acl=config.bypass_acl,
+                )
+
+        return RegulatoryProvisionTool(
+            tool_id=tool_id,
+            emitter=emitter,
+            document_index=document_index,
+            filters_provider=filters_provider,
+        )
+
     added_search_tool = False
     for db_tool_model in configured_tools:
         # If allowed_tool_ids is specified, skip tools not in the allowed list
@@ -353,6 +386,29 @@ def _construct_tools_impl(
 
                 tool_dict[db_tool_model.id] = [
                     _build_search_tool(db_tool_model.id, search_tool_config)
+                ]
+
+            elif tool_cls.__name__ == RegulatoryProvisionTool.__name__:
+                if (
+                    search_usage_forcing_setting == SearchToolUsage.DISABLED
+                    or not db_tool_model.enabled
+                    or not any(
+                        configured.in_code_tool_id == SearchTool.__name__
+                        and configured.enabled
+                        for configured in configured_tools
+                    )
+                ):
+                    continue
+                if allowed_tool_ids is not None and not any(
+                    configured.in_code_tool_id == SearchTool.__name__
+                    and configured.id in allowed_tool_ids
+                    for configured in configured_tools
+                ):
+                    continue
+                tool_dict[db_tool_model.id] = [
+                    _build_provision_tool(
+                        db_tool_model.id, search_tool_config or SearchToolConfig()
+                    )
                 ]
 
             # Handle Image Generation Tool

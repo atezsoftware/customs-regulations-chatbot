@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, cast
@@ -15,6 +16,28 @@ from onyx.regulatory.amendments.models import (
 from onyx.regulatory.amendments.ranker import CandidateChunk
 
 _CREATOR_ID = UUID("00000000-0000-0000-0000-000000000321")
+
+
+@pytest.fixture(autouse=True)
+def _checkpoint_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(job, "match_scope_fingerprint", lambda *_args: "scope")
+    monkeypatch.setattr(
+        job,
+        "capture_match_evidence",
+        lambda *_args: job.MatchEvidence(scope_sha256="scope", candidates={}),
+    )
+    saved: dict[int, object] = {}
+
+    def persist(*_args: object, **kwargs: Any) -> bool:
+        saved[kwargs["checkpoint"].instruction_index] = kwargs["checkpoint"]
+        return True
+
+    monkeypatch.setattr(job, "persist_match_checkpoint", persist)
+    monkeypatch.setattr(
+        job,
+        "load_match_checkpoint",
+        lambda *_args, **kwargs: saved.get(kwargs["instruction_index"]),
+    )
 
 
 def _patch_empty_retriever(
@@ -52,6 +75,9 @@ def _run_grouping_job(
     draft_failures: dict[int, Exception] | None = None,
     instructions_override: list[AmendmentInstruction] | None = None,
     source_package_id: UUID | None = None,
+    checkpoint_store: dict[int, object] | None = None,
+    interrupt_match_at: int | None = None,
+    before_work: Callable[[], None] | None = None,
 ) -> SimpleNamespace:
     instructions = instructions_override or [
         AmendmentInstruction(
@@ -116,11 +142,14 @@ def _run_grouping_job(
         instruction: AmendmentInstruction,
         amendment_context: object = None,
         trace: object = None,
+        capture_evidence: object = None,
     ) -> tuple[list[CandidateChunk], MatchResult]:
-        del retriever, llm, amendment_context, trace
+        del retriever, llm, amendment_context, trace, capture_evidence
         assert session_depth == 0
         instruction_index = index_by_text[instruction.instruction_text]
         events.append(("match", instruction_index))
+        if instruction_index == interrupt_match_at:
+            raise RuntimeError("simulated worker interruption")
         return candidate_lists[instruction_index], matches[instruction_index]
 
     def load_context(
@@ -181,7 +210,25 @@ def _run_grouping_job(
     monkeypatch.setattr(
         job, "get_amendment_analysis_llm", MagicMock(return_value=MagicMock())
     )
-    job.run_amendment_batch(batch_id=batch_id, lease_generation=2)
+    saved_matches = checkpoint_store if checkpoint_store is not None else {}
+
+    def save_match(*_args: object, **kwargs: Any) -> bool:
+        events.append(("checkpoint", kwargs["checkpoint"].instruction_index))
+        if not heartbeat_result:
+            return False
+        saved_matches[kwargs["checkpoint"].instruction_index] = kwargs["checkpoint"]
+        return True
+
+    monkeypatch.setattr(job, "persist_match_checkpoint", save_match, raising=False)
+    monkeypatch.setattr(
+        job,
+        "load_match_checkpoint",
+        lambda *_args, **kwargs: saved_matches.get(kwargs["instruction_index"]),
+        raising=False,
+    )
+    job.run_amendment_batch(
+        batch_id=batch_id, lease_generation=2, before_work=before_work
+    )
     return SimpleNamespace(
         draft=draft_group_mock,
         persist=persisted,
@@ -826,10 +873,12 @@ def test_same_target_instructions_create_one_combined_proposal(
     assert proposal.instruction_indices == [0, 1]
     assert proposal.instruction_texts == ["Instruction 0", "Instruction 1"]
     assert proposal.match_confidence == 0.8
-    assert result.heartbeat.call_count == 2
+    assert result.heartbeat.call_count == 0
     assert result.events == [
         ("match", 0),
+        ("checkpoint", 0),
         ("match", 1),
+        ("checkpoint", 1),
         ("load", ("shared", ["shared", "first-only", "second-only"])),
         ("draft", [0, 1]),
     ]
@@ -852,7 +901,11 @@ def test_noncontiguous_same_target_instructions_still_consolidate(
         call.kwargs["proposal"].instruction_indices
         for call in result.persist.call_args_list
     ] == [[0, 2], [1]]
-    assert result.events[:3] == [("match", 0), ("match", 1), ("match", 2)]
+    assert [event for event in result.events if event[0] == "match"] == [
+        ("match", 0),
+        ("match", 1),
+        ("match", 2),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1071,3 +1124,88 @@ def test_quoted_annex_designator_loads_complete_canonical_scope(
     )
     load.assert_called_once()
     assert len(result.draft.call_args.kwargs["contexts"]) == 2
+
+
+def test_restart_reuses_committed_matches_and_preserves_same_target_grouping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved: dict[int, object] = {}
+    first = _run_grouping_job(
+        monkeypatch,
+        batch_id=97,
+        targets=["same", "other", "same"],
+        checkpoint_store=saved,
+    )
+    assert len(saved) == 3
+    assert first.events.index(("checkpoint", 0)) < first.events.index(("match", 1))
+    restarted = _run_grouping_job(
+        monkeypatch,
+        batch_id=97,
+        targets=["same", "other", "same"],
+        checkpoint_store=saved,
+    )
+    assert not any(event == "match" for event, _ in restarted.events)
+    assert ("draft", [0, 2]) in restarted.events
+    assert ("draft", [1]) in restarted.events
+
+
+def test_partial_matching_restart_skips_saved_work_and_merges_later_same_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved: dict[int, object] = {}
+    with pytest.raises(RuntimeError, match="simulated worker interruption"):
+        _run_grouping_job(
+            monkeypatch,
+            batch_id=98,
+            targets=["same", "other", "same"],
+            checkpoint_store=saved,
+            interrupt_match_at=1,
+        )
+    assert list(saved) == [0]
+    restarted = _run_grouping_job(
+        monkeypatch,
+        batch_id=98,
+        targets=["same", "other", "same"],
+        checkpoint_store=saved,
+    )
+    assert [index for event, index in restarted.events if event == "match"] == [1, 2]
+    assert ("draft", [0, 2]) in restarted.events
+
+
+def test_evidence_is_captured_before_model_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    retriever = MagicMock()
+    retriever.search.return_value = [_candidate("candidate")]
+    retriever.last_attention = None
+    retriever.query_stats = []
+    monkeypatch.setattr(job, "deterministic_structural_candidate", lambda *_: None)
+
+    def confirm(*_args: object, **_kwargs: object) -> MatchResult:
+        events.append("confirm")
+        return MatchResult(old_chunk_id="candidate", confidence=1, rationale="test")
+
+    monkeypatch.setattr(job, "confirm_instruction_match", confirm)
+    job.retrieve_and_confirm_instruction(
+        retriever=retriever,
+        llm=MagicMock(),
+        instruction=AmendmentInstruction(instruction_text="Replace text"),
+        capture_evidence=lambda _candidates: events.append("capture"),
+    )
+    assert events == ["capture", "confirm"]
+
+
+def test_draft_does_not_start_without_reserved_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory.amendments.memory_budget import ResourcePressure
+
+    def no_headroom() -> None:
+        raise ResourcePressure("insufficient_draft_headroom")
+
+    with pytest.raises(ResourcePressure):
+        _run_grouping_job(
+            monkeypatch, batch_id=500, targets=["same"], before_work=no_headroom
+        )
+    cast(MagicMock, job.persist_proposal_checkpoint).assert_not_called()

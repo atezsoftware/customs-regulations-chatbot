@@ -57,3 +57,23 @@ def test_reloaded_citation_packet_preserves_exact_source_identity() -> None:
             source_type=DocumentSource.USER_FILE,
         )
     ]
+
+
+def test_reloaded_provision_tool_retains_its_label_and_query() -> None:
+    from onyx.server.query_and_chat.session_loading import create_search_packets
+    from onyx.server.query_and_chat.streaming_models import (
+        SearchToolQueriesDelta,
+        SearchToolStart,
+    )
+
+    packets = create_search_packets(
+        search_queries=["5434 / MADDE 72"],
+        search_docs=[],
+        is_internet_search=False,
+        turn_index=1,
+        display_name="Mevzuat Maddesi Bul",
+    )
+    assert isinstance(packets[0].obj, SearchToolStart)
+    assert packets[0].obj.display_name == "Mevzuat Maddesi Bul"
+    assert isinstance(packets[1].obj, SearchToolQueriesDelta)
+    assert packets[1].obj.queries == ["5434 / MADDE 72"]

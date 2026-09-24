@@ -151,6 +151,7 @@ def _build_index_filters(
         forced_document_set=forced_document_set,
         as_of_date=base_filters.as_of_date,
         regulatory_chunks_only=base_filters.regulatory_chunks_only,
+        regulatory_source_hint=base_filters.regulatory_source_hint,
     )
 
     return final_filters

@@ -27,6 +27,7 @@ from onyx.background.celery.tasks.regulatory_amendments.tasks import (
 )
 from onyx.configs.app_configs import MAX_AMENDMENT_SOURCE_BYTES
 from onyx.configs.constants import PUBLIC_API_TAGS, FileOrigin
+from onyx.db.amendment_match_checkpoints import match_checkpoint_counts
 from onyx.db.amendment_sources import (
     attach_source_package_to_batch,
     create_source_package,
@@ -638,9 +639,11 @@ def list_amendment_batches(
 ) -> list[AmendmentBatchSnapshot]:
     _get_editable_document_set(db_session, document_set_id, user)
     batches = list_batches_for_document_set(db_session, document_set_id)
+    match_counts = match_checkpoint_counts(db_session, [batch.id for batch in batches])
     return [
         AmendmentBatchSnapshot.from_model(
             b,
+            matched_instruction_count=match_counts.get(b.id, 0),
             annex_groups=list_annex_changes(db_session, b.id)
             if b.created_by == user.id
             else [],
@@ -696,6 +699,9 @@ def get_amendment_analysis(
         ],
         batch=AmendmentBatchSnapshot.from_model(
             batch,
+            matched_instruction_count=match_checkpoint_counts(
+                db_session, [batch.id]
+            ).get(batch.id, 0),
             annex_groups=list_annex_changes(db_session, batch.id)
             if batch.created_by == user.id
             else [],
@@ -733,7 +739,7 @@ def retry_amendment_analysis(
     if retried is None:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
-            "Only failed batches or completed batches with unresolved instructions can be retried.",
+            "Only failed or paused batches, or completed batches with unresolved instructions, can be retried.",
         )
     try:
         enqueue_amendment_batch(batch_id=batch_id, tenant_id=tenant_id)

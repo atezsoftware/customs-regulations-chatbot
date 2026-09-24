@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from onyx.background.celery.queue_names import REGULATORY_AMENDMENT_QUEUE
 from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryTask
+from onyx.db.amendment_resources import defer_analysis, parallel_analysis_allowed
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.regulatory_amendments import (
     claim_batch_for_analysis,
@@ -21,7 +22,8 @@ from onyx.db.regulatory_amendments import (
 )
 from onyx.db.search_settings import get_current_search_settings
 from onyx.regulatory.amendments.annexes import config as annex_config
-from onyx.regulatory.amendments.job import run_amendment_batch
+from onyx.regulatory.amendments.memory_budget import ResourcePressure
+from onyx.regulatory.amendments.supervision import run_supervised_amendment
 from onyx.utils.logger import setup_logger
 from shared_configs.enums import EmbeddingProvider
 
@@ -223,14 +225,28 @@ def regulatory_amendment_run(
     if lease is None:
         return
     try:
+        with get_session_with_current_tenant() as db_session:
+            parallel = parallel_analysis_allowed(db_session, batch_id)
         with _renew_batch_lease(
             batch_id=batch_id,
             lease_generation=lease.generation,
         ):
-            run_amendment_batch(
+            run_supervised_amendment(
                 batch_id=batch_id,
                 lease_generation=lease.generation,
+                tenant_id=tenant_id,
+                parallel=parallel,
             )
+    except ResourcePressure as error:
+        with get_session_with_current_tenant() as db_session:
+            defer_analysis(
+                db_session,
+                batch_id=batch_id,
+                lease_generation=lease.generation,
+                reason=str(error),
+                started=error.started,
+            )
+        logger.info("Amendment batch=%s waiting for resources: %s", batch_id, error)
     except Exception as error:
         logger.exception("Amendment batch %s failed", batch_id)
         with get_session_with_current_tenant() as db_session:

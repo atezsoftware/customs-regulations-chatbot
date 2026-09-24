@@ -11,6 +11,9 @@ from onyx.tools.tool_implementations.knowledge_graph.knowledge_graph_tool import
     KnowledgeGraphTool,
 )
 from onyx.tools.tool_implementations.memory.memory_tool import MemoryTool
+from onyx.tools.tool_implementations.regulatory_provision.regulatory_provision_tool import (
+    RegulatoryProvisionTool,
+)
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.utils.logger import setup_logger
 
@@ -24,6 +27,7 @@ logger = setup_logger()
 # migration that detaches any persona still referencing them.
 BUILT_IN_TOOL_TYPES = Union[
     SearchTool,
+    RegulatoryProvisionTool,
     ImageGenerationTool,
     KnowledgeGraphTool,
     FileReaderTool,
@@ -33,6 +37,7 @@ BUILT_IN_TOOL_TYPES = Union[
 
 BUILT_IN_TOOL_MAP: dict[str, Type[BUILT_IN_TOOL_TYPES]] = {
     SearchTool.__name__: SearchTool,
+    RegulatoryProvisionTool.__name__: RegulatoryProvisionTool,
     ImageGenerationTool.__name__: ImageGenerationTool,
     KnowledgeGraphTool.__name__: KnowledgeGraphTool,
     FileReaderTool.__name__: FileReaderTool,
@@ -43,6 +48,7 @@ BUILT_IN_TOOL_MAP: dict[str, Type[BUILT_IN_TOOL_TYPES]] = {
 STOPPING_TOOLS_NAMES: list[str] = [ImageGenerationTool.NAME]
 CITEABLE_TOOLS_NAMES: list[str] = [
     SearchTool.NAME,
+    RegulatoryProvisionTool.NAME,
 ]
 
 

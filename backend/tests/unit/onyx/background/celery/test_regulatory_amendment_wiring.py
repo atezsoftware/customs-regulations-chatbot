@@ -107,12 +107,15 @@ def test_run_task_claims_and_executes_batch() -> None:
     with (
         patch.object(tasks, "get_session_with_current_tenant") as session_factory,
         patch.object(tasks, "claim_batch_for_analysis", return_value=lease),
-        patch.object(tasks, "run_amendment_batch") as run_batch,
+        patch.object(tasks, "run_supervised_amendment") as run_batch,
+        patch.object(tasks, "parallel_analysis_allowed", return_value=True),
     ):
         session_factory.return_value.__enter__.return_value = MagicMock()
         tasks.regulatory_amendment_run.run(batch_id=42, tenant_id="public")
 
-    run_batch.assert_called_once_with(batch_id=42, lease_generation=7)
+    run_batch.assert_called_once_with(
+        batch_id=42, lease_generation=7, tenant_id="public", parallel=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -470,7 +473,8 @@ def test_worker_retains_exception_with_current_failure_lease() -> None:
             return_value=SimpleNamespace(generation=7),
         ),
         patch.object(tasks, "_renew_batch_lease", return_value=nullcontext()),
-        patch.object(tasks, "run_amendment_batch", side_effect=error),
+        patch.object(tasks, "run_supervised_amendment", side_effect=error),
+        patch.object(tasks, "parallel_analysis_allowed", return_value=True),
         patch.object(tasks, "mark_batch_failed") as mark_failed,
         patch.object(tasks.logger, "exception"),
     ):
@@ -483,4 +487,37 @@ def test_worker_retains_exception_with_current_failure_lease() -> None:
         lease_generation=7,
         error_message=tasks._SAFE_FAILURE_MESSAGE,
         failure=error,
+    )
+
+
+def test_memory_pressure_defers_without_content_attention_or_failed_state() -> None:
+    from contextlib import nullcontext
+
+    from onyx.regulatory.amendments.memory_budget import ResourcePressure
+
+    with (
+        patch.object(tasks, "get_session_with_current_tenant") as factory,
+        patch.object(
+            tasks,
+            "claim_batch_for_analysis",
+            return_value=SimpleNamespace(generation=7),
+        ),
+        patch.object(tasks, "_renew_batch_lease", return_value=nullcontext()),
+        patch.object(
+            tasks,
+            "run_supervised_amendment",
+            side_effect=ResourcePressure("memory_pressure", started=True),
+        ),
+        patch.object(tasks, "parallel_analysis_allowed", return_value=True),
+        patch.object(tasks, "defer_analysis") as defer,
+        patch.object(tasks, "mark_batch_failed") as failed,
+    ):
+        tasks.regulatory_amendment_run.run(batch_id=44, tenant_id="public")
+    failed.assert_not_called()
+    defer.assert_called_once_with(
+        factory.return_value.__enter__.return_value,
+        batch_id=44,
+        lease_generation=7,
+        reason="memory_pressure",
+        started=True,
     )

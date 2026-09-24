@@ -37,6 +37,10 @@ from onyx.tools.tool_implementations.memory.memory_tool import (
 )
 from onyx.tools.tool_implementations.open_url.open_url_tool import OpenURLTool
 from onyx.tools.tool_implementations.python.python_tool import PythonTool
+from onyx.tools.tool_implementations.regulatory_provision.regulatory_provision_tool import (
+    ProvisionToolOverrideKwargs,
+    RegulatoryProvisionTool,
+)
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tools.tool_implementations.web_search.web_search_tool import WebSearchTool
 from onyx.tracing.framework.create import function_span
@@ -551,6 +555,7 @@ def run_tool_calls(
 
         override_kwargs: (
             SearchToolOverrideKwargs
+            | ProvisionToolOverrideKwargs
             | WebSearchToolOverrideKwargs
             | OpenURLToolOverrideKwargs
             | PythonToolOverrideKwargs
@@ -596,6 +601,12 @@ def run_tool_calls(
             )
             # Increment citation number for next search tool to avoid conflicts
             # Estimate: reserve 100 citation slots per search tool
+            starting_citation_num += 100
+
+        elif isinstance(tool, RegulatoryProvisionTool):
+            override_kwargs = ProvisionToolOverrideKwargs(
+                starting_citation_num=starting_citation_num
+            )
             starting_citation_num += 100
 
         elif isinstance(tool, WebSearchTool):

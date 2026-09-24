@@ -172,6 +172,7 @@ class SearchToolStart(BaseObj):
     type: Literal["search_tool_start"] = StreamingType.SEARCH_TOOL_START.value
 
     is_internet_search: bool = False
+    display_name: str | None = None
 
 
 # Queries coming through as the LLM determines what to search

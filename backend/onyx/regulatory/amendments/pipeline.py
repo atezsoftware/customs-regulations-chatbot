@@ -7,7 +7,8 @@ rows, and nothing lands in `regulatory_chunk` until an admin approves a
 specific proposal (see onyx/db/regulatory_amendments.py).
 """
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from onyx.db.models import RegulatoryChunk
 from onyx.db.regulatory_chunks import (
+    get_active_chunks_by_structural_reference,
     get_chunk_snapshot_by_id,
     get_next_chunk_position,
     load_active_structural_descendants,
@@ -25,6 +27,10 @@ from onyx.regulatory.amendments.amendment_context import (
     build_amendment_context,
 )
 from onyx.regulatory.amendments.candidate_finder import find_candidates
+from onyx.regulatory.amendments.compound_heading import (
+    attach_heading_changes,
+    compound_heading_title,
+)
 from onyx.regulatory.amendments.draft_integrity import (
     DraftIntegrityError,
     explicit_replacement_body,
@@ -54,6 +60,7 @@ from onyx.regulatory.amendments.pdf_vision import PdfBatchSource
 from onyx.regulatory.amendments.ranker import CandidateChunk
 from onyx.regulatory.amendments.segmenter import segment_amendment_text
 from onyx.regulatory.amendments.structural_target import (
+    amendment_operation_text,
     article_identity,
     parse_amendment_structural_target,
 )
@@ -103,6 +110,7 @@ class InstructionDraftContext:
     has_active_descendants: bool = False
     target_evidence: str | None = None
     expected_new_article_no: str | None = None
+    heading_change_snapshots: list[dict[str, Any]] = field(default_factory=list)
 
 
 def confirm_instruction_match(
@@ -240,8 +248,37 @@ def load_instruction_draft_context(
         snapshot["descendant_snapshots"] = [
             _chunk_to_review_dict(row) for row in descendants
         ]
+    heading_snapshots: list[dict[str, Any]] = []
+    if (
+        instruction is not None
+        and added_subordinate_unit_kind(instruction.instruction_text)
+        and re.search(
+            r"başlığı",
+            amendment_operation_text(instruction.instruction_text),
+            re.IGNORECASE,
+        )
+        and compound_heading_title(instruction.instruction_text) is None
+    ):
+        return None
+    if instruction is not None and compound_heading_title(instruction.instruction_text):
+        target = parse_amendment_structural_target(instruction)
+        if target is None or target.article_no is None or old_chunk is not None:
+            return None
+        heading_rows = get_active_chunks_by_structural_reference(
+            db_session,
+            user_file_ids=[target_user_file_id],
+            article_no=target.article_no,
+            clause_label=None,
+            appendix_label=None,
+            source_name_hint=None,
+            limit=257,
+        )
+        if not heading_rows or len(heading_rows) > 256:
+            return None
+        heading_snapshots = [_chunk_to_review_dict(row.chunk) for row in heading_rows]
     return InstructionDraftContext(
         match=match,
+        heading_change_snapshots=heading_snapshots,
         old_chunk_snapshot=snapshot,
         target_user_file_id=target_user_file_id,
         target_position=target_position,
@@ -504,6 +541,20 @@ def draft_instruction_group_proposal(
         context=context,
         draft=draft,
     )
+    heading_titles = {
+        title
+        for item in instructions
+        if (title := compound_heading_title(item.instruction_text))
+    }
+    if heading_titles:
+        if len(heading_titles) != 1 or not context.expected_new_article_no:
+            raise DraftIntegrityError("Combined heading change is ambiguous")
+        proposal = attach_heading_changes(
+            proposal,
+            snapshots=context.heading_change_snapshots,
+            article_no=context.expected_new_article_no,
+            title=next(iter(heading_titles)),
+        )
     if evidence is not None:
         from onyx.regulatory.amendments.pdf_vision import (
             PDF_EVIDENCE_KEY,

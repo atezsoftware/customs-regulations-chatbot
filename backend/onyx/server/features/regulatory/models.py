@@ -381,6 +381,7 @@ class AmendmentBatchSnapshot(BaseModel):
     stage: str = "queued"
     instruction_count: int = 0
     processed_instruction_count: int = 0
+    matched_instruction_count: int = 0
     error_message: str | None
     created_by: str | None
     created_at: datetime.datetime
@@ -391,7 +392,10 @@ class AmendmentBatchSnapshot(BaseModel):
 
     @classmethod
     def from_model(
-        cls, batch: Any, annex_groups: list[AnnexChangeSet] | None = None
+        cls,
+        batch: Any,
+        annex_groups: list[AnnexChangeSet] | None = None,
+        matched_instruction_count: int = 0,
     ) -> "AmendmentBatchSnapshot":
         return cls(
             source_package_id=getattr(batch, "source_package_id", None),
@@ -405,6 +409,7 @@ class AmendmentBatchSnapshot(BaseModel):
             annex_pending_count=sum(
                 group.status == "pending" for group in annex_groups or []
             ),
+            matched_instruction_count=matched_instruction_count,
             id=batch.id,
             document_set_id=batch.document_set_id,
             raw_text=batch.raw_text,

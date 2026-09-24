@@ -821,6 +821,7 @@ class AmendmentBatchStatus(str, PyEnum):
     ANALYZING = "analyzing"
     ANALYZED = "analyzed"
     FAILED = "failed"
+    PAUSED = "paused"
 
 
 class AmendmentBatchStage(str, PyEnum):
@@ -830,6 +831,7 @@ class AmendmentBatchStage(str, PyEnum):
     SEGMENTING = "segmenting"
     PROCESSING = "processing"
     FINALIZING = "finalizing"
+    WAITING_RESOURCES = "waiting_resources"
 
 
 class AmendmentProposalStatus(str, PyEnum):

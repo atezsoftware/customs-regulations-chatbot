@@ -501,6 +501,8 @@ def build_amendment_search_retriever(
             ):
                 file_id = verified_files[0]
                 if file_id not in source_chunks:
+                    # Keep only the current source; a batch can touch thousands of files.
+                    source_chunks.clear()
                     source_chunks[file_id] = [
                         replace(as_candidate(match), source_verified=True)
                         for match in load_amendment_source_chunks(

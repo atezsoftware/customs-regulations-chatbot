@@ -4324,3 +4324,31 @@ def test_effective_regulatory_search_budget_excludes_direct_review_recovery(
         )
         == expected
     )
+
+
+def test_structural_lookup_is_optional_and_duplicate_attempts_are_bounded() -> None:
+    from onyx.chat.llm_loop import _search_query_mode_identity
+
+    lookup = ToolCallKickoff(
+        tool_call_id="lookup",
+        tool_name="get_regulatory_provision",
+        tool_args={"source": "5434 sayılı Kanun", "article_number": "72"},
+        placement=Placement(turn_index=0),
+    )
+    normal = _search_tool_call("normal")
+    assert _constrain_regulatory_tool_calls([normal], search_slots=2) == [normal]
+    assert _constrain_regulatory_tool_calls([normal, lookup], search_slots=2) == [
+        normal,
+        lookup,
+    ]
+    assert _constrain_regulatory_tool_calls([lookup, lookup], search_slots=2) == [
+        lookup
+    ]
+    identity = _search_query_mode_identity(lookup)
+    assert identity is not None
+    assert (
+        _constrain_regulatory_tool_calls(
+            [lookup], search_slots=2, attempted_query_modes={identity}
+        )
+        == []
+    )

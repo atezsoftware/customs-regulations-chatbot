@@ -10,10 +10,16 @@ export interface AmendmentBatch {
   document_set_id: number;
   raw_text: string;
   reference_date: string | null;
-  status: "queued" | "analyzing" | "analyzed" | "failed";
-  stage: "queued" | "segmenting" | "processing" | "finalizing";
+  status: "queued" | "analyzing" | "analyzed" | "failed" | "paused";
+  stage:
+    | "queued"
+    | "segmenting"
+    | "processing"
+    | "finalizing"
+    | "waiting_resources";
   instruction_count: number;
   processed_instruction_count: number;
+  matched_instruction_count?: number;
   error_message: string | null;
   created_by: string | null;
   created_at: string;

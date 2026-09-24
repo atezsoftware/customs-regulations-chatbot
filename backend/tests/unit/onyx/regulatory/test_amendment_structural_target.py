@@ -52,6 +52,37 @@ _ADD_ANNEX_ROW = (
 
 
 @pytest.mark.parametrize(
+    ("ordinal", "expected"),
+    [
+        ("on birinci", "11"),
+        ("on beşinci", "15"),
+        ("ON BEŞİNCİ", "15"),
+        ("yirmi birinci", "21"),
+        ("yüz on beşinci", "115"),
+        ("altıncı", "6"),
+        ("15 inci", "15"),
+        ("on beşinci ve on altıncı", None),
+        ("bin beşinci", None),
+        ("15 ve 16 ncı", None),
+        ("15 ila 16 ncı", None),
+        ("15-16 ncı", None),
+        ("on beşinci, on altıncı", None),
+    ],
+)
+def test_compound_paragraph_ordinal_never_matches_its_suffix(
+    ordinal: str,
+    expected: str | None,
+) -> None:
+    target = parse_amendment_structural_target(
+        AmendmentInstruction(
+            instruction_text=f"MADDE 6- Aynı Kararın 12 nci maddesinin {ordinal} fıkrası yürürlükten kaldırılmıştır."
+        )
+    )
+    assert target is not None
+    assert target.paragraph_no == expected
+
+
+@pytest.mark.parametrize(
     ("instruction_text", "article_no", "paragraph_no", "clause_label"),
     [
         (_REPLACE_PARAGRAPH, "1", "2", None),
@@ -316,3 +347,14 @@ def test_actual_law_identity_survives_amendment_words_in_its_title(title: str) -
     from onyx.regulatory.amendments.structural_target import named_law_number
 
     assert named_law_number(title) == title[:4]
+
+
+def test_heading_edit_does_not_hide_a_following_paragraph_addition() -> None:
+    text = 'MADDE 4- Aynı Kararın 10 uncu maddesinin başlığı "Yetki, denetim ve izleme" şeklinde değiştirilmiş ve aynı maddeye aşağıdaki fıkra eklenmiştir:\n"(4) Yatırımcı bilgi verir."'
+    assert added_subordinate_unit_kind(text) == "paragraph"
+    target = parse_amendment_structural_target(
+        AmendmentInstruction(instruction_text=text)
+    )
+    assert (
+        target is not None and target.article_no == "10" and target.paragraph_no is None
+    )

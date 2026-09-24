@@ -71,7 +71,8 @@ export const InternalSearchToolRenderer: MessageRenderer<
 
   const hasResults = results.length > 0;
 
-  const queriesHeader = formatSearchHeader(sourceFilters, timeFilter);
+  const queriesHeader =
+    searchState.displayName ?? formatSearchHeader(sourceFilters, timeFilter);
 
   if (queries.length === 0) {
     return children([

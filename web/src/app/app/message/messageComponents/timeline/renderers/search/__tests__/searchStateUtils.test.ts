@@ -91,3 +91,20 @@ describe("constructCurrentSearchState filter extraction", () => {
     expect(state.timeFilter).toBeNull();
   });
 });
+
+it("retains a structural lookup label alongside normal source packets", () => {
+  const state = constructCurrentSearchState([
+    {
+      placement: { turn_index: 0 },
+      obj: { type: "search_tool_start", display_name: "Mevzuat Maddesi Bul" },
+    } as SearchToolPacket,
+    {
+      placement: { turn_index: 0 },
+      obj: { type: "search_tool_queries_delta", queries: ["5434 / MADDE 72"] },
+    },
+  ]);
+  expect(state).toMatchObject({
+    displayName: "Mevzuat Maddesi Bul",
+    queries: ["5434 / MADDE 72"],
+  });
+});

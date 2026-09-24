@@ -1093,6 +1093,18 @@ def _run(
         patch(f"{MODULE}.rerank_chunks", rerank_mock),
         patch(f"{MODULE}.select_sections_for_expansion", selector_mock),
         patch(f"{MODULE}.populate_file_ids_on_sections"),
+        patch.multiple(
+            "onyx.regulatory.provision_retrieval",
+            get_regulatory_provision_heading_source=MagicMock(return_value=None),
+            get_bounded_same_provision_siblings=MagicMock(return_value=[]),
+            get_bounded_referenced_provisions=MagicMock(return_value=[]),
+            get_bounded_adjacent_provisions=MagicMock(return_value=[]),
+            get_bounded_source_lexical_matches=MagicMock(return_value=[]),
+        ),
+        patch(
+            f"{MODULE}.get_visible_regulatory_chunk_ids",
+            side_effect=lambda _session, chunk_ids, **_kwargs: set(chunk_ids),
+        ),
         patch(f"{MODULE}.get_llm_token_counter", return_value=lambda text: len(text)),
         patch(f"{MODULE}.search_pipeline", mock_search_pipeline),
     ):
@@ -2074,3 +2086,17 @@ def test_auto_detect_disabled_keeps_user_selected_filters() -> None:
     for applied in filters:
         assert applied is not None
         assert applied.source_type == restriction
+
+
+def test_named_provision_does_not_force_exact_source_lane_in_normal_chat() -> None:
+    question = "Karayolu Dışında Kullanılan Hareketli Makinaların İthalat Denetimi Tebliği’nin 1 inci maddesinin ikinci fıkrası nedir?"
+    lanes = build_query_lanes(
+        original_query=question,
+        semantic_query=None,
+        model_queries=[question],
+        keyword_queries=[],
+        search_mode="hybrid",
+        regulatory_chunks_only=False,
+    )
+    exact = [lane for lane in lanes if getattr(lane, "exact_source_hint", None)]
+    assert exact == []

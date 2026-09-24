@@ -616,3 +616,36 @@ class TestMergeToolCalls:
         assert len(result) == 1
         # String should be converted to list item
         assert result[0].tool_args["queries"] == ["single_query", "q2"]
+
+
+def test_provision_and_internal_search_get_distinct_citation_slots() -> None:
+    from onyx.tools.tool_implementations.regulatory_provision.regulatory_provision_tool import (
+        RegulatoryProvisionTool,
+    )
+    from onyx.tools.tool_implementations.search.search_tool import SearchTool
+
+    exact = MagicMock(spec=RegulatoryProvisionTool)
+    exact.name = RegulatoryProvisionTool.NAME
+    search = MagicMock(spec=SearchTool)
+    search.name = SearchTool.NAME
+    calls = [
+        _make_tool_call(
+            exact.name, {"source": "Kanun", "article_number": "1"}, "exact"
+        ),
+        _make_tool_call(search.name, {"queries": ["source"]}, "search"),
+    ]
+    with patch(
+        "onyx.tools.tool_runner.run_functions_tuples_in_parallel", return_value=[]
+    ) as parallel:
+        run_tool_calls(
+            tool_calls=calls,
+            tools=[exact, search],
+            message_history=[_chat_message("Soruyu araştır", MessageType.USER)],
+            user_memory_context=None,
+            user_info=None,
+            citation_mapping={},
+            next_citation_num=1,
+        )
+    params = parallel.call_args.args[0]
+    overrides = [args[2] for _, args in params]
+    assert [item.starting_citation_num for item in overrides] == [1, 101]

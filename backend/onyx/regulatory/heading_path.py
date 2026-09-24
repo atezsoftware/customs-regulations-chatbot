@@ -287,9 +287,14 @@ def extract_regulatory_instrument_source_hint(query: str) -> str | None:
         # contiguous title-cased name immediately before the legal-form word.
         # Lower-case/model-normalized queries retain the bounded fallback above.
         title_start_index = designator_index
-        while title_start_index > start_index:
+        while title_start_index > max(0, designator_index - 20):
             preceding_term = original_terms[title_start_index - 1]
-            if not preceding_term[:1].isupper():
+            if not preceding_term[:1].isupper() or _fold(preceding_term) in {
+                "olay",
+                "soru",
+                "ornek",
+                "bu",
+            }:
                 break
             title_start_index -= 1
         if title_start_index < designator_index:

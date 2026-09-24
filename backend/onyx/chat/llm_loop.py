@@ -129,6 +129,9 @@ from onyx.tools.tool_implementations.images.models import FinalImageGenerationRe
 from onyx.tools.tool_implementations.memory.models import MemoryToolResponse
 from onyx.tools.tool_implementations.open_url.open_url_tool import OpenURLTool
 from onyx.tools.tool_implementations.python.python_tool import PythonTool
+from onyx.tools.tool_implementations.regulatory_provision.regulatory_provision_tool import (
+    RegulatoryProvisionTool,
+)
 from onyx.tools.tool_implementations.search.search_tool import (
     SearchTool,
     _prepare_search_query,
@@ -1912,6 +1915,11 @@ def _search_query_mode_identity(
 ) -> tuple[str, str] | None:
     """Return the retrieval semantics used for exact duplicate prevention."""
 
+    if tool_call.tool_name == RegulatoryProvisionTool.NAME:
+        return (
+            json.dumps(tool_call.tool_args, sort_keys=True, ensure_ascii=False),
+            "structural",
+        )
     if tool_call.tool_name != SearchTool.NAME:
         return None
     raw_queries = tool_call.tool_args.get("queries")
@@ -1945,7 +1953,7 @@ def _constrain_regulatory_tool_calls(
     retained_search_calls = 0
 
     for tool_call in tool_calls:
-        if tool_call.tool_name != SearchTool.NAME:
+        if tool_call.tool_name not in (SearchTool.NAME, RegulatoryProvisionTool.NAME):
             constrained.append(tool_call)
             continue
 
@@ -3728,10 +3736,12 @@ def run_llm_loop(
                 attempted_query_modes=regulatory_attempted_query_modes,
             )
             requested_search_calls = sum(
-                tool_call.tool_name == SearchTool.NAME for tool_call in raw_tool_calls
+                tool_call.tool_name in (SearchTool.NAME, RegulatoryProvisionTool.NAME)
+                for tool_call in raw_tool_calls
             )
             executed_search_calls = sum(
-                tool_call.tool_name == SearchTool.NAME for tool_call in tool_calls
+                tool_call.tool_name in (SearchTool.NAME, RegulatoryProvisionTool.NAME)
+                for tool_call in tool_calls
             )
             regulatory_tool_feedback = _format_regulatory_tool_call_batch_feedback(
                 requested_search_calls=requested_search_calls,
@@ -3763,7 +3773,10 @@ def run_llm_loop(
                 else:
                     llm_step_result.tool_calls = tool_calls
                 for tool_call in tool_calls:
-                    if tool_call.tool_name != SearchTool.NAME:
+                    if tool_call.tool_name not in (
+                        SearchTool.NAME,
+                        RegulatoryProvisionTool.NAME,
+                    ):
                         continue
                     regulatory_search_calls_attempted += 1
                     query_mode = _search_query_mode_identity(tool_call)
@@ -4340,7 +4353,10 @@ def run_llm_loop(
                 )
                 llm_history_response = tool_response.llm_facing_response
                 repeated_result_count = 0
-                if tool_call.tool_name == SearchTool.NAME:
+                if tool_call.tool_name in (
+                    SearchTool.NAME,
+                    RegulatoryProvisionTool.NAME,
+                ):
                     (
                         llm_history_response,
                         repeated_result_count,
@@ -4353,8 +4369,15 @@ def run_llm_loop(
                 )
 
                 # Track whether indexed evidence is available for review and synthesis.
-                if tool_call.tool_name == SearchTool.NAME:
-                    has_called_search_tool = True
+                if tool_call.tool_name in (
+                    SearchTool.NAME,
+                    RegulatoryProvisionTool.NAME,
+                ):
+                    if tool_call.tool_name == SearchTool.NAME or (
+                        isinstance(tool_response.rich_response, SearchDocsResponse)
+                        and tool_response.rich_response.search_docs
+                    ):
+                        has_called_search_tool = True
 
                 # Track if code interpreter generated files with download links
                 if (
@@ -4386,19 +4409,24 @@ def run_llm_loop(
                     search_docs = tool_response.rich_response.search_docs
                     displayed_docs = tool_response.rich_response.displayed_docs
 
-                    if tool_call.tool_name == SearchTool.NAME:
+                    if tool_call.tool_name in (
+                        SearchTool.NAME,
+                        RegulatoryProvisionTool.NAME,
+                    ):
                         raw_queries = tool_call.tool_args.get("queries")
                         query = (
                             raw_queries[0]
                             if isinstance(raw_queries, list)
                             and raw_queries
                             and isinstance(raw_queries[0], str)
-                            else "unspecified query"
+                            else json.dumps(tool_call.tool_args, ensure_ascii=False)
                         )
                         raw_search_mode = tool_call.tool_args.get("search_mode")
                         search_mode = (
                             raw_search_mode
                             if isinstance(raw_search_mode, str)
+                            else "structural"
+                            if tool_call.tool_name == RegulatoryProvisionTool.NAME
                             else "unspecified"
                         )
                         llm_visible_results = _extract_llm_visible_search_results(

@@ -6556,11 +6556,11 @@ class AmendmentBatch(Base):
             "created_at",
         ),
         CheckConstraint(
-            "status IN ('queued', 'analyzing', 'analyzed', 'failed')",
+            "status IN ('queued', 'analyzing', 'analyzed', 'failed', 'paused')",
             name="amendment_batch_status_check",
         ),
         CheckConstraint(
-            "stage IN ('queued', 'segmenting', 'processing', 'finalizing')",
+            "stage IN ('queued', 'segmenting', 'processing', 'finalizing', 'waiting_resources')",
             name="amendment_batch_stage_check",
         ),
         CheckConstraint(
@@ -6571,6 +6571,31 @@ class AmendmentBatch(Base):
         CheckConstraint(
             "lease_generation >= 0",
             name="amendment_batch_lease_generation_check",
+        ),
+    )
+
+
+class AmendmentMatchCheckpoint(Base):
+    """One durable matching result, independent of a worker's lifetime."""
+
+    __tablename__ = "amendment_match_checkpoint"
+
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("amendment_batch.id", ondelete="CASCADE"), primary_key=True
+    )
+    instruction_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    input_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(PGJSONB, nullable=False)
+    source_fingerprints: Mapped[dict[str, str]] = mapped_column(PGJSONB, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "instruction_index >= 0 AND lease_generation >= 0",
+            name="amendment_match_checkpoint_indices_check",
         ),
     )
 

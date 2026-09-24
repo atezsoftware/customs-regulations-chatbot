@@ -94,7 +94,9 @@ def test_regulatory_scope_requires_postgres_backed_chunk_identity() -> None:
     clauses = _build_filters(regulatory_chunks_only=True)
 
     assert {"exists": {"field": REGULATORY_CHUNK_ID_FIELD_NAME}} in clauses
-    assert _build_filters(regulatory_chunks_only=False) == []
+    assert {"exists": {"field": REGULATORY_CHUNK_ID_FIELD_NAME}} not in _build_filters(
+        regulatory_chunks_only=False
+    )
 
 
 def test_regulatory_validity_window_has_exclusive_end_boundary() -> None:
@@ -240,3 +242,67 @@ def test_empty_range_is_skipped() -> None:
     """A range with neither bound set contributes no clause."""
     clauses = _build_filters(created_at_range=TimeRange())
     assert _clause_for_field(clauses, CREATED_AT_FIELD_NAME) is None
+
+
+def test_named_provision_filter_keeps_acl_publication_and_validity_constraints() -> (
+    None
+):
+    import json
+
+    from onyx.context.search.models import IndexFilters
+
+    source = (
+        "Karayolu Dışında Kullanılan Hareketli Makinaların İthalat Denetimi Tebliği"
+    )
+    query = DocumentQuery.get_keyword_search_query(
+        query_text=f"{source} 1 inci maddesinin ikinci fıkrası",
+        num_hits=12,
+        tenant_state=TenantState(tenant_id=POSTGRES_DEFAULT_SCHEMA, multitenant=False),
+        index_filters=IndexFilters(
+            access_control_list=["allowed-principal"],
+            document_set=["allowed-set"],
+            as_of_date=date(2026, 9, 24),
+            regulatory_chunks_only=True,
+            regulatory_source_hint=source,
+        ),
+        include_hidden=False,
+    )
+    serialized = json.dumps(query, ensure_ascii=False)
+    for required in (
+        "allowed-principal",
+        "allowed-set",
+        "publication_tombstone",
+        "validity_start_date",
+        "validity_end_date",
+    ):
+        assert required in serialized
+    assert '"type": "phrase"' in serialized
+    assert source in serialized
+
+
+def test_optional_structural_lookup_preserves_scope_without_full_text_ranking() -> None:
+    import json
+
+    from onyx.context.search.models import IndexFilters
+
+    query = DocumentQuery.get_keyword_search_query(
+        query_text="MADDE 72",
+        num_hits=129,
+        tenant_state=TenantState(tenant_id=POSTGRES_DEFAULT_SCHEMA, multitenant=False),
+        index_filters=IndexFilters(
+            access_control_list=["user:restricted"],
+            document_set=["selected-corpus"],
+            as_of_date=date(2026, 9, 24),
+            regulatory_chunks_only=True,
+            regulatory_source_hint="5434",
+            regulatory_lookup=True,
+            regulatory_lookup_heading="MADDE 72",
+        ),
+        include_hidden=False,
+    )
+    assert set(query["query"]["bool"]) == {"filter"}
+    filters = json.dumps(query["query"]["bool"]["filter"])
+    assert "user:restricted" in filters and "selected-corpus" in filters
+    assert "5434" in filters and "MADDE 72" in filters
+    assert VALIDITY_END_DATE_FIELD_NAME in filters
+    assert query["size"] == 129

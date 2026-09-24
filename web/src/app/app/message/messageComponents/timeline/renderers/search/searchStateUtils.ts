@@ -46,6 +46,7 @@ export interface SearchState {
   hasResults: boolean;
   isComplete: boolean;
   isInternetSearch: boolean;
+  displayName: string | null;
 }
 
 const MAX_HEADER_SOURCES = 3;
@@ -186,5 +187,6 @@ export const constructCurrentSearchState = (
     hasResults,
     isComplete,
     isInternetSearch,
+    displayName: searchStart?.display_name ?? null,
   };
 };

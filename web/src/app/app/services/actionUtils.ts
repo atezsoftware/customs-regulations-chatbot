@@ -15,6 +15,7 @@ import {
 const isSearchTool = (tool: ToolSnapshot): boolean => {
   return (
     tool.in_code_tool_id === "SearchTool" ||
+    tool.in_code_tool_id === "RegulatoryProvisionTool" ||
     tool.name === "run_search" ||
     tool.display_name?.toLowerCase().includes("search tool")
   );

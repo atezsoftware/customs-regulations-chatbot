@@ -1,6 +1,6 @@
 """Durable execution of one checkpointed amendment-analysis batch."""
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date
@@ -8,6 +8,12 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from onyx.db.amendment_match_checkpoints import (
+    capture_match_evidence,
+    load_match_checkpoint,
+    match_scope_fingerprint,
+    persist_match_checkpoint,
+)
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.regulatory_amendments import (
     append_batch_log,
@@ -16,7 +22,6 @@ from onyx.db.regulatory_amendments import (
     persist_proposal_checkpoint,
     persist_segmentation_checkpoint,
     persist_unmatched_checkpoint,
-    touch_batch_heartbeat,
 )
 from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.amendment_context import (
@@ -26,6 +31,11 @@ from onyx.regulatory.amendments.amendment_context import (
 from onyx.regulatory.amendments.analysis_llm import get_amendment_analysis_llm
 from onyx.regulatory.amendments.draft_integrity import DraftIntegrityError
 from onyx.regulatory.amendments.drafter import AmendmentDateConflict
+from onyx.regulatory.amendments.match_checkpoint import (
+    MatchedInstruction,
+    MatchEvidence,
+    match_input_sha256,
+)
 from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
 from onyx.regulatory.amendments.new_provision_policy import (
     added_subordinate_unit_kind,
@@ -56,14 +66,6 @@ from onyx.regulatory.structured_llm import StructuredOutputValidationError
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
-
-
-@dataclass(frozen=True)
-class _MatchedInstruction:
-    instruction_index: int
-    instruction: AmendmentInstruction
-    candidates: list[CandidateChunk]
-    match: MatchResult
 
 
 @contextmanager
@@ -149,11 +151,14 @@ def retrieve_and_confirm_instruction(
     instruction: AmendmentInstruction,
     amendment_context: AmendmentContext | None = None,
     trace: "_InstructionTrace | None" = None,
+    capture_evidence: Callable[[list[CandidateChunk]], None] | None = None,
 ) -> tuple[list[CandidateChunk], MatchResult | None]:
     """Search, confirm, then make at most one focused recovery attempt."""
 
     trace = trace if trace is not None else _InstructionTrace()
     candidates = retriever.search(instruction=instruction, recovery=False)
+    if capture_evidence is not None:
+        capture_evidence(candidates)
     trace.searched += 1
     trace.candidates = len(candidates)
     trace.queries.extend(retriever.query_stats)
@@ -201,6 +206,8 @@ def retrieve_and_confirm_instruction(
     if not recovered:
         return candidates, None
     candidates = _merge_candidates(candidates, recovered)
+    if capture_evidence is not None:
+        capture_evidence(candidates)
     trace.candidates = len(candidates)
     if appendix_replacement_attention_message(instruction, candidates) is not None:
         trace.note = "This annex target needs its replacement body supplied."
@@ -217,7 +224,21 @@ def retrieve_and_confirm_instruction(
     return candidates, match
 
 
-def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
+MatchGroupKey = tuple[str, str | int]
+MatchOutcome = tuple[int, MatchGroupKey] | None
+InstructionRunner = Callable[
+    [Callable[[int], MatchOutcome], list[int]], Iterable[MatchOutcome]
+]
+
+
+def run_amendment_batch(
+    *,
+    batch_id: int,
+    lease_generation: int,
+    instruction_runner: InstructionRunner | None = None,
+    check_resources: Callable[[], None] | None = None,
+    before_work: Callable[[], None] | None = None,
+) -> None:
     def log(step: str, **fields: object) -> None:
         with _session() as log_session:
             append_batch_log(
@@ -238,7 +259,6 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         batch = get_batch(db_session, batch_id)
         if batch is None:
             raise RuntimeError(f"Amendment batch {batch_id} no longer exists")
-        pdf_source = load_batch_pdf_source(db_session, batch)
         user_file_ids = [UUID(value) for value in batch.user_file_ids]
         document_set_id = batch.document_set_id
         created_by = batch.created_by
@@ -260,15 +280,10 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             instruction_payloads = []
             reference_date = None
 
-        retriever = build_amendment_search_retriever(
-            db_session,
-            document_set_id=document_set_id,
-            created_by=created_by,
-            user_file_ids=user_file_ids,
-            llm=llm,
-        )
-
+    del batch
     if not instruction_payloads:
+        if before_work is not None:
+            before_work()
         # No database session is held while the provider performs segmentation.
         # An empty result is a legitimate terminal outcome, not a failure: the
         # segmenter is instructed to return no instructions whenever the pasted
@@ -308,6 +323,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             ):
                 raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
         reference_date = segmentation.reference_date
+        del segmentation
 
     instructions = propagate_target_sources(
         [
@@ -332,9 +348,9 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
     )
 
     annex_indices: set[int] = set()
-    groups = group_annex_instructions(instructions)
+    annex_groups = group_annex_instructions(instructions)
     review_groups = []
-    if annex_config.REGULATORY_ANNEX_UPDATES_ENABLED and groups:
+    if annex_config.REGULATORY_ANNEX_UPDATES_ENABLED and annex_groups:
         with _session() as db_session:
             batch = get_batch(db_session, batch_id)
             if batch is None:
@@ -342,7 +358,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             # A package supplies evidence, not the operation type. Explicit
             # edits use indexed chunks; only replacement evidence needs review.
             if batch.source_package_id is not None:
-                for group in groups:
+                for group in annex_groups:
                     if not can_draft_annex_from_instructions(
                         db_session,
                         batch=batch,
@@ -353,7 +369,8 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     ):
                         annex_indices.update(group.instruction_indices)
                         review_groups.append(group)
-    for group in groups:
+        del batch
+    for group in annex_groups:
         log(
             "annex_route_selected",
             indices=group.instruction_indices,
@@ -367,20 +384,51 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
         instructions=len(instructions),
         already_processed=sorted(processed_instruction_indices),
         annex_handled=sorted(annex_indices),
-        annex_groups=len(groups),
+        annex_groups=len(annex_groups),
     )
-    matched_instructions: list[_MatchedInstruction] = []
-    for instruction_index, instruction in enumerate(instructions):
+    input_sha256 = match_input_sha256(
+        raw_text=raw_text,
+        instructions=[item.model_dump(mode="json") for item in instructions],
+        document_set_id=document_set_id,
+        user_file_ids=sorted(str(value) for value in user_file_ids),
+        created_by=created_by,
+        reference_date=reference_date,
+        retrieval_date=date.today().isoformat(),
+        model=str(llm.config.model_name),
+        provider=str(llm.config.model_provider),
+    )
+    del raw_text, instruction_payloads
+    groups: dict[tuple[str, str | int], list[int]] = {}
+
+    def match_one(instruction_index: int) -> MatchOutcome:
+        if check_resources is not None:
+            check_resources()
+        instruction = instructions[instruction_index]
+        instruction_llm = (
+            get_amendment_analysis_llm() if instruction_runner is not None else llm
+        )
         if instruction_index in processed_instruction_indices:
             log(
                 "instruction_skipped",
                 index=instruction_index,
                 reason="already processed",
             )
-            continue
+            return None
         if instruction_index in annex_indices:
             log("instruction_skipped", index=instruction_index, reason="annex review")
-            continue
+            return None
+        with _session() as db_session:
+            checkpoint = load_match_checkpoint(
+                db_session,
+                batch_id=batch_id,
+                instruction_index=instruction_index,
+                input_sha256=input_sha256,
+            )
+        if checkpoint is not None:
+            restored_group = checkpoint.group_key
+            log("instruction_match_restored", index=instruction_index)
+            del checkpoint
+            return instruction_index, restored_group
         log(
             "instruction_started",
             index=instruction_index,
@@ -389,14 +437,37 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             target_source=instruction.target_source,
             article_reference=instruction.article_reference,
         )
+        with _session() as db_session:
+            source_scope = match_scope_fingerprint(
+                db_session, [str(value) for value in user_file_ids]
+            )
+            retriever = build_amendment_search_retriever(
+                db_session,
+                document_set_id=document_set_id,
+                created_by=created_by,
+                user_file_ids=user_file_ids,
+                llm=instruction_llm,
+            )
+        evidence: MatchEvidence | None = None
+
+        def capture(candidates: list[CandidateChunk]) -> None:
+            nonlocal evidence
+            with _session() as db_session:
+                evidence = capture_match_evidence(
+                    db_session, [str(value) for value in user_file_ids], candidates
+                )
+            if evidence.scope_sha256 != source_scope:
+                raise ValueError("Amendment source identity changed during retrieval")
+
         trace = _InstructionTrace()
         try:
             candidates, match = retrieve_and_confirm_instruction(
                 retriever=retriever,
-                llm=llm,
+                llm=instruction_llm,
                 instruction=instruction,
                 amendment_context=amendment_context,
                 trace=trace,
+                capture_evidence=capture,
             )
         except (StructuredOutputValidationError, TimeoutError) as error:
             log(
@@ -413,6 +484,8 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     batch_id=batch_id,
                     lease_generation=lease_generation,
                     instruction_index=instruction_index,
+                    expected_evidence=evidence
+                    or MatchEvidence(scope_sha256=source_scope, candidates={}),
                     instruction_text=(
                         f"{instruction.instruction_text}\n\nAttention: Model output "
                         f"could not be validated ({type(error).__name__})."
@@ -420,7 +493,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                 )
             if not persisted:
                 raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
-            continue
+            return None
         except Exception as error:
             # Still fatal, but no longer silent: the batch's own record names
             # what stopped it instead of only saying that it stopped.
@@ -447,6 +520,9 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             outcome="matched" if match else "unmatched",
             detail=trace.describe() if match is None else None,
         )
+        if check_resources is not None:
+            check_resources()
+        outcome: MatchOutcome = None
         if match is None:
             unresolved_text = (
                 appendix_replacement_attention_message(instruction, candidates)
@@ -458,67 +534,86 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     batch_id=batch_id,
                     lease_generation=lease_generation,
                     instruction_index=instruction_index,
+                    expected_evidence=evidence
+                    or MatchEvidence(scope_sha256=source_scope, candidates={}),
                     instruction_text=unresolved_text,
                 )
             if not persisted:
                 raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
         else:
+            checkpoint = MatchedInstruction(
+                instruction_index=instruction_index,
+                instruction=instruction,
+                candidates=candidates,
+                match=match,
+                evidence=evidence,
+            )
             with _session() as db_session:
-                heartbeat_refreshed = touch_batch_heartbeat(
+                persisted = persist_match_checkpoint(
                     db_session,
                     batch_id=batch_id,
                     lease_generation=lease_generation,
+                    input_sha256=input_sha256,
+                    checkpoint=checkpoint,
                 )
-            if not heartbeat_refreshed:
+            if not persisted:
                 raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
-            matched_instructions.append(
-                _MatchedInstruction(
-                    instruction_index=instruction_index,
-                    instruction=instruction,
-                    candidates=candidates,
-                    match=match,
-                )
-            )
+            outcome = instruction_index, checkpoint.group_key
+            log("instruction_match_checkpointed", index=instruction_index)
+            del checkpoint
 
         logger.info(
             "Amendment batch=%s collected instruction=%s/%s lease=%s candidates=%s",
             batch_id,
             instruction_index + 1,
-            len(instruction_payloads),
+            len(instructions),
             lease_generation,
             len(candidates),
         )
 
-    groups: dict[tuple[str, str | int], list[_MatchedInstruction]] = {}
-    for matched_instruction in matched_instructions:
-        old_chunk_id = matched_instruction.match.old_chunk_id
-        structural_target = parse_amendment_structural_target(
-            matched_instruction.instruction
-        )
-        group_key: tuple[str, str | int] = (
-            (
-                "appendix",
-                f"{next((candidate.user_file_id for candidate in matched_instruction.candidates if candidate.chunk_id == old_chunk_id), old_chunk_id)}:{normalize_appendix_label(structural_target.appendix_label)}",
-            )
-            if old_chunk_id is not None
-            and structural_target is not None
-            and structural_target.appendix_label is not None
-            else ("existing", old_chunk_id)
-            if old_chunk_id is not None
-            else ("new", matched_instruction.instruction_index)
-        )
-        groups.setdefault(group_key, []).append(matched_instruction)
+        # Only checkpoint references survive the next retrieval/model call.
+        return outcome
 
-    ordered_groups = sorted(
-        groups.values(),
-        key=lambda group: min(item.instruction_index for item in group),
-    )
-    for group in ordered_groups:
-        ordered_group = sorted(group, key=lambda item: item.instruction_index)
-        instruction_indices = [item.instruction_index for item in ordered_group]
+    outcomes = (instruction_runner or map)(match_one, list(range(len(instructions))))
+    for outcome in outcomes:
+        if outcome is not None:
+            index, group_key = outcome
+            groups.setdefault(group_key, []).append(index)
+
+    with _session() as db_session:
+        batch = get_batch(db_session, batch_id)
+        if batch is None:
+            raise RuntimeError(f"Amendment batch {batch_id} no longer exists")
+        pdf_source = load_batch_pdf_source(db_session, batch)
+    del batch
+    ordered_groups = sorted(groups.values(), key=lambda indices: min(indices))
+
+    def draft_group(group: list[int]) -> None:
+        if before_work is not None:
+            before_work()
+        if check_resources is not None:
+            check_resources()
+        instruction_indices = sorted(group)
+        ordered_group: list[MatchedInstruction] = []
         group_candidates: list[CandidateChunk] = []
-        for item in ordered_group:
-            group_candidates = _merge_candidates(group_candidates, item.candidates)
+        with _session() as db_session:
+            for instruction_index in instruction_indices:
+                checkpoint = load_match_checkpoint(
+                    db_session,
+                    batch_id=batch_id,
+                    instruction_index=instruction_index,
+                    input_sha256=input_sha256,
+                )
+                if checkpoint is None:
+                    raise RuntimeError(
+                        "Amendment match source changed before drafting; resume to revalidate"
+                    )
+                group_candidates = _merge_candidates(
+                    group_candidates, checkpoint.candidates
+                )
+                # Drafting needs each operation and one shared candidate set.
+                ordered_group.append(checkpoint.model_copy(update={"candidates": []}))
+                del checkpoint
 
         appendix_target = parse_amendment_structural_target(
             ordered_group[0].instruction
@@ -580,6 +675,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     for row in appendix_rows
                     if not row.chunk_metadata.get("bound_to_regulatory_chunk_id")
                 ]
+                del appendix_rows
             if len(appendix_candidate_ids) > 1:
                 for candidate_id in appendix_candidate_ids:
                     context = load_instruction_draft_context(
@@ -641,7 +737,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     )
                 if not persisted:
                     raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
-            continue
+            return
 
         try:
             if len(contexts) > 1:
@@ -692,7 +788,7 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     )
                 if not persisted:
                     raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
-            continue
+            return
         except (DraftIntegrityError, AmendmentDateConflict) as error:
             log(
                 "draft_group_rejected",
@@ -712,7 +808,9 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
                     )
                 if not persisted:
                     raise RuntimeError(f"Amendment batch {batch_id} lost its lease")
-            continue
+            return
+        if check_resources is not None:
+            check_resources()
         with _session() as db_session:
             persisted = persist_proposal_checkpoint(
                 db_session,
@@ -730,7 +828,14 @@ def run_amendment_batch(*, batch_id: int, lease_generation: int) -> None:
             len(group_candidates),
         )
 
+    for group in ordered_groups:
+        draft_group(group)
     log("proposals_finished", groups=len(ordered_groups))
+    if check_resources is not None:
+        check_resources()
+
+    if review_groups and before_work is not None:
+        before_work()
     run_annex_groups(
         batch_id=batch_id,
         lease_generation=lease_generation,

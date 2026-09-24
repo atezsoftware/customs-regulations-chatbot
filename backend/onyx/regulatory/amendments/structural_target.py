@@ -1,13 +1,25 @@
 """Deterministic structural anchors for amendment target retrieval."""
 
 import re
-import unicodedata
 from dataclasses import dataclass
 
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.ranker import CandidateChunk
-from onyx.regulatory.heading_path import (
-    extract_regulatory_provision_references,
+from onyx.regulatory.paragraph_reference import extract_single_paragraph_reference
+from onyx.regulatory.provision_identity import (
+    QUALIFIED_ARTICLE_RE as _QUALIFIED_ARTICLE_RE,
+)
+from onyx.regulatory.provision_identity import (
+    article_identity as article_identity,
+)
+from onyx.regulatory.source_identity import (
+    named_law_number as named_law_number,
+)
+from onyx.regulatory.source_identity import (
+    source_identity_distinguishing_tokens as source_identity_distinguishing_tokens,
+)
+from onyx.regulatory.source_identity import (
+    source_identity_matches as source_identity_matches,
 )
 
 _CLAUSE_REFERENCE_RE = re.compile(
@@ -24,41 +36,9 @@ _INSTRUCTION_HEADER_RE = re.compile(
     r"[-–—.)]\s*",
     flags=re.IGNORECASE,
 )
-_PARAGRAPH_ORDINALS = {
-    "birinci": "1",
-    "ikinci": "2",
-    "üçüncü": "3",
-    "ucuncu": "3",
-    "dördüncü": "4",
-    "dorduncu": "4",
-    "beşinci": "5",
-    "besinci": "5",
-    "altıncı": "6",
-    "altinci": "6",
-    "yedinci": "7",
-    "sekizinci": "8",
-    "dokuzuncu": "9",
-    "onuncu": "10",
-}
-_PARAGRAPH_ORDINAL_ALTERNATION: str = "|".join(
-    sorted(_PARAGRAPH_ORDINALS, key=lambda name: (-len(name), name))
-)
-_PARAGRAPH_REFERENCE_RE = re.compile(
-    rf"(?:(?P<ordinal>{_PARAGRAPH_ORDINAL_ALTERNATION})"
-    r"|(?P<number>\d{1,3})\s*(?:inci|ıncı|incı|uncu|üncü|uncü|nci|ncı|ncu|ncü)?)"
-    r"\s+f[ıi]kra",
-    flags=re.IGNORECASE,
-)
 _APPENDIX_REFERENCE_RE = re.compile(
     r"(?<![\w])ek\s*[-–—:.]?\s*(?P<label>\d+[a-z]?)\b",
     flags=re.IGNORECASE,
-)
-_QUALIFIED_ARTICLE_RE = re.compile(
-    r"(?<!\w)(?P<kind>ek|geçici|gecici|mükerrer|mukerrer)\s+"
-    r"(?:madde\s+(?P<forward>\d+[a-z]?)\b|"
-    r"(?P<reverse>\d+[a-z]?)\s*(?:[.'’]?\s*"
-    r"(?:inci|ıncı|uncu|üncü|nci|ncı|ncu|ncü))?\s+madd\w*)",
-    re.IGNORECASE,
 )
 _EDIT_VERB_RE = re.compile(
     r"\b(?:değiştirilmiş|degistirilmis|eklenmiş|eklenmis|"
@@ -66,6 +46,7 @@ _EDIT_VERB_RE = re.compile(
     r"çıkarılmış|cikarilmis)(?:tir|tır|tur|tür|ti)?\b",
     re.IGNORECASE,
 )
+
 _QUOTED_TEXT_RE = re.compile(r'"[^"]*"|“[^”]*”', re.DOTALL)
 _QUOTED_APPENDIX_TARGET_RE = re.compile(
     r'[“"]((?:ek|annex|appendix)[\s:–—-]*(?:\d+[a-z]?|[ivxlcdm]+|[a-z])'
@@ -75,27 +56,6 @@ _QUOTED_APPENDIX_TARGET_RE = re.compile(
 _ATTACHED_REPLACEMENT_RE = re.compile(
     r"ekteki\s+şekilde\s+değiştirilmiştir\s*[.!:]?",
     flags=re.IGNORECASE,
-)
-_SOURCE_GENERIC_TOKENS = frozenset(
-    {
-        "genel",
-        "gumruk",
-        "karar",
-        "karari",
-        "kanun",
-        "kanunu",
-        "no",
-        "sayili",
-        "seri",
-        "tebligi",
-        "teblig",
-        "urun",
-        "guvenligi",
-        "denetimi",
-        "ve",
-        "yonetmeligi",
-        "yonetmelik",
-    }
 )
 
 
@@ -114,72 +74,6 @@ def normalize_appendix_label(value: str) -> str:
             character for character in value.casefold() if character.isalnum()
         )
     return f"ek{match.group('label').casefold()}"
-
-
-def _source_identity_tokens(value: str) -> set[str]:
-    decoded = re.sub(r"_?x[12]", " ", value, flags=re.IGNORECASE)
-    folded = unicodedata.normalize(
-        "NFKD",
-        decoded.casefold().translate(
-            str.maketrans({"ı": "i", "ş": "s", "ç": "c", "ğ": "g", "ö": "o", "ü": "u"})
-        ),
-    )
-    ascii_value = "".join(
-        character for character in folded if not unicodedata.combining(character)
-    )
-    return {
-        str(int(token)) if token.isdigit() else token
-        for token in re.findall(r"[a-z0-9]+", ascii_value)
-    }
-
-
-def source_identity_matches(target_source: str | None, source_name: str) -> bool:
-    """Require explicit instrument-specific title tokens when they are available."""
-
-    if not target_source:
-        return True
-    law_number = named_law_number(target_source)
-    source_number = named_law_number(source_name)
-    if law_number is not None:
-        return law_number == source_number
-    distinguishing_tokens = set(source_identity_distinguishing_tokens(target_source))
-    if not distinguishing_tokens:
-        return True
-    return distinguishing_tokens <= _source_identity_tokens(source_name)
-
-
-def named_law_number(source_name: str) -> str | None:
-    """Identify a law title, not a law cited inside another document's name."""
-    folded = unicodedata.normalize("NFKD", source_name.casefold().replace("ı", "i"))
-    title = "".join(
-        character for character in folded if not unicodedata.combining(character)
-    ).replace("_", " ")
-    if not re.search(r"\bkanun", title):
-        return None
-    match = re.search(r"\b(\d{3,5})\s+sayili\b", title)
-    if match is not None:
-        own_title = re.sub(
-            r"\.(?:md|txt|pdf|docx|html?)$", "", title[match.end() :]
-        ).strip()
-        # A title may itself amend other laws. Its final instrument type, not
-        # the word 'amendment', distinguishes it from a regulation citing a law.
-        if not re.search(r"\bkanun(?:u)?(?:\s*\(.*\))?\s*$", own_title):
-            return None
-        if re.match(r"kanun(?:da|unda|a|una)\b", own_title):
-            return None
-    if match is None:
-        match = re.search(r"\bkanun\s+(?:no|numarasi)\s*[:.]?\s*(\d{3,5})\b", title)
-    return str(int(match.group(1))) if match else None
-
-
-def source_identity_distinguishing_tokens(
-    target_source: str | None,
-) -> tuple[str, ...]:
-    if not target_source:
-        return ()
-    return tuple(
-        sorted(_source_identity_tokens(target_source) - _SOURCE_GENERIC_TOKENS)
-    )
 
 
 def amended_body(instruction_text: str) -> str:
@@ -201,47 +95,23 @@ def amendment_operation_text(instruction_text: str) -> str:
     # mistaken for the command being performed.
     unquoted = unquoted_text(body)
     command = _EDIT_VERB_RE.search(unquoted)
-    return unquoted[: command.end()] if command is not None else unquoted
-
-
-def article_identity(reference: str) -> str | None:
-    """Preserve the normal/additional/temporary/repeated article namespace."""
-    references = extract_regulatory_provision_references(reference)
-    if not references:
-        return None
-    number = references[0].article_no
-    qualified = _QUALIFIED_ARTICLE_RE.search(reference)
-    if (
-        qualified
-        and (qualified.group("forward") or qualified.group("reverse")).upper() == number
+    if command is None:
+        return unquoted
+    end = command.end()
+    # Keep the coordinated heading/addition command together. Other multi-edit
+    # instructions retain their existing target-resolution contract.
+    if not re.search(
+        r"başlığı\s+şeklinde\s+değiştirilmiş", unquoted[:end], re.IGNORECASE
     ):
-        kind = qualified.group("kind").casefold().replace("\u0307", "")
-        prefix = (
-            "EK"
-            if kind == "ek"
-            else "GEÇİCİ"
-            if kind in {"geçici", "gecici"}
-            else "MÜKERRER"
-        )
-        return f"{prefix} {number}"
-    return number
-
-
-def _target_paragraph_no(instruction_body: str) -> str | None:
-    """Return the single amended paragraph number, if the text names one."""
-
-    numbers = {
-        _PARAGRAPH_ORDINALS[
-            match.group("ordinal").casefold().replace("\u0307", "").replace("ı", "i")
-        ]
-        if match.group("ordinal")
-        else match.group("number").lstrip("0")
-        for match in _PARAGRAPH_REFERENCE_RE.finditer(instruction_body)
-    }
-    numbers.discard("")
-    if len(numbers) != 1:
-        return None
-    return next(iter(numbers))
+        return unquoted[:end]
+    for following in _EDIT_VERB_RE.finditer(unquoted, end):
+        connector = unquoted[end : following.start()]
+        if not re.match(r"\s+ve\s+", connector, re.IGNORECASE) or re.search(
+            r"[:.\n]", connector
+        ):
+            break
+        end = following.end()
+    return unquoted[:end]
 
 
 def appendix_reference_text(text: str) -> str:
@@ -286,7 +156,7 @@ def parse_amendment_structural_target(
         appendix_label=(
             f"EK-{appendix_match.group('label').upper()}" if appendix_match else None
         ),
-        paragraph_no=_target_paragraph_no(instruction_body),
+        paragraph_no=extract_single_paragraph_reference(instruction_body),
     )
     if target.article_no is None and target.appendix_label is None:
         return None

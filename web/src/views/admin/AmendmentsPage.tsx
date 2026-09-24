@@ -139,9 +139,14 @@ function sourceIssueMessage(code: string) {
 }
 
 function analysisProgressLabel(batch: AmendmentBatch) {
+  if (batch.stage === "waiting_resources")
+    return "Waiting for available memory; saved progress is preserved.";
   if (batch.stage === "segmenting") return "Segmenting amendment…";
   if (batch.stage === "finalizing") return "Finalizing analysis…";
   if (batch.instruction_count > 0) {
+    if (batch.matched_instruction_count !== undefined) {
+      return `Matched ${batch.matched_instruction_count} / ${batch.instruction_count} · Finalized ${batch.processed_instruction_count} / ${batch.instruction_count}`;
+    }
     return `Analyzing ${batch.processed_instruction_count} / ${batch.instruction_count}`;
   }
   return "Analysis queued…";
@@ -1810,6 +1815,21 @@ export default function AmendmentsPage() {
                     <Text font="main-ui-body" color="text-05" as="p">
                       {analysisProgressLabel(selectedBatch)}
                     </Text>
+                  )}
+                  {selectedBatch.status === "paused" && (
+                    <div className="flex items-center justify-between gap-3">
+                      <Text font="main-ui-body" color="text-05" as="p">
+                        Analysis paused to protect memory; saved progress is
+                        preserved. Retry after capacity is available.
+                      </Text>
+                      <Button
+                        size="sm"
+                        onClick={() => void handleRetry()}
+                        disabled={retrying}
+                      >
+                        {retrying ? "Retrying…" : "Retry"}
+                      </Button>
+                    </div>
                   )}
                   {selectedBatch.status === "failed" && (
                     <div className="flex items-center justify-between gap-3">

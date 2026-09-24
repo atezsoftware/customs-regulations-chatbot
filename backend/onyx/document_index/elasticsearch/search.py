@@ -223,6 +223,7 @@ class DocumentQuery:
             created_at_range=index_filters.created_at_range,
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
+            regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             min_chunk_index=min_chunk_index,
             max_chunk_index=max_chunk_index,
@@ -409,6 +410,7 @@ class DocumentQuery:
             created_at_range=index_filters.created_at_range,
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
+            regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             min_chunk_index=None,
             max_chunk_index=None,
@@ -502,6 +504,7 @@ class DocumentQuery:
             created_at_range=index_filters.created_at_range,
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
+            regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             min_chunk_index=None,
             max_chunk_index=None,
@@ -542,6 +545,25 @@ class DocumentQuery:
                 ),
             )
         )
+
+        if index_filters.regulatory_lookup:
+            # The caller already supplies a source scope. Ranking text must not
+            # drop sibling fragments of the requested structural unit.
+            if (
+                not index_filters.regulatory_chunks_only
+                or not index_filters.regulatory_source_hint
+            ):
+                raise ValueError("Structural lookup requires a regulatory source scope")
+            lookup_filters = list(keyword_search_filters)
+            if index_filters.regulatory_lookup_heading:
+                lookup_filters.append(
+                    {
+                        "match_phrase": {
+                            HEADING_PATH_FIELD_NAME: index_filters.regulatory_lookup_heading
+                        }
+                    }
+                )
+            keyword_search_query = {"bool": {"filter": lookup_filters}}
 
         final_keyword_search_query: dict[str, Any] = {
             "query": keyword_search_query,
@@ -615,6 +637,7 @@ class DocumentQuery:
             created_at_range=index_filters.created_at_range,
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
+            regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             min_chunk_index=None,
             max_chunk_index=None,
@@ -683,6 +706,7 @@ class DocumentQuery:
             created_at_range=index_filters.created_at_range,
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
+            regulatory_source_hint=index_filters.regulatory_source_hint,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             min_chunk_index=None,
             max_chunk_index=None,
@@ -1144,6 +1168,7 @@ class DocumentQuery:
         max_chunk_index: int | None,
         as_of_date: date | None = None,
         regulatory_chunks_only: bool = False,
+        regulatory_source_hint: str | None = None,
         max_chunk_size: int | None = None,
         document_id: str | None = None,
         # Assistant knowledge filters
@@ -1600,6 +1625,18 @@ class DocumentQuery:
         filter_clauses: list[dict[str, Any]] = [
             {"bool": {"must_not": [{"term": {"publication_tombstone": True}}]}}
         ]
+
+        if regulatory_source_hint:
+            filter_clauses.append(
+                {
+                    "multi_match": {
+                        "query": regulatory_source_hint,
+                        "fields": [TITLE_FIELD_NAME, HEADING_PATH_FIELD_NAME],
+                        "type": "phrase",
+                        "slop": 0,
+                    }
+                }
+            )
 
         if not include_hidden:
             filter_clauses.append({"term": {HIDDEN_FIELD_NAME: {"value": False}}})

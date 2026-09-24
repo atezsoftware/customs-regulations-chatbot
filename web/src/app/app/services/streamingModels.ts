@@ -132,6 +132,7 @@ export interface PacketError extends BaseObj {
 export interface SearchToolStart extends BaseObj {
   type: "search_tool_start";
   is_internet_search?: boolean;
+  display_name?: string | null;
 }
 
 export interface SearchToolQueriesDelta extends BaseObj {

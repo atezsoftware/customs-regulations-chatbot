@@ -8,7 +8,7 @@ amendment-sourced row into `regulatory_chunk` — everything upstream
 
 import datetime
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import and_, case, func, or_, select, update
@@ -49,6 +49,10 @@ from onyx.utils.logger import setup_logger
 _MAX_ERROR_MESSAGE_LENGTH = 4000
 _AMENDMENT_PROJECTION_ORDINAL_BASE = 1_000_000_000
 _MAX_AMENDMENT_PROPOSAL_ID = 999_999_999
+
+
+if TYPE_CHECKING:
+    from onyx.regulatory.amendments.match_checkpoint import MatchEvidence
 
 
 @dataclass(frozen=True)
@@ -263,6 +267,7 @@ def persist_unmatched_checkpoint(
     lease_generation: int,
     instruction_index: int,
     instruction_text: str,
+    expected_evidence: "MatchEvidence | None" = None,
 ) -> bool:
     batch = _get_batch_for_update(db_session, batch_id)
     if (
@@ -275,6 +280,10 @@ def persist_unmatched_checkpoint(
     if instruction_index < 0 or instruction_index >= batch.instruction_count:
         db_session.rollback()
         return False
+    if expected_evidence is not None:
+        from onyx.db.amendment_match_checkpoints import assert_match_evidence
+
+        assert_match_evidence(db_session, batch.user_file_ids, expected_evidence)
     covered_indices = _processed_instruction_indices(batch)
     if instruction_index in covered_indices:
         proposal_owns_index = db_session.scalar(
@@ -413,7 +422,10 @@ def reset_failed_batch_for_retry(
     db_session: Session, *, batch_id: int
 ) -> AmendmentBatch | None:
     batch = _get_batch_for_update(db_session, batch_id)
-    if batch is None or batch.status != AmendmentBatchStatus.FAILED.value:
+    if batch is None or batch.status not in (
+        AmendmentBatchStatus.FAILED.value,
+        AmendmentBatchStatus.PAUSED.value,
+    ):
         db_session.rollback()
         return None
     batch.status = AmendmentBatchStatus.QUEUED.value
@@ -442,6 +454,17 @@ def claim_stale_batches_for_recovery(
             select(AmendmentBatch)
             .where(
                 or_(
+                    (
+                        (AmendmentBatch.status == AmendmentBatchStatus.QUEUED.value)
+                        & (
+                            AmendmentBatch.stage
+                            == AmendmentBatchStage.WAITING_RESOURCES.value
+                        )
+                        & (
+                            AmendmentBatch.heartbeat_at
+                            <= claimed_at - datetime.timedelta(seconds=60)
+                        )
+                    ),
                     (
                         (AmendmentBatch.status == AmendmentBatchStatus.QUEUED.value)
                         & (
@@ -489,7 +512,9 @@ def claim_stale_batches_for_recovery(
             batch.lease_generation += 1
         batch.status = AmendmentBatchStatus.QUEUED.value
         batch.stage = (
-            AmendmentBatchStage.PROCESSING.value
+            AmendmentBatchStage.WAITING_RESOURCES.value
+            if batch.stage == AmendmentBatchStage.WAITING_RESOURCES.value
+            else AmendmentBatchStage.PROCESSING.value
             if batch.segmented_instructions
             else AmendmentBatchStage.QUEUED.value
         )
@@ -995,6 +1020,23 @@ def _validated_reviewed_chunk_draft(
         heading_path=heading_path,
         metadata=metadata,
     )
+    heading_change = old_chunk_snapshot.get("heading_change")
+    if heading_change is not None:
+        from onyx.regulatory.amendments.compound_heading import (
+            apply_article_heading_change,
+        )
+
+        if (
+            not isinstance(heading_change, dict)
+            or not isinstance(heading_change.get("article_no"), str)
+            or not isinstance(heading_change.get("title"), str)
+            or not heading_change["title"].strip()
+            or str(metadata.get("article_no")) != heading_change["article_no"]
+        ):
+            raise ValueError("Invalid stored article heading change")
+        payload = apply_article_heading_change(
+            payload, heading_change["article_no"], heading_change["title"]
+        )
     return payload
 
 
@@ -1090,8 +1132,29 @@ def _approve_multi_chunk_proposal(
         for change in changes
         if change.get("old_chunk_id") is not None
     ]
-    if len(target_ids) != len(changes) or len(set(target_ids)) != len(target_ids):
+    if len(set(target_ids)) != len(target_ids):
         raise ValueError("Multi-chunk proposal targets must be unique existing chunks")
+    heading_scope = proposal.old_chunk_snapshot.get("heading_change_scope")
+    if len(target_ids) != len(changes) and heading_scope is None:
+        raise ValueError(
+            "New multi-chunk members require a verified heading/addition scope"
+        )
+    if heading_scope is not None:
+        from onyx.db.regulatory_chunks import get_active_chunks_by_structural_reference
+
+        live_scope = get_active_chunks_by_structural_reference(
+            db_session,
+            user_file_ids=[publication_owner.user_file_id],
+            article_no=heading_scope["article_no"],
+            clause_label=None,
+            appendix_label=None,
+            source_name_hint=None,
+            limit=257,
+        )
+        if {row.chunk.id for row in live_scope} != set(heading_scope["chunk_ids"]):
+            raise ValueError(
+                "Article heading scope changed after review; reanalyze before approval"
+            )
     locked = list(
         db_session.scalars(
             select(RegulatoryChunk)
@@ -1112,21 +1175,30 @@ def _approve_multi_chunk_proposal(
     old_chunks: list[RegulatoryChunk | None] = []
     today = datetime.date.today()
     for index, change in enumerate(changes):
-        old_chunk = by_id[str(change["old_chunk_id"])]
+        old_chunk = by_id.get(str(change.get("old_chunk_id")))
         snapshot = dict(change.get("old_chunk_snapshot") or {})
-        if snapshot.get("id") != old_chunk.id:
+        if old_chunk is None and snapshot.get("id") is not None:
             raise ValueError("Reviewed multi-chunk target identity changed")
-        if old_chunk.status != RegulatoryChunkStatus.ACTIVE.value:
-            raise ValueError(
-                f"Old chunk {old_chunk.id} is already {old_chunk.status}; cannot approve."
-            )
-        if is_hierarchical_aggregate_chunk(old_chunk):
-            raise ValueError("Derived aggregate chunks cannot be amended directly.")
-        _ensure_old_chunk_matches_review_snapshot(old_chunk, snapshot)
-        if has_active_structural_descendants(db_session, old_chunk):
-            raise ValueError(
-                "A multi-chunk target gained active descendants; reanalyze before approval."
-            )
+        if old_chunk is not None:
+            if snapshot.get("id") != old_chunk.id:
+                raise ValueError("Reviewed multi-chunk target identity changed")
+            if old_chunk.status != RegulatoryChunkStatus.ACTIVE.value:
+                raise ValueError(
+                    f"Old chunk {old_chunk.id} is already {old_chunk.status}; cannot approve."
+                )
+            if is_hierarchical_aggregate_chunk(old_chunk):
+                raise ValueError("Derived aggregate chunks cannot be amended directly.")
+            _ensure_old_chunk_matches_review_snapshot(old_chunk, snapshot)
+            descendants = load_active_structural_descendants(db_session, old_chunk)
+            if descendants and not (
+                heading_scope is not None
+                and snapshot.get("heading_change", {}).get("article_no")
+                == heading_scope["article_no"]
+                and {row.id for row in descendants}.issubset(target_ids)
+            ):
+                raise ValueError(
+                    "A multi-chunk target gained active descendants; reanalyze before approval."
+                )
         draft = _validated_reviewed_chunk_draft(
             change["new_chunk_draft"],
             change["new_chunk_draft"],
@@ -1151,7 +1223,8 @@ def _approve_multi_chunk_proposal(
         if end_date is not None and end_date <= start_date:
             raise ValueError("effective_end_date must be after effective_start_date")
         if (
-            old_chunk.validity_start_date is not None
+            old_chunk is not None
+            and old_chunk.validity_start_date is not None
             and old_chunk.validity_start_date >= start_date
         ):
             raise ValueError(
@@ -1161,7 +1234,7 @@ def _approve_multi_chunk_proposal(
         metadata = dict(draft.get("metadata") or {})
         for key in RegulatoryChunkEvidence.model_fields:
             metadata.pop(key, None)
-            if key in old_chunk.chunk_metadata:
+            if old_chunk is not None and key in old_chunk.chunk_metadata:
                 metadata[key] = old_chunk.chunk_metadata[key]
         metadata.setdefault("chunk_variant", ATOMIC_CHUNK_VARIANT)
         metadata.setdefault("source_chunk_orders", [])
@@ -1190,23 +1263,24 @@ def _approve_multi_chunk_proposal(
             projection_ordinal=projection_ordinal,
             validity_start_date=start_date,
             validity_end_date=end_date,
-            supersedes_chunk_id=old_chunk.id,
+            supersedes_chunk_id=old_chunk.id if old_chunk else None,
         )
         db_session.add(new_chunk)
         db_session.flush()
-        copy_annex_chunk_links(
-            db_session, old_chunk_id=old_chunk.id, new_chunk_id=new_chunk.id
-        )
-        supersede_hierarchical_aggregates_referencing_chunk(
-            db_session,
-            user_file_id=user_file_id,
-            source_chunk_id=old_chunk.id,
-            superseded_at=start_date,
-        )
-        old_chunk.status = RegulatoryChunkStatus.SUPERSEDED.value
-        old_chunk.validity_end_date = start_date
-        old_chunk.superseded_by_chunk_id = new_chunk.id
-        db_session.add(old_chunk)
+        if old_chunk is not None:
+            copy_annex_chunk_links(
+                db_session, old_chunk_id=old_chunk.id, new_chunk_id=new_chunk.id
+            )
+            supersede_hierarchical_aggregates_referencing_chunk(
+                db_session,
+                user_file_id=user_file_id,
+                source_chunk_id=old_chunk.id,
+                superseded_at=start_date,
+            )
+            old_chunk.status = RegulatoryChunkStatus.SUPERSEDED.value
+            old_chunk.validity_end_date = start_date
+            old_chunk.superseded_by_chunk_id = new_chunk.id
+            db_session.add(old_chunk)
         change["new_chunk_draft"] = draft
         new_chunks.append(new_chunk)
         old_chunks.append(old_chunk)
@@ -1591,7 +1665,7 @@ def append_batch_log(
     if not entries:
         return
     try:
-        batch = db_session.get(AmendmentBatch, batch_id)
+        batch = _get_batch_for_update(db_session, batch_id)
         if batch is None:
             db_session.rollback()
             return

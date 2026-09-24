@@ -66,6 +66,9 @@ from onyx.tools.tool_implementations.images.image_generation_tool import (
 from onyx.tools.tool_implementations.memory.memory_tool import MemoryTool
 from onyx.tools.tool_implementations.open_url.open_url_tool import OpenURLTool
 from onyx.tools.tool_implementations.python.python_tool import PythonTool
+from onyx.tools.tool_implementations.regulatory_provision.regulatory_provision_tool import (
+    RegulatoryProvisionTool,
+)
 from onyx.tools.tool_implementations.search.search_tool import SearchTool
 from onyx.tools.tool_implementations.web_search.web_search_tool import WebSearchTool
 from onyx.utils.logger import setup_logger
@@ -481,6 +484,7 @@ def create_search_packets(
     is_internet_search: bool,
     turn_index: int,
     tab_index: int = 0,
+    display_name: str | None = None,
 ) -> list[Packet]:
     packets: list[Packet] = []
 
@@ -489,6 +493,7 @@ def create_search_packets(
             placement=Placement(turn_index=turn_index, tab_index=tab_index),
             obj=SearchToolStart(
                 is_internet_search=is_internet_search,
+                display_name=display_name,
             ),
         )
     )
@@ -596,11 +601,21 @@ def translate_assistant_message_to_packets(
                     # Handle different tool types
                     if tool.in_code_tool_id in [
                         SearchTool.__name__,
+                        RegulatoryProvisionTool.__name__,
                         WebSearchTool.__name__,
                     ]:
                         queries = cast(
                             list[str], tool_call.tool_call_arguments.get("queries", [])
                         )
+                        structural_lookup = (
+                            tool.in_code_tool_id == RegulatoryProvisionTool.__name__
+                        )
+                        if structural_lookup:
+                            queries = [
+                                json.dumps(
+                                    tool_call.tool_call_arguments, ensure_ascii=False
+                                )
+                            ]
                         search_docs: list[SavedSearchDoc] = [
                             translate_db_search_doc_to_saved_search_doc(doc)
                             for doc in tool_call.search_docs
@@ -608,6 +623,9 @@ def translate_assistant_message_to_packets(
                         turn_tool_packets.extend(
                             create_search_packets(
                                 search_queries=queries,
+                                display_name=RegulatoryProvisionTool.DISPLAY_NAME
+                                if structural_lookup
+                                else None,
                                 search_docs=search_docs,
                                 is_internet_search=tool.in_code_tool_id
                                 == WebSearchTool.__name__,

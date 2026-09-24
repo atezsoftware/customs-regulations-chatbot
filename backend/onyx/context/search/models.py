@@ -117,6 +117,8 @@ class BaseFilters(BaseModel):
     # prevents legacy whole-file/user-file chunks from contaminating results,
     # including for administrators whose ACL would otherwise expose them.
     regulatory_chunks_only: bool = False
+    # Additional source constraint for a named-provision retrieval lane.
+    regulatory_source_hint: str | None = None
     # Internal orchestration selector. Excluded from index filter payloads; the
     # SearchTool and research loops consume it to choose bounded workflow limits.
     regulatory_workflow_mode: Literal["standard", "fast"] = Field(
@@ -165,6 +167,10 @@ class AssistantKnowledgeFilters(BaseModel):
 
 
 class IndexFilters(BaseFilters, UserFileFilters, AssistantKnowledgeFilters):
+    # Internal structural lookup: filter-only keyword reads, never LLM routing.
+    regulatory_lookup: bool = False
+    regulatory_lookup_heading: str | None = None
+
     # NOTE: These strings must be formatted in the same way as the output of
     # DocumentAccess::to_acl.
     access_control_list: list[str] | None
