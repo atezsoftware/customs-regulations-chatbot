@@ -12,6 +12,82 @@ from onyx.regulatory.amendments.memory_budget import (
 from onyx.regulatory.amendments.supervision import supervise
 
 
+def test_child_pool_supports_nested_parallel_reads_and_releases_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import ExitStack
+    from threading import Barrier
+
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+    from sqlalchemy.pool import QueuePool
+
+    from onyx.db.engine.sql_engine import SqlEngine
+    from onyx.regulatory.amendments import job, supervision
+    from onyx.utils import variable_functionality as versioning
+
+    engine: Engine | None = None
+
+    def initialize(*, pool_size: int, max_overflow: int, **_kwargs: object) -> None:
+        nonlocal engine
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=QueuePool,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=0.1,
+        )
+
+    def run_batch(**_kwargs: object) -> None:
+        assert engine is not None
+        analysis_engine = engine
+        # Four instructions can each fan out into five query lanes.
+        held = Barrier(20, timeout=2)
+        nested = Barrier(20, timeout=2)
+
+        def read(_index: int) -> int:
+            try:
+                with analysis_engine.connect():
+                    held.wait()
+                    with analysis_engine.connect() as publication:
+                        nested.wait()
+                        return publication.execute(text("SELECT 1")).scalar_one()
+            except Exception:
+                held.abort()
+                nested.abort()
+                raise
+
+        with ThreadPoolExecutor(max_workers=20) as workers:
+            assert list(workers.map(read, range(20))) == [1] * 20
+        pool = analysis_engine.pool
+        assert isinstance(pool, QueuePool)
+        assert pool.checkedout() == 0
+        assert pool.overflow() == 0
+        assert pool.checkedin() < 40  # Burst connections are closed on return.
+        with ExitStack() as connections:
+            for _ in range(48):
+                connections.enter_context(analysis_engine.connect())
+            with pytest.raises(PoolTimeout):
+                analysis_engine.connect()
+        assert pool.checkedout() == 0
+
+    monkeypatch.setattr(versioning, "set_is_ee_based_on_env_variable", lambda: None)
+    monkeypatch.setattr(supervision, "protect_parent_lifetime", lambda: None)
+    monkeypatch.setattr(SqlEngine, "reset_engine", lambda: None)
+    monkeypatch.setattr(SqlEngine, "set_app_name", lambda _name: None)
+    monkeypatch.setattr(SqlEngine, "init_engine", initialize)
+    monkeypatch.setattr(job, "run_amendment_batch", run_batch)
+    monkeypatch.setattr(sys, "argv", ["supervision", "189", "1", "public", "parallel"])
+    try:
+        supervision._child_main()
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+
 @pytest.mark.parametrize("current_mib", [2800, 3084])
 def test_serial_child_phases_use_actual_reserve(
     monkeypatch: pytest.MonkeyPatch, current_mib: int

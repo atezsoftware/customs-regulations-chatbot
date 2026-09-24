@@ -340,6 +340,34 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
         repository.activate_temporal_projection(
             source_session, user_file_id=file.id, binding=item
         )
+    from sqlalchemy import update
+
+    from onyx.db.models import RegulatoryTemporalProjection
+
+    # An unrelated projection must never be hydrated by a bounded hit read;
+    # selected evidence must still undergo its full integrity validation.
+    with source_session.begin_nested() as probe:
+        source_session.execute(
+            update(RegulatoryTemporalProjection)
+            .where(RegulatoryTemporalProjection.id == second.id)
+            .values(payload_sha256="corrupt-fixture")
+        )
+        assert load_public_temporal_bindings(
+            source_session,
+            file.id,
+            index=indices[0],
+            as_of_date=date(2025, 1, 1),
+            projection_ordinals=(first.projection.ordinal,),
+        ) == [first]
+        with pytest.raises(ValueError, match="payload changed"):
+            load_public_temporal_bindings(
+                source_session,
+                file.id,
+                index=indices[0],
+                as_of_date=date(2026, 2, 1),
+                projection_ordinals=(second.projection.ordinal,),
+            )
+        probe.rollback()
     for index, when, expected in (
         (indices[0], date(2025, 1, 1), first),
         (indices[0], date(2026, 2, 1), second),
@@ -357,6 +385,26 @@ def test_index_qualified_temporal_bindings_keep_two_configurations_and_source_hi
             as_of_date=when,
         )
         assert inventory == [expected]
+        assert (
+            load_public_temporal_bindings(
+                source_session,
+                file.id,
+                index=index,
+                as_of_date=when,
+                projection_ordinals=(expected.projection.ordinal,),
+            )
+            == inventory
+        )
+        assert (
+            load_public_temporal_bindings(
+                source_session,
+                file.id,
+                index=index,
+                as_of_date=when,
+                projection_ordinals=(),
+            )
+            == []
+        )
         from onyx.db.regulatory_chunks import get_bounded_same_provision_siblings
         from onyx.document_index.elasticsearch.elasticsearch_document_index import (
             convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned,

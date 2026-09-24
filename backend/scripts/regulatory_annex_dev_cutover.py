@@ -964,17 +964,60 @@ class Driver:
         self.stop_background()
 
 
+def live_background_resource_values() -> dict[str, str]:
+    """Preserve the approved live DEV allocation across stale Helm values."""
+    result = subprocess.run(
+        [
+            "kubectl",
+            "--namespace",
+            NAMESPACE,
+            "get",
+            "deployment",
+            "dev-customs-regulations-background-deployment",
+            "-o",
+            "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    containers = [
+        container
+        for container in json.loads(result.stdout)["spec"]["template"]["spec"][
+            "containers"
+        ]
+        if container.get("image", "").startswith(REPOSITORY + ":")
+    ]
+    if len(containers) != 1:
+        raise CutoverRefusal("single_DEV_background_container_required")
+    resources = containers[0].get("resources", {})
+    values = {
+        f"{label}_{kind}": resources.get(kind, {}).get(resource)
+        for label, resource in (("mem", "memory"), ("cpu", "cpu"))
+        for kind in ("requests", "limits")
+    }
+    if any(not isinstance(value, str) or not value for value in values.values()):
+        raise CutoverRefusal("complete_live_DEV_resources_required")
+    if values["mem_limits"] not in {"5Gi", "5120Mi"}:
+        raise CutoverRefusal("approved_DEV_5Gi_memory_limit_required")
+    return cast(dict[str, str], values)
+
+
 def render_values(enabled: bool = False) -> None:
     import yaml
 
     staging_uri = os.environ.get("REGULATORY_LABELING_VERTEX_GCS_URI", "").strip()
     if not re.fullmatch(r"gs://[a-z0-9][a-z0-9._-]+/[\S]+", staging_uri):
         raise CutoverRefusal("DEV_labeling_GCS_location_required")
+    live_resources = live_background_resource_values() if enabled else None
     for app in APPS:
         path = Path(
             f"devops/dev/customs-regulations/customs-regulations-{app}-values.yaml"
         )
         values = yaml.safe_load(path.read_text())
+        if app == "background" and live_resources is not None:
+            values["app"].update(live_resources)
         environment = values["app"].setdefault("environment", {})
         environment["enabled"] = True
         parameters = environment.setdefault("parameters", [])

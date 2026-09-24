@@ -224,9 +224,10 @@ def _child_main() -> None:
     token = CURRENT_TENANT_ID_CONTEXTVAR.set(tenant_id)
     SqlEngine.reset_engine()
     SqlEngine.set_app_name("amendment_analysis_child")
-    # Search lanes can nest settings/publication reads and cost accounting.
-    # Bound the shared pool without starving those reads behind matching lanes.
-    SqlEngine.init_engine(pool_size=12, max_overflow=0, pool_pre_ping=True)
+    # Four matching tasks fan out into up to twenty search lanes with nested
+    # publication reads. Burst connections close on return; only this child
+    # receives the larger pool, leaving API and Celery defaults unchanged.
+    SqlEngine.init_engine(pool_size=24, max_overflow=24, pool_pre_ping=True)
     policy = MemoryPolicy()
 
     def report(measurements: dict[str, int]) -> None:

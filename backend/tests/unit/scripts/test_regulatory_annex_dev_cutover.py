@@ -2551,6 +2551,44 @@ def test_runtime_redis_checks_after_settled_apps_only_once() -> None:
     ]
 
 
+@pytest.mark.parametrize("memory", ["5Gi", "5120Mi", "3584Mi", None])
+def test_live_background_resources_keep_cpu_and_require_approved_memory(
+    memory: str | None,
+) -> None:
+    import json
+
+    container = {
+        "image": cutover.REPOSITORY + ":" + "a" * 40,
+        "resources": {
+            "requests": {"memory": "2560Mi", "cpu": "100m"},
+            "limits": {"memory": memory, "cpu": "1"},
+        },
+    }
+    response = {"spec": {"template": {"spec": {"containers": [container]}}}}
+    with patch.object(
+        cutover.subprocess, "run", return_value=Mock(stdout=json.dumps(response))
+    ) as command:
+        if memory not in {"5Gi", "5120Mi"}:
+            with pytest.raises(cutover.CutoverRefusal):
+                cutover.live_background_resource_values()
+        else:
+            assert cutover.live_background_resource_values() == {
+                "mem_limits": memory,
+                "mem_requests": "2560Mi",
+                "cpu_limits": "1",
+                "cpu_requests": "100m",
+            }
+    args = command.call_args.args[0]
+    assert args[:5] == [
+        "kubectl",
+        "--namespace",
+        "customs-regulations-dev",
+        "get",
+        "deployment",
+    ]
+    assert args[5] == "dev-customs-regulations-background-deployment"
+
+
 def test_redis_deployment_values_override_both_apps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2632,6 +2670,17 @@ def test_labeling_vertex_storage_values_match_both_apps_and_replace_stale_values
 ) -> None:
     import yaml
 
+    monkeypatch.setattr(
+        cutover,
+        "live_background_resource_values",
+        lambda: {
+            "mem_limits": "5Gi",
+            "mem_requests": "2560Mi",
+            "cpu_limits": "1",
+            "cpu_requests": "100m",
+        },
+        raising=False,
+    )
     name = "REGULATORY_LABELING_VERTEX_GCS_URI"
     monkeypatch.chdir(tmp_path)
     if gcs_uri is None:
@@ -2663,6 +2712,13 @@ def test_labeling_vertex_storage_values_match_both_apps_and_replace_stale_values
         data = yaml.safe_load(
             (directory / f"customs-regulations-{app}-values.yaml").read_text()
         )
+        if enabled and app == "background":
+            assert data["app"]["mem_limits"] == "5Gi"
+            assert data["app"]["mem_requests"] == "2560Mi"
+            assert data["app"]["cpu_limits"] == "1"
+            assert data["app"]["cpu_requests"] == "100m"
+        else:
+            assert "mem_limits" not in data["app"]
         parameters = data["app"]["environment"]["parameters"]
         assert [entry for entry in parameters if entry["name"] == name] == [
             {"name": name, "value": gcs_uri or ""}

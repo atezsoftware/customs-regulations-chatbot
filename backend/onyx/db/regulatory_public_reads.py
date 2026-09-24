@@ -4,6 +4,7 @@ These reads never grant access: callers retain the existing file/document ACLs.
 """
 
 import json
+from collections.abc import Mapping
 from datetime import date, timedelta
 from uuid import UUID
 
@@ -54,22 +55,38 @@ def load_public_temporal_bindings(
     *,
     index: PublicationIndexSnapshot,
     as_of_date: date,
+    projection_ordinals: tuple[int, ...] | None = None,
 ) -> list[AnnexTemporalProjection]:
     """Use each immutable activated binding's positive receipt and actual physical index."""
     from onyx.regulatory.contextual import validity_window_contains
 
-    canonical = {
-        row.id: row
-        for row in session.scalars(
-            select(RegulatoryChunk)
-            .execution_options(populate_existing=True)
-            .where(
-                RegulatoryChunk.user_file_id == user_file_id,
+    bindings = load_file_temporal_bindings(
+        session,
+        user_file_id,
+        refresh=True,
+        projection_ordinals=projection_ordinals,
+        index_uuid=index.index_uuid if projection_ordinals is not None else None,
+    )
+    if not bindings:
+        return []
+    canonical_query = (
+        select(RegulatoryChunk)
+        .execution_options(populate_existing=True)
+        .where(RegulatoryChunk.user_file_id == user_file_id)
+    )
+    if projection_ordinals is not None:
+        # Search hits need only their own canonical validity and frozen evidence.
+        canonical_query = canonical_query.where(
+            RegulatoryChunk.id.in_(
+                {
+                    json.loads(binding.projection.source_json)["regulatory_chunk_id"]
+                    for binding in bindings
+                }
             )
         )
-    }
+    canonical = {row.id: row for row in session.scalars(canonical_query)}
     selected = []
-    for binding in load_file_temporal_bindings(session, user_file_id, refresh=True):
+    for binding in bindings:
         if not binding.index.matches_temporal_index(index):
             continue
         source = json.loads(binding.projection.source_json)
@@ -213,6 +230,7 @@ def query_temporal_bindings(
     *,
     index: PublicationIndexSnapshot,
     as_of_date: date,
+    projection_ordinals: Mapping[UUID, tuple[int, ...]] | None = None,
 ) -> dict[UUID, list[AnnexTemporalProjection]]:
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
 
@@ -223,6 +241,11 @@ def query_temporal_bindings(
                 file_id,
                 index=index,
                 as_of_date=as_of_date,
+                projection_ordinals=(
+                    projection_ordinals.get(file_id, ())
+                    if projection_ordinals is not None
+                    else None
+                ),
             )
             for file_id in file_ids
         }

@@ -1,5 +1,6 @@
 """Short scoped database reads for final annex publication preparation."""
 
+import json
 from datetime import date
 from uuid import UUID
 
@@ -75,28 +76,49 @@ def load_annex_publication_inputs(
 
 
 def load_file_temporal_bindings(
-    session: Session, user_file_id: UUID, *, refresh: bool = False
+    session: Session,
+    user_file_id: UUID,
+    *,
+    refresh: bool = False,
+    projection_ordinals: tuple[int, ...] | None = None,
+    index_uuid: str | None = None,
 ) -> list[AnnexTemporalProjection]:
     from onyx.db.regulatory_canonical_revisions import (
         validate_temporal_canonical_revisions,
     )
     from onyx.document_index.publication_models import publication_digest
 
-    rows = list(
-        session.scalars(
-            select(RegulatoryTemporalProjection)
-            .execution_options(populate_existing=refresh)
-            .where(
-                RegulatoryTemporalProjection.user_file_id == user_file_id,
-                RegulatoryTemporalProjection.retired_at.is_(None),
-            )
+    if projection_ordinals == ():
+        return []
+    query = (
+        select(RegulatoryTemporalProjection)
+        .execution_options(populate_existing=refresh)
+        .where(
+            RegulatoryTemporalProjection.user_file_id == user_file_id,
+            RegulatoryTemporalProjection.retired_at.is_(None),
         )
     )
+    if projection_ordinals is not None:
+        query = query.where(
+            RegulatoryTemporalProjection.projection_ordinal.in_(projection_ordinals)
+        )
+    if index_uuid is not None:
+        query = query.where(RegulatoryTemporalProjection.index_uuid == index_uuid)
+    rows = list(session.scalars(query))
     for row in rows:
         if publication_digest(row.payload) != row.payload_sha256:
             raise ValueError("temporal binding payload changed")
     validate_temporal_canonical_revisions(session, rows)
-    return [AnnexTemporalProjection.model_validate(row.payload) for row in rows]
+    bindings = [AnnexTemporalProjection.model_validate(row.payload) for row in rows]
+    for row, binding in zip(rows, bindings):
+        if (
+            row.projection_ordinal != binding.projection.ordinal
+            or row.index_uuid != binding.index.index_uuid
+            or str(row.user_file_id)
+            != json.loads(binding.projection.source_json)["document_id"]
+        ):
+            raise ValueError("temporal binding lookup identity mismatch")
+    return bindings
 
 
 def load_binding_context_sources(

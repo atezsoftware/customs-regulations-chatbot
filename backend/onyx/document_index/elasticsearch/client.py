@@ -1954,6 +1954,16 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                 tuple(qualified),
                 index=query_index,
                 as_of_date=as_of_date or datetime.date.today(),
+                projection_ordinals={
+                    file_id: tuple(
+                        {
+                            hit.document_chunk.chunk_index
+                            for hit in search_hits
+                            if file_uuid(hit.document_chunk.document_id) == file_id
+                        }
+                    )
+                    for file_id in qualified
+                },
             )
             by_slot = {
                 (str(file_id), binding.projection.ordinal): binding
