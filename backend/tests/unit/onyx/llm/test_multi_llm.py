@@ -1312,6 +1312,53 @@ def test_anthropic_model_passes_isolated_client() -> None:
         assert isinstance(kwargs["client"], HTTPHandler)
 
 
+@pytest.mark.parametrize("method", ["invoke", "stream"])
+def test_timed_vertex_stream_owns_bounded_client_and_closes_on_error(
+    method: str,
+) -> None:
+    from litellm import HTTPHandler
+
+    llm = LitellmLLM(
+        api_key=None,
+        timeout=30,
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name="gemini-3.8-flash",
+        max_input_tokens=200000,
+    )
+    clients: list[HTTPHandler] = []
+
+    def fail_stream(**kwargs: object) -> object:
+        client = kwargs["client"]
+        assert isinstance(client, HTTPHandler)
+        assert client.client.timeout.read == 7
+        assert not client.client.is_closed
+        clients.append(client)
+        raise RuntimeError("provider stream interrupted")
+
+    with patch.object(llm, "_completion", side_effect=fail_stream):
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="provider stream interrupted"):
+                if method == "invoke":
+                    llm.invoke([UserMessage(content="Hi")], timeout_override=7)
+                else:
+                    list(llm.stream([UserMessage(content="Hi")], timeout_override=7))
+    assert len(clients) == 2 and clients[0] is not clients[1]
+    assert all(client.client.is_closed for client in clients)
+
+
+def test_untimed_vertex_call_keeps_existing_client_policy() -> None:
+    llm = LitellmLLM(
+        api_key=None,
+        timeout=30,
+        model_provider=LlmProviderNames.VERTEX_AI,
+        model_name="gemini-3.8-flash",
+        max_input_tokens=200000,
+    )
+    with patch.object(llm, "_completion", return_value=[]) as completion:
+        list(llm.stream([UserMessage(content="Hi")]))
+    assert completion.call_args.kwargs["client"] is None
+
+
 def test_bedrock_model_passes_no_client() -> None:
     """Test that Bedrock models don't get a client passed."""
     llm = LitellmLLM(

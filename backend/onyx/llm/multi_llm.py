@@ -1041,12 +1041,19 @@ class LitellmLLM(LLM):
             max_input_tokens=self._max_input_tokens,
         )
 
-    def _uses_isolated_client(self) -> bool:
+    def _uses_isolated_client(self, timeout_override: int | None = None) -> bool:
         """Providers whose sync calls need a fresh per-call HTTPHandler instead of
         litellm's shared module_level_client (see threading notes in invoke())."""
         return (
             is_true_openai_model(self.config.model_provider, self.config.model_name)
             or self.config.model_provider == LlmProviderNames.ANTHROPIC
+            # Vertex Gemini's sync streaming adapter does not forward timeout
+            # to its shared HTTP client. Bind explicit limits to an owned client.
+            or (
+                timeout_override is not None
+                and self.config.model_provider == LlmProviderNames.VERTEX_AI
+                and self.config.model_name.startswith("gemini-")
+            )
         )
 
     def invoke(
@@ -1068,8 +1075,8 @@ class LitellmLLM(LLM):
 
         # HTTPHandler Threading & Connection Pool Notes:
         # =============================================
-        # We create an isolated HTTPHandler ONLY for true OpenAI models (not OpenAI-compatible
-        # providers like glm-4.7, DeepSeek, etc.). This distinction is critical:
+        # Client isolation depends on the provider, not OpenAI-compatible API shape.
+        # Providers like glm-4.7 and DeepSeek do not accept this HTTPHandler:
         #
         # 1. WHY ONLY TRUE OPENAI MODELS:
         #    - True OpenAI models use litellm's "responses API" path which expects HTTPHandler
@@ -1096,13 +1103,17 @@ class LitellmLLM(LLM):
         #    - Must use is_true_openai_model() NOT just check model_provider == "openai"
         #    - Many OpenAI-compatible providers set model_provider="openai" but are NOT true
         #      OpenAI models (glm-4.7, DeepSeek, local proxies, etc.)
+        #
+        # 5. VERTEX GEMINI WITH AN EXPLICIT TIMEOUT:
+        #    - The sync streaming adapter ignores the completion timeout when selecting
+        #      its default client. A per-call HTTPHandler applies it and closes on exit.
         #    - is_true_openai_model() checks both provider AND model name patterns
         #
         # This note may not be entirely accurate as there is a lot of complexity in the LiteLLM codebase around this
         # and not every model path was traced thoroughly. It is also possible that in future versions of LiteLLM
         # they will realize that their OpenAI handling is not threadsafe. Hope they will just fix it.
         client = None
-        if self._uses_isolated_client():
+        if self._uses_isolated_client(timeout_override):
             client = HTTPHandler(timeout=timeout_override or self._timeout)
 
         try:
@@ -1220,7 +1231,7 @@ class LitellmLLM(LLM):
         for attempt in range(max_attempts):
             client = None
             retry_delay_s: float | None = None
-            if self._uses_isolated_client():
+            if self._uses_isolated_client(timeout_override):
                 client = HTTPHandler(timeout=timeout_override or self._timeout)
 
             try:
